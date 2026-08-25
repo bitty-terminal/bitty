@@ -58,6 +58,17 @@ pull request, and merge stages are unavailable; scoped shared-checkout work is
 the only authorized exception. See [AGENTS.md](AGENTS.md) for the normative
 rules.
 
+### Branch and worktree naming
+
+Use uniform names across all Bitty repositories:
+
+- Branches follow `ctx-XXXX/<type>-<short-slug>` where `XXXX` is the owning
+  CarryCtx task number, `<type>` is one of `feat|fix|chore|docs`, and the slug
+  is short kebab-case (for example `ctx-0031/feat-isolation-rfc`).
+- CarryCtx-bound worktrees live at `.worktrees/ctx-XXXX-<type>-<short-slug>`
+  with `/` mapped to `-`.
+- Use one branch per task; commander housekeeping branches may use `cmd/<slug>`.
+
 ## Committing
 
 Use Conventional Commits:

@@ -50,7 +50,13 @@
   independent review plus CI, merge, documentation synchronization, final
   checkpoint, task completion, and Issue closure.
 - After the first commit, parallel implementation uses dedicated worktrees and
-  branches. Declare cross-repository dependencies and merge order explicitly.
+  branches. Branches use `ctx-XXXX/<type>-<short-slug>` where `XXXX` is the
+  owning CarryCtx task number, `<type>` is one of `feat|fix|chore|docs`, and
+  the slug is short kebab-case (for example `ctx-0031/feat-isolation-rfc`);
+  CarryCtx-bound worktrees live at `.worktrees/ctx-XXXX-<type>-<short-slug>`
+  with `/` mapped to `-`. One branch per task; commander housekeeping branches
+  may use `cmd/<slug>`. Declare cross-repository dependencies and merge order
+  explicitly.
 - Before the first commit, branches, worktrees, commits, and pull requests are
   unavailable. The commander may authorize a shared checkout only for disjoint
   scopes with CI-equivalent local checks. This exception ends at initialization.

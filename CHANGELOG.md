@@ -9,3 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial repository governance and toolchain scaffolding (proposed; no
   release has been published).
+- Lefthook Git hooks wired to justfile quality gates: pre-commit Rust
+  formatting, Clippy, and Markdown linting; commit-msg Conventional Commits
+  validation; pre-push workspace check (proposed; no release has been
+  published).

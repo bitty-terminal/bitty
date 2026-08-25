@@ -7,5 +7,5 @@
     "MD041": false
   },
   "globs": ["**/*.md"],
-  "ignores": ["node_modules", "target", "dist", "build", "site"]
+  "ignores": ["node_modules", "target", "dist", "build", "site", ".worktrees"]
 }

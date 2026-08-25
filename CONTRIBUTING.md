@@ -16,22 +16,34 @@ and agent must follow.
   resolves and installs it automatically (includes `rustfmt` and Clippy)
 - `just` — command runner for the quality gates
 - `actionlint` — GitHub Actions workflow linting, invoked by `just actionlint`
+- `lefthook` — Git hook manager, installed into the repository hooks by
+  `just setup`
+- `bun` — runs the pinned JavaScript dev tools (commitlint,
+  markdownlint-cli2) through `bunx --bun`; no `npm`, `npx`, or `yarn`
 
 ## Setup
 
-Clone the repository and let `rustup` provision the pinned toolchain. There is
-no separate setup target yet; tooling wiring (hooks, additional just targets,
-CI workflows) is deferred to follow-up initialization tasks.
+Clone the repository and run:
+
+```bash
+just setup
+```
+
+This fetches Cargo dependencies, installs the Lefthook Git hooks
+(pre-commit format/lint/markdown gates, commit-msg Conventional Commits
+check, pre-push build check), and provisions the pinned JS dev tools under
+`target/dev-tools`.
 
 ## Development loop
 
 All checks run through the justfile:
 
 ```bash
-just check              # fmt-check + clippy + test + actionlint
+just check              # fmt-check + clippy + test + actionlint + markdownlint
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
 just test               # cargo test --workspace --all-targets --locked
+just markdownlint       # markdownlint-cli2 over the repository Markdown
 ```
 
 Run `just check` before requesting review. Formatting, lints, tests, and
@@ -56,9 +68,10 @@ fix(app): correct workspace member resolution
 docs(readme): clarify scaffold scope
 ```
 
-A Conventional Commits configuration is provided in
-`commitlint.config.ts`. Enforcement through Git hooks or CI is not wired up
-yet and remains a follow-up task.
+A Conventional Commits configuration is provided in `commitlint.config.ts`.
+After `just setup`, the commit-msg hook enforces it locally through
+`just commit-check`; the pre-commit hooks run the same Rust and Markdown
+gates as `just check`.
 
 ## Scope expectations
 

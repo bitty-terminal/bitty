@@ -175,6 +175,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-runtime"
+version = "0.0.0"
+dependencies = [
+ "bitty-platform",
+ "bitty-pty",
+ "bitty-render",
+ "bitty-term-state",
+ "bitty-vt",
+]
+
+[[package]]
 name = "bitty-term-state"
 version = "0.0.0"
 dependencies = [

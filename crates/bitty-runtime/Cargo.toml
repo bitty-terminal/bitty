@@ -1,0 +1,16 @@
+[package]
+name = "bitty-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-vt = { path = "../bitty-vt" }
+bitty-term-state = { path = "../bitty-term-state" }
+bitty-pty = { path = "../bitty-pty" }
+bitty-render = { path = "../bitty-render" }
+bitty-platform = { path = "../bitty-platform" }

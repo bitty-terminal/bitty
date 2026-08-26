@@ -1,0 +1,21 @@
+[package]
+name = "bitty-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Software fallback seed: a bounded CPU alpha-blit of glyph bitmaps onto an
+# in-memory RGBA surface. Opt-in; see `src/software.rs`.
+sw-fallback = []
+
+[dependencies]
+# ADR-0004 rendering rows: ADOPT wgpu (~25.x line); WRAP crossfont.
+# Neither upstream type may appear in this crate's public API.
+wgpu = "25.0"
+crossfont = "0.9"

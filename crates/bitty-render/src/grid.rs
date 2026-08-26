@@ -127,12 +127,14 @@ impl CellMetrics {
         Ok(Self { width, height })
     }
 
-    /// Pixel extent of a `cols x rows` grid (saturating arithmetic).
+    /// Pixel extent of a `cols x rows` grid (saturating arithmetic: every
+    /// intermediate multiply saturates, so hostile dimensions cannot panic
+    /// or wrap under any build profile).
     #[must_use]
     pub fn extent_for(&self, cols: usize, rows: usize) -> ExtentPx {
         ExtentPx::new(
-            saturating_u32(u64::from(self.width) * cols as u64),
-            saturating_u32(u64::from(self.height) * rows as u64),
+            saturating_u32(u64::from(self.width).saturating_mul(cols as u64)),
+            saturating_u32(u64::from(self.height).saturating_mul(rows as u64)),
         )
     }
 }
@@ -810,8 +812,12 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.counters.cells_examined += 1;
 
         let (fg, bg) = resolved_colors(&term_cell.style);
-        let left = col as u64 * u64::from(self.cell.width);
-        let top = row as u64 * u64::from(self.cell.height);
+        let left = u64::try_from(col)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.width));
+        let top = u64::try_from(row)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.height));
 
         // Span in columns: wide cells cover their spacer column too, while
         // spacers paint only their own half (the leading half already
@@ -830,7 +836,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             rect: RectPx::new(
                 saturating_i32(left),
                 saturating_i32(top),
-                saturating_u32(span_cols as u64 * u64::from(self.cell.width)),
+                saturating_u32(
+                    u64::try_from(span_cols)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::from(self.cell.width)),
+                ),
                 self.cell.height,
             ),
             color: bg,
@@ -867,9 +877,17 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         use bitty_term_state::UnderlineStyle;
 
         let thickness = (self.cell.height / 8).clamp(1, 2);
-        let left = col as u64 * u64::from(self.cell.width);
-        let top = row as u64 * u64::from(self.cell.height);
-        let span_w = saturating_u32(span_cols as u64 * u64::from(self.cell.width));
+        let left = u64::try_from(col)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.width));
+        let top = u64::try_from(row)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.height));
+        let span_w = saturating_u32(
+            u64::try_from(span_cols)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(self.cell.width)),
+        );
         let underline_color = resolve_color(term_cell.style.underline_color.as_ref(), fg);
 
         // Curly/dotted/dashed shapes approximate to solid bars until the

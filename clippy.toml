@@ -1,5 +1,5 @@
 # Clippy configuration for Bitty
 
-msrv = "1.97.1"
+msrv = "1.85"
 cognitive-complexity-threshold = 25
 upper-case-acronyms-aggressive = true

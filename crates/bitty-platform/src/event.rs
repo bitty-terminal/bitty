@@ -410,11 +410,38 @@ pub enum ScrollDelta {
 }
 
 /// Window-scoped events, fully owned.
+///
+/// # Renderer resize flow
+///
+/// The size-carrying variants feed the GPU surface reconfiguration sequence
+/// documented on [`crate::surface::SurfaceTarget`]:
+///
+/// - [`Resized`](WindowEventKind::Resized): map the payload through
+///   [`crate::surface::map_resize_to_surface_extent`] and configure the
+///   attached surface with the resulting extent (`None` => zero-sized window,
+///   skip configuration).
+/// - [`ScaleFactorChanged`](WindowEventKind::ScaleFactorChanged): refresh
+///   DPI-dependent sizes with
+///   [`crate::surface::SurfaceTarget::logical_to_physical`] (or re-read
+///   `inner_size`) before reconfiguring; a following `Resized` event takes
+///   precedence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WindowEventKind {
     /// The window's inner size changed to the given physical size.
+    ///
+    /// Renderer flow: pass the payload through
+    /// [`crate::surface::map_resize_to_surface_extent`]; a `None` result means
+    /// the window collapsed to a zero extent and surface configuration must
+    /// be skipped until a non-zero size arrives. Prefer re-reading
+    /// [`crate::surface::SurfaceTarget::inner_size`] over caching sizes.
     Resized(PhysicalSize),
     /// The DPI scale factor changed; the OS-suggested resize is kept.
+    ///
+    /// Renderer flow: treat as a DPI-size refresh — convert cached logical
+    /// geometry with
+    /// [`crate::surface::SurfaceTarget::logical_to_physical`] at the new
+    /// factor, then reconfigure the surface extent. A `Resized` event usually
+    /// follows and supersedes the computed value.
     ScaleFactorChanged(ScaleFactor),
     /// The window requests a redraw.
     RedrawRequested,
@@ -444,6 +471,9 @@ pub enum WindowEventKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {
     /// An event scoped to one window.
+    ///
+    /// The size-carrying payloads drive the GPU surface reconfiguration flow
+    /// documented on [`WindowEventKind`].
     Window {
         /// Window the event belongs to.
         window_id: WindowId,

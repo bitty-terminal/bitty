@@ -17,6 +17,12 @@
 //! The default capacity of 2048 covers several full screens of distinct
 //! glyphs across styles; worst case memory is bounded by capacity times the
 //! largest accepted bitmap.
+//!
+//! # Counters
+//!
+//! [`GlyphCache`] tracks cumulative hit/miss lookups ([`GlyphCache::hits`],
+//! [`GlyphCache::misses`]) so callers can report rasterization cost against
+//! the performance-budget-rfc counters without their own instrumentation.
 
 use std::collections::HashMap;
 
@@ -43,6 +49,8 @@ pub struct GlyphCache<R: GlyphRasterizer> {
     rasterizer: R,
     entries: HashMap<RasterKey, Option<GlyphBitmap>>,
     capacity: usize,
+    lookups_hit: u64,
+    lookups_missed: u64,
 }
 
 impl<R: GlyphRasterizer> GlyphCache<R> {
@@ -62,6 +70,8 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
             rasterizer,
             entries: HashMap::new(),
             capacity,
+            lookups_hit: 0,
+            lookups_missed: 0,
         })
     }
 
@@ -83,6 +93,21 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
         self.entries.is_empty()
     }
 
+    /// Cumulative lookups served from the cache without touching the
+    /// upstream rasterizer. Saturates at `u64::MAX`; never resets.
+    #[must_use]
+    pub const fn hits(&self) -> u64 {
+        self.lookups_hit
+    }
+
+    /// Cumulative lookups that had to rasterize (including cached-negative
+    /// blanks). Saturates at `u64::MAX`; never resets. Errors are counted as
+    /// misses but never cached.
+    #[must_use]
+    pub const fn misses(&self) -> u64 {
+        self.lookups_missed
+    }
+
     /// Loads a font through to the wrapped rasterizer. New faces get fresh
     /// handles, so no cached entry can go stale after this call.
     ///
@@ -100,6 +125,7 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
     /// Propagates rasterizer failures without caching them (see module docs).
     pub fn glyph(&mut self, key: RasterKey) -> Result<CachedGlyph<'_>, RenderError> {
         if !self.entries.contains_key(&key) {
+            self.lookups_missed = self.lookups_missed.saturating_add(1);
             if self.entries.len() >= self.capacity {
                 // Wholesale eviction keeps the bound obvious and the policy
                 // deterministic; see module docs.
@@ -107,6 +133,8 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
             }
             let entry = self.rasterizer.rasterize(key)?;
             self.entries.insert(key, entry);
+        } else {
+            self.lookups_hit = self.lookups_hit.saturating_add(1);
         }
         Ok(match &self.entries[&key] {
             Some(bitmap) => CachedGlyph::Bitmap(bitmap),
@@ -201,6 +229,24 @@ mod tests {
             assert_eq!(bm.metrics.width + bm.metrics.height, 2 * side);
         }
         assert_eq!(cache.rasterizer.rasterize_calls.get(), 1);
+        assert_eq!(cache.hits(), 4);
+        assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn counters_cover_blanks_and_errors() {
+        let mut fake = FakeRasterizer::default();
+        fake.blank_keys.push(' ');
+        let mut cache = GlyphCache::new(fake, DEFAULT_GLYPH_CACHE_CAPACITY).unwrap();
+        let font = cache.load_font(&font_query()).unwrap();
+        let space = RasterKey::new(' ', font, 12.0).unwrap();
+
+        assert!(matches!(cache.glyph(space), Ok(CachedGlyph::Blank)));
+        assert!(matches!(cache.glyph(space), Ok(CachedGlyph::Blank)));
+        // A cached blank costs one rasterization (a miss); the second
+        // lookup is a hit served from the cache.
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 1);
     }
 
     #[test]

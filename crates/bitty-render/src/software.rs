@@ -1,12 +1,14 @@
-//! Software fallback seed: CPU compositing of glyph bitmaps onto an
+//! Software fallback: CPU compositing of grid-pipeline draw lists onto an
 //! in-memory surface (opt-in via the `sw-fallback` feature).
 //!
-//! This is the honest, minimal beginning of the software/degraded fallback
-//! path required by the platform contracts: a bounded premultiplied-alpha
-//! RGBA framebuffer plus a clipped src-over blit of [`GlyphBitmap`]s. It is
-//! **not** a full software renderer — there is no cell layout, no atlas, no
-//! present path; those arrive with the renderer slices that consume this.
-//! What it does guarantee today:
+//! The software/degraded fallback path required by the platform contracts:
+//! a bounded premultiplied-alpha RGBA framebuffer, clipped src-over blits
+//! of [`GlyphBitmap`]s and of one-byte coverage masks (the software
+//! equivalent of sampling an atlas mask texel), and [`draw_list_onto`] —
+//! which composites a full [`crate::grid::DrawList`] produced by the SAME
+//! plan/place/cache pipeline the GPU backend consumes. Headless tests drive
+//! `snapshot -> DrawList -> RGBA bytes` through this module end to end.
+//! What it guarantees today:
 //!
 //! - allocation is capped at [`MAX_SURFACE_BYTES`] (bounded memory);
 //! - blits are fully clipped and use saturating arithmetic (no panics on any
@@ -23,6 +25,7 @@
 
 use crate::error::RenderError;
 use crate::glyph::{BitmapFormat, GlyphBitmap, GlyphMetrics};
+use crate::grid::Rgba8;
 
 /// Hard cap on surface bytes (64 MiB): a 4-byte-per-pixel RGBA surface can
 /// therefore never exceed 16 Mi pixels. Bounded-memory requirement for any
@@ -184,6 +187,165 @@ impl SurfaceRgba {
         }
         Ok(())
     }
+
+    /// Fills `rect` (clipped to the surface) with a straight-alpha color,
+    /// converting it to premultiplied storage.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidInput`] never occurs today; the signature keeps
+    /// compositing callers uniform. Empty or off-surface rects are no-ops.
+    pub fn fill_rect(&mut self, rect: crate::geometry::RectPx, color: Rgba8) {
+        let [r, g, b, a] = color;
+        // Destination clip window in surface coordinates (i64 throughout).
+        let left = i64::from(rect.x).max(0);
+        let top = i64::from(rect.y).max(0);
+        let right = (i64::from(rect.x) + i64::from(rect.width))
+            .max(0)
+            .min(i64::from(self.width));
+        let bottom = (i64::from(rect.y) + i64::from(rect.height))
+            .max(0)
+            .min(i64::from(self.height));
+        if right <= left || bottom <= top {
+            return;
+        }
+        let pr = premultiply_byte(r, a);
+        let pg = premultiply_byte(g, a);
+        let pb = premultiply_byte(b, a);
+        for y in top..bottom {
+            let row = y as usize * self.width as usize;
+            for x in left..right {
+                let d = (row + x as usize) * 4;
+                self.data[d] = pr;
+                self.data[d + 1] = pg;
+                self.data[d + 2] = pb;
+                self.data[d + 3] = a;
+            }
+        }
+    }
+
+    /// Composites a one-byte-per-pixel coverage mask tinted with
+    /// `color` (straight alpha) using premultiplied src-over — the software
+    /// equivalent of sampling an atlas mask texel in the GPU pipeline.
+    /// Out-of-surface regions are clipped.
+    pub fn blend_coverage_mask(
+        &mut self,
+        mask: &[u8],
+        mask_width: u32,
+        mask_height: u32,
+        x: i32,
+        y: i32,
+        color: Rgba8,
+    ) {
+        let Some(mask_width) = usize::try_from(mask_width).ok().filter(|w| *w > 0) else {
+            return;
+        };
+        let mask_height = usize::try_from(mask_height).unwrap_or(0);
+
+        let dst_left = i64::from(-x).max(0);
+        let dst_top = i64::from(-y).max(0);
+        let dst_right = (i64::from(self.width) - i64::from(x))
+            .max(0)
+            .min(i64::try_from(mask_width).unwrap_or(i64::MAX));
+        let dst_bottom = (i64::from(self.height) - i64::from(y))
+            .max(0)
+            .min(i64::try_from(mask_height).unwrap_or(i64::MAX));
+
+        let [cr, cg, cb, ca] = color;
+        for gy in dst_top..dst_bottom {
+            for gx in dst_left..dst_right {
+                let coverage = u32::from(mask[gy as usize * mask_width + gx as usize]);
+                if coverage == 0 {
+                    continue;
+                }
+                // Straight -> premultiplied: channel * alpha, then the mask
+                // coverage scales both: rgb * c * a / 65025 fits u32.
+                let sa = (coverage * u32::from(ca)) / 255;
+                let src = [
+                    ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8,
+                    ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8,
+                    ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8,
+                    sa.min(255) as u8,
+                ];
+                let sx = (i64::from(x) + gx) as usize;
+                let sy = (i64::from(y) + gy) as usize;
+                let d = (sy * self.width as usize + sx) * 4;
+                let inv = 255 - u32::from(src[3]);
+                self.data[d] =
+                    saturating_add_u8(src[0], (u32::from(self.data[d]) * inv / 255) as u8);
+                self.data[d + 1] =
+                    saturating_add_u8(src[1], (u32::from(self.data[d + 1]) * inv / 255) as u8);
+                self.data[d + 2] =
+                    saturating_add_u8(src[2], (u32::from(self.data[d + 2]) * inv / 255) as u8);
+                self.data[d + 3] =
+                    saturating_add_u8(src[3], (u32::from(self.data[d + 3]) * inv / 255) as u8);
+            }
+        }
+    }
+}
+
+/// Composites a grid-pipeline [`DrawList`] onto a surface: fills first,
+/// then glyphs, preserving vector order. Atlas instances sample
+/// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
+///
+/// # Errors
+///
+/// [`RenderError::InvalidInput`] when an atlas instance exists but no atlas
+/// was supplied, or when an inline mask violates its own dimensions.
+pub fn draw_list_onto(
+    list: &crate::grid::DrawList,
+    atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
+    surface: &mut SurfaceRgba,
+) -> Result<(), RenderError> {
+    for fill in &list.fills {
+        surface.fill_rect(fill.rect, fill.color);
+    }
+    for glyph in &list.glyphs {
+        match &glyph.source {
+            crate::grid::GlyphSource::Atlas { slot } => {
+                let Some((texels, dims)) = atlas else {
+                    return Err(RenderError::InvalidInput {
+                        reason: "atlas instance requires atlas texels",
+                    });
+                };
+                let stride = usize::from(dims.width);
+                let mut mask =
+                    Vec::with_capacity(usize::from(slot.width) * usize::from(slot.height));
+                for row in 0..usize::from(slot.height) {
+                    let start = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
+                    mask.extend_from_slice(&texels[start..start + usize::from(slot.width)]);
+                }
+                surface.blend_coverage_mask(
+                    &mask,
+                    slot.width.into(),
+                    slot.height.into(),
+                    glyph.dest[0],
+                    glyph.dest[1],
+                    glyph.color,
+                );
+            }
+            crate::grid::GlyphSource::Inline {
+                mask,
+                width,
+                height,
+            } => {
+                if mask.len() != *width as usize * *height as usize {
+                    return Err(RenderError::InvalidInput {
+                        reason: "inline mask length does not match its dimensions",
+                    });
+                }
+                surface.blend_coverage_mask(
+                    mask,
+                    *width,
+                    *height,
+                    glyph.dest[0],
+                    glyph.dest[1],
+                    glyph.color,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 const fn premultiply_byte(color: u8, alpha: u8) -> u8 {

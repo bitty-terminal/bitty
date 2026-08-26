@@ -1,13 +1,15 @@
-//! `bitty-render`: owned rendering skeleton for the Bitty microkernel core.
+//! `bitty-render`: owned rendering for the Bitty microkernel core.
 //!
 //! The crate implements the render row of the Core Workspace Topology
-//! (ADR-0003): it plans frames from damage descriptors, owns glyph atlas
-//! math and a bounded glyph cache, and wraps upstream rasterization behind a
-//! Bitty-owned trait. It has **no workspace-crate dependencies** in this
-//! slice: the damage-aware frame plan consumes a generic descriptor defined
-//! here, and the real wiring to `bitty-term-state` render snapshots arrives
-//! with the grid-integration slice. Exactly two third-party dependencies are
-//! permitted, both by the accepted rows of ADR-0004.
+//! (ADR-0003): it plans frames from damage descriptors, renders terminal
+//! snapshots into owned draw records through the grid pipeline
+//! ([`grid::GridRenderer`]), owns glyph atlas math and a bounded glyph
+//! cache, and wraps upstream rasterization behind a Bitty-owned trait.
+//! Per ADR-0003 dependency rule 3, the grid pipeline reads **only** the
+//! public `Snapshot`/`Damage` surface of `bitty-term-state`; no private
+//! structure is reached into and terminal state is never mutated. Exactly
+//! two third-party dependencies are permitted, both by the accepted rows of
+//! ADR-0004.
 //!
 //! # Upstream boundary (ADR-0004 "Adopt" / "Wrap" rows)
 //!
@@ -34,29 +36,39 @@
 //! [`crossfont_backend`], [`cache`]), GPU context creation with owned errors
 //! ([`gpu`]), and an opt-in CPU fallback seed (`sw-fallback` feature).
 //!
+//! Implemented here as well: [`frame`] planning from pixel-domain damage,
+//! [`atlas`] shelf packing, glyph caching, GPU context creation with owned
+//! errors, and — under the opt-in `sw-fallback` feature — a CPU compositor
+//! that exercises the whole pipeline headlessly (`snapshot -> RGBA`).
+//!
 //! Explicitly **out of scope** and not implemented yet: window-surface
 //! attachment (needs the `bitty-platform` integration slice to define the
 //! raw-window-handle boundary), pipelines/shaders and vertex upload (the
-//! first place where `bytemuck` would be required — see below), real grid
-//! snapshot wiring from `bitty-term-state`, text shaping/HarfBuzz (deferred
-//! to the text RFC named in ADR-0004), and subpixel RGB rendering policy.
-//! None of these may be described as existing until they land with evidence.
+//! first place where `bytemuck` would be required — see below; the grid
+//! pipeline stops at owned draw records), cursor visuals and scrollback
+//! viewport rendering (deferred inside [`grid`]), text shaping/HarfBuzz
+//! (deferred to the text RFC named in ADR-0004), and subpixel RGB rendering
+//! policy. None of these may be described as existing until they land with
+//! evidence.
 //!
 //! # Headless friendliness and what CI does and does not verify
 //!
 //! CI runs on GPU-less Linux runners. Everything in this crate except
 //! actually requesting a live adapter/device is pure logic and is unit-tested
 //! there: rect algebra, frame-plan decisions and coalescing, shelf-pack atlas
-//! math, bitmap conversion invariants of the crossfont wrapper, and the
-//! [`glyph::GlyphRasterizer`] contract against an in-crate fake rasterizer.
+//! math, bitmap conversion invariants of the crossfont wrapper, the
+//! [`glyph::GlyphRasterizer`] contract against an in-crate fake rasterizer,
+//! and the full grid pipeline including output determinism
+//! (`snapshot + damage -> DrawList`) against deterministic fake fonts.
 //! What plain CI **cannot** verify: any code path that reaches a real GPU
 //! (adapter enumeration, device creation, eventual present). Those paths are
 //! exercised only by the integration test in `tests/gpu_integration.rs`,
 //! which skips itself unless the environment variable
 //! `BITTY_RENDER_GPU_TESTS=1` is set on a machine with a working driver. The
 //! `sw-fallback` software path is also outside the default feature set and
-//! is therefore compiled and tested locally (`--features sw-fallback`), not
-//! in the default CI matrix.
+//! is therefore compiled and tested locally
+//! (`cargo test -p bitty-render --features sw-fallback`); under that flag
+//! the same pipeline runs end to end from snapshot bytes to RGBA bytes.
 //!
 //! # Memory bounds
 //!
@@ -115,6 +127,7 @@ pub mod frame;
 pub mod geometry;
 pub mod glyph;
 pub mod gpu;
+pub mod grid;
 
 #[cfg(feature = "sw-fallback")]
 pub mod software;
@@ -124,3 +137,7 @@ pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{FontId, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey};
+pub use grid::{
+    CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer, RenderCounters,
+    SnapshotDamage,
+};

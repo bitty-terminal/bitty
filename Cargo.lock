@@ -167,6 +167,8 @@ dependencies = [
 name = "bitty-render"
 version = "0.0.0"
 dependencies = [
+ "bitty-term-state",
+ "bitty-vt",
  "crossfont",
  "wgpu",
 ]

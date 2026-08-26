@@ -24,9 +24,10 @@ use crate::error::RenderError;
 pub struct FontId(u64);
 
 impl FontId {
-    /// Issues the next sequential handle. Crate-internal: only rasterizer
-    /// implementations inside this crate mint handles.
-    pub(crate) fn next(counter: &mut u64) -> Self {
+    /// Issues the next sequential handle. Public so external
+    /// [`GlyphRasterizer`] implementations can mint their own session
+    /// handles; the built-in crossfont backend uses the same entry point.
+    pub fn next(counter: &mut u64) -> Self {
         let id = *counter;
         *counter = counter.wrapping_add(1);
         FontId(id)

@@ -15,7 +15,15 @@ default = []
 sw-fallback = []
 
 [dependencies]
+# ADR-0003 dependency rule 3: bitty-render consumes only the public
+# Snapshot/Damage render surface of bitty-term-state, never grid internals.
+bitty-term-state = { path = "../bitty-term-state" }
 # ADR-0004 rendering rows: ADOPT wgpu (~25.x line); WRAP crossfont.
 # Neither upstream type may appear in this crate's public API.
 wgpu = "25.0"
 crossfont = "0.9"
+
+[dev-dependencies]
+# Tests drive the pipeline through real State action scripts; GraphemeCell
+# lives in bitty-vt (dev-only edge; the ADR-0003 DAG stays acyclic).
+bitty-vt = { path = "../bitty-vt" }

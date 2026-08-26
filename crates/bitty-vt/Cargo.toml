@@ -1,5 +1,5 @@
 [package]
-name = "bitty-app"
+name = "bitty-vt"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+vte = "0.15"

@@ -1,0 +1,15 @@
+[package]
+name = "bitty-term-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-vt = { path = "../bitty-vt" }
+
+[dev-dependencies]
+proptest = "1"

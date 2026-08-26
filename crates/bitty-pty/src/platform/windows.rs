@@ -1,0 +1,73 @@
+//! Windows ConPTY compile seam (NOT an implementation).
+//!
+//! ADR-0002 schedules Tier-1 Windows support for a later slice; CTX-0011
+//! delivers the Unix PTY only. This module exists so that:
+//!
+//! - the crate's public API compiles unchanged on `cfg(windows)`;
+//! - every operation fails loudly with [`PtyError::Unsupported`] instead of
+//!   silently misbehaving or exposing a half-implemented ConPTY path;
+//! - no Windows-specific unsafe, FFI, or ConPTY code is present yet.
+//!
+//! The future implementation must keep these exact signatures and honor the
+//! same security defaults enforced on Unix: direct argv exec without shell
+//! interpolation, cleared inherited environment with explicit allowlist, and
+//! bounded output buffering.
+
+use std::ffi::OsString;
+use std::io;
+use std::path::PathBuf;
+
+use crate::builder::SpawnConfig;
+use crate::error::PtyError;
+use crate::platform::ExitStatus;
+
+pub(crate) struct Master {
+    _private: (),
+}
+
+pub(crate) struct Child {
+    _private: (),
+}
+
+const SEAM_MESSAGE: &str = "Windows ConPTY backend is not implemented yet; \
+ it is planned for the Tier-1 Windows slice (ADR-0002)";
+
+pub(crate) fn open_pty_and_spawn(_config: &SpawnConfig) -> Result<(Master, Child), PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn resize(_master: &Master, _cols: u16, _rows: u16) -> Result<(), PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn size(_master: &Master) -> Result<(u16, u16), PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn tty_name(_master: &Master) -> Option<PathBuf> {
+    None
+}
+
+pub(crate) fn try_clone_reader(_master: &Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn take_writer(_master: &mut Master) -> Result<Box<dyn io::Write + Send>, PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn child_pid(_child: &Child) -> Option<u32> {
+    None
+}
+
+pub(crate) fn kill(_child: &mut Child) -> Result<(), PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn try_wait(_child: &mut Child) -> Result<Option<ExitStatus>, PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}
+
+pub(crate) fn wait(_child: &mut Child) -> Result<ExitStatus, PtyError> {
+    Err(PtyError::Unsupported(SEAM_MESSAGE))
+}

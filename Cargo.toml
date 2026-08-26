@@ -4,6 +4,7 @@ members = [
     "crates/bitty-core",
     "crates/bitty-pty",
     "crates/bitty-vt",
+    "crates/bitty-term-state",
 ]
 resolver = "3"
 

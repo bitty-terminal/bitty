@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b69243bb2c17710c010edf8be1f6f20ca5ec1a5896aeb5d8eec76b03fa09defa # shrinks to actions = [Print(GraphemeCell('中')), CursorRestore, Print(GraphemeCell('a'))]
+cc 92519951670afd2fb2698432d7b2a690899db3d42e5f21523520f23999bc76b0 # shrinks to actions = [Print(GraphemeCell('a')), CursorSave, Print(GraphemeCell('a')), CursorMove { dir: Right, n: Count(37) }, Print(GraphemeCell('a')), SetAttributes { attrs: AttributeDiff { changes: [Reset] } }, Print(GraphemeCell('中')), ScrollDown { n: Count(23) }, ScrollUp { n: Count(23) }, TabBackward { n: Count(4) }, Print(GraphemeCell('a')), Print(GraphemeCell('a')), DeleteChars { n: Count(23) }]
+cc 8ec3858de583a1192b5aada62711ef1d61a9f96ee246a4ea093ce1005ebd80c4 # shrinks to actions = [SetMode { mode: Insert, enabled: true }, Print(GraphemeCell('中')), SetScrollRegion { top: Row(1), bottom: Row(65535) }, Print(GraphemeCell('a'))]

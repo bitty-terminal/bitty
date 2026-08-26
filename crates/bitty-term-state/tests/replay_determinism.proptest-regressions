@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ce689c3ce8c85969a3887a079e147ee6c6bc5e3281e637673e0a4828be9c1063 # shrinks to actions = [CursorMove { dir: Right, n: Count(22) }, Reply { bytes: [40, 95, 234, 14, 88, 51, 234, 195, 158, 85, 67, 11, 238, 132, 212, 31, 42, 192, 228, 231, 98, 146, 49, 82, 230, 134, 69, 56, 246, 248, 48, 207, 123, 49, 139, 221, 182, 81, 80] }]

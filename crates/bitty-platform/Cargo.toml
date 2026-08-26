@@ -1,0 +1,25 @@
+[package]
+name = "bitty-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+winit = "0.30"
+
+[features]
+# Opt-in integration tests that require a live display server (Wayland/X11).
+# They are excluded from CI and from the default test run; execute locally with
+# `cargo test -p bitty-platform --features gui-tests`.
+gui-tests = []
+
+# Runs as a plain process entry point (`harness = false`) because winit
+# requires event-loop creation on the OS main thread; see the file header.
+[[test]]
+name = "headless_run"
+harness = false
+

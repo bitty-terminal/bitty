@@ -234,7 +234,7 @@ fn os_contains_nul(s: &OsStr) -> bool {
 #[cfg(windows)]
 fn os_contains_nul(s: &OsStr) -> bool {
     use std::os::windows::ffi::OsStrExt;
-    s.as_wide().contains(&0)
+    s.encode_wide().any(|unit| unit == 0)
 }
 
 #[cfg(unix)]
@@ -246,7 +246,7 @@ fn os_byte_len(s: &OsStr) -> usize {
 #[cfg(windows)]
 fn os_byte_len(s: &OsStr) -> usize {
     use std::os::windows::ffi::OsStrExt;
-    s.as_wide().len() * std::mem::size_of::<u16>()
+    s.encode_wide().count() * std::mem::size_of::<u16>()
 }
 
 #[cfg(test)]

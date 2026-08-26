@@ -1716,3 +1716,234 @@ fn color_option(color: bitty_vt::Color) -> Option<bitty_vt::Color> {
 fn effective_count(n: Count) -> u16 {
     n.0.max(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scrollback::SCROLLBACK_MAX_LINES;
+    use bitty_vt::{AttributeChange, AttributeDiff, Color, ControlChar, GraphemeCell};
+
+    fn prints(state: &mut State, text: &str) {
+        for c in text.chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+    }
+
+    #[test]
+    fn print_places_glyphs_and_advances_cursor() {
+        let mut s = State::new();
+        prints(&mut s, "ab\u{4E2D}");
+        assert_eq!(s.cursor().position.col, 4);
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[0].glyph, 'a');
+        assert_eq!(snap.cells[2].glyph, '\u{4E2D}');
+        assert_eq!(snap.cells[2].width, 2);
+        assert!(snap.cells[3].spacer);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn deferred_wrap_latches_at_last_column() {
+        let mut s = State::new();
+        s.cursor.position.col = GRID_COLUMNS as u16 - 1;
+        prints(&mut s, "x");
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
+        assert!(s.cursor().pending_wrap);
+        // Next print consumes the latch onto the next line.
+        prints(&mut s, "y");
+        assert_eq!(s.cursor().position.col, 1);
+        assert_eq!(s.cursor().position.row, 1);
+        assert!(!s.cursor().pending_wrap);
+    }
+
+    #[test]
+    fn origin_mode_addresses_relative_to_region() {
+        let mut s = State::new();
+        s.apply(&TerminalAction::SetScrollRegion {
+            top: Row(5),
+            bottom: Row(10),
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::Origin,
+            enabled: true,
+        });
+        // DECOM homes into the region.
+        assert_eq!(s.cursor().position.row, 4);
+        s.apply(&TerminalAction::CursorPosition {
+            row: Row(1),
+            col: Col(3),
+        });
+        assert_eq!(s.cursor().position.row, 4);
+        assert_eq!(s.cursor().position.col, 2);
+    }
+
+    #[test]
+    fn invalid_scroll_region_is_ignored() {
+        let mut s = State::new();
+        s.apply(&TerminalAction::SetScrollRegion {
+            top: Row(10),
+            bottom: Row(5),
+        });
+        assert_eq!(s.scroll_region_top, 0);
+        assert_eq!(s.scroll_region_bottom, GRID_ROWS as u16 - 1);
+    }
+
+    #[test]
+    fn alt_screen_roundtrip_restores_primary_set() {
+        let mut s = State::new();
+        prints(&mut s, "primary");
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![
+                    AttributeChange::Enable(bitty_vt::Attribute::Bold),
+                    AttributeChange::Foreground(Color::Indexed(1)),
+                ]
+                .into_boxed_slice(),
+            },
+        });
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Down,
+            n: Count(3),
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::BracketedPaste,
+            enabled: true,
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: true,
+        });
+        assert!(s.alt_screen_active());
+        // Mutate the alternate context aggressively: modes flipped on alt
+        // must NOT leak into the restored primary set (invariant 5), while
+        // the pre-entry bracketed-paste state must come back.
+        prints(&mut s, "alt junk");
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::BracketedPaste,
+            enabled: false,
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::Origin,
+            enabled: true,
+        });
+        s.apply(&TerminalAction::EraseInDisplay {
+            mode: EraseDisplayMode::All,
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: false,
+        });
+        // Full primary-screen cursor/style/mode set restored (invariant 5).
+        assert!(!s.alt_screen_active());
+        assert!(
+            s.modes.bracketed_paste,
+            "pre-entry mode state must survive the roundtrip"
+        );
+        assert!(!s.modes.origin);
+        assert!(s.cursor().style.attributes.bold);
+        assert_eq!(
+            s.cursor().style.foreground,
+            Some(Color::Indexed(1)),
+            "pen style must survive the roundtrip"
+        );
+        assert_eq!(s.cursor().position.col, 7);
+        let snap = s.snapshot();
+        assert_eq!(
+            &snap.cells[..7].iter().map(|c| c.glyph).collect::<String>(),
+            "primary"
+        );
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn scroll_under_screen_bottom_captures_scrollback() {
+        let mut s = State::new();
+        prints(&mut s, "line one");
+        for _ in 0..(GRID_ROWS + 3) {
+            s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        assert!(
+            s.scrollback_len() > 0 && s.scrollback_len() <= SCROLLBACK_MAX_LINES,
+            "indexing at the screen bottom must feed scrollback"
+        );
+        assert_eq!(
+            s.scrollback_line(0).unwrap().cells[0].glyph,
+            'l',
+            "oldest captured line first"
+        );
+        // Partial regions never capture (invariant 4).
+        let before = s.scrollback_len();
+        s.apply(&TerminalAction::SetScrollRegion {
+            top: Row(2),
+            bottom: Row(10),
+        });
+        s.apply(&TerminalAction::ScrollUp { n: Count(3) });
+        assert_eq!(s.scrollback_len(), before);
+    }
+
+    #[test]
+    fn reply_synthesis_is_origin_aware_and_bounded() {
+        let mut s = State::new();
+        s.apply(&TerminalAction::RequestDeviceStatus {
+            kind: StatusKind::OperatingStatus,
+        });
+        s.apply(&TerminalAction::RequestDeviceStatus {
+            kind: StatusKind::DeviceAttributes,
+        });
+        let replies = s.take_replies();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(&replies[0][..], b"\x1b[0n");
+        assert_eq!(&replies[1][..], b"\x1b[?6c");
+        // CPR reflects origin-relative rows.
+        s.apply(&TerminalAction::SetScrollRegion {
+            top: Row(5),
+            bottom: Row::SENTINEL,
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::Origin,
+            enabled: true,
+        });
+        s.apply(&TerminalAction::RequestDeviceStatus {
+            kind: StatusKind::CursorPosition,
+        });
+        let replies = s.take_replies();
+        assert_eq!(&replies[0][..], b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn decstr_resets_defined_subset_only() {
+        let mut s = State::new();
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![AttributeChange::Enable(bitty_vt::Attribute::Bold)]
+                    .into_boxed_slice(),
+            },
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::Origin,
+            enabled: true,
+        });
+        s.apply(&TerminalAction::SoftReset);
+        assert!(s.cursor().visible);
+        assert!(!s.modes.origin);
+        assert!(!s.modes.auto_wrap, "DECSTR resets DECAWM per VT510");
+        assert_eq!(s.cursor().style, Style::default());
+        assert_eq!(s.scroll_region_bottom, GRID_ROWS as u16 - 1);
+    }
+
+    #[test]
+    fn full_reset_restores_initial_truth() {
+        let mut s = State::new();
+        prints(&mut s, "junk \u{4E2D} more");
+        s.apply(&TerminalAction::OscTitle {
+            text: BoundedString::new("t"),
+        });
+        s.apply(&TerminalAction::FullReset);
+        assert!(s.check_invariants().is_ok());
+        assert_eq!(s.state_hash(), State::new().state_hash());
+        assert!(s.title().is_empty());
+        assert_eq!(s.scrollback_len(), 0);
+        let snap = s.snapshot();
+        assert!(snap.cells.iter().all(Cell::is_blank));
+    }
+}

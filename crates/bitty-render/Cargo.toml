@@ -18,6 +18,9 @@ sw-fallback = []
 # ADR-0003 dependency rule 3: bitty-render consumes only the public
 # Snapshot/Damage render surface of bitty-term-state, never grid internals.
 bitty-term-state = { path = "../bitty-term-state" }
+# ADR-0003/ADR-0004 platform seam: GpuContext consumes the owned SurfaceTarget
+# produced by bitty-platform without leaking winit types.
+bitty-platform = { path = "../bitty-platform" }
 # ADR-0004 rendering rows: ADOPT wgpu (~25.x line); WRAP crossfont.
 # Neither upstream type may appear in this crate's public API.
 wgpu = "25.0"

@@ -30,43 +30,54 @@
 //!
 //! # Scope boundaries of this slice
 //!
-//! This is deliberately a skeleton. Implemented here: frame planning from
-//! pixel-domain damage ([`frame::plan_frame`]), atlas layout math
-//! ([`atlas`]), the rasterizer contract plus wrapper and cache ([`glyph`],
-//! [`crossfont_backend`], [`cache`]), GPU context creation with owned errors
-//! ([`gpu`]), and an opt-in CPU fallback seed (`sw-fallback` feature).
+//! Implemented here: frame planning from pixel-domain damage
+//! ([`frame::plan_frame`]), atlas layout math ([`atlas`]), the rasterizer
+//! contract plus wrapper and cache ([`glyph`], [`crossfont_backend`],
+//! [`cache`]), GPU context creation with owned errors ([`gpu::GpuContext`]),
+//! the owned GPU surface lifecycle ([`gpu::Surface`] created from
+//! [`bitty_platform::SurfaceTarget`] via [`gpu::GpuContext::create_surface`],
+//! with `configure`/`resize`/`present` paths), the grid pipeline
+//! ([`grid::GridRenderer`] `Snapshot`/`Damage` -> `DrawList`/`Atlas`), and —
+//! under the opt-in `sw-fallback` feature — a CPU compositor that exercises
+//! the whole pipeline headlessly (`snapshot -> RGBA`).
 //!
-//! Implemented here as well: [`frame`] planning from pixel-domain damage,
-//! [`atlas`] shelf packing, glyph caching, GPU context creation with owned
-//! errors, and — under the opt-in `sw-fallback` feature — a CPU compositor
-//! that exercises the whole pipeline headlessly (`snapshot -> RGBA`).
-//!
-//! Explicitly **out of scope** and not implemented yet: window-surface
-//! attachment (needs the `bitty-platform` integration slice to define the
-//! raw-window-handle boundary), pipelines/shaders and vertex upload (the
-//! first place where `bytemuck` would be required — see below; the grid
-//! pipeline stops at owned draw records), cursor visuals and scrollback
-//! viewport rendering (deferred inside [`grid`]), text shaping/HarfBuzz
-//! (deferred to the text RFC named in ADR-0004), and subpixel RGB rendering
-//! policy. None of these may be described as existing until they land with
-//! evidence.
+//! Explicitly **out of scope** and not implemented yet: pipelines/shaders and
+//! vertex upload (the first place where `bytemuck` would be required — see
+//! below; the grid pipeline stops at owned draw records and the present path
+//! composites `DrawList`+`Atlas` via the software headless fake or a minimal
+//! GPU clear), cursor visuals and scrollback viewport rendering (deferred
+//! inside [`grid`]), text shaping/HarfBuzz (deferred to the text RFC named in
+//! ADR-0004), and subpixel RGB rendering policy. Window-surface attachment
+//! **is** implemented here as the owned [`gpu::Surface`] wrapper around
+//! `bitty-platform`'s [`bitty_platform::SurfaceTarget`]; no `wgpu` type leaks
+//! except through that owned wrapper. None of the remaining deferred items may
+//! be described as existing until they land with evidence.
 //!
 //! # Headless friendliness and what CI does and does not verify
 //!
 //! CI runs on GPU-less Linux runners. Everything in this crate except
-//! actually requesting a live adapter/device is pure logic and is unit-tested
-//! there: rect algebra, frame-plan decisions and coalescing, shelf-pack atlas
-//! math, bitmap conversion invariants of the crossfont wrapper, the
-//! [`glyph::GlyphRasterizer`] contract against an in-crate fake rasterizer,
-//! and the full grid pipeline including output determinism
-//! (`snapshot + damage -> DrawList`) against deterministic fake fonts.
+//! actually requesting a live adapter/device or a live window surface is pure
+//! logic and is unit-tested there: rect algebra, frame-plan decisions and
+//! coalescing, shelf-pack atlas math, bitmap conversion invariants of the
+//! crossfont wrapper, the [`glyph::GlyphRasterizer`] contract against an
+//! in-crate fake rasterizer, the full grid pipeline including output
+//! determinism (`snapshot + damage -> DrawList`) against deterministic fake
+//! fonts, and the **headless GPU-surface seam**: [`gpu::Surface::headless`]
+//! (a fake surface that holds a [`PhysicalSize`] extent and composites
+//! `DrawList`+`Atlas` onto an in-memory RGBA buffer via the same
+//! [`software::draw_list_onto`] path the GPU backend will share). Headless
+//! surface tests exercise configuration, resize, and present composition
+//! without any display server or adapter.
+//!
 //! What plain CI **cannot** verify: any code path that reaches a real GPU
-//! (adapter enumeration, device creation, eventual present). Those paths are
-//! exercised only by the integration test in `tests/gpu_integration.rs`,
-//! which skips itself unless the environment variable
-//! `BITTY_RENDER_GPU_TESTS=1` is set on a machine with a working driver. The
-//! `sw-fallback` software path is also outside the default feature set and
-//! is therefore compiled and tested locally
+//! (adapter enumeration, device creation, real surface creation from a
+//! [`bitty_platform::SurfaceTarget`], and present of the swap-chain texture).
+//! Those paths are exercised only by the integration test in
+//! `tests/gpu_integration.rs`, which skips itself unless the environment
+//! variable `BITTY_RENDER_GPU_TESTS=1` is set on a machine with a working
+//! driver (and a window system when surface tests run). The `sw-fallback`
+//! software path is also outside the default feature set and is therefore
+//! compiled and tested locally
 //! (`cargo test -p bitty-render --features sw-fallback`); under that flag
 //! the same pipeline runs end to end from snapshot bytes to RGBA bytes.
 //!
@@ -81,12 +92,18 @@
 //!
 //! # Unsafe code policy
 //!
-//! This crate carries `#![forbid(unsafe_code)]`. Neither wgpu nor crossfont
-//! requires unsafe code in *callers* for anything implemented in this slice;
-//! `bytemuck` is intentionally not introduced. The future vertex-upload
-//! slice will need `Pod` bit-casting and must revisit this lint then, with
-//! the narrowest possible exception (module-scoped `allow(unsafe_code)` plus
-//! a reviewed justification) rather than dropping the forbid wholesale.
+//! This crate denies `unsafe_code` at the workspace and crate level. The only
+//! exception is [`gpu`]'s surface creation path: `wgpu::Instance::create_surface`
+//! consumes `raw-window-handle` 0.6 handles supplied by
+//! [`bitty_platform::SurfaceTarget::with_raw_handles`]. That call bridges raw
+//! handles into a `wgpu::Surface`; it requires `unsafe` to borrow the raw
+//! `DisplayHandle`/`WindowHandle` (see `GPU Surface Seam` in [`gpu`]). The
+//! `unsafe` is confined to `gpu::Surface` construction (a single `unsafe`
+//! block with a safety comment) and does not leak. `crossfont` still requires
+//! no caller unsafe. `bytemuck` is intentionally not introduced. A future
+//! vertex-upload slice will need `Pod` bit-casting and will add a second
+//! narrow module-scoped `allow(unsafe_code)` with its own justification,
+//! rather than lifting the crate-wide deny.
 //!
 //! # Example
 //!
@@ -117,7 +134,7 @@
 //! assert_eq!(plan.dirty_rects[0], RectPx::new(0, 0, 15, 15));
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod atlas;
 pub mod cache;
@@ -126,6 +143,7 @@ pub mod error;
 pub mod frame;
 pub mod geometry;
 pub mod glyph;
+#[allow(unsafe_code)]
 pub mod gpu;
 pub mod grid;
 

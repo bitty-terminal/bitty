@@ -35,6 +35,14 @@ pub enum RenderError {
     /// message carries the upstream error's primary display text; the
     /// upstream type itself never crosses this crate's API boundary.
     UpstreamGraphics(String),
+    /// GPU surface creation failed (no wgpu type escapes; diagnostic is owned).
+    SurfaceCreate(String),
+    /// Surface configuration failed (invalid extent, unsupported format, or
+    /// upstream rejection).
+    SurfaceConfigure(String),
+    /// Acquiring the next swap-chain texture failed (outdated, lost, timeout,
+    /// or other upstream surface status).
+    SurfaceAcquire(String),
 }
 
 impl RenderError {
@@ -60,6 +68,13 @@ impl fmt::Display for RenderError {
             }
             RenderError::UpstreamRasterizer(msg) => write!(f, "font rasterizer error: {msg}"),
             RenderError::UpstreamGraphics(msg) => write!(f, "graphics backend error: {msg}"),
+            RenderError::SurfaceCreate(msg) => write!(f, "surface creation failed: {msg}"),
+            RenderError::SurfaceConfigure(msg) => {
+                write!(f, "surface configuration failed: {msg}")
+            }
+            RenderError::SurfaceAcquire(msg) => {
+                write!(f, "surface acquire failed: {msg}")
+            }
         }
     }
 }
@@ -99,6 +114,18 @@ mod tests {
         assert_eq!(
             RenderError::UpstreamGraphics("kaboom".into()).to_string(),
             "graphics backend error: kaboom"
+        );
+        assert_eq!(
+            RenderError::SurfaceCreate("nope".into()).to_string(),
+            "surface creation failed: nope"
+        );
+        assert_eq!(
+            RenderError::SurfaceConfigure("bad".into()).to_string(),
+            "surface configuration failed: bad"
+        );
+        assert_eq!(
+            RenderError::SurfaceAcquire("lost".into()).to_string(),
+            "surface acquire failed: lost"
         );
     }
 

@@ -143,6 +143,10 @@ dependencies = [
 [[package]]
 name = "bitty-app"
 version = "0.0.0"
+dependencies = [
+ "bitty-platform",
+ "bitty-runtime",
+]
 
 [[package]]
 name = "bitty-core"

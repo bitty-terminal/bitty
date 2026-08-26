@@ -10,6 +10,10 @@ workspace = true
 
 [dependencies]
 winit = "0.30"
+# ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
+# at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
+# pinned and re-exported; see crate-level ownership rules and src/surface.rs.
+raw-window-handle = "=0.6.2"
 
 [features]
 # Opt-in integration tests that require a live display server (Wayland/X11).

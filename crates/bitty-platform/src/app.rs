@@ -13,6 +13,7 @@ use winit::window::{Window as WinitWindow, WindowAttributes, WindowId as WinitWi
 use crate::dpi::{LogicalSize, PhysicalSize, ScaleFactor};
 use crate::error::PlatformError;
 use crate::event::{PlatformEvent, WindowId, translate_window_event};
+use crate::surface::SurfaceTarget;
 
 /// Receives translated [`PlatformEvent`]s for the lifetime of [`App::run`].
 ///
@@ -145,6 +146,26 @@ impl WindowHandle {
     /// Current DPI scale factor, sanitized to a valid range.
     pub fn scale_factor(&self) -> ScaleFactor {
         ScaleFactor::new_sanitized(self.window.scale_factor())
+    }
+
+    /// Derives a [`SurfaceTarget`] for GPU renderer attachment.
+    ///
+    /// The target shares this handle's window, so it stays valid as long as
+    /// any clone of it lives; see the [`surface`] module lifetime contract.
+    ///
+    /// [`surface`]: crate::surface
+    pub fn surface_target(&self) -> SurfaceTarget {
+        SurfaceTarget::from_window(self.id, Arc::clone(&self.window))
+    }
+
+    /// DPI-size refresh hook: converts a logical size into physical pixels at
+    /// the current scale factor.
+    ///
+    /// Convenience twin of
+    /// [`LogicalSize::to_physical`]`(`[`WindowHandle::scale_factor`]`())` for
+    /// handlers that keep window geometry in logical units.
+    pub fn logical_to_physical(&self, size: LogicalSize) -> PhysicalSize {
+        size.to_physical(self.scale_factor())
     }
 }
 

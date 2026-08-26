@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bitty_platform::{
-    App, AppHandler, EventContext, LogicalSize, PhysicalSize, PlatformEvent, WindowConfig,
-    WindowEventKind,
+    App, AppHandler, EventContext, LogicalSize, PhysicalSize, PlatformEvent, SurfaceTarget,
+    WindowConfig, WindowEventKind, map_resize_to_surface_extent,
 };
 
 #[derive(Default)]
@@ -48,6 +48,21 @@ impl AppHandler for SmokeTest {
                     .expect("window creation succeeds on a live display");
                 assert!(handle.inner_size().height() > 0);
                 assert!(handle.scale_factor().get() > 0.0);
+
+                // Live-path evidence for the GPU surface seam: the derived
+                // target must yield both raw handles on a real window.
+                let target: SurfaceTarget = handle.surface_target();
+                assert_eq!(target.window_id(), handle.id());
+                assert!(
+                    target
+                        .with_raw_handles(|_display, _window| true)
+                        .expect("raw handles available on a live window")
+                );
+                assert_eq!(
+                    map_resize_to_surface_extent(handle.inner_size()),
+                    Some(handle.inner_size()),
+                    "a live window's size is a usable surface extent"
+                );
                 handle.request_redraw();
             }
             PlatformEvent::Window { kind, .. } => {

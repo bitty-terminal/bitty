@@ -21,6 +21,12 @@ pub enum PlatformError {
     /// The event loop failed while running (after successful creation).
     EventLoopRun(String),
 
+    /// A platform surface handle could not be obtained for GPU surface
+    /// attachment (see [`crate::surface::SurfaceTarget`]).
+    ///
+    /// Carries the upstream diagnostic text.
+    SurfaceHandle(String),
+
     /// A scale factor was not finite or not strictly positive.
     InvalidScaleFactor(f64),
 }
@@ -33,6 +39,9 @@ impl fmt::Display for PlatformError {
             }
             Self::WindowCreation(detail) => write!(f, "window creation failed: {detail}"),
             Self::EventLoopRun(detail) => write!(f, "event loop failed: {detail}"),
+            Self::SurfaceHandle(detail) => {
+                write!(f, "platform surface handle unavailable: {detail}")
+            }
             Self::InvalidScaleFactor(value) => {
                 write!(f, "invalid scale factor (must be finite and > 0): {value}")
             }

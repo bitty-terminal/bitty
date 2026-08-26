@@ -152,6 +152,7 @@ version = "0.0.0"
 name = "bitty-platform"
 version = "0.0.0"
 dependencies = [
+ "raw-window-handle",
  "winit",
 ]
 

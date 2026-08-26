@@ -47,6 +47,11 @@ impl PtyError {
     /// Flattens an upstream failure into owned data. The upstream error type
     /// is intentionally unnamed; callers pass whatever the wrapped layer
     /// returned and only its `Display` output survives.
+    // This helper is fully exercised on Unix via `platform::unix`; on
+    // Windows the ConPTY seam returns `PtyError::Unsupported` directly until
+    // the Tier-1 Windows follow-up slice (ADR-0002) implements the backend,
+    // so the helper is intentionally unused on `cfg(windows)`.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn flatten_upstream<E: fmt::Display>(err: E) -> Self {
         PtyError::Upstream(err.to_string())
     }

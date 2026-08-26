@@ -20,10 +20,17 @@ use crate::builder::SpawnConfig;
 use crate::error::PtyError;
 use crate::platform::ExitStatus;
 
+// `Master` / `Child` are never constructed on Windows until the Tier-1
+// Windows follow-up slice (ADR-0002) implements ConPTY. Keep the seam types
+// constructible inside this module with a private sentinel so the crate
+// continues to compile on `cfg(windows)` without emitting dead-code warnings
+// that would mask future real usage.
+#[allow(dead_code)]
 pub(crate) struct Master {
     _private: (),
 }
 
+#[allow(dead_code)]
 pub(crate) struct Child {
     _private: (),
 }
@@ -31,7 +38,20 @@ pub(crate) struct Child {
 const SEAM_MESSAGE: &str = "Windows ConPTY backend is not implemented yet; \
  it is planned for the Tier-1 Windows slice (ADR-0002)";
 
-pub(crate) fn open_pty_and_spawn(_config: &SpawnConfig) -> Result<(Master, Child), PtyError> {
+pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child), PtyError> {
+    // `SpawnConfig` is validated on all platforms; on Windows the ConPTY
+    // backend is not yet implemented (ADR-0002, Tier-1 Windows follow-up
+    // slice) and this seam intentionally returns `Unsupported`. Touch the
+    // config fields so they are considered read on `cfg(windows)` and the
+    // seam remains exercisable without masking future real usage.
+    let _ = (
+        &config.program,
+        &config.args,
+        &config.env,
+        &config.cwd,
+        config.cols,
+        config.rows,
+    );
     Err(PtyError::Unsupported(SEAM_MESSAGE))
 }
 

@@ -13,7 +13,6 @@
 //! interpolation, cleared inherited environment with explicit allowlist, and
 //! bounded output buffering.
 
-use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 

@@ -2,6 +2,7 @@
 members = [
     "crates/bitty-app",
     "crates/bitty-core",
+    "crates/bitty-platform",
     "crates/bitty-pty",
     "crates/bitty-vt",
     "crates/bitty-term-state",

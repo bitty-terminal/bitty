@@ -3,6 +3,7 @@ members = [
     "crates/bitty-app",
     "crates/bitty-config",
     "crates/bitty-core",
+    "crates/bitty-ipc",
     "crates/bitty-package",
     "crates/bitty-platform",
     "crates/bitty-plugin-host",

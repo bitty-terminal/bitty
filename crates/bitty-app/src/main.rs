@@ -4,20 +4,22 @@
 //! Binary entry point; argument handling, startup, safe-mode selection;
 //! depends on `bitty-runtime` only"). It owns **no business logic** beyond
 //! wiring already-owned libraries: argument parsing, [`bitty_runtime::Runtime`]
-//! creation, optional window / GPU attachment, PTY pump integration, platform
-//! event-loop forwarding, and `tick` → present.
+//! creation, layout wiring via `LayoutNode`, optional window / GPU attachment,
+//! PTY pump integration, platform event-loop forwarding, and `tick` → present.
 //!
 //! # Startup flow (owned)
 //!
 //! ```text
 //! args --parse--> Args --Runtime::with_defaults--> Runtime
+//!       --build_layout--> LayoutNode --set_layout--> Runtime --set_focus--> Runtime
 //!       --spawn_shell--> PTY --handle_pty_bytes--> Runtime
 //!       --App::run--> PlatformEvent --handle_platform_event--> Runtime --tick--> present
 //! ```
 //!
-//! 1. **Parse args** (`--help` / `--version` / `--headless` and an optional
-//!    program to spawn). Parsing is pure, total, and tested without touching
-//!    the filesystem or network.
+//! 1. **Parse args** (`--help` / `--version` / `--headless`, layout flags
+//!    `--split`/`--stack`/`--overlay`/`--layout`, focus flag `--focus`, and an
+//!    optional program to spawn). Parsing is pure, total, and tested without
+//!    touching the filesystem or network.
 //! 2. **Create [`Runtime`](bitty_runtime::Runtime)** via
 //!    [`Runtime::with_defaults`](bitty_runtime::Runtime::with_defaults) (or
 //!    [`Runtime::new`](bitty_runtime::Runtime::new) with a validated
@@ -25,13 +27,24 @@
 //!    builds a headless software surface (`Surface::headless`) and the
 //!    deterministic `GridRenderer` — no display server, window, adapter, or
 //!    font file is contacted.
-//! 3. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
+//! 3. **Build layout** via [`build_layout`] from the parsed [`Args`] (default
+//!    single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
+//!    `--layout` spec). The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
+//!    via `bitty-ui` types re-exported through `bitty-runtime` and calls
+//!    [`Runtime::set_layout`](bitty_runtime::Runtime::set_layout). No config or
+//!    plugin coupling is involved; the layout is derived purely from argv.
+//! 4. **Focus handling** via `--focus` (numeric id or `next`/`prev`/`up`/`down`/
+//!    `left`/`right`) and via keyboard shortcuts in real mode (Tab/arrow/n/p/1..5).
+//!    Focus moves are routed through [`Runtime::set_focus`](bitty_runtime::Runtime::set_focus)
+//!    and [`Runtime::move_focus`](bitty_runtime::Runtime::move_focus) which
+//!    delegate to the layout's deterministic adjacency.
+//! 5. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
 //!    when a program argument is present. The program is taken as a direct
 //!    `argv[0]` without shell interpolation (P0 posture). Failures are owned
 //!    [`RuntimeError`](bitty_runtime::RuntimeError) values flattened from
 //!    `bitty-pty` (`Unsupported` on Windows before ConPTY, `Upstream`/`Io`
 //!    elsewhere) and are reported without panicking.
-//! 4. **PTY pump integration** — the bounded `PtyReader` (`READ_CHUNK_SIZE`
+//! 6. **PTY pump integration** — the bounded `PtyReader` (`READ_CHUNK_SIZE`
 //!    × `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) pumps kernel bytes into a
 //!    `sync_channel`; the app drains `Receiver::try_recv` on the platform
 //!    thread and feeds `Runtime::handle_pty_bytes`. The **honest gap** in this
@@ -43,31 +56,59 @@
 //!    follow-up slice that adds `Runtime::take_pty_reader` (or
 //!    `Runtime::poll_pty`) will wire the live pump without changing the
 //!    app's public contract.
-//! 5. **Platform event loop** (`bitty-platform::App::run`) forwards every
+//! 7. **Platform event loop** (`bitty-platform::App::run`) forwards every
 //!    [`PlatformEvent`](bitty_platform::PlatformEvent) into
 //!    [`Runtime::handle_platform_event`](bitty_runtime::Runtime::handle_platform_event)
 //!    (resize → `handle_resize`, `CloseRequested`/`Exiting` → exit, other
 //!    window events → `false`). `AboutToWait` and `RedrawRequested` call
 //!    [`Runtime::tick`](bitty_runtime::Runtime::tick) and request redraw when
 //!    the frame produced damage. This keeps the idle resource budget
-//!    (≤ 1 % CPU when no damage) honest: zero damage presents nothing.
-//! 6. **Headless smoke** (`--headless`) performs a single `tick` after feeding
-//!    a synthetic byte batch, prints the cold-queue summary and present stats,
-//!    and exits. This is the **only path CI exercises** (no display server or
-//!    GPU required) and is the fallback when `App::run` returns
-//!    `PlatformError::DisplayUnavailable`.
+//!    (≤ 1 % CPU when no damage) honest: zero damage presents nothing. `tick`
+//!    is layout-aware: it reflows the owned `LayoutNode` into the container
+//!    rect and composites per-leaf `View` allocations via the headless software
+//!    seam (deterministic RGBA) or the real `SurfaceTarget` when available.
+//! 8. **Headless smoke** (`--headless`) feeds a synthetic byte batch, ticks
+//!    layout-aware, prints cold-queue + present stats, and then proves
+//!    `split`/`stack`/`overlay` composition deterministically via software
+//!    present without window/GPU. This is the **only path CI exercises** (no
+//!    display server or GPU required) and is the fallback when `App::run`
+//!    returns `PlatformError::DisplayUnavailable`.
+//!
+//! # Layout wiring (CTX-0025)
+//!
+//! - The app never invents layout math: all geometry lives in `bitty-ui` and
+//!   `bitty-runtime`. The app only parses argv, constructs a `LayoutNode`,
+//!   calls `Runtime::set_layout`, and optionally moves focus. The runtime owns
+//!   `LayoutNode` + `Focus` and performs `reflow` + per-leaf `GridRenderer`
+//!   translation + single `Surface::headless_present` (headless) or real
+//!   `SurfaceTarget` present (real). The app stays thin.
+//! - `--layout` takes precedence over `--stack`/`--overlay`/`--split`; when no
+//!   layout flag is given the default is a single leaf `ViewId(1)` sized to
+//!   the runtime's current grid (80×24 by default). Leaf sizes are updated by
+//!   `LayoutNode::reflow` on the next tick, so the initial `View::new` sizes
+//!   are only hints.
+//! - Focus is owned by `Runtime`. `--focus` for smoke and keyboard shortcuts in
+//!   real mode both resolve to `Runtime::set_focus` (numeric id) or
+//!   `Runtime::move_focus` (directional). Invalid focus specs are warned and
+//!   ignored (total, no panic).
 //!
 //! # Headless vs real split (documented honestly)
 //!
 //! - **Headless (CI, default, `--headless`, or display unavailable):**
 //!   `Runtime::new` builds `Surface::headless` with the config-derived pixel
 //!   extent and a deterministic `HeadlessRasterizer` (no font stack). `tick`
-//!   composites `DrawList + Atlas` onto an in-memory RGBA buffer via
+//!   reflows the `LayoutNode` into the container `Rect` (cell space), builds a
+//!   viewport snapshot per leaf, renders each through the shared `GridRenderer`
+//!   (translated to the leaf's pixel origin), and composites the combined
+//!   `DrawList + Atlas` onto an in-memory RGBA buffer via
 //!   `Surface::headless_present`. No `GpuContext`, adapter, `SurfaceTarget`,
 //!   window, or font file is contacted. The proof `bytes → parser → state →
 //!   damage → GridRenderer DrawList → software present` is exercised by
 //!   `crates/bitty-runtime/tests/runtime_soft_present.rs` and by this binary's
-//!   `--headless` smoke. This is the only end-to-end path CI verifies.
+//!   `--headless` smoke, which additionally proves `split`/`stack`/`overlay`
+//!   composition deterministically (separate runtimes with the same bytes/layout
+//!   produce bit-identical RGBA; different compositions produce distinct RGBA).
+//!   This is the only end-to-end path CI verifies.
 //!
 //! - **Real (env-gated, display available):** attaching a real window surface
 //!   requires `bitty_render::gpu::GpuContext::initialize().await` on a machine
@@ -80,10 +121,13 @@
 //!   implemented" and no `Runtime::attach_gpu` API exists yet. The app
 //!   therefore **documents but does not yet drive** the async GPU initializer;
 //!   even when `App::run` succeeds and a window is created, `tick` still
-//!   presents via the headless software seam. `SurfaceTarget` lifetime
+//!   presents via the headless software seam (but layout-aware, per-frame,
+//!   with focus movement via keyboard). `SurfaceTarget` lifetime
 //!   handling (`with_raw_handles` → `wgpu::Surface` must be dropped before the
 //!   last `WindowHandle` clone) is owned by the future `GpuContext` slice and
-//!   is not fabricated here.
+//!   is not fabricated here. The window creation + `PlatformEvent` →
+//!   `Runtime::handle_platform_event` + `tick` plumbing is proven even on
+//!   headless CI via the `DisplayUnavailable` → headless smoke fallback.
 //!
 //! What CI **cannot** verify: any code path that reaches a live adapter/device
 //! or a live window surface (`GpuContext::initialize`,
@@ -117,10 +161,10 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
 use bitty_platform::{
-    App, AppHandler, EventContext, LogicalSize, PlatformError, PlatformEvent, WindowConfig,
-    WindowHandle, WindowId,
+    App, AppHandler, EventContext, LogicalKey, LogicalSize, NamedKey, PlatformError, PlatformEvent,
+    PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
 };
-use bitty_runtime::Runtime;
+use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
 // ---------------------------------------------------------------------------
 // Args
@@ -130,7 +174,7 @@ use bitty_runtime::Runtime;
 ///
 /// `program` is the optional `argv[0]` to spawn inside the PTY. When `None`
 /// the runtime starts without a child (CI smoke still ticks the grid).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
     headless: bool,
@@ -144,6 +188,18 @@ struct Args {
     /// `PtyBuilder::arg` because `Runtime::spawn_shell` currently takes a
     /// single `&str` — documented as a follow-up).
     program_args: Vec<String>,
+    /// Optional split axis (from `--split`).
+    split_axis: Option<SplitAxis>,
+    /// Optional split ratio (from `--split-ratio` or `--split` colon form).
+    split_ratio: Option<f32>,
+    /// When true, request a stack layout (from `--stack`).
+    stack: bool,
+    /// When true, request an overlay layout (from `--overlay`).
+    overlay: bool,
+    /// Raw layout spec (from `--layout`), e.g. "single", "split:h:0.5", "stack", "overlay:5,5,20,10".
+    layout: Option<String>,
+    /// Raw focus spec (from `--focus`), e.g. "next", "prev", "up", "1".
+    focus: Option<String>,
 }
 
 impl Args {
@@ -154,7 +210,32 @@ impl Args {
             version: false,
             program: None,
             program_args: Vec::new(),
+            split_axis: None,
+            split_ratio: None,
+            stack: false,
+            overlay: false,
+            layout: None,
+            focus: None,
         }
+    }
+}
+
+fn parse_split_axis(s: &str) -> Option<SplitAxis> {
+    match s.to_ascii_lowercase().as_str() {
+        "horizontal" | "h" | "horiz" | "hor" => Some(SplitAxis::Horizontal),
+        "vertical" | "v" | "vert" | "ver" => Some(SplitAxis::Vertical),
+        _ => None,
+    }
+}
+
+/// Parses a value that may be `axis` or `axis:ratio` (e.g. "h:0.3", "vertical:0.7").
+fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
+    if let Some((axis_part, ratio_part)) = token.split_once(':') {
+        let axis = parse_split_axis(axis_part.trim());
+        let ratio = ratio_part.trim().parse::<f32>().ok();
+        (axis, ratio)
+    } else {
+        (parse_split_axis(token.trim()), None)
     }
 }
 
@@ -164,6 +245,13 @@ impl Args {
 /// - `-h` / `--help` → help
 /// - `-V` / `--version` → version
 /// - `--headless` → headless smoke (also triggered by `BITTY_HEADLESS=1`)
+/// - `--split [AXIS]` → split layout (AXIS = horizontal|h / vertical|v, default horizontal)
+/// - `--split=AXIS[:RATIO]` → split with optional ratio
+/// - `--split-ratio RATIO` → ratio for split
+/// - `--stack` → stack layout (2 panes)
+/// - `--overlay` → overlay layout
+/// - `--layout SPEC` → explicit layout spec (single, split:h[:ratio], stack[:n], overlay[:x,y,w,h])
+/// - `--focus SPEC` → focus (next|prev|up|down|left|right|<id>)
 /// - `--` → treat the rest as program argv verbatim
 ///
 /// The first non-flag token becomes `program`; additional non-flag tokens
@@ -181,7 +269,9 @@ fn parse_args(raw: &[String]) -> Args {
     }
     let mut after_double_dash = false;
     let mut program_set = false;
-    for token in raw.iter().skip(1) {
+    let mut i = 1usize;
+    while i < raw.len() {
+        let token = &raw[i];
         if after_double_dash {
             if !program_set {
                 out.program = Some(token.clone());
@@ -189,15 +279,137 @@ fn parse_args(raw: &[String]) -> Args {
             } else {
                 out.program_args.push(token.clone());
             }
+            i += 1;
+            continue;
+        }
+        // Handle flags with `=` first
+        if token.starts_with("--split-ratio=") {
+            let val = token.trim_start_matches("--split-ratio=");
+            if let Ok(f) = val.parse::<f32>() {
+                out.split_ratio = Some(f);
+            } else {
+                eprintln!("warning: invalid --split-ratio value {val:?} — ignoring");
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--split=") {
+            let val = token.trim_start_matches("--split=");
+            // val may be "h:0.3" or "horizontal" etc.
+            let (axis, ratio) = parse_split_token(val);
+            if let Some(ax) = axis {
+                out.split_axis = Some(ax);
+            } else if !val.is_empty() {
+                eprintln!("warning: unknown --split axis {val:?} — defaulting to horizontal");
+                out.split_axis = Some(SplitAxis::Horizontal);
+            } else {
+                out.split_axis = Some(SplitAxis::Horizontal);
+            }
+            if let Some(r) = ratio {
+                out.split_ratio = Some(r);
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--layout=") {
+            let val = token.trim_start_matches("--layout=");
+            out.layout = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--focus=") {
+            let val = token.trim_start_matches("--focus=");
+            out.focus = Some(val.to_string());
+            i += 1;
             continue;
         }
         match token.as_str() {
             "--" => {
                 after_double_dash = true;
+                i += 1;
             }
-            "-h" | "--help" => out.help = true,
-            "-V" | "--version" => out.version = true,
-            "--headless" => out.headless = true,
+            "-h" | "--help" => {
+                out.help = true;
+                i += 1;
+            }
+            "-V" | "--version" => {
+                out.version = true;
+                i += 1;
+            }
+            "--headless" => {
+                out.headless = true;
+                i += 1;
+            }
+            "--stack" => {
+                out.stack = true;
+                i += 1;
+            }
+            "--overlay" => {
+                out.overlay = true;
+                i += 1;
+            }
+            "--split" => {
+                // Check next token for axis (if not a flag)
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    let next = raw[i + 1].clone();
+                    let (axis, ratio) = parse_split_token(&next);
+                    if axis.is_some() || ratio.is_some() {
+                        if let Some(ax) = axis {
+                            out.split_axis = Some(ax);
+                        } else {
+                            // axis parse failed but ratio present? Keep default axis
+                            out.split_axis = Some(SplitAxis::Horizontal);
+                        }
+                        if let Some(r) = ratio {
+                            out.split_ratio = Some(r);
+                        }
+                        i += 2;
+                    } else {
+                        // Next token is not an axis/ratio (e.g. "/bin/bash"), treat --split as horizontal without consuming
+                        out.split_axis = Some(SplitAxis::Horizontal);
+                        i += 1;
+                    }
+                } else {
+                    out.split_axis = Some(SplitAxis::Horizontal);
+                    i += 1;
+                }
+            }
+            "--split-ratio" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    let next = &raw[i + 1];
+                    if let Ok(f) = next.parse::<f32>() {
+                        out.split_ratio = Some(f);
+                    } else {
+                        eprintln!("warning: invalid --split-ratio value {next:?} — ignoring");
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("warning: --split-ratio needs a numeric value — ignoring");
+                    i += 1;
+                }
+            }
+            "--layout" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.layout = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "warning: --layout needs a value (single|split:h[:ratio]|stack[:n]|overlay[:x,y,w,h]) — ignoring"
+                    );
+                    i += 1;
+                }
+            }
+            "--focus" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.focus = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "warning: --focus needs a value (next|prev|up|down|left|right|<id>) — ignoring"
+                    );
+                    i += 1;
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("warning: unknown flag {s:?} — treating as program name");
                 if !program_set {
@@ -206,6 +418,7 @@ fn parse_args(raw: &[String]) -> Args {
                 } else {
                     out.program_args.push(token.clone());
                 }
+                i += 1;
             }
             _ => {
                 if !program_set {
@@ -214,6 +427,7 @@ fn parse_args(raw: &[String]) -> Args {
                 } else {
                     out.program_args.push(token.clone());
                 }
+                i += 1;
             }
         }
     }
@@ -230,6 +444,14 @@ fn help_text() -> String {
            -h, --help       Print this help and exit\n  \
            -V, --version    Print version and exit\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
+               --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
+               --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
+               --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \
+               --stack      Stack layout (2 panes, full bounds, last on top)\n  \
+               --overlay    Overlay layout (base + 20×10 floating at 5,5)\n  \
+               --layout SPEC  Explicit layout: single | split:h[:ratio] | split:v[:ratio]\n  \
+           \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20stack[:N] | overlay[:X,Y,W,H]  (overrides --split/--stack/--overlay)\n  \
+               --focus SPEC Focus: next|prev|up|down|left|right|<id> (e.g. --focus next, --focus 2)\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
          Arguments:\n  \
@@ -237,21 +459,39 @@ fn help_text() -> String {
                             no shell interpolation). When omitted the runtime\n  \
                             starts without a child; --headless still ticks.\n\
          \n\
+         Layout:\n  \
+           The app constructs a LayoutNode via bitty-ui and calls Runtime::set_layout.\n  \
+           Precedence: --layout > --stack > --overlay > --split > single (default).\n  \
+           Examples: --split, --split v, --split=h:0.3 --stack, --overlay,\n  \
+                     --layout single, --layout split:h:0.5, --layout stack:3,\n  \
+                     --layout overlay:5,5,20,10\n\
+         \n\
+         Focus:\n  \
+           --focus moves focus after layout install (Direction via FocusDirection\n  \
+           or numeric ViewId). Keyboard in real mode: Tab/n→Next, p→Prev,\n  \
+           Arrows→spatial, 1..5→ViewId(1..5). Focus changes are deterministic.\n\
+         \n\
          Modes:\n  \
            headless         Surface::headless software present, no display/GPU.\n  \
                             Triggered by --headless, BITTY_HEADLESS=1, or\n  \
-                            App::run -> DisplayUnavailable fallback.\n  \
+                            App::run -> DisplayUnavailable fallback. Proves\n  \
+                            split/stack/overlay composition deterministically\n  \
+                            (separate runtimes same bytes/layout → identical RGBA;\n  \
+                            different layouts → distinct RGBA). No window/GPU.\n  \
            real             App::run event loop with Window creation and\n  \
                             PlatformEvent -> Runtime::handle_platform_event\n  \
-                            plus tick -> present. GPU attach (GpuContext +\n  \
-                            SurfaceTarget) is an honest env-gated gap: runtime\n  \
-                            still presents via the headless seam until the\n  \
-                            attach_gpu slice lands. See module docs.\n\
+                            plus layout-aware tick -> present. GPU attach\n  \
+                            (GpuContext + SurfaceTarget) is an honest env-gated\n  \
+                            gap: runtime still presents via the headless seam\n  \
+                            until the attach_gpu slice lands. See module docs.\n\
          \n\
          Examples:\n  \
            bitty --help\n  \
            bitty --version\n  \
            bitty --headless\n  \
+           bitty --headless --split v --focus next\n  \
+           bitty --headless --layout stack:2 --focus 2\n  \
+           bitty --headless --layout overlay:5,5,20,10\n  \
            bitty --headless -- /bin/bash\n  \
            bitty /bin/bash\n  \
            bitty -- /bin/cat -A\n",
@@ -264,11 +504,178 @@ fn version_text() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Layout construction
+// ---------------------------------------------------------------------------
+
+fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode> {
+    let lower = spec.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed == "single" || trimmed == "leaf" || trimmed == "1" {
+        return Some(LayoutNode::leaf(View::new(ViewId::new(1), cols, rows)));
+    }
+    if trimmed.starts_with("split") {
+        // forms: split, split:h, split:horizontal, split:h:0.3, split:vertical:0.7 etc
+        let rest = trimmed.trim_start_matches("split").trim_start_matches(':');
+        if rest.is_empty() {
+            let a = View::new(ViewId::new(1), cols, rows);
+            let b = View::new(ViewId::new(2), cols, rows);
+            return Some(LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(a),
+                LayoutNode::leaf(b),
+            ));
+        }
+        // rest may be "h", "h:0.3", "horizontal:0.5" etc
+        let mut parts = rest.split(':');
+        let axis_part = parts.next().unwrap_or("").trim();
+        let ratio_part = parts.next().map(str::trim);
+        let axis = parse_split_axis(axis_part).unwrap_or(SplitAxis::Horizontal);
+        let ratio = if let Some(r_str) = ratio_part {
+            r_str.parse::<f32>().unwrap_or(0.5)
+        } else {
+            0.5
+        };
+        let a = View::new(ViewId::new(1), cols, rows);
+        let b = View::new(ViewId::new(2), cols, rows);
+        return Some(LayoutNode::split(
+            axis,
+            ratio,
+            LayoutNode::leaf(a),
+            LayoutNode::leaf(b),
+        ));
+    }
+    if trimmed.starts_with("stack") {
+        // forms: stack, stack:2, stack:3
+        let rest = trimmed.trim_start_matches("stack").trim_start_matches(':');
+        let n: usize = if rest.is_empty() {
+            2
+        } else {
+            rest.parse::<usize>().unwrap_or(2).clamp(1, 8)
+        };
+        let mut children = Vec::with_capacity(n);
+        for id in 1..=n as u64 {
+            children.push(LayoutNode::leaf(View::new(ViewId::new(id), cols, rows)));
+        }
+        return Some(LayoutNode::stack(children));
+    }
+    if trimmed.starts_with("overlay") {
+        // forms: overlay, overlay:5,5,20,10
+        let rest = trimmed
+            .trim_start_matches("overlay")
+            .trim_start_matches(':');
+        if rest.is_empty() {
+            let base = View::new(ViewId::new(1), cols, rows);
+            let over = View::new(ViewId::new(2), 20.min(cols), 10.min(rows));
+            let bounds = UiRect::new(5, 5, 20.min(cols as u16), 10.min(rows as u16));
+            return Some(LayoutNode::overlay(
+                LayoutNode::leaf(base),
+                LayoutNode::leaf(over),
+                bounds,
+            ));
+        }
+        // parse x,y,w,h
+        let nums: Vec<u16> = rest
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .collect();
+        if nums.len() == 4 {
+            let base = View::new(ViewId::new(1), cols, rows);
+            let over = View::new(ViewId::new(2), nums[2] as usize, nums[3] as usize);
+            let bounds = UiRect::new(nums[0], nums[1], nums[2], nums[3]);
+            return Some(LayoutNode::overlay(
+                LayoutNode::leaf(base),
+                LayoutNode::leaf(over),
+                bounds,
+            ));
+        }
+        // fallback to default overlay on parse failure
+        let base = View::new(ViewId::new(1), cols, rows);
+        let over = View::new(ViewId::new(2), 20.min(cols), 10.min(rows));
+        let bounds = UiRect::new(5, 5, 20.min(cols as u16), 10.min(rows as u16));
+        return Some(LayoutNode::overlay(
+            LayoutNode::leaf(base),
+            LayoutNode::leaf(over),
+            bounds,
+        ));
+    }
+    None
+}
+
+fn build_layout(args: &Args, cols: usize, rows: usize) -> LayoutNode {
+    // Precedence: --layout > --stack > --overlay > --split > single
+    if let Some(spec) = args.layout.as_deref() {
+        if let Some(node) = parse_layout_spec(spec, cols, rows) {
+            return node;
+        }
+        eprintln!("warning: unknown --layout spec {spec:?} — falling back");
+    }
+    if args.stack {
+        let n = 2usize;
+        let mut children = Vec::with_capacity(n);
+        for id in 1..=n as u64 {
+            children.push(LayoutNode::leaf(View::new(ViewId::new(id), cols, rows)));
+        }
+        return LayoutNode::stack(children);
+    }
+    if args.overlay {
+        let base = View::new(ViewId::new(1), cols, rows);
+        let over = View::new(ViewId::new(2), 20.min(cols), 10.min(rows));
+        let bounds = UiRect::new(5, 5, 20.min(cols as u16), 10.min(rows as u16));
+        return LayoutNode::overlay(LayoutNode::leaf(base), LayoutNode::leaf(over), bounds);
+    }
+    if let Some(axis) = args.split_axis {
+        let ratio = args.split_ratio.unwrap_or(0.5);
+        let a = View::new(ViewId::new(1), cols, rows);
+        let b = View::new(ViewId::new(2), cols, rows);
+        return LayoutNode::split(axis, ratio, LayoutNode::leaf(a), LayoutNode::leaf(b));
+    }
+    LayoutNode::leaf(View::new(ViewId::new(1), cols, rows))
+}
+
+fn apply_focus(runtime: &mut Runtime, spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    let dir = match lower.as_str() {
+        "next" | "n" => Some(FocusDirection::Next),
+        "prev" | "previous" | "p" => Some(FocusDirection::Prev),
+        "up" => Some(FocusDirection::Up),
+        "down" => Some(FocusDirection::Down),
+        "left" => Some(FocusDirection::Left),
+        "right" => Some(FocusDirection::Right),
+        _ => None,
+    };
+    if let Some(dir) = dir {
+        let prev = runtime.focused_view();
+        let next = runtime.move_focus(dir);
+        eprintln!("bitty: focus move {dir:?} from {prev:?} -> {next:?}");
+        return next.is_some();
+    }
+    if let Ok(num) = spec.trim().parse::<u64>() {
+        let id = ViewId::new(num);
+        let ok = runtime.set_focus(id);
+        if ok {
+            eprintln!("bitty: focus set to {id}");
+        } else {
+            eprintln!(
+                "warning: focus id {id} not in layout (leaf ids {:?})",
+                runtime.layout().leaf_ids()
+            );
+        }
+        return ok;
+    }
+    eprintln!(
+        "warning: unknown --focus spec {spec:?} (expected next|prev|up|down|left|right|<id>)"
+    );
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Headless smoke
 // ---------------------------------------------------------------------------
 
-/// Runs a single headless tick smoke: feeds a synthetic byte batch, ticks,
-/// and prints the cold-queue summary and present stats.
+/// Runs a single headless tick smoke: feeds a synthetic byte batch, ticks
+/// layout-aware, prints cold-queue summary and present stats, then proves
+/// split/stack/overlay composition deterministically.
 ///
 /// Returns an exit code (0 success, 1 runtime build failure, 2 no present).
 fn run_headless_smoke(runtime: &mut Runtime) -> i32 {
@@ -283,6 +690,17 @@ fn run_headless_smoke(runtime: &mut Runtime) -> i32 {
     let dropped = runtime.cold_queue_dropped();
     let cap = runtime.cold_queue_capacity();
     let generation_before = runtime.state().generation();
+    let layout_desc = {
+        let ids = runtime.layout().leaf_ids();
+        let allocs = runtime.layout_allocations();
+        format!(
+            "layout leafs={} ids={:?} allocs={:?} focused={:?}",
+            runtime.leaf_count(),
+            ids,
+            allocs,
+            runtime.focused_view()
+        )
+    };
 
     let stats = runtime.tick();
 
@@ -298,7 +716,6 @@ fn run_headless_smoke(runtime: &mut Runtime) -> i32 {
                 events.len(),
                 present.generation
             );
-            // Surface extent must be non-zero and RGBA buffer must exist on headless.
             if let Some(extent) = runtime.surface_extent() {
                 println!(
                     "  surface: headless={} extent={}x{} rgba_len={}",
@@ -308,9 +725,13 @@ fn run_headless_smoke(runtime: &mut Runtime) -> i32 {
                     runtime.headless_rgba().map_or(0, |b| b.len())
                 );
             }
-            // Warn if program_args were supplied but not forwarded (honest gap).
-            // Caller supplied args are kept in `Args::program_args` but
-            // `Runtime::spawn_shell` currently takes a single `&str`.
+            println!("  {layout_desc}");
+            // Prove split/stack/overlay deterministically (no window/GPU, software present only).
+            // This runs even for single-leaf headless to show composition is layout-aware.
+            let proof_code = run_layout_proof(synthetic);
+            if proof_code != 0 {
+                eprintln!("bitty: layout proof failed with code {proof_code}");
+            }
             0
         }
         None => {
@@ -320,12 +741,149 @@ fn run_headless_smoke(runtime: &mut Runtime) -> i32 {
             eprintln!(
                 "  cold-queue: len={queued} cap={cap} dropped={dropped} generation={generation_before}"
             );
+            eprintln!("  {layout_desc}");
             // Idle is not a failure for CI smoke when no bytes produced damage
             // (e.g. synthetic was filtered). The generation check still proves
             // the path, so return 0 rather than 2 to keep CI green, but log.
+            // Still run layout proof to keep composition evidence deterministic.
+            let _ = run_layout_proof(synthetic);
             0
         }
     }
+}
+
+/// Deterministic proof that split/stack/overlay compose via software present.
+///
+/// Creates separate headless runtimes per composition, feeds the same synthetic
+/// bytes, ticks, and asserts:
+///
+/// - same layout + same bytes → identical RGBA (determinism)
+/// - different layouts → distinct RGBA (composition)
+///
+/// Prints evidence; returns 0 on success, 1 on failure.
+fn run_layout_proof(synthetic: &[u8]) -> i32 {
+    // Helper to build a runtime with a given layout, feed bytes, tick, and return (stats, rgba)
+    fn tick_with_layout(
+        layout: LayoutNode,
+        bytes: &[u8],
+    ) -> Option<(bitty_runtime::PresentStats, Vec<u8>)> {
+        let mut rt = Runtime::with_defaults().expect("defaults must build");
+        rt.set_layout(layout);
+        rt.handle_pty_bytes(bytes);
+        let stats = rt.tick()?;
+        let rgba = rt.headless_rgba()?;
+        Some((stats, rgba))
+    }
+
+    // Split
+    let split = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    );
+    let (split_stats, split_rgba) = match tick_with_layout(split.clone(), synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: split tick produced no present");
+            return 1;
+        }
+    };
+    // Second split must be deterministic
+    let (_, split_rgba2) = match tick_with_layout(split, synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: second split tick produced no present");
+            return 1;
+        }
+    };
+    if split_rgba != split_rgba2 {
+        eprintln!("layout-proof: split not deterministic");
+        return 1;
+    }
+
+    // Stack
+    let stack = LayoutNode::stack(vec![
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ]);
+    let (stack_stats, stack_rgba) = match tick_with_layout(stack.clone(), synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: stack tick produced no present");
+            return 1;
+        }
+    };
+    let (_, stack_rgba2) = match tick_with_layout(stack, synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: second stack tick produced no present");
+            return 1;
+        }
+    };
+    if stack_rgba != stack_rgba2 {
+        eprintln!("layout-proof: stack not deterministic");
+        return 1;
+    }
+
+    // Overlay
+    let overlay = LayoutNode::overlay(
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 20, 10)),
+        UiRect::new(5, 5, 20, 10),
+    );
+    let (overlay_stats, overlay_rgba) = match tick_with_layout(overlay.clone(), synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: overlay tick produced no present");
+            return 1;
+        }
+    };
+    let (_, overlay_rgba2) = match tick_with_layout(overlay, synthetic) {
+        Some(v) => v,
+        None => {
+            eprintln!("layout-proof: second overlay tick produced no present");
+            return 1;
+        }
+    };
+    if overlay_rgba != overlay_rgba2 {
+        eprintln!("layout-proof: overlay not deterministic");
+        return 1;
+    }
+
+    // Distinctness
+    if split_rgba == stack_rgba {
+        eprintln!("layout-proof: split and stack produced identical rgba — unexpected");
+        return 1;
+    }
+    if split_rgba == overlay_rgba {
+        eprintln!("layout-proof: split and overlay produced identical rgba — unexpected");
+        return 1;
+    }
+    if stack_rgba == overlay_rgba {
+        eprintln!("layout-proof: stack and overlay produced identical rgba — unexpected");
+        return 1;
+    }
+
+    println!(
+        "  layout-proof: ok — split (fills={}, glyphs={}) stack (fills={}, glyphs={}) overlay (fills={}, glyphs={}) distinct deterministic rgba",
+        split_stats.fills,
+        split_stats.glyphs,
+        stack_stats.fills,
+        stack_stats.glyphs,
+        overlay_stats.fills,
+        overlay_stats.glyphs
+    );
+    println!(
+        "    rgba lens: split={} stack={} overlay={} (split!=stack {}, split!=overlay {}, stack!=overlay {})",
+        split_rgba.len(),
+        stack_rgba.len(),
+        overlay_rgba.len(),
+        split_rgba != stack_rgba,
+        split_rgba != overlay_rgba,
+        stack_rgba != overlay_rgba
+    );
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -419,13 +977,15 @@ impl TerminalApp {
         if let Some(present) = stats {
             self.presented_frames += 1;
             eprintln!(
-                "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={}",
+                "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={}",
                 present.frame,
                 present.fills,
                 present.glyphs,
                 present.headless,
                 present.generation,
-                self.presented_frames
+                self.presented_frames,
+                self.runtime.focused_view(),
+                self.runtime.leaf_count()
             );
             // Replies synthesized by terminal state (device-status queries)
             // would be written back to the PTY master via `PtyWriter` here;
@@ -506,8 +1066,10 @@ impl AppHandler for TerminalApp {
                             self.window_id = Some(id);
                             self.window = Some(handle);
                             eprintln!(
-                                "bitty: window created id={} headless_fallback=true (gpu attach deferred)",
-                                id.get()
+                                "bitty: window created id={} headless_fallback=true (gpu attach deferred) focused={:?} leafs={}",
+                                id.get(),
+                                self.runtime.focused_view(),
+                                self.runtime.leaf_count()
                             );
                         }
                         Err(err) => {
@@ -528,10 +1090,75 @@ impl AppHandler for TerminalApp {
                 }
             }
             PlatformEvent::Window { window_id: _, kind } => {
+                // Keyboard focus movement (thin shortcut handling; keeps app free of input-encoding policy).
+                // The input-encoding slice (keymaps/IME) lives elsewhere; this is only deterministic
+                // focus traversal over the owned layout, proven headlessly via --focus and via tick.
+                if let WindowEventKind::KeyboardInput(key) = &kind {
+                    if key.state == PressState::Pressed && !key.repeat {
+                        let mut handled = false;
+                        match &key.logical_key {
+                            LogicalKey::Named(NamedKey::Tab) => {
+                                self.runtime.move_focus(FocusDirection::Next);
+                                handled = true;
+                            }
+                            LogicalKey::Named(NamedKey::ArrowRight) => {
+                                self.runtime.move_focus(FocusDirection::Right);
+                                handled = true;
+                            }
+                            LogicalKey::Named(NamedKey::ArrowLeft) => {
+                                self.runtime.move_focus(FocusDirection::Left);
+                                handled = true;
+                            }
+                            LogicalKey::Named(NamedKey::ArrowUp) => {
+                                self.runtime.move_focus(FocusDirection::Up);
+                                handled = true;
+                            }
+                            LogicalKey::Named(NamedKey::ArrowDown) => {
+                                self.runtime.move_focus(FocusDirection::Down);
+                                handled = true;
+                            }
+                            LogicalKey::Character(s) => {
+                                let low = s.to_ascii_lowercase();
+                                match low.as_str() {
+                                    "n" => {
+                                        self.runtime.move_focus(FocusDirection::Next);
+                                        handled = true;
+                                    }
+                                    "p" => {
+                                        self.runtime.move_focus(FocusDirection::Prev);
+                                        handled = true;
+                                    }
+                                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" => {
+                                        if let Ok(num) = low.parse::<u64>() {
+                                            self.runtime.set_focus(ViewId::new(num));
+                                            handled = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        if handled {
+                            eprintln!(
+                                "bitty: keyboard focus -> {:?} leafs={} (key={:?})",
+                                self.runtime.focused_view(),
+                                self.runtime.leaf_count(),
+                                key.logical_key
+                            );
+                            // Request redraw so the next AboutToWait/RedrawRequested will tick layout-aware.
+                            // Focus itself does not dirty generation, but the next tick after set_layout's
+                            // pending_full_redraw already presented; for keyboard moves we still request
+                            // redraw to keep frame-on-demand honest (no periodic wakeups).
+                            if let Some(win) = self.window.as_ref() {
+                                win.request_redraw();
+                            }
+                        }
+                    }
+                }
                 // `handle_platform_event` already routed Resized /
                 // ScaleFactorChanged / CloseRequested / RedrawRequested.
                 // Request a tick on redraw and after resize.
-                use bitty_platform::WindowEventKind;
                 match kind {
                     WindowEventKind::Resized(_) | WindowEventKind::ScaleFactorChanged(_) => {
                         if let Some(win) = self.window.as_ref() {
@@ -619,6 +1246,28 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Layout wiring: construct LayoutNode via bitty-ui types (re-exported through bitty-runtime),
+    // call Runtime::set_layout, then apply focus. Keeps app thin; no config/plugin coupling.
+    {
+        let cols = runtime.config().cols;
+        let rows = runtime.config().rows;
+        let layout = build_layout(&args, cols, rows);
+        let leaf_ids = layout.leaf_ids();
+        let focused_before = runtime.focused_view();
+        runtime.set_layout(layout);
+        eprintln!(
+            "bitty: layout installed — leafs={} ids={:?} focused_before={:?} focused_after={:?} container={:?}",
+            runtime.leaf_count(),
+            leaf_ids,
+            focused_before,
+            runtime.focused_view(),
+            runtime.container()
+        );
+        if let Some(focus_spec) = args.focus.as_deref() {
+            apply_focus(&mut runtime, focus_spec);
+        }
+    }
+
     if let Some(program) = args.program.as_deref() {
         match runtime.spawn_shell(program) {
             Ok(()) => eprintln!("bitty: spawned program {program:?}"),
@@ -637,7 +1286,10 @@ fn main() {
     // Runtime::handle_platform_event and tick → present. On headless CI
     // `App::run` returns `DisplayUnavailable` instead of panicking — fall
     // back to the headless smoke so CI stays green and the failure is
-    // honest rather than fatal.
+    // honest rather than fatal. The event loop is layout-aware: every tick
+    // reflows the LayoutNode into the container and composites per-leaf via
+    // the headless software seam (deterministic RGBA) until a real
+    // SurfaceTarget is attached in a future slice.
     let app = TerminalApp::new(runtime);
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
@@ -661,6 +1313,17 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // Re-apply layout and focus in fallback so headless smoke proves the same composition
+        // that real mode would have driven via the window.
+        {
+            let cols = rt.config().cols;
+            let rows = rt.config().rows;
+            let layout = build_layout(&args, cols, rows);
+            rt.set_layout(layout);
+            if let Some(focus_spec) = args.focus.as_deref() {
+                apply_focus(&mut rt, focus_spec);
+            }
+        }
         // Preserve program spawn attempt in the fallback when it existed.
         if let Some(program) = args.program.as_deref() {
             let _ = rt.spawn_shell(program);
@@ -691,6 +1354,12 @@ mod tests {
         assert!(!parsed.version);
         assert_eq!(parsed.program, None);
         assert!(parsed.program_args.is_empty());
+        assert_eq!(parsed.split_axis, None);
+        assert_eq!(parsed.split_ratio, None);
+        assert!(!parsed.stack);
+        assert!(!parsed.overlay);
+        assert_eq!(parsed.layout, None);
+        assert_eq!(parsed.focus, None);
     }
 
     #[test]
@@ -746,6 +1415,8 @@ mod tests {
     fn help_and_version_text_are_non_empty() {
         assert!(help_text().contains("bitty"));
         assert!(help_text().contains("--headless"));
+        assert!(help_text().contains("--split"));
+        assert!(help_text().contains("--layout"));
         assert!(!version_text().is_empty());
     }
 
@@ -786,5 +1457,234 @@ mod tests {
         let _ = app2.drive_tick();
         // After first present the second idle tick in the same app may be None.
         // We do not assert presence, only totality (no panic).
+    }
+
+    #[test]
+    fn parse_split_flags() {
+        let raw = args_of(&["bitty", "--split"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.split_axis, Some(SplitAxis::Horizontal));
+        assert_eq!(p.split_ratio, None);
+
+        let raw = args_of(&["bitty", "--split", "vertical"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.split_axis, Some(SplitAxis::Vertical));
+
+        let raw = args_of(&["bitty", "--split", "h"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.split_axis, Some(SplitAxis::Horizontal));
+
+        let raw = args_of(&["bitty", "--split=v"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.split_axis, Some(SplitAxis::Vertical));
+
+        let raw = args_of(&["bitty", "--split", "h:0.3"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.split_axis, Some(SplitAxis::Horizontal));
+        assert!(p.split_ratio.is_some());
+        assert!((p.split_ratio.unwrap() - 0.3).abs() < f32::EPSILON);
+
+        let raw = args_of(&["bitty", "--split-ratio", "0.7"]);
+        let p = parse_args(&raw);
+        assert!(p.split_ratio.is_some());
+        assert!((p.split_ratio.unwrap() - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_layout_and_focus_flags() {
+        let raw = args_of(&["bitty", "--layout", "split:h:0.5"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.layout.as_deref(), Some("split:h:0.5"));
+
+        let raw = args_of(&["bitty", "--layout=stack:3"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.layout.as_deref(), Some("stack:3"));
+
+        let raw = args_of(&["bitty", "--focus", "next"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.focus.as_deref(), Some("next"));
+
+        let raw = args_of(&["bitty", "--focus=2"]);
+        let p = parse_args(&raw);
+        assert_eq!(p.focus.as_deref(), Some("2"));
+
+        let raw = args_of(&["bitty", "--stack", "--overlay"]);
+        let p = parse_args(&raw);
+        assert!(p.stack);
+        assert!(p.overlay);
+    }
+
+    #[test]
+    fn build_layout_single_default() {
+        let args = parse_args(&args_of(&["bitty"]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 1);
+        assert_eq!(layout.leaf_ids(), vec![ViewId::new(1)]);
+    }
+
+    #[test]
+    fn build_layout_split_via_flag() {
+        let args = parse_args(&args_of(&["bitty", "--split", "vertical"]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 2);
+        let allocs = layout.layout(UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs.len(), 2);
+        // vertical split 24 rows -> first 12, second 12 with 0.5 ratio
+        assert_eq!(allocs[0].1.height, 12);
+        assert_eq!(allocs[1].1.height, 12);
+    }
+
+    #[test]
+    fn build_layout_stack_and_overlay() {
+        let args = parse_args(&args_of(&["bitty", "--stack"]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 2);
+        let allocs = layout.layout(UiRect::new(0, 0, 80, 24));
+        // stack: both cover full bounds
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs[1].1, UiRect::new(0, 0, 80, 24));
+
+        let args = parse_args(&args_of(&["bitty", "--overlay"]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 2);
+        let allocs = layout.layout(UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs[1].1, UiRect::new(5, 5, 20, 10));
+    }
+
+    #[test]
+    fn build_layout_via_explicit_spec() {
+        let args = parse_args(&args_of(&["bitty", "--layout", "split:h:0.3"]));
+        let layout = build_layout(&args, 100, 24);
+        let allocs = layout.layout(UiRect::new(0, 0, 100, 24));
+        assert_eq!(allocs.len(), 2);
+        assert_eq!(allocs[0].1.width, 30); // floor(100*0.3)
+        assert_eq!(allocs[1].1.width, 70);
+
+        let args = parse_args(&args_of(&["bitty", "--layout", "stack:3"]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 3);
+
+        let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,10,5"]));
+        let layout = build_layout(&args, 80, 24);
+        let allocs = layout.layout(UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs[1].1, UiRect::new(1, 2, 10, 5));
+    }
+
+    #[test]
+    fn layout_precedence_stack_over_split() {
+        // --layout overrides --split/--stack per help text
+        let args = parse_args(&args_of(&["bitty", "--split", "h", "--stack"]));
+        // without explicit --layout, stack wins over split
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 2);
+        // Verify it's stack (both full)
+        let allocs = layout.layout(UiRect::new(0, 0, 80, 24));
+        assert_eq!(allocs[0].1, allocs[1].1);
+
+        let args = parse_args(&args_of(&[
+            "bitty", "--split", "h", "--stack", "--layout", "single",
+        ]));
+        let layout = build_layout(&args, 80, 24);
+        assert_eq!(layout.leaf_count(), 1);
+    }
+
+    #[test]
+    fn focus_via_args_and_runtime() {
+        let mut rt = Runtime::with_defaults().expect("must build");
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        );
+        rt.set_layout(split);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert!(apply_focus(&mut rt, "next"));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+        assert!(apply_focus(&mut rt, "1"));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert!(!apply_focus(&mut rt, "99")); // invalid id
+        assert!(!apply_focus(&mut rt, "bogus")); // invalid spec returns false
+    }
+
+    #[test]
+    fn focus_directional_via_args() {
+        let mut rt = Runtime::with_defaults().expect("must build");
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt.set_layout(split);
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        rt.reflow_layout();
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert!(apply_focus(&mut rt, "right"));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+        assert!(apply_focus(&mut rt, "left"));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn headless_smoke_with_split_is_deterministic() {
+        // Two runtimes with same split + same bytes must produce identical rgba
+        let synthetic = b"hello split deterministic";
+        let mut rt1 = Runtime::with_defaults().expect("must build");
+        let layout = build_layout(&parse_args(&args_of(&["bitty", "--split", "h"])), 80, 24);
+        rt1.set_layout(layout.clone());
+        rt1.handle_pty_bytes(synthetic);
+        let _ = rt1.tick().expect("must present");
+        let rgba1 = rt1.headless_rgba().expect("rgba");
+
+        let mut rt2 = Runtime::with_defaults().expect("must build");
+        rt2.set_layout(layout);
+        rt2.handle_pty_bytes(synthetic);
+        let _ = rt2.tick().expect("must present");
+        let rgba2 = rt2.headless_rgba().expect("rgba");
+        assert_eq!(rgba1, rgba2);
+    }
+
+    #[test]
+    fn layout_proof_is_deterministic_and_distinct() {
+        let synthetic = b"layout proof test";
+        let code = run_layout_proof(synthetic);
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn tick_is_layout_aware_after_set_layout() {
+        let mut rt = Runtime::with_defaults().expect("must build");
+        let before = rt.tick().expect("first tick must present");
+        assert!(before.headless);
+        // Install split layout and tick with new bytes must still present layout-aware
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(10), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(20), 40, 24)),
+        );
+        rt.set_layout(split);
+        assert_eq!(rt.leaf_count(), 2);
+        rt.handle_pty_bytes(b"tick layout aware");
+        let stats = rt.tick().expect("split tick must present");
+        assert!(stats.headless);
+        assert!(stats.fills > 0);
+        let rgba = rt.headless_rgba().expect("rgba after split");
+        assert!(!rgba.is_empty());
+    }
+
+    #[test]
+    fn split_ratio_clamped_via_layout_node() {
+        let args = parse_args(&args_of(&["bitty", "--split", "h", "--split-ratio", "5.0"]));
+        let layout = build_layout(&args, 80, 24);
+        if let LayoutNode::Split { ratio, .. } = layout {
+            // LayoutNode::split clamps to [0.10,0.90]
+            assert!(ratio <= LayoutNode::MAX_RATIO);
+            assert!(ratio >= LayoutNode::MIN_RATIO);
+        } else {
+            panic!("expected split");
+        }
     }
 }

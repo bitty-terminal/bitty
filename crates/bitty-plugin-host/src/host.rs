@@ -472,11 +472,19 @@ impl PluginHost {
     }
 
     /// Publish an observation/lifecycle event to all subscribers of its kind.
+    ///
+    /// Admission is fail-closed at the `EventPipeline` boundary: per-plugin
+    /// `1024`/`256 KiB` and global `8192`/`2 MiB` aggregates are enforced via
+    /// the shared `DropPolicy` (same as `EventPipeline::publish`). Global
+    /// `invariant_global_bounds` is strict after this call.
     pub fn publish(&mut self, event: Event) {
         self.pipeline.publish(event);
     }
 
     /// Publish to a specific subscriber (lifecycle).
+    ///
+    /// Admission is fail-closed at the `EventPipeline` boundary with the same
+    /// per-plugin/global enforcement as `publish`.
     pub fn publish_to(&mut self, plugin_id: &PluginId, event: Event) -> Result<(), PluginError> {
         self.pipeline.publish_to(plugin_id, event)
     }
@@ -566,7 +574,10 @@ impl PluginHost {
         self.pipeline.invariant_queue_bounds()
     }
 
-    /// Whether global bounds hold (candidate, RC-5 global 8192 / 2 MiB).
+    /// Whether global bounds hold (strict, fail-closed, RC-5 global 8192 / 2 MiB).
+    ///
+    /// Enforced at the `publish` / `publish_to` admission boundary via
+    /// `DropPolicy`; always holds after any publish (fail-closed).
     #[must_use]
     pub fn invariant_global_bounds(&self) -> bool {
         self.pipeline.invariant_global_bounds()

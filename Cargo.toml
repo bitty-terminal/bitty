@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/bitty-agent",
     "crates/bitty-app",
     "crates/bitty-config",
     "crates/bitty-core",

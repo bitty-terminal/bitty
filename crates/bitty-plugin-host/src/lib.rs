@@ -21,6 +21,14 @@
 //! window/GPU coupling, and no `unsafe` — the crate is headlessly testable on
 //! both Linux CI and the `windows-latest` job.
 //!
+//! The `install` module ([`install::verify_install`]) wires the **proposed**
+//! `package-lifecycle` RFC (draft) into the install path: it calls
+//! `bitty_package::verify_pipeline` (7 stages) before any staging, checks
+//! capability-diff `P0-AC-030`, trust `V-A`/`V-B`/`V-C`, and generation
+//! integrity, fail-closed with owned errors for `bitty plugin doctor`. The
+//! package RFC itself is still `Proposed`; this wiring is a draft seam and
+//! may change without a semver major bump until acceptance.
+//!
 //! # Pipeline (candidate)
 //!
 //! ```text
@@ -56,6 +64,7 @@
 //! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` proposed), [`event::DropPolicy`] open decision point |
 //! | Timeouts and failure policy | `event` | [`event::InterceptionDecision`] veto-wins, fail-open, [`event::should_proceed`], reentrancy rejected, interception not queued (cold-path synchronous) |
 //! | Plugin host (ADRs) | `host` | [`host::PluginHost`] owns registry + grant store + event pipeline + [`host::SideQueue`] bounded side queue; no window/GPU/PTY coupling; headless testable |
+//! | Package install verification (proposed, draft) | `install` | [`install::verify_install`] calls `bitty_package::verify_pipeline` (7 stages) before staging; `V-A`/`V-B`/`V-C` trust, capability-diff `P0-AC-030`, generation integrity `verify_all`; fail-closed owned errors + [`install::DoctorIssue`] for `bitty plugin doctor`; headless tamper/capability tests |
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
 //! | Open points remaining under OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropPolicy` open point documented; exact queue depths/timeouts remain `OQ-014` candidates |
 //!
@@ -80,8 +89,9 @@
 //!
 //! # Ownership rules (ADR-0003 / ADR-0004)
 //!
-//! - **Depends on:** `bitty-term-state` and `bitty-config` only (path deps per
-//!   the ADR crate graph). No other workspace crate is depended upon.
+//! - **Depends on:** `bitty-term-state`, `bitty-config`, and `bitty-package`
+//!   (draft package lifecycle) only (path deps per the ADR crate graph). No other
+//!   workspace crate is depended upon.
 //! - **No third-party dependencies** (pure `std`). `mlua` seam deferred; `toml`
 //!   parsing stays outside this crate's pure-data core (caller supplies an
 //!   already-parsed [`manifest::PluginManifest`] or raw bytes length).
@@ -104,6 +114,7 @@ pub mod error;
 pub mod event;
 pub mod grant;
 pub mod host;
+pub mod install;
 pub mod manifest;
 pub mod registry;
 
@@ -116,6 +127,7 @@ pub use event::{
 };
 pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};
+pub use install::{DoctorIssue, InstallInputs, is_staging_allowed, verify_install};
 pub use manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, MANIFEST_MAX_BYTES,
     MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,

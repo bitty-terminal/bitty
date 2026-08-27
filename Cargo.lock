@@ -149,6 +149,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-config"
+version = "0.0.0"
+
+[[package]]
 name = "bitty-core"
 version = "0.0.0"
 

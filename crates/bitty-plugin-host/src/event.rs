@@ -59,39 +59,45 @@
 //!   plugin's queues for `DropOldest`, or refuse the arrival for `DropNewest`),
 //!   counting the drop against the target queue. This enforcement is **candidate**
 //!   and requires `P0` review before being considered normative; see `OQ-014`.
-//! - **GlobalQueuedEventLimit = 8192 events** (`GLOBAL_QUEUED_EVENT_LIMIT`, candidate):
-//!   total events across all plugins. Documented as a candidate open item;
-//!   enforcement requires host-level admission control not yet wired (global
-//!   isolation budget). The pipeline exposes [`EventPipeline::total_queued_events`]
-//!   and [`EventPipeline::total_queued_bytes`] for the future host limiter and
-//!   reports the limit in `bitty plugin doctor`. Marked as candidate with a
-//!   `P0` review note — not enforced as a hard gate in this draft.
+//! - **GlobalQueuedEventLimit = 8192 events** (`GLOBAL_QUEUED_EVENT_LIMIT`):
+//!   total events across all plugins. Enforced as a hard gate at the
+//!   host admission boundary (`Host::publish` / `EventPipeline::publish`),
+//!   fail-closed: when the global would overflow, the pipeline applies the
+//!   shared [`DropPolicy`] (evict oldest globally for `DropOldest`, or refuse
+//!   the arrival for `DropNewest`), counting the drop against the target queue.
+//!   Exposed via [`EventPipeline::total_queued_events`] /
+//!   [`EventPipeline::total_queued_bytes`] and `budget_snapshot` for
+//!   `bitty plugin doctor`. Strict invariant `invariant_global_bounds` always
+//!   holds after enforcement.
 //!
-//! Bytes dimension (candidate, OQ-014):
+//! Bytes dimension:
 //!
 //! - **PerPluginQueuedBytesLimit = 256 KiB** (`PER_PLUGIN_QUEUED_BYTES_LIMIT`):
 //!   aggregate payload bytes queued for one plugin. Enforced alongside the event-count
 //!   aggregate in the publish path using the same [`DropPolicy`] at the plugin
-//!   boundary (candidate, same `P0` note).
-//! - **GlobalQueuedBytesLimit = 2 MiB** (`GLOBAL_QUEUED_BYTES_LIMIT`, candidate):
-//!   total payload bytes across all plugins; documented open item for future
-//!   host admission control.
+//!   boundary (accepted for v1, `OQ-014` P0-reviewed per CTX-0040).
+//! - **GlobalQueuedBytesLimit = 2 MiB** (`GLOBAL_QUEUED_BYTES_LIMIT`):
+//!   total payload bytes across all plugins; enforced alongside the global
+//!   event-count aggregate at the same admission boundary with the same
+//!   `DropPolicy`, strict `invariant_global_bounds`.
 //!
 //! Per-event payloads are separately bounded by [`EVENT_MAX_BYTES`] (8 KiB) via
 //! [`BoundedText`] / [`EventPayload::try_text`] — see the payload section.
 //!
-//! # RC-1 / RC-2 and memory ceilings — Open candidate (no Lua VM yet)
+//! # RC-1 / RC-2 and memory ceilings — enforced via `bitty-lua` (piccolo)
 //!
-//! The isolation/resource RFC also proposes `RC-1` (callback CPU/instruction
+//! The isolation/resource RFC proposes `RC-1` (callback CPU/instruction
 //! budget: `10^7` VM instructions or `50 ms` wall clock, warning `8 ms`) and
 //! `RC-2` (memory per plugin `32 MiB`, aggregate `512 MiB`, `RC-6` fd caps).
-//! These dimensions require a Lua VM (`OQ-009` piccolo watch-list) and allocator
-//! accounting; **no VM is wired yet**, so no enforcement is claimed here.
-//! Constants `RC1_INSTRUCTION_BUDGET`, `RC1_WALL_CLOCK_BUDGET_MS`,
-//! `RC1_WARNING_MS`, `RC2_MEMORY_PER_PLUGIN_BYTES` are documented as **Open**
-//! candidate values with follow-up in `CTX-0038` / `OQ-014` tuning. They are
-//! exposed only for harness parameterization and must not be described as
-//! normative until the VM exists and the RFC moves `Accepted`.
+//! These dimensions are enforced by the `bitty-lua` crate which wraps the
+//! `piccolo` stackless VM deterministically (one VM per `(PluginId, generation)`,
+//! isolated globals/registry, `Fuel`-bounded instruction counter + wall-clock
+//! deadline + allocator-accounted `32 MiB` heap, fail-closed suspend,
+//! `BudgetSnapshot`-compatible counters). Config VM remains `mlua` per
+//! `ADR-0004`; plugin VM is `piccolo` per isolation RFC watch-list (documented
+//! clearly in `bitty-lua`). See `crates/bitty-lua` for the bounded,
+//! headless, deterministic implementation and `tests/measurement_lua.rs` for
+//! harness proof.
 //!
 //! # Measurement methodology (CTX-0037 harness)
 //!
@@ -107,9 +113,10 @@
 //!   `queued_events_for_plugin <= 1024` and `queued_bytes_for_plugin <= 256 KiB`,
 //!   drops counted on target queue, `DropOldest` evicts globally oldest.
 //! - **Global `8192 / 2 MiB`:** storm many plugins; assert `total_queued_*`
-//!   invariants and `invariant_global_bounds` hold; admission control is still
-//!   candidate (not hard-gated) — the harness proves tracking correctness, not
-//!   shedding.
+//!   invariants and `invariant_global_bounds` hold strictly (fail-closed);
+//!   admission control is enforced at `Host::publish` / `EventPipeline::publish`
+//!   via `DropPolicy` (same policy as per-plugin), proven by
+//!   `measurement_lua` global tests.
 //! - **Payload `8 KiB`:** `BoundedText::try_new` rejects `> 8 KiB`, truncation
 //!   fits at char boundary, `EventQueue::push` counts oversized as drop.
 //! - **`drain_batch` strict:** never exceeds `max_bytes` even for first event;
@@ -121,8 +128,10 @@
 //!   `budget_snapshot`. Host also tracks `publish_count`.
 //!
 //! RFC lifecycle: `Draft -> experimental review evidence -> Accepted ->
-//! normative` per `bitty-docs` workflow. Queue depths are candidate (`OQ-014`);
-//! `DropOldest` is accepted for v1 (`OQ-013` closed). RC-1/RC-2 remain `Open`.
+//! normative` per `bitty-docs` workflow. Queue depths and `DropOldest` are
+//! accepted for v1 (`OQ-013` closed, `OQ-014` P0-reviewed per CTX-0040);
+//! RC-1/RC-2 are enforced via `bitty-lua` (see crate docs) and host
+//! `invariant_global_bounds` is strict.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -887,13 +896,14 @@ impl EventQueue {
 /// ordering between observation delivery and unrelated user actions.
 ///
 /// Budget enforcement: per-subscription limits are enforced inline in
-/// [`EventQueue::push`]; per-plugin aggregates (`PER_PLUGIN_QUEUED_EVENT_LIMIT`,
-/// `PER_PLUGIN_QUEUED_BYTES_LIMIT`) are enforced at the pipeline `publish`
-/// boundary using the shared [`DropPolicy`] — `DropOldest` is the accepted
-/// v1 default (OQ-013 closed decision point, experimental review evidence;
-/// RFC remains `Proposed`), while the aggregate **budgets remain candidate**
-/// (`OQ-014`, `P0` review required). Global limits are documented but not
-/// gated here — future host admission control.
+/// [`EventQueue::push`] (strict); per-plugin aggregates
+/// (`PER_PLUGIN_QUEUED_EVENT_LIMIT`, `PER_PLUGIN_QUEUED_BYTES_LIMIT`) and
+/// global aggregates (`GLOBAL_QUEUED_EVENT_LIMIT`, `GLOBAL_QUEUED_BYTES_LIMIT`)
+/// are enforced at the pipeline `publish` / `publish_to` admission boundary
+/// using the shared [`DropPolicy`] — `DropOldest` is the accepted v1 default
+/// (OQ-013 closed, OQ-014 P0-reviewed per CTX-0040), `DropNewest` is explicit
+/// opt-in. Global enforcement is fail-closed and strict:
+/// `invariant_global_bounds` always holds after any `publish`.
 #[derive(Debug)]
 pub struct EventPipeline {
     queues: BTreeMap<(String, String), EventQueue>,
@@ -990,11 +1000,14 @@ impl EventPipeline {
     /// Publish `event` to all subscribers of its kind (observation/lifecycle).
     ///
     /// Producers never block; each matching queue receives one copy or drops per policy.
-    /// Per-plugin aggregate budgets (events + bytes) are enforced at this boundary:
-    /// if the plugin would exceed `PER_PLUGIN_QUEUED_EVENT_LIMIT` or
-    /// `PER_PLUGIN_QUEUED_BYTES_LIMIT`, the arrival is handled per [`DropPolicy`]
-    /// at the plugin aggregate (evict oldest across the plugin, or drop newest).
-    /// Global budgets are tracked via `total_queued_*` but not gated (candidate).
+    /// Per-plugin and global aggregate budgets (events + bytes) are enforced at
+    /// this admission boundary, fail-closed:
+    /// - if the plugin would exceed `PER_PLUGIN_*` or the global would exceed
+    ///   `GLOBAL_*`, the arrival is handled per [`DropPolicy`] (evict oldest for
+    ///   `DropOldest`, or refuse the arrival for `DropNewest`), counting the drop
+    ///   against the target queue. Global eviction scans all queues for the
+    ///   globally oldest sequence. `invariant_global_bounds` is strict after any
+    ///   publish.
     pub fn publish(&mut self, event: Event) {
         self.publish_count = self.publish_count.wrapping_add(1);
         let kind_str = event.kind.as_str().to_string();
@@ -1006,12 +1019,45 @@ impl EventPipeline {
             .collect();
         for key in targets {
             let plugin_id_str = key.0.clone();
-            // Enforce per-plugin aggregate before pushing to this target queue.
-            if self.would_exceed_plugin_limits(&plugin_id_str, &event) {
+            let would_exceed_plugin = self.would_exceed_plugin_limits(&plugin_id_str, &event);
+            let would_exceed_global = self.would_exceed_global_limits(&event);
+            if would_exceed_plugin || would_exceed_global {
                 match self.drop_policy {
                     DropPolicy::DropOldest => {
-                        self.evict_oldest_for_plugin(&plugin_id_str);
-                        if let Some(q) = self.queues.get_mut(&key) {
+                        // Evict until both dimensions would allow the push, or no more to evict.
+                        // Prefer global first to respect the host-wide ceiling.
+                        let mut attempts = 0;
+                        while (self.would_exceed_plugin_limits(&plugin_id_str, &event)
+                            || self.would_exceed_global_limits(&event))
+                            && attempts < 4
+                        {
+                            let before_events = self.total_queued_events();
+                            let before_bytes = self.total_queued_bytes();
+                            if self.would_exceed_global_limits(&event) {
+                                self.evict_oldest_globally();
+                            } else if self.would_exceed_plugin_limits(&plugin_id_str, &event) {
+                                self.evict_oldest_for_plugin(&plugin_id_str);
+                            } else {
+                                break;
+                            }
+                            // Guard against infinite loop when single payload itself exceeds
+                            // byte budget (should not happen with 8 KiB vs 256 KiB/2 MiB, but
+                            // fail-closed: if eviction made no progress, break and drop).
+                            if self.total_queued_events() == before_events
+                                && self.total_queued_bytes() == before_bytes
+                            {
+                                break;
+                            }
+                            attempts += 1;
+                        }
+                        // If still would exceed after evictions, treat as DropNewest for this arrival.
+                        if self.would_exceed_plugin_limits(&plugin_id_str, &event)
+                            || self.would_exceed_global_limits(&event)
+                        {
+                            if let Some(q) = self.queues.get_mut(&key) {
+                                q.dropped = q.dropped.wrapping_add(1);
+                            }
+                        } else if let Some(q) = self.queues.get_mut(&key) {
                             q.push(event.clone());
                         }
                     }
@@ -1028,16 +1074,54 @@ impl EventPipeline {
     }
 
     /// Publish to a specific subscriber (lifecycle, delivered to owning plugin only).
+    ///
+    /// Enforces per-plugin and global aggregates at the admission boundary,
+    /// fail-closed with the same `DropPolicy` semantics as `publish`.
     pub fn publish_to(&mut self, plugin_id: &PluginId, event: Event) -> Result<(), PluginError> {
         self.publish_count = self.publish_count.wrapping_add(1);
-        if self.would_exceed_plugin_limits(plugin_id.as_str(), &event) {
+        let would_exceed_plugin = self.would_exceed_plugin_limits(plugin_id.as_str(), &event);
+        let would_exceed_global = self.would_exceed_global_limits(&event);
+        if would_exceed_plugin || would_exceed_global {
             let key = (
                 plugin_id.as_str().to_string(),
                 event.kind.as_str().to_string(),
             );
             match self.drop_policy {
                 DropPolicy::DropOldest => {
-                    self.evict_oldest_for_plugin(plugin_id.as_str());
+                    let mut attempts = 0;
+                    while (self.would_exceed_plugin_limits(plugin_id.as_str(), &event)
+                        || self.would_exceed_global_limits(&event))
+                        && attempts < 4
+                    {
+                        let before_events = self.total_queued_events();
+                        let before_bytes = self.total_queued_bytes();
+                        if self.would_exceed_global_limits(&event) {
+                            self.evict_oldest_globally();
+                        } else if self.would_exceed_plugin_limits(plugin_id.as_str(), &event) {
+                            self.evict_oldest_for_plugin(plugin_id.as_str());
+                        } else {
+                            break;
+                        }
+                        if self.total_queued_events() == before_events
+                            && self.total_queued_bytes() == before_bytes
+                        {
+                            break;
+                        }
+                        attempts += 1;
+                    }
+                    if self.would_exceed_plugin_limits(plugin_id.as_str(), &event)
+                        || self.would_exceed_global_limits(&event)
+                    {
+                        let q = self.queues.get_mut(&key).ok_or_else(|| {
+                            PluginError::event(format!(
+                                "not subscribed: {}:{}",
+                                plugin_id.as_str(),
+                                event.kind.as_str()
+                            ))
+                        })?;
+                        q.dropped = q.dropped.wrapping_add(1);
+                        return Ok(());
+                    }
                     let q = self.queues.get_mut(&key).ok_or_else(|| {
                         PluginError::event(format!(
                             "not subscribed: {}:{}",
@@ -1174,6 +1258,33 @@ impl EventPipeline {
             || cur_bytes + event.payload.byte_len() > PER_PLUGIN_QUEUED_BYTES_LIMIT
     }
 
+    /// Whether pushing `event` would exceed global aggregates (events or bytes).
+    fn would_exceed_global_limits(&self, event: &Event) -> bool {
+        self.total_queued_events() + 1 > GLOBAL_QUEUED_EVENT_LIMIT
+            || self.total_queued_bytes() + event.payload.byte_len() > GLOBAL_QUEUED_BYTES_LIMIT
+    }
+
+    /// Evict the oldest event globally (for `DropOldest` at global admission).
+    fn evict_oldest_globally(&mut self) {
+        let mut oldest_key: Option<(String, String)> = None;
+        let mut oldest_seq: Option<u64> = None;
+        for (key, q) in self.queues.iter() {
+            if let Some(front) = q.iter().next() {
+                let seq = front.sequence;
+                if oldest_seq.is_none_or(|cur| seq < cur) {
+                    oldest_seq = Some(seq);
+                    oldest_key = Some(key.clone());
+                }
+            }
+        }
+        if let Some(k) = oldest_key {
+            if let Some(q) = self.queues.get_mut(&k) {
+                q.inner.pop_front();
+                q.dropped = q.dropped.wrapping_add(1);
+            }
+        }
+    }
+
     /// Evict the oldest event across all queues owned by `plugin_id` (for `DropOldest` at aggregate).
     fn evict_oldest_for_plugin(&mut self, plugin_id: &str) {
         // Find the queue of this plugin with the smallest front sequence (oldest).
@@ -1230,7 +1341,7 @@ impl EventPipeline {
 
     /// Validate that queue bounds are never exceeded (property test helper).
     ///
-    /// Checks per-queue capacity and per-plugin aggregates (candidate).
+    /// Checks per-queue capacity and per-plugin aggregates (strict, enforced).
     #[must_use]
     pub fn invariant_queue_bounds(&self) -> bool {
         if !self.queues.values().all(|q| q.len() <= q.capacity()) {
@@ -1258,7 +1369,10 @@ impl EventPipeline {
         true
     }
 
-    /// Validate global queue bounds are not exceeded (candidate).
+    /// Validate global queue bounds are not exceeded (strict, fail-closed).
+    ///
+    /// Enforced at the `publish` / `publish_to` admission boundary via
+    /// `DropPolicy`; always holds after any publish.
     #[must_use]
     pub fn invariant_global_bounds(&self) -> bool {
         self.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT

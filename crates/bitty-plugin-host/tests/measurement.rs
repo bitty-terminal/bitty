@@ -312,10 +312,10 @@ fn global_invariants_held_under_storm() {
 
 #[test]
 fn global_tracking_isolation_not_hard_gated() {
-    // Prove tracking correctness: we can storm past the global limit via per-plugin
-    // fanout if we use enough plugins (9*1024=9216 >8192). Global is documented
-    // not hard-gated, but tracking via total_queued_* must be accurate.
-    // This test asserts tracking, not shedding.
+    // CTX-0040: global is now enforced (fail-closed) at admission — this test
+    // proves enforcement, not just tracking. Storm 9 plugins * 1024 = 9216 >8192
+    // would have overflowed before; now shedding via DropOldest keeps
+    // total <= GLOBAL limit and invariant holds.
     let mut p = EventPipeline::new(1024, DropPolicy::DropOldest);
     let plugins: Vec<String> = (0..9).map(|i| format!("xuepoo.over{i}")).collect();
     for pid_str in &plugins {
@@ -332,14 +332,17 @@ fn global_tracking_isolation_not_hard_gated() {
             .unwrap();
         }
     }
-    // Each plugin capped at 1024, global would be 9216 > 8192.
-    assert_eq!(p.total_queued_events(), 9 * 1024);
-    // Global invariant is expected to fail here because global is not gated — prove detection.
-    assert!(!p.invariant_global_bounds());
+    // Global is hard-gated: never exceeds 8192, invariant holds, shedding counted.
+    assert!(p.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT);
+    assert_eq!(p.total_queued_events(), GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(p.invariant_global_bounds());
+    assert!(p.invariant_queue_bounds());
     let snap = p.budget_snapshot();
-    assert!(!snap.global_hold);
-    assert_eq!(snap.total_queued_events, 9216);
+    assert!(snap.global_hold);
+    assert_eq!(snap.total_queued_events, GLOBAL_QUEUED_EVENT_LIMIT);
     assert_eq!(snap.global_event_limit, GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(snap.total_dropped > 0);
+    assert!(p.total_dropped() > 0);
 }
 
 #[test]
@@ -576,6 +579,132 @@ fn rc1_rc2_constants_are_open_and_documented() {
     assert_eq!(RC2_MEMORY_PER_PLUGIN_BYTES, 32 * 1024 * 1024);
     // No VM: we intentionally do not test enforcement, only that values are
     // stable for parameterization.
+}
+
+// ── global enforced (CTX-0040) ────────────────────────────────────────────
+
+#[test]
+fn global_events_enforced_dropoldest_via_publish() {
+    // Publish fanout to many plugins exceeding global 8192 must be hard-gated.
+    // Use large per-queue capacity so global is the binding limit, not per-sub.
+    let mut p = EventPipeline::new(1024, DropPolicy::DropOldest);
+    let plugins: Vec<String> = (0..10).map(|i| format!("xuepoo.ge{i}")).collect();
+    for pid_str in &plugins {
+        p.subscribe(&pid(pid_str), EventKind::TerminalBell).unwrap();
+    }
+    // 10 plugins * 1024 per-plugin = 10240 > 8192, so global must shed.
+    // Each publish fans out to 10 queues (10 events per publish), 2000 publishes = 20000 attempts.
+    for seq in 0..2000 {
+        p.publish(Event::new(
+            EventKind::TerminalBell,
+            EventPayload::Empty,
+            seq,
+        ));
+    }
+    assert!(p.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT);
+    assert_eq!(p.total_queued_events(), GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(p.invariant_global_bounds());
+    assert!(p.invariant_queue_bounds());
+    let snap = p.budget_snapshot();
+    assert!(snap.global_hold);
+    assert!(snap.per_plugin_hold);
+    assert!(snap.per_subscription_hold);
+    // DropOldest retains newest sequences globally.
+    let mut all_seqs: Vec<u64> = Vec::new();
+    for pid_str in &plugins {
+        let mut drained = p.drain(&pid(pid_str), &EventKind::TerminalBell).unwrap();
+        all_seqs.extend(drained.drain(..).map(|e| e.sequence));
+    }
+    all_seqs.sort_unstable();
+    // Oldest should be >0 due to shedding, newest should be 1999.
+    assert!(!all_seqs.is_empty());
+    assert_eq!(all_seqs.last().copied().unwrap(), 1999);
+    assert!(all_seqs.first().copied().unwrap() > 0);
+    assert!(p.total_dropped() > 0);
+}
+
+#[test]
+fn global_events_enforced_dropnewest() {
+    let mut p = EventPipeline::new(1024, DropPolicy::DropNewest);
+    let plugins: Vec<String> = (0..10).map(|i| format!("xuepoo.gn{i}")).collect();
+    for pid_str in &plugins {
+        p.subscribe(&pid(pid_str), EventKind::TerminalBell).unwrap();
+    }
+    for seq in 0..2000 {
+        p.publish(Event::new(
+            EventKind::TerminalBell,
+            EventPayload::Empty,
+            seq,
+        ));
+    }
+    assert!(p.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(p.invariant_global_bounds());
+    // DropNewest keeps oldest sequences.
+    let drained = p
+        .drain(&pid("xuepoo.gn0"), &EventKind::TerminalBell)
+        .unwrap();
+    assert_eq!(drained.first().unwrap().sequence, 0);
+}
+
+#[test]
+fn global_bytes_enforced() {
+    let mut p = EventPipeline::new(1024, DropPolicy::DropOldest);
+    // Need enough plugins so global bytes is binding before per-plugin bytes.
+    // Per-plugin 256 KiB with 4 KiB payload = 64 events/plug; global 2 MiB = 512 events.
+    // 10 plugins *64 = 640 events >512, so global bytes will cap.
+    let plugins: Vec<String> = (0..10).map(|i| format!("xuepoo.gb{i}")).collect();
+    for pid_str in &plugins {
+        p.subscribe(&pid(pid_str), EventKind::TerminalBell).unwrap();
+    }
+    let payload = "a".repeat(4 * 1024);
+    for seq in 0..2000 {
+        for pid_str in &plugins {
+            p.publish_to(
+                &pid(pid_str),
+                Event::new(
+                    EventKind::TerminalBell,
+                    EventPayload::try_text(payload.clone()).unwrap(),
+                    seq,
+                ),
+            )
+            .unwrap();
+        }
+    }
+    assert!(p.total_queued_bytes() <= GLOBAL_QUEUED_BYTES_LIMIT);
+    assert!(p.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(p.invariant_global_bounds());
+    assert!(p.invariant_queue_bounds());
+    let snap = p.budget_snapshot();
+    assert!(snap.global_hold);
+    // Global bytes utilization should be ~1.0.
+    assert!(snap.utilization_global_bytes() <= 1.0 + 1e-9);
+    assert!(snap.utilization_global_bytes() >= 0.9);
+}
+
+#[test]
+fn global_host_enforced_via_publish() {
+    let mut host = PluginHost::with_capacity(DropPolicy::DropOldest, 1024, 8);
+    for i in 0..10 {
+        let id = format!("xuepoo.hge{i}");
+        let m = minimal_manifest(&id, vec!["terminal.bell"]);
+        host.declare(m).unwrap();
+        host.resolve(&pid(&id)).unwrap();
+        host.register(&pid(&id)).unwrap();
+        host.subscribe(&pid(&id), EventKind::TerminalBell).unwrap();
+    }
+    for seq in 0..2000 {
+        host.publish(Event::new(
+            EventKind::TerminalBell,
+            EventPayload::Empty,
+            seq,
+        ));
+    }
+    assert!(host.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT);
+    assert!(host.invariant_global_bounds());
+    assert!(host.invariant_queue_bounds());
+    let snap = host.budget_snapshot();
+    assert!(snap.global_hold);
+    assert_eq!(snap.total_queued_events, GLOBAL_QUEUED_EVENT_LIMIT);
 }
 
 // ── host vs pipeline parity ────────────────────────────────────────────

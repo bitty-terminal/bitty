@@ -215,10 +215,14 @@ dependencies = [
 name = "bitty-runtime"
 version = "0.0.0"
 dependencies = [
+ "bitty-agent",
+ "bitty-ipc",
+ "bitty-package",
  "bitty-platform",
  "bitty-plugin-host",
  "bitty-pty",
  "bitty-render",
+ "bitty-rich",
  "bitty-term-state",
  "bitty-ui",
  "bitty-vt",

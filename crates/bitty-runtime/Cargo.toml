@@ -14,3 +14,4 @@ bitty-term-state = { path = "../bitty-term-state" }
 bitty-pty = { path = "../bitty-pty" }
 bitty-render = { path = "../bitty-render" }
 bitty-platform = { path = "../bitty-platform" }
+bitty-ui = { path = "../bitty-ui" }

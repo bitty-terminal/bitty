@@ -65,13 +65,12 @@
 
 ### Local gates before push (mandatory)
 
-- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (bitty: fmt-check + clippy -D warnings + test + actionlint + markdownlint; bitty-docs: fmt-check + markdownlint + links + metadata + language + agents + hygiene + actionlint), plus `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets` for bitty. All must pass. Never push with known local failures to save CI.
+- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. All must pass. Never push with known local failures to save CI. Note: bitty-docs local gate is `just check` only (no cargo).
 - Verify no `TODO/FIXME` and frontmatter/links valid for docs.
 
-### Remote monitoring and merge
+### Remote monitoring and merge (bitty)
 
-- After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR>` (or `gh pr view --json` / `gh api`), poll every 30s until all required checks (CodeQL, Quality gates/Docs quality, Windows) are `pass`. Use `gh` directly (already installed, no npx).
-- Merge only when `mergeable == MERGEABLE` and all checks `pass`: `HTTPS_PROXY=$NETWORK_PROXY gh pr merge <PR> --squash` (auto-merge disabled). Delete remote branch after merge; local worktree branch deletion requires `git worktree remove` first.
+- After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR>` poll 30s until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`.
 
 ### Continuous patrol and Code Review
 

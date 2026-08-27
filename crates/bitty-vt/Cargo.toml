@@ -1,9 +1,14 @@
 [package]
 name = "bitty-vt"
+description = "Bitty VT parser producing TerminalAction values (wraps vte)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["terminal", "vt", "parser", "ansi", "bitty"]
+categories = ["parsing", "text-processing"]
+publish = true
 
 [lints]
 workspace = true

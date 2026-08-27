@@ -165,6 +165,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-plugin-host"
+version = "0.0.0"
+dependencies = [
+ "bitty-config",
+ "bitty-term-state",
+]
+
+[[package]]
 name = "bitty-pty"
 version = "0.0.0"
 dependencies = [

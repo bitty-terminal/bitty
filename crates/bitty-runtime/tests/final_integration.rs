@@ -317,7 +317,7 @@ fn final_headless_integration_end_to_end() {
     for i in 0..5 {
         rt.publish_plugin_event(Event::new(
             EventKind::TerminalTitleChanged,
-            EventPayload::TitleChanged(format!("title-{i}")),
+            EventPayload::try_title_changed(format!("title-{i}")).unwrap(),
             100 + i,
         ));
     }
@@ -328,7 +328,7 @@ fn final_headless_integration_end_to_end() {
     assert_eq!(titles.len(), 1, "coalescable must collapse to latest");
     assert_eq!(
         titles[0].payload,
-        EventPayload::TitleChanged("title-4".into())
+        EventPayload::try_title_changed("title-4").unwrap()
     );
 
     // Side queue bridging already exercised; now test explicit observation pushes

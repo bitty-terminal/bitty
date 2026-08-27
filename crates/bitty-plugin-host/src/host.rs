@@ -7,7 +7,7 @@
 //! `ADR-0003` rule 4, and through the public `Snapshot` surface where needed
 //! (pure reads of the terminal truth).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use crate::capability::CapabilityId;
 use crate::error::PluginError;
@@ -16,8 +16,8 @@ use crate::event::{
     EventKind, EventPipeline,
 };
 use crate::grant::{GrantRecord, GrantStore};
-use crate::manifest::{PluginId, PluginManifest};
-use crate::registry::{Generation, Registry};
+use crate::manifest::{FsAccess, PluginId, PluginManifest};
+use crate::registry::{Generation, PluginState, Registry};
 
 // ── bounded side queue (ADR-0003 rule 4) ──────────────────────────────────
 
@@ -252,13 +252,114 @@ impl PluginHost {
         self.registry.register(id)
     }
 
-    /// Activate a registered plugin.
+    /// Activate a registered plugin (fail-closed capability gate).
+    ///
+    /// Before `registry.activate`, validates:
+    /// - manifest hash (`PluginManifest::manifest_hash()`) matches the stored
+    ///   [`GrantRecord::manifest_hash`] for this plugin,
+    /// - every declared capability (flat `capability.ids` plus expanded
+    ///   `fs.read:PARAM`/`fs.write:PARAM` from `capabilities.filesystem`)
+    ///   is present in the grant record for that hash (deny-by-default),
+    /// - the grant record exists and is not denied, and no denial marker exists.
+    ///
+    /// If the manifest declares no capabilities, no grant record is required
+    /// and activation proceeds directly (least authority). Otherwise failure
+    /// is fail-closed with an owned [`PluginError::Grant`] describing the
+    /// missing manifest hash or missing capabilities. No partially activated
+    /// state is produced on failure.
     pub fn activate(&mut self, id: &PluginId) -> Result<(), PluginError> {
-        // Check that all declared capabilities are granted for the current hash.
-        // For the draft stub, manifest hash is the version string (opaque); callers
-        // supply the hash via the grant record. We skip hash matching here and simply
-        // ensure that if the manifest requests capabilities, a grant record exists when
-        // not in safe mode. Full hash binding is exercised through GrantStore directly.
+        // Snapshot entry without holding borrow across grant checks.
+        let entry = self
+            .registry
+            .get(id)
+            .cloned()
+            .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?;
+        if entry.state != PluginState::Registered {
+            return Err(PluginError::InvalidState {
+                id: id.to_string(),
+                current: entry.state.to_string(),
+                expected: PluginState::Registered.to_string(),
+            });
+        }
+        // Collect required capabilities: flat ids + filesystem expansions.
+        let required: BTreeSet<CapabilityId> = {
+            let mut set = entry.manifest.capabilities.ids.clone();
+            for req in &entry.manifest.capabilities.filesystem {
+                for pat in &req.paths {
+                    let cap_str = match req.access {
+                        FsAccess::Read => format!("fs.read:{pat}"),
+                        FsAccess::Write => format!("fs.write:{pat}"),
+                    };
+                    let cap = CapabilityId::parse(&cap_str).map_err(|e| {
+                        PluginError::grant(format!(
+                            "invalid filesystem capability '{cap_str}': {e}"
+                        ))
+                    })?;
+                    set.insert(cap);
+                }
+            }
+            set
+        };
+        // No declared authority: activation does not require a grant record.
+        if required.is_empty() {
+            return self.registry.activate(id);
+        }
+        let hash = entry.manifest.manifest_hash();
+        // Grant record must exist and match hash.
+        let record = self.grants.get(id).ok_or_else(|| {
+            PluginError::grant(format!(
+                "missing grant record for '{}' (manifest hash {})",
+                id.as_str(),
+                hash
+            ))
+        })?;
+        if record.denied {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' is denied; explicit re-grant required (hash {})",
+                id.as_str(),
+                hash
+            )));
+        }
+        if self.grants.is_denied(id) {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' has denial marker (hash {})",
+                id.as_str(),
+                hash
+            )));
+        }
+        if record.manifest_hash != hash {
+            return Err(PluginError::grant(format!(
+                "manifest hash mismatch for '{}': expected {}, got {}",
+                id.as_str(),
+                hash,
+                record.manifest_hash
+            )));
+        }
+        // Every declared capability must be granted for this hash.
+        let mut missing: Vec<String> = Vec::new();
+        for cap in &required {
+            if !self.grants.is_granted(id, &hash, cap) {
+                missing.push(cap.as_str().to_string());
+            }
+        }
+        if !missing.is_empty() {
+            return Err(PluginError::grant(format!(
+                "missing grants for '{}' (hash {}): {}",
+                id.as_str(),
+                hash,
+                missing.join(", ")
+            )));
+        }
+        self.registry.activate(id)
+    }
+
+    /// Activate without capability gating (test-only).
+    ///
+    /// Exposed `pub(crate)` so unit tests can exercise registry lifecycle
+    /// without wiring grant records, while the public [`Self::activate`]
+    /// remains strictly gated. Production callers must not use this.
+    #[allow(dead_code)]
+    pub(crate) fn activate_unchecked_for_test(&mut self, id: &PluginId) -> Result<(), PluginError> {
         self.registry.activate(id)
     }
 
@@ -444,6 +545,7 @@ impl PluginHost {
 mod tests {
     use super::*;
     use crate::event::{Event, EventPayload};
+    use crate::grant::GrantRecord;
     use crate::manifest::{CapabilityRequests, Compat, LazyTriggers, PluginIdentity};
 
     fn minimal_manifest(id: &str, events: Vec<&str>) -> PluginManifest {
@@ -469,6 +571,14 @@ mod tests {
             },
             raw_bytes_len: 256,
         }
+    }
+
+    fn manifest_with_caps(id: &str, caps: Vec<&str>) -> PluginManifest {
+        let mut m = minimal_manifest(id, vec![]);
+        for c in caps {
+            m.capabilities.ids.insert(CapabilityId::parse(c).unwrap());
+        }
+        m
     }
 
     #[test]
@@ -546,6 +656,157 @@ mod tests {
             )
             .unwrap();
         assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn host_activate_gate_requires_grant_and_hash() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = manifest_with_caps("xuepoo.gated", vec!["terminal.semantic-read"]);
+        // Lifecycle to Registered without grants.
+        host.declare(m.clone()).unwrap();
+        host.resolve(&PluginId::new("xuepoo.gated").unwrap())
+            .unwrap();
+        host.register(&PluginId::new("xuepoo.gated").unwrap())
+            .unwrap();
+        // Activate without grant must fail-closed.
+        assert!(
+            host.activate(&PluginId::new("xuepoo.gated").unwrap())
+                .is_err()
+        );
+        // Insert correct grant.
+        let hash = m.manifest_hash();
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        host.insert_grant(GrantRecord::granted(
+            PluginId::new("xuepoo.gated").unwrap(),
+            hash.clone(),
+            granted,
+            1,
+        ));
+        assert!(
+            host.activate(&PluginId::new("xuepoo.gated").unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            host.registry()
+                .get(&PluginId::new("xuepoo.gated").unwrap())
+                .unwrap()
+                .state,
+            crate::registry::PluginState::Activated
+        );
+        // Hash mismatch should be rejected (new manifest version).
+        let mut host2 = PluginHost::new(DropPolicy::DropOldest, 8);
+        let mut m2 = manifest_with_caps("xuepoo.gated2", vec!["terminal.semantic-read"]);
+        m2.identity.version = "0.2.0".to_string();
+        host2.declare(m2.clone()).unwrap();
+        host2
+            .resolve(&PluginId::new("xuepoo.gated2").unwrap())
+            .unwrap();
+        host2
+            .register(&PluginId::new("xuepoo.gated2").unwrap())
+            .unwrap();
+        // Grant with old hash.
+        let mut granted2 = std::collections::BTreeSet::new();
+        granted2.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        host2.insert_grant(GrantRecord::granted(
+            PluginId::new("xuepoo.gated2").unwrap(),
+            "oldhash".to_string(),
+            granted2,
+            1,
+        ));
+        assert!(
+            host2
+                .activate(&PluginId::new("xuepoo.gated2").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_activate_no_caps_needs_no_grant() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = minimal_manifest("xuepoo.nocap", vec![]);
+        host.declare(m).unwrap();
+        host.resolve(&PluginId::new("xuepoo.nocap").unwrap())
+            .unwrap();
+        host.register(&PluginId::new("xuepoo.nocap").unwrap())
+            .unwrap();
+        assert!(
+            host.activate(&PluginId::new("xuepoo.nocap").unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn host_activate_missing_one_cap_fails() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let mut m = minimal_manifest("xuepoo.partial", vec![]);
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("ui.rich").unwrap());
+        host.declare(m.clone()).unwrap();
+        host.resolve(&PluginId::new("xuepoo.partial").unwrap())
+            .unwrap();
+        host.register(&PluginId::new("xuepoo.partial").unwrap())
+            .unwrap();
+        let hash = m.manifest_hash();
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        // missing ui.rich
+        host.insert_grant(GrantRecord::granted(
+            PluginId::new("xuepoo.partial").unwrap(),
+            hash,
+            granted,
+            1,
+        ));
+        assert!(
+            host.activate(&PluginId::new("xuepoo.partial").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_activate_unchecked_bypasses_gate() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = manifest_with_caps("xuepoo.bypass", vec!["terminal.semantic-read"]);
+        host.declare(m).unwrap();
+        host.resolve(&PluginId::new("xuepoo.bypass").unwrap())
+            .unwrap();
+        host.register(&PluginId::new("xuepoo.bypass").unwrap())
+            .unwrap();
+        // Unchecked succeeds without grant.
+        assert!(
+            host.activate_unchecked_for_test(&PluginId::new("xuepoo.bypass").unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn host_activate_filesystem_caps_expanded() {
+        use crate::manifest::{FilesystemRequest, FsAccess};
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let mut m = minimal_manifest("xuepoo.fs", vec![]);
+        m.capabilities.filesystem.push(FilesystemRequest {
+            access: FsAccess::Read,
+            paths: vec!["~/docs/*.md".to_string()],
+        });
+        host.declare(m.clone()).unwrap();
+        host.resolve(&PluginId::new("xuepoo.fs").unwrap()).unwrap();
+        host.register(&PluginId::new("xuepoo.fs").unwrap()).unwrap();
+        // Without fs.read grant, activate fails.
+        assert!(host.activate(&PluginId::new("xuepoo.fs").unwrap()).is_err());
+        let hash = m.manifest_hash();
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(CapabilityId::parse("fs.read:~/docs/*.md").unwrap());
+        host.insert_grant(GrantRecord::granted(
+            PluginId::new("xuepoo.fs").unwrap(),
+            hash,
+            granted,
+            1,
+        ));
+        assert!(host.activate(&PluginId::new("xuepoo.fs").unwrap()).is_ok());
     }
 
     #[test]

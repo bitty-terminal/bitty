@@ -121,9 +121,11 @@ pub mod registry;
 pub use capability::{CapabilityFamily, CapabilityId, effect_statement};
 pub use error::{ErrorClass, PluginError};
 pub use event::{
-    DEFAULT_BATCH_BYTES, DEFAULT_BATCH_EVENTS, DEFAULT_QUEUE_CAPACITY, DropPolicy, Event,
-    EventClass, EventKind, EventPayload, EventPipeline, EventQueue, InterceptionDecision,
-    accumulate_interceptions, should_proceed,
+    BATCH_MAX_BYTES, BATCH_MAX_EVENTS, BoundedText, DEFAULT_BATCH_BYTES, DEFAULT_BATCH_EVENTS,
+    DEFAULT_QUEUE_CAPACITY, DropPolicy, EVENT_MAX_BYTES, Event, EventClass, EventKind,
+    EventPayload, EventPipeline, EventQueue, GLOBAL_QUEUED_BYTES_LIMIT, GLOBAL_QUEUED_EVENT_LIMIT,
+    InterceptionDecision, PER_PLUGIN_QUEUED_BYTES_LIMIT, PER_PLUGIN_QUEUED_EVENT_LIMIT,
+    PER_SUBSCRIPTION_QUEUE_LIMIT, accumulate_interceptions, should_proceed,
 };
 pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};

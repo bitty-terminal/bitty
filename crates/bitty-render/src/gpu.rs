@@ -702,6 +702,7 @@ impl Surface {
                         label: Some("bitty-clear"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
+                            depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -907,6 +908,7 @@ impl Surface {
                         label: Some("bitty-clear-draw-list"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
+                            depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Clear(wgpu::Color {

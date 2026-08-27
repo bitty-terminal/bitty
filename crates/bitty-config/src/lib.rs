@@ -1,15 +1,26 @@
 //! `bitty-config`: draft typed configuration pipeline for Bitty.
 //!
-//! # Draft status — not normative
+//! # Draft status — experimental implementation as review evidence
 //!
 //! This crate implements the **proposed** contracts from
-//! `bitty-docs/docs/specifications/configuration-model-rfc.md`.
-//! That RFC is still `Proposed` (not accepted) and closes
-//! `OQ-010` only if it is adopted. Nothing here claims normative behavior,
-//! stable file formats, or a frozen CLI surface. The crate is intentionally
-//! `draft` / `proposed` and its contract **may change** without a semver
-//! major bump until the RFC is accepted. Do not describe its behavior as
-//! shipped until an ADR records acceptance and a release ships it.
+//! `bitty-docs/docs/specifications/configuration-model-rfc.md`
+//! (`Proposed` / `draft`, `OQ-010`). That RFC remains `Proposed` (not
+//! `Accepted`/`normative`) until independent review (category owner + docs
+//! curator + security reviewer) accepts it and an ADR records acceptance.
+//! Per the new RFC lifecycle (`Draft -> experimental review evidence ->
+//! Accepted -> normative` per `bitty-docs/docs/specifications/README.md` and
+//! `docs/development/documentation-workflow.md`), this crate's **experimental
+//! implementation of Candidate A** serves as review evidence and carries no
+//! compatibility promise; do not describe its behavior as shipped/stable until
+//! the RFC is `Accepted` and a release ships it.
+//!
+//! **Candidate A accepted for v1:** the two-stage declarative plan
+//! `Lua -> ConfigPlan -> typed validation -> merge -> diff -> reconcile` is
+//! the accepted configuration pipeline for v1 (see
+//! `configuration-model-rfc.md` § “Candidate A: two-stage declarative plan with
+//! Rust reconciliation”). Candidate C (hybrid declarative plus bounded
+//! imperative overlay) is **deferred** to a future
+//! `plugin/runtime overlay` RFC and is not part of the v1 contract.
 //!
 //! The RFC's Lua Runtime dependency (`lua-runtime-rfc`, `OQ-009`) is also
 //! still proposed, so this crate is **pure data + validation**: it takes an
@@ -18,7 +29,7 @@
 //! resolution, and no `unsafe` — the crate is headlessly testable on both
 //! Linux CI and the `windows-latest` job.
 //!
-//! # Pipeline (candidate, RFC “Candidate A”)
+//! # Pipeline — Candidate A accepted for v1 (experimental review evidence)
 //!
 //! ```text
 //! Lua (outside crate) -> ConfigPlan -> typed validation -> migration -> merge -> diff -> reconcile
@@ -46,7 +57,7 @@
 //!
 //! | RFC section | Module(s) | Key items |
 //! |-------------|-----------|-----------|
-//! | Pipeline candidates (§Candidate A) | `plan`, `validation`, `migration`, `merge`, `reload` | [`plan::ConfigPlan`] plain data; `ConfigPlan -> validation -> merge -> diff -> reconcile` in safe Rust, no half-mutated terminal state |
+//! | Pipeline candidates (§Candidate A, accepted for v1) | `plan`, `validation`, `migration`, `merge`, `reload` | [`plan::ConfigPlan`] plain data; `ConfigPlan -> validation -> merge -> diff -> reconcile` in safe Rust, no half-mutated terminal state; Candidate A accepted for v1 as experimental review evidence per new RFC lifecycle (`Draft -> experimental review evidence -> Accepted -> normative`), Candidate C deferred to plugin/runtime overlay RFC |
 //! | Layers, merge, and attribution | `plan`, `merge` | [`plan::LayerKind`] 8-layer stack + precedence; [`merge::MergeClass`] per-field table; [`merge::MergeConflict`] reporting; attribution `HashMap<String, ConfigSource>` surviving merge for `config show --source` |
 //! | System policy non-overridable | `merge`, `error` | [`plan::LayerKind::SystemPolicy`] + [`error::ConfigError::NonOverridable`] distinct from system defaults |
 //! | Profile `extends` | `merge` | [`merge::resolve_profile_chain`] single-parent chains with cycle detection; multiple inheritance remains an open item |
@@ -54,7 +65,7 @@
 //! | Project trust | `trust` | Declarative-only; path+hash consent binding; [`trust::TrustStore`], [`trust::validate_project_plan`]; trust DB location/expiry/rename/UX remain open |
 //! | Failure and safe-mode interaction | `reload` | [`reload::fallback_builtin`], [`reload::should_retain_previous`], last-good-plan retention |
 //! | Security review notes | `trust`, `merge`, `reload`, `error` | No control downgrades normative baseline; overlay writes are rejected at validation (no privileged project fields) — negative tests included |
-//! | Open items remaining under OQ-010 | doc only | Documented honestly: A vs C decision, schema-sync tooling, reload table stability, trust DB, multi-parent `extends`, manifest/lock coexistence, native path mappings |
+//! | Open items remaining under OQ-010 | doc only | Documented honestly: A vs C decision resolved (Candidate A accepted for v1 as experimental review evidence, Candidate C deferred to plugin/runtime overlay RFC), schema-sync tooling, reload table stability, trust DB, multi-parent `extends`, manifest/lock coexistence, native path mappings — see `configuration-model-rfc.md` § Open items remaining under OQ-010 (resolved vs migrated) |
 //!
 //! # Ownership rules
 //!

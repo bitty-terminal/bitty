@@ -68,24 +68,32 @@
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
 //! | Open points remaining under OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropPolicy` open point documented; exact queue depths/timeouts remain `OQ-014` candidates |
 //!
-//! # Drop policy — open decision point
+//! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
-//! Queue overflow when a queue is full is a single shared **open decision
+//! Queue overflow when a queue is full was a single shared **open decision
 //! point** owned by `OQ-013` and the RFC section “Delivery, ordering, batching,
-//! and coalescing” (point 3). Two candidate policies remain proposed:
+//! and coalescing” (point 3). That point is **closed for v1: `DropOldest` is
+//! the accepted default** (experimental implementation as review evidence per
+//! the new RFC lifecycle `Draft -> experimental review evidence -> Accepted ->
+//! normative`; `plugin-platform-rfc.md` remains `Proposed`/`draft` until
+//! independent review by category owner + docs curator + security reviewer).
+//! `DropNewest` remains available via explicit construction
+//! ([`event::DropPolicy::DropNewest`]) but is not the v1 default:
 //!
-//! - `DropOldest`: newest signals survive, consumers converge on current state,
+//! - `DropOldest` (accepted v1 default): newest signals survive, consumers converge on current state,
 //!   but early burst history is lost.
-//! - `DropNewest`: already-queued events keep FIFO delivery, but newest signals
+//! - `DropNewest` (explicit opt-in): already-queued events keep FIFO delivery, but newest signals
 //!   starve under sustained flood.
 //!
-//! This crate exposes both via [`event::DropPolicy`] and requires callers to
-//! choose explicitly (no implicit default). Numeric queue depths and timeout
-//! milliseconds are `OQ-014` (proposed defaults in this crate are `64` per-queue,
-//! `32`/`8 KiB` per batch as candidate values, not normative). See
+//! This crate exposes both via [`event::DropPolicy`]; `DropOldest` is the
+//! accepted v1 default used by [`event::DEFAULT_QUEUE_CAPACITY`] /
+//! `DEFAULT_PLUGIN_DROP_POLICY` and `bitty-runtime::Runtime::new` (experimental
+//! review evidence; RFC remains `Proposed` until acceptance). Numeric queue
+//! depths and timeout milliseconds are `OQ-014` (proposed defaults in this
+//! crate are `64` per-queue, `32`/`8 KiB` per batch as candidate values, not
+//! normative until `OQ-014` is accepted). See
 //! `plugin-platform-rfc.md` § “Delivery, ordering, batching, and coalescing”
-//! for the authoritative trade-off statement; other documents must reference
-//! that point instead of asserting a settled policy.
+//! for the authoritative trade-off statement.
 //!
 //! # Ownership rules (ADR-0003 / ADR-0004)
 //!

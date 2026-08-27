@@ -6,33 +6,47 @@
 //! and the single shared open decision point for queue overflow are modelled
 //! here.
 //!
-//! # Drop policy — open decision point
+//! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
-//! Queue overflow when a queue is full is a **single shared open decision
+//! Queue overflow when a queue is full was a **single shared open decision
 //! point** owned by `OQ-013` and the plugin-platform RFC section
-//! “Delivery, ordering, batching, and coalescing” (point 3). Two candidate
-//! policies remain proposed:
+//! “Delivery, ordering, batching, and coalescing” (point 3). That point is
+//! **closed for v1: `DropOldest` is the accepted default** (experimental
+//! implementation as review evidence per the new RFC lifecycle `Draft ->
+//! experimental review evidence -> Accepted -> normative`;
+//! `plugin-platform-rfc.md` remains `Proposed`/`draft` until independent
+//! review by category owner + docs curator + security reviewer). `DropNewest`
+//! remains available via explicit construction
+//! ([`DropPolicy::DropNewest`], `Runtime::with_plugin_drop_policy`) but is not
+//! the v1 default:
 //!
-//! - **DropOldest:** evict the oldest queued event. Newest signals survive,
+//! - **DropOldest (accepted v1 default):** evict the oldest queued event. Newest signals survive,
 //!   consumers converge on current state, but sustained bursts lose early history.
-//! - **DropNewest:** refuse arrivals at an already-full queue. Already-queued
+//! - **DropNewest (explicit opt-in):** refuse arrivals at an already-full queue. Already-queued
 //!   events keep FIFO delivery, but newest signals starve.
 //!
-//! Under either candidate, drops are counted per queue, attributed to the owning
+//! Under either policy, drops are counted per queue, attributed to the owning
 //! plugin, and reported via `bitty plugin doctor` — silent loss is not permitted.
-//! This crate exposes both policies via [`DropPolicy`] and requires callers to
-//! choose explicitly (no implicit default) so the open point stays honest.
+//! This crate exposes both policies via [`DropPolicy`]; `DropOldest` is the
+//! accepted v1 default used by [`crate::event::DEFAULT_QUEUE_CAPACITY`] /
+//! `DEFAULT_PLUGIN_DROP_POLICY` and `bitty-runtime::Runtime::new` (experimental
+//! review evidence; RFC remains `Proposed` until acceptance). See
+//! `bitty-docs/docs/specifications/plugin-platform-rfc.md` § “Delivery, ordering,
+//! batching, and coalescing” (point 3) and `OQ-013` for the authoritative
+//! trade-off statement.
 //! Numeric queue depths and timeout milliseconds are OQ-014; this crate uses
 //! bounded defaults that are headless-testable (`DEFAULT_QUEUE_CAPACITY`, etc.)
-//! and documents them as candidate values.
 //!
-//! # Three-level queue budgets (candidate, OQ-014)
+//! # Three-level queue budgets (budgets candidate, OQ-014; DropPolicy DropOldest accepted for v1, OQ-013 closed)
 //!
 //! The isolation/resource RFC (`bitty-docs`) proposes three related dimensions
 //! (per-queue vs aggregate dimension drift noted in Wave-C review). This crate
-//! documents and enforces the following **candidate** budgets — not normative
-//! until `OQ-014` is accepted. Values are headless-testable and may change
-//! without a semver major bump while the RFC is `Proposed`:
+//! documents and enforces the following budgets — queue **depth/byte limits
+//! remain candidate** (not normative until `OQ-014` is accepted; values are
+//! headless-testable and may change without a semver major bump while the RFC
+//! is `Proposed`), while the **drop policy is accepted for v1 as `DropOldest`**
+//! (OQ-013 closed decision point, experimental review evidence per new RFC
+//! lifecycle):
 //!
 //! - **PerSubscriptionQueueLimit = 64 events** (`DEFAULT_QUEUE_CAPACITY` / `PER_SUBSCRIPTION_QUEUE_LIMIT`):
 //!   each `(plugin, event-type)` queue is a bounded FIFO of at most 64 events.
@@ -471,13 +485,19 @@ impl Event {
     }
 }
 
-// ── drop policy (open decision point) ───────────────────────────────────
+// ── drop policy (OQ-013 closed: DropOldest accepted for v1) ──────────────
 
 /// Queue-overflow drop policy.
 ///
-/// This is the single shared open decision point for `OQ-013` and the
-/// delivery rules in the plugin-platform RFC (point 3). Two candidates remain
-/// proposed; this type exposes both without fixing the decision.
+/// This was the single shared open decision point for `OQ-013` and the
+/// delivery rules in the plugin-platform RFC (point 3). That point is
+/// **closed for v1: `DropOldest` is the accepted default** (experimental
+/// implementation as review evidence per the new RFC lifecycle
+/// `Draft -> experimental review evidence -> Accepted -> normative`;
+/// `plugin-platform-rfc.md` remains `Proposed` until independent review).
+/// `DropNewest` remains available via explicit opt-in but is not the v1 default.
+/// This type exposes both policies; see [`DEFAULT_QUEUE_CAPACITY`] and
+/// `bitty-runtime::DEFAULT_PLUGIN_DROP_POLICY` for the v1 default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DropPolicy {
     /// Evict the oldest queued event; newest signals survive.
@@ -500,12 +520,15 @@ impl std::fmt::Display for DropPolicy {
     }
 }
 
-/// Candidate default (not normative).
+/// Accepted v1 default — `DropOldest` (OQ-013 closed decision point).
 ///
+/// Experimental implementation as review evidence per the new RFC lifecycle
+/// (`Draft -> experimental review evidence -> Accepted -> normative`;
+/// `plugin-platform-rfc.md` remains `Proposed` until independent review).
 /// The RFC proposes `<= 32 events or 8 KiB per wakeup` as batch limits and
 /// leaves exact queue depths to `OQ-014`. This crate uses a headless-testable
-/// default capacity that satisfies the bounded-queue invariant without claiming
-/// the accepted number.
+/// default capacity that satisfies the bounded-queue invariant and is the
+/// accepted v1 baseline (per-queue 64; see `DEFAULT_PLUGIN_DROP_POLICY`).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 64;
 /// Per-subscription queue limit (candidate, `OQ-014`). Alias of `DEFAULT_QUEUE_CAPACITY`.
 pub const PER_SUBSCRIPTION_QUEUE_LIMIT: usize = 64;
@@ -715,9 +738,11 @@ impl EventQueue {
 /// Budget enforcement: per-subscription limits are enforced inline in
 /// [`EventQueue::push`]; per-plugin aggregates (`PER_PLUGIN_QUEUED_EVENT_LIMIT`,
 /// `PER_PLUGIN_QUEUED_BYTES_LIMIT`) are enforced at the pipeline `publish`
-/// boundary using the shared [`DropPolicy`] (candidate, `OQ-014`, `P0` review
-/// required). Global limits are documented but not gated here — future host
-/// admission control.
+/// boundary using the shared [`DropPolicy`] — `DropOldest` is the accepted
+/// v1 default (OQ-013 closed decision point, experimental review evidence;
+/// RFC remains `Proposed`), while the aggregate **budgets remain candidate**
+/// (`OQ-014`, `P0` review required). Global limits are documented but not
+/// gated here — future host admission control.
 #[derive(Debug)]
 pub struct EventPipeline {
     queues: BTreeMap<(String, String), EventQueue>,
@@ -730,9 +755,12 @@ pub struct EventPipeline {
 impl EventPipeline {
     /// Create a new pipeline.
     ///
-    /// `drop_policy` is the shared policy for queue overflow (open decision point).
-    /// `default_capacity` is the per-queue bound (candidate default, usually
-    /// [`PER_SUBSCRIPTION_QUEUE_LIMIT`]).
+    /// `drop_policy` is the shared policy for queue overflow — `DropOldest` is
+    /// the accepted v1 default (OQ-013 closed; experimental review evidence per
+    /// new RFC lifecycle, RFC remains `Proposed` until independent review).
+    /// `DropNewest` remains available via explicit opt-in. `default_capacity`
+    /// is the per-queue bound (candidate default, usually
+    /// [`PER_SUBSCRIPTION_QUEUE_LIMIT`], OQ-014).
     pub fn new(default_capacity: usize, drop_policy: DropPolicy) -> Self {
         assert!(default_capacity > 0, "pipeline capacity must be > 0");
         Self {

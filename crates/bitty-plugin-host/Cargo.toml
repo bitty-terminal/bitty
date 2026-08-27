@@ -11,3 +11,4 @@ workspace = true
 [dependencies]
 bitty-term-state = { path = "../bitty-term-state" }
 bitty-config = { path = "../bitty-config" }
+bitty-package = { path = "../bitty-package" }

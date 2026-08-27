@@ -1,0 +1,16 @@
+[package]
+name = "bitty-rich"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-term-state = { path = "../bitty-term-state" }
+bitty-vt = { path = "../bitty-vt" }
+
+[dev-dependencies]
+bitty-vt = { path = "../bitty-vt" }

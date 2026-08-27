@@ -360,10 +360,65 @@ impl State {
         self.zones.iter()
     }
 
-    /// The image store stub; see `crate::image` for the OQ-008 status.
+    /// Number of distinct hyperlink identities retained (bounded, see
+    /// [`HYPERLINK_TABLE_MAX`]).
+    #[must_use]
+    pub fn hyperlink_count(&self) -> usize {
+        self.hyperlink_table.len()
+    }
+
+    /// Resolves a [`HyperlinkId`] to its `(id, uri)` pair when present.
+    ///
+    /// `id` is the optional OSC 8 `id=` parameter; `uri` is the target.
+    #[must_use]
+    pub fn hyperlink_entry(&self, id: HyperlinkId) -> Option<(Option<&str>, &str)> {
+        let index = id.as_u32() as usize;
+        self.hyperlink_table
+            .get(index)
+            .map(|(opt_id, uri)| (opt_id.as_ref().map(BoundedString::as_str), uri.as_str()))
+    }
+
+    /// Iterates the hyperlink table oldest first; `(HyperlinkId, Option<id>,
+    /// uri)`.
+    pub fn hyperlink_table(&self) -> impl Iterator<Item = (HyperlinkId, Option<&str>, &str)> + '_ {
+        self.hyperlink_table
+            .iter()
+            .enumerate()
+            .map(|(idx, (opt_id, uri))| {
+                (
+                    HyperlinkId::new(idx as u32),
+                    opt_id.as_ref().map(BoundedString::as_str),
+                    uri.as_str(),
+                )
+            })
+    }
+
+    /// The hyperlink currently applied to newly printed cells, if any.
+    #[must_use]
+    pub fn current_hyperlink(&self) -> Option<HyperlinkId> {
+        self.current_hyperlink
+    }
+
+    /// Number of retained semantic-zone records.
+    #[must_use]
+    pub fn zone_len(&self) -> usize {
+        self.zones.len()
+    }
+
+    /// The image store; see `crate::image` for the OQ-008 status.
+    ///
+    /// Bounded placeholder stub (64 entries, 4096 bytes each) until the
+    /// image RFC lands; no decoded pixels are held here.
     #[must_use]
     pub fn image_store(&self) -> &ImageStore {
         &self.images
+    }
+
+    /// Mutable image store (bounded placeholder). Restricted to tests and
+    /// the future image protocol; not used by the parser path in this
+    /// milestone.
+    pub fn image_store_mut(&mut self) -> &mut ImageStore {
+        &mut self.images
     }
 
     /// Inert-sequence telemetry counters (outside the state hash).

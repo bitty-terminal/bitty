@@ -195,6 +195,7 @@ name = "bitty-runtime"
 version = "0.0.0"
 dependencies = [
  "bitty-platform",
+ "bitty-plugin-host",
  "bitty-pty",
  "bitty-render",
  "bitty-term-state",

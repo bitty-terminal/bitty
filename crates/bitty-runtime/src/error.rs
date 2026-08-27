@@ -20,6 +20,8 @@ pub enum RuntimeError {
     InvalidSize(&'static str),
     /// A bounded queue was constructed with zero capacity.
     InvalidQueueCapacity,
+    /// Plugin host rejected the request.
+    Plugin(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -31,6 +33,7 @@ impl fmt::Display for RuntimeError {
             Self::Render(msg) => write!(f, "render error: {msg}"),
             Self::InvalidSize(msg) => write!(f, "invalid size: {msg}"),
             Self::InvalidQueueCapacity => write!(f, "cold queue capacity must be > 0"),
+            Self::Plugin(msg) => write!(f, "plugin error: {msg}"),
         }
     }
 }
@@ -52,5 +55,11 @@ impl From<bitty_render::RenderError> for RuntimeError {
 impl From<bitty_platform::PlatformError> for RuntimeError {
     fn from(value: bitty_platform::PlatformError) -> Self {
         Self::Platform(value.to_string())
+    }
+}
+
+impl From<bitty_plugin_host::PluginError> for RuntimeError {
+    fn from(value: bitty_plugin_host::PluginError) -> Self {
+        Self::Plugin(value.to_string())
     }
 }

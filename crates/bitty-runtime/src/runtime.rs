@@ -8,6 +8,11 @@
 //!                                  |                |
 //!                                  v                v
 //!                         cold-path queue      GridRenderer -> DrawList -> Surface::present
+//!                                  |                ^
+//!                                  +--> bounded side queue --> PluginHost (draft)
+//!                                         |   owned EventPipeline + SideQueue<HostObservation>
+//!                                         v
+//!                                   grant checks / DropPolicy (open point) / interception stubs
 //! ```
 //!
 //! The hot path never touches Lua, plugins, or the cold queue beyond pushing
@@ -25,6 +30,42 @@
 //! combined `DrawList` is presented once via the headless software seam.
 //! Layout math remains headless-testable without GPU/window; the software
 //! present proves split/stack/overlay composition.
+//!
+//! # Plugin-host wiring (CTX-0027) — draft status, not normative
+//!
+//! This module owns a [`bitty_plugin_host::PluginHost`] behind the cold path.
+//! The host is **proposed** and tracks the `plugin-platform-rfc.md` contract
+//! (`Proposed` / `draft`, `OQ-011..OQ-013`). The wiring is headless-testable
+//! and introduces no window, GPU, or Lua VM coupling:
+//!
+//! - **Owned host:** `Runtime` owns one `PluginHost` (always present, not feature-gated
+//!   for this draft slice). Construction uses the RFC candidate default
+//!   [`bitty_plugin_host::DropPolicy::DropOldest`] with per-queue `64` and side queue `128`.
+//!   The choice is **not normative** — it is the single shared open decision point for
+//!   `OQ-013` § “Delivery, ordering, batching, and coalescing” (point 3). Callers that
+//!   need `DropNewest` must construct via [`Runtime::with_plugin_host`] / [`Runtime::with_plugin_drop_policy`]
+//!   or replace the host via [`Runtime::plugin_host_mut`]; there is no implicit settling beyond
+//!   the candidate documented here.
+//! - **Cold → side bridging (ADR-0003 rule 4):** `handle_pty_bytes` pushes bounded
+//!   [`crate::queue::ColdEvent`]s to the `ColdQueue` *and* non-blocking bounded
+//!   [`bitty_plugin_host::HostObservation`]s to the host's [`bitty_plugin_host::SideQueue`].
+//!   The side queue is strictly bounded and never blocks the producer; when full the
+//!   oldest observation is dropped and the count is exposed for `bitty plugin doctor` via
+//!   [`Runtime::plugin_side_dropped`]/[`Runtime::plugin_total_dropped`].
+//! - **Event routing:** `register_plugin` validates and registers a manifest via
+//!   `declare → resolve → register`; subscriptions and publishing go through the
+//!   host's [`bitty_plugin_host::EventPipeline`]. Interception handlers are synchronous,
+//!   veto-wins, fail-open, and remain cold-path only (the four v1 points
+//!   `intercept.command-dispatch/terminal-spawn/paste/open-url`).
+//! - **Grant stubs:** `is_capability_granted`, `insert_grant`, `revoke_grant`, and
+//!   `dispatch_command` (grant-checked) are headless stubs with no file I/O; they
+//!   intersect the manifest's declared capabilities with the grant store.
+//! - **No hot-path coupling:** plugins never observe `byte-received` / `cell-changed` /
+//!   per-byte signals; only bounded post-state observations cross the queue.
+//! - **Honest gaps:** Lua VM creation/execution, real capability consent UX, handler
+//!   execution with budgets/timeouts (OQ-014), and actual command invocation via the
+//!   plugin VM remain deferred. This slice only wires the host-owned data structures
+//!   and the bounded crossing.
 
 use bitty_platform::{PhysicalSize, PlatformEvent, WindowEventKind};
 use bitty_pty::{Pty, PtyBuilder};
@@ -41,6 +82,11 @@ use bitty_render::{
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{Focus, FocusDirection, LayoutNode, Rect as UiRect, View, ViewId};
 use bitty_vt::{Parser, SequenceKind};
+
+use bitty_plugin_host::{
+    CapabilityId, DropPolicy, Event, EventKind, GrantRecord, HostObservation, InterceptionDecision,
+    PluginHost, PluginId, PluginManifest, QualifiedName,
+};
 
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
@@ -245,6 +291,37 @@ fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Snapshot {
 ///   in `bitty-render`). This crate does not yet expose an `attach_gpu`
 ///   API; callers must not describe it as implemented.
 ///
+/// Candidate defaults for the plugin-host wiring (not normative).
+/// These satisfy bounded-queue invariants and are headless-testable (`OQ-014`).
+pub const DEFAULT_PLUGIN_PIPELINE_CAPACITY: usize = bitty_plugin_host::DEFAULT_QUEUE_CAPACITY;
+/// Side queue capacity for [`HostObservation`] (ADR-0003 rule 4).
+pub const DEFAULT_PLUGIN_SIDE_CAPACITY: usize = 128;
+/// Candidate drop policy for this slice — `DropOldest` (not normative, open point `OQ-013`).
+pub const DEFAULT_PLUGIN_DROP_POLICY: DropPolicy = DropPolicy::DropOldest;
+
+/// Map a [`ColdEvent`] to a [`HostObservation`] where semantics overlap.
+///
+/// Only post-state, bounded observations cross the queue; hot-path payloads
+/// (bytes, cells, per-frame damage beyond generation) never cross. Returns `None`
+/// when there is no direct observation mapping (e.g. `ZoneMarked`, `HyperlinkChanged`).
+fn cold_to_observation(event: &ColdEvent) -> Option<HostObservation> {
+    match event {
+        ColdEvent::TitleChanged(s) => Some(HostObservation::TitleChanged(s.clone())),
+        ColdEvent::CwdChanged(s) => Some(HostObservation::CwdChanged(s.clone())),
+        ColdEvent::Bell => Some(HostObservation::Bell),
+        ColdEvent::ModeChanged { mode, enabled } => Some(HostObservation::ModeChanged {
+            mode: format!("{mode:?}"),
+            enabled: *enabled,
+        }),
+        ColdEvent::Damage { generation } => Some(HostObservation::Damage {
+            generation: *generation,
+        }),
+        ColdEvent::ZoneMarked(_)
+        | ColdEvent::HyperlinkChanged(_)
+        | ColdEvent::UnknownSequence(_) => None,
+    }
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -253,6 +330,7 @@ pub struct Runtime {
     renderer: GridRenderer<HeadlessRasterizer>,
     surface: Surface,
     cold_queue: ColdQueue,
+    plugin_host: PluginHost,
     last_presented_generation: u64,
     pending_full_redraw: bool,
     cols: usize,
@@ -269,11 +347,24 @@ impl std::fmt::Debug for Runtime {
             .field("rows", &self.rows)
             .field("generation", &self.state.generation())
             .field("cold_queue_len", &self.cold_queue.len())
+            .field("plugin_side_len", &self.plugin_host.side_queue().len())
+            .field(
+                "plugin_side_dropped",
+                &self.plugin_host.side_queue().dropped(),
+            )
+            .field(
+                "plugin_pipeline_dropped",
+                &self.plugin_host.pipeline().total_dropped(),
+            )
             .field("has_pty", &self.pty.is_some())
             .field("pending_full_redraw", &self.pending_full_redraw)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
             .field("container", &self.container)
+            .field(
+                "plugin_drop_policy",
+                &self.plugin_host.pipeline().drop_policy(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -284,6 +375,13 @@ impl Runtime {
     ///
     /// The initial layout is a single leaf `ViewId(1)` sized to `config`
     /// cols/rows with focus on that leaf and a container matching the grid.
+    /// The owned [`PluginHost`] is created with the candidate
+    /// [`DEFAULT_PLUGIN_DROP_POLICY`] (`DropOldest`), pipeline capacity
+    /// [`DEFAULT_PLUGIN_PIPELINE_CAPACITY`] (64) and side capacity
+    /// [`DEFAULT_PLUGIN_SIDE_CAPACITY`] (128). The policy choice is the
+    /// single shared open decision point for `OQ-013`; this default is **not
+    /// normative** and callers that require `DropNewest` must use
+    /// [`Self::with_plugin_drop_policy`] or [`Self::with_plugin_host`].
     ///
     /// # Errors
     ///
@@ -291,6 +389,86 @@ impl Runtime {
     /// [`RuntimeError::Render`] when the surface or renderer construction
     /// rejects the derived pixel extent or font query.
     pub fn new(config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        Self::with_plugin_drop_policy(config, DEFAULT_PLUGIN_DROP_POLICY)
+    }
+
+    /// Creates a runtime with an explicit [`DropPolicy`] for the plugin host.
+    ///
+    /// The caller chooses the queue-overflow policy explicitly because the choice
+    /// is an open decision point (`OQ-013`, RFC § “Delivery, ordering, batching,
+    /// and coalescing” point 3). No implicit settling beyond the documented
+    /// candidate exists; this constructor makes the choice visible at the call site.
+    pub fn with_plugin_drop_policy(
+        config: RuntimeConfig,
+        drop_policy: DropPolicy,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_plugin_host_capacity(
+            config,
+            drop_policy,
+            DEFAULT_PLUGIN_PIPELINE_CAPACITY,
+            DEFAULT_PLUGIN_SIDE_CAPACITY,
+        )
+    }
+
+    /// Creates a runtime with explicit plugin-host capacities and drop policy.
+    ///
+    /// `pipeline_capacity` bounds each per-subscriber event queue; `side_capacity`
+    /// bounds the [`HostObservation`] side queue per ADR-0003 rule 4
+    /// (hot path never blocks, drops counted for `bitty plugin doctor`).
+    pub fn with_plugin_host_capacity(
+        config: RuntimeConfig,
+        drop_policy: DropPolicy,
+        pipeline_capacity: usize,
+        side_capacity: usize,
+    ) -> Result<Self, RuntimeError> {
+        config.validate()?;
+        if pipeline_capacity == 0 || side_capacity == 0 {
+            return Err(RuntimeError::InvalidQueueCapacity);
+        }
+        let extent = config.pixel_extent();
+        let surface = Surface::headless(extent).map_err(RuntimeError::from)?;
+        let cell = CellMetrics::new(config.cell_width, config.cell_height)
+            .expect("validated config guarantees non-zero cell metrics");
+        let query = FontQuery {
+            family: config.font_family.clone(),
+            style: FontStyle::Normal,
+            point_size: config.font_size,
+        };
+        let renderer = GridRenderer::new(HeadlessRasterizer::new(), &query, cell)
+            .map_err(RuntimeError::from)?;
+        let cols = config.cols;
+        let rows = config.rows;
+        let layout = default_layout(cols, rows);
+        let focus = Focus::with_focus(ViewId::new(1));
+        let container = default_container(cols, rows);
+        let plugin_host = PluginHost::with_capacity(drop_policy, pipeline_capacity, side_capacity);
+        Ok(Self {
+            cols,
+            rows,
+            config: config.clone(),
+            parser: Parser::new(),
+            state: State::new(),
+            pty: None,
+            renderer,
+            surface,
+            cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            plugin_host,
+            last_presented_generation: u64::MAX,
+            pending_full_redraw: true,
+            layout,
+            focus,
+            container,
+        })
+    }
+
+    /// Creates a runtime that takes ownership of an already-constructed [`PluginHost`].
+    ///
+    /// Headless tests may pre-populate the host (grants, safe mode) before handing it to
+    /// the runtime; this constructor preserves that state and does not re-create capacities.
+    pub fn with_plugin_host(
+        config: RuntimeConfig,
+        plugin_host: PluginHost,
+    ) -> Result<Self, RuntimeError> {
         config.validate()?;
         let extent = config.pixel_extent();
         let surface = Surface::headless(extent).map_err(RuntimeError::from)?;
@@ -318,6 +496,7 @@ impl Runtime {
             renderer,
             surface,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            plugin_host,
             last_presented_generation: u64::MAX,
             pending_full_redraw: true,
             layout,
@@ -395,6 +574,352 @@ impl Runtime {
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         let raw = self.surface.headless_rgba()?;
         Some(raw)
+    }
+
+    // ------------------------------------------------------------------
+    // Plugin-host wiring (CTX-0027) — draft, headless, no window/GPU/Lua
+    // ------------------------------------------------------------------
+
+    /// Owned plugin host (read-only).
+    #[must_use]
+    pub fn plugin_host(&self) -> &PluginHost {
+        &self.plugin_host
+    }
+
+    /// Owned plugin host (mutable).
+    #[must_use]
+    pub fn plugin_host_mut(&mut self) -> &mut PluginHost {
+        &mut self.plugin_host
+    }
+
+    /// Drop policy for the plugin host's event pipeline (open decision point `OQ-013`).
+    #[must_use]
+    pub fn plugin_drop_policy(&self) -> DropPolicy {
+        self.plugin_host.pipeline().drop_policy()
+    }
+
+    /// Per-queue capacity for the plugin pipeline (candidate, `OQ-014`).
+    #[must_use]
+    pub fn plugin_pipeline_capacity(&self) -> usize {
+        self.plugin_host.pipeline().default_capacity()
+    }
+
+    /// Side-queue capacity for [`HostObservation`] (ADR-0003 rule 4).
+    #[must_use]
+    pub fn plugin_side_capacity(&self) -> usize {
+        self.plugin_host.side_queue().capacity()
+    }
+
+    /// Number of queued [`HostObservation`]s in the side queue.
+    #[must_use]
+    pub fn plugin_side_len(&self) -> usize {
+        self.plugin_host.side_queue().len()
+    }
+
+    /// How many side-queue observations have been dropped (bounded, counted for `bitty plugin doctor`).
+    #[must_use]
+    pub fn plugin_side_dropped(&self) -> u64 {
+        self.plugin_host.side_queue().dropped()
+    }
+
+    /// Total dropped events across all per-subscriber pipeline queues (for `bitty plugin doctor`).
+    #[must_use]
+    pub fn plugin_total_dropped(&self) -> u64 {
+        self.plugin_host.pipeline().total_dropped()
+    }
+
+    /// Per-queue dropped counts `(plugin_id, event_kind) -> dropped`.
+    #[must_use]
+    pub fn plugin_dropped_per_queue(&self) -> std::collections::BTreeMap<(String, String), u64> {
+        self.plugin_host.pipeline().dropped_per_queue()
+    }
+
+    /// Whether the host is in safe mode (`bitty --safe` skips third-party plugins).
+    #[must_use]
+    pub fn plugin_safe_mode(&self) -> bool {
+        self.plugin_host.is_safe_mode()
+    }
+
+    /// Enable or disable safe mode.
+    pub fn set_plugin_safe_mode(&mut self, safe: bool) {
+        self.plugin_host.set_safe_mode(safe);
+    }
+
+    /// Register a plugin from its already-parsed manifest.
+    ///
+    /// Validates the manifest, inserts as `Declared`, resolves dependencies
+    /// against the current registry, and reserves commands/event subscriptions
+    /// at graph construction time (duplicate qualified names are rejected here,
+    /// not shadowed). On success the entry is `Registered`; caller may then
+    /// [`Self::activate_plugin`] or let the lazy loader activate on first
+    /// command/event.
+    ///
+    /// Headless-testable: no file I/O, no VM, no window/GPU.
+    pub fn register_plugin(&mut self, manifest: PluginManifest) -> Result<(), RuntimeError> {
+        let id = manifest.id().clone();
+        self.plugin_host.declare(manifest)?;
+        // Resolve may fail if dependencies missing; we keep the `Declared` entry
+        // and surface the error for the caller to inspect `plugin_host.registry()`.
+        self.plugin_host.resolve(&id)?;
+        self.plugin_host.register(&id)?;
+        Ok(())
+    }
+
+    /// Activate a previously registered plugin (moves `Registered -> Activated`).
+    pub fn activate_plugin(&mut self, id: &PluginId) -> Result<(), RuntimeError> {
+        self.plugin_host.activate(id).map_err(RuntimeError::from)
+    }
+
+    /// Suspend a plugin.
+    pub fn suspend_plugin(&mut self, id: &PluginId) -> Result<(), RuntimeError> {
+        self.plugin_host.suspend(id).map_err(RuntimeError::from)
+    }
+
+    /// Resume a suspended plugin (`Suspended -> Registered`, caller may `activate` again).
+    pub fn resume_plugin(&mut self, id: &PluginId) -> Result<(), RuntimeError> {
+        self.plugin_host.resume(id).map_err(RuntimeError::from)
+    }
+
+    /// Dispose a plugin (releases generation resources).
+    pub fn dispose_plugin(&mut self, id: &PluginId) -> Result<(), RuntimeError> {
+        self.plugin_host.dispose(id).map_err(RuntimeError::from)
+    }
+
+    /// Subscribe `plugin_id` to `kind` (requires the event was declared in the manifest).
+    pub fn subscribe_plugin_event(
+        &mut self,
+        plugin_id: &PluginId,
+        kind: EventKind,
+    ) -> Result<(), RuntimeError> {
+        self.plugin_host
+            .subscribe(plugin_id, kind)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Publish an event to all subscribers of its kind (observation/lifecycle).
+    ///
+    /// Bounded, never blocks the producer; drops are counted per queue under `DropPolicy`.
+    pub fn publish_plugin_event(&mut self, event: Event) {
+        self.plugin_host.publish(event);
+    }
+
+    /// Publish to a specific subscriber (lifecycle, owning plugin only).
+    pub fn publish_plugin_event_to(
+        &mut self,
+        plugin_id: &PluginId,
+        event: Event,
+    ) -> Result<(), RuntimeError> {
+        self.plugin_host
+            .publish_to(plugin_id, event)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Drain a bounded batch for `plugin_id` + `kind` (FIFO, bounded by count/bytes).
+    pub fn drain_plugin_events(
+        &mut self,
+        plugin_id: &PluginId,
+        kind: &EventKind,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        self.plugin_host
+            .drain_batch(plugin_id, kind, max_events, max_bytes)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Drain all queued events for `plugin_id` + `kind`.
+    pub fn drain_plugin_events_all(
+        &mut self,
+        plugin_id: &PluginId,
+        kind: &EventKind,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        self.plugin_host
+            .drain(plugin_id, kind)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Drain side-queue observations (bounded host-mediated `HostObservation`s).
+    pub fn drain_plugin_observations(&mut self) -> Vec<HostObservation> {
+        self.plugin_host.drain_observations()
+    }
+
+    /// Drain side-queue observations up to `limit` (bounded batch).
+    pub fn drain_plugin_observations_bounded(&mut self, limit: usize) -> Vec<HostObservation> {
+        self.plugin_host.drain_observations_bounded(limit)
+    }
+
+    /// Push a [`HostObservation`] into the side queue (producer never blocks, bounded drops).
+    ///
+    /// Exposed for headless tests that drive observations without going through `handle_pty_bytes`.
+    pub fn push_plugin_observation(&mut self, obs: HostObservation) {
+        self.plugin_host.push_observation(obs);
+    }
+
+    /// Bridge all currently queued [`ColdEvent`]s into the side queue where a direct
+    /// [`HostObservation`] mapping exists. This drains the `ColdQueue` and pushes
+    /// corresponding observations without blocking; the side queue's bounded drop
+    /// counter increments on overflow (visible via `plugin_side_dropped` for doctor).
+    ///
+    /// In steady state, `handle_pty_bytes` already bridges overlapping events automatically;
+    /// this helper is for callers that have drained or synthesized cold events and want
+    /// to observe them through the plugin host side queue headlessly.
+    pub fn bridge_cold_to_side_queue(&mut self) {
+        let drained = self.cold_queue.drain();
+        for ev in drained {
+            if let Some(obs) = cold_to_observation(&ev) {
+                self.plugin_host.push_observation(obs);
+            }
+            // Keep the original cold event re-queued? No — draining is consuming.
+            // For the cold+side dual accounting mode used by `handle_pty_bytes`,
+            // we re-push the cold event so `cold_queue` remains observable.
+            // But this drain-into-side is explicit; caller has already drained.
+            // To preserve cold observability, we do not re-enqueue here — the
+            // caller can decide to handle cold events separately. Documented honestly.
+        }
+    }
+
+    // ── grant / command stubs (headless, no file I/O) ───────────────────
+
+    /// Whether `capability` is granted for `plugin_id` under `manifest_hash`.
+    #[must_use]
+    pub fn is_capability_granted(
+        &self,
+        plugin_id: &PluginId,
+        manifest_hash: &str,
+        capability: &CapabilityId,
+    ) -> bool {
+        self.plugin_host
+            .is_granted(plugin_id, manifest_hash, capability)
+    }
+
+    /// Insert a grant record (headless helper; persistence deferred).
+    pub fn insert_grant(&mut self, record: GrantRecord) {
+        self.plugin_host.insert_grant(record);
+    }
+
+    /// Revoke a capability or all grants for `plugin_id`.
+    pub fn revoke_grant(
+        &mut self,
+        plugin_id: &PluginId,
+        capability: Option<&CapabilityId>,
+    ) -> Result<bitty_plugin_host::RevokeReport, RuntimeError> {
+        self.plugin_host
+            .revoke(plugin_id, capability)
+            .map_err(RuntimeError::from)
+    }
+
+    /// Stub: check whether `plugin_id` may dispatch `command` under `manifest_hash` and `capability`.
+    ///
+    /// The full dispatch will run the command via the Lua VM with the plugin's grants;
+    /// here we only intersect the requested capability with the grant store (deny-by-default,
+    /// hash-bound). Returns `Ok(())` when granted, `Err(RuntimeError::Plugin)` otherwise.
+    ///
+    /// High-risk identifiers (`terminal.raw-read`, `ui.protocol-register`, etc.) are already
+    /// flagged by `CapabilityId::is_high_risk`; revocation and workspace narrowing are
+    /// enforced by the underlying `GrantStore`.
+    pub fn check_command_grant(
+        &self,
+        plugin_id: &PluginId,
+        manifest_hash: &str,
+        capability: &CapabilityId,
+    ) -> Result<(), RuntimeError> {
+        if self.is_capability_granted(plugin_id, manifest_hash, capability) {
+            Ok(())
+        } else {
+            Err(RuntimeError::Plugin(format!(
+                "command dispatch denied: plugin '{}' lacks capability '{capability}' for hash '{manifest_hash}' (deny-by-default)",
+                plugin_id.as_str()
+            )))
+        }
+    }
+
+    /// Stub: grant-checked command dispatch.
+    ///
+    /// Validates that `qualified` is owned by `plugin_id` (via the registry) and that
+    /// the required `capability` is granted. On success returns `Ok(())` as a
+    /// placeholder for the future VM invocation; actual execution remains deferred.
+    pub fn dispatch_command(
+        &self,
+        plugin_id: &PluginId,
+        qualified: &QualifiedName,
+        manifest_hash: &str,
+        capability: &CapabilityId,
+    ) -> Result<(), RuntimeError> {
+        // Qualified name must be owned by this plugin (registry invariant: duplicates rejected at graph construction).
+        let entry = self.plugin_host.registry().get(plugin_id).ok_or_else(|| {
+            RuntimeError::Plugin(format!("plugin not found: '{}'", plugin_id.as_str()))
+        })?;
+        if !entry
+            .commands
+            .iter()
+            .any(|c| c.as_str() == qualified.as_str())
+        {
+            return Err(RuntimeError::Plugin(format!(
+                "command '{}' not owned by plugin '{}'",
+                qualified.as_str(),
+                plugin_id.as_str()
+            )));
+        }
+        self.check_command_grant(plugin_id, manifest_hash, capability)
+    }
+
+    // ── interception routing (open points, cold-path synchronous) ─────────
+
+    /// Accumulate interceptor decisions for a single user action (veto-wins, deterministic).
+    ///
+    /// This mirrors the RFC fail-open, veto-wins policy: a single `Veto` vetoes
+    /// regardless of handler order; otherwise the action proceeds.
+    #[must_use]
+    pub fn accumulate_interceptions(decisions: &[InterceptionDecision]) -> InterceptionDecision {
+        bitty_plugin_host::accumulate_interceptions(decisions)
+    }
+
+    /// Whether an intercepted action should proceed (`true`) or be vetoed (`false`) under fail-open.
+    ///
+    /// Timeouts are treated as abstention: the host proceeds without the plugin, records a
+    /// violation, and disables the handler after repeated violations (threshold deferred to `OQ-014`).
+    #[must_use]
+    pub fn should_proceed_for_intercept(decision: InterceptionDecision, timed_out: bool) -> bool {
+        bitty_plugin_host::should_proceed(decision, timed_out)
+    }
+
+    /// Convenience wrapper: `accumulate_interceptions` then `should_proceed`.
+    #[must_use]
+    pub fn should_proceed_after_interceptions(
+        decisions: &[InterceptionDecision],
+        timed_out: bool,
+    ) -> bool {
+        let acc = Self::accumulate_interceptions(decisions);
+        Self::should_proceed_for_intercept(acc, timed_out)
+    }
+
+    /// Interception helper for `intercept.command-dispatch` (v1 of four points).
+    ///
+    /// Callers collect per-handler [`InterceptionDecision`]s (e.g. from future VM invocations)
+    /// and pass them here; the host applies veto-wins and fail-open semantics.
+    /// Reentrancy (a handler triggering another interception on the same thread) is rejected
+    /// by the caller — nested interception is not defined behavior (RFC).
+    #[must_use]
+    pub fn intercept_command_dispatch(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
+        Self::should_proceed_after_interceptions(decisions, timed_out)
+    }
+
+    /// `intercept.terminal-spawn` stub — same fail-open, veto-wins policy.
+    #[must_use]
+    pub fn intercept_terminal_spawn(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
+        Self::should_proceed_after_interceptions(decisions, timed_out)
+    }
+
+    /// `intercept.paste` stub — bounded metadata path (no clipboard text without `clipboard.read`).
+    #[must_use]
+    pub fn intercept_paste(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
+        Self::should_proceed_after_interceptions(decisions, timed_out)
+    }
+
+    /// `intercept.open-url` stub.
+    #[must_use]
+    pub fn intercept_open_url(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
+        Self::should_proceed_after_interceptions(decisions, timed_out)
     }
 
     // ------------------------------------------------------------------
@@ -545,6 +1070,12 @@ impl Runtime {
     /// The byte stream may be split arbitrarily; splitting the same bytes
     /// differently yields the same action sequence (deterministic replay
     /// contract). Malformed or hostile sequences are bounded and never panic.
+    ///
+    /// Bridging (ADR-0003 rule 4): every [`ColdEvent`] that has a direct
+    /// [`HostObservation`] mapping is also pushed into the bounded
+    /// [`PluginHost`] side queue without blocking the hot path. When the side
+    /// queue is full the oldest observation is dropped and
+    /// [`Self::plugin_side_dropped`] increments (counted for `bitty plugin doctor`).
     pub fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -578,13 +1109,20 @@ impl Runtime {
                 _ => None,
             };
             if let Some(ev) = pre_event {
-                self.cold_queue.push(ev);
+                // Cold queue: bounded, drop-oldest, never blocks.
+                self.cold_queue.push(ev.clone());
+                // Side queue bridging: bounded, same non-blocking guarantee (ADR-0003 rule 4).
+                if let Some(obs) = cold_to_observation(&ev) {
+                    self.plugin_host.push_observation(obs);
+                }
             }
             let damage = self.state.apply(&action);
             if !damage.regions.is_empty() {
-                self.cold_queue.push(ColdEvent::Damage {
-                    generation: damage.generation,
-                });
+                let generation = damage.generation;
+                self.cold_queue.push(ColdEvent::Damage { generation });
+                // Bridge damage generation as well.
+                self.plugin_host
+                    .push_observation(HostObservation::Damage { generation });
             }
         }
     }
@@ -1317,5 +1855,324 @@ mod tests {
         assert!(rt.tick().is_some());
         assert!(rt.is_headless());
         assert!(rt.headless_rgba().is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // CTX-0027: plugin-host wiring tests (headless, no Lua/window/GPU)
+    // ------------------------------------------------------------------
+
+    use bitty_plugin_host::{
+        CapabilityId, Event as HostEvent, EventKind as HostEventKind, EventPayload as HostPayload,
+        HostObservation as HostObs, InterceptionDecision as HostDecision, PluginId as HostPid,
+        PluginManifest as HostManifest,
+    };
+
+    fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManifest {
+        use bitty_plugin_host::{
+            CapabilityRequests, Compat, LazyTriggers, PluginIdentity, QualifiedName,
+        };
+        HostManifest {
+            identity: PluginIdentity {
+                id: HostPid::new(id).unwrap(),
+                name: "Test".to_string(),
+                version: "0.1.0".to_string(),
+                description: "desc".to_string(),
+                license: Some("MIT".to_string()),
+            },
+            compat: Compat {
+                bitty: Some(">=0.5,<1.0".to_string()),
+                plugin_api: Some("^1.0".to_string()),
+            },
+            dependencies: Vec::new(),
+            provided_services: Vec::new(),
+            capabilities: CapabilityRequests::default(),
+            lazy: LazyTriggers {
+                commands: commands
+                    .into_iter()
+                    .map(|c| QualifiedName::new(c).unwrap())
+                    .collect(),
+                events: events.into_iter().map(|s| s.to_string()).collect(),
+                claims: Vec::new(),
+            },
+            raw_bytes_len: 256,
+        }
+    }
+
+    #[test]
+    fn default_plugin_host_is_drop_oldest_with_bounded_queues() {
+        let rt = make_runtime();
+        assert_eq!(
+            rt.plugin_drop_policy(),
+            bitty_plugin_host::DropPolicy::DropOldest
+        );
+        assert_eq!(
+            rt.plugin_pipeline_capacity(),
+            DEFAULT_PLUGIN_PIPELINE_CAPACITY
+        );
+        assert_eq!(rt.plugin_side_capacity(), DEFAULT_PLUGIN_SIDE_CAPACITY);
+        assert_eq!(rt.plugin_side_len(), 0);
+        assert_eq!(rt.plugin_total_dropped(), 0);
+    }
+
+    #[test]
+    fn runtime_with_drop_newest_honors_open_point() {
+        let cfg = RuntimeConfig::default();
+        let rt = Runtime::with_plugin_drop_policy(cfg, bitty_plugin_host::DropPolicy::DropNewest)
+            .expect("must build");
+        assert_eq!(
+            rt.plugin_drop_policy(),
+            bitty_plugin_host::DropPolicy::DropNewest
+        );
+    }
+
+    #[test]
+    fn runtime_with_custom_capacities() {
+        let cfg = RuntimeConfig::default();
+        let rt = Runtime::with_plugin_host_capacity(
+            cfg,
+            bitty_plugin_host::DropPolicy::DropOldest,
+            8,
+            16,
+        )
+        .expect("must build");
+        assert_eq!(rt.plugin_pipeline_capacity(), 8);
+        assert_eq!(rt.plugin_side_capacity(), 16);
+    }
+
+    #[test]
+    fn register_plugin_happy_path_and_duplicate_command_rejected() {
+        let mut rt = make_runtime();
+        let m1 = host_manifest("xuepoo.a", vec!["xuepoo.a:cmd"], vec!["terminal.bell"]);
+        rt.register_plugin(m1).expect("first register must succeed");
+        assert_eq!(rt.plugin_host().registry().len(), 1);
+
+        // Second plugin claiming same qualified command must be rejected at graph construction.
+        let m2 = host_manifest("xuepoo.b", vec!["xuepoo.a:cmd"], vec![]);
+        let err = rt
+            .register_plugin(m2)
+            .expect_err("duplicate command must be rejected");
+        assert!(
+            err.to_string().contains("already owned"),
+            "error must mention duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn register_plugin_validates_manifest() {
+        let mut rt = make_runtime();
+        let mut bad = host_manifest("xuepoo.bad", vec![], vec![]);
+        bad.raw_bytes_len = bitty_plugin_host::MANIFEST_MAX_BYTES + 1;
+        assert!(rt.register_plugin(bad).is_err());
+    }
+
+    #[test]
+    fn side_queue_bridging_is_bounded_and_never_blocks_hot_path() {
+        // Use small side capacity to force drops.
+        let cfg = RuntimeConfig {
+            cold_queue_capacity: 4,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = Runtime::with_plugin_host_capacity(
+            cfg,
+            bitty_plugin_host::DropPolicy::DropOldest,
+            64,
+            2,
+        )
+        .expect("must build");
+
+        // Feed five title changes; each title yields TitleChanged only (no damage),
+        // so cold queue sees 5 events, capacity 4 => 1 dropped; side queue sees
+        // 5 observations, capacity 2 => 3 dropped. This proves bounded drops without blocking.
+        for name in ["first", "second", "third", "fourth", "fifth"] {
+            rt.handle_pty_bytes(format!("\x1b]0;{name}\x07").as_bytes());
+        }
+
+        assert_eq!(rt.cold_queue_len(), 4);
+        assert_eq!(rt.cold_queue_dropped(), 1);
+
+        assert_eq!(rt.plugin_side_len(), 2);
+        assert_eq!(rt.plugin_side_dropped(), 3);
+        let obs = rt.drain_plugin_observations();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(rt.plugin_side_len(), 0);
+        // The surviving two are the newest (DropOldest policy).
+        assert_eq!(obs[0], HostObs::TitleChanged("fourth".to_string()));
+        assert_eq!(obs[1], HostObs::TitleChanged("fifth".to_string()));
+    }
+
+    #[test]
+    fn handle_pty_bytes_also_pushes_bell_and_mode_to_side_queue() {
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"\x07"); // BEL
+        let obs = rt.drain_plugin_observations();
+        assert!(obs.contains(&HostObs::Bell));
+
+        // `CSI 4 h` enables Insert mode (Mode::Insert) — mapped to ModeChanged and thence to HostObservation.
+        rt.handle_pty_bytes(b"\x1b[4h");
+        let obs2 = rt.drain_plugin_observations();
+        assert!(
+            obs2.iter()
+                .any(|o| matches!(o, HostObs::ModeChanged { .. })),
+            "Insert mode toggle must produce ModeChanged observation, got {obs2:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_publish_and_drain_via_runtime() {
+        let mut rt = make_runtime();
+        let m = host_manifest("xuepoo.test", vec![], vec!["terminal.bell"]);
+        rt.register_plugin(m).expect("register");
+        rt.subscribe_plugin_event(
+            &HostPid::new("xuepoo.test").unwrap(),
+            HostEventKind::TerminalBell,
+        )
+        .expect("subscribe");
+
+        rt.publish_plugin_event(HostEvent::new(
+            HostEventKind::TerminalBell,
+            HostPayload::Empty,
+            1,
+        ));
+        rt.publish_plugin_event(HostEvent::new(
+            HostEventKind::TerminalBell,
+            HostPayload::Empty,
+            2,
+        ));
+
+        let batch = rt
+            .drain_plugin_events_all(
+                &HostPid::new("xuepoo.test").unwrap(),
+                &HostEventKind::TerminalBell,
+            )
+            .expect("drain");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].sequence, 1);
+    }
+
+    #[test]
+    fn pipeline_bounded_drops_counted_for_doctor() {
+        let mut rt = Runtime::with_plugin_host_capacity(
+            RuntimeConfig::default(),
+            bitty_plugin_host::DropPolicy::DropNewest,
+            2,
+            64,
+        )
+        .expect("must build");
+        let m = host_manifest("xuepoo.test", vec![], vec!["terminal.bell"]);
+        rt.register_plugin(m).unwrap();
+        rt.subscribe_plugin_event(
+            &HostPid::new("xuepoo.test").unwrap(),
+            HostEventKind::TerminalBell,
+        )
+        .unwrap();
+
+        for i in 0..5 {
+            rt.publish_plugin_event(HostEvent::new(
+                HostEventKind::TerminalBell,
+                HostPayload::Empty,
+                i,
+            ));
+        }
+        assert!(rt.plugin_total_dropped() > 0);
+        let per = rt.plugin_dropped_per_queue();
+        assert!(!per.is_empty());
+        let drained = rt
+            .drain_plugin_events_all(
+                &HostPid::new("xuepoo.test").unwrap(),
+                &HostEventKind::TerminalBell,
+            )
+            .unwrap();
+        assert_eq!(drained.len(), 2); // capacity 2 with DropNewest keeps oldest 2.
+    }
+
+    #[test]
+    fn grant_check_stub_deny_by_default_and_hash_binding() {
+        let mut rt = make_runtime();
+        let m = host_manifest("xuepoo.test", vec!["xuepoo.test:cmd"], vec![]);
+        rt.register_plugin(m).unwrap();
+        let pid = HostPid::new("xuepoo.test").unwrap();
+        let cap = CapabilityId::parse("terminal.semantic-read").unwrap();
+        let hash = "abc123";
+        // No grant yet -> denied.
+        assert!(!rt.is_capability_granted(&pid, hash, &cap));
+        assert!(rt.check_command_grant(&pid, hash, &cap).is_err());
+
+        // Insert grant and then succeed.
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(cap.clone());
+        rt.insert_grant(GrantRecord::granted(pid.clone(), hash, granted, 1));
+        assert!(rt.is_capability_granted(&pid, hash, &cap));
+        assert!(rt.check_command_grant(&pid, hash, &cap).is_ok());
+        // Wrong hash denies.
+        assert!(!rt.is_capability_granted(&pid, "other", &cap));
+        assert!(rt.check_command_grant(&pid, "other", &cap).is_err());
+    }
+
+    #[test]
+    fn dispatch_command_checks_ownership_and_grant() {
+        let mut rt = make_runtime();
+        let m = host_manifest("xuepoo.test", vec!["xuepoo.test:run"], vec![]);
+        rt.register_plugin(m).unwrap();
+        let pid = HostPid::new("xuepoo.test").unwrap();
+        let cap = CapabilityId::parse("ui.rich").unwrap();
+        let hash = "h";
+        let qn = bitty_plugin_host::QualifiedName::new("xuepoo.test:run").unwrap();
+
+        // Without grant -> dispatch denied.
+        assert!(rt.dispatch_command(&pid, &qn, hash, &cap).is_err());
+
+        let mut granted = std::collections::BTreeSet::new();
+        granted.insert(cap.clone());
+        rt.insert_grant(GrantRecord::granted(pid.clone(), hash, granted, 1));
+        assert!(rt.dispatch_command(&pid, &qn, hash, &cap).is_ok());
+
+        // Wrong qualified name -> not owned.
+        let other = bitty_plugin_host::QualifiedName::new("xuepoo.test:other").unwrap();
+        assert!(rt.dispatch_command(&pid, &other, hash, &cap).is_err());
+    }
+
+    #[test]
+    fn interception_veto_wins_and_fail_open() {
+        assert!(!Runtime::intercept_command_dispatch(
+            &[HostDecision::Approve, HostDecision::Veto],
+            false
+        ));
+        assert!(Runtime::intercept_command_dispatch(
+            &[HostDecision::Approve, HostDecision::Veto],
+            true
+        ));
+        assert!(Runtime::intercept_paste(&[HostDecision::Approve], false));
+        assert!(!Runtime::intercept_open_url(&[HostDecision::Veto], false));
+        assert!(Runtime::intercept_terminal_spawn(&[], false));
+    }
+
+    #[test]
+    fn safe_mode_rejects_third_party_via_host() {
+        let mut rt = make_runtime();
+        rt.set_plugin_safe_mode(true);
+        assert!(rt.plugin_safe_mode());
+        let m = host_manifest("xuepoo.third", vec![], vec![]);
+        assert!(rt.register_plugin(m).is_err());
+        let builtin = host_manifest("bitty.core", vec![], vec![]);
+        assert!(rt.register_plugin(builtin).is_ok());
+    }
+
+    #[test]
+    fn no_lua_vm_window_gpu_coupling_in_runtime_api() {
+        // Compile-time proof: Runtime constructs headlessly without window/GPU/Lua.
+        let rt = make_runtime();
+        assert!(rt.is_headless());
+        assert!(rt.plugin_host().side_queue().is_empty());
+        assert_eq!(rt.plugin_host().pipeline().queue_count(), 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_plugin_wiring_compiles_and_is_headless() {
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"hi");
+        let _ = rt.tick();
+        assert!(rt.is_headless());
+        assert!(rt.plugin_side_len() <= rt.plugin_side_capacity());
     }
 }

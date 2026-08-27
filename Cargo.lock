@@ -157,6 +157,10 @@ name = "bitty-core"
 version = "0.0.0"
 
 [[package]]
+name = "bitty-ipc"
+version = "0.0.0"
+
+[[package]]
 name = "bitty-package"
 version = "0.0.0"
 

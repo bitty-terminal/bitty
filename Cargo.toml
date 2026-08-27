@@ -7,6 +7,7 @@ members = [
     "crates/bitty-platform",
     "crates/bitty-plugin-host",
     "crates/bitty-pty",
+    "crates/bitty-rich",
     "crates/bitty-vt",
     "crates/bitty-term-state",
     "crates/bitty-render",

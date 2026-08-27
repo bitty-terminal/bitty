@@ -83,12 +83,14 @@ pub use bitty_vt::{
 pub use cell::{Attributes, Cell, HyperlinkId, Style, char_cell_width};
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};
-pub use image::{ImageId, ImageStore};
+pub use image::{
+    IMAGE_STORE_MAX_ENTRIES, IMAGE_STORE_MAX_PAYLOAD_BYTES, ImageId, ImagePlaceholder, ImageStore,
+};
 pub use modes::Modes;
 pub use replies::{REPLY_CAP_BYTES, Replies};
 pub use scrollback::{SCROLLBACK_MAX_LINES, ScrollbackLine};
 pub use state::{
     GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, SNAPSHOT_VERSION, Snapshot,
-    State, TelemetryCounters, ZONE_RECORDS_MAX,
+    State, TelemetryCounters, ZONE_RECORDS_MAX, ZoneRecord,
 };
 pub use tabs::TabStops;

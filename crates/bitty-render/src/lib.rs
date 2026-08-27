@@ -13,7 +13,7 @@
 //!
 //! # Upstream boundary (ADR-0004 "Adopt" / "Wrap" rows)
 //!
-//! - **`wgpu` (~25.x line) is adopted** as the graphics abstraction inside
+//! - **`wgpu` (~26.x line) is adopted** as the graphics abstraction inside
 //!   [`gpu`]. Its types never appear anywhere in this crate's public API:
 //!   every upstream failure is flattened into the owned [`RenderError`], and
 //!   adapter facts are re-described by owned enums ([`gpu::AdapterSummary`]).

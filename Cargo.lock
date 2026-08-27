@@ -198,6 +198,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-ui"
+version = "0.0.0"
+dependencies = [
+ "bitty-term-state",
+]
+
+[[package]]
 name = "bitty-vt"
 version = "0.0.0"
 dependencies = [

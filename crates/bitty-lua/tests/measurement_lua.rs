@@ -149,12 +149,13 @@ fn rc1_wall_real_busy_loop_suspends_or_warns() {
     // it should either suspend (wall or instruction) or complete with warning.
     // We assert that suspension is counted if it happens, and that the harness is headless.
     let mut vm = LuaVm::new("xuepoo.wall-real");
-    // Heavyish loop: accumulate string rep to burn time.
+    // Light loop: enough to exercise wall/instruction accounting but finishes in <1s
+    // even in CI debug (was 200k `s..\"a\"` O(n²) → 6-16s locally, >5m in CI debug).
     let outcome = vm
         .execute(
             r#"
-            local s = ""
-            for i=1,200000 do s = s .. "a" end
+            local s = 0
+            for i=1,50000 do s = s + i end
             return s
             "#,
         )

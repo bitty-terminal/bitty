@@ -63,6 +63,21 @@
 - Do not commit, push, merge, publish, or mutate remote state unless the task or
   user explicitly authorizes it.
 
+### Local gates before push (mandatory)
+
+- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (bitty: fmt-check + clippy -D warnings + test + actionlint + markdownlint; bitty-docs: fmt-check + markdownlint + links + metadata + language + agents + hygiene + actionlint), plus `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets` for bitty. All must pass. Never push with known local failures to save CI.
+- Verify no `TODO/FIXME` and frontmatter/links valid for docs.
+
+### Remote monitoring and merge
+
+- After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR>` (or `gh pr view --json` / `gh api`), poll every 30s until all required checks (CodeQL, Quality gates/Docs quality, Windows) are `pass`. Use `gh` directly (already installed, no npx).
+- Merge only when `mergeable == MERGEABLE` and all checks `pass`: `HTTPS_PROXY=$NETWORK_PROXY gh pr merge <PR> --squash` (auto-merge disabled). Delete remote branch after merge; local worktree branch deletion requires `git worktree remove` first.
+
+### Continuous patrol and Code Review
+
+- Every completed task receives independent commander/reviewer review of its diff before acceptance (mandatory post-completion Code Review). Record defects via CarryCtx progress/risk and convert to follow-up tasks.
+- Weekly `delegate_task` patrol: `carryctx team status` + `rg --files` + `just check` drift detection, then `compress` closed sections into dense summaries to keep context lean.
+
 ## Documentation contract
 
 - Repository-owned documentation is English-only.

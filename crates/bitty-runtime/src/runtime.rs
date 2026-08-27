@@ -15,19 +15,31 @@
 //! bytes cannot grow the heap without limit (T-01). When full, the oldest
 //! event is dropped and a counter increments, mirroring terminal-state's
 //! reply-cap policy.
+//!
+//! Multi-pane extension (CTX-0023): `Runtime` owns a `LayoutNode` tree and a
+//! `Focus` state. `set_layout` replaces the tree; `tick` reflows the tree
+//! into the current container `Rect` (cell coordinates) via `LayoutNode::reflow`,
+//! then renders per leaf: each leaf `View`'s `cols`/`rows` and `origin` are
+//! updated to its allocation, a viewport snapshot slice is rendered through the
+//! shared `GridRenderer` (translated to the leaf's pixel origin), and the
+//! combined `DrawList` is presented once via the headless software seam.
+//! Layout math remains headless-testable without GPU/window; the software
+//! present proves split/stack/overlay composition.
 
 use bitty_platform::{PhysicalSize, PlatformEvent, WindowEventKind};
 use bitty_pty::{Pty, PtyBuilder};
 use bitty_render::{
     RenderError,
+    frame::{FrameMode, FramePlan},
     glyph::{
         BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
         RasterKey,
     },
     gpu::{PresentStats as RenderPresentStats, Surface},
-    grid::{CellMetrics, GridRenderer},
+    grid::{CellMetrics, DrawList, GridRenderer},
 };
-use bitty_term_state::{Damage, DamageRect, DamagedRegion, State, TerminalAction};
+use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
+use bitty_ui::{Focus, FocusDirection, LayoutNode, Rect as UiRect, View, ViewId};
 use bitty_vt::{Parser, SequenceKind};
 
 use crate::config::RuntimeConfig;
@@ -122,6 +134,74 @@ impl From<RenderPresentStats> for PresentStats {
     }
 }
 
+fn default_layout(cols: usize, rows: usize) -> LayoutNode {
+    let view = View::new(ViewId::new(1), cols, rows);
+    LayoutNode::leaf(view)
+}
+
+fn default_container(cols: usize, rows: usize) -> UiRect {
+    let w = cols.min(u16::MAX as usize) as u16;
+    let h = rows.min(u16::MAX as usize) as u16;
+    UiRect::new(0, 0, w, h)
+}
+
+/// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
+///
+/// The viewport is the top-left `cols x rows` window of the active screen,
+/// padded with erased cells when the requested size exceeds the snapshot
+/// dimensions (honest padding for the deferred grid-resize reflow). Cursor and
+/// modes are carried over; title/modes are snapshot-owned.
+fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Snapshot {
+    let req_w = cols as usize;
+    let req_h = rows as usize;
+    if snapshot.width == req_w && snapshot.height == req_h {
+        return snapshot.clone();
+    }
+    let mut cells = Vec::with_capacity(req_w * req_h);
+    let src_w = snapshot.width;
+    let src_h = snapshot.height;
+    for r in 0..req_h {
+        for c in 0..req_w {
+            if r < src_h && c < src_w {
+                let idx = r * src_w + c;
+                let cell = snapshot.cells.get(idx).cloned().unwrap_or_else(|| {
+                    bitty_term_state::Cell::erased(bitty_term_state::Style::default())
+                });
+                // For the trailing spacer of a wide char that would be split
+                // across the viewport edge, degrade to an erased cell to keep
+                // invariants (no orphan spacer): the leading half outside the
+                // viewport is not visible, so the spacer inside is erased.
+                if cell.spacer && c == 0 {
+                    cells.push(bitty_term_state::Cell::erased(cell.style));
+                } else {
+                    // If this is a wide leading cell at the right edge and its
+                    // spacer would fall outside the viewport, truncate to single
+                    // width to avoid unpaired wide.
+                    let mut out = cell;
+                    if out.width == 2 && c + 1 >= req_w && !out.spacer {
+                        out.width = 1;
+                    }
+                    cells.push(out);
+                }
+            } else {
+                cells.push(bitty_term_state::Cell::erased(
+                    bitty_term_state::Style::default(),
+                ));
+            }
+        }
+    }
+    Snapshot {
+        version: snapshot.version,
+        generation: snapshot.generation,
+        width: req_w,
+        height: req_h,
+        cells: cells.into_boxed_slice(),
+        cursor: snapshot.cursor.clone(),
+        modes: snapshot.modes.clone(),
+        title: snapshot.title.clone(),
+    }
+}
+
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
 /// renderer, surface, and the bounded cold-path queue.
 ///
@@ -138,6 +218,9 @@ impl From<RenderPresentStats> for PresentStats {
 ///   below and remain unavailable on headless CI.
 /// - **Cold queue**: bounded, drop-oldest when full, observed by the future
 ///   plugin host without ever borrowing hot-path state mutably.
+/// - **Layout + Focus**: owned `LayoutNode` tree and `Focus` state. The tree
+///   is deterministically laid out into the current container `Rect` via
+///   `LayoutNode::reflow`; per-leaf tick renders each `View` allocation.
 ///
 /// # Threading
 ///
@@ -174,6 +257,9 @@ pub struct Runtime {
     pending_full_redraw: bool,
     cols: usize,
     rows: usize,
+    layout: LayoutNode,
+    focus: Focus,
+    container: UiRect,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -185,6 +271,9 @@ impl std::fmt::Debug for Runtime {
             .field("cold_queue_len", &self.cold_queue.len())
             .field("has_pty", &self.pty.is_some())
             .field("pending_full_redraw", &self.pending_full_redraw)
+            .field("leaf_count", &self.layout.leaf_count())
+            .field("focused", &self.focus.focused())
+            .field("container", &self.container)
             .finish_non_exhaustive()
     }
 }
@@ -192,6 +281,9 @@ impl std::fmt::Debug for Runtime {
 impl Runtime {
     /// Creates a runtime from `config`, validating the config eagerly and
     /// building the headless software surface and deterministic renderer.
+    ///
+    /// The initial layout is a single leaf `ViewId(1)` sized to `config`
+    /// cols/rows with focus on that leaf and a container matching the grid.
     ///
     /// # Errors
     ///
@@ -211,9 +303,14 @@ impl Runtime {
         };
         let renderer = GridRenderer::new(HeadlessRasterizer::new(), &query, cell)
             .map_err(RuntimeError::from)?;
+        let cols = config.cols;
+        let rows = config.rows;
+        let layout = default_layout(cols, rows);
+        let focus = Focus::with_focus(ViewId::new(1));
+        let container = default_container(cols, rows);
         Ok(Self {
-            cols: config.cols,
-            rows: config.rows,
+            cols,
+            rows,
             config: config.clone(),
             parser: Parser::new(),
             state: State::new(),
@@ -223,7 +320,9 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             last_presented_generation: u64::MAX,
             pending_full_redraw: true,
-            // pty size mirrors grid until resize arrives
+            layout,
+            focus,
+            container,
         })
     }
 
@@ -296,6 +395,121 @@ impl Runtime {
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         let raw = self.surface.headless_rgba()?;
         Some(raw)
+    }
+
+    // ------------------------------------------------------------------
+    // Layout + Focus ownership (CTX-0023)
+    // ------------------------------------------------------------------
+
+    /// Immutable view of the owned layout tree.
+    #[must_use]
+    pub fn layout(&self) -> &LayoutNode {
+        &self.layout
+    }
+
+    /// Mutable view of the owned layout tree.
+    #[must_use]
+    pub fn layout_mut(&mut self) -> &mut LayoutNode {
+        &mut self.layout
+    }
+
+    /// Replaces the owned layout tree.
+    ///
+    /// The new tree's leaf `View`s are kept as provided; `tick` will reflow
+    /// them into the current container on the next frame. Focus is retained
+    /// when the focused `ViewId` still exists, otherwise it moves to the
+    /// first leaf (if any) or clears.
+    pub fn set_layout(&mut self, layout: LayoutNode) {
+        self.layout = layout;
+        let leaf_ids = self.layout.leaf_ids();
+        if leaf_ids.is_empty() {
+            self.focus.clear();
+        } else if let Some(focused) = self.focus.focused() {
+            if !leaf_ids.contains(&focused) {
+                self.focus.set(leaf_ids[0]);
+            }
+        } else {
+            self.focus.set(leaf_ids[0]);
+        }
+        self.pending_full_redraw = true;
+    }
+
+    /// Owned focus state.
+    #[must_use]
+    pub fn focus(&self) -> &Focus {
+        &self.focus
+    }
+
+    /// Mutable focus state.
+    #[must_use]
+    pub fn focus_mut(&mut self) -> &mut Focus {
+        &mut self.focus
+    }
+
+    /// Currently focused view, if any.
+    #[must_use]
+    pub fn focused_view(&self) -> Option<ViewId> {
+        self.focus.focused()
+    }
+
+    /// Sets focus to `id` when it exists in the current layout; otherwise
+    /// leaves focus unchanged and returns `false`.
+    pub fn set_focus(&mut self, id: ViewId) -> bool {
+        if self.layout.leaf_ids().contains(&id) {
+            self.focus.set(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Moves focus in `dir` using the layout's deterministic adjacency.
+    ///
+    /// Returns the new focused view (if any) and updates internal focus.
+    pub fn move_focus(&mut self, dir: FocusDirection) -> Option<ViewId> {
+        let next = self.focus.advance(&self.layout, self.container, dir);
+        if let Some(id) = next {
+            self.focus.set(id);
+        }
+        next
+    }
+
+    /// Container rect (cell coordinates) that the layout is reflowed into.
+    #[must_use]
+    pub fn container(&self) -> UiRect {
+        self.container
+    }
+
+    /// Sets the container rect directly (cell coordinates). The container is
+    /// also updated automatically by `handle_resize` via pixel-to-cell
+    /// conversion; this setter exists for headless tests that drive layout
+    /// without a physical surface.
+    pub fn set_container(&mut self, rect: UiRect) {
+        self.container = rect;
+        self.pending_full_redraw = true;
+    }
+
+    /// Current leaf allocations `(ViewId, Rect)` in deterministic depth-first
+    /// order, computed from the last reflowed layout or the current container
+    /// without mutating the tree (pure `LayoutNode::layout`).
+    #[must_use]
+    pub fn layout_allocations(&self) -> Vec<(ViewId, UiRect)> {
+        self.layout.layout(self.container)
+    }
+
+    /// Leaf count of the current layout.
+    #[must_use]
+    pub fn leaf_count(&self) -> usize {
+        self.layout.leaf_count()
+    }
+
+    /// Reflows the layout into the current container, mutating each leaf
+    /// `View`'s `cols`/`rows`/`origin` to match its allocation. Returns the
+    /// allocations for inspection. Deterministic over the same layout and
+    /// container.
+    pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
+        self.layout.reflow(self.container);
+        self.layout.layout(self.container)
     }
 
     /// Spawns `program` inside a PTY sized to the current grid, storing the
@@ -376,13 +590,13 @@ impl Runtime {
     }
 
     /// Handles a physical-pixel resize: recomputes the grid size from the
-    /// configured cell metrics, reconfigures the software surface, and
-    /// resizes the PTY when present. Grid memory resize (the state reflow
-    /// algorithm) is deferred per the terminal-state-rfc open item, so the
-    /// state grid stays at its current dimensions while the surface and PTY
-    /// reflect the new window size honestly. Zero-sized extents are skipped
-    /// (minimized/occluded windows) per the `map_resize_to_surface_extent`
-    /// contract.
+    /// configured cell metrics, reconfigures the software surface, updates
+    /// the layout container, reflows leaf views, and resizes the PTY when
+    /// present. Grid memory resize (the state reflow algorithm) is deferred
+    /// per the terminal-state-rfc open item, so the state grid stays at its
+    /// current dimensions while the surface and PTY reflect the new window
+    /// size honestly. Zero-sized extents are skipped (minimized/occluded
+    /// windows) per the `map_resize_to_surface_extent` contract.
     ///
     /// # Errors
     ///
@@ -401,6 +615,12 @@ impl Runtime {
         let (new_cols, new_rows) = self.config.grid_from_pixels(size);
         self.cols = new_cols;
         self.rows = new_rows;
+        self.container = default_container(new_cols, new_rows);
+        // Reflow leaf views to new container allocations before the next tick
+        // (tick will also reflow, but doing it here keeps `layout()` view of
+        // leaf sizes consistent immediately after resize for callers that
+        // query without ticking).
+        self.layout.reflow(self.container);
         self.surface
             .headless_resize(size)
             .map_err(RuntimeError::from)?;
@@ -476,12 +696,27 @@ impl Runtime {
     /// depends on this property. The first frame after creation or resize
     /// forces a full redraw.
     ///
+    /// Multi-pane: the layout tree is reflowed into the current container;
+    /// each leaf `View`'s `cols`/`rows`/`origin` are updated via
+    /// `LayoutNode::reflow`. Then each leaf is rendered: a viewport snapshot
+    /// sized to the leaf's dimensions is built from the shared `State`
+    /// snapshot (headless seam, no GPU/window required), rendered through the
+    /// shared `GridRenderer` with a full-damage hint, and its `DrawList`
+    /// translated to the leaf's pixel origin. The per-leaf `DrawList`s are
+    /// combined and presented once via `Surface::headless_present`.
+    ///
     /// The software seam composites `DrawList + Atlas` onto an owned RGBA
     /// buffer via `Surface::headless_present`; no display server or adapter
     /// is touched. Real GPU present remains env-gated (`BITTY_RENDER_GPU_TESTS=1`)
     /// and is not available on headless CI — `is_headless` is `true` for
     /// every present this method emits today.
     pub fn tick(&mut self) -> Option<PresentStats> {
+        // Reflow layout tree into container before rendering so leaf Views
+        // carry deterministic origins/sizes for this frame. This is headless
+        // and deterministic: same layout + container always yields same
+        // allocations.
+        self.layout.reflow(self.container);
+
         let snapshot = self.state.snapshot();
         let pending_full = self.pending_full_redraw;
         let last = self.last_presented_generation;
@@ -492,53 +727,195 @@ impl Runtime {
             return None;
         }
 
-        let damage = if pending_full || last == u64::MAX {
-            Damage {
-                generation: current_gen,
-                regions: vec![DamagedRegion::Grid(DamageRect::full(
-                    snapshot.height as u16,
-                    snapshot.width as u16,
-                ))]
-                .into_boxed_slice(),
+        // Collect allocations deterministically; empty layout -> idle (no leaf to present).
+        let allocations = self.layout.layout(self.container);
+        if allocations.is_empty() {
+            self.last_presented_generation = current_gen;
+            self.pending_full_redraw = false;
+            return None;
+        }
+
+        // Build the combined DrawList by rendering each leaf's viewport.
+        let mut combined_fills = Vec::new();
+        let mut combined_glyphs = Vec::new();
+        let mut any_needs_draw = false;
+
+        // For damage, we treat any new generation or pending_full as full
+        // per leaf (over-damage safe, deterministic). If generation gap is
+        // large and regions empty, also full. Otherwise still full for
+        // correctness with viewport slicing.
+        let use_full = pending_full
+            || last == u64::MAX
+            || {
+                let gap = current_gen.saturating_sub(last);
+                let regions = self.state.damage_since(last);
+                gap > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64 && regions.is_empty()
             }
-        } else {
-            // Pull coalesced regions since the last presented generation.
-            // When the history window has fallen behind, the returned set may
-            // be incomplete; treat a large gap as a full redraw to keep
-            // correctness over performance.
-            let regions = self.state.damage_since(last);
-            let gap = current_gen.saturating_sub(last);
-            if gap > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64 && regions.is_empty() {
+            || {
+                let regions = self.state.damage_since(last);
+                !regions.is_empty() || pending_full
+            };
+
+        for (_view_id, rect) in &allocations {
+            if rect.is_empty() {
+                continue;
+            }
+            let view_snapshot = viewport_snapshot(&snapshot, rect.width, rect.height);
+            let damage = if use_full || pending_full || last == u64::MAX {
                 Damage {
                     generation: current_gen,
                     regions: vec![DamagedRegion::Grid(DamageRect::full(
-                        snapshot.height as u16,
-                        snapshot.width as u16,
+                        view_snapshot.height as u16,
+                        view_snapshot.width as u16,
                     ))]
                     .into_boxed_slice(),
                 }
             } else {
-                Damage {
-                    generation: current_gen,
-                    regions: regions.into_boxed_slice(),
+                // Incremental path: clip damage_since to viewport bounds.
+                // For this slice we still produce a full per-leaf damage when
+                // any damage exists (over-damage safe), keeping determinism.
+                let regions = self.state.damage_since(last);
+                if regions.is_empty() {
+                    Damage {
+                        generation: current_gen,
+                        regions: Box::new([]),
+                    }
+                } else {
+                    Damage {
+                        generation: current_gen,
+                        regions: vec![DamagedRegion::Grid(DamageRect::full(
+                            view_snapshot.height as u16,
+                            view_snapshot.width as u16,
+                        ))]
+                        .into_boxed_slice(),
+                    }
                 }
+            };
+
+            if damage.regions.is_empty() {
+                continue;
             }
-        };
+
+            let list = match self.renderer.render(&view_snapshot, &damage) {
+                Ok(list) => list,
+                Err(_) => continue,
+            };
+            if !list.needs_draw() {
+                continue;
+            }
+            any_needs_draw = true;
+
+            let origin_px_x = rect.x as i32 * self.config.cell_width as i32;
+            let origin_px_y = rect.y as i32 * self.config.cell_height as i32;
+            for mut fill in list.fills {
+                fill.rect.x += origin_px_x;
+                fill.rect.y += origin_px_y;
+                combined_fills.push(fill);
+            }
+            for mut glyph in list.glyphs {
+                glyph.dest[0] += origin_px_x;
+                glyph.dest[1] += origin_px_y;
+                combined_glyphs.push(glyph);
+            }
+        }
 
         self.pending_full_redraw = false;
-        let list = match self.renderer.render(&snapshot, &damage) {
-            Ok(list) => list,
-            Err(_) => return None,
-        };
-        if !list.needs_draw() {
+
+        if !any_needs_draw && combined_fills.is_empty() && combined_glyphs.is_empty() {
+            // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
+            // But ensure generation advances for idle detection.
             self.last_presented_generation = current_gen;
             return None;
         }
+
+        // Synthesize a DrawList for the combined frame. Plan is not used by
+        // headless_present beyond fill/glyph counts, so we create a minimal
+        // plan that reports needs_draw == true when we have content.
+        let combined_list = {
+            // We need a FramePlan; construct via a dummy damage descriptor that
+            // indicates full. Simplest: reuse empty plan but set dirty_rects
+            // to surface extent so needs_draw is true. Instead we construct a
+            // DrawList manually with a plan that has needs_draw true.
+            // The easiest is to create a FramePlan::default-like but we don't
+            // have that. So we synthesize via render's FramePlan by creating
+            // a dummy DrawList from first leaf and replacing its fills/glyphs.
+            // Instead, construct a DrawList with a plan that has one dirty rect.
+            // Look at FramePlan structure: we can get it from rendering a full
+            // snapshot once and reusing its plan.
+            // For minimal, we will create a plan via the renderer's internal
+            // but we can just create an empty plan with needs_draw = true by
+            // using a helper: we know DrawList::needs_draw checks fills/glyphs,
+            // not plan alone. So plan can be empty as headless_present doesn't
+            // check plan.
+            // Let's create a dummy plan via unsafe uninitialized? Better to just
+            // reuse a plan from first allocation's render if available.
+            // Instead, we will construct a DrawList with a plan that we know
+            // will have dirty_rects covering the surface. We can synthesize by
+            // directly constructing FramePlan via its public fields if any.
+            // Check FramePlan fields - read its definition.
+            // As a shortcut, we will create a DrawList with plan from a full
+            // render of the viewport_snapshot for the container size.
+            // But simpler: we can just create a DrawList with plan that has
+            // needs_draw true by fabricating via bitty_render's test helper?
+            // Most straightforward: create a DrawList with an empty plan that
+            // we override to have a dirty rect, but we don't have constructor.
+            // Workaround: create a DrawList via renderer.render of a 1x1 snapshot
+            // and then replace its fills/glyphs.
+            let tmp_snap = viewport_snapshot(&snapshot, 1, 1);
+            let tmp_damage = Damage {
+                generation: current_gen,
+                regions: vec![DamagedRegion::Grid(DamageRect::full(1, 1))].into_boxed_slice(),
+            };
+            let mut tmp_list = self
+                .renderer
+                .render(&tmp_snap, &tmp_damage)
+                .unwrap_or(DrawList {
+                    generation: current_gen,
+                    plan: FramePlan {
+                        dirty_rects: Vec::new(),
+                        extent: bitty_render::geometry::ExtentPx::new(0, 0),
+                        mode: FrameMode::Clean,
+                    },
+                    fills: Vec::new(),
+                    glyphs: Vec::new(),
+                });
+            // Now replace fills/glyphs with combined, and set plan to indicate full
+            tmp_list.generation = current_gen;
+            tmp_list.fills = combined_fills;
+            tmp_list.glyphs = combined_glyphs;
+            // Ensure plan indicates dirty if we have content; set a dummy dirty rect
+            if tmp_list.fills.is_empty() && tmp_list.glyphs.is_empty() {
+                tmp_list.plan.dirty_rects = Vec::new();
+            } else if tmp_list.plan.dirty_rects.is_empty() {
+                // Fabricate one dirty rect covering the surface extent so
+                // needs_draw logic that might inspect plan still sees work.
+                // The DrawList::needs_draw checks fills/glyphs, so this is
+                // not strictly needed, but we set it for completeness.
+                tmp_list.plan.dirty_rects = vec![bitty_render::geometry::RectPx::new(
+                    0,
+                    0,
+                    self.surface.extent().map(|e| e.width()).unwrap_or(0),
+                    self.surface.extent().map(|e| e.height()).unwrap_or(0),
+                )];
+                tmp_list.plan.mode = FrameMode::Full;
+                tmp_list.plan.extent = bitty_render::geometry::ExtentPx::new(
+                    self.surface.extent().map(|e| e.width()).unwrap_or(0),
+                    self.surface.extent().map(|e| e.height()).unwrap_or(0),
+                );
+            }
+            tmp_list
+        };
+
+        if !combined_list.needs_draw() {
+            self.last_presented_generation = current_gen;
+            return None;
+        }
+
         let atlas_texels = self.renderer.atlas_texels().to_vec();
         let dims = self.renderer.atlas_dims();
         let stats = match self
             .surface
-            .headless_present(&list, Some((&atlas_texels, dims)))
+            .headless_present(&combined_list, Some((&atlas_texels, dims)))
         {
             Ok(stats) => stats,
             Err(_) => return None,
@@ -557,10 +934,15 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_ui::{Rect as UiRect, SplitAxis};
+
+    fn make_runtime() -> Runtime {
+        Runtime::with_defaults().expect("defaults must build")
+    }
 
     #[test]
     fn tick_is_idle_when_no_damage() {
-        let mut rt = Runtime::with_defaults().expect("defaults must build");
+        let mut rt = make_runtime();
         let first = rt.tick().expect("first tick must present full redraw");
         assert!(first.headless);
         assert_eq!(
@@ -572,7 +954,7 @@ mod tests {
 
     #[test]
     fn handle_pty_bytes_flow_reaches_render() {
-        let mut rt = Runtime::with_defaults().expect("defaults must build");
+        let mut rt = make_runtime();
         assert!(rt.tick().is_some());
         rt.handle_pty_bytes(b"hello ");
         let stats = rt.tick().expect("damage from bytes must present");
@@ -582,7 +964,7 @@ mod tests {
 
     #[test]
     fn handle_resize_reconfigures_surface_and_keeps_grid_pending_full_redraw() {
-        let mut rt = Runtime::with_defaults().expect("defaults must build");
+        let mut rt = make_runtime();
         let before = rt.surface_extent().expect("surface must have extent");
         assert_eq!(before, RuntimeConfig::default().pixel_extent());
         rt.handle_resize(PhysicalSize::new(800, 600))
@@ -593,7 +975,7 @@ mod tests {
 
     #[test]
     fn zero_resize_is_skipped_honestly() {
-        let mut rt = Runtime::with_defaults().expect("defaults must build");
+        let mut rt = make_runtime();
         rt.handle_resize(PhysicalSize::new(0, 0))
             .expect("zero resize must not error");
         assert_eq!(
@@ -622,7 +1004,7 @@ mod tests {
 
     #[test]
     fn handle_platform_event_close_semantics() {
-        let mut rt = Runtime::with_defaults().expect("must build");
+        let mut rt = make_runtime();
         let close = rt.handle_platform_event(PlatformEvent::Exiting);
         assert!(close);
         assert!(!rt.handle_platform_event(PlatformEvent::Resumed));
@@ -632,7 +1014,7 @@ mod tests {
 
     #[test]
     fn handle_platform_event_resize_via_handle_resize() {
-        let mut rt = Runtime::with_defaults().expect("must build");
+        let mut rt = make_runtime();
         rt.handle_resize(PhysicalSize::new(320, 240))
             .expect("valid resize");
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(320, 240)));
@@ -641,7 +1023,7 @@ mod tests {
 
     #[test]
     fn spawn_shell_blank_program_rejected_without_touching_pty() {
-        let mut rt = Runtime::with_defaults().expect("must build");
+        let mut rt = make_runtime();
         assert!(rt.spawn_shell("").is_err());
         assert!(rt.spawn_shell("   ").is_err());
     }
@@ -650,9 +1032,290 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_build_still_compiles_with_queue_and_tick() {
-        let mut rt = Runtime::with_defaults().expect("windows defaults must build");
+        let mut rt = make_runtime();
         rt.handle_pty_bytes(b"hi");
         let _ = rt.tick();
         assert!(rt.is_headless());
+    }
+
+    // ------------------------------------------------------------------
+    // CTX-0023: LayoutNode wiring tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_layout_is_single_leaf_and_focused() {
+        let rt = make_runtime();
+        assert_eq!(rt.leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(rt.container(), UiRect::new(0, 0, 80, 24));
+        let allocs = rt.layout_allocations();
+        assert_eq!(allocs.len(), 1);
+        assert_eq!(allocs[0].0, ViewId::new(1));
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 80, 24));
+    }
+
+    #[test]
+    fn set_layout_replaces_tree_and_updates_focus() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(10), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(20), 40, 24)),
+        );
+        rt.set_layout(split);
+        assert_eq!(rt.leaf_count(), 2);
+        // Focus should move to first leaf of new tree since old focus (1) no longer exists
+        assert_eq!(rt.focused_view(), Some(ViewId::new(10)));
+        let ids = rt.layout().leaf_ids();
+        assert_eq!(ids, vec![ViewId::new(10), ViewId::new(20)]);
+    }
+
+    #[test]
+    fn set_layout_retains_focus_when_still_present() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt.set_layout(split);
+        // Focused view 1 still exists, should be retained
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        rt.set_focus(ViewId::new(2));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+        // Replace with another tree containing 2 but not 1 -> focus moves to first leaf
+        let split2 = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+        );
+        rt.set_layout(split2);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(2))); // 2 still present, retained
+        let split3 = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(4), 40, 24)),
+        );
+        rt.set_layout(split3);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(3))); // 2 gone, first leaf becomes focused
+    }
+
+    #[test]
+    fn reflow_updates_view_origins_and_sizes() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 10, 10)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 10, 10)),
+        );
+        rt.set_layout(split);
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let allocs = rt.reflow_layout();
+        assert_eq!(allocs.len(), 2);
+        // Horizontal split 80 cols -> 40 each
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 40, 24));
+        assert_eq!(allocs[1].1, UiRect::new(40, 0, 40, 24));
+        // Views themselves must have been reflowed
+        let v1 = rt.layout().find_leaf(ViewId::new(1)).unwrap();
+        assert_eq!(v1.origin(), bitty_ui::Point::new(0, 0));
+        assert_eq!(v1.cols(), 40);
+        assert_eq!(v1.rows(), 24);
+        let v2 = rt.layout().find_leaf(ViewId::new(2)).unwrap();
+        assert_eq!(v2.origin(), bitty_ui::Point::new(40, 0));
+        assert_eq!(v2.cols(), 40);
+    }
+
+    #[test]
+    fn focus_movement_next_prev_and_spatial() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt.set_layout(split);
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        rt.reflow_layout();
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        let next = rt.move_focus(FocusDirection::Next);
+        assert_eq!(next, Some(ViewId::new(2)));
+        assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+        let prev = rt.move_focus(FocusDirection::Prev);
+        assert_eq!(prev, Some(ViewId::new(1)));
+        // Spatial right from left pane goes to right pane
+        let right = rt.move_focus(FocusDirection::Right);
+        assert_eq!(right, Some(ViewId::new(2)));
+        let left = rt.move_focus(FocusDirection::Left);
+        assert_eq!(left, Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn tick_with_split_composites_both_leaves_headlessly() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt.set_layout(split);
+        rt.handle_pty_bytes(b"hello");
+        let stats = rt.tick().expect("split tick must present");
+        assert!(stats.headless);
+        assert!(stats.fills > 0);
+        // Both leaves produce fills; total fills should be > single leaf.
+        // Single leaf for 80x24 produces one fill per cell visited; split
+        // produces per-leaf fills translated. So we expect fills roughly double
+        // but at least more than one leaf's minimal.
+        assert!(
+            stats.fills >= 2,
+            "split must composite at least two leaf fills"
+        );
+        let rgba = rt.headless_rgba().expect("rgba after split");
+        assert!(!rgba.is_empty());
+        // Deterministic: second runtime with same layout and bytes must be identical
+        let mut rt2 = make_runtime();
+        let split2 = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt2.set_layout(split2);
+        rt2.handle_pty_bytes(b"hello");
+        let stats2 = rt2.tick().expect("second split must present");
+        let rgba2 = rt2.headless_rgba().expect("second rgba");
+        assert_eq!(stats.fills, stats2.fills);
+        assert_eq!(stats.glyphs, stats2.glyphs);
+        assert_eq!(rgba, rgba2, "deterministic split composition");
+    }
+
+    #[test]
+    fn tick_with_stack_and_overlay_prove_composition() {
+        let mut rt = make_runtime();
+        // Stack: two children full size (second on top)
+        let stack = LayoutNode::stack(vec![
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ]);
+        rt.set_layout(stack);
+        rt.handle_pty_bytes(b"stack");
+        let stats = rt.tick().expect("stack tick must present");
+        assert!(stats.headless);
+        assert!(stats.fills > 0);
+        let rgba_stack = rt.headless_rgba().expect("stack rgba").clone();
+
+        // Overlay: base plus floating overlay
+        let overlay = LayoutNode::overlay(
+            LayoutNode::leaf(View::new(ViewId::new(10), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(20), 20, 10)),
+            UiRect::new(5, 5, 20, 10),
+        );
+        let mut rt2 = make_runtime();
+        rt2.set_layout(overlay);
+        rt2.handle_pty_bytes(b"overlay");
+        let stats2 = rt2.tick().expect("overlay tick must present");
+        assert!(stats2.headless);
+        let rgba_overlay = rt2.headless_rgba().expect("overlay rgba");
+        assert_ne!(
+            rgba_stack, rgba_overlay,
+            "different compositions produce different pixels"
+        );
+        // Overlay must still be deterministic
+        let mut rt3 = make_runtime();
+        let overlay2 = LayoutNode::overlay(
+            LayoutNode::leaf(View::new(ViewId::new(10), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(20), 20, 10)),
+            UiRect::new(5, 5, 20, 10),
+        );
+        rt3.set_layout(overlay2);
+        rt3.handle_pty_bytes(b"overlay");
+        rt3.tick().expect("overlay replay");
+        assert_eq!(rgba_overlay, rt3.headless_rgba().unwrap());
+    }
+
+    #[test]
+    fn tick_with_empty_stack_is_idle() {
+        let mut rt = make_runtime();
+        rt.set_layout(LayoutNode::stack(vec![]));
+        assert_eq!(rt.leaf_count(), 0);
+        assert_eq!(rt.focused_view(), None);
+        // Even with pending full redraw, empty layout has no leaf to present
+        assert_eq!(rt.tick(), None);
+    }
+
+    #[test]
+    fn deterministic_layout_same_tree_same_container() {
+        let mut rt = make_runtime();
+        let tree = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.3,
+            LayoutNode::leaf(View::new(ViewId::new(5), 80, 10)),
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.7,
+                LayoutNode::leaf(View::new(ViewId::new(6), 40, 14)),
+                LayoutNode::leaf(View::new(ViewId::new(7), 40, 14)),
+            ),
+        );
+        rt.set_layout(tree.clone());
+        rt.set_container(UiRect::new(0, 0, 100, 40));
+        let a1 = rt.reflow_layout();
+        let mut rt2 = make_runtime();
+        rt2.set_layout(tree);
+        rt2.set_container(UiRect::new(0, 0, 100, 40));
+        let a2 = rt2.reflow_layout();
+        assert_eq!(a1, a2, "layout must be deterministic");
+    }
+
+    #[test]
+    fn handle_resize_updates_container_and_reflows() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        rt.set_layout(split);
+        // Resize to 800x600 pixels with default cell 8x16 => 100x37 cells
+        rt.handle_resize(PhysicalSize::new(800, 600))
+            .expect("resize");
+        assert_eq!(rt.container(), UiRect::new(0, 0, 100, 37));
+        let allocs = rt.layout_allocations();
+        // Horizontal split of 100 -> 50 each
+        assert_eq!(allocs[0].1.width, 50);
+        assert_eq!(allocs[1].1.width, 50);
+        assert_eq!(allocs[0].1.height, 37);
+    }
+
+    #[test]
+    fn set_container_headless_seam_without_gpu() {
+        let mut rt = make_runtime();
+        let split = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 10, 10)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 10, 10)),
+        );
+        rt.set_layout(split);
+        // Drive layout math headlessly without surface resize
+        rt.set_container(UiRect::new(0, 0, 60, 20));
+        let allocs = rt.layout_allocations();
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 30, 20));
+        assert_eq!(allocs[1].1, UiRect::new(30, 0, 30, 20));
+        // Tick must still present via headless seam (surface is still 640x384,
+        // but layout container is 60x20 cells; rendering will still composite
+        // correctly, and no window is required).
+        rt.handle_pty_bytes(b"headless");
+        assert!(rt.tick().is_some());
+        assert!(rt.is_headless());
+        assert!(rt.headless_rgba().is_some());
     }
 }

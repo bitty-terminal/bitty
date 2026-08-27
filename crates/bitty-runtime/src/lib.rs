@@ -12,8 +12,10 @@
 //!
 //! ```text
 //! PTY bytes --handle_pty_bytes--> Parser --TerminalAction--> State --Snapshot+Damage--tick--> DrawList --present--> Surface
-//!                                       |                         |
-//!                                       +--> bounded cold queue ----+--> plugin runtime (future)
+//!                                       |                         |                ^
+//!                                       +--> bounded cold queue ----+--> plugin runtime   |
+//!                                                                  |
+//!                                                    LayoutNode + Focus --reflow--> View allocations
 //! ```
 //!
 //! - The **hot path** is PTY bytes -> parser -> state -> damage -> render
@@ -23,10 +25,20 @@
 //!   limit (threat T-01). The queue is drained by the future plugin host.
 //! - Platform `Resized` events flow through
 //!   [`Runtime::handle_platform_event`] -> [`Runtime::handle_resize`], which
-//!   reconfigures the surface extent and PTY window size without yet growing
-//!   grid memory — the singular reflow algorithm deferred under the
-//!   terminal-state-rfc ("Open items remaining under OQ-007") is not yet
-//!   implemented and is documented honestly.
+//!   reconfigures the surface extent, the layout container, and PTY window
+//!   size. The layout is reflowed deterministically via
+//!   [`LayoutNode::reflow`]; grid memory reflow for the singular terminal
+//!   state is deferred under the terminal-state-rfc ("Open items remaining
+//!   under OQ-007") and is documented honestly.
+//! - Multi-pane: [`Runtime`] owns a [`LayoutNode`] tree and [`Focus`]. Per-leaf
+//!   `tick` reflows the tree into the container `Rect` (cell space) via
+//!   `LayoutNode::reflow`, updates each leaf [`View`]'s `origin`/`cols`/`rows`,
+//!   then renders each leaf's viewport snapshot through the shared
+//!   [`GridRenderer`] (translated to the leaf's pixel origin) and presents
+//!   the combined `DrawList` once via the headless software seam. Layout math
+//!   is headless-testable without GPU/window; `set_layout` and focus moves are
+//!   deterministic. Wide-char selection snapping remains deferred.
+
 //!
 //! # Headless software seam
 //!
@@ -126,3 +138,9 @@ pub use config::RuntimeConfig;
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::{PresentStats, Runtime};
+
+// Re-export layout primitives for ergonomic `Runtime::set_layout` callers.
+// The runtime depends on `bitty-ui` only via these owned value types; no
+// render/platform/pty coupling is introduced through them.
+pub use bitty_ui::{Focus, FocusDirection, LayoutNode, SplitAxis, View, ViewId};
+pub use bitty_ui::{Point as UiPoint, Rect as UiRect, Size as UiSize};

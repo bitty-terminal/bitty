@@ -79,6 +79,50 @@
 //!
 //! Per-event payloads are separately bounded by [`EVENT_MAX_BYTES`] (8 KiB) via
 //! [`BoundedText`] / [`EventPayload::try_text`] — see the payload section.
+//!
+//! # RC-1 / RC-2 and memory ceilings — Open candidate (no Lua VM yet)
+//!
+//! The isolation/resource RFC also proposes `RC-1` (callback CPU/instruction
+//! budget: `10^7` VM instructions or `50 ms` wall clock, warning `8 ms`) and
+//! `RC-2` (memory per plugin `32 MiB`, aggregate `512 MiB`, `RC-6` fd caps).
+//! These dimensions require a Lua VM (`OQ-009` piccolo watch-list) and allocator
+//! accounting; **no VM is wired yet**, so no enforcement is claimed here.
+//! Constants `RC1_INSTRUCTION_BUDGET`, `RC1_WALL_CLOCK_BUDGET_MS`,
+//! `RC1_WARNING_MS`, `RC2_MEMORY_PER_PLUGIN_BYTES` are documented as **Open**
+//! candidate values with follow-up in `CTX-0038` / `OQ-014` tuning. They are
+//! exposed only for harness parameterization and must not be described as
+//! normative until the VM exists and the RFC moves `Accepted`.
+//!
+//! # Measurement methodology (CTX-0037 harness)
+//!
+//! Budgets are proven **headless, deterministic, no window/GPU**, via the
+//! integration harness `crates/bitty-plugin-host/tests/measurement.rs` and the
+//! unit invariants `invariant_queue_bounds` / `invariant_global_bounds`:
+//!
+//! - **Per-subscription `64` strict:** flood one queue past `64` with
+//!   non-coalescable events; assert `len==64`, `dropped==N-64`, FIFO order
+//!   per `DropPolicy`.
+//! - **Per-plugin `1024 events / 256 KiB` aggregate:** publish across two
+//!   queues of one plugin past the aggregate; assert
+//!   `queued_events_for_plugin <= 1024` and `queued_bytes_for_plugin <= 256 KiB`,
+//!   drops counted on target queue, `DropOldest` evicts globally oldest.
+//! - **Global `8192 / 2 MiB`:** storm many plugins; assert `total_queued_*`
+//!   invariants and `invariant_global_bounds` hold; admission control is still
+//!   candidate (not hard-gated) — the harness proves tracking correctness, not
+//!   shedding.
+//! - **Payload `8 KiB`:** `BoundedText::try_new` rejects `> 8 KiB`, truncation
+//!   fits at char boundary, `EventQueue::push` counts oversized as drop.
+//! - **`drain_batch` strict:** never exceeds `max_bytes` even for first event;
+//!   remainder stays queued.
+//! - **Perf counters:** `BudgetSnapshot` captures `total_queued_*`,
+//!   `total_dropped`, per-plugin and per-queue drops, queue counts, and
+//!   adherence flags headless. `PluginHost` delegates the same via
+//!   `total_queued_*`, `queued_*_for_plugin`, `total_dropped`,
+//!   `budget_snapshot`. Host also tracks `publish_count`.
+//!
+//! RFC lifecycle: `Draft -> experimental review evidence -> Accepted ->
+//! normative` per `bitty-docs` workflow. Queue depths are candidate (`OQ-014`);
+//! `DropOldest` is accepted for v1 (`OQ-013` closed). RC-1/RC-2 remain `Open`.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -545,6 +589,113 @@ pub const DEFAULT_BATCH_EVENTS: usize = 32;
 /// Proposed default batch byte limit (8 KiB, also `BATCH_MAX_BYTES`).
 pub const DEFAULT_BATCH_BYTES: usize = 8 * 1024;
 
+// ── RC-1 / RC-2 open budgets — no VM yet (candidate, OQ-014) ─────────────
+
+/// RC-1 instruction budget candidate (Open, no VM yet): `10^7` VM instructions.
+///
+/// Documented for harness parameterization; not enforced until the Lua VM
+/// (`OQ-009` piccolo) exists. Do not describe as normative.
+pub const RC1_INSTRUCTION_BUDGET: u64 = 10_000_000;
+
+/// RC-1 wall-clock budget candidate (Open): `50 ms` per callback.
+pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
+
+/// RC-1 warning threshold candidate (Open): `8 ms` (candidate warning before hard limit).
+pub const RC1_WARNING_MS: u64 = 8;
+
+/// RC-2 per-plugin memory ceiling candidate (Open, no allocator accounting yet): `32 MiB`.
+pub const RC2_MEMORY_PER_PLUGIN_BYTES: usize = 32 * 1024 * 1024;
+
+/// RC-3 aggregate plugin memory candidate (Open): `512 MiB` for all plugins.
+pub const RC2_MEMORY_AGGREGATE_BYTES: usize = 512 * 1024 * 1024;
+
+/// RC-6 per-plugin file descriptor cap candidate (Open): `16` concurrently open.
+pub const RC6_FD_PER_PLUGIN: usize = 16;
+
+// ── Budget snapshot — perf counters for budget adherence ─────────────────
+
+/// Headless snapshot of queue budget adherence at a point in time.
+///
+/// All fields are derived from `EventPipeline` / `PluginHost` live queue
+/// state (`total_queued_*`, `queued_*_for_plugin`, `dropped`, queue counts)
+/// plus the `RC-5` limits, so the snapshot is deterministic and needs no
+/// wall-clock or GPU. Used by the `tests/measurement.rs` harness and
+/// `bitty plugin doctor` diagnostics.
+///
+/// # RFC lifecycle
+///
+/// Queue depth limits are candidate (`OQ-014`); `DropOldest` is accepted for
+/// v1 (`OQ-013` closed). RC-1/RC-2 memory ceilings remain `Open` (no VM).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetSnapshot {
+    /// Per-subscription limit (`PER_SUBSCRIPTION_QUEUE_LIMIT`, 64).
+    pub per_subscription_limit: usize,
+    /// Per-plugin event limit (`PER_PLUGIN_QUEUED_EVENT_LIMIT`, 1024).
+    pub per_plugin_event_limit: usize,
+    /// Per-plugin bytes limit (`PER_PLUGIN_QUEUED_BYTES_LIMIT`, 256 KiB).
+    pub per_plugin_bytes_limit: usize,
+    /// Global event limit (`GLOBAL_QUEUED_EVENT_LIMIT`, 8192).
+    pub global_event_limit: usize,
+    /// Global bytes limit (`GLOBAL_QUEUED_BYTES_LIMIT`, 2 MiB).
+    pub global_bytes_limit: usize,
+    /// Total queued events across all queues.
+    pub total_queued_events: usize,
+    /// Total queued payload bytes across all queues.
+    pub total_queued_bytes: usize,
+    /// Total dropped events (sum of per-queue `dropped`).
+    pub total_dropped: u64,
+    /// Queued events per plugin.
+    pub per_plugin_events: BTreeMap<String, usize>,
+    /// Queued bytes per plugin.
+    pub per_plugin_bytes: BTreeMap<String, usize>,
+    /// Dropped events per `(plugin, kind)` queue.
+    pub per_queue_dropped: BTreeMap<(String, String), u64>,
+    /// Number of queues.
+    pub queue_count: usize,
+    /// Whether every queue respects `per_subscription_limit` (strict).
+    pub per_subscription_hold: bool,
+    /// Whether every plugin respects `per_plugin_*` aggregates.
+    pub per_plugin_hold: bool,
+    /// Whether global respects `global_*` aggregates.
+    pub global_hold: bool,
+    /// Total `publish` calls observed (perf counter).
+    pub publish_count: u64,
+}
+
+impl BudgetSnapshot {
+    /// Whether all three levels hold (`true` means fully adherent at snapshot time).
+    #[must_use]
+    pub fn invariants_hold(&self) -> bool {
+        self.per_subscription_hold && self.per_plugin_hold && self.global_hold
+    }
+
+    /// Global event utilization `0.0..1.0+` (may exceed 1.0 if over limit before clamp).
+    #[must_use]
+    pub fn utilization_global_events(&self) -> f64 {
+        self.total_queued_events as f64 / self.global_event_limit as f64
+    }
+
+    /// Global byte utilization.
+    #[must_use]
+    pub fn utilization_global_bytes(&self) -> f64 {
+        self.total_queued_bytes as f64 / self.global_bytes_limit as f64
+    }
+
+    /// Per-plugin event utilization for `plugin_id`.
+    #[must_use]
+    pub fn utilization_per_plugin_events(&self, plugin_id: &str) -> f64 {
+        self.per_plugin_events.get(plugin_id).copied().unwrap_or(0) as f64
+            / self.per_plugin_event_limit as f64
+    }
+
+    /// Per-plugin byte utilization.
+    #[must_use]
+    pub fn utilization_per_plugin_bytes(&self, plugin_id: &str) -> f64 {
+        self.per_plugin_bytes.get(plugin_id).copied().unwrap_or(0) as f64
+            / self.per_plugin_bytes_limit as f64
+    }
+}
+
 // ── per-subscriber bounded queue ────────────────────────────────────────
 
 /// Bounded FIFO queue for one `(plugin, event-type)` subscription.
@@ -750,6 +901,7 @@ pub struct EventPipeline {
     drop_policy: DropPolicy,
     interception_timeout_ms: Option<u64>,
     observation_soft_limit_ms: Option<u64>,
+    publish_count: u64,
 }
 
 impl EventPipeline {
@@ -769,7 +921,14 @@ impl EventPipeline {
             drop_policy,
             interception_timeout_ms: None,
             observation_soft_limit_ms: None,
+            publish_count: 0,
         }
+    }
+
+    /// Total `publish` / `publish_to` calls observed (perf counter).
+    #[must_use]
+    pub fn publish_count(&self) -> u64 {
+        self.publish_count
     }
 
     /// Drop policy for this pipeline.
@@ -837,6 +996,7 @@ impl EventPipeline {
     /// at the plugin aggregate (evict oldest across the plugin, or drop newest).
     /// Global budgets are tracked via `total_queued_*` but not gated (candidate).
     pub fn publish(&mut self, event: Event) {
+        self.publish_count = self.publish_count.wrapping_add(1);
         let kind_str = event.kind.as_str().to_string();
         let targets: Vec<(String, String)> = self
             .queues
@@ -869,6 +1029,7 @@ impl EventPipeline {
 
     /// Publish to a specific subscriber (lifecycle, delivered to owning plugin only).
     pub fn publish_to(&mut self, plugin_id: &PluginId, event: Event) -> Result<(), PluginError> {
+        self.publish_count = self.publish_count.wrapping_add(1);
         if self.would_exceed_plugin_limits(plugin_id.as_str(), &event) {
             let key = (
                 plugin_id.as_str().to_string(),
@@ -1102,6 +1263,48 @@ impl EventPipeline {
     pub fn invariant_global_bounds(&self) -> bool {
         self.total_queued_events() <= GLOBAL_QUEUED_EVENT_LIMIT
             && self.total_queued_bytes() <= GLOBAL_QUEUED_BYTES_LIMIT
+    }
+
+    /// Capture a headless budget adherence snapshot (perf counters).
+    ///
+    /// Deterministic and headless: all fields are computed from live queue
+    /// state and the RC-5 limits. Use in `tests/measurement.rs` harness and
+    /// `bitty plugin doctor` diagnostics. `publish_count` is the monotonic
+    /// `publish`/`publish_to` counter.
+    #[must_use]
+    pub fn budget_snapshot(&self) -> BudgetSnapshot {
+        let mut per_plugin_events: BTreeMap<String, usize> = BTreeMap::new();
+        let mut per_plugin_bytes: BTreeMap<String, usize> = BTreeMap::new();
+        for ((pid, _), q) in &self.queues {
+            *per_plugin_events.entry(pid.clone()).or_default() += q.len();
+            *per_plugin_bytes.entry(pid.clone()).or_default() += q.queued_bytes();
+        }
+        let per_subscription_hold = self.queues.values().all(|q| q.len() <= q.capacity());
+        let per_plugin_hold = per_plugin_events
+            .values()
+            .all(|&c| c <= PER_PLUGIN_QUEUED_EVENT_LIMIT)
+            && per_plugin_bytes
+                .values()
+                .all(|&b| b <= PER_PLUGIN_QUEUED_BYTES_LIMIT);
+        let global_hold = self.invariant_global_bounds();
+        BudgetSnapshot {
+            per_subscription_limit: PER_SUBSCRIPTION_QUEUE_LIMIT,
+            per_plugin_event_limit: PER_PLUGIN_QUEUED_EVENT_LIMIT,
+            per_plugin_bytes_limit: PER_PLUGIN_QUEUED_BYTES_LIMIT,
+            global_event_limit: GLOBAL_QUEUED_EVENT_LIMIT,
+            global_bytes_limit: GLOBAL_QUEUED_BYTES_LIMIT,
+            total_queued_events: self.total_queued_events(),
+            total_queued_bytes: self.total_queued_bytes(),
+            total_dropped: self.total_dropped(),
+            per_plugin_events,
+            per_plugin_bytes,
+            per_queue_dropped: self.dropped_per_queue(),
+            queue_count: self.queue_count(),
+            per_subscription_hold,
+            per_plugin_hold,
+            global_hold,
+            publish_count: self.publish_count,
+        }
     }
 }
 

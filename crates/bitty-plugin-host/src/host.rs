@@ -12,8 +12,9 @@ use std::collections::{BTreeSet, VecDeque};
 use crate::capability::CapabilityId;
 use crate::error::PluginError;
 use crate::event::{
-    DEFAULT_BATCH_BYTES, DEFAULT_BATCH_EVENTS, DEFAULT_QUEUE_CAPACITY, DropPolicy, Event,
-    EventKind, EventPipeline,
+    BudgetSnapshot, DEFAULT_BATCH_BYTES, DEFAULT_BATCH_EVENTS, DEFAULT_QUEUE_CAPACITY, DropPolicy,
+    Event, EventKind, EventPipeline, GLOBAL_QUEUED_BYTES_LIMIT, GLOBAL_QUEUED_EVENT_LIMIT,
+    PER_PLUGIN_QUEUED_BYTES_LIMIT, PER_PLUGIN_QUEUED_EVENT_LIMIT, PER_SUBSCRIPTION_QUEUE_LIMIT,
 };
 use crate::grant::{GrantRecord, GrantStore};
 use crate::manifest::{FsAccess, PluginId, PluginManifest};
@@ -509,6 +510,96 @@ impl PluginHost {
     ) -> Result<Vec<Event>, PluginError> {
         self.pipeline
             .drain_batch(plugin_id, kind, DEFAULT_BATCH_EVENTS, DEFAULT_BATCH_BYTES)
+    }
+
+    /// Total queued events across all queues (global, RC-5 global limit 8192).
+    #[must_use]
+    pub fn total_queued_events(&self) -> usize {
+        self.pipeline.total_queued_events()
+    }
+
+    /// Total queued payload bytes across all queues (global, RC-5 global limit 2 MiB).
+    #[must_use]
+    pub fn total_queued_bytes(&self) -> usize {
+        self.pipeline.total_queued_bytes()
+    }
+
+    /// Queued events for one plugin (aggregate, RC-5 per-plugin limit 1024).
+    #[must_use]
+    pub fn queued_events_for_plugin(&self, plugin_id: &PluginId) -> usize {
+        self.pipeline.queued_events_for_plugin(plugin_id.as_str())
+    }
+
+    /// Queued payload bytes for one plugin (RC-5 per-plugin limit 256 KiB).
+    #[must_use]
+    pub fn queued_bytes_for_plugin(&self, plugin_id: &PluginId) -> usize {
+        self.pipeline.queued_bytes_for_plugin(plugin_id.as_str())
+    }
+
+    /// Total dropped events across all queues (attributed, for `bitty plugin doctor`).
+    #[must_use]
+    pub fn total_dropped(&self) -> u64 {
+        self.pipeline.total_dropped()
+    }
+
+    /// Per-queue dropped counts `(plugin_id, event_kind) -> dropped`.
+    #[must_use]
+    pub fn dropped_per_queue(&self) -> std::collections::BTreeMap<(String, String), u64> {
+        self.pipeline.dropped_per_queue()
+    }
+
+    /// Total `publish` / `publish_to` calls observed (perf counter).
+    #[must_use]
+    pub fn publish_count(&self) -> u64 {
+        self.pipeline.publish_count()
+    }
+
+    /// Headless budget adherence snapshot (perf counters for `tests/measurement.rs`).
+    #[must_use]
+    pub fn budget_snapshot(&self) -> BudgetSnapshot {
+        self.pipeline.budget_snapshot()
+    }
+
+    /// Whether per-subscription, per-plugin, and global invariants all hold.
+    #[must_use]
+    pub fn invariant_queue_bounds(&self) -> bool {
+        self.pipeline.invariant_queue_bounds()
+    }
+
+    /// Whether global bounds hold (candidate, RC-5 global 8192 / 2 MiB).
+    #[must_use]
+    pub fn invariant_global_bounds(&self) -> bool {
+        self.pipeline.invariant_global_bounds()
+    }
+
+    /// Per-subscription queue limit (64).
+    #[must_use]
+    pub const fn per_subscription_limit(&self) -> usize {
+        PER_SUBSCRIPTION_QUEUE_LIMIT
+    }
+
+    /// Per-plugin queued event limit (1024).
+    #[must_use]
+    pub const fn per_plugin_event_limit(&self) -> usize {
+        PER_PLUGIN_QUEUED_EVENT_LIMIT
+    }
+
+    /// Per-plugin queued bytes limit (256 KiB).
+    #[must_use]
+    pub const fn per_plugin_bytes_limit(&self) -> usize {
+        PER_PLUGIN_QUEUED_BYTES_LIMIT
+    }
+
+    /// Global queued event limit (8192).
+    #[must_use]
+    pub const fn global_event_limit(&self) -> usize {
+        GLOBAL_QUEUED_EVENT_LIMIT
+    }
+
+    /// Global queued bytes limit (2 MiB).
+    #[must_use]
+    pub const fn global_bytes_limit(&self) -> usize {
+        GLOBAL_QUEUED_BYTES_LIMIT
     }
 
     // ── side queue (ADR-0003 rule 4) ──────────────────────────────────

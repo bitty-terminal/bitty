@@ -96,20 +96,25 @@
 //!   deferred to the accepted text/rfc open items; resize currently only
 //!   reconfigures the surface and PTY.
 //!
-//! # Plugin-host wiring (CTX-0027) — draft status, not normative
+//! # Plugin-host wiring (CTX-0027) — draft status, experimental review evidence
 //!
 //! This crate owns a [`bitty_plugin_host::PluginHost`] behind the cold path.
-//! The host tracks the **proposed** `plugin-platform-rfc.md` contract
-//! (`Proposed` / `draft`, `OQ-011..OQ-013`, `OQ-014`). Until that RFC is
-//! accepted via independent review (category owner + docs curator + security
-//! reviewer) and an ADR records acceptance, nothing here claims stable file
-//! formats, frozen capability identifiers, or a settled event-pipeline policy.
+//! The host tracks the `plugin-platform-rfc.md` contract
+//! (`Proposed` / `draft`, `OQ-011..OQ-013`, `OQ-014`; new lifecycle
+//! `Draft -> experimental review evidence -> Accepted -> normative`).
+//! Until that RFC is accepted via independent review (category owner + docs
+//! curator + security reviewer) and an ADR records acceptance, nothing here
+//! claims stable file formats or frozen capability identifiers; the
+//! experimental implementation serves as review evidence and carries no
+//! compatibility promise.
 //!
 //! - The runtime exposes [`Runtime::register_plugin`], grant-checked stubs
 //!   (`is_capability_granted` / `dispatch_command`), event routing through the
-//!   host's [`bitty_plugin_host::EventPipeline`] with the single shared open
-//!   decision point [`bitty_plugin_host::DropPolicy`] honored, and the bounded
-//!   side queue per ADR-0003 rule 4. The candidate default is `DropOldest`
+//!   host's [`bitty_plugin_host::EventPipeline`] with the **accepted v1 default**
+//!   [`bitty_plugin_host::DropPolicy::DropOldest`] honored (OQ-013 closed
+//!   decision point; experimental review evidence per new RFC lifecycle, RFC
+//!   remains `Proposed` until independent review), and the bounded
+//!   side queue per ADR-0003 rule 4. The v1 default is `DropOldest`
 //!   with pipeline `64` / side `128` and batch `32`/`8 KiB`; see
 //!   [`bitty_plugin_host::event::DropPolicy`] and the RFC § “Delivery, ordering,
 //!   batching, and coalescing” for the authoritative trade-off statement.

@@ -1,15 +1,21 @@
 [package]
 name = "bitty-ui"
+description = "View, layout and selection primitives for Bitty"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["ui", "layout", "terminal", "bitty"]
+categories = ["gui", "data-structures"]
+publish = true
 
 [lints]
 workspace = true
 
 [dependencies]
-bitty-term-state = { path = "../bitty-term-state" }
+bitty-term-state = { version = "0.1.0", path = "../bitty-term-state" }
+
 
 [dev-dependencies]
-bitty-term-state = { path = "../bitty-term-state" }
+bitty-term-state = { version = "0.1.0", path = "../bitty-term-state" }

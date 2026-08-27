@@ -1,20 +1,17 @@
 [package]
 name = "bitty-platform"
+description = "Window and event-loop adapter for Bitty (wraps winit)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["window", "winit", "platform", "bitty"]
+categories = ["gui", "os"]
+publish = true
 
 [lints]
 workspace = true
-
-[dependencies]
-winit = "0.30"
-# ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
-# at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
-# pinned and re-exported; see crate-level ownership rules and src/surface.rs.
-raw-window-handle = "=0.6.2"
-
 [features]
 # Opt-in integration tests that require a live display server (Wayland/X11).
 # They are excluded from CI and from the default test run; execute locally with
@@ -23,7 +20,15 @@ gui-tests = []
 
 # Runs as a plain process entry point (`harness = false`) because winit
 # requires event-loop creation on the OS main thread; see the file header.
+
+[dependencies]
+winit = "0.30"
+# ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
+# at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
+# pinned and re-exported; see crate-level ownership rules and src/surface.rs.
+raw-window-handle = "=0.6.2"
+
+
 [[test]]
 name = "headless_run"
 harness = false
-

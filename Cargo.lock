@@ -148,11 +148,11 @@ dependencies = [
 
 [[package]]
 name = "bitty-agent"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitty-app"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-platform",
  "bitty-runtime",
@@ -160,30 +160,30 @@ dependencies = [
 
 [[package]]
 name = "bitty-config"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitty-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitty-ipc"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitty-lua"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "piccolo",
 ]
 
 [[package]]
 name = "bitty-package"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitty-platform"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "raw-window-handle",
  "winit",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-plugin-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-config",
  "bitty-package",
@@ -200,14 +200,14 @@ dependencies = [
 
 [[package]]
 name = "bitty-pty"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "portable-pty",
 ]
 
 [[package]]
 name = "bitty-render"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-platform",
  "bitty-term-state",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-rich"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-term-state",
  "bitty-vt",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-agent",
  "bitty-ipc",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-term-state"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-vt",
  "proptest",
@@ -251,14 +251,14 @@ dependencies = [
 
 [[package]]
 name = "bitty-ui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bitty-term-state",
 ]
 
 [[package]]
 name = "bitty-vt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vte",
 ]

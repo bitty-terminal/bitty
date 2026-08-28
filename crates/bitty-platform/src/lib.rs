@@ -92,6 +92,7 @@ pub mod app;
 pub mod dpi;
 pub mod error;
 pub mod event;
+pub mod keyboard;
 pub mod surface;
 
 // ADR-0004 wrapper-rule exception: raw display/window handles are the payload
@@ -107,4 +108,5 @@ pub use event::{
     CursorPosition, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, NamedKey,
     PlatformEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
 };
+pub use keyboard::{encode_key_event, encode_named_key};
 pub use surface::{SurfaceTarget, map_resize_to_surface_extent};

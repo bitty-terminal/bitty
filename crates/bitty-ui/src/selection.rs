@@ -457,6 +457,391 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
     out
 }
 
+/// Buffer-anchored position for persistent selection.
+///
+/// `buffer_row` is a zero-based index into the combined scrollback + live grid
+/// buffer: `0` is the oldest retained scrollback line, `sb_len-1` the newest
+/// scrollback line, `sb_len` the live grid's top row (row 0), and
+/// `sb_len + height - 1` the live grid's bottom row. This anchoring survives
+/// scroll (lines move from grid into scrollback with the same `buffer_row`),
+/// and survives `View` scroll offset changes (viewport rows are a window into
+/// the buffer). Headless and deterministic: no I/O, no wall-clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferPos {
+    /// Combined buffer row index.
+    pub buffer_row: usize,
+    /// Cell column (lead column for wide chars).
+    pub col: u16,
+}
+
+impl BufferPos {
+    /// Creates a buffer position.
+    #[must_use]
+    pub const fn new(buffer_row: usize, col: u16) -> Self {
+        Self { buffer_row, col }
+    }
+}
+
+/// Buffer-anchored selection that persists across scroll, scrollback pruning
+/// (when not pruned), and resize (clamped). Conversion to/from the live-grid
+/// `Selection` is explicit via `State` (and optionally `View`).
+///
+/// This is the selection persistence primitive for CTX-0060: a live-grid
+/// `Selection` can be lifted to `PersistentSelection` via
+/// [`PersistentSelection::from_grid_selection`] (anchored to the combined
+/// buffer), survive state mutations, and be resolved back to a live-grid
+/// `Selection` when its buffer rows still map into the current live grid
+/// window. When a buffer row has been pruned (scrollback capacity) or moved
+/// entirely into history, `to_grid_selection` returns `None` and `is_valid`
+/// is `false`; when it survives, `text` extracts the same glyphs deterministically.
+///
+/// Bounded and headless: the stored rows are `usize` and no heap grows beyond
+/// the selection itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PersistentSelection {
+    /// Anchor in buffer coordinates.
+    pub anchor: BufferPos,
+    /// Optional stable line id for the anchor when it was in scrollback
+    /// (None for live-grid anchors). Used to detect pruning.
+    pub anchor_line_id: Option<u64>,
+    /// Focus in buffer coordinates.
+    pub focus: BufferPos,
+    /// Optional stable line id for the focus when it was in scrollback.
+    pub focus_line_id: Option<u64>,
+    /// Kind influences word/line expansion semantics when re-resolved.
+    pub kind: SelectionKind,
+    /// Whether the drag is still active.
+    pub active: bool,
+}
+
+impl PersistentSelection {
+    /// Lifts a live-grid `Selection` (snapshot coordinates) to a buffer-anchored
+    /// persistent selection using the current `State`.
+    ///
+    /// `Selection` rows `0..height-1` map to buffer rows `sb_len + row`. Column
+    /// is preserved (snapped later on resolution). `line_id` is always `None`
+    /// for live-grid selections; scrollback-anchored selections created via
+    /// `from_view_selection` may carry ids.
+    #[must_use]
+    pub fn from_grid_selection(sel: Selection, state: &bitty_term_state::State) -> Self {
+        let sb_len = state.scrollback_len();
+        let map = |pos: CellPos| {
+            let buffer_row = sb_len + pos.row as usize;
+            BufferPos::new(buffer_row, pos.col)
+        };
+        Self {
+            anchor: map(sel.anchor),
+            anchor_line_id: None,
+            focus: map(sel.focus),
+            focus_line_id: None,
+            kind: sel.kind,
+            active: sel.active,
+        }
+    }
+
+    /// Lifts a viewport `Selection` (where `sel` rows are viewport rows `0..rows-1`)
+    /// to a buffer-anchored selection using `View` scroll offset and `State`.
+    ///
+    /// When the view is live (`scroll_offset == 0`) the viewport shows the bottom
+    /// `rows` of the combined buffer; when scrolled, it shows an earlier window.
+    /// This method preserves the logical buffer row so the selection persists
+    /// across `View::scroll_by` and state growth.
+    #[must_use]
+    pub fn from_view_selection(
+        sel: Selection,
+        view: &crate::view::View,
+        state: &bitty_term_state::State,
+    ) -> Self {
+        let sb_len = state.scrollback_len();
+        let total = sb_len + state.height();
+        let rows = view.rows() as usize;
+        let offset = view.scroll_offset().min(sb_len);
+        let start = total.saturating_sub(rows).saturating_sub(offset);
+        let map = |pos: CellPos| {
+            let viewport_row = pos.row as usize;
+            let buffer_row = start + viewport_row;
+            // Resolve line id if buffer row is in scrollback.
+            let line_id = if buffer_row < sb_len {
+                state.scrollback_line(buffer_row).map(|l| l.id)
+            } else {
+                None
+            };
+            (BufferPos::new(buffer_row, pos.col), line_id)
+        };
+        let (anchor, anchor_line_id) = map(sel.anchor);
+        let (focus, focus_line_id) = map(sel.focus);
+        Self {
+            anchor,
+            anchor_line_id,
+            focus,
+            focus_line_id,
+            kind: sel.kind,
+            active: sel.active,
+        }
+    }
+
+    /// Attempts to resolve back to a live-grid `Selection`.
+    ///
+    /// Returns `Some` when both endpoints still map into the current live grid
+    /// window (`sb_len .. sb_len+height-1`) and survive pruning checks;
+    /// `None` when either endpoint has been pruned or now lives in scrollback
+    /// history (use `text` to read buffer content even when not live).
+    #[must_use]
+    pub fn to_grid_selection(&self, state: &bitty_term_state::State) -> Option<Selection> {
+        if !self.is_valid(state) {
+            return None;
+        }
+        let sb_len = state.scrollback_len();
+        let height = state.height();
+        let total = sb_len + height;
+        // Both endpoints must be within live window.
+        let in_live = |bp: BufferPos| bp.buffer_row >= sb_len && bp.buffer_row < total;
+        if !in_live(self.anchor) || !in_live(self.focus) {
+            return None;
+        }
+        let to_cell = |bp: BufferPos| {
+            let row = (bp.buffer_row - sb_len) as u16;
+            let col = bp.col.min(state.width().saturating_sub(1) as u16);
+            CellPos::new(row, col)
+        };
+        let mut sel = Selection {
+            anchor: to_cell(self.anchor),
+            focus: to_cell(self.focus),
+            kind: self.kind,
+            active: self.active,
+        };
+        // Snap wide positions and clamp to current snapshot bounds.
+        let snap = state.snapshot();
+        sel = sel.clamped(&snap).snapped(Some(&snap));
+        Some(sel)
+    }
+
+    /// Attempts to resolve to a viewport `Selection` (rows `0..view.rows-1`).
+    ///
+    /// Returns `Some` when the buffer rows are currently visible in the view's
+    /// viewport window; `None` when outside the window or pruned.
+    #[must_use]
+    pub fn to_view_selection(
+        &self,
+        view: &crate::view::View,
+        state: &bitty_term_state::State,
+    ) -> Option<Selection> {
+        if !self.is_valid(state) {
+            return None;
+        }
+        let sb_len = state.scrollback_len();
+        let total = sb_len + state.height();
+        let rows = view.rows() as usize;
+        let offset = view.scroll_offset().min(sb_len);
+        let start = total.saturating_sub(rows).saturating_sub(offset);
+        let end = start + rows; // exclusive
+        let in_view = |bp: BufferPos| bp.buffer_row >= start && bp.buffer_row < end;
+        if !in_view(self.anchor) || !in_view(self.focus) {
+            return None;
+        }
+        let to_cell = |bp: BufferPos| {
+            let row = (bp.buffer_row - start) as u16;
+            let col = bp.col;
+            CellPos::new(row, col)
+        };
+        let anchor = snap_to_leading(&state.snapshot(), to_cell(self.anchor));
+        let focus = snap_to_leading(&state.snapshot(), to_cell(self.focus));
+        // Clamp viewport rows/cols to view size.
+        let max_row = view.rows().saturating_sub(1);
+        let max_col = view.cols().saturating_sub(1);
+        let clamp_vp = |p: CellPos| CellPos::new(p.row.min(max_row), p.col.min(max_col));
+        Some(Selection {
+            anchor: clamp_vp(anchor),
+            focus: clamp_vp(focus),
+            kind: self.kind,
+            active: self.active,
+        })
+    }
+
+    /// Whether the anchored buffer rows still exist.
+    ///
+    /// For scrollback-anchored endpoints (`line_id.is_some()`) the method checks
+    /// that the buffered row still holds the same logical line id. This detects
+    /// prune drift where the buffer row now points to a different line after
+    /// oldest-first eviction, and also detects pruned ids. For live endpoints
+    /// (`line_id.is_none()`) it checks only combined buffer bounds; column is
+    /// not validated here because it is clamped on resolution. A grid-anchored
+    /// selection that has scrolled into history (`buffer_row < sb_len` without
+    /// an id) remains valid for buffer text extraction (live-grid resolve will
+    /// reject it as not live).
+    #[must_use]
+    pub fn is_valid(&self, state: &bitty_term_state::State) -> bool {
+        let sb_len = state.scrollback_len();
+        let total = sb_len + state.height();
+        let check = |bp: BufferPos, line_id: Option<u64>| {
+            if bp.buffer_row >= total {
+                return false;
+            }
+            if let Some(id) = line_id {
+                if bp.buffer_row >= sb_len {
+                    return false;
+                }
+                match state.scrollback_line(bp.buffer_row) {
+                    Some(line) if line.id == id => {}
+                    _ => return false,
+                }
+            }
+            true
+        };
+        check(self.anchor, self.anchor_line_id) && check(self.focus, self.focus_line_id)
+    }
+
+    /// Extracts the selected text from the combined buffer (scrollback + grid).
+    ///
+    /// This is the buffer-level counterpart to `Selection::text(&Snapshot)`: it
+    /// concatenates glyphs between the two buffer positions row-major, skipping
+    /// spacers and emitting `' '` for blanks, joining rows with `\n`. Returns
+    /// `None` when the selection is not valid (pruned or drifted).
+    ///
+    /// For scrollback-anchored endpoints the buffer row is validated against the
+    /// stored line id and located by id search; if the stored row no longer
+    /// holds the same id (prune shift) the selection is considered pruned.
+    #[must_use]
+    pub fn text(&self, state: &bitty_term_state::State) -> Option<String> {
+        if !self.is_valid(state) {
+            return None;
+        }
+        // Defensive id-located resolve for scrollback endpoints: is_valid already
+        // guarantees scrollback_line(buffer_row).id == stored id, but double-check
+        // here and locate by id to guard against stale buffer_row after pruning.
+        let resolve = |bp: BufferPos, line_id: Option<u64>| -> Option<BufferPos> {
+            if let Some(id) = line_id {
+                let line = state.scrollback_line(bp.buffer_row)?;
+                if line.id != id {
+                    return None;
+                }
+                // Also verify via id search that the line is still at the stored row
+                // (handles prune shift where id moved to a different index).
+                let mut found_idx = None;
+                for (idx, l) in state.scrollback().enumerate() {
+                    if l.id == id {
+                        found_idx = Some(idx);
+                        break;
+                    }
+                }
+                match found_idx {
+                    Some(idx) if idx == bp.buffer_row => Some(bp),
+                    _ => None,
+                }
+            } else {
+                Some(bp)
+            }
+        };
+        let eff_anchor = resolve(self.anchor, self.anchor_line_id)?;
+        let eff_focus = resolve(self.focus, self.focus_line_id)?;
+        // Order endpoints
+        let (start_bp, end_bp) = if eff_anchor.buffer_row < eff_focus.buffer_row
+            || (eff_anchor.buffer_row == eff_focus.buffer_row && eff_anchor.col <= eff_focus.col)
+        {
+            (eff_anchor, eff_focus)
+        } else {
+            (eff_focus, eff_anchor)
+        };
+        let sb_len = state.scrollback_len();
+        let mut out = String::new();
+        for buffer_row in start_bp.buffer_row..=end_bp.buffer_row {
+            let (cells, width) = if buffer_row < sb_len {
+                if let Some(line) = state.scrollback_line(buffer_row) {
+                    (line.cells.clone(), line.cells.len())
+                } else {
+                    continue;
+                }
+            } else {
+                let snap = state.snapshot();
+                let grid_row = buffer_row - sb_len;
+                if grid_row >= snap.height {
+                    continue;
+                }
+                let start = grid_row * snap.width;
+                let end = start + snap.width;
+                if end > snap.cells.len() {
+                    continue;
+                }
+                let slice = snap.cells[start..end].to_vec();
+                (slice.into_boxed_slice(), snap.width)
+            };
+            let col_start = if buffer_row == start_bp.buffer_row {
+                start_bp.col as usize
+            } else {
+                0
+            };
+            let col_end = if buffer_row == end_bp.buffer_row {
+                end_bp.col as usize
+            } else {
+                width.saturating_sub(1)
+            };
+            let mut col = col_start;
+            while col <= col_end && col < width {
+                if let Some(cell) = cells.get(col) {
+                    if cell.spacer {
+                        col += 1;
+                        continue;
+                    }
+                    if cell.is_blank() {
+                        out.push(' ');
+                    } else {
+                        out.push(cell.glyph);
+                    }
+                    if cell.width == 2 {
+                        col += 2;
+                        continue;
+                    }
+                }
+                col += 1;
+            }
+            if buffer_row != end_bp.buffer_row {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    /// Clamps columns to the current state's width (preserving `buffer_row`).
+    ///
+    /// Used after `State::resize` to keep a persistent selection within the new
+    /// geometry without changing its logical buffer row. Column is clamped to
+    /// `width - 1`; wide-char snapping is applied on resolution
+    /// (`to_grid_selection` / `to_view_selection` / `text`) rather than here,
+    /// keeping this operation deterministic and independent of line content.
+    #[must_use]
+    pub fn clamped(&self, state: &bitty_term_state::State) -> Self {
+        let width = state.width() as u16;
+        let clamp_col = |c: u16| {
+            if width == 0 {
+                0
+            } else {
+                c.min(width.saturating_sub(1))
+            }
+        };
+        Self {
+            anchor: BufferPos::new(self.anchor.buffer_row, clamp_col(self.anchor.col)),
+            anchor_line_id: self.anchor_line_id,
+            focus: BufferPos::new(self.focus.buffer_row, clamp_col(self.focus.col)),
+            focus_line_id: self.focus_line_id,
+            kind: self.kind,
+            active: self.active,
+        }
+    }
+
+    /// Clears the selection after a full reset.
+    ///
+    /// FullReset clears scrollback and erases the grid. Any persistent selection
+    /// is therefore no longer anchored to valid content. This helper always
+    /// returns `None` to signal that the caller should drop the persistent
+    /// selection. It is a headless, deterministic convenience for callers that
+    /// observe `TerminalAction::FullReset`; the state parameter is retained
+    /// for API symmetry and future use.
+    #[must_use]
+    pub fn after_full_reset(self, _state: &bitty_term_state::State) -> Option<Self> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

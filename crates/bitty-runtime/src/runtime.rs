@@ -85,10 +85,11 @@ use bitty_render::{
     gpu::{PresentStats as RenderPresentStats, Surface},
     grid::{CellMetrics, DrawList, GridRenderer},
 };
+use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
-    CellPos, Focus, FocusDirection, LayoutNode, Rect as UiRect, Selection, SelectionKind, View,
-    ViewId,
+    CellPos, Focus, FocusDirection, LayoutNode, PersistentSelection, Rect as UiRect, Selection,
+    SelectionKind, View, ViewId,
 };
 use bitty_vt::{ClipboardOp, Parser, SequenceKind};
 
@@ -1016,6 +1017,98 @@ impl Runtime {
     }
 
     // ------------------------------------------------------------------
+    // Scrollback search and selection persistence (CTX-0060) — headless
+    // ------------------------------------------------------------------
+
+    /// Searches scrollback and live grid for `pattern`.
+    ///
+    /// Bounded by [`bitty_term_state::search::SEARCH_MAX_PATTERN_LEN`] and
+    /// [`bitty_term_state::search::SEARCH_MAX_RESULTS`]; headless and deterministic;
+    /// no I/O. Delegates to [`State::search`].
+    #[must_use]
+    pub fn search(&self, pattern: &str, options: SearchOptions) -> Vec<SearchMatch> {
+        self.state.search(pattern, options)
+    }
+
+    /// Convenience: case-sensitive search with default limits.
+    #[must_use]
+    pub fn search_case_sensitive(&self, pattern: &str) -> Vec<SearchMatch> {
+        self.search(pattern, SearchOptions::default())
+    }
+
+    /// Lifts the current live-grid selection to a buffer-anchored persistent
+    /// selection, if any. The returned value survives scroll (lines moving
+    /// from grid into scrollback), `View` scroll offset changes, and resize
+    /// (clamped). Returns `None` when no selection exists.
+    #[must_use]
+    pub fn persistent_selection(&self) -> Option<PersistentSelection> {
+        let sel = self.selection?;
+        Some(PersistentSelection::from_grid_selection(sel, &self.state))
+    }
+
+    /// Attempts to restore a persistent selection into the live-grid selection.
+    ///
+    /// Returns `true` when the persistent buffer rows still map into the
+    /// current live grid window (and survive pruning); `false` when the
+    /// selection has moved into history or been pruned. On `false` the live
+    /// selection is cleared to keep invariants (empty pruned selections never
+    /// linger as stale grid coords). Headless and bounded.
+    pub fn restore_persistent_selection(&mut self, pers: PersistentSelection) -> bool {
+        if let Some(sel) = pers.to_grid_selection(&self.state) {
+            self.selection = Some(sel);
+            self.selection_dragging = sel.active;
+            true
+        } else {
+            // Buffer is either pruned or now in history: clear live selection.
+            // Caller may still use `pers.text(&state)` for history highlight.
+            self.selection = None;
+            self.selection_dragging = false;
+            false
+        }
+    }
+
+    /// Returns the buffer text for a persistent selection, if still valid.
+    ///
+    /// This reads from scrollback + live grid according to the persistent
+    /// buffer rows, so a selection that has scrolled into history still yields
+    /// its original text (unless pruned). Headless.
+    #[must_use]
+    pub fn persistent_selection_text(&self, pers: &PersistentSelection) -> Option<String> {
+        pers.text(&self.state)
+    }
+
+    /// Whether a persistent selection is still valid against the current state
+    /// (not pruned, buffer rows in bounds).
+    #[must_use]
+    pub fn is_persistent_selection_valid(&self, pers: &PersistentSelection) -> bool {
+        pers.is_valid(&self.state)
+    }
+
+    /// View-aware persistence: lifts a viewport `Selection` (viewport rows) to
+    /// a persistent selection anchored to the combined buffer (respects `View`
+    /// scroll offset). Headless.
+    #[must_use]
+    pub fn persistent_selection_from_view(
+        &self,
+        sel: Selection,
+        view: &View,
+    ) -> PersistentSelection {
+        PersistentSelection::from_view_selection(sel, view, &self.state)
+    }
+
+    /// View-aware restore: attempts to map a persistent selection back into a
+    /// viewport `Selection` for the given `View`. Returns `None` when the
+    /// selection is outside the current viewport window or pruned.
+    #[must_use]
+    pub fn persistent_to_view_selection(
+        &self,
+        pers: &PersistentSelection,
+        view: &View,
+    ) -> Option<Selection> {
+        pers.to_view_selection(view, &self.state)
+    }
+
+    // ------------------------------------------------------------------
     // Plugin-host wiring (CTX-0027) — draft, headless, no window/GPU/Lua
     // ------------------------------------------------------------------
 
@@ -1707,6 +1800,14 @@ impl Runtime {
                 // Bridge damage generation as well.
                 self.plugin_host
                     .push_observation(HostObservation::Damage { generation });
+            }
+            // Selection persistence (CTX-0060): FullReset erases grid and scrollback,
+            // so any live selection is no longer anchored to valid content.
+            // ED 3 (EraseDisplayMode::Scrollback) clears scrollback history but
+            // leaves the live grid; live-grid selections remain valid. We only
+            // clear on FullReset here; scrollback-only clears keep live selection.
+            if matches!(action, TerminalAction::FullReset) {
+                self.clear_selection();
             }
         }
     }

@@ -63,6 +63,7 @@ pub mod image;
 pub mod modes;
 pub mod replies;
 pub mod scrollback;
+pub mod search;
 mod state;
 mod tabs;
 

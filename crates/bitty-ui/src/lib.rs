@@ -60,6 +60,7 @@ pub use focus::{Focus, FocusDirection};
 pub use geometry::{Point, Rect, Size, SplitAxis};
 pub use layout::{LayoutNode, clamp_ratio, split_rect};
 pub use selection::{
-    CellPos, Selection, SelectionKind, SelectionRange, is_word_char, snap_to_leading,
+    BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
+    is_word_char, snap_to_leading,
 };
 pub use view::{View, ViewId};

@@ -20,8 +20,8 @@ status: draft
   `6a8dae4b-2aec-83ea-9174-03abc1f81531`; English rendering, not reproduced).
   Nothing here is accepted direction, a roadmap commitment, or authorization
   to publish — it is a reviewable proposal awaiting independent review.
-- Ownership: bitty CTX-0044 (updated CTX-0049). Companion implementation
-  is bitty CTX-0043 `chore(crate): prepare workspace for crates.io v0.1.0`
+- Ownership: bitty CTX-0044 (updated CTX-0049, CTX-0050). Companion
+  implementation is bitty CTX-0043 `chore(crate): prepare workspace for crates.io v0.1.0`
   — branch `ctx-0043/chore-crate-publish`, PR #74 — which set
   `workspace.package.version 0.0.0 -> 0.1.0`, added
   `description`/`license`/`repository`/`keywords`/`categories` workspace
@@ -193,6 +193,72 @@ align with the `v0.5`/`v0.6`/`v0.8`/`v0.9` slices.
   `cargo test --workspace --all-targets --locked` PASS,
   `actionlint` PASS, `markdownlint` PASS.
 
+### v0.1 slice evidence (CTX-0050 — `ctx-0050/feat-minimal-terminal`) — implemented, draft
+
+CTX-0050 implements the `v0.1` row — Minimal Correct Terminal
+(`vt` + `pty` + `term-state` + `platform` + `config` + `render` + `ui` + `runtime` + `app`;
+`package`/`lua` leaves ready but not on the hot path per CTX-0049) — as a
+**headless, deterministic, bounded** slice. Status remains **draft** until
+independent review; this section records evidence, not acceptance.
+
+- **Shell echo (headless, deterministic replay):**
+  `crates/bitty-runtime/tests/v01_minimal_terminal.rs::v01_shell_echo_headless_and_deterministic_replay`
+  feeds the same synthetic shell byte stream (`"bitty"` + SGR + OSC title + BEL)
+  as one chunk, byte-by-byte, and split mid-escape; each path yields identical
+  `Snapshot` text/generation/title and identical `PresentStats` fills/glyphs and
+  bit-identical `headless_rgba`. The stream exercises
+  `PTY bytes -> VT Parser -> TerminalAction -> State -> Snapshot + Damage -> GridRenderer -> Surface::headless_present`
+  without window, GPU, or filesystem. Existing
+  `bitty-vt` replay tests (`parser::tests::action_stream_identical_across_chunkings`,
+  `tests/replay.rs` fixtures `shell_session`, `escape_storm`) and
+  `bitty-runtime::tests::handle_pty_bytes_flow_reaches_render`
+  provide the parser/state leg of the same contract.
+- **Resize (headless, honest):**
+  `v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically`
+  proves `Runtime::handle_resize(PhysicalSize::new(800, 600))` recomputes the
+  logical grid from `RuntimeConfig::grid_from_pixels` (800×600 → 100×37 cells at
+  8×16), reconfigures the `Surface::headless` extent, reflows `LayoutNode` leaf
+  allocations (horizontal split 100 → 50+50), and forces a full redraw; a
+  zero-sized resize is correctly skipped per
+  `bitty_platform::map_resize_to_surface_extent` (minimized/occluded contract).
+  Covered also by `bitty-runtime::tests::handle_resize_reconfigures_surface_and_keeps_grid_pending_full_redraw`,
+  `zero_resize_is_skipped_honestly`, `handle_resize_updates_container_and_reflows`
+  and `bitty-app` `handle_resize` path via `PlatformEvent`.
+- **Backpressure (bounded, no growth):**
+  `v01_backpressure_bounded_no_growth` asserts the hard bound
+  `MAX_BUFFERED_BYTES = READ_CHUNK_SIZE (8 KiB) × CHANNEL_CAPACITY_CHUNKS (16) = 128 KiB`
+  and drives the runtime's bounded queues headlessly:
+  `ColdQueue` capacity 2 with 5 title OSCs → `len == 2`, `dropped >= 3`;
+  `PluginHost` side queue capacity 2 with 5 titles → `len == 2`, `dropped == 3`,
+  `DropOldest` keeps the newest two. The PTY pump invariant
+  (`bitty-pty::reader::tests::pump_respects_channel_bound_with_idle_consumer`:
+  blocked `send` → channel at `CAPACITY + 1` chunks max → kernel PTY buffer → child
+  blocks, no loss, no growth) is the same contract the runtime inherits via `bitty-pty`.
+  No unbounded allocation path exists on the hot PTY → VT → State leg.
+- **Deterministic replay (extra):** byte-identity across 1-byte and mid-escape splits
+  above, plus layout determinism (`layout_allocations` identical across two runtimes
+  with same tree+container) proven in `v01_resize_*` and in existing
+  `deterministic_layout_same_tree_same_container`, `tick_with_split_composites_both_leaves_headlessly`
+  (renders split/stack/overlay deterministically via `HeadlessRasterizer`).
+- **Gates on this branch:**
+  `cargo check --workspace --all-targets --locked` PASS,
+  `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets --locked` PASS,
+  `cargo test --workspace --all-targets --locked` **708 passed, 0 failed** (704 prior + 4 new v0.1 proofs),
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` 0 warnings,
+  `cargo fmt --all -- --check` clean,
+  `just check` (fmt-check + clippy + test + actionlint + markdownlint) **0 issues**,
+  `actionlint` 0, `markdownlint` 0.
+- **App headless smoke:** `bitty-app::run_headless_smoke` and
+  `headless_smoke_is_total_without_display_or_gpu` feed synthetic bytes,
+  tick via `Surface::headless_present`, and prove the same `bitty-runtime` path
+  from the binary composition root (`--headless` / `BITTY_HEADLESS=1` /
+  display-unavailable fallback), including split/stack/overlay layout proofs
+  deterministically.
+
+No open question is closed by this branch; `v0.1` remains candidate until an
+ADR/RFC with independent review accepts the slice. The next `0.0.2` patch line
+and deferred `0.1.0` gating remain as described in Workspace version mapping.
+
 ## Cross-reference and maintenance
 
 - Candidate spine and early-deferral list: canonical in
@@ -221,4 +287,8 @@ register item still requires its RFC/ADR with independent review per the
 Updated 2026-08-27 via CTX-0044 (`ctx-0044/docs-release-ladder`) on top of
 CTX-0043 `7b215a2`; updated 2026-08-28 via CTX-0049
 (`ctx-0049/chore-version-0-0-1`) adjusting earliest to `0.0.1` and deferring
-`0.1.0`.
+`0.1.0`; updated 2026-08-28 via CTX-0050 (`ctx-0050/feat-minimal-terminal`)
+adding headless `v0.1` slice evidence (shell echo deterministic replay,
+resize, backpressure bounded, 708 tests, `just check` 0 issues) and a new
+`crates/bitty-runtime/tests/v01_minimal_terminal.rs` integration suite —
+still `status: draft`.

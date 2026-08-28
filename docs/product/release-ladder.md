@@ -20,13 +20,16 @@ status: draft
   `6a8dae4b-2aec-83ea-9174-03abc1f81531`; English rendering, not reproduced).
   Nothing here is accepted direction, a roadmap commitment, or authorization
   to publish — it is a reviewable proposal awaiting independent review.
-- Ownership: bitty CTX-0044. Companion implementation is bitty CTX-0043
-  `chore(crate): prepare workspace for crates.io v0.1.0` —
-  branch `ctx-0043/chore-crate-publish`, PR #74 —
-  which set `workspace.package.version 0.0.0 -> 0.1.0`, added
+- Ownership: bitty CTX-0044 (updated CTX-0049). Companion implementation
+  is bitty CTX-0043 `chore(crate): prepare workspace for crates.io v0.1.0`
+  — branch `ctx-0043/chore-crate-publish`, PR #74 — which set
+  `workspace.package.version 0.0.0 -> 0.1.0`, added
   `description`/`license`/`repository`/`keywords`/`categories` workspace
   metadata, and set per-crate `publish` flags plus `description` and
-  versioned `path` deps for publishable crates.
+  versioned `path` deps for publishable crates. CTX-0049
+  `chore(version): adjust workspace to 0.0.1 (earliest)` adjusts the
+  earliest publish to `0.0.1` and defers `0.1.0` until plugins etc. are
+  more complete (see Workspace version mapping).
 - Authority: if an ADR/RFC accepts part of this ladder, update that artifact
   and this record together. No open question is closed here.
 - Relationship: the [Roadmap index](../../../bitty-docs/docs/roadmap/README.md)
@@ -64,17 +67,21 @@ candidates (OQ-020), not part of this ladder.
 
 ## Workspace version mapping
 
-- `workspace.package.version = "0.1.0"` (CTX-0043). The `v0.1` shell slice
-  publishes at `0.1.0` when that slice lands; earlier tags remain `0.0.x`
-  prototypes with `publish = false` at the workspace root.
-- Per-crate `version.workspace = true` inherits `0.1.0`; publishable crates
-  additionally pin internal `path` edges with `version = "0.1.0"` so
-  `cargo publish` requires the dependency already on crates.io at `^0.1.0`.
+- `workspace.package.version = "0.0.1"` (CTX-0049; was `"0.1.0"` in
+  CTX-0043). The earliest publish slice (minimal Correct Terminal,
+  `v0.1` ladder row) publishes at `0.0.1` when that slice lands;
+  `0.1.0` is deferred until plugins etc. are more complete (see Group 4
+  tail). Earlier tags remain `0.0.x` prototypes before `0.0.1` with
+  `publish = false` at the workspace root.
+- Per-crate `version.workspace = true` inherits `0.0.1`; publishable crates
+  additionally pin internal `path` edges with `version = "0.0.1"` so
+  `cargo publish` requires the dependency already on crates.io at `^0.0.1`.
   Draft crates keep `publish = false` but still carry `description`/`license`
-  /`repository` for consistency and are **not** published at `0.1.0`.
-- Future increments follow semver within the ladder: `0.2.0` for the
-  VT/TUI slice, `0.3.0` for GPU, etc., with patch bumps for fixes. The `1.0`
-  bump requires stabilization gates per
+  /`repository` for consistency and are **not** published at `0.0.1`.
+- Future increments follow semver within the ladder: `0.0.2`/`0.0.x` for
+  `0.0.1` patches, `0.1.0` for the deferred plugin-complete slice,
+  `0.2.0` for VT/TUI, `0.3.0` for GPU, etc., with patch bumps for fixes.
+  The `1.0` bump requires stabilization gates per
   [v1.0 criteria in proposed-delivery-sequence](../../../bitty-docs/docs/product/proposed-delivery-sequence.md#candidate-v10-criteria).
 
 ## Crate inventory (as of CTX-0043 head `7b215a2` / `3bfe386` base)
@@ -100,7 +107,7 @@ Sixteen members in `bitty/Cargo.toml`; `publish` flags added in CTX-0043:
 | `bitty-app`         | false   | `platform`, `runtime`                                                | Thin binary composition root                                              |
 | `bitty-core`        | false   | none                                                                 | Bootstrap seed to be retired                                              |
 
-Nine publishable at `0.1.0` (first six rows above (vt, pty, platform, config, package, lua) plus `term-state`/`ui`/`render`):
+Nine publishable at `0.0.1` (first six rows above (vt, pty, platform, config, package, lua) plus `term-state`/`ui`/`render`):
 `vt`, `pty`, `platform`, `config`, `package`, `lua`, `term-state`, `ui`, `render`.
 Seven remain `publish = false` until their RFC is accepted and they are wired
 into the publishable set in order dependency order.
@@ -109,12 +116,13 @@ into the publishable set in order dependency order.
 
 The order is forced by the DAG in
 [ADR 0003](../../../bitty-docs/docs/decisions/adrs/ADR-0003-core-workspace-topology.md)
-and the `version = "0.1.0"` pins added in CTX-0043. Publish groups are
+and the `version = "0.0.1"` pins (CTX-0043 at `0.1.0`, adjusted to `0.0.1`
+in CTX-0049). Publish groups are
 sequential; within a group crates are unordered (independent).
 
 ### Group 1 — Leaves (`publish = true`, no workspace deps)
 
-No internal path dependency with `version = "0.1.0"`; each can be
+No internal path dependency with `version = "0.0.1"`; each can be
 `cargo publish --dry-run` verified independently. CTX-0043 verified:
 
 - `bitty-vt` — `cargo publish --dry-run --allow-dirty` Packaging+Verifying PASS
@@ -129,30 +137,32 @@ between groups.
 
 ### Group 2 — Terminal Truth
 
-- `bitty-term-state` — depends only on `bitty-vt = "0.1.0"`. Publish after
+- `bitty-term-state` — depends only on `bitty-vt = "0.0.1"`. Publish after
   `vt` is on crates.io. CTX-0043 dry-run correctly reported missing index
   for this ordering reason (metadata valid, `version` pin present).
 
 ### Group 3 — Presentation branch (parallel after Group 2)
 
-- `bitty-ui` — depends on `bitty-term-state = "0.1.0"` — publish after Group 2.
-- `bitty-render` — depends on `bitty-term-state = "0.1.0"` and
-  `bitty-platform = "0.1.0"` — publish after Groups 1+2. Dev-edge `bitty-vt`
+- `bitty-ui` — depends on `bitty-term-state = "0.0.1"` — publish after Group 2.
+- `bitty-render` — depends on `bitty-term-state = "0.0.1"` and
+  `bitty-platform = "0.0.1"` — publish after Groups 1+2. Dev-edge `bitty-vt`
   is `dev-dependencies` only and does not impose publish ordering beyond
   `term-state`/`platform`.
 
 `ui` and `render` have no edge between them and may publish concurrently once
 their prerequisites are indexed. Together with Groups 1-2 they constitute the
-**v0.1 shell publish slice**: `vt`, `pty`, `platform`, `config`, `package`,
-`lua`, `term-state`, `ui`, `render` at `0.1.0`. (`config`/`package`/`lua` are
-leaves included at `0.1.0` for completeness though not on the hot path of the
-minimal shell.)
+earliest shell publish slice (ladder `v0.1` row): `vt`, `pty`, `platform`,
+`config`, `package`, `lua`, `term-state`, `ui`, `render` at `0.0.1`.
+(`config`/`package`/`lua` are leaves included at `0.0.1` for completeness
+though not on the hot path of the minimal shell; `0.1.0` is deferred until
+plugins etc. are more complete.)
 
 ### Group 4 — Later draft tail (`publish = false` today)
 
-Deferred past `0.1.0` until RFC acceptance and explicit wiring into the graph.
-All retain `publish = false` with `description`/`license`/`repository` for
-consistency; none is `cargo publish`ed at `0.1.0`:
+Deferred past `0.0.1` (and `0.1.0` deferred until plugins etc. are more
+complete) until RFC acceptance and explicit wiring into the graph. All retain
+`publish = false` with `description`/`license`/`repository` for consistency;
+none is `cargo publish`ed at `0.0.1`:
 
 - `bitty-plugin-host` — draft; depends on `term-state`, `config`, `package`.
   Publish only after Groups 1-3 are at the target version and OQ-014 is
@@ -162,7 +172,8 @@ consistency; none is `cargo publish`ed at `0.1.0`:
   slice.
 - `bitty-runtime` — orchestrator fan-in; publishes only when its seven
   dependencies are already published at the same version line. Kept
-  `publish = false` at `0.1.0` — the `v0.1` shell is validated via headless
+  `publish = false` at `0.0.1` — the `v0.1` row shell is validated via
+  headless
   integration tests in the workspace, not via a crates.io `runtime` release.
 - `bitty-app` — binary; never published (`publish = false`).
 - `bitty-core` — seed to be retired; never published.
@@ -203,8 +214,11 @@ align with the `v0.5`/`v0.6`/`v0.8`/`v0.9` slices.
 This ladder overlays the candidate build-order spine with a concrete
 publishing sequence without accepting it. `proposed-delivery-sequence.md`
 retains provenance and candidate status; this file adds the implementable
-slice at `0.1.0` and the forward ordering for `0.2`-`1.0`. Closing any
+earliest slice at `0.0.1` (deferring `0.1.0` until plugins etc. are more
+complete) and the forward ordering for `0.2`-`1.0`. Closing any
 register item still requires its RFC/ADR with independent review per the
 [open-question register](../../../bitty-docs/docs/decisions/open-questions.md).
 Updated 2026-08-27 via CTX-0044 (`ctx-0044/docs-release-ladder`) on top of
-CTX-0043 `7b215a2`.
+CTX-0043 `7b215a2`; updated 2026-08-28 via CTX-0049
+(`ctx-0049/chore-version-0-0-1`) adjusting earliest to `0.0.1` and deferring
+`0.1.0`.

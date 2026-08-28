@@ -277,10 +277,77 @@ fn deterministic_replay_same_code_same_budget_same_outcome() {
     let mut vm2 = LuaVm::with_budgets("xuepoo.replay2", 5000, 50, 8, 32 * 1024 * 1024);
     let o1 = vm1.execute(code).unwrap();
     let o2 = vm2.execute(code).unwrap();
-    assert_eq!(o1, o2);
-    assert_eq!(
-        vm1.budget_snapshot().instructions_used,
-        vm2.budget_snapshot().instructions_used
+    // Wall is non-deterministic (0 vs 1ms on Windows); compare deterministically
+    // and allow small wall variance.
+    assert_eq!(std::mem::discriminant(&o1), std::mem::discriminant(&o2));
+    match (o1, o2) {
+        (
+            ExecuteOutcome::Completed {
+                instructions_used: i1,
+                wall_elapsed_ms: w1,
+                memory_used: m1,
+                warning_triggered: wt1,
+            },
+            ExecuteOutcome::Completed {
+                instructions_used: i2,
+                wall_elapsed_ms: w2,
+                memory_used: m2,
+                warning_triggered: wt2,
+            },
+        ) => {
+            assert_eq!(i1, i2);
+            assert_eq!(m1, m2);
+            assert_eq!(wt1, wt2);
+            let diff = w1.abs_diff(w2);
+            assert!(
+                diff <= 5,
+                "wall variance too large: {w1} vs {w2} diff {diff} > 5"
+            );
+        }
+        (
+            ExecuteOutcome::Suspended {
+                reason: r1,
+                instructions_used: i1,
+                wall_elapsed_ms: w1,
+                memory_used: m1,
+            },
+            ExecuteOutcome::Suspended {
+                reason: r2,
+                instructions_used: i2,
+                wall_elapsed_ms: w2,
+                memory_used: m2,
+            },
+        ) => {
+            assert_eq!(r1, r2);
+            assert_eq!(i1, i2);
+            assert_eq!(m1, m2);
+            let diff = w1.abs_diff(w2);
+            assert!(
+                diff <= 5,
+                "wall variance too large: {w1} vs {w2} diff {diff} > 5"
+            );
+        }
+        (
+            ExecuteOutcome::RuntimeError { message: m1 },
+            ExecuteOutcome::RuntimeError { message: m2 },
+        ) => {
+            assert_eq!(m1, m2);
+        }
+        _ => unreachable!("discriminant already checked"),
+    }
+    let s1 = vm1.budget_snapshot();
+    let s2 = vm2.budget_snapshot();
+    assert_eq!(s1.instructions_used, s2.instructions_used);
+    assert_eq!(s1.memory_used, s2.memory_used);
+    assert_eq!(s1.warning_triggered, s2.warning_triggered);
+    assert_eq!(s1.suspended, s2.suspended);
+    assert_eq!(s1.suspend_reason, s2.suspend_reason);
+    let wall_diff = s1.wall_elapsed_ms.abs_diff(s2.wall_elapsed_ms);
+    assert!(
+        wall_diff <= 5,
+        "snapshot wall variance too large: {} vs {} diff {wall_diff} > 5",
+        s1.wall_elapsed_ms,
+        s2.wall_elapsed_ms
     );
     assert_eq!(vm1.is_suspended(), vm2.is_suspended());
 }

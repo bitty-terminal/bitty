@@ -1415,35 +1415,38 @@ impl Runtime {
 
     /// Handles a physical-pixel resize: recomputes the grid size from the
     /// configured cell metrics, reconfigures the software surface, updates
-    /// the layout container, reflows leaf views, and resizes the PTY when
-    /// present. Grid memory resize (the state reflow algorithm) is deferred
-    /// per the terminal-state-rfc open item, so the state grid stays at its
-    /// current dimensions while the surface and PTY reflect the new window
-    /// size honestly. Zero-sized extents are skipped (minimized/occluded
-    /// windows) per the `map_resize_to_surface_extent` contract.
+    /// the layout container, reflows leaf views, resizes the terminal grid
+    /// via the singular reflow (truncate/pad with orphan repair) and resizes
+    /// the PTY when present. Zero-sized extents are skipped
+    /// (minimized/occluded windows) per the `map_resize_to_surface_extent`
+    /// contract. The reflow is deterministic and headless-testable.
     ///
     /// # Errors
     ///
     /// [`RuntimeError::Render`] when headless reconfiguration rejects the
     /// extent; [`RuntimeError::Pty`] when the PTY resize fails.
     pub fn handle_resize(&mut self, size: PhysicalSize) -> Result<(), RuntimeError> {
-        // Software surface: zero-sized skips reconfiguration, exactly like the
-        // GPU path (map_resize_to_surface_extent returns None).
         if bitty_platform::map_resize_to_surface_extent(size).is_none() {
             return Ok(());
         }
-        // Recompute logical grid size for the PTY and stored config. The
-        // state grid itself cannot resize yet (singular reflow algorithm
-        // deferred), so we keep the state's 80x24 until that lands and hold
-        // the logical size separately for PTY and surface bookkeeping.
         let (new_cols, new_rows) = self.config.grid_from_pixels(size);
+        // Resize terminal state first so snapshot dimensions reflect the new
+        // geometry before layout and surface work; resize also emits full
+        // damage (grid + scrollback reflow) with a new generation.
+        let _damage = self.state.resize(new_cols, new_rows);
         self.cols = new_cols;
         self.rows = new_rows;
         self.container = default_container(new_cols, new_rows);
-        // Reflow leaf views to new container allocations before the next tick
-        // (tick will also reflow, but doing it here keeps `layout()` view of
-        // leaf sizes consistent immediately after resize for callers that
-        // query without ticking).
+        // Clamp any leaf View scroll offsets to the new scrollback limit
+        // (scrollback may have been truncated on shrink, though we preserve
+        // ids; clamp keeps offset in-bounds deterministically).
+        let max_scrollback = self.state.scrollback_len();
+        let ids = self.layout.leaf_ids();
+        for id in ids {
+            if let Some(view) = self.layout.find_leaf_mut(id) {
+                view.clamp_scroll_offset(max_scrollback);
+            }
+        }
         self.layout.reflow(self.container);
         self.surface
             .headless_resize(size)

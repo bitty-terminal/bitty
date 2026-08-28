@@ -308,6 +308,123 @@ impl State {
         self.height
     }
 
+    /// Resizes the terminal grid to `new_cols x new_rows` using the singular
+    /// deterministic reflow: truncate/pad with wide-pair orphan repair, bounded
+    /// to `[1, 1000]` per dimension (same bound as `RuntimeConfig` to keep
+    /// memory bounded under T-01). Scrollback lines are resized to the new
+    /// width with ids preserved; scroll region is reset to the full screen
+    /// and the cursor is clamped off spacers (RFC invariants 1-6). This is
+    /// the environment-declared resize path (RFC "Environment declaration")
+    /// and the only mutation of retained scrollback outside `push`/`clear`.
+    /// Returns the damage for the resize batch (full grid plus scrollback
+    /// reflow range when scrollback non-empty) tagged with the new
+    /// generation. Headless: pure in-memory, no I/O, deterministic.
+    pub fn resize(&mut self, new_cols: usize, new_rows: usize) -> Damage {
+        let cols = new_cols.clamp(1, 1000);
+        let rows = new_rows.clamp(1, 1000);
+        if cols == self.width && rows == self.height {
+            return Damage {
+                generation: self.generation,
+                regions: Vec::new().into_boxed_slice(),
+            };
+        }
+        let erase = self.bce_style();
+        // Resize stored scrollback lines to the new column width before the
+        // grid changes, so `check_invariants` sees consistent widths throughout.
+        self.scrollback.resize(cols, &erase);
+        // Resize both screen grids with the same erase style.
+        self.screens.main.resize(rows, cols, &erase);
+        self.screens.alt.resize(rows, cols, &erase);
+        // Resize tab lattice: preserve stops that still fit, default for new columns.
+        let old_len = self.tabs.len();
+        let mut new_tabs = crate::tabs::TabStops::default_lattice(cols);
+        for c in 0..old_len.min(cols) {
+            if self.tabs.contains(c) {
+                new_tabs.set(c);
+            } else {
+                new_tabs.clear_at(c);
+            }
+        }
+        self.tabs = new_tabs;
+        self.width = cols;
+        self.height = rows;
+        // Reset scroll region to the full screen (clamps invariants 1) and
+        // clamp cursor and saved cursors into the new bounds.
+        self.scroll_region_top = 0;
+        self.scroll_region_bottom = (rows - 1) as u16;
+        self.cursor.position.row = self.cursor.position.row.min((rows - 1) as u16);
+        self.cursor.position.col = self.cursor.position.col.min((cols - 1) as u16);
+        self.cursor.pending_wrap = false;
+        self.enforce_cursor_invariants();
+        for (slot, saved) in self.saved_cursors.iter_mut().enumerate() {
+            if let Some(s) = saved {
+                s.position.row = s.position.row.min((rows - 1) as u16);
+                s.position.col = s.position.col.min((cols - 1) as u16);
+                let grid = if slot == 0 {
+                    &self.screens.main
+                } else {
+                    &self.screens.alt
+                };
+                if grid
+                    .get(s.position.row as usize, s.position.col as usize)
+                    .spacer
+                    && s.position.col > 0
+                {
+                    s.position.col -= 1;
+                }
+            }
+        }
+        if let Some(save) = &mut self.primary_save {
+            save.cursor_position.row = save.cursor_position.row.min((rows - 1) as u16);
+            save.cursor_position.col = save.cursor_position.col.min((cols - 1) as u16);
+            if self
+                .screens
+                .main
+                .get(
+                    save.cursor_position.row as usize,
+                    save.cursor_position.col as usize,
+                )
+                .spacer
+                && save.cursor_position.col > 0
+            {
+                save.cursor_position.col -= 1;
+            }
+        }
+        // Damage for resize: full grid plus scrollback reflow range when
+        // scrollback non-empty (RFC damage model). Coalesce ordering is grid
+        // rectangles first, then scrollback ranges.
+        self.generation += 1;
+        let mut regions: Vec<DamagedRegion> = Vec::new();
+        regions.push(DamagedRegion::Grid(DamageRect::full(
+            rows as u16,
+            cols as u16,
+        )));
+        if !self.scrollback.is_empty() {
+            let first = self.scrollback.line(0).map(|l| l.id).unwrap_or(0);
+            let count = self.scrollback.len() as u64;
+            regions.push(DamagedRegion::Scrollback {
+                first_line_id: first,
+                count,
+            });
+        }
+        let damage = Damage {
+            generation: self.generation,
+            regions: regions.into_boxed_slice(),
+        };
+        if self.damage_history.len() == DAMAGE_HISTORY_BATCHES {
+            self.damage_history.pop_front();
+        }
+        self.damage_history.push_back(damage.clone());
+        self.batch_rects.clear();
+        self.batch_scroll_events.clear();
+        debug_assert!(
+            self.check_invariants().is_ok(),
+            "RFC invariants violated after resize: {:?}",
+            self.check_invariants()
+        );
+        damage
+    }
+
     /// The live cursor.
     #[must_use]
     pub fn cursor(&self) -> &Cursor {

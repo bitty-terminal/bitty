@@ -245,6 +245,7 @@ dependencies = [
 name = "bitty-term-state"
 version = "0.0.1"
 dependencies = [
+ "bitty-ui",
  "bitty-vt",
  "proptest",
 ]

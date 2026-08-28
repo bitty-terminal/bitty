@@ -282,6 +282,7 @@ name = "bitty-ui"
 version = "0.0.1"
 dependencies = [
  "bitty-term-state",
+ "bitty-vt",
 ]
 
 [[package]]

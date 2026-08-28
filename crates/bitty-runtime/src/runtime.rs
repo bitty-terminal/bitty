@@ -71,7 +71,7 @@
 //!   and the bounded crossing.
 
 use bitty_platform::{PhysicalSize, PlatformEvent, WindowEventKind};
-use bitty_pty::{Pty, PtyBuilder};
+use bitty_pty::{Pty, PtyBuilder, PtyReader};
 use bitty_render::{
     RenderError,
     frame::{FrameMode, FramePlan},
@@ -337,6 +337,7 @@ pub struct Runtime {
     parser: Parser,
     state: State,
     pty: Option<Pty>,
+    pty_reader: Option<PtyReader>,
     renderer: GridRenderer<HeadlessRasterizer>,
     surface: Surface,
     cold_queue: ColdQueue,
@@ -367,6 +368,7 @@ impl std::fmt::Debug for Runtime {
                 &self.plugin_host.pipeline().total_dropped(),
             )
             .field("has_pty", &self.pty.is_some())
+            .field("has_pty_reader", &self.pty_reader.is_some())
             .field("pending_full_redraw", &self.pending_full_redraw)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
@@ -465,6 +467,7 @@ impl Runtime {
             parser: Parser::new(),
             state: State::new(),
             pty: None,
+            pty_reader: None,
             renderer,
             surface,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -509,6 +512,7 @@ impl Runtime {
             parser: Parser::new(),
             state: State::new(),
             pty: None,
+            pty_reader: None,
             renderer,
             surface,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -1058,7 +1062,11 @@ impl Runtime {
     /// interpolation (P0 security posture).
     ///
     /// Replaces any previously spawned child: the old `Pty` is dropped, which
-    /// kills and reaps its child without leaking a zombie.
+    /// kills and reaps its child without leaking a zombie. The output side
+    /// is pumped into a bounded channel (`READ_CHUNK_SIZE` ×
+    /// `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) so backpressure is end-to-end;
+    /// see [`poll_pty`] for the non-blocking drain that feeds
+    /// [`handle_pty_bytes`].
     ///
     /// # Errors
     ///
@@ -1067,17 +1075,135 @@ impl Runtime {
     /// (`Unsupported` on Windows before the ConPTY slice, `Upstream` or
     /// `Io` elsewhere).
     pub fn spawn_shell(&mut self, program: &str) -> Result<(), RuntimeError> {
+        self.spawn_shell_with_args(program, &[])
+    }
+
+    /// Spawns `program` with additional `args` inside a PTY sized to the
+    /// current grid.
+    ///
+    /// Direct argv exec, no shell interpolation: `program` plus `args` are
+    /// passed verbatim to the platform exec path. For a shell echo, pass
+    /// `program = "/bin/sh"` and `args = &["-c", "echo hello"]`. Bounded
+    /// backpressure and lifecycle are identical to [`spawn_shell`].
+    pub fn spawn_shell_with_args(
+        &mut self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
         }
         let cols = self.cols.min(u16::MAX as usize) as u16;
         let rows = self.rows.min(u16::MAX as usize) as u16;
-        let pty = PtyBuilder::new(program)
-            .size(cols, rows)
-            .spawn()
-            .map_err(RuntimeError::from)?;
+        let mut builder = PtyBuilder::new(program).size(cols, rows);
+        for arg in args {
+            builder = builder.arg(*arg);
+        }
+        let mut pty = builder.spawn().map_err(RuntimeError::from)?;
+        let reader = pty.take_reader().map_err(RuntimeError::from)?;
+        // Replace any previously spawned child (drop kills old).
         self.pty = Some(pty);
+        self.pty_reader = Some(reader);
         Ok(())
+    }
+
+    /// Whether a PTY child is currently owned.
+    #[must_use]
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
+    /// Whether a PTY reader channel is currently owned (implies [`has_pty`]).
+    #[must_use]
+    pub fn has_pty_reader(&self) -> bool {
+        self.pty_reader.is_some()
+    }
+
+    /// Process id of the child, when available.
+    #[must_use]
+    pub fn pty_pid(&self) -> Option<u32> {
+        self.pty.as_ref().and_then(|p| p.pid())
+    }
+
+    /// Current PTY size as known by the kernel, if a PTY is owned.
+    pub fn pty_size(&self) -> Option<(u16, u16)> {
+        self.pty.as_ref().and_then(|p| p.size().ok())
+    }
+
+    /// Takes exclusive ownership of the bounded PTY output reader, if present.
+    ///
+    /// The caller becomes responsible for draining the channel without blocking
+    /// the runtime thread and for joining the pump on EOF. After this call
+    /// [`poll_pty`] will return `0` because the channel no longer belongs to
+    /// the runtime; most embedders should prefer [`poll_pty`] instead.
+    pub fn take_pty_reader(&mut self) -> Option<PtyReader> {
+        self.pty_reader.take()
+    }
+
+    /// Non-blocking drain of the bounded PTY output channel into
+    /// [`handle_pty_bytes`].
+    ///
+    /// When a consumer stalls, the bounded channel (`CHANNEL_CAPACITY_CHUNKS` ×
+    /// `READ_CHUNK_SIZE` = 128 KiB) fills, the pump blocks, the kernel PTY
+    /// buffer fills, and the child's writes block — end-to-end backpressure
+    /// with zero data loss and zero unbounded memory growth. This method is
+    /// the consumer side: it drains all immediately available chunks without
+    /// blocking, feeding each through the VT parser and terminal state.
+    ///
+    /// Returns the number of chunks drained. `0` means either no PTY, no data
+    /// available yet, or EOF has been reached and the queue drained. Headless
+    /// tests that never called [`spawn_shell`] get `0` without error, so the
+    /// same binary works headlessly (synthetic `handle_pty_bytes`) and with a
+    /// real PTY (live `poll_pty`).
+    pub fn poll_pty(&mut self) -> usize {
+        // Collect without holding an immutable borrow across the mutable
+        // `handle_pty_bytes` call (borrow checker).
+        let chunks: Vec<Vec<u8>> = {
+            let Some(reader) = self.pty_reader.as_ref() else {
+                return 0;
+            };
+            let mut out = Vec::new();
+            while out.len() < 1024 {
+                match reader.try_recv() {
+                    Some(chunk) => {
+                        debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                        out.push(chunk);
+                    }
+                    None => break,
+                }
+            }
+            out
+        };
+        let drained = chunks.len();
+        for chunk in chunks {
+            self.handle_pty_bytes(&chunk);
+        }
+        drained
+    }
+
+    /// Blocking drain with a timeout, returning the number of chunks drained.
+    ///
+    /// Blocks at most `timeout` for the first chunk; once data is flowing it
+    /// drains all immediately available chunks without further blocking. Useful
+    /// for tests that need to wait for a shell echo. Returns `0` on timeout
+    /// or EOF.
+    pub fn poll_pty_timeout(&mut self, timeout: std::time::Duration) -> usize {
+        let first: Option<Vec<u8>> = {
+            let Some(reader) = self.pty_reader.as_ref() else {
+                return 0;
+            };
+            match reader.recv_timeout(timeout) {
+                Ok(Some(chunk)) => Some(chunk),
+                Ok(None) | Err(_) => None,
+            }
+        };
+        match first {
+            Some(chunk) => {
+                self.handle_pty_bytes(&chunk);
+                1 + self.poll_pty()
+            }
+            None => 0,
+        }
     }
 
     /// Feeds raw PTY bytes through the parser into terminal state, enqueuing

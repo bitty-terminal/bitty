@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_term_state::Snapshot;
+use bitty_term_state::{Cell, Snapshot, State, Style};
 
 use crate::geometry::{Point, Rect, Size};
 
@@ -150,9 +150,116 @@ impl View {
         self.scroll_offset == 0
     }
 
+    /// Clamps the current scroll offset to the current scrollback limit.
+    /// Call after state resize or scrollback pruning to keep the viewport
+    /// within history bounds. No-op when already clamped.
+    pub fn clamp_scroll_offset(&mut self, max_scrollback: usize) {
+        if self.scroll_offset > max_scrollback {
+            self.scroll_offset = max_scrollback;
+        }
+    }
+
     /// Sets horizontal column offset, clamped to snapshot width.
     pub fn set_col_offset(&mut self, offset: u16) {
         self.col_offset = offset;
+    }
+
+    /// Returns the viewport cells composited from scrollback history and the
+    /// live snapshot, respecting `scroll_offset` and `col_offset`.
+    /// The returned buffer is `rows * cols` cells row-major, deterministic and
+    /// headless-testable. Wide-pair orphans have already been repaired by
+    /// state resize, so no extra repair is needed here; out-of-range history
+    /// pads with erased blanks.
+    #[must_use]
+    pub fn visible_cells(&self, state: &State) -> Box<[Cell]> {
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        let sb_len = state.scrollback_len();
+        let total = sb_len + state.height();
+        let offset = self.scroll_offset.min(sb_len);
+        // Bottom-aligned window: when live (offset 0) the window ends at the
+        // bottom of the combined buffer (the live cursor row). When scrolled,
+        // it slides upward by `offset` lines.
+        let start = total.saturating_sub(rows).saturating_sub(offset);
+        let snap = state.snapshot();
+        let mut out = Vec::with_capacity(rows * cols);
+        let blank = Cell::erased(Style::default());
+        for r in 0..rows {
+            let combined = start + r;
+            if combined < sb_len {
+                // History line.
+                if let Some(line) = state.scrollback_line(combined) {
+                    let src = &line.cells;
+                    for c in 0..cols {
+                        let src_col = self.col_offset as usize + c;
+                        if src_col < src.len() {
+                            out.push(src[src_col].clone());
+                        } else {
+                            out.push(blank.clone());
+                        }
+                    }
+                } else {
+                    for _ in 0..cols {
+                        out.push(blank.clone());
+                    }
+                }
+            } else if combined < total {
+                // Live grid row.
+                let grid_row = combined - sb_len;
+                for c in 0..cols {
+                    let src_col = self.col_offset as usize + c;
+                    if grid_row < snap.height && src_col < snap.width {
+                        let idx = grid_row * snap.width + src_col;
+                        if let Some(cell) = snap.cells.get(idx) {
+                            let mut cloned = cell.clone();
+                            // Clip wide-pair overflow at the viewport's right edge:
+                            // if a leading half would need its spacer beyond the
+                            // viewport edge, demote to single width.
+                            if c + 1 == cols && cloned.width == 2 && !cloned.spacer {
+                                cloned.width = 1;
+                            }
+                            if cloned.spacer && c == 0 {
+                                out.push(blank.clone());
+                            } else {
+                                out.push(cloned);
+                            }
+                        } else {
+                            out.push(blank.clone());
+                        }
+                    } else {
+                        out.push(blank.clone());
+                    }
+                }
+            } else {
+                // Beyond combined buffer (viewport taller than history+grid).
+                for _ in 0..cols {
+                    out.push(blank.clone());
+                }
+            }
+        }
+        out.into_boxed_slice()
+    }
+
+    /// Convenience: rows of visible text trimmed for assertions (headless).
+    #[must_use]
+    pub fn visible_text_rows(&self, state: &State) -> Vec<String> {
+        let cells = self.visible_cells(state);
+        let cols = self.cols as usize;
+        let mut rows = Vec::new();
+        for r in 0..self.rows as usize {
+            let start = r * cols;
+            let end = start + cols;
+            let slice = &cells[start..end];
+            let mut s = String::new();
+            for cell in slice {
+                if cell.spacer {
+                    continue;
+                }
+                s.push(cell.glyph);
+            }
+            rows.push(s.trim_end().to_string());
+        }
+        rows
     }
 
     /// Resize primitives: attempts to set new dimensions. Returns `true` when

@@ -286,6 +286,58 @@ impl Grid {
             self.replace_row(top, &mut blank);
         }
     }
+
+    /// Resizes the grid to `new_rows x new_cols`, preserving overlapping cells
+    /// and repairing wide-character pairs that would otherwise straddle the new
+    /// boundary (RFC invariant 2). New area is filled with `erase_style`.
+    /// This is the singular reflow primitive for resize: truncate/pad with
+    /// orphan repair, deterministically identical on all platforms.
+    pub(crate) fn resize(&mut self, new_rows: usize, new_cols: usize, erase_style: &Style) {
+        let new_rows = new_rows.max(1);
+        let new_cols = new_cols.max(1);
+        if new_rows == self.rows && new_cols == self.cols {
+            return;
+        }
+        let mut new_cells = vec![Cell::erased(erase_style.clone()); new_rows * new_cols];
+        let copy_rows = self.rows.min(new_rows);
+        let copy_cols = self.cols.min(new_cols);
+        for r in 0..copy_rows {
+            for c in 0..copy_cols {
+                let src = self.get(r, c).clone();
+                new_cells[r * new_cols + c] = src;
+            }
+        }
+        // Repair every copied row for possible orphaned wide halves at the
+        // truncation boundary (new_cols may cut a pair).
+        for r in 0..copy_rows {
+            let start = r * new_cols;
+            let row_slice = &mut new_cells[start..start + new_cols];
+            let mut i = 0;
+            while i < new_cols {
+                let cell = row_slice[i].clone();
+                if cell.spacer {
+                    let paired = i > 0 && {
+                        let lead = &row_slice[i - 1];
+                        lead.width == 2 && !lead.spacer
+                    };
+                    if !paired {
+                        row_slice[i] = Cell::erased(erase_style.clone());
+                    }
+                } else if cell.width == 2 {
+                    let paired_trailer = i + 1 < new_cols && row_slice[i + 1].spacer;
+                    if !paired_trailer {
+                        row_slice[i] = Cell::erased(erase_style.clone());
+                    } else {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        self.rows = new_rows;
+        self.cols = new_cols;
+        self.cells = new_cells;
+    }
 }
 
 /// Primary and alternate screen grids; see [`crate::state::State`] for the

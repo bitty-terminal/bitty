@@ -19,3 +19,10 @@ bitty-vt = { version = "0.0.1", path = "../bitty-vt" }
 
 [dev-dependencies]
 proptest = "1"
+# Test-only dev-graph cycle exception (ses_fb7edd547 low #3):
+# bitty-term-state (prod) -> bitty-vt only; this dev-dep on bitty-ui is used
+# solely by `tests/resize_scrollback.rs` to exercise View+State composition
+# headlessly and does not affect the production dependency graph. Candidate
+# alternative is to move that test to `bitty-runtime`/`bitty-ui`; kept here with
+# this documented exception to preserve locality of the singular reflow proof.
+bitty-ui = { version = "0.0.1", path = "../bitty-ui" }

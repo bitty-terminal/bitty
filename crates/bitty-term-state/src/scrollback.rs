@@ -128,6 +128,61 @@ impl Scrollback {
             removed_count: removed,
         }
     }
+
+    /// Resizes every retained line to `new_cols` cells deterministically.
+    /// Wider lines are truncated with wide-pair orphan repair at the boundary;
+    /// narrower lines are padded with `erase_style` blanks. Ids are preserved
+    /// (reflow mutates cells but not line identity). This is the singular
+    /// resize reflow for scrollback: the environment-declared geometry change
+    /// is the only time retained lines are rewritten (RFC damage model:
+    /// resize reflow range).
+    pub(crate) fn resize(&mut self, new_cols: usize, erase_style: &crate::cell::Style) {
+        let new_cols = new_cols.max(1);
+        for line in &mut self.lines {
+            let old_len = line.cells.len();
+            if old_len == new_cols {
+                continue;
+            }
+            let mut new_cells = Vec::with_capacity(new_cols);
+            if new_cols < old_len {
+                // Truncate, then repair possible orphan at boundary.
+                for c in line.cells.iter().take(new_cols).cloned() {
+                    new_cells.push(c);
+                }
+                // Orphan repair for the truncated tail: same scan as Grid::repair_row but on line slice.
+                let mut i = 0;
+                while i < new_cols {
+                    let cell = new_cells[i].clone();
+                    if cell.spacer {
+                        let paired = i > 0 && {
+                            let lead = &new_cells[i - 1];
+                            lead.width == 2 && !lead.spacer
+                        };
+                        if !paired {
+                            new_cells[i] = crate::cell::Cell::erased(erase_style.clone());
+                        }
+                    } else if cell.width == 2 {
+                        let paired_trailer = i + 1 < new_cols && new_cells[i + 1].spacer;
+                        if !paired_trailer {
+                            new_cells[i] = crate::cell::Cell::erased(erase_style.clone());
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    i += 1;
+                }
+            } else {
+                // Pad: copy existing plus erased fill.
+                for c in line.cells.iter().cloned() {
+                    new_cells.push(c);
+                }
+                for _ in old_len..new_cols {
+                    new_cells.push(crate::cell::Cell::erased(erase_style.clone()));
+                }
+            }
+            line.cells = new_cells.into_boxed_slice();
+        }
+    }
 }
 
 impl Default for Scrollback {

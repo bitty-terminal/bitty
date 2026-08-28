@@ -1,6 +1,6 @@
 ---
 title: G1 Publish Checklist — Leaf Crates Dry-Run
-description: Draft checklist verifying workspace 0.1.0, publish flags, and cargo publish dry-run for G1 leaf crates (vt, pty, platform, config, package, lua) with publish order and gates
+description: Draft checklist verifying workspace 0.0.1, publish flags, and cargo publish dry-run for G1 leaf crates (vt, pty, platform, config, package, lua) with publish order and gates
 category: product
 audience: maintainer
 document_type: research
@@ -21,14 +21,14 @@ status: draft
 - Companion records:
   - **CTX-0043** `chore(crate): prepare workspace for crates.io v0.1.0`
     — merged as `168493a` / PR #74 — set `workspace.package.version`
-    `0.0.0 -> 0.1.0`, added workspace `description`/`license`/`repository`
+    `0.0.0 -> 0.1.0` (CTX-0043; earliest now `0.0.1` via CTX-0049), added workspace `description`/`license`/`repository`
     /`keywords`/`categories`, set per-crate `publish` flags and `description`,
-    and added `version = "0.1.0"` pins on publishable internal `path` deps.
+    and added `version = "0.1.0"` pins on publishable internal `path` deps (now `0.0.1` via CTX-0049).
   - **CTX-0044** `docs(product): add release ladder v0.1-v1.0 and publish
 order` — PR #75 (`ctx-0044/docs-release-ladder`, commit `5a3322a`) —
     **pending** (OPEN, MERGEABLE) at the time of this checklist. CTX-0044
     is **not blocking** the G1 leaf dry-run: leaves have no internal
-    workspace dependency with `version = "0.1.0"` and verify independently.
+    workspace dependency with `version = "0.0.1"` (was `0.1.0` in CTX-0043) and verify independently.
     This checklist overlays the concrete Group 1 dry-run evidence on that
     ladder without duplicating or re-approving it.
 - Provenance: builds on the candidate `v0.1` shell slice and publish-order
@@ -43,21 +43,21 @@ order` — PR #75 (`ctx-0044/docs-release-ladder`, commit `5a3322a`) —
 ## Scope
 
 - **G1 leaves** (this checklist): the six crates with `publish = true` and
-  no workspace `version = "0.1.0"` path edge — `bitty-vt`, `bitty-pty`,
+  no workspace `version = "0.0.1"` path edge — `bitty-vt`, `bitty-pty`,
   `bitty-platform`, `bitty-config`, `bitty-package`, `bitty-lua`. Each can
   be verified with `cargo publish --dry-run --allow-dirty` without waiting
   for crates.io index propagation beyond external crates.
 - Out of scope for G1: `bitty-term-state` (Group 2, depends on `vt`),
   `bitty-ui`/`bitty-render` (Group 3, after `term-state` + `platform`),
   and the draft tail (`plugin-host`, `rich`, `ipc`, `agent`, `runtime`,
-  `app`, `core`) which remain `publish = false` at `0.1.0`. Their order
+  `app`, `core`) which remain `publish = false` at `0.0.1` (deferring `0.1.0`). Their order
   and gates are documented in the release ladder, not re-verified here.
 
 ## Pre-publish workspace verification
 
 ### Workspace version
 
-- `Cargo.toml` `[workspace.package] version = "0.1.0"` — verified in
+- `Cargo.toml` `[workspace.package] version = "0.0.1"` — verified in CTX-0049 (was `0.1.0` in CTX-0043) at
   `ctx-0045/publish-g1` at `168493a` (inherited from CTX-0043). No drift.
 - `[workspace.package]` carries `edition = "2024"`,
   `rust-version = "1.85"`, `publish = false` at the workspace root,
@@ -67,19 +67,19 @@ order` — PR #75 (`ctx-0044/docs-release-ladder`, commit `5a3322a`) —
 
 ```toml
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 publish = false
 ```
 
-- Per-crate `version.workspace = true` inherits `0.1.0`; G1 leaves set
+- Per-crate `version.workspace = true` inherits `0.0.1` (was `0.1.0`); G1 leaves set
   `publish = true` with their own `description`/`license`/`repository`
-  and no internal `path` dependency requiring `version = "0.1.0"`.
+  and no internal `path` dependency requiring `version = "0.0.1"` (was `0.1.0`).
 
 ### Publish flags (as of `168493a`, verified `2026-08-28`)
 
-| Crate               | `publish` | Internal workspace deps                                              | Expected at `0.1.0` |
+| Crate               | `publish` | Internal workspace deps                                              | Expected at `0.0.1` |
 | ------------------- | --------- | -------------------------------------------------------------------- | ------------------- |
 | `bitty-vt`          | `true`    | none                                                                 | publish in G1       |
 | `bitty-pty`         | `true`    | none                                                                 | publish in G1       |
@@ -87,9 +87,9 @@ publish = false
 | `bitty-config`      | `true`    | none                                                                 | publish in G1       |
 | `bitty-package`     | `true`    | none                                                                 | publish in G1       |
 | `bitty-lua`         | `true`    | none (`piccolo = "0.3.3"` external only)                             | publish in G1       |
-| `bitty-term-state`  | `true`    | `bitty-vt = "0.1.0"`                                                 | Group 2             |
-| `bitty-ui`          | `true`    | `bitty-term-state = "0.1.0"`                                         | Group 3             |
-| `bitty-render`      | `true`    | `bitty-term-state = "0.1.0"`, `bitty-platform = "0.1.0"`             | Group 3             |
+| `bitty-term-state`  | `true`    | `bitty-vt = "0.0.1"`                                                 | Group 2             |
+| `bitty-ui`          | `true`    | `bitty-term-state = "0.0.1"`                                         | Group 3             |
+| `bitty-render`      | `true`    | `bitty-term-state = "0.0.1"`, `bitty-platform = "0.0.1"`             | Group 3             |
 | `bitty-plugin-host` | `false`   | `term-state`, `config`, `package`                                    | tail                |
 | `bitty-rich`        | `false`   | `term-state`, `vt`                                                   | tail                |
 | `bitty-ipc`         | `false`   | none                                                                 | tail                |
@@ -144,8 +144,8 @@ Group 2.
   `bitty-ui` (after `term-state`) and `bitty-render` (after `term-state` +
   `platform`). May publish concurrently once prerequisites are indexed.
   `bitty-vt` dev-dependency in `bitty-render` does not impose ordering.
-- **Group 4 — Tail** (`publish = false` at `0.1.0`): `plugin-host`, `rich`,
-  `ipc`, `agent`, `runtime`, `app`, `core`. Not publishable at `0.1.0`;
+- **Group 4 — Tail** (`publish = false` at `0.0.1`): `plugin-host`, `rich`,
+  `ipc`, `agent`, `runtime`, `app`, `core`. Not publishable at `0.0.1` (deferring `0.1.0`);
   promotion requires RFC acceptance and DAG-order `publish` flips plus
   `version = "x.y.z"` pins (CTX-0043 pattern). `runtime`/`app` are validated
   via workspace headless integration tests, not via a crates.io release.
@@ -162,7 +162,7 @@ Group 2.
 | └ `actionlint`               | `actionlint -color`                                                                                 | PASS                                                                                                                       |
 | └ `markdownlint`             | `bunx --bun markdownlint-cli2@0.23.1` (`**/*.md`)                                                   | PASS — `0 issues in 0 files` — now covers 25 files including this draft                                                    |
 | publish metadata             | `cargo publish --dry-run --allow-dirty` per G1 leaf                                                 | **PASS all 6** — see dry-run table                                                                                         |
-| version/publish flag drift   | `grep` of `Cargo.toml` workspace + per-crate                                                        | PASS — `workspace.package.version 0.1.0`, G1 leaves `publish = true`, rest as table above                                  |
+| version/publish flag drift   | `grep` of `Cargo.toml` workspace + per-crate                                                        | PASS — `workspace.package.version 0.0.1` (was `0.1.0`), G1 leaves `publish = true`, rest as table above                    |
 
 `just check` evidence (tail):
 
@@ -199,19 +199,19 @@ cargo publish --dry-run -p bitty-lua --allow-dirty
 ```
 
 Run independently; each leaf verifies from the packaged tarball
-(`target/package/<crate>-0.1.0`) with `Finished dev profile` and
+(`target/package/<crate>-0.0.1`) with `Finished dev profile` and
 `warning: aborting upload due to dry run` (expected for `--dry-run`).
 
 ### Results table
 
 | #   | Crate            | Version | `cargo publish --dry-run --allow-dirty` | Packaged                                  | Verified build                                                                        |
 | --- | ---------------- | ------- | --------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------- |
-| 1   | `bitty-vt`       | `0.1.0` | **PASS**                                | 23 files, 97.8 KiB (22.5 KiB compressed)  | `Compiling bitty-vt ... Finished dev` — `vte 0.15`                                    |
-| 2   | `bitty-pty`      | `0.1.0` | **PASS**                                | 14 files, 66.1 KiB (19.5 KiB compressed)  | `Compiling bitty-pty ... Finished dev` — `portable-pty 0.9`                           |
-| 3   | `bitty-platform` | `0.1.0` | **PASS**                                | 12 files, 124.4 KiB (33.6 KiB compressed) | `Compiling bitty-platform ... Finished dev` — `winit 0.30`, `raw-window-handle 0.6.2` |
-| 4   | `bitty-config`   | `0.1.0` | **PASS**                                | 13 files, 120.7 KiB (24.9 KiB compressed) | `Compiling bitty-config ... Finished dev`                                             |
-| 5   | `bitty-package`  | `0.1.0` | **PASS**                                | 13 files, 153.8 KiB (33.8 KiB compressed) | `Compiling bitty-package ... Finished dev`                                            |
-| 6   | `bitty-lua`      | `0.1.0` | **PASS**                                | 6 files, 58.1 KiB (14.0 KiB compressed)   | `Compiling bitty-lua ... Finished dev` — `piccolo 0.3.3`                              |
+| 1   | `bitty-vt`       | `0.0.1` | **PASS**                                | 23 files, 97.8 KiB (22.5 KiB compressed)  | `Compiling bitty-vt ... Finished dev` — `vte 0.15`                                    |
+| 2   | `bitty-pty`      | `0.0.1` | **PASS**                                | 14 files, 66.1 KiB (19.5 KiB compressed)  | `Compiling bitty-pty ... Finished dev` — `portable-pty 0.9`                           |
+| 3   | `bitty-platform` | `0.0.1` | **PASS**                                | 12 files, 124.4 KiB (33.6 KiB compressed) | `Compiling bitty-platform ... Finished dev` — `winit 0.30`, `raw-window-handle 0.6.2` |
+| 4   | `bitty-config`   | `0.0.1` | **PASS**                                | 13 files, 120.7 KiB (24.9 KiB compressed) | `Compiling bitty-config ... Finished dev`                                             |
+| 5   | `bitty-package`  | `0.0.1` | **PASS**                                | 13 files, 153.8 KiB (33.8 KiB compressed) | `Compiling bitty-package ... Finished dev`                                            |
+| 6   | `bitty-lua`      | `0.0.1` | **PASS**                                | 6 files, 58.1 KiB (14.0 KiB compressed)   | `Compiling bitty-lua ... Finished dev` — `piccolo 0.3.3`                              |
 
 All six: **dry-run PASS**. No metadata errors, no missing `description`/
 `license`/`repository`, no unpublished internal path dep errors (expected
@@ -222,16 +222,16 @@ Raw log excerpt (`bitty-vt` representative; all 6 analogous):
 
 ```text
 Updating crates.io index
-Packaging bitty-vt v0.1.0 (.../crates/bitty-vt)
+Packaging bitty-vt v0.0.1 (.../crates/bitty-vt)
 Updating crates.io index
 Packaged 23 files, 97.8KiB (22.5KiB compressed)
-Verifying bitty-vt v0.1.0 (.../target/package/bitty-vt-0.1.0)
+Verifying bitty-vt v0.0.1 (.../target/package/bitty-vt-0.0.1)
  Compiling arrayvec v0.7.8
  Compiling memchr v2.8.3
  Compiling vte v0.15.0
- Compiling bitty-vt v0.1.0 (.../target/package/bitty-vt-0.1.0)
+ Compiling bitty-vt v0.0.1 (.../target/package/bitty-vt-0.0.1)
   Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.00s
- Uploading bitty-vt v0.1.0 (.../crates/bitty-vt)
+ Uploading bitty-vt v0.0.1 (.../crates/bitty-vt)
 warning: aborting upload due to dry run
 ```
 
@@ -274,7 +274,7 @@ cargo publish -p bitty-render       # Group 3 (after term-state + platform)
 Each step requires `cargo check --workspace --all-targets --locked` and
 `just check` green on that commit, plus a fresh `--dry-run` for the next
 crate. Do not use `--allow-dirty` for the real publish; ensure `git status`
-is clean and the tag is `0.1.0`. CI `Quality gates` + `CodeQL` must be green
+is clean and the tag is `0.0.1` (deferring `0.1.0`). CI `Quality gates` + `CodeQL` must be green
 before push per `AGENTS.md`.
 
 ## Cross-reference and maintenance
@@ -300,6 +300,6 @@ before push per `AGENTS.md`.
 ## Revision history
 
 - `2026-08-28` CTX-0045 `ctx-0045/publish-g1` at `168493a` — draft checklist
-  created; workspace `0.1.0` + publish flags verified; CTX-0044 PR #75
+  created; workspace `0.1.0` (now `0.0.1`) + publish flags verified; CTX-0044 PR #75
   confirmed OPEN/MERGEABLE and non-blocking; all 6 G1 leaves dry-run PASS;
   `cargo check --workspace --all-targets` PASS; `just check` PASS.

@@ -14,7 +14,7 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-vt = { version = "0.1.0", path = "../bitty-vt" }
+bitty-vt = { version = "0.0.1", path = "../bitty-vt" }
 
 
 [dev-dependencies]

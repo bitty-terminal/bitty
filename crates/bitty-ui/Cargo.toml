@@ -14,8 +14,8 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-term-state = { version = "0.1.0", path = "../bitty-term-state" }
+bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }
 
 
 [dev-dependencies]
-bitty-term-state = { version = "0.1.0", path = "../bitty-term-state" }
+bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }

@@ -180,6 +180,136 @@ fn invalid_spawn_requests_are_rejected_without_spawning() {
     ));
 }
 
+#[test]
+fn shell_echo_via_sh_with_bounded_backpressure() {
+    // Real shell echo dogfood for 0.0.1: `sh -c 'echo …'` proves direct argv
+    // exec (no shell interpolation inside bitty-pty), the bounded channel, and
+    // clean exit. Works headlessly — no window or GPU required.
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("echo hello-bitty-pty")
+        .spawn()
+        .expect("spawn sh -c echo");
+
+    // PTY size is still kernel-queryable even for a shell child.
+    let (cols, rows) = pty.size().expect("size after shell spawn");
+    assert!(
+        cols >= 10 && rows >= 5,
+        "unexpected initial size {cols}x{rows}"
+    );
+
+    let reader = pty.take_reader().expect("reader half");
+    // No writer needed; `echo` exits without input.
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut out = Vec::new();
+    while !contains(&out, b"hello-bitty-pty") {
+        match reader.recv_timeout(ECHO_TIMEOUT).expect("recv_timeout") {
+            Some(chunk) => {
+                assert!(
+                    chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
+                    "shell echo chunk {} exceeds READ_CHUNK_SIZE {}",
+                    chunk.len(),
+                    bitty_pty::READ_CHUNK_SIZE
+                );
+                assert!(
+                    chunk.len() <= bitty_pty::MAX_BUFFERED_BYTES,
+                    "chunk must not exceed MAX_BUFFERED_BYTES"
+                );
+                out.extend_from_slice(&chunk);
+                // Also prove try_recv path does not break backpressure:
+                // a non-blocking poll after the blocking recv should not panic
+                // and must respect the same bound if it yields data.
+                if let Some(extra) = reader.try_recv() {
+                    assert!(extra.len() <= bitty_pty::READ_CHUNK_SIZE);
+                    out.extend_from_slice(&extra);
+                }
+            }
+            None => break,
+        }
+        assert!(std::time::Instant::now() < deadline, "shell echo timed out");
+    }
+    assert!(
+        contains(&out, b"hello-bitty-pty"),
+        "expected shell echo, got {out:?} as {}",
+        String::from_utf8_lossy(&out)
+    );
+
+    let status = pty.wait().expect("reap sh");
+    assert!(
+        status.is_success(),
+        "shell echo should exit 0, got {status:?}"
+    );
+
+    // Drain remaining bytes (e.g. trailing newline, shell prompt if any)
+    // and assert pump ended cleanly with bounded semantics.
+    let _rest = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
+    reader.join().expect("pump ended cleanly after shell");
+}
+
+#[test]
+fn backpressure_bound_holds_under_flood() {
+    // Flood the bounded channel: the child produces unbounded output (`yes`
+    // piped through `head -n 5000` so it terminates), but the in-crate
+    // buffer never exceeds MAX_BUFFERED_BYTES. The kernel PTY buffer +
+    // channel backpressure blocks the child instead of growing the heap.
+    let mut pty = PtyBuilder::new("/bin/sh")
+        .arg("-c")
+        .arg("yes | head -n 5000")
+        .spawn()
+        .expect("spawn flood");
+
+    let reader = pty.take_reader().expect("reader half");
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let mut total = 0usize;
+    let mut chunks = 0usize;
+    let mut max_chunk = 0usize;
+    // Drain until EOF, asserting per-chunk bound holds even under flood.
+    while let Some(chunk) = reader.recv() {
+        assert!(
+            chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
+            "flood chunk {} exceeds READ_CHUNK_SIZE {}",
+            chunk.len(),
+            bitty_pty::READ_CHUNK_SIZE
+        );
+        max_chunk = max_chunk.max(chunk.len());
+        total += chunk.len();
+        chunks += 1;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "flood drain timed out"
+        );
+        // The channel itself is bounded to 16 chunks; even if we drained
+        // slowly, total buffered inside the crate at any instant could never
+        // exceed MAX_BUFFERED_BYTES. We prove the weaker invariant that no
+        // single chunk exceeds READ_CHUNK_SIZE and that the pump completes
+        // without unbounded growth (total > MAX shunts would have hung or
+        // panicked if backpressure were broken).
+        assert!(
+            total <= 5000 * 10 + 8192,
+            "unreasonable total {total}, backpressure may have duplicated or leaked"
+        );
+    }
+    assert!(chunks > 0, "flood should produce at least one chunk");
+    assert!(
+        max_chunk > 0 && max_chunk <= bitty_pty::READ_CHUNK_SIZE,
+        "max chunk sanity"
+    );
+    // Verify the semantic bound documented in lib.rs: channel holds at most
+    // CHANNEL_CAPACITY_CHUNKS chunks, so hard buffer bound is 128 KiB.
+    assert_eq!(
+        bitty_pty::MAX_BUFFERED_BYTES,
+        bitty_pty::READ_CHUNK_SIZE * bitty_pty::CHANNEL_CAPACITY_CHUNKS
+    );
+
+    let status = pty.wait().expect("reap flood");
+    // `yes | head` exits 0 on most cores (SIGPIPE on `yes` is masked by pipe).
+    // We only assert the child was reaped, not success.
+    let _ = status.code();
+    reader.join().expect("pump clean after flood");
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

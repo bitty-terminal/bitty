@@ -161,6 +161,18 @@ impl PtyReader {
         }
     }
 
+    /// Non-blocking attempt to receive the next chunk.
+    ///
+    /// Returns `Some(chunk)` when data is immediately available, `None` when
+    /// the channel is empty or has reached EOF. Use [`recv`] for blocking or
+    /// [`recv_timeout`] when a deadline is needed. This helper exists so
+    /// embedders (e.g. `bitty-runtime::Runtime::poll_pty`) can drain without
+    /// blocking the render thread while preserving the bounded channel
+    /// backpressure contract.
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        self.rx.try_recv().ok()
+    }
+
     /// Joins the pump thread and returns its terminal outcome.
     ///
     /// `Ok(())` means clean EOF; `Err` surfaces read failures (or the

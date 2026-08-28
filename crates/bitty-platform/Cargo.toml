@@ -28,6 +28,7 @@ headless = []
 
 [dependencies]
 winit = "0.30"
+arboard = "3.6"
 # ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
 # at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
 # pinned and re-exported; see crate-level ownership rules and src/surface.rs.

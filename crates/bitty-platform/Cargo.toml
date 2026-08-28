@@ -17,6 +17,11 @@ workspace = true
 # They are excluded from CI and from the default test run; execute locally with
 # `cargo test -p bitty-platform --features gui-tests`.
 gui-tests = []
+# Headless mode marker: no code is gated behind it, but the feature exists so
+# `cargo test --features headless` still exercises the headless fallback
+# (`App::run` -> DisplayUnavailable) without requiring a window system.
+# CI never enables gui-tests; the default run proves headless still works.
+headless = []
 
 # Runs as a plain process entry point (`harness = false`) because winit
 # requires event-loop creation on the OS main thread; see the file header.
@@ -31,4 +36,8 @@ raw-window-handle = "=0.6.2"
 
 [[test]]
 name = "headless_run"
+harness = false
+
+[[test]]
+name = "winit_window"
 harness = false

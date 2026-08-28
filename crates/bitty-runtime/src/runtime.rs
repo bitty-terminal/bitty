@@ -70,8 +70,8 @@
 //!   plugin VM remain deferred. This slice only wires the host-owned data structures
 //!   and the bounded crossing.
 
-use bitty_platform::{PhysicalSize, PlatformEvent, WindowEventKind};
-use bitty_pty::{Pty, PtyBuilder, PtyReader};
+use bitty_platform::{KeyEvent, PhysicalSize, PlatformEvent, WindowEventKind};
+use bitty_pty::{Pty, PtyBuilder, PtyReader, PtyWriter};
 use bitty_render::{
     RenderError,
     frame::{FrameMode, FramePlan},
@@ -332,12 +332,22 @@ fn cold_to_observation(event: &ColdEvent) -> Option<HostObservation> {
     }
 }
 
+/// Bounded pending input buffer (keyboard bytes awaiting PTY write or
+/// headless observation). Mirrors the cold-queue bound philosophy (T-01) but
+/// for the input path; 8 KiB is enough for burst typing without unbounded
+/// growth. When full, oldest bytes are dropped and counted via
+/// `pending_input_dropped`.
+const MAX_PENDING_INPUT: usize = 8192;
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
     state: State,
     pty: Option<Pty>,
     pty_reader: Option<PtyReader>,
+    pty_writer: Option<PtyWriter>,
+    pending_input: Vec<u8>,
+    pending_input_dropped: u64,
     renderer: GridRenderer<HeadlessRasterizer>,
     surface: Surface,
     cold_queue: ColdQueue,
@@ -369,6 +379,9 @@ impl std::fmt::Debug for Runtime {
             )
             .field("has_pty", &self.pty.is_some())
             .field("has_pty_reader", &self.pty_reader.is_some())
+            .field("has_pty_writer", &self.pty_writer.is_some())
+            .field("pending_input_len", &self.pending_input.len())
+            .field("pending_input_dropped", &self.pending_input_dropped)
             .field("pending_full_redraw", &self.pending_full_redraw)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
@@ -468,6 +481,9 @@ impl Runtime {
             state: State::new(),
             pty: None,
             pty_reader: None,
+            pty_writer: None,
+            pending_input: Vec::new(),
+            pending_input_dropped: 0,
             renderer,
             surface,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -513,6 +529,9 @@ impl Runtime {
             state: State::new(),
             pty: None,
             pty_reader: None,
+            pty_writer: None,
+            pending_input: Vec::new(),
+            pending_input_dropped: 0,
             renderer,
             surface,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -594,6 +613,126 @@ impl Runtime {
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         let raw = self.surface.headless_rgba()?;
         Some(raw)
+    }
+
+    // ------------------------------------------------------------------
+    // Keyboard input (CTX-0057) — winit → owned KeyEvent → legacy VT bytes → PTY
+    // ------------------------------------------------------------------
+
+    /// Encodes a [`KeyEvent`] into the terminal input bytes (legacy xterm).
+    ///
+    /// Pure, headless, and deterministic: delegates to
+    /// [`bitty_platform::encode_key_event`] which owns the xterm legacy table
+    /// (M1 required baseline; Kitty protocol is deferred). Returns `None` for
+    /// release/synthetic/modifier-only/unmapped inputs.
+    #[must_use]
+    pub fn encode_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
+        bitty_platform::encode_key_event(event)
+    }
+
+    /// Handles a decoded keyboard event: encodes to bytes and routes to the PTY.
+    ///
+    /// When a live PTY writer exists the bytes are written directly (best
+    /// effort; errors are ignored so a transient write failure never panics
+    /// the loop). Otherwise the bytes are buffered in a bounded
+    /// `pending_input` queue (`MAX_PENDING_INPUT` = 8 KiB) so headless
+    /// synthetic tests can observe them via [`Self::drain_pending_input`].
+    /// When the buffer would overflow the oldest bytes are dropped and
+    /// [`Self::pending_input_dropped`] increments (drop-oldest).
+    ///
+    /// Returns the encoded bytes when the event produced input, `None`
+    /// otherwise (release, synthetic, modifier-only, etc.). Headless
+    /// callers may synthesize [`KeyEvent`]s without a window and drive this
+    /// path deterministically.
+    pub fn handle_key_event(&mut self, event: KeyEvent) -> Option<Vec<u8>> {
+        let bytes = Self::encode_key_event(&event)?;
+        self.push_input_bytes(&bytes);
+        Some(bytes)
+    }
+
+    /// Convenience: handles a borrowed [`KeyEvent`] without moving it.
+    pub fn handle_key_event_ref(&mut self, event: &KeyEvent) -> Option<Vec<u8>> {
+        let bytes = Self::encode_key_event(event)?;
+        self.push_input_bytes(&bytes);
+        Some(bytes)
+    }
+
+    /// Pushes raw input bytes into the pending queue and, when a PTY writer
+    /// is live, writes them through.
+    pub fn push_input_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Try live PTY write first (best effort, never panics).
+        if let Some(writer) = self.pty_writer.as_mut() {
+            use std::io::Write as _;
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+            // Also keep a copy in pending for observability? For live PTY
+            // tests the child will echo, so pending is not needed. We do not
+            // double-buffer when writer exists to keep the bound honest.
+            // Headless tests without a writer will observe via pending.
+            return;
+        }
+        // Headless / no-writer path: bounded buffer with drop-oldest.
+        let overflow = self.pending_input.len() + bytes.len() > MAX_PENDING_INPUT;
+        if overflow {
+            // Make room by dropping oldest bytes.
+            let needed = self.pending_input.len() + bytes.len() - MAX_PENDING_INPUT;
+            let drop = needed.min(self.pending_input.len());
+            self.pending_input.drain(0..drop);
+            self.pending_input_dropped += drop as u64;
+            // If the incoming chunk itself exceeds capacity, truncate to last
+            // MAX_PENDING_INPUT bytes (still bounded).
+            if bytes.len() > MAX_PENDING_INPUT {
+                let start = bytes.len() - MAX_PENDING_INPUT;
+                let dropped_extra = bytes.len() - MAX_PENDING_INPUT;
+                self.pending_input_dropped += dropped_extra as u64;
+                self.pending_input.extend_from_slice(&bytes[start..]);
+                return;
+            }
+        }
+        self.pending_input.extend_from_slice(bytes);
+    }
+
+    /// Number of bytes currently buffered for PTY input (headless observation).
+    #[must_use]
+    pub fn pending_input_len(&self) -> usize {
+        self.pending_input.len()
+    }
+
+    /// How many input bytes have been dropped due to buffer overflow.
+    #[must_use]
+    pub fn pending_input_dropped(&self) -> u64 {
+        self.pending_input_dropped
+    }
+
+    /// Views the pending input buffer without draining (headless helper).
+    #[must_use]
+    pub fn pending_input(&self) -> &[u8] {
+        &self.pending_input
+    }
+
+    /// Drains and returns all pending input bytes (headless helper).
+    pub fn drain_pending_input(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_input)
+    }
+
+    /// Whether a live PTY writer is currently owned.
+    #[must_use]
+    pub fn has_pty_writer(&self) -> bool {
+        self.pty_writer.is_some()
+    }
+
+    /// Takes exclusive ownership of the PTY writer, if present (test helper).
+    pub fn take_pty_writer(&mut self) -> Option<PtyWriter> {
+        self.pty_writer.take()
+    }
+
+    /// Writes raw bytes as terminal input, same routing as keyboard (writer
+    /// when live, bounded pending otherwise).
+    pub fn write_input(&mut self, bytes: &[u8]) {
+        self.push_input_bytes(bytes);
     }
 
     // ------------------------------------------------------------------
@@ -1101,9 +1240,14 @@ impl Runtime {
         }
         let mut pty = builder.spawn().map_err(RuntimeError::from)?;
         let reader = pty.take_reader().map_err(RuntimeError::from)?;
+        let writer = pty.take_writer().map_err(RuntimeError::from)?;
         // Replace any previously spawned child (drop kills old).
         self.pty = Some(pty);
         self.pty_reader = Some(reader);
+        self.pty_writer = Some(writer);
+        // Clear pending input on new shell: fresh session, no stale keystrokes.
+        self.pending_input.clear();
+        self.pending_input_dropped = 0;
         Ok(())
     }
 
@@ -1316,11 +1460,11 @@ impl Runtime {
     /// Handles one platform event, returning `true` when the event asks the
     /// application loop to exit (window close requested or `Exiting` phase).
     ///
-    /// Resize events are routed through [`Self::handle_resize`]; other
-    /// window events currently return `false` without side effects so the
-    /// hot path stays deterministic. Input routing (keymap, encoder) is an
-    /// open placement question tracked in ADR-0003 and is intentionally
-    /// not handled here yet.
+    /// Resize events are routed through [`Self::handle_resize`]; keyboard
+    /// input is encoded via the legacy xterm table (CTX-0057) and routed to
+    /// the PTY writer when live, otherwise buffered as bounded pending input
+    /// for headless observation. Other window events currently return `false`
+    /// without side effects so the hot path stays deterministic.
     pub fn handle_platform_event(&mut self, event: PlatformEvent) -> bool {
         match event {
             PlatformEvent::Window { window_id: _, kind } => match kind {
@@ -1343,6 +1487,10 @@ impl Runtime {
                     // The embedder will call `tick` on `AboutToWait`; we do
                     // not present eagerly here so frame-on-demand stays
                     // honest (no periodic wakeups when idle).
+                    false
+                }
+                WindowEventKind::KeyboardInput(key) => {
+                    let _ = self.handle_key_event(key);
                     false
                 }
                 _ => false,

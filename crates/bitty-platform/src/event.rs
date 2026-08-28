@@ -32,6 +32,16 @@ impl WindowId {
         Self(raw)
     }
 
+    /// Creates a `WindowId` from a raw value.
+    ///
+    /// Exposed for tests and for handlers that synthesize [`PlatformEvent`]s
+    /// without a live window (e.g. headless `Runtime` integration tests).
+    /// Production window identities remain those assigned by
+    /// [`EventContext::create_window`](crate::EventContext::create_window).
+    pub fn from_raw_public(raw: u64) -> Self {
+        Self::from_raw(raw)
+    }
+
     /// Returns the raw numeric identity (process-local).
     pub const fn get(self) -> u64 {
         self.0

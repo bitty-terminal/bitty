@@ -685,10 +685,22 @@ impl Surface {
                 }
                 drop(state);
 
-                // Acquire, clear, and present.
-                let frame = surface
-                    .get_current_texture()
-                    .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?;
+                // Acquire with one retry on Outdated/Lost: reconfigure and try again.
+                // This matches wgpu's recommended recovery for swap-chain loss
+                // (see wgpu::SurfaceError::Outdated/Lost). Timeout/OutOfMemory
+                // are propagated without retry because they are transient or
+                // fatal in different ways — the caller decides whether to retry
+                // the frame. The headless fake never reaches this branch.
+                let frame = match surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                        self.configure(ctx, config.extent)?;
+                        surface
+                            .get_current_texture()
+                            .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?
+                    }
+                    Err(e) => return Err(RenderError::SurfaceAcquire(e.to_string())),
+                };
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
@@ -891,10 +903,20 @@ impl Surface {
             SurfaceKind::Gpu { surface, .. } => {
                 // Real GPU path: validate then acquire+clear+present. Full
                 // `DrawList`→pipeline draw is deferred; we still submit a
-                // clear so `present` can be observably called.
-                let frame = surface
-                    .get_current_texture()
-                    .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?;
+                // clear so `present` can be observably called. Handle
+                // Outdated/Lost with one reconfigure retry, matching the
+                // `present` recovery contract; headless composite above is
+                // the CI-tested equivalent.
+                let frame = match surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                        self.configure(ctx, config.extent)?;
+                        surface
+                            .get_current_texture()
+                            .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?
+                    }
+                    Err(e) => return Err(RenderError::SurfaceAcquire(e.to_string())),
+                };
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());

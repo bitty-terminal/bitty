@@ -29,6 +29,12 @@ pub enum PlatformError {
 
     /// A scale factor was not finite or not strictly positive.
     InvalidScaleFactor(f64),
+
+    /// Clipboard is unavailable on this platform or display server.
+    ClipboardUnavailable(String),
+
+    /// Clipboard operation failed.
+    ClipboardOperation(String),
 }
 
 impl fmt::Display for PlatformError {
@@ -44,6 +50,12 @@ impl fmt::Display for PlatformError {
             }
             Self::InvalidScaleFactor(value) => {
                 write!(f, "invalid scale factor (must be finite and > 0): {value}")
+            }
+            Self::ClipboardUnavailable(detail) => {
+                write!(f, "clipboard unavailable: {detail}")
+            }
+            Self::ClipboardOperation(detail) => {
+                write!(f, "clipboard operation failed: {detail}")
             }
         }
     }

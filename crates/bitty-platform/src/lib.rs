@@ -89,6 +89,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod clipboard;
 pub mod dpi;
 pub mod error;
 pub mod event;
@@ -102,6 +103,7 @@ pub mod surface;
 pub use raw_window_handle;
 
 pub use app::{App, AppHandler, EventContext, WindowConfig, WindowHandle};
+pub use clipboard::Clipboard;
 pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor};
 pub use error::PlatformError;
 pub use event::{

@@ -70,7 +70,10 @@
 //!   plugin VM remain deferred. This slice only wires the host-owned data structures
 //!   and the bounded crossing.
 
-use bitty_platform::{KeyEvent, PhysicalSize, PlatformEvent, WindowEventKind};
+use bitty_platform::{
+    Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
+    WindowEventKind,
+};
 use bitty_pty::{Pty, PtyBuilder, PtyReader, PtyWriter};
 use bitty_render::{
     RenderError,
@@ -83,8 +86,11 @@ use bitty_render::{
     grid::{CellMetrics, DrawList, GridRenderer},
 };
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
-use bitty_ui::{Focus, FocusDirection, LayoutNode, Rect as UiRect, View, ViewId};
-use bitty_vt::{Parser, SequenceKind};
+use bitty_ui::{
+    CellPos, Focus, FocusDirection, LayoutNode, Rect as UiRect, Selection, SelectionKind, View,
+    ViewId,
+};
+use bitty_vt::{ClipboardOp, Parser, SequenceKind};
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, GrantRecord, HostObservation, InterceptionDecision,
@@ -192,6 +198,12 @@ fn default_container(cols: usize, rows: usize) -> UiRect {
     let w = cols.min(u16::MAX as usize) as u16;
     let h = rows.min(u16::MAX as usize) as u16;
     UiRect::new(0, 0, w, h)
+}
+
+fn clamp_cell_pos(snapshot: &Snapshot, pos: CellPos) -> CellPos {
+    let max_row = snapshot.height.saturating_sub(1) as u16;
+    let max_col = snapshot.width.saturating_sub(1) as u16;
+    CellPos::new(pos.row.min(max_row), pos.col.min(max_col))
 }
 
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
@@ -359,6 +371,10 @@ pub struct Runtime {
     layout: LayoutNode,
     focus: Focus,
     container: UiRect,
+    clipboard: Clipboard,
+    selection: Option<Selection>,
+    selection_dragging: bool,
+    last_cursor: Option<CursorPosition>,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -390,6 +406,9 @@ impl std::fmt::Debug for Runtime {
                 "plugin_drop_policy",
                 &self.plugin_host.pipeline().drop_policy(),
             )
+            .field("has_selection", &self.selection.is_some())
+            .field("selection_dragging", &self.selection_dragging)
+            .field("clipboard_headless", &self.clipboard.is_headless())
             .finish_non_exhaustive()
     }
 }
@@ -493,6 +512,10 @@ impl Runtime {
             layout,
             focus,
             container,
+            clipboard: Clipboard::new(),
+            selection: None,
+            selection_dragging: false,
+            last_cursor: None,
         })
     }
 
@@ -541,6 +564,10 @@ impl Runtime {
             layout,
             focus,
             container,
+            clipboard: Clipboard::new(),
+            selection: None,
+            selection_dragging: false,
+            last_cursor: None,
         })
     }
 
@@ -733,6 +760,259 @@ impl Runtime {
     /// when live, bounded pending otherwise).
     pub fn write_input(&mut self, bytes: &[u8]) {
         self.push_input_bytes(bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // Selection and clipboard (CTX-0059) — winit/arboard with headless fallback
+    // ------------------------------------------------------------------
+
+    /// Current selection, if any (read-only).
+    #[must_use]
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    /// Whether a drag is in progress.
+    #[must_use]
+    pub fn is_selection_dragging(&self) -> bool {
+        self.selection_dragging
+    }
+
+    /// Whether a selection currently exists and is non-empty.
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| !s.is_empty())
+    }
+
+    /// Clears the current selection.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_dragging = false;
+    }
+
+    /// Directly sets the selection (headless test seam).
+    pub fn set_selection(&mut self, selection: Selection) {
+        let snap = self.state.snapshot();
+        let clamped = selection.clamped(&snap).snapped(Some(&snap));
+        self.selection = Some(clamped);
+        self.selection_dragging = clamped.active;
+    }
+
+    /// Starts a new selection at `pos` (mouse down).
+    pub fn start_selection(&mut self, pos: CellPos) {
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        self.selection = Some(Selection {
+            anchor: snapped,
+            focus: snapped,
+            kind: SelectionKind::Simple,
+            active: true,
+        });
+        self.selection_dragging = true;
+    }
+
+    /// Updates the current selection's focus to `pos` (mouse drag).
+    pub fn update_selection(&mut self, pos: CellPos) {
+        let Some(mut sel) = self.selection else {
+            return;
+        };
+        if !self.selection_dragging {
+            return;
+        }
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        sel.focus = snapped;
+        sel.active = true;
+        self.selection = Some(sel);
+    }
+
+    /// Ends the selection at `pos` (mouse up) and leaves it active for copy.
+    pub fn end_selection(&mut self, pos: CellPos) {
+        let Some(mut sel) = self.selection else {
+            return;
+        };
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        sel.focus = snapped;
+        sel.active = false;
+        self.selection_dragging = false;
+        // Keep zero-length selections as None to avoid empty copies.
+        if sel.anchor == sel.focus {
+            self.selection = None;
+        } else {
+            self.selection = Some(sel);
+        }
+    }
+
+    /// Returns selected text for the current selection, if any.
+    #[must_use]
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let snap = self.state.snapshot();
+        let text = sel.text(&snap);
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Copies the current selection to the system clipboard (via `arboard`
+    /// with headless fallback). Returns the copied text on success, `None`
+    /// when no selection exists.
+    ///
+    /// # Errors
+    ///
+    /// When a system clipboard is present and the OS reports an error,
+    /// returns `PlatformError::ClipboardOperation` but still updates the
+    /// headless buffer so headless tests can observe the value.
+    pub fn copy_selection_to_clipboard(
+        &mut self,
+    ) -> Result<Option<String>, bitty_platform::PlatformError> {
+        let Some(text) = self.selection_text() else {
+            return Ok(None);
+        };
+        self.clipboard.set_text(text.clone())?;
+        Ok(Some(text))
+    }
+
+    /// Best-effort copy that never returns an error (drops system errors).
+    pub fn copy_selection_lossy(&mut self) -> Option<String> {
+        let text = self.selection_text()?;
+        self.clipboard.set_text_lossy(text.clone());
+        Some(text)
+    }
+
+    /// Pastes text from the system clipboard (or headless buffer) and routes
+    /// it as terminal input via the bounded pending path. Returns the pasted
+    /// text on success, `None` when clipboard is empty.
+    ///
+    /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
+    /// primitive before the write, so untrusted clipboard content cannot grow
+    /// the heap without limit (T-01). When a live PTY writer exists the bytes
+    /// are written directly; otherwise they land in `pending_input` for
+    /// headless observation.
+    pub fn paste_from_clipboard(
+        &mut self,
+    ) -> Result<Option<String>, bitty_platform::PlatformError> {
+        let text = self.clipboard.get_text()?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        self.write_input(text.as_bytes());
+        Ok(Some(text))
+    }
+
+    /// Pastes the given text directly as terminal input, bypassing the
+    /// system clipboard (for synthetic/headless tests or OSC 52 writes).
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.write_input(text.as_bytes());
+    }
+
+    /// Selects all cells in the current snapshot (Ctrl+Shift+A / triple-click equivalent).
+    pub fn select_all(&mut self) {
+        let snap = self.state.snapshot();
+        if snap.width == 0 || snap.height == 0 {
+            self.selection = None;
+            return;
+        }
+        let start = CellPos::new(0, 0);
+        let end = CellPos::new((snap.height - 1) as u16, (snap.width - 1) as u16);
+        let sel = Selection {
+            anchor: start,
+            focus: bitty_ui::snap_to_leading(&snap, end),
+            kind: SelectionKind::Simple,
+            active: false,
+        };
+        self.selection = Some(sel);
+        self.selection_dragging = false;
+    }
+
+    /// Converts a physical cursor position to a grid cell coordinate using
+    /// the configured cell metrics. Clamped to the current snapshot bounds.
+    ///
+    /// When the position lies far outside the window it clamps to the nearest
+    /// cell rather than returning `None`, so drag selections that leave the
+    /// window still produce deterministic inclusive ranges.
+    #[must_use]
+    pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
+        let snap = self.state.snapshot();
+        let cell_w = self.config.cell_width as f64;
+        let cell_h = self.config.cell_height as f64;
+        let col = if cell_w <= 0.0 {
+            0
+        } else {
+            (pos.x / cell_w).floor() as i64
+        };
+        let row = if cell_h <= 0.0 {
+            0
+        } else {
+            (pos.y / cell_h).floor() as i64
+        };
+        let max_col = snap.width.saturating_sub(1) as i64;
+        let max_row = snap.height.saturating_sub(1) as i64;
+        let clamped_col = col.clamp(0, max_col) as u16;
+        let clamped_row = row.clamp(0, max_row) as u16;
+        bitty_ui::snap_to_leading(&snap, CellPos::new(clamped_row, clamped_col))
+    }
+
+    /// Handles a mouse button event for selection (Linux copy-on-select behavior
+    /// is not automatic: callers must call `copy_selection_to_clipboard`).
+    pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
+        match (event.button, event.state) {
+            (MouseButton::Left, PressState::Pressed) => {
+                if let Some(pos) = self.last_cursor {
+                    let cell = self.cursor_to_cell(pos);
+                    self.start_selection(cell);
+                }
+            }
+            (MouseButton::Left, PressState::Released) => {
+                if let Some(pos) = self.last_cursor {
+                    let cell = self.cursor_to_cell(pos);
+                    self.end_selection(cell);
+                } else {
+                    self.selection_dragging = false;
+                    if let Some(mut sel) = self.selection {
+                        sel.active = false;
+                        self.selection = Some(sel);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles cursor movement for drag selection.
+    pub fn handle_cursor_moved(&mut self, pos: CursorPosition) {
+        self.last_cursor = Some(pos);
+        if self.selection_dragging {
+            let cell = self.cursor_to_cell(pos);
+            self.update_selection(cell);
+        }
+    }
+
+    /// Current cursor position, if known.
+    #[must_use]
+    pub fn last_cursor(&self) -> Option<CursorPosition> {
+        self.last_cursor
+    }
+
+    /// Owned clipboard handle (mutable) for advanced use (e.g. OSC 52 tests).
+    pub fn clipboard_mut(&mut self) -> &mut Clipboard {
+        &mut self.clipboard
+    }
+
+    /// Owned clipboard handle (read-only).
+    #[must_use]
+    pub fn clipboard(&self) -> &Clipboard {
+        &self.clipboard
+    }
+
+    /// Forces the clipboard into headless mode (test helper, deterministic).
+    pub fn force_headless_clipboard(&mut self) {
+        self.clipboard = Clipboard::new_headless();
     }
 
     // ------------------------------------------------------------------
@@ -1402,6 +1682,24 @@ impl Runtime {
                     self.plugin_host.push_observation(obs);
                 }
             }
+            // OSC 52 clipboard (CTX-0059): bridge parser's bounded clipboard action
+            // to the platform clipboard via the headless-fallback primitive. Reads
+            // remain denied (M1): no data leaves the clipboard. Writes are
+            // forwarded as text lossily (base64 decode deferred until RFC lands;
+            // headless stores raw bytes as UTF-8 lossy, bounded to Clipboard limit
+            // before the system call). This stays headless-testable: `Clipboard`
+            // falls back to memory on CI without a display server.
+            if let TerminalAction::OscClipboard { op, data } = &action {
+                match op {
+                    ClipboardOp::Write => {
+                        let raw = String::from_utf8_lossy(data.as_bytes()).into_owned();
+                        self.clipboard.set_text_lossy(raw);
+                    }
+                    ClipboardOp::Read => {
+                        // Denied in M1: do not touch the system clipboard.
+                    }
+                }
+            }
             let damage = self.state.apply(&action);
             if !damage.regions.is_empty() {
                 let generation = damage.generation;
@@ -1448,6 +1746,18 @@ impl Runtime {
             }
         }
         self.layout.reflow(self.container);
+        // Clamp selection to new snapshot bounds (keeps invariants after reflow;
+        // wide-char snapping is preserved). Headless so deterministic.
+        if let Some(sel) = self.selection {
+            let snap = self.state.snapshot();
+            let clamped = sel.clamped(&snap).snapped(Some(&snap));
+            if clamped.is_empty() {
+                self.selection = None;
+                self.selection_dragging = false;
+            } else {
+                self.selection = Some(clamped);
+            }
+        }
         self.surface
             .headless_resize(size)
             .map_err(RuntimeError::from)?;
@@ -1466,7 +1776,9 @@ impl Runtime {
     /// Resize events are routed through [`Self::handle_resize`]; keyboard
     /// input is encoded via the legacy xterm table (CTX-0057) and routed to
     /// the PTY writer when live, otherwise buffered as bounded pending input
-    /// for headless observation. Other window events currently return `false`
+    /// for headless observation. Mouse and cursor events drive the
+    /// headless-tested selection state (CTX-0059) via `bitty-ui::Selection`
+    /// with wide-char snapping; other window events currently return `false`
     /// without side effects so the hot path stays deterministic.
     pub fn handle_platform_event(&mut self, event: PlatformEvent) -> bool {
         match event {
@@ -1496,7 +1808,26 @@ impl Runtime {
                     let _ = self.handle_key_event(key);
                     false
                 }
-                _ => false,
+                WindowEventKind::MouseInput(mouse) => {
+                    self.handle_mouse_input(mouse);
+                    false
+                }
+                WindowEventKind::CursorMoved(pos) => {
+                    self.handle_cursor_moved(pos);
+                    false
+                }
+                WindowEventKind::CursorLeft => {
+                    // Cursor left window: end drag if active (deterministic).
+                    if self.selection_dragging {
+                        self.selection_dragging = false;
+                        if let Some(mut sel) = self.selection {
+                            sel.active = false;
+                            self.selection = Some(sel);
+                        }
+                    }
+                    false
+                }
+                WindowEventKind::MouseWheel(_) | WindowEventKind::Focused(_) => false,
             },
             PlatformEvent::Exiting => true,
             _ => false,

@@ -19,3 +19,4 @@ bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }
 
 [dev-dependencies]
 bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.1", path = "../bitty-vt" }

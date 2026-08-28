@@ -30,6 +30,10 @@
 //! - [`selection`] — `CellPos`, `SelectionRange`, `Selection` and helpers for
 //!   range / word / line anchoring with wide-char awareness (spacer snapping,
 //!   never splitting a `width==2` pair), plus `selected_text`.
+//! - [`search`] — [`search::SearchState`] headless search UI: bounded query
+//!   (`256` bytes) and matches (`1000`), deterministic `next`/`prev` with wrap,
+//!   view-aware highlight mapping, `PersistentSelection` conversion, and
+//!   scroll-to-current for the viewport.
 //! - [`geometry`] — integer `Rect`, `Point`, `Size`, `SplitAxis`.
 //!
 //! # Determinism
@@ -52,6 +56,7 @@
 pub mod focus;
 pub mod geometry;
 pub mod layout;
+pub mod search;
 pub mod selection;
 pub mod view;
 
@@ -59,6 +64,7 @@ pub mod view;
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Point, Rect, Size, SplitAxis};
 pub use layout::{LayoutNode, clamp_ratio, split_rect};
+pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,

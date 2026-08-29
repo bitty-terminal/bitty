@@ -16,8 +16,10 @@ status: draft
 - Status: **draft**. Preparation artifact only. No `cargo publish` was
   executed, no credentials were used, and no crates.io upload occurred.
   This log records pre-publish **dry-run** verification for
-  `CTX-0047` on branch `ctx-0047/publish-g1-actual`.
-- Ownership: bitty **CTX-0047** — branch `ctx-0047/publish-g1-actual`.
+  `CTX-0047` on branch `ctx-0047/publish-g1-actual`, re-verified at
+  `CTX-0052` (`ctx-0052/publish-g1`) and `CTX-0062`
+  (`ctx-0062/publish-g1-final` at `ffd3eee`).
+- Ownership: bitty **CTX-0047** — branch `ctx-0047/publish-g1-actual` (re-verified CTX-0062 at `ffd3eee`).
 - Task: `Publish G1 leaves to crates.io (actual) — dry-run preparation only`
   — verify `0.0.1` and `cargo publish --dry-run` for G1 leaves
   `vt`, `pty`, `platform`, `config`, `package`, `lua` in documented order.
@@ -33,7 +35,9 @@ order` — PR #75 (`ff9715d`) — **merged** to `main` at `9eec31b`.
   - **CTX-0049** `chore(crate): adjust workspace to 0.0.1 earliest, defer
 0.1.0` — PR #77 (`956926c`) — earliest publish `0.0.1`.
   - **CTX-0050** `feat(runtime): add v0.1 minimal terminal slice` — PR #78
-    (`9eec31b`) — current `HEAD`.
+    (`9eec31b`) — prior `HEAD`.
+  - **CTX-0061** `feat(ui): implement scrollback search UI integration` — PR #97
+    (`ffd3eee`) — current `HEAD` at `ctx-0062/publish-g1-final`.
 - Provenance: builds on the publish-order DAG in
   [`release-ladder.md`](./release-ladder.md) (CTX-0044) and
   [`g1-publish-checklist.md`](./g1-publish-checklist.md) (CTX-0045), and the
@@ -65,19 +69,20 @@ order` — PR #75 (`ff9715d`) — **merged** to `main` at `9eec31b`.
 
 ### Head and toolchain
 
-- Worktree: `/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0052-publish-g1`
-- Branch: `ctx-0052/publish-g1` — `HEAD bbbdc1c` (`main` at
-  `bbbdc1c`; historical `ctx-0047/publish-g1-actual` at `9eec31b` — see Revision history).
+- Worktree: `/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0062-publish-g1-final`
+- Branch: `ctx-0062/publish-g1-final` — `HEAD ffd3eee` (`main` at
+  `ffd3eee`; historical `ctx-0052/publish-g1` at `bbbdc1c`, `ctx-0047/publish-g1-actual` at `9eec31b` — see Revision history).
 - Toolchain: `rust-toolchain.toml` `channel = "1.97.1"` — `cargo 1.97.1`
   (`c980f4866 2026-06-30`), `rustc 1.97.1` (`8bab26f4f 2026-07-14`).
 - `git status` was **clean** before this draft log; the log itself is
-  intentionally left **dirty** (untracked) per the task — real publish
-  must run from a clean tree without `--allow-dirty`.
+  intentionally left **dirty** per the task — real publish must run from a
+  clean tree without `--allow-dirty`.
 
 ### Workspace version
 
 - `Cargo.toml` `[workspace.package] version = "0.0.1"` — inherited from
-  CTX-0049 at `956926c`, retained at `9eec31b`. No drift.
+  CTX-0049 at `956926c`, retained at `9eec31b` through `ffd3eee`. No drift
+  (verified `2026-08-29` at `ffd3eee`).
 - `[workspace.package]` carries `edition = "2024"`,
   `rust-version = "1.85"`, `publish = false` at the workspace root,
   plus `description = "Bitty terminal workspace"`,
@@ -97,7 +102,7 @@ publish = false
   `publish = true` with their own `description`/`license`/`repository`
   and no internal `path` dependency requiring `version = "0.0.1"`.
 
-### Publish flags (verified `2026-08-28` at `bbbdc1c`; historical `9eec31b`)
+### Publish flags (verified `2026-08-29` at `ffd3eee`; historical `bbbdc1c` `2026-08-28`, `9eec31b`)
 
 | Crate               | `publish` | Internal workspace deps                                              | Expected at `0.0.1` |
 | ------------------- | --------- | -------------------------------------------------------------------- | ------------------- |
@@ -163,17 +168,17 @@ dry-run; for a real publish, allow index propagation before starting Group 2.
 
 ## Verification gates (must PASS before any real publish)
 
-| Gate                         | Command                                                                                             | Result on `ctx-0052/publish-g1` at `bbbdc1c` (2026-08-28; historical `ctx-0047/publish-g1-actual` at `9eec31b`) |
-| ---------------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `cargo check`                | `cargo check --workspace --all-targets --locked`                                                    | **PASS** — `Finished dev profile` (re-run via `just check` clippy/typecheck leg)                                |
-| `just check`                 | `just check` (`fmt-check` + `clippy -D warnings` + `test --locked` + `actionlint` + `markdownlint`) | **PASS** — 0 issues (see evidence below)                                                                        |
-| └ `cargo fmt --check`        | via `just fmt-check`                                                                                | PASS — no diff                                                                                                  |
-| └ `cargo clippy -D warnings` | `cargo clippy --workspace --all-targets --locked -- -D warnings`                                    | PASS — 0 warnings                                                                                               |
-| └ `cargo test`               | `cargo test --workspace --all-targets --locked`                                                     | PASS — 708 passed, 0 failed (CTX-0050 baseline; see `just check` tail)                                          |
-| └ `actionlint`               | `actionlint -color`                                                                                 | PASS                                                                                                            |
-| └ `markdownlint`             | `bunx --bun markdownlint-cli2@0.23.1` (`**/*.md`)                                                   | PASS — 0 issues in 28 files (now includes this draft; historical 27 at `9eec31b`)                               |
-| publish metadata             | `cargo publish --dry-run --allow-dirty` per G1 leaf                                                 | **PASS all 6** — see dry-run table                                                                              |
-| version/publish flag drift   | `grep` of `Cargo.toml` workspace + per-crate                                                        | PASS — `workspace.package.version 0.0.1`, G1 leaves `publish = true`                                            |
+| Gate                         | Command                                                                                             | Result on `ctx-0062/publish-g1-final` at `ffd3eee` (2026-08-29; historical `ctx-0052/publish-g1` at `bbbdc1c` `2026-08-28`, `ctx-0047/publish-g1-actual` at `9eec31b`) |
+| ---------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cargo check`                | `cargo check --workspace --all-targets --locked`                                                    | **PASS** — `Finished dev profile` (re-run via `just check` clippy/typecheck leg)                                                                                       |
+| `just check`                 | `just check` (`fmt-check` + `clippy -D warnings` + `test --locked` + `actionlint` + `markdownlint`) | **PASS** — 0 issues (see evidence below)                                                                                                                               |
+| └ `cargo fmt --check`        | via `just fmt-check`                                                                                | PASS — no diff                                                                                                                                                         |
+| └ `cargo clippy -D warnings` | `cargo clippy --workspace --all-targets --locked -- -D warnings`                                    | PASS — 0 warnings                                                                                                                                                      |
+| └ `cargo test`               | `cargo test --workspace --all-targets --locked`                                                     | PASS — 801 passed, 0 failed (CTX-0062 at `ffd3eee`; historical 708 at `bbbdc1c`/`9eec31b`; see `just check` tail)                                                      |
+| └ `actionlint`               | `actionlint -color`                                                                                 | PASS                                                                                                                                                                   |
+| └ `markdownlint`             | `bunx --bun markdownlint-cli2@0.23.1` (`**/*.md`)                                                   | PASS — 0 issues in 28 files (retained from `bbbdc1c`; historical 27 at `9eec31b`)                                                                                      |
+| publish metadata             | `cargo publish --dry-run --allow-dirty` per G1 leaf                                                 | **PASS all 6** — see dry-run table                                                                                                                                     |
+| version/publish flag drift   | `grep` of `Cargo.toml` workspace + per-crate                                                        | PASS — `workspace.package.version 0.0.1`, G1 leaves `publish = true`                                                                                                   |
 
 `just check` is the normative gate per `justfile`; it was executed on this
 worktree after writing this draft log (worktree intentionally dirty). Raw
@@ -184,10 +189,12 @@ No `TODO`/`FIXME` introduced; frontmatter `status: draft` retained.
 ## G1 leaf `cargo publish --dry-run` results
 
 Executed in worktree
-`/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0052-publish-g1`
-at `bbbdc1c` (historical `ctx-0047/publish-g1-actual` at `9eec31b`), toolchain `1.97.1`, with `--allow-dirty` so the untracked draft
+`/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0062-publish-g1-final`
+at `ffd3eee` (historical `ctx-0052/publish-g1` at `bbbdc1c`, `ctx-0047/publish-g1-actual` at `9eec31b`), toolchain `1.97.1`, with `--allow-dirty` so the draft
 log does not block verification. Mirrors the CTX-0043/CTX-0045 dry-run pattern;
-`--allow-dirty` is **not** used for a real `cargo publish`.
+`--allow-dirty` is **not** used for a real `cargo publish`. Actual publish is
+deferred **after P0 (CTX-0053)** and `0.0.1` tag from a clean tree without
+`--allow-dirty`; no credentials used here.
 
 ### Commands (task-specified order)
 
@@ -206,19 +213,20 @@ Run independently; each leaf verifies from the packaged tarball
 
 ### Results table
 
-| #   | Crate            | Version | `cargo publish --dry-run --allow-dirty` | Packaged                                  | Verified build                                                                        |
-| --- | ---------------- | ------- | --------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------- |
-| 1   | `bitty-vt`       | `0.0.1` | **PASS**                                | 23 files, 97.8 KiB (22.5 KiB compressed)  | `Compiling bitty-vt ... Finished dev` — `vte 0.15`                                    |
-| 2   | `bitty-pty`      | `0.0.1` | **PASS**                                | 14 files, 66.1 KiB (19.5 KiB compressed)  | `Compiling bitty-pty ... Finished dev` — `portable-pty 0.9`                           |
-| 3   | `bitty-platform` | `0.0.1` | **PASS**                                | 12 files, 124.4 KiB (33.6 KiB compressed) | `Compiling bitty-platform ... Finished dev` — `winit 0.30`, `raw-window-handle 0.6.2` |
-| 4   | `bitty-config`   | `0.0.1` | **PASS**                                | 13 files, 120.7 KiB (24.9 KiB compressed) | `Compiling bitty-config ... Finished dev`                                             |
-| 5   | `bitty-package`  | `0.0.1` | **PASS**                                | 13 files, 153.8 KiB (33.8 KiB compressed) | `Compiling bitty-package ... Finished dev`                                            |
-| 6   | `bitty-lua`      | `0.0.1` | **PASS**                                | 6 files, 60.4 KiB (14.3 KiB compressed)   | `Compiling bitty-lua ... Finished dev` — `piccolo 0.3.3`                              |
+| #   | Crate            | Version | `cargo publish --dry-run --allow-dirty` | Packaged (at `ffd3eee`; historical `bbbdc1c` in parentheses)            | Verified build                                                                        |
+| --- | ---------------- | ------- | --------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 1   | `bitty-vt`       | `0.0.1` | **PASS**                                | 23 files, 97.8 KiB (22.5 KiB compressed) — historical 97.8 KiB          | `Compiling bitty-vt ... Finished dev` — `vte 0.15`                                    |
+| 2   | `bitty-pty`      | `0.0.1` | **PASS**                                | 14 files, 71.7 KiB (20.9 KiB compressed) — historical 66.1 KiB (19.5)   | `Compiling bitty-pty ... Finished dev` — `portable-pty 0.9`                           |
+| 3   | `bitty-platform` | `0.0.1` | **PASS**                                | 16 files, 174.9 KiB (44.8 KiB compressed) — historical 124.4 KiB (33.6) | `Compiling bitty-platform ... Finished dev` — `winit 0.30`, `raw-window-handle 0.6.2` |
+| 4   | `bitty-config`   | `0.0.1` | **PASS**                                | 13 files, 120.7 KiB (24.9 KiB compressed) — same as historical          | `Compiling bitty-config ... Finished dev`                                             |
+| 5   | `bitty-package`  | `0.0.1` | **PASS**                                | 13 files, 153.8 KiB (33.8 KiB compressed) — same as historical          | `Compiling bitty-package ... Finished dev`                                            |
+| 6   | `bitty-lua`      | `0.0.1` | **PASS**                                | 6 files, 60.4 KiB (14.3 KiB compressed) — same as historical            | `Compiling bitty-lua ... Finished dev` — `piccolo 0.3.3`                              |
 
-All six: **dry-run PASS**. No metadata errors, no missing `description`/
+All six: **dry-run PASS** at `ffd3eee` (CTX-0062, re-verified with `--allow-dirty`; `just check` was run on dirty worktree per task, so sizes reflect `ffd3eee` head plus pending doc delta). No metadata errors, no missing `description`/
 `license`/`repository`, no unpublished internal path dep errors (expected
 only for Groups 2-3), no `publish = false` block. Warnings are only the
-intentional `aborting upload due to dry run`.
+intentional `aborting upload due to dry run`. Actual publish remains deferred
+after **P0 (CTX-0053)** and `0.0.1` tag from a clean tree without credentials.
 
 Raw log excerpt (`bitty-vt` representative; all 6 analogous on this worktree):
 
@@ -234,44 +242,53 @@ Verifying bitty-vt v0.0.1 (.../target/package/bitty-vt-0.0.1)
 warning: aborting upload due to dry run
 ```
 
-Equivalent `Finished` lines were observed for `bitty-pty` (5.33 s),
-`bitty-platform` (55.11 s, full winit/Wayland recompilation in the
-verification sandbox), `bitty-config` (4.32 s), `bitty-package` (4.40 s),
-`bitty-lua` (17.63 s, `piccolo 0.3.3` recompilation) on this worktree
-(toolchain `1.97.1`, `--allow-dirty`).
+Equivalent `Finished` lines were observed for `bitty-pty` (5.33 s historical,
+0.72 s at `ffd3eee` re-run), `bitty-platform` (55.11 s historical, 0.97 s at
+`ffd3eee` cached), `bitty-config` (4.32 s / 0.52 s), `bitty-package`
+(4.40 s / 0.50 s), `bitty-lua` (17.63 s / 0.76 s) on this worktree (toolchain
+`1.97.1`, `--allow-dirty`). CTX-0062 re-run at `ffd3eee` confirmed identical
+`Packaged` counts for `vt/config/package/lua` and updated `pty`/`platform`
+sizes due to intervening features (keyboard, scrollback/search).
 
 ### Why `--allow-dirty` is used
 
-The draft `docs/product/g1-publish-log.md` itself is untracked in this
-worktree (the task directs to leave the worktree dirty and not commit until
-review). Real `cargo publish` after final review must be run from a **clean**
-tree on the merge commit without `--allow-dirty`; the flag here only allows
-the checklist/log to coexist with the verification. The packaged output still
-verifies from a clean tarball copy.
+The draft `docs/product/g1-publish-log.md` itself is modified in this
+worktree (the task directs to leave the worktree **dirty** and not commit until
+review; actual publish will be done **after P0 and with clean tree**). Real
+`cargo publish` after final review must be run from a **clean** tree on the
+merge commit without `--allow-dirty`; the flag here only allows the
+checklist/log to coexist with the verification. The packaged output still
+verifies from a clean tarball copy. No credentials were configured; dry-run
+only.
 
-## `just check` evidence (2026-08-28, `ctx-0052/publish-g1` at `bbbdc1c`; historical `ctx-0047/publish-g1-actual` at `9eec31b`)
+## `just check` evidence (2026-08-29, `ctx-0062/publish-g1-final` at `ffd3eee`; historical `ctx-0052/publish-g1` at `bbbdc1c` `2026-08-28`, `ctx-0047/publish-g1-actual` at `9eec31b`)
 
-Re-verified at `bbbdc1c` (`ctx-0052/publish-g1`) after historical `ctx-0047/publish-g1-actual` at `9eec31b`. Executed after writing this draft log (worktree dirty, `--allow-dirty` for publish only; `just check` itself does not use `--allow-dirty`):
+Re-verified at `ffd3eee` (`ctx-0062/publish-g1-final`) after historical `ctx-0052/publish-g1` at `bbbdc1c` and `ctx-0047/publish-g1-actual` at `9eec31b`. Executed after writing this draft log (worktree **dirty**, `--allow-dirty` for publish only; `just check` itself does not use `--allow-dirty`):
 
 ```text
 cargo fmt --all -- --check -> PASS
 cargo clippy --workspace --all-targets --locked -- -D warnings -> PASS (0 warnings)
-cargo test --workspace --all-targets --locked -> PASS (708 passed, 0 failed; 704 prior + 4 new v0.1 proofs)
+cargo test --workspace --all-targets --locked -> PASS (801 passed, 0 failed; historical 708 at bbbdc1c/9eec31b)
 actionlint -color -> PASS
 bunx --bun markdownlint-cli2@0.23.1 -> PASS (0 issues in 28 files, including this draft)
 ```
 
 Full `just check` log is retained in the task checkpoint; the tail above is
 the auditable summary. No formatting, lint, test, or markdown failures were
-introduced by this draft log. The file count increased from 27 (CTX-0047 at `9eec31b`) to 28 (CTX-0052 at `bbbdc1c`; CTX-0051 added `docs/development/maintainability.md`).
+introduced by this draft log. The file count remains 28 (CTX-0051 added
+`docs/development/maintainability.md` at `bbbdc1c`); test count grew 708 →
+801 due to intervening CTX-0054–0061 features. Worktree left **dirty** per
+task; actual publish deferred after P0 and clean tree.
 
 ## Future real-publish procedure (not executed here)
 
 > Do not run `cargo publish` in this task. The checklist/log is intentionally
-> left dirty; no `cargo publish` executed; verification was --dry-run only (token present but not used).
+> left **dirty**; no `cargo publish` executed; verification was --dry-run only
+> (token present but not used in CTX-0052, no credentials in CTX-0062).
+> Actual publish will be done **after P0 and with clean tree**.
 
 When the ladder (CTX-0044, merged) and the G1 evidence (CTX-0045 checklist +
-this CTX-0047 log) are reviewed, the maintainer sequence is:
+this CTX-0047/CTX-0052/CTX-0062 log) are reviewed, the maintainer sequence is:
 
 ```bash
 # from a clean checkout of main at the merge commit
@@ -293,8 +310,10 @@ crate. Do not use `--allow-dirty` for the real publish; ensure `git status`
 is clean and the tag is `0.0.1` (deferring `0.1.0`). CI `Quality gates` +
 `CodeQL` must be green before push per `AGENTS.md`.
 
-No `cargo publish` executed in CTX-0047/CTX-0052; verification was --dry-run only (token present but not used); all
-verifications were `cargo publish --dry-run --allow-dirty`.
+No `cargo publish` executed in CTX-0047/CTX-0052/CTX-0062; verification was
+--dry-run only (token present but not used in CTX-0052, no credentials in
+CTX-0062 / deferred after P0 and clean tree); all verifications were
+`cargo publish --dry-run --allow-dirty`.
 
 ## Next steps — actual `cargo publish` (after P0 review and `0.0.1` tag)
 
@@ -303,18 +322,19 @@ verifications were `cargo publish --dry-run --allow-dirty`.
   `bitty-config` → `bitty-package` → `bitty-lua` will be executed **after**
   **P0 review** (CTX-0053, prior CTX-0048, OQ-008/014/015/016/018/019/030/031/032)
   and the `0.0.1` tag on `main`, from a clean checkout without `--allow-dirty`.
-  CTX-0052 re-verifies this order and confirms no `cargo publish` is executed
-  without credentials; dry-run only.
-- Order is fixed for repeatability per CTX-0047/CTX-0052 (Group 1 has no DAG
+  CTX-0062 re-verifies this order at `ffd3eee` and confirms no `cargo publish`
+  is executed without credentials; dry-run only with `--allow-dirty` and dirty
+  worktree left per task.
+- Order is fixed for repeatability per CTX-0047/CTX-0052/CTX-0062 (Group 1 has no DAG
   edges; any order is valid for crates.io, but this sequence is the auditable
   path). `release-ladder.md` Groups 1→2→3 remain correct: Group 1 leaves
   (no internal `version = "0.0.1"` edge), Group 2 `term-state` after `vt`,
   Group 3 `ui`/`render` after `term-state` (+ `platform` for render).
 - Gates before publish: `cargo check --workspace --all-targets --locked`
-  PASS, `just check` PASS (28 files, 708 tests), fresh
+  PASS, `just check` PASS (28 files, 801 tests at `ffd3eee`; 708 historical), fresh
   `cargo publish --dry-run` PASS for the next crate, and CI `Quality gates` +
-  `CodeQL` green. CTX-0052 verified all three at `bbbdc1c` (see Revision
-  history).
+  `CodeQL` green. CTX-0062 verified all three at `ffd3eee` (see Revision
+  history); CTX-0052 at `bbbdc1c`.
 - Index propagation: allow crates.io index to settle before Group 2
   (`bitty-term-state` after `vt`); Group 3 (`bitty-ui`, `bitty-render`)
   after Group 2 is indexed. Tail crates remain `publish = false` at
@@ -344,6 +364,8 @@ verifications were `cargo publish --dry-run --allow-dirty`.
 
 ## Revision history
 
+- `2026-08-29` CTX-0062 `ctx-0062/publish-g1-final` at `ffd3eee` — **re-verified** for
+  `0.0.1`; workspace `0.0.1` retained (no drift); publish flags `vt/pty/platform/config/package/lua = true` retained; publish order `vt` → `pty` → `platform` → `config` → `package` → `lua` confirmed correct per `release-ladder.md`; all 6 G1 leaves `cargo publish --dry-run --allow-dirty` **PASS** (vt 97.8 KiB, pty 71.7 KiB, platform 174.9 KiB, config 120.7 KiB, package 153.8 KiB, lua 60.4 KiB; historical `bbbdc1c` pty 66.1 KiB / platform 124.4 KiB; each `Finished dev` + `aborting upload due to dry run`); `just check` **PASS** (fmt, clippy 0 warnings, **801** tests, actionlint, markdownlint 28 files; historical 708 at `bbbdc1c`); `cargo check` PASS; **no `cargo publish` executed; verification was --dry-run only (no credentials; deferred after P0 and clean tree)**; actual publish deferred **after P0 (CTX-0053)** and `0.0.1` tag from clean tree without `--allow-dirty`; worktree left **dirty** per task; companion `release-ladder.md` and `g1-publish-checklist.md` retained.
 - `2026-08-28` CTX-0052 `ctx-0052/publish-g1` at `bbbdc1c` — **re-verified** for
   `0.0.1`; workspace `0.0.1` verified (`Cargo.toml` + `version.workspace`);
   publish flags `vt/pty/platform/config/package/lua = true` retained; publish

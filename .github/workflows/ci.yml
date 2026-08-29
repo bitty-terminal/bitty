@@ -54,16 +54,140 @@ jobs:
           docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
           -color
 
-  windows:
-    name: Windows check and test
-    runs-on: windows-latest
-    timeout-minutes: 30
+  msrv:
+    name: MSRV 1.85 check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install font stack development libraries
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev
+
+      - name: Install MSRV toolchain 1.85
+        run: >-
+          rustup toolchain install 1.85
+          --profile minimal
+          --component clippy
+
+      - name: Check MSRV compilation
+        run: cargo +1.85 check --workspace --all-targets --locked
+
+  linux-x11:
+    name: Linux X11 (xvfb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DISPLAY: :99
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install font stack and xvfb
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev xvfb
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy
+
+      - name: Run tests under xvfb (X11)
+        run: xvfb-run -a cargo test --workspace --all-targets --locked
+
+  linux-wayland:
+    name: Linux Wayland
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      WAYLAND_DISPLAY: wayland-0
+      XDG_SESSION_TYPE: wayland
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install font stack and Wayland libraries
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev libwayland-dev
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy
+
+      - name: Run tests with Wayland env
+        run: cargo test --workspace --all-targets --locked
+
+  macos:
+    name: macOS ARM64 check and test
+    runs-on: macos-14
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy
+
+      - name: Check workspace compilation (macOS ARM64)
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run tests (macOS ARM64)
+        run: cargo test --workspace --all-targets --locked
+
+  supply-chain:
+    name: Supply chain (deny/audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Check dependencies (licenses, bans, sources)
+        run: cargo deny check
+
+      # unmaintained advisories for ttf-parser/paste are tracked via deny.toml
+      # and ignored for audit until upstream replacement lands (winit/metal paths)
+      - name: Audit advisories
+        run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+
+  windows:
+    name: Windows check and test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy
 
       - name: Check workspace compilation
         run: cargo check --workspace --all-targets --locked

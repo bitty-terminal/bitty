@@ -1,0 +1,46 @@
+[package]
+name = "bitty-perf"
+description = "Performance baseline harness owner for benches (Phase F) — headless, bounded, forbid(unsafe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["benchmark", "performance", "bitty"]
+categories = ["development-tools"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-vt = { path = "../bitty-vt" }
+bitty-term-state = { path = "../bitty-term-state" }
+bitty-render = { path = "../bitty-render" }
+bitty-platform = { path = "../bitty-platform" }
+bitty-pty = { path = "../bitty-pty" }
+
+[[bench]]
+name = "vt_throughput"
+path = "../../benches/vt_throughput.rs"
+harness = false
+
+[[bench]]
+name = "terminal_state"
+path = "../../benches/terminal_state.rs"
+harness = false
+
+[[bench]]
+name = "reflow"
+path = "../../benches/reflow.rs"
+harness = false
+
+[[bench]]
+name = "search"
+path = "../../benches/search.rs"
+harness = false
+
+[[bench]]
+name = "render_prepare"
+path = "../../benches/render_prepare.rs"
+harness = false

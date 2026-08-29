@@ -248,8 +248,6 @@ fn validate_method(method: &str) -> Result<(), IpcError> {
             reason: "method must not contain control bytes".into(),
         });
     }
-    // Candidate CLI grammar reserves `:` and `/` for qualified names;
-    // method names that contain whitespace would be ambiguous in logs.
     if method
         .bytes()
         .any(|b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r')
@@ -258,6 +256,42 @@ fn validate_method(method: &str) -> Result<(), IpcError> {
             method: method.to_string(),
             reason: "method must not contain whitespace".into(),
         });
+    }
+    // RFC wire: segments match ^[a-z][a-z0-9_]*$ separated by '.'.
+    // Rejects empty segments, leading/trailing/double dots, and
+    // non-lowercase/upper/digit/_ characters. This mirrors the scope crate
+    // validation to keep the channel fail-closed on untrusted method strings
+    // without depending on the scope module at compile time (avoids cycle).
+    if method.starts_with('.') || method.ends_with('.') || method.contains("..") {
+        return Err(IpcError::InvalidMethod {
+            method: method.to_string(),
+            reason: "method must not have empty segment (no leading/trailing/double dot)".into(),
+        });
+    }
+    for seg in method.split('.') {
+        if seg.is_empty() {
+            return Err(IpcError::InvalidMethod {
+                method: method.to_string(),
+                reason: "method segment must be non-empty".into(),
+            });
+        }
+        let mut chars = seg.bytes();
+        let first = chars.next().unwrap();
+        if !first.is_ascii_lowercase() {
+            return Err(IpcError::InvalidMethod {
+                method: method.to_string(),
+                reason: "method segment must start with [a-z]".into(),
+            });
+        }
+        for b in chars {
+            let ok = b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+            if !ok {
+                return Err(IpcError::InvalidMethod {
+                    method: method.to_string(),
+                    reason: "method segment must match ^[a-z][a-z0-9_]*$".into(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -579,7 +613,12 @@ mod tests {
         assert!(IpcRequest::new(RequestId(1), "bad method".into(), vec![], 0, 1000).is_err());
         assert!(IpcRequest::new(RequestId(1), "bad\x01method".into(), vec![], 0, 1000).is_err());
         assert!(IpcRequest::new(RequestId(1), "ok.method".into(), vec![], 0, 1000).is_ok());
-        assert!(IpcRequest::new(RequestId(1), "a:b/c".into(), vec![], 0, 1000).is_ok());
+        // RFC segment grammar: ^[a-z][a-z0-9_]*$ per dot segment
+        assert!(IpcRequest::new(RequestId(1), "a:b/c".into(), vec![], 0, 1000).is_err());
+        assert!(IpcRequest::new(RequestId(1), "terminal..text".into(), vec![], 0, 1000).is_err());
+        assert!(IpcRequest::new(RequestId(1), "Terminal.text".into(), vec![], 0, 1000).is_err());
+        assert!(IpcRequest::new(RequestId(1), ".leading".into(), vec![], 0, 1000).is_err());
+        assert!(IpcRequest::new(RequestId(1), "trailing.".into(), vec![], 0, 1000).is_err());
     }
 
     #[test]

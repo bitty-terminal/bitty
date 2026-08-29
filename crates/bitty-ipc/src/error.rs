@@ -3,6 +3,10 @@
 use std::fmt;
 
 /// Stable error class mirroring the security and isolation corpus.
+///
+/// Maps to the RFC error taxonomy: `InvalidFrame`/`PayloadTooLarge` -> `Framing`,
+/// `MethodInvalid`/`VersionMismatch` -> `Validation`, `Unauthenticated` -> `Unauthenticated`,
+/// `Denied`/`ScopeViolation`/`RateLimited`/`PayloadCap` -> `Scope`, plus transport/channel/timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorClass {
     /// Frame or payload size / truncation failure.
@@ -17,6 +21,16 @@ pub enum ErrorClass {
     Validation,
     /// Scope / peer-credential denial.
     Scope,
+    /// Peer credential unauthenticated (SO_PEERCRED mismatch, wrong UID).
+    Unauthenticated,
+    /// Generic denied (rate limited, payload cap whole, chunk violation).
+    Denied,
+    /// Requested entity not found.
+    NotFound,
+    /// Unavailable / shed.
+    Unavailable,
+    /// Internal invariant.
+    Internal,
 }
 
 impl fmt::Display for ErrorClass {
@@ -28,6 +42,11 @@ impl fmt::Display for ErrorClass {
             Self::Timeout => "timeout",
             Self::Validation => "validation",
             Self::Scope => "scope",
+            Self::Unauthenticated => "unauthenticated",
+            Self::Denied => "denied",
+            Self::NotFound => "not_found",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
         };
         f.write_str(label)
     }
@@ -131,6 +150,40 @@ pub enum IpcError {
         /// Actual.
         actual: usize,
     },
+    /// Wire version mismatch (expected v1, got other).
+    VersionMismatch {
+        /// Expected version.
+        expected: u16,
+        /// Actual version.
+        actual: u16,
+    },
+    /// Peer credential check failed — UID mismatch or tampered endpoint.
+    Unauthenticated {
+        /// Reason (no stack trace, no OS handle).
+        reason: String,
+    },
+    /// Generic denied with stable code (RateLimited, PayloadCap, ChunkViolation, ScopeViolation).
+    Denied {
+        /// Stable code e.g. `ScopeViolation`, `RateLimited`, `PayloadCap`, `ChunkViolation`.
+        code: String,
+        /// Human message.
+        reason: String,
+    },
+    /// Entity not found (instance, method, terminal).
+    NotFound {
+        /// Reason.
+        reason: String,
+    },
+    /// Service unavailable or connection shed.
+    Unavailable {
+        /// Reason.
+        reason: String,
+    },
+    /// Internal invariant failure (fail-closed).
+    Internal {
+        /// Reason.
+        reason: String,
+    },
 }
 
 impl IpcError {
@@ -188,6 +241,37 @@ impl IpcError {
         }
     }
 
+    /// Convenience for unauthenticated peer.
+    #[must_use]
+    pub fn unauthenticated(reason: impl Into<String>) -> Self {
+        Self::Unauthenticated {
+            reason: reason.into(),
+        }
+    }
+
+    /// Convenience for version mismatch.
+    #[must_use]
+    pub fn version_mismatch(expected: u16, actual: u16) -> Self {
+        Self::VersionMismatch { expected, actual }
+    }
+
+    /// Convenience for generic denied.
+    #[must_use]
+    pub fn denied(code: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Denied {
+            code: code.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Convenience for not found.
+    #[must_use]
+    pub fn not_found(reason: impl Into<String>) -> Self {
+        Self::NotFound {
+            reason: reason.into(),
+        }
+    }
+
     /// Stable class for diagnostics and doctor aggregation.
     #[must_use]
     pub fn error_class(&self) -> ErrorClass {
@@ -202,9 +286,16 @@ impl IpcError {
                 ErrorClass::Transport
             }
             Self::Timeout { .. } => ErrorClass::Timeout,
-            Self::InvalidMethod { .. } | Self::InvalidRequest { .. } => ErrorClass::Validation,
+            Self::InvalidMethod { .. }
+            | Self::InvalidRequest { .. }
+            | Self::VersionMismatch { .. } => ErrorClass::Validation,
             Self::PendingLimitExceeded { .. } => ErrorClass::Channel,
             Self::ScopeDenied { .. } => ErrorClass::Scope,
+            Self::Unauthenticated { .. } => ErrorClass::Unauthenticated,
+            Self::Denied { .. } => ErrorClass::Denied,
+            Self::NotFound { .. } => ErrorClass::NotFound,
+            Self::Unavailable { .. } => ErrorClass::Unavailable,
+            Self::Internal { .. } => ErrorClass::Internal,
         }
     }
 }
@@ -253,6 +344,14 @@ impl fmt::Display for IpcError {
                 limit,
                 actual,
             } => write!(f, "{field}: limit {limit} exceeded (actual {actual})"),
+            Self::VersionMismatch { expected, actual } => {
+                write!(f, "version mismatch: expected {expected}, got {actual}")
+            }
+            Self::Unauthenticated { reason } => write!(f, "unauthenticated: {reason}"),
+            Self::Denied { code, reason } => write!(f, "denied [{code}]: {reason}"),
+            Self::NotFound { reason } => write!(f, "not found: {reason}"),
+            Self::Unavailable { reason } => write!(f, "unavailable: {reason}"),
+            Self::Internal { reason } => write!(f, "internal: {reason}"),
         }
     }
 }

@@ -206,12 +206,14 @@ fn validate_version_req(raw: &str, field: &str) -> Result<(), PackageError> {
             actual: raw.len(),
         });
     }
+    // Closed grammar: allow only alphanumeric, whitespace, ., -, +, ,, <, >, =, ^, ~
+    // Explicitly deny *, |, & and other shell characters.
     for b in raw.bytes() {
         if !(b.is_ascii_alphanumeric()
             || b.is_ascii_whitespace()
             || matches!(
                 b,
-                b'.' | b'-' | b'+' | b',' | b'<' | b'>' | b'=' | b'^' | b'~' | b'*' | b'|' | b'&'
+                b'.' | b'-' | b'+' | b',' | b'<' | b'>' | b'=' | b'^' | b'~'
             ))
         {
             return Err(PackageError::manifest(
@@ -219,6 +221,22 @@ fn validate_version_req(raw: &str, field: &str) -> Result<(), PackageError> {
                 format!("version requirement '{raw}' contains invalid character"),
             ));
         }
+    }
+    // Additional closed-grammar denials with explicit messages for audit.
+    if raw.contains('*') {
+        return Err(PackageError::manifest(
+            field,
+            "wildcard '*' is not allowed in v1",
+        ));
+    }
+    if raw.contains('|') {
+        return Err(PackageError::manifest(
+            field,
+            "disjunction '||' is not allowed in v1",
+        ));
+    }
+    if raw.contains('&') {
+        return Err(PackageError::manifest(field, "operator '&' is not allowed"));
     }
     Ok(())
 }
@@ -447,6 +465,12 @@ pub struct PackageDependency {
     pub id: PackageId,
     /// Version requirement.
     pub version_req: String,
+    /// Whether this edge opts into prerelease selection (RFC §Prerelease policy).
+    ///
+    /// When false, prerelease candidates are excluded unless the requirement
+    /// itself contains a prerelease identifier on the same X.Y.Z. When true,
+    /// the edge explicitly allows prerelease.
+    pub prerelease: bool,
 }
 
 impl PackageDependency {
@@ -454,6 +478,30 @@ impl PackageDependency {
     pub fn validate(&self) -> Result<(), PackageError> {
         validate_version_req(&self.version_req, "dependencies.version_req")?;
         Ok(())
+    }
+
+    /// Convenience constructor with `prerelease = false`.
+    #[must_use]
+    pub fn new(id: PackageId, version_req: impl Into<String>) -> Self {
+        Self {
+            id,
+            version_req: version_req.into(),
+            prerelease: false,
+        }
+    }
+
+    /// Constructor with explicit prerelease flag.
+    #[must_use]
+    pub fn with_prerelease(
+        id: PackageId,
+        version_req: impl Into<String>,
+        prerelease: bool,
+    ) -> Self {
+        Self {
+            id,
+            version_req: version_req.into(),
+            prerelease,
+        }
     }
 }
 
@@ -590,6 +638,9 @@ impl PackageManifest {
             out.extend_from_slice(d.id.as_str().as_bytes());
             out.push(b'@');
             out.extend_from_slice(d.version_req.as_bytes());
+            if d.prerelease {
+                out.extend_from_slice(b":pre");
+            }
             out.push(b'\n');
         }
         // Capabilities sorted.
@@ -692,10 +743,12 @@ mod tests {
         m.dependencies.push(PackageDependency {
             id: PackageId::new("xuepoo.dep").unwrap(),
             version_req: "^1.0".to_string(),
+            prerelease: false,
         });
         m.dependencies.push(PackageDependency {
             id: PackageId::new("xuepoo.dep").unwrap(),
             version_req: "^2.0".to_string(),
+            prerelease: false,
         });
         assert!(m.validate().is_err());
     }
@@ -741,6 +794,7 @@ mod tests {
         m.dependencies.push(PackageDependency {
             id: PackageId::new("xuepoo.theme").unwrap(),
             version_req: "^1.0".to_string(),
+            prerelease: false,
         });
         assert!(m.validate().is_err());
     }

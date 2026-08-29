@@ -124,11 +124,13 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
         presented > 800,
         "most soak iterations should present, got {presented} presented, {idle} idle"
     );
-    // Windows debug is ~10× slower (portable-pty + debug clippy); allow 90s on Windows, 10s elsewhere.
+    // Wall budget is liveness guard only (functional bounds like caps/determinism remain strict);
+    // CI debug+workspace contention shows ~40s on ubuntu (cargo test --workspace --all-targets, debug)
+    // and ~80s on windows; allow 60s linux / 90s windows.
     let budget = if cfg!(target_os = "windows") {
         Duration::from_secs(90)
     } else {
-        Duration::from_secs(10)
+        Duration::from_secs(60)
     };
     assert!(
         elapsed < budget,

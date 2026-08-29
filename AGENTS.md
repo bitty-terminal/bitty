@@ -65,8 +65,9 @@
 
 ### Issue hygiene (labels and milestones)
 
-- Every GitHub Issue must have appropriate `labels` (e.g., `feat`, `fix`, `docs`, `chore`, `P0`, `area:pty` etc.) and `milestone` (e.g., `v0.0.1`, `v0.1.0`, `v1.0`) when applicable. Write issues with clear title, description, acceptance criteria, and link to CarryCtx task and related RFC/OQ.
-- Use `gh issue create --label "feat,area:runtime" --milestone "v0.0.1"` and `gh issue edit` to add labels/milestones.
+- Every GitHub Issue and PR must have appropriate `labels` (e.g., `feat`, `fix`, `docs`, `chore`, `P0`, `area:pty` etc.) and `milestone` (e.g., `v0.0.1`, `v0.1.0`, `v1.0`) when applicable. Write issues with clear title, description, acceptance criteria, and link to CarryCtx task and related RFC/OQ.
+- Use `gh issue create --label "feat,area:runtime" --milestone "v0.0.1"` and `gh issue edit`/`gh pr edit` to add labels/milestones. Every PR must also carry labels and milestone via `gh pr edit` (or `gh issue edit` for a PR number), e.g. `gh pr edit 108 --add-label "feat,area:ipc,P0" --milestone "v0.0.1"` or `gh issue edit 108 --add-label "feat,area:ipc,P0" --milestone "v0.0.1"`.
+- Every carryctx task must include `Priority: P0/P1/P2 | Area: xxx | Labels: feat,area:xxx,P0 | Milestone: v0.0.1 | RFC: OQ-xxx | Task: CTX-XXXX` in description, subagent must read and apply via `gh issue edit` / `gh pr edit`, missing considered NEEDS-FIX.
 
 ### Local gates before push (mandatory)
 

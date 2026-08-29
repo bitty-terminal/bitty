@@ -114,20 +114,75 @@ fn child_environment_is_minimal_allowlist_only() {
     reader.join().expect("pump clean");
 
     let text = String::from_utf8_lossy(&output);
-    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    // PTY output on macOS includes CRLF, line-discipline control chars and
+    // caret echo (e.g. "\r\n^D\x08\x08BITTY_PROBE=1\r\n" where ^D is 0x04
+    // echoed as "^D" or raw). Normalize by stripping caret notation then
+    // extracting KEY=VALUE with alphanumeric scan to tolerate leading garbage.
+    let mut normalized: Vec<String> = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Remove all control bytes first (including \x04, \x08, \r etc)
+        let cleaned0: String = line.chars().filter(|c| !c.is_control()).collect();
+        // Strip caret echo sequences: "^@".. "^Z", "^[", "^\", "^]", "^^", "^_", "^?"
+        // as emitted by the PTY line discipline for control bytes.
+        let mut cleaned = String::with_capacity(cleaned0.len());
+        let mut chars = cleaned0.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '^' {
+                if let Some(&next) = chars.peek() {
+                    let nb = next as u8;
+                    if (0x40..=0x5F).contains(&nb) || nb == b'?' {
+                        chars.next();
+                        continue;
+                    }
+                }
+            }
+            cleaned.push(c);
+        }
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() || !cleaned.contains('=') {
+            continue;
+        }
+        // Extract key as contiguous [A-Za-z0-9_] immediately before '='
+        if let Some(eq_pos) = cleaned.find('=') {
+            let bytes = cleaned.as_bytes();
+            let mut start = eq_pos;
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            {
+                start -= 1;
+            }
+            let key = &cleaned[start..eq_pos];
+            let value = cleaned[eq_pos + 1..].trim();
+            if !key.is_empty() {
+                normalized.push(format!("{}={}", key, value));
+            } else {
+                normalized.push(cleaned.to_string());
+            }
+        }
+    }
+    // Use substring-tolerant checks for presence; exact line match fails on
+    // macOS due to control/caret prefix, so check normalized entries.
     assert!(
-        lines.contains(&"TERM=xterm-256color"),
-        "default TERM missing from {text:?}"
+        normalized.iter().any(|l| l == "TERM=xterm-256color")
+            || text.contains("TERM=xterm-256color"),
+        "default TERM missing from {text:?} normalized {normalized:?}"
     );
     assert!(
-        lines.contains(&"BITTY_PROBE=1"),
-        "allowlisted entry missing from {text:?}"
+        normalized.iter().any(|l| l == "BITTY_PROBE=1") || text.contains("BITTY_PROBE=1"),
+        "allowlisted entry missing from {text:?} normalized {normalized:?}"
     );
-    for line in &lines {
-        let key = line.split('=').next().unwrap_or("");
+    for line in &normalized {
+        if !line.contains('=') {
+            continue;
+        }
+        let key = line.split('=').next().unwrap_or("").trim();
         assert!(
             matches!(key, "TERM" | "BITTY_PROBE" | "SHELL"),
-            "child leaked environment entry {line:?}; allowlist violated"
+            "child leaked environment entry {line:?}; allowlist violated (full {text:?}) normalized {normalized:?}"
         );
     }
 }
@@ -146,7 +201,28 @@ fn cwd_is_applied_to_child() {
     let output = drain(&reader, std::time::Instant::now() + ECHO_TIMEOUT);
     reader.join().expect("pump clean");
     let text = String::from_utf8_lossy(&output);
-    assert_eq!(text.trim_end(), "/tmp", "pwd reported {text:?}");
+    // /tmp is a symlink to /private/tmp on macOS; canonicalize both sides.
+    let raw = text.trim();
+    let cleaned: String = raw
+        .trim_start_matches(|c: char| c.is_control())
+        .trim_end_matches(|c: char| c.is_control())
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let reported = cleaned.trim();
+    let expected = std::path::Path::new("/tmp");
+    let canonical_expected =
+        std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    let reported_path = std::path::Path::new(reported);
+    let canonical_reported =
+        std::fs::canonicalize(reported_path).unwrap_or_else(|_| reported_path.to_path_buf());
+    assert!(
+        reported == "/tmp"
+            || reported == "/private/tmp"
+            || canonical_reported == canonical_expected
+            || reported_path == canonical_expected,
+        "pwd reported {text:?} (normalized {reported:?}) canonical {canonical_reported:?} expected /tmp canonical {canonical_expected:?}"
+    );
 }
 
 #[test]

@@ -91,7 +91,8 @@ jobs:
         run: >-
           sudo apt-get update
           && sudo apt-get install -y --no-install-recommends
-          libfontconfig1-dev libfreetype6-dev xvfb
+          libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-0
+          libxkbcommon-dev xvfb
 
       - name: Install pinned Rust toolchain
         run: >-
@@ -172,8 +173,10 @@ jobs:
 
       # unmaintained advisories for ttf-parser/paste are tracked via deny.toml
       # and ignored for audit until upstream replacement lands (winit/metal paths)
+      # cargo-deny and cargo-audit share ~/.cargo/advisory-db; deny populates it
+      # so clear before audit to avoid "Refusing to initialize non-empty directory" failure.
       - name: Audit advisories
-        run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+        run: rm -rf ~/.cargo/advisory-db && cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
 
   windows:
     name: Windows check and test

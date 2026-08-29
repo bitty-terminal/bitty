@@ -65,6 +65,22 @@ Non-goals and daemon staging remain as in
 `proposed-delivery-sequence.md`: `bittyd` and remote UI are **post-v1.0**
 candidates (OQ-020), not part of this ladder.
 
+### v0.2 compatibility lab (Phase C scaffold) — CTX-0074
+
+Phase C scaffolds `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui}/` with
+placeholder corpora and headless bounded harness (`tests/compat/harness.rs`,
+`#![forbid(unsafe_code)]`, `MAX_CORPUS_BYTES = 8 KiB`, `MAX_ACTIONS = 4096`)
+referencing `vttest` (menus 1–12), Ghostty/kitty/WezTerm differential (offline
+grid-dump snapshot diff, not pixel), and existing `bitty-vt` tests
+(`crates/bitty-vt/tests/replay.rs` fixtures `shell_session`/`escape_storm`/
+`fullscreen_app`/`osc_sweep` plus `crates/bitty-vt/seeds/*.bin` 14 seeds).
+Lab is headless (`Parser -> TerminalAction -> State` only), bounded,
+`forbid(unsafe)`, no window/GPU leak (grep `tests/compat` for `winit`/`wgpu`/
+`Window`/`Surface` must be 0). Detailed runbook and corpora plan live in
+[`compat-lab.md`](./compat-lab.md). This scaffold does not close OQ-004 nor
+accept the `v0.2` slice; it provides the reviewable layout for follow-up real
+`vttest` captures and reference dumps pinned in `tmp/references/`.
+
 ## Workspace version mapping
 
 - `workspace.package.version = "0.0.1"` (CTX-0049; was `"0.1.0"` in
@@ -290,5 +306,9 @@ CTX-0043 `7b215a2`; updated 2026-08-28 via CTX-0049
 `0.1.0`; updated 2026-08-28 via CTX-0050 (`ctx-0050/feat-minimal-terminal`)
 adding headless `v0.1` slice evidence (shell echo deterministic replay,
 resize, backpressure bounded, 708 tests, `just check` 0 issues) and a new
-`crates/bitty-runtime/tests/v01_minimal_terminal.rs` integration suite —
-still `status: draft`.
+`crates/bitty-runtime/tests/v01_minimal_terminal.rs` integration suite;
+updated 2026-08-29 via CTX-0074 (`ctx-0074/chore-compat-lab`) scaffolding
+`tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui}/` headless
+bounded `forbid(unsafe)` harness referencing `vttest` / Ghostty/kitty/WezTerm
+differential / `crates/bitty-vt/tests/replay.rs` and adding
+`docs/product/compat-lab.md` — still `status: draft`.

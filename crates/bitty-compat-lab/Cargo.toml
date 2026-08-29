@@ -1,0 +1,18 @@
+[package]
+name = "bitty-compat-lab"
+description = "Compat lab harness owner — headless bounded vttest/differential (CTX-0078)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["terminal", "compat", "bitty"]
+categories = ["development-tools"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-vt = { version = "0.0.1", path = "../bitty-vt" }
+bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }

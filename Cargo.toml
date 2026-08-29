@@ -2,6 +2,7 @@
 members = [
     "crates/bitty-agent",
     "crates/bitty-app",
+    "crates/bitty-compat-lab",
     "crates/bitty-config",
     "crates/bitty-core",
     "crates/bitty-ipc",

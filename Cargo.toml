@@ -7,6 +7,7 @@ members = [
     "crates/bitty-ipc",
     "crates/bitty-lua",
     "crates/bitty-package",
+    "crates/bitty-perf",
     "crates/bitty-platform",
     "crates/bitty-plugin-host",
     "crates/bitty-pty",

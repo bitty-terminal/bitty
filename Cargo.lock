@@ -185,6 +185,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-compat-lab"
+version = "0.0.1"
+dependencies = [
+ "bitty-term-state",
+ "bitty-vt",
+]
+
+[[package]]
 name = "bitty-config"
 version = "0.0.1"
 

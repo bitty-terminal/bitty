@@ -126,12 +126,8 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
     );
     // Wall budget is liveness guard only (functional bounds like caps/determinism remain strict);
     // CI debug+workspace contention shows ~40s on ubuntu (cargo test --workspace --all-targets, debug)
-    // and ~80s on windows; allow 60s linux / 90s windows.
-    let budget = if cfg!(target_os = "windows") {
-        Duration::from_secs(90)
-    } else {
-        Duration::from_secs(60)
-    };
+    // and ~80s on windows, with spikes to ~70s observed on linux; allow 90s uniform.
+    let budget = Duration::from_secs(90);
     assert!(
         elapsed < budget,
         "soak must be fast, took {elapsed:?} (budget {budget:?})"

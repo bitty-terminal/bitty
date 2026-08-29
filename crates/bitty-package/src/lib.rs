@@ -38,6 +38,10 @@
 //!   capability gates.
 //! - Local-path development packages with visibly different trust semantics
 //!   and drift detection.
+//! - Closed constraint grammar (`^`, `~`, comparators, comma intersection)
+//!   and deterministic resolver with single-version convergence, yank
+//!   advisory and prerelease opt-in per follow-up RFC (see `version`,
+//!   `requirement`, `resolver`).
 //!
 //! # What this crate does NOT do
 //!
@@ -52,8 +56,9 @@
 //!   job.
 //! - No registry service, key-directory, or revocation infrastructure beyond
 //!   the in-memory stub stores that demonstrate the V-B/V-C contracts.
-//! - Constraint grammar, prerelease/yanked policy, and side-by-side versions
-//!   remain open items under `OQ-021` and are not modeled here.
+//! - Side-by-side coexisting versions remain deferred per follow-up RFC;
+//!   the resolver converges to a single version per ID and fails on diamond
+//!   conflicts (see `resolver`).
 //!
 //! # Pipeline (candidate, RFC §Lifecycle + §Integrity chain)
 //!
@@ -86,7 +91,11 @@
 //! | Safe rollback — retained environments | `activation` | [`activation::Generation`] immutable entry + `verify_integrity` self-verification, [`activation::RetentionPolicy`] `N=2` (+current) bounded prune, never removes current |
 //! | Safe rollback — operations | `activation` | [`activation::rollback_full`] + [`activation::rollback_per_plugin`] same staged txn in reverse, capability gates symmetric via `integrity::check_capability_diff`, safe-mode independent (no third-party load) |
 //! | Verification criteria PL-AC-001..010 | `integrity`, `trust`, `source`, `activation` | `PL-AC-001` multi-digest binding via triple digest + independent tamper detection; `PL-AC-002` canonical determinism (sorted keys, cross-platform `sha256_hex`); `PL-AC-003` pin-change loud event (`TrustPinChanged`); `PL-AC-004` signature fail-closed; `PL-AC-005` drift detection; `PL-AC-006` atomic staged switch (pre-commit failure leaves pointer, mixed-state impossible); `PL-AC-007` wake/confirm restore; `PL-AC-008` deterministic rollback digest equality; `PL-AC-009` retention bounds; `PL-AC-010` symmetric capability gates on redo |
-//! | Residual open items | docs only | Documented honestly: manifest/lock format versions and canonical encoding spec, constraint grammar, N/byte budget, key enrollment/rotation/freshness, registry attestation, bundled packages |
+//! | Constraint grammar (closed, 128B) | `version`, `requirement` | [`version::Version`], [`requirement::VersionReq`] with caret/tilde expansion, comparator intersection, `*`/`||` denial, prerelease opt-in check |
+//! | Resolver determinism & convergence | `resolver` | [`resolver::resolve`] pure `(manifest, index)` with canonical sorting, single-version per ID, conflict report, yank/prerelease filtering, budgets 64 edges/pkg and 256 pkgs, deterministic digest |
+//! | Yank & prerelease lifecycle (PLF-AC-004) | `resolver` | Yanked excluded for new resolves, preserved for locked `resolve_preserving_locked` with `yanked (locked)` warning; prerelease excluded unless every edge opts in via `prerelease=true` or same-core `X.Y.Z-prerelease` comparator |
+//! | Single-version convergence, side-by-side deferred | `resolver` | One version per ID in active generation; resolver never merges two coexisting versions, fails with conflict naming both edges |
+//! | Residual open items | docs only | Documented honestly: manifest/lock format versions and canonical encoding spec, key enrollment/rotation/freshness, registry attestation, bundled packages |
 //!
 //! # Ownership rules (ADR-0003 / ADR-0004)
 //!
@@ -112,8 +121,11 @@ pub mod integrity;
 pub mod lifecycle;
 pub mod lockfile;
 pub mod manifest;
+pub mod requirement;
+pub mod resolver;
 pub mod source;
 pub mod trust;
+pub mod version;
 
 pub use activation::{
     ActivationPhase, ActivationReport, Environment, Generation, RetentionPolicy, activate,
@@ -134,6 +146,11 @@ pub use manifest::{
     CapabilityId, Compat, MANIFEST_MAX_BYTES, MAX_CAPABILITIES, MAX_DEPENDENCIES,
     PackageDependency, PackageId, PackageIdentity, PackageManifest,
 };
+pub use requirement::{Comparator, ComparatorOp, MAX_REQUIREMENT_LEN, VersionReq};
+pub use resolver::{
+    IndexEntry, MAX_EDGES_PER_PACKAGE, MAX_PACKAGES_PER_RESOLUTION, PackageIndex, Resolution,
+    ResolvedPackage, resolve, resolve_preserving_locked,
+};
 pub use source::{
     PackageSource, check_local_path_drift, digest_local_content, ensure_no_promotion_without_chain,
 };
@@ -141,6 +158,7 @@ pub use trust::{
     KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, stub_sign,
     verify_signature,
 };
+pub use version::{MAX_VERSION_LEN, Version};
 
 #[cfg(test)]
 mod integration_tests {

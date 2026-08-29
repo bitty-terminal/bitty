@@ -70,7 +70,8 @@
 
 ### Local gates before push (mandatory)
 
-- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. All must pass. Never push with known local failures to save CI. Note: bitty-docs local gate is `just check` only (no cargo).
+- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus full `cargo test --workspace --all-targets --locked` and `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets` and validate GitHub workflows with `act -n` (or `act --dry-run`) for `.github/workflows/ci.yml` and `.github/workflows/codeql.yml`. All must pass. `act` only checks workflow syntax, not runtime or performance, so `cargo test` must still pass locally; do not rely on `act` alone. Never push with known local failures to save CI.
+- Also run `actionlint -color` and `act -n` explicitly when workflows change; install `act` if missing (`which act` else note absence) but do not skip `just check`/`cargo test`/`cargo check`.
 - Verify no `TODO/FIXME` and frontmatter/links valid for docs.
 
 ### Remote monitoring and merge (bitty)

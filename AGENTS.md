@@ -63,6 +63,11 @@
 - Do not commit, push, merge, publish, or mutate remote state unless the task or
   user explicitly authorizes it.
 
+### Issue hygiene (labels and milestones)
+
+- Every GitHub Issue must have appropriate `labels` (e.g., `feat`, `fix`, `docs`, `chore`, `P0`, `area:pty` etc.) and `milestone` (e.g., `v0.0.1`, `v0.1.0`, `v1.0`) when applicable. Write issues with clear title, description, acceptance criteria, and link to CarryCtx task and related RFC/OQ.
+- Use `gh issue create --label "feat,area:runtime" --milestone "v0.0.1"` and `gh issue edit` to add labels/milestones.
+
 ### Local gates before push (mandatory)
 
 - Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. All must pass. Never push with known local failures to save CI. Note: bitty-docs local gate is `just check` only (no cargo).

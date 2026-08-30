@@ -64,6 +64,7 @@ pub mod geometry;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
+pub mod loader;
 pub mod presentation;
 pub mod scene;
 pub mod shell;

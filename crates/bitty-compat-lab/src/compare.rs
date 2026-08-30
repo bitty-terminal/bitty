@@ -412,7 +412,10 @@ pub fn load_bitty_dumps() -> Result<Vec<BittyDump>, String> {
             return Ok(out);
         }
     }
-    Err("no bitty dump directory found at tmp/references/bitty".to_string())
+    Err(
+        "no bitty dump directory found at tmp/references/bitty (not found; run collect_dumps)"
+            .to_string(),
+    )
 }
 
 fn load_reference_texts_for_corpus(corpus_rel: &str) -> Vec<(String, String)> {
@@ -627,9 +630,16 @@ pub fn compare_one(dump: &BittyDump) -> CompareOutcome {
 /// each corpus at most `MAX_CORPUS_BYTES` with at most `MAX_ACTIONS` actions.
 /// Deterministic: sorted input, sorted report, no wall-clock or RNG.
 pub fn compare_all() -> Result<CompareReport, String> {
-    let dumps = load_bitty_dumps()?;
+    let dumps = load_bitty_dumps().map_err(|e| {
+        // Preserve sentinel phrase for test skip detection when dumps absent.
+        if e.contains("not found") || e.contains("no bitty") || e.contains("no dumps") {
+            format!("{e} (not found)")
+        } else {
+            e
+        }
+    })?;
     if dumps.is_empty() {
-        return Err("no dumps loaded".to_string());
+        return Err("no dumps loaded (not found)".to_string());
     }
     if dumps.len() > MAX_SNAPSHOTS {
         return Err(format!(

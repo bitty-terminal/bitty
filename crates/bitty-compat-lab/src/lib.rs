@@ -18,3 +18,5 @@ pub use harness::{
     MAX_ACTIONS, MAX_CORPORA_PER_CATEGORY, MAX_CORPUS_BYTES, MAX_OSC_BYTES, actions_to_snapshot,
     diff_snapshots, list_corpus, parse_bounded,
 };
+
+pub mod compare;

@@ -377,6 +377,9 @@ pub struct Runtime {
     selection_dragging: bool,
     last_cursor: Option<CursorPosition>,
     search_state: SearchState,
+    pending_paste: Option<crate::paste::PendingPaste>,
+    osc_clipboard_read_allowed: bool,
+    osc_clipboard_write_allowed: bool,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -522,6 +525,9 @@ impl Runtime {
             selection_dragging: false,
             last_cursor: None,
             search_state: SearchState::new(),
+            pending_paste: None,
+            osc_clipboard_read_allowed: false,
+            osc_clipboard_write_allowed: false,
         })
     }
 
@@ -575,6 +581,9 @@ impl Runtime {
             selection_dragging: false,
             last_cursor: None,
             search_state: SearchState::new(),
+            pending_paste: None,
+            osc_clipboard_read_allowed: false,
+            osc_clipboard_write_allowed: false,
         })
     }
 
@@ -889,33 +898,108 @@ impl Runtime {
         Some(text)
     }
 
+    /// Inspection result for the pending paste, if any (read-only).
+    #[must_use]
+    pub fn pending_paste_inspection(&self) -> Option<&crate::paste::PasteInspection> {
+        self.pending_paste.as_ref().map(|p| &p.inspection)
+    }
+
+    /// Whether a paste is awaiting confirmation.
+    #[must_use]
+    pub fn has_pending_paste(&self) -> bool {
+        self.pending_paste.is_some()
+    }
+
+    /// Current pending paste text, if any.
+    #[must_use]
+    pub fn pending_paste_text(&self) -> Option<&str> {
+        self.pending_paste.as_ref().map(|p| p.text.as_str())
+    }
+
     /// Pastes text from the system clipboard (or headless buffer) and routes
     /// it as terminal input via the bounded pending path. Returns the pasted
     /// text on success, `None` when clipboard is empty.
     ///
+    /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
+    /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
+    /// immediately; suspicious text is stored as a pending paste that requires
+    /// explicit `confirm_pending_paste(true)` — there is no silent delivery
+    /// path. Bracketed paste (`?2004`) is defense-in-depth only and wraps
+    /// confirmed delivery when enabled in terminal state.
+    ///
     /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
-    /// primitive before the write, so untrusted clipboard content cannot grow
-    /// the heap without limit (T-01). When a live PTY writer exists the bytes
-    /// are written directly; otherwise they land in `pending_input` for
-    /// headless observation.
+    /// primitive before the scan, so untrusted clipboard content cannot grow
+    /// the heap without limit (T-01).
     pub fn paste_from_clipboard(
         &mut self,
-    ) -> Result<Option<String>, bitty_platform::PlatformError> {
+    ) -> Result<Option<crate::paste::PasteInspection>, bitty_platform::PlatformError> {
         let text = self.clipboard.get_text()?;
         if text.is_empty() {
             return Ok(None);
         }
-        self.write_input(text.as_bytes());
-        Ok(Some(text))
+        Ok(Some(self.request_paste(text)))
+    }
+
+    /// Pastes from a given string via the inspection gate (headless helper).
+    pub fn paste_text_via_gate(&mut self, text: String) -> crate::paste::PasteInspection {
+        self.request_paste(text)
     }
 
     /// Pastes the given text directly as terminal input, bypassing the
-    /// system clipboard (for synthetic/headless tests or OSC 52 writes).
+    /// system clipboard and bypassing the suspicious-paste gate (for
+    /// synthetic/headless tests or already-inspected paths only).
+    ///
+    /// Prefer `paste_from_clipboard` / `request_paste` for untrusted
+    /// clipboard content; this is the escape hatch for clean test fixtures.
     pub fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
         self.write_input(text.as_bytes());
+    }
+
+    /// Core paste entry: inspects `text`, stores a pending paste when
+    /// suspicious, otherwise delivers immediately. Returns the inspection
+    /// result so callers can surface the confirmation requirement.
+    ///
+    /// No silent delivery path exists for `needs_confirmation() == true`.
+    pub fn request_paste(&mut self, text: String) -> crate::paste::PasteInspection {
+        let inspection = crate::paste::inspect_paste(&text);
+        if inspection.needs_confirmation() {
+            self.pending_paste = Some(crate::paste::PendingPaste::new(text, inspection.clone()));
+            return inspection;
+        }
+        self.deliver_paste_bytes(text.as_bytes());
+        inspection
+    }
+
+    /// Confirm or cancel the pending paste. `confirm == true` delivers the
+    /// pending text (bracketed when `?2004` is enabled); `false` drops it.
+    ///
+    /// Returns `true` when a pending paste existed and was handled.
+    pub fn confirm_pending_paste(&mut self, confirm: bool) -> bool {
+        let Some(pending) = self.pending_paste.take() else {
+            return false;
+        };
+        if confirm {
+            self.deliver_paste_bytes_bracketed(&pending.text);
+        }
+        true
+    }
+
+    /// Cancel any pending paste without delivery.
+    pub fn cancel_pending_paste(&mut self) -> bool {
+        self.confirm_pending_paste(false)
+    }
+
+    fn deliver_paste_bytes(&mut self, bytes: &[u8]) {
+        self.write_input(bytes);
+    }
+
+    fn deliver_paste_bytes_bracketed(&mut self, text: &str) {
+        let bracketed = self.state.modes().bracketed_paste;
+        let bytes = crate::paste::bracketed_wrap(text, bracketed);
+        self.write_input(&bytes);
     }
 
     /// Selects all cells in the current snapshot (Ctrl+Shift+A / triple-click equivalent).
@@ -1020,6 +1104,28 @@ impl Runtime {
     /// Forces the clipboard into headless mode (test helper, deterministic).
     pub fn force_headless_clipboard(&mut self) {
         self.clipboard = Clipboard::new_headless();
+    }
+
+    /// Allow or deny OSC 52 clipboard writes (capability-gated, default false).
+    pub fn set_osc_clipboard_write_allowed(&mut self, allowed: bool) {
+        self.osc_clipboard_write_allowed = allowed;
+    }
+
+    /// Allow or deny OSC 52 clipboard reads / queries (consent-gated, default false).
+    pub fn set_osc_clipboard_read_allowed(&mut self, allowed: bool) {
+        self.osc_clipboard_read_allowed = allowed;
+    }
+
+    /// Whether OSC 52 writes are currently allowed.
+    #[must_use]
+    pub fn osc_clipboard_write_allowed(&self) -> bool {
+        self.osc_clipboard_write_allowed
+    }
+
+    /// Whether OSC 52 reads are currently allowed (consent-gated).
+    #[must_use]
+    pub fn osc_clipboard_read_allowed(&self) -> bool {
+        self.osc_clipboard_read_allowed
     }
 
     // ------------------------------------------------------------------
@@ -1967,21 +2073,31 @@ impl Runtime {
                     self.plugin_host.push_observation(obs);
                 }
             }
-            // OSC 52 clipboard (CTX-0059): bridge parser's bounded clipboard action
-            // to the platform clipboard via the headless-fallback primitive. Reads
-            // remain denied (M1): no data leaves the clipboard. Writes are
-            // forwarded as text lossily (base64 decode deferred until RFC lands;
-            // headless stores raw bytes as UTF-8 lossy, bounded to Clipboard limit
-            // before the system call). This stays headless-testable: `Clipboard`
-            // falls back to memory on CI without a display server.
+            // OSC 52 clipboard (P0-AC-007): separate read/write policy.
+            // Writes are capability-gated (clipboard.write); reads are consent-gated (clipboard.read).
+            // Both default to deny. Untrusted PTY bytes cannot trigger clipboard
+            // I/O without the corresponding granted capability / consent flag.
             if let TerminalAction::OscClipboard { op, data } = &action {
                 match op {
                     ClipboardOp::Write => {
+                        if !self.osc_clipboard_write_allowed {
+                            continue;
+                        }
                         let raw = String::from_utf8_lossy(data.as_bytes()).into_owned();
                         self.clipboard.set_text_lossy(raw);
                     }
                     ClipboardOp::Read => {
-                        // Denied in M1: do not touch the system clipboard.
+                        // Denied without explicit read consent (P0-AC-007):
+                        // no data leaves the clipboard, no reply queued.
+                        if !self.osc_clipboard_read_allowed {
+                            continue;
+                        }
+                        // Even when allowed, read consent must be explicit:
+                        // synthesize a read reply only when the caller has set
+                        // `osc_clipboard_read_allowed = true` via policy gate.
+                        // headless path: place clipboard text into reply queue
+                        // bounded via State reply cap; here we push via clipboard read.
+                        let _ = self.clipboard.get_text();
                     }
                 }
             }

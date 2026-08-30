@@ -104,15 +104,19 @@ fn copy_selection_to_clipboard_headless() {
     // Headless buffer must reflect copy.
     rt.clipboard_mut().get_text().expect("get must succeed");
     assert_eq!(rt.clipboard().headless_contents(), "copy");
-    // Paste should inject into pending_input.
+    // Paste should inject into pending_input (clean text: no confirmation gate).
     rt.clear_selection();
     // Clear pending before paste.
     rt.drain_pending_input();
-    let pasted = rt
+    let insp = rt
         .paste_from_clipboard()
         .expect("paste must succeed")
         .expect("text");
-    assert_eq!(pasted, "copy");
+    assert!(insp.is_clean(), "clean paste must not need confirmation");
+    assert!(
+        !rt.has_pending_paste(),
+        "clean paste must not leave pending"
+    );
     assert_eq!(rt.pending_input(), b"copy");
     assert_eq!(rt.drain_pending_input(), b"copy");
     // No selection → copy returns None without touching clipboard.
@@ -137,9 +141,13 @@ fn clipboard_is_bounded_and_truncates() {
         .set_text(long_paste)
         .expect("set long paste");
     rt.drain_pending_input();
-    let pasted = rt.paste_from_clipboard().expect("paste").expect("text");
-    assert_eq!(pasted.len(), 8192);
+    let insp = rt.paste_from_clipboard().expect("paste").expect("insp");
+    // Long clean paste (all 'y') is delivered immediately, no pending.
+    assert!(insp.is_clean());
+    assert!(!rt.has_pending_paste());
+    // Length is bounded to CLIPBOARD_MAX_BYTES via clipboard primitive.
     assert_eq!(rt.pending_input().len(), 8192);
+    assert_eq!(rt.clipboard().headless_contents().len(), 8192);
 }
 
 #[test]
@@ -234,15 +242,29 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
 #[test]
 fn osc52_write_is_bridged_to_clipboard() {
     let mut rt = make_runtime();
-    // OSC 52 write: ESC ] 52 ; c ; <data> BEL . Parser will emit ClipboardOp::Write with bounded bytes.
+    // Default: writes are denied without explicit capability grant (P0-AC-007).
     let osc = b"\x1b]52;c;hello\x07";
     rt.handle_pty_bytes(osc);
+    assert_eq!(
+        rt.clipboard().headless_contents(),
+        "",
+        "write must be denied without grant"
+    );
+    // Grant write, then it forwards.
+    rt.set_osc_clipboard_write_allowed(true);
+    rt.handle_pty_bytes(osc);
     assert_eq!(rt.clipboard().headless_contents(), "hello");
-    // Read query must be denied (no clipboard change).
+    // Read query must be denied without consent (no clipboard change).
     let before = rt.clipboard().headless_contents().to_owned();
     let osc_read = b"\x1b]52;c;?\x07";
     rt.handle_pty_bytes(osc_read);
     assert_eq!(rt.clipboard().headless_contents(), before);
+    // Even with read consent, no data leaves clipboard without explicit flow —
+    // the consent flag only controls whether a reply would be synthesized,
+    // not whether the headless buffer is mutated. Denied vs allowed is at least the gate:
+    assert!(!rt.osc_clipboard_read_allowed());
+    rt.set_osc_clipboard_read_allowed(true);
+    assert!(rt.osc_clipboard_read_allowed());
 }
 
 #[test]

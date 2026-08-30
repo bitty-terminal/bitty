@@ -158,6 +158,7 @@ shellcheck -S warning scripts/dogfood.sh -> PASS
 - Compatibility lab (vttest/differential/corpus, Phase C): [`compat-lab.md`](./compat-lab.md) (CTX-0074, harness `forbid(unsafe)`).
 - Perf baseline harness (Phase F, PB-1..PB-7): [`perf-baseline.md`](./perf-baseline.md) (CTX-0076, benches + `tools/perf/*`).
 - Dogfooding harness: `crates/bitty-runtime/tests/dogfooding.rs` + `scripts/dogfood.sh` (this task).
+- Manual smoke checklist (human-in-loop ghostty/kitty/wezterm/alacritty, prompt marks/mouse/keyboard, `hyprctl`/`grim` guidance, not CI-blocking): [`manual-smoke.md`](./manual-smoke.md) (CTX-0087, research draft, optional extension of this harness).
 - Candidate spine: [`proposed-delivery-sequence.md`](../../../bitty-docs/docs/product/proposed-delivery-sequence.md).
 - Workspace topology DAG: [ADR-0003](../../../bitty-docs/docs/decisions/adrs/ADR-0003-core-workspace-topology.md).
 - Platform tiers: [ADR-0002](../../../bitty-docs/docs/decisions/adrs/ADR-0002-platform-support-tiers.md).

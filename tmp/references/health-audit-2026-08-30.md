@@ -14,16 +14,16 @@ All mandatory local gates green before any PR. No `TODO`/`FIXME` introduced. Ref
 
 Executed in `bitty/` (workspace root) at `1ab5fb9` on `1.97.1` channel `rust-toolchain.toml:1`.
 
-| Gate | Command | Result | Evidence |
-|------|---------|--------|----------|
-| host check | `cargo check --workspace --all-targets --locked` | PASS | `Finished dev [unoptimized+debuginfo] in 0.18s` — exit 0 |
-| windows cross | `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets --locked` | PASS | `Finished dev` — exit 0 — `Cargo.toml:workspace.package` `rust-version 1.85` compatible |
-| clippy | `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS | `Finished dev in 0.14s` — exit 0 — `cargo clippy --workspace --all-targets --locked -- -D warnings` (`justfile:clippy`) |
-| tests | `cargo test --workspace --all-targets --locked` | **983 passed, 0 failed** | 30 suites — `awk sum` 983 — `cargo test --workspace --all-targets --locked` (`justfile:test`) — matches task spec `983 passed` |
-| just check | `just check` = `fmt-check + clippy + test + actionlint + markdownlint` | PASS | `cargo fmt --all -- --check` PASS; `clippy` PASS; `cargo test` PASS (re-run, same 983); `actionlint -color` PASS; `bunx --bun markdownlint-cli2@0.23.1` — `Linting: 44 files / Summary: 0 issues in 0 files` — exit 0 |
-| workflows | `act -n` (dry-run) for `.github/workflows/ci.yml` + `codeql.yml` | PASS — 7 jobs | `Quality gates`, `MSRV 1.85 check`, `Linux Wayland`, `Linux X11 (xvfb)`, `Supply chain (deny/audit)`, `CodeQL Analyze (rust)`, `CodeQL Analyze (actions)` — each `🏁 Job succeeded` — 2 skipped `macos-14`/`windows-latest` unsupported locally as expected |
-| supply chain | `cargo deny check` | PASS | `advisories ok, bans ok, licenses ok, sources ok` — `deny.toml` `allow-licenses` MIT/Apache-2.0/BSD-3-Clause etc. — 2 duplicate `thiserror` 1.0/2.0 warnings only (allowed `multiple-versions = warn`) |
-| audit | `cargo audit` (`deny.toml:advisories.ignore`) | PASS — 2 allowed warnings | `RUSTSEC-2024-0436 paste 1.0.15 unmaintained` + `RUSTSEC-2026-0192 ttf-parser 0.25.1 unmaintained` — both in `deny.toml:[advisories].ignore` — `cargo audit` exits 0 with `warning: 2 allowed warnings found` |
+| Gate          | Command                                                                         | Result                    | Evidence                                                                                                                                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| host check    | `cargo check --workspace --all-targets --locked`                                | PASS                      | `Finished dev [unoptimized+debuginfo] in 0.18s` — exit 0                                                                                                                                                                                                    |
+| windows cross | `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets --locked` | PASS                      | `Finished dev` — exit 0 — `Cargo.toml:workspace.package` `rust-version 1.85` compatible                                                                                                                                                                     |
+| clippy        | `cargo clippy --workspace --all-targets --locked -- -D warnings`                | PASS                      | `Finished dev in 0.14s` — exit 0 — `cargo clippy --workspace --all-targets --locked -- -D warnings` (`justfile:clippy`)                                                                                                                                     |
+| tests         | `cargo test --workspace --all-targets --locked`                                 | **983 passed, 0 failed**  | 30 suites — `awk sum` 983 — `cargo test --workspace --all-targets --locked` (`justfile:test`) — matches task spec `983 passed`                                                                                                                              |
+| just check    | `just check` = `fmt-check + clippy + test + actionlint + markdownlint`          | PASS                      | `cargo fmt --all -- --check` PASS; `clippy` PASS; `cargo test` PASS (re-run, same 983); `actionlint -color` PASS; `bunx --bun markdownlint-cli2@0.23.1` — `Linting: 44 files / Summary: 0 issues in 0 files` — exit 0                                       |
+| workflows     | `act -n` (dry-run) for `.github/workflows/ci.yml` + `codeql.yml`                | PASS — 7 jobs             | `Quality gates`, `MSRV 1.85 check`, `Linux Wayland`, `Linux X11 (xvfb)`, `Supply chain (deny/audit)`, `CodeQL Analyze (rust)`, `CodeQL Analyze (actions)` — each `🏁 Job succeeded` — 2 skipped `macos-14`/`windows-latest` unsupported locally as expected |
+| supply chain  | `cargo deny check`                                                              | PASS                      | `advisories ok, bans ok, licenses ok, sources ok` — `deny.toml` `allow-licenses` MIT/Apache-2.0/BSD-3-Clause etc. — 2 duplicate `thiserror` 1.0/2.0 warnings only (allowed `multiple-versions = warn`)                                                      |
+| audit         | `cargo audit` (`deny.toml:advisories.ignore`)                                   | PASS — 2 allowed warnings | `RUSTSEC-2024-0436 paste 1.0.15 unmaintained` + `RUSTSEC-2026-0192 ttf-parser 0.25.1 unmaintained` — both in `deny.toml:[advisories].ignore` — `cargo audit` exits 0 with `warning: 2 allowed warnings found`                                               |
 
 No `file:line` defects to report — all gates exit 0, zero clippy warnings (`-D warnings`), zero fmt diff, zero markdownlint issues.
 
@@ -57,12 +57,14 @@ No `file:line` defects to report — all gates exit 0, zero clippy warnings (`-D
 - `tmp/references/waybar` @ `6d60c8e` (`6d60c8e02be67bb85bb9b1ea803f2fbcf0722002`, `Merge PR #5222`) — MIT (`LICENSE` Copyright 2025 Alex) — `git clone --depth 1 https://github.com/Alexays/Waybar` 2026-08-30.
 - Also retained: `ghostty@8867c37` MIT, `kitty@087b8c3` GPL-3.0, `neovim@a1de074` Apache-2.0/Vim, `wezterm@f93d903` MIT, `vttest` synthetic corpora (<8 KiB) — see `tmp/references/README.md` table and `tmp/references/panel-tabs-research-2026-08-30.md`.
 - Verification (read-only, no build):
+
   ```bash
   git -C tmp/references/hyprland rev-parse HEAD  # c91fa5ab...
-  git -C tmp/references/waybar  rev-parse HEAD  # 6d60c8e...
+  git -C tmp/references/waybar rev-parse HEAD  # 6d60c8e...
   head -5 tmp/references/hyprland/LICENSE      # BSD 3-Clause
   head -5 tmp/references/waybar/LICENSE        # MIT
   ```
+
 - Research distilled in `tmp/references/panel-tabs-research-2026-08-30.md` (exa searches 2026-08-30): Hyprland dwindle BSP / Waybar `AModule`/`ALabel` provider / `winit` vs `smithay-client-toolkit` layer-shell (`wlr-layer-shell`) patterns for future `bitty-ui::layout` and optional `bitty-panel` crate behind `backend-wlr`. **No dependencies added, no code executed, no imports** — snapshots are untrusted, excluded by `bitty/.gitignore` (`/target`, `.worktrees`, `.carryctx/config.local.toml`) and not referenced in `Cargo.toml`.
 - Policy: never `cargo add` hyprland/waybar; future panel work starts with pure `bitty-ui::layout` unit tests mirroring `hyprgate` `insertion_plan`/`resize_plan`, then feature-gated `bitty-panel` per `fono 4bc83bc` fallback table.
 
@@ -83,4 +85,5 @@ No `file:line` defects to report — all gates exit 0, zero clippy warnings (`-D
 - Next: PR may be opened only after this audit is recorded; all gates already green locally so CI expected green.
 
 ---
-*Generated 2026-08-30 by `opencode-commander` — `bitty` repo `main 1ab5fb9` — `CTX-0083` health patrol.*
+
+_Generated 2026-08-30 by `opencode-commander` — `bitty` repo `main 1ab5fb9` — `CTX-0083` health patrol._

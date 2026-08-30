@@ -7,5 +7,13 @@
     "MD041": false
   },
   "globs": ["**/*.md"],
-  "ignores": ["node_modules", "target", "dist", "build", "site", ".worktrees"]
+  "ignores": [
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "site",
+    ".worktrees",
+    "tmp/references/health-audit-2026-08-30.md"
+  ]
 }

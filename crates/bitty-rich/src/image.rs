@@ -949,4 +949,760 @@ mod tests {
         assert!(store.placement_is_empty());
         assert_eq!(store.total_bytes(), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // R-002 adversarial: IMG-1..IMG-9 pre-allocation + sustained-load + bomb
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compressed_exact_cap_ok_one_over_denied_no_alloc() {
+        let mut store = ImageStore::new();
+        // Exactly 4 MiB OK
+        let ok = store
+            .insert(
+                ImageSource::Kitty,
+                100,
+                100,
+                IMAGE_MAX_COMPRESSED_BYTES,
+                1,
+                0,
+            )
+            .unwrap();
+        assert!(store.get(ok).is_some());
+        assert_eq!(store.len(), 1);
+        let bytes_before = store.total_bytes();
+        // One over must be rejected before allocation
+        let err = store
+            .insert(
+                ImageSource::Kitty,
+                100,
+                100,
+                IMAGE_MAX_COMPRESSED_BYTES + 1,
+                1,
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::CompressedTooLarge { .. }));
+        assert_eq!(store.len(), 1, "no allocation on rejected compressed bomb");
+        assert_eq!(store.total_bytes(), bytes_before);
+        assert!(store.get(ok).is_some());
+    }
+
+    #[test]
+    fn dimensions_exact_cap_ok_one_over_denied_no_alloc() {
+        let mut store = ImageStore::new();
+        // Exactly 4096 OK
+        let ok = store
+            .insert(ImageSource::Sixel, 4096, 4096, 1024, 1, 0)
+            .unwrap();
+        assert_eq!(
+            store.get(ok).unwrap().decoded_bytes,
+            IMAGE_MAX_DECODED_BYTES
+        );
+        let len_before = store.len();
+        let bytes_before = store.total_bytes();
+        // Width 4097 denied
+        let err = store
+            .insert(ImageSource::Sixel, 4097, 4096, 1024, 1, 0)
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
+        // Height 4097 denied
+        let err2 = store
+            .insert(ImageSource::Sixel, 4096, 4097, 1024, 1, 0)
+            .unwrap_err();
+        assert!(matches!(err2, ImageStoreError::DimensionsTooLarge { .. }));
+        assert_eq!(store.len(), len_before, "no allocation on dimension bomb");
+        assert_eq!(store.total_bytes(), bytes_before);
+    }
+
+    #[test]
+    fn decoded_exact_cap_ok_dimension_wins_over_decoded() {
+        let mut store = ImageStore::new();
+        // 4096x4096*4 = 64 MiB exactly OK (IMG-3 cap)
+        let id = store
+            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+            .unwrap();
+        assert_eq!(
+            store.get(id).unwrap().decoded_bytes,
+            IMAGE_MAX_DECODED_BYTES
+        );
+        assert_eq!(store.get(id).unwrap().total_bytes, IMAGE_MAX_DECODED_BYTES);
+        // Any larger dimension is rejected as DimensionsTooLarge before decoded check;
+        // decoded branch is overflow-checked and would fire on usize overflow, but
+        // with u32 capped dimensions overflow cannot happen on 64-bit — still validated
+        // pre-allocation.
+        let len_before = store.len();
+        let err = store
+            .insert(ImageSource::Kitty, 4096, 4097, 1024, 1, 0)
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
+        assert_eq!(store.len(), len_before);
+    }
+
+    #[test]
+    fn animation_total_boundary_256mib_ok_one_over_denied() {
+        let mut store = ImageStore::new();
+        // 1024x1024*4 = 4 MiB per frame; *64 = 256 MiB exactly OK (IMG-7 cap via IMG-4)
+        let ok = store
+            .insert(ImageSource::Kitty, 1024, 1024, 1024, 64, 0)
+            .unwrap();
+        assert_eq!(store.get(ok).unwrap().total_bytes, IMAGE_STORE_MAX_BYTES);
+        store.clear();
+        // 1025x1024*4*64 = 268_697_600 > 256 MiB must be rejected as AnimationTooLarge
+        // (dimensions within 4096 cap, so decoded passes, animation fails)
+        let err = store
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 64, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, ImageStoreError::AnimationTooLarge { .. }),
+            "expected AnimationTooLarge, got {err:?}"
+        );
+        assert!(store.is_empty(), "no allocation on animation bomb");
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn animation_frame_clamp_64_validates_total_pre_alloc() {
+        let mut store = ImageStore::new();
+        // frame_count 100 clamped to 64, so same boundary as 64
+        let err = store
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 100, 0)
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::AnimationTooLarge { .. }));
+        assert!(store.is_empty());
+        // frame_count 0 clamped to 1, so 1025x1024 with 0 frames = 1 frame = 4_198_400 < 64 MiB OK
+        let ok = store
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 0, 0)
+            .unwrap();
+        assert_eq!(store.get(ok).unwrap().frame_count, 1);
+        assert!(store.get(ok).unwrap().total_bytes <= IMAGE_MAX_DECODED_BYTES);
+    }
+
+    #[test]
+    fn animation_single_image_exceeds_store_cap_even_when_empty_denied() {
+        let mut store = ImageStore::new();
+        // 2048x2048*4=16 MiB *64=1 GiB >256 MiB
+        let err = store
+            .insert(ImageSource::Kitty, 2048, 2048, 1024, 64, 0)
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::AnimationTooLarge { .. }));
+        assert!(store.is_empty());
+        // Store remains usable after bomb
+        let ok = store.insert_simple(10, 10, 100).unwrap();
+        assert!(store.get(ok).is_some());
+    }
+
+    #[test]
+    fn decompression_bomb_pre_allocation_no_alloc_peak_under_64mib_per_image() {
+        let mut store = ImageStore::new();
+        // Seed with one valid image
+        let valid = store.insert_simple(64, 64, 1024).unwrap();
+        let len_before = store.len();
+        let bytes_before = store.total_bytes();
+        // Bomb 1: huge compressed payload (IMG-1)
+        let e1 = store
+            .insert(
+                ImageSource::Kitty,
+                64,
+                64,
+                IMAGE_MAX_COMPRESSED_BYTES + 1024,
+                1,
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(e1, ImageStoreError::CompressedTooLarge { .. }));
+        // Bomb 2: huge dimensions (IMG-2) — small compressed_len but decoded would be huge
+        let e2 = store
+            .insert(ImageSource::Kitty, 8192, 8192, 100, 1, 0)
+            .unwrap_err();
+        assert!(matches!(e2, ImageStoreError::DimensionsTooLarge { .. }));
+        // Bomb 3: animation bomb — dimensions OK but total animation >256 MiB (IMG-7)
+        let e3 = store
+            .insert(ImageSource::Kitty, 4096, 4096, 100, 64, 0)
+            .unwrap_err();
+        assert!(matches!(e3, ImageStoreError::AnimationTooLarge { .. }));
+        // No allocation occurred for any bomb: len and bytes unchanged, valid still present
+        assert_eq!(store.len(), len_before);
+        assert_eq!(store.total_bytes(), bytes_before);
+        assert!(store.get(valid).is_some());
+        // Peak memory invariant: per-image 64 MiB cap and aggregate 256 MiB cap never exceeded
+        assert!(store.total_bytes() <= IMAGE_STORE_MAX_BYTES);
+        for img in store.iter() {
+            assert!(img.decoded_bytes <= IMAGE_MAX_DECODED_BYTES);
+            assert!(img.total_bytes <= IMAGE_STORE_MAX_BYTES);
+        }
+    }
+
+    #[test]
+    fn sustained_load_count_invariant_fifo_256() {
+        let mut store = ImageStore::new();
+        // Insert 500 tiny images (1x1*4=4 B) — exceeds 256 count cap, must FIFO evict
+        let mut ids = Vec::new();
+        for _ in 0..500 {
+            ids.push(store.insert_simple(1, 1, 10).unwrap());
+        }
+        assert_eq!(store.len(), IMAGE_STORE_MAX_COUNT);
+        assert!(store.len() <= 256);
+        assert!(store.total_bytes() <= IMAGE_STORE_MAX_BYTES);
+        // Oldest 244 evicted, newest 256 retained
+        for evicted in ids.iter().take(500 - IMAGE_STORE_MAX_COUNT) {
+            assert!(store.get(*evicted).is_none(), "oldest should be evicted");
+        }
+        for kept in ids.iter().skip(500 - IMAGE_STORE_MAX_COUNT) {
+            assert!(store.get(*kept).is_some());
+        }
+        // Deterministic: re-inserting same sequence elsewhere would yield same retained set
+        let mut other = ImageStore::new();
+        for _ in 0..500 {
+            other.insert_simple(1, 1, 10).unwrap();
+        }
+        assert_eq!(store.drain_ordered(), other.drain_ordered());
+    }
+
+    #[test]
+    fn sustained_load_bytes_invariant_fifo_256mib() {
+        let mut store = ImageStore::new();
+        // Each 4096x4096 is 64 MiB; 4 fills 256 MiB. Repeated inserts must stay within cap via FIFO.
+        for i in 0..20 {
+            store
+                .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, i)
+                .unwrap();
+            assert!(
+                store.total_bytes() <= IMAGE_STORE_MAX_BYTES,
+                "byte invariant after insert {i}"
+            );
+            assert!(store.len() <= IMAGE_STORE_MAX_COUNT);
+            assert!(store.len() <= 4, "64MiB images: at most 4 fit in 256MiB");
+        }
+        assert_eq!(store.total_bytes(), IMAGE_STORE_MAX_BYTES);
+        assert_eq!(store.len(), 4);
+        // Total bytes is exactly sum of retained images
+        let sum: usize = store.iter().map(|img| img.total_bytes).sum();
+        assert_eq!(sum, store.total_bytes());
+    }
+
+    #[test]
+    fn sustained_load_mixed_sizes_byte_and_count_invariants() {
+        let mut store = ImageStore::new();
+        // Alternate small and large images to stress both caps
+        for i in 0..300 {
+            if i % 10 == 0 {
+                // Large 64 MiB every 10th
+                store
+                    .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, i as u64)
+                    .unwrap();
+            } else {
+                store.insert_simple(64, 64, 1024).unwrap();
+            }
+            assert!(store.total_bytes() <= IMAGE_STORE_MAX_BYTES);
+            assert!(store.len() <= IMAGE_STORE_MAX_COUNT);
+        }
+        // Sum invariant holds after mixed load
+        let sum: usize = store.iter().map(|img| img.total_bytes).sum();
+        assert_eq!(sum, store.total_bytes());
+    }
+
+    #[test]
+    fn placement_admission_128_fifo_and_image_eviction_cleans_placements() {
+        let mut store = ImageStore::new();
+        let img1 = store.insert_simple(10, 10, 100).unwrap();
+        let img2 = store.insert_simple(10, 10, 100).unwrap();
+        // Fill placements to 128 for img1
+        let mut pids = Vec::new();
+        for i in 0..IMAGE_MAX_PLACEMENTS {
+            pids.push(
+                store
+                    .insert_placement(
+                        img1,
+                        PlacementAnchor::Line(i as u64),
+                        PlacementGeometry::new(1, 1, 0),
+                        ClipRect::full(),
+                        ScrollBehavior::Inline,
+                        true,
+                        AlternateScope::Suppress,
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(store.placement_len(), 128);
+        // 129th evicts oldest (FIFO)
+        let extra = store
+            .insert_placement(
+                img1,
+                PlacementAnchor::Line(9999),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.placement_len(), 128);
+        assert!(store.get_placement(pids[0]).is_none());
+        assert!(store.get_placement(extra).is_some());
+        // Add placement for img2, then evict img2 via image count overflow — placement must be cleaned
+        let pid2 = store
+            .insert_placement(
+                img2,
+                PlacementAnchor::Zone(42),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        assert!(store.get_placement(pid2).is_some());
+        // Flood images to evict img1 and img2 (need 256 images to push them out)
+        for _ in 0..IMAGE_STORE_MAX_COUNT {
+            store.insert_simple(1, 1, 10).unwrap();
+        }
+        assert!(store.get(img1).is_none());
+        assert!(store.get(img2).is_none());
+        assert!(
+            store.get_placement(pid2).is_none(),
+            "placements for evicted image must be dropped"
+        );
+        // After eviction, placements for evicted images are gone, count still bounded
+        assert!(store.placement_len() <= IMAGE_MAX_PLACEMENTS);
+    }
+
+    #[test]
+    fn placement_missing_image_denied_no_partial() {
+        let mut store = ImageStore::new();
+        let fake = ImageId(0xDEAD_BEEF);
+        let before = store.placement_len();
+        let err = store
+            .insert_placement(
+                fake,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ImageStoreError::ImageNotFound(_)));
+        assert_eq!(
+            store.placement_len(),
+            before,
+            "no partial placement on ImageNotFound"
+        );
+    }
+
+    #[test]
+    fn total_bytes_sum_invariant_after_removes_and_clear() {
+        let mut store = ImageStore::new();
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            ids.push(store.insert_simple(100, 100, 1024).unwrap());
+        }
+        let sum: usize = store.iter().map(|img| img.total_bytes).sum();
+        assert_eq!(sum, store.total_bytes());
+        // Remove half
+        for id in ids.iter().take(5) {
+            assert!(store.remove(*id));
+        }
+        let sum2: usize = store.iter().map(|img| img.total_bytes).sum();
+        assert_eq!(sum2, store.total_bytes());
+        assert_eq!(store.len(), 5);
+        store.clear();
+        assert_eq!(store.total_bytes(), 0);
+        assert_eq!(store.iter().map(|img| img.total_bytes).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn zero_dimension_both_axes_denied() {
+        let mut store = ImageStore::new();
+        assert!(matches!(
+            store
+                .insert(ImageSource::Kitty, 0, 0, 100, 1, 0)
+                .unwrap_err(),
+            ImageStoreError::ZeroDimension
+        ));
+        assert!(matches!(
+            store
+                .insert(ImageSource::Kitty, 10, 0, 100, 1, 0)
+                .unwrap_err(),
+            ImageStoreError::ZeroDimension
+        ));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn compressed_at_cap_all_sources_ok() {
+        let mut store = ImageStore::new();
+        for source in [
+            ImageSource::Kitty,
+            ImageSource::Sixel,
+            ImageSource::Iterm2,
+            ImageSource::File,
+        ] {
+            let id = store
+                .insert(source, 10, 10, IMAGE_MAX_COMPRESSED_BYTES, 1, 0)
+                .unwrap();
+            assert_eq!(store.get(id).unwrap().source, source);
+            assert_eq!(
+                store.get(id).unwrap().compressed_len,
+                IMAGE_MAX_COMPRESSED_BYTES
+            );
+            store.clear();
+        }
+    }
+
+    #[test]
+    fn placement_anchor_variants_all_ok() {
+        let mut store = ImageStore::new();
+        let img = store.insert_simple(10, 10, 100).unwrap();
+        let anchors = [
+            PlacementAnchor::Zone(1),
+            PlacementAnchor::Line(2),
+            PlacementAnchor::CellRange {
+                start_row: 0,
+                start_col: 0,
+                end_row: 10,
+                end_col: 10,
+            },
+        ];
+        for anchor in anchors {
+            let pid = store
+                .insert_placement(
+                    img,
+                    anchor.clone(),
+                    PlacementGeometry::new(1, 1, 0),
+                    ClipRect::full(),
+                    ScrollBehavior::Inline,
+                    true,
+                    AlternateScope::Suppress,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(store.get_placement(pid).unwrap().anchor, anchor);
+        }
+    }
+
+    #[test]
+    fn scroll_behavior_variants_placement_ok() {
+        let mut store = ImageStore::new();
+        let img = store.insert_simple(10, 10, 100).unwrap();
+        for scroll in [
+            ScrollBehavior::Inline,
+            ScrollBehavior::PinnedBelow,
+            ScrollBehavior::Overlay,
+        ] {
+            let pid = store
+                .insert_placement(
+                    img,
+                    PlacementAnchor::Zone(10),
+                    PlacementGeometry::new(1, 1, 0),
+                    ClipRect::full(),
+                    scroll,
+                    true,
+                    AlternateScope::Suppress,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(store.get_placement(pid).unwrap().scroll, scroll);
+        }
+    }
+
+    #[test]
+    fn alternate_scope_matrix_suppression() {
+        let mut store = ImageStore::new();
+        let img = store.insert_simple(10, 10, 100).unwrap();
+        // Suppress vs Allow for each scroll
+        let pid_inline_suppress = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        let pid_pinned_suppress = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(2),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::PinnedBelow,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        let pid_overlay_suppress = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(3),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Overlay,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        let pid_inline_allow = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(4),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Allow,
+                0,
+            )
+            .unwrap();
+        assert!(
+            store.is_suppressed_in_alternate(
+                store.get_placement(pid_inline_suppress).unwrap(),
+                true
+            )
+        );
+        assert!(
+            store.is_suppressed_in_alternate(
+                store.get_placement(pid_pinned_suppress).unwrap(),
+                true
+            )
+        );
+        assert!(
+            !store.is_suppressed_in_alternate(
+                store.get_placement(pid_overlay_suppress).unwrap(),
+                true
+            )
+        );
+        assert!(
+            !store.is_suppressed_in_alternate(store.get_placement(pid_inline_allow).unwrap(), true)
+        );
+        // When alt inactive, none suppressed
+        assert!(
+            !store.is_suppressed_in_alternate(
+                store.get_placement(pid_inline_suppress).unwrap(),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn generation_does_not_affect_admission() {
+        let mut store = ImageStore::new();
+        let id1 = store.insert(ImageSource::Kitty, 10, 10, 100, 1, 0).unwrap();
+        let id2 = store
+            .insert(ImageSource::Kitty, 10, 10, 100, 1, u64::MAX)
+            .unwrap();
+        assert_ne!(id1, id2);
+        assert_eq!(store.get(id1).unwrap().generation, 0);
+        assert_eq!(store.get(id2).unwrap().generation, u64::MAX);
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false_no_side_effect() {
+        let mut store = ImageStore::new();
+        let id = store.insert_simple(10, 10, 100).unwrap();
+        let bytes_before = store.total_bytes();
+        assert!(!store.remove(ImageId(999_999)));
+        assert!(store.get(id).is_some());
+        assert_eq!(store.total_bytes(), bytes_before);
+        assert!(!store.remove_placement(PlacementId(999_999)));
+    }
+
+    #[test]
+    fn drain_ordered_preserves_fifo_after_eviction() {
+        let mut store = ImageStore::new();
+        let mut ids = Vec::new();
+        for _ in 0..10 {
+            ids.push(store.insert_simple(1, 1, 10).unwrap());
+        }
+        let ordered = store.drain_ordered();
+        assert_eq!(ordered, ids);
+        // Flood to evict oldest 5
+        for _ in 0..IMAGE_STORE_MAX_COUNT {
+            store.insert_simple(1, 1, 10).unwrap();
+        }
+        assert_eq!(store.len(), IMAGE_STORE_MAX_COUNT);
+        let ordered2 = store.drain_ordered();
+        // Oldest from first batch must be gone
+        for evicted in ids.iter().take(5) {
+            assert!(!ordered2.contains(evicted));
+        }
+        // drain_ordered is oldest-first and matches iter order
+        let iter_ids: Vec<ImageId> = store.iter().map(|img| img.id).collect();
+        assert_eq!(ordered2, iter_ids);
+    }
+
+    #[test]
+    fn iter_len_total_bytes_consistent() {
+        let mut store = ImageStore::new();
+        for _ in 0..5 {
+            store.insert_simple(100, 100, 1024).unwrap();
+        }
+        assert_eq!(store.iter().count(), store.len());
+        let sum: usize = store.iter().map(|img| img.total_bytes).sum();
+        assert_eq!(sum, store.total_bytes());
+        assert!(store.total_bytes() <= IMAGE_STORE_MAX_BYTES);
+    }
+
+    #[test]
+    fn accessors_max_count_bytes_placements() {
+        let store = ImageStore::new();
+        assert_eq!(store.max_count(), IMAGE_STORE_MAX_COUNT);
+        assert_eq!(store.max_bytes(), IMAGE_STORE_MAX_BYTES);
+        assert_eq!(store.max_placements(), IMAGE_MAX_PLACEMENTS);
+        assert_eq!(IMAGE_MAX_FRAMES, 64);
+        assert_eq!(IMAGE_MAX_COMPRESSED_BYTES, 4 * 1024 * 1024);
+        assert_eq!(IMAGE_MAX_DIMENSION, 4096);
+        assert_eq!(IMAGE_MAX_DECODED_BYTES, 64 * 1024 * 1024);
+        assert_eq!(IMAGE_STORE_MAX_BYTES, 256 * 1024 * 1024);
+        assert_eq!(IMAGE_STORE_MAX_COUNT, 256);
+        assert_eq!(IMAGE_MAX_PLACEMENTS, 128);
+    }
+
+    #[test]
+    fn is_empty_and_placement_is_empty_transitions() {
+        let mut store = ImageStore::new();
+        assert!(store.is_empty());
+        assert!(store.placement_is_empty());
+        let img = store.insert_simple(10, 10, 100).unwrap();
+        assert!(!store.is_empty());
+        assert!(store.placement_is_empty());
+        store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        assert!(!store.placement_is_empty());
+        store.clear();
+        assert!(store.is_empty());
+        assert!(store.placement_is_empty());
+    }
+
+    #[test]
+    fn total_bytes_zero_after_clear_and_after_remove_all() {
+        let mut store = ImageStore::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(store.insert_simple(64, 64, 1024).unwrap());
+        }
+        assert!(store.total_bytes() > 0);
+        for id in ids {
+            assert!(store.remove(id));
+        }
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.is_empty());
+        // Re-fill and clear
+        for _ in 0..3 {
+            store.insert_simple(64, 64, 1024).unwrap();
+        }
+        store.clear();
+        assert_eq!(store.total_bytes(), 0);
+    }
+
+    #[test]
+    fn deterministic_ids_across_many_inserts() {
+        let mut a = ImageStore::new();
+        let mut b = ImageStore::new();
+        for i in 0..50 {
+            let w = 10 + (i % 10) as u32;
+            let h = 10 + (i % 5) as u32;
+            assert_eq!(
+                a.insert_simple(w, h, 100 + i as usize).unwrap(),
+                b.insert_simple(w, h, 100 + i as usize).unwrap()
+            );
+        }
+        // Placement ids also deterministic
+        let img_a = a.drain_ordered()[0];
+        let img_b = b.drain_ordered()[0];
+        let pid_a = a
+            .insert_placement(
+                img_a,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        let pid_b = b
+            .insert_placement(
+                img_b,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap();
+        assert_eq!(pid_a, pid_b);
+    }
+
+    #[test]
+    fn clip_and_geometry_round_trip() {
+        let geom = PlacementGeometry::new(80, 24, -5);
+        assert_eq!(geom.cols, 80);
+        assert_eq!(geom.rows, 24);
+        assert_eq!(geom.z_index, -5);
+        let clip = ClipRect::new(1, 2, 10, 20);
+        assert_eq!(clip.x, 1);
+        assert_eq!(clip.y, 2);
+        assert_eq!(clip.width, 10);
+        assert_eq!(clip.height, 20);
+        let full = ClipRect::full();
+        assert_eq!(full.width, u16::MAX);
+        assert_eq!(full.height, u16::MAX);
+        // Insert with custom clip/geom retained
+        let mut store = ImageStore::new();
+        let img = store.insert_simple(10, 10, 100).unwrap();
+        let pid = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(1),
+                geom,
+                clip,
+                ScrollBehavior::PinnedBelow,
+                false,
+                AlternateScope::Suppress,
+                7,
+            )
+            .unwrap();
+        let p = store.get_placement(pid).unwrap();
+        assert_eq!(p.geometry, geom);
+        assert_eq!(p.clip, clip);
+        assert_eq!(p.generation, 7);
+        assert!(!p.visible);
+    }
+
+    #[test]
+    fn animation_frame_64_boundary_total_at_256mib() {
+        let mut store = ImageStore::new();
+        // 1024x1024=4MiB per frame *64=256MiB exactly at cap — should succeed
+        let id = store
+            .insert(ImageSource::Kitty, 1024, 1024, 1024, 64, 0)
+            .unwrap();
+        assert_eq!(store.get(id).unwrap().frame_count, 64);
+        assert_eq!(store.get(id).unwrap().total_bytes, 256 * 1024 * 1024);
+        assert_eq!(store.total_bytes(), 256 * 1024 * 1024);
+    }
 }

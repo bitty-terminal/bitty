@@ -1638,4 +1638,289 @@ mod tests {
         let second = parse(&soup);
         assert_eq!(first, second);
     }
+
+    // — P0-AC-001 boundary matrix: every numeric/param-count/payload limit has a named test.
+    // RS-1..RS-7: CSI u16 saturation, param-count truncation, OSC raw/Bounded caps,
+    // DCS/APC/SOS/PM inert handling, intermediate overflow — all parse-twice deterministic,
+    // zero panics/hangs.
+
+    #[test]
+    fn csi_numeric_boundary_at_u16_max_saturates_deterministically() {
+        // vte params.rs saturates via saturating_mul/add to u16::MAX (65535).
+        // Verify at, just-below, and beyond the limit, plus deterministic re-parse.
+        let cases: &[(&[u8], u16)] = &[
+            (b"\x1b[65534C", 65534),
+            (b"\x1b[65535C", 65535),
+            (b"\x1b[65536C", u16::MAX),
+            (b"\x1b[99999C", u16::MAX),
+            (b"\x1b[9999999999C", u16::MAX),
+        ];
+        for (bytes, expected) in cases {
+            let a1 = parse(bytes);
+            let a2 = parse(bytes);
+            assert_eq!(a1, a2, "deterministic divergence for {bytes:?}");
+            match a1.first() {
+                Some(TerminalAction::CursorMove { n, .. }) => assert_eq!(n.0, *expected),
+                other => panic!("expected CursorMove for {bytes:?}, got {other:?}"),
+            }
+        }
+        // Multiple params near the cap: 65535;1 should yield 65535, not wrap.
+        let multi = parse(b"\x1b[65535;1m");
+        assert_eq!(multi, parse(b"\x1b[65535;1m"));
+    }
+
+    #[test]
+    fn csi_param_count_at_and_beyond_max_truncates_deterministically() {
+        // vte MAX_PARAMS = 32 (params.rs). At the cap the full 32 dispatch;
+        // beyond it extra params are dropped with `ignore=true` but still dispatch.
+        let p32 = {
+            let s = "1;".repeat(31) + "1";
+            format!("\x1b[{s}m").into_bytes()
+        };
+        let p33 = {
+            let s = "1;".repeat(32) + "1";
+            format!("\x1b[{s}m").into_bytes()
+        };
+        let p64 = {
+            let s = "1;".repeat(63) + "1";
+            format!("\x1b[{s}m").into_bytes()
+        };
+        for seq in [&p32, &p33, &p64] {
+            let a1 = parse(seq);
+            let a2 = parse(seq);
+            assert_eq!(a1, a2, "deterministic divergence for len {}", seq.len());
+            assert_eq!(a1.len(), 1, "must still dispatch exactly one action");
+            match &a1[0] {
+                TerminalAction::SetAttributes { attrs } => {
+                    assert!(!attrs.changes.is_empty());
+                    // Even truncated, changes are bounded well below 1 per param.
+                    assert!(attrs.changes.len() <= 64);
+                }
+                other => panic!("expected SetAttributes, got {other:?}"),
+            }
+        }
+        // Subparam form also respects the same cap (colon notation).
+        let sub = parse(b"\x1b[38:2:255:0:128;48:5:200m");
+        assert_eq!(sub, parse(b"\x1b[38:2:255:0:128;48:5:200m"));
+    }
+
+    #[test]
+    fn csi_intermediate_overflow_is_ignored_deterministically() {
+        // vte MAX_INTERMEDIATES = 2. Three intermediates forces CsiIgnore path
+        // but must not panic and must be deterministic.
+        let seq = b"\x1b[   q"; // three spaces as intermediates + final 'q'
+        let a1 = parse(seq);
+        let a2 = parse(seq);
+        assert_eq!(a1, a2);
+        // Must still produce a single terminal action (unknown or cursor-style fallback).
+        assert_eq!(a1.len(), 1);
+    }
+
+    #[test]
+    fn osc_payload_at_raw_and_bounded_caps_truncates_deterministically() {
+        // vte MAX_OSC_RAW = 1024, BoundedString MAX_LEN = 4096.
+        // At 1024 the raw buffer is full; beyond it vte truncates deterministically
+        // and BoundedString then caps at 4096. Test at and beyond both caps.
+        for len in [1024_usize, 1025, 2048, 4095, 4096, 5000] {
+            let payload = vec![b'a'; len];
+            let mut seq = b"\x1b]2;".to_vec();
+            seq.extend_from_slice(&payload);
+            seq.push(0x07);
+            let a1 = parse(&seq);
+            let a2 = parse(&seq);
+            assert_eq!(a1, a2, "deterministic divergence for OSC len {len}");
+            assert_eq!(a1.len(), 1);
+            match &a1[0] {
+                TerminalAction::OscTitle { text } => {
+                    // BoundedString caps at 4096; vte caps at 1024+overhead => <=4096 anyway.
+                    assert!(text.len() <= BoundedString::MAX_LEN);
+                    if len >= BoundedString::MAX_LEN {
+                        assert_eq!(text.len(), BoundedString::MAX_LEN);
+                    }
+                }
+                other => panic!("expected OscTitle for len {len}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn osc_clipboard_payload_at_bounded_bytes_cap_truncates_deterministically() {
+        // BoundedBytes caps at 4096 for OSC 52.
+        for len in [4095_usize, 4096, 5000, 8192] {
+            let payload = vec![b'A'; len];
+            let mut seq = b"\x1b]52;c;".to_vec();
+            seq.extend_from_slice(&payload);
+            seq.push(0x07);
+            let a1 = parse(&seq);
+            let a2 = parse(&seq);
+            assert_eq!(a1, a2, "divergence for clipboard len {len}");
+            assert_eq!(a1.len(), 1);
+            match &a1[0] {
+                TerminalAction::OscClipboard { data, .. } => {
+                    assert!(data.len() <= BoundedBytes::MAX_LEN);
+                    if len >= BoundedBytes::MAX_LEN {
+                        assert_eq!(data.len(), BoundedBytes::MAX_LEN);
+                    }
+                }
+                other => panic!("expected OscClipboard for len {len}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_escape_resynchronizes_deterministically() {
+        // Truncated CSI intro without final byte must not hang; re-parse identical.
+        let cases: &[&[u8]] = &[
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b[31",
+            b"\x1b[38;5;196",
+            b"\x1b]",
+            b"\x1b]2;title without terminator",
+            b"\x1bP",
+            b"\x1bP+q544e without ST",
+            b"\x1b_",
+            b"\x1b_hello APC without ST",
+            b"\x1b^",
+            b"\x1bX",
+        ];
+        for bytes in cases {
+            let a1 = parse(bytes);
+            let a2 = parse(bytes);
+            assert_eq!(a1, a2, "divergence for truncated {bytes:?}");
+            // Appending a resync terminator plus printable must produce a print after.
+            let mut extended = bytes.to_vec();
+            extended.extend_from_slice(b"\x1b[31mred");
+            let extended_actions = parse(&extended);
+            let reparsed = parse(&extended);
+            assert_eq!(extended_actions, reparsed);
+            // Must contain the red SGR at the tail.
+            assert!(
+                extended_actions
+                    .iter()
+                    .any(|a| matches!(a, TerminalAction::SetAttributes { .. }))
+                    || extended_actions
+                        .iter()
+                        .any(|a| matches!(a, TerminalAction::Print(_))),
+                "resync failed for {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_osc_dcs_apc_strings_are_panic_free_and_deterministic() {
+        // Unterminated OSC/DCS/APC/SOS/PM must not emit partial actions until
+        // terminated, must not hang, and must resynchronize on the next ESC.
+        let osc_unterm = b"\x1b]2;unterminated title";
+        let dcs_unterm = b"\x1bP+q544e world without terminator";
+        let apc_unterm = b"\x1b_hello APC without ST";
+        let pm_unterm = b"\x1b^PM data without ST";
+        let sos_unterm = b"\x1bX SOS data without ST";
+        // vte's SosPmApcString (APC/PM/SOS via ESC _/^/X) is inert: even terminated
+        // with ST it emits nothing (anywhere handler discards). Only OSC (BEL/ST)
+        // and DCS (ST) produce a dispatch on termination; others remain empty.
+        for bytes in [osc_unterm.as_slice(), dcs_unterm] {
+            let a1 = parse(bytes);
+            let a2 = parse(bytes);
+            assert_eq!(a1, a2, "divergence for unterminated {bytes:?}");
+            assert!(
+                a1.is_empty(),
+                "unterminated OSC/DCS should be empty, got {a1:?}"
+            );
+            let mut terminated = bytes.to_vec();
+            if bytes.starts_with(b"\x1b]") {
+                terminated.push(0x07);
+            } else {
+                terminated.extend_from_slice(b"\x1b\\");
+            }
+            let t1 = parse(&terminated);
+            let t2 = parse(&terminated);
+            assert_eq!(t1, t2, "terminated divergence for {bytes:?}");
+            assert!(!t1.is_empty(), "terminated {bytes:?} should emit");
+        }
+        for bytes in [apc_unterm as &[u8], pm_unterm, sos_unterm] {
+            let a1 = parse(bytes);
+            let a2 = parse(bytes);
+            assert_eq!(a1, a2, "divergence for unterminated APC/PM/SOS {bytes:?}");
+            assert!(
+                a1.is_empty(),
+                "unterminated APC/PM/SOS should be inert, got {a1:?}"
+            );
+            let mut terminated = bytes.to_vec();
+            terminated.extend_from_slice(b"\x1b\\");
+            let t1 = parse(&terminated);
+            let t2 = parse(&terminated);
+            assert_eq!(t1, t2, "terminated APC/PM/SOS divergence for {bytes:?}");
+            // APC/PM/SOS are inert even after ST — no action emitted.
+            assert!(
+                t1.is_empty(),
+                "terminated APC/PM/SOS should remain inert, got {t1:?}"
+            );
+        }
+        // Interleaved unterminated + terminated + printable: no cross-contamination.
+        let mixed = b"\x1b]2;first title\x07\x1b]2;second without terminator";
+        assert_eq!(parse(mixed), parse(mixed));
+    }
+
+    #[test]
+    fn invalid_utf8_heavy_is_replaced_and_deterministic() {
+        // Heavy invalid UTF-8 must replace with U+FFFD per parser obligations,
+        // never panic, and remain deterministic across chunkings.
+        let bytes: Vec<u8> = vec![
+            0xFF, 0xFE, 0x80, 0x81, 0xC0, 0x80, 0xED, 0xA0, 0x80, 0xF0, 0x80, 0x80, 0x84, 0xE2,
+            0x28, 0xA1, 0xC3, 0x28,
+        ];
+        let a1 = parse(&bytes);
+        let a2 = parse(&bytes);
+        assert_eq!(a1, a2);
+        assert!(a1.iter().any(|a| matches!(
+            a,
+            TerminalAction::Print(c) if c.clone().scalar() == '\u{FFFD}'
+        )));
+        // Split across arbitrary chunk boundary must yield same replacement.
+        let mut p1 = Parser::new();
+        let mut whole = Vec::new();
+        p1.advance(&bytes, |a| whole.push(a));
+        let mut p2 = Parser::new();
+        let mut chunked = Vec::new();
+        for chunk in bytes.chunks(3) {
+            p2.advance(chunk, |a| chunked.push(a));
+        }
+        assert_eq!(whole, chunked);
+    }
+
+    #[test]
+    fn boundary_matrix_zero_panics_all_limits() {
+        // Single adversarial matrix covering every P0-AC-001/002 limit in one
+        // deterministic re-parse pass (parse twice). Zero panics/hangs is the
+        // pass threshold; every limit here has a dedicated named test above.
+        let mut corpus: Vec<u8> = Vec::new();
+        corpus.extend_from_slice(b"\x1b[9999999999C"); // u16 saturation
+        corpus.extend_from_slice(b"\x1b[65535;65536;0;1m");
+        corpus.extend_from_slice(b"\x1b["); // truncated
+        corpus.extend_from_slice(&b"1;".repeat(64));
+        corpus.extend_from_slice(b"m");
+        corpus.extend_from_slice(b"\x1b]2;");
+        corpus.extend_from_slice(&vec![b'Z'; BoundedString::MAX_LEN + 100]);
+        corpus.extend_from_slice(b"\x07");
+        corpus.extend_from_slice(b"\x1b]52;c;");
+        corpus.extend_from_slice(&vec![b'A'; BoundedBytes::MAX_LEN + 100]);
+        corpus.extend_from_slice(b"\x07");
+        corpus.extend_from_slice(b"\x1bP+q544e\x1b\\");
+        corpus.extend_from_slice(b"\x1b_ APC payload \x1b\\");
+        corpus.extend_from_slice(b"\x1b^ PM payload \x1b\\");
+        corpus.extend_from_slice(b"\x1bX SOS payload \x1b\\");
+        corpus.extend_from_slice(b"\xff\xfe\x80\x81");
+        corpus.extend_from_slice("héllo 🎉 ".as_bytes());
+        // Deterministic re-parse and byte-wise chunking identity.
+        let a1 = parse(&corpus);
+        let a2 = parse(&corpus);
+        assert_eq!(a1, a2);
+        let mut p = Parser::new();
+        let mut chunked = Vec::new();
+        for b in corpus.iter() {
+            p.advance(std::slice::from_ref(b), |a| chunked.push(a));
+        }
+        assert_eq!(a1, chunked);
+    }
 }

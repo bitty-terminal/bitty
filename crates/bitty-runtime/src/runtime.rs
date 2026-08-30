@@ -898,10 +898,12 @@ impl Runtime {
         Some(text)
     }
 
-    /// Inspection result for the pending paste, if any (read-only).
+    /// Whether the pending paste requires confirmation, if one exists.
     #[must_use]
-    pub fn pending_paste_inspection(&self) -> Option<&crate::paste::PasteInspection> {
-        self.pending_paste.as_ref().map(|p| &p.inspection)
+    pub fn pending_paste_inspection(&self) -> Option<bool> {
+        self.pending_paste
+            .as_ref()
+            .map(|p| p.inspection.needs_confirmation())
     }
 
     /// Whether a paste is awaiting confirmation.
@@ -917,8 +919,10 @@ impl Runtime {
     }
 
     /// Pastes text from the system clipboard (or headless buffer) and routes
-    /// it as terminal input via the bounded pending path. Returns the pasted
-    /// text on success, `None` when clipboard is empty.
+    /// it as terminal input via the bounded pending path. Returns
+    /// `Err(PlatformError)` when clipboard acquisition fails, `Ok(None)` when
+    /// the clipboard is empty, and `Ok(Some(true))` when confirmation is
+    /// required or `Ok(Some(false))` when the text is delivered immediately.
     ///
     /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
     /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
@@ -930,9 +934,7 @@ impl Runtime {
     /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
     /// primitive before the scan, so untrusted clipboard content cannot grow
     /// the heap without limit (T-01).
-    pub fn paste_from_clipboard(
-        &mut self,
-    ) -> Result<Option<crate::paste::PasteInspection>, bitty_platform::PlatformError> {
+    pub fn paste_from_clipboard(&mut self) -> Result<Option<bool>, bitty_platform::PlatformError> {
         let text = self.clipboard.get_text()?;
         if text.is_empty() {
             return Ok(None);
@@ -941,36 +943,44 @@ impl Runtime {
     }
 
     /// Pastes from a given string via the inspection gate (headless helper).
-    pub fn paste_text_via_gate(&mut self, text: String) -> crate::paste::PasteInspection {
+    /// Returns `true` when the submitted paste requires confirmation and
+    /// `false` when it is delivered immediately. If another suspicious paste
+    /// is already pending, the new paste is rejected and the first pending
+    /// paste is preserved; the return value remains `true`.
+    pub fn paste_text_via_gate(&mut self, text: String) -> bool {
         self.request_paste(text)
     }
 
-    /// Pastes the given text directly as terminal input, bypassing the
-    /// system clipboard and bypassing the suspicious-paste gate (for
-    /// synthetic/headless tests or already-inspected paths only).
+    /// Pastes the given text through the suspicious-paste inspection gate.
     ///
-    /// Prefer `paste_from_clipboard` / `request_paste` for untrusted
-    /// clipboard content; this is the escape hatch for clean test fixtures.
+    /// This string-input seam is safe for production callers because it uses
+    /// the same pending confirmation path as clipboard input.
     pub fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.write_input(text.as_bytes());
+        self.request_paste(text.to_owned());
     }
 
-    /// Core paste entry: inspects `text`, stores a pending paste when
-    /// suspicious, otherwise delivers immediately. Returns the inspection
-    /// result so callers can surface the confirmation requirement.
+    /// Core paste entry: bounds and inspects `text`, stores a pending paste
+    /// when suspicious, otherwise delivers immediately. Returns `true` when
+    /// confirmation is required and `false` when delivery is immediate. A
+    /// suspicious request is rejected while another paste is pending, which
+    /// preserves the first pending paste for explicit confirmation or cancel.
     ///
     /// No silent delivery path exists for `needs_confirmation() == true`.
-    pub fn request_paste(&mut self, text: String) -> crate::paste::PasteInspection {
+    pub fn request_paste(&mut self, text: String) -> bool {
+        let text = truncate_paste_text(text);
         let inspection = crate::paste::inspect_paste(&text);
         if inspection.needs_confirmation() {
+            if self.pending_paste.is_some() {
+                return true;
+            }
             self.pending_paste = Some(crate::paste::PendingPaste::new(text, inspection.clone()));
-            return inspection;
+            return true;
         }
         self.deliver_paste_bytes(text.as_bytes());
-        inspection
+        false
     }
 
     /// Confirm or cancel the pending paste. `confirm == true` delivers the
@@ -2511,6 +2521,18 @@ impl Runtime {
             generation: current_gen,
         })
     }
+}
+
+fn truncate_paste_text(text: String) -> String {
+    const MAX_BYTES: usize = bitty_platform::clipboard::CLIPBOARD_MAX_BYTES;
+    if text.len() <= MAX_BYTES {
+        return text;
+    }
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 #[cfg(test)]

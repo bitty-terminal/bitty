@@ -112,7 +112,7 @@ fn copy_selection_to_clipboard_headless() {
         .paste_from_clipboard()
         .expect("paste must succeed")
         .expect("text");
-    assert!(insp.is_clean(), "clean paste must not need confirmation");
+    assert!(!insp, "clean paste must not need confirmation");
     assert!(
         !rt.has_pending_paste(),
         "clean paste must not leave pending"
@@ -143,7 +143,7 @@ fn clipboard_is_bounded_and_truncates() {
     rt.drain_pending_input();
     let insp = rt.paste_from_clipboard().expect("paste").expect("insp");
     // Long clean paste (all 'y') is delivered immediately, no pending.
-    assert!(insp.is_clean());
+    assert!(!insp);
     assert!(!rt.has_pending_paste());
     // Length is bounded to CLIPBOARD_MAX_BYTES via clipboard primitive.
     assert_eq!(rt.pending_input().len(), 8192);

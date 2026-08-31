@@ -363,6 +363,13 @@ impl Registry {
         let entry = self
             .get(id)
             .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?;
+        if entry.manifest.id() != id {
+            return Err(PluginError::registry(format!(
+                "registered manifest identity '{}' does not match requested plugin '{}'",
+                entry.manifest.id(),
+                id
+            )));
+        }
         if entry.state == PluginState::Disposed {
             return Err(PluginError::InvalidState {
                 id: id.to_string(),
@@ -370,24 +377,35 @@ impl Registry {
                 expected: "non-Disposed (cannot reload a disposed plugin)".to_string(),
             });
         }
-        // Dispose old generation resources before activating new one.
+        // Validate the replacement before releasing the current generation.
         let old_gen = entry.generation;
-        let old_commands = entry.commands.clone();
-        for q in &old_commands {
-            self.command_owners.remove(q.as_str());
-        }
         // Prepare new entry at generation old+1, state Declared -> Resolved -> Registered -> Activated.
-        let new_gen = old_gen + 1;
+        let new_gen = old_gen.checked_add(1).ok_or_else(|| {
+            PluginError::registry(format!("generation overflow for plugin '{}'", id))
+        })?;
         let mut new_entry = RegistryEntry::declared(new_manifest);
+        if new_entry.manifest.id() != id {
+            return Err(PluginError::registry(format!(
+                "replacement manifest id '{}' does not match requested plugin '{}'",
+                new_entry.manifest.id(),
+                id
+            )));
+        }
         new_entry.generation = new_gen;
         // Validate no duplicate commands with remaining plugins.
         for q in &new_entry.commands {
             if let Some(owner) = self.command_owners.get(q.as_str()) {
-                return Err(PluginError::Duplicate {
-                    kind: "command".to_string(),
-                    value: format!("'{q}' already owned by '{owner}'"),
-                });
+                if owner != id.as_str() {
+                    return Err(PluginError::Duplicate {
+                        kind: "command".to_string(),
+                        value: format!("'{q}' already owned by '{owner}'"),
+                    });
+                }
             }
+        }
+        let old_commands = entry.commands.clone();
+        for q in &old_commands {
+            self.command_owners.remove(q.as_str());
         }
         // Commit: replace entry and advance through lifecycle stub (Declared->Resolved->Registered->Activated).
         // For reload we bypass separate steps and mark as Activated directly (all reservations validated).
@@ -553,6 +571,28 @@ mod tests {
         assert_eq!(entry.state, PluginState::Activated);
         assert!(reg.is_command_owned("xuepoo.a:cmd2"));
         assert!(!reg.is_command_owned("xuepoo.a:cmd"));
+    }
+
+    #[test]
+    fn reload_generation_overflow_fails_closed_without_mutation() {
+        let mut reg = Registry::new();
+        let m = minimal_manifest("xuepoo.overflow", vec!["xuepoo.overflow:cmd"]);
+        let id = m.identity.id.clone();
+        reg.declare(m).unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        reg.activate(&id).unwrap();
+        reg.plugins.get_mut(id.as_str()).unwrap().generation = Generation::MAX;
+
+        let replacement = minimal_manifest("xuepoo.overflow", vec!["xuepoo.overflow:new"]);
+        let err = reg.reload(&id, replacement).unwrap_err();
+
+        assert!(format!("{err}").contains("generation overflow"));
+        let entry = reg.get(&id).unwrap();
+        assert_eq!(entry.generation, Generation::MAX);
+        assert_eq!(entry.state, PluginState::Activated);
+        assert!(reg.is_command_owned("xuepoo.overflow:cmd"));
+        assert!(!reg.is_command_owned("xuepoo.overflow:new"));
     }
 
     #[test]

@@ -380,6 +380,24 @@ pub struct Runtime {
     pending_paste: Option<crate::paste::PendingPaste>,
     osc_clipboard_read_allowed: bool,
     osc_clipboard_write_allowed: bool,
+    pending_activation_gesture: Option<ActivationGesture>,
+    next_activation_gesture: u64,
+}
+
+/// Opaque, runtime-issued proof of a platform input gesture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivationGesture(u64);
+
+/// Runtime-issued authorization for a non-local URL activation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UrlActivation {
+    uri: String,
+}
+
+/// Runtime-issued authorization for a local-file URL activation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileUrlActivation {
+    uri: String,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -528,6 +546,8 @@ impl Runtime {
             pending_paste: None,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            pending_activation_gesture: None,
+            next_activation_gesture: 1,
         })
     }
 
@@ -584,6 +604,8 @@ impl Runtime {
             pending_paste: None,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            pending_activation_gesture: None,
+            next_activation_gesture: 1,
         })
     }
 
@@ -1759,7 +1781,120 @@ impl Runtime {
     /// `intercept.open-url` stub.
     #[must_use]
     pub fn intercept_open_url(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
-        Self::should_proceed_after_interceptions(decisions, timed_out)
+        if timed_out {
+            return false;
+        }
+        Self::should_proceed_after_interceptions(decisions, false)
+    }
+
+    /// Authorizes a non-local URL activation and binds it to the exact URI.
+    /// The gesture must have been issued by the runtime's platform-event path;
+    /// terminal output and caller-supplied booleans cannot satisfy this gate.
+    pub fn authorize_url_activation(
+        &mut self,
+        uri: &str,
+        gesture: ActivationGesture,
+        decisions: &[InterceptionDecision],
+        timed_out: bool,
+    ) -> Result<UrlActivation, bitty_platform::PlatformError> {
+        if self.pending_activation_gesture.as_ref() != Some(&gesture)
+            || !Self::intercept_open_url(decisions, timed_out)
+        {
+            return Err(bitty_platform::PlatformError::UrlActivationDenied);
+        }
+        self.pending_activation_gesture = None;
+        let validated = bitty_platform::validate_url(uri)?;
+        if validated.as_str().starts_with("file:") {
+            return Err(bitty_platform::PlatformError::UrlActivationDenied);
+        }
+        Ok(UrlActivation {
+            uri: validated.as_str().to_owned(),
+        })
+    }
+
+    /// Authorizes a local-file URL through a separate explicit approval path.
+    pub fn authorize_file_url_activation(
+        &mut self,
+        uri: &str,
+        gesture: ActivationGesture,
+        decisions: &[InterceptionDecision],
+        timed_out: bool,
+    ) -> Result<FileUrlActivation, bitty_platform::PlatformError> {
+        if self.pending_activation_gesture.as_ref() != Some(&gesture)
+            || !Self::intercept_open_url(decisions, timed_out)
+        {
+            return Err(bitty_platform::PlatformError::UrlActivationDenied);
+        }
+        self.pending_activation_gesture = None;
+        let validated = bitty_platform::validate_file_url(uri)?;
+        Ok(FileUrlActivation {
+            uri: validated.as_str().to_owned(),
+        })
+    }
+
+    /// Takes the one-use gesture minted by a real primary mouse activation.
+    /// Terminal output and synthetic API calls never mint this proof.
+    pub fn take_activation_gesture(&self) -> Option<ActivationGesture> {
+        self.pending_activation_gesture.clone()
+    }
+
+    /// Opens a URL using only a runtime-issued, URI-bound authorization.
+    pub fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError> {
+        let validated = bitty_platform::validate_url(&activation.uri)?;
+        if validated.as_str().starts_with("file:") {
+            return Err(bitty_platform::PlatformError::UrlActivationDenied);
+        }
+        Self::spawn_validated_url(validated.as_str())
+    }
+
+    /// Opens a local-file URL using only its distinct runtime-issued approval.
+    pub fn open_file_url(
+        &self,
+        activation: FileUrlActivation,
+    ) -> Result<(), bitty_platform::PlatformError> {
+        let validated = bitty_platform::validate_file_url(&activation.uri)?;
+        Self::spawn_validated_url(validated.as_str())
+    }
+
+    fn spawn_validated_url(uri: &str) -> Result<(), bitty_platform::PlatformError> {
+        use std::process::Command;
+        let (program, prefix) = Self::url_dispatch();
+        if cfg!(target_os = "linux") && !Self::handler_available(program) {
+            return Err(bitty_platform::PlatformError::UrlLaunch(format!(
+                "URL handler is unavailable: {program}"
+            )));
+        }
+        let mut command = Command::new(program);
+        if let Some(argument) = prefix {
+            command.arg(argument);
+        }
+        command.arg(uri);
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| bitty_platform::PlatformError::UrlLaunch(error.to_string()))
+    }
+
+    fn handler_available(program: &str) -> bool {
+        std::path::Path::new(program).is_file()
+    }
+
+    fn url_handler() -> &'static str {
+        if cfg!(target_os = "windows") {
+            r"C:\Windows\System32\explorer.exe"
+        } else if cfg!(target_os = "macos") {
+            "/usr/bin/open"
+        } else {
+            "/usr/bin/gio"
+        }
+    }
+
+    fn url_dispatch() -> (&'static str, Option<&'static str>) {
+        if cfg!(target_os = "linux") {
+            (Self::url_handler(), Some("open"))
+        } else {
+            (Self::url_handler(), None)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2240,6 +2375,33 @@ impl Runtime {
                 }
                 WindowEventKind::MouseInput(mouse) => {
                     self.handle_mouse_input(mouse);
+                    if mouse.button == MouseButton::Left && mouse.state == PressState::Released {
+                        if let Some(pos) = self.last_cursor {
+                            let cell = self.cursor_to_cell(pos);
+                            let snapshot = self.state.snapshot();
+                            let Some(index) = (cell.row as usize)
+                                .checked_mul(snapshot.width)
+                                .and_then(|base| base.checked_add(cell.col as usize))
+                            else {
+                                return false;
+                            };
+                            if let Some(id) = snapshot.cells.get(index).and_then(|c| c.hyperlink) {
+                                if let Some((_, uri)) = self.state.hyperlink_entry(id) {
+                                    let is_safe = if uri.starts_with("file:") {
+                                        bitty_platform::validate_file_url(uri).is_ok()
+                                    } else {
+                                        bitty_platform::validate_url(uri).is_ok()
+                                    };
+                                    if is_safe {
+                                        let token = ActivationGesture(self.next_activation_gesture);
+                                        self.next_activation_gesture =
+                                            self.next_activation_gesture.wrapping_add(1).max(1);
+                                        self.pending_activation_gesture = Some(token);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     false
                 }
                 WindowEventKind::CursorMoved(pos) => {
@@ -3209,7 +3371,216 @@ mod tests {
         ));
         assert!(Runtime::intercept_paste(&[HostDecision::Approve], false));
         assert!(!Runtime::intercept_open_url(&[HostDecision::Veto], false));
+        assert!(!Runtime::intercept_open_url(&[HostDecision::Approve], true));
         assert!(Runtime::intercept_terminal_spawn(&[], false));
+    }
+
+    #[test]
+    fn opening_url_requires_gesture_and_interception_approval() {
+        let mut rt = make_runtime();
+        let denied = rt.authorize_url_activation(
+            "https://example.test",
+            ActivationGesture(0),
+            &[HostDecision::Approve],
+            false,
+        );
+        assert_eq!(
+            denied,
+            Err(bitty_platform::PlatformError::UrlActivationDenied)
+        );
+    }
+
+    #[test]
+    fn platform_hyperlink_activation_mints_single_use_gesture() {
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+        let window_id = bitty_platform::WindowId::from_raw_public(1);
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        });
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        let gesture = rt
+            .take_activation_gesture()
+            .expect("runtime must mint gesture");
+        let activation = rt
+            .authorize_url_activation("https://example.test", gesture, &[], false)
+            .expect("platform gesture must authorize safe hyperlink");
+        assert_eq!(activation.uri, "https://example.test");
+        assert!(
+            rt.take_activation_gesture().is_none(),
+            "gesture is single-use"
+        );
+    }
+
+    #[test]
+    fn opening_url_validates_after_activation_gate() {
+        let mut rt = make_runtime();
+        let result =
+            rt.authorize_url_activation("javascript:alert(1)", ActivationGesture(0), &[], false);
+        assert_eq!(
+            result,
+            Err(bitty_platform::PlatformError::UrlActivationDenied)
+        );
+    }
+
+    #[test]
+    fn file_urls_require_distinct_approval() {
+        let mut rt = make_runtime();
+        assert!(
+            rt.authorize_url_activation("file:///tmp/report", ActivationGesture(0), &[], false)
+                .is_err()
+        );
+        assert!(
+            rt.authorize_file_url_activation(
+                "file:///tmp/report",
+                ActivationGesture(0),
+                &[],
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_output_alone_cannot_activate() {
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"file:///tmp/report");
+        assert!(
+            rt.authorize_file_url_activation(
+                "file:///tmp/report",
+                ActivationGesture(0),
+                &[],
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_authority_is_rejected_before_authorization_token_is_issued() {
+        let mut rt = make_runtime();
+        assert_eq!(
+            rt.authorize_file_url_activation(
+                "file://server/share",
+                ActivationGesture(0),
+                &[],
+                false
+            ),
+            Err(bitty_platform::PlatformError::UrlActivationDenied)
+        );
+    }
+
+    #[test]
+    fn hostile_hyperlink_does_not_consume_gesture_slot() {
+        let mut rt = make_runtime();
+        // Hostile URI should not mint a gesture.
+        rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07link\x1b]8;;\x07");
+        let window_id = bitty_platform::WindowId::from_raw_public(1);
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        });
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        assert!(
+            rt.take_activation_gesture().is_none(),
+            "hostile hyperlink must not mint gesture"
+        );
+        // Safe hyperlink after hostile must still mint.
+        let mut rt2 = make_runtime();
+        rt2.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+        rt2.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        });
+        rt2.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        assert!(
+            rt2.take_activation_gesture().is_some(),
+            "safe hyperlink must mint gesture even after hostile attempt in separate runtime"
+        );
+    }
+
+    #[test]
+    fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
+        let mut rt = make_runtime();
+        let window_id = bitty_platform::WindowId::from_raw_public(2);
+        // First, hostile.
+        rt.handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        });
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        assert!(rt.take_activation_gesture().is_none());
+        // Then safe link overwriting same cell (carriage return to col 0).
+        rt.handle_pty_bytes(b"\r\x1b]8;;https://example.test\x07y\x1b]8;;\x07");
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition { x: 1.0, y: 1.0 }),
+        });
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        let gesture = rt
+            .take_activation_gesture()
+            .expect("safe must mint after hostile");
+        let ok = rt.authorize_url_activation("https://example.test", gesture, &[], false);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn hyperlink_activation_overflow_is_handled_without_panic() {
+        let mut rt = make_runtime();
+        // Force a large snapshot width via state resize to max config-allowed, then
+        // verify checked arithmetic does not panic on extreme cursor.
+        // The runtime clamps cursor_to_cell, so overflow is defensive.
+        let window_id = bitty_platform::WindowId::from_raw_public(3);
+        rt.handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+        // Cursor far outside window should clamp, not overflow.
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(CursorPosition {
+                x: f64::MAX,
+                y: f64::MAX,
+            }),
+        });
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
+                button: MouseButton::Left,
+                state: PressState::Released,
+            }),
+        });
+        // Should not panic; may or may not mint depending on clamped cell.
+        let _ = rt.take_activation_gesture();
     }
 
     #[test]

@@ -35,6 +35,15 @@ pub enum PlatformError {
 
     /// Clipboard operation failed.
     ClipboardOperation(String),
+
+    /// The URI is not in the supported, safe scheme allowlist.
+    InvalidUrl,
+
+    /// URL activation was not caused by a user gesture or was vetoed.
+    UrlActivationDenied,
+
+    /// The default URL handler could not be started.
+    UrlLaunch(String),
 }
 
 impl fmt::Display for PlatformError {
@@ -57,6 +66,11 @@ impl fmt::Display for PlatformError {
             Self::ClipboardOperation(detail) => {
                 write!(f, "clipboard operation failed: {detail}")
             }
+            Self::InvalidUrl => write!(f, "URL rejected by scheme and character policy"),
+            Self::UrlActivationDenied => {
+                write!(f, "URL activation requires a user gesture and approval")
+            }
+            Self::UrlLaunch(detail) => write!(f, "URL launch failed: {detail}"),
         }
     }
 }

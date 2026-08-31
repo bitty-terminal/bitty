@@ -185,8 +185,8 @@ pub use config::RuntimeConfig;
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::{
-    DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY,
-    PresentStats, Runtime,
+    ActivationGesture, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,
+    DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation, PresentStats, Runtime, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

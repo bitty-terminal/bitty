@@ -95,6 +95,7 @@ pub mod error;
 pub mod event;
 pub mod keyboard;
 pub mod surface;
+pub mod url;
 
 // ADR-0004 wrapper-rule exception: raw display/window handles are the payload
 // of GPU surface creation, so the exact pinned upstream version is re-exported
@@ -112,3 +113,4 @@ pub use event::{
 };
 pub use keyboard::{encode_key_event, encode_named_key};
 pub use surface::{SurfaceTarget, map_resize_to_surface_extent};
+pub use url::{URL_MAX_LEN, ValidatedUrl, validate_file_url, validate_url};

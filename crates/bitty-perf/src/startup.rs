@@ -329,11 +329,16 @@ fn probe_winit_availability() -> PhaseStatus {
         Ok(Err(e)) => {
             let msg = truncate(format!("{e:?}"), 256);
             // winit maps NotSupported/Os errors to display-unavailable.
+            // RecreationAttempt occurs when EventLoop was already created
+            // (winit enforces single EventLoop per process via EVENT_LOOP_CREATED);
+            // sequential tests with --test-threads=1 hit this on the 2nd probe and
+            // must be classified as Unavailable, not Failed.
             if msg.contains("NotSupported")
                 || msg.contains("Unavailable")
                 || msg.contains("Display")
                 || msg.contains("Wayland")
                 || msg.contains("X11")
+                || msg.contains("RecreationAttempt")
             {
                 PhaseStatus::Unavailable(msg)
             } else {

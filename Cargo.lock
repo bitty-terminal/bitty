@@ -221,11 +221,16 @@ version = "0.0.1"
 name = "bitty-perf"
 version = "0.0.1"
 dependencies = [
+ "bitty-config",
  "bitty-platform",
  "bitty-pty",
  "bitty-render",
+ "bitty-runtime",
  "bitty-term-state",
+ "bitty-ui",
  "bitty-vt",
+ "pollster",
+ "winit",
 ]
 
 [[package]]

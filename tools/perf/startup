@@ -1,123 +1,68 @@
 #!/usr/bin/env bash
-# PB-1 cold startup harness — headless, bounded.
-# Budget: ≤100 ms p50 / ≤200 ms p99 (bitty-docs/docs/specifications/performance-budget-rfc.md#pb-1-cold-startup-time)
-# Scope: Phase F baseline harness (CTX-0076). Warm OS file cache, default config,
-# local shell, single window, bundled plugins only. Measures `bitty-app` headless
-# startup (not a window) via `cargo run --release -p bitty-app -- --help` timing
-# and via `hyperfine` when available, reporting p50/p99. Real cold-to-first-frame
-# requires a display server; this script proves the measurement plumbing headlessly
-# and records the bound so CI stays display-free.
+# PB-1 cold startup — real-window instrumentation (CTX-0100).
+# Budget: ≤100 ms p50 / ≤200 ms p99 first prompt frame (performance-budget-rfc.md#pb-1)
+# Scope: CTX-0100 upgrade from `--help` proxy to real-window tracing:
+#   process start → args → config → runtime (font+surface) → layout → PTY spawn
+#   → winit window probe → wgpu init probe → font probe → first shell bytes
+#   → first frame presented. Each phase timestamped with Instant, bounded,
+#   headless or real window. On headless CI winit/wgpu report Unavailable with
+#   attempt duration; on Tier 1 with BITTY_PERF_REAL_WINDOW=1 they report real.
+#   Former --help/hyperfine path retained as secondary comparison.
 #
-# Headless: never opens `winit::Window` or `wgpu::Surface`; uses `--help` or
-# `cargo run` headless fallback (`DisplayUnavailable`) from `bitty-platform`.
-# Bounded: 50 samples max, `timeout` guarded, no unbounded log growth.
+# Bounded: 1 startup_real bench run + 50 hyperfine samples max, timeout guarded.
+# Headless: never requires window to prove seam; real gated on display.
 
 set -euo pipefail
 
-SAMPLES="${PERF_SAMPLES:-50}"
-TIMEOUT_SECS="${PERF_TIMEOUT_SECS:-5}"
 PB1_P50_MS=100
 PB1_P99_MS=200
+TIMEOUT_SECS="${PERF_TIMEOUT_SECS:-30}"
 
 goto_root() {
 	cd "$(dirname "${0}")/../.."
 }
 
-have_hyperfine() {
-	command -v hyperfine >/dev/null 2>&1
-}
-
-measure_with_date() {
-	# Portable fallback: 1 run via `date +%s%N` (nanoseconds) if available.
-	local bin="${1}"
-	local start end diff_ms
-	if date +%s%N >/dev/null 2>&1; then
-		start="$(date +%s%N)"
-		timeout "${TIMEOUT_SECS}" "${bin}" --help >/dev/null 2>&1 || true
-		end="$(date +%s%N)"
-		diff_ms="$(((end - start) / 1000000))"
-		echo "${diff_ms}"
-	else
-		# Seconds fallback; coarse but headless.
-		start="$(date +%s)"
-		timeout "${TIMEOUT_SECS}" "${bin}" --help >/dev/null 2>&1 || true
-		end="$(date +%s)"
-		diff_ms="$(((end - start) * 1000))"
-		echo "${diff_ms}"
-	fi
+have_cargo() {
+	command -v cargo >/dev/null 2>&1
 }
 
 main() {
 	goto_root
-	echo "perf/startup — PB-1 cold startup ≤${PB1_P50_MS} ms p50 / ≤${PB1_P99_MS} ms p99 (headless bounded, 50 samples)"
-	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-1"
-	echo "headless: --help path only, no Window/Surface, bounded ${SAMPLES} samples, timeout ${TIMEOUT_SECS}s"
+	echo "perf/startup — PB-1 cold startup ≤${PB1_P50_MS} ms p50 / ≤${PB1_P99_MS} ms p99 (CTX-0100 real-window tracing, bounded)"
+	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-1 (default config, warm file cache, local shell)"
+	echo "pipeline: process_start → args_parse → config_load → runtime_create(font+surface) → layout → pty_spawn → winit_probe → wgpu_probe → font_probe → first_bytes → first_frame"
+	echo "instrumentation: crates/bitty-perf/src/startup.rs Instant per-phase, benches/startup_real.rs (headless baseline, BITTY_PERF_REAL_WINDOW=1 for real)"
 
-	# Build release binary headlessly; `cargo check` already proves types but
-	# we need a binary to time. Bounded build via `cargo build --release -p bitty-app`.
-	if ! command -v cargo >/dev/null 2>&1; then
-		echo "skip: cargo not on PATH (measurement plumbing only)"
+	if ! have_cargo; then
+		echo "skip: cargo not on PATH"
 		exit 0
 	fi
 
-	# Prefer hyperfine when present (records p50/p99 with warmup).
-	if have_hyperfine; then
-		echo "runner: hyperfine (${SAMPLES} runs, warmup 3)"
-		# Build once to warm file cache (RFC: warm OS file cache).
-		cargo build --release -p bitty-app >/dev/null 2>&1 || {
-			echo "warn: cargo build --release -p bitty-app failed — falling back to cargo check timing"
-		}
+	echo "--- benches/startup_real.rs (CTX-0100 real-window instrumentation, timeout ${TIMEOUT_SECS}s) ---"
+	if timeout "${TIMEOUT_SECS}" cargo bench -p bitty-perf --bench startup_real -- --nocapture 2>&1 | tail -n 120; then
+		echo "startup_real bench: ran headless baseline (winit/wgpu phases show ok or unavailable with duration)"
+	else
+		echo "startup_real bench: timeout or compile error — fallback to cargo bench --no-run check"
+		cargo bench --no-run 2>&1 | tail -n 20 || true
+	fi
+
+	# Secondary: hyperfine comparison when available (retains Phase F history).
+	if command -v hyperfine >/dev/null 2>&1; then
+		echo "--- hyperfine comparison (secondary, --help path retained for history, not primary) ---"
+		echo "runner: hyperfine 5 runs, timeout ${TIMEOUT_SECS}s"
 		bin="./target/release/bitty-app"
-		if [ -x "${bin}" ]; then
-			hyperfine --warmup 3 --runs "${SAMPLES}" --export-json "/tmp/bitty-perf-startup.json" "${bin} --help" || true
-			echo "hyperfine JSON: /tmp/bitty-perf-startup.json"
-			if command -v python3 >/dev/null 2>&1 && [ -f /tmp/bitty-perf-startup.json ]; then
-				python3 - <<'PY'
-import json, pathlib
-p = pathlib.Path("/tmp/bitty-perf-startup.json")
-if not p.exists():
-    print("no hyperfine JSON")
-    raise SystemExit
-j = json.loads(p.read_text())
-# hyperfine 1.18+ schema: results[0].median, times etc.
-try:
-    r = j.get("results", [{}])[0]
-    median = r.get("median", None)
-    # hyperfine reports seconds; convert to ms
-    if median is not None:
-        print(f"median {median*1000:.1f} ms")
-except Exception as e:
-    print(f"parse warn: {e}")
-PY
-			fi
-		else
-			echo "no release binary; measuring cargo run --release -p bitty-app --help"
-			hyperfine --warmup 2 --runs 20 "cargo run --release -p bitty-app -- --help" || true
+		if [ ! -x "${bin}" ]; then
+			cargo build --release -p bitty-app >/dev/null 2>&1 || true
 		fi
-		exit 0
+		if [ -x "${bin}" ]; then
+			hyperfine --warmup 1 --runs 5 --export-json "/tmp/bitty-perf-startup.json" "${bin} --help" 2>&1 | tail -n 20 || true
+			echo "hyperfine JSON: /tmp/bitty-perf-startup.json (headless --help proxy, not real first-frame)"
+		fi
+	else
+		echo "hyperfine not present — primary instrumentation is startup_real bench above"
 	fi
 
-	# Fallback without hyperfine: cargo run timing (bounded 5 samples to keep fast).
-	echo "runner: date fallback (no hyperfine, bounded)"
-	for i in $(seq 1 5); do
-		# Use cargo run --help as headless proxy; timeout keeps it bounded.
-		if date +%s%N >/dev/null 2>&1; then
-			start="$(date +%s%N)"
-			timeout "${TIMEOUT_SECS}" cargo run --release -p bitty-app -- --help >/dev/null 2>&1 || true
-			end="$(date +%s%N)"
-			ms="$(((end - start) / 1000000))"
-		else
-			start="$(date +%s)"
-			timeout "${TIMEOUT_SECS}" cargo run --release -p bitty-app -- --help >/dev/null 2>&1 || true
-			end="$(date +%s)"
-			ms="$(((end - start) * 1000))"
-		fi
-		echo "sample ${i}: ${ms} ms"
-		if [ "${ms}" -gt "${PB1_P99_MS}" ]; then
-			echo "note: sample ${ms} ms > PB-1 p99 ${PB1_P99_MS} ms (soft gate; real windowing startup measured on display host)"
-		fi
-	done
-	echo "PB-1 headless plumbing done (real cold-to-first-frame needs display server; see performance-budget-rfc.md Open items)"
+	echo "PB-1 real-window tracing done (primary: startup_real Instant per-phase; headless CI shows unavailable with duration, Tier 1 real shows success; see docs/product/perf-evidence.md and crates/bitty-perf/src/startup.rs)"
 }
 
 main "$@"

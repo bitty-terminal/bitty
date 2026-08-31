@@ -3316,10 +3316,11 @@ mod tests {
     #[test]
     fn grant_check_stub_deny_by_default_and_hash_binding() {
         let mut rt = make_runtime();
-        let m = host_manifest("xuepoo.test", vec!["xuepoo.test:cmd"], vec![]);
+        let cap = CapabilityId::parse("terminal.semantic-read").unwrap();
+        let mut m = host_manifest("xuepoo.test", vec!["xuepoo.test:cmd"], vec![]);
+        m.capabilities.ids.insert(cap.clone());
         rt.register_plugin(m).unwrap();
         let pid = HostPid::new("xuepoo.test").unwrap();
-        let cap = CapabilityId::parse("terminal.semantic-read").unwrap();
         let hash = "abc123";
         // No grant yet -> denied.
         assert!(!rt.is_capability_granted(&pid, hash, &cap));
@@ -3339,10 +3340,11 @@ mod tests {
     #[test]
     fn dispatch_command_checks_ownership_and_grant() {
         let mut rt = make_runtime();
-        let m = host_manifest("xuepoo.test", vec!["xuepoo.test:run"], vec![]);
+        let cap = CapabilityId::parse("ui.rich").unwrap();
+        let mut m = host_manifest("xuepoo.test", vec!["xuepoo.test:run"], vec![]);
+        m.capabilities.ids.insert(cap.clone());
         rt.register_plugin(m).unwrap();
         let pid = HostPid::new("xuepoo.test").unwrap();
-        let cap = CapabilityId::parse("ui.rich").unwrap();
         let hash = "h";
         let qn = bitty_plugin_host::QualifiedName::new("xuepoo.test:run").unwrap();
 

@@ -360,10 +360,10 @@ impl FilesystemRequest {
                     "path pattern too long (max 512)",
                 ));
             }
-            if p.contains('\0') {
+            if p.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
                 return Err(PluginError::manifest(
                     "capabilities.filesystem.paths",
-                    "path pattern must not contain NUL",
+                    "path pattern must not contain control characters or whitespace",
                 ));
             }
             total += p.len();
@@ -483,6 +483,24 @@ pub struct CapabilityRequests {
 }
 
 impl CapabilityRequests {
+    /// Whether this manifest explicitly requests `capability`.
+    #[must_use]
+    pub fn contains(&self, capability: &CapabilityId) -> bool {
+        if self.ids.contains(capability) {
+            return true;
+        }
+        self.filesystem.iter().any(|request| {
+            let name = match request.access {
+                FsAccess::Read => "fs.read",
+                FsAccess::Write => "fs.write",
+            };
+            request.paths.iter().any(|path| {
+                CapabilityId::parse(&format!("{name}:{path}"))
+                    .is_ok_and(|expanded| expanded == *capability)
+            })
+        })
+    }
+
     /// Validate all capability requests.
     pub fn validate(&self) -> Result<(), PluginError> {
         // Already validated via CapabilityId::parse at insertion; re-validate invariants.
@@ -843,6 +861,24 @@ mod tests {
         };
         m.capabilities.filesystem.push(req);
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn filesystem_patterns_reject_controls_and_unicode_whitespace() {
+        for path in ["path\0name", "path\u{0007}name", "path\u{2003}name"] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(req.validate().is_err(), "should reject {path:?}");
+
+            let mut manifest = minimal_manifest("xuepoo.test");
+            manifest.capabilities.filesystem.push(req);
+            assert!(
+                manifest.validate().is_err(),
+                "manifest should reject {path:?}"
+            );
+        }
     }
 
     #[test]

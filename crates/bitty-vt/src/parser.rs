@@ -117,6 +117,10 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
         // Kitty progressive flags (7727) carry a bitmask in secondary params;
         // for the vertical slice we map any 7727 enable to flags=1 (legacy disambiguation)
         // and disable to 0, bounded to u32.
+        // TODO(Curated): extract progressive sub-params (e.g. `1:2:5`) and mask
+        // `flags & 0x1F` into `Mode::KittyKeyboard(flags)` so multiple flags are
+        // not collapsed to `1`. State masking `& 0x1F` is already correct; this
+        // TODO widens parser fidelity without changing the bounded state contract.
         let mapped = match code {
             1 => Some(Mode::ApplicationCursorKeys),
             3 => Some(Mode::Column132),

@@ -966,6 +966,16 @@ impl TerminalApp {
         let real = self.runtime.poll_pty();
         if real > 0 {
             consumed = true;
+            // TODO(Curated): reply bytes are currently observed via `eprintln!`
+            // rather than written through `PtyWriter::write_all`. `Runtime`
+            // owns the writer internally and `poll_pty` already drains
+            // `RepliesQueue` via `take_replies()` (bounded 4 KiB, overflow caps
+            // at one truncation marker). The honest gap for this slice is that
+            // `TerminalApp::poll_pty_pump` logs rather than calls
+            // `writer.write_all(&replies)`. A follow-up will add
+            // `Runtime::write_replies()` or `Runtime::with_pty_writer(|w| …)`
+            // so replies reach the PTY master without expanding the app's
+            // boundary (no unbounded buffering, no shell interpolation).
             // Write pending replies back to PTY master (bounded, best-effort)
             let replies = self.runtime.take_replies();
             if !replies.is_empty() {
@@ -1033,6 +1043,10 @@ impl TerminalApp {
             if self.runtime.replies_overflowed() {
                 eprintln!("warning: terminal reply queue overflowed (bounded cap)");
             }
+            // TODO(Curated): same honest gap as `poll_pty_pump` — replies are
+            // logged not written. See `poll_pty_pump` TODO for the bounded
+            // `Runtime::write_replies()` follow-up that will drain replies
+            // through `PtyWriter` instead of `eprintln!`.
             let replies = self.runtime.take_replies();
             if !replies.is_empty() {
                 eprintln!(

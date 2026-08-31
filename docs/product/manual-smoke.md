@@ -7,7 +7,7 @@ document_type: research
 status: draft
 ---
 
-<!-- markdownlint-disable MD025 -->
+<!-- markdownlint-disable MD025 MD060 -->
 
 # Manual Smoke Checklist vs Mainstream Terminals
 

@@ -52,18 +52,25 @@ fn workspace_root() -> PathBuf {
 }
 
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
-    let ws = workspace_root().join("tmp/references/bitty");
-    let umbrella =
+    let ws_tmp = workspace_root().join("tmp/references/bitty");
+    let ws_rec = workspace_root().join("recordings/references/bitty");
+    let umbrella_tmp =
         PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
-    vec![ws, umbrella]
+    let umbrella_rec =
+        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/bitty");
+    vec![ws_tmp, ws_rec, umbrella_tmp, umbrella_rec]
 }
 
 fn reference_dir(backend: &str) -> Vec<PathBuf> {
-    let ws = workspace_root().join(format!("tmp/references/{backend}"));
-    let umbrella = PathBuf::from(format!(
+    let ws_tmp = workspace_root().join(format!("tmp/references/{backend}"));
+    let ws_rec = workspace_root().join(format!("recordings/references/{backend}"));
+    let umbrella_tmp = PathBuf::from(format!(
         "/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/{backend}"
     ));
-    vec![ws, umbrella]
+    let umbrella_rec = PathBuf::from(format!(
+        "/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/{backend}"
+    ));
+    vec![ws_tmp, ws_rec, umbrella_tmp, umbrella_rec]
 }
 
 /// One parsed bitty dump record.

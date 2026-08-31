@@ -1,3 +1,6 @@
 .carryctx/config.local.toml
 .worktrees/
 /target/
+recordings/manual-smoke/
+recordings/references/bitty/
+tmp/references/

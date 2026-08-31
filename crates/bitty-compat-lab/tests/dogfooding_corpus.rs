@@ -172,7 +172,7 @@ fn dogfooding_shell_prompt_marks_bounded_zones() {
     // ZONE_RECORDS_MAX=1024 inside State.
     let shell_dogs: Vec<_> = list_dogfooding_corpora()
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("/shell/"))
+        .filter(|p| p.components().any(|c| c.as_os_str() == "shell"))
         .collect();
     assert!(!shell_dogs.is_empty(), "no shell dogfooding corpora found");
     for path in shell_dogs {
@@ -192,7 +192,7 @@ fn dogfooding_shell_prompt_marks_bounded_zones() {
 fn dogfooding_unicode_ime_width_invariants() {
     let uni_dogs: Vec<_> = list_dogfooding_corpora()
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("/unicode/"))
+        .filter(|p| p.components().any(|c| c.as_os_str() == "unicode"))
         .collect();
     assert!(!uni_dogs.is_empty(), "no unicode dogfooding corpora found");
     for path in uni_dogs {
@@ -227,8 +227,8 @@ fn dogfooding_resize_alt_screen_no_panic() {
     let resize_dogs: Vec<_> = list_dogfooding_corpora()
         .into_iter()
         .filter(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/resize/") || s.contains("/tui/")
+            p.components().any(|c| c.as_os_str() == "resize")
+                || p.components().any(|c| c.as_os_str() == "tui")
         })
         .collect();
     assert!(!resize_dogs.is_empty(), "no resize/tui dogfooding corpora");
@@ -256,8 +256,8 @@ fn dogfooding_mouse_keyboard_modes_no_corruption() {
     let mk_dogs: Vec<_> = list_dogfooding_corpora()
         .into_iter()
         .filter(|p| {
-            let s = p.to_string_lossy();
-            s.contains("/mouse/") || s.contains("/keyboard/")
+            p.components().any(|c| c.as_os_str() == "mouse")
+                || p.components().any(|c| c.as_os_str() == "keyboard")
         })
         .collect();
     assert!(!mk_dogs.is_empty(), "no mouse/keyboard dogfooding corpora");

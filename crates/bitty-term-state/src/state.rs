@@ -749,6 +749,7 @@ impl State {
         h.boolean(self.modes.cursor_blinking);
         h.boolean(self.modes.bracketed_paste);
         h.boolean(self.modes.focus_events);
+        h.u32(self.modes.kitty_keyboard);
         h.option_tag(self.modes.mouse_tracking.is_some());
         if let Some(mode) = self.modes.mouse_tracking {
             h.u8(mouse_tracking_discriminant(mode));
@@ -1555,6 +1556,17 @@ impl State {
             }
             Mode::BracketedPaste => self.modes.bracketed_paste = enabled,
             Mode::FocusEvents => self.modes.focus_events = enabled,
+            Mode::KittyKeyboard(flags) => {
+                if enabled {
+                    // Progressive flags: OR in bounded bits (candidate spec: u32, unknown bits ignored)
+                    self.modes.kitty_keyboard |= flags & 0x1F;
+                } else if flags == 0 {
+                    // CSI ? 7727 l without flags disables all
+                    self.modes.kitty_keyboard = 0;
+                } else {
+                    self.modes.kitty_keyboard &= !(flags & 0x1F);
+                }
+            }
             Mode::MouseTracking(tracking) => {
                 self.modes.mouse_tracking = enabled.then_some(tracking);
             }

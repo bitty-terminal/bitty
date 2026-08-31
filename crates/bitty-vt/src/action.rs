@@ -290,6 +290,8 @@ pub enum Mode {
     BracketedPaste,
     /// Focus reporting (`?1004`).
     FocusEvents,
+    /// Kitty keyboard protocol (`?7727` progressive flags, bitmask).
+    KittyKeyboard(u32),
     /// Mouse press/release/release-drag/all-motion reporting.
     MouseTracking(MouseTrackingMode),
     /// Extended mouse coordinate encoding.

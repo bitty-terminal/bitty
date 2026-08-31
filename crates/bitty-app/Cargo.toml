@@ -16,3 +16,5 @@ workspace = true
 [dependencies]
 bitty-platform = { path = "../bitty-platform" }
 bitty-runtime = { path = "../bitty-runtime" }
+bitty-render = { path = "../bitty-render" }
+pollster = "0.3"

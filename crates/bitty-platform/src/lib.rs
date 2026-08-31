@@ -108,8 +108,8 @@ pub use clipboard::Clipboard;
 pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor};
 pub use error::PlatformError;
 pub use event::{
-    CursorPosition, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, NamedKey,
-    PlatformEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
+    CursorPosition, ImeEvent, KeyEvent, KeyLocation, LogicalKey, ModifiersState, MouseButton,
+    MouseEvent, NamedKey, PlatformEvent, PressState, ScrollDelta, WindowEventKind, WindowId,
 };
 pub use keyboard::{encode_key_event, encode_named_key};
 pub use surface::{SurfaceTarget, map_resize_to_surface_extent};

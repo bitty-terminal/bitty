@@ -197,10 +197,9 @@ fn url_dispatch() -> (&'static str, Option<&'static str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handler_available, is_local_file_url, url_dispatch, url_handler, validate_file_url,
-        validate_url,
-    };
+    #[cfg(target_os = "linux")]
+    use super::handler_available;
+    use super::{is_local_file_url, url_dispatch, url_handler, validate_file_url, validate_url};
 
     #[test]
     fn adversarial_uri_corpus_is_rejected() {

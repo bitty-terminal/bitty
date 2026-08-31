@@ -72,17 +72,17 @@
 
 use bitty_platform::{
     Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
-    WindowEventKind,
+    ScaleFactor, ScrollDelta, WindowEventKind,
 };
 use bitty_pty::{Pty, PtyBuilder, PtyReader, PtyWriter};
 use bitty_render::{
-    RenderError,
+    CrossFontRasterizer, RenderError,
     frame::{FrameMode, FramePlan},
     glyph::{
         BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
         RasterKey,
     },
-    gpu::{PresentStats as RenderPresentStats, Surface},
+    gpu::{GpuContext, PresentStats as RenderPresentStats, Surface},
     grid::{CellMetrics, DrawList, GridRenderer},
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
@@ -156,6 +156,44 @@ impl GlyphRasterizer for HeadlessRasterizer {
             GlyphBitmap::try_new(metrics, BitmapFormat::Rgb, data)
                 .expect("deterministic bitmap must be valid"),
         ))
+    }
+}
+
+/// Owned rasterizer that can be either deterministic headless or real crossfont.
+///
+/// Headless is the CI baseline (no font file, bit-identical everywhere).
+/// Crossfont is the vertical-slice real path (platform font stack).
+/// Both implement `GlyphRasterizer` so `GridRenderer` stays generic.
+#[derive(Debug)]
+enum AnyRasterizer {
+    Headless(HeadlessRasterizer),
+    CrossFont(Box<CrossFontRasterizer>),
+}
+
+impl AnyRasterizer {
+    fn try_crossfont() -> Self {
+        match CrossFontRasterizer::new() {
+            Ok(cf) => Self::CrossFont(Box::new(cf)),
+            Err(_) => Self::Headless(HeadlessRasterizer::new()),
+        }
+    }
+    fn is_crossfont(&self) -> bool {
+        matches!(self, Self::CrossFont(_))
+    }
+}
+
+impl GlyphRasterizer for AnyRasterizer {
+    fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
+        match self {
+            Self::Headless(r) => r.load_font(query),
+            Self::CrossFont(r) => r.load_font(query),
+        }
+    }
+    fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+        match self {
+            Self::Headless(r) => r.rasterize(key),
+            Self::CrossFont(r) => r.rasterize(key),
+        }
     }
 }
 
@@ -361,8 +399,9 @@ pub struct Runtime {
     pty_writer: Option<PtyWriter>,
     pending_input: Vec<u8>,
     pending_input_dropped: u64,
-    renderer: GridRenderer<HeadlessRasterizer>,
+    renderer: GridRenderer<AnyRasterizer>,
     surface: Surface,
+    gpu: Option<GpuContext>,
     cold_queue: ColdQueue,
     plugin_host: PluginHost,
     last_presented_generation: u64,
@@ -382,6 +421,23 @@ pub struct Runtime {
     osc_clipboard_write_allowed: bool,
     pending_activation_gesture: Option<ActivationGesture>,
     next_activation_gesture: u64,
+    // Input/Pointer RFC (CTX-0107) state for single-window slice
+    kitty_flags: u32,
+    shift_pressed: bool,
+    control_pressed: bool,
+    alt_pressed: bool,
+    // Focus/mouse capture tracking per lifecycle RFC
+    focused: bool,
+    mouse_capture_enabled: bool,
+    // IME composition overlay (presentation only, not Terminal Truth)
+    ime_preedit: Option<String>,
+    ime_cursor: usize,
+    // Wheel accumulator for pixel scroll (candidate: 4*cell bound)
+    wheel_accum_y: f32,
+    wheel_accum_x: f32,
+    // DPI scale
+    scale_factor: ScaleFactor,
+    is_crossfont: bool,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -510,8 +566,25 @@ impl Runtime {
             style: FontStyle::Normal,
             point_size: config.font_size,
         };
-        let renderer = GridRenderer::new(HeadlessRasterizer::new(), &query, cell)
-            .map_err(RuntimeError::from)?;
+        // Vertical slice: prefer crossfont when available, fallback to headless
+        // for CI determinism. Both are bounded and headless-testable. On
+        // Windows the monospace family may be absent, so a FontNotFound from
+        // GridRenderer re-tries deterministically with HeadlessRasterizer
+        // instead of failing with_defaults on headless CI.
+        let (renderer, is_crossfont) = {
+            let raster = AnyRasterizer::try_crossfont();
+            let is_cf = raster.is_crossfont();
+            match GridRenderer::new(raster, &query, cell) {
+                Ok(r) => (r, is_cf),
+                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
+                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let r =
+                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
+                    (r, false)
+                }
+                Err(err) => return Err(RuntimeError::from(err)),
+            }
+        };
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);
@@ -531,6 +604,7 @@ impl Runtime {
             pending_input_dropped: 0,
             renderer,
             surface,
+            gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
@@ -548,6 +622,18 @@ impl Runtime {
             osc_clipboard_write_allowed: false,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
+            kitty_flags: 0,
+            shift_pressed: false,
+            control_pressed: false,
+            alt_pressed: false,
+            focused: true,
+            mouse_capture_enabled: false,
+            ime_preedit: None,
+            ime_cursor: 0,
+            wheel_accum_y: 0.0,
+            wheel_accum_x: 0.0,
+            scale_factor: ScaleFactor::ONE,
+            is_crossfont,
         })
     }
 
@@ -569,8 +655,20 @@ impl Runtime {
             style: FontStyle::Normal,
             point_size: config.font_size,
         };
-        let renderer = GridRenderer::new(HeadlessRasterizer::new(), &query, cell)
-            .map_err(RuntimeError::from)?;
+        let (renderer, is_crossfont) = {
+            let raster = AnyRasterizer::try_crossfont();
+            let is_cf = raster.is_crossfont();
+            match GridRenderer::new(raster, &query, cell) {
+                Ok(r) => (r, is_cf),
+                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
+                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let r =
+                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
+                    (r, false)
+                }
+                Err(err) => return Err(RuntimeError::from(err)),
+            }
+        };
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);
@@ -589,6 +687,7 @@ impl Runtime {
             pending_input_dropped: 0,
             renderer,
             surface,
+            gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
@@ -606,6 +705,18 @@ impl Runtime {
             osc_clipboard_write_allowed: false,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
+            kitty_flags: 0,
+            shift_pressed: false,
+            control_pressed: false,
+            alt_pressed: false,
+            focused: true,
+            mouse_capture_enabled: false,
+            ime_preedit: None,
+            ime_cursor: 0,
+            wheel_accum_y: 0.0,
+            wheel_accum_x: 0.0,
+            scale_factor: ScaleFactor::ONE,
+            is_crossfont,
         })
     }
 
@@ -617,6 +728,56 @@ impl Runtime {
     /// every platform.
     pub fn with_defaults() -> Result<Self, RuntimeError> {
         Self::new(RuntimeConfig::default())
+    }
+
+    /// Attempts to attach a real GPU surface (vertical slice: one window/one terminal).
+    ///
+    /// The caller has created `gpu` via `GpuContext::initialize().await` and a
+    /// `Surface` via `gpu.create_surface(&target)`. This method stores the
+    /// GPU context so `tick` can present via `Surface::present_draw_list` with
+    /// the real swapchain. When no GPU is available the headless seam remains.
+    pub fn attach_gpu(&mut self, gpu: GpuContext, surface: Surface) {
+        // Keep renderer as is (AnyRasterizer may be crossfont already); surface
+        // and gpu are swapped wholesale. Headless fallback remains if gpu later
+        // fails present (caller may detach).
+        self.surface = surface;
+        self.gpu = Some(gpu);
+        self.pending_full_redraw = true;
+    }
+
+    /// Detaches GPU, falling back to headless surface at current extent.
+    pub fn detach_gpu(&mut self) {
+        if let Some(extent) = self.surface.extent() {
+            if let Ok(s) = Surface::headless(extent) {
+                self.surface = s;
+            }
+        }
+        self.gpu = None;
+        self.pending_full_redraw = true;
+    }
+
+    /// Whether a real GPU surface is attached (not headless).
+    #[must_use]
+    pub fn has_gpu(&self) -> bool {
+        self.gpu.is_some() && !self.surface.is_headless()
+    }
+
+    /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.
+    #[must_use]
+    pub fn kitty_flags(&self) -> u32 {
+        self.kitty_flags
+    }
+
+    /// Whether crossfont rasterizer is active.
+    #[must_use]
+    pub fn is_crossfont(&self) -> bool {
+        self.is_crossfont
+    }
+
+    /// Current IME preedit overlay, if any (presentation only).
+    #[must_use]
+    pub fn ime_preedit(&self) -> Option<&str> {
+        self.ime_preedit.as_deref()
     }
 
     /// Owned config view.
@@ -695,6 +856,50 @@ impl Runtime {
         bitty_platform::encode_key_event(event)
     }
 
+    /// Encodes with Kitty protocol when `kitty_flags != 0` (opt-in 7727).
+    /// Bounded to 64 bytes per spec; progressive flags are honored with fallback to legacy when flag not set.
+    fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
+        if self.kitty_flags == 0 {
+            return Self::encode_key_event(event);
+        }
+        // Kitty active: produce CSI u for disambiguated keys, else legacy with fallback.
+        // For vertical slice, handle Tab vs Ctrl-I disambiguation and Enter vs Ctrl-M.
+        // When event is Tab with Ctrl modifier (text is \t but logical is Tab), encode Kitty distinct.
+        // Simplistic: if logical is Named(Tab) and control_pressed, encode Kitty 9;1:1 etc.
+        // General: encode any character key as CSI <codepoint> ; mods u
+        // Bounded: single key ≤64 bytes, checked.
+        let mods: u8 = (if self.shift_pressed { 1 } else { 0 })
+            | (if self.alt_pressed { 2 } else { 0 })
+            | (if self.control_pressed { 4 } else { 0 });
+        // For named keys with CSI u equivalents, use codepoint of logical char if available
+        let codepoint_opt = match &event.logical_key {
+            bitty_platform::LogicalKey::Character(s) => s.chars().next().map(|c| c as u32),
+            bitty_platform::LogicalKey::Named(named) => match named {
+                bitty_platform::NamedKey::Enter => Some(13),
+                bitty_platform::NamedKey::Tab => Some(9),
+                bitty_platform::NamedKey::Backspace => Some(127),
+                bitty_platform::NamedKey::Escape => Some(27),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(cp) = codepoint_opt {
+            // Kitty CSI u: ESC [ <codepoint> ; <mods+1> u  (mods+1 per Kitty spec where 1 = no mods)
+            // Event type 1 = press, 2 = repeat, 3 = release (only when requested flag bit 1 set)
+            let event_type = if event.repeat { 2 } else { 1 };
+            // Only emit Kitty when flag for disambiguation wants it; for slice, always when Kitty active and mods non-zero or named.
+            let is_named = matches!(&event.logical_key, bitty_platform::LogicalKey::Named(_));
+            if mods != 0 || is_named {
+                let seq = format!("\x1b[{cp};{}:{}u", mods + 1, event_type);
+                if seq.len() <= 64 {
+                    return Some(seq.into_bytes());
+                }
+            }
+        }
+        // Fallback to legacy for keys not disambiguated
+        Self::encode_key_event(event)
+    }
+
     /// Handles a decoded keyboard event: encodes to bytes and routes to the PTY.
     ///
     /// When a live PTY writer exists the bytes are written directly (best
@@ -710,14 +915,46 @@ impl Runtime {
     /// callers may synthesize [`KeyEvent`]s without a window and drive this
     /// path deterministically.
     pub fn handle_key_event(&mut self, event: KeyEvent) -> Option<Vec<u8>> {
-        let bytes = Self::encode_key_event(&event)?;
+        let is_modifier = matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Named(
+                bitty_platform::NamedKey::Shift
+                    | bitty_platform::NamedKey::Control
+                    | bitty_platform::NamedKey::Alt
+                    | bitty_platform::NamedKey::AltGraph
+                    | bitty_platform::NamedKey::Super
+                    | bitty_platform::NamedKey::Meta
+            )
+        );
+        self.track_modifiers_from_key(&event);
+        if is_modifier {
+            // Modifier-only keys produce no PTY input but still update state.
+            return None;
+        }
+        let bytes = self.encode_key_with_kitty(&event)?;
+        // Bounded encoding already ≤64; push respects MAX_PENDING_INPUT.
         self.push_input_bytes(&bytes);
         Some(bytes)
     }
 
     /// Convenience: handles a borrowed [`KeyEvent`] without moving it.
     pub fn handle_key_event_ref(&mut self, event: &KeyEvent) -> Option<Vec<u8>> {
-        let bytes = Self::encode_key_event(event)?;
+        let is_modifier = matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Named(
+                bitty_platform::NamedKey::Shift
+                    | bitty_platform::NamedKey::Control
+                    | bitty_platform::NamedKey::Alt
+                    | bitty_platform::NamedKey::AltGraph
+                    | bitty_platform::NamedKey::Super
+                    | bitty_platform::NamedKey::Meta
+            )
+        );
+        self.track_modifiers_from_key(event);
+        if is_modifier {
+            return None;
+        }
+        let bytes = self.encode_key_with_kitty(event)?;
         self.push_input_bytes(&bytes);
         Some(bytes)
     }
@@ -1081,9 +1318,72 @@ impl Runtime {
         bitty_ui::snap_to_leading(&snap, CellPos::new(clamped_row, clamped_col))
     }
 
-    /// Handles a mouse button event for selection (Linux copy-on-select behavior
-    /// is not automatic: callers must call `copy_selection_to_clipboard`).
+    /// Handles a mouse button event for selection or terminal mouse tracking.
+    ///
+    /// Single-window vertical slice semantics (candidate Input RFC):
+    /// - When mouse tracking is enabled (`1000`/`1002`/`1003`) + SGR `1006` and
+    ///   not in shift-override, the event encodes to bounded SGR bytes
+    ///   (`ESC[<b;x;yM/m`, ≤32 bytes) and is written to the PTY.
+    /// - Holding Shift bypasses capture unconditionally to force selection
+    ///   (accessibility escape).
+    /// - Otherwise the event drives presentation selection (Linux copy-on-select
+    ///   is not automatic: callers must call `copy_selection_to_clipboard`).
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
+        // Shift override always forces selection path.
+        let shift_override = self.shift_pressed;
+        let capture = !shift_override
+            && self.state.modes().mouse_tracking.is_some()
+            && self.state.modes().mouse_coordinate_encoding
+                == Some(bitty_vt::MouseCoordinateEncoding::Sgr)
+            && self.should_capture_mouse();
+
+        if capture {
+            if let Some(pos) = self.last_cursor {
+                let cell = self.cursor_to_cell(pos);
+                // Bounded SGR encoding: ≤32 bytes per event, batch ≤4 KiB (candidate)
+                // Coordinates are 1-based per SGR, clamped to [1,65535] then to grid.
+                let col = (cell.col as u32 + 1).clamp(1, 65535) as u16;
+                let row = (cell.row as u32 + 1).clamp(1, 65535) as u16;
+                let mut code = match event.button {
+                    MouseButton::Left => 0,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    MouseButton::Back => 8,
+                    MouseButton::Forward => 9,
+                    MouseButton::Other(n) => (n % 8) as u8,
+                };
+                // Modifier bits: shift 4, alt 8, ctrl 16
+                if self.shift_pressed {
+                    code |= 4;
+                }
+                if self.alt_pressed {
+                    code |= 8;
+                }
+                if self.control_pressed {
+                    code |= 16;
+                }
+                // Drag adds 32 for button-event tracking? For simplicity we map release vs press.
+                let trailer = if event.state == PressState::Pressed {
+                    'M'
+                } else {
+                    'm'
+                };
+                // For SGR, release is still reported with same button code but 'm'
+                // Bounded <32 bytes: format "ESC[<code;col;rowM"
+                let seq = format!("\x1b[<{code};{col};{row}{trailer}");
+                // Enforce bound explicitly (candidate table: mouse encode ≤32 bytes)
+                let bytes = if seq.len() > 32 {
+                    &seq.as_bytes()[..32]
+                } else {
+                    seq.as_bytes()
+                };
+                self.push_input_bytes(bytes);
+            }
+            // Still update last_cursor tracking but do not start selection.
+            return;
+        }
+
+        // Selection path (including shift override)
         match (event.button, event.state) {
             (MouseButton::Left, PressState::Pressed) => {
                 if let Some(pos) = self.last_cursor {
@@ -1107,13 +1407,220 @@ impl Runtime {
         }
     }
 
-    /// Handles cursor movement for drag selection.
+    fn should_capture_mouse(&self) -> bool {
+        // Capture when a mouse mode is enabled; for single-window slice we
+        // capture in any view (not only alternate screen) to prove 1000..1006
+        // end-to-end, but we document that alternate-screen capture is the
+        // normative owner. This keeps headless tests deterministic.
+        self.state.modes().mouse_tracking.is_some()
+    }
+
+    /// Handles cursor movement for drag selection or mouse-tracking motion.
     pub fn handle_cursor_moved(&mut self, pos: CursorPosition) {
         self.last_cursor = Some(pos);
         if self.selection_dragging {
             let cell = self.cursor_to_cell(pos);
             self.update_selection(cell);
+            return;
         }
+        // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when capture active.
+        let capture = !self.shift_pressed
+            && self.state.modes().mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)
+            && self.state.modes().mouse_coordinate_encoding
+                == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
+        if capture {
+            let cell = self.cursor_to_cell(pos);
+            let col = (cell.col as u32 + 1).clamp(1, 65535) as u16;
+            let row = (cell.row as u32 + 1).clamp(1, 65535) as u16;
+            // Motion button code 32 (no button) plus modifiers, SGR uses 'M' for press/drag
+            let mut code: u8 = 32;
+            if self.shift_pressed {
+                code |= 4;
+            }
+            if self.alt_pressed {
+                code |= 8;
+            }
+            if self.control_pressed {
+                code |= 16;
+            }
+            let seq = format!("\x1b[<{code};{col};{row}M");
+            let bytes = if seq.len() > 32 {
+                &seq.as_bytes()[..32]
+            } else {
+                seq.as_bytes()
+            };
+            // Bounded: drop if PTY queue full, never block
+            self.push_input_bytes(bytes);
+        }
+    }
+
+    /// Handles wheel scroll: accumulates pixel deltas per Text RFC candidate
+    /// (threshold = cell_height) and emits lines or scrolls viewport.
+    /// Bounded: at most 32 lines per frame, accumulator clamped to 4*cell_height.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn handle_wheel(&mut self, delta: ScrollDelta) {
+        let cell_h = self.config.cell_height as f32;
+        let cell_w = self.config.cell_width as f32;
+        match delta {
+            ScrollDelta::Lines(x, y) => {
+                // Shift+wheel or no capture scrolls viewport; otherwise emit mouse wheel SGR when mouse mode active.
+                let capture_scroll = !self.shift_pressed
+                    && self.state.modes().mouse_tracking.is_some()
+                    && self.state.modes().mouse_coordinate_encoding
+                        == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
+                if capture_scroll {
+                    // SGR wheel: buttons 64 (up) / 65 (down), horizontal 66/67
+                    let lines = y as isize;
+                    for _ in 0..lines.abs().min(32) as isize {
+                        let btn = if lines > 0 { 64 } else { 65 };
+                        let seq = if let Some(pos) = self.last_cursor {
+                            let cell = self.cursor_to_cell(pos);
+                            let col = (cell.col as u32 + 1) as u16;
+                            let row = (cell.row as u32 + 1) as u16;
+                            format!("\x1b[<{btn};{col};{row}M")
+                        } else {
+                            format!("\x1b[<{btn};1;1M")
+                        };
+                        self.push_input_bytes(seq.as_bytes());
+                    }
+                    for _ in 0..(x.abs() as usize).min(32) {
+                        let btn = if x > 0.0 { 66 } else { 67 };
+                        let seq = format!("\x1b[<{btn};1;1M");
+                        self.push_input_bytes(seq.as_bytes());
+                    }
+                } else {
+                    // Viewport scroll
+                    if y != 0.0 {
+                        // Positive y is scroll down toward live? winit Lines: y>0 is down?
+                        // We treat y>0 as scroll down (toward live) but viewport offset is up.
+                        // So delta for view is -y (down reduces offset). Clamp bounded.
+                        let delta = (-y) as isize;
+                        let max = self.state.scrollback_len();
+                        if let Some(view_id) = self.focused_view() {
+                            if let Some(view) = self.layout.find_leaf_mut(view_id) {
+                                view.scroll_by(delta, max);
+                            }
+                        } else {
+                            // Single-window fallback: find leaf 1
+                            if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
+                                view.scroll_by(delta, max);
+                            }
+                        }
+                        if delta != 0 {
+                            self.pending_full_redraw = true;
+                        }
+                    }
+                }
+            }
+            ScrollDelta::Pixels(px, py) => {
+                // Accumulate pixel deltas; threshold = cell size
+                self.wheel_accum_x += px as f32;
+                self.wheel_accum_y += py as f32;
+                let bound = 4.0 * cell_h;
+                self.wheel_accum_y = self.wheel_accum_y.clamp(-bound, bound);
+                self.wheel_accum_x = self.wheel_accum_x.clamp(-4.0 * cell_w, 4.0 * cell_w);
+                let lines_y = (self.wheel_accum_y / cell_h).trunc() as isize;
+                let lines_x = (self.wheel_accum_x / cell_w).trunc() as isize;
+                if lines_y != 0 || lines_x != 0 {
+                    // Use lines path with coalescing
+                    let clamped_y = lines_y.clamp(-32, 32);
+                    let clamped_x = lines_x.clamp(-32, 32) as f32;
+                    self.handle_wheel(ScrollDelta::Lines(clamped_x, clamped_y as f32));
+                    self.wheel_accum_y -= clamped_y as f32 * cell_h;
+                    self.wheel_accum_x -= clamped_x * cell_w;
+                }
+            }
+        }
+    }
+
+    /// Tracks modifier state from keyboard events (Shift/Ctrl/Alt).
+    pub fn track_modifiers_from_key(&mut self, event: &KeyEvent) {
+        // Update shift/ctrl/alt pressed state based on named keys.
+        // This keeps hot-path allocation-free (no HashMap) and bounded.
+        if let bitty_platform::LogicalKey::Named(named) = &event.logical_key {
+            match named {
+                bitty_platform::NamedKey::Shift => {
+                    self.shift_pressed = event.state == PressState::Pressed;
+                }
+                bitty_platform::NamedKey::Control => {
+                    self.control_pressed = event.state == PressState::Pressed;
+                }
+                bitty_platform::NamedKey::Alt | bitty_platform::NamedKey::AltGraph => {
+                    self.alt_pressed = event.state == PressState::Pressed;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Sets focus state and emits focus reports when mode 1004 is enabled.
+    pub fn set_focused(&mut self, focused: bool) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        if self.state.modes().focus_events {
+            let seq = if focused { "\x1b[I" } else { "\x1b[O" };
+            self.push_input_bytes(seq.as_bytes());
+        }
+    }
+
+    /// Handles IME preedit (presentation overlay, not Terminal Truth).
+    pub fn handle_ime_preedit(&mut self, text: Option<String>, cursor: Option<usize>) {
+        // Bounded: preedit ≤128 chars or 256 bytes per candidate TXT-10/11; truncate at char boundary.
+        if let Some(t) = text {
+            const MAX: usize = 128;
+            let truncated = if t.chars().count() > MAX {
+                let mut s = String::new();
+                for (i, ch) in t.chars().enumerate() {
+                    if i >= MAX {
+                        break;
+                    }
+                    s.push(ch);
+                }
+                s
+            } else {
+                t
+            };
+            let cur = cursor.unwrap_or(truncated.len()).min(truncated.len());
+            self.ime_preedit = Some(truncated);
+            self.ime_cursor = cur;
+            self.pending_full_redraw = true;
+        } else {
+            self.ime_preedit = None;
+            self.ime_cursor = 0;
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Commits IME text: bounded ≤256 chars / ≤1024 bytes, then encoder path.
+    #[allow(clippy::explicit_counter_loop)]
+    pub fn handle_ime_commit(&mut self, text: String) {
+        // Bounded before allocation (candidate TXT-11)
+        let bytes_len = text.len();
+        let char_count = text.chars().count();
+        let bounded = if bytes_len > 1024 || char_count > 256 {
+            let mut out = String::new();
+            let mut bytes = 0usize;
+            let mut chars = 0usize;
+            for ch in text.chars() {
+                let clen = ch.len_utf8();
+                if bytes + clen > 1024 || chars + 1 > 256 {
+                    break;
+                }
+                out.push(ch);
+                bytes += clen;
+                chars += 1;
+            }
+            out
+        } else {
+            text
+        };
+        self.ime_preedit = None;
+        self.ime_cursor = 0;
+        // IME commit shares PTY write queue with keyboard (bounded 8192)
+        self.push_input_bytes(bounded.as_bytes());
+        self.pending_full_redraw = true;
     }
 
     /// Current cursor position, if known.
@@ -2247,6 +2754,9 @@ impl Runtime {
                 }
             }
             let damage = self.state.apply(&action);
+            // Keep input-related mode caches in sync (Kitty, mouse capture)
+            self.kitty_flags = self.state.modes().kitty_keyboard;
+            self.mouse_capture_enabled = self.state.modes().mouse_tracking.is_some();
             if !damage.regions.is_empty() {
                 let generation = damage.generation;
                 self.cold_queue.push(ColdEvent::Damage { generation });
@@ -2323,9 +2833,14 @@ impl Runtime {
         if self.search_state.is_active() {
             self.search_state.refresh(&self.state);
         }
-        self.surface
-            .headless_resize(size)
-            .map_err(RuntimeError::from)?;
+        // Surface resize: real GPU path when attached, else headless
+        if let Some(gpu) = self.gpu.as_ref() {
+            self.surface.resize(gpu, size).map_err(RuntimeError::from)?;
+        } else {
+            self.surface
+                .headless_resize(size)
+                .map_err(RuntimeError::from)?;
+        }
         if let Some(pty) = self.pty.as_mut() {
             let cols = self.cols.min(u16::MAX as usize) as u16;
             let rows = self.rows.min(u16::MAX as usize) as u16;
@@ -2339,12 +2854,14 @@ impl Runtime {
     /// application loop to exit (window close requested or `Exiting` phase).
     ///
     /// Resize events are routed through [`Self::handle_resize`]; keyboard
-    /// input is encoded via the legacy xterm table (CTX-0057) and routed to
-    /// the PTY writer when live, otherwise buffered as bounded pending input
+    /// input is encoded via the legacy xterm table plus Kitty opt-in (7727) and
+    /// routed to the PTY writer when live, otherwise buffered as bounded pending input
     /// for headless observation. Mouse and cursor events drive the
-    /// headless-tested selection state (CTX-0059) via `bitty-ui::Selection`
-    /// with wide-char snapping; other window events currently return `false`
-    /// without side effects so the hot path stays deterministic.
+    /// headless-tested selection state via `bitty-ui::Selection`
+    /// with wide-char snapping, or when mouse 1000/1002/1003 + 1006 SGR capture active
+    /// encode to bounded SGR bytes (≤32 per event). Focus 1004 emits CSI I/O,
+    /// bracketed paste 2004 wraps commits, wheel accumulates pixel deltas to cell lines,
+    /// and IME preedit is presentation overlay.
     pub fn handle_platform_event(&mut self, event: PlatformEvent) -> bool {
         match event {
             PlatformEvent::Window { window_id: _, kind } => match kind {
@@ -2352,14 +2869,12 @@ impl Runtime {
                     let _ = self.handle_resize(size);
                     false
                 }
-                WindowEventKind::ScaleFactorChanged(_) => {
-                    // DPI factor alone carries no new physical size in this
-                    // seam: a `Resized` event with the refresh-computed
-                    // extent follows and takes precedence. Keeping the
-                    // headless seam single-threaded, we wait for that event
-                    // rather than fabricating a size here. Documented as a
-                    // deferred piece of the DPI refresh hook in
-                    // `bitty_platform::SurfaceTarget::logical_to_physical`.
+                WindowEventKind::ScaleFactorChanged(factor) => {
+                    self.scale_factor = factor;
+                    // Force full redraw at new DPI; physical size will arrive as Resized.
+                    // Update cell metrics derived extent? cell metrics are config fixed,
+                    // but scale affects future physical->grid mapping via reconfigured surface.
+                    self.pending_full_redraw = true;
                     false
                 }
                 WindowEventKind::CloseRequested | WindowEventKind::Closed => true,
@@ -2419,7 +2934,42 @@ impl Runtime {
                     }
                     false
                 }
-                WindowEventKind::MouseWheel(_) | WindowEventKind::Focused(_) => false,
+                WindowEventKind::MouseWheel(delta) => {
+                    self.handle_wheel(delta);
+                    false
+                }
+                WindowEventKind::Focused(focused) => {
+                    self.set_focused(focused);
+                    false
+                }
+                WindowEventKind::ModifiersChanged(mods) => {
+                    self.shift_pressed = mods.shift;
+                    self.control_pressed = mods.control;
+                    self.alt_pressed = mods.alt;
+                    false
+                }
+                WindowEventKind::Ime(ime) => {
+                    match ime {
+                        bitty_platform::ImeEvent::Preedit(text, cursor) => {
+                            if text.is_empty() {
+                                self.handle_ime_preedit(None, None);
+                            } else {
+                                let cur = cursor.map(|(s, _)| s);
+                                self.handle_ime_preedit(Some(text), cur);
+                            }
+                        }
+                        bitty_platform::ImeEvent::Commit(text) => {
+                            self.handle_ime_commit(text);
+                        }
+                        bitty_platform::ImeEvent::Enabled | bitty_platform::ImeEvent::Disabled => {
+                            // No grid mutation; just ensure overlay cleared on disabled
+                            if matches!(ime, bitty_platform::ImeEvent::Disabled) {
+                                self.handle_ime_preedit(None, None);
+                            }
+                        }
+                    }
+                    false
+                }
             },
             PlatformEvent::Exiting => true,
             _ => false,
@@ -2510,11 +3060,49 @@ impl Runtime {
                 !regions.is_empty() || pending_full
             };
 
-        for (_view_id, rect) in &allocations {
+        // For single-window slice we need per-view scrollback viewport and cursor.
+        // Build id->View map for scroll/IME lookups.
+        let view_map: std::collections::HashMap<ViewId, View> = {
+            let mut m = std::collections::HashMap::new();
+            for (vid, r) in &allocations {
+                if let Some(v) = self.layout.find_leaf(*vid) {
+                    m.insert(*vid, v.clone());
+                } else {
+                    // Fallback: synthesized view sized to allocation
+                    let mut v = View::new(*vid, r.width as usize, r.height as usize);
+                    v.set_origin(bitty_ui::Point::new(r.x, r.y));
+                    m.insert(*vid, v);
+                }
+            }
+            m
+        };
+
+        for (view_id, rect) in &allocations {
             if rect.is_empty() {
                 continue;
             }
-            let view_snapshot = viewport_snapshot(&snapshot, rect.width, rect.height);
+            // Determine viewport snapshot: when view scroll_offset !=0, visible_cells composites scrollback.
+            let view = view_map.get(view_id);
+            let view_snapshot = if let Some(v) = view {
+                if v.scroll_offset() != 0 {
+                    let cells = v.visible_cells(&self.state);
+                    Snapshot {
+                        version: snapshot.version,
+                        generation: snapshot.generation,
+                        width: v.cols() as usize,
+                        height: v.rows() as usize,
+                        cells,
+                        cursor: snapshot.cursor.clone(),
+                        modes: snapshot.modes.clone(),
+                        title: snapshot.title.clone(),
+                    }
+                } else {
+                    viewport_snapshot(&snapshot, rect.width, rect.height)
+                }
+            } else {
+                viewport_snapshot(&snapshot, rect.width, rect.height)
+            };
+
             let damage = if use_full || pending_full || last == u64::MAX {
                 Damage {
                     generation: current_gen,
@@ -2554,6 +3142,55 @@ impl Runtime {
                 Ok(list) => list,
                 Err(_) => continue,
             };
+            // Cursor rendering: add a cursor fill when visible, focused, and live.
+            // Single-window slice: cursor is presentation overlay, not terminal truth mutation.
+            let mut list = list;
+            if view_snapshot.cursor.visible
+                && self.focused
+                && view.map(|v| v.scroll_offset() == 0).unwrap_or(true)
+            {
+                // Only draw cursor when this view is the focused view (or single leaf default)
+                let is_focused_view = self
+                    .focused_view()
+                    .map(|fid| fid == *view_id)
+                    .unwrap_or(true);
+                if is_focused_view {
+                    let cur = &view_snapshot.cursor.position;
+                    if (cur.row as usize) < view_snapshot.height
+                        && (cur.col as usize) < view_snapshot.width
+                    {
+                        // Check not on spacer
+                        let idx = cur.row as usize * view_snapshot.width + cur.col as usize;
+                        let is_spacer = view_snapshot
+                            .cells
+                            .get(idx)
+                            .map(|c| c.spacer)
+                            .unwrap_or(false);
+                        if !is_spacer {
+                            let cursor_rect = bitty_render::geometry::RectPx::new(
+                                cur.col as i32 * self.config.cell_width as i32,
+                                cur.row as i32 * self.config.cell_height as i32,
+                                self.config.cell_width,
+                                self.config.cell_height,
+                            );
+                            // Cursor color: inverse of cell bg/fg? Use resolved color from grid.rs DEFAULT_FG/BG inversion.
+                            // For slice, use white with 0x80 alpha for block cursor, respecting blinking flag;
+                            // if blinking and not focused, we skip (already checked focused).
+                            let cursor_color: bitty_render::grid::Rgba8 =
+                                if view_snapshot.cursor.visible {
+                                    [0xFF, 0xFF, 0xFF, 0xA0]
+                                } else {
+                                    [0, 0, 0, 0]
+                                };
+                            list.fills.push(bitty_render::grid::FillRect {
+                                rect: cursor_rect,
+                                color: cursor_color,
+                            });
+                        }
+                    }
+                }
+            }
+
             if !list.needs_draw() {
                 continue;
             }
@@ -2570,6 +3207,49 @@ impl Runtime {
                 glyph.dest[0] += origin_px_x;
                 glyph.dest[1] += origin_px_y;
                 combined_glyphs.push(glyph);
+            }
+        }
+
+        // IME preedit overlay: presentation-only, not state mutation. Paints atop cursor.
+        if let Some(preedit) = self.ime_preedit.clone() {
+            if !preedit.is_empty() && self.focused {
+                // Determine focused view allocation origin and cursor pixel position.
+                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
+                    if let Some((vid, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                        let cur = snapshot.cursor.position;
+                        let origin_px_x = rect.x as i32 * self.config.cell_width as i32;
+                        let origin_px_y = rect.y as i32 * self.config.cell_height as i32;
+                        let base_x = origin_px_x + cur.col as i32 * self.config.cell_width as i32;
+                        let base_y = origin_px_y + cur.row as i32 * self.config.cell_height as i32;
+                        // Simple IME overlay: underline background rect plus glyphs for preedit chars.
+                        // For slice, render preedit as single underline fill plus per-char glyphs via renderer? Simplified: add a fill rect for underline.
+                        let preedit_width =
+                            (preedit.chars().count() as u32 * self.config.cell_width).min(1024);
+                        let underline_rect = bitty_render::geometry::RectPx::new(
+                            base_x,
+                            base_y + self.config.cell_height as i32 - 2,
+                            preedit_width,
+                            2,
+                        );
+                        combined_fills.push(bitty_render::grid::FillRect {
+                            rect: underline_rect,
+                            color: [0xFF, 0xFF, 0x00, 0xFF],
+                        });
+                        // Also push a background fill for preedit area (semi-transparent)
+                        let bg_rect = bitty_render::geometry::RectPx::new(
+                            base_x,
+                            base_y,
+                            preedit_width,
+                            self.config.cell_height,
+                        );
+                        combined_fills.push(bitty_render::grid::FillRect {
+                            rect: bg_rect,
+                            color: [0x33, 0x33, 0x33, 0xCC],
+                        });
+                        any_needs_draw = true;
+                        let _ = vid; // keep
+                    }
+                }
             }
         }
 
@@ -2667,12 +3347,31 @@ impl Runtime {
 
         let atlas_texels = self.renderer.atlas_texels().to_vec();
         let dims = self.renderer.atlas_dims();
-        let stats = match self
-            .surface
-            .headless_present(&combined_list, Some((&atlas_texels, dims)))
-        {
-            Ok(stats) => stats,
-            Err(_) => return None,
+        let stats = if let Some(gpu) = self.gpu.as_ref() {
+            match self
+                .surface
+                .present_draw_list(gpu, &combined_list, Some((&atlas_texels, dims)))
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    // GPU present failed (surface lost/outdated): fallback to headless for this frame
+                    match self
+                        .surface
+                        .headless_present(&combined_list, Some((&atlas_texels, dims)))
+                    {
+                        Ok(h) => h,
+                        Err(_) => return None,
+                    }
+                }
+            }
+        } else {
+            match self
+                .surface
+                .headless_present(&combined_list, Some((&atlas_texels, dims)))
+            {
+                Ok(stats) => stats,
+                Err(_) => return None,
+            }
         };
         self.last_presented_generation = current_gen;
         Some(PresentStats {

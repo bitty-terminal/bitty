@@ -567,10 +567,24 @@ impl Runtime {
             point_size: config.font_size,
         };
         // Vertical slice: prefer crossfont when available, fallback to headless
-        // for CI determinism. Both are bounded and headless-testable.
-        let raster = AnyRasterizer::try_crossfont();
-        let is_crossfont = raster.is_crossfont();
-        let renderer = GridRenderer::new(raster, &query, cell).map_err(RuntimeError::from)?;
+        // for CI determinism. Both are bounded and headless-testable. On
+        // Windows the monospace family may be absent, so a FontNotFound from
+        // GridRenderer re-tries deterministically with HeadlessRasterizer
+        // instead of failing with_defaults on headless CI.
+        let (renderer, is_crossfont) = {
+            let raster = AnyRasterizer::try_crossfont();
+            let is_cf = raster.is_crossfont();
+            match GridRenderer::new(raster, &query, cell) {
+                Ok(r) => (r, is_cf),
+                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
+                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let r =
+                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
+                    (r, false)
+                }
+                Err(err) => return Err(RuntimeError::from(err)),
+            }
+        };
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);
@@ -641,9 +655,20 @@ impl Runtime {
             style: FontStyle::Normal,
             point_size: config.font_size,
         };
-        let raster = AnyRasterizer::try_crossfont();
-        let is_crossfont = raster.is_crossfont();
-        let renderer = GridRenderer::new(raster, &query, cell).map_err(RuntimeError::from)?;
+        let (renderer, is_crossfont) = {
+            let raster = AnyRasterizer::try_crossfont();
+            let is_cf = raster.is_crossfont();
+            match GridRenderer::new(raster, &query, cell) {
+                Ok(r) => (r, is_cf),
+                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
+                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let r =
+                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
+                    (r, false)
+                }
+                Err(err) => return Err(RuntimeError::from(err)),
+            }
+        };
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);

@@ -179,6 +179,7 @@ pub mod config;
 pub mod error;
 pub mod paste;
 pub mod queue;
+pub mod registry;
 pub mod runtime;
 
 pub use config::RuntimeConfig;
@@ -194,3 +195,9 @@ pub use runtime::{
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{Focus, FocusDirection, LayoutNode, SplitAxis, View, ViewId};
 pub use bitty_ui::{Point as UiPoint, Rect as UiRect, Size as UiSize};
+
+pub use registry::{
+    Generation, LogicalRect, MAX_COLS, MAX_ROWS, MAX_TERMINALS, MAX_VIEWS_PER_WORKSPACE,
+    MAX_WORKSPACES_PER_WINDOW, PersistentId, RESIZE_DEBOUNCE_CAP, RegistryConfig, RegistryError,
+    RuntimeId, TerminalHandle, TerminalId, TerminalRegistry, ViewHandle, Visibility, WorkspaceId,
+};

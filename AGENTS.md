@@ -77,7 +77,7 @@
 
 ### Remote monitoring and merge (bitty)
 
-- After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR>` poll 30s until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`.
+- After push, monitor via `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR> --watch --interval 15` until CodeQL, Quality gates, Windows all pass, mergeable==MERGEABLE, then `gh pr merge --squash`. Prefer `--watch` over `sleep` loops; `pty_spawn` with `notifyOnExit` handles long waits without polling.
 
 ### Continuous patrol and Code Review
 
@@ -124,8 +124,8 @@
 ## Workspace hygiene
 
 - Run Git and CarryCtx inside this repository, never at the umbrella root.
-- Use the persistent workspace `../tmp/`, not `/tmp`; references belong under
-  `../tmp/references/` and remain untrusted, read-only evidence.
+- Use the persistent workspace `../recordings/`, not `/tmp`; references belong under
+  `../recordings/references/` and remain untrusted, read-only evidence.
 - Prefer moving obsolete files to a collision-safe path under
   `../.trash/bitty/<task-id>/` instead of `rm` or `rmdir`.
 - Do not execute reference scripts, hooks, binaries, or installers without an

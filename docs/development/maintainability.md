@@ -168,7 +168,7 @@ No drift detected. `cargo clippy --locked` and `cargo test --locked` enforce loc
 - `.gitignore:1-3` covers `.carryctx/config.local.toml`, `.worktrees/`, `/target/`.
 - `lefthook.yml:1-20` wires `pre-commit` (fmt-check, clippy, markdown), `commit-msg` (commitlint), `pre-push` (`just typecheck`). No hook bypass.
 - `CONTRIBUTING.md:34-44` documents `just setup` (fetch, lefthook install, tools). `commitlint.config.ts` extends `@commitlint/config-conventional`.
-- No stray temp files in repo root; `tmp/` lives at umbrella `../tmp/` per `AGENTS.md:89`. `target/` is ignored but large (5.1 GiB) — periodic `cargo clean` recommended on CI runners, not in repo.
+- No stray temp files in repo root; `recordings/` lives at umbrella `../recordings/` per `AGENTS.md:89`. `target/` is ignored but large (5.1 GiB) — periodic `cargo clean` recommended on CI runners, not in repo.
 - `bitty-core` (`crates/bitty-core/src/lib.rs:1`) remains the retirement seed (`publish = false`); `AGENTS.md:53` branch naming `ctx-XXXX/<type>-<short-slug>` is honored.
 
 ## Fixes applied in this worktree

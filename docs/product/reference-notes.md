@@ -19,29 +19,29 @@ status: draft
   - Priority: P0 | Area: ui | Labels: docs,area:ui,P0 | Milestone: v0.1.0 | RFC: workspace-compositor | Task: CTX-0084
   - Issue: [#120](https://github.com/bitty-terminal/bitty/issues/120) — `docs,area:ui,P0` — milestone `v0.1.0`
 - Worktree: `.worktrees/ctx-0084-reference-clone` — branch `ctx-0084/reference-clone` — base `1ab5fb9`.
-- Scope: clone Hyprland/Waybar at depth 1 to **global** `tmp/references/` (umbrella, outside `bitty` worktree per isolation), record revision + license in `tmp/references/README.md`, summarize exa patterns in `tmp/references/panel-tabs-research-2026-08-30.md`, and record this docs artifact. No `tmp/references/` commit inside `bitty`; this file is the in-repo artifact.
+- Scope: clone Hyprland/Waybar at depth 1 to **global** `recordings/references/` (umbrella, outside `bitty` worktree per isolation), record revision + license in `recordings/references/README.md`, summarize exa patterns in `recordings/references/panel-tabs-research-2026-08-30.md`, and record this docs artifact. No `recordings/references/` commit inside `bitty`; this file is the in-repo artifact.
 
 ## Global snapshots — verification
 
-Read-only clones under umbrella `tmp/references/` (never executed, never imported as dependencies, not referenced in `Cargo.toml`):
+Read-only clones under umbrella `recordings/references/` (never executed, never imported as dependencies, not referenced in `Cargo.toml`):
 
 | Snapshot   | Upstream                             | Revision (short) | Full HEAD                                                                                                                              | License                                                   | Cloned                           |
 | ---------- | ------------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | -------------------------------- |
 | `hyprland` | <https://github.com/hyprwm/Hyprland> | `c91fa5a`        | `c91fa5ab4d566206888c708dba66fca3646c382e` — `fullscreen: fix missing early return (#16063)`                                           | BSD-3-Clause — `LICENSE` Copyright (c) 2022-2026 vaxerski | 2026-08-30 `git clone --depth 1` |
 | `waybar`   | <https://github.com/Alexays/Waybar>  | `6d60c8e`        | `6d60c8e02be67bb85bb9b1ea803f2fbcf0722002` — `Merge pull request #5222 from IlyasKhallouki/fix/5220-taskbar-dedup-only-with-max-icons` | MIT — `LICENSE` Copyright (c) 2025 Alex                   | 2026-08-30 `git clone --depth 1` |
 
-Retained for VT/grid differential (unchanged): `ghostty@8867c37` MIT, `kitty@087b8c3` GPL-3.0, `neovim@a1de074` Apache-2.0/Vim, `wezterm@f93d903` MIT, synthetic `vttest` corpora (< 8 KiB) — see `tmp/references/README.md` table.
+Retained for VT/grid differential (unchanged): `ghostty@8867c37` MIT, `kitty@087b8c3` GPL-3.0, `neovim@a1de074` Apache-2.0/Vim, `wezterm@f93d903` MIT, synthetic `vttest` corpora (< 8 KiB) — see `recordings/references/README.md` table.
 
 Verification (read-only, no build):
 
 ```bash
-git -C tmp/references/hyprland rev-parse HEAD  # c91fa5ab4d566206888c708dba66fca3646c382e
-git -C tmp/references/waybar rev-parse HEAD    # 6d60c8e02be67bb85bb9b1ea803f2fbcf0722002
-head -5 tmp/references/hyprland/LICENSE        # BSD 3-Clause
-head -5 tmp/references/waybar/LICENSE          # MIT
+git -C recordings/references/hyprland rev-parse HEAD  # c91fa5ab4d566206888c708dba66fca3646c382e
+git -C recordings/references/waybar rev-parse HEAD    # 6d60c8e02be67bb85bb9b1ea803f2fbcf0722002
+head -5 recordings/references/hyprland/LICENSE        # BSD 3-Clause
+head -5 recordings/references/waybar/LICENSE          # MIT
 ```
 
-`tmp/references/README.md` and `tmp/references/panel-tabs-research-2026-08-30.md` (73 lines) in the umbrella workspace hold the canonical revision table and distilled research; this file does not duplicate the clones.
+`recordings/references/README.md` and `recordings/references/panel-tabs-research-2026-08-30.md` (73 lines) in the umbrella workspace hold the canonical revision table and distilled research; this file does not duplicate the clones.
 
 ## Exa research — distilled patterns (not TODO)
 
@@ -64,12 +64,12 @@ Three `exa_web_search_exa` queries on 2026-08-30, distilled as patterns Bitty co
 
 - Tabs/panes remain an in-window BSP inside `bitty-ui::layout::LayoutNode` / `bitty-runtime` (dwindle `splitTop`/`splitRatio`/`box` + `recalcSizePosRecursive`); persist layouts as rect lists and recompute via `insertion_plan` for replay/determinism.
 - An out-of-window status panel is a separate SCTK `Layer::Top` bar (Waybar provider pattern) with `exclusive_zone` strut; main window stays `winit`. On GNOME, fall back to X11 override-redirect — do not block on `winit` layer-shell.
-- No dependencies added; snapshots remain untrusted, excluded by umbrella `tmp/` routing and not referenced in `Cargo.toml`. Future work starts with pure `bitty-ui::layout` unit tests mirroring `hyprgate` cases, then a feature-gated `bitty-panel` crate behind `backend-wlr` following `fono` fallback.
+- No dependencies added; snapshots remain untrusted, excluded by umbrella `recordings/` routing and not referenced in `Cargo.toml`. Future work starts with pure `bitty-ui::layout` unit tests mirroring `hyprgate` cases, then a feature-gated `bitty-panel` crate behind `backend-wlr` following `fono` fallback.
 
 ## Evidence — file:line pointers (no defects)
 
-- Umbrella research: `tmp/references/panel-tabs-research-2026-08-30.md:1`, `tmp/references/README.md:11`
-- Clones: `tmp/references/hyprland` @ `c91fa5a`, `tmp/references/waybar` @ `6d60c8e`
+- Umbrella research: `recordings/references/panel-tabs-research-2026-08-30.md:1`, `recordings/references/README.md:11`
+- Clones: `recordings/references/hyprland` @ `c91fa5a`, `recordings/references/waybar` @ `6d60c8e`
 - Issue: `gh issue view 120 --repo bitty-terminal/bitty` — `docs,area:ui,P0`, milestone `v0.1.0`
 - This artifact: `docs/product/reference-notes.md:1` — research `status: draft`, not a TODO implementation claim
 

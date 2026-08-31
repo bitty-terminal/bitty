@@ -24,7 +24,7 @@
 
 /// Which suspicious classes were found in a paste.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PasteInspection {
+pub(crate) struct PasteInspection {
     /// `true` when any `0x00..0x1F` C0 control (excluding `\t` allow-list)
     /// is present. This overlaps with the more specific NUL/ESC/CR/newline
     /// flags but is reported separately so every C0 byte is covered.
@@ -57,6 +57,7 @@ impl PasteInspection {
     }
 
     /// Human-readable reasons for inspection (bounded, deterministic order).
+    #[cfg(test)]
     #[must_use]
     pub fn reasons(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
@@ -85,6 +86,7 @@ impl PasteInspection {
     }
 
     /// Whether no flag is set.
+    #[cfg(test)]
     #[must_use]
     pub fn is_clean(&self) -> bool {
         !self.needs_confirmation()
@@ -98,7 +100,7 @@ impl PasteInspection {
 /// `bitty_platform::clipboard::CLIPBOARD_MAX_BYTES` (8192) before this call
 /// in the runtime paste path, so this scan is bounded `O(n)` with `n ≤ 8192`.
 #[must_use]
-pub fn inspect_paste(text: &str) -> PasteInspection {
+pub(crate) fn inspect_paste(text: &str) -> PasteInspection {
     let mut insp = PasteInspection::default();
     for ch in text.chars() {
         let cp = ch as u32;
@@ -174,17 +176,17 @@ fn is_bidi_control(ch: char) -> bool {
 /// truncated to `CLIPBOARD_MAX_BYTES` at a char boundary before this struct is
 /// created, so it is bounded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPaste {
+pub(crate) struct PendingPaste {
     /// Bounded paste bytes as confirmed text.
-    pub text: String,
+    pub(crate) text: String,
     /// Inspection result for the pending text.
-    pub inspection: PasteInspection,
+    pub(crate) inspection: PasteInspection,
 }
 
 impl PendingPaste {
     /// Create a pending entry from already-inspected text.
     #[must_use]
-    pub fn new(text: String, inspection: PasteInspection) -> Self {
+    pub(crate) fn new(text: String, inspection: PasteInspection) -> Self {
         Self { text, inspection }
     }
 }
@@ -194,7 +196,7 @@ impl PendingPaste {
 /// Defense-in-depth only: wrapping never bypasses the confirmation gate.
 /// Caller must have already confirmed the paste.
 #[must_use]
-pub fn bracketed_wrap(text: &str, bracketed: bool) -> Vec<u8> {
+pub(crate) fn bracketed_wrap(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         let mut out = Vec::with_capacity(text.len() + 12);
         out.extend_from_slice(b"\x1b[200~");

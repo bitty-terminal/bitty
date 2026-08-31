@@ -183,7 +183,6 @@ pub mod runtime;
 
 pub use config::RuntimeConfig;
 pub use error::RuntimeError;
-pub use paste::{PasteInspection, PendingPaste, bracketed_wrap, inspect_paste};
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::{
     DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY,

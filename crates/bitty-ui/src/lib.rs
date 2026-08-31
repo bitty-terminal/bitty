@@ -56,6 +56,7 @@
 pub mod focus;
 pub mod geometry;
 pub mod layout;
+pub mod panel;
 pub mod search;
 pub mod selection;
 pub mod view;
@@ -64,6 +65,12 @@ pub mod view;
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Point, Rect, Size, SplitAxis};
 pub use layout::{LayoutNode, clamp_ratio, split_rect};
+pub use panel::{
+    CommandError, CommandRegistry, InputTarget, MAX_COMMANDS_PER_PANEL_TYPE, MAX_OVERLAY_TEXT_LEN,
+    MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError, OverlayKind,
+    OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand, ViewContent,
+    route_input, validate_panel_bounds,
+};
 pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,

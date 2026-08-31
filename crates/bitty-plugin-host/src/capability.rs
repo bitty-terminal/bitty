@@ -21,6 +21,8 @@ pub enum CapabilityFamily {
     Platform,
     /// Protocol registration and dispatch authority.
     Protocol,
+    /// Panel runtime (generic Panel Runtime per OQ-014 pre-study).
+    Panel,
 }
 
 impl CapabilityFamily {
@@ -37,6 +39,7 @@ impl CapabilityFamily {
             "debug" => Some(Self::Debug),
             "platform" => Some(Self::Platform),
             "protocol" => Some(Self::Protocol),
+            "panel" => Some(Self::Panel),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl CapabilityFamily {
             Self::Debug => "debug",
             Self::Platform => "platform",
             Self::Protocol => "protocol",
+            Self::Panel => "panel",
         }
     }
 
@@ -95,6 +99,12 @@ impl CapabilityFamily {
                 "platform.image-file",
             ],
             Self::Protocol => &["protocol.register"],
+            Self::Panel => &[
+                "panel.provider",
+                "panel.create",
+                "panel.focus",
+                "panel.overlay",
+            ],
         }
     }
 }
@@ -296,6 +306,10 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "platform.open-url" => "Open URLs in the default handler",
         "platform.image-file" => "Access image files at approved locations",
         "protocol.register" => "Register a protocol handler",
+        "panel.provider" => "Provide panel types for the workspace",
+        "panel.create" => "Create and manage panels",
+        "panel.focus" => "Focus panels and control workspace focus",
+        "panel.overlay" => "Show panel overlays and modals",
         _ => "Requested capability",
     }
 }
@@ -352,6 +366,10 @@ fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, P
             | "platform.open-url"
             | "platform.image-file"
             | "protocol.register"
+            | "panel.provider"
+            | "panel.create"
+            | "panel.focus"
+            | "panel.overlay"
     );
 
     if !is_known {
@@ -408,6 +426,7 @@ mod tests {
             CapabilityFamily::Protocol,
             CapabilityFamily::Runtime,
             CapabilityFamily::Debug,
+            CapabilityFamily::Panel,
         ];
         for family in families {
             assert!(family.denied_without_grant());

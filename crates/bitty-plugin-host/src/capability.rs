@@ -19,6 +19,8 @@ pub enum CapabilityFamily {
     Runtime,
     Debug,
     Platform,
+    /// Protocol registration and dispatch authority.
+    Protocol,
 }
 
 impl CapabilityFamily {
@@ -34,6 +36,7 @@ impl CapabilityFamily {
             "runtime" => Some(Self::Runtime),
             "debug" => Some(Self::Debug),
             "platform" => Some(Self::Platform),
+            "protocol" => Some(Self::Protocol),
             _ => None,
         }
     }
@@ -51,6 +54,47 @@ impl CapabilityFamily {
             Self::Runtime => "runtime",
             Self::Debug => "debug",
             Self::Platform => "platform",
+            Self::Protocol => "protocol",
+        }
+    }
+
+    /// Whether an absent grant denies every capability in this family.
+    ///
+    /// This deliberately returns `true` for every family. The host must grant
+    /// individual, validated identifiers; family membership is never authority.
+    #[must_use]
+    pub const fn denied_without_grant(self) -> bool {
+        true
+    }
+
+    /// The closed, non-parameterized identifiers in this family.
+    #[must_use]
+    pub const fn closed_identifiers(self) -> &'static [&'static str] {
+        match self {
+            Self::Terminal => &[
+                "terminal.semantic-read",
+                "terminal.raw-read",
+                "terminal.input.self",
+                "terminal.input.all",
+                "terminal.manage",
+            ],
+            Self::Ui => &["ui.rich", "ui.overlay", "ui.protocol-register"],
+            Self::Clipboard => &["clipboard.read", "clipboard.write"],
+            Self::Fs => &["fs.read", "fs.write"],
+            Self::Process => &["process.spawn"],
+            Self::Network => &["network.connect"],
+            Self::Runtime => &[
+                "runtime.inspect",
+                "runtime.configure",
+                "runtime.plugin-manage",
+            ],
+            Self::Debug => &["debug.inspect", "debug.trace", "debug.control"],
+            Self::Platform => &[
+                "platform.notify",
+                "platform.open-url",
+                "platform.image-file",
+            ],
+            Self::Protocol => &["protocol.register"],
         }
     }
 }
@@ -84,10 +128,10 @@ impl CapabilityId {
                 "capability id too long (max 512)",
             ));
         }
-        if raw.contains(' ') || raw.contains('\t') || raw.contains('\n') {
+        if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
             return Err(PluginError::capability(
                 raw,
-                "capability must not contain whitespace",
+                "capability must not contain control characters or whitespace",
             ));
         }
 
@@ -115,7 +159,7 @@ impl CapabilityId {
                     "parameter too long (max 1024)",
                 ));
             }
-            // Param may contain ':', '/', '*', etc. for host:port and globs; only NUL/whitespace would be rejected earlier.
+            // Param may contain ':', '/', '*', etc. for host:port and globs; controls and whitespace are rejected above.
             // No additional colon check here — network.connect:example.com:443 is valid.
         }
 
@@ -251,6 +295,7 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "platform.notify" => "Show system notifications",
         "platform.open-url" => "Open URLs in the default handler",
         "platform.image-file" => "Access image files at approved locations",
+        "protocol.register" => "Register a protocol handler",
         _ => "Requested capability",
     }
 }
@@ -306,6 +351,7 @@ fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, P
             | "platform.notify"
             | "platform.open-url"
             | "platform.image-file"
+            | "protocol.register"
     );
 
     if !is_known {
@@ -338,6 +384,7 @@ mod tests {
             "runtime.inspect",
             "debug.trace",
             "platform.notify",
+            "protocol.register",
         ] {
             assert!(CapabilityId::parse(id).is_ok(), "should parse {id}");
         }
@@ -347,6 +394,38 @@ mod tests {
     fn wildcard_rejected() {
         assert!(CapabilityId::parse("fs.*").is_err());
         assert!(CapabilityId::parse("terminal.*").is_err());
+    }
+
+    #[test]
+    fn every_family_is_closed_and_denied_without_grant() {
+        let families = [
+            CapabilityFamily::Fs,
+            CapabilityFamily::Process,
+            CapabilityFamily::Network,
+            CapabilityFamily::Terminal,
+            CapabilityFamily::Clipboard,
+            CapabilityFamily::Ui,
+            CapabilityFamily::Protocol,
+            CapabilityFamily::Runtime,
+            CapabilityFamily::Debug,
+        ];
+        for family in families {
+            assert!(family.denied_without_grant());
+            for raw in family.closed_identifiers() {
+                let parsed = CapabilityId::parse(raw);
+                if matches!(
+                    family,
+                    CapabilityFamily::Fs | CapabilityFamily::Process | CapabilityFamily::Network
+                ) {
+                    assert!(
+                        parsed.is_err(),
+                        "scoped family must require a parameter: {raw}"
+                    );
+                } else {
+                    assert!(parsed.is_ok(), "closed identifier must parse: {raw}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -404,5 +483,12 @@ mod tests {
         assert!(CapabilityId::parse("terminal.Semantic-read").is_err());
         assert!(CapabilityId::parse("terminal.").is_err());
         assert!(CapabilityId::parse(".terminal").is_err());
+    }
+
+    #[test]
+    fn parameters_reject_controls_and_unicode_whitespace() {
+        for parameter in ["path\0name", "path\u{0007}name", "path\u{2003}name"] {
+            assert!(CapabilityId::parse(&format!("fs.read:{parameter}")).is_err());
+        }
     }
 }

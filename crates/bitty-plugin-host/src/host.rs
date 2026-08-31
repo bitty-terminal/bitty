@@ -339,7 +339,10 @@ impl PluginHost {
         // Every declared capability must be granted for this hash.
         let mut missing: Vec<String> = Vec::new();
         for cap in &required {
-            if !self.grants.is_granted(id, &hash, cap) {
+            if !self
+                .grants
+                .is_granted(id, &hash, cap, &entry.manifest.capabilities)
+            {
                 missing.push(cap.as_str().to_string());
             }
         }
@@ -416,7 +419,15 @@ impl PluginHost {
         manifest_hash: &str,
         capability: &CapabilityId,
     ) -> bool {
-        self.grants.is_granted(plugin_id, manifest_hash, capability)
+        let Some(entry) = self.registry.get(plugin_id) else {
+            return false;
+        };
+        self.grants.is_granted(
+            plugin_id,
+            manifest_hash,
+            capability,
+            &entry.manifest.capabilities,
+        )
     }
 
     /// Revoke a grant (single capability or all), detaching at the next dispatch boundary.
@@ -836,6 +847,30 @@ mod tests {
             host.activate(&PluginId::new("xuepoo.nocap").unwrap())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn host_grant_check_requires_current_manifest_declaration() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = manifest_with_caps("xuepoo.declared", vec!["terminal.semantic-read"]);
+        let id = PluginId::new("xuepoo.declared").unwrap();
+        let hash = m.manifest_hash();
+        host.declare(m).unwrap();
+        host.insert_grant(GrantRecord::granted(
+            id.clone(),
+            hash.clone(),
+            [CapabilityId::parse("clipboard.read").unwrap()]
+                .into_iter()
+                .collect(),
+            1,
+        ));
+
+        assert!(!host.is_granted(&id, &hash, &CapabilityId::parse("clipboard.read").unwrap(),));
+        assert!(!host.is_granted(
+            &id,
+            &hash,
+            &CapabilityId::parse("terminal.semantic-read").unwrap()
+        ));
     }
 
     #[test]

@@ -876,6 +876,17 @@ mod vm_unit_tests {
     }
 
     #[test]
+    fn restricted_stdlib_denies_ambient_io_and_dynamic_loading() {
+        let mut vm = LuaVm::new("xuepoo.sandbox");
+        let outcome = vm
+            .execute(
+                "assert(io == nil and os == nil and package == nil and debug == nil and load == nil and loadfile == nil and dofile == nil)",
+            )
+            .unwrap();
+        assert!(matches!(outcome, ExecuteOutcome::Completed { .. }));
+    }
+
+    #[test]
     fn fail_closed_after_suspend() {
         let mut vm = LuaVm::with_budgets("xuepoo.fail", 10, 50, 8, 32 * 1024 * 1024);
         // Infinite loop with tiny instruction budget should suspend.

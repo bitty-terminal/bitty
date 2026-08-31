@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::capability::CapabilityId;
 use crate::error::PluginError;
-use crate::manifest::PluginId;
+use crate::manifest::{CapabilityRequests, PluginId};
 
 /// How the grant decision was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,7 +149,11 @@ impl GrantStore {
         plugin_id: &PluginId,
         manifest_hash: &str,
         capability: &CapabilityId,
+        declared: &CapabilityRequests,
     ) -> bool {
+        if !declared.contains(capability) {
+            return false;
+        }
         let Some(rec) = self.get(plugin_id) else {
             return false;
         };
@@ -313,11 +317,15 @@ mod tests {
         granted.insert(cap("terminal.semantic-read"));
         granted.insert(cap("ui.rich"));
         store.insert(GrantRecord::granted(pid.clone(), hash, granted.clone(), 1));
+        let declared = CapabilityRequests {
+            ids: granted,
+            ..CapabilityRequests::default()
+        };
 
-        assert!(store.is_granted(&pid, hash, &cap("terminal.semantic-read")));
-        assert!(!store.is_granted(&pid, hash, &cap("clipboard.read")));
+        assert!(store.is_granted(&pid, hash, &cap("terminal.semantic-read"), &declared));
+        assert!(!store.is_granted(&pid, hash, &cap("clipboard.read"), &declared));
         // Wrong hash denies.
-        assert!(!store.is_granted(&pid, "other", &cap("terminal.semantic-read")));
+        assert!(!store.is_granted(&pid, "other", &cap("terminal.semantic-read"), &declared));
     }
 
     #[test]
@@ -343,12 +351,14 @@ mod tests {
         granted.insert(cap("terminal.semantic-read"));
         granted.insert(cap("ui.rich"));
         store.insert(GrantRecord::granted(pid.clone(), "h", granted, 1));
+        let mut declared = CapabilityRequests::default();
+        declared.ids.insert(cap("terminal.semantic-read"));
 
         let report = store.revoke(&pid, Some(&cap("ui.rich"))).unwrap();
         assert_eq!(report.revoked.len(), 1);
         assert!(!report.fully_revoked);
-        assert!(!store.is_granted(&pid, "h", &cap("ui.rich")));
-        assert!(store.is_granted(&pid, "h", &cap("terminal.semantic-read")));
+        assert!(!store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
+        assert!(store.is_granted(&pid, "h", &cap("terminal.semantic-read"), &declared));
     }
 
     #[test]

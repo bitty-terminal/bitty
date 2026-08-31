@@ -40,6 +40,8 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// Focus reporting (`?1004`).
     pub focus_events: bool,
+    /// Kitty keyboard progressive flags (`?7727`, bitmask).
+    pub kitty_keyboard: u32,
     /// Active mouse-tracking protocol level (`None`: off).
     pub mouse_tracking: Option<MouseTrackingMode>,
     /// Extended mouse coordinate encoding (`None`: legacy default).
@@ -60,6 +62,7 @@ impl Default for Modes {
             cursor_blinking: false,
             bracketed_paste: false,
             focus_events: false,
+            kitty_keyboard: 0,
             mouse_tracking: None,
             mouse_coordinate_encoding: None,
         }

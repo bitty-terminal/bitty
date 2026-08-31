@@ -114,6 +114,9 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
     }
 
     fn dispatch_mode(&mut self, code: u16, enabled: bool) {
+        // Kitty progressive flags (7727) carry a bitmask in secondary params;
+        // for the vertical slice we map any 7727 enable to flags=1 (legacy disambiguation)
+        // and disable to 0, bounded to u32.
         let mapped = match code {
             1 => Some(Mode::ApplicationCursorKeys),
             3 => Some(Mode::Column132),
@@ -134,6 +137,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
                 MouseCoordinateEncoding::Urxvt,
             )),
             2004 => Some(Mode::BracketedPaste),
+            7727 => Some(Mode::KittyKeyboard(if enabled { 1 } else { 0 })),
             _ => None,
         };
         match mapped {

@@ -474,6 +474,30 @@ pub enum WindowEventKind {
     /// The window was destroyed by the platform; no further events arrive for
     /// it regardless of any pending close request.
     Closed,
+    /// Modifier state changed (shift/ctrl/alt/super).
+    ModifiersChanged(ModifiersState),
+    /// IME composition event (preedit/commit).
+    Ime(ImeEvent),
+}
+
+/// Modifier key state snapshot (pressed flags, bounded).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModifiersState {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub super_pressed: bool,
+}
+
+/// IME event (bounded, presentation-only).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ImeEvent {
+    /// Preedit with text and optional cursor range.
+    Preedit(String, Option<(usize, usize)>),
+    /// Commit string (bounded 256 chars / 1024 bytes).
+    Commit(String),
+    Enabled,
+    Disabled,
 }
 
 /// Every event the platform layer delivers to an [`AppHandler`]
@@ -550,6 +574,8 @@ pub(crate) fn translate_window_event(event: WindowEvent) -> Option<WindowEventKi
         }
         WindowEvent::CursorMoved { position, .. } => map_cursor_moved(position.x, position.y),
         WindowEvent::CursorLeft { .. } => Some(WindowEventKind::CursorLeft),
+        WindowEvent::ModifiersChanged(mods) => Some(map_modifiers_changed(mods)),
+        WindowEvent::Ime(ime) => map_ime(ime).map(WindowEventKind::Ime),
         _ => None,
     }
 }
@@ -623,6 +649,60 @@ pub(crate) fn map_mouse_wheel(delta: MouseScrollDelta) -> Option<ScrollDelta> {
 
 pub(crate) const fn map_cursor_moved(x: f64, y: f64) -> Option<WindowEventKind> {
     Some(WindowEventKind::CursorMoved(CursorPosition::new(x, y)))
+}
+
+pub(crate) fn map_modifiers_changed(mods: winit::event::Modifiers) -> WindowEventKind {
+    let state = mods.state();
+    WindowEventKind::ModifiersChanged(ModifiersState {
+        shift: state.shift_key(),
+        control: state.control_key(),
+        alt: state.alt_key(),
+        super_pressed: state.super_key(),
+    })
+}
+
+pub(crate) fn map_ime(ime: winit::event::Ime) -> Option<ImeEvent> {
+    match ime {
+        winit::event::Ime::Enabled => Some(ImeEvent::Enabled),
+        winit::event::Ime::Disabled => Some(ImeEvent::Disabled),
+        winit::event::Ime::Preedit(text, cursor) => {
+            // Bounded preedit text: truncate to 128 chars headless, candidate bound TXT-10
+            let bounded = if text.chars().count() > 128 {
+                let mut s = String::new();
+                for (i, ch) in text.chars().enumerate() {
+                    if i >= 128 {
+                        break;
+                    }
+                    s.push(ch);
+                }
+                s
+            } else {
+                text
+            };
+            Some(ImeEvent::Preedit(bounded, cursor))
+        }
+        winit::event::Ime::Commit(text) => {
+            // Bounded commit: 256 chars / 1024 bytes
+            let bounded = if text.len() > 1024 || text.chars().count() > 256 {
+                let mut out = String::new();
+                let mut bytes = 0usize;
+                #[allow(clippy::explicit_counter_loop)]
+                for ch in text.chars() {
+                    let clen = ch.len_utf8();
+                    let chars = out.chars().count();
+                    if bytes + clen > 1024 || chars + 1 > 256 {
+                        break;
+                    }
+                    out.push(ch);
+                    bytes += clen;
+                }
+                out
+            } else {
+                text
+            };
+            Some(ImeEvent::Commit(bounded))
+        }
+    }
 }
 
 #[cfg(test)]

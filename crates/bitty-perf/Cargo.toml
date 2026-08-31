@@ -19,6 +19,11 @@ bitty-term-state = { path = "../bitty-term-state" }
 bitty-render = { path = "../bitty-render" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-pty = { path = "../bitty-pty" }
+bitty-runtime = { path = "../bitty-runtime" }
+bitty-config = { path = "../bitty-config" }
+bitty-ui = { path = "../bitty-ui" }
+pollster = "0.3"
+winit = "0.30.13"
 
 [[bench]]
 name = "vt_throughput"
@@ -43,4 +48,19 @@ harness = false
 [[bench]]
 name = "render_prepare"
 path = "../../benches/render_prepare.rs"
+harness = false
+
+[[bench]]
+name = "startup_real"
+path = "../../benches/startup_real.rs"
+harness = false
+
+[[bench]]
+name = "latency_real"
+path = "../../benches/latency_real.rs"
+harness = false
+
+[[bench]]
+name = "idle_real"
+path = "../../benches/idle_real.rs"
 harness = false

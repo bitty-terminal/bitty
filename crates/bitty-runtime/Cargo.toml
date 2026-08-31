@@ -28,3 +28,4 @@ bitty-ipc = { path = "../bitty-ipc" }
 bitty-agent = { path = "../bitty-agent" }
 bitty-package = { path = "../bitty-package" }
 bitty-rich = { path = "../bitty-rich" }
+bitty-config = { path = "../bitty-config" }

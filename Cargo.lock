@@ -278,6 +278,7 @@ name = "bitty-runtime"
 version = "0.0.1"
 dependencies = [
  "bitty-agent",
+ "bitty-config",
  "bitty-ipc",
  "bitty-package",
  "bitty-platform",

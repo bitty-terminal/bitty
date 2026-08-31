@@ -95,11 +95,19 @@ fn json_escape(input: &str) -> String {
 
 fn main() {
     let ws = workspace_root();
-    let out_worktree = ws.join("tmp/references/bitty");
-    let out_umbrella =
+    let out_worktree_tmp = ws.join("tmp/references/bitty");
+    let out_worktree_rec = ws.join("recordings/references/bitty");
+    let out_umbrella_tmp =
         PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
+    let out_umbrella_rec =
+        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/bitty");
 
-    for dir in [&out_worktree, &out_umbrella] {
+    for dir in [
+        &out_worktree_tmp,
+        &out_worktree_rec,
+        &out_umbrella_tmp,
+        &out_umbrella_rec,
+    ] {
         if let Err(e) = fs::create_dir_all(dir) {
             eprintln!("warn: cannot create {}: {e}", dir.display());
         }
@@ -196,7 +204,12 @@ fn main() {
                 "snapshot json unexpectedly large {} for {path:?}",
                 json.len()
             );
-            for dir in [&out_worktree, &out_umbrella] {
+            for dir in [
+                &out_worktree_tmp,
+                &out_worktree_rec,
+                &out_umbrella_tmp,
+                &out_umbrella_rec,
+            ] {
                 if dir.exists() {
                     let out_path = dir.join(&file_name);
                     fs::write(&out_path, &json)
@@ -222,9 +235,11 @@ fn main() {
         "expected at least 22 snapshots written, saw {written}"
     );
     println!(
-        "collect_dumps done: {written}/{total} snapshots written to {} and {}",
-        out_worktree.display(),
-        out_umbrella.display()
+        "collect_dumps done: {written}/{total} snapshots written to {} , {} , {} and {}",
+        out_worktree_tmp.display(),
+        out_worktree_rec.display(),
+        out_umbrella_tmp.display(),
+        out_umbrella_rec.display()
     );
     let _ = PathBuf::from(".");
 }

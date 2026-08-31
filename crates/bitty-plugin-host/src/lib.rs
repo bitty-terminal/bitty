@@ -117,6 +117,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bundled;
 pub mod capability;
 pub mod error;
 pub mod event;

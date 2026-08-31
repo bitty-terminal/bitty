@@ -61,7 +61,7 @@ tests/compat/
   tui/corpus/* + README       # nvim/tmux/htop/fzf/lazygit traces
 ```
 
-Each `corpus/*.bin` placeholder < 1 KiB and < 8 KiB bound; real captures will be pinned in `tmp/references/` before check-in.
+Each `corpus/*.bin` placeholder < 1 KiB and < 8 KiB bound; real captures will be pinned in `recordings/references/` before check-in.
 
 ## Per-category corpora
 
@@ -103,12 +103,12 @@ SGR (`1006`), UTF-8 (`1005`), urxvt (`1015`). Baseline: `replay.rs::fixture_esca
 
 ## `vttest` runbook
 
-1. Pin `vttest` source in `tmp/references/vttest/` (record revision + license, per `tmp/references/` rule).
+1. Pin `vttest` source in `recordings/references/vttest/` (record revision + license, per `recordings/references/` rule).
 2. Build `vttest` (`./configure && make`).
 3. Run `script -c "./vttest" vttest.log` and `script --timing=vttest.timing` for menus 1–12; also harvest curated sequences from `vttest.c` expected grids.
 4. Split `vttest.log` into bounded `tests/compat/vt/corpus/vttest-*.bin` slices (< 8 KiB each) with accompanying `vt/reference/*.txt` grid dumps.
 5. Drive harness `parse_bounded` → `State` → `Snapshot`; assert snapshot text equals reference dump via `diff_snapshots`. Failures become tracked follow-ups, not silent skips.
-6. Never copy `tmp/references/` code into `tests/compat`; corpora are bytes + reference dumps only.
+6. Never copy `recordings/references/` code into `tests/compat`; corpora are bytes + reference dumps only.
 
 ## Ghostty / kitty / WezTerm differential
 
@@ -136,5 +136,5 @@ SGR (`1006`), UTF-8 (`1005`), urxvt (`1015`). Baseline: `replay.rs::fixture_esca
 ## Next
 
 - Wire `tests/compat/**/corpus/*.bin` into a `cargo test` harness (`compat_lab_is_deterministic_and_bounded`) that runs headlessly under `just test`.
-- Pin `vttest` revision/license in `tmp/references/vttest/` and land first real captures (bounded slices) plus Ghostty/kitty/WezTerm reference dumps.
+- Pin `vttest` revision/license in `recordings/references/vttest/` and land first real captures (bounded slices) plus Ghostty/kitty/WezTerm reference dumps.
 - Record `compat-lab.md` revision in `bitty-docs` when OQ-004 RFC accepts the differential contract.

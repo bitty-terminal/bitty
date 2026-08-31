@@ -21,7 +21,7 @@ status: draft
   - Base: `main` descendant of `78d8876` (CTX-0077 dogfooding harness) and `compat-lab` scaffold (CTX-0074).
 - Companion tasks:
   - **CTX-0085** — differential comparator (`tests/compat` grid hash/damage vs reference dumps, headless `forbid(unsafe)`).
-  - **CTX-0086** — pinned reference dumps (`ghostty`/`kitty`/`wezterm`/`alacritty`/`xterm` under `tmp/references/<emulator>/`, revision+license).
+  - **CTX-0086** — pinned reference dumps (`ghostty`/`kitty`/`wezterm`/`alacritty`/`xterm` under `recordings/references/<emulator>/`, revision+license).
 - Scope: human-in-loop manual regression — the same 7 surfaces as the automated compat lab (`prompt marks`, `nvim`, `tmux`, `fzf/htop`, `ssh`, `mouse`, `kitty keyboard/modifyOtherKeys`) plus shell-integration parity (`ghostty`/`kitty` vs `bitty`). Automated leg stays bounded/headless; this doc is the **manual extension**.
 - Authority: OQ-004 remains `Proposed` until `compatibility-milestone-rfc.md` is accepted. This doc does not close OQ-004, does not claim daily-driver completeness, and does not weaken normative security controls in `bitty-docs/docs/security/`.
 
@@ -36,7 +36,7 @@ status: draft
 | Leg       | Where                                                                                              | What                                                                                                                                                   | Bound                                                                             | CI-blocking                                            | Evidence                                                     |
 | --------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ |
 | Automated | `crates/bitty-runtime/tests/dogfooding.rs` + `tests/compat/harness.rs` + `crates/bitty-compat-lab` | `Parser -> TerminalAction -> State -> Snapshot` on `<=8 KiB` corpora, `<=4096` actions, `ZONE_RECORDS_MAX 1024`, deterministic re-parse + `state_hash` | `READ_CHUNK_SIZE 8 KiB`, `MAX_CORPUS_BYTES 8192`, `MAX_ACTIONS 4096`, wall `90 s` | yes — `just check` + `cargo test --workspace --locked` | `eprintln!` findings table, `cargo test -p bitty-compat-lab` |
-| Manual    | this doc                                                                                           | Windowed bitty vs ghostty/kitty/wezterm/alacritty on the same bytes/key/mouse sequence                                                                 | human bounded (~15 s per row, `grim` file `<2 MiB`)                               | **no** — human-run, not wired to `just check`          | `tmp/manual-smoke/<date>/` + table below                     |
+| Manual    | this doc                                                                                           | Windowed bitty vs ghostty/kitty/wezterm/alacritty on the same bytes/key/mouse sequence                                                                 | human bounded (~15 s per row, `grim` file `<2 MiB`)                               | **no** — human-run, not wired to `just check`          | `recordings/manual-smoke/<date>/` + table below                     |
 
 No window/GPU leak in automated checks — `rg -n winit|wgpu|Window|Surface tests/compat crat
 es/bitty-compat-lab crates/bitty-runtime/tests/dogfooding.rs` must be `0` except forbid comments (same rule as `dogfooding.md`). Manual screenshots via `grim` are human-run and live outside the repo.
@@ -62,7 +62,7 @@ nvim: <nvim --version | head -1>  tmux: <tmux -V>  fzf: <fzf --version>  htop: <
 2. Open bitty and one reference terminal side-by-side on workspace 9 (Hyprland dwindle split).
 3. Feed the same bytes/interactions to both; capture windowed evidence only via `grim` (see Screenshot guidance).
 4. Fill the row's `Actual (bitty)` and `Status` in place; keep `Expected (reference)` verbatim from the reference emulator's observed grid/title/zones.
-5. Store artefacts under `tmp/manual-smoke/<YYYY-MM-DD>/` (ignored, not committed) — commit only the **filled table** to the checkpoint note, not the PNGs.
+5. Store artefacts under `recordings/manual-smoke/<YYYY-MM-DD>/` (ignored, not committed) — commit only the **filled table** to the checkpoint note, not the PNGs.
 
 ## 1 — Prompt marks — `OSC 133` zones + `OSC 7` cwd
 
@@ -144,7 +144,7 @@ Shell integration ownership stays host-shell side (`zsh`/`fish` `OSC 133/7` plug
 
 One matrix row per manual scenario; **Expected** is what the reference panel showed, **Actual** is bitty on the same bytes/keys/mouse. Fill `Verdict` as `PASS` / `DIFF:<reason>` / `SKIP:<tool missing>` and file a follow-up when `DIFF`.
 
-| Area       | #   | Scenario                | References exercised | Expected (panel consensus = ghostty/kitty/wezterm/alacritty) | Actual (bitty) | Verdict | Artefact (`tmp/manual-smoke/<date>/…`) |
+| Area       | #   | Scenario                | References exercised | Expected (panel consensus = ghostty/kitty/wezterm/alacritty) | Actual (bitty) | Verdict | Artefact (`recordings/manual-smoke/<date>/…`) |
 | ---------- | --- | ----------------------- | -------------------- | ------------------------------------------------------------ | -------------- | ------- | -------------------------------------- |
 | prompt     | 1.1 | `133;A/B`               | g/k/w/a              | zones `A`+`B` visible in reference dumps                     |                |         | `01-prompt-AB.png`                     |
 | prompt     | 1.2 | `133;C/D`               | g/k/w                | `C`/`D` with exit code in ghostty JSON, marks in kitty       |                |         | `02-prompt-CD.png`                     |
@@ -185,27 +185,27 @@ Headless companion rows are green when `cargo test -p bitty-compat-lab` + `cargo
 - **Window capture (preferred — avoids slurp in CI logs):**
 
   ```bash
-  mkdir -p tmp/manual-smoke/$(date +%F)
+  mkdir -p recordings/manual-smoke/$(date +%F)
   # list windows on workspace 9, then capture one by address
   hyprctl clients -j | jq -r '.[] | select(.workspace.id==9) | "\(.address) \(.class) \(.title)"'
-  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="bitty") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" tmp/manual-smoke/$(date +%F)/01-bitty.png
-  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="kitty")  | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" tmp/manual-smoke/$(date +%F)/01-kitty.png
+  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="bitty") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recordings/manual-smoke/$(date +%F)/01-bitty.png
+  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="kitty")  | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recordings/manual-smoke/$(date +%F)/01-kitty.png
   # or interactive (human only)
-  grim -g "$(slurp)" tmp/manual-smoke/$(date +%F)/manual-$(date +%H%M%S).png
+  grim -g "$(slurp)" recordings/manual-smoke/$(date +%F)/manual-$(date +%H%M%S).png
   ```
 
-- **Full-workspace fallback (when addresses drift):** `grim tmp/manual-smoke/$(date +%F)/workspace-9-$(date +%H%M%S).png`.
+- **Full-workspace fallback (when addresses drift):** `grim recordings/manual-smoke/$(date +%F)/workspace-9-$(date +%H%M%S).png`.
 - **Grid dump (text) alongside PNGs** — prefer text diffs for the comparator (CTX-0085) and keep PNGs as visual sanity:
 
   ```bash
   # kitty / ghostty / wezterm dumps of the same PTY bytes
-  kitty --dump-commands > tmp/manual-smoke/$(date +%F)/kitty-dump.json
-  wezterm record --cwd . > tmp/manual-smoke/$(date +%F)/wezterm-record.json
+  kitty --dump-commands > recordings/manual-smoke/$(date +%F)/kitty-dump.json
+  wezterm record --cwd . > recordings/manual-smoke/$(date +%F)/wezterm-record.json
   # bitty headless snapshot for the same bytes
-  cargo test -p bitty-compat-lab -- --nocapture > tmp/manual-smoke/$(date +%F)/bitty-snapshot.txt
+  cargo test -p bitty-compat-lab -- --nocapture > recordings/manual-smoke/$(date +%F)/bitty-snapshot.txt
   ```
 
-- **Storage:** `tmp/manual-smoke/<YYYY-MM-DD>/` is git-ignored and stays out of the PR — it is not `tmp/references/` (which is revision-pinned). Commit only the filled comparison matrix, not the PNGs.
+- **Storage:** `recordings/manual-smoke/<YYYY-MM-DD>/` is git-ignored and stays out of the PR — it is not `recordings/references/` (which is revision-pinned). Commit only the filled comparison matrix, not the PNGs.
 - **Bounded artefacts:** `grim` PNGs are target `<2 MiB`; failed captures are re-taken, not accumulated. Do not wrap `grim` in a loop that spams screenshots.
 - **No GPU leak in repo:** `rg -n "grim|hyprctl|winit|wgpu|Window|Surface" crates/ tests/ scripts/` must still be `0` except in this doc and `docs/product/soak-0.0.1.md`/`dogfooding.md` where those strings appear only as documentation/forbid lists. Automated harness never invokes them; see `crates/bitty-compat-lab/tests/harness.rs:11` and `crates/bitty-runtime/tests/dogfooding.rs:1`.
 
@@ -247,7 +247,7 @@ This doc itself is **not** a gate — its rows are `draft` until a human fills `
 - Compatibility lab scaffold + harness (`Parser -> State`, `MAX_CORPUS_BYTES`): [`compat-lab.md`](./compat-lab.md) (CTX-0074) and `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui}/` corpora.
 - Soak evidence (headless/real PTY/winit/wgpu/`hyprctl`+`grim` perf): [`soak-0.0.1.md`](./soak-0.0.1.md) (CTX-0067).
 - Perf baseline (PB-1..PB-7): [`perf-baseline.md`](./perf-baseline.md).
-- Reference dumps (CTX-0086, read-only): `tmp/references/<emulator>/` per `tmp/references/README.md` (ghostty `8867c37` MIT, kitty `087b8c3` GPL-3.0, wezterm `f93d903` MIT, alacritty/xterm pinned separately).
+- Reference dumps (CTX-0086, read-only): `recordings/references/<emulator>/` per `recordings/references/README.md` (ghostty `8867c37` MIT, kitty `087b8c3` GPL-3.0, wezterm `f93d903` MIT, alacritty/xterm pinned separately).
 - Comparator harness (CTX-0085, grid hash/damage vs dumps): `crates/bitty-compat-lab/tests/harness.rs` (`compat_corpus_is_bounded_and_deterministic`, bounded `forbid(unsafe)`).
 - Release ladder + `v0.1`–`v1.0` crates: [`release-ladder.md`](./release-ladder.md).
 - Security gates for `v1.0` remain normative in [`security/overview.md`](../../../bitty-docs/docs/security/overview.md) and [`threat-model.md`](../../../bitty-docs/docs/security/threat-model.md); this manual checklist does not weaken them.

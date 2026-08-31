@@ -79,7 +79,7 @@ Lab is headless (`Parser -> TerminalAction -> State` only), bounded,
 `Window`/`Surface` must be 0). Detailed runbook and corpora plan live in
 [`compat-lab.md`](./compat-lab.md). This scaffold does not close OQ-004 nor
 accept the `v0.2` slice; it provides the reviewable layout for follow-up real
-`vttest` captures and reference dumps pinned in `tmp/references/`.
+`vttest` captures and reference dumps pinned in `recordings/references/`.
 
 ## Workspace version mapping
 

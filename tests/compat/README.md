@@ -53,4 +53,4 @@ Search `tests/compat` — must contain zero `winit`, `wgpu`, `Window`, `Surface`
 
 ## Next
 
-Phase C scaffold leaves corpora as placeholders (each `< 1 KiB`, bounded). Real captures land in Phase C follow-up after `vttest` runbook and Ghostty/kitty/WezTerm dump tooling are pinned in `tmp/references/`.
+Phase C scaffold leaves corpora as placeholders (each `< 1 KiB`, bounded). Real captures land in Phase C follow-up after `vttest` runbook and Ghostty/kitty/WezTerm dump tooling are pinned in `recordings/references/`.

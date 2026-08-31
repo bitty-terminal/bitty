@@ -122,9 +122,9 @@ Platform Input (winit)
 
 ## Next
 
-- Wire `tests/compat/unicode/corpus/*.bin` (and existing categories) into a `cargo test` harness that calls `harness::parse_bounded` + `State` and optionally diffs against checked-in `unicode/reference/*.txt` grid dumps (Phase C follow-up after `vttest` pin in `tmp/references/`).
+- Wire `tests/compat/unicode/corpus/*.bin` (and existing categories) into a `cargo test` harness that calls `harness::parse_bounded` + `State` and optionally diffs against checked-in `unicode/reference/*.txt` grid dumps (Phase C follow-up after `vttest` pin in `recordings/references/`).
 - Land `bitty-platform::PlatformEvent::Ime*` + `ImeState` (bounded overlay data) and `bitty-runtime` commit-to-PTY wiring as the IME implementation slice (requires input-domain ADR acceptance). Until then, this draft is the reviewable seam.
-- Land `terminfo/bitty.ti` draft and record the `terminfo` revision in `tmp/references/` when accepted.
+- Land `terminfo/bitty.ti` draft and record the `terminfo` revision in `recordings/references/` when accepted.
 
 ## References
 

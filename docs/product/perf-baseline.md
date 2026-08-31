@@ -117,7 +117,7 @@ Each tool prints the PB budget line, the headless proxy note, and the `timeout` 
 ## Next
 
 - Wire `benches/*` into CI `cargo bench --no-run` gate (supplement to `just check`) without requiring a display.
-- Pin reference hardware + OS (`specifications/performance-budget-rfc.md` Open items) and define the fixed synthetic corpus revision in `tmp/references/` before tightening to hard gates.
+- Pin reference hardware + OS (`specifications/performance-budget-rfc.md` Open items) and define the fixed synthetic corpus revision in `recordings/references/` before tightening to hard gates.
 - Replace `tools/perf/*` `--help` proxies with real `bitty-app` cold-to-first-frame and Wayland photon timings on a Tier 1 box (requires display server, not CI).
 - Land real `hyperfine` + `ps` + compositor traces on the reference machine and record p50/p99 + variance in this doc.
 - Coordinate OQ-014 isolation so plugin VM creation cost is charged against plugin budgets, not PB-2/PB-3.

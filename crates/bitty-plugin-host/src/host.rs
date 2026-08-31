@@ -379,7 +379,23 @@ impl PluginHost {
 
     /// Dispose a plugin (releases generation resources).
     pub fn dispose(&mut self, id: &PluginId) -> Result<(), PluginError> {
-        self.registry.dispose(id)
+        let events = self
+            .registry
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?
+            .subscribed_events
+            .clone();
+        let result = self.registry.dispose(id);
+        if result.is_ok() {
+            // Drop all generation-owned queues only after the lifecycle transition
+            // succeeds. This is the reclaim boundary for PB-3.
+            for event in events {
+                if let Ok(kind) = EventKind::parse(&event) {
+                    let _ = self.pipeline.unsubscribe(id, &kind);
+                }
+            }
+        }
+        result
     }
 
     /// Reload: dispose generation `N` resources before activating `N+1` atomically.
@@ -388,7 +404,102 @@ impl PluginHost {
         id: &PluginId,
         new_manifest: PluginManifest,
     ) -> Result<Generation, PluginError> {
-        self.registry.reload(id, new_manifest)
+        new_manifest.validate()?;
+        if new_manifest.id() != id {
+            return Err(PluginError::registry(format!(
+                "replacement manifest id '{}' does not match requested plugin '{}'",
+                new_manifest.id(),
+                id
+            )));
+        }
+        if self.safe_mode && !id.as_str().starts_with("bitty.") {
+            return Err(PluginError::registry(format!(
+                "safe mode: plugin '{}' is not a built-in plugin",
+                id
+            )));
+        }
+
+        // Validate all replacement authority before the registry can release the
+        // current generation. This keeps reload fail-closed and transactional.
+        let required = Self::required_capabilities(&new_manifest)?;
+        if !required.is_empty() {
+            let hash = new_manifest.manifest_hash();
+            let record = self.grants.get(id).ok_or_else(|| {
+                PluginError::grant(format!(
+                    "missing grant record for '{}' (manifest hash {})",
+                    id.as_str(),
+                    hash
+                ))
+            })?;
+            if record.denied || self.grants.is_denied(id) {
+                return Err(PluginError::grant(format!(
+                    "plugin '{}' is denied (manifest hash {})",
+                    id.as_str(),
+                    hash
+                )));
+            }
+            if record.manifest_hash != hash {
+                return Err(PluginError::grant(format!(
+                    "manifest hash mismatch for '{}': expected {}, got {}",
+                    id.as_str(),
+                    hash,
+                    record.manifest_hash
+                )));
+            }
+            let missing: Vec<String> = required
+                .iter()
+                .filter(|cap| {
+                    !self
+                        .grants
+                        .is_granted(id, &hash, cap, &new_manifest.capabilities)
+                })
+                .map(|cap| cap.as_str().to_string())
+                .collect();
+            if !missing.is_empty() {
+                return Err(PluginError::grant(format!(
+                    "missing grants for '{}' (hash {}): {}",
+                    id.as_str(),
+                    hash,
+                    missing.join(", ")
+                )));
+            }
+        }
+
+        let old_events = self
+            .registry
+            .get(id)
+            .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?
+            .subscribed_events
+            .clone();
+        let generation = self.registry.reload(id, new_manifest)?;
+        // A generation owns its subscriptions. Reclaim the old queues only after
+        // registry reload commits, so a failed reload leaves the old generation intact.
+        for event in old_events {
+            if let Ok(kind) = EventKind::parse(&event) {
+                let _ = self.pipeline.unsubscribe(id, &kind);
+            }
+        }
+        Ok(generation)
+    }
+
+    fn required_capabilities(
+        manifest: &PluginManifest,
+    ) -> Result<BTreeSet<CapabilityId>, PluginError> {
+        let mut required = manifest.capabilities.ids.clone();
+        for request in &manifest.capabilities.filesystem {
+            for path in &request.paths {
+                let capability = match request.access {
+                    FsAccess::Read => format!("fs.read:{path}"),
+                    FsAccess::Write => format!("fs.write:{path}"),
+                };
+                required.insert(CapabilityId::parse(&capability).map_err(|error| {
+                    PluginError::grant(format!(
+                        "invalid filesystem capability '{capability}': {error}"
+                    ))
+                })?);
+            }
+        }
+        Ok(required)
     }
 
     /// Access the registry (read-only).
@@ -865,7 +976,7 @@ mod tests {
             1,
         ));
 
-        assert!(!host.is_granted(&id, &hash, &CapabilityId::parse("clipboard.read").unwrap(),));
+        assert!(!host.is_granted(&id, &hash, &CapabilityId::parse("clipboard.read").unwrap()));
         assert!(!host.is_granted(
             &id,
             &hash,
@@ -954,5 +1065,185 @@ mod tests {
         assert!(!host.is_safe_mode());
         assert!(host.side_queue().is_empty());
         assert_eq!(host.pipeline().queue_count(), 0);
+    }
+
+    #[test]
+    fn dispose_reclaims_generation_queues() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = minimal_manifest("xuepoo.reclaim", vec!["terminal.bell"]);
+        let id = m.identity.id.clone();
+        host.declare(m).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        host.subscribe(&id, EventKind::TerminalBell).unwrap();
+        host.publish_to(
+            &id,
+            Event::new(EventKind::TerminalBell, EventPayload::Empty, 1),
+        )
+        .unwrap();
+        assert_eq!(host.total_queued_events(), 1);
+        host.dispose(&id).unwrap();
+        assert_eq!(host.total_queued_events(), 0);
+        assert_eq!(host.pipeline().queue_count(), 0);
+        assert!(host.invariant_queue_bounds());
+    }
+
+    #[test]
+    fn failed_reload_preserves_current_generation_and_queues() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = minimal_manifest("xuepoo.atomic", vec!["terminal.bell"]);
+        let id = m.identity.id.clone();
+        host.declare(m.clone()).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        host.subscribe(&id, EventKind::TerminalBell).unwrap();
+        host.publish_to(
+            &id,
+            Event::new(EventKind::TerminalBell, EventPayload::Empty, 7),
+        )
+        .unwrap();
+
+        let mut invalid = minimal_manifest("xuepoo.atomic", vec!["terminal.bell"]);
+        invalid.raw_bytes_len = crate::manifest::MANIFEST_MAX_BYTES + 1;
+        let err = host.reload(&id, invalid).unwrap_err();
+        assert!(format!("{err}").contains("raw_bytes_len") || format!("{err}").contains("limit"));
+        assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+        assert_eq!(host.total_queued_events(), 1);
+        assert_eq!(
+            host.drain(&id, &EventKind::TerminalBell).unwrap()[0].sequence,
+            7
+        );
+    }
+
+    #[test]
+    fn successful_reload_reclaims_old_queues_before_new_subscription() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let m = minimal_manifest("xuepoo.reload", vec!["terminal.bell"]);
+        let id = m.identity.id.clone();
+        host.declare(m).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        host.subscribe(&id, EventKind::TerminalBell).unwrap();
+        host.publish_to(
+            &id,
+            Event::new(EventKind::TerminalBell, EventPayload::Empty, 11),
+        )
+        .unwrap();
+        assert_eq!(host.queued_events_for_plugin(&id), 1);
+
+        let generation = host
+            .reload(
+                &id,
+                minimal_manifest("xuepoo.reload", vec!["terminal.bell"]),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+        assert_eq!(host.total_queued_events(), 0);
+        assert_eq!(host.pipeline().queue_count(), 0);
+        // Reload keeps the replacement event declaration, but subscriptions are
+        // generation-owned and must be explicitly recreated by the host.
+        assert_eq!(
+            host.registry().get(&id).unwrap().subscribed_events,
+            vec!["terminal.bell".to_string()]
+        );
+        assert!(host.subscribe(&id, EventKind::TerminalBell).is_ok());
+        assert_eq!(host.pipeline().queue_count(), 1);
+        assert!(host.invariant_queue_bounds());
+    }
+
+    #[test]
+    fn reload_rejects_identity_mismatch_without_mutation() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let manifest = minimal_manifest("xuepoo.identity", vec![]);
+        let id = manifest.identity.id.clone();
+        host.declare(manifest).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+
+        let replacement = minimal_manifest("xuepoo.other", vec![]);
+        assert!(
+            host.reload(&id, replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+        assert_eq!(
+            host.registry().get(&id).unwrap().state,
+            PluginState::Registered
+        );
+    }
+
+    #[test]
+    fn reload_rejects_new_or_undeclared_capability_before_commit() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let current = manifest_with_caps("xuepoo.capreload", vec!["terminal.semantic-read"]);
+        let id = current.identity.id.clone();
+        host.declare(current.clone()).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+
+        let replacement = manifest_with_caps("xuepoo.capreload", vec!["ui.rich"]);
+        let hash = replacement.manifest_hash();
+        let mut grants = std::collections::BTreeSet::new();
+        grants.insert(CapabilityId::parse("terminal.semantic-read").unwrap());
+        host.insert_grant(GrantRecord::granted(id.clone(), hash, grants, 1));
+
+        assert!(
+            host.reload(&id, replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("missing grants")
+        );
+        assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+        assert_eq!(host.registry().get(&id).unwrap().manifest, current);
+    }
+
+    #[test]
+    fn reload_rejects_hash_and_denial_before_commit() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let current = manifest_with_caps("xuepoo.grantreload", vec!["ui.rich"]);
+        let id = current.identity.id.clone();
+        host.declare(current).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        let replacement = manifest_with_caps("xuepoo.grantreload", vec!["ui.rich"]);
+        host.insert_grant(GrantRecord::granted(
+            id.clone(),
+            "wrong-hash",
+            std::collections::BTreeSet::new(),
+            1,
+        ));
+        assert!(host.reload(&id, replacement.clone()).is_err());
+        host.insert_grant(GrantRecord::denied(
+            id.clone(),
+            replacement.manifest_hash(),
+            2,
+        ));
+        assert!(
+            host.reload(&id, replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("denied")
+        );
+        assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+    }
+
+    #[test]
+    fn reload_matches_declare_safe_mode_policy() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let manifest = minimal_manifest("xuepoo.safe", vec![]);
+        let id = manifest.identity.id.clone();
+        host.declare(manifest).unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        host.set_safe_mode(true);
+        assert!(
+            host.reload(&id, minimal_manifest("xuepoo.safe", vec![]))
+                .unwrap_err()
+                .to_string()
+                .contains("safe mode")
+        );
+        assert_eq!(host.registry().get(&id).unwrap().generation, 1);
     }
 }

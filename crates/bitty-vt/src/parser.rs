@@ -113,14 +113,33 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
         }));
     }
 
-    fn dispatch_mode(&mut self, code: u16, enabled: bool) {
-        // Kitty progressive flags (7727) carry a bitmask in secondary params;
-        // for the vertical slice we map any 7727 enable to flags=1 (legacy disambiguation)
-        // and disable to 0, bounded to u32.
-        // TODO(Curated): extract progressive sub-params (e.g. `1:2:5`) and mask
-        // `flags & 0x1F` into `Mode::KittyKeyboard(flags)` so multiple flags are
-        // not collapsed to `1`. State masking `& 0x1F` is already correct; this
-        // TODO widens parser fidelity without changing the bounded state contract.
+    fn kitty_flags_from_sub(sub: &[u16]) -> u32 {
+        // Progressive Kitty flags: sub[0] == 7727, remaining entries are colon-
+        // separated flag identifiers. Each identifier is either a 1-indexed flag
+        // number (1..5 -> bit 0..4) or a direct bitmask fragment. We handle both:
+        // values 1..5 map via 1 << (v-1), values 6..31 are treated as direct
+        // mask fragments (masked to 0x1F). This covers `1:2:5` -> 19 and `19`
+        // -> 19 deterministically, bounded to 5 bits.
+        if sub.len() <= 1 {
+            return 1;
+        }
+        let mut flags: u32 = 0;
+        for &v in &sub[1..] {
+            if v == 0 {
+                continue;
+            }
+            if (1..=5).contains(&v) {
+                flags |= 1u32 << (v - 1);
+            } else {
+                flags |= u32::from(v) & 0x1F;
+            }
+        }
+        if flags == 0 { 1 } else { flags & 0x1F }
+    }
+
+    fn dispatch_mode(&mut self, params: &Params, index: usize, enabled: bool) {
+        let sub = sub_params(params, index).unwrap_or(&[]);
+        let code = sub.first().copied().unwrap_or(0);
         let mapped = match code {
             1 => Some(Mode::ApplicationCursorKeys),
             3 => Some(Mode::Column132),
@@ -141,7 +160,28 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
                 MouseCoordinateEncoding::Urxvt,
             )),
             2004 => Some(Mode::BracketedPaste),
-            7727 => Some(Mode::KittyKeyboard(if enabled { 1 } else { 0 })),
+            7727 => {
+                let flags = if enabled {
+                    Self::kitty_flags_from_sub(sub)
+                } else if sub.len() > 1 {
+                    // Progressive disable: extract flags to clear; if none, 0 means all
+                    let mut f: u32 = 0;
+                    for &v in &sub[1..] {
+                        if v == 0 {
+                            continue;
+                        }
+                        if (1..=5).contains(&v) {
+                            f |= 1u32 << (v - 1);
+                        } else {
+                            f |= u32::from(v) & 0x1F;
+                        }
+                    }
+                    f & 0x1F
+                } else {
+                    0
+                };
+                Some(Mode::KittyKeyboard(flags))
+            }
             _ => None,
         };
         match mapped {
@@ -507,21 +547,87 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
 
         if private && matches!(final_byte, b'h' | b'l') {
             let enabled = final_byte == b'h';
-            for position in 0..params.len() {
-                let code = sub_params(params, position)
-                    .and_then(<[u16]>::first)
-                    .copied()
-                    .unwrap_or(0);
+            let mut idx = 0;
+            while idx < params.len() {
+                let sub = sub_params(params, idx).unwrap_or(&[]);
+                let code = sub.first().copied().unwrap_or(0);
                 if code == 25 {
                     self.emit(TerminalAction::CursorVisibility { visible: enabled });
+                    idx += 1;
                 } else if code == 1048 {
                     self.emit(if enabled {
                         TerminalAction::CursorSave
                     } else {
                         TerminalAction::CursorRestore
                     });
+                    idx += 1;
+                } else if code == 7727 {
+                    // Progressive Kitty flags: colon subparams inside same entry plus
+                    // semicolon-separated flag masks immediately following this entry.
+                    let mut flags = if enabled {
+                        Self::kitty_flags_from_sub(sub)
+                    } else if sub.len() > 1 {
+                        let mut f: u32 = 0;
+                        for &v in &sub[1..] {
+                            if v == 0 {
+                                continue;
+                            }
+                            if (1..=5).contains(&v) {
+                                f |= 1u32 << (v - 1);
+                            } else {
+                                f |= u32::from(v) & 0x1F;
+                            }
+                        }
+                        f & 0x1F
+                    } else {
+                        0
+                    };
+                    let had_colon = sub.len() > 1;
+                    let mut consumed = 0usize;
+                    let mut agg = flags;
+                    let mut look = idx + 1;
+                    // Consume following `;`-separated flag values (small numbers) as part of same Kitty negotiation.
+                    // This matches the `;`-separated bitmask description while keeping distinct mode numbers like 1000 separate.
+                    while look < params.len() {
+                        let next_sub = sub_params(params, look).unwrap_or(&[]);
+                        if next_sub.is_empty() {
+                            break;
+                        }
+                        let next_code = next_sub[0];
+                        if next_code == 7727 {
+                            break;
+                        }
+                        if next_sub.len() > 1 {
+                            break;
+                        }
+                        if next_code > 31 {
+                            break;
+                        }
+                        if next_code == 25 || next_code == 1048 {
+                            break;
+                        }
+                        // Treat as Kitty flag fragment
+                        if !had_colon && consumed == 0 && agg == 1 {
+                            // `7727` alone defaults to 1; a following `;19` should replace it, not OR with 1
+                            agg = 0;
+                        }
+                        let add: u32 = u32::from(next_code) & 0x1F;
+                        agg |= add;
+                        consumed += 1;
+                        look += 1;
+                    }
+                    if consumed > 0 {
+                        flags = agg & 0x1F;
+                        if flags == 0 && enabled {
+                            flags = 1;
+                        }
+                    }
+                    let mode = Mode::KittyKeyboard(flags);
+                    self.emit(TerminalAction::SetMode { mode, enabled });
+                    idx += 1 + consumed;
                 } else {
-                    self.dispatch_mode(code, enabled);
+                    self.dispatch_mode(params, idx, enabled);
+                    idx += 1;
                 }
             }
             return;

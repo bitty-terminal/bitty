@@ -7,12 +7,30 @@
 //! [`HyperlinkId`]) against the table to produce spans, hit tests, and
 //! headless overlay geometry.
 
+use bitty_platform::{validate_file_url, validate_url};
 use bitty_term_state::{HyperlinkId, Snapshot, State};
 
 use crate::geometry::{CellMetrics, RectPx};
 
 /// Re-exported bound from `bitty-term-state`.
 pub const HYPERLINK_TABLE_MAX: usize = bitty_term_state::HYPERLINK_TABLE_MAX;
+
+/// Maximum sizes accepted at the hyperlink presentation boundary.
+pub const HYPERLINK_URI_MAX: usize = bitty_platform::URL_MAX_LEN;
+pub const HYPERLINK_ID_MAX: usize = bitty_vt::BoundedString::MAX_LEN;
+
+/// Validates a terminal-provided URI before it reaches an OS URL handler.
+///
+/// This intentionally does not normalize or invoke a shell. Exact, lowercase
+/// schemes and one-layer percent-encoding checks prevent scheme obfuscation.
+#[must_use]
+pub fn is_safe_hyperlink_uri(uri: &str) -> bool {
+    if uri.starts_with("file:") {
+        validate_file_url(uri).is_ok()
+    } else {
+        validate_url(uri).is_ok()
+    }
+}
 
 /// Resolved hyperlink target plus its optional `id=` parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -53,6 +71,9 @@ pub struct HyperlinkSpan {
 #[must_use]
 pub fn hyperlink_info(state: &State, id: HyperlinkId) -> Option<HyperlinkInfo> {
     let (id_param, uri) = state.hyperlink_entry(id)?;
+    if !is_safe_hyperlink_uri(uri) || id_param.is_some_and(|value| value.len() > HYPERLINK_ID_MAX) {
+        return None;
+    }
     Some(HyperlinkInfo {
         hyperlink_id: id,
         id_param: id_param.map(ToOwned::to_owned),
@@ -76,7 +97,7 @@ pub fn hyperlink_at(
     if row >= snapshot.height || col >= snapshot.width {
         return None;
     }
-    let idx = row * snapshot.width + col;
+    let idx = row.checked_mul(snapshot.width)?.checked_add(col)?;
     let cell = snapshot.cells.get(idx)?;
     if let Some(id) = cell.hyperlink {
         return hyperlink_info(state, id);
@@ -85,7 +106,8 @@ pub fn hyperlink_at(
     // hyperlink of its leading half (wide char pair). This matches the
     // visual expectation that the whole wide glyph is clickable.
     if cell.spacer && col > 0 {
-        let lead = snapshot.cells.get(row * snapshot.width + (col - 1))?;
+        let lead_idx = row.checked_mul(snapshot.width)?.checked_add(col - 1)?;
+        let lead = snapshot.cells.get(lead_idx)?;
         if lead.width == 2 {
             if let Some(id) = lead.hyperlink {
                 return hyperlink_info(state, id);
@@ -106,7 +128,12 @@ pub fn hyperlink_spans(snapshot: &Snapshot, state: &State) -> Vec<HyperlinkSpan>
     for row in 0..snapshot.height {
         let mut col = 0;
         while col < snapshot.width {
-            let idx = row * snapshot.width + col;
+            let Some(idx) = row
+                .checked_mul(snapshot.width)
+                .and_then(|base| base.checked_add(col))
+            else {
+                break;
+            };
             let Some(cell) = snapshot.cells.get(idx) else {
                 col += 1;
                 continue;
@@ -119,15 +146,22 @@ pub fn hyperlink_spans(snapshot: &Snapshot, state: &State) -> Vec<HyperlinkSpan>
                 col += 1;
                 continue;
             };
-            let Some((id_param, uri)) = state.hyperlink_entry(id) else {
+            let Some(info) = hyperlink_info(state, id) else {
                 col += 1;
                 continue;
             };
+            let uri = info.uri.as_str();
             let start = col;
             let mut end = col;
             // Extend while the next leading cell carries the same hyperlink id.
-            while end + 1 < snapshot.width {
-                let next_idx = row * snapshot.width + (end + 1);
+            while end.checked_add(1).is_some_and(|next| next < snapshot.width) {
+                let next_col = end + 1;
+                let Some(next_idx) = row
+                    .checked_mul(snapshot.width)
+                    .and_then(|base| base.checked_add(next_col))
+                else {
+                    break;
+                };
                 let Some(next_cell) = snapshot.cells.get(next_idx) else {
                     break;
                 };
@@ -156,12 +190,15 @@ pub fn hyperlink_spans(snapshot: &Snapshot, state: &State) -> Vec<HyperlinkSpan>
             spans.push(HyperlinkSpan {
                 hyperlink_id: id,
                 uri: uri.to_owned(),
-                id_param: id_param.map(ToOwned::to_owned),
+                id_param: info.id_param,
                 row,
                 col_start: start,
                 col_end: end,
             });
-            col = end + 1;
+            let Some(next_col) = end.checked_add(1) else {
+                break;
+            };
+            col = next_col;
         }
     }
     spans
@@ -336,5 +373,67 @@ mod tests {
         let snap = state.snapshot();
         assert!(hyperlink_at(&snap, &state, 99, 0).is_none());
         assert!(hyperlink_at(&snap, &state, 0, 99).is_none());
+    }
+
+    #[test]
+    fn adversarial_uri_corpus_is_rejected() {
+        for uri in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "java%73cript:alert(1)",
+            "https://example.test/%3Btouch%20/tmp/x",
+            "https://example.test;touch /tmp/x",
+            "https://example.test/`id`",
+            "https://example.test/$(id)",
+            "https://example.test/$HOME",
+            "https://example.test/\\x",
+            "https://example.test/\nnext",
+            "file:///tmp/a|b",
+            "https://example.test/%",
+        ] {
+            assert!(!is_safe_hyperlink_uri(uri), "accepted hostile URI: {uri:?}");
+        }
+    }
+
+    #[test]
+    fn supported_uri_corpus_is_accepted() {
+        for uri in [
+            "https://example.test/path?q=a%20b",
+            "http://127.0.0.1:8080/",
+            "mailto:user@example.test",
+            "file:///tmp/report.txt",
+        ] {
+            assert!(
+                is_safe_hyperlink_uri(uri),
+                "rejected supported URI: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_table_entries_are_not_presented() {
+        let mut state = State::new();
+        state.apply(&TerminalAction::OscHyperlink {
+            link: Some(Hyperlink {
+                id: None,
+                uri: BoundedString::new("javascript:alert(1)"),
+            }),
+        });
+        print(&mut state, "x");
+        let snapshot = state.snapshot();
+        assert!(hyperlink_at(&snapshot, &state, 0, 0).is_none());
+        assert!(hyperlink_spans(&snapshot, &state).is_empty());
+    }
+
+    #[test]
+    fn hyperlink_at_overflow_is_none() {
+        let state = State::new();
+        let snapshot = Snapshot {
+            width: usize::MAX,
+            height: usize::MAX,
+            cells: Vec::new().into(),
+            ..State::new().snapshot()
+        };
+        assert!(hyperlink_at(&snapshot, &state, usize::MAX, usize::MAX).is_none());
     }
 }

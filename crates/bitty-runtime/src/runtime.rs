@@ -2645,6 +2645,9 @@ impl Runtime {
         for chunk in chunks {
             self.handle_pty_bytes(&chunk);
         }
+        // Bounded PTY reply loop: parse->state->replies->writer (4 KiB cap, fail-closed)
+        // Headless (no writer) keeps replies queued for `take_replies` observation.
+        let _ = self.write_replies();
         drained
     }
 
@@ -2983,6 +2986,55 @@ impl Runtime {
     /// master via `PtyWriter`. No upstream type is exposed.
     pub fn take_replies(&mut self) -> Vec<Box<[u8]>> {
         self.state.take_replies()
+    }
+
+    /// Writes pending PTY replies to the PTY writer (bounded, fail-closed).
+    ///
+    /// Forms the `poll_pty()->parse->state->replies->bounded PtyWriter::write_all()`
+    /// loop for DSR/DA/cursor queries (DSR 6, DA `CSI c`, etc.). Bounded by
+    /// `REPLY_CAP_BYTES` (4 KiB) in `State` (DropNewest per RFC invariant 7
+    /// and counted via `replies_overflowed`). The hot path (`handle_pty_bytes`
+    /// parsing and state apply) never blocks; this method is the only
+    /// producer into the PTY master for replies and is best-effort, never
+    /// panics, never interpolates through a shell, and never grows without
+    /// bound. No shell interpolation, no unbounded buffering.
+    ///
+    /// When no live `PtyWriter` is owned (headless CI), the replies remain
+    /// queued for `take_replies` observation and no I/O is performed (0
+    /// returned). When a writer is present the replies are drained and each
+    /// chunk is `write_all` + `flush` best-effort; errors are ignored
+    /// (fail-closed, reply dropped, overflow already counted). Returns the
+    /// total bytes successfully written (≤ 4 KiB, bounded).
+    pub fn write_replies(&mut self) -> usize {
+        if self.pty_writer.is_none() {
+            return 0;
+        }
+        let replies = self.state.take_replies();
+        if replies.is_empty() {
+            return 0;
+        }
+        let Some(writer) = self.pty_writer.as_mut() else {
+            return 0;
+        };
+        let mut total = 0usize;
+        use std::io::Write as _;
+        for chunk in replies {
+            // Each chunk is bounded; total bounded by REPLY_CAP_BYTES (4 KiB).
+            // Best-effort, fail-closed: on write error break and drop remainder.
+            if writer.write_all(&chunk).is_ok() {
+                total += chunk.len();
+            } else {
+                break;
+            }
+        }
+        let _ = writer.flush();
+        total
+    }
+
+    /// Alias for `write_replies` for embedders that use the `flush_pty_replies`
+    /// name (both drain through the same bounded, fail-closed writer path).
+    pub fn flush_pty_replies(&mut self) -> usize {
+        self.write_replies()
     }
 
     /// Whether any reply was dropped due to the cap since the last drain.

@@ -126,6 +126,7 @@ mod tests {
         print(&mut state, "hi");
         state.apply(&TerminalAction::OscPromptMark {
             kind: ZoneKind::PromptStart,
+            exit_code: None,
         });
         let snap = state.snapshot();
         let metrics = CellMetrics {

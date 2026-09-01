@@ -92,6 +92,7 @@ fn fixed_scenarios_replay_byte_identically() {
         },
         TerminalAction::OscPromptMark {
             kind: bitty_vt::ZoneKind::OutputStart,
+            exit_code: None,
         },
         TerminalAction::SetMode {
             mode: Mode::AlternateScreenClearAndRestore,

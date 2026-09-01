@@ -18,6 +18,7 @@ pub const SHELL_ZONE_MAX: usize = ZONE_RECORDS_MAX;
 /// `PromptStart -> InputStart -> OutputStart -> OutputEnd`. Real shells
 /// may emit subsets; fields are `Option` to capture partial signals. Each
 /// region is bounded by the ordinals that produced it, not by grid rows.
+/// `OutputEnd` may carry an exit code (`OSC 133;D;code`).
 /// A future RFC may add row anchoring; this draft keeps the headless log
 /// view and groups by ordinal sequence only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -30,6 +31,8 @@ pub struct CommandRegion {
     pub output_start: Option<u64>,
     /// Ordinal of the `OutputEnd` (`D`) that closed command output, if seen.
     pub output_end: Option<u64>,
+    /// Exit status for the command, if reported via `OSC 133;D;code`.
+    pub exit_code: Option<i32>,
 }
 
 impl CommandRegion {
@@ -106,6 +109,7 @@ impl ShellIntegration {
                         input_start: None,
                         output_start: None,
                         output_end: None,
+                        exit_code: None,
                     });
                 }
                 ZoneKind::InputStart => {
@@ -114,6 +118,7 @@ impl ShellIntegration {
                         input_start: None,
                         output_start: None,
                         output_end: None,
+                        exit_code: None,
                     });
                     if entry.input_start.is_none() {
                         entry.input_start = Some(record.ordinal);
@@ -125,6 +130,7 @@ impl ShellIntegration {
                         input_start: None,
                         output_start: None,
                         output_end: None,
+                        exit_code: None,
                     });
                     if entry.output_start.is_none() {
                         entry.output_start = Some(record.ordinal);
@@ -136,9 +142,11 @@ impl ShellIntegration {
                         input_start: None,
                         output_start: None,
                         output_end: None,
+                        exit_code: None,
                     });
                     if entry.output_end.is_none() {
                         entry.output_end = Some(record.ordinal);
+                        entry.exit_code = record.exit_code;
                     }
                 }
             }
@@ -164,7 +172,17 @@ mod tests {
     use bitty_term_state::{State, TerminalAction, ZoneKind};
 
     fn mark(state: &mut State, kind: ZoneKind) {
-        state.apply(&TerminalAction::OscPromptMark { kind });
+        state.apply(&TerminalAction::OscPromptMark {
+            kind,
+            exit_code: None,
+        });
+    }
+
+    fn mark_with_exit(state: &mut State, code: i32) {
+        state.apply(&TerminalAction::OscPromptMark {
+            kind: ZoneKind::OutputEnd,
+            exit_code: Some(code),
+        });
     }
 
     #[test]
@@ -249,5 +267,31 @@ mod tests {
         let zones = ShellIntegration::zones(&state);
         // First 5 ordinals evicted, so oldest retained is 6.
         assert_eq!(zones.first().unwrap().ordinal, 6);
+    }
+
+    #[test]
+    fn exit_code_captured_on_output_end() {
+        let mut state = State::new();
+        mark(&mut state, ZoneKind::PromptStart);
+        mark_with_exit(&mut state, 42);
+        let zones = ShellIntegration::zones(&state);
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones[1].kind, ZoneKind::OutputEnd);
+        assert_eq!(zones[1].exit_code, Some(42));
+        let regions = ShellIntegration::command_regions(&state);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].exit_code, Some(42));
+    }
+
+    #[test]
+    fn prompt_start_exit_code_always_none() {
+        let mut state = State::new();
+        // Even if we try to set exit_code on PromptStart, State discards it.
+        state.apply(&TerminalAction::OscPromptMark {
+            kind: ZoneKind::PromptStart,
+            exit_code: Some(99),
+        });
+        let zones = ShellIntegration::zones(&state);
+        assert_eq!(zones[0].exit_code, None);
     }
 }

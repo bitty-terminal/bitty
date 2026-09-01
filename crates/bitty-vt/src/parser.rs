@@ -904,7 +904,15 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                         return;
                     }
                 };
-                self.emit(TerminalAction::OscPromptMark { kind });
+                // For D (OutputEnd) parse optional exit code: second segment after `D` may be `;<code>`.
+                let exit_code = if kind == ZoneKind::OutputEnd {
+                    rest.get(1)
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                } else {
+                    None
+                };
+                self.emit(TerminalAction::OscPromptMark { kind, exit_code });
             }
             _ => {
                 let data = join_segments(rest);
@@ -1539,7 +1547,10 @@ mod tests {
             let sequence = [&b"\x1b]133;"[..], &[letter][..], &b";extra\x07"[..]].concat();
             assert_eq!(
                 parse(&sequence),
-                vec![TerminalAction::OscPromptMark { kind }]
+                vec![TerminalAction::OscPromptMark {
+                    kind,
+                    exit_code: None
+                }]
             );
         }
         assert_eq!(

@@ -53,6 +53,9 @@ pub struct ZoneRecord {
     pub ordinal: u64,
     /// Which zone boundary was marked.
     pub kind: ZoneKind,
+    /// Exit status for `OutputEnd` (`D`), `None` otherwise or on parse failure.
+    /// Bounded: validated as signed 32-bit integer; malformed yields `None`.
+    pub exit_code: Option<i32>,
 }
 
 /// Versioned read-only view of terminal state for renderers and plugins.
@@ -806,6 +809,10 @@ impl State {
         for record in &self.zones {
             h.u64(record.ordinal);
             h.u8(zone_discriminant(record.kind));
+            h.option_tag(record.exit_code.is_some());
+            if let Some(code) = record.exit_code {
+                h.u32(code as u32);
+            }
         }
 
         h.u64(self.scrollback.next_line_id());
@@ -966,7 +973,9 @@ impl State {
             }
             TerminalAction::OscCwd { url } => self.cwd_report = Some(url.clone()),
             TerminalAction::OscHyperlink { link } => self.osc_hyperlink(link.as_ref()),
-            TerminalAction::OscPromptMark { kind } => self.record_zone(*kind),
+            TerminalAction::OscPromptMark { kind, exit_code } => {
+                self.record_zone(*kind, *exit_code);
+            }
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
 
             TerminalAction::Unknown(report) => match report.kind {
@@ -1642,11 +1651,17 @@ impl State {
         }
     }
 
-    fn record_zone(&mut self, kind: ZoneKind) {
+    fn record_zone(&mut self, kind: ZoneKind, exit_code: Option<i32>) {
         self.zone_counter += 1;
+        let code = if kind == ZoneKind::OutputEnd {
+            exit_code
+        } else {
+            None
+        };
         self.zones.push_back(ZoneRecord {
             ordinal: self.zone_counter,
             kind,
+            exit_code: code,
         });
         while self.zones.len() > ZONE_RECORDS_MAX {
             self.zones.pop_front();

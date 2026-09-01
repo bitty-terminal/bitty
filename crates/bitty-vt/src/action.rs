@@ -635,11 +635,14 @@ pub enum TerminalAction {
     },
     /// Semantic prompt zone marker (`OSC 133`).
     ///
-    /// Optional trailing option segments are currently dropped after the
-    /// zone letter; extending the shape requires an RFC revision.
+    /// For `D` (command output end) an optional `;exit_code` payload carries
+    /// the exit status as a bounded signed integer; other kinds ignore the
+    /// trailing payload. Absent or malformed exit codes are `None`.
     OscPromptMark {
         /// Which zone boundary was marked.
         kind: ZoneKind,
+        /// Exit status for `D` (OutputEnd), `None` for other kinds or on parse failure.
+        exit_code: Option<i32>,
     },
     /// An OSC code with no mapped semantic family, recorded for replay.
     ///

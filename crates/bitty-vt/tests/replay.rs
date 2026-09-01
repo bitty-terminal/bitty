@@ -65,6 +65,7 @@ Compiling bitty-vt v0.0.0\n\
         },
         TerminalAction::OscPromptMark {
             kind: ZoneKind::PromptStart,
+            exit_code: None,
         },
         TerminalAction::SetMode {
             mode: Mode::BracketedPaste,
@@ -93,6 +94,7 @@ Compiling bitty-vt v0.0.0\n\
         TerminalAction::Print(GraphemeCell::from(' ')),
         TerminalAction::OscPromptMark {
             kind: ZoneKind::InputStart,
+            exit_code: None,
         },
         TerminalAction::Print(GraphemeCell::from('c')),
         TerminalAction::Print(GraphemeCell::from('a')),
@@ -108,6 +110,7 @@ Compiling bitty-vt v0.0.0\n\
         TerminalAction::PrintControl(ControlChar(0x0A)),
         TerminalAction::OscPromptMark {
             kind: ZoneKind::OutputStart,
+            exit_code: None,
         },
         TerminalAction::Print(GraphemeCell::from('C')),
         TerminalAction::Print(GraphemeCell::from('o')),
@@ -137,6 +140,7 @@ Compiling bitty-vt v0.0.0\n\
         TerminalAction::PrintControl(ControlChar(0x0A)),
         TerminalAction::OscPromptMark {
             kind: ZoneKind::OutputEnd,
+            exit_code: Some(0),
         },
         TerminalAction::SetMode {
             mode: Mode::AlternateScreenClearAndRestore,

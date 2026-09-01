@@ -43,6 +43,33 @@ impl std::fmt::Display for PanelId {
 }
 
 // ---------------------------------------------------------------------------
+// Identity: BrowserSurfaceId distinct newtype, pairwise incompatible with PanelId / ViewId / TerminalId
+// ---------------------------------------------------------------------------
+
+/// Stable handle for a browser WebView surface. Distinct newtype from
+/// `PanelId`, `ViewId`, `TerminalId`; no `From` bridge exists.
+/// Lifecycle parallels `PanelId` with `Generation` monotonic reserve `1024`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BrowserSurfaceId(pub u64);
+
+impl BrowserSurfaceId {
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BrowserSurfaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BrowserSurfaceId({})", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle: Declared -> Created -> Mounted -> Focused -> Suspended -> Disposed
 // ---------------------------------------------------------------------------
 
@@ -151,13 +178,14 @@ impl std::fmt::Display for PanelType {
 
 /// Content hosted inside a `View` leaf. Generic Panel Runtime adds
 /// `Panel(PanelId)` as a fifth variant without adding a new tiling primitive.
-/// `LayoutNode` and decoration stay Core-owned.
+/// `LayoutNode` and decoration stay Core-owned. Browser is host-owned
+/// `BrowserSurfaceId` via embedder (Option A of browser-agent pre-study).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ViewContent {
     Empty,
     Terminal(u64),
     Rich(u64),
-    Browser(u64),
+    Browser(BrowserSurfaceId),
     Panel(PanelId),
 }
 
@@ -171,6 +199,19 @@ impl ViewContent {
     pub fn panel_id(self) -> Option<PanelId> {
         match self {
             Self::Panel(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_browser(self) -> bool {
+        matches!(self, Self::Browser(_))
+    }
+
+    #[must_use]
+    pub fn browser_id(self) -> Option<BrowserSurfaceId> {
+        match self {
+            Self::Browser(id) => Some(id),
             _ => None,
         }
     }
@@ -852,6 +893,34 @@ mod tests {
         assert_eq!(vc.panel_id(), Some(pid));
         let empty = ViewContent::Empty;
         assert!(!empty.is_panel());
+    }
+
+    #[test]
+    fn view_content_browser() {
+        let bid = BrowserSurfaceId::new(10);
+        let vc = ViewContent::Browser(bid);
+        assert!(vc.is_browser());
+        assert_eq!(vc.browser_id(), Some(bid));
+        assert!(!vc.is_panel());
+        let empty = ViewContent::Empty;
+        assert!(!empty.is_browser());
+    }
+
+    #[test]
+    fn browser_surface_id_distinct_from_panel_and_view() {
+        let bid = BrowserSurfaceId::new(1);
+        let pid = PanelId::new(1);
+        let vid = ViewId::new(1);
+        assert_eq!(bid.0, pid.0);
+        assert_eq!(bid.0, vid.0);
+        assert_ne!(
+            std::any::TypeId::of::<BrowserSurfaceId>(),
+            std::any::TypeId::of::<PanelId>()
+        );
+        assert_ne!(
+            std::any::TypeId::of::<BrowserSurfaceId>(),
+            std::any::TypeId::of::<ViewId>()
+        );
     }
 
     #[test]

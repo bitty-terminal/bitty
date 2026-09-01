@@ -23,6 +23,8 @@ pub enum CapabilityFamily {
     Protocol,
     /// Panel runtime (generic Panel Runtime per OQ-014 pre-study).
     Panel,
+    /// Browser embed/navigation/storage for WebView surface (CTX-0110, BA-1..BA-3).
+    Browser,
 }
 
 impl CapabilityFamily {
@@ -40,6 +42,7 @@ impl CapabilityFamily {
             "platform" => Some(Self::Platform),
             "protocol" => Some(Self::Protocol),
             "panel" => Some(Self::Panel),
+            "browser" => Some(Self::Browser),
             _ => None,
         }
     }
@@ -59,6 +62,7 @@ impl CapabilityFamily {
             Self::Platform => "platform",
             Self::Protocol => "protocol",
             Self::Panel => "panel",
+            Self::Browser => "browser",
         }
     }
 
@@ -104,6 +108,12 @@ impl CapabilityFamily {
                 "panel.create",
                 "panel.focus",
                 "panel.overlay",
+            ],
+            Self::Browser => &[
+                "browser.embed",
+                "browser.navigation",
+                "browser.file-url",
+                "browser.storage",
             ],
         }
     }
@@ -275,6 +285,7 @@ fn is_high_risk(head: &str) -> bool {
             | "ui.protocol-register"
             | "debug.control"
             | "runtime.plugin-manage"
+            | "browser.embed"
     )
 }
 
@@ -310,6 +321,10 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "panel.create" => "Create and manage panels",
         "panel.focus" => "Focus panels and control workspace focus",
         "panel.overlay" => "Show panel overlays and modals",
+        "browser.embed" => "Embed browser surface via embedder (high-risk)",
+        "browser.navigation" => "Navigate browser surface to allowlisted URLs",
+        "browser.file-url" => "Allow file:// navigation validated against project scope",
+        "browser.storage" => "Persist browser cookies/cache with bounded quota",
         _ => "Requested capability",
     }
 }
@@ -370,6 +385,10 @@ fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, P
             | "panel.create"
             | "panel.focus"
             | "panel.overlay"
+            | "browser.embed"
+            | "browser.navigation"
+            | "browser.file-url"
+            | "browser.storage"
     );
 
     if !is_known {
@@ -427,6 +446,7 @@ mod tests {
             CapabilityFamily::Runtime,
             CapabilityFamily::Debug,
             CapabilityFamily::Panel,
+            CapabilityFamily::Browser,
         ];
         for family in families {
             assert!(family.denied_without_grant());

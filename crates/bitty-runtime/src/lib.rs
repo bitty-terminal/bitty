@@ -177,6 +177,7 @@
 
 pub mod config;
 pub mod error;
+pub mod file_manager;
 pub mod palette;
 pub mod paste;
 pub mod project;

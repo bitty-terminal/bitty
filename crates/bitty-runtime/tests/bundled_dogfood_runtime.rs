@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Runtime dogfood for the five bundled-disabled plugins (CTX-0096).
+//! Runtime dogfood for the six bundled-disabled plugins (CTX-0096 + file-manager, CTX-0108).
 //!
 //! Proves:
 //! - default disabled: fresh `EffectiveConfig` / `Runtime::with_defaults` has
@@ -13,7 +13,8 @@
 //!   side queue `Snapshot`/`HostObservation`, never grid mutation
 //! - bounded cold-path execution: `DropOldest`, per-sub 64 / per-plugin 1024
 //!   + 256 KiB / global 8192 + 2 MiB, drops attributed for `bitty plugin doctor`
-//! - no panel runtime / browser / agent / marketplace / daemon smuggled in
+//! - Panel Runtime is the host for file-manager (tiled Panel), browser/agent
+//!   still excluded; no marketplace/daemon/remoe UI smuggled
 
 use bitty_config::{EffectiveConfig, PluginSpec};
 use bitty_plugin_host::{
@@ -78,7 +79,7 @@ fn bundled_plugins_load_via_public_api_through_runtime() {
         rt.activate_plugin(&id)
             .unwrap_or_else(|e| panic!("activate {}: {e}", id.as_str()));
     }
-    assert_eq!(rt.plugin_host().registry().len(), 5);
+    assert_eq!(rt.plugin_host().registry().len(), 6);
     // Each plugin's subscription (if any) can be established via public API.
     let shell_id = bitty_plugin_host::PluginId::new("bitty-terminal.shell-integration").unwrap();
     rt.subscribe_plugin_event(&shell_id, EventKind::TerminalTitleChanged)
@@ -241,18 +242,19 @@ fn bounded_cold_path_drop_oldest_and_attributable() {
 
 #[test]
 fn no_panel_runtime_browser_agent_marketplace_smuggled() {
-    // This task explicitly forbids Panel Runtime, Browser, Agent,
-    // marketplace, daemon, remote UI. Assert they do not appear as crate
-    // dependencies of this runtime test (compile-time) and that bundled
-    // catalog is exactly the five accepted ids (no splits/search).
+    // Panel Runtime is the host for file-manager (CTX-0102, CTX-0108 tiled Panel
+    // with fs.read+optional fs.write). Browser/Agent/marketplace/daemon remain
+    // excluded; bundled catalog is exactly the six accepted ids (no splits/search
+    // beyond file-manager, no browser/agent).
     let ids = bundled::bundled_ids_sorted();
-    assert_eq!(ids.len(), 5);
+    assert_eq!(ids.len(), 6);
     assert!(
         !ids.iter()
             .any(|id| id.contains("splits") || id.contains("search"))
     );
     assert!(
         !ids.iter()
-            .any(|id| id.contains("browser") || id.contains("agent") || id.contains("panel"))
+            .any(|id| id.contains("browser") || id.contains("agent"))
     );
+    assert!(ids.contains(&"bitty-terminal.file-manager".to_string()));
 }

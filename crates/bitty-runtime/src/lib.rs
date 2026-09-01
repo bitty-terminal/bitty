@@ -175,6 +175,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ai_panel;
 pub mod browser_panel;
 pub mod config;
 pub mod error;

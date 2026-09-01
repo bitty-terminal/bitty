@@ -25,6 +25,12 @@ pub enum CapabilityFamily {
     Panel,
     /// Browser embed/navigation/storage for WebView surface (CTX-0110, BA-1..BA-3).
     Browser,
+    /// Agent context, memory and workspace (CTX-0111, ai-panel).
+    Agent,
+    /// MCP tool invocation per-tool (CTX-0111, ai-panel).
+    Mcp,
+    /// AI provider/stream/model (CTX-0111, ai-panel).
+    Ai,
 }
 
 impl CapabilityFamily {
@@ -43,6 +49,9 @@ impl CapabilityFamily {
             "protocol" => Some(Self::Protocol),
             "panel" => Some(Self::Panel),
             "browser" => Some(Self::Browser),
+            "agent" => Some(Self::Agent),
+            "mcp" => Some(Self::Mcp),
+            "ai" => Some(Self::Ai),
             _ => None,
         }
     }
@@ -63,6 +72,9 @@ impl CapabilityFamily {
             Self::Protocol => "protocol",
             Self::Panel => "panel",
             Self::Browser => "browser",
+            Self::Agent => "agent",
+            Self::Mcp => "mcp",
+            Self::Ai => "ai",
         }
     }
 
@@ -115,6 +127,13 @@ impl CapabilityFamily {
                 "browser.file-url",
                 "browser.storage",
             ],
+            Self::Agent => &[
+                "agent.context.terminal",
+                "agent.context.workspace",
+                "agent.memory",
+            ],
+            Self::Mcp => &["mcp.invoke"],
+            Self::Ai => &["ai.provider", "ai.stream", "ai.model"],
         }
     }
 }
@@ -325,6 +344,13 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "browser.navigation" => "Navigate browser surface to allowlisted URLs",
         "browser.file-url" => "Allow file:// navigation validated against project scope",
         "browser.storage" => "Persist browser cookies/cache with bounded quota",
+        "agent.context.terminal" => "Observe terminal context for this agent (bounded 32KiB)",
+        "agent.context.workspace" => "Observe workspace context for this agent (bounded 32KiB)",
+        "agent.memory" => "Persist agent conversational memory (opt-in, 0600, <=7 days)",
+        "mcp.invoke" => "Invoke allowlisted MCP tool (per-tool, bounded frame 256KiB)",
+        "ai.provider" => "Use allowlisted AI provider",
+        "ai.stream" => "Stream AI responses for this agent",
+        "ai.model" => "Select AI model for this agent (bounded)",
         _ => "Requested capability",
     }
 }
@@ -337,7 +363,12 @@ fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, P
     // Families that require a parameter.
     let param_required = matches!(
         head,
-        "fs.read" | "fs.write" | "process.spawn" | "network.connect"
+        "fs.read"
+            | "fs.write"
+            | "process.spawn"
+            | "network.connect"
+            | "mcp.invoke"
+            | "agent.memory"
     );
 
     // Validate param presence rules.
@@ -389,6 +420,13 @@ fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, P
             | "browser.navigation"
             | "browser.file-url"
             | "browser.storage"
+            | "agent.context.terminal"
+            | "agent.context.workspace"
+            | "agent.memory"
+            | "mcp.invoke"
+            | "ai.provider"
+            | "ai.stream"
+            | "ai.model"
     );
 
     if !is_known {
@@ -447,6 +485,9 @@ mod tests {
             CapabilityFamily::Debug,
             CapabilityFamily::Panel,
             CapabilityFamily::Browser,
+            CapabilityFamily::Agent,
+            CapabilityFamily::Mcp,
+            CapabilityFamily::Ai,
         ];
         for family in families {
             assert!(family.denied_without_grant());
@@ -454,8 +495,12 @@ mod tests {
                 let parsed = CapabilityId::parse(raw);
                 if matches!(
                     family,
-                    CapabilityFamily::Fs | CapabilityFamily::Process | CapabilityFamily::Network
-                ) {
+                    CapabilityFamily::Fs
+                        | CapabilityFamily::Process
+                        | CapabilityFamily::Network
+                        | CapabilityFamily::Mcp
+                ) || *raw == "agent.memory"
+                {
                     assert!(
                         parsed.is_err(),
                         "scoped family must require a parameter: {raw}"

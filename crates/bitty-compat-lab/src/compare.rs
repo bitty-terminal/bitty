@@ -10,8 +10,8 @@
 //! - `State::state_hash` (canonical FNV-1a, little-endian, version-pinned)
 //! - `Snapshot` grid (text + width/height + cursor + title + generation)
 //! - damage (`damage_since`) bookkeeping
-//! - vs reference dumps when available (ghostty/kitty/wezterm headless dumps
-//!   under `tmp/references/<backend>/*.snapshot.json`). When no reference
+//! - vs reference dumps when available (ghostty/kitty/wezterm/alacritty headless
+//!   dumps under `tmp/references/<backend>/*.snapshot.json`). When no reference
 //!   backend dumps are present the comparator falls back to self-consistency:
 //!   regenerate + byte-by-byte determinism + invariant asserts.
 //!
@@ -117,8 +117,8 @@ pub struct CompareOutcome {
     pub self_consistent: bool,
     /// Self-consistency failure reason, when `!self_consistent`.
     pub self_failure: Option<String>,
-    /// Reference backend comparison count (ghostty/kitty/wezterm) that had a
-    /// matching dump for the same `corpus_rel`.
+    /// Reference backend comparison count (ghostty/kitty/wezterm/alacritty)
+    /// that had a matching dump for the same `corpus_rel`.
     pub reference_compared: usize,
     /// Reference mismatches, each as `"backend: reason"`.
     pub reference_failures: Vec<String>,
@@ -429,8 +429,9 @@ fn load_reference_texts_for_corpus(corpus_rel: &str) -> Vec<(String, String)> {
     // Returns Vec<(backend, text)> for backends that have a matching dump file.
     // Reference dumps are expected to share the same `corpus_rel` and JSON shape
     // when available; otherwise graceful skip. Each file is bounded.
+    // CTX-0114 adds `alacritty` as fourth terminal for release matrix.
     let mut out = Vec::new();
-    for backend in ["ghostty", "kitty", "wezterm"] {
+    for backend in ["ghostty", "kitty", "wezterm", "alacritty"] {
         for dir in reference_dir(backend) {
             if !dir.is_dir() {
                 continue;

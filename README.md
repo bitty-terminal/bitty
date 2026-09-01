@@ -5,10 +5,13 @@ currently contains a 16-crate Cargo workspace (see Current scaffold) plus the
 quality gates that validate it. Draft crates implement the Minimal Correct
 Terminal headless slice (`vt` + `pty` + `term-state` + `platform` + `config` +
 `render` + `ui` + `runtime` + `app`; `package`/`lua` leaves ready) under
-`publish = false` where RFCs are still draft — it does not yet provide a
-released terminal binary, stable public Rust API, or published crates.io
-artifacts beyond the `cargo publish --dry-run` verification recorded in
-`docs/product/release-ladder.md`.
+`publish = false` where RFCs are still draft — `0.0.1` has published 9 leaf
+crates to crates.io (`vt`, `pty`, `platform`, `config`, `package`, `lua`,
+`term-state`, `ui`, `render`) and a Linux x64 binary preview on GitHub
+Releases (`bitty-app` remains `publish = false`, preview only); it does not yet
+provide a stable public Rust API, and the detailed publish verification remains
+recorded in `docs/product/release-ladder.md` and
+`docs/product/formal-release-0.0.1.md`.
 
 The accepted bootstrap boundary is recorded in
 [ADR 0001](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/decisions/adrs/ADR-0001-repository-bootstrap-baseline.md)

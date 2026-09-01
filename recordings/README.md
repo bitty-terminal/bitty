@@ -19,8 +19,9 @@ status: draft
 recordings/
   README.md                         # this file
   references/
-    bitty/*.snapshot.json            # headless bounded dumps (Parser -> State) via collect_dumps, 39 as of CTX-0099
+    bitty/*.snapshot.json            # headless bounded dumps (Parser -> State) via collect_dumps, 39 as of CTX-0114
     ghostty/ kitty/ wezterm/ alacritty/ xterm/ # read-only reference clones, revision+license in recordings/references/README.md (umbrella) and tmp/references/ mirrors
+  compat-matrix-2026-09-01.json      # machine-readable 14×4 matrix (CTX-0114, bounded <16 KiB, 39 dumps)
   manual-smoke/<YYYY-MM-DD>/         # git-ignored windowed `grim`/`hyprctl` PNGs (human-run, not committed)
 ```
 
@@ -37,3 +38,9 @@ recordings/
 - Dogfooding corpora: `tests/compat/*/corpus/*dogfooding*.bin` (zsh/bash/fish, nvim/tmux/fzf/htop/ssh, alt-screen/mouse/resize/OSC 7/8/133/clipboard/Kitty/IME/DPI, each ≤310 bytes, deterministic, bounded).
 - Regression: `cargo test -p bitty-compat-lab --test dogfooding_corpus` 6 tests PASS, `cargo test -p bitty-compat-lab --test compare` `total 39 self_passed 39` PASS, `cargo test -p bitty-compat-lab --test harness` `compat_corpus_is_bounded_and_deterministic` 39 PASS, no `unsafe`, no window/GPU leak.
 - Differential vs Ghostty/Kitty/WezTerm/Alacritty via `crates/bitty-compat-lab/src/compare.rs` snapshot-to-snapshot (grid hash + Snapshot grid + damage), graceful skip when backend dumps absent; next bugs are differential compatibility.
+
+## CTX-0114 snapshot
+
+- Base `1d9eb6a` (CTX-0113) → 39 snapshots after `cargo run -p bitty-compat-lab --bin collect_dumps --locked` (same 39, deterministic `state_hash` at `1d9eb6a+`).
+- Matrix: 14 surfaces (`shell/tmux/nvim/fzf/htop/ssh/alt-screen/mouse/resize/OSC/clipboard/Kitty/IME/DPI`) across 4 terminals (`Ghostty/Kitty/WezTerm/Alacritty`) via `crates/bitty-compat-lab/src/matrix.rs` + `compare.rs` (alacritty added) and `recordings/compat-matrix-2026-09-01.json` (14 entries, `<16 KiB`, bounded, `forbid(unsafe)`).
+- Regression: `cargo test -p bitty-compat-lab --test compat_matrix` 8 tests PASS (covers all 14), `cargo test -p bitty-compat-lab --test compare` `total 39 self_passed 39` PASS with 4-backend graceful skip, `cargo test -p bitty-compat-lab --test dogfooding_corpus` 6 PASS, `cargo test -p bitty-compat-lab --test harness` 3 PASS, `cargo test --workspace --locked` green, `cargo clippy -D warnings` 0, `cargo check --target x86_64-pc-windows-gnu` 0, no `unsafe`, no window/GPU, no `TODO`.

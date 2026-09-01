@@ -20,3 +20,4 @@ pub use harness::{
 };
 
 pub mod compare;
+pub mod matrix;

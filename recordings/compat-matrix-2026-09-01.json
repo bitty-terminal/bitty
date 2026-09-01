@@ -1,0 +1,281 @@
+{
+  "version": 1,
+  "generated": "2026-09-01",
+  "base": "1d9eb6a",
+  "matrix_len": 14,
+  "bounds": {
+    "MAX_CORPUS_BYTES": 8192,
+    "MAX_ACTIONS": 4096,
+    "MAX_SNAPSHOT_JSON_BYTES": 16384,
+    "GRID": "80x24",
+    "CANONICAL_HASH_VERSION": 1
+  },
+  "entries": [
+    {
+      "surface": "shell",
+      "category": "shell",
+      "corpus_rel": "shell/corpus/02-dogfooding-shell-osc133-osc7-fish.bin",
+      "description": "shell prompt marks 133;A/B/C/D plus OSC 7 cwd and OSC 8 hyperlink (zsh/fish)",
+      "bytes_len": 201,
+      "actions_len": 74,
+      "state_hash": "35c312b80dff738b",
+      "width": 80,
+      "height": 24,
+      "generation": 74,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "tmux",
+      "category": "tui",
+      "corpus_rel": "tui/corpus/01-nvim-tmux.bin",
+      "description": "tmux pane border \u2502 and status bar with 42m color",
+      "bytes_len": 28,
+      "actions_len": 8,
+      "state_hash": "5fd49d6d039ff0d1",
+      "width": 80,
+      "height": 24,
+      "generation": 8,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "nvim",
+      "category": "tui",
+      "corpus_rel": "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+      "description": "nvim fullscreen alt-screen 1049h scroll region and statusline",
+      "bytes_len": 155,
+      "actions_len": 82,
+      "state_hash": "446def2b5a6f1875",
+      "width": 80,
+      "height": 24,
+      "generation": 82,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "fzf",
+      "category": "tui",
+      "corpus_rel": "tui/corpus/02-htop-fzf.bin",
+      "description": "fzf fuzzy finder --height 40% alt-screen list",
+      "bytes_len": 23,
+      "actions_len": 6,
+      "state_hash": "f3719f25f24c8b9a",
+      "width": 80,
+      "height": 24,
+      "generation": 6,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "htop",
+      "category": "tui",
+      "corpus_rel": "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+      "description": "htop process table color bars with alt-screen",
+      "bytes_len": 155,
+      "actions_len": 82,
+      "state_hash": "446def2b5a6f1875",
+      "width": 80,
+      "height": 24,
+      "generation": 82,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "ssh",
+      "category": "tui",
+      "corpus_rel": "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+      "description": "ssh remote echo ssh-ok plus OSC 0 remote-title",
+      "bytes_len": 155,
+      "actions_len": 82,
+      "state_hash": "446def2b5a6f1875",
+      "width": 80,
+      "height": 24,
+      "generation": 82,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "alt-screen",
+      "category": "resize",
+      "corpus_rel": "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+      "description": "alt-screen 1049h/1049l with scroll region 2;10r and 800x600 resize",
+      "bytes_len": 99,
+      "actions_len": 44,
+      "state_hash": "b9b0376baebac32e",
+      "width": 80,
+      "height": 24,
+      "generation": 44,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "mouse",
+      "category": "mouse",
+      "corpus_rel": "mouse/corpus/03-dogfooding-mouse-resize-sgr.bin",
+      "description": "mouse SGR 1006 with 1000/1002/1003 modes click drag scroll",
+      "bytes_len": 144,
+      "actions_len": 17,
+      "state_hash": "c5cbed0ac241e9cf",
+      "width": 80,
+      "height": 24,
+      "generation": 17,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "resize",
+      "category": "resize",
+      "corpus_rel": "resize/corpus/01-resize-reflow.bin",
+      "description": "resize reflow with scroll region and erase",
+      "bytes_len": 15,
+      "actions_len": 3,
+      "state_hash": "c5cbed0ac241e9cf",
+      "width": 80,
+      "height": 24,
+      "generation": 3,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "OSC",
+      "category": "osc",
+      "corpus_rel": "osc/corpus/03-dogfooding-osc7-8-52-title.bin",
+      "description": "OSC 0/2 title plus 7 cwd file:// plus 8 hyperlink",
+      "bytes_len": 197,
+      "actions_len": 34,
+      "state_hash": "7f039e64f556a4ab",
+      "width": 80,
+      "height": 24,
+      "generation": 34,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "clipboard",
+      "category": "osc",
+      "corpus_rel": "osc/corpus/02-clipboard.bin",
+      "description": "clipboard OSC 52 query c versus write with base64 payload",
+      "bytes_len": 16,
+      "actions_len": 1,
+      "state_hash": "d293cb8ca2b6e106",
+      "width": 80,
+      "height": 24,
+      "generation": 1,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "Kitty",
+      "category": "keyboard",
+      "corpus_rel": "keyboard/corpus/03-dogfooding-kitty-keyboard-bracketed.bin",
+      "description": "Kitty keyboard progressive 7727 plus CSI u and bracketed paste",
+      "bytes_len": 104,
+      "actions_len": 19,
+      "state_hash": "99901016955070cd",
+      "width": 80,
+      "height": 24,
+      "generation": 19,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "IME",
+      "category": "unicode",
+      "corpus_rel": "unicode/corpus/09-dogfooding-ime-unicode-dpi.bin",
+      "description": "IME wide CJK emoji ZWJ combining zero-width invalid utf8",
+      "bytes_len": 99,
+      "actions_len": 64,
+      "state_hash": "09c75f8905650c80",
+      "width": 80,
+      "height": 24,
+      "generation": 64,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    },
+    {
+      "surface": "DPI",
+      "category": "resize",
+      "corpus_rel": "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+      "description": "DPI scale 800x600 -> 100x37 @8x16 with alt-screen",
+      "bytes_len": 99,
+      "actions_len": 44,
+      "state_hash": "b9b0376baebac32e",
+      "width": 80,
+      "height": 24,
+      "generation": 44,
+      "self": "PASS",
+      "references": {
+        "ghostty": "SKIP",
+        "kitty": "SKIP",
+        "wezterm": "SKIP",
+        "alacritty": "SKIP"
+      }
+    }
+  ]
+}

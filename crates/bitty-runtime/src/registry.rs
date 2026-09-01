@@ -717,9 +717,13 @@ impl TerminalRegistry {
                 id_raw: id.0,
             });
         }
-        // Check exited
-        let rec = self.terminals.get_mut(&id.0).expect("checked");
-        Ok(rec)
+        // Return mutable reference after validation (fail-closed, no expect).
+        self.terminals
+            .get_mut(&id.0)
+            .ok_or(RegistryError::NotFound {
+                kind: "terminal",
+                id_raw: id.0,
+            })
     }
 
     /// Returns terminal snapshot handle (read-only).
@@ -1017,7 +1021,10 @@ impl TerminalRegistry {
         ws.layout = if new_children.is_empty() {
             LayoutNode::stack(Vec::new())
         } else if new_children.len() == 1 {
-            new_children.into_iter().next().unwrap()
+            new_children
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| LayoutNode::stack(Vec::new()))
         } else {
             LayoutNode::stack(new_children)
         };
@@ -1449,10 +1456,14 @@ impl TerminalRegistry {
             if pending_len == 0 {
                 continue;
             }
-            // Coalesce to latest: drain all, keep last
+            // Coalesce to latest: drain all, keep last (fail-closed, no unwrap).
             let latest = {
-                let rec = self.terminals.get_mut(&tid.0).unwrap();
-                let last = rec.pending_rects.back().copied().unwrap();
+                let Some(rec) = self.terminals.get_mut(&tid.0) else {
+                    continue;
+                };
+                let Some(last) = rec.pending_rects.back().copied() else {
+                    continue;
+                };
                 rec.pending_rects.clear();
                 last
             };
@@ -1544,10 +1555,16 @@ impl TerminalRegistry {
                 current: new_count,
             });
         }
-        // Validate all leaf ViewIds are known to this workspace
+        // Validate all leaf ViewIds are known to this workspace (fail-closed).
         let new_ids = layout.leaf_ids();
         {
-            let ws = self.workspaces.get(&workspace_id.0).unwrap();
+            let ws = self
+                .workspaces
+                .get(&workspace_id.0)
+                .ok_or(RegistryError::NotFound {
+                    kind: "workspace",
+                    id_raw: workspace_id.0,
+                })?;
             for vid in &new_ids {
                 if !ws.view_gens.contains_key(vid) {
                     return Err(RegistryError::NotFound {
@@ -1559,7 +1576,13 @@ impl TerminalRegistry {
         }
         // Remove views that are no longer in layout
         let to_remove: Vec<ViewId> = {
-            let ws = self.workspaces.get(&workspace_id.0).unwrap();
+            let ws = self
+                .workspaces
+                .get(&workspace_id.0)
+                .ok_or(RegistryError::NotFound {
+                    kind: "workspace",
+                    id_raw: workspace_id.0,
+                })?;
             ws.view_gens
                 .keys()
                 .filter(|id| !new_ids.contains(id))
@@ -1568,7 +1591,9 @@ impl TerminalRegistry {
         };
         for vid in &to_remove {
             {
-                let ws = self.workspaces.get_mut(&workspace_id.0).unwrap();
+                let Some(ws) = self.workspaces.get_mut(&workspace_id.0) else {
+                    continue;
+                };
                 ws.view_gens.remove(vid);
                 ws.view_visibility.remove(vid);
                 ws.mru.retain(|&id| id != *vid);
@@ -1578,7 +1603,12 @@ impl TerminalRegistry {
             }
         }
         {
-            let ws = self.workspaces.get_mut(&workspace_id.0).unwrap();
+            let Some(ws) = self.workspaces.get_mut(&workspace_id.0) else {
+                return Err(RegistryError::NotFound {
+                    kind: "workspace",
+                    id_raw: workspace_id.0,
+                });
+            };
             ws.layout = layout;
             // Reconcile focus: if focused view no longer exists, move to MRU
             if let Some(focused) = ws.focus.focused() {
@@ -2180,7 +2210,9 @@ impl BusQueue {
             if bytes + payload_len > max_bytes {
                 break;
             }
-            let ev = self.inner.pop_front().expect("checked");
+            let Some(ev) = self.inner.pop_front() else {
+                break;
+            };
             bytes += payload_len;
             out.push(ev);
         }
@@ -2615,7 +2647,10 @@ impl PanelRegistry {
                 id_raw: id.0,
             });
         }
-        let rec = self.panels.get_mut(&id.0).expect("checked");
+        let rec = self.panels.get_mut(&id.0).ok_or(PanelError::NotFound {
+            kind: "panel",
+            id_raw: id.0,
+        })?;
         if rec.state == UiPanelState::Disposed {
             return Err(PanelError::NotFound {
                 kind: "panel",

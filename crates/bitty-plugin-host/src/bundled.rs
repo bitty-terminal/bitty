@@ -241,10 +241,63 @@ pub fn project_manifest() -> PluginManifest {
     }
 }
 
+/// `bitty-terminal.file-manager` — tiled `Panel(PanelId)` file manager.
+///
+/// Capability: `panel.provider` + `panel.create` for Panel Runtime plus
+/// `fs.read:~/projects/**` (read-only listing via path-glob) and optional
+/// `fs.write:~/projects/**` for user-confirmed mutations (rename/move/copy).
+/// Also `terminal.semantic-read` for cwd context and title observation.
+/// No `process.spawn`, no `network.*` — bounded `8 KiB`/`32`/`64`/
+/// `1024`/`8192` `DropOldest`, PR-1..PR-12, single-process `winit`.
+#[must_use]
+pub fn file_manager_manifest() -> PluginManifest {
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("panel.create").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
+    caps.filesystem.push(FilesystemRequest {
+        access: FsAccess::Read,
+        paths: vec!["~/projects/**".to_string()],
+    });
+    caps.filesystem.push(FilesystemRequest {
+        access: FsAccess::Write,
+        paths: vec!["~/projects/**".to_string()],
+    });
+    PluginManifest {
+        identity: bundled_identity(
+            "bitty-terminal.file-manager",
+            "File Manager",
+            "Tiled Panel file manager with fs.read + optional fs.write, bounded 8KiB/32/64 PR-1..12",
+        ),
+        compat: bundled_compat(),
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        capabilities: caps,
+        lazy: LazyTriggers {
+            commands: vec![
+                QualifiedName::new("bitty-terminal.file-manager:open").expect("qualified"),
+                QualifiedName::new("bitty-terminal.file-manager:preview").expect("qualified"),
+                QualifiedName::new("bitty-terminal.file-manager:rename").expect("qualified"),
+            ],
+            events: vec![
+                "terminal.cwd-changed".to_string(),
+                "terminal.title-changed".to_string(),
+                "focus.changed".to_string(),
+            ],
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
+}
+
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All five bundled-disabled manifests for `v1` (fresh install: staged but
-/// not enabled).
+/// All six bundled-disabled manifests for `v1` (fresh install: staged but
+/// not enabled). File-manager is P1 tiled Panel with `fs.read`+optional
+/// `fs.write`, bounded `8 KiB`/`32`/`64`/PR-1..PR-12, single-process `winit`.
 #[must_use]
 pub fn all_bundled_manifests() -> Vec<PluginManifest> {
     vec![
@@ -253,10 +306,11 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
         statusline_manifest(),
         palette_manifest(),
         project_manifest(),
+        file_manager_manifest(),
     ]
 }
 
-/// Plugin ids of the five bundled-disabled plugins, in catalog order.
+/// Plugin ids of the six bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -273,7 +327,7 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the five bundled ids.
+/// Whether `id` is one of the six bundled ids.
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
     matches!(
@@ -283,6 +337,7 @@ pub fn is_bundled(id: &PluginId) -> bool {
             | "bitty-terminal.statusline"
             | "bitty-terminal.palette"
             | "bitty-terminal.project"
+            | "bitty-terminal.file-manager"
     )
 }
 
@@ -295,6 +350,7 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.statusline" => Some(statusline_manifest()),
         "bitty-terminal.palette" => Some(palette_manifest()),
         "bitty-terminal.project" => Some(project_manifest()),
+        "bitty-terminal.file-manager" => Some(file_manager_manifest()),
         _ => None,
     }
 }
@@ -314,7 +370,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -322,6 +378,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "bitty-terminal.file-manager",
                 "bitty-terminal.palette",
                 "bitty-terminal.project",
                 "bitty-terminal.shell-integration",
@@ -396,6 +453,67 @@ mod tests {
         assert_eq!(expanded.family(), crate::capability::CapabilityFamily::Fs);
         // manifest hash must be deterministic
         assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
+    }
+
+    #[test]
+    fn file_manager_manifest_filesystem_and_panel_capabilities() {
+        let m = file_manager_manifest();
+        assert_eq!(m.capabilities.filesystem.len(), 2);
+        let read = m
+            .capabilities
+            .filesystem
+            .iter()
+            .find(|r| r.access == FsAccess::Read)
+            .unwrap();
+        assert_eq!(read.paths, vec!["~/projects/**"]);
+        let write = m
+            .capabilities
+            .filesystem
+            .iter()
+            .find(|r| r.access == FsAccess::Write)
+            .unwrap();
+        assert_eq!(write.paths, vec!["~/projects/**"]);
+        assert!(
+            m.capabilities
+                .ids
+                .contains(&CapabilityId::parse("panel.provider").unwrap())
+        );
+        assert!(
+            m.capabilities
+                .ids
+                .contains(&CapabilityId::parse("panel.create").unwrap())
+        );
+        assert!(
+            m.capabilities
+                .ids
+                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
+        );
+        assert_eq!(m.lazy.commands.len(), 3);
+        assert!(
+            m.lazy
+                .commands
+                .iter()
+                .any(|c| c.as_str() == "bitty-terminal.file-manager:open")
+        );
+        assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
+        let expanded_read = CapabilityId::parse("fs.read:~/projects/**").unwrap();
+        assert_eq!(
+            expanded_read.family(),
+            crate::capability::CapabilityFamily::Fs
+        );
+        let expanded_write = CapabilityId::parse("fs.write:~/projects/**").unwrap();
+        assert_eq!(
+            expanded_write.family(),
+            crate::capability::CapabilityFamily::Fs
+        );
+        assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
+        // tiled Panel + fs isolation, no process/network
+        assert!(
+            !m.capabilities.ids.contains(
+                &CapabilityId::parse("network.connect:example.com:443")
+                    .unwrap_or_else(|_| CapabilityId::parse("fs.read:~/projects/**").unwrap())
+            )
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ bitty-render = { path = "../bitty-render" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-ui = { path = "../bitty-ui" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
+bitty-agent = { path = "../bitty-agent" }
 
 
 [dev-dependencies]

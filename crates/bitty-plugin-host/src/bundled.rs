@@ -408,9 +408,77 @@ pub fn browser_panel_manifest() -> PluginManifest {
     }
 }
 
+/// `bitty-terminal.ai-panel` — tiled `Panel(PanelId)` agent surface plus
+/// `AgentId`/`AgentWorkspace` `32 KiB` budget, `mcp.invoke`.
+///
+/// Capability: `panel.provider` + `panel.create` for Panel plus
+/// `agent.context.terminal` per `Terminal` with generation +
+/// `agent.context.workspace` per `Workspace` +
+/// `agent.memory:persist` opt-in only (`0600`, `<=7 days`, no exfiltration) +
+/// `mcp.invoke:TOOL` per-tool capability (e.g. `mcp.invoke:read_file`) +
+/// `ai.provider` + `ai.stream` (`ai.model`).
+///
+/// `AgentId` `owner.name` bounded `128` (`a.b` grammar),
+/// `AgentWorkspace` ephemeral `64` files / `2 MiB` aggregate /
+/// `256 KiB` per file, `ContextProvider` set with `32 KiB` Context Budget per
+/// turn, `AgentMemory` conversational `32` turns / `64 KiB` aggregate;
+/// Tool Bus via MCP adapter bounded framing `256 KiB` frame,
+/// `512 KiB` in-flight, depth `32`, `RC-9`/`RC-10`.
+#[must_use]
+pub fn ai_panel_manifest() -> PluginManifest {
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("panel.create").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("agent.context.terminal").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("agent.context.workspace").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("agent.memory:persist").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("mcp.invoke:read_file").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("mcp.invoke:fetch").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("ai.provider").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("ai.stream").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("ai.model").expect("known capability"));
+    PluginManifest {
+        identity: bundled_identity(
+            "bitty-terminal.ai-panel",
+            "AI Panel",
+            "Tiled Panel ai-panel with AgentId/AgentWorkspace 32KiB budget mcp.invoke bounded Panel(PanelId) BA-7..10",
+        ),
+        compat: bundled_compat(),
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        capabilities: caps,
+        lazy: LazyTriggers {
+            commands: vec![
+                QualifiedName::new("bitty-terminal.ai-panel:open").expect("qualified"),
+                QualifiedName::new("bitty-terminal.ai-panel:send").expect("qualified"),
+                QualifiedName::new("bitty-terminal.ai-panel:clear").expect("qualified"),
+                QualifiedName::new("bitty-terminal.ai-panel:new-session").expect("qualified"),
+                QualifiedName::new("bitty-terminal.ai-panel:stop").expect("qualified"),
+            ],
+            events: vec![
+                "terminal.cwd-changed".to_string(),
+                "terminal.title-changed".to_string(),
+                "focus.changed".to_string(),
+            ],
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
+}
+
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All eight bundled-disabled manifests for `v1` (fresh install: staged but
+/// All nine bundled-disabled manifests for `v1` (fresh install: staged but
 /// not enabled). File-manager is P1 tiled Panel with `fs.read`+optional
 /// `fs.write`, git-panel is P1 tiled Panel with `process.spawn:git`
 /// allowlisted `[tools.git]`, browser-panel is P2 `View Browser` + `Panel`
@@ -428,10 +496,11 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
         file_manager_manifest(),
         git_panel_manifest(),
         browser_panel_manifest(),
+        ai_panel_manifest(),
     ]
 }
 
-/// Plugin ids of the eight bundled-disabled plugins, in catalog order.
+/// Plugin ids of the nine bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -448,7 +517,7 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the eight bundled ids.
+/// Whether `id` is one of the nine bundled ids.
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
     matches!(
@@ -461,6 +530,7 @@ pub fn is_bundled(id: &PluginId) -> bool {
             | "bitty-terminal.file-manager"
             | "bitty-terminal.git-panel"
             | "bitty-terminal.browser-panel"
+            | "bitty-terminal.ai-panel"
     )
 }
 
@@ -476,6 +546,7 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.file-manager" => Some(file_manager_manifest()),
         "bitty-terminal.git-panel" => Some(git_panel_manifest()),
         "bitty-terminal.browser-panel" => Some(browser_panel_manifest()),
+        "bitty-terminal.ai-panel" => Some(ai_panel_manifest()),
         _ => None,
     }
 }
@@ -495,7 +566,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -503,6 +574,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "bitty-terminal.ai-panel",
                 "bitty-terminal.browser-panel",
                 "bitty-terminal.file-manager",
                 "bitty-terminal.git-panel",

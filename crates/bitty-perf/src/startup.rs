@@ -333,12 +333,17 @@ fn probe_winit_availability() -> PhaseStatus {
             // (winit enforces single EventLoop per process via EVENT_LOOP_CREATED);
             // sequential tests with --test-threads=1 hit this on the 2nd probe and
             // must be classified as Unavailable, not Failed.
+            // any_thread is the Windows variant of "outside main thread" (see
+            // winit windows event_loop.rs:190) and must also be Unavailable.
             if msg.contains("NotSupported")
                 || msg.contains("Unavailable")
                 || msg.contains("Display")
                 || msg.contains("Wayland")
                 || msg.contains("X11")
                 || msg.contains("RecreationAttempt")
+                || msg.contains("any_thread")
+                || msg.contains("main thread")
+                || msg.contains("outside main")
             {
                 PhaseStatus::Unavailable(msg)
             } else {
@@ -354,8 +359,13 @@ fn probe_winit_availability() -> PhaseStatus {
                 "winit EventLoop::builder panicked".to_string()
             };
             let truncated = truncate(msg, 256);
-            // Building EventLoop off the main thread panics on Linux; treat as Unavailable (headless seam).
-            if truncated.contains("main thread") || truncated.contains("any_thread") {
+            // Building EventLoop off the main thread panics on Linux/Windows;
+            // Windows reports `any_thread` at event_loop.rs:190, Linux reports
+            // "outside main thread" — both are headless Unavailable, not Failed.
+            if truncated.contains("main thread")
+                || truncated.contains("any_thread")
+                || truncated.contains("outside main")
+            {
                 PhaseStatus::Unavailable(truncated)
             } else {
                 PhaseStatus::Failed(truncated)
@@ -568,11 +578,12 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing phase {expected}");
         }
-        // Bounded: each elapsed < 5 s (no unbounded hang).
+        // Bounded: each elapsed < 15 s (no unbounded hang; relaxed from 5s for
+        // Windows wgpu slow path where wgpu_init_probe was 10.2s in run 33474778404).
         for p in &report.phases {
             assert!(
-                p.elapsed.as_secs() < 5,
-                "phase {} elapsed {:?} exceeds bounded 5s",
+                p.elapsed.as_secs() < 15,
+                "phase {} elapsed {:?} exceeds bounded 15s",
                 p.name,
                 p.elapsed
             );

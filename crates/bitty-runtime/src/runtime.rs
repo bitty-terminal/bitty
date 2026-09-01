@@ -2705,7 +2705,7 @@ impl Runtime {
                 TerminalAction::OscCwd { url } => {
                     Some(ColdEvent::CwdChanged(url.as_str().to_owned()))
                 }
-                TerminalAction::OscPromptMark { kind } => Some(ColdEvent::ZoneMarked(*kind)),
+                TerminalAction::OscPromptMark { kind, .. } => Some(ColdEvent::ZoneMarked(*kind)),
                 TerminalAction::OscHyperlink { link } => Some(ColdEvent::HyperlinkChanged(
                     link.as_ref().map(|h| h.uri.as_str().to_owned()),
                 )),

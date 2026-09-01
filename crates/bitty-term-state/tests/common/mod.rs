@@ -180,7 +180,11 @@ pub fn arb_action() -> impl Strategy<Value = TerminalAction> {
                 }),
             }
         }),
-        1 => arb_zone_kind().prop_map(|kind| TerminalAction::OscPromptMark { kind }),
+        1 => (arb_zone_kind(), prop::option::of(-128..=128))
+            .prop_map(|(kind, code)| TerminalAction::OscPromptMark {
+                kind,
+                exit_code: if kind == ZoneKind::OutputEnd { code } else { None },
+            }),
         1 => (any::<u32>(), prop::collection::vec(any::<u8>(), 0..=32)).prop_map(
             |(id, data)| TerminalAction::OscUnknown {
                 id,

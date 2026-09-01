@@ -1,0 +1,39 @@
+{
+    "version": "0.0.1",
+    "description": "Bitty pre-alpha terminal workspace minimal correct terminal",
+    "homepage": "https://github.com/bitty-terminal/bitty",
+    "license": "MIT OR Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/bitty-terminal/bitty/releases/download/v0.0.1/bitty-v0.0.1-windows-x64.zip",
+            "hash": "SKIP",
+            "bin": "bitty.exe"
+        },
+        "arm64": {
+            "url": "https://github.com/bitty-terminal/bitty/releases/download/v0.0.1/bitty-v0.0.1-windows-arm64.zip",
+            "hash": "SKIP",
+            "bin": "bitty.exe"
+        }
+    },
+    "bin": "bitty.exe",
+    "shortcuts": [
+        [
+            "bitty.exe",
+            "Bitty"
+        ]
+    ],
+    "persist": "config",
+    "checkver": {
+        "github": "https://github.com/bitty-terminal/bitty"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/bitty-terminal/bitty/releases/download/v$version/bitty-v$version-windows-x64.zip"
+            },
+            "arm64": {
+                "url": "https://github.com/bitty-terminal/bitty/releases/download/v$version/bitty-v$version-windows-arm64.zip"
+            }
+        }
+    }
+}

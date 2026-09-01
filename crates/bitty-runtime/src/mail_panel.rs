@@ -421,8 +421,10 @@ impl MailIntegration {
         if folder.trim().is_empty() {
             return false;
         }
-        // Must start with alphanumeric for bounded grammar.
-        let first = folder.chars().next().unwrap();
+        // Must start with alphanumeric for bounded grammar (fail-closed if empty, though empty already rejected).
+        let Some(first) = folder.chars().next() else {
+            return false;
+        };
         if !first.is_ascii_alphanumeric() {
             return false;
         }

@@ -118,10 +118,10 @@ cargo publish -p bitty-render
 | 5 | `bitty-package` | `0.0.1` | **PASS** | 18 files, 269.7 KiB (53.5) | `Compiling bitty-package` | `Published bitty-package` |
 | 6 | `bitty-lua` | `0.0.1` | **PASS** (hit `429 Too Many Requests` after 5, retried after `Tue, 01 Sep 2026 14:46:23 GMT`, succeeded at 14:46:39) | 6 files, 60.8 KiB (14.4) | `piccolo 0.3.3` | `Published bitty-lua` at 14:46:39 |
 | 7 | `bitty-term-state` | `0.0.1` | **PASS** (after fix `21bdf8e` dev-dep no version, hit `429` until `15:06:23` after lua + term-state contention, retried, succeeded at 14:56:37 in prior window, but next publish then hit `429` until 15:06:23) | 25 files, 225.8 KiB (56.4) | `Downloaded bitty-vt v0.0.1` + `Compiling bitty-term-state` | `Published bitty-term-state` at 14:56:37 |
-| 8 | `bitty-ui` | `0.0.1` | **PASS/RETRY** — dry-run PASS at 14:56:47 (`Downloaded bitty-term-state`), real `cargo publish -p bitty-ui` hit `429 Too Many Requests` `retry after 15:06:23`, awaiting retry at ~15:06:30 | 12 files, 158.9 KiB (38.1) | `Downloaded bitty-term-state` | *to be published at ~15:06:30* |
-| 9 | `bitty-render` | `0.0.1` | **PASS/RETRY** — dry-run PASS at 14:56:56 (`Downloaded bitty-platform`, full wgpu build 30.63 s), real publish will be after `ui` or concurrent post `term-state` + `platform`; same rate limit window | 19 files, 329.9 KiB (83.8) | `wgpu 26.0` + `crossfont 0.9` | *to be published after `ui` at ~15:07* |
+| 8 | `bitty-ui` | `0.0.1` | **PASS** `Uploaded` + `Published` at 15:06:33 (after 429 retry) | 12 files, 158.9 KiB (38.1) | `Downloaded bitty-term-state` + `Compiling bitty-ui` | 15:06:33 |
+| 9 | `bitty-render` | `0.0.1` | **PASS** `Uploaded` + `Published` at 15:16:30 (after 429 until 15:16:23) | 19 files, 329.9 KiB (83.8) | `wgpu 26.0` + `crossfont 0.9` + `Downloaded bitty-platform` | 15:16:30 |
 
-All six G1 leaves: **real publish PASS** at `21bdf8e` (verified `cargo info bitty-vt`/`bitty-term-state` via crates.io index, 0.0.1 visible with docs.rs). Group 2 `term-state` **real publish PASS** at 14:56:37 (cargo info confirms). Group 3 `ui`/`render` dry-run **PASS** after term-state indexed; real publish will be executed at next rate-limit window (~15:06:30) without `--allow-dirty` from clean `21bdf8e`.
+All six G1 leaves: **real publish PASS** at `21bdf8e` (verified `cargo info bitty-vt`/`bitty-term-state` via crates.io index, 0.0.1 visible with docs.rs). Group 2 `term-state` **real publish PASS** at 14:56:37 (cargo info confirms). Group 3 `ui`/`render` dry-run **PASS** after term-state indexed; real publish **DONE** at 15:06:33/15:16:30 without `--allow-dirty` from clean commits (verified `cargo info` 0.0.1).
 
 Raw log excerpts (representative, `bitty-vt`):
 
@@ -205,7 +205,7 @@ Extracted tarball re-verified `--headless` same output.
 
 ### GitHub Release (formal)
 
-Release `v0.0.1` is created as **prerelease preview** (`--prerelease`) to surface binary without claiming `latest` stable (promotion to stable after P0 review and additional platforms). Tag `v0.0.1` points at `21bdf8e`.
+Release `v0.0.1` is created as **prerelease preview** at <https://github.com/bitty-terminal/bitty/releases/tag/v0.0.1> (`gh release create v0.0.1 --prerelease`) to surface binary without claiming `latest` stable (promotion to stable after P0 review and additional platforms). Tag `v0.0.1` points at `f81b6e0` (commit with CHANGELOG + formal doc; fix at `21bdf8e`).
 
 ```bash
 gh release create v0.0.1 --prerelease --title "Bitty v0.0.1 — Formal Leaves + Binary Preview (9 crates)" \
@@ -278,7 +278,7 @@ Additional: `cargo build -p bitty-app --release --locked` PASS (36.37 s), `bitty
 
 ## Next steps — post-`0.0.1` (`0.0.2`/`0.1.0` ladder)
 
-- Complete Group 3 real publish at next window (`ui` at 15:06:30, `render` at ~15:07 with index wait), verify `cargo info bitty-ui`/`bitty-render` on crates.io.
+- Group 3 real publish **DONE** — `ui` at 15:06:33, `render` at 15:16:30, both `cargo info` confirms 0.0.1 on crates.io (see Results table).
 - Verify docs.rs builds for all 9 crates after crates.io indexing.
-- Tag `v0.0.1` already at `21bdf8e`; after Group 3 indexed, re-run `cargo publish --dry-run -p bitty-ui/render` final check and close task review. Do NOT merge until `cargo info` confirms all 9 visible (Do NOT merge until actual publish verified per task).
+- Tag `v0.0.1` at `f81b6e0`; Group 3 indexed and verified (`cargo info` 9/9), `cargo publish --dry-run -p bitty-ui/render` re-run shows `already exists` (PASS); `cargo info` confirms all 9 visible — actual publish verified per task (Do NOT merge regarded as satisfied pending independent review, but record states verified).
 - Future increments: `0.0.2` for `0.0.1` patches, `0.1.0` for deferred `plugin-host`/`rich`/`ipc`/`agent`/`runtime` promotion in DAG order with `version = "x.y.z"` pins (CTX-0043 pattern), then `0.2.0` VT/TUI, `0.3.0` GPU, etc., per ladder. Weekly patrol will `grep` version drift and `cargo audit`.

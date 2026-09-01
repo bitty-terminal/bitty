@@ -2,9 +2,9 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the nine `v1` bundled-disabled first-party plugins
+//! Verifies the ten `v1` bundled-disabled first-party plugins
 //! (`bitty-terminal.shell-integration`, `tabs`, `statusline`, `palette`,
-//! `project`, `file-manager`, `git-panel`, `browser-panel`, `ai-panel`) dogfood the **public** Plugin API with manifest / capability /
+//! `project`, `file-manager`, `git-panel`, `browser-panel`, `ai-panel`, `mail-panel`) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
@@ -19,8 +19,8 @@ use bitty_plugin_host::{
     bundled::{
         ai_panel_manifest, all_bundled_manifests, browser_panel_manifest, bundled_ids_sorted,
         bundled_manifest_for, file_manager_manifest, git_panel_manifest, is_bundled,
-        palette_manifest, project_manifest, shell_integration_manifest, statusline_manifest,
-        tabs_manifest,
+        mail_panel_manifest, palette_manifest, project_manifest, shell_integration_manifest,
+        statusline_manifest, tabs_manifest,
     },
 };
 
@@ -41,7 +41,7 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_are_five_and_validate() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 10);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
@@ -52,6 +52,7 @@ fn bundled_manifests_are_five_and_validate() {
             "bitty-terminal.browser-panel",
             "bitty-terminal.file-manager",
             "bitty-terminal.git-panel",
+            "bitty-terminal.mail-panel",
             "bitty-terminal.palette",
             "bitty-terminal.project",
             "bitty-terminal.shell-integration",
@@ -95,7 +96,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 9);
+    assert_eq!(host.registry().len(), 10);
 }
 
 #[test]
@@ -204,6 +205,7 @@ fn default_disabled_safe_mode_leaves_host_functional() {
     assert!(safe.declare(git_panel_manifest()).is_err());
     assert!(safe.declare(browser_panel_manifest()).is_err());
     assert!(safe.declare(ai_panel_manifest()).is_err());
+    assert!(safe.declare(mail_panel_manifest()).is_err());
     // `bitty.*` builtin would still be allowed in safe mode (candidate built-in
     // namespace) — prove the distinction is exactly the prefix, not a private
     // flag.

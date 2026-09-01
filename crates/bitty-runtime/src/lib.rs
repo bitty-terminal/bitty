@@ -177,11 +177,14 @@
 
 pub mod config;
 pub mod error;
+pub mod palette;
 pub mod paste;
+pub mod project;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
 pub mod shell_integration;
+pub mod statusline;
 pub mod tabs;
 
 pub use config::RuntimeConfig;

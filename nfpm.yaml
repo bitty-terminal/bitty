@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/schema.json
+# nfpm configuration for Bitty terminal
+# Supports: deb (Debian/Ubuntu), rpm (Fedora/RHEL/OpenSUSE), apk (Alpine), archlinux (Arch/AUR)
+name: bitty
+arch: amd64
+platform: linux
+version: 0.0.1
+section: utils
+priority: optional
+maintainer: Bitty Maintainers <maintainers@bitty-terminal.dev>
+description: Bitty pre-alpha terminal workspace minimal correct terminal
+vendor: Bitty Terminal
+homepage: https://github.com/bitty-terminal/bitty
+license: MIT OR Apache-2.0
+contents:
+  - src: ./target/release/bitty
+    dst: /usr/bin/bitty
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/licenses/bitty/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/bitty/README.md
+  - src: ./CHANGELOG.md
+    dst: /usr/share/doc/bitty/CHANGELOG.md
+deb:
+  fields:
+    Bugs: https://github.com/bitty-terminal/bitty/issues
+    Origin: bitty-terminal
+rpm:
+  summary: Bitty terminal minimal correct terminal
+  group: Applications/System
+archlinux:
+  pkgbase: bitty
+  packager: Bitty Maintainers <maintainers@bitty-terminal.dev>

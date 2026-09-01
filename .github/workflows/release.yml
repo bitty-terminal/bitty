@@ -113,7 +113,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libfontconfig1-dev libfreetype6-dev
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config libfontconfig1-dev libfreetype6-dev
 
       - name: Install font stack (Linux x64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -124,24 +124,32 @@ jobs:
       - name: Build bitty-app
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
 
       - name: Rename artifact
         shell: bash
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/bitty-app"
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          TARGET="${{ matrix.target }}"
+          BIN="target/${TARGET}/release/bitty-app"
+          if [[ "$TARGET" == *windows* ]]; then
             BIN="${BIN}.exe"
           fi
           ls -lh "$BIN"
           mkdir -p dist
           EXT=""
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          if [[ "$TARGET" == *windows* ]]; then
             EXT=".exe"
           fi
-          cp "$BIN" "dist/bitty-${{ matrix.target }}${EXT}"
-          sha256sum "dist/bitty-${{ matrix.target }}${EXT}" | tee "dist/bitty-${{ matrix.target }}${EXT}.sha256"
+          cp "$BIN" "dist/bitty-${TARGET}${EXT}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/bitty-${TARGET}${EXT}" | tee "dist/bitty-${TARGET}${EXT}.sha256"
+          else
+            shasum -a 256 "dist/bitty-${TARGET}${EXT}" | tee "dist/bitty-${TARGET}${EXT}.sha256"
+          fi
 
       - name: Package (nfpm) - Linux only
         if: contains(matrix.packagers, 'deb')
@@ -149,7 +157,9 @@ jobs:
         run: |
           set -euo pipefail
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          GOPATH_BIN="$(go env GOPATH)/bin"
+          export PATH="$GOPATH_BIN:$PATH"
+          echo "$GOPATH_BIN" >> "$GITHUB_PATH"
           mkdir -p target/release
           cp "target/${{ matrix.target }}/release/bitty-app" target/release/bitty
           # Map target arch to nfpm arch

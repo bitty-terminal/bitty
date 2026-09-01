@@ -182,6 +182,7 @@ pub mod queue;
 pub mod registry;
 pub mod runtime;
 pub mod shell_integration;
+pub mod tabs;
 
 pub use config::RuntimeConfig;
 pub use error::RuntimeError;

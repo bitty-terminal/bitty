@@ -2,9 +2,9 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the six `v1` bundled-disabled first-party plugins
+//! Verifies the seven `v1` bundled-disabled first-party plugins
 //! (`bitty-terminal.shell-integration`, `tabs`, `statusline`, `palette`,
-//! `project`, `file-manager`) dogfood the **public** Plugin API with manifest / capability /
+//! `project`, `file-manager`, `git-panel`) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
@@ -18,8 +18,8 @@ use bitty_plugin_host::{
     PluginHost, PluginId,
     bundled::{
         all_bundled_manifests, bundled_ids_sorted, bundled_manifest_for, file_manager_manifest,
-        is_bundled, palette_manifest, project_manifest, shell_integration_manifest,
-        statusline_manifest, tabs_manifest,
+        git_panel_manifest, is_bundled, palette_manifest, project_manifest,
+        shell_integration_manifest, statusline_manifest, tabs_manifest,
     },
 };
 
@@ -40,7 +40,7 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_are_five_and_validate() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 6);
+    assert_eq!(all.len(), 7);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
@@ -48,6 +48,7 @@ fn bundled_manifests_are_five_and_validate() {
         bundled_ids_sorted(),
         vec![
             "bitty-terminal.file-manager",
+            "bitty-terminal.git-panel",
             "bitty-terminal.palette",
             "bitty-terminal.project",
             "bitty-terminal.shell-integration",
@@ -91,7 +92,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 6);
+    assert_eq!(host.registry().len(), 7);
 }
 
 #[test]
@@ -197,6 +198,7 @@ fn default_disabled_safe_mode_leaves_host_functional() {
     assert!(safe.declare(palette_manifest()).is_err());
     assert!(safe.declare(project_manifest()).is_err());
     assert!(safe.declare(file_manager_manifest()).is_err());
+    assert!(safe.declare(git_panel_manifest()).is_err());
     // `bitty.*` builtin would still be allowed in safe mode (candidate built-in
     // namespace) — prove the distinction is exactly the prefix, not a private
     // flag.

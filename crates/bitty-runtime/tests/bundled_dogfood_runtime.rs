@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Runtime dogfood for the seven bundled-disabled plugins (CTX-0096 + file-manager, CTX-0108 + git-panel, CTX-0109).
+//! Runtime dogfood for the eight bundled-disabled plugins (CTX-0096 + file-manager CTX-0108 + git-panel CTX-0109 + browser-panel CTX-0110).
 //!
 //! Proves:
 //! - default disabled: fresh `EffectiveConfig` / `Runtime::with_defaults` has
@@ -13,8 +13,8 @@
 //!   side queue `Snapshot`/`HostObservation`, never grid mutation
 //! - bounded cold-path execution: `DropOldest`, per-sub 64 / per-plugin 1024
 //!   + 256 KiB / global 8192 + 2 MiB, drops attributed for `bitty plugin doctor`
-//! - Panel Runtime is the host for file-manager and git-panel (tiled Panel), browser/agent
-//!   still excluded; no marketplace/daemon/remoe UI smuggled
+//! - Panel Runtime is the host for file-manager, git-panel and browser-panel (tiled Panel + View Browser), agent
+//!   still excluded; no marketplace/daemon/remote UI smuggled
 
 use bitty_config::{EffectiveConfig, PluginSpec};
 use bitty_plugin_host::{
@@ -79,7 +79,7 @@ fn bundled_plugins_load_via_public_api_through_runtime() {
         rt.activate_plugin(&id)
             .unwrap_or_else(|e| panic!("activate {}: {e}", id.as_str()));
     }
-    assert_eq!(rt.plugin_host().registry().len(), 7);
+    assert_eq!(rt.plugin_host().registry().len(), 8);
     // Each plugin's subscription (if any) can be established via public API.
     let shell_id = bitty_plugin_host::PluginId::new("bitty-terminal.shell-integration").unwrap();
     rt.subscribe_plugin_event(&shell_id, EventKind::TerminalTitleChanged)
@@ -242,20 +242,20 @@ fn bounded_cold_path_drop_oldest_and_attributable() {
 
 #[test]
 fn no_panel_runtime_browser_agent_marketplace_smuggled() {
-    // Panel Runtime is the host for file-manager and git-panel (CTX-0102, CTX-0108 tiled Panel
-    // with fs.read+optional fs.write, CTX-0109 with process.spawn:git). Browser/Agent/marketplace/daemon remain
-    // excluded; bundled catalog is exactly the seven accepted ids (no splits/search
-    // beyond file-manager and git-panel, no browser/agent).
+    // Panel Runtime is the host for file-manager, git-panel and browser-panel
+    // (CTX-0102, CTX-0108 tiled Panel with fs.read+optional fs.write, CTX-0109
+    // with process.spawn:git, CTX-0110 View Browser + Panel controls with
+    // browser.embed/navigation/file-url/storage allowlisted). Agent/marketplace/
+    // daemon remain excluded; bundled catalog is exactly the eight accepted ids
+    // (no splits/search beyond the three panel plugins, no agent).
     let ids = bundled::bundled_ids_sorted();
-    assert_eq!(ids.len(), 7);
+    assert_eq!(ids.len(), 8);
     assert!(
         !ids.iter()
             .any(|id| id.contains("splits") || id.contains("search"))
     );
-    assert!(
-        !ids.iter()
-            .any(|id| id.contains("browser") || id.contains("agent"))
-    );
+    assert!(!ids.iter().any(|id| id.contains("agent")));
     assert!(ids.contains(&"bitty-terminal.file-manager".to_string()));
     assert!(ids.contains(&"bitty-terminal.git-panel".to_string()));
+    assert!(ids.contains(&"bitty-terminal.browser-panel".to_string()));
 }

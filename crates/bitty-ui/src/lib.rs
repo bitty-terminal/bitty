@@ -66,10 +66,10 @@ pub use focus::{Focus, FocusDirection};
 pub use geometry::{Point, Rect, Size, SplitAxis};
 pub use layout::{LayoutNode, clamp_ratio, split_rect};
 pub use panel::{
-    CommandError, CommandRegistry, InputTarget, MAX_COMMANDS_PER_PANEL_TYPE, MAX_OVERLAY_TEXT_LEN,
-    MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError, OverlayKind,
-    OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand, ViewContent,
-    route_input, validate_panel_bounds,
+    BrowserSurfaceId, CommandError, CommandRegistry, InputTarget, MAX_COMMANDS_PER_PANEL_TYPE,
+    MAX_OVERLAY_TEXT_LEN, MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError,
+    OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
+    ViewContent, route_input, validate_panel_bounds,
 };
 pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{

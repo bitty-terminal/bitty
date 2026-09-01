@@ -25,4 +25,4 @@ proptest = "1"
 # headlessly and does not affect the production dependency graph. Candidate
 # alternative is to move that test to `bitty-runtime`/`bitty-ui`; kept here with
 # this documented exception to preserve locality of the singular reflow proof.
-bitty-ui = { version = "0.0.1", path = "../bitty-ui" }
+bitty-ui = { path = "../bitty-ui" }

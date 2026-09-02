@@ -350,7 +350,7 @@ jobs:
           cd aur-bitty
           useradd --create-home builder
           chown -R builder:builder .
-          su builder -s /bin/bash -c 'updpkgsums && makepkg --printsrcinfo > /tmp/bitty.SRCINFO'
+          su builder -s /bin/bash -c 'makepkg --printsrcinfo > /tmp/bitty.SRCINFO'
           install -m644 /tmp/bitty.SRCINFO .SRCINFO
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

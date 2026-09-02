@@ -330,9 +330,6 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
           git clone ssh://aur@aur.archlinux.org/bitty.git aur-bitty
-          if ! git -C aur-bitty rev-parse --verify HEAD >/dev/null 2>&1; then
-            git -C aur-bitty checkout --orphan master
-          fi
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           if [ ! -f aur-bitty/PKGBUILD ]; then
@@ -341,8 +338,9 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD
           cd aur-bitty
           useradd --create-home builder
-          chown -R builder:builder .
-          su builder -s /bin/bash -c 'updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+          chown builder:builder PKGBUILD
+          su builder -s /bin/bash -c 'updpkgsums && makepkg --printsrcinfo > /tmp/bitty.SRCINFO'
+          install -m644 /tmp/bitty.SRCINFO .SRCINFO
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add PKGBUILD .SRCINFO

@@ -307,7 +307,7 @@ jobs:
         run: |
           pacman-key --init
           pacman -Syu --noconfirm git openssh pacman-contrib base-devel
-      - name: Configure SSH
+      - name: Publish to AUR
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
@@ -329,9 +329,6 @@ jobs:
             StrictHostKeyChecking yes
           EOF
           chmod 600 ~/.ssh/config
-      - name: Publish to AUR
-        run: |
-          set -euo pipefail
           git clone ssh://aur@aur.archlinux.org/bitty.git aur-bitty
           if ! git -C aur-bitty rev-parse --verify HEAD >/dev/null 2>&1; then
             git -C aur-bitty checkout --orphan master

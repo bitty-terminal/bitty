@@ -466,14 +466,15 @@ jobs:
               "architecture": {
                   "64bit": {
                       "url": "${BASE_URL}/${X64_ASSET}",
-                      "hash": "${SHA_X64}"
+                      "hash": "${SHA_X64}",
+                      "bin": "${X64_ASSET}"
                   },
                   "arm64": {
                       "url": "${BASE_URL}/${ARM64_ASSET}",
-                      "hash": "${SHA_ARM64}"
+                      "hash": "${SHA_ARM64}",
+                      "bin": "${ARM64_ASSET}"
                   }
               },
-              "bin": "${X64_ASSET}",
               "checkver": {
                   "github": "https://github.com/bitty-terminal/bitty"
               },

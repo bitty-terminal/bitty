@@ -358,18 +358,66 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Update Homebrew Formula
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PUBLISH_TOKEN: ${{ secrets.GH_PAT || secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
-            echo "HOMEBREW_TAP_TOKEN not set, skipping"
-            exit 0
+          if [ -z "${PUBLISH_TOKEN:-}" ]; then
+            echo "Homebrew publishing is enabled but neither GH_PAT nor HOMEBREW_TAP_TOKEN is set" >&2
+            exit 1
           fi
-          echo "Homebrew bump would run here: update Formula/bitty.rb sha256 and version from release"
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          echo "Version $VERSION"
-          # In a real tap, this would clone homebrew-bitty and push updated Formula
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE_URL="https://github.com/bitty-terminal/bitty/releases/download/${TAG}"
+          INTEL_ASSET="bitty-x86_64-apple-darwin"
+          ARM_ASSET="bitty-aarch64-apple-darwin"
+          curl --fail --location --silent --show-error --output "$INTEL_ASSET" "${BASE_URL}/${INTEL_ASSET}"
+          curl --fail --location --silent --show-error --output "$ARM_ASSET" "${BASE_URL}/${ARM_ASSET}"
+          SHA_INTEL="$(sha256sum "$INTEL_ASSET" | cut -d' ' -f1)"
+          SHA_ARM="$(sha256sum "$ARM_ASSET" | cut -d' ' -f1)"
+
+          mkdir -p homebrew-tap
+          git -C homebrew-tap init
+          git -C homebrew-tap remote remove origin 2>/dev/null || true
+          git -C homebrew-tap remote add origin "https://x-access-token:${PUBLISH_TOKEN}@github.com/bitty-terminal/homebrew-tap.git"
+          if git -C homebrew-tap fetch --depth=1 origin main; then
+            git -C homebrew-tap checkout -B main FETCH_HEAD
+          else
+            git -C homebrew-tap checkout --orphan main
+            git -C homebrew-tap rm -rf . 2>/dev/null || true
+          fi
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/bitty.rb <<EOF
+          class Bitty < Formula
+            desc "Bitty pre-alpha terminal workspace minimal correct terminal"
+            homepage "https://github.com/bitty-terminal/bitty"
+            version "${VERSION}"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            if OS.mac? && Hardware::CPU.intel?
+              url "${BASE_URL}/${INTEL_ASSET}"
+              sha256 "${SHA_INTEL}"
+            elsif OS.mac? && Hardware::CPU.arm?
+              url "${BASE_URL}/${ARM_ASSET}"
+              sha256 "${SHA_ARM}"
+            end
+
+            def install
+              bin.install "${INTEL_ASSET}" => "bitty" if Hardware::CPU.intel?
+              bin.install "${ARM_ASSET}" => "bitty" if Hardware::CPU.arm?
+            end
+
+            test do
+              assert_match "${VERSION}", shell_output("#{bin}/bitty --version")
+            end
+          end
+          EOF
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap add Formula/bitty.rb
+          if ! git -C homebrew-tap diff --cached --quiet; then
+            git -C homebrew-tap commit -m "chore(homebrew): bump bitty to ${VERSION}"
+            git -C homebrew-tap push origin main
+          fi
 
   scoop:
     name: Bump Scoop Manifest
@@ -381,15 +429,71 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Update Scoop manifest
         env:
-          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          PUBLISH_TOKEN: ${{ secrets.GH_PAT || secrets.SCOOP_BUCKET_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${SCOOP_BUCKET_TOKEN:-}" ]; then
-            echo "SCOOP_BUCKET_TOKEN not set, skipping"
-            exit 0
+          if [ -z "${PUBLISH_TOKEN:-}" ]; then
+            echo "Scoop publishing is enabled but neither GH_PAT nor SCOOP_BUCKET_TOKEN is set" >&2
+            exit 1
           fi
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          echo "Scoop bump to $VERSION"
-          python3 -c "import json, pathlib; p=pathlib.Path('bucket/bitty.json'); d=json.loads(p.read_text()); d['version']='$VERSION'; p.write_text(json.dumps(d, indent=4)+'\n'); print('updated scoop manifest to', d['version'])"
-          cat bucket/bitty.json
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE_URL="https://github.com/bitty-terminal/bitty/releases/download/${TAG}"
+          X64_ASSET="bitty-x86_64-pc-windows-msvc.exe"
+          ARM64_ASSET="bitty-aarch64-pc-windows-msvc.exe"
+          curl --fail --location --silent --show-error --output "$X64_ASSET" "${BASE_URL}/${X64_ASSET}"
+          curl --fail --location --silent --show-error --output "$ARM64_ASSET" "${BASE_URL}/${ARM64_ASSET}"
+          SHA_X64="$(sha256sum "$X64_ASSET" | cut -d' ' -f1)"
+          SHA_ARM64="$(sha256sum "$ARM64_ASSET" | cut -d' ' -f1)"
+
+          mkdir -p scoop-bucket
+          git -C scoop-bucket init
+          git -C scoop-bucket remote remove origin 2>/dev/null || true
+          git -C scoop-bucket remote add origin "https://x-access-token:${PUBLISH_TOKEN}@github.com/bitty-terminal/scoop-bucket.git"
+          if git -C scoop-bucket fetch --depth=1 origin main; then
+            git -C scoop-bucket checkout -B main FETCH_HEAD
+          else
+            git -C scoop-bucket checkout --orphan main
+            git -C scoop-bucket rm -rf . 2>/dev/null || true
+          fi
+          mkdir -p scoop-bucket/bucket
+          cat > scoop-bucket/bucket/bitty.json <<EOF
+          {
+              "version": "${VERSION}",
+              "description": "Bitty pre-alpha terminal workspace minimal correct terminal",
+              "homepage": "https://github.com/bitty-terminal/bitty",
+              "license": "MIT OR Apache-2.0",
+              "architecture": {
+                  "64bit": {
+                      "url": "${BASE_URL}/${X64_ASSET}",
+                      "hash": "${SHA_X64}",
+                      "bin": "${X64_ASSET}"
+                  },
+                  "arm64": {
+                      "url": "${BASE_URL}/${ARM64_ASSET}",
+                      "hash": "${SHA_ARM64}",
+                      "bin": "${ARM64_ASSET}"
+                  }
+              },
+              "checkver": {
+                  "github": "https://github.com/bitty-terminal/bitty"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/bitty-terminal/bitty/releases/download/v\$version/bitty-x86_64-pc-windows-msvc.exe"
+                      },
+                      "arm64": {
+                          "url": "https://github.com/bitty-terminal/bitty/releases/download/v\$version/bitty-aarch64-pc-windows-msvc.exe"
+                      }
+                  }
+              }
+          }
+          EOF
+          git -C scoop-bucket config user.name "github-actions[bot]"
+          git -C scoop-bucket config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C scoop-bucket add bucket/bitty.json
+          if ! git -C scoop-bucket diff --cached --quiet; then
+            git -C scoop-bucket commit -m "chore(scoop): bump bitty to ${VERSION}"
+            git -C scoop-bucket push origin main
+          fi

@@ -113,7 +113,27 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo apt-get update || true
+          . /etc/os-release
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo awk '
+              /^Types:/ {
+                print;
+                print "Architectures: amd64";
+                next;
+              }
+              /^Architectures:/ { next; }
+              { print; }
+            ' /etc/apt/sources.list.d/ubuntu.sources | sudo tee /etc/apt/sources.list.d/ubuntu.sources >/dev/null
+          fi
+          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-backports ${VERSION_CODENAME}-security
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config libfontconfig1-dev:arm64 libfreetype6-dev:arm64
 
       - name: Install font stack (Linux x64)

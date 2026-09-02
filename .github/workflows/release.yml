@@ -316,19 +316,22 @@ jobs:
             echo "AUR_SSH_PRIVATE_KEY not set, skipping AUR publish"
             exit 0
           fi
-          install -dm700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-          cat > ~/.ssh/config <<'EOF'
+          export HOME=/root
+          SSH_DIR="$HOME/.ssh"
+          install -dm700 "$SSH_DIR"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$SSH_DIR/id_ed25519"
+          chmod 600 "$SSH_DIR/id_ed25519"
+          ssh-keyscan -t ed25519 aur.archlinux.org >> "$SSH_DIR/known_hosts"
+          chmod 600 "$SSH_DIR/known_hosts"
+          cat > "$SSH_DIR/config" <<'EOF'
           Host aur.archlinux.org
             IdentityFile ~/.ssh/id_ed25519
             User aur
             UserKnownHostsFile ~/.ssh/known_hosts
             StrictHostKeyChecking yes
           EOF
-          chmod 600 ~/.ssh/config
+          chmod 600 "$SSH_DIR/config"
+          export GIT_SSH_COMMAND="ssh -F $SSH_DIR/config"
           git clone ssh://aur@aur.archlinux.org/bitty.git aur-bitty
           git -C aur-bitty checkout -B master
           VERSION="${{ github.ref_name }}"

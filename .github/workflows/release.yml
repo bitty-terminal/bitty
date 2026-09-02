@@ -347,16 +347,17 @@ jobs:
             cp packaging/PKGBUILD aur-bitty/PKGBUILD
           fi
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD
-          cd aur-bitty
+          AUR_DIR="$PWD/aur-bitty"
           useradd --create-home builder
-          chown -R builder:builder .
-          su builder -s /bin/bash -c 'makepkg --printsrcinfo > /tmp/bitty.SRCINFO'
-          install -m644 /tmp/bitty.SRCINFO .SRCINFO
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add PKGBUILD .SRCINFO
-          git diff --cached --quiet || git commit -m "chore(aur): bump bitty to $VERSION"
-          git push origin master
+          chown -R builder:builder "$AUR_DIR"
+          # su changes cwd to builder's home, so make the repository path explicit.
+          su builder -s /bin/bash -c "cd \"$AUR_DIR\" && makepkg --printsrcinfo > /tmp/bitty.SRCINFO"
+          install -m644 /tmp/bitty.SRCINFO "$AUR_DIR/.SRCINFO"
+          git -C "$AUR_DIR" config user.name "github-actions[bot]"
+          git -C "$AUR_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "$AUR_DIR" add PKGBUILD .SRCINFO
+          git -C "$AUR_DIR" diff --cached --quiet || git -C "$AUR_DIR" commit -m "chore(aur): bump bitty to $VERSION"
+          git -C "$AUR_DIR" push origin master
 
   homebrew:
     name: Bump Homebrew Formula

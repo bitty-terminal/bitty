@@ -113,7 +113,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
-          sudo apt-get update
+          sudo apt-get update || true
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config libfontconfig1-dev:arm64 libfreetype6-dev:arm64
 
       - name: Install font stack (Linux x64)

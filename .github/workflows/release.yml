@@ -323,7 +323,10 @@ jobs:
           # Update PKGBUILD version from tag
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
-          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD || cp packaging/PKGBUILD aur-bitty/PKGBUILD && sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD
+          if [ ! -f aur-bitty/PKGBUILD ]; then
+            cp packaging/PKGBUILD aur-bitty/PKGBUILD
+          fi
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD
           # Update checksums (SKIP for VCS, otherwise use updpkgsums if available)
           cd aur-bitty
           if command -v updpkgsums >/dev/null 2>&1; then
@@ -335,7 +338,10 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add PKGBUILD .SRCINFO
+          git add PKGBUILD
+          if [ -f .SRCINFO ]; then
+            git add .SRCINFO
+          fi
           git diff --cached --quiet || git commit -m "chore(aur): bump bitty to $VERSION"
           git push
 

@@ -37,18 +37,24 @@
 //! the owned GPU surface lifecycle ([`gpu::Surface`] created from
 //! [`bitty_platform::SurfaceTarget`] via [`gpu::GpuContext::create_surface`],
 //! with `configure`/`resize`/`present` paths), the grid pipeline
-//! ([`grid::GridRenderer`] `Snapshot`/`Damage` -> `DrawList`/`Atlas`), and —
-//! under the opt-in `sw-fallback` feature — a CPU compositor that exercises
-//! the whole pipeline headlessly (`snapshot -> RGBA`).
+//! ([`grid::GridRenderer`] `Snapshot`/`Damage` -> `DrawList`/`Atlas`),
+//! CPU batch translation ([`batch`]: `DrawList` -> bounded vertex batches +
+//! atlas dirty-region bookkeeping), GPU presentation resources plus WGSL
+//! fill/glyph pipelines (crate-private `pipeline` module, consumed by
+//! [`gpu::Surface::present_draw_list`]), and — under the opt-in
+//! `sw-fallback` feature — a CPU compositor that exercises the whole
+//! pipeline headlessly (`snapshot -> RGBA`).
 //!
-//! Explicitly **out of scope** and not implemented yet: pipelines/shaders and
-//! vertex upload (the first place where `bytemuck` would be required — see
-//! below; the grid pipeline stops at owned draw records and the present path
-//! composites `DrawList`+`Atlas` via the software headless fake or a minimal
-//! GPU clear), cursor visuals and scrollback viewport rendering (deferred
-//! inside [`grid`]), text shaping/HarfBuzz (deferred to the text RFC named in
-//! ADR-0004), and subpixel RGB rendering policy. Window-surface attachment
-//! **is** implemented here as the owned [`gpu::Surface`] wrapper around
+//! Explicitly **out of scope** and not implemented yet: cursor visuals
+//! and scrollback viewport rendering (deferred inside [`grid`]), text
+//! shaping/HarfBuzz (deferred to the text RFC named in ADR-0004), and
+//! subpixel RGB rendering policy. Presentation pipelines and WGSL shaders
+//! **are** implemented: [`batch`] translates an owned [`DrawList`] into
+//! bounded vertex batches plus atlas-upload bookkeeping on any CPU, and the
+//! crate-private [`pipeline`](crate::pipeline) module owns the `wgpu` fill +
+//! glyph pipelines, the `R8` atlas texture with dirty-region uploads, and
+//! chunked draws consumed by [`gpu::Surface::present_draw_list`].
+//! Window-surface attachment **is** implemented here as the owned [`gpu::Surface`] wrapper around
 //! `bitty-platform`'s [`bitty_platform::SurfaceTarget`]; no `wgpu` type leaks
 //! except through that owned wrapper. None of the remaining deferred items may
 //! be described as existing until they land with evidence.
@@ -100,10 +106,9 @@
 //! `DisplayHandle`/`WindowHandle` (see `GPU Surface Seam` in [`gpu`]). The
 //! `unsafe` is confined to `gpu::Surface` construction (a single `unsafe`
 //! block with a safety comment) and does not leak. `crossfont` still requires
-//! no caller unsafe. `bytemuck` is intentionally not introduced. A future
-//! vertex-upload slice will need `Pod` bit-casting and will add a second
-//! narrow module-scoped `allow(unsafe_code)` with its own justification,
-//! rather than lifting the crate-wide deny.
+//! no caller unsafe. `bytemuck` is intentionally not introduced: vertex bytes
+//! are serialized with explicit little-endian `to_le_bytes` calls, so no
+//! `Pod` bit-casting (and no second `unsafe` scope) is required.
 //!
 //! # Example
 //!
@@ -137,6 +142,7 @@
 #![deny(unsafe_code)]
 
 pub mod atlas;
+pub mod batch;
 pub mod cache;
 pub mod crossfont_backend;
 pub mod error;
@@ -146,6 +152,7 @@ pub mod glyph;
 #[allow(unsafe_code)]
 pub mod gpu;
 pub mod grid;
+pub(crate) mod pipeline;
 
 #[cfg(feature = "sw-fallback")]
 pub mod software;

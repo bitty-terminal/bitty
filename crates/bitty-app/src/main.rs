@@ -49,15 +49,14 @@
 //! 6. **PTY pump integration** — the bounded `PtyReader` (`READ_CHUNK_SIZE`
 //!    × `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) pumps kernel bytes into a
 //!    `sync_channel`; the app drains `Receiver::try_recv` on the platform
-//!    thread and feeds `Runtime::handle_pty_bytes`. The **honest gap** in this
-//!    slice is that [`Runtime`](bitty_runtime::Runtime) currently encapsulates
-//!    its `Pty` without exposing a `PtyReader` handle (see
-//!    `crates/bitty-runtime/src/runtime.rs` "PTY: optional" ownership note).
-//!    Headless smoke therefore exercises `handle_pty_bytes` via synthetic bytes,
-//!    and the real loop documents where the bounded thread would poll. A
-//!    follow-up slice that adds `Runtime::take_pty_reader` (or
-//!    `Runtime::poll_pty`) will wire the live pump without changing the
-//!    app's public contract.
+//!    thread and feeds `Runtime::handle_pty_bytes`. The live pump is wired:
+//!    [`Runtime::take_pty_reader`](bitty_runtime::Runtime::take_pty_reader)
+//!    and [`Runtime::poll_pty`](bitty_runtime::Runtime::poll_pty) exist and
+//!    `TerminalApp::poll_pty_pump` drains the real runtime channel first
+//!    (replies flushed via `Runtime::write_replies`), with the synthetic
+//!    demo pump kept only as a bounded fallback for headless runs without
+//!    a spawned child. Headless smoke exercises `handle_pty_bytes` via
+//!    synthetic bytes in addition to the live path.
 //! 7. **Platform event loop** (`bitty-platform::App::run`) forwards every
 //!    [`PlatformEvent`](bitty_platform::PlatformEvent) into
 //!    [`Runtime::handle_platform_event`](bitty_runtime::Runtime::handle_platform_event)
@@ -140,12 +139,13 @@
 //! # PTY pump note
 //!
 //! PTY bytes are untrusted input; unbounded parsing or buffering is forbidden.
-//! The production pump will be `PtyReader::spawn` (kernel → bounded
+//! The production pump is `PtyReader::spawn` (kernel → bounded
 //! `sync_channel` 16 × 8 KiB = 128 KiB → `handle_pty_bytes`). Backpressure is
 //! end-to-end: when the consumer stalls the channel fills, the pump blocks,
 //! the kernel PTY buffer fills, and the child's `write` blocks. This binary
 //! demonstrates that contract via a synthetic bounded demo pump (no real child
-//! required) and wires the real `PtyReader` once `Runtime` exposes it.
+//! required), and the live pump is wired: `Runtime::take_pty_reader` and
+//! `Runtime::poll_pty` exist and `TerminalApp::poll_pty_pump` drains them.
 //!
 //! # Security
 //!
@@ -982,8 +982,9 @@ fn run_layout_proof(synthetic: &[u8]) -> i32 {
 /// backpressure that would propagate to the kernel PTY buffer for a real child.
 ///
 /// This exists to keep the composition root's PTY wiring total and testable on
-/// headless CI. The live `PtyReader::spawn` wiring will replace this once
-/// `Runtime` exposes a `take_pty_reader` handle (documented above).
+/// headless CI. It is the bounded fallback only: the live pump is wired —
+/// `Runtime::take_pty_reader` and `Runtime::poll_pty` exist and
+/// `TerminalApp::poll_pty_pump` drains the real runtime channel first.
 fn spawn_demo_pty_pump() -> (Receiver<Vec<u8>>, JoinHandle<()>) {
     // Small channel to make backpressure observable in tests; 16 matches the
     // real `CHANNEL_CAPACITY_CHUNKS`.

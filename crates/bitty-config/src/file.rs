@@ -176,14 +176,15 @@ pub fn probe_config_path_with_env(
             fallback_name: false,
         });
     }
-    if let Some(fallback) = config_file_path_with_env(xdg_config_home, home, FALLBACK_LUA_NAME)
-        && exists(&fallback)
-    {
-        return Some(ProbedConfig {
-            path: fallback,
-            explicit: false,
-            fallback_name: true,
-        });
+    // MSRV 1.85: no let-chains; nest instead of `if let ... && ...`.
+    if let Some(fallback) = config_file_path_with_env(xdg_config_home, home, FALLBACK_LUA_NAME) {
+        if exists(&fallback) {
+            return Some(ProbedConfig {
+                path: fallback,
+                explicit: false,
+                fallback_name: true,
+            });
+        }
     }
     Some(ProbedConfig {
         path: canonical,

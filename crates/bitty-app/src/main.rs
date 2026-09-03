@@ -1003,14 +1003,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     .as_ref()
                     .filter(|p| p.path.exists())
                     .map(|p| p.path.clone());
-                if let Some(probe) = &probed
-                    && probe.fallback_name
-                    && probe.path.exists()
-                {
-                    eprintln!(
-                        "bitty: using fallback '{}' (canonical is 'init.lua')",
-                        probe.path.display()
-                    );
+                // MSRV 1.85: no let-chains; nest instead of `if let ... && ...`.
+                if let Some(probe) = &probed {
+                    if probe.fallback_name && probe.path.exists() {
+                        eprintln!(
+                            "bitty: using fallback '{}' (canonical is 'init.lua')",
+                            probe.path.display()
+                        );
+                    }
                 }
                 let e = &merged.effective;
                 let src = |field: &str| layer_source_label(&merged, field, file_path.as_deref());
@@ -1098,14 +1098,15 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 }
             };
             if !target.exists() {
-                if let Some(parent) = target.parent()
-                    && let Err(err) = std::fs::create_dir_all(parent)
-                {
-                    eprintln!(
-                        "bitty config edit: cannot create '{}': {err}",
-                        parent.display()
-                    );
-                    return 1;
+                // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
+                if let Some(parent) = target.parent() {
+                    if let Err(err) = std::fs::create_dir_all(parent) {
+                        eprintln!(
+                            "bitty config edit: cannot create '{}': {err}",
+                            parent.display()
+                        );
+                        return 1;
+                    }
                 }
                 // Starter only when missing: never clobbers existing content.
                 if let Err(err) = std::fs::write(&target, starter_init_lua()) {

@@ -1631,7 +1631,11 @@ impl Runtime {
         if self.focused == focused {
             return;
         }
+        let gained = focused;
         self.focused = focused;
+        if gained {
+            self.pending_full_redraw = true;
+        }
         if self.state.modes().focus_events {
             let seq = if focused { "\x1b[I" } else { "\x1b[O" };
             self.push_input_bytes(seq.as_bytes());
@@ -3340,6 +3344,10 @@ impl Runtime {
                 }
             },
             PlatformEvent::Exiting => true,
+            PlatformEvent::Resumed => {
+                self.pending_full_redraw = true;
+                false
+            }
             _ => false,
         }
     }
@@ -3899,6 +3907,20 @@ mod tests {
             .expect("valid resize");
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(320, 240)));
         assert!(rt.tick().is_some(), "resize forces full redraw");
+    }
+
+    #[test]
+    fn focus_gain_and_resumed_force_full_redraw() {
+        let mut rt = make_runtime();
+        assert!(rt.tick().is_some(), "first tick presents");
+        assert!(rt.tick().is_none(), "idle when no damage");
+        rt.set_focused(false);
+        assert!(rt.tick().is_none(), "focus loss alone stays idle");
+        rt.set_focused(true);
+        assert!(rt.tick().is_some(), "focus gain repaints");
+        assert!(rt.tick().is_none(), "idle again after focus repaint");
+        assert!(!rt.handle_platform_event(PlatformEvent::Resumed));
+        assert!(rt.tick().is_some(), "resume repaints");
     }
 
     // ------------------------------------------------------------------

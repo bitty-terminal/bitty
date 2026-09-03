@@ -721,6 +721,34 @@ fn full_frame_matches_union_of_incremental_cell_visits() {
     assert_eq!(counters.background_fills, 4);
 }
 
+#[test]
+fn scrolled_blanks_after_sgr_reset_stay_themed() {
+    use bitty_vt::{Color as VtColor, Rgb};
+    let light = VtColor::Rgb(Rgb {
+        r: 231,
+        g: 236,
+        b: 248,
+    });
+    let mut script = vec![
+        sgr(&[AttributeChange::Background(light)]),
+        sgr(&[AttributeChange::Reset]),
+    ];
+    for _ in 0..(80 + 5) {
+        script.push(TerminalAction::PrintControl(bitty_vt::ControlChar(0x0A)));
+    }
+    let state = state_from(&script);
+    let snapshot = state.snapshot();
+    let mut grid = renderer();
+    let list = grid.render(&snapshot, &full_damage(&state)).unwrap();
+    assert_eq!(list.fills.len(), snapshot.width * snapshot.height);
+    for fill in &list.fills {
+        assert_eq!(
+            fill.color, DEFAULT_BG,
+            "every scrolled row must use the themed background"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DPI rescale: atlas rasterization matches the scaled cell
 // ---------------------------------------------------------------------------

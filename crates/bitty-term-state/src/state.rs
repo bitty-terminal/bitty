@@ -1507,24 +1507,38 @@ impl State {
 
     fn apply_attribute_diff(&mut self, diff: &AttributeDiff) {
         for change in &diff.changes {
-            let kind = match change {
-                AttributeChange::Reset => AttributeChangeKind::Reset,
-                AttributeChange::Enable(attr) => AttributeChangeKind::Set(*attr, true),
-                AttributeChange::Disable(attr) => AttributeChangeKind::Set(*attr, false),
+            match change {
+                AttributeChange::Reset => {
+                    self.cursor.style.foreground = None;
+                    self.cursor.style.background = None;
+                    self.cursor.style.underline_color = None;
+                    self.cursor
+                        .style
+                        .attributes
+                        .apply_change(&AttributeChangeKind::Reset);
+                }
+                AttributeChange::Enable(attr) => {
+                    self.cursor
+                        .style
+                        .attributes
+                        .apply_change(&AttributeChangeKind::Set(*attr, true));
+                }
+                AttributeChange::Disable(attr) => {
+                    self.cursor
+                        .style
+                        .attributes
+                        .apply_change(&AttributeChangeKind::Set(*attr, false));
+                }
                 AttributeChange::Foreground(color) => {
                     self.cursor.style.foreground = color_option(*color);
-                    continue;
                 }
                 AttributeChange::Background(color) => {
                     self.cursor.style.background = color_option(*color);
-                    continue;
                 }
                 AttributeChange::UnderlineColor(color) => {
                     self.cursor.style.underline_color = color_option(*color);
-                    continue;
                 }
-            };
-            self.cursor.style.attributes.apply_change(&kind);
+            }
         }
     }
 
@@ -2144,5 +2158,34 @@ mod tests {
         assert_eq!(s.scrollback_len(), 0);
         let snap = s.snapshot();
         assert!(snap.cells.iter().all(Cell::is_blank));
+    }
+
+    #[test]
+    fn sgr_reset_clears_pen_colors_for_bce_blanks() {
+        let mut s = State::new();
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![AttributeChange::Background(Color::Rgb(bitty_vt::Rgb {
+                    r: 231,
+                    g: 236,
+                    b: 248,
+                }))]
+                .into_boxed_slice(),
+            },
+        });
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![AttributeChange::Reset].into_boxed_slice(),
+            },
+        });
+        assert_eq!(s.cursor().style, Style::default());
+        for _ in 0..(GRID_ROWS + 3) {
+            s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        let snap = s.snapshot();
+        assert!(
+            snap.cells.iter().all(|c| c.style.background.is_none()),
+            "BCE blanks after SGR 0 must use the default background"
+        );
     }
 }

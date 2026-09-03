@@ -22,21 +22,21 @@
 //! imperative overlay) is **deferred** to a future
 //! `plugin/runtime overlay` RFC and is not part of the v1 contract.
 //!
-//! The RFC's Lua Runtime dependency (`lua-runtime-rfc`, `OQ-009`) is also
-//! still proposed, so this crate is **pure data + validation**: it takes an
-//! already evaluated [`ConfigPlan`] as plain data and owns everything after
-//! it. There is no Lua VM coupling, no file I/O, no platform path
-//! resolution, and no `unsafe` — the crate is headlessly testable on both
-//! Linux CI and the `windows-latest` job.
+//! Per DEC-0011 the user config file is Lua evaluated in the `bitty-lua`
+//! sandbox (same budgets as plugins): the [`file`] module loads
+//! `init.lua`/`config.lua` through that sandbox into a [`ConfigPlan`]. The
+//! core pipeline stays **pure data + validation** past that point, with no
+//! `unsafe` — the crate stays headlessly testable on both Linux CI and the
+//! `windows-latest` job.
 //!
 //! # Pipeline — Candidate A accepted for v1 (experimental review evidence)
 //!
 //! ```text
-//! Lua (outside crate) -> ConfigPlan -> typed validation -> migration -> merge -> diff -> reconcile
+//! `init.lua` (sandboxed) -> ConfigPlan -> typed validation -> migration -> merge -> diff -> reconcile
 //! ```
 //!
-//! - Lua evaluation is side-effect-free by construction and outside this
-//!   crate. The host evaluates modules to a [`plan::ConfigPlan`] value.
+//! - Lua evaluation runs in the `bitty-lua` sandbox ([`file`]) with plugin
+//!   budgets and no `io`/`os`; it yields plain data as [`plan::ConfigPlan`].
 //! - Typed validation (`validation`, `types`) checks every present field.
 //! - Migration (`migration`) bumps older `schema_version`s to the current
 //!   version via stub transforms.
@@ -81,6 +81,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod file;
 pub mod merge;
 pub mod migration;
 pub mod plan;

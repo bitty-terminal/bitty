@@ -17,28 +17,39 @@
 //! ```
 //!
 //! 1. **Parse args** (`--help` / `--version` / `--headless`, layout flags
-//!    `--split`/`--stack`/`--overlay`/`--layout`, focus flag `--focus`, and an
-//!    optional program to spawn). Parsing is pure, total, and tested without
-//!    touching the filesystem or network.
-//! 2. **Create [`Runtime`](bitty_runtime::Runtime)** via
-//!    [`Runtime::with_defaults`](bitty_runtime::Runtime::with_defaults) (or
-//!    [`Runtime::new`](bitty_runtime::Runtime::new) with a validated
-//!    [`RuntimeConfig`](bitty_runtime::RuntimeConfig)). This immediately
+//!    `--split`/`--stack`/`--overlay`/`--layout`, focus flag `--focus`,
+//!    config flags `--config`/`--theme`, and an optional program to spawn).
+//!    Flag parsing itself is pure, total, and tested without touching the
+//!    filesystem or network; config-file loading happens in step 2.
+//! 2. **Load user config** (CTX-0148 Lua, DEC-0011): resolve `--config` or
+//!    the XDG default (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
+//!    `~/.config/bitty/init.lua`, then `config.lua`), evaluate the
+//!    wezterm-style return table in the `bitty-lua` sandbox via
+//!    `bitty-config::file` (never executed as code), validate/migrate/merge
+//!    with precedence `CLI (`--theme`) > file > defaults`. Invalid files
+//!    fail closed (clear stderr, exit 2, no panic, no silent ignore); a
+//!    missing default-path file simply yields defaults.
+//! 3. **Create [`Runtime`](bitty_runtime::Runtime)** via
+//!    [`Runtime::new`](bitty_runtime::Runtime::new) with a [`RuntimeConfig`](bitty_runtime::RuntimeConfig)
+//!    derived from the effective config (font family/size; grid/cell/queue
+//!    stay at defaults). This immediately
 //!    builds a headless software surface (`Surface::headless`) and the
 //!    deterministic `GridRenderer` — no display server, window, adapter, or
 //!    font file is contacted.
-//! 3. **Build layout** via [`build_layout`] from the parsed [`Args`] (default
+//! 4. **Build layout** via [`build_layout`] from the parsed [`Args`] (default
 //!    single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
 //!    `--layout` spec). The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
 //!    via `bitty-ui` types re-exported through `bitty-runtime` and calls
-//!    [`Runtime::set_layout`](bitty_runtime::Runtime::set_layout). No config or
-//!    plugin coupling is involved; the layout is derived purely from argv.
-//! 4. **Focus handling** via `--focus` (numeric id or `next`/`prev`/`up`/`down`/
+//!    [`Runtime::set_layout`](bitty_runtime::Runtime::set_layout). No plugin
+//!    coupling is involved; the layout is derived purely from argv (config
+//!    files today carry appearance/font/window/terminal scalars only, never
+//!    layout).
+//! 5. **Focus handling** via `--focus` (numeric id or `next`/`prev`/`up`/`down`/
 //!    `left`/`right`) and via keyboard shortcuts in real mode (Tab/arrow/n/p/1..5).
 //!    Focus moves are routed through [`Runtime::set_focus`](bitty_runtime::Runtime::set_focus)
 //!    and [`Runtime::move_focus`](bitty_runtime::Runtime::move_focus) which
 //!    delegate to the layout's deterministic adjacency.
-//! 5. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
+//! 6. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
 //!    for the explicit program argument, or via the default shell (`$SHELL`
 //!    fallback `/bin/sh`, see [`resolve_default_shell`]) when no program is
 //!    given. The program is taken as a direct
@@ -46,7 +57,7 @@
 //!    [`RuntimeError`](bitty_runtime::RuntimeError) values flattened from
 //!    `bitty-pty` (`Unsupported` on Windows before ConPTY, `Upstream`/`Io`
 //!    elsewhere) and are reported without panicking.
-//! 6. **PTY pump integration** — the bounded `PtyReader` (`READ_CHUNK_SIZE`
+//! 7. **PTY pump integration** — the bounded `PtyReader` (`READ_CHUNK_SIZE`
 //!    × `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) pumps kernel bytes into a
 //!    `sync_channel`; the app drains `Receiver::try_recv` on the platform
 //!    thread and feeds `Runtime::handle_pty_bytes`. The live pump is wired:
@@ -57,7 +68,7 @@
 //!    demo pump kept only as a bounded fallback for headless runs without
 //!    a spawned child. Headless smoke exercises `handle_pty_bytes` via
 //!    synthetic bytes in addition to the live path.
-//! 7. **Platform event loop** (`bitty-platform::App::run`) forwards every
+//! 8. **Platform event loop** (`bitty-platform::App::run`) forwards every
 //!    [`PlatformEvent`](bitty_platform::PlatformEvent) into
 //!    [`Runtime::handle_platform_event`](bitty_runtime::Runtime::handle_platform_event)
 //!    (resize → `handle_resize`, `CloseRequested`/`Exiting` → exit, other
@@ -208,6 +219,55 @@ struct Args {
     layout: Option<String>,
     /// Raw focus spec (from `--focus`), e.g. "next", "prev", "up", "1".
     focus: Option<String>,
+    /// Explicit config file path (from `--config`). When `None` the default
+    /// XDG path is probed (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
+    /// `~/.config/bitty/init.lua`, then `config.lua`); see `bitty-config::file`.
+    config_path: Option<String>,
+    /// CLI theme override (from `--theme`). Wins over the config file, which
+    /// wins over defaults (`CLI > file > defaults` via `bitty-config` merge).
+    theme: Option<String>,
+    /// `bitty config <verb>` subcommand (CLI-first management per DEC-0007).
+    /// `None` means normal terminal startup. A program literally named
+    /// `config` must be invoked as `bitty -- config ...`.
+    config_cmd: Option<ConfigCommand>,
+    /// True once the first positional `config` word is seen (subcommand
+    /// mode); unknown/missing verbs fail closed via usage instead of
+    /// spawning a program named `config`.
+    config_word: bool,
+    /// Unexpected extra positionals in subcommand mode (dispatch errors).
+    config_args: Vec<String>,
+}
+
+/// `bitty config` subcommand verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigCommand {
+    /// Print the resolved config file path.
+    Path,
+    /// Load + validate and print per-key sources (the testing hook).
+    Check,
+    /// Open the file in `$VISUAL`/`$EDITOR` (never overwrites existing).
+    Edit,
+}
+
+impl ConfigCommand {
+    /// Parse a verb token.
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "path" => Some(Self::Path),
+            "check" => Some(Self::Check),
+            "edit" => Some(Self::Edit),
+            _ => None,
+        }
+    }
+
+    /// Verb name for usage/errors.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Check => "check",
+            Self::Edit => "edit",
+        }
+    }
 }
 
 impl Args {
@@ -224,6 +284,11 @@ impl Args {
             overlay: false,
             layout: None,
             focus: None,
+            config_path: None,
+            theme: None,
+            config_cmd: None,
+            config_word: false,
+            config_args: Vec::new(),
         }
     }
 }
@@ -335,6 +400,13 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 /// - `--overlay` → overlay layout
 /// - `--layout SPEC` → explicit layout spec (single, split:h[:ratio], stack[:n], overlay[:x,y,w,h])
 /// - `--focus SPEC` → focus (next|prev|up|down|left|right|<id>)
+/// - `--config PATH` → explicit user config file (`init.lua`); when omitted
+///   the XDG default is probed (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
+///   `~/.config/bitty/init.lua`, then `config.lua` alias)
+/// - `--theme NAME` → CLI theme override (wins over config file, which wins
+///   over defaults; see `bitty-config::file::resolve_effective`)
+/// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
+///   literally named `config` needs `bitty -- config ...`
 /// - `--` → treat the rest as program argv verbatim
 ///
 /// The first non-flag token becomes `program`; additional non-flag tokens
@@ -403,6 +475,22 @@ fn parse_args(raw: &[String]) -> Args {
         if token.starts_with("--focus=") {
             let val = token.trim_start_matches("--focus=");
             out.focus = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--config=") {
+            let val = token.trim_start_matches("--config=");
+            if val.trim().is_empty() {
+                eprintln!("warning: --config needs a file path — ignoring");
+            } else {
+                out.config_path = Some(val.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--theme=") {
+            let val = token.trim_start_matches("--theme=");
+            out.theme = Some(val.to_string());
             i += 1;
             continue;
         }
@@ -493,6 +581,24 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                 }
             }
+            "--config" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.config_path = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --config needs a file path — ignoring");
+                    i += 1;
+                }
+            }
+            "--theme" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.theme = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --theme needs a theme name — ignoring");
+                    i += 1;
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("warning: unknown flag {s:?} — treating as program name");
                 if !program_set {
@@ -504,6 +610,45 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             _ => {
+                // `bitty config <verb>` subcommand (first positional only;
+                // `--` escape hatch bypasses this via after_double_dash).
+                // A program literally named `config` needs `bitty -- config`.
+                if !program_set && !out.config_word && token == "config" {
+                    out.config_word = true;
+                    if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                        let verb = raw[i + 1].clone();
+                        match ConfigCommand::parse(&verb) {
+                            Some(cmd) => {
+                                out.config_cmd = Some(cmd);
+                            }
+                            None => {
+                                // Unknown verb: record for fail-closed usage.
+                                out.config_args.push(verb);
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        // Bare `bitty config` (or `config` + flag): dispatch
+                        // prints usage + exit 2.
+                        i += 1;
+                    }
+                    continue;
+                }
+                if out.config_word {
+                    // Verb may follow flags (`config --config X check`): take
+                    // the first bare token as the verb when none is set yet.
+                    if out.config_cmd.is_none() && out.config_args.is_empty() {
+                        if let Some(cmd) = ConfigCommand::parse(token) {
+                            out.config_cmd = Some(cmd);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    // Extra positionals in subcommand mode fail closed.
+                    out.config_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
                 if !program_set {
                     out.program = Some(token.clone());
                     program_set = true;
@@ -535,7 +680,22 @@ fn help_text() -> String {
                --layout SPEC  Explicit layout: single | split:h[:ratio] | split:v[:ratio]\n  \
            \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20stack[:N] | overlay[:X,Y,W,H]  (overrides --split/--stack/--overlay)\n  \
                --focus SPEC Focus: next|prev|up|down|left|right|<id> (e.g. --focus next, --focus 2)\n  \
+               --config PATH  Explicit user config file (init.lua). When omitted\n  \
+                            the XDG default is probed ($XDG_CONFIG_HOME/bitty/init.lua,\n  \
+                            fallback ~/.config/bitty/init.lua, then config.lua alias).\n  \
+                            Invalid files fail closed (clear stderr, exit non-zero,\n  \
+                            no panic).\n  \
+               --theme NAME   CLI theme override (e.g. --theme dark). Wins over the\n  \
+                            config file, which wins over defaults.\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
+         \n\
+         Subcommands (CLI-first management, DEC-0007):\n  \
+           config path      Print the resolved config file path\n  \
+           config check     Load + validate; print per-key sources\n  \
+                            (cli/file/default), exit non-zero on invalid files\n  \
+           config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
+                            creates parents + starter when missing, never\n  \
+                            overwrites existing content\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -568,6 +728,11 @@ fn help_text() -> String {
                             gap: runtime still presents via the headless seam\n  \
                             until the attach_gpu slice lands. See module docs.\n\
          \n\
+         Config file (Lua, wezterm-style init.lua):\n  \
+           return {{ theme = \"dark\", font = {{ family = \"Mono\", size = 12 }} }}\n  \
+                            Evaluated in the bitty-lua sandbox (same budgets as\n  \
+                            plugins; no io/os). Unknown keys fail closed.\n  \
+         \n\
          Examples:\n  \
            bitty --help\n  \
            bitty --version\n  \
@@ -584,6 +749,416 @@ fn help_text() -> String {
 
 fn version_text() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+// ---------------------------------------------------------------------------
+// User config-file loading (CTX-0148 Lua via bitty-lua sandbox, DEC-0011)
+// ---------------------------------------------------------------------------
+
+/// Owned result of loading the effective user configuration.
+///
+/// `source` is `"cli"` when `--theme` overrode, `"file"` when the config file
+/// provided the theme, else `"default"`. The resolved `theme` preset is the
+/// single `bitty-config` registry entry the window renders.
+struct AppConfig {
+    /// Merged effective config (`CLI > file > defaults`).
+    effective: bitty_config::EffectiveConfig,
+    /// Config file path that was used, if any.
+    file_path: Option<std::path::PathBuf>,
+    /// Resolved theme preset (static registry entry).
+    theme: &'static bitty_config::theme::Theme,
+    /// How the theme resolved (Default/Named/FallbackUnknown).
+    resolution: bitty_config::theme::ThemeResolution,
+    /// `"cli"` / `"file"` / `"default"`: which layer provided the theme.
+    source: &'static str,
+}
+
+/// Shared probe + load + merge behind startup and `config check`.
+///
+/// Returns the merged layers plus the probed path (if any). impure
+/// (filesystem + env); total (all failures become `Err(String)`).
+fn load_merged_config(
+    args: &Args,
+) -> Result<
+    (
+        bitty_config::MergedConfig,
+        Option<bitty_config::file::ProbedConfig>,
+    ),
+    String,
+> {
+    let explicit = args.config_path.as_deref();
+    let probed = bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty()));
+    let mut file_layer: Option<bitty_config::LayeredPlan> = None;
+    let mut used_path: Option<std::path::PathBuf> = None;
+    if let Some(probe) = probed.clone() {
+        if probe.path.exists() {
+            match bitty_config::file::load_user_layer(&probe.path) {
+                Ok(layer) => {
+                    used_path = Some(probe.path.clone());
+                    file_layer = Some(layer);
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "bitty: invalid config file '{}': {err}",
+                        probe.path.display()
+                    ));
+                }
+            }
+        } else if probe.explicit {
+            return Err(format!(
+                "bitty: --config '{}' not found",
+                probe.path.display()
+            ));
+        }
+    }
+    let merged = bitty_config::file::resolve_effective(file_layer, args.theme.as_deref()).map_err(
+        |err| {
+            if let Some(p) = &used_path {
+                format!("bitty: invalid config '{}': {err}", p.display())
+            } else {
+                format!("bitty: invalid --theme: {err}")
+            }
+        },
+    )?;
+    Ok((merged, probed))
+}
+
+/// Loads the effective config for `args`.
+///
+/// - Probes `--config` verbatim, else `init.lua`, else the `config.lua`
+///   alias, else the canonical `init.lua` path.
+/// - A missing **probed** file yields defaults (no error); a missing
+///   **explicit** `--config` file fails closed.
+/// - A present-but-invalid file (Lua syntax/runtime/budget/shape/validation)
+///   fails closed with a user-facing message (caller prints to stderr and
+///   exits non-zero; no panic, no silent ignore).
+/// - Merges `CLI (--theme) > file > defaults` via `bitty-config` and resolves
+///   `appearance.theme` through the preset registry.
+///
+/// impure (filesystem reads + env vars XDG/HOME); total (all failures become
+/// `Err(String)`).
+fn load_app_config(args: &Args) -> Result<AppConfig, String> {
+    let (merged, probed) = load_merged_config(args)?;
+    let mut file_path: Option<std::path::PathBuf> = None;
+    if let Some(probe) = &probed {
+        if probe.path.exists() {
+            if probe.fallback_name {
+                eprintln!(
+                    "bitty: using fallback '{}' (canonical is 'init.lua')",
+                    probe.path.display()
+                );
+            }
+            file_path = Some(probe.path.clone());
+        }
+    }
+    // Attribute the theme source for title/demo/log evidence. The merge
+    // attribution answers which layer won `appearance.theme`; fall back to
+    // CLI-vs-file presence when the field is at defaults.
+    let source: &'static str = match merged.source_of("appearance.theme").map(|s| s.layer) {
+        Some(bitty_config::LayerKind::Cli) => "cli",
+        Some(bitty_config::LayerKind::User) => "file",
+        _ => "default",
+    };
+    let effective = merged.effective;
+    let (theme, resolution) =
+        bitty_config::theme::resolve_theme_with_status(effective.appearance.theme.as_deref());
+    // Log unknown-theme fallbacks (the pure resolver stays silent for tests).
+    if resolution == bitty_config::theme::ThemeResolution::FallbackUnknown {
+        let raw = effective.appearance.theme.as_deref().unwrap_or_default();
+        eprintln!(
+            "bitty: unknown theme '{raw}'; falling back to '{}'",
+            bitty_config::theme::DEFAULT_THEME_NAME
+        );
+    }
+    if let Some(p) = &file_path {
+        eprintln!(
+            "bitty: config loaded from '{}' (theme={:?} resolution={resolution:?} source={source})",
+            p.display(),
+            effective.appearance.theme.as_deref().unwrap_or("(default)")
+        );
+    } else if args.theme.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+        eprintln!(
+            "bitty: CLI theme {:?} (resolution={resolution:?} source={source})",
+            args.theme.as_deref().unwrap_or_default()
+        );
+    }
+    Ok(AppConfig {
+        effective,
+        file_path,
+        theme,
+        resolution,
+        source,
+    })
+}
+
+/// Short usage for `bitty config` (stderr, fail-closed exit 2).
+fn config_usage() -> String {
+    "usage: bitty config <path|check|edit> [--config PATH]\n\
+     \n\
+     verbs:\n\
+     \x20 path   print the resolved config file path\n\
+     \x20 check  load + validate; print per-key sources (cli/file/default)\n\
+     \x20 edit   open the file in $VISUAL/$EDITOR (vi fallback)\n\
+     \n\
+     config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)"
+        .to_string()
+}
+
+/// Resolves the editor for `config edit` without touching the process:
+/// `$VISUAL`, then `$EDITOR`, then `vi`. Pure over injected values for
+/// headless tests.
+fn resolve_editor_with_env(visual: Option<&str>, editor: Option<&str>) -> String {
+    for cmd in [visual, editor].into_iter().flatten() {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "vi".to_string()
+}
+
+/// Live-environment editor resolution.
+fn resolve_editor() -> String {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    resolve_editor_with_env(visual.as_deref(), editor.as_deref())
+}
+
+/// Starter `init.lua` written by `config edit` only when the file is missing.
+/// Never used to overwrite existing content.
+fn starter_init_lua() -> &'static str {
+    "-- bitty user configuration (Lua, wezterm-style).\n\
+     -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
+     -- Unknown keys fail closed; validate with `bitty config check`.\n\
+     return {\n\
+     \x20\x20theme = \"dark\",\n\
+     }\n"
+}
+
+/// Formats one `config check` row: `dotted.key = value (source)`.
+fn check_row(key: &str, value: String, source: &str) -> String {
+    format!("{key} = {value} ({source})")
+}
+
+/// Source label for a merged layer: `cli`, `file: <path>`, `default`, or the
+/// raw layer label for future layers.
+fn layer_source_label(
+    merged: &bitty_config::MergedConfig,
+    field: &str,
+    file_path: Option<&std::path::Path>,
+) -> String {
+    match merged.source_of(field).map(|s| s.layer) {
+        Some(bitty_config::LayerKind::Cli) => "cli".to_string(),
+        Some(bitty_config::LayerKind::User) => match file_path {
+            Some(p) => format!("file: {}", p.display()),
+            None => "file".to_string(),
+        },
+        Some(layer) => {
+            if layer == bitty_config::LayerKind::CoreDefaults {
+                "default".to_string()
+            } else {
+                layer.label().to_string()
+            }
+        }
+        None => "default".to_string(),
+    }
+}
+
+/// Runs `bitty config <verb>`; returns the process exit code.
+///
+/// - `path`: print resolved path (0) or fail closed (2) when no root exists.
+/// - `check`: load + validate via the startup path, print per-key sources
+///   (0); invalid files reuse the startup error verbatim (2).
+/// - `edit`: mkdir parents + starter-when-missing, open `$VISUAL`/`$EDITOR`
+///   (0 on editor success; 1 on spawn failure; editor non-zero propagates).
+fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
+    if !args.config_args.is_empty() {
+        eprintln!(
+            "bitty config {}: unexpected argument '{}'\n{}",
+            cmd.name(),
+            args.config_args[0],
+            config_usage()
+        );
+        return 2;
+    }
+    let explicit = args.config_path.as_deref();
+    match cmd {
+        ConfigCommand::Path => {
+            match bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty())) {
+                Some(probed) => {
+                    println!("{}", probed.path.display());
+                    0
+                }
+                None => {
+                    eprintln!(
+                        "bitty config path: no config root ($XDG_CONFIG_HOME or $HOME unset)"
+                    );
+                    2
+                }
+            }
+        }
+        ConfigCommand::Check => match load_merged_config(args) {
+            Ok((merged, probed)) => {
+                let file_path = probed
+                    .as_ref()
+                    .filter(|p| p.path.exists())
+                    .map(|p| p.path.clone());
+                // MSRV 1.85: no let-chains; nest instead of `if let ... && ...`.
+                if let Some(probe) = &probed {
+                    if probe.fallback_name && probe.path.exists() {
+                        eprintln!(
+                            "bitty: using fallback '{}' (canonical is 'init.lua')",
+                            probe.path.display()
+                        );
+                    }
+                }
+                let e = &merged.effective;
+                let src = |field: &str| layer_source_label(&merged, field, file_path.as_deref());
+                let theme = e
+                    .appearance
+                    .theme
+                    .as_deref()
+                    .map_or(String::from("(default)"), |t| format!("\"{t}\""));
+                println!(
+                    "{}",
+                    check_row("appearance.theme", theme, &src("appearance.theme"))
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "font.family",
+                        format!("\"{}\"", e.font.family),
+                        &src("font.family")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row("font.size", format!("{}", e.font.size), &src("font.size"))
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "window.opacity",
+                        format!("{}", e.window.opacity),
+                        &src("window.opacity")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "window.padding",
+                        format!("{}", e.window.padding),
+                        &src("window.padding")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "terminal.scrollback",
+                        format!("{}", e.terminal.scrollback),
+                        &src("terminal.scrollback")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "terminal.shell",
+                        e.terminal
+                            .shell
+                            .as_deref()
+                            .map_or(String::from("(unset)"), |v| format!("\"{v}\"")),
+                        &src("terminal.shell")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "keymaps",
+                        format!("{} entries", e.keymaps.len()),
+                        &src("keymaps")
+                    )
+                );
+                0
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                2
+            }
+        },
+        ConfigCommand::Edit => {
+            let probed =
+                bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty()));
+            let target = match probed {
+                Some(p) => p.path,
+                None => {
+                    eprintln!(
+                        "bitty config edit: no config root ($XDG_CONFIG_HOME or $HOME unset)"
+                    );
+                    return 2;
+                }
+            };
+            if !target.exists() {
+                // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
+                if let Some(parent) = target.parent() {
+                    if let Err(err) = std::fs::create_dir_all(parent) {
+                        eprintln!(
+                            "bitty config edit: cannot create '{}': {err}",
+                            parent.display()
+                        );
+                        return 1;
+                    }
+                }
+                // Starter only when missing: never clobbers existing content.
+                if let Err(err) = std::fs::write(&target, starter_init_lua()) {
+                    eprintln!(
+                        "bitty config edit: cannot write '{}': {err}",
+                        target.display()
+                    );
+                    return 1;
+                }
+                eprintln!("bitty config edit: created '{}'", target.display());
+            }
+            let editor = resolve_editor();
+            match std::process::Command::new(&editor).arg(&target).status() {
+                Ok(status) if status.success() => 0,
+                Ok(status) => status.code().unwrap_or(1),
+                Err(err) => {
+                    eprintln!("bitty config edit: cannot run editor '{editor}': {err}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
+///
+/// Grid/cell/queue geometry stays at compiled defaults; font family/size come
+/// from the file/CLI/default chain (already validated by `bitty-config`, so
+/// construction is expected to succeed — failures stay fail-closed).
+fn runtime_config_from_effective(
+    effective: &bitty_config::EffectiveConfig,
+) -> Result<bitty_runtime::RuntimeConfig, String> {
+    let defaults = bitty_runtime::RuntimeConfig::default();
+    bitty_runtime::RuntimeConfig::new(
+        defaults.cols,
+        defaults.rows,
+        defaults.cell_width,
+        defaults.cell_height,
+        defaults.cold_queue_capacity,
+        effective.font.family.clone(),
+        effective.font.size,
+    )
+    .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
+}
+
+/// Window title carrying the resolved theme preset and its source layer.
+///
+/// Visible via `hyprctl clients` and (where decorations show) the title bar,
+/// so screenshots plus class-check prove which config path the window took:
+/// `... — bitty-dark (default)` vs `... — bitty-dark (file)`.
+fn window_title_for_theme(theme_name: &str, source: &str) -> String {
+    format!("bitty \u{2014} Correct Terminal \u{2014} {theme_name} ({source})")
 }
 
 // ---------------------------------------------------------------------------
@@ -986,16 +1561,32 @@ fn run_layout_proof(synthetic: &[u8]) -> i32 {
 /// headless CI. It is the bounded fallback only: the live pump is wired —
 /// `Runtime::take_pty_reader` and `Runtime::poll_pty` exist and
 /// `TerminalApp::poll_pty_pump` drains the real runtime channel first.
-fn spawn_demo_pty_pump() -> (Receiver<Vec<u8>>, JoinHandle<()>) {
+/// Theme-aware demo pump: the greeting names the resolved theme preset
+/// and its source layer (`default`/`file`/`cli`) so the live window visibly
+/// proves which config path it took. The green SGR still resolves through the
+/// themed palette (no hardcoded green outside the theme).
+///
+/// Both strings come from the trusted registry/source labels (bounded, ASCII)
+/// — never from raw file bytes — so the burst stays bounded.
+fn spawn_demo_pty_pump_with_theme(
+    theme_name: &str,
+    source: &str,
+) -> (Receiver<Vec<u8>>, JoinHandle<()>) {
+    // Bound the label at construction (registry names are short; this is
+    // defense-in-depth so a future registry entry cannot grow the burst).
+    let theme_safe: String = theme_name.chars().take(64).collect();
+    let source_safe: String = source.chars().take(16).collect();
+    let greeting = format!("demo pty: hello theme={theme_safe} src={source_safe} ");
     // Small channel to make backpressure observable in tests; 16 matches the
     // real `CHANNEL_CAPACITY_CHUNKS`.
     let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(16);
     let handle = std::thread::spawn(move || {
         // Single synthetic burst — enough to exercise one tick's damage.
-        let chunks: &[&[u8]] = &[b"demo pty: hello ", b"\x1b[32mgreen\x1b[0m\n"];
-        for chunk in chunks {
+        let green: &[u8] = b"\x1b[32mgreen\x1b[0m\n";
+        let chunks: Vec<Vec<u8>> = vec![greeting.into_bytes(), green.to_vec()];
+        for chunk in &chunks {
             // `send` blocks when the channel is full — the backpressure point.
-            if tx.send(chunk.to_vec()).is_err() {
+            if tx.send(chunk.clone()).is_err() {
                 break;
             }
         }
@@ -1015,6 +1606,8 @@ fn spawn_demo_pty_pump() -> (Receiver<Vec<u8>>, JoinHandle<()>) {
 /// attachment for the single-window vertical slice.
 struct TerminalApp {
     runtime: Runtime,
+    /// Window title carrying the resolved theme preset + source layer.
+    window_title: String,
     window: Option<WindowHandle>,
     window_id: Option<WindowId>,
     /// Demo bounded PTY pump fallback when no real PTY is owned (headless tests).
@@ -1025,14 +1618,17 @@ struct TerminalApp {
 }
 
 impl TerminalApp {
-    fn new(runtime: Runtime) -> Self {
+    /// Theme-aware constructor: the demo fallback burst names the resolved
+    /// preset and source so the live window proves its config path.
+    fn with_theme(runtime: Runtime, theme_name: &str, source: &str) -> Self {
         // Keep demo pump as fallback when no real PTY is spawned (headless CI,
         // tests). When a real PTY is spawned via `Runtime::spawn_shell`, the
         // real `poll_pty` path handles bytes and the demo pump just delivers a
         // harmless synthetic burst.
-        let (pty_rx, handle) = spawn_demo_pty_pump();
+        let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
         Self {
             runtime,
+            window_title: window_title_for_theme(theme_name, source),
             window: None,
             window_id: None,
             pty_rx: Some(pty_rx),
@@ -1217,7 +1813,7 @@ impl AppHandler for TerminalApp {
                         LogicalSize::new(640.0, 480.0).expect("fallback size must be valid")
                     });
                     let config = WindowConfig::new()
-                        .with_title("bitty — Correct Terminal")
+                        .with_title(self.window_title.clone())
                         .with_inner_size(default_size)
                         .with_visible(true);
                     match ctx.create_window(config) {
@@ -1406,9 +2002,10 @@ impl AppHandler for TerminalApp {
 // The `bitty-pty` bounded-channel seam uses `READ_CHUNK_SIZE` and
 // `CHANNEL_CAPACITY_CHUNKS` constants, but we keep the demo pump's channel
 // capacity literal (16) mirroring that constant without importing the crate
-// directly — `bitty-app` depends on `bitty-runtime` and `bitty-platform` only,
-// per ADR-0003 minimal deps. The literal is documented here to avoid a
-// hidden dependency.
+// directly — `bitty-app` wires `bitty-runtime` + `bitty-platform` +
+// `bitty-render` + `bitty-config` as the thin composition root (ADR-0003
+// entry point; no business logic beyond wiring). The literal is documented
+// here to avoid a hidden dependency.
 #[allow(dead_code)]
 fn _assert_channel_capacity_is_documented() {
     const EXPECTED: usize = 16;
@@ -1432,7 +2029,44 @@ fn main() {
         std::process::exit(0);
     }
 
-    let mut runtime = match Runtime::with_defaults() {
+    // `bitty config` subcommand first (CLI-first management per DEC-0007).
+    if let Some(cmd) = args.config_cmd {
+        std::process::exit(run_config_subcommand(cmd, &args));
+    }
+    if args.config_word {
+        if args.config_args.is_empty() {
+            eprintln!("{}", config_usage());
+        } else {
+            eprintln!(
+                "bitty config: unknown verb '{}'\n{}",
+                args.config_args[0],
+                config_usage()
+            );
+        }
+        std::process::exit(2);
+    }
+
+    // User config first (fail-closed): invalid files exit non-zero with a
+    // clear stderr message; missing default-path files yield defaults.
+    let app_config = match load_app_config(&args) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+    eprintln!(
+        "bitty: theme '{}' (resolution={:?} source={})",
+        app_config.theme.name, app_config.resolution, app_config.source
+    );
+    let runtime_cfg = match runtime_config_from_effective(&app_config.effective) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+    let mut runtime = match Runtime::new(runtime_cfg) {
         Ok(rt) => rt,
         Err(err) => {
             eprintln!("bitty: runtime init failed: {err}");
@@ -1505,6 +2139,15 @@ fn main() {
         // In headless mode we still fed synthetic bytes via run_headless_smoke, but the live PTY
         // (if any) has been spawned above and will be polled on AboutToWait. For deterministic CI
         // we also keep synthetic smoke proof.
+        println!(
+            "bitty headless: theme '{}' source={} file={}",
+            app_config.theme.name,
+            app_config.source,
+            app_config
+                .file_path
+                .as_ref()
+                .map_or(String::from("(none)"), |p| p.display().to_string())
+        );
         let code = run_headless_smoke(&mut runtime);
         std::process::exit(code);
     }
@@ -1517,7 +2160,7 @@ fn main() {
     // reflows the LayoutNode into the container and composites per-leaf via
     // the headless software seam (deterministic RGBA) until a real
     // SurfaceTarget is attached in a future slice.
-    let app = TerminalApp::new(runtime);
+    let app = TerminalApp::with_theme(runtime, app_config.theme.name, app_config.source);
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {
@@ -1533,7 +2176,14 @@ fn main() {
     };
 
     if headless_fallback_needed {
-        let mut rt = match Runtime::with_defaults() {
+        let fallback_cfg = match runtime_config_from_effective(&app_config.effective) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
+        let mut rt = match Runtime::new(fallback_cfg) {
             Ok(rt) => rt,
             Err(err) => {
                 eprintln!("bitty: fallback runtime init failed: {err}");
@@ -1596,6 +2246,11 @@ mod tests {
         assert!(!parsed.overlay);
         assert_eq!(parsed.layout, None);
         assert_eq!(parsed.focus, None);
+        assert_eq!(parsed.config_path, None);
+        assert_eq!(parsed.theme, None);
+        assert_eq!(parsed.config_cmd, None);
+        assert!(!parsed.config_word);
+        assert!(parsed.config_args.is_empty());
     }
 
     #[test]
@@ -1722,7 +2377,8 @@ mod tests {
 
     #[test]
     fn demo_pty_pump_is_bounded_and_delivers_chunks() {
-        let (rx, handle) = spawn_demo_pty_pump();
+        let (rx, handle) =
+            spawn_demo_pty_pump_with_theme(bitty_config::theme::DEFAULT_THEME_NAME, "default");
         let mut total = 0usize;
         while let Ok(chunk) = rx.recv() {
             assert!(!chunk.is_empty());
@@ -1736,7 +2392,8 @@ mod tests {
     #[test]
     fn terminal_app_poll_and_tick_are_total() {
         let rt = Runtime::with_defaults().expect("must build");
-        let mut app = TerminalApp::new(rt);
+        let mut app =
+            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default");
         // Poll the synthetic pump and drive a tick — must not panic and must
         // consume the channel without deadlocking.
         let consumed = app.poll_pty_pump();
@@ -1744,7 +2401,8 @@ mod tests {
         let _ = app.drive_tick();
         // Second tick without new bytes should be idle (frame-on-demand).
         let rt2 = Runtime::with_defaults().expect("must build");
-        let mut app2 = TerminalApp::new(rt2);
+        let mut app2 =
+            TerminalApp::with_theme(rt2, bitty_config::theme::DEFAULT_THEME_NAME, "default");
         let _ = app2.drive_tick();
         // After first present the second idle tick in the same app may be None.
         // We do not assert presence, only totality (no panic).
@@ -1977,5 +2635,249 @@ mod tests {
         } else {
             panic!("expected split");
         }
+    }
+
+    #[test]
+    fn parse_config_and_theme_flags() {
+        let p = parse_args(&args_of(&["bitty", "--config", "/tmp/c.toml"]));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.toml"));
+        assert_eq!(p.theme, None);
+        let p = parse_args(&args_of(&["bitty", "--config=/tmp/d.toml"]));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/d.toml"));
+        let p = parse_args(&args_of(&["bitty", "--theme", "dark"]));
+        assert_eq!(p.theme.as_deref(), Some("dark"));
+        let p = parse_args(&args_of(&["bitty", "--theme=bitty-dark"]));
+        assert_eq!(p.theme.as_deref(), Some("bitty-dark"));
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--config",
+            "/tmp/c.toml",
+            "--theme",
+            "dark",
+        ]));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.toml"));
+        assert_eq!(p.theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn help_text_documents_config_flags() {
+        let help = help_text();
+        assert!(help.contains("--config"));
+        assert!(help.contains("--theme"));
+        assert!(help.contains("init.lua"));
+        assert!(help.contains("config check"));
+    }
+
+    #[test]
+    fn cli_flag_wins_over_file_wins_over_default() {
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        // File layer from a Lua chunk (no fs): theme "dark".
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let file_plan =
+            parse_lua_config(r#"return { theme = "dark" }"#, &src).expect("file parses");
+        let file_layer = bitty_config::plan::LayeredPlan::new(src, file_plan);
+        // CLI wins over file.
+        let merged = resolve_effective(Some(file_layer.clone()), Some("bitty-dark"))
+            .expect("merge cli>file");
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("bitty-dark")
+        );
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            bitty_config::plan::LayerKind::Cli
+        );
+        // File wins over default.
+        let merged = resolve_effective(Some(file_layer), None).expect("merge file>default");
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Default when neither.
+        let merged = resolve_effective(None, None).expect("defaults");
+        assert_eq!(merged.effective.appearance.theme, None);
+        // Resolved presets agree with the CTX-0147 registry contract.
+        let (named, status) = bitty_config::theme::resolve_theme_with_status(Some("dark"));
+        assert_eq!(status, bitty_config::theme::ThemeResolution::Named);
+        assert_eq!(named.name, bitty_config::theme::DEFAULT_THEME_NAME);
+    }
+
+    #[test]
+    fn invalid_theme_fails_closed_at_merge() {
+        use bitty_config::file::resolve_effective;
+        // Overlong CLI theme must fail validation (not silently ignored).
+        let long = "x".repeat(65);
+        assert!(resolve_effective(None, Some(&long)).is_err());
+        // Whitespace-only CLI theme means no override (falls to default).
+        let merged = resolve_effective(None, Some("   ")).expect("blank cli is no-op");
+        assert_eq!(merged.effective.appearance.theme, None);
+    }
+
+    #[test]
+    fn runtime_config_inherits_file_font() {
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let content = r#"return {
+            font = { family = "JetBrains Mono", size = 13.0 },
+            appearance = { theme = "dark" },
+        }"#;
+        let plan = parse_lua_config(content, &src).expect("font parses");
+        let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!(cfg.font_family, "JetBrains Mono");
+        assert!((cfg.font_size - 13.0).abs() < f32::EPSILON);
+        // Defaults preserved for geometry.
+        let defaults = bitty_runtime::RuntimeConfig::default();
+        assert_eq!(cfg.cols, defaults.cols);
+        assert_eq!(cfg.rows, defaults.rows);
+    }
+
+    #[test]
+    fn window_title_carries_theme_and_source() {
+        let t = window_title_for_theme("bitty-dark", "file");
+        assert!(t.contains("bitty-dark"));
+        assert!(t.contains("file"));
+        let d = window_title_for_theme("bitty-dark", "default");
+        assert_ne!(t, d);
+    }
+
+    #[test]
+    fn parse_config_subcommands() {
+        let p = parse_args(&args_of(&["bitty", "config", "check"]));
+        assert!(p.config_word);
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert!(p.config_args.is_empty());
+        assert_eq!(p.program, None);
+
+        let p = parse_args(&args_of(&["bitty", "config", "path"]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Path));
+
+        let p = parse_args(&args_of(&["bitty", "config", "edit"]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Edit));
+
+        // Flags compose in any order: --config before or after the verb.
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--config",
+            "/tmp/c.lua",
+            "config",
+            "check",
+        ]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.lua"));
+
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "config",
+            "check",
+            "--config",
+            "/tmp/d.lua",
+        ]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/d.lua"));
+
+        // Escape hatch: a program literally named `config`.
+        let p = parse_args(&args_of(&["bitty", "--", "config"]));
+        assert!(!p.config_word);
+        assert_eq!(p.config_cmd, None);
+        assert_eq!(p.program.as_deref(), Some("config"));
+    }
+
+    #[test]
+    fn parse_config_bare_and_unknown_verbs_fail_closed_at_parse() {
+        let p = parse_args(&args_of(&["bitty", "config"]));
+        assert!(p.config_word);
+        assert_eq!(p.config_cmd, None);
+        assert_eq!(p.program, None);
+
+        let p = parse_args(&args_of(&["bitty", "config", "chek"]));
+        assert!(p.config_word);
+        assert_eq!(p.config_cmd, None);
+        assert_eq!(p.config_args, vec!["chek".to_string()]);
+        assert_eq!(p.program, None);
+
+        // Extra positionals after a known verb are recorded for dispatch.
+        let p = parse_args(&args_of(&["bitty", "config", "check", "extra"]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert_eq!(p.config_args, vec!["extra".to_string()]);
+    }
+
+    #[test]
+    fn config_usage_names_verbs() {
+        let usage = config_usage();
+        assert!(usage.contains("path"));
+        assert!(usage.contains("check"));
+        assert!(usage.contains("edit"));
+        assert!(usage.contains("init.lua"));
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual_then_editor_then_vi() {
+        assert_eq!(
+            resolve_editor_with_env(Some("/usr/bin/hx"), Some("/usr/bin/nano")),
+            "/usr/bin/hx"
+        );
+        assert_eq!(
+            resolve_editor_with_env(Some("  "), Some("/usr/bin/nano")),
+            "/usr/bin/nano"
+        );
+        assert_eq!(resolve_editor_with_env(None, None), "vi");
+        assert_eq!(resolve_editor_with_env(Some(""), Some(" ")), "vi");
+    }
+
+    #[test]
+    fn starter_init_lua_is_valid_config() {
+        use bitty_config::file::parse_lua_config;
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(starter_init_lua(), &src).expect("starter valid");
+        assert_eq!(plan.appearance.unwrap().theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn config_check_subcommand_good_and_broken_files() {
+        let dir = std::env::temp_dir().join(format!("bitty-ctx0148-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let good = dir.join("init.lua");
+        std::fs::write(&good, r#"return { theme = "dark" }"#).expect("write good");
+        let broken = dir.join("broken.lua");
+        std::fs::write(&broken, "return { theme = }").expect("write broken");
+
+        let mut args = Args::new();
+        args.config_cmd = Some(ConfigCommand::Check);
+        args.config_path = Some(good.display().to_string());
+        assert_eq!(run_config_subcommand(ConfigCommand::Check, &args), 0);
+
+        args.config_path = Some(broken.display().to_string());
+        assert_eq!(run_config_subcommand(ConfigCommand::Check, &args), 2);
+
+        args.config_path = Some(dir.join("missing.lua").display().to_string());
+        assert_eq!(run_config_subcommand(ConfigCommand::Check, &args), 2);
+
+        // Unexpected extras fail closed even for a good file.
+        args.config_path = Some(good.display().to_string());
+        args.config_args = vec!["extra".to_string()];
+        assert_eq!(run_config_subcommand(ConfigCommand::Check, &args), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn themed_demo_pump_names_theme_and_source() {
+        let (rx, handle) = spawn_demo_pty_pump_with_theme("bitty-dark", "file");
+        let mut total = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            total.extend_from_slice(&chunk);
+        }
+        handle.join().expect("pump joins");
+        let text = String::from_utf8_lossy(&total);
+        assert!(text.contains("bitty-dark"));
+        assert!(text.contains("file"));
+        // Still exercises the green SGR through the themed palette.
+        assert!(text.contains("green"));
     }
 }

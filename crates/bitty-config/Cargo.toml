@@ -14,3 +14,4 @@ publish = true
 workspace = true
 
 [dependencies]
+bitty-lua = { path = "../bitty-lua" }

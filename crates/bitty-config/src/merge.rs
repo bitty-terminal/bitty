@@ -1026,7 +1026,7 @@ mod tests {
             ConfigPlan {
                 keymaps: Some(vec![KeymapEntry {
                     chord: "ctrl+p".into(),
-                    action: "pick".into(),
+                    action: "focus_next".into(),
                     context: "global".into(),
                 }]),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
@@ -1038,7 +1038,7 @@ mod tests {
             ConfigPlan {
                 keymaps: Some(vec![KeymapEntry {
                     chord: "ctrl+p".into(),
-                    action: "other".into(),
+                    action: "focus_prev".into(),
                     context: "global".into(),
                 }]),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
@@ -1047,7 +1047,7 @@ mod tests {
         );
         let merged = merge_layers(vec![a, b]).expect("merge");
         assert_eq!(merged.effective.keymaps.len(), 1);
-        assert_eq!(merged.effective.keymaps[0].action, "other");
+        assert_eq!(merged.effective.keymaps[0].action, "focus_prev");
         assert_eq!(merged.source_of("keymaps").unwrap().layer, LayerKind::Cli);
     }
 

@@ -312,8 +312,6 @@ jobs:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          set -x
-          export PS4='+ AURDBG $LINENO: '
           if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
             echo "AUR_SSH_PRIVATE_KEY not set, skipping AUR publish"
             exit 0
@@ -341,36 +339,25 @@ jobs:
           EOF
           chmod 600 "$SSH_DIR/config"
           export GIT_SSH_COMMAND="ssh -F $SSH_DIR/config"
-          git --version
           git clone ssh://aur@aur.archlinux.org/bitty.git aur-bitty
-          git -C aur-bitty checkout -B master
+          AUR_DIR="$PWD/aur-bitty"
+          git config --global --add safe.directory "$AUR_DIR"
+          git -C "$AUR_DIR" checkout -B master
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
-          if [ ! -f aur-bitty/PKGBUILD ]; then
-            cp packaging/PKGBUILD aur-bitty/PKGBUILD
+          if [ ! -f "$AUR_DIR/PKGBUILD" ]; then
+            cp packaging/PKGBUILD "$AUR_DIR/PKGBUILD"
           fi
-          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur-bitty/PKGBUILD
-          AUR_DIR="$PWD/aur-bitty"
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$AUR_DIR/PKGBUILD"
           id builder >/dev/null 2>&1 || useradd --create-home builder
-          chown -R builder:builder "$AUR_DIR"
-          # makepkg must not run inside the git checkout: v0.0.16 run
-          # 33671756972 showed `fatal: not in a git directory` when
-          # `su builder ... makepkg --printsrcinfo` ran with cwd inside
-          # aur-bitty. Generate .SRCINFO from an isolated copy instead.
+          # Keep the AUR checkout root-owned so root git stays trusted; run
+          # makepkg as builder only inside an isolated BUILD_DIR copy.
           BUILD_DIR="$(mktemp -d)"
           cp "$AUR_DIR/PKGBUILD" "$BUILD_DIR/PKGBUILD"
           chown -R builder:builder "$BUILD_DIR"
-          echo "AURDBG AUR_DIR=$AUR_DIR BUILD_DIR=$BUILD_DIR PWD=$PWD"
-          ls -la "$AUR_DIR"
-          head -n 20 "$AUR_DIR/PKGBUILD"
-          which makepkg
-          makepkg --version || true
-          id builder || true
-          su builder -s /bin/bash -c "cd \"$BUILD_DIR\" && makepkg --printsrcinfo > .SRCINFO" || { echo "AURDBG makepkg failed $?"; ls -la "$BUILD_DIR"; head -n 50 "$BUILD_DIR/.SRCINFO" 2>&1 || true; exit 1; }
+          su builder -s /bin/bash -c "cd \"$BUILD_DIR\" && makepkg --printsrcinfo > .SRCINFO"
           install -m644 "$BUILD_DIR/.SRCINFO" "$AUR_DIR/.SRCINFO"
           rm -rf "$BUILD_DIR"
-          git --version
-          git -C "$AUR_DIR" status
           git -C "$AUR_DIR" config user.name "github-actions[bot]"
           git -C "$AUR_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
           git -C "$AUR_DIR" add PKGBUILD .SRCINFO

@@ -23,6 +23,22 @@ contents:
     dst: /usr/share/doc/bitty/README.md
   - src: ./CHANGELOG.md
     dst: /usr/share/doc/bitty/CHANGELOG.md
+  - src: ./packaging/bitty.desktop
+    dst: /usr/share/applications/bitty.desktop
+  - src: ./packaging/icons/hicolor/16x16/apps/bitty.png
+    dst: /usr/share/icons/hicolor/16x16/apps/bitty.png
+  - src: ./packaging/icons/hicolor/32x32/apps/bitty.png
+    dst: /usr/share/icons/hicolor/32x32/apps/bitty.png
+  - src: ./packaging/icons/hicolor/64x64/apps/bitty.png
+    dst: /usr/share/icons/hicolor/64x64/apps/bitty.png
+  - src: ./packaging/icons/hicolor/128x128/apps/bitty.png
+    dst: /usr/share/icons/hicolor/128x128/apps/bitty.png
+  - src: ./packaging/icons/hicolor/256x256/apps/bitty.png
+    dst: /usr/share/icons/hicolor/256x256/apps/bitty.png
+  - src: ./packaging/icons/hicolor/512x512/apps/bitty.png
+    dst: /usr/share/icons/hicolor/512x512/apps/bitty.png
+  - src: ./packaging/icons/hicolor/scalable/apps/bitty.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/bitty.svg
 deb:
   fields:
     Bugs: https://github.com/bitty-terminal/bitty/issues

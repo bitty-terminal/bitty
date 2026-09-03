@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bitty
+Comment=minimal correct terminal
+Exec=bitty
+Icon=bitty
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=bitty
+StartupNotify=true

@@ -15,6 +15,43 @@ use crate::error::PlatformError;
 use crate::event::{PlatformEvent, WindowId, translate_window_event};
 use crate::surface::SurfaceTarget;
 
+/// User-event payload carried by the winit event loop.
+///
+/// The loop is built with this type so a cross-thread
+/// [`EventWaker`] can wake it when PTY bytes become readable (mirroring
+/// alacritty's `event_proxy.send_event(Event::Wakeup)` pattern, implemented
+/// natively here without copying reference code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WakeEvent {
+    /// PTY output is readable; the handler should drain its bounded channel.
+    PtyReadable,
+}
+
+/// Thread-safe wakeup handle for PTY readability.
+///
+/// Cloned into the PTY forwarder thread; calling [`EventWaker::wake_pty`]
+/// wakes the event loop exactly once per call (coalescing applies: many
+/// queued chunks still surface as one [`PlatformEvent::PtyReadable`]
+/// delivery at most, and the handler must drain all available chunks).
+/// Sending after the loop closed is a silent no-op so pump shutdown never
+/// panics.
+#[derive(Clone, Debug)]
+pub struct EventWaker {
+    proxy: winit::event_loop::EventLoopProxy<WakeEvent>,
+}
+
+impl EventWaker {
+    /// Wakes the loop with a PTY-readability signal (best-effort).
+    pub fn wake_pty(&self) {
+        let _ = self.proxy.send_event(WakeEvent::PtyReadable);
+    }
+
+    /// Alias for readability wakeup.
+    pub fn wake(&self) {
+        self.wake_pty();
+    }
+}
+
 /// Receives translated [`PlatformEvent`]s for the lifetime of [`App::run`].
 ///
 /// Implementations decide application behavior; the platform layer owns all
@@ -28,6 +65,12 @@ pub trait AppHandler {
     /// The first delivery is always [`PlatformEvent::Resumed`]; creating the
     /// initial window there is the intended startup pattern.
     fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent);
+
+    /// Receives the cross-thread wakeup handle before the loop starts.
+    ///
+    /// The default is a no-op so headless/test handlers keep working;
+    /// PTY-owning handlers forward it into their bounded drain pump.
+    fn set_event_waker(&mut self, _waker: EventWaker) {}
 }
 
 /// Entry point that drives a handler on the OS event loop.
@@ -46,8 +89,17 @@ impl App {
     ///
     /// - [`PlatformError::DisplayUnavailable`] when no window system exists.
     /// - [`PlatformError::EventLoopRun`] when a created loop fails afterwards.
-    pub fn run<H: AppHandler>(handler: H) -> Result<(), PlatformError> {
-        let event_loop = EventLoop::builder().build().map_err(map_loop_error)?;
+    pub fn run<H: AppHandler>(mut handler: H) -> Result<(), PlatformError> {
+        let event_loop = EventLoop::<WakeEvent>::with_user_event()
+            .build()
+            .map_err(map_loop_error)?;
+        // Hand the cross-thread waker to the handler before the loop starts
+        // so a PTY forwarder thread can wake on readability. Handlers that
+        // ignore it keep the previous incidental-wakeup behavior.
+        let waker = EventWaker {
+            proxy: event_loop.create_proxy(),
+        };
+        handler.set_event_waker(waker);
         let mut adapter = Adapter::new(handler);
         event_loop
             .run_app(&mut adapter)
@@ -346,9 +398,17 @@ impl<H: AppHandler> Adapter<H> {
     }
 }
 
-impl<H: AppHandler> ApplicationHandler for Adapter<H> {
+impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.dispatch(event_loop, PlatformEvent::Resumed);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
+        match event {
+            WakeEvent::PtyReadable => {
+                self.dispatch(event_loop, PlatformEvent::PtyReadable);
+            }
+        }
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {

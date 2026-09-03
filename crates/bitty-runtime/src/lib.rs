@@ -85,10 +85,13 @@
 //!   system. On headless CI `GpuContext::initialize` returns
 //!   `NoCompatibleAdapter`; this crate never fabricates a fallback that would
 //!   hide the failure.
-//! - Window `ScaleFactorChanged` alone does not reconfigure the headless
-//!   surface; the spec requires refreshing logical geometry through
-//!   `SurfaceTarget::logical_to_physical` and a following `Resized` event
-//!   which takes precedence. Headless tests exercise that precedence.
+//! - Window `ScaleFactorChanged` rescales the renderer immediately via
+//!   [`Runtime::apply_dpi_scale`] (sanitized, fail-safe, never panics); the
+//!   grid follows from the physical extent when the embedder re-reads
+//!   `inner_size` (preferred — already physical pixels) or from cached
+//!   logical geometry via `SurfaceTarget::logical_to_physical` /
+//!   `surface_extent_from_logical`, while a following `Resized` event takes
+//!   precedence either way. Headless tests exercise that precedence.
 //! - `handle_resize` with a zero-sized extent is skipped per
 //!   `bitty_platform::map_resize_to_surface_extent` (minimized/occluded),
 //!   matching the GPU path contract.

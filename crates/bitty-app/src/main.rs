@@ -1125,6 +1125,14 @@ impl TerminalApp {
             eprintln!("bitty: gpu attach skipped (zero-size surface)");
             return;
         }
+        // CTX-0142: adopt the live DPI scale at attach (the compositor may
+        // have delivered fractional scale before this point while winit still
+        // reported 1.0): rescale renderer font/atlas to scaled cells and
+        // derive the grid from the physical inner_size — never the logical
+        // size path (the suspected original sin behind #232).
+        let scale = target.scale_factor().get();
+        self.runtime.apply_dpi_scale(scale, Some(inner));
+        let snap = self.runtime.snapshot();
         match pollster::block_on(GpuContext::initialize()) {
             Ok(gpu) => match gpu.create_surface(&target) {
                 Ok(surface) => {
@@ -1134,9 +1142,12 @@ impl TerminalApp {
                         Ok(()) => {
                             self.runtime.attach_gpu(gpu, surface);
                             eprintln!(
-                                "bitty: gpu attached (extent={}x{} crossfont={})",
+                                "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} crossfont={})",
                                 extent.width(),
                                 extent.height(),
+                                self.runtime.dpi_scale(),
+                                snap.width,
+                                snap.height,
                                 self.runtime.is_crossfont()
                             );
                         }
@@ -1303,6 +1314,34 @@ impl AppHandler for TerminalApp {
                 // Request a tick on redraw and after resize.
                 match kind {
                     WindowEventKind::Resized(_) | WindowEventKind::ScaleFactorChanged(_) => {
+                        // CTX-0142: ScaleFactorChanged carries no size (winit
+                        // 0.30 drops the negotiation hook), so re-read the
+                        // physical inner_size here — never the logical path —
+                        // and adopt before the tick renders at scaled cells.
+                        // Resized needs no extra work: runtime derives from
+                        // the same live scaled cells.
+                        if let WindowEventKind::ScaleFactorChanged(factor) = &kind {
+                            let physical = self.window.as_ref().map(|win| win.inner_size());
+                            self.runtime.apply_dpi_scale(factor.get(), physical);
+                            let snap = self.runtime.snapshot();
+                            eprintln!(
+                                "bitty: dpi adopted scale={} dpi={} grid={}x{} physical={} surface={:?}",
+                                factor.get(),
+                                self.runtime.dpi_scale(),
+                                snap.width,
+                                snap.height,
+                                physical.map_or(String::from("none"), |p| format!(
+                                    "{}x{}",
+                                    p.width(),
+                                    p.height()
+                                )),
+                                self.runtime.surface_extent().map(|e| format!(
+                                    "{}x{}",
+                                    e.width(),
+                                    e.height()
+                                )),
+                            );
+                        }
                         if let Some(win) = self.window.as_ref() {
                             win.request_redraw();
                         } else {

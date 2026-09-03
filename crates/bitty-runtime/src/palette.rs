@@ -189,6 +189,47 @@ pub fn validate_palette_panel_config(
     cfg.validate()
 }
 
+// ---------------------------------------------------------------------------
+// CTX-0147: designed default theme colors (bridge, no hot path)
+// ---------------------------------------------------------------------------
+//
+// The terminal color preset itself lives in `bitty-config` (`theme` module,
+// single source of truth) and is consumed by `bitty-render` (`grid` defaults,
+// GPU/headless clear colors, ANSI 0–15, cursor/selection fills). This section
+// re-exposes the exact render-side RGBA values for runtime consumers so the
+// command-palette UI and any runtime-painted overlay (cursor, selection)
+// agree with the grid pipeline on hue. It performs no I/O and allocates
+// nothing.
+//
+// Follow-up (out of scope here: `runtime.rs` is owned by another task): the
+// runtime tick's cursor overlay still paints its legacy hardcoded white. It
+// should adopt [`theme_cursor_rgba`] (with its existing alpha compositing)
+// and selection fills should adopt [`theme_selection_rgba`].
+
+/// Theme background as straight-alpha RGBA (Bitty Dark `#1e1e2e`).
+#[must_use]
+pub const fn theme_background_rgba() -> [u8; 4] {
+    bitty_render::grid::DEFAULT_BG
+}
+
+/// Theme foreground as straight-alpha RGBA (Bitty Dark `#cdd6f4`).
+#[must_use]
+pub const fn theme_foreground_rgba() -> [u8; 4] {
+    bitty_render::grid::DEFAULT_FG
+}
+
+/// Theme block-cursor fill as straight-alpha RGBA (Bitty Dark `#f5e0dc`).
+#[must_use]
+pub const fn theme_cursor_rgba() -> [u8; 4] {
+    bitty_render::grid::DEFAULT_CURSOR
+}
+
+/// Theme selection background as straight-alpha RGBA (Bitty Dark `#313244`).
+#[must_use]
+pub const fn theme_selection_rgba() -> [u8; 4] {
+    bitty_render::grid::DEFAULT_SELECTION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +400,43 @@ mod tests {
         let long = "a".repeat(PALETTE_OVERLAY_TEXT_MAX_CHARS + 100);
         let truncated = PaletteIntegration::truncate_text(&long);
         assert_eq!(truncated.chars().count(), PALETTE_OVERLAY_TEXT_MAX_CHARS);
+    }
+}
+
+#[cfg(test)]
+mod theme_bridge_tests {
+    use super::{
+        theme_background_rgba, theme_cursor_rgba, theme_foreground_rgba, theme_selection_rgba,
+    };
+
+    #[test]
+    fn bridge_matches_render_and_preset() {
+        assert_eq!(theme_background_rgba(), bitty_render::grid::DEFAULT_BG);
+        assert_eq!(theme_foreground_rgba(), bitty_render::grid::DEFAULT_FG);
+        assert_eq!(theme_cursor_rgba(), bitty_render::grid::DEFAULT_CURSOR);
+        assert_eq!(
+            theme_selection_rgba(),
+            bitty_render::grid::DEFAULT_SELECTION
+        );
+
+        // Same values as the config preset (opaque alpha added by render).
+        assert_eq!(
+            theme_background_rgba()[..3],
+            bitty_config::theme::BITTY_DARK.background
+        );
+        assert_eq!(
+            theme_foreground_rgba()[..3],
+            bitty_config::theme::BITTY_DARK.foreground
+        );
+        assert_eq!(
+            theme_cursor_rgba()[..3],
+            bitty_config::theme::BITTY_DARK.cursor
+        );
+        assert_eq!(
+            theme_selection_rgba()[..3],
+            bitty_config::theme::BITTY_DARK.selection
+        );
+        assert_eq!(theme_background_rgba(), [0x1E, 0x1E, 0x2E, 0xFF]);
+        assert_eq!(theme_foreground_rgba(), [0xCD, 0xD6, 0xF4, 0xFF]);
     }
 }

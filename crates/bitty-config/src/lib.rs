@@ -85,6 +85,7 @@ pub mod merge;
 pub mod migration;
 pub mod plan;
 pub mod reload;
+pub mod theme;
 pub mod trust;
 pub mod types;
 pub mod validation;
@@ -98,6 +99,10 @@ pub use migration::{CURRENT_SCHEMA_VERSION, migrate, needs_migration};
 pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 pub use reload::{
     ReloadClass, ReloadReport, classify_field, diff, fallback_builtin, reconcile_live,
+};
+pub use theme::{
+    BITTY_DARK, DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeResolution, default_theme,
+    normalize_theme_name, resolve_theme, resolve_theme_with_status,
 };
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{

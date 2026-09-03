@@ -198,6 +198,9 @@ dependencies = [
 [[package]]
 name = "bitty-config"
 version = "0.0.1"
+dependencies = [
+ "bitty-lua",
+]
 
 [[package]]
 name = "bitty-core"

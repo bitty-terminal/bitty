@@ -2,21 +2,22 @@
 //!
 //! # Role in Bitty (no mlua conflict)
 //!
-//! This crate wraps the pure-Rust [`piccolo`] VM for **per-plugin isolation**.
-//! It is the plugin VM per the isolation/resource RFC watch-list (OQ-014) and
-//! is **separate** from the configuration VM:
+//! This crate wraps the pure-Rust [`piccolo`] VM for **per-plugin isolation**
+//! and, per DEC-0011, **user configuration evaluation**.
 //!
-//! - **Config VM:** `mlua` with vendored Lua 5.4 remains the P0 baseline for
-//!   configuration evaluation per `ADR-0004` (Lua 5.4 via `mlua`, `piccolo` as
-//!   watch-list). That VM lives outside this crate (future `bitty-config`/
-//!   host integration) and is not imported here, so there is no type conflict
-//!   between `mlua::Lua` and `piccolo::Lua`.
-//! - **Plugin VM (this crate):** `piccolo` 0.3.x stackless VM, one instance per
+//! - **Plugin VMs:** `piccolo` 0.3.x stackless VM, one instance per
 //!   `(PluginId, generation)`, isolated globals/registry/module trees, restricted
 //!   stdlib construction (no `io`/`os`/`debug` ambient authority, no raw
 //!   metatable access to host objects, no dynamic native loading). Host
 //!   privileged work happens only via capability-checked host calls injected as
 //!   `Callback`s.
+//! - **Config evaluation (this crate, [`config`] module):** user `init.lua` is
+//!   evaluated in a fresh [`LuaVm`] with the **same** RC-1/RC-2 budgets as a
+//!   plugin — config never executes with more authority than a plugin. The
+//!   chunk must return a plain-data table (wezterm-style `return {...}`) that
+//!   maps 1:1 to `bitty-config` plan fields; extraction is bounded and the
+//!   typed schema remains the validation authority. There is no `mlua`
+//!   dependency anywhere, so no `mlua::Lua` / `piccolo::Lua` type conflict.
 //!
 //! The crate is `std`-only, `#![forbid(unsafe_code)]`, `MSRV 1.85`,
 //! `edition = "2024"`, `publish = false` (workspace), headless and
@@ -54,7 +55,11 @@
 
 use std::time::{Duration, Instant};
 
-use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua};
+use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
+
+pub mod config;
+
+pub use config::{ConfigData, ConfigOutcome, FontData, KeymapData, TerminalData, WindowData};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 
@@ -228,6 +233,38 @@ impl VmBudgetSnapshot {
     pub fn invariants_hold(&self) -> bool {
         !self.suspended
     }
+}
+
+/// Shared result of [`LuaVm::drive_chunk`]: either a terminal budget
+/// suspension, a load failure, or a finished executor awaiting result
+/// extraction by the caller (`execute` vs `eval_config`).
+///
+/// Suspension bookkeeping (`status`, `suspension_count`, per-run metrics) is
+/// already applied before returning `Suspended`; callers only translate.
+#[derive(Debug)]
+pub(crate) enum DriveOutcome {
+    /// Budget exceeded; VM is now suspended (fail-closed).
+    Suspended {
+        /// Reason for suspension.
+        reason: SuspendReason,
+        /// Instructions consumed up to suspend.
+        instructions_used: u64,
+        /// Wall elapsed ms.
+        wall_elapsed_ms: u64,
+        /// Memory used.
+        memory_used: usize,
+    },
+    /// Chunk failed to load/compile (message only, no source echo).
+    Failed {
+        /// Load error message.
+        message: String,
+    },
+    /// Chunk finished within budgets; executor awaits mode inspection plus
+    /// result extraction.
+    Ready {
+        /// Rooted executor handle for `take_result`.
+        stashed: StashedExecutor,
+    },
 }
 
 // ── VM ───────────────────────────────────────────────────────────────────────
@@ -499,18 +536,15 @@ impl LuaVm {
         self.lua.total_memory()
     }
 
-    /// Execute Lua source `code` with RC-1/RC-2 enforcement.
+    /// Shared budget-enforced chunk driver behind [`LuaVm::execute`] and
+    /// [`LuaVm::eval_config`](crate::config::ConfigEval).
     ///
-    /// Deterministic replay: given identical `code` and identical budgets on a
-    /// fresh VM, the outcome (completion, suspension reason, warning flag) is
-    /// identical. The VM is headless — no window/GPU, no `mlua` types.
-    ///
-    /// Fail-closed: if the VM is already `Suspended`, this call returns
-    /// `Err(VmError::Suspended)` without touching the Lua heap. On budget
-    /// exceed during execution, the VM transitions to `Suspended` at the next
-    /// instruction boundary, increments `suspension_count`, and returns
-    /// `Ok(ExecuteOutcome::Suspended)`.
-    pub fn execute(&mut self, code: &str) -> Result<ExecuteOutcome, VmError> {
+    /// Runs `code` through load plus the RC-1/RC-2 stepping loop with the same
+    /// fail-closed suspension bookkeeping in both paths, then hands the
+    /// finished executor back for result extraction. Final completion checks
+    /// (warning/memory/instruction) run inside, so every `Ready` already
+    /// passed them; callers only inspect the executor mode and take results.
+    pub(crate) fn drive_chunk(&mut self, code: &str) -> Result<DriveOutcome, VmError> {
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
@@ -537,7 +571,9 @@ impl LuaVm {
                 |ctx| match Closure::load(ctx, None, code_owned.as_bytes()) {
                     Ok(closure) => Some(ctx.stash(Executor::start(ctx, closure.into(), ()))),
                     Err(e) => {
-                        load_error = Some(format!("{e:?}"));
+                        // Display (not Debug): "parse error at line N: ..."
+                        // with 1-based lines and no internal dump.
+                        load_error = Some(format!("{e}"));
                         None
                     }
                 },
@@ -545,10 +581,10 @@ impl LuaVm {
         let stashed = match (stashed_opt, load_error) {
             (Some(s), None) => s,
             (None, Some(msg)) => {
-                return Ok(ExecuteOutcome::RuntimeError { message: msg });
+                return Ok(DriveOutcome::Failed { message: msg });
             }
             _ => {
-                return Ok(ExecuteOutcome::RuntimeError {
+                return Ok(DriveOutcome::Failed {
                     message: "unknown load error".to_string(),
                 });
             }
@@ -566,7 +602,7 @@ impl LuaVm {
             self.memory_used = mem_before;
             self.instructions_used = 0;
             self.wall_elapsed_ms = start.elapsed().as_millis() as u64;
-            return Ok(ExecuteOutcome::Suspended {
+            return Ok(DriveOutcome::Suspended {
                 reason,
                 instructions_used: 0,
                 wall_elapsed_ms: self.wall_elapsed_ms,
@@ -595,7 +631,7 @@ impl LuaVm {
                 self.suspension_count = self.suspension_count.wrapping_add(1);
                 self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
                 self.memory_used = self.lua.total_memory();
-                return Ok(ExecuteOutcome::Suspended {
+                return Ok(DriveOutcome::Suspended {
                     reason,
                     instructions_used: self.instructions_used,
                     wall_elapsed_ms: elapsed_ms,
@@ -614,7 +650,7 @@ impl LuaVm {
                 self.status = VmStatus::Suspended(reason.clone());
                 self.suspension_count = self.suspension_count.wrapping_add(1);
                 self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
-                return Ok(ExecuteOutcome::Suspended {
+                return Ok(DriveOutcome::Suspended {
                     reason,
                     instructions_used: self.instructions_used,
                     wall_elapsed_ms: elapsed_ms,
@@ -638,7 +674,7 @@ impl LuaVm {
                     self.suspension_count = self.suspension_count.wrapping_add(1);
                     self.instructions_used = used;
                     self.memory_used = self.lua.total_memory();
-                    return Ok(ExecuteOutcome::Suspended {
+                    return Ok(DriveOutcome::Suspended {
                         reason,
                         instructions_used: used,
                         wall_elapsed_ms: elapsed_ms,
@@ -660,39 +696,11 @@ impl LuaVm {
             // will handle suspension. If done, break.
 
             if done {
-                // Check mode — Result indicates completion (or error).
-                let mode = self.lua.enter(|ctx| ctx.fetch(&stashed).mode());
-                if mode == ExecutorMode::Result {
-                    // Extract result — if runtime error, report as RuntimeError.
-                    let mut runtime_msg: Option<String> = None;
-                    let mut ok = false;
-                    self.lua.enter(|ctx| {
-                        let exec = ctx.fetch(&stashed);
-                        match exec.take_result::<()>(ctx) {
-                            Ok(Ok(())) => ok = true,
-                            Ok(Err(e)) => runtime_msg = Some(format!("{e:?}")),
-                            Err(e) => runtime_msg = Some(format!("{e:?}")),
-                        }
-                    });
-                    if ok {
-                        break;
-                    }
-                    if let Some(msg) = runtime_msg {
-                        self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
-                        self.memory_used = self.lua.total_memory();
-                        self.wall_elapsed_ms = start.elapsed().as_millis() as u64;
-                        return Ok(ExecuteOutcome::RuntimeError { message: msg });
-                    }
-                    break;
-                } else if mode == ExecutorMode::Stopped {
-                    break;
-                } else if mode == ExecutorMode::Suspended {
-                    // Yielded — treat as completed for now (no host resume in v1).
-                    break;
-                } else {
-                    // Still Normal but step said done? Should not happen; treat as done.
-                    break;
-                }
+                // Step reports the executor finished (Result/Stopped/yielded).
+                // Mode inspection and result extraction belong to the caller
+                // (`execute` vs `eval_config`), which run after the shared
+                // final completion checks below.
+                break;
             }
 
             // If we consumed a lot of fuel in this slice, loop will detect on
@@ -713,7 +721,7 @@ impl LuaVm {
                 self.suspension_count = self.suspension_count.wrapping_add(1);
                 self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
                 self.memory_used = self.lua.total_memory();
-                return Ok(ExecuteOutcome::Suspended {
+                return Ok(DriveOutcome::Suspended {
                     reason,
                     instructions_used: self.instructions_used,
                     wall_elapsed_ms: elapsed_ms,
@@ -741,7 +749,7 @@ impl LuaVm {
             };
             self.status = VmStatus::Suspended(reason.clone());
             self.suspension_count = self.suspension_count.wrapping_add(1);
-            return Ok(ExecuteOutcome::Suspended {
+            return Ok(DriveOutcome::Suspended {
                 reason,
                 instructions_used: self.instructions_used,
                 wall_elapsed_ms: self.wall_elapsed_ms,
@@ -767,7 +775,7 @@ impl LuaVm {
             // checked < budget case earlier, so this is genuine exceed.
             self.status = VmStatus::Suspended(reason.clone());
             self.suspension_count = self.suspension_count.wrapping_add(1);
-            return Ok(ExecuteOutcome::Suspended {
+            return Ok(DriveOutcome::Suspended {
                 reason,
                 instructions_used: self.instructions_used,
                 wall_elapsed_ms: self.wall_elapsed_ms,
@@ -775,12 +783,62 @@ impl LuaVm {
             });
         }
 
-        Ok(ExecuteOutcome::Completed {
-            instructions_used: self.instructions_used,
-            wall_elapsed_ms: self.wall_elapsed_ms,
-            memory_used: self.memory_used,
-            warning_triggered: self.warning_triggered,
-        })
+        Ok(DriveOutcome::Ready { stashed })
+    }
+
+    /// Execute Lua source `code` with RC-1/RC-2 enforcement.
+    ///
+    /// Deterministic replay: given identical `code` and identical budgets on a
+    /// fresh VM, the outcome (completion, suspension reason, warning flag) is
+    /// identical. The VM is headless — no window/GPU, no `mlua` types.
+    ///
+    /// Fail-closed: if the VM is already `Suspended`, this call returns
+    /// `Err(VmError::Suspended)` without touching the Lua heap. On budget
+    /// exceed during execution, the VM transitions to `Suspended` at the next
+    /// instruction boundary, increments `suspension_count`, and returns
+    /// `Ok(ExecuteOutcome::Suspended)`.
+    pub fn execute(&mut self, code: &str) -> Result<ExecuteOutcome, VmError> {
+        match self.drive_chunk(code)? {
+            DriveOutcome::Suspended {
+                reason,
+                instructions_used,
+                wall_elapsed_ms,
+                memory_used,
+            } => Ok(ExecuteOutcome::Suspended {
+                reason,
+                instructions_used,
+                wall_elapsed_ms,
+                memory_used,
+            }),
+            DriveOutcome::Failed { message } => Ok(ExecuteOutcome::RuntimeError { message }),
+            DriveOutcome::Ready { stashed } => {
+                // Mode inspection mirrors the pre-refactor loop: Result carries
+                // the outcome (or a runtime error), anything else counts as
+                // completed (Stopped / yielded / already-done).
+                let mode = self.lua.enter(|ctx| ctx.fetch(&stashed).mode());
+                if mode == ExecutorMode::Result {
+                    let mut runtime_msg: Option<String> = None;
+                    let mut ok = false;
+                    self.lua.enter(|ctx| {
+                        let exec = ctx.fetch(&stashed);
+                        match exec.take_result::<()>(ctx) {
+                            Ok(Ok(())) => ok = true,
+                            Ok(Err(e)) => runtime_msg = Some(format!("{e}")),
+                            Err(e) => runtime_msg = Some(format!("{e:?}")),
+                        }
+                    });
+                    if let Some(msg) = runtime_msg {
+                        return Ok(ExecuteOutcome::RuntimeError { message: msg });
+                    }
+                }
+                Ok(ExecuteOutcome::Completed {
+                    instructions_used: self.instructions_used,
+                    wall_elapsed_ms: self.wall_elapsed_ms,
+                    memory_used: self.memory_used,
+                    warning_triggered: self.warning_triggered,
+                })
+            }
+        }
     }
 
     /// Execute with synthetic elapsed for deterministic wall tests.

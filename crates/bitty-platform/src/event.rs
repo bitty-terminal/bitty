@@ -520,6 +520,14 @@ pub enum PlatformEvent {
     Suspended,
     /// All pending input has been processed; a good time to redraw.
     AboutToWait,
+    /// PTY output is readable; the embedder should drain via its bounded
+    /// `poll_pty` path and tick when damage exists.
+    ///
+    /// Delivered once per readability wakeup signalled from the PTY pump
+    /// thread via [`crate::EventWaker`]. Coalescing applies: a single
+    /// delivery may cover many queued chunks, and the handler must drain
+    /// all immediately available chunks without blocking.
+    PtyReadable,
     /// The loop is about to exit after an [`EventContext::exit`]
     /// (crate::app::EventContext::exit) request.
     Exiting,

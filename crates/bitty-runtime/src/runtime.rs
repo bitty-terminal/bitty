@@ -391,12 +391,66 @@ fn cold_to_observation(event: &ColdEvent) -> Option<HostObservation> {
 /// `pending_input_dropped`.
 const MAX_PENDING_INPUT: usize = 8192;
 
+/// Cross-thread PTY readability callback.
+///
+/// Invoked exactly once per readability signal (per forwarded chunk plus once
+/// on EOF) from the forwarder thread — never on a timer, never when quiet.
+/// Production wires this to [`bitty_platform::EventWaker::wake_pty`];
+/// headless tests wire it to a counter/channel. Only `Send` is required:
+/// the forwarder thread owns its clone and is the sole caller.
+pub type PtyWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Forwarding channel capacity for the wakeup pump (chunks).
+///
+/// Matches [`bitty_pty::CHANNEL_CAPACITY_CHUNKS`] so each stage stays within
+/// the documented bound. Worst-case total buffered when the wakeup pump is
+/// active is 2 x 128 KiB (original pump channel plus forwarding channel),
+/// still bounded, fail-closed, and backpressured end to end.
+pub const PTY_FORWARD_CAPACITY_CHUNKS: usize = bitty_pty::CHANNEL_CAPACITY_CHUNKS;
+
+/// Blocking forwarder: sole consumer of `reader`, pushing into `tx` and
+/// waking once per chunk plus once on EOF.
+///
+/// - Quiet child: parked in `recv`, zero wakeups, zero CPU.
+/// - Backpressure: `send` blocks when `tx` is full, which fills the original
+///   pump channel, which fills the kernel PTY buffer, which blocks the child.
+/// - Fail-closed: a dropped consumer breaks `send` and ends the thread with
+///   no loss beyond already-queued chunks and no unbounded growth.
+fn pty_forward_loop(reader: PtyReader, tx: std::sync::mpsc::SyncSender<Vec<u8>>, waker: PtyWaker) {
+    loop {
+        match reader.recv() {
+            Some(chunk) => {
+                debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                if tx.send(chunk).is_err() {
+                    break;
+                }
+                (waker)();
+            }
+            None => {
+                // EOF: wake once so the consumer drains final chunks promptly
+                // instead of waiting for an incidental wakeup.
+                (waker)();
+                break;
+            }
+        }
+    }
+    // Reap the pump thread; outcome is informational (EOF vs I/O error).
+    let _ = reader.join();
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
     state: State,
     pty: Option<Pty>,
     pty_reader: Option<PtyReader>,
+    /// Wakeup-pump forwarding receiver (active after [`Runtime::set_pty_waker`]
+    /// promotes the direct reader). Bounded [`PTY_FORWARD_CAPACITY_CHUNKS`].
+    pty_forward_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    /// Forwarder thread handle (detached on respawn; exits on EOF/disconnect).
+    pty_forward_handle: Option<std::thread::JoinHandle<()>>,
+    /// Readability callback moved (cloned) into the forwarder on promotion.
+    pty_waker: Option<PtyWaker>,
     pty_writer: Option<PtyWriter>,
     pending_input: Vec<u8>,
     pending_input_dropped: u64,
@@ -474,7 +528,10 @@ impl std::fmt::Debug for Runtime {
                 &self.plugin_host.pipeline().total_dropped(),
             )
             .field("has_pty", &self.pty.is_some())
-            .field("has_pty_reader", &self.pty_reader.is_some())
+            .field(
+                "has_pty_reader",
+                &(self.pty_reader.is_some() || self.pty_forward_rx.is_some()),
+            )
             .field("has_pty_writer", &self.pty_writer.is_some())
             .field("pending_input_len", &self.pending_input.len())
             .field("pending_input_dropped", &self.pending_input_dropped)
@@ -600,6 +657,9 @@ impl Runtime {
             state: State::new(),
             pty: None,
             pty_reader: None,
+            pty_forward_rx: None,
+            pty_forward_handle: None,
+            pty_waker: None,
             pty_writer: None,
             pending_input: Vec::new(),
             pending_input_dropped: 0,
@@ -683,6 +743,9 @@ impl Runtime {
             state: State::new(),
             pty: None,
             pty_reader: None,
+            pty_forward_rx: None,
+            pty_forward_handle: None,
+            pty_waker: None,
             pty_writer: None,
             pending_input: Vec::new(),
             pending_input_dropped: 0,
@@ -2567,14 +2630,78 @@ impl Runtime {
         let mut pty = builder.spawn().map_err(RuntimeError::from)?;
         let reader = pty.take_reader().map_err(RuntimeError::from)?;
         let writer = pty.take_writer().map_err(RuntimeError::from)?;
-        // Replace any previously spawned child (drop kills old).
+        // Replace any previously spawned child (drop kills old). A prior
+        // wakeup forwarder (if any) is detached: it owns the old reader and
+        // exits on EOF/disconnect once the old PTY is dropped.
+        self.pty_forward_rx = None;
+        self.pty_forward_handle = None;
         self.pty = Some(pty);
         self.pty_reader = Some(reader);
         self.pty_writer = Some(writer);
+        // If a waker is already installed (respawn after `set_pty_waker`),
+        // promote immediately so the new child wakes the loop too.
+        if self.pty_waker.is_some() {
+            self.promote_pty_reader_to_forwarder();
+        }
         // Clear pending input on new shell: fresh session, no stale keystrokes.
         self.pending_input.clear();
         self.pending_input_dropped = 0;
         Ok(())
+    }
+
+    /// Installs the cross-thread PTY readability callback and promotes the
+    /// direct reader into the wakeup forwarder pump.
+    ///
+    /// The forwarder is the sole consumer of the bounded pump channel from
+    /// this point: it blocks in `recv` (zero wakeups when quiet), forwards
+    /// each chunk into a second bounded channel
+    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per chunk
+    /// plus once on EOF. [`poll_pty`] drains the forwarding channel, so the
+    /// existing bounded-drain contract is preserved end to end.
+    ///
+    /// Idempotent: replacing the waker re-promotes only when a direct reader
+    /// is still present; an already-promoted pump keeps its original waker
+    /// clone (all clones wake the same loop).
+    pub fn set_pty_waker(&mut self, waker: PtyWaker) {
+        self.pty_waker = Some(waker);
+        self.promote_pty_reader_to_forwarder();
+    }
+
+    /// Whether a readability waker is installed.
+    #[must_use]
+    pub fn has_pty_waker(&self) -> bool {
+        self.pty_waker.is_some()
+    }
+
+    /// Whether the wakeup forwarder pump is active (implies [`has_pty_reader`]).
+    #[must_use]
+    pub fn has_pty_forwarder(&self) -> bool {
+        self.pty_forward_rx.is_some()
+    }
+
+    /// Moves the direct [`PtyReader`] into the forwarder thread when both a
+    /// reader and a waker are present. No-op otherwise.
+    fn promote_pty_reader_to_forwarder(&mut self) {
+        if self.pty_forward_rx.is_some() {
+            return;
+        }
+        if self.pty_reader.is_none() || self.pty_waker.is_none() {
+            return;
+        }
+        let Some(reader) = self.pty_reader.take() else {
+            return;
+        };
+        let Some(waker) = self.pty_waker.clone() else {
+            self.pty_reader = Some(reader);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
+        let handle = std::thread::Builder::new()
+            .name("bitty-pty-wakeup".to_owned())
+            .spawn(move || pty_forward_loop(reader, tx, waker))
+            .expect("std thread spawn cannot fail with default builder options");
+        self.pty_forward_rx = Some(rx);
+        self.pty_forward_handle = Some(handle);
     }
 
     /// Whether a PTY child is currently owned.
@@ -2584,9 +2711,12 @@ impl Runtime {
     }
 
     /// Whether a PTY reader channel is currently owned (implies [`has_pty`]).
+    ///
+    /// True while either the direct pump reader or the wakeup-forwarder
+    /// channel is owned.
     #[must_use]
     pub fn has_pty_reader(&self) -> bool {
-        self.pty_reader.is_some()
+        self.pty_reader.is_some() || self.pty_forward_rx.is_some()
     }
 
     /// Process id of the child, when available.
@@ -2602,23 +2732,35 @@ impl Runtime {
 
     /// Takes exclusive ownership of the bounded PTY output reader, if present.
     ///
-    /// The caller becomes responsible for draining the channel without blocking
-    /// the runtime thread and for joining the pump on EOF. After this call
-    /// [`poll_pty`] will return `0` because the channel no longer belongs to
-    /// the runtime; most embedders should prefer [`poll_pty`] instead.
+    /// Only available before [`set_pty_waker`](Self::set_pty_waker) promotes
+    /// the reader into the wakeup forwarder: afterwards the forwarder thread
+    /// owns the reader and this returns `None` (drain via [`poll_pty`]
+    /// instead). When no forwarder is active the caller becomes responsible
+    /// for draining the channel without blocking the runtime thread and for
+    /// joining the pump on EOF. After this call [`poll_pty`] will return `0`
+    /// because the channel no longer belongs to the runtime; most embedders
+    /// should prefer [`poll_pty`] instead.
     pub fn take_pty_reader(&mut self) -> Option<PtyReader> {
+        if self.pty_forward_rx.is_some() {
+            return None;
+        }
         self.pty_reader.take()
     }
 
     /// Non-blocking drain of the bounded PTY output channel into
     /// [`handle_pty_bytes`].
     ///
-    /// When a consumer stalls, the bounded channel (`CHANNEL_CAPACITY_CHUNKS` ×
-    /// `READ_CHUNK_SIZE` = 128 KiB) fills, the pump blocks, the kernel PTY
-    /// buffer fills, and the child's writes block — end-to-end backpressure
-    /// with zero data loss and zero unbounded memory growth. This method is
-    /// the consumer side: it drains all immediately available chunks without
-    /// blocking, feeding each through the VT parser and terminal state.
+    /// Drains the wakeup-forwarder channel when [`set_pty_waker`](Self::set_pty_waker)
+    /// promoted the pump, otherwise the direct pump channel. Either way the
+    /// bound holds (`CHANNEL_CAPACITY_CHUNKS` × `READ_CHUNK_SIZE` = 128 KiB
+    /// per stage, 256 KiB worst-case total with the forwarder active).
+    ///
+    /// When a consumer stalls, the bounded channel(s) fill, the pump blocks,
+    /// the kernel PTY buffer fills, and the child's writes block —
+    /// end-to-end backpressure with zero data loss and zero unbounded memory
+    /// growth. This method is the consumer side: it drains all immediately
+    /// available chunks without blocking, feeding each through the VT parser
+    /// and terminal state.
     ///
     /// Returns the number of chunks drained. `0` means either no PTY, no data
     /// available yet, or EOF has been reached and the queue drained. Headless
@@ -2629,20 +2771,34 @@ impl Runtime {
         // Collect without holding an immutable borrow across the mutable
         // `handle_pty_bytes` call (borrow checker).
         let chunks: Vec<Vec<u8>> = {
-            let Some(reader) = self.pty_reader.as_ref() else {
-                return 0;
-            };
-            let mut out = Vec::new();
-            while out.len() < 1024 {
-                match reader.try_recv() {
-                    Some(chunk) => {
-                        debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                        out.push(chunk);
+            if let Some(rx) = self.pty_forward_rx.as_ref() {
+                let mut out = Vec::new();
+                while out.len() < 1024 {
+                    match rx.try_recv() {
+                        Ok(chunk) => {
+                            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            out.push(chunk);
+                        }
+                        Err(_) => break,
                     }
-                    None => break,
                 }
+                out
+            } else {
+                let Some(reader) = self.pty_reader.as_ref() else {
+                    return 0;
+                };
+                let mut out = Vec::new();
+                while out.len() < 1024 {
+                    match reader.try_recv() {
+                        Some(chunk) => {
+                            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            out.push(chunk);
+                        }
+                        None => break,
+                    }
+                }
+                out
             }
-            out
         };
         let drained = chunks.len();
         for chunk in chunks {
@@ -2662,12 +2818,16 @@ impl Runtime {
     /// or EOF.
     pub fn poll_pty_timeout(&mut self, timeout: std::time::Duration) -> usize {
         let first: Option<Vec<u8>> = {
-            let Some(reader) = self.pty_reader.as_ref() else {
-                return 0;
-            };
-            match reader.recv_timeout(timeout) {
-                Ok(Some(chunk)) => Some(chunk),
-                Ok(None) | Err(_) => None,
+            if let Some(rx) = self.pty_forward_rx.as_ref() {
+                rx.recv_timeout(timeout).ok()
+            } else {
+                let Some(reader) = self.pty_reader.as_ref() else {
+                    return 0;
+                };
+                match reader.recv_timeout(timeout) {
+                    Ok(Some(chunk)) => Some(chunk),
+                    Ok(None) | Err(_) => None,
+                }
             }
         };
         match first {

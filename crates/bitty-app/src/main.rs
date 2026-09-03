@@ -163,8 +163,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
 use bitty_platform::{
-    App, AppHandler, EventContext, LogicalKey, LogicalSize, NamedKey, PhysicalSize, PlatformError,
-    PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
+    App, AppHandler, EventContext, EventWaker, LogicalKey, LogicalSize, NamedKey, PhysicalSize,
+    PlatformError, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle,
+    WindowId,
 };
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
@@ -1170,6 +1171,21 @@ impl TerminalApp {
 }
 
 impl AppHandler for TerminalApp {
+    fn set_event_waker(&mut self, waker: EventWaker) {
+        // Bridge the platform proxy into the runtime's bounded wakeup pump:
+        // the forwarder thread owns its clone and wakes once per readability
+        // signal (plus once on EOF). `Mutex` keeps the closure `Send + Sync`
+        // even if the proxy is only `Send`.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(waker));
+        let pty_waker: bitty_runtime::PtyWaker = std::sync::Arc::new(move || {
+            if let Ok(w) = shared.lock() {
+                w.wake_pty();
+            }
+        });
+        self.runtime.set_pty_waker(pty_waker);
+        eprintln!("bitty: pty wakeup armed (event-loop proxy)");
+    }
+
     fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
         // Bounded PTY pump: drain before handling the event so fresh bytes are
         // visible to the state machine before the tick.
@@ -1362,6 +1378,17 @@ impl AppHandler for TerminalApp {
                 // Poll PTY pump again and drive tick; request redraw only when
                 // tick produced a present (frame-on-demand).
                 self.poll_pty_pump();
+                if self.drive_tick().is_some() {
+                    if let Some(win) = self.window.as_ref() {
+                        win.request_redraw();
+                    }
+                }
+            }
+            PlatformEvent::PtyReadable => {
+                // Evented PTY wakeup: the top-of-handler `poll_pty_pump`
+                // already drained the bounded forwarder channel, so tick when
+                // damage exists and request a redraw only on present
+                // (frame-on-demand; quiet shells idle with no further wakes).
                 if self.drive_tick().is_some() {
                     if let Some(win) = self.window.as_ref() {
                         win.request_redraw();

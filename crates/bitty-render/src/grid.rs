@@ -86,10 +86,31 @@ use crate::glyph::{
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
 pub type Rgba8 = [u8; 4];
 
-/// Default foreground: light gray, fully opaque.
-pub const DEFAULT_FG: Rgba8 = [0xE5, 0xE5, 0xE5, 0xFF];
-/// Default background: near-black, fully opaque.
-pub const DEFAULT_BG: Rgba8 = [0x10, 0x10, 0x10, 0xFF];
+/// Default foreground: Bitty Dark `#cdd6f4`, fully opaque.
+///
+/// Mirrors [`bitty_config::theme::BITTY_DARK`]`foreground`: a soft
+/// lavender-white that avoids pure-white glare on the dark background.
+/// This is the glyph color for unstyled cells and prompt text.
+pub const DEFAULT_FG: Rgba8 = [0xCD, 0xD6, 0xF4, 0xFF];
+/// Default background: Bitty Dark `#1e1e2e`, fully opaque.
+///
+/// Mirrors [`bitty_config::theme::BITTY_DARK`]`background` and drives every
+/// clear path (GPU clear color, headless composite, software surface): the
+/// 0.06 hardcoded gray is gone. Dark indigo-gray, not pure black.
+pub const DEFAULT_BG: Rgba8 = [0x1E, 0x1E, 0x2E, 0xFF];
+/// Block cursor fill: Bitty Dark `#f5e0dc`, fully opaque.
+///
+/// Mirrors [`bitty_config::theme::BITTY_DARK`]`cursor`: warm rosewater,
+/// distinct from foreground and selection so the cursor stays findable.
+/// Embedders composite it (e.g. with reduced alpha for a block cursor);
+/// the hue itself is owned by the theme.
+pub const DEFAULT_CURSOR: Rgba8 = [0xF5, 0xE0, 0xDC, 0xFF];
+/// Selection background fill: Bitty Dark `#313244`, fully opaque.
+///
+/// Mirrors [`bitty_config::theme::BITTY_DARK`]`selection`: one step above
+/// the background so selected cells read clearly while foreground-colored
+/// text stays legible on top.
+pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
 /// Foreground alpha substituted for faint (`SGR 2`) text.
 pub const FAINT_ALPHA: u8 = 0x7F;
 
@@ -157,10 +178,12 @@ const fn saturating_i32(value: u64) -> i32 {
 
 /// Resolves one palette/indexed/direct color to straight-alpha RGBA.
 ///
-/// `Color::Default` maps to `fallback`; indexed entries go through the
-/// built-in deterministic 256-color palette (16 ANSI entries, the 6×6×6
-/// cube, 24 grayscale steps — xterm-compatible values). Fully deterministic
-/// on every platform; palette customization awaits the configuration model.
+/// `Color::Default` maps to `fallback`; indexed entries 0–15 go through the
+/// designed default preset ([`bitty_config::theme::BITTY_DARK`]`ansi`, so the
+/// synthetic demo pump's `\x1b[32m` green renders as the theme's `#a6e3a1`
+/// instead of a hardcoded green), while 16–231 (6x6x6 cube) and 232–255
+/// (grayscale ramp) stay xterm-compatible. Fully deterministic on every
+/// platform.
 #[must_use]
 pub fn resolve_color(color: Option<&Color>, fallback: Rgba8) -> Rgba8 {
     let rgb = match color {
@@ -171,40 +194,28 @@ pub fn resolve_color(color: Option<&Color>, fallback: Rgba8) -> Rgba8 {
     [rgb[0], rgb[1], rgb[2], fallback[3]]
 }
 
-/// Built-in 256-color palette entry (`xterm`-compatible constants).
+/// Built-in 256-color palette entry.
+///
+/// Indices 0–15 are the designed default preset's ANSI colors
+/// ([`bitty_config::theme::BITTY_DARK`]`ansi`, the single source of truth —
+/// read from the preset, never duplicated here); 16–231 are the
+/// xterm-compatible 6x6x6 cube and 232–255 the grayscale ramp.
 #[must_use]
 pub fn palette_rgb(index: u8) -> [u8; 3] {
-    const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-    match index {
-        0 => [0, 0, 0],
-        1 => [205, 0, 0],
-        2 => [0, 205, 0],
-        3 => [205, 205, 0],
-        4 => [0, 0, 238],
-        5 => [205, 0, 205],
-        6 => [0, 205, 205],
-        7 => [229, 229, 229],
-        8 => [127, 127, 127],
-        9 => [255, 0, 0],
-        10 => [0, 255, 0],
-        11 => [255, 255, 0],
-        12 => [92, 92, 255],
-        13 => [255, 0, 255],
-        14 => [0, 255, 255],
-        15 => [255, 255, 255],
-        16..=231 => {
-            let n = u32::from(index) - 16;
-            [
-                CUBE_LEVELS[(n / 36) as usize],
-                CUBE_LEVELS[((n / 6) % 6) as usize],
-                CUBE_LEVELS[(n % 6) as usize],
-            ]
-        }
-        232..=255 => {
-            let gray = 8 + 10 * (u32::from(index) - 232);
-            [gray as u8; 3]
-        }
+    if index < 16 {
+        return bitty_config::theme::BITTY_DARK.ansi[index as usize];
     }
+    const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    if index <= 231 {
+        let n = u32::from(index) - 16;
+        return [
+            CUBE_LEVELS[(n / 36) as usize],
+            CUBE_LEVELS[((n / 6) % 6) as usize],
+            CUBE_LEVELS[(n % 6) as usize],
+        ];
+    }
+    let gray = 8 + 10 * (u32::from(index) - 232);
+    [gray as u8; 3]
 }
 
 /// Effective (foreground, background) pair for a styled cell.
@@ -226,6 +237,62 @@ pub fn resolved_colors(style: &Style) -> (Rgba8, Rgba8) {
         fg
     };
     (fg, bg)
+}
+
+/// Resolves an `appearance.theme` identifier to the preset render consumes.
+///
+/// Thin wrapper over [`bitty_config::theme::resolve_theme`]: `None`/empty
+/// and unknown names yield the designed default preset (unknown names are
+/// logged to stderr by the config layer). Render entry points that take a
+/// theme name — rather than assuming defaults — go through here so there is
+/// exactly one preset registry.
+#[must_use]
+pub fn active_theme(appearance_theme: Option<&str>) -> &'static bitty_config::theme::Theme {
+    bitty_config::theme::resolve_theme(appearance_theme)
+}
+
+/// Block-cursor fill for a live cursor, or `None` when the cursor is hidden
+/// or outside the `cols` x `rows` grid.
+///
+/// The fill color is the theme cursor ([`DEFAULT_CURSOR`]); geometry is one
+/// cell at the cursor position. This is the render-side cursor primitive —
+/// embedders that paint their own overlay (e.g. the runtime tick path) must
+/// use the same theme color so the cursor never depends on which layer drew
+/// it.
+#[must_use]
+pub fn cursor_fill(
+    cursor: &bitty_term_state::Cursor,
+    cell: CellMetrics,
+    cols: usize,
+    rows: usize,
+) -> Option<FillRect> {
+    if !cursor.visible {
+        return None;
+    }
+    let row = usize::from(cursor.position.row);
+    let col = usize::from(cursor.position.col);
+    if row >= rows || col >= cols {
+        return None;
+    }
+    Some(FillRect {
+        rect: RectPx::new(
+            saturating_i32(u64::from(col as u32).saturating_mul(u64::from(cell.width))),
+            saturating_i32(u64::from(row as u32).saturating_mul(u64::from(cell.height))),
+            cell.width,
+            cell.height,
+        ),
+        color: DEFAULT_CURSOR,
+    })
+}
+
+/// Selection background fill color: the theme selection ([`DEFAULT_SELECTION`]).
+///
+/// Selection highlighting itself lives with the embedder (which owns the
+/// selection range), but the hue is owned here so every layer paints the
+/// same `#313244`.
+#[must_use]
+pub const fn selection_fill() -> Rgba8 {
+    DEFAULT_SELECTION
 }
 
 /// Converts grid-coordinate damage into the pixel-domain descriptor

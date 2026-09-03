@@ -26,6 +26,10 @@ bitty-term-state = { version = "0.0.1", path = "../bitty-term-state" }
 # ADR-0003/ADR-0004 platform seam: GpuContext consumes the owned SurfaceTarget
 # produced by bitty-platform without leaking winit types.
 bitty-platform = { version = "0.0.1", path = "../bitty-platform" }
+# Theme preset registry: render consumes bitty-config's single source of
+# truth for clear color, default fg/bg, cursor, selection, and ANSI 0-15
+# (CTX-0147). bitty-config stays dependency-free (pure std), so no cycle.
+bitty-config = { version = "0.0.1", path = "../bitty-config" }
 # ADR-0004 rendering rows: ADOPT wgpu (~26.x line); WRAP crossfont.
 # Neither upstream type may appear in this crate's public API.
 wgpu = "26.0"

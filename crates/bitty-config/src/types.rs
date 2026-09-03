@@ -148,6 +148,12 @@ impl TerminalConfig {
 }
 
 /// Appearance configuration.
+///
+/// The optional theme identifier resolves through the built-in preset
+/// registry ([`crate::theme`]): `None`/empty means the designed default
+/// preset ([`crate::theme::DEFAULT_THEME_NAME`]), a known name resolves to
+/// its exact values, and an unknown name falls back to the default (logged).
+/// No config-file I/O happens here; the identifier is already-parsed data.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppearanceConfig {
     /// Optional theme identifier.

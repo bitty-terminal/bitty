@@ -262,6 +262,7 @@ dependencies = [
 name = "bitty-render"
 version = "0.0.1"
 dependencies = [
+ "bitty-config",
  "bitty-platform",
  "bitty-term-state",
  "bitty-vt",

@@ -730,10 +730,14 @@ impl Surface {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
+                                // Bitty Dark clear color (single source of
+                                // truth: `bitty_config::theme::BITTY_DARK`
+                                // via `crate::grid::DEFAULT_BG`); the 0.06
+                                // hardcoded gray is gone.
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.06,
-                                    g: 0.06,
-                                    b: 0.06,
+                                    r: f64::from(crate::grid::DEFAULT_BG[0]) / 255.0,
+                                    g: f64::from(crate::grid::DEFAULT_BG[1]) / 255.0,
+                                    b: f64::from(crate::grid::DEFAULT_BG[2]) / 255.0,
                                     a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,
@@ -826,8 +830,9 @@ impl Surface {
                 let width = config.extent.width();
                 let height = config.extent.height();
                 let mut rgba = vec![0u8; width as usize * height as usize * 4];
-                // Clear to default background (premultiplied) — matches the GPU
-                // clear color above.
+                // Clear to the theme background (premultiplied) — Bitty Dark
+                // via `crate::grid::DEFAULT_BG`; matches the GPU clear
+                // color above.
                 {
                     let bg = crate::grid::DEFAULT_BG;
                     let pr = premultiply(bg[0], bg[3]);
@@ -997,6 +1002,7 @@ impl Surface {
                     config.extent.height(),
                     draw_list.plan.extent,
                 );
+                // Theme clear color: Bitty Dark via `crate::grid::DEFAULT_BG`.
                 let bg = crate::grid::DEFAULT_BG;
                 let clear = wgpu::Color {
                     r: f64::from(bg[0]) / 255.0,
@@ -1634,5 +1640,34 @@ mod tests {
             ),
             Err(RenderError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn headless_clear_uses_theme_background() {
+        // CTX-0147: every clear path paints Bitty Dark `#1e1e2e`, never the
+        // old 0.06 hardcoded gray. An empty draw list presents just the
+        // clear, so the first pixel must equal the theme background
+        // (opaque, hence premultiply-identity).
+        let surface = Surface::headless(PhysicalSize::new(32, 16)).expect("valid extent");
+        let empty = crate::grid::DrawList {
+            generation: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(32, 16),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 32, 16)],
+            },
+            fills: vec![],
+            glyphs: vec![],
+        };
+        surface
+            .headless_present(&empty, None)
+            .expect("clear-only present");
+        let rgba = surface.headless_rgba().expect("rgba after present");
+        assert_eq!(rgba.len(), 32 * 16 * 4);
+        let theme_bg = bitty_config::theme::BITTY_DARK.background;
+        assert_eq!(&rgba[..4], &[theme_bg[0], theme_bg[1], theme_bg[2], 0xFF]);
+        assert!(rgba.chunks_exact(4).all(|px| px == &rgba[0..4]));
+        // And the render-side default matches the same preset entry.
+        assert_eq!(crate::grid::DEFAULT_BG[..3], theme_bg);
     }
 }

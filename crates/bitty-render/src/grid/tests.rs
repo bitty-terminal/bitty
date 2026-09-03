@@ -166,10 +166,13 @@ fn extent_for_saturates_without_overflow() {
 
 #[test]
 fn palette_spots_cover_all_bands() {
-    assert_eq!(palette_rgb(0), [0, 0, 0]);
-    assert_eq!(palette_rgb(1), [205, 0, 0]);
-    assert_eq!(palette_rgb(7), [229, 229, 229]);
-    assert_eq!(palette_rgb(15), [255, 255, 255]);
+    // Indices 0-15 are the Bitty Dark preset (single source of truth in
+    // `bitty_config::theme::BITTY_DARK`); see the CTX-0147 theme tests for
+    // the full table.
+    assert_eq!(palette_rgb(0), [0x45, 0x47, 0x5A]);
+    assert_eq!(palette_rgb(1), [0xF3, 0x8B, 0xA8]);
+    assert_eq!(palette_rgb(7), [0xBA, 0xC2, 0xDE]);
+    assert_eq!(palette_rgb(15), [0xCD, 0xD6, 0xF4]);
     // Cube corner: index 231 = level (5,5,5).
     assert_eq!(palette_rgb(231), [255, 255, 255]);
     assert_eq!(palette_rgb(16), [0, 0, 0]);
@@ -186,7 +189,7 @@ fn resolve_color_covers_default_indexed_and_rgb() {
         resolve_color(None, DEFAULT_FG),
         [DEFAULT_FG[0], DEFAULT_FG[1], DEFAULT_FG[2], DEFAULT_FG[3]]
     );
-    assert_eq!(resolve_color(Some(&Color::Indexed(1)), DEFAULT_FG)[0], 205);
+    assert_eq!(resolve_color(Some(&Color::Indexed(1)), DEFAULT_FG)[0], 0xF3);
     assert_eq!(
         resolve_color(Some(&Color::Rgb(Rgb { r: 1, g: 2, b: 3 })), DEFAULT_FG),
         [1, 2, 3, 255]
@@ -803,4 +806,112 @@ fn dpi_rescale_failure_leaves_renderer_unchanged() {
     );
     assert_eq!(renderer.cell_metrics(), cell_metrics());
     assert_eq!(renderer.atlas_placements(), placements_before);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-0147: designed default theme preset (render consumes the registry)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn theme_resolution_none_unknown_and_known() {
+    use super::{DEFAULT_CURSOR, DEFAULT_SELECTION};
+    use super::{active_theme, cursor_fill, selection_fill};
+
+    // None -> default preset.
+    let theme = active_theme(None);
+    assert_eq!(theme.name, bitty_config::theme::DEFAULT_THEME_NAME);
+    assert_eq!(theme.background, [0x1E, 0x1E, 0x2E]);
+    assert_eq!(theme.foreground, [0xCD, 0xD6, 0xF4]);
+
+    // Unknown name -> default preset (config layer logs the fallback).
+    let (fallback, status) = bitty_config::theme::resolve_theme_with_status(Some("not-a-theme"));
+    assert_eq!(
+        status,
+        bitty_config::theme::ThemeResolution::FallbackUnknown
+    );
+    assert_eq!(fallback.name, bitty_config::theme::DEFAULT_THEME_NAME);
+    assert!(std::ptr::eq(active_theme(Some("not-a-theme")), fallback));
+
+    // Known name -> exact preset values.
+    let named = active_theme(Some("bitty-dark"));
+    assert_eq!(named.background, [0x1E, 0x1E, 0x2E]);
+    assert_eq!(named.foreground, [0xCD, 0xD6, 0xF4]);
+    assert_eq!(named.cursor, [0xF5, 0xE0, 0xDC]);
+    assert_eq!(named.selection, [0x31, 0x32, 0x44]);
+
+    // Render-side cursor/selection colors equal the preset entries.
+    assert_eq!(DEFAULT_CURSOR[..3], named.cursor);
+    assert_eq!(DEFAULT_SELECTION[..3], named.selection);
+    assert_eq!(selection_fill()[..3], named.selection);
+    let _ = cursor_fill;
+}
+
+#[test]
+fn default_fg_bg_match_preset_and_ansi_maps_to_theme() {
+    // Default cell colors are the preset foreground/background.
+    assert_eq!(DEFAULT_FG[..3], bitty_config::theme::BITTY_DARK.foreground);
+    assert_eq!(DEFAULT_BG[..3], bitty_config::theme::BITTY_DARK.background);
+
+    // All 16 ANSI entries resolve to the preset table (single source).
+    for index in 0u8..16 {
+        assert_eq!(
+            palette_rgb(index),
+            bitty_config::theme::BITTY_DARK.ansi[usize::from(index)],
+            "ANSI index {index}"
+        );
+    }
+    // Spot checks: the roles from the module table.
+    assert_eq!(palette_rgb(0), [0x45, 0x47, 0x5A]);
+    assert_eq!(palette_rgb(2), [0xA6, 0xE3, 0xA1]);
+    assert_eq!(palette_rgb(4), [0x89, 0xB4, 0xFA]);
+    assert_eq!(palette_rgb(15), [0xCD, 0xD6, 0xF4]);
+    // The 256-color cube and grays stay xterm-compatible past index 15.
+    assert_eq!(palette_rgb(16), [0, 0, 0]);
+    assert_eq!(palette_rgb(231), [255, 255, 255]);
+    assert_eq!(palette_rgb(232), [8, 8, 8]);
+
+    // Indexed colors inherit the fallback alpha, like before.
+    assert_eq!(
+        resolve_color(Some(&Color::Indexed(2)), [9, 9, 9, 7]),
+        [0xA6, 0xE3, 0xA1, 7]
+    );
+}
+
+#[test]
+fn cursor_fill_geometry_and_bounds() {
+    use super::{DEFAULT_CURSOR, cursor_fill};
+    use bitty_term_state::{Cursor, CursorPosition};
+
+    let cell = cell_metrics(); // 8x16
+    let visible = Cursor {
+        position: CursorPosition { row: 2, col: 3 },
+        visible: true,
+        ..Cursor::default()
+    };
+    let fill = cursor_fill(&visible, cell, 80, 24).expect("visible cursor in grid");
+    assert_eq!(fill.rect, crate::geometry::RectPx::new(24, 32, 8, 16));
+    assert_eq!(fill.color, DEFAULT_CURSOR);
+
+    // Hidden cursor paints nothing.
+    let hidden = Cursor {
+        visible: false,
+        ..visible.clone()
+    };
+    assert!(cursor_fill(&hidden, cell, 80, 24).is_none());
+
+    // Out-of-grid cursor paints nothing (no panic, no wraparound).
+    let outside = Cursor {
+        position: CursorPosition { row: 24, col: 0 },
+        visible: true,
+        ..Cursor::default()
+    };
+    assert!(cursor_fill(&outside, cell, 80, 24).is_none());
+}
+
+#[test]
+fn demo_green_resolves_to_theme_green() {
+    // The synthetic demo pump emits `\x1b[32m` (Indexed 2). Render must map
+    // it to the preset green, not a hardcoded ad-hoc green.
+    let themed = resolve_color(Some(&Color::Indexed(2)), DEFAULT_FG);
+    assert_eq!(themed, [0xA6, 0xE3, 0xA1, 0xFF]);
 }

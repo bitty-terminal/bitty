@@ -921,17 +921,41 @@ impl Runtime {
     /// Pure, headless, and deterministic: delegates to
     /// [`bitty_platform::encode_key_event`] which owns the xterm legacy table
     /// (M1 required baseline; Kitty protocol is deferred). Returns `None` for
-    /// release/synthetic/modifier-only/unmapped inputs.
+    /// release/synthetic/modifier-only/unmapped inputs. This entry point
+    /// assumes no modifiers are held; the live input path
+    /// ([`Self::handle_key_event`]) applies the tracked modifier snapshot via
+    /// [`encode_key_with_kitty`](Self::encode_key_with_kitty) instead, so
+    /// `Ctrl+letter` synthesizes C0 bytes on Wayland where winit reports
+    /// `text=None` (CTX-0154).
     #[must_use]
     pub fn encode_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
         bitty_platform::encode_key_event(event)
+    }
+
+    /// Snapshots the tracked modifier flags for the legacy encoder.
+    ///
+    /// winit delivers modifiers (`ModifiersChanged`, modifier key presses)
+    /// separately from the key press itself, and on Wayland the press carries
+    /// `text=None` (or the bare letter) for `Ctrl+letter`. The legacy encoder
+    /// therefore cannot rely on `text` and synthesizes C0/ESC bytes from this
+    /// snapshot instead (CTX-0154).
+    fn modifier_snapshot(&self) -> bitty_platform::ModifiersState {
+        bitty_platform::ModifiersState {
+            shift: self.shift_pressed,
+            control: self.control_pressed,
+            alt: self.alt_pressed,
+            super_pressed: false,
+        }
     }
 
     /// Encodes with Kitty protocol when `kitty_flags != 0` (opt-in 7727).
     /// Bounded to 64 bytes per spec; progressive flags are honored with fallback to legacy when flag not set.
     fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         if self.kitty_flags == 0 {
-            return Self::encode_key_event(event);
+            return bitty_platform::keyboard::encode_key_event_with_modifiers(
+                event,
+                &self.modifier_snapshot(),
+            );
         }
         // Kitty active: produce CSI u for disambiguated keys, else legacy with fallback.
         // For vertical slice, handle Tab vs Ctrl-I disambiguation and Enter vs Ctrl-M.
@@ -967,8 +991,9 @@ impl Runtime {
                 }
             }
         }
-        // Fallback to legacy for keys not disambiguated
-        Self::encode_key_event(event)
+        // Fallback to legacy for keys not disambiguated, still honoring the
+        // tracked modifier snapshot (CTX-0154: Ctrl+letter synthesis).
+        bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
     }
 
     /// Handles a decoded keyboard event: encodes to bytes and routes to the PTY.
@@ -3826,6 +3851,86 @@ mod tests {
 
     fn make_runtime() -> Runtime {
         Runtime::with_defaults().expect("defaults must build")
+    }
+
+    fn test_char_key(logical: &str, text: Option<&str>, state: PressState) -> KeyEvent {
+        KeyEvent {
+            logical_key: bitty_platform::LogicalKey::Character(logical.to_string()),
+            text: text.map(|s| s.to_string()),
+            location: bitty_platform::KeyLocation::Standard,
+            state,
+            repeat: false,
+            is_synthetic: false,
+        }
+    }
+
+    fn test_named_key(named: bitty_platform::NamedKey, state: PressState) -> KeyEvent {
+        KeyEvent {
+            logical_key: bitty_platform::LogicalKey::Named(named),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state,
+            repeat: false,
+            is_synthetic: false,
+        }
+    }
+
+    #[test]
+    fn tracked_control_state_synthesizes_ctrl_bytes() {
+        // CTX-0154: the legacy encoder must consult the tracked modifier
+        // state, not winit text (None for Ctrl+letter on Wayland).
+        let mut rt = make_runtime();
+        // Pressing Control is modifier-only (no PTY bytes) but latches state.
+        assert!(
+            rt.handle_key_event(test_named_key(
+                bitty_platform::NamedKey::Control,
+                PressState::Pressed
+            ))
+            .is_none()
+        );
+        assert_eq!(rt.pending_input_len(), 0);
+        // Wayland-style Ctrl+F (text=None) synthesizes 0x06.
+        assert_eq!(
+            rt.handle_key_event(test_char_key("f", None, PressState::Pressed)),
+            Some(vec![0x06])
+        );
+        assert_eq!(rt.pending_input(), b"\x06");
+        assert_eq!(rt.drain_pending_input(), b"\x06");
+        // Bare-letter text under held Control synthesizes identically.
+        assert_eq!(
+            rt.handle_key_event(test_char_key("c", Some("c"), PressState::Pressed)),
+            Some(vec![0x03])
+        );
+        assert_eq!(rt.drain_pending_input(), b"\x03");
+        // Releasing Control unlatches: plain letters pass through again.
+        assert!(
+            rt.handle_key_event(test_named_key(
+                bitty_platform::NamedKey::Control,
+                PressState::Released
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            rt.handle_key_event(test_char_key("f", None, PressState::Pressed)),
+            Some(b"f".to_vec())
+        );
+        assert_eq!(rt.drain_pending_input(), b"f");
+        // Alt tracked via ModifiersChanged prefixes ESC (metaSendsEscape).
+        let alt_on = PlatformEvent::Window {
+            window_id: bitty_platform::WindowId::from_raw_public(7),
+            kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+                shift: false,
+                control: false,
+                alt: true,
+                super_pressed: false,
+            }),
+        };
+        assert!(!rt.handle_platform_event(alt_on));
+        assert_eq!(
+            rt.handle_key_event(test_char_key("x", Some("x"), PressState::Pressed)),
+            Some(vec![0x1b, b'x'])
+        );
+        assert_eq!(rt.drain_pending_input(), b"\x1bx");
     }
 
     #[test]

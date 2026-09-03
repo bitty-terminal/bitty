@@ -194,8 +194,23 @@ impl SurfaceTarget {
     /// Call after
     /// [`WindowEventKind::ScaleFactorChanged`](crate::WindowEventKind::ScaleFactorChanged)
     /// to recompute cached logical geometry before reconfiguring the surface.
+    /// Prefer re-reading [`SurfaceTarget::inner_size`](Self::inner_size)
+    /// (already physical) when possible; a following
+    /// [`WindowEventKind::Resized`](crate::WindowEventKind::Resized) event
+    /// takes precedence over the converted value either way.
     pub fn logical_to_physical(&self, size: LogicalSize) -> PhysicalSize {
         size.to_physical(self.source.scale_factor())
+    }
+
+    /// Scale-change surface recompute from cached logical geometry.
+    ///
+    /// Convenience over
+    /// [`surface_extent_from_logical`](crate::dpi::surface_extent_from_logical)
+    /// at the *current* scale factor. Returns `None` for zero extents (skip
+    /// reconfiguration until a non-zero size arrives, matching
+    /// [`map_resize_to_surface_extent`]).
+    pub fn scale_change_extent(&self, logical: LogicalSize) -> Option<PhysicalSize> {
+        crate::dpi::surface_extent_from_logical(logical, self.source.scale_factor())
     }
 }
 
@@ -377,5 +392,34 @@ mod tests {
             None
         );
         assert_eq!(map_resize_to_surface_extent(PhysicalSize::new(0, 0)), None);
+    }
+
+    #[test]
+    fn scale_change_recompute_matches_physical_resize() {
+        // Fractional 1.6 scale change: cached logical 1566x935 recomputes to
+        // the same physical extent a Resized event would carry (2506x1496),
+        // so either path configures an identical surface.
+        let attached = target(FakeSource {
+            scale: ScaleFactor::new_sanitized(1.6),
+            ..FakeSource::ok()
+        });
+        let logical = LogicalSize::new(1566.0, 935.0).expect("valid");
+        let recomputed = attached.scale_change_extent(logical);
+        assert_eq!(recomputed, Some(PhysicalSize::new(2506, 1496)));
+        assert_eq!(
+            recomputed.and_then(map_resize_to_surface_extent),
+            recomputed,
+            "recomputed extents always survive the resize mapping"
+        );
+    }
+
+    #[test]
+    fn scale_change_recompute_drops_zero_extents() {
+        let attached = target(FakeSource {
+            scale: ScaleFactor::new_sanitized(1.6),
+            ..FakeSource::ok()
+        });
+        let zero = LogicalSize::new(0.0, 935.0).expect("valid");
+        assert_eq!(attached.scale_change_extent(zero), None);
     }
 }

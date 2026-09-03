@@ -105,7 +105,7 @@ pub use raw_window_handle;
 
 pub use app::{App, AppHandler, EventContext, WindowConfig, WindowHandle};
 pub use clipboard::Clipboard;
-pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor};
+pub use dpi::{LogicalPixel, LogicalSize, PhysicalSize, ScaleFactor, surface_extent_from_logical};
 pub use error::PlatformError;
 pub use event::{
     CursorPosition, ImeEvent, KeyEvent, KeyLocation, LogicalKey, ModifiersState, MouseButton,

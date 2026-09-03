@@ -118,6 +118,16 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
         self.rasterizer.load_font(query)
     }
 
+    /// Drops all cached entries (bitmaps and blanks) without resetting the
+    /// cumulative hit/miss counters.
+    ///
+    /// Call after the rasterized size changes (for example a DPI rescale):
+    /// keys embed the point size, so stale entries would otherwise pin
+    /// previous-scale bitmaps while new-scale keys rasterize alongside them.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Returns the glyph for `key`, rasterizing on first use.
     ///
     /// # Errors

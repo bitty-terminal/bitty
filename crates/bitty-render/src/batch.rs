@@ -724,6 +724,19 @@ mod tests {
     }
 
     #[test]
+    fn scale_derivation_recovers_fractional_hidpi_factor() {
+        // Matched scale-aware plan: 192x57 cells at 13x26 physical pixels on
+        // a 2496x1482 surface derives ~1.0 (no magnification).
+        let matched = derive_scale(2496, 1482, ExtentPx::new(2496, 1482));
+        assert!((matched - 1.0).abs() < 1e-6);
+        // Stale 1x plan (192x57 cells at 8x16) against the same physical
+        // surface derives ~1.625: every 1x texel magnifies through linear
+        // filtering. The hidpi rescale path exists to prevent this state.
+        let stale = derive_scale(2496, 1482, ExtentPx::new(1536, 912));
+        assert!((stale - 1.625).abs() < 1e-3, "stale scale {stale}");
+    }
+
+    #[test]
     fn fill_chunking_preserves_order_and_bounds_chunks() {
         let fills: Vec<FillRect> = (0..10).map(|i| fill_rect(i * 8, 0, 8, 16)).collect();
         let chunks = chunk_fills(&fills, 800, 600, 1.0);

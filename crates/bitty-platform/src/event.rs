@@ -779,6 +779,22 @@ mod tests {
     }
 
     #[test]
+    fn scale_factor_mapper_preserves_fractional_hidpi_values() {
+        // Hyprland fractional 1.6 must survive translation exactly: the
+        // renderer derives scaled cells and the surface extent from it.
+        let fractional = ScaleFactor::new(1.6).expect("valid");
+        assert_eq!(
+            map_scale_factor_changed(1.6),
+            WindowEventKind::ScaleFactorChanged(fractional)
+        );
+        assert_ne!(
+            map_scale_factor_changed(1.6),
+            map_scale_factor_changed(2.0),
+            "fractional factors must not collapse to integers"
+        );
+    }
+
+    #[test]
     fn keyboard_character_parts_translate() {
         let translated = translate_key_parts(
             Key::Character(SmolStr::from("a")),

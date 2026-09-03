@@ -540,6 +540,21 @@ impl GlyphAtlas {
         std::mem::take(&mut self.pending)
     }
 
+    /// Drops all placements and texels while keeping the atlas dimensions.
+    ///
+    /// Cumulative hits/misses/evictions/inline-fallback counters are
+    /// preserved. Call after the rasterized size changes (for example a DPI
+    /// rescale): slots hold previous-scale coverage, so they must not survive
+    /// alongside new-scale placements. Unlike exhaustion recovery (which
+    /// counts an eviction), this explicit invalidation leaves the cumulative
+    /// counters untouched.
+    pub fn clear(&mut self) {
+        self.layout.reset();
+        self.slots.clear();
+        self.texels.fill(0);
+        self.pending.clear();
+    }
+
     /// Ensures `bitmap` is placed for `key`, queueing an upload when newly
     /// placed. Blank bitmaps are refused by callers before reaching the
     /// atlas.
@@ -633,6 +648,22 @@ fn write_slot_texels(texels: &mut [u8], dims: AtlasDims, slot: AtlasSlot, mask: 
     }
 }
 
+/// Result of a DPI rescale: the metrics subsequent frames rasterize at.
+///
+/// Returned by
+/// [`GridRenderer::apply_dpi_scale`](GridRenderer::apply_dpi_scale) so the
+/// embedder can derive the grid from physical pixels over [`cell`](Self::cell)
+/// and reconfigure the surface extent without re-deriving the math.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppliedDpiScale {
+    /// Sanitized scale that was applied (see [`crate::hidpi::sanitize_dpi_scale`]).
+    pub scale: f64,
+    /// Cell metrics subsequent frames place glyphs at.
+    pub cell: CellMetrics,
+    /// Point size subsequent glyphs rasterize at.
+    pub point_size: f32,
+}
+
 /// Renders terminal snapshots through the shared pipeline: plan, place,
 /// cache, emit.
 ///
@@ -691,6 +722,55 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     #[must_use]
     pub const fn cell_metrics(&self) -> CellMetrics {
         self.cell
+    }
+
+    /// Applies a DPI scale change so atlas rasterization matches the scaled cell.
+    ///
+    /// Recomputes cell metrics and point size from `base_cell`/`base_query`
+    /// at `scale` (see [`crate::hidpi`]), reloads the font at the scaled
+    /// size, and invalidates the glyph cache plus atlas so subsequent frames
+    /// rasterize at the new size. Cumulative cache/atlas counters are
+    /// preserved; only stale entries and previous-scale texels are dropped.
+    ///
+    /// Call on DPI scale changes after reconfiguring the surface to physical
+    /// pixels, then derive the grid from physical pixels over the returned
+    /// [`AppliedDpiScale::cell`] so the per-frame NDC factor stays near 1.0
+    /// instead of magnifying 1x texels (soft text) or leaving a stale small
+    /// surface for the compositor to upscale (blurry text).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidInput`] when the scaled query is invalid (only
+    /// reachable from an invalid `base_query`, since scaling stays total);
+    /// whatever the rasterizer reports when the scaled font fails to load.
+    /// On error the renderer is unchanged: the font is loaded before any
+    /// field is updated or any cache is cleared.
+    pub fn apply_dpi_scale(
+        &mut self,
+        base_cell: CellMetrics,
+        base_query: &FontQuery,
+        scale: f64,
+    ) -> Result<AppliedDpiScale, RenderError> {
+        let sanitized = crate::hidpi::sanitize_dpi_scale(scale);
+        let cell = crate::hidpi::scaled_cell_metrics(base_cell, sanitized);
+        let point_size = crate::hidpi::scaled_point_size(base_query.point_size, sanitized);
+        let scaled_query = FontQuery {
+            family: base_query.family.clone(),
+            style: base_query.style.clone(),
+            point_size,
+        };
+        scaled_query.validate()?;
+        let font = self.cache.load_font(&scaled_query)?;
+        self.cell = cell;
+        self.point_size = point_size;
+        self.font = font;
+        self.cache.clear();
+        self.atlas.clear();
+        Ok(AppliedDpiScale {
+            scale: sanitized,
+            cell,
+            point_size,
+        })
     }
 
     /// Point-in-time copy of the renderer-side counters.

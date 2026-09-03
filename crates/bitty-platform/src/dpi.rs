@@ -122,6 +122,29 @@ impl LogicalSize {
     }
 }
 
+/// Computes the surface extent for a logical window size at `scale`.
+///
+/// This is the scale-change recompute: after
+/// [`WindowEventKind::ScaleFactorChanged`](crate::WindowEventKind::ScaleFactorChanged),
+/// convert the cached logical geometry at the new factor and reconfigure the
+/// surface with the result. Prefer re-reading
+/// [`SurfaceTarget::inner_size`](crate::SurfaceTarget::inner_size) (already
+/// physical) when a handle is available; a following
+/// [`WindowEventKind::Resized`](crate::WindowEventKind::Resized) event takes
+/// precedence over the computed value either way.
+///
+/// Returns `None` when either physical dimension rounds to zero: a GPU
+/// surface cannot take a zero extent, so reconfiguration must be skipped
+/// until a non-zero size arrives (matching
+/// [`map_resize_to_surface_extent`](crate::map_resize_to_surface_extent)).
+pub fn surface_extent_from_logical(
+    logical: LogicalSize,
+    scale: ScaleFactor,
+) -> Option<PhysicalSize> {
+    let physical = logical.to_physical(scale);
+    (physical.width() > 0 && physical.height() > 0).then_some(physical)
+}
+
 /// A width/height pair in physical (device) pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PhysicalSize {
@@ -279,6 +302,41 @@ mod tests {
             huge.to_physical(ScaleFactor::ONE),
             PhysicalSize::new(u32::MAX, 0),
             "saturates instead of wrapping"
+        );
+    }
+
+    #[test]
+    fn fractional_scale_converts_tiled_window_to_physical() {
+        // Hyprland scale 1.6: tiled logical 1566x935 becomes 2506x1496 physical.
+        let scale = ScaleFactor::new(1.6).expect("valid");
+        let logical = LogicalSize::new(1566.0, 935.0).expect("valid");
+        assert_eq!(
+            logical.to_physical(scale),
+            PhysicalSize::new(2506, 1496),
+            "2505.6 rounds half away from zero to 2506"
+        );
+        assert_eq!(
+            surface_extent_from_logical(logical, scale),
+            Some(PhysicalSize::new(2506, 1496))
+        );
+    }
+
+    #[test]
+    fn surface_extent_from_logical_drops_zero_dimensions() {
+        let scale = ScaleFactor::new(1.6).expect("valid");
+        let zero_w = LogicalSize::new(0.0, 935.0).expect("valid");
+        assert_eq!(surface_extent_from_logical(zero_w, scale), None);
+        let tiny = LogicalSize::new(0.1, 0.1).expect("valid");
+        assert_eq!(
+            surface_extent_from_logical(tiny, scale),
+            None,
+            "0.16px rounds to zero and must skip configuration"
+        );
+        // Saturation still yields a configurable extent, never a wrap.
+        let huge = LogicalSize::new(1.0e300, 600.0).expect("valid");
+        assert_eq!(
+            surface_extent_from_logical(huge, ScaleFactor::ONE),
+            Some(PhysicalSize::new(u32::MAX, 600))
         );
     }
 

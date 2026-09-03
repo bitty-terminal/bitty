@@ -23,11 +23,12 @@
 //! `plugin/runtime overlay` RFC and is not part of the v1 contract.
 //!
 //! The RFC's Lua Runtime dependency (`lua-runtime-rfc`, `OQ-009`) is also
-//! still proposed, so this crate is **pure data + validation**: it takes an
+//! still proposed, so the core pipeline is **pure data + validation**: it takes an
 //! already evaluated [`ConfigPlan`] as plain data and owns everything after
-//! it. There is no Lua VM coupling, no file I/O, no platform path
-//! resolution, and no `unsafe` — the crate is headlessly testable on both
-//! Linux CI and the `windows-latest` job.
+//! it. There is no Lua VM coupling and no `unsafe` — the crate stays headlessly
+//! testable on both Linux CI and the `windows-latest` job. The [`file`] module
+//! adds the data-only TOML bootstrap loader (`config.toml` discovery/parsing,
+//! never executed as code) ahead of the Lua track.
 //!
 //! # Pipeline — Candidate A accepted for v1 (experimental review evidence)
 //!
@@ -81,6 +82,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod file;
 pub mod merge;
 pub mod migration;
 pub mod plan;

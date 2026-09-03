@@ -717,3 +717,90 @@ fn full_frame_matches_union_of_incremental_cell_visits() {
     assert_eq!(counters.cells_examined, 4);
     assert_eq!(counters.background_fills, 4);
 }
+
+// ---------------------------------------------------------------------------
+// DPI rescale: atlas rasterization matches the scaled cell
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dpi_rescale_updates_cell_font_and_invalidates_caches() {
+    let mut renderer = renderer();
+    // Populate caches at 1x so invalidation is observable.
+    let script: Vec<TerminalAction> = "ab".chars().map(print).collect();
+    let state = state_from(&script);
+    let snapshot = state.snapshot();
+    let list = renderer.render(&snapshot, &full_damage(&state)).unwrap();
+    assert!(!list.glyphs.is_empty());
+    assert!(renderer.atlas_placements() > 0);
+    let (hits_before, misses_before, _, _) = renderer.atlas_stats();
+
+    let applied = renderer
+        .apply_dpi_scale(cell_metrics(), &font_query(), 1.6)
+        .unwrap();
+    assert_eq!(applied.scale, 1.6);
+    assert_eq!(applied.cell, CellMetrics::new(13, 26).unwrap());
+    assert!((applied.point_size - 19.2).abs() < 1e-4);
+    assert_eq!(renderer.cell_metrics(), applied.cell);
+    // Stale placements and cached bitmaps are gone; cumulative counters stay.
+    assert_eq!(renderer.atlas_placements(), 0);
+    assert!(renderer.atlas_texels().iter().all(|&b| b == 0));
+    let (hits_after, misses_after, _, _) = renderer.atlas_stats();
+    assert_eq!((hits_after, misses_after), (hits_before, misses_before));
+
+    // Frames after the rescale place glyphs on the 13px pitch.
+    let script: Vec<TerminalAction> = "ab".chars().map(print).collect();
+    let state = state_from(&script);
+    let snapshot = state.snapshot();
+    let list = renderer.render(&snapshot, &full_damage(&state)).unwrap();
+    assert!(!list.glyphs.is_empty());
+    for glyph in &list.glyphs {
+        assert_eq!(glyph.dest[0] % 13, 0, "glyph origin follows scaled pitch");
+    }
+    assert_eq!(list.plan.extent.width % 13, 0);
+}
+
+#[test]
+fn dpi_rescale_sanitizes_invalid_scales() {
+    let mut renderer = renderer();
+    for invalid in [0.0, -1.6, f64::NAN, f64::INFINITY] {
+        let applied = renderer
+            .apply_dpi_scale(cell_metrics(), &font_query(), invalid)
+            .unwrap();
+        assert_eq!(applied.scale, 1.0);
+        assert_eq!(applied.cell, cell_metrics());
+        assert_eq!(applied.point_size, 12.0);
+    }
+    // Hostile scales clamp instead of exploding geometry.
+    let applied = renderer
+        .apply_dpi_scale(cell_metrics(), &font_query(), 100.0)
+        .unwrap();
+    assert_eq!(applied.scale, 4.0);
+    assert_eq!(applied.cell, CellMetrics::new(32, 64).unwrap());
+}
+
+#[test]
+fn dpi_rescale_failure_leaves_renderer_unchanged() {
+    let mut renderer = renderer();
+    let script: Vec<TerminalAction> = "ab".chars().map(print).collect();
+    let state = state_from(&script);
+    let snapshot = state.snapshot();
+    let before = renderer.render(&snapshot, &full_damage(&state)).unwrap();
+    assert!(!before.glyphs.is_empty());
+    let placements_before = renderer.atlas_placements();
+
+    // An invalid base query fails validation before any mutation: the font
+    // is loaded before fields update or caches clear, so the renderer keeps
+    // serving 1x frames.
+    let invalid = FontQuery {
+        family: "   ".into(),
+        style: FontStyle::Normal,
+        point_size: 12.0,
+    };
+    assert!(
+        renderer
+            .apply_dpi_scale(cell_metrics(), &invalid, 1.6)
+            .is_err()
+    );
+    assert_eq!(renderer.cell_metrics(), cell_metrics());
+    assert_eq!(renderer.atlas_placements(), placements_before);
+}

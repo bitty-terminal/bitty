@@ -152,6 +152,7 @@ pub mod glyph;
 #[allow(unsafe_code)]
 pub mod gpu;
 pub mod grid;
+pub mod hidpi;
 pub(crate) mod pipeline;
 
 #[cfg(feature = "sw-fallback")]
@@ -163,6 +164,11 @@ pub use error::RenderError;
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{FontId, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey};
 pub use grid::{
-    CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer, RenderCounters,
-    SnapshotDamage,
+    AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
+    RenderCounters, SnapshotDamage,
+};
+pub use hidpi::{
+    MAX_DPI_SCALE, MAX_SCALED_POINT_SIZE, MIN_DPI_SCALE, grid_from_surface_extent,
+    sanitize_dpi_scale, scaled_cell_metrics, scaled_cell_side, scaled_point_size,
+    surface_extent_for_grid,
 };

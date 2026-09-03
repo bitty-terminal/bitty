@@ -312,6 +312,8 @@ jobs:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          set -x
+          export PS4='+ AURDBG $LINENO: '
           if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
             echo "AUR_SSH_PRIVATE_KEY not set, skipping AUR publish"
             exit 0
@@ -339,6 +341,7 @@ jobs:
           EOF
           chmod 600 "$SSH_DIR/config"
           export GIT_SSH_COMMAND="ssh -F $SSH_DIR/config"
+          git --version
           git clone ssh://aur@aur.archlinux.org/bitty.git aur-bitty
           git -C aur-bitty checkout -B master
           VERSION="${{ github.ref_name }}"
@@ -357,9 +360,17 @@ jobs:
           BUILD_DIR="$(mktemp -d)"
           cp "$AUR_DIR/PKGBUILD" "$BUILD_DIR/PKGBUILD"
           chown -R builder:builder "$BUILD_DIR"
-          su builder -s /bin/bash -c "cd \"$BUILD_DIR\" && makepkg --printsrcinfo > .SRCINFO"
+          echo "AURDBG AUR_DIR=$AUR_DIR BUILD_DIR=$BUILD_DIR PWD=$PWD"
+          ls -la "$AUR_DIR"
+          head -n 20 "$AUR_DIR/PKGBUILD"
+          which makepkg
+          makepkg --version || true
+          id builder || true
+          su builder -s /bin/bash -c "cd \"$BUILD_DIR\" && makepkg --printsrcinfo > .SRCINFO" || { echo "AURDBG makepkg failed $?"; ls -la "$BUILD_DIR"; head -n 50 "$BUILD_DIR/.SRCINFO" 2>&1 || true; exit 1; }
           install -m644 "$BUILD_DIR/.SRCINFO" "$AUR_DIR/.SRCINFO"
           rm -rf "$BUILD_DIR"
+          git --version
+          git -C "$AUR_DIR" status
           git -C "$AUR_DIR" config user.name "github-actions[bot]"
           git -C "$AUR_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
           git -C "$AUR_DIR" add PKGBUILD .SRCINFO

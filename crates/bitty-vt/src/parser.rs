@@ -811,6 +811,9 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             ([], b'o') => self.emit(TerminalAction::InvokeCharset {
                 slot: CharsetSlot::G3,
             }),
+            ([], b'Z') => self.emit(TerminalAction::RequestDeviceStatus {
+                kind: StatusKind::DeviceAttributes,
+            }),
             ([], b'\\') => {}
             ([designator], table @ (b'B' | b'A' | b'0')) => {
                 let slot = match designator {
@@ -1454,6 +1457,19 @@ mod tests {
                     enabled: false
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn esc_decid_reports_primary_device_attributes() {
+        // Legacy DECID (`ESC Z`) is the oldest primary-DA query shape; like
+        // `CSI c` it must surface as a device-attributes request so terminal
+        // state queues the bounded `ESC[?6c` reply instead of silence.
+        assert_eq!(
+            parse(b"\x1bZ"),
+            vec![TerminalAction::RequestDeviceStatus {
+                kind: StatusKind::DeviceAttributes
+            }]
         );
     }
 

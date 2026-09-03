@@ -39,7 +39,9 @@
 //!    and [`Runtime::move_focus`](bitty_runtime::Runtime::move_focus) which
 //!    delegate to the layout's deterministic adjacency.
 //! 5. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
-//!    when a program argument is present. The program is taken as a direct
+//!    for the explicit program argument, or via the default shell (`$SHELL`
+//!    fallback `/bin/sh`, see [`resolve_default_shell`]) when no program is
+//!    given. The program is taken as a direct
 //!    `argv[0]` without shell interpolation (P0 posture). Failures are owned
 //!    [`RuntimeError`](bitty_runtime::RuntimeError) values flattened from
 //!    `bitty-pty` (`Unsupported` on Windows before ConPTY, `Upstream`/`Io`
@@ -174,7 +176,9 @@ use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View
 /// Owned argument bag for the composition root.
 ///
 /// `program` is the optional `argv[0]` to spawn inside the PTY. When `None`
-/// the runtime starts without a child (CI smoke still ticks the grid).
+/// the spawn layer resolves to the default shell (`$SHELL` or `/bin/sh` via
+/// [`resolve_default_shell`); parsing itself stays `None` to keep arg parsing
+/// pure (CTX-0136).
 #[derive(Debug, Clone, PartialEq)]
 struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
@@ -183,7 +187,9 @@ struct Args {
     help: bool,
     /// When true print version and exit 0.
     version: bool,
-    /// Optional program to spawn via `Runtime::spawn_shell`.
+    /// Optional explicit program to spawn via `Runtime::spawn_shell`.
+    /// When `None`, the spawn layer falls back to the default shell
+    /// ([`resolve_default_shell`]); explicit values are used verbatim.
     program: Option<String>,
     /// Extra argv tail for the program (reserved; not yet forwarded to
     /// `PtyBuilder::arg` because `Runtime::spawn_shell` currently takes a
@@ -217,6 +223,81 @@ impl Args {
             overlay: false,
             layout: None,
             focus: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default shell resolution (CTX-0136)
+// ---------------------------------------------------------------------------
+
+/// Fallback shell when `$SHELL` is unset or blank.
+///
+/// POSIX default. Windows keeps the same fallback for now; the ConPTY default
+/// slice may refine this without changing the resolver contract (pure/total,
+/// no env/fs access — the caller injects `$SHELL`).
+const FALLBACK_SHELL: &str = "/bin/sh";
+
+/// Resolves the default shell program from an injected `$SHELL` value.
+///
+/// Pure and total for unit testing (no env/fs/net): `None`, empty, or
+/// whitespace-only resolves to [`FALLBACK_SHELL`]; otherwise returns the
+/// trimmed `$SHELL` value verbatim as a direct `argv[0]` (no interpolation,
+/// no arg splitting — `$SHELL` is trusted only as a binary path).
+fn resolve_default_shell(shell_env: Option<&str>) -> &str {
+    match shell_env {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => FALLBACK_SHELL,
+    }
+}
+
+/// Resolves the program to spawn: the explicit `args.program` unchanged when
+/// present, else the default shell from the injected `$SHELL` value.
+///
+/// Pure and total; the caller reads `std::env::var("SHELL")` once and injects
+/// it so tests never touch the environment.
+fn resolve_spawn_program<'a>(args: &'a Args, shell_env: Option<&'a str>) -> &'a str {
+    if let Some(program) = args.program.as_deref() {
+        program
+    } else {
+        resolve_default_shell(shell_env)
+    }
+}
+
+/// Spawns the default shell (`$SHELL` or [`FALLBACK_SHELL`]) inside `runtime`.
+///
+/// Tries the resolved default first; when the resolved default came from
+/// `$SHELL` and its spawn fails, retries once with [`FALLBACK_SHELL`] before
+/// surfacing the error. Callers log and continue without a child on error so
+/// headless smoke still ticks.
+fn spawn_default_shell(
+    runtime: &mut Runtime,
+    shell_env: Option<&str>,
+) -> Result<(), bitty_runtime::RuntimeError> {
+    let default = resolve_default_shell(shell_env);
+    match runtime.spawn_shell(default) {
+        Ok(()) => {
+            eprintln!("bitty: spawned default shell {default:?}");
+            Ok(())
+        }
+        Err(err) if default != FALLBACK_SHELL => {
+            eprintln!(
+                "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {FALLBACK_SHELL:?}"
+            );
+            match runtime.spawn_shell(FALLBACK_SHELL) {
+                Ok(()) => {
+                    eprintln!("bitty: spawned fallback shell {FALLBACK_SHELL:?}");
+                    Ok(())
+                }
+                Err(fallback_err) => {
+                    eprintln!("bitty: spawn_shell({FALLBACK_SHELL:?}) failed: {fallback_err}");
+                    Err(fallback_err)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("bitty: spawn_shell({default:?}) failed: {err}");
+            Err(err)
         }
     }
 }
@@ -457,8 +538,8 @@ fn help_text() -> String {
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
-                            no shell interpolation). When omitted the runtime\n  \
-                            starts without a child; --headless still ticks.\n\
+                            no shell interpolation). When omitted defaults to\n  \
+                            $SHELL or /bin/sh; --headless still ticks.\n\
          \n\
          Layout:\n  \
            The app constructs a LayoutNode via bitty-ui and calls Runtime::set_layout.\n  \
@@ -1321,9 +1402,17 @@ fn main() {
     }
 
     // Single-window vertical slice: one PTY, one shell.
-    // If args.program is provided, spawn it (with tail args when present via spawn_shell_with_args).
-    // Otherwise try default shell (SHELL env → /bin/bash → /bin/sh) for manual smoke.
+    // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
+    // bare invocation resolves to the default shell ($SHELL or /bin/sh).
     // Headless CI still succeeds even if spawn fails (bounded synthetic smoke).
+    // `$SHELL` is read once here and injected into the pure resolver so arg
+    // handling stays testable; it is trusted only as a binary path, never split.
+    let shell_env = std::env::var("SHELL").ok();
+    let effective = resolve_spawn_program(&args, shell_env.as_deref());
+    eprintln!(
+        "bitty: effective program {effective:?} (explicit={})",
+        args.program.is_some()
+    );
     let spawn_result = if let Some(program) = args.program.as_deref() {
         let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
         if tail.is_empty() {
@@ -1332,32 +1421,7 @@ fn main() {
             runtime.spawn_shell_with_args(program, &tail)
         }
     } else {
-        // No program arg: try default shell. For vertical slice this is the single terminal's shell.
-        // Env SHELL is not trusted for args, just the binary path.
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let try_shells = [shell.as_str(), "/bin/bash", "/bin/sh"];
-        let mut last_err = None;
-        let mut ok = false;
-        for cand in try_shells {
-            match runtime.spawn_shell(cand) {
-                Ok(()) => {
-                    eprintln!("bitty: spawned default shell {cand:?}");
-                    ok = true;
-                    break;
-                }
-                Err(err) => {
-                    eprintln!("bitty: spawn_shell({cand:?}) failed: {err}");
-                    last_err = Some(err);
-                }
-            }
-        }
-        if ok {
-            Ok(())
-        } else if let Some(err) = last_err {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        spawn_default_shell(&mut runtime, shell_env.as_deref())
     };
     match spawn_result {
         Ok(()) => eprintln!(
@@ -1420,7 +1484,8 @@ fn main() {
                 apply_focus(&mut rt, focus_spec);
             }
         }
-        // Preserve program spawn attempt in the fallback when it existed, else try default shell for completeness.
+        // Preserve program spawn attempt in the fallback when it existed, else
+        // resolve the default shell ($SHELL or /bin/sh) for completeness.
         if let Some(program) = args.program.as_deref() {
             let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
             if tail.is_empty() {
@@ -1429,12 +1494,8 @@ fn main() {
                 let _ = rt.spawn_shell_with_args(program, &tail);
             }
         } else {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            for cand in [shell.as_str(), "/bin/bash", "/bin/sh"] {
-                if rt.spawn_shell(cand).is_ok() {
-                    break;
-                }
-            }
+            let fallback_shell = std::env::var("SHELL").ok();
+            let _ = spawn_default_shell(&mut rt, fallback_shell.as_deref());
         }
         let code = run_headless_smoke(&mut rt);
         std::process::exit(code);
@@ -1480,6 +1541,61 @@ mod tests {
         assert!(parse_args(&raw).version);
         let raw = args_of(&["bitty", "-V"]);
         assert!(parse_args(&raw).version);
+    }
+
+    #[test]
+    fn default_shell_prefers_shell_env() {
+        assert_eq!(resolve_default_shell(Some("/bin/fish")), "/bin/fish");
+        assert_eq!(resolve_default_shell(Some("/bin/bash")), "/bin/bash");
+        assert_eq!(resolve_default_shell(Some("/usr/bin/zsh")), "/usr/bin/zsh");
+    }
+
+    #[test]
+    fn default_shell_falls_back_when_env_missing_or_blank() {
+        assert_eq!(resolve_default_shell(None), "/bin/sh");
+        assert_eq!(resolve_default_shell(Some("")), "/bin/sh");
+        assert_eq!(resolve_default_shell(Some("   ")), "/bin/sh");
+        assert_eq!(resolve_default_shell(Some("\t\n ")), "/bin/sh");
+    }
+
+    #[test]
+    fn default_shell_trims_surrounding_whitespace() {
+        assert_eq!(resolve_default_shell(Some("  /bin/fish  ")), "/bin/fish");
+    }
+
+    #[test]
+    fn bare_args_resolve_to_default_shell() {
+        let parsed = parse_args(&args_of(&["bitty"]));
+        assert_eq!(parsed.program, None);
+        assert_eq!(
+            resolve_spawn_program(&parsed, Some("/bin/fish")),
+            "/bin/fish"
+        );
+        assert_eq!(resolve_spawn_program(&parsed, None), "/bin/sh");
+        assert_eq!(resolve_spawn_program(&parsed, Some("")), "/bin/sh");
+    }
+
+    #[test]
+    fn explicit_program_arg_stays_identical() {
+        let parsed = parse_args(&args_of(&["bitty", "--", "fish", "-l"]));
+        assert_eq!(parsed.program.as_deref(), Some("fish"));
+        assert_eq!(parsed.program_args, vec!["-l"]);
+        // Explicit program wins over any injected $SHELL.
+        assert_eq!(resolve_spawn_program(&parsed, Some("/bin/bash")), "fish");
+        assert_eq!(resolve_spawn_program(&parsed, None), "fish");
+
+        let parsed = parse_args(&args_of(&["bitty", "/bin/bash"]));
+        assert_eq!(
+            resolve_spawn_program(&parsed, Some("/bin/fish")),
+            "/bin/bash"
+        );
+    }
+
+    #[test]
+    fn help_text_documents_default_shell() {
+        let help = help_text();
+        assert!(help.contains("$SHELL"));
+        assert!(help.contains("/bin/sh"));
     }
 
     #[test]

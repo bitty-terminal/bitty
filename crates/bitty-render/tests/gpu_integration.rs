@@ -253,13 +253,83 @@ fn real_surface_creation_is_env_gated_and_display_dependent() {
         .expect("valid resize");
     assert_eq!(surface.extent(), Some(PhysicalSize::new(800, 600)));
 
-    // Minimal present (clear) — full DrawList→pipeline draw awaits the shader
-    // slice, but the acquire/present loop is still exercised.
-    match surface.present(&ctx) {
-        Ok(stats) => eprintln!("real present ok: frame {}", stats.frame),
-        Err(e) => eprintln!(
-            "real present skipped (swap-chain acquire failed, likely window occluded): {e}"
-        ),
+    // Full DrawList presentation through the fill + glyph pipelines with
+    // dirty-region atlas upload (CTX-0140): render a small snapshot with the
+    // deterministic fake rasterizer, then present it on the real surface.
+    // Swap-chain acquire may still fail on an occluded window; that reports
+    // `skipped`, never a panic.
+    {
+        let q = FontQuery {
+            family: "Fake".into(),
+            style: FontStyle::Normal,
+            point_size: 12.0,
+        };
+        let mut renderer = GridRenderer::new(
+            FakeRealSurfaceR { next: 0 },
+            &q,
+            CellMetrics::new(8, 16).unwrap(),
+        )
+        .unwrap();
+        let mut st = bitty_term_state::State::new();
+        st.apply(&bitty_term_state::TerminalAction::Print(
+            bitty_vt::GraphemeCell::from('A'),
+        ));
+        let snap = st.snapshot();
+        let dmg = bitty_term_state::Damage {
+            generation: snap.generation,
+            regions: st.damage_since(0).into_boxed_slice(),
+        };
+        let list = renderer.render(&snap, &dmg).expect("render");
+        let texels = renderer.atlas_texels().to_vec();
+        let dims = renderer.atlas_dims();
+        match surface.present_draw_list(&ctx, &list, Some((&texels, dims))) {
+            Ok(stats) => {
+                assert_eq!(stats.fills, list.fills.len());
+                assert_eq!(stats.glyphs, list.glyphs.len());
+                assert!(!stats.headless);
+                eprintln!(
+                    "real present_draw_list ok: frame {} ({} fills, {} glyphs)",
+                    stats.frame, stats.fills, stats.glyphs
+                );
+            }
+            Err(e) => eprintln!(
+                "real present_draw_list skipped (swap-chain acquire failed, likely window occluded): {e}"
+            ),
+        }
+    }
+}
+
+/// Deterministic fake rasterizer for the real-surface DrawList draw above
+/// (mirrors the headless fake; no font stack or filesystem touched).
+#[derive(Debug)]
+struct FakeRealSurfaceR {
+    next: u64,
+}
+
+impl GlyphRasterizer for FakeRealSurfaceR {
+    fn load_font(&mut self, _: &FontQuery) -> Result<FontId, RenderError> {
+        Ok(FontId::next(&mut self.next))
+    }
+
+    fn rasterize(&mut self, k: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+        if k.character == ' ' {
+            return Ok(None);
+        }
+        let side = (u32::from(k.character) % 3 + 6) as i32;
+        Ok(Some(
+            GlyphBitmap::try_new(
+                GlyphMetrics {
+                    left: 0,
+                    top: 6,
+                    width: side,
+                    height: side,
+                    advance: [side, 0],
+                },
+                BitmapFormat::Rgb,
+                vec![0xAA; side as usize * side as usize * 3],
+            )
+            .unwrap(),
+        ))
     }
 }
 

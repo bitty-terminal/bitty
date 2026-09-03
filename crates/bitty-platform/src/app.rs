@@ -244,8 +244,35 @@ impl WindowConfig {
         attributes = apply_optional_size(attributes, self.inner_size, SizeKind::Inner);
         attributes = apply_optional_size(attributes, self.min_inner_size, SizeKind::Min);
         attributes = apply_optional_size(attributes, self.max_inner_size, SizeKind::Max);
+        attributes = apply_app_id(attributes);
         attributes
     }
+}
+
+/// Application identifier for window-system grouping.
+///
+/// Sets the Wayland `app_id` and the X11 `WM_CLASS` instance/general pair
+/// to `bitty` so compositors (`hyprctl clients` → `class: bitty`) and the
+/// shipped `bitty.desktop` (`StartupWMClass=bitty`) agree. Verified against
+/// the vendored winit 0.30.13 API: both
+/// `winit::platform::wayland::WindowAttributesExtWayland::with_name` and
+/// `winit::platform::x11::WindowAttributesExtX11::with_name` set the same
+/// shared `platform_specific.name` field, so one value covers both
+/// backends; both calls below are idempotent with identical arguments.
+#[cfg(target_os = "linux")]
+fn apply_app_id(attributes: WindowAttributes) -> WindowAttributes {
+    use winit::platform::wayland::WindowAttributesExtWayland as WaylandExt;
+    use winit::platform::x11::WindowAttributesExtX11 as X11Ext;
+    let attributes = WaylandExt::with_name(attributes, "bitty", "bitty");
+    X11Ext::with_name(attributes, "bitty", "bitty")
+}
+
+/// Non-Linux targets have no Wayland/X11 app-id concept; keep attributes
+/// unchanged there (this also keeps the Windows cross-check green, where
+/// neither `winit::platform` module exists).
+#[cfg(not(target_os = "linux"))]
+fn apply_app_id(attributes: WindowAttributes) -> WindowAttributes {
+    attributes
 }
 
 enum SizeKind {

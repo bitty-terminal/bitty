@@ -40,7 +40,9 @@
 //!    [`Surface::present_draw_list`] per frame. The headless fake path
 //!    composites the supplied [`crate::grid::DrawList`] + atlas coverage
 //!    onto an in-memory RGBA buffer (no GPU required); the real GPU path
-//!    acquires the swap-chain texture and presents (clears) it.
+//!    draws the same [`crate::grid::DrawList`] through the `wgpu` fill +
+//!    glyph pipelines (see [`crate::batch`] and the crate-private
+//!    `pipeline` module) and presents the swap-chain texture.
 //!
 //! # Headless vs GPU-tested
 //!
@@ -54,13 +56,16 @@
 //!   (damage-driven `DrawList`, atlas hits/misses, inline fallback) without
 //!   touching `wgpu`.
 //! - **Real GPU (env-gated):** `GpuContext::initialize` plus
-//!   `GpuContext::create_surface` and `Surface::present` reach the driver.
-//!   They are covered only by `tests/gpu_integration.rs`, which skips itself
+//!   `GpuContext::create_surface` and `Surface::present_draw_list` reach the
+//!   driver: fills draw through the solid-fill pipeline and glyphs through
+//!   the atlas-textured pipeline, with dirty-region atlas uploads. They are
+//!   covered only by `tests/gpu_integration.rs`, which skips itself
 //!   unless `BITTY_RENDER_GPU_TESTS=1` (and, for surface tests, a live window
 //!   system via `BITTY_RENDER_GPU_SURFACE_TESTS=1`). CI never runs these.
-//!   What CI *does* run is the headless fake, which is compiled and tested on
-//!   both `native` and `x86_64-pc-windows-gnu` targets to ensure no
-//!   `dead_code` warnings are introduced (see below).
+//!   What CI *does* run is the headless fake plus the pure CPU batch
+//!   translation ([`crate::batch`]), both compiled and tested on `native`
+//!   and `x86_64-pc-windows-gnu` targets to ensure no `dead_code` warnings
+//!   are introduced (see below).
 //!
 //! # Format and present-mode fallback
 //!
@@ -99,8 +104,10 @@ use wgpu::{
 };
 
 use crate::atlas::AtlasDims;
+use crate::batch;
 use crate::error::RenderError;
 use crate::grid::DrawList;
+use crate::pipeline::GpuResources;
 
 // ---------------------------------------------------------------------------
 // Adapter description
@@ -464,6 +471,11 @@ struct SurfaceState {
     // Headless-only last RGBA buffer (premultiplied, `width*height*4` bytes).
     headless_rgba: Option<Vec<u8>>,
     headless_extent: Option<PhysicalSize>,
+    // Real-surface GPU presentation resources (pipelines, buffers, atlas
+    // texture). Created lazily on the first presented frame and recreated
+    // when the surface format or atlas dimensions change; `None` on
+    // headless fakes (never used there).
+    resources: Option<GpuResources>,
 }
 
 impl SurfaceState {
@@ -474,6 +486,7 @@ impl SurfaceState {
             frame: 0,
             headless_rgba: None,
             headless_extent: None,
+            resources: None,
         }
     }
 }
@@ -754,11 +767,23 @@ impl Surface {
     ///   instance without `atlas` are rejected). The buffer is saved and
     ///   observable via [`Self::headless_rgba`]; the method returns
     ///   [`PresentStats`] with fill/glyph counts.
-    /// - On a real surface: the same validation runs, then the method
-    ///   acquires the swap-chain texture, clears it, and presents (full GPU
-    ///   draw of `DrawList`+`Atlas` awaits the pipeline/shader slice; this
-    ///   path still validates that `DrawList`+`Atlas` plumbing is reachable
-    ///   and that `present` can be called after `configure`/`resize`).
+    /// - On a real surface: the same validation runs, then fills draw
+    ///   through the solid-fill pipeline and glyphs through the
+    ///   atlas-textured pipeline (atlas texels uploaded with dirty-region
+    ///   invalidation; inline glyphs via the transient texture), and the
+    ///   swap-chain texture is presented. Handle `Outdated`/`Lost` with one
+    ///   reconfigure retry, matching the `present` recovery contract; the
+    ///   headless composite above is the CI-tested equivalent of the same
+    ///   `DrawList`.
+    ///
+    /// Device-loss safety: every buffer/texture write is bounds-checked
+    /// before submission (overruns return [`RenderError::InvalidInput`]
+    /// rather than panicking), the DPI scale is derived per frame from
+    /// `surface_extent / plan_extent` (clamped, never dividing by zero),
+    /// and pipeline resources are recreated when the surface format or
+    /// atlas dimensions change. A resource-creation or draw failure returns
+    /// [`RenderError::UpstreamGraphics`] or [`RenderError::InvalidInput`];
+    /// callers fall back to the headless seam for that frame.
     ///
     /// # Errors
     ///
@@ -901,16 +926,18 @@ impl Surface {
                 })
             }
             SurfaceKind::Gpu { surface, .. } => {
-                // Real GPU path: validate then acquire+clear+present. Full
-                // `DrawList`→pipeline draw is deferred; we still submit a
-                // clear so `present` can be observably called. Handle
-                // Outdated/Lost with one reconfigure retry, matching the
-                // `present` recovery contract; headless composite above is
-                // the CI-tested equivalent.
+                // Real GPU path: validate, then draw the DrawList through
+                // the fill + glyph pipelines and present. Resources are
+                // created lazily and recreated when the surface format or
+                // atlas dimensions change (covers reconfiguration and
+                // device-loss recovery without panicking).
                 let frame = match surface.get_current_texture() {
                     Ok(f) => f,
                     Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
                         self.configure(ctx, config.extent)?;
+                        // Reconfiguration may have picked a new format; drop
+                        // cached resources so the draw below recreates them.
+                        self.state.lock().expect("surface state poisoned").resources = None;
                         surface
                             .get_current_texture()
                             .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?
@@ -920,34 +947,82 @@ impl Surface {
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
-                let mut encoder =
-                    ctx.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("bitty-present-draw-list"),
-                        });
+
+                // Resolve atlas dimensions for resource matching: when the
+                // frame needs atlas texels they must be supplied (checked
+                // above); otherwise reuse the cached dims or fall back to a
+                // 1x1 probe that keeps resource creation total. The draw
+                // below revalidates before sampling.
+                let atlas_dims = atlas.map(|(_, dims)| dims).or_else(|| {
+                    self.state
+                        .lock()
+                        .expect("surface state poisoned")
+                        .resources
+                        .as_ref()
+                        .map(|r| r.atlas_dims_for_match())
+                });
+                let draw_atlas_dims = match (atlas, atlas_dims) {
+                    (Some((_, dims)), _) => Some(dims),
+                    (None, Some(dims)) => Some(dims),
+                    (None, None) => None,
+                };
+                // Surface format for pipeline matching.
+                let surface_format = config.format.to_wgpu();
                 {
-                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("bitty-clear-draw-list"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.06,
-                                    g: 0.06,
-                                    b: 0.06,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
+                    let mut state = self.state.lock().expect("surface state poisoned");
+                    let needs_recreate = match (&state.resources, draw_atlas_dims) {
+                        (None, _) => true,
+                        (Some(r), Some(dims)) => !r.matches(surface_format, dims),
+                        // No atlas on this frame and resources exist: keep
+                        // them (format check below still applies).
+                        (Some(r), None) => r.format_for_match() != surface_format,
+                    };
+                    if needs_recreate {
+                        // Without atlas dims there is nothing to size the
+                        // atlas texture from; use the default atlas
+                        // dimension as a total fallback (draws with no
+                        // atlas glyphs never sample it).
+                        let dims = draw_atlas_dims.unwrap_or(crate::atlas::AtlasDims {
+                            width: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+                            height: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+                        });
+                        let resources = GpuResources::create(&ctx.device, surface_format, dims)
+                            .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
+                        state.resources = Some(resources);
+                    }
                 }
-                ctx.queue.submit(std::iter::once(encoder.finish()));
+
+                let scale = batch::derive_scale(
+                    config.extent.width(),
+                    config.extent.height(),
+                    draw_list.plan.extent,
+                );
+                let bg = crate::grid::DEFAULT_BG;
+                let clear = wgpu::Color {
+                    r: f64::from(bg[0]) / 255.0,
+                    g: f64::from(bg[1]) / 255.0,
+                    b: f64::from(bg[2]) / 255.0,
+                    a: 1.0,
+                };
+                {
+                    let mut state = self.state.lock().expect("surface state poisoned");
+                    let resources = state.resources.as_mut().ok_or_else(|| {
+                        RenderError::UpstreamGraphics("GPU resources missing after creation".into())
+                    })?;
+                    resources
+                        .draw_frame(
+                            &ctx.device,
+                            &ctx.queue,
+                            &view,
+                            config.extent.width(),
+                            config.extent.height(),
+                            scale,
+                            draw_list,
+                            atlas,
+                            clear,
+                        )
+                        .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
+                }
                 frame.present();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;

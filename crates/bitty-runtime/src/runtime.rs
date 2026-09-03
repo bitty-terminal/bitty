@@ -84,6 +84,7 @@ use bitty_render::{
     },
     gpu::{GpuContext, PresentStats as RenderPresentStats, Surface},
     grid::{CellMetrics, DrawList, GridRenderer},
+    grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
@@ -1291,7 +1292,7 @@ impl Runtime {
     }
 
     /// Converts a physical cursor position to a grid cell coordinate using
-    /// the configured cell metrics. Clamped to the current snapshot bounds.
+    /// the live (DPI-scaled) cell metrics. Clamped to the current snapshot bounds.
     ///
     /// When the position lies far outside the window it clamps to the nearest
     /// cell rather than returning `None`, so drag selections that leave the
@@ -1299,8 +1300,9 @@ impl Runtime {
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
-        let cell_w = self.config.cell_width as f64;
-        let cell_h = self.config.cell_height as f64;
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
         let col = if cell_w <= 0.0 {
             0
         } else {
@@ -1459,8 +1461,9 @@ impl Runtime {
     /// Bounded: at most 32 lines per frame, accumulator clamped to 4*cell_height.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
-        let cell_h = self.config.cell_height as f32;
-        let cell_w = self.config.cell_width as f32;
+        let live = self.live_cell_metrics();
+        let cell_h = live.height as f32;
+        let cell_w = live.width as f32;
         match delta {
             ScrollDelta::Lines(x, y) => {
                 // Shift+wheel or no capture scrolls viewport; otherwise emit mouse wheel SGR when mouse mode active.
@@ -2785,12 +2788,13 @@ impl Runtime {
     }
 
     /// Handles a physical-pixel resize: recomputes the grid size from the
-    /// configured cell metrics, reconfigures the software surface, updates
-    /// the layout container, reflows leaf views, resizes the terminal grid
-    /// via the singular reflow (truncate/pad with orphan repair) and resizes
-    /// the PTY when present. Zero-sized extents are skipped
-    /// (minimized/occluded windows) per the `map_resize_to_surface_extent`
-    /// contract. The reflow is deterministic and headless-testable.
+    /// live (possibly DPI-scaled) cell metrics, reconfigures the software
+    /// surface, updates the layout container, reflows leaf views, resizes
+    /// the terminal grid via the singular reflow (truncate/pad with orphan
+    /// repair) and resizes the PTY when present. Zero-sized extents are
+    /// skipped (minimized/occluded windows) per the
+    /// `map_resize_to_surface_extent` contract. The reflow is deterministic
+    /// and headless-testable.
     ///
     /// # Errors
     ///
@@ -2800,14 +2804,140 @@ impl Runtime {
         if bitty_platform::map_resize_to_surface_extent(size).is_none() {
             return Ok(());
         }
-        let (new_cols, new_rows) = self.config.grid_from_pixels(size);
+        let (new_cols, new_rows) = self.grid_from_physical(size);
+        self.reflow_to_grid(new_cols, new_rows, size)
+    }
+
+    /// Base (design) cell metrics from the validated config.
+    ///
+    /// The renderer starts here at scale 1.0; [`Self::apply_dpi_scale`]
+    /// derives scaled cells from this base on every change so repeated scale
+    /// changes never compound rounding (each rescale starts from the design
+    /// cell instead of re-scaling the previous scaled cell).
+    fn base_cell_metrics(&self) -> CellMetrics {
+        CellMetrics::new(self.config.cell_width, self.config.cell_height)
+            .expect("validated config guarantees non-zero cell metrics")
+    }
+
+    /// Base font query from the validated config.
+    fn base_font_query(&self) -> FontQuery {
+        FontQuery {
+            family: self.config.font_family.clone(),
+            style: FontStyle::Normal,
+            point_size: self.config.font_size,
+        }
+    }
+
+    /// Currently live cell metrics: the design cell at scale 1.0, the
+    /// DPI-scaled cell after [`Self::apply_dpi_scale`].
+    ///
+    /// All physical-pixel geometry (grid derivation, cursor mapping,
+    /// per-leaf pixel origins) flows through this so the renderer placement
+    /// and the runtime geometry can never disagree about the cell size.
+    fn live_cell_metrics(&self) -> CellMetrics {
+        self.renderer.cell_metrics()
+    }
+
+    /// Last adopted DPI scale (1.0 until [`Self::apply_dpi_scale`] or a
+    /// `ScaleFactorChanged` event adopts another; always sanitized, so this
+    /// never reports zero, negative, NaN, or infinite).
+    #[must_use]
+    pub fn dpi_scale(&self) -> f64 {
+        self.scale_factor.get()
+    }
+
+    /// Derives `cols`/`rows` from a physical extent over the live (possibly
+    /// DPI-scaled) cell metrics, saturating to at least 1x1 and capping at
+    /// the 1000x1000 grid bound so hostile extents cannot grow grid memory
+    /// without limit (mirrors [`RuntimeConfig::grid_from_pixels`]).
+    fn grid_from_physical(&self, extent: PhysicalSize) -> (usize, usize) {
+        let (cols, rows) = grid_from_surface_extent(extent, self.live_cell_metrics());
+        (cols.clamp(1, 1000), rows.clamp(1, 1000))
+    }
+
+    /// Pixel extent the combined frame's plan covers: container cells at the
+    /// live (DPI-scaled) cell metrics.
+    ///
+    /// The GPU present path recovers its per-frame NDC factor as
+    /// `surface / plan` ([`bitty_render::batch::derive_scale`]), so this
+    /// must describe the DrawList's own pixel space — not the 1x1 probe the
+    /// combined list is synthesized from (a stale 1-cell extent clamps the
+    /// factor to 4x and magnifies the whole frame, the dominant blur behind
+    /// #232 alongside the unscaled surface/grid/atlas).
+    fn present_plan_extent(&self) -> bitty_render::geometry::ExtentPx {
+        self.live_cell_metrics().extent_for(
+            usize::from(self.container.width),
+            usize::from(self.container.height),
+        )
+    }
+
+    /// Adopts a DPI scale change (fail-safe, headless-testable, no I/O).
+    ///
+    /// Sanitizes `scale` via [`sanitize_dpi_scale`] (invalid input becomes
+    /// 1.0, hostile input clamps to `[MIN_DPI_SCALE, MAX_DPI_SCALE]` — never
+    /// panics), reloads the renderer's font at the scaled size through
+    /// `GridRenderer::apply_dpi_scale`, and — when `physical_extent` carries
+    /// a non-zero extent — derives the grid from physical pixels over the
+    /// scaled cells ([`grid_from_surface_extent`]) and reflows state, layout,
+    /// surface, and PTY to match.
+    ///
+    /// Callers holding only cached logical geometry should convert it first
+    /// via [`bitty_platform::surface_extent_from_logical`] and pass the
+    /// result here; callers with a live window must prefer re-reading the
+    /// physical `inner_size` (already physical pixels — the winit logical
+    /// size path is the suspected original sin behind #232). A following
+    /// `Resized` event takes precedence either way: [`Self::handle_resize`]
+    /// derives from the same live scaled cells.
+    ///
+    /// Passing `None` rescales the renderer and forces a full redraw while
+    /// leaving the grid for the next `Resized` (this is what the
+    /// `ScaleFactorChanged` event path does when no window handle is at
+    /// hand).
+    ///
+    /// Never strands the window: renderer font-load failures keep the
+    /// previous cells/grid and still force a full redraw; reflow failures
+    /// after a successful rescale are absorbed for the same reason.
+    pub fn apply_dpi_scale(&mut self, scale: f64, physical_extent: Option<PhysicalSize>) {
+        let sanitized = sanitize_dpi_scale(scale);
+        let base_cell = self.base_cell_metrics();
+        let base_query = self.base_font_query();
+        if self
+            .renderer
+            .apply_dpi_scale(base_cell, &base_query, sanitized)
+            .is_err()
+        {
+            // Fail-safe: keep previous cells/grid; the window stays drawable.
+            self.pending_full_redraw = true;
+            return;
+        }
+        self.scale_factor = ScaleFactor::new_sanitized(sanitized);
+        if let Some(extent) = physical_extent.and_then(bitty_platform::map_resize_to_surface_extent)
+        {
+            let (cols, rows) = self.grid_from_physical(extent);
+            // Absorb reflow errors after a successful rescale so the adopted
+            // renderer cells always win over stranding the window.
+            let _ = self.reflow_to_grid(cols, rows, extent);
+        }
+        self.pending_full_redraw = true;
+    }
+
+    /// Reflows terminal state, layout, surface, and PTY to `cols`/`rows`
+    /// with `surface_extent` as the configured extent. Shared by
+    /// [`Self::handle_resize`] and [`Self::apply_dpi_scale`] so both paths
+    /// stay consistent.
+    fn reflow_to_grid(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        surface_extent: PhysicalSize,
+    ) -> Result<(), RuntimeError> {
         // Resize terminal state first so snapshot dimensions reflect the new
         // geometry before layout and surface work; resize also emits full
         // damage (grid + scrollback reflow) with a new generation.
-        let _damage = self.state.resize(new_cols, new_rows);
-        self.cols = new_cols;
-        self.rows = new_rows;
-        self.container = default_container(new_cols, new_rows);
+        let _damage = self.state.resize(cols, rows);
+        self.cols = cols;
+        self.rows = rows;
+        self.container = default_container(cols, rows);
         // Clamp any leaf View scroll offsets to the new scrollback limit
         // (scrollback may have been truncated on shrink, though we preserve
         // ids; clamp keeps offset in-bounds deterministically).
@@ -2838,16 +2968,18 @@ impl Runtime {
         }
         // Surface resize: real GPU path when attached, else headless
         if let Some(gpu) = self.gpu.as_ref() {
-            self.surface.resize(gpu, size).map_err(RuntimeError::from)?;
+            self.surface
+                .resize(gpu, surface_extent)
+                .map_err(RuntimeError::from)?;
         } else {
             self.surface
-                .headless_resize(size)
+                .headless_resize(surface_extent)
                 .map_err(RuntimeError::from)?;
         }
         if let Some(pty) = self.pty.as_mut() {
-            let cols = self.cols.min(u16::MAX as usize) as u16;
-            let rows = self.rows.min(u16::MAX as usize) as u16;
-            pty.resize(cols, rows).map_err(RuntimeError::from)?;
+            let pty_cols = self.cols.min(u16::MAX as usize) as u16;
+            let pty_rows = self.rows.min(u16::MAX as usize) as u16;
+            pty.resize(pty_cols, pty_rows).map_err(RuntimeError::from)?;
         }
         self.pending_full_redraw = true;
         Ok(())
@@ -2873,11 +3005,12 @@ impl Runtime {
                     false
                 }
                 WindowEventKind::ScaleFactorChanged(factor) => {
-                    self.scale_factor = factor;
-                    // Force full redraw at new DPI; physical size will arrive as Resized.
-                    // Update cell metrics derived extent? cell metrics are config fixed,
-                    // but scale affects future physical->grid mapping via reconfigured surface.
-                    self.pending_full_redraw = true;
+                    // Adopt immediately (fail-safe: sanitized, never panics,
+                    // never strands the window). The grid follows when the
+                    // embedder re-reads the physical inner_size (see
+                    // apply_dpi_scale) or from the next Resized, which takes
+                    // precedence either way.
+                    self.apply_dpi_scale(factor.get(), None);
                     false
                 }
                 WindowEventKind::CloseRequested | WindowEventKind::Closed => true,
@@ -3219,11 +3352,12 @@ impl Runtime {
                             .map(|c| c.spacer)
                             .unwrap_or(false);
                         if !is_spacer {
+                            let live = self.live_cell_metrics();
                             let cursor_rect = bitty_render::geometry::RectPx::new(
-                                cur.col as i32 * self.config.cell_width as i32,
-                                cur.row as i32 * self.config.cell_height as i32,
-                                self.config.cell_width,
-                                self.config.cell_height,
+                                cur.col as i32 * live.width as i32,
+                                cur.row as i32 * live.height as i32,
+                                live.width,
+                                live.height,
                             );
                             // Cursor color: inverse of cell bg/fg? Use resolved color from grid.rs DEFAULT_FG/BG inversion.
                             // For slice, use white with 0x80 alpha for block cursor, respecting blinking flag;
@@ -3248,8 +3382,9 @@ impl Runtime {
             }
             any_needs_draw = true;
 
-            let origin_px_x = rect.x as i32 * self.config.cell_width as i32;
-            let origin_px_y = rect.y as i32 * self.config.cell_height as i32;
+            let live = self.live_cell_metrics();
+            let origin_px_x = rect.x as i32 * live.width as i32;
+            let origin_px_y = rect.y as i32 * live.height as i32;
             for mut fill in list.fills {
                 fill.rect.x += origin_px_x;
                 fill.rect.y += origin_px_y;
@@ -3268,18 +3403,18 @@ impl Runtime {
                 // Determine focused view allocation origin and cursor pixel position.
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
                     if let Some((vid, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                        let live = self.live_cell_metrics();
                         let cur = snapshot.cursor.position;
-                        let origin_px_x = rect.x as i32 * self.config.cell_width as i32;
-                        let origin_px_y = rect.y as i32 * self.config.cell_height as i32;
-                        let base_x = origin_px_x + cur.col as i32 * self.config.cell_width as i32;
-                        let base_y = origin_px_y + cur.row as i32 * self.config.cell_height as i32;
+                        let origin_px_x = rect.x as i32 * live.width as i32;
+                        let origin_px_y = rect.y as i32 * live.height as i32;
+                        let base_x = origin_px_x + cur.col as i32 * live.width as i32;
+                        let base_y = origin_px_y + cur.row as i32 * live.height as i32;
                         // Simple IME overlay: underline background rect plus glyphs for preedit chars.
                         // For slice, render preedit as single underline fill plus per-char glyphs via renderer? Simplified: add a fill rect for underline.
-                        let preedit_width =
-                            (preedit.chars().count() as u32 * self.config.cell_width).min(1024);
+                        let preedit_width = (preedit.chars().count() as u32 * live.width).min(1024);
                         let underline_rect = bitty_render::geometry::RectPx::new(
                             base_x,
-                            base_y + self.config.cell_height as i32 - 2,
+                            base_y + live.height as i32 - 2,
                             preedit_width,
                             2,
                         );
@@ -3292,7 +3427,7 @@ impl Runtime {
                             base_x,
                             base_y,
                             preedit_width,
-                            self.config.cell_height,
+                            live.height,
                         );
                         combined_fills.push(bitty_render::grid::FillRect {
                             rect: bg_rect,
@@ -3365,29 +3500,25 @@ impl Runtime {
                     fills: Vec::new(),
                     glyphs: Vec::new(),
                 });
-            // Now replace fills/glyphs with combined, and set plan to indicate full
+            // Now replace fills/glyphs with combined, and reset the plan to
+            // describe the combined pixel space: the 1x1 probe's extent must
+            // not survive (see present_plan_extent), and the dirty rect must
+            // cover the combined frame when content exists.
             tmp_list.generation = current_gen;
             tmp_list.fills = combined_fills;
             tmp_list.glyphs = combined_glyphs;
-            // Ensure plan indicates dirty if we have content; set a dummy dirty rect
+            let plan_extent = self.present_plan_extent();
+            tmp_list.plan.extent = plan_extent;
             if tmp_list.fills.is_empty() && tmp_list.glyphs.is_empty() {
                 tmp_list.plan.dirty_rects = Vec::new();
-            } else if tmp_list.plan.dirty_rects.is_empty() {
-                // Fabricate one dirty rect covering the surface extent so
-                // needs_draw logic that might inspect plan still sees work.
-                // The DrawList::needs_draw checks fills/glyphs, so this is
-                // not strictly needed, but we set it for completeness.
+            } else {
                 tmp_list.plan.dirty_rects = vec![bitty_render::geometry::RectPx::new(
                     0,
                     0,
-                    self.surface.extent().map(|e| e.width()).unwrap_or(0),
-                    self.surface.extent().map(|e| e.height()).unwrap_or(0),
+                    plan_extent.width,
+                    plan_extent.height,
                 )];
                 tmp_list.plan.mode = FrameMode::Full;
-                tmp_list.plan.extent = bitty_render::geometry::ExtentPx::new(
-                    self.surface.extent().map(|e| e.width()).unwrap_or(0),
-                    self.surface.extent().map(|e| e.height()).unwrap_or(0),
-                );
             }
             tmp_list
         };
@@ -3536,6 +3667,200 @@ mod tests {
             .expect("valid resize");
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(320, 240)));
         assert!(rt.tick().is_some(), "resize forces full redraw");
+    }
+
+    // ------------------------------------------------------------------
+    // CTX-0142: DPI adoption (scale-change -> recompute -> grid derivation)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dpi_adoption_derives_grid_from_physical_over_scaled_cells() {
+        let mut rt = make_runtime();
+        assert_eq!(rt.dpi_scale(), 1.0);
+        // Hyprland scale 1.6, tiled physical extent 2506x1496: scaled cells
+        // are 13x26, so the grid must be 192x57 (not 313x93 unscaled).
+        rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
+        assert_eq!(rt.dpi_scale(), 1.6);
+        let snap = rt.snapshot();
+        assert_eq!((snap.width, snap.height), (192, 57));
+        assert_eq!(
+            rt.surface_extent(),
+            Some(PhysicalSize::new(2506, 1496)),
+            "surface must be reconfigured to the physical extent"
+        );
+        assert!(rt.tick().is_some(), "adoption forces full redraw");
+    }
+
+    #[test]
+    fn dpi_rescale_without_extent_keeps_grid_for_following_resized() {
+        let mut rt = make_runtime();
+        let before = rt.snapshot();
+        rt.apply_dpi_scale(1.6, None);
+        assert_eq!(rt.dpi_scale(), 1.6, "renderer rescales even without extent");
+        let kept = rt.snapshot();
+        assert_eq!(
+            (kept.width, kept.height),
+            (before.width, before.height),
+            "grid waits for the physical extent"
+        );
+        // The following Resized takes precedence and derives from the same
+        // scaled cells (proves Resized-after-scale consistency).
+        rt.handle_resize(PhysicalSize::new(2506, 1496))
+            .expect("valid resize");
+        let snap = rt.snapshot();
+        assert_eq!((snap.width, snap.height), (192, 57));
+    }
+
+    #[test]
+    fn invalid_dpi_scales_are_sanitized_fail_safe() {
+        for invalid in [0.0, -1.6, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut rt = make_runtime();
+            // Must never panic or strand the window.
+            rt.apply_dpi_scale(invalid, Some(PhysicalSize::new(800, 600)));
+            assert_eq!(
+                rt.dpi_scale(),
+                1.0,
+                "invalid scale {invalid:?} must sanitize to 1.0"
+            );
+            let snap = rt.snapshot();
+            assert_eq!(
+                (snap.width, snap.height),
+                (100, 37),
+                "unscaled 8x16 cells over 800x600"
+            );
+            assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
+            assert!(rt.tick().is_some(), "window stays drawable");
+        }
+        // Hostile magnitudes clamp instead of exploding geometry.
+        let mut rt = make_runtime();
+        rt.apply_dpi_scale(100.0, Some(PhysicalSize::new(800, 600)));
+        assert_eq!(rt.dpi_scale(), 4.0);
+        let snap = rt.snapshot();
+        assert!(snap.width >= 1 && snap.height >= 1);
+        let mut rt = make_runtime();
+        rt.apply_dpi_scale(0.01, Some(PhysicalSize::new(800, 600)));
+        assert_eq!(rt.dpi_scale(), 0.25);
+    }
+
+    #[test]
+    fn zero_extent_dpi_adoption_rescales_but_skips_reflow() {
+        let mut rt = make_runtime();
+        let surface_before = rt.surface_extent();
+        let grid_before = {
+            let snap = rt.snapshot();
+            (snap.width, snap.height)
+        };
+        rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(0, 0)));
+        assert_eq!(rt.dpi_scale(), 1.6, "renderer still rescales");
+        let snap = rt.snapshot();
+        assert_eq!(
+            (snap.width, snap.height),
+            grid_before,
+            "zero extent (minimized) must not reflow the grid"
+        );
+        assert_eq!(rt.surface_extent(), surface_before);
+    }
+
+    #[test]
+    fn scale_factor_changed_event_adopts_without_exit() {
+        let mut rt = make_runtime();
+        let exit = rt.handle_platform_event(PlatformEvent::Window {
+            window_id: bitty_platform::WindowId::from_raw_public(1),
+            kind: WindowEventKind::ScaleFactorChanged(ScaleFactor::new(1.6).expect("valid")),
+        });
+        assert!(!exit, "scale change must not request exit");
+        assert_eq!(rt.dpi_scale(), 1.6);
+        assert!(rt.tick().is_some(), "scale change forces full redraw");
+        // Invalid factors through the event path sanitize, never panic.
+        let exit = rt.handle_platform_event(PlatformEvent::Window {
+            window_id: bitty_platform::WindowId::from_raw_public(1),
+            kind: WindowEventKind::ScaleFactorChanged(ScaleFactor::new_sanitized(f64::NAN)),
+        });
+        assert!(!exit);
+        assert_eq!(rt.dpi_scale(), 1.0);
+    }
+
+    #[test]
+    fn logical_recompute_matches_physical_resize() {
+        // Embedders holding only cached logical geometry convert via
+        // surface_extent_from_logical first: 1566x935 logical at 1.6x must
+        // reach the identical grid as the physical Resized path (2506x1496).
+        let logical = bitty_platform::LogicalSize::new(1566.0, 935.0).expect("valid");
+        let scale = ScaleFactor::new(1.6).expect("valid");
+        let physical =
+            bitty_platform::surface_extent_from_logical(logical, scale).expect("non-zero extent");
+        assert_eq!(physical, PhysicalSize::new(2506, 1496));
+        let mut via_logical = make_runtime();
+        via_logical.apply_dpi_scale(1.6, Some(physical));
+        let mut via_physical = make_runtime();
+        via_physical.apply_dpi_scale(1.6, None);
+        via_physical.handle_resize(physical).expect("valid resize");
+        let a = via_logical.snapshot();
+        let b = via_physical.snapshot();
+        assert_eq!((a.width, a.height), (192, 57));
+        assert_eq!((b.width, b.height), (192, 57));
+    }
+
+    #[test]
+    fn repeated_rescales_start_from_design_base_without_drift() {
+        let mut rt = make_runtime();
+        rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
+        let scaled = rt.snapshot();
+        // 8x16 base at 2x -> 16x32 cells: 1600/16=100, 1200/32=37.
+        assert_eq!((scaled.width, scaled.height), (100, 37));
+        // Back to 1.0 must restore the exact base grid, not a rounded echo.
+        rt.apply_dpi_scale(1.0, Some(PhysicalSize::new(1600, 1200)));
+        let restored = rt.snapshot();
+        assert_eq!((restored.width, restored.height), (200, 75));
+        assert_eq!(rt.dpi_scale(), 1.0);
+    }
+
+    #[test]
+    fn resized_after_scale_uses_scaled_cells() {
+        let mut rt = make_runtime();
+        rt.apply_dpi_scale(2.0, None);
+        rt.handle_resize(PhysicalSize::new(800, 600))
+            .expect("valid resize");
+        let snap = rt.snapshot();
+        // 16x32 scaled cells: 800/16=50, 600/32=18 (unscaled would be 100x37).
+        assert_eq!((snap.width, snap.height), (50, 18));
+    }
+
+    #[test]
+    fn present_plan_extent_matches_draw_list_pixels_so_gpu_scale_stays_near_one() {
+        use bitty_render::batch::derive_scale;
+
+        let mut rt = make_runtime();
+        rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
+        let surface = rt.surface_extent().expect("adopted surface");
+        let plan = rt.present_plan_extent();
+        // 192x57 grid at 13x26 scaled cells = 2496x1482 draw-list pixels.
+        assert_eq!((plan.width, plan.height), (192 * 13, 57 * 26));
+        let scale = derive_scale(surface.width(), surface.height(), plan);
+        assert!(
+            (scale - 1.0).abs() < 0.05,
+            "adopted frame must present near 1.0, got {scale}"
+        );
+        // The stale 1-cell probe extent this replaced clamped to 4x
+        // magnification (the dominant blur behind #232).
+        let stale = bitty_render::geometry::ExtentPx::new(13, 26);
+        assert_eq!(
+            derive_scale(surface.width(), surface.height(), stale),
+            4.0,
+            "1-cell plan extent magnifies 4x"
+        );
+    }
+
+    #[test]
+    fn present_plan_extent_tracks_scale_one_frames() {
+        use bitty_render::batch::derive_scale;
+
+        let rt = make_runtime();
+        let surface = rt.surface_extent().expect("default surface");
+        let plan = rt.present_plan_extent();
+        // Default 80x24 grid at 8x16 base cells = 640x384.
+        assert_eq!((plan.width, plan.height), (640, 384));
+        assert_eq!(derive_scale(surface.width(), surface.height(), plan), 1.0);
     }
 
     #[test]

@@ -188,6 +188,7 @@ pub mod mail_panel;
 pub mod palette;
 pub mod paste;
 pub mod project;
+pub mod queries;
 pub mod queue;
 pub mod registry;
 pub mod runtime;

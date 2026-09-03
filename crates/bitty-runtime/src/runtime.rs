@@ -493,6 +493,11 @@ pub struct Runtime {
     // DPI scale
     scale_factor: ScaleFactor,
     is_crossfont: bool,
+    /// Tail of previously seen PTY bytes retained so a terminal query split
+    /// over two PTY reads is still recognized (CTX-0146). Bounded by
+    /// [`crate::queries::QUERY_OVERLAP_MAX`]; raw query scans never retain
+    /// more.
+    query_overlap: Vec<u8>,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -695,6 +700,7 @@ impl Runtime {
             wheel_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
+            query_overlap: Vec::new(),
         })
     }
 
@@ -781,6 +787,7 @@ impl Runtime {
             wheel_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
+            query_overlap: Vec::new(),
         })
     }
 
@@ -2855,6 +2862,17 @@ impl Runtime {
         if bytes.is_empty() {
             return;
         }
+        // CTX-0146: pre-scan overlap ++ new bytes for parameterized queries
+        // (DECRQM mode numbers, XTGETTCAP payloads, secondary-DA request
+        // forms). Bounded scans; matches ending inside the overlap were
+        // answered on the earlier call and are filtered by the scanners.
+        let overlap_len = self.query_overlap.len();
+        let mut combined = Vec::with_capacity(overlap_len + bytes.len());
+        combined.extend_from_slice(&self.query_overlap);
+        combined.extend_from_slice(bytes);
+        let mut decrqm = crate::queries::find_decrqm(&combined, overlap_len);
+        let mut secondary = crate::queries::find_secondary_da(&combined, overlap_len);
+        let mut tcaps = crate::queries::find_xtgettcap(&combined, overlap_len);
         let mut actions: Vec<TerminalAction> = Vec::new();
         self.parser.advance(bytes, |action| actions.push(action));
         for action in actions {
@@ -2938,6 +2956,60 @@ impl Runtime {
             if matches!(action, TerminalAction::FullReset) {
                 self.clear_selection();
             }
+            // CTX-0146 (Issue #238): answer standard terminal queries with
+            // true capabilities. The parser maps these shapes to `Unknown`
+            // (inert for the grid); the runtime queues the bounded reply via
+            // the existing `Reply` action so the 4 KiB reply cap and the
+            // `poll_pty -> write_replies` flush path apply unchanged.
+            // Parameterized families additionally require their raw match
+            // (pre-scanned above), so bytes buried inside OSC strings can
+            // never spoof a reply, and stale overlap matches (answered on an
+            // earlier call) are never re-answered.
+            if let TerminalAction::Unknown(seq) = &action {
+                let mut pending: Vec<Vec<u8>> = Vec::new();
+                if crate::queries::is_secondary_da(seq) {
+                    if secondary > 0 {
+                        secondary -= 1;
+                        pending.push(crate::queries::secondary_da_reply());
+                    }
+                } else if crate::queries::is_xterm_version(seq) {
+                    pending.push(crate::queries::xterm_version_reply());
+                } else if crate::queries::is_legacy_decid(seq) {
+                    pending.push(crate::queries::primary_da_reply());
+                } else if crate::queries::is_decrqm_private(seq)
+                    || crate::queries::is_decrqm_ansi(seq)
+                {
+                    let want_private = crate::queries::is_decrqm_private(seq);
+                    if let Some(pos) = decrqm.iter().position(|m| m.private == want_private) {
+                        let query = decrqm.remove(pos);
+                        for mode in query.modes {
+                            let value =
+                                crate::queries::decrqm_value(&self.state, want_private, mode);
+                            pending.push(crate::queries::decrpm_reply(want_private, mode, value));
+                        }
+                    }
+                } else if crate::queries::is_xtgettcap(seq) && !tcaps.is_empty() {
+                    let query = tcaps.remove(0);
+                    pending.push(crate::queries::xtgettcap_reply(&query.payload));
+                }
+                for reply in pending {
+                    self.state.apply(&TerminalAction::Reply {
+                        bytes: reply.into_boxed_slice(),
+                    });
+                }
+            }
+        }
+        // Retain a bounded tail so a query split over two PTY reads is still
+        // recognized on the next call. Capacity stays near the overlap bound:
+        // huge chunks shrink back instead of pinning a large buffer.
+        self.query_overlap.extend_from_slice(bytes);
+        if self.query_overlap.len() > crate::queries::QUERY_OVERLAP_MAX {
+            let excess = self.query_overlap.len() - crate::queries::QUERY_OVERLAP_MAX;
+            self.query_overlap.drain(..excess);
+        }
+        if self.query_overlap.capacity() > crate::queries::QUERY_OVERLAP_MAX * 2 {
+            self.query_overlap
+                .shrink_to(crate::queries::QUERY_OVERLAP_MAX * 2);
         }
         // Search UI integration (CTX-0061): keep bounded matches in sync after
         // state growth/scrollback pushes; headless refresh is cheap (truncated

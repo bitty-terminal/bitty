@@ -22,10 +22,10 @@ bitty-platform = { path = "../bitty-platform" }
 bitty-ui = { path = "../bitty-ui" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-agent = { path = "../bitty-agent" }
+bitty-ipc = { path = "../bitty-ipc" }
 
 
 [dev-dependencies]
-bitty-ipc = { path = "../bitty-ipc" }
 bitty-agent = { path = "../bitty-agent" }
 bitty-package = { path = "../bitty-package" }
 bitty-rich = { path = "../bitty-rich" }

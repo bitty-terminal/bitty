@@ -303,6 +303,28 @@ fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Snapshot {
     }
 }
 
+/// Bounded human-readable label for a [`KeyEvent`] (CTX-0159 input ring).
+///
+/// Prefers the layout-dependent `text` when present (so `wtype` probes show
+/// the typed character), else the logical key name. Truncated to 32
+/// characters here; the ring applies the final [`crate::inspect`] bound.
+fn key_inspect_label(event: &KeyEvent) -> String {
+    if let Some(text) = event.text.as_deref() {
+        let first = text.chars().next().unwrap_or('?');
+        if !text.is_empty() && text.chars().count() == 1 && !first.is_control() {
+            return format!("key:{text}");
+        }
+    }
+    match &event.logical_key {
+        bitty_platform::LogicalKey::Character(s) => {
+            let short: String = s.chars().take(8).collect();
+            format!("key:{short}")
+        }
+        bitty_platform::LogicalKey::Named(named) => format!("key:{named:?}"),
+        _ => "key:Unidentified".to_string(),
+    }
+}
+
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
 /// renderer, surface, and the bounded cold-path queue.
 ///
@@ -498,6 +520,10 @@ pub struct Runtime {
     /// [`crate::queries::QUERY_OVERLAP_MAX`]; raw query scans never retain
     /// more.
     query_overlap: Vec<u8>,
+    /// Bounded ring of the last input events for screenshots-free debugging
+    /// (CTX-0159, Issue #258). Published read-only to the `BITTY_SOCKET`
+    /// introspection store; never affects terminal truth or PTY bytes.
+    inspect_ring: crate::inspect::InputRing,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -701,6 +727,7 @@ impl Runtime {
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
             query_overlap: Vec::new(),
+            inspect_ring: crate::inspect::InputRing::new(),
         })
     }
 
@@ -788,6 +815,7 @@ impl Runtime {
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
             query_overlap: Vec::new(),
+            inspect_ring: crate::inspect::InputRing::new(),
         })
     }
 
@@ -837,6 +865,79 @@ impl Runtime {
     #[must_use]
     pub fn kitty_flags(&self) -> u32 {
         self.kitty_flags
+    }
+
+    /// Whether Shift is currently latched (CTX-0159 read-only accessor).
+    #[must_use]
+    pub fn shift_pressed(&self) -> bool {
+        self.shift_pressed
+    }
+
+    /// Whether Control is currently latched (CTX-0159 read-only accessor).
+    #[must_use]
+    pub fn control_pressed(&self) -> bool {
+        self.control_pressed
+    }
+
+    /// Whether Alt is currently latched (CTX-0159 read-only accessor).
+    #[must_use]
+    pub fn alt_pressed(&self) -> bool {
+        self.alt_pressed
+    }
+
+    /// Whether the window currently holds keyboard focus (CTX-0159).
+    #[must_use]
+    pub fn is_window_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Whether mouse-event capture is active (CTX-0159 read-only accessor).
+    #[must_use]
+    pub fn mouse_capture_active(&self) -> bool {
+        self.mouse_capture_enabled
+    }
+
+    /// Snapshot of the bounded input ring, oldest first (CTX-0159).
+    #[must_use]
+    pub fn inspect_input_snapshot(&self, limit: usize) -> Vec<crate::inspect::InputEvent> {
+        self.inspect_ring.snapshot(limit)
+    }
+
+    /// Number of retained input-ring events (CTX-0159).
+    #[must_use]
+    pub fn inspect_input_len(&self) -> usize {
+        self.inspect_ring.len()
+    }
+
+    /// Publish bounded read-only introspection snapshots to the `BITTY_SOCKET`
+    /// live store (CTX-0159, Issue #258).
+    ///
+    /// Copies grid text, the input ring, modifier latches, and focus/window
+    /// state into `bitty-ipc` globals (`&self` only; never mutates terminal
+    /// truth, never writes to the PTY, never blocks). Called on input and on
+    /// tick so socket probes observe typed text without screenshots.
+    pub fn publish_inspect_snapshot(&self) {
+        let grid = crate::inspect::grid_text_from_state(
+            &self.state,
+            crate::inspect::INSPECT_MAX_ROWS,
+            crate::inspect::INSPECT_MAX_COLS,
+        );
+        crate::inspect::publish_grid(&grid);
+        crate::inspect::publish_input_ring(&self.inspect_ring.snapshot_all());
+        crate::inspect::publish_modifiers(&crate::inspect::ModifierSnapshot {
+            shift: self.shift_pressed,
+            control: self.control_pressed,
+            alt: self.alt_pressed,
+            kitty_flags: self.kitty_flags,
+        });
+        crate::inspect::publish_focus(&crate::inspect::FocusSnapshot {
+            focused: self.focused,
+            focused_view: self.focus.focused().map(|v| v.0),
+            mouse_capture: self.mouse_capture_enabled,
+            alt_screen: self.state.alt_screen_active(),
+            bracketed_paste: self.state.modes().bracketed_paste,
+            focus_events: self.state.modes().focus_events,
+        });
     }
 
     /// Whether crossfont rasterizer is active.
@@ -1023,13 +1124,29 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0159: retain a bounded input trace for screenshots-free probes.
+        let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
             // Modifier-only keys produce no PTY input but still update state.
+            self.inspect_ring.push_modifiers(
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+            );
+            self.publish_inspect_snapshot();
             return None;
         }
+        self.inspect_ring.push_key(
+            &key_inspect_label(&event),
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+            pressed,
+        );
         let bytes = self.encode_key_with_kitty(&event)?;
         // Bounded encoding already ≤64; push respects MAX_PENDING_INPUT.
         self.push_input_bytes(&bytes);
+        self.publish_inspect_snapshot();
         Some(bytes)
     }
 
@@ -1047,11 +1164,26 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
+            self.inspect_ring.push_modifiers(
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+            );
+            self.publish_inspect_snapshot();
             return None;
         }
+        self.inspect_ring.push_key(
+            &key_inspect_label(event),
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+            pressed,
+        );
         let bytes = self.encode_key_with_kitty(event)?;
         self.push_input_bytes(&bytes);
+        self.publish_inspect_snapshot();
         Some(bytes)
     }
 
@@ -1426,6 +1558,31 @@ impl Runtime {
     /// - Otherwise the event drives presentation selection (Linux copy-on-select
     ///   is not automatic: callers must call `copy_selection_to_clipboard`).
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
+        // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
+        // Coordinates come from the last known cursor position mapped to cell
+        // space (clamped); `None` when the cursor never entered the window.
+        {
+            let cell = self.last_cursor.map(|pos| self.cursor_to_cell(pos));
+            let button = match event.button {
+                MouseButton::Left => "Left",
+                MouseButton::Right => "Right",
+                MouseButton::Middle => "Middle",
+                MouseButton::Back => "Back",
+                MouseButton::Forward => "Forward",
+                MouseButton::Other(_) => "Other",
+            };
+            let pressed = event.state == PressState::Pressed;
+            self.inspect_ring.push_mouse(
+                button,
+                cell.map(|c| c.col),
+                cell.map(|c| c.row),
+                pressed,
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+            );
+            self.publish_inspect_snapshot();
+        }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
         let capture = !shift_override
@@ -1556,6 +1713,28 @@ impl Runtime {
     /// Bounded: at most 32 lines per frame, accumulator clamped to 4*cell_height.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
+        // CTX-0159: retain a bounded wheel trace for screenshots-free probes.
+        match delta {
+            ScrollDelta::Lines(x, y) => {
+                self.inspect_ring.push_wheel(
+                    (x as i32).clamp(-32, 32),
+                    (y as i32).clamp(-32, 32),
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+            }
+            ScrollDelta::Pixels(px, py) => {
+                self.inspect_ring.push_wheel(
+                    (px as i32).clamp(-512, 512),
+                    (py as i32).clamp(-512, 512),
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+            }
+        }
+        self.publish_inspect_snapshot();
         let live = self.live_cell_metrics();
         let cell_h = live.height as f32;
         let cell_w = live.width as f32;
@@ -1658,6 +1837,13 @@ impl Runtime {
         }
         let gained = focused;
         self.focused = focused;
+        // CTX-0159: retain focus transitions for screenshots-free probes.
+        self.inspect_ring.push_focus(
+            focused,
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+        );
         if gained {
             self.pending_full_redraw = true;
         }
@@ -1665,6 +1851,7 @@ impl Runtime {
             let seq = if focused { "\x1b[I" } else { "\x1b[O" };
             self.push_input_bytes(seq.as_bytes());
         }
+        self.publish_inspect_snapshot();
     }
 
     /// Handles IME preedit (presentation overlay, not Terminal Truth).
@@ -3343,6 +3530,13 @@ impl Runtime {
                     self.shift_pressed = mods.shift;
                     self.control_pressed = mods.control;
                     self.alt_pressed = mods.alt;
+                    // CTX-0159: retain modifier latch changes for probes.
+                    self.inspect_ring.push_modifiers(
+                        self.shift_pressed,
+                        self.control_pressed,
+                        self.alt_pressed,
+                    );
+                    self.publish_inspect_snapshot();
                     false
                 }
                 WindowEventKind::Ime(ime) => {
@@ -3822,6 +4016,9 @@ impl Runtime {
             }
         };
         self.last_presented_generation = current_gen;
+        // CTX-0159: publish grid plus latched input/focus so socket probes see
+        // typed text without screenshots (`&self` only, bounded).
+        self.publish_inspect_snapshot();
         Some(PresentStats {
             frame: stats.frame,
             fills: stats.fills,

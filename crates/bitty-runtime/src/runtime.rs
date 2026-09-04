@@ -491,21 +491,22 @@ pub struct Runtime {
     clipboard: Clipboard,
     selection: Option<Selection>,
     selection_dragging: bool,
-    /// In-memory primary (selection) clipboard (CTX-0158, ghostty
-    /// `copy-on-select` semantics).
+    /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
     ///
     /// Ghostty copies a committed left-drag selection to both the standard
     /// clipboard and the selection/primary clipboard; middle-click then
-    /// pastes from the selection clipboard (falling back to standard where
-    /// the platform has no selection clipboard). `bitty-platform::Clipboard`
-    /// only carries the standard clipboard (arboard default kind, X11
-    /// backend without `wayland-data-control`), so the primary side lives
-    /// here as bounded headless-first state: always updated on auto-copy,
-    /// always readable without display, and the deterministic fake seam for
-    /// headless tests (`force_headless_clipboard` clears it alongside the
-    /// standard buffer). Native Wayland primary sync stays a platform
-    /// follow-up; this buffer never touches fs/net and never errors.
-    primary_selection: String,
+    /// pastes from the primary selection. Both selections live in
+    /// `bitty-platform::Clipboard`, which is Wayland-first on Linux
+    /// (`wayland-data-control` backend when `WAYLAND_DISPLAY` is set, X11
+    /// fallback, fail-soft headless buffers otherwise — CTX-0160): there is
+    /// no runtime-side primary buffer, so cross-app copy/paste works in both
+    /// directions without a second source of truth.
+    ///
+    /// Reads/writes on the mouse path stay fail-soft (no paste, no panic,
+    /// no block), but failures are recorded here instead of swallowed, so
+    /// the embedder can surface them. A subsequent successful clipboard
+    /// operation clears the slot. Bounded: at most one retained error.
+    last_clipboard_error: Option<bitty_platform::PlatformError>,
     last_cursor: Option<CursorPosition>,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
@@ -722,7 +723,7 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
-            primary_selection: String::new(),
+            last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
@@ -811,7 +812,7 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
-            primary_selection: String::new(),
+            last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
@@ -1381,9 +1382,10 @@ impl Runtime {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Copies the current selection to the system clipboard (via `arboard`
-    /// with headless fallback). Returns the copied text on success, `None`
-    /// when no selection exists.
+    /// Copies the current selection to the system clipboard (via the
+    /// Wayland-first platform backend with headless fallback, which
+    /// best-effort syncs the primary selection on Linux). Returns the copied
+    /// text on success, `None` when no selection exists.
     ///
     /// # Errors
     ///
@@ -1407,57 +1409,109 @@ impl Runtime {
         Some(text)
     }
 
-    /// Current contents of the in-memory primary (selection) clipboard.
+    /// Current contents of the platform primary (selection) clipboard buffer.
     ///
-    /// Headless-first fake seam for tests: never touches the display server,
-    /// so unit tests stay deterministic even on live desktops.
+    /// Headless-first observation seam for tests: on a live Wayland/X11
+    /// desktop this mirrors the last primary write through
+    /// `bitty-platform::Clipboard`, so unit tests stay deterministic by
+    /// forcing the headless clipboard first (`force_headless_clipboard`).
     #[must_use]
     pub fn primary_contents(&self) -> &str {
-        &self.primary_selection
+        self.clipboard.primary_contents()
     }
 
-    /// Directly sets the in-memory primary clipboard (headless test seam).
+    /// Last clipboard failure observed on the mouse-paste path, if any.
     ///
-    /// Bounded to `CLIPBOARD_MAX_BYTES` (8192) at a char boundary, mirroring
-    /// the platform clipboard primitive. Never touches the display server.
-    pub fn set_primary_text(&mut self, text: String) {
-        self.primary_selection = truncate_paste_text(text);
+    /// Mouse paste stays fail-soft (no bytes, no panic), but read/write
+    /// failures from the platform clipboard are recorded here instead of
+    /// swallowed, so the embedder can surface them (PR #259 review). A
+    /// subsequent successful clipboard operation clears the slot. Cloned
+    /// because [`Runtime`] is not `Sync`-friendly to borrow across frames.
+    #[must_use]
+    pub fn last_clipboard_error(&self) -> Option<bitty_platform::PlatformError> {
+        self.last_clipboard_error.clone()
     }
 
-    /// Copies the current selection to the in-memory primary clipboard.
+    /// Records a platform clipboard failure for later surfacing.
+    fn record_clipboard_error(&mut self, err: bitty_platform::PlatformError) {
+        self.last_clipboard_error = Some(err);
+    }
+
+    /// Clears the recorded clipboard failure after a successful operation.
+    fn clear_clipboard_error(&mut self) {
+        self.last_clipboard_error = None;
+    }
+
+    /// Directly sets the platform primary clipboard (headless test seam).
+    ///
+    /// Routes through `bitty-platform::Clipboard::set_primary` (Wayland
+    /// primary selection where supported, headless buffer otherwise).
+    /// Fail-soft: a system error is recorded for
+    /// [`Self::last_clipboard_error`] but the headless buffer is still
+    /// updated by the platform layer, so headless tests stay deterministic.
+    pub fn set_primary_text(&mut self, text: String) {
+        if let Err(err) = self.clipboard.set_primary(text) {
+            self.record_clipboard_error(err);
+        } else {
+            self.clear_clipboard_error();
+        }
+    }
+
+    /// Copies the current selection to the platform primary clipboard.
     /// Returns the copied text, or `None` when no selection exists.
-    /// Never fails and never touches the display server.
+    /// Fail-soft: a system error is recorded for
+    /// [`Self::last_clipboard_error`] while the void return keeps the
+    /// historic call shape.
     pub fn copy_selection_to_primary(&mut self) -> Option<String> {
         let text = self.selection_text()?;
-        let bounded = truncate_paste_text(text);
-        self.primary_selection = bounded.clone();
-        Some(bounded)
+        if let Err(err) = self.clipboard.set_primary(text.clone()) {
+            self.record_clipboard_error(err);
+        } else {
+            self.clear_clipboard_error();
+        }
+        Some(text)
     }
 
     /// Ghostty `setSelectionAndCopy` equivalent (CTX-0158): copies the
-    /// current selection to both the standard clipboard (via `arboard` with
-    /// headless fallback, best-effort) and the in-memory primary clipboard.
+    /// current selection to the standard clipboard, which the platform layer
+    /// best-effort syncs to the primary selection on Linux (CTX-0160).
     /// Returns the copied text, or `None` when no selection exists.
-    /// Fail-soft: system clipboard errors are dropped, the headless buffers
-    /// always update, and headless tests never touch the real clipboard.
+    /// Fail-soft: a system clipboard error is recorded for
+    /// [`Self::last_clipboard_error`] while the headless buffers always
+    /// update, and headless tests never touch the real clipboard.
     pub fn auto_copy_selection(&mut self) -> Option<String> {
         let text = self.selection_text()?;
-        self.clipboard.set_text_lossy(text.clone());
-        let bounded = truncate_paste_text(text);
-        self.primary_selection = bounded.clone();
-        Some(bounded)
+        match self.clipboard.set_text(text.clone()) {
+            Ok(()) => self.clear_clipboard_error(),
+            Err(err) => self.record_clipboard_error(err),
+        }
+        Some(text)
     }
 
-    /// Pastes from the in-memory primary clipboard through the same
-    /// suspicious-paste inspection gate as clipboard input. Returns `None`
-    /// when the primary buffer is empty, otherwise `Some(true)` when the
-    /// paste requires confirmation or `Some(false)` when delivered
-    /// immediately. Never touches the display server.
+    /// Pastes from the platform primary selection (middle-click /
+    /// `wl-paste --primary`) through the same suspicious-paste inspection
+    /// gate as clipboard input. Returns `None` when the primary selection is
+    /// empty, otherwise `Some(true)` when the paste requires confirmation or
+    /// `Some(false)` when delivered immediately.
+    ///
+    /// Fail-soft with a surfaced error: a platform read failure pastes
+    /// nothing but is recorded for [`Self::last_clipboard_error`] instead of
+    /// swallowed (PR #259 review); a successful read clears the slot.
     pub fn paste_from_primary(&mut self) -> Option<bool> {
-        if self.primary_selection.is_empty() {
+        let text = match self.clipboard.get_primary() {
+            Ok(text) => {
+                self.clear_clipboard_error();
+                text
+            }
+            Err(err) => {
+                self.record_clipboard_error(err);
+                return None;
+            }
+        };
+        if text.is_empty() {
             return None;
         }
-        Some(self.request_paste(self.primary_selection.clone()))
+        Some(self.request_paste(text))
     }
 
     /// Whether the pending paste requires confirmation, if one exists.
@@ -1485,6 +1539,10 @@ impl Runtime {
     /// `Err(PlatformError)` when clipboard acquisition fails, `Ok(None)` when
     /// the clipboard is empty, and `Ok(Some(true))` when confirmation is
     /// required or `Ok(Some(false))` when the text is delivered immediately.
+    ///
+    /// The right-click mouse path records `Err` for
+    /// [`Self::last_clipboard_error`] instead of dropping it (PR #259
+    /// review); direct callers match on the `Result` themselves.
     ///
     /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
     /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
@@ -1636,11 +1694,13 @@ impl Runtime {
     ///   (accessibility escape).
     /// - Otherwise the event drives presentation selection with ghostty
     ///   copy-on-select: left press starts a drag, left release commits it and
-    ///   auto-copies to both the standard clipboard and the in-memory primary
-    ///   (fail-soft via [`Self::auto_copy_selection`]); right press pastes the
-    ///   standard clipboard and middle press pastes the primary, both through
-    ///   the suspicious-paste inspection gate and both fail-soft (empty source
-    ///   or system error means no bytes, never a panic or block).
+    ///   auto-copies to the platform clipboard (which best-effort syncs the
+    ///   primary selection on Linux, CTX-0160); right press pastes the
+    ///   standard clipboard (Wayland-first backend) and middle press pastes
+    ///   the platform primary selection, both through the suspicious-paste
+    ///   inspection gate. All three stay fail-soft (empty source means no
+    ///   bytes, never a panic or block) but platform failures are recorded
+    ///   for [`Self::last_clipboard_error`] instead of swallowed.
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
         // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
         // Coordinates come from the last known cursor position mapped to cell
@@ -1742,20 +1802,29 @@ impl Runtime {
                     self.pending_full_redraw = true;
                 }
                 // Ghostty copy-on-select: a committed drag auto-copies to
-                // both clipboards. Fail-soft: empty selection or system
-                // clipboard error still leaves the headless buffers updated
-                // and never blocks the input path.
+                // both selections via the platform clipboard (Wayland-first,
+                // CTX-0160). Fail-soft: empty selection pastes nothing and a
+                // system clipboard error is recorded for
+                // `last_clipboard_error` while the headless buffers still
+                // update; the input path never blocks.
                 let _ = self.auto_copy_selection();
             }
             (MouseButton::Right, PressState::Pressed) => {
                 // Ghostty `paste` right-click action for the standard
-                // clipboard. Fail-soft: errors and empty clipboards paste
-                // nothing; suspicious text waits on the confirmation gate.
-                let _ = self.paste_from_clipboard();
+                // clipboard (Wayland-first via the platform backend,
+                // CTX-0160). Fail-soft: empty clipboards paste nothing and
+                // suspicious text waits on the confirmation gate; a read
+                // failure is recorded for `last_clipboard_error` instead of
+                // swallowed (PR #259 review).
+                match self.paste_from_clipboard() {
+                    Ok(_) => self.clear_clipboard_error(),
+                    Err(err) => self.record_clipboard_error(err),
+                }
             }
             (MouseButton::Middle, PressState::Pressed) => {
                 // Ghostty `primary-paste` middle-click action for the
-                // primary (selection) clipboard. Fail-soft like right-click.
+                // platform primary selection (fail-soft like right-click;
+                // read failures are recorded inside `paste_from_primary`).
                 let _ = self.paste_from_primary();
             }
             _ => {}
@@ -2032,11 +2101,12 @@ impl Runtime {
 
     /// Forces the clipboard into headless mode (test helper, deterministic).
     ///
-    /// Also clears the in-memory primary clipboard so the headless fake seam
-    /// starts empty and tests never touch the real clipboard or primary.
+    /// Replaces the handle (clearing both the standard and primary headless
+    /// buffers) and drops any recorded clipboard error, so tests start from
+    /// a clean seam and never touch the real clipboard or primary.
     pub fn force_headless_clipboard(&mut self) {
         self.clipboard = Clipboard::new_headless();
-        self.primary_selection.clear();
+        self.last_clipboard_error = None;
     }
 
     /// Allow or deny OSC 52 clipboard writes (capability-gated, default false).
@@ -5441,6 +5511,8 @@ mod tests {
         // Ghostty copy-on-select: both clipboards hold the selection.
         assert_eq!(rt.clipboard().headless_contents(), "hello");
         assert_eq!(rt.primary_contents(), "hello");
+        // A successful copy clears any recorded clipboard failure.
+        assert!(rt.last_clipboard_error().is_none());
     }
 
     #[test]
@@ -5465,39 +5537,81 @@ mod tests {
         rt.handle_mouse_input(mouse_press(MouseButton::Right));
         assert!(!rt.has_pending_paste(), "clean paste needs no confirm");
         assert_eq!(rt.pending_input(), b"hi");
+        // A successful read leaves no recorded clipboard failure.
+        assert!(rt.last_clipboard_error().is_none());
         // Release is a no-op: exactly one paste per click.
         rt.handle_mouse_input(mouse_release(MouseButton::Right));
         assert_eq!(rt.pending_input(), b"hi");
     }
 
     #[test]
+    fn right_click_with_empty_clipboard_pastes_nothing_without_error() {
+        let mut rt = mouse_headless_runtime("hello world");
+        assert!(rt.last_clipboard_error().is_none());
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(rt.pending_input().is_empty());
+        assert!(!rt.has_pending_paste());
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
     fn middle_click_pastes_primary_bytes() {
         let mut rt = mouse_headless_runtime("hello world");
-        rt.set_primary_text("pq".to_string());
         // Standard clipboard holds something else: middle must read primary.
+        // Order matters: the platform `set_text` best-effort syncs the
+        // primary selection (CTX-0160 ghostty copy-on-select), so stage the
+        // standard clipboard first and the primary second.
         rt.clipboard_mut()
             .set_text("zz".to_string())
             .expect("headless set");
+        rt.set_primary_text("pq".to_string());
+        assert_eq!(rt.clipboard().headless_contents(), "zz");
+        assert_eq!(rt.primary_contents(), "pq");
         rt.drain_pending_input();
         rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Middle));
         assert!(!rt.has_pending_paste());
         assert_eq!(rt.pending_input(), b"pq");
+        assert!(rt.last_clipboard_error().is_none());
         rt.handle_mouse_input(mouse_release(MouseButton::Middle));
         assert_eq!(rt.pending_input(), b"pq");
+        // Right-click still reads the standard clipboard, not primary.
+        rt.drain_pending_input();
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(!rt.has_pending_paste());
+        assert_eq!(rt.pending_input(), b"zz");
+    }
+
+    #[test]
+    fn clipboard_copy_syncs_primary_like_ghostty() {
+        // Platform CTX-0160 contract through the runtime seam: a standard
+        // clipboard write also lands in the primary selection, so a
+        // left-drag auto-copy is middle-pasteable without a second write.
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("synced".to_string())
+            .expect("headless set");
+        assert_eq!(rt.primary_contents(), "synced");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+        assert_eq!(rt.pending_input(), b"synced");
     }
 
     #[test]
     fn middle_click_with_empty_primary_pastes_nothing() {
+        // Fresh headless seam: both buffers start empty, so the primary read
+        // succeeds empty (no error recorded) and pastes nothing.
         let mut rt = mouse_headless_runtime("hello world");
-        rt.clipboard_mut()
-            .set_text("zz".to_string())
-            .expect("headless set");
+        assert_eq!(rt.primary_contents(), "");
         rt.drain_pending_input();
         rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Middle));
         assert!(rt.pending_input().is_empty());
         assert!(!rt.has_pending_paste());
+        assert!(rt.last_clipboard_error().is_none());
     }
 
     #[test]
@@ -5540,6 +5654,7 @@ mod tests {
         assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M\x1b[<1;1;1M\x1b[<0;1;1m");
         assert_eq!(rt.clipboard().headless_contents(), "clip");
         assert_eq!(rt.primary_contents(), "prim");
+        assert!(rt.last_clipboard_error().is_none());
     }
 
     #[test]

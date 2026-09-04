@@ -104,6 +104,11 @@ fn copy_selection_to_clipboard_headless() {
     // Headless buffer must reflect copy.
     rt.clipboard_mut().get_text().expect("get must succeed");
     assert_eq!(rt.clipboard().headless_contents(), "copy");
+    // CTX-0160 platform contract: the standard write best-effort syncs the
+    // primary selection, so the copy is middle-pasteable without a second
+    // write. A successful copy also leaves no recorded clipboard failure.
+    assert_eq!(rt.clipboard().primary_contents(), "copy");
+    assert!(rt.last_clipboard_error().is_none());
     // Paste should inject into pending_input (clean text: no confirmation gate).
     rt.clear_selection();
     // Clear pending before paste.

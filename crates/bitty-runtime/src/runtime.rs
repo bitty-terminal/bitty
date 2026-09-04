@@ -31,6 +31,15 @@
 //! Layout math remains headless-testable without GPU/window; the software
 //! present proves split/stack/overlay composition.
 //!
+//! Per-pane shells (CTX-0176): every split leaf may own a private
+//! [`PaneSession`](Runtime::spawn_shell_for_view) — its own parser, grid
+//! state, and PTY triple — so panes stop mirroring the single primary
+//! session. Leaves without a session keep rendering the shared primary
+//! state (the unchanged single-pane path). Input routes to the focused
+//! leaf's writer only (see [`Runtime::push_input_bytes`]); [`Runtime::tick`]
+//! renders each leaf from its own grid; [`Runtime::poll_pty`] drains every
+//! session. [`Runtime::close_pane_session`] tears a leaf's child down.
+//!
 //! # Plugin-host wiring (CTX-0027) — draft status, experimental review evidence
 //!
 //! This module owns a [`bitty_plugin_host::PluginHost`] behind the cold path.
@@ -69,6 +78,8 @@
 //!   execution with budgets/timeouts (OQ-014), and actual command invocation via the
 //!   plugin VM remain deferred. This slice only wires the host-owned data structures
 //!   and the bounded crossing.
+
+use std::collections::BTreeMap;
 
 use bitty_platform::{
     Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
@@ -460,6 +471,22 @@ fn pty_forward_loop(reader: PtyReader, tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     let _ = reader.join();
 }
 
+/// One split pane's private shell session (CTX-0176).
+///
+/// Each leaf created by a split owns at most one of these: its own VT
+/// parser, terminal grid state, query-overlap tail, and PTY triple. The
+/// owned [`Pty`] keeps the child alive — dropping the session kills and
+/// reaps it without leaking a zombie. The reader stays direct (drained by
+/// [`Runtime::poll_pty`]); no wakeup-forwarder promotion applies to panes.
+struct PaneSession {
+    parser: Parser,
+    state: State,
+    query_overlap: Vec<u8>,
+    pty: Pty,
+    reader: PtyReader,
+    writer: PtyWriter,
+}
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -474,6 +501,9 @@ pub struct Runtime {
     /// Readability callback moved (cloned) into the forwarder on promotion.
     pty_waker: Option<PtyWaker>,
     pty_writer: Option<PtyWriter>,
+    /// Private shell sessions keyed by split-leaf id (CTX-0176). Empty in
+    /// single-pane use, where the primary PTY/state path is unchanged.
+    pane_sessions: BTreeMap<ViewId, PaneSession>,
     pending_input: Vec<u8>,
     pending_input_dropped: u64,
     renderer: GridRenderer<AnyRasterizer>,
@@ -580,6 +610,7 @@ impl std::fmt::Debug for Runtime {
                 &(self.pty_reader.is_some() || self.pty_forward_rx.is_some()),
             )
             .field("has_pty_writer", &self.pty_writer.is_some())
+            .field("pane_sessions", &self.pane_sessions.len())
             .field("pending_input_len", &self.pending_input.len())
             .field("pending_input_dropped", &self.pending_input_dropped)
             .field("pending_full_redraw", &self.pending_full_redraw)
@@ -708,6 +739,7 @@ impl Runtime {
             pty_forward_handle: None,
             pty_waker: None,
             pty_writer: None,
+            pane_sessions: BTreeMap::new(),
             pending_input: Vec::new(),
             pending_input_dropped: 0,
             renderer,
@@ -797,6 +829,7 @@ impl Runtime {
             pty_forward_handle: None,
             pty_waker: None,
             pty_writer: None,
+            pane_sessions: BTreeMap::new(),
             pending_input: Vec::new(),
             pending_input_dropped: 0,
             renderer,
@@ -1211,6 +1244,13 @@ impl Runtime {
         if bytes.is_empty() {
             return;
         }
+        // CTX-0176: with per-pane sessions live, input routes to the focused
+        // leaf's shell only — never broadcast. Leaves without a session (the
+        // primary leaf) keep the original writer path below.
+        if !self.pane_sessions.is_empty() {
+            self.push_input_bytes_multipane(bytes);
+            return;
+        }
         // Try live PTY write first (best effort, never panics).
         if let Some(writer) = self.pty_writer.as_mut() {
             use std::io::Write as _;
@@ -1222,7 +1262,34 @@ impl Runtime {
             // Headless tests without a writer will observe via pending.
             return;
         }
-        // Headless / no-writer path: bounded buffer with drop-oldest.
+        self.buffer_input_headless(bytes);
+    }
+
+    /// Focused-leaf input routing for split layouts (CTX-0176): the focused
+    /// leaf's session writer wins; the shared writer serves leaves without a
+    /// session; with no writer live, bytes fall back to the bounded headless
+    /// buffer. Best-effort, never panics.
+    fn push_input_bytes_multipane(&mut self, bytes: &[u8]) {
+        use std::io::Write as _;
+        if let Some(focused) = self.focus.focused() {
+            if let Some(sess) = self.pane_sessions.get_mut(&focused) {
+                let _ = sess.writer.write_all(bytes);
+                let _ = sess.writer.flush();
+                return;
+            }
+        }
+        if let Some(writer) = self.pty_writer.as_mut() {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+            return;
+        }
+        self.buffer_input_headless(bytes);
+    }
+
+    /// Headless / no-writer input path: bounded buffer with drop-oldest.
+    /// Shared by the single-pane and multipane routers so the bound
+    /// (`MAX_PENDING_INPUT`, truncate-to-tail) stays identical on both.
+    fn buffer_input_headless(&mut self, bytes: &[u8]) {
         let overflow = self.pending_input.len() + bytes.len() > MAX_PENDING_INPUT;
         if overflow {
             // Make room by dropping oldest bytes.
@@ -3047,6 +3114,247 @@ impl Runtime {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // Per-pane shell sessions (CTX-0176)
+    // ------------------------------------------------------------------
+
+    /// Spawns `program` with `args` as the private shell of layout leaf
+    /// `view`, sized to `cols` x `rows` cells.
+    ///
+    /// Direct argv exec, no shell interpolation: the identical sandbox to
+    /// [`spawn_shell_with_args`](Self::spawn_shell_with_args) — `program`
+    /// plus `args` pass verbatim to the platform exec path, and a blank
+    /// `program` is rejected before any spawn is attempted.
+    ///
+    /// The leaf must exist in the current layout; spawning for an unknown id
+    /// is rejected. Re-spawning a leaf that already owns a session replaces
+    /// it: the old `Pty` drops, killing and reaping its child without
+    /// leaking a zombie (same lifecycle as
+    /// [`spawn_shell_with_args`](Self::spawn_shell_with_args)). The session
+    /// starts with a fresh grid resized to `cols` x `rows`
+    /// ([`State::resize`] clamps to `1..=1000` per dimension; zero dims
+    /// clamp to 1).
+    ///
+    /// The pane reader stays direct (no wakeup-forwarder promotion):
+    /// [`poll_pty`](Self::poll_pty) drains every pane session on each call,
+    /// so live panes need no waker. Pane replies flush to the pane's own
+    /// writer on the same path.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when `program` is blank or `view` is
+    /// not a leaf of the current layout; [`RuntimeError::Pty`] when the
+    /// platform reports spawn failure.
+    pub fn spawn_shell_for_view(
+        &mut self,
+        view: ViewId,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RuntimeError> {
+        if program.trim().is_empty() {
+            return Err(RuntimeError::InvalidConfig("program must not be empty"));
+        }
+        if !self.layout.leaf_ids().contains(&view) {
+            return Err(RuntimeError::InvalidConfig(
+                "view is not a leaf of the current layout",
+            ));
+        }
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let mut builder = PtyBuilder::new(program).size(cols, rows);
+        for arg in args {
+            builder = builder.arg(*arg);
+        }
+        let mut pty = builder.spawn().map_err(RuntimeError::from)?;
+        let reader = pty.take_reader().map_err(RuntimeError::from)?;
+        let writer = pty.take_writer().map_err(RuntimeError::from)?;
+        // All fallible steps done: publish the session. A replaced session's
+        // old `Pty` drops here, killing + reaping its child (no zombie).
+        let mut state = State::new();
+        state.resize(cols as usize, rows as usize);
+        self.pane_sessions.insert(
+            view,
+            PaneSession {
+                parser: Parser::new(),
+                state,
+                query_overlap: Vec::new(),
+                pty,
+                reader,
+                writer,
+            },
+        );
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
+    /// Whether leaf `view` owns a private shell session.
+    #[must_use]
+    pub fn has_pane_session(&self, view: &ViewId) -> bool {
+        self.pane_sessions.contains_key(view)
+    }
+
+    /// Number of live per-pane shell sessions.
+    #[must_use]
+    pub fn pane_count(&self) -> usize {
+        self.pane_sessions.len()
+    }
+
+    /// Ids owning a private shell session, in deterministic (`ViewId`) order.
+    #[must_use]
+    pub fn pane_session_ids(&self) -> Vec<ViewId> {
+        self.pane_sessions.keys().copied().collect()
+    }
+
+    /// Process id of the leaf's shell child, when the session exists and the
+    /// platform reports one.
+    #[must_use]
+    pub fn pane_pid(&self, view: &ViewId) -> Option<u32> {
+        self.pane_sessions.get(view).and_then(|sess| sess.pty.pid())
+    }
+
+    /// Read-only snapshot of the leaf's private grid, when it owns a
+    /// session. Leaves without a session share the primary
+    /// [`snapshot`](Self::snapshot).
+    #[must_use]
+    pub fn pane_snapshot(&self, view: &ViewId) -> Option<Snapshot> {
+        self.pane_sessions
+            .get(view)
+            .map(|sess| sess.state.snapshot())
+    }
+
+    /// Tears down the leaf's private shell session, if any. The owned `Pty`
+    /// drops, killing and reaping the child without leaking a zombie.
+    /// Returns true when a session was removed.
+    pub fn close_pane_session(&mut self, view: &ViewId) -> bool {
+        let removed = self.pane_sessions.remove(view).is_some();
+        if removed {
+            self.pending_full_redraw = true;
+        }
+        removed
+    }
+
+    /// Drains every pane session's direct reader into its private grid via
+    /// the shared PTY pipeline (see [`handle_pane_bytes`](Self::handle_pane_bytes)),
+    /// flushes pane replies to each pane's own writer, and re-syncs the
+    /// global input-mode caches to the focused leaf. Returns the drained
+    /// chunk count. No-op when no pane session exists.
+    fn pump_pane_sessions(&mut self) -> usize {
+        if self.pane_sessions.is_empty() {
+            return 0;
+        }
+        // Collect without holding a borrow across the mutable pump calls.
+        // `BTreeMap` iteration is `ViewId`-ordered, so multi-pane wakeups
+        // are deterministic.
+        let mut pending: Vec<(ViewId, Vec<u8>)> = Vec::new();
+        for (id, sess) in self.pane_sessions.iter() {
+            let mut per_pane = 0usize;
+            while per_pane < 1024 {
+                match sess.reader.try_recv() {
+                    Some(chunk) => {
+                        debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                        pending.push((*id, chunk));
+                        per_pane += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        let drained = pending.len();
+        for (id, chunk) in pending {
+            self.handle_pane_bytes(id, &chunk);
+            let _ = self.write_pane_replies(id);
+        }
+        self.sync_mode_caches_to_focus();
+        drained
+    }
+
+    /// Feeds raw PTY bytes from one pane's shell into that pane's private
+    /// grid through the exact [`handle_pty_bytes`](Self::handle_pty_bytes)
+    /// pipeline (query replies, clipboard policy, cold bridge, search).
+    ///
+    /// Implemented by swapping the pane's `Parser`/`State`/overlap tail into
+    /// the primary slots for the call and swapping back afterwards, so panes
+    /// get full pipeline fidelity with no duplicated logic. Unknown ids and
+    /// empty input are no-ops. Single-threaded (`&mut self`), and nothing in
+    /// the [`handle_pty_bytes`](Self::handle_pty_bytes) call tree touches
+    /// `pane_sessions`, so the session cannot vanish mid-call; that call's
+    /// documented never-panics-over-untrusted-bytes contract keeps the swap
+    /// pair total.
+    fn handle_pane_bytes(&mut self, view: ViewId, bytes: &[u8]) {
+        if bytes.is_empty() || !self.pane_sessions.contains_key(&view) {
+            return;
+        }
+        {
+            let Some(sess) = self.pane_sessions.get_mut(&view) else {
+                return;
+            };
+            std::mem::swap(&mut self.parser, &mut sess.parser);
+            std::mem::swap(&mut self.state, &mut sess.state);
+            std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+        }
+        self.handle_pty_bytes(bytes);
+        let Some(sess) = self.pane_sessions.get_mut(&view) else {
+            // Unreachable single-threaded (see doc above); keep total rather
+            // than debug-panicking on a corrupted swap pair.
+            debug_assert!(false, "pane session vanished mid-pump");
+            return;
+        };
+        std::mem::swap(&mut self.parser, &mut sess.parser);
+        std::mem::swap(&mut self.state, &mut sess.state);
+        std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+    }
+
+    /// Flushes one pane's queued terminal replies to that pane's own writer
+    /// (bounded, fail-closed — the per-pane mirror of
+    /// [`write_replies`](Self::write_replies)). No-op without a session.
+    fn write_pane_replies(&mut self, view: ViewId) -> usize {
+        let Some(sess) = self.pane_sessions.get_mut(&view) else {
+            return 0;
+        };
+        let replies = sess.state.take_replies();
+        if replies.is_empty() {
+            return 0;
+        }
+        let mut total = 0usize;
+        use std::io::Write as _;
+        for chunk in replies {
+            // Each chunk is bounded; total bounded by the reply cap (4 KiB).
+            // Best-effort, fail-closed: on write error break and drop remainder.
+            if sess.writer.write_all(&chunk).is_ok() {
+                total += chunk.len();
+            } else {
+                break;
+            }
+        }
+        let _ = sess.writer.flush();
+        total
+    }
+
+    /// Re-syncs the global Kitty/mouse-capture caches to the focused leaf's
+    /// grid (or the primary grid when focus owns no session). Called after
+    /// pumping panes so a mouse-tracking app in the focused pane still takes
+    /// effect. No-op equivalent when no pane session exists.
+    fn sync_mode_caches_to_focus(&mut self) {
+        if self.pane_sessions.is_empty() {
+            return;
+        }
+        let focused = self.focus.focused();
+        let (kitty, mouse) = match focused.and_then(|id| self.pane_sessions.get(&id)) {
+            Some(sess) => {
+                let modes = sess.state.modes();
+                (modes.kitty_keyboard, modes.mouse_tracking.is_some())
+            }
+            None => {
+                let modes = self.state.modes();
+                (modes.kitty_keyboard, modes.mouse_tracking.is_some())
+            }
+        };
+        self.kitty_flags = kitty;
+        self.mouse_capture_enabled = mouse;
+    }
+
     /// Installs the cross-thread PTY readability callback and promotes the
     /// direct reader into the wakeup forwarder pump.
     ///
@@ -3183,7 +3491,8 @@ impl Runtime {
                 out
             } else {
                 let Some(reader) = self.pty_reader.as_ref() else {
-                    return 0;
+                    // No primary reader: pane sessions (if any) still pump.
+                    return self.pump_pane_sessions();
                 };
                 let mut out = Vec::new();
                 while out.len() < 1024 {
@@ -3205,7 +3514,8 @@ impl Runtime {
         // Bounded PTY reply loop: parse->state->replies->writer (4 KiB cap, fail-closed)
         // Headless (no writer) keeps replies queued for `take_replies` observation.
         let _ = self.write_replies();
-        drained
+        // CTX-0176: pump every pane session on the same bounded path.
+        drained + self.pump_pane_sessions()
     }
 
     /// Blocking drain with a timeout, returning the number of chunks drained.
@@ -3843,7 +4153,13 @@ impl Runtime {
         let snapshot = self.state.snapshot();
         let pending_full = self.pending_full_redraw;
         let last = self.last_presented_generation;
-        let current_gen = snapshot.generation;
+        // CTX-0176: the presented generation tracks the newest grid across
+        // the primary state and every pane session, so frame-on-demand idles
+        // only when all shells are quiet.
+        let mut current_gen = snapshot.generation;
+        for sess in self.pane_sessions.values() {
+            current_gen = current_gen.max(sess.state.generation());
+        }
 
         // Frame-on-demand: no new generation and no forced redraw -> idle.
         if !pending_full && current_gen == last && last != u64::MAX {
@@ -3867,7 +4183,11 @@ impl Runtime {
         // per leaf (over-damage safe, deterministic). If generation gap is
         // large and regions empty, also full. Otherwise still full for
         // correctness with viewport slicing.
-        let use_full = pending_full
+        // CTX-0176: per-pane grids carry independent generations that the
+        // shared damage ring cannot see, so any live pane session forces the
+        // full per-leaf path (over-damage safe, deterministic).
+        let use_full = !self.pane_sessions.is_empty()
+            || pending_full
             || last == u64::MAX
             || {
                 let gap = current_gen.saturating_sub(last);
@@ -3900,26 +4220,41 @@ impl Runtime {
             if rect.is_empty() {
                 continue;
             }
+            // CTX-0176: a leaf with its own shell renders that session's
+            // grid; leaves without a session share the primary snapshot
+            // (the unchanged single-pane path while no session exists).
+            let pane_snap: Option<Snapshot> = if self.pane_sessions.is_empty() {
+                None
+            } else {
+                Some(match self.pane_sessions.get(view_id) {
+                    Some(sess) => sess.state.snapshot(),
+                    None => snapshot.clone(),
+                })
+            };
+            let base_snap: &Snapshot = pane_snap.as_ref().unwrap_or(&snapshot);
             // Determine viewport snapshot: when view scroll_offset !=0, visible_cells composites scrollback.
             let view = view_map.get(view_id);
             let view_snapshot = if let Some(v) = view {
                 if v.scroll_offset() != 0 {
-                    let cells = v.visible_cells(&self.state);
+                    let cells = match self.pane_sessions.get(view_id) {
+                        Some(sess) => v.visible_cells(&sess.state),
+                        None => v.visible_cells(&self.state),
+                    };
                     Snapshot {
-                        version: snapshot.version,
-                        generation: snapshot.generation,
+                        version: base_snap.version,
+                        generation: base_snap.generation,
                         width: v.cols() as usize,
                         height: v.rows() as usize,
                         cells,
-                        cursor: snapshot.cursor.clone(),
-                        modes: snapshot.modes.clone(),
-                        title: snapshot.title.clone(),
+                        cursor: base_snap.cursor.clone(),
+                        modes: base_snap.modes.clone(),
+                        title: base_snap.title.clone(),
                     }
                 } else {
-                    viewport_snapshot(&snapshot, rect.width, rect.height)
+                    viewport_snapshot(base_snap, rect.width, rect.height)
                 }
             } else {
-                viewport_snapshot(&snapshot, rect.width, rect.height)
+                viewport_snapshot(base_snap, rect.width, rect.height)
             };
 
             let damage = if use_full || pending_full || last == u64::MAX {
@@ -4083,7 +4418,14 @@ impl Runtime {
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
                     if let Some((vid, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
                         let live = self.live_cell_metrics();
-                        let cur = snapshot.cursor.position;
+                        // CTX-0176: the preedit overlay tracks the focused
+                        // leaf's cursor, so IME lands on the pane receiving
+                        // input (primary grid when focus owns no session).
+                        let cur = self
+                            .focused_view()
+                            .and_then(|focused| self.pane_sessions.get(&focused))
+                            .map(|sess| sess.state.snapshot().cursor.position)
+                            .unwrap_or(snapshot.cursor.position);
                         let origin_px_x = rect.x as i32 * live.width as i32;
                         let origin_px_y = rect.y as i32 * live.height as i32;
                         let base_x = origin_px_x + cur.col as i32 * live.width as i32;
@@ -4644,6 +4986,54 @@ mod tests {
         let mut rt = make_runtime();
         assert!(rt.spawn_shell("").is_err());
         assert!(rt.spawn_shell("   ").is_err());
+    }
+
+    #[test]
+    fn pane_sessions_default_to_empty() {
+        // CTX-0176: single-pane runtimes own no pane session; the primary
+        // PTY/state path is untouched.
+        let mut rt = make_runtime();
+        assert_eq!(rt.pane_count(), 0);
+        assert!(rt.pane_session_ids().is_empty());
+        assert!(!rt.has_pane_session(&ViewId::new(2)));
+        assert_eq!(rt.pane_pid(&ViewId::new(2)), None);
+        assert!(rt.pane_snapshot(&ViewId::new(2)).is_none());
+        assert!(!rt.close_pane_session(&ViewId::new(2)));
+    }
+
+    #[test]
+    fn pane_spawn_rejects_blank_program_and_unknown_view() {
+        // CTX-0176: validation precedes any spawn; no PTY is touched.
+        let mut rt = make_runtime();
+        assert!(
+            rt.spawn_shell_for_view(ViewId::new(1), "", &[], 80, 24)
+                .is_err()
+        );
+        assert!(
+            rt.spawn_shell_for_view(ViewId::new(1), "   ", &[], 80, 24)
+                .is_err()
+        );
+        assert!(!rt.has_pty());
+        assert_eq!(rt.pane_count(), 0);
+        // Leaf 9 is not in the single-leaf default layout.
+        assert!(
+            rt.spawn_shell_for_view(ViewId::new(9), "/bin/sh", &[], 80, 24)
+                .is_err()
+        );
+        assert_eq!(rt.pane_count(), 0);
+    }
+
+    #[test]
+    fn pane_pump_and_poll_are_noops_without_sessions() {
+        // CTX-0176: unknown ids never touch the primary pipeline, polling an
+        // unspawned runtime still drains nothing, and the single-pane input
+        // path still lands in the headless buffer.
+        let mut rt = make_runtime();
+        rt.handle_pane_bytes(ViewId::new(2), b"hello");
+        rt.handle_pane_bytes(ViewId::new(2), b"");
+        assert_eq!(rt.poll_pty(), 0);
+        rt.push_input_bytes(b"abc");
+        assert_eq!(rt.pending_input(), b"abc");
     }
 
     // Ensures missing `allow` does not leak `dead_code` on the Window target.

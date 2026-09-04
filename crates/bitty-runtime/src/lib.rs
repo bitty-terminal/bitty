@@ -184,6 +184,7 @@ pub mod config;
 pub mod error;
 pub mod file_manager;
 pub mod git_panel;
+pub mod inspect;
 pub mod mail_panel;
 pub mod palette;
 pub mod paste;

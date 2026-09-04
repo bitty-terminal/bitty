@@ -28,7 +28,7 @@
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish" },
 //!     keymaps = {
-//!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
+//!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
 //! }
 //! ```
@@ -603,7 +603,7 @@ mod tests {
             terminal = { scrollback = 10000, shell = "/bin/fish" },
             appearance = { theme = "dark" },
             keymaps = {
-                { chord = "ctrl+p", action = "palette:toggle", context = "global" },
+                { chord = "alt+h", action = "goto_split:left", context = "global" },
             },
         }"#;
         let plan = parse_lua_config(content, &test_source()).expect("full");
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
         let maps = plan.keymaps.unwrap();
         assert_eq!(maps.len(), 1);
-        assert_eq!(maps[0].chord, "ctrl+p");
+        assert_eq!(maps[0].chord, "alt+h");
     }
 
     #[test]
@@ -719,14 +719,14 @@ mod tests {
     fn lua_keymaps_merge_by_chord() {
         let src = test_source();
         let plan = parse_lua_config(
-            r#"return { keymaps = { { chord = "ctrl+p", action = "a", context = "global" } } }"#,
+            r#"return { keymaps = { { chord = "ctrl+p", action = "focus_next", context = "global" } } }"#,
             &src,
         )
         .expect("keymaps");
         let layer = LayeredPlan::new(src, plan);
         let merged = resolve_effective(Some(layer), None).expect("merge");
         assert_eq!(merged.effective.keymaps.len(), 1);
-        assert_eq!(merged.effective.keymaps[0].action, "a");
+        assert_eq!(merged.effective.keymaps[0].action, "focus_next");
     }
 
     #[test]

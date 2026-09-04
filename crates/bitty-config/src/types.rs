@@ -196,7 +196,8 @@ pub struct KeymapEntry {
 }
 
 impl KeymapEntry {
-    /// Validate this entry.
+    /// Validate this entry: shape bounds plus semantic chord/action/context
+    /// checks ([`crate::keymap`]); unknown actions or keys fail closed.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.chord.trim().is_empty() {
             return Err(ConfigError::validation(
@@ -222,7 +223,7 @@ impl KeymapEntry {
                 "chord/action/context exceed length bounds",
             ));
         }
-        Ok(())
+        crate::keymap::validate_entry(self)
     }
 
     /// Identity key for set-by-identifier merging.
@@ -414,12 +415,12 @@ mod tests {
             keymaps: vec![
                 KeymapEntry {
                     chord: "ctrl+p".into(),
-                    action: "a".into(),
+                    action: "focus_next".into(),
                     context: "global".into(),
                 },
                 KeymapEntry {
                     chord: "ctrl+p".into(),
-                    action: "b".into(),
+                    action: "focus_prev".into(),
                     context: "global".into(),
                 },
             ],

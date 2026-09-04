@@ -45,8 +45,11 @@
 //!    files today carry appearance/font/window/terminal scalars only, never
 //!    layout).
 //! 5. **Focus handling** via `--focus` (numeric id or `next`/`prev`/`up`/`down`/
-//!    `left`/`right`) and via keyboard shortcuts in real mode (Tab/arrow/n/p/1..5).
-//!    Focus moves are routed through [`Runtime::set_focus`](bitty_runtime::Runtime::set_focus)
+//!    `left`/`right`) and via config keymaps in real mode (CTX-0153). The
+//!    single-owner rule applies: a key event bound in `keymaps` is consumed
+//!    by its chrome action and never reaches the PTY; unbound keys (Tab,
+//!    arrows, plain letters) always go to the shell, so Tab completion keeps
+//!    working. Focus moves are routed through [`Runtime::set_focus`](bitty_runtime::Runtime::set_focus)
 //!    and [`Runtime::move_focus`](bitty_runtime::Runtime::move_focus) which
 //!    delegate to the layout's deterministic adjacency.
 //! 6. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
@@ -99,10 +102,11 @@
 //!   the runtime's current grid (80×24 by default). Leaf sizes are updated by
 //!   `LayoutNode::reflow` on the next tick, so the initial `View::new` sizes
 //!   are only hints.
-//! - Focus is owned by `Runtime`. `--focus` for smoke and keyboard shortcuts in
+//! - Focus is owned by `Runtime`. `--focus` for smoke and config keymaps in
 //!   real mode both resolve to `Runtime::set_focus` (numeric id) or
 //!   `Runtime::move_focus` (directional). Invalid focus specs are warned and
-//!   ignored (total, no panic).
+//!   ignored (total, no panic). Unbound keys always reach the shell
+//!   (single-owner rule, CTX-0153).
 //!
 //! # Headless vs real split (documented honestly)
 //!
@@ -174,9 +178,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
 use bitty_platform::{
-    App, AppHandler, EventContext, EventWaker, LogicalKey, LogicalSize, NamedKey, PhysicalSize,
-    PlatformError, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle,
-    WindowId,
+    App, AppHandler, EventContext, EventWaker, KeyEvent, LogicalKey, LogicalSize, NamedKey,
+    PhysicalSize, PlatformError, PlatformEvent, PressState, WindowConfig, WindowEventKind,
+    WindowHandle, WindowId,
 };
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
@@ -711,8 +715,12 @@ fn help_text() -> String {
          \n\
          Focus:\n  \
            --focus moves focus after layout install (Direction via FocusDirection\n  \
-           or numeric ViewId). Keyboard in real mode: Tab/n→Next, p→Prev,\n  \
-           Arrows→spatial, 1..5→ViewId(1..5). Focus changes are deterministic.\n\
+           or numeric ViewId). Keyboard in real mode is keymap-driven (CTX-0153\n  \
+           single-owner rule): a bound chord is consumed by its chrome action\n  \
+           and never reaches the PTY; unbound keys (Tab, arrows, plain\n  \
+           letters) always go to the shell. Defaults: Alt+h/j/k/l and\n  \
+           Ctrl+Alt+arrows move focus, Alt+w closes, Ctrl+Tab cycles;\n  \
+           see `bitty config check` for the active table.\n\
          \n\
          Modes:\n  \
            headless         Surface::headless software present, no display/GPU.\n  \
@@ -930,8 +938,17 @@ fn starter_init_lua() -> &'static str {
     "-- bitty user configuration (Lua, wezterm-style).\n\
      -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
      -- Unknown keys fail closed; validate with `bitty config check`.\n\
+     --\n\
+     -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
+     -- consumed by its action and never reaches the shell; unbound keys\n\
+     -- (Tab, arrows, plain letters) always go to the shell. Defaults ship\n\
+     -- Alt+h/j/k/l + Ctrl+Alt+arrows for focus, Alt+w to close;\n\
+     -- uncomment to override (context + chord identity replaces the default):\n\
      return {\n\
      \x20\x20theme = \"dark\",\n\
+     \x20\x20-- keymaps = {\n\
+     \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
+     \x20\x20-- },\n\
      }\n"
 }
 
@@ -1078,6 +1095,40 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         &src("keymaps")
                     )
                 );
+                // CLI-printable keymap introspection (DEC-0007): one row per
+                // resolved binding, `user` entries from the config file and
+                // the rest from the shipped defaults (CTX-0153).
+                match bitty_config::keymap::resolve_keymaps(e) {
+                    Ok(maps) => {
+                        for m in &maps {
+                            let origin = if m.from_default {
+                                String::from("default")
+                            } else {
+                                match &file_path {
+                                    Some(p) => format!("file: {}", p.display()),
+                                    None => String::from("file"),
+                                }
+                            };
+                            println!(
+                                "{}",
+                                check_row(
+                                    &format!("keymaps[{}]", m.id()),
+                                    format!(
+                                        "\"{}\" -> {} ({})",
+                                        m.chord.canonical(),
+                                        m.action.canonical(),
+                                        m.context
+                                    ),
+                                    &origin
+                                )
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("bitty config check: invalid keymaps: {err}");
+                        return 2;
+                    }
+                }
                 0
             }
             Err(msg) => {
@@ -1599,6 +1650,26 @@ fn spawn_demo_pty_pump_with_theme(
 // App handler
 // ---------------------------------------------------------------------------
 
+/// App-side modifier mirror for keymap matching (CTX-0153).
+///
+/// `KeyEvent` carries no modifier field (modifiers arrive as separate
+/// `ModifiersChanged` events plus modifier key presses), and `Runtime` keeps
+/// its own tracker for PTY encoding. The app mirrors the same stream so a
+/// bound chord (`alt+h`, `ctrl+tab`, ...) resolves before routing; both
+/// trackers stay in sync because modifier-only keys and `ModifiersChanged`
+/// are always routed to `Runtime` and never consumed as chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AppModifiers {
+    /// Shift held.
+    shift: bool,
+    /// Control held.
+    control: bool,
+    /// Alt held.
+    alt: bool,
+    /// Super held.
+    super_held: bool,
+}
+
 /// The Correct Terminal handler: owns `Runtime`, an optional window, and a
 /// bounded PTY pump (real PTY via `Runtime::poll_pty` plus synthetic fallback).
 /// All business stays in `bitty-runtime`; this type only wires
@@ -1615,12 +1686,23 @@ struct TerminalApp {
     _pty_thread: Option<JoinHandle<()>>,
     /// Count of `tick` calls that presented a frame.
     presented_frames: u64,
+    /// Resolved keymap table (shipped defaults + user overrides).
+    keymaps: Vec<bitty_config::ResolvedKeymap>,
+    /// App-side modifier mirror for chord matching.
+    app_mods: AppModifiers,
+    /// Layout stashed by `toggle_zoom`; `None` when not zoomed.
+    zoom_backup: Option<LayoutNode>,
 }
 
 impl TerminalApp {
     /// Theme-aware constructor: the demo fallback burst names the resolved
     /// preset and source so the live window proves its config path.
-    fn with_theme(runtime: Runtime, theme_name: &str, source: &str) -> Self {
+    fn with_theme(
+        runtime: Runtime,
+        theme_name: &str,
+        source: &str,
+        keymaps: Vec<bitty_config::ResolvedKeymap>,
+    ) -> Self {
         // Keep demo pump as fallback when no real PTY is spawned (headless CI,
         // tests). When a real PTY is spawned via `Runtime::spawn_shell`, the
         // real `poll_pty` path handles bytes and the demo pump just delivers a
@@ -1634,6 +1716,9 @@ impl TerminalApp {
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
+            keymaps,
+            app_mods: AppModifiers::default(),
+            zoom_backup: None,
         }
     }
 
@@ -1766,6 +1851,451 @@ impl TerminalApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keymap-driven chrome keys (CTX-0153 single-owner rule)
+// ---------------------------------------------------------------------------
+
+/// True for modifier-only keys: always routed to `Runtime` (its modifier
+/// tracker needs them) and never treated as chrome.
+fn is_modifier_key(key: &KeyEvent) -> bool {
+    matches!(
+        &key.logical_key,
+        LogicalKey::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+        )
+    )
+}
+
+/// Mirror the modifier stream into the app snapshot (same rules as
+/// `Runtime::track_modifiers_from_key`): modifier key presses latch, releases
+/// unlatch. Pure over the event; total.
+fn track_app_modifiers(mods: &mut AppModifiers, key: &KeyEvent) {
+    if let LogicalKey::Named(named) = &key.logical_key {
+        let pressed = key.state == PressState::Pressed;
+        match named {
+            NamedKey::Shift => mods.shift = pressed,
+            NamedKey::Control => mods.control = pressed,
+            NamedKey::Alt | NamedKey::AltGraph => mods.alt = pressed,
+            NamedKey::Super | NamedKey::Meta | NamedKey::Hyper => mods.super_held = pressed,
+            _ => {}
+        }
+    }
+}
+
+/// Convert a key press plus the app modifier mirror into a matchable
+/// [`bitty_config::KeyRef`]. Returns `None` for keys with no chord identity
+/// (dead keys, unidentified, media/modifier leftovers, non-ASCII text), which
+/// always route to the PTY. Single characters are lowercased so `Shift+Alt+H`
+/// matches the `shift+alt+h` chord.
+fn key_ref_from_event(key: &KeyEvent, mods: &AppModifiers) -> Option<bitty_config::KeyRef> {
+    use bitty_config::{KeyName, KeyRef};
+    let name = match &key.logical_key {
+        LogicalKey::Character(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if c.is_ascii_graphic() => KeyName::Char(c.to_ascii_lowercase()),
+                _ => return None,
+            }
+        }
+        LogicalKey::Named(named) => match named {
+            NamedKey::Tab => KeyName::Tab,
+            NamedKey::Enter => KeyName::Enter,
+            NamedKey::Escape => KeyName::Escape,
+            NamedKey::Space => KeyName::Space,
+            NamedKey::Backspace => KeyName::Backspace,
+            NamedKey::Delete => KeyName::Delete,
+            NamedKey::Insert => KeyName::Insert,
+            NamedKey::Home => KeyName::Home,
+            NamedKey::End => KeyName::End,
+            NamedKey::PageUp => KeyName::PageUp,
+            NamedKey::PageDown => KeyName::PageDown,
+            NamedKey::ArrowUp => KeyName::Up,
+            NamedKey::ArrowDown => KeyName::Down,
+            NamedKey::ArrowLeft => KeyName::Left,
+            NamedKey::ArrowRight => KeyName::Right,
+            _ => {
+                // Function keys `F1`..=`F35` share the `F<n>` debug spelling;
+                // everything else (modifiers, media, `Other`) has no chord
+                // identity and routes to the PTY.
+                let spelled = format!("{named:?}");
+                let n = spelled.strip_prefix('F')?;
+                match n.parse::<u8>() {
+                    Ok(num) if (1..=35).contains(&num) => KeyName::F(num),
+                    _ => return None,
+                }
+            }
+        },
+        LogicalKey::Dead(_) | LogicalKey::Unidentified => return None,
+    };
+    Some(KeyRef {
+        key: name,
+        ctrl: mods.control,
+        alt: mods.alt,
+        shift: mods.shift,
+        super_held: mods.super_held,
+    })
+}
+
+/// Map a split direction onto focus movement.
+fn split_dir_to_focus(dir: bitty_config::SplitDir) -> FocusDirection {
+    match dir {
+        bitty_config::SplitDir::Left => FocusDirection::Left,
+        bitty_config::SplitDir::Right => FocusDirection::Right,
+        bitty_config::SplitDir::Up => FocusDirection::Up,
+        bitty_config::SplitDir::Down => FocusDirection::Down,
+    }
+}
+
+/// Map a split direction onto the axis a new split divides.
+fn split_dir_to_axis(dir: bitty_config::SplitDir) -> SplitAxis {
+    match dir {
+        bitty_config::SplitDir::Left | bitty_config::SplitDir::Right => SplitAxis::Horizontal,
+        bitty_config::SplitDir::Up | bitty_config::SplitDir::Down => SplitAxis::Vertical,
+    }
+}
+
+/// Fresh view id: one past the current maximum (total; empty layouts yield 1).
+fn next_view_id(layout: &LayoutNode) -> ViewId {
+    let max = layout.leaf_ids().iter().map(|id| id.0).max().unwrap_or(0);
+    ViewId::new(max.saturating_add(1).max(1))
+}
+
+/// Split the focused leaf along `axis`, keeping the focused view and adding a
+/// fresh sibling. The new pane goes first for `Left`/`Up`, second otherwise.
+/// Returns false when the focused id is not in the tree.
+fn split_focused_leaf(
+    layout: &mut LayoutNode,
+    focused: ViewId,
+    axis: SplitAxis,
+    new_id: ViewId,
+    place_new_first: bool,
+) -> bool {
+    match layout {
+        LayoutNode::Leaf(v) => {
+            if v.id() != focused {
+                return false;
+            }
+            let old = v.clone();
+            let fresh = View::new(new_id, usize::from(old.cols()), usize::from(old.rows()));
+            let (first, second) = if place_new_first {
+                (LayoutNode::leaf(fresh), LayoutNode::leaf(old))
+            } else {
+                (LayoutNode::leaf(old), LayoutNode::leaf(fresh))
+            };
+            *layout = LayoutNode::split(axis, 0.5, first, second);
+            true
+        }
+        LayoutNode::Split { first, second, .. } => {
+            split_focused_leaf(first, focused, axis, new_id, place_new_first)
+                || split_focused_leaf(second, focused, axis, new_id, place_new_first)
+        }
+        LayoutNode::Stack(children) => children
+            .iter_mut()
+            .any(|c| split_focused_leaf(c, focused, axis, new_id, place_new_first)),
+        LayoutNode::Overlay { base, overlay, .. } => {
+            split_focused_leaf(base, focused, axis, new_id, place_new_first)
+                || split_focused_leaf(overlay, focused, axis, new_id, place_new_first)
+        }
+    }
+}
+
+/// Remove the focused leaf, promoting its sibling. Refuses the last leaf so
+/// the layout is never stranded empty. Returns false when refused or missing.
+fn close_focused_leaf(layout: &mut LayoutNode, focused: ViewId) -> bool {
+    match layout {
+        LayoutNode::Leaf(_) => false,
+        LayoutNode::Split { first, second, .. } => {
+            if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
+                let sibling = (**second).clone();
+                *layout = sibling;
+                true
+            } else if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == focused) {
+                let sibling = (**first).clone();
+                *layout = sibling;
+                true
+            } else if close_focused_leaf(first, focused) {
+                true
+            } else {
+                close_focused_leaf(second, focused)
+            }
+        }
+        LayoutNode::Stack(children) => {
+            if let Some(pos) = children
+                .iter()
+                .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == focused))
+            {
+                if children.len() <= 1 {
+                    return false;
+                }
+                children.remove(pos);
+                true
+            } else {
+                children.iter_mut().any(|c| close_focused_leaf(c, focused))
+            }
+        }
+        LayoutNode::Overlay { base, overlay, .. } => {
+            close_focused_leaf(base, focused) || close_focused_leaf(overlay, focused)
+        }
+    }
+}
+
+/// Record a candidate resize target: path to the deepest split whose axis
+/// matches the resize direction and whose subtree holds focus, plus its ratio
+/// and whether focus sits in its first child.
+fn find_resize_target(
+    node: &LayoutNode,
+    focused: ViewId,
+    horizontal: bool,
+    path: &mut Vec<usize>,
+    out: &mut Option<(Vec<usize>, f32, bool)>,
+) {
+    match node {
+        LayoutNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let axis_matches = (*axis == SplitAxis::Horizontal) == horizontal;
+            if first.leaf_ids().contains(&focused) {
+                if axis_matches {
+                    *out = Some((path.clone(), *ratio, true));
+                }
+                path.push(0);
+                find_resize_target(first, focused, horizontal, path, out);
+                path.pop();
+            } else if second.leaf_ids().contains(&focused) {
+                if axis_matches {
+                    *out = Some((path.clone(), *ratio, false));
+                }
+                path.push(1);
+                find_resize_target(second, focused, horizontal, path, out);
+                path.pop();
+            }
+        }
+        LayoutNode::Stack(children) => {
+            for (i, child) in children.iter().enumerate() {
+                if child.leaf_ids().contains(&focused) {
+                    path.push(i);
+                    find_resize_target(child, focused, horizontal, path, out);
+                    path.pop();
+                    break;
+                }
+            }
+        }
+        LayoutNode::Overlay { base, overlay, .. } => {
+            if base.leaf_ids().contains(&focused) {
+                path.push(0);
+                find_resize_target(base, focused, horizontal, path, out);
+                path.pop();
+            } else if overlay.leaf_ids().contains(&focused) {
+                path.push(1);
+                find_resize_target(overlay, focused, horizontal, path, out);
+                path.pop();
+            }
+        }
+        LayoutNode::Leaf(_) => {}
+    }
+}
+
+/// Nudge the enclosing split ratio 0.1 toward the given direction so the
+/// focused pane grows that way (`set_split_ratio_at` clamps to
+/// `0.10..=0.90`). Returns false when no matching split holds focus.
+fn resize_focused_pane(
+    layout: &mut LayoutNode,
+    focused: ViewId,
+    dir: bitty_config::SplitDir,
+) -> bool {
+    use bitty_config::SplitDir as D;
+    let horizontal = matches!(dir, D::Left | D::Right);
+    let mut out: Option<(Vec<usize>, f32, bool)> = None;
+    let mut path = Vec::new();
+    find_resize_target(layout, focused, horizontal, &mut path, &mut out);
+    let (target, ratio, focus_in_first) = match out {
+        Some(t) => t,
+        None => return false,
+    };
+    let positive = matches!(dir, D::Right | D::Down);
+    let delta = if focus_in_first == positive {
+        0.1
+    } else {
+        -0.1
+    };
+    layout.set_split_ratio_at(&target, ratio + delta)
+}
+
+impl TerminalApp {
+    /// Restore a zoomed layout before a tree-mutating action so the mutation
+    /// applies to the real tree instead of the single-leaf zoom view.
+    fn restore_zoom(&mut self) -> bool {
+        if let Some(backup) = self.zoom_backup.take() {
+            self.runtime.set_layout(backup);
+            eprintln!("bitty: zoom restored for layout mutation");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Execute one bound chrome action (single owner: the PTY never sees the
+    /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
+    /// refusals warn and keep the current layout.
+    fn apply_chrome_action(&mut self, action: bitty_config::ChromeAction) {
+        use bitty_config::ChromeAction as A;
+        match action {
+            A::GotoSplit(dir) => {
+                let focus = split_dir_to_focus(dir);
+                let next = self.runtime.move_focus(focus);
+                eprintln!(
+                    "bitty: keymap goto_split:{} -> {:?} leafs={}",
+                    dir.canonical(),
+                    next,
+                    self.runtime.leaf_count()
+                );
+            }
+            A::FocusNext => {
+                let next = self.runtime.move_focus(FocusDirection::Next);
+                eprintln!(
+                    "bitty: keymap focus_next -> {next:?} leafs={}",
+                    self.runtime.leaf_count()
+                );
+            }
+            A::FocusPrev => {
+                let next = self.runtime.move_focus(FocusDirection::Prev);
+                eprintln!(
+                    "bitty: keymap focus_prev -> {next:?} leafs={}",
+                    self.runtime.leaf_count()
+                );
+            }
+            A::FocusId(n) => {
+                let ok = self.runtime.set_focus(ViewId::new(n));
+                if ok {
+                    eprintln!("bitty: keymap focus:{n} -> focused");
+                } else {
+                    eprintln!(
+                        "warning: keymap focus:{n} not in layout (leaf ids {:?}) — ignoring",
+                        self.runtime.layout().leaf_ids()
+                    );
+                }
+            }
+            A::NewSplit(dir) => {
+                self.restore_zoom();
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap new_split has no focused pane — ignoring");
+                        return;
+                    }
+                };
+                let mut layout = self.runtime.layout().clone();
+                let new_id = next_view_id(&layout);
+                let place_new_first = matches!(
+                    dir,
+                    bitty_config::SplitDir::Left | bitty_config::SplitDir::Up
+                );
+                if split_focused_leaf(
+                    &mut layout,
+                    focused,
+                    split_dir_to_axis(dir),
+                    new_id,
+                    place_new_first,
+                ) {
+                    self.runtime.set_layout(layout);
+                    eprintln!(
+                        "bitty: keymap new_split:{} -> leafs={} focused={:?}",
+                        dir.canonical(),
+                        self.runtime.leaf_count(),
+                        self.runtime.focused_view()
+                    );
+                } else {
+                    eprintln!("warning: keymap new_split found no focused pane — ignoring");
+                }
+            }
+            A::CloseView => {
+                self.restore_zoom();
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap close_view has no focused pane — ignoring");
+                        return;
+                    }
+                };
+                if self.runtime.leaf_count() <= 1 {
+                    eprintln!("warning: keymap close_view refused (last pane) — ignoring");
+                    return;
+                }
+                let mut layout = self.runtime.layout().clone();
+                if close_focused_leaf(&mut layout, focused) {
+                    self.runtime.set_layout(layout);
+                    eprintln!(
+                        "bitty: keymap close_view -> leafs={} focused={:?}",
+                        self.runtime.leaf_count(),
+                        self.runtime.focused_view()
+                    );
+                } else {
+                    eprintln!("warning: keymap close_view found no focused pane — ignoring");
+                }
+            }
+            A::ResizeSplit(dir) => {
+                self.restore_zoom();
+                let focused = match self.runtime.focused_view() {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("warning: keymap resize_split has no focused pane — ignoring");
+                        return;
+                    }
+                };
+                let mut layout = self.runtime.layout().clone();
+                if resize_focused_pane(&mut layout, focused, dir) {
+                    self.runtime.set_layout(layout);
+                    eprintln!("bitty: keymap resize_split:{} applied", dir.canonical());
+                } else {
+                    eprintln!(
+                        "warning: keymap resize_split:{} found no matching split — ignoring",
+                        dir.canonical()
+                    );
+                }
+            }
+            A::ToggleZoom => {
+                if let Some(backup) = self.zoom_backup.take() {
+                    self.runtime.set_layout(backup);
+                    eprintln!(
+                        "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
+                        self.runtime.leaf_count(),
+                        self.runtime.focused_view()
+                    );
+                } else {
+                    let focused = match self.runtime.focused_view() {
+                        Some(id) => id,
+                        None => {
+                            eprintln!("warning: keymap toggle_zoom has no focused pane — ignoring");
+                            return;
+                        }
+                    };
+                    match self.runtime.layout().find_leaf(focused).cloned() {
+                        Some(view) => {
+                            let backup = self.runtime.layout().clone();
+                            self.runtime.set_layout(LayoutNode::leaf(view));
+                            self.zoom_backup = Some(backup);
+                            eprintln!("bitty: keymap toggle_zoom on -> {focused:?}");
+                        }
+                        None => {
+                            eprintln!(
+                                "warning: keymap toggle_zoom found no focused pane — ignoring"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl AppHandler for TerminalApp {
     fn set_event_waker(&mut self, waker: EventWaker) {
         // Bridge the platform proxy into the runtime's bounded wakeup pump:
@@ -1786,6 +2316,40 @@ impl AppHandler for TerminalApp {
         // Bounded PTY pump: drain before handling the event so fresh bytes are
         // visible to the state machine before the tick.
         self.poll_pty_pump();
+
+        // CTX-0153 single-owner intercept: resolve bound chrome keys BEFORE
+        // `Runtime` routing. A bound chord is consumed here — its action runs
+        // and the PTY never sees the key — while unbound keys (Tab, arrows,
+        // plain letters) fall through to `Runtime` (shell input). Modifier
+        // tracking stays in sync because modifier-only keys and
+        // `ModifiersChanged` are always routed, never consumed.
+        if let PlatformEvent::Window { window_id: _, kind } = &event {
+            if let WindowEventKind::KeyboardInput(key) = kind {
+                track_app_modifiers(&mut self.app_mods, key);
+                if !is_modifier_key(key) && key.state == PressState::Pressed {
+                    if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
+                        if let Some(action) = bitty_config::match_keymap(&self.keymaps, keyref) {
+                            // Repeats of a bound chord stay owned by chrome
+                            // (no action, no PTY bytes).
+                            if !key.repeat {
+                                self.apply_chrome_action(action);
+                            }
+                            if let Some(win) = self.window.as_ref() {
+                                win.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+            } else if let WindowEventKind::ModifiersChanged(mods) = kind {
+                self.app_mods = AppModifiers {
+                    shift: mods.shift,
+                    control: mods.control,
+                    alt: mods.alt,
+                    super_held: mods.super_pressed,
+                };
+            }
+        }
 
         // Shutdown handling: PlatformEvent::Exiting or CloseRequested/Closed
         // ask the handler to exit the loop.
@@ -1855,74 +2419,11 @@ impl AppHandler for TerminalApp {
                 }
             }
             PlatformEvent::Window { window_id: _, kind } => {
-                // Keyboard focus movement (thin shortcut handling; keeps app free of input-encoding policy).
-                // The input-encoding slice (keymaps/IME) lives elsewhere; this is only deterministic
-                // focus traversal over the owned layout, proven headlessly via --focus and via tick.
-                if let WindowEventKind::KeyboardInput(key) = &kind {
-                    if key.state == PressState::Pressed && !key.repeat {
-                        let mut handled = false;
-                        match &key.logical_key {
-                            LogicalKey::Named(NamedKey::Tab) => {
-                                self.runtime.move_focus(FocusDirection::Next);
-                                handled = true;
-                            }
-                            LogicalKey::Named(NamedKey::ArrowRight) => {
-                                self.runtime.move_focus(FocusDirection::Right);
-                                handled = true;
-                            }
-                            LogicalKey::Named(NamedKey::ArrowLeft) => {
-                                self.runtime.move_focus(FocusDirection::Left);
-                                handled = true;
-                            }
-                            LogicalKey::Named(NamedKey::ArrowUp) => {
-                                self.runtime.move_focus(FocusDirection::Up);
-                                handled = true;
-                            }
-                            LogicalKey::Named(NamedKey::ArrowDown) => {
-                                self.runtime.move_focus(FocusDirection::Down);
-                                handled = true;
-                            }
-                            LogicalKey::Character(s) => {
-                                let low = s.to_ascii_lowercase();
-                                match low.as_str() {
-                                    "n" => {
-                                        self.runtime.move_focus(FocusDirection::Next);
-                                        handled = true;
-                                    }
-                                    "p" => {
-                                        self.runtime.move_focus(FocusDirection::Prev);
-                                        handled = true;
-                                    }
-                                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" => {
-                                        if let Ok(num) = low.parse::<u64>() {
-                                            self.runtime.set_focus(ViewId::new(num));
-                                            handled = true;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
-                        if handled {
-                            eprintln!(
-                                "bitty: keyboard focus -> {:?} leafs={} (key={:?})",
-                                self.runtime.focused_view(),
-                                self.runtime.leaf_count(),
-                                key.logical_key
-                            );
-                            // Request redraw so the next AboutToWait/RedrawRequested will tick layout-aware.
-                            // Focus itself does not dirty generation, but the next tick after set_layout's
-                            // pending_full_redraw already presented; for keyboard moves we still request
-                            // redraw to keep frame-on-demand honest (no periodic wakeups).
-                            if let Some(win) = self.window.as_ref() {
-                                win.request_redraw();
-                            }
-                        }
-                    }
-                }
                 // `handle_platform_event` already routed Resized /
-                // ScaleFactorChanged / CloseRequested / RedrawRequested.
+                // ScaleFactorChanged / CloseRequested / RedrawRequested /
+                // KeyboardInput (unbound keys to the PTY; bound chords were
+                // consumed by the single-owner intercept above and return
+                // early, so no focus matcher lives here anymore).
                 // Request a tick on redraw and after resize.
                 match kind {
                     WindowEventKind::Resized(_) | WindowEventKind::ScaleFactorChanged(_) => {
@@ -2059,6 +2560,19 @@ fn main() {
         "bitty: theme '{}' (resolution={:?} source={})",
         app_config.theme.name, app_config.resolution, app_config.source
     );
+    // CTX-0153: resolve the keymap table (shipped defaults + user overrides).
+    // Unknown actions/chords fail closed here exactly as in `config check`;
+    // the merge already validated entries, so this is defense in depth.
+    let keymaps = match bitty_config::resolve_keymaps(&app_config.effective) {
+        Ok(maps) => {
+            eprintln!("bitty: keymaps resolved ({} entries)", maps.len());
+            maps
+        }
+        Err(err) => {
+            eprintln!("bitty: invalid keymaps: {err}");
+            std::process::exit(2);
+        }
+    };
     let runtime_cfg = match runtime_config_from_effective(&app_config.effective) {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -2160,7 +2674,7 @@ fn main() {
     // reflows the LayoutNode into the container and composites per-leaf via
     // the headless software seam (deterministic RGBA) until a real
     // SurfaceTarget is attached in a future slice.
-    let app = TerminalApp::with_theme(runtime, app_config.theme.name, app_config.source);
+    let app = TerminalApp::with_theme(runtime, app_config.theme.name, app_config.source, keymaps);
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {
@@ -2392,8 +2906,12 @@ mod tests {
     #[test]
     fn terminal_app_poll_and_tick_are_total() {
         let rt = Runtime::with_defaults().expect("must build");
-        let mut app =
-            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+        );
         // Poll the synthetic pump and drive a tick — must not panic and must
         // consume the channel without deadlocking.
         let consumed = app.poll_pty_pump();
@@ -2401,8 +2919,12 @@ mod tests {
         let _ = app.drive_tick();
         // Second tick without new bytes should be idle (frame-on-demand).
         let rt2 = Runtime::with_defaults().expect("must build");
-        let mut app2 =
-            TerminalApp::with_theme(rt2, bitty_config::theme::DEFAULT_THEME_NAME, "default");
+        let mut app2 = TerminalApp::with_theme(
+            rt2,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+        );
         let _ = app2.drive_tick();
         // After first present the second idle tick in the same app may be None.
         // We do not assert presence, only totality (no panic).
@@ -2879,5 +3401,198 @@ mod tests {
         assert!(text.contains("file"));
         // Still exercises the green SGR through the themed palette.
         assert!(text.contains("green"));
+    }
+
+    // CTX-0153 keymap-driven chrome keys: single-owner rule + layout surgery.
+    // -----------------------------------------------------------------------
+
+    fn test_key(logical: LogicalKey) -> KeyEvent {
+        KeyEvent {
+            logical_key: logical,
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        }
+    }
+
+    fn test_char_key(s: &str) -> KeyEvent {
+        test_key(LogicalKey::Character(s.to_string()))
+    }
+
+    #[test]
+    fn modifier_keys_route_never_chrome() {
+        for named in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::Super,
+            NamedKey::Meta,
+        ] {
+            assert!(is_modifier_key(&test_key(LogicalKey::Named(named))));
+        }
+        assert!(!is_modifier_key(&test_key(LogicalKey::Named(
+            NamedKey::Tab
+        ))));
+        assert!(!is_modifier_key(&test_char_key("h")));
+    }
+
+    #[test]
+    fn app_modifier_mirror_latches_and_releases() {
+        let mut mods = AppModifiers::default();
+        let mut press = test_key(LogicalKey::Named(NamedKey::Alt));
+        track_app_modifiers(&mut mods, &press);
+        assert!(mods.alt);
+        press.state = PressState::Released;
+        track_app_modifiers(&mut mods, &press);
+        assert!(!mods.alt);
+        // Non-modifier keys leave the mirror alone.
+        track_app_modifiers(&mut mods, &test_char_key("h"));
+        assert_eq!(mods, AppModifiers::default());
+    }
+
+    #[test]
+    fn key_ref_mapping_covers_chords_and_shell_keys() {
+        use bitty_config::KeyName;
+        let plain = AppModifiers::default();
+        let with_alt = AppModifiers {
+            alt: true,
+            ..Default::default()
+        };
+        // alt+h resolves to the matchable chord.
+        let r = key_ref_from_event(&test_char_key("h"), &with_alt).expect("matchable");
+        assert_eq!(r.key, KeyName::Char('h'));
+        assert!(r.alt && !r.ctrl);
+        // Shift+uppercase letter normalizes to the lowercase chord key.
+        let with_shift_alt = AppModifiers {
+            shift: true,
+            alt: true,
+            ..Default::default()
+        };
+        let r = key_ref_from_event(&test_char_key("H"), &with_shift_alt).expect("matchable");
+        assert_eq!(r.key, KeyName::Char('h'));
+        // Named keys map; modifier/media leftovers and dead keys do not.
+        let r = key_ref_from_event(&test_key(LogicalKey::Named(NamedKey::Tab)), &plain)
+            .expect("tab matchable");
+        assert_eq!(r.key, KeyName::Tab);
+        assert!(
+            key_ref_from_event(&test_key(LogicalKey::Named(NamedKey::Shift)), &plain).is_none()
+        );
+        assert!(key_ref_from_event(&test_key(LogicalKey::Dead(None)), &plain).is_none());
+        assert!(key_ref_from_event(&test_key(LogicalKey::Unidentified), &plain).is_none());
+        assert!(key_ref_from_event(&test_char_key("ab"), &plain).is_none());
+    }
+
+    #[test]
+    fn single_owner_unbound_keys_reach_shell() {
+        use bitty_config::{KeyName, KeyRef, match_keymap, resolve_keymaps};
+        let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+        let shell = |key: KeyName, ctrl: bool, alt: bool, shift: bool| KeyRef {
+            key,
+            ctrl,
+            alt,
+            shift,
+            super_held: false,
+        };
+        // The stolen keys from #249: plain Tab/arrows/letters/digits plus
+        // Ctrl+P (0x10 via CTX-0154) must all stay shell input by default.
+        for k in [
+            shell(KeyName::Tab, false, false, false),
+            shell(KeyName::Up, false, false, false),
+            shell(KeyName::Down, false, false, false),
+            shell(KeyName::Left, false, false, false),
+            shell(KeyName::Right, false, false, false),
+            shell(KeyName::Char('n'), false, false, false),
+            shell(KeyName::Char('p'), false, false, false),
+            shell(KeyName::Char('1'), false, false, false),
+            shell(KeyName::Char('p'), true, false, false),
+        ] {
+            assert_eq!(match_keymap(&maps, k), None, "shell key {k:?}");
+        }
+        // Bound chords resolve to exactly one action each.
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('h'), false, true, false)),
+            Some(bitty_config::ChromeAction::GotoSplit(
+                bitty_config::SplitDir::Left
+            ))
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Tab, true, false, false)),
+            Some(bitty_config::ChromeAction::FocusNext)
+        );
+    }
+
+    fn two_pane_layout() -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        )
+    }
+
+    #[test]
+    fn chrome_focus_actions_move_runtime_focus() {
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app =
+            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default", maps);
+        app.runtime.set_layout(two_pane_layout());
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        app.apply_chrome_action(ChromeAction::FocusPrev);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::FocusId(2));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        // Unknown id warns and keeps focus.
+        app.apply_chrome_action(ChromeAction::FocusId(99));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+    }
+
+    #[test]
+    fn chrome_split_close_resize_zoom_round_trip() {
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app =
+            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default", maps);
+        app.runtime.set_layout(two_pane_layout());
+        // Split focused pane right: 2 -> 3 leaves, focus stays.
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        // Resize nudges without changing leaf count.
+        app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        // Zoom collapses to one leaf and restores the tree.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 3);
+        // Close removes the focused leaf and refocuses inside the tree.
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(app.runtime.focused_view().is_some());
+        // Last pane refuses to close.
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    #[test]
+    fn close_last_leaf_helper_refuses() {
+        let mut single = LayoutNode::leaf(View::new(ViewId::new(1), 80, 24));
+        assert!(!close_focused_leaf(&mut single, ViewId::new(1)));
+        assert!(!close_focused_leaf(&mut single, ViewId::new(9)));
+        let mut two = two_pane_layout();
+        assert!(!close_focused_leaf(&mut two, ViewId::new(9)));
+        assert!(close_focused_leaf(&mut two, ViewId::new(2)));
+        assert_eq!(two.leaf_count(), 1);
     }
 }

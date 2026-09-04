@@ -99,7 +99,7 @@ fn shutdown_kills_and_reaps_in_one_step() {
 }
 
 #[test]
-fn child_environment_is_minimal_allowlist_only() {
+fn child_environment_inherits_session_with_overrides() {
     let mut pty = PtyBuilder::new("/usr/bin/env")
         .env("BITTY_PROBE", "1")
         .spawn()
@@ -172,19 +172,54 @@ fn child_environment_is_minimal_allowlist_only() {
         "default TERM missing from {text:?} normalized {normalized:?}"
     );
     assert!(
+        normalized.iter().any(|l| l == "COLORTERM=truecolor")
+            || text.contains("COLORTERM=truecolor"),
+        "default COLORTERM missing from {text:?} normalized {normalized:?}"
+    );
+    assert!(
         normalized.iter().any(|l| l == "BITTY_PROBE=1") || text.contains("BITTY_PROBE=1"),
         "allowlisted entry missing from {text:?} normalized {normalized:?}"
     );
-    for line in &normalized {
-        if !line.contains('=') {
-            continue;
-        }
-        let key = line.split('=').next().unwrap_or("").trim();
-        assert!(
-            matches!(key, "TERM" | "BITTY_PROBE" | "SHELL"),
-            "child leaked environment entry {line:?}; allowlist violated (full {text:?}) normalized {normalized:?}"
-        );
-    }
+    // Verify child inherits environment entries from parent (e.g. PATH is always present)
+    assert!(
+        normalized.iter().any(|l| l.starts_with("PATH=")) || text.contains("PATH="),
+        "inherited PATH missing from child environment: {text:?} normalized {normalized:?}"
+    );
+}
+
+#[test]
+fn child_environment_builder_overrides_defaults() {
+    let mut pty = PtyBuilder::new("/usr/bin/env")
+        .env("TERM", "custom-256color")
+        .env("COLORTERM", "custom-color")
+        .spawn()
+        .expect("spawn env");
+
+    let reader = pty.take_reader().expect("reader half");
+    let writer = pty.take_writer().expect("writer half");
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let output = drain(&reader, deadline);
+    reader.join().expect("pump clean");
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("TERM=custom-256color"),
+        "expected custom TERM override in {text:?}"
+    );
+    assert!(
+        text.contains("COLORTERM=custom-color"),
+        "expected custom COLORTERM override in {text:?}"
+    );
+    assert!(
+        !text.contains("TERM=xterm-256color"),
+        "default TERM should have been overridden in {text:?}"
+    );
+    assert!(
+        !text.contains("COLORTERM=truecolor"),
+        "default COLORTERM should have been overridden in {text:?}"
+    );
 }
 
 #[test]

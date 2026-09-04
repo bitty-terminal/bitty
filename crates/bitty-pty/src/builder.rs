@@ -5,9 +5,10 @@
 //!
 //! - **Direct argv exec.** The program plus argument vector is passed to the
 //!   platform exec path verbatim; no shell, no interpolation, ever.
-//! - **Minimal child environment.** The inherited environment is stripped;
-//!   only explicitly allowlisted entries are forwarded, plus a single
-//!   `TERM` entry by default (override via [`PtyBuilder::env`]).
+//! - **Inherited session environment with overrides.** Children inherit the
+//!   session environment by default (DEC-0017, Ghostty/Alacritty reference);
+//!   explicit builder entries (`TERM=xterm-256color`, `COLORTERM=truecolor`,
+//!   and caller additions via [`PtyBuilder::env`]) override.
 //! - **Bounded configuration.** Argument count/size and allowlist size/value
 //!   length are capped so a misconfigured caller cannot smuggle unbounded
 //!   data into spawn.
@@ -38,6 +39,9 @@ pub const DEFAULT_ROWS: u16 = 24;
 
 /// Default `TERM` value set in the child environment.
 pub const DEFAULT_TERM: &str = "xterm-256color";
+
+/// Default `COLORTERM` value set in the child environment.
+pub const DEFAULT_COLORTERM: &str = "truecolor";
 
 /// Validated spawn configuration handed to the platform backend.
 //
@@ -77,15 +81,21 @@ impl PtyBuilder {
     /// executable (absolute path recommended; bare names resolve through the
     /// standard PATH search without any shell involvement).
     ///
-    /// Defaults: 80x24 size, inherited working directory, and a minimal
-    /// environment of exactly one variable (`TERM=xterm-256color`). Every
-    /// other environment entry must be added explicitly with
-    /// [`PtyBuilder::env`].
+    /// Defaults: 80x24 size, inherited working directory, and default
+    /// overrides (`TERM=xterm-256color`, `COLORTERM=truecolor`). The child
+    /// process inherits the session environment by default (DEC-0017); any
+    /// entry added via [`PtyBuilder::env`] overrides the inherited value.
     pub fn new(program: impl Into<OsString>) -> Self {
         PtyBuilder {
             program: program.into(),
             args: Vec::new(),
-            env: vec![(OsString::from("TERM"), OsString::from(DEFAULT_TERM))],
+            env: vec![
+                (OsString::from("TERM"), OsString::from(DEFAULT_TERM)),
+                (
+                    OsString::from("COLORTERM"),
+                    OsString::from(DEFAULT_COLORTERM),
+                ),
+            ],
             cwd: None,
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
@@ -265,11 +275,13 @@ mod tests {
     }
 
     #[test]
-    fn default_env_is_minimal_term_only() {
+    fn default_env_contains_term_and_colorterm() {
         let cfg = valid_builder().validate().unwrap();
-        assert_eq!(cfg.env.len(), 1);
+        assert_eq!(cfg.env.len(), 2);
         assert_eq!(cfg.env[0].0, OsString::from("TERM"));
         assert_eq!(cfg.env[0].1, OsString::from(DEFAULT_TERM));
+        assert_eq!(cfg.env[1].0, OsString::from("COLORTERM"));
+        assert_eq!(cfg.env[1].1, OsString::from(DEFAULT_COLORTERM));
     }
 
     #[test]
@@ -280,9 +292,9 @@ mod tests {
             .env("A", "3")
             .validate()
             .unwrap();
-        assert_eq!(cfg.env.len(), 3); // TERM + A + B
-        assert_eq!(cfg.env[1], (OsString::from("A"), OsString::from("3")));
-        assert_eq!(cfg.env[2], (OsString::from("B"), OsString::from("2")));
+        assert_eq!(cfg.env.len(), 4); // TERM + COLORTERM + A + B
+        assert_eq!(cfg.env[2], (OsString::from("A"), OsString::from("3")));
+        assert_eq!(cfg.env[3], (OsString::from("B"), OsString::from("2")));
     }
 
     #[test]

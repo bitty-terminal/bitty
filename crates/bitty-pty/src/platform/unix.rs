@@ -61,9 +61,8 @@ pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child)
     if let Some(cwd) = &config.cwd {
         command.cwd(cwd);
     }
-    // Strip the inherited environment entirely, then forward exactly the
-    // validated allowlist. See module docs for the single SHELL exception.
-    command.env_clear();
+    // Inherit the session environment by default (DEC-0017, Ghostty/Alacritty reference).
+    // Explicit builder entries (TERM, COLORTERM, and caller additions) override.
     for (key, value) in &config.env {
         command.env(key, value);
     }

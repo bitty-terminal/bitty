@@ -22,9 +22,10 @@
 //!
 //! - **No shell interpolation.** [`PtyBuilder`] spawns the program from a
 //!   direct argv vector; there is no code path that routes through a shell.
-//! - **Minimal child environment.** The inherited environment is stripped;
-//!   children receive only explicitly allowlisted entries plus a default
-//!   `TERM=xterm-256color` (see [`builder`] for the exact rules and limits).
+//! - **Inherited session environment with overrides.** Children inherit the
+//!   session environment by default (DEC-0017, Ghostty/Alacritty reference),
+//!   with default `TERM=xterm-256color` and `COLORTERM=truecolor` entries
+//!   overriding or augmenting the inherited environment.
 //! - **fd hygiene.** On Unix the wrapped layer opens both PTY descriptors
 //!   close-on-exec, resets inherited signal dispositions, and starts the
 //!   child in a fresh session with the PTY as controlling terminal.
@@ -92,6 +93,7 @@ mod pty;
 mod reader;
 mod writer;
 
+pub use builder::DEFAULT_COLORTERM;
 pub use builder::DEFAULT_COLS;
 pub use builder::DEFAULT_ROWS;
 pub use builder::DEFAULT_TERM;

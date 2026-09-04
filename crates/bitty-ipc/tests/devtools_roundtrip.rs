@@ -14,25 +14,39 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitty_ipc::PeerCredentials;
 use bitty_ipc::devtools::{
-    Dispatcher, ServeContext, ServerInfo, prepare_socket_dir, serve_connection,
+    Dispatcher, MAX_SOCKET_PATH_BYTES, SUN_LEN_MACOS, ServeContext, ServerInfo, prepare_socket_dir,
+    serve_connection, transport_attested_peer,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
 
 fn temp_socket_path(tag: &str) -> String {
+    // Portable AF_UNIX paths: macOS SUN_LEN is 104 incl. NUL (Linux 108), so
+    // keep payload < 100 bytes with a short /tmp leaf plus short file name.
+    // `/tmp` is used directly (not `temp_dir`, which is long on CI runners).
+    let short = match tag {
+        "roundtrip" => "rt",
+        "oversize" => "ov",
+        "stale" => "st",
+        other => other,
+    };
     let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("bitty-ctx0144-e2e-{pid}-{nanos}-{tag}"));
-    dir.join("bitty")
-        .join(format!("{tag}.sock"))
-        .to_str()
-        .unwrap()
-        .to_string()
+    let path = format!("/tmp/bt{pid}{short}/s.sock");
+    assert!(
+        path.len() < 100,
+        "socket path must fit macOS SUN_LEN: {path} ({} bytes)",
+        path.len()
+    );
+    assert!(
+        path.len() <= MAX_SOCKET_PATH_BYTES,
+        "socket path exceeds portable bound: {path}"
+    );
+    assert!(
+        path.len() < SUN_LEN_MACOS,
+        "socket path must fit macOS SUN_LEN 104 incl. NUL: {path}"
+    );
+    path
 }
 
 fn read_framed(stream: &mut UnixStream) -> String {
@@ -58,11 +72,8 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let peer = PeerCredentials::new(
-            unit_owner_uid(&socket_path),
-            unit_owner_uid(&socket_path),
-            0,
-        );
+        // Accept-boundary auth: attested marker only, no raw credentials.
+        let verified = transport_attested_peer(unit_owner_uid(&socket_path));
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("e2e".to_string(), socket_path.clone(), 80, 24);
         let context = ServeContext::new(&server);
@@ -75,8 +86,7 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         };
         let stats = serve_connection(
             &mut stream,
-            peer,
-            unit_owner_uid(&socket_path),
+            verified,
             &dispatcher,
             &context,
             &mut limiter,

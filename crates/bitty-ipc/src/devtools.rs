@@ -60,9 +60,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::auth::VerifiedPeer;
 #[cfg(unix)]
 use crate::auth::{DIR_MODE, SOCKET_MODE};
-use crate::auth::{PeerCredentials, verify_peer_uid};
 use crate::error::IpcError;
 use crate::frame::{MAX_FRAME_BYTES, encode_frame};
 use crate::limits::{RC9_MAX_CONNECTIONS, RateLimiter};
@@ -77,8 +77,23 @@ pub const DEVTOOLS_PROTOCOL_VERSION: &str = "1.0";
 /// Required method prefix (`protocol.ts` `encodeRequest` rule).
 pub const DEVTOOLS_METHOD_PREFIX: &str = "bitty.debug/";
 
-/// Maximum bytes for `BITTY_SOCKET` (`auth.ts` rejects paths over 512).
-pub const MAX_SOCKET_PATH_BYTES: usize = 512;
+/// Portable `AF_UNIX` socket-path ceiling in payload bytes (excl. NUL).
+///
+/// `sockaddr_un.sun_path` is 108 bytes incl. NUL on Linux and 104 bytes incl.
+/// NUL on macOS/BSD (`SUN_LEN`; macOS limit documented in `sys/un.h`, Linux
+/// in `unix(7)`). A 100-byte payload (101 incl. NUL) fits every target with
+/// margin, including smaller historical limits (92). This intentionally
+/// diverges from `auth.ts`'s 512-byte advisory check: 512 is wrong for
+/// `bind`/`connect`, which fail with `EINVAL`/`InvalidInput` ("path must be
+/// shorter than SUN_LEN") past the kernel bound. All socket paths produced or
+/// accepted here must fit this portable bound.
+pub const MAX_SOCKET_PATH_BYTES: usize = 100;
+
+/// `sun_path` size incl. NUL on Linux (108) per `unix(7)`.
+pub const SUN_LEN_LINUX: usize = 108;
+
+/// `sun_path` size incl. NUL on macOS/BSD (104) per `sys/un.h`.
+pub const SUN_LEN_MACOS: usize = 104;
 
 /// Maximum length of an instance id (`auth.ts`: 1..64).
 pub const MAX_INSTANCE_ID_LEN: usize = 64;
@@ -121,24 +136,33 @@ pub const ACCEPT_POLL_INTERVAL_MS: u64 = 20;
 
 // ── socket path ─────────────────────────────────────────────────────────────
 
-/// Resolve the Unix socket path exactly as `bitty-devtools/src/auth.ts`
-/// `resolveSocketPath` does (parity, byte-based lengths documented below).
+/// Resolve the Unix socket path with `auth.ts` precedence but a portable
+/// `AF_UNIX` bound.
 ///
 /// Precedence: non-empty `bitty_socket` (`BITTY_SOCKET`, advisory) wins
 /// verbatim; otherwise `<base>/bitty/<instance>.sock` where `base` is
 /// `xdg_runtime_dir` (`XDG_RUNTIME_DIR`) or `/run/user/<uid>`, and `instance`
 /// is `instance_id` (`BITTY_INSTANCE_ID`) or `"default"`.
 ///
-/// Validation mirrors the sibling: socket paths over 512 bytes or containing
-/// NUL are rejected; instance ids must be 1..=64 ASCII alphanumeric/`-`/`_`
-/// (`auth.ts` regex `^[a-z0-9_-]+$`, case-insensitive). Lengths are measured
-/// in bytes here (Rust) rather than UTF-16 code units (TypeScript); for the
-/// ASCII paths this contract admits, the two agree.
+/// Validation: socket paths over [`MAX_SOCKET_PATH_BYTES`] payload bytes or
+/// containing NUL are rejected fail-closed; instance ids must be 1..=64 ASCII
+/// alphanumeric/`-`/`_` (`auth.ts` regex `^[a-z0-9_-]+$`, case-insensitive).
+/// Lengths are measured in bytes here (Rust) rather than UTF-16 code units
+/// (TypeScript); for the ASCII paths this contract admits, the two agree.
+///
+/// When the constructed `<base>/bitty/<instance>.sock` exceeds the portable
+/// bound, the instance id is clamped to a deterministic 16-hex FNV-1a hash
+/// (`<base>/bitty/<hash>.sock`) to keep short names stable; when even the
+/// hashed form is too long the base directory itself is too long and
+/// resolution fails closed with a clear `AF_UNIX`/`SUN_LEN` error. `auth.ts`
+/// parity is precedence and instance grammar only: its 512-byte length check
+/// is not portable to `bind` (Linux 108 / macOS 104 incl. NUL) and is not
+/// adopted here.
 ///
 /// # Errors
 ///
-/// Returns [`IpcError::InvalidRequest`] for overlong/NUL paths and invalid
-/// instance ids.
+/// Returns [`IpcError::InvalidRequest`] for overlong/NUL paths, invalid
+/// instance ids, and overlong base directories.
 pub fn resolve_socket_path(
     runtime_uid: u32,
     xdg_runtime_dir: Option<&str>,
@@ -147,17 +171,17 @@ pub fn resolve_socket_path(
 ) -> Result<String, IpcError> {
     if let Some(sock) = bitty_socket {
         if !sock.is_empty() {
-            if sock.len() > MAX_SOCKET_PATH_BYTES {
-                return Err(IpcError::InvalidRequest {
-                    reason: format!(
-                        "BITTY_SOCKET path too long ({} > {MAX_SOCKET_PATH_BYTES})",
-                        sock.len()
-                    ),
-                });
-            }
             if sock.contains('\0') {
                 return Err(IpcError::InvalidRequest {
                     reason: "BITTY_SOCKET contains NUL".into(),
+                });
+            }
+            if sock.len() > MAX_SOCKET_PATH_BYTES {
+                return Err(IpcError::InvalidRequest {
+                    reason: format!(
+                        "BITTY_SOCKET path too long for AF_UNIX ({} > {MAX_SOCKET_PATH_BYTES} payload bytes; portable SUN_LEN: Linux {SUN_LEN_LINUX} / macOS {SUN_LEN_MACOS} incl. NUL)",
+                        sock.len()
+                    ),
                 });
             }
             return Ok(sock.to_string());
@@ -169,7 +193,40 @@ pub fn resolve_socket_path(
         Some(dir) if !dir.is_empty() => dir.to_string(),
         _ => format!("/run/user/{runtime_uid}"),
     };
-    Ok(format!("{base}/{SOCKET_LEAF_DIR}/{instance}.sock"))
+    let direct = format!("{base}/{SOCKET_LEAF_DIR}/{instance}.sock");
+    if direct.len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(direct);
+    }
+    let hashed = format!(
+        "{base}/{SOCKET_LEAF_DIR}/{}.sock",
+        short_instance_hash(instance)
+    );
+    if hashed.len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(hashed);
+    }
+    Err(IpcError::InvalidRequest {
+        reason: format!(
+            "socket base dir too long for AF_UNIX ({} > {MAX_SOCKET_PATH_BYTES} payload bytes even with hashed instance; portable SUN_LEN: Linux {SUN_LEN_LINUX} / macOS {SUN_LEN_MACOS} incl. NUL; shorten XDG_RUNTIME_DIR or set BITTY_SOCKET)",
+            hashed.len()
+        ),
+    })
+}
+
+/// Deterministic 64-bit FNV-1a hash rendered as 16 lowercase hex chars.
+///
+/// `std`-only (no new dependencies): used solely to clamp long instance ids
+/// into short, stable socket leaf names that fit the portable `AF_UNIX`
+/// bound. Not a security hash; collision handling is fail-soft via live
+/// socket reclaim in the servo.
+fn short_instance_hash(instance: &str) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in instance.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// Validate an instance id per `auth.ts` (`1..64`, `^[a-z0-9_-]+$`).
@@ -1257,12 +1314,21 @@ pub struct ConnectionStats {
 
 /// Serve one connection until EOF, idle timeout, or fatal transport error.
 ///
-/// Reads length-prefixed frames (`u32` BE + payload `<= 256 KiB`), verifies
-/// the peer UID **before** parsing the first byte, rate-limits per request
-/// (`RC-9` via `limiter` and caller-supplied `clock_ms`), and dispatches via
-/// [`handle_envelope`]. Oversize frames get one correlated error response and
-/// then the connection closes (fail-closed, no stream desync). Rate-limited
-/// requests get an error response and the connection stays open.
+/// Reads length-prefixed frames (`u32` BE + payload `<= 256 KiB`), rate-limits
+/// per request (`RC-9` via `limiter` and caller-supplied `clock_ms`), and
+/// dispatches via [`handle_envelope`]. Oversize frames get one correlated
+/// error response and then the connection closes (fail-closed, no stream
+/// desync). Rate-limited requests get an error response and the connection
+/// stays open.
+///
+/// Authentication happens at the accept boundary, not here: the caller must
+/// verify peer UID before the first byte via
+/// [`verify_peer_for_connection`](crate::auth::verify_peer_for_connection)
+/// or [`transport_attested_peer`], and pass only the resulting sanitized
+/// [`VerifiedPeer`] marker. This function takes no `PeerCredentials`-typed
+/// value, so credential dataflow ends at the accept boundary and never
+/// reaches serving counters or logging (CodeQL `cleartext logging of
+/// sensitive information` clean by construction).
 ///
 /// The stream is generic (`Read + Write`) so headless tests drive this exact
 /// function over `UnixStream::pair`; the servo passes live streams with
@@ -1271,12 +1337,10 @@ pub struct ConnectionStats {
 ///
 /// # Errors
 ///
-/// Returns `Unauthenticated` without reading when the peer UID mismatches,
-/// or `Transport` when the stream fails mid-protocol.
+/// Returns `Transport` when the stream fails mid-protocol.
 pub fn serve_connection<S>(
     stream: &mut S,
-    peer: PeerCredentials,
-    runtime_uid: u32,
+    _peer: VerifiedPeer,
     dispatcher: &Dispatcher,
     context: &ServeContext,
     limiter: &mut RateLimiter,
@@ -1285,7 +1349,6 @@ pub fn serve_connection<S>(
 where
     S: Read + Write,
 {
-    verify_peer_uid(peer, runtime_uid)?;
     let mut stats = ConnectionStats::default();
     loop {
         // Read the 4-byte header, distinguishing clean EOF (zero bytes) from
@@ -1400,16 +1463,21 @@ where
 /// owner is the peer. A forged `BITTY_SOCKET` pointing elsewhere still fails
 /// because the servo only serves the path it bound and attested itself.
 ///
+/// Returns a sanitized [`VerifiedPeer`] marker carrying no credential bytes:
+/// the accept boundary in `bitty-app/src/ipc_serve.rs` calls this before
+/// [`serve_connection`], so no `PeerCredentials`-typed value flows into the
+/// serving/logging path.
+///
 /// `SO_PEERCRED` per-connection re-verification (defense in depth against
 /// file-descriptor passing) needs either nightly
 /// `peer_credentials_unix_socket` (still unstable, rust-lang/rust#42839) or
 /// a reviewed `unsafe` `getsockopt` seam, both out of scope for this
 /// fail-soft slice; it is recorded hardening for CTX-0159. The headless
-/// [`verify_peer_uid`] primitive and its tests already encode the check the
-/// live seam will call.
+/// [`crate::auth::verify_peer_uid`] primitive and its tests already encode
+/// the check the live seam will call.
 #[must_use]
-pub fn transport_attested_peer(runtime_uid: u32) -> PeerCredentials {
-    PeerCredentials::new(runtime_uid, runtime_uid, 0)
+pub fn transport_attested_peer(runtime_uid: u32) -> VerifiedPeer {
+    VerifiedPeer::attested(runtime_uid)
 }
 
 /// Maximum concurrent connections served (`RC-9`, shed newest).
@@ -1469,6 +1537,49 @@ mod tests {
         let long = "a".repeat(MAX_SOCKET_PATH_BYTES + 1);
         assert!(resolve_socket_path(1000, None, Some(&long), None).is_err());
         assert!(resolve_socket_path(1000, None, Some("/tmp/a\0b.sock"), None).is_err());
+    }
+
+    #[test]
+    fn socket_path_portable_bound_is_pinned() {
+        // Portable AF_UNIX ceiling: 100 payload bytes fits Linux 108 and
+        // macOS/BSD 104 incl. NUL with margin (historical floor 92).
+        const { assert!(MAX_SOCKET_PATH_BYTES <= 100) };
+        const { assert!(SUN_LEN_LINUX == 108) };
+        const { assert!(SUN_LEN_MACOS == 104) };
+        const { assert!(MAX_SOCKET_PATH_BYTES < SUN_LEN_MACOS) };
+        // Every resolved path fits the portable bound incl. NUL.
+        let path = resolve_socket_path(1000, Some("/run/user/1000"), None, None).unwrap();
+        assert!(path.len() <= MAX_SOCKET_PATH_BYTES);
+        assert!(path.len() < SUN_LEN_MACOS);
+    }
+
+    #[test]
+    fn socket_path_hashes_long_instance_to_fit() {
+        // A 64-char instance with a medium base overflows direct form but
+        // fits via deterministic hash clamping.
+        let base = format!("/tmp/{}", "b".repeat(50));
+        let long_instance = "c".repeat(MAX_INSTANCE_ID_LEN);
+        let direct_len =
+            base.len() + 1 + SOCKET_LEAF_DIR.len() + 1 + long_instance.len() + ".sock".len();
+        assert!(direct_len > MAX_SOCKET_PATH_BYTES);
+        let path = resolve_socket_path(1000, Some(&base), None, Some(&long_instance)).unwrap();
+        assert!(path.len() <= MAX_SOCKET_PATH_BYTES);
+        assert!(!path.contains(&long_instance));
+        assert!(path.ends_with(".sock"));
+        // Deterministic: same instance hashes identically.
+        let again = resolve_socket_path(1000, Some(&base), None, Some(&long_instance)).unwrap();
+        assert_eq!(path, again);
+    }
+
+    #[test]
+    fn socket_path_rejects_long_base_fail_closed() {
+        // Even the hashed leaf cannot save a base dir that is itself too long.
+        let base = format!("/tmp/{}", "d".repeat(120));
+        let err = resolve_socket_path(1000, Some(&base), None, None).unwrap_err();
+        let reason = format!("{err}");
+        assert!(reason.contains("AF_UNIX") || reason.contains("too long"));
+        let long_socket = format!("/tmp/{}.sock", "e".repeat(120));
+        assert!(resolve_socket_path(1000, None, Some(&long_socket), None).is_err());
     }
 
     #[test]
@@ -1712,7 +1823,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let context = test_context();
-        let peer = PeerCredentials::new(1000, 1000, 1);
+        let peer = transport_attested_peer(1000);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || 0u64;
 
@@ -1720,7 +1831,6 @@ mod tests {
             serve_connection(
                 &mut server,
                 peer,
-                1000,
                 &dispatcher,
                 &context,
                 &mut limiter,
@@ -1750,27 +1860,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn serve_connection_rejects_foreign_uid_without_reading() {
+    fn serve_path_takes_verified_marker_only() {
+        use crate::auth::{PeerCredentials, verify_peer_for_connection};
+        // Regression for CodeQL HIGH `cleartext logging of sensitive
+        // information`: `serve_connection` takes only the pre-verified
+        // `VerifiedPeer` marker, so no `PeerCredentials`-typed value flows
+        // into the serving path. Accept-boundary verification is fail-closed.
+        let good = PeerCredentials::new(1000, 1000, 1);
+        let verified = verify_peer_for_connection(good, 1000).unwrap();
+        let attested = transport_attested_peer(1000);
+        assert_eq!(verified, attested);
+
+        // Foreign UID cannot produce a marker: rejected before any byte read.
+        let foreign = PeerCredentials::new(2000, 2000, 99);
+        let err = verify_peer_for_connection(foreign, 1000).unwrap_err();
+        assert!(matches!(err, IpcError::Unauthenticated { .. }));
+
+        // Verified marker serves correctly over a socketpair.
         use std::os::unix::net::UnixStream;
 
-        let (client, mut server) = UnixStream::pair().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let context = test_context();
-        let peer = PeerCredentials::new(2000, 2000, 99);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || 0u64;
-
-        let result = serve_connection(
-            &mut server,
-            peer,
-            1000,
-            &dispatcher,
-            &context,
-            &mut limiter,
-            &clock,
-        );
-        assert!(matches!(result, Err(IpcError::Unauthenticated { .. })));
+        let handle = std::thread::spawn(move || {
+            serve_connection(
+                &mut server,
+                verified,
+                &dispatcher,
+                &context,
+                &mut limiter,
+                &clock,
+            )
+        });
+        let payload = br#"{"id":1,"method":"bitty.debug/ping","version":"1.0"}"#;
+        let wire = encode_frame(payload).unwrap();
+        client.write_all(&wire).unwrap();
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8(body).unwrap().contains("\"ok\":true"));
         drop(client);
+        let stats = handle.join().unwrap().unwrap();
+        assert_eq!(stats.requests, 1);
     }
 
     #[cfg(unix)]
@@ -1781,7 +1916,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let context = test_context();
-        let peer = PeerCredentials::new(1000, 1000, 1);
+        let peer = transport_attested_peer(1000);
         let mut limiter = RateLimiter::new(100, 1);
         let clock = || 0u64;
 
@@ -1789,7 +1924,6 @@ mod tests {
             serve_connection(
                 &mut server,
                 peer,
-                1000,
                 &dispatcher,
                 &context,
                 &mut limiter,
@@ -1831,7 +1965,7 @@ mod tests {
             .unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let context = test_context();
-        let peer = PeerCredentials::new(1000, 1000, 1);
+        let peer = transport_attested_peer(1000);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || 0u64;
 
@@ -1839,7 +1973,6 @@ mod tests {
             serve_connection(
                 &mut server,
                 peer,
-                1000,
                 &dispatcher,
                 &context,
                 &mut limiter,

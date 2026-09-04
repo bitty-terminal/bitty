@@ -279,13 +279,18 @@ impl Drop for ActiveCount {
     }
 }
 
-/// Serve one accepted stream: timeouts, peer identity, dispatch loop.
+/// Serve one accepted stream: timeouts, accept-boundary auth, dispatch loop.
 ///
-/// Peer identity is transport-attested: this stream arrived on the
-/// owner-only (`0600`) socket the servo bound itself, so the kernel already
-/// refused any other UID at `connect`. See
-/// [`bitty_ipc::devtools::transport_attested_peer`] for the contract and the
-/// recorded `SO_PEERCRED` hardening for CTX-0159.
+/// Peer identity is verified at the accept boundary before [`serve_connection`]
+/// reads the first byte: this stream arrived on the owner-only (`0600`)
+/// socket the servo bound itself, so the kernel already refused any other UID
+/// at `connect`. [`bitty_ipc::devtools::transport_attested_peer`] folds that
+/// attestation into a sanitized [`bitty_ipc::auth::VerifiedPeer`] marker
+/// carrying no credential bytes; [`serve_connection`] takes only the marker,
+/// so no `PeerCredentials`-typed value flows into the serving counters or the
+/// `eprintln` logging below (CodeQL `cleartext logging of sensitive
+/// information` clean by construction). See `transport_attested_peer` for the
+/// contract and the recorded `SO_PEERCRED` hardening for CTX-0159.
 #[cfg(unix)]
 fn serve_stream(
     mut stream: std::os::unix::net::UnixStream,
@@ -311,7 +316,9 @@ fn serve_stream(
     {
         return;
     }
-    let peer = bitty_ipc::devtools::transport_attested_peer(runtime_uid);
+    // Accept-boundary verification: attested marker first, serving second.
+    // No credential-typed value survives past this line.
+    let verified = bitty_ipc::devtools::transport_attested_peer(runtime_uid);
     let context = bitty_ipc::devtools::ServeContext::new(server);
     let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
     let clock = || {
@@ -322,8 +329,7 @@ fn serve_stream(
     };
     match bitty_ipc::devtools::serve_connection(
         &mut stream,
-        peer,
-        runtime_uid,
+        verified,
         dispatcher,
         &context,
         &mut limiter,
@@ -365,5 +371,62 @@ mod tests {
         let descriptor = ServerDescriptor { cols: 80, rows: 24 };
         assert_eq!(descriptor.cols, 80);
         assert_eq!(descriptor.rows, 24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_path_takes_verified_marker_only() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        // Regression for CodeQL HIGH `cleartext logging of sensitive
+        // information`: the serving path accepts only the pre-verified marker
+        // produced at the accept boundary, never raw credentials.
+        let verified = bitty_ipc::devtools::transport_attested_peer(1000);
+        // Type-level proof: `serve_connection` takes `VerifiedPeer`.
+        fn accepts_verified(_: bitty_ipc::auth::VerifiedPeer) {}
+        accepts_verified(verified);
+
+        // Fail-closed: foreign credentials cannot mint a marker.
+        let foreign = bitty_ipc::PeerCredentials::new(2000, 2000, 99);
+        assert!(
+            bitty_ipc::verify_peer_for_connection(foreign, 1000).is_err(),
+            "foreign UID must fail closed at the accept boundary"
+        );
+
+        // The verified marker drives the real serving loop.
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
+        let info = bitty_ipc::devtools::ServerInfo::new(
+            "test".to_string(),
+            "/tmp/verified-marker.sock".to_string(),
+            80,
+            24,
+        );
+        let context = bitty_ipc::devtools::ServeContext::new(&info);
+        let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
+        let clock = || 0u64;
+        let handle = std::thread::spawn(move || {
+            bitty_ipc::devtools::serve_connection(
+                &mut server,
+                verified,
+                &dispatcher,
+                &context,
+                &mut limiter,
+                &clock,
+            )
+        });
+        let payload = br#"{"id":1,"method":"bitty.debug/ping","version":"1.0"}"#;
+        let wire = bitty_ipc::frame::encode_frame(payload).unwrap();
+        client.write_all(&wire).unwrap();
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).unwrap();
+        let len = u32::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8(body).unwrap().contains("\"ok\":true"));
+        drop(client);
+        let stats = handle.join().unwrap().unwrap();
+        assert_eq!(stats.requests, 1);
     }
 }

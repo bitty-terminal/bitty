@@ -124,8 +124,8 @@ pub mod wire;
 
 pub use auth::{
     CHILD_TOKEN_TTL_MS, ChildToken, ChildTokenStore, DIR_MODE, MAX_CHILD_TOKENS,
-    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, verify_peer_uid,
-    verify_unix_endpoint, verify_windows_pipe,
+    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, VerifiedPeer,
+    verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint, verify_windows_pipe,
 };
 pub use channel::{
     BoundedChannel, DEFAULT_REQUEST_CAPACITY, DEFAULT_RESPONSE_CAPACITY, IpcEndpoint, IpcRequest,

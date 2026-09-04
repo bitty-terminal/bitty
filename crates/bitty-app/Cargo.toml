@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 bitty-config = { path = "../bitty-config" }
+bitty-ipc = { path = "../bitty-ipc" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-render = { path = "../bitty-render" }

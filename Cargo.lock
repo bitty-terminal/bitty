@@ -181,6 +181,7 @@ name = "bitty-app"
 version = "0.0.1"
 dependencies = [
  "bitty-config",
+ "bitty-ipc",
  "bitty-platform",
  "bitty-render",
  "bitty-runtime",

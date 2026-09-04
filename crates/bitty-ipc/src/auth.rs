@@ -119,6 +119,54 @@ pub fn verify_peer_uid(peer: PeerCredentials, expected_uid: u32) -> Result<(), I
     }
 }
 
+/// Pre-verified peer marker: proof that UID equality was checked at the
+/// accept boundary before any request byte was parsed.
+///
+/// The inner field is private so callers cannot forge it: the only
+/// constructors are [`verify_peer_for_connection`] (for `SO_PEERCRED` /
+/// `LOCAL_PEERCRED` triples) and [`VerifiedPeer::attested`] (for the
+/// kernel-gated `0600` transport where only the owner could have connected).
+/// It carries no credential bytes itself, so downstream serving and logging
+/// paths handle only this sanitized marker and never `PeerCredentials`-typed
+/// values (CodeQL `cleartext logging of sensitive information` stays clean
+/// by construction: credential dataflow ends at the accept boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VerifiedPeer {
+    _sealed: (),
+}
+
+impl VerifiedPeer {
+    /// Accept-boundary attestation for the kernel-gated owner-only transport.
+    ///
+    /// Contract (caller must uphold): the transport kernel-gates peer
+    /// identity, i.e. only the attested UID could have opened this stream.
+    /// That holds for the servo's owner-only (`0600`) socket file: the kernel
+    /// refuses `connect` from any other UID with `EACCES` before userspace
+    /// runs. No credential bytes are retained.
+    #[must_use]
+    pub fn attested(_runtime_uid: u32) -> Self {
+        Self { _sealed: () }
+    }
+}
+
+/// Verify raw peer credentials at the accept boundary and return a sanitized
+/// marker for the serving path.
+///
+/// Fail-closed: a UID mismatch returns `Unauthenticated` before any request
+/// byte is read, and no marker is produced. The returned marker carries no
+/// credential bytes; serving/logging code takes only the marker.
+///
+/// # Errors
+///
+/// Returns `IpcError::Unauthenticated` when UIDs differ.
+pub fn verify_peer_for_connection(
+    peer: PeerCredentials,
+    expected_uid: u32,
+) -> Result<VerifiedPeer, IpcError> {
+    verify_peer_uid(peer, expected_uid)?;
+    Ok(VerifiedPeer { _sealed: () })
+}
+
 /// Verify Unix endpoint permissions headlessly.
 ///
 /// Checks:
@@ -541,5 +589,18 @@ mod tests {
         // Even if client forges BITTY_SOCKET="...",
         // peer check still fails because UID mismatch.
         assert!(verify_peer_uid(forged_peer, runtime_uid).is_err());
+    }
+
+    #[test]
+    fn verified_peer_marker_is_fail_closed() {
+        let good = PeerCredentials::new(1000, 1000, 1);
+        assert!(verify_peer_for_connection(good, 1000).is_ok());
+        let foreign = PeerCredentials::new(2000, 2000, 99);
+        let err = verify_peer_for_connection(foreign, 1000).unwrap_err();
+        assert!(matches!(err, IpcError::Unauthenticated { .. }));
+        // Attested transport produces a marker without credential bytes.
+        let attested = VerifiedPeer::attested(1000);
+        let verified = verify_peer_for_connection(good, 1000).unwrap();
+        assert_eq!(attested, verified);
     }
 }

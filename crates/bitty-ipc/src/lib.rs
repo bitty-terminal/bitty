@@ -43,6 +43,12 @@
 //! - Transport stub: in-memory `transport::StdioTransportStub` pair with
 //!   `forward_to` headless pipe simulation, no OS handle, fail-closed at
 //!   capacity, `send_drop_oldest` only for observation streams.
+//! - DevTools socket contract (`devtools::Dispatcher`,
+//!   `devtools::resolve_socket_path`, `devtools::serve_connection`):
+//!   headless `bitty.debug/*` request parsing, extensible method dispatch
+//!   (`ping`, `getSnapshot`), framed serving over caller-provided streams,
+//!   and socket-directory attestation (`0700`/`0600`). Opens no socket
+//!   itself; the `bitty-app` servo owns the listener lifecycle.
 //! - MCP stub: `mcp::McpClientStub` with bounded framing, correlation, and
 //!   deterministic timeouts (`DEFAULT_MCP_TIMEOUT_MS` 10 s, ceiling 30 s).
 //!
@@ -107,6 +113,7 @@
 
 pub mod auth;
 pub mod channel;
+pub mod devtools;
 pub mod error;
 pub mod frame;
 pub mod limits;
@@ -117,8 +124,8 @@ pub mod wire;
 
 pub use auth::{
     CHILD_TOKEN_TTL_MS, ChildToken, ChildTokenStore, DIR_MODE, MAX_CHILD_TOKENS,
-    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, verify_peer_uid,
-    verify_unix_endpoint, verify_windows_pipe,
+    MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, VerifiedPeer,
+    verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint, verify_windows_pipe,
 };
 pub use channel::{
     BoundedChannel, DEFAULT_REQUEST_CAPACITY, DEFAULT_RESPONSE_CAPACITY, IpcEndpoint, IpcRequest,

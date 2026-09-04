@@ -28,7 +28,12 @@ headless = []
 
 [dependencies]
 winit = "0.30"
-arboard = "3.6"
+# Wayland-first clipboard: `wayland-data-control` enables arboard's
+# wl-clipboard-rs backend, which selects Wayland when `WAYLAND_DISPLAY` is set
+# and falls back to X11 otherwise (see `src/clipboard.rs`). The `wl-clipboard-rs`
+# dependency reuses the `wayland-client`/`wayland-protocols` stack already
+# vendored via `winit`, so no new protocol stack is introduced.
+arboard = { version = "3.6", features = ["wayland-data-control"] }
 # ADR-0004 wrapper-rule exception: raw display/window handles are unavoidable
 # at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
 # pinned and re-exported; see crate-level ownership rules and src/surface.rs.

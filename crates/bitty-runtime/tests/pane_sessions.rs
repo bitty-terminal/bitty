@@ -162,6 +162,27 @@ fn multipane_input_falls_back_to_buffer_without_writer() {
 }
 
 #[test]
+fn pane_grid_tracks_leaf_allocation_across_layout_changes() {
+    // Horizontal 80x24 split: leaf 2 owns the right 40x24. Spawn its
+    // session deliberately off-size, then install a vertical split where
+    // leaf 2 owns the bottom 80x12: set_layout re-syncs the pane grid
+    // (+ PTY winsize) to the new allocation instead of rendering stale.
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &[], 10, 10)
+        .expect("spawn pane shell");
+    let before = rt.pane_snapshot(&ViewId::new(2)).expect("pane grid");
+    assert_eq!((before.width, before.height), (10, 10));
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Vertical,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    let after = rt.pane_snapshot(&ViewId::new(2)).expect("pane grid");
+    assert_eq!((after.width, after.height), (80, 12));
+}
+
+#[test]
 fn close_pane_session_tears_down_child() {
     let mut rt = two_pane_runtime();
     rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &[], 40, 12)

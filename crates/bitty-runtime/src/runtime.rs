@@ -2969,6 +2969,9 @@ impl Runtime {
         } else {
             self.focus.set(leaf_ids[0]);
         }
+        // CTX-0176: leaf boundaries may have moved (split/close/resize),
+        // so re-sync every pane session's grid + PTY winsize to its leaf.
+        self.sync_pane_geometry();
         self.pending_full_redraw = true;
     }
 
@@ -3233,6 +3236,30 @@ impl Runtime {
             self.pending_full_redraw = true;
         }
         removed
+    }
+
+    /// Re-syncs every pane session's grid + PTY winsize to its leaf's
+    /// current allocation (CTX-0176). Called after layout reflows that can
+    /// move leaf boundaries (`set_layout`, `reflow_to_grid`) so split panes
+    /// track window resizes, DPI reflows, and split-ratio changes exactly
+    /// like the primary session. Per-pane best-effort: leaves whose dims
+    /// already match are skipped (keeps generations stable for
+    /// frame-on-demand); a PTY resize error never fails the reflow.
+    fn sync_pane_geometry(&mut self) {
+        if self.pane_sessions.is_empty() {
+            return;
+        }
+        let allocs = self.layout.layout(self.container);
+        for (id, rect) in &allocs {
+            let cols = rect.width.max(1);
+            let rows = rect.height.max(1);
+            if let Some(sess) = self.pane_sessions.get_mut(id) {
+                if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
+                    let _ = sess.state.resize(cols as usize, rows as usize);
+                    let _ = sess.pty.resize(cols, rows);
+                }
+            }
+        }
     }
 
     /// Drains every pane session's direct reader into its private grid via
@@ -3882,6 +3909,9 @@ impl Runtime {
             }
         }
         self.layout.reflow(self.container);
+        // CTX-0176: the container moved, so every pane session's grid +
+        // PTY winsize follows its leaf (primary state/PTY handled below).
+        self.sync_pane_geometry();
         // Clamp selection to new snapshot bounds (keeps invariants after reflow;
         // wide-char snapping is preserved). Headless so deterministic.
         if let Some(sel) = self.selection {

@@ -295,6 +295,84 @@ pub const fn selection_fill() -> Rgba8 {
     DEFAULT_SELECTION
 }
 
+/// Selection highlight rectangles for a normalized inclusive cell range.
+///
+/// Pure embedder overlay primitive (CTX-0158): the caller owns the selection
+/// range (ghostty `setSelection` semantics) and this function only maps it to
+/// pixel [`FillRect`]s in the theme selection color ([`selection_fill`]).
+/// One opaque rect per spanned row, row-major order, so the caller pushes at
+/// most `grid_height` rects (bounded by the grid, never by input).
+///
+/// Endpoints are sorted and clamped to the `grid_width` x `grid_height` grid;
+/// empty grids, zero cells, or collapsed ranges yield no rects. Total over
+/// all inputs: no panics, no allocation beyond the bounded row count, no I/O.
+#[must_use]
+pub fn selection_fill_rects(
+    anchor: (u16, u16),
+    focus: (u16, u16),
+    grid_width: usize,
+    grid_height: usize,
+    cell: CellMetrics,
+) -> Vec<FillRect> {
+    if grid_width == 0 || grid_height == 0 {
+        return Vec::new();
+    }
+    if cell.width == 0 || cell.height == 0 {
+        return Vec::new();
+    }
+    let (mut start_row, mut start_col) = (anchor.0 as usize, anchor.1 as usize);
+    let (mut end_row, mut end_col) = (focus.0 as usize, focus.1 as usize);
+    if (start_row, start_col) > (end_row, end_col) {
+        core::mem::swap(&mut start_row, &mut end_row);
+        core::mem::swap(&mut start_col, &mut end_col);
+    }
+    if start_row == end_row && start_col == end_col {
+        return Vec::new();
+    }
+    let max_row = grid_height.saturating_sub(1);
+    let max_col = grid_width.saturating_sub(1);
+    start_row = start_row.min(max_row);
+    start_col = start_col.min(max_col);
+    end_row = end_row.min(max_row);
+    end_col = end_col.min(max_col);
+    if (start_row, start_col) == (end_row, end_col) {
+        return Vec::new();
+    }
+    let mut rects = Vec::new();
+    let mut row = start_row;
+    while row <= end_row {
+        let col_start = if row == start_row { start_col } else { 0 };
+        let col_end = if row == end_row { end_col } else { max_col };
+        if col_end >= col_start {
+            let span = col_end - col_start + 1;
+            let x = saturating_i32(
+                u64::try_from(col_start)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::from(cell.width)),
+            );
+            let y = saturating_i32(
+                u64::try_from(row)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::from(cell.height)),
+            );
+            let width = saturating_u32(
+                u64::try_from(span)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::from(cell.width)),
+            );
+            rects.push(FillRect {
+                rect: RectPx::new(x, y, width, cell.height),
+                color: selection_fill(),
+            });
+        }
+        if row == end_row {
+            break;
+        }
+        row += 1;
+    }
+    rects
+}
+
 /// Converts grid-coordinate damage into the pixel-domain descriptor
 /// consumed by [`plan_frame`].
 ///

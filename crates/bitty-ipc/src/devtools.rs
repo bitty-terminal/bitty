@@ -2707,10 +2707,35 @@ mod tests {
 
     // ── introspection (CTX-0159, read-only, bounded) ───────────────────────
     //
-    // The global live store is shared across tests in this binary: each test
-    // below publishes its own known snapshot, asserts, then clears, and the
-    // single round-trip test covers all four methods sequentially so parallel
-    // execution cannot interleave publishes.
+    // The global live stores (`live_grid_store`, `live_input_store`, ...) are
+    // shared across tests in this binary. Rust runs tests in parallel
+    // threads, so one test's `clear_introspection_for_tests` can wipe another
+    // test's published snapshot mid-sequence (CTX-0179 CI flake: 134 passed /
+    // 1 failed on `introspection_round_trip_all_methods_sequential`). Every
+    // test below that touches the globals holds
+    // `lock_introspection_for_test` for its whole publish→assert sequence;
+    // tests that only exercise pure parsers need no guard. Test-only:
+    // production paths never take this lock (lock order is always
+    // serial-guard → store locks, never the reverse, so no deadlock).
+
+    /// Serial guard for the process-global live introspection stores.
+    ///
+    /// std-only on purpose (`serial_test` would add a dev-dependency for
+    /// what is ten lines): same `OnceLock<Mutex<...>>` idiom as the stores
+    /// themselves. Poison-safe so a panicking holder cannot cascade-fail the
+    /// rest of the suite.
+    fn introspection_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Hold for the whole body of any test that publishes, reads, or clears
+    /// the global introspection stores.
+    fn lock_introspection_for_test() -> std::sync::MutexGuard<'static, ()> {
+        introspection_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn introspection_params_are_per_method_bounded() {
@@ -2820,6 +2845,7 @@ mod tests {
 
     #[test]
     fn introspection_round_trip_all_methods_sequential() {
+        let _introspection_guard = lock_introspection_for_test();
         clear_introspection_for_tests();
         publish_grid_text(
             vec!["hello introspect".to_string(), "second row".to_string()],
@@ -2952,6 +2978,7 @@ mod tests {
 
     #[test]
     fn introspection_empty_store_is_not_an_error() {
+        let _introspection_guard = lock_introspection_for_test();
         clear_introspection_for_tests();
         let dispatcher = Dispatcher::with_defaults();
         let context = test_context();
@@ -2979,6 +3006,7 @@ mod tests {
 
     #[test]
     fn introspection_publish_is_bounded() {
+        let _introspection_guard = lock_introspection_for_test();
         clear_introspection_for_tests();
         // Overlong grid input is truncated deterministically at publish time.
         let long_line = "x".repeat(MAX_INSPECT_COLS + 50);

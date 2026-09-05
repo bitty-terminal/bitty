@@ -8,7 +8,16 @@
 //! - **Inherited session environment with overrides.** Children inherit the
 //!   session environment by default (DEC-0017, Ghostty/Alacritty reference);
 //!   explicit builder entries (`TERM=xterm-256color`, `COLORTERM=truecolor`,
-//!   and caller additions via [`PtyBuilder::env`]) override.
+//!   `TERM_PROGRAM=bitty`, and caller additions via [`PtyBuilder::env`])
+//!   override.
+//! - **Graphics-fingerprint sanitization (CTX-0194).** Inherited markers that
+//!   claim graphics capabilities bitty lacks are stripped at spawn time (see
+//!   [`GRAPHICS_FINGERPRINT_PREFIXES`], [`GRAPHICS_FINGERPRINT_EXACT_KEYS`],
+//!   and [`should_strip_graphics_fingerprint`]); `TERM_PROGRAM` is overridden
+//!   to [`DEFAULT_TERM_PROGRAM`] so terminfo/term-DB probes (e.g. chafa)
+//!   fall back to symbols instead of emitting Kitty-graphics APC that bitty
+//!   renders blank. Caller-explicit [`PtyBuilder::env`] entries are applied
+//!   after sanitization and therefore win.
 //! - **Bounded configuration.** Argument count/size and allowlist size/value
 //!   length are capped so a misconfigured caller cannot smuggle unbounded
 //!   data into spawn.
@@ -42,6 +51,77 @@ pub const DEFAULT_TERM: &str = "xterm-256color";
 
 /// Default `COLORTERM` value set in the child environment.
 pub const DEFAULT_COLORTERM: &str = "truecolor";
+
+/// Default `TERM_PROGRAM` value set in the child environment.
+///
+/// Overriding the inherited `TERM_PROGRAM` (e.g. `ghostty`, `kitty`,
+/// `WezTerm`) prevents term-DB probes from assuming Kitty-graphics support
+/// bitty lacks (CTX-0194, chafa blank). A caller-explicit
+/// `PtyBuilder::env("TERM_PROGRAM", …)` still wins.
+pub const DEFAULT_TERM_PROGRAM: &str = "bitty";
+
+/// Inherited key prefixes stripped at spawn time (CTX-0194).
+///
+/// Every variable whose name starts with one of these prefixes claims a host
+/// terminal with graphics capabilities bitty does not implement, so keeping
+/// it would mislead term-DB probes (e.g. chafa term-DB matching `ghostty`
+/// over `xterm-256color` and emitting Kitty APC):
+///
+/// - `GHOSTTY_*`: Ghostty resources / bin dir / shell-integration flags.
+/// - `WEZTERM_*`: WezTerm pane / socket / executable markers.
+/// - `KITTY_*`: Kitty pid / window / listen-socket markers.
+pub const GRAPHICS_FINGERPRINT_PREFIXES: &[&str] = &["GHOSTTY_", "WEZTERM_", "KITTY_"];
+
+/// Inherited exact keys stripped at spawn time (CTX-0194).
+///
+/// Documented, minimal, fail-safe: only keys proven (or directly companion
+/// to proven) to advertise graphics bitty lacks. Functional environment
+/// (`PATH`, `HOME`, `TERM`, `COLORTERM`, `SHELL`, `LANG`, …) is never listed.
+///
+/// - `KITTY_PID`, `KITTY_WINDOW_ID`, `KITTY_LISTEN_ON`, `KITTY_PUBLIC_KEY`:
+///   explicit Kitty markers (also covered by the `KITTY_` prefix; listed
+///   here for auditability).
+/// - `VTE_VERSION`: VTE/VTE-based terminals advertise SIXEL in recent
+///   versions; bitty implements neither SIXEL nor Kitty-graphics.
+/// - `ITERM_SESSION_ID`, `ITERM_PROFILE`: iTerm2 session markers (iTerm2
+///   supports inline images bitty lacks).
+/// - `LC_TERMINAL`, `LC_TERMINAL_VERSION`: iTerm2 announces itself here;
+///   not locale data (`LANG`/`LC_ALL`/`LC_CTYPE` stay untouched).
+/// - `TERM_PROGRAM_VERSION`: companion to `TERM_PROGRAM`; the parent
+///   version no longer applies once `TERM_PROGRAM` is overridden to
+///   [`DEFAULT_TERM_PROGRAM`].
+pub const GRAPHICS_FINGERPRINT_EXACT_KEYS: &[&str] = &[
+    "KITTY_PID",
+    "KITTY_WINDOW_ID",
+    "KITTY_LISTEN_ON",
+    "KITTY_PUBLIC_KEY",
+    "VTE_VERSION",
+    "ITERM_SESSION_ID",
+    "ITERM_PROFILE",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM_PROGRAM_VERSION",
+];
+
+/// Returns true when `key` is a graphics-fingerprint marker stripped from
+/// the inherited environment at spawn time (CTX-0194).
+///
+/// Fail-safe: unknown keys return false (kept). `TERM_PROGRAM` itself
+/// returns false — it is overridden to [`DEFAULT_TERM_PROGRAM`], not
+/// removed — and functional keys (`PATH`, `HOME`, `TERM`, `COLORTERM`,
+/// `SHELL`, …) always return false.
+pub fn should_strip_graphics_fingerprint(key: &OsStr) -> bool {
+    let text = key.to_string_lossy();
+    if GRAPHICS_FINGERPRINT_EXACT_KEYS
+        .iter()
+        .any(|exact| text == *exact)
+    {
+        return true;
+    }
+    GRAPHICS_FINGERPRINT_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
 
 /// Validated spawn configuration handed to the platform backend.
 //
@@ -82,9 +162,13 @@ impl PtyBuilder {
     /// standard PATH search without any shell involvement).
     ///
     /// Defaults: 80x24 size, inherited working directory, and default
-    /// overrides (`TERM=xterm-256color`, `COLORTERM=truecolor`). The child
-    /// process inherits the session environment by default (DEC-0017); any
-    /// entry added via [`PtyBuilder::env`] overrides the inherited value.
+    /// overrides (`TERM=xterm-256color`, `COLORTERM=truecolor`,
+    /// `TERM_PROGRAM=bitty`). The child process inherits the session
+    /// environment by default (DEC-0017); any entry added via
+    /// [`PtyBuilder::env`] overrides the inherited value. Graphics
+    /// fingerprint markers (see [`should_strip_graphics_fingerprint`]) are
+    /// removed from the inherited environment at spawn time; explicit
+    /// [`PtyBuilder::env`] entries are applied after that removal and win.
     pub fn new(program: impl Into<OsString>) -> Self {
         PtyBuilder {
             program: program.into(),
@@ -94,6 +178,10 @@ impl PtyBuilder {
                 (
                     OsString::from("COLORTERM"),
                     OsString::from(DEFAULT_COLORTERM),
+                ),
+                (
+                    OsString::from("TERM_PROGRAM"),
+                    OsString::from(DEFAULT_TERM_PROGRAM),
                 ),
             ],
             cwd: None,
@@ -277,11 +365,92 @@ mod tests {
     #[test]
     fn default_env_contains_term_and_colorterm() {
         let cfg = valid_builder().validate().unwrap();
-        assert_eq!(cfg.env.len(), 2);
+        assert_eq!(cfg.env.len(), 3);
         assert_eq!(cfg.env[0].0, OsString::from("TERM"));
         assert_eq!(cfg.env[0].1, OsString::from(DEFAULT_TERM));
         assert_eq!(cfg.env[1].0, OsString::from("COLORTERM"));
         assert_eq!(cfg.env[1].1, OsString::from(DEFAULT_COLORTERM));
+        assert_eq!(cfg.env[2].0, OsString::from("TERM_PROGRAM"));
+        assert_eq!(cfg.env[2].1, OsString::from(DEFAULT_TERM_PROGRAM));
+    }
+
+    #[test]
+    fn default_term_program_is_bitty() {
+        let cfg = valid_builder().validate().unwrap();
+        let slot = cfg
+            .env
+            .iter()
+            .find(|(k, _)| k == "TERM_PROGRAM")
+            .expect("TERM_PROGRAM default present");
+        assert_eq!(slot.1, OsString::from(DEFAULT_TERM_PROGRAM));
+    }
+
+    #[test]
+    fn explicit_term_program_overrides_default() {
+        let cfg = valid_builder()
+            .env("TERM_PROGRAM", "custom-term")
+            .validate()
+            .unwrap();
+        let matches: Vec<_> = cfg
+            .env
+            .iter()
+            .filter(|(k, _)| k == "TERM_PROGRAM")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, OsString::from("custom-term"));
+    }
+
+    #[test]
+    fn graphics_fingerprint_exact_keys_are_stripped() {
+        for key in GRAPHICS_FINGERPRINT_EXACT_KEYS {
+            assert!(
+                should_strip_graphics_fingerprint(OsStr::new(key)),
+                "{key} should be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn graphics_fingerprint_prefixes_are_stripped() {
+        for key in [
+            "GHOSTTY_BIN_DIR",
+            "GHOSTTY_RESOURCES_DIR",
+            "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
+            "WEZTERM_PANE",
+            "WEZTERM_EXECUTABLE",
+            "WEZTERM_UNIX_SOCKET",
+            "KITTY_PID",
+            "KITTY_WINDOW_ID",
+            "KITTY_LISTEN_ON",
+        ] {
+            assert!(
+                should_strip_graphics_fingerprint(OsStr::new(key)),
+                "{key} should be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_env_is_never_stripped() {
+        for key in [
+            "PATH",
+            "HOME",
+            "TERM",
+            "COLORTERM",
+            "TERM_PROGRAM",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "USER",
+            "LOGNAME",
+            "BITTY_PROBE",
+        ] {
+            assert!(
+                !should_strip_graphics_fingerprint(OsStr::new(key)),
+                "{key} must be kept"
+            );
+        }
     }
 
     #[test]
@@ -292,9 +461,9 @@ mod tests {
             .env("A", "3")
             .validate()
             .unwrap();
-        assert_eq!(cfg.env.len(), 4); // TERM + COLORTERM + A + B
-        assert_eq!(cfg.env[2], (OsString::from("A"), OsString::from("3")));
-        assert_eq!(cfg.env[3], (OsString::from("B"), OsString::from("2")));
+        assert_eq!(cfg.env.len(), 5); // TERM + COLORTERM + TERM_PROGRAM + A + B
+        assert_eq!(cfg.env[3], (OsString::from("A"), OsString::from("3")));
+        assert_eq!(cfg.env[4], (OsString::from("B"), OsString::from("2")));
     }
 
     #[test]

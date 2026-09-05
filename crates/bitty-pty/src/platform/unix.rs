@@ -5,8 +5,14 @@
 //! - **Direct exec, no shell.** The child is spawned from the argv vector via
 //!   the platform exec path; upstream never routes through a shell because
 //!   this wrapper never uses `CommandBuilder::new_default_prog`.
-//! - **Minimal environment.** The builder's inherited environment is cleared
-//!   before allowlisted entries are applied. Upstream unconditionally injects
+//! - **Inherited session environment with overrides plus graphics
+//!   sanitization.** Children inherit the session environment by default
+//!   (DEC-0017, Ghostty/Alacritty reference). Inherited markers claiming
+//!   graphics capabilities bitty lacks (CTX-0194: `GHOSTTY_*`, `WEZTERM_*`,
+//!   `KITTY_*`, `VTE_VERSION`, iTerm markers, `TERM_PROGRAM_VERSION`) are
+//!   removed before exec; explicit builder entries (`TERM`, `COLORTERM`,
+//!   `TERM_PROGRAM=bitty`, and caller additions) are applied after that
+//!   removal and therefore win. Upstream unconditionally injects
 //!   a single extra variable (`SHELL`, resolved from `$SHELL` or the password
 //!   database); an explicitly allowlisted `SHELL` overrides that injection.
 //! - **fd hygiene.** Upstream sets close-on-exec on both PTY descriptors at
@@ -62,7 +68,26 @@ pub(crate) fn open_pty_and_spawn(config: &SpawnConfig) -> Result<(Master, Child)
         command.cwd(cwd);
     }
     // Inherit the session environment by default (DEC-0017, Ghostty/Alacritty reference).
-    // Explicit builder entries (TERM, COLORTERM, and caller additions) override.
+    //
+    // CTX-0194: strip inherited graphics-fingerprint markers before applying
+    // overrides. A bitty child launched from ghostty/kitty/wezterm would
+    // otherwise inherit e.g. TERM_PROGRAM=ghostty, and term-DB probes (chafa)
+    // match that entry over xterm-256color and emit Kitty-graphics APC that
+    // bitty renders blank. Removal is fail-safe (unknown keys are kept) and
+    // only touches the documented fingerprint list; PATH/HOME/TERM stay
+    // inherited. Explicit builder entries (TERM, COLORTERM,
+    // TERM_PROGRAM=bitty, caller additions) are applied after removal and win.
+    for (key, _) in std::env::vars_os() {
+        if crate::builder::should_strip_graphics_fingerprint(&key) {
+            command.env_remove(&key);
+        }
+    }
+    // Belt-and-braces for exact keys (harmless when absent; covers a marker
+    // appearing between the scan above and exec).
+    for key in crate::builder::GRAPHICS_FINGERPRINT_EXACT_KEYS {
+        command.env_remove(key);
+    }
+    // Explicit builder entries override the (sanitized) inherited environment.
     for (key, value) in &config.env {
         command.env(key, value);
     }

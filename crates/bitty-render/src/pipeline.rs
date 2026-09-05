@@ -22,8 +22,13 @@
 //! Vertex buffers are fixed at the [`crate::batch`] chunk caps
 //! ([`MAX_FILL_QUADS_PER_BATCH`](crate::batch::MAX_FILL_QUADS_PER_BATCH) and
 //! [`MAX_GLYPH_QUADS_PER_BATCH`](crate::batch::MAX_GLYPH_QUADS_PER_BATCH));
-//! frames larger than one chunk draw chunk after chunk reusing the same
-//! buffers. The atlas texture is capped by
+//! frames larger than one chunk submit chunk after chunk (one `queue.submit`
+//! per chunk, first `Clear` then `Load`) reusing the same buffers safely:
+//! each `write_buffer` is followed by its own submit before the next write
+//! overwrites the buffer (CTX-0182: sharing one encoder+submit across chunks
+//! left earlier chunks overwritten so only the last chunk's fills painted,
+//! i.e. fullscreen TUIs showed top dark stale + bottom blue). The atlas
+//! texture is capped by
 //! [`MAX_ATLAS_DIMENSION`](crate::batch::MAX_ATLAS_DIMENSION) and the
 //! transient inline texture is fixed at
 //! [`INLINE_TEXTURE_SIZE`](crate::batch::INLINE_TEXTURE_SIZE). Every
@@ -713,80 +718,141 @@ impl GpuResources {
             self.ensure_indices(queue, max_quads)?;
         }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bitty-present-draw-list"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("bitty-draw-list"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            for chunk in &fill_chunks {
-                if chunk.bytes.len() as u64 > fill_buffer_size() {
+        let mut first_pass = true;
+        // CTX-0182: one submit per chunk (Clear then Load). Sharing a single
+        // encoder+submit across chunks reuses vertex-buffer offset 0, so later
+        // `write_buffer` calls overwrite earlier chunks before the GPU draws
+        // (only the last chunk painted: fullscreen top went dark stale).
+        let mut submit_fill_chunk =
+            |chunk_bytes: &[u8], quad_count: usize| -> Result<(), RenderError> {
+                if chunk_bytes.len() as u64 > fill_buffer_size() {
                     return Err(RenderError::InvalidInput {
                         reason: "draw batch exceeds the bounded vertex cap",
                     });
                 }
-                queue.write_buffer(&self.fill_vb, 0, &chunk.bytes);
-                pass.set_pipeline(&self.fill_pipeline);
-                pass.set_vertex_buffer(0, self.fill_vb.slice(..chunk.bytes.len() as u64));
-                pass.set_index_buffer(
-                    self.index_buf
-                        .slice(..(chunk.quad_count * INDICES_PER_QUAD * 2) as u64),
-                    IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..(chunk.quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
-            }
-
-            for chunk in &atlas_chunks {
-                if chunk.bytes.len() as u64 > glyph_buffer_size() {
-                    return Err(RenderError::InvalidInput {
-                        reason: "draw batch exceeds the bounded vertex cap",
+                queue.write_buffer(&self.fill_vb, 0, chunk_bytes);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bitty-present-draw-list"),
+                });
+                {
+                    let load = if first_pass {
+                        LoadOp::Clear(clear)
+                    } else {
+                        LoadOp::Load
+                    };
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("bitty-draw-list"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
                     });
+                    pass.set_pipeline(&self.fill_pipeline);
+                    pass.set_vertex_buffer(0, self.fill_vb.slice(..chunk_bytes.len() as u64));
+                    pass.set_index_buffer(
+                        self.index_buf
+                            .slice(..(quad_count * INDICES_PER_QUAD * 2) as u64),
+                        IndexFormat::Uint16,
+                    );
+                    pass.draw_indexed(0..(quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
                 }
-                queue.write_buffer(&self.glyph_vb, 0, &chunk.bytes);
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, &self.atlas_bind, &[]);
-                pass.set_vertex_buffer(0, self.glyph_vb.slice(..chunk.bytes.len() as u64));
-                pass.set_index_buffer(
-                    self.index_buf
-                        .slice(..(chunk.quad_count * INDICES_PER_QUAD * 2) as u64),
-                    IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..(chunk.quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
-            }
+                queue.submit(std::iter::once(encoder.finish()));
+                first_pass = false;
+                Ok(())
+            };
 
-            for chunk in &inline_chunks {
-                if chunk.bytes.len() as u64 > glyph_buffer_size() {
-                    return Err(RenderError::InvalidInput {
-                        reason: "draw batch exceeds the bounded vertex cap",
-                    });
-                }
-                queue.write_buffer(&self.glyph_vb, 0, &chunk.bytes);
-                pass.set_pipeline(&self.glyph_pipeline);
-                pass.set_bind_group(0, &self.inline_bind, &[]);
-                pass.set_vertex_buffer(0, self.glyph_vb.slice(..chunk.bytes.len() as u64));
-                pass.set_index_buffer(
-                    self.index_buf
-                        .slice(..(chunk.quad_count * INDICES_PER_QUAD * 2) as u64),
-                    IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..(chunk.quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
-            }
+        for chunk in &fill_chunks {
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count)?;
         }
-        queue.submit(std::iter::once(encoder.finish()));
+
+        let mut submit_glyph_chunk =
+            |chunk_bytes: &[u8], quad_count: usize, bind: &BindGroup| -> Result<(), RenderError> {
+                if chunk_bytes.len() as u64 > glyph_buffer_size() {
+                    return Err(RenderError::InvalidInput {
+                        reason: "draw batch exceeds the bounded vertex cap",
+                    });
+                }
+                queue.write_buffer(&self.glyph_vb, 0, chunk_bytes);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("bitty-present-draw-list"),
+                });
+                {
+                    let load = if first_pass {
+                        LoadOp::Clear(clear)
+                    } else {
+                        LoadOp::Load
+                    };
+                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("bitty-draw-list"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.set_vertex_buffer(0, self.glyph_vb.slice(..chunk_bytes.len() as u64));
+                    pass.set_index_buffer(
+                        self.index_buf
+                            .slice(..(quad_count * INDICES_PER_QUAD * 2) as u64),
+                        IndexFormat::Uint16,
+                    );
+                    pass.draw_indexed(0..(quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
+                }
+                queue.submit(std::iter::once(encoder.finish()));
+                first_pass = false;
+                Ok(())
+            };
+
+        for chunk in &atlas_chunks {
+            submit_glyph_chunk(&chunk.bytes, chunk.quad_count, &self.atlas_bind)?;
+        }
+
+        for chunk in &inline_chunks {
+            submit_glyph_chunk(&chunk.bytes, chunk.quad_count, &self.inline_bind)?;
+        }
+
+        // Empty frame (no chunks): single Clear so the surface never keeps
+        // stale content from the previous frame.
+        if first_pass {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-present-draw-list"),
+            });
+            {
+                let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("bitty-draw-list"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(clear),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+        }
         Ok(())
     }
 }

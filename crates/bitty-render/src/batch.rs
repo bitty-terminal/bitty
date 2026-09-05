@@ -792,6 +792,35 @@ mod tests {
     }
 
     #[test]
+    fn ctx_0182_fullscreen_multi_chunk_requires_all_submits() {
+        // nmtui live repro (CTX-0182, issue #282): 200x62 fullscreen alt-screen
+        // = 12400 background fills -> 4 bounded chunks (4096*3 + 112).
+        // The GPU present path must submit every chunk (first Clear, rest
+        // Load). Reusing one encoder+submit with vertex-buffer offset 0 lets
+        // later writes overwrite earlier chunks before the draw, so only the
+        // last (bottom) chunk painted: top went dark stale + bottom blue with
+        // dialog glyphs (single glyph chunk) visible but wrong bg on top.
+        let fills: Vec<FillRect> = (0..12400usize)
+            .map(|i| fill_rect((i % 200) as i32 * 8, (i / 200) as i32 * 16, 8, 16))
+            .collect();
+        let chunks = chunk_fills(&fills, 2506, 1496, 1.0);
+        assert_eq!(chunks.len(), 4, "200x62 fullscreen must split");
+        let total: usize = chunks.iter().map(|c| c.quad_count).sum();
+        assert_eq!(total, 12400, "all fills must survive chunking");
+        for chunk in &chunks {
+            assert!(chunk.quad_count <= MAX_FILL_QUADS_PER_BATCH);
+        }
+        // Last chunk alone covers only the bottom (<1 row here), never the
+        // full frame: drawing only it would leave the top dark stale.
+        let last = chunks.last().expect("non-empty").quad_count;
+        assert!(last < 1000, "last chunk {last} must not cover fullscreen");
+        assert!(
+            chunks[0].quad_count == MAX_FILL_QUADS_PER_BATCH,
+            "first (top) chunk must be full or top rows go missing"
+        );
+    }
+
+    #[test]
     fn inline_packing_places_masks_and_reports_skips() {
         let glyphs = vec![
             GlyphInstance {

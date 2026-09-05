@@ -2248,4 +2248,57 @@ mod tests {
         );
         assert!(s.check_invariants().is_ok());
     }
+
+    #[test]
+    fn ctx_0182_large_altscreen_fullscreen_stays_blue() {
+        // nmtui live pattern at 200x62 (CTX-0182, issue #282): alt-screen
+        // entry, ED All with black BCE, then blue EL fills for every row.
+        // The top row must stay blue (Indexed 4), never dark stale: the
+        // observed top-dark/bottom-blue split was a GPU multi-chunk submit
+        // bug, not state, so this locks the state half of the contract.
+        let mut s = State::new();
+        s.resize(200, 62);
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: true,
+        });
+        assert!(s.alt_screen_active());
+        // ED All with black bg (nmtui sets 37m/40m before H/2J).
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![AttributeChange::Background(Color::Indexed(0))].into_boxed_slice(),
+            },
+        });
+        s.apply(&TerminalAction::EraseInDisplay {
+            mode: EraseDisplayMode::All,
+        });
+        // Blue EL fill per row (97m/44m + EL Right + LF).
+        s.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: vec![AttributeChange::Background(Color::Indexed(4))].into_boxed_slice(),
+            },
+        });
+        for _ in 0..62 {
+            s.apply(&TerminalAction::EraseInLine {
+                mode: EraseLineMode::Right,
+            });
+            s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        let snap = s.snapshot();
+        assert_eq!((snap.width, snap.height), (200, 62));
+        for (i, cell) in snap.cells.iter().enumerate().take(snap.width) {
+            assert_eq!(
+                cell.style.background,
+                Some(Color::Indexed(4)),
+                "top row col {i} must be nmtui blue"
+            );
+        }
+        assert!(
+            snap.cells
+                .iter()
+                .all(|c| c.style.background == Some(Color::Indexed(4))),
+            "every fullscreen row must be blue after EL fills"
+        );
+        assert!(s.check_invariants().is_ok());
+    }
 }

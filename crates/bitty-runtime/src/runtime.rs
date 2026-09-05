@@ -1175,6 +1175,12 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0186: Esc while a paste is pending cancels the confirmation
+        // dialog. The Esc is consumed (never reaches the PTY) so a dismissal
+        // cannot also drive shell/vim state.
+        if self.cancel_pending_on_escape(&event) {
+            return None;
+        }
         // CTX-0159: retain a bounded input trace for screenshots-free probes.
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
@@ -1215,6 +1221,10 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0186: Esc while a paste is pending cancels (see owned path).
+        if self.cancel_pending_on_escape(event) {
+            return None;
+        }
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
             self.inspect_ring.push_modifiers(
@@ -1601,6 +1611,32 @@ impl Runtime {
         self.pending_paste.as_ref().map(|p| p.text.as_str())
     }
 
+    /// Bounded human-readable summary of the pending paste, if any (CTX-0186).
+    ///
+    /// A gated paste is never silent: while [`Self::has_pending_paste`] holds,
+    /// this returns `Some` line of the form
+    /// `Paste 2 lines, 11 bytes [newline, C0] "line1\nline2" — repeat paste
+    /// to confirm, Esc to cancel`.
+    ///
+    /// Bounded and deterministic: the input is already capped at
+    /// `CLIPBOARD_MAX_BYTES` (8192), reasons are at most 7 static tokens, and
+    /// the preview keeps the first 64 chars escaped (`escape_debug`) and cut
+    /// to 96 bytes at a char boundary. Total length stays well under 512
+    /// bytes. `O(n)` with `n ≤ 8192`.
+    #[must_use]
+    pub fn pending_paste_summary(&self) -> Option<String> {
+        let pending = self.pending_paste.as_ref()?;
+        let lines = pending.text.bytes().filter(|&b| b == b'\n').count() + 1;
+        let bytes = pending.text.len();
+        let reasons = pending.inspection.reasons().join(", ");
+        let preview: String = pending.text.chars().take(64).collect();
+        let preview = preview.escape_debug().to_string();
+        let preview = truncate_str_to_bytes(&preview, 96);
+        Some(format!(
+            "Paste {lines} lines, {bytes} bytes [{reasons}] \"{preview}\" — repeat paste to confirm, Esc to cancel"
+        ))
+    }
+
     /// Pastes text from the system clipboard (or headless buffer) and routes
     /// it as terminal input via the bounded pending path. Returns
     /// `Err(PlatformError)` when clipboard acquisition fails, `Ok(None)` when
@@ -1614,9 +1650,13 @@ impl Runtime {
     /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
     /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
     /// immediately; suspicious text is stored as a pending paste that requires
-    /// explicit `confirm_pending_paste(true)` — there is no silent delivery
-    /// path. Bracketed paste (`?2004`) is defense-in-depth only and wraps
-    /// confirmed delivery when enabled in terminal state.
+    /// explicit confirmation — `confirm_pending_paste(true)`, repeating the
+    /// identical paste while pending (CTX-0186 second chord/right-click press
+    /// with unchanged clipboard), or `Esc` to cancel. The pending paste stays
+    /// visible via [`Self::pending_paste_summary`]: there is no silent
+    /// delivery path and no silent drop. Bracketed paste (`?2004`) is
+    /// defense-in-depth only and wraps confirmed delivery when enabled in
+    /// terminal state.
     ///
     /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
     /// primitive before the scan, so untrusted clipboard content cannot grow
@@ -1631,9 +1671,9 @@ impl Runtime {
 
     /// Pastes from a given string via the inspection gate (headless helper).
     /// Returns `true` when the submitted paste requires confirmation and
-    /// `false` when it is delivered immediately. If another suspicious paste
-    /// is already pending, the new paste is rejected and the first pending
-    /// paste is preserved; the return value remains `true`.
+    /// `false` when it is delivered immediately. Re-submitting the identical
+    /// pending text confirms and delivers (CTX-0186); different suspicious
+    /// content while pending preserves the first paste and returns `true`.
     pub fn paste_text_via_gate(&mut self, text: String) -> bool {
         self.request_paste(text)
     }
@@ -1652,18 +1692,36 @@ impl Runtime {
     /// Core paste entry: bounds and inspects `text`, stores a pending paste
     /// when suspicious, otherwise delivers immediately. Returns `true` when
     /// confirmation is required and `false` when delivery is immediate. A
-    /// suspicious request is rejected while another paste is pending, which
-    /// preserves the first pending paste for explicit confirmation or cancel.
+    /// different suspicious request while another paste is pending is rejected,
+    /// which preserves the first pending paste for explicit confirmation or
+    /// cancel.
+    ///
+    /// CTX-0186 explicit repeat-to-confirm: re-submitting the identical
+    /// (post-truncation) text while it is pending is the user's confirmation
+    /// gesture — the second chord/right-click press with an unchanged
+    /// clipboard delivers (bracketed when `?2004` is on) and clears pending.
+    /// Different content while pending preserves the first paste (TOCTOU-safe:
+    /// a swapped clipboard cannot smuggle new bytes through confirmation).
     ///
     /// No silent delivery path exists for `needs_confirmation() == true`.
     pub fn request_paste(&mut self, text: String) -> bool {
         let text = truncate_paste_text(text);
+        // Explicit confirmation: identical re-paste while pending delivers.
+        if let Some(pending) = self.pending_paste.as_ref() {
+            if pending.text == text {
+                let pending = self.pending_paste.take().expect("checked above");
+                self.deliver_paste_bytes_bracketed(&pending.text);
+                self.pending_full_redraw = true;
+                return false;
+            }
+        }
         let inspection = crate::paste::inspect_paste(&text);
         if inspection.needs_confirmation() {
             if self.pending_paste.is_some() {
                 return true;
             }
             self.pending_paste = Some(crate::paste::PendingPaste::new(text, inspection.clone()));
+            self.pending_full_redraw = true;
             return true;
         }
         self.deliver_paste_bytes(text.as_bytes());
@@ -1681,12 +1739,46 @@ impl Runtime {
         if confirm {
             self.deliver_paste_bytes_bracketed(&pending.text);
         }
+        self.pending_full_redraw = true;
         true
     }
 
     /// Cancel any pending paste without delivery.
     pub fn cancel_pending_paste(&mut self) -> bool {
         self.confirm_pending_paste(false)
+    }
+
+    /// Consume an `Esc` press while a paste is pending (CTX-0186).
+    ///
+    /// Returns `true` when the event was an `Esc` press with a pending paste:
+    /// the pending paste is dropped without delivery, a redraw is requested so
+    /// any pending indicator clears, and the caller must not forward the key
+    /// to the PTY. Returns `false` otherwise (no pending paste, not `Esc`, or
+    /// not a press), leaving existing key routing untouched.
+    fn cancel_pending_on_escape(&mut self, event: &KeyEvent) -> bool {
+        if event.state != PressState::Pressed {
+            return false;
+        }
+        if !matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Escape)
+        ) {
+            return false;
+        }
+        if self.pending_paste.is_none() {
+            return false;
+        }
+        self.pending_paste = None;
+        self.pending_full_redraw = true;
+        self.inspect_ring.push_key(
+            &key_inspect_label(event),
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+            Some(true),
+        );
+        self.publish_inspect_snapshot();
+        true
     }
 
     fn deliver_paste_bytes(&mut self, bytes: &[u8]) {
@@ -4630,6 +4722,18 @@ fn truncate_paste_text(text: String) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// Truncate `s` to at most `max_bytes` at a char boundary (CTX-0186 summary).
+fn truncate_str_to_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]

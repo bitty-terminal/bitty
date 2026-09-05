@@ -403,3 +403,136 @@ fn selection_copy_paste_clean_is_not_gated_but_clipboard_paste_is() {
     assert!(!insp);
     assert_eq!(rt.pending_input(), b"hello");
 }
+
+// ── CTX-0186: multi-line paste must never silently drop ────────────────
+//
+// Owner verify 2026-09-05 (issue #287): 2+ line clipboard content reaches the
+// clipboard but right-click does nothing; outside multi-line content cannot
+// paste via chords or right-click, while single-line works. The
+// suspicious-paste gate holds newline content as pending-confirmation with no
+// confirmation UI surfaced, so the paste is silently dropped.
+//
+// Contract under test (same paths the chord/right-click use):
+// - first paste of 2-line text is gated (pending, nothing delivered) AND
+//   visible via a bounded summary (line count + reason), never silent;
+// - repeating the identical paste is explicit confirmation and delivers;
+// - right-click follows the same visible/confirmable path;
+// - Esc while pending cancels without delivery and without leaking Esc.
+
+#[test]
+fn ctx0186_multiline_chord_paste_is_visible_and_repeat_confirms() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    // Same entry the Ctrl+Shift+V chrome action uses.
+    let insp = rt.paste_from_clipboard().unwrap().unwrap();
+    assert!(insp, "2-line paste must be gated");
+    assert!(rt.has_pending_paste());
+    assert_eq!(
+        rt.pending_input(),
+        b"",
+        "gated paste must not deliver before confirm"
+    );
+    // Visible, not silent: bounded summary names the line count + reason.
+    let summary = rt
+        .pending_paste_summary()
+        .expect("pending paste must be visible, never silent");
+    assert!(
+        summary.contains("2 lines"),
+        "summary must name line count: {summary:?}"
+    );
+    assert!(
+        summary.contains("newline"),
+        "summary must name reason: {summary:?}"
+    );
+    // Explicit repeat of the identical paste confirms and delivers.
+    rt.drain_pending_input();
+    let insp2 = rt.paste_from_clipboard().unwrap().unwrap();
+    assert!(
+        !insp2,
+        "repeating the identical pending paste confirms delivery"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"line1\nline2");
+}
+
+#[test]
+fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
+    use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("aaa\nbbb\nccc".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    // Same entry the right-click mouse path uses.
+    rt.handle_mouse_input(MouseEvent {
+        button: MouseButton::Right,
+        state: PressState::Pressed,
+    });
+    assert!(rt.has_pending_paste(), "3-line right-click must gate");
+    assert_eq!(rt.pending_input(), b"", "no silent delivery before confirm");
+    let summary = rt
+        .pending_paste_summary()
+        .expect("pending paste must be visible, never silent");
+    assert!(
+        summary.contains("3 lines"),
+        "summary must name line count: {summary:?}"
+    );
+    // Second identical right-click confirms and delivers both lines.
+    rt.handle_mouse_input(MouseEvent {
+        button: MouseButton::Right,
+        state: PressState::Pressed,
+    });
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"aaa\nbbb\nccc");
+}
+
+#[test]
+fn ctx0186_esc_cancels_pending_without_delivery_or_esc_leak() {
+    use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text("one\ntwo".to_string()).unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    // Esc while pending cancels the dialog; Esc itself must not leak to the PTY.
+    let cancelled = rt.handle_key_event(KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Escape),
+        text: None,
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    });
+    assert_eq!(
+        cancelled, None,
+        "cancelling Esc is consumed, never PTY input"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"", "cancel must not deliver");
+}
+
+#[test]
+fn ctx0186_different_clipboard_while_pending_preserves_first() {
+    // TOCTOU pin: swapping the clipboard between presses must not smuggle
+    // new content through the repeat-to-confirm path.
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("first\npaste".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert_eq!(rt.pending_paste_text(), Some("first\npaste"));
+    rt.clipboard_mut()
+        .set_text("second\npaste".to_string())
+        .unwrap();
+    let still_pending = rt.paste_from_clipboard().unwrap().unwrap();
+    assert!(still_pending, "different content must not confirm");
+    assert_eq!(rt.pending_paste_text(), Some("first\npaste"));
+    assert_eq!(rt.pending_input(), b"");
+    assert!(rt.confirm_pending_paste(true));
+    assert_eq!(rt.pending_input(), b"first\npaste");
+}

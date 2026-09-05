@@ -815,7 +815,8 @@ fn help_text() -> String {
            single-owner rule): a bound chord is consumed by its chrome action\n  \
            and never reaches the PTY; unbound keys (Tab, arrows, plain\n  \
            letters) always go to the shell. Defaults: Alt+h/j/k/l and\n  \
-           Ctrl+Alt+arrows move focus, Alt+w closes, Ctrl+Tab cycles;\n  \
+           Ctrl+Alt+arrows move focus, Alt+w closes, Ctrl+Tab cycles,\n  \
+           Ctrl+Shift+C/V copy/paste;\n  \
            see `bitty config check` for the active table.\n\
          \n\
          Modes:\n  \
@@ -1035,10 +1036,11 @@ fn starter_init_lua() -> &'static str {
      -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
      -- Unknown keys fail closed; validate with `bitty config check`.\n\
      --\n\
-     -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
-     -- consumed by its action and never reaches the shell; unbound keys\n\
-     -- (Tab, arrows, plain letters) always go to the shell. Defaults ship\n\
-     -- Alt+h/j/k/l + Ctrl+Alt+arrows for focus, Alt+w to close;\n\
+      -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
+      -- consumed by its action and never reaches the shell; unbound keys\n\
+      -- (Tab, arrows, plain letters) always go to the shell. Defaults ship\n\
+      -- Alt+h/j/k/l + Ctrl+Alt+arrows for focus, Alt+w to close,\n\
+      -- Ctrl+Shift+C/V for copy/paste (fish never sees the chord);\n\
      -- uncomment to override (context + chord identity replaces the default):\n\
      return {\n\
      \x20\x20theme = \"dark\",\n\
@@ -2386,6 +2388,44 @@ impl TerminalApp {
                     );
                 }
             }
+            A::CopyToClipboard => {
+                // CTX-0161: explicit single-owner copy chord (ctrl+shift+c).
+                // Before this binding the chord fell through to the PTY as
+                // 0x03 (SIGINT); now chrome owns it and fish never sees the
+                // byte. Reuses the Wayland-first clipboard path (CTX-0160)
+                // with headless fallback; refusals warn like other chrome.
+                match self.runtime.copy_selection_to_clipboard() {
+                    Ok(Some(text)) => {
+                        eprintln!("bitty: keymap copy_to_clipboard -> {} bytes", text.len())
+                    }
+                    Ok(None) => {
+                        eprintln!("warning: keymap copy_to_clipboard has no selection — ignoring")
+                    }
+                    Err(err) => eprintln!(
+                        "warning: keymap copy_to_clipboard clipboard error ({err}) — ignoring"
+                    ),
+                }
+            }
+            A::PasteFromClipboard => {
+                // CTX-0161: explicit single-owner paste chord (ctrl+shift+v).
+                // Before this binding the chord fell through to the PTY as
+                // 0x16; now chrome owns it. Routes through the
+                // suspicious-paste inspection gate (P0-AC-008): clean text
+                // delivers immediately, suspicious text waits on the pending
+                // confirmation path, clipboard errors warn.
+                match self.runtime.paste_from_clipboard() {
+                    Ok(Some(true)) => {
+                        eprintln!("bitty: keymap paste_from_clipboard -> pending confirmation")
+                    }
+                    Ok(Some(false)) => eprintln!("bitty: keymap paste_from_clipboard delivered"),
+                    Ok(None) => {
+                        eprintln!("warning: keymap paste_from_clipboard clipboard empty — ignoring")
+                    }
+                    Err(err) => eprintln!(
+                        "warning: keymap paste_from_clipboard clipboard error ({err}) — ignoring"
+                    ),
+                }
+            }
             A::ToggleZoom => {
                 if let Some(backup) = self.zoom_backup.take() {
                     self.runtime.set_layout(backup);
@@ -3687,6 +3727,99 @@ mod tests {
             match_keymap(&maps, shell(KeyName::Tab, true, false, false)),
             Some(bitty_config::ChromeAction::FocusNext)
         );
+    }
+
+    #[test]
+    fn single_owner_copy_paste_chords_resolve_and_shell_stays_clean() {
+        // CTX-0161: the shifted chords are chrome-owned (single-owner
+        // intercept consumes them before the PTY), while the unshifted C0
+        // bytes (Ctrl+C SIGINT, Ctrl+V) stay shell input.
+        use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
+        let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+        let chord = |key: KeyName, ctrl: bool, alt: bool, shift: bool| KeyRef {
+            key,
+            ctrl,
+            alt,
+            shift,
+            super_held: false,
+        };
+        assert_eq!(
+            match_keymap(&maps, chord(KeyName::Char('c'), true, false, true)),
+            Some(ChromeAction::CopyToClipboard)
+        );
+        assert_eq!(
+            match_keymap(&maps, chord(KeyName::Char('v'), true, false, true)),
+            Some(ChromeAction::PasteFromClipboard)
+        );
+        assert_eq!(
+            match_keymap(&maps, chord(KeyName::Char('c'), true, false, false)),
+            None,
+            "Ctrl+C must reach fish as 0x03"
+        );
+        assert_eq!(
+            match_keymap(&maps, chord(KeyName::Char('v'), true, false, false)),
+            None,
+            "Ctrl+V must stay shell input"
+        );
+        // Uppercase letters normalize through the event mapper (Shift held
+        // to type 'C' is part of the chord, not shell typing).
+        let mods = AppModifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let r = key_ref_from_event(&test_char_key("C"), &mods).expect("matchable");
+        assert_eq!(match_keymap(&maps, r), Some(ChromeAction::CopyToClipboard));
+        let r = key_ref_from_event(&test_char_key("V"), &mods).expect("matchable");
+        assert_eq!(
+            match_keymap(&maps, r),
+            Some(ChromeAction::PasteFromClipboard)
+        );
+    }
+
+    #[test]
+    fn chrome_copy_paste_round_trip_headless() {
+        // CTX-0161 end-to-end through the chrome arms (no window): copy
+        // mirrors the selection into the clipboard, paste routes through
+        // the suspicious-paste gate, and no stray C0 reaches the PTY.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.force_headless_clipboard();
+        rt.handle_pty_bytes(b"hello");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        // Copy with no selection warns and touches nothing.
+        app.apply_chrome_action(ChromeAction::CopyToClipboard);
+        assert_eq!(app.runtime.clipboard().headless_contents(), "");
+        // Select everything, copy: clipboard mirrors the selection text.
+        app.runtime.select_all();
+        let selected = app.runtime.selection_text().expect("selection");
+        assert!(selected.contains("hello"), "grid holds fed text");
+        app.apply_chrome_action(ChromeAction::CopyToClipboard);
+        assert_eq!(app.runtime.clipboard().headless_contents(), selected);
+        // Pasting the grid-shaped clipboard goes through the inspection
+        // gate (embedded newlines are suspicious): held pending, nothing
+        // delivered silently.
+        app.runtime.clear_selection();
+        app.apply_chrome_action(ChromeAction::PasteFromClipboard);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        // Clean clipboard text delivers immediately as PTY input bytes.
+        assert!(app.runtime.cancel_pending_paste());
+        app.runtime
+            .clipboard_mut()
+            .set_text("clean-paste".to_string())
+            .expect("headless set");
+        app.apply_chrome_action(ChromeAction::PasteFromClipboard);
+        assert!(!app.runtime.has_pending_paste());
+        assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
     }
 
     fn two_pane_layout() -> LayoutNode {

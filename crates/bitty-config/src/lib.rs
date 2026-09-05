@@ -154,6 +154,7 @@ mod integration_tests {
                 terminal: Some(TerminalConfig {
                     scrollback: 50_000,
                     shell: None,
+                    ..Default::default()
                 }),
                 appearance: Some(AppearanceConfig {
                     theme: Some("dark".into()),

@@ -57,6 +57,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `keymaps`                 | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
+/// | `terminal.scroll_lines_per_notch` | RestartRequired |
+/// | `terminal.scroll_pixels_per_notch` | RestartRequired |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -64,9 +66,12 @@ pub fn classify_field(field: &str) -> ReloadClass {
     match field {
         "font.family" | "font.size" | "font" | "window.opacity" | "window.padding" | "window"
         | "appearance.theme" | "appearance" | "keymaps" => ReloadClass::Live,
-        "terminal.scrollback" | "terminal.shell" | "terminal" | "plugins" => {
-            ReloadClass::RestartRequired
-        }
+        "terminal.scrollback"
+        | "terminal.shell"
+        | "terminal.scroll_lines_per_notch"
+        | "terminal.scroll_pixels_per_notch"
+        | "terminal"
+        | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,
     }
 }
@@ -171,6 +176,19 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         format!("{:?}", old.terminal.shell),
         format!("{:?}", new.terminal.shell),
     );
+    // CTX-0185: scroll speed is terminal-table state; like scrollback it is
+    // adopted at startup (RuntimeConfig is built once from the effective
+    // config), so changes are restart-required, not live.
+    push_if_changed(
+        "terminal.scroll_lines_per_notch",
+        old.terminal.scroll_lines_per_notch.to_string(),
+        new.terminal.scroll_lines_per_notch.to_string(),
+    );
+    push_if_changed(
+        "terminal.scroll_pixels_per_notch",
+        old.terminal.scroll_pixels_per_notch.to_string(),
+        new.terminal.scroll_pixels_per_notch.to_string(),
+    );
     push_if_changed(
         "appearance.theme",
         format!("{:?}", old.appearance.theme),
@@ -258,7 +276,7 @@ mod tests {
         EffectiveConfig {
             terminal: TerminalConfig {
                 scrollback: n,
-                shell: None,
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -338,6 +356,41 @@ mod tests {
             classify_field("terminal.scrollback"),
             ReloadClass::RestartRequired
         );
+        // CTX-0185: scroll speed is restart-required (adopted at startup).
+        assert_eq!(
+            classify_field("terminal.scroll_lines_per_notch"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(
+            classify_field("terminal.scroll_pixels_per_notch"),
+            ReloadClass::RestartRequired
+        );
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
+    }
+
+    #[test]
+    fn diff_scroll_speed_is_restart_required() {
+        // CTX-0185: changing either scroll key must surface as a
+        // restart-required diff (no silent no-op on reload).
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.terminal.scroll_lines_per_notch = 6;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(
+            r.diffs
+                .iter()
+                .any(|d| d.field == "terminal.scroll_lines_per_notch")
+        );
+        let mut new2 = old.clone();
+        new2.terminal.scroll_pixels_per_notch = 32;
+        let r2 = diff(&old, &new2);
+        assert_eq!(r2.overall, ReloadClass::RestartRequired);
+        assert!(
+            r2.diffs
+                .iter()
+                .any(|d| d.field == "terminal.scroll_pixels_per_notch")
+        );
     }
 }

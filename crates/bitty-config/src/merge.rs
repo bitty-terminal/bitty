@@ -65,6 +65,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "window.padding"
         | "terminal.scrollback"
         | "terminal.shell"
+        | "terminal.scroll_lines_per_notch"
+        | "terminal.scroll_pixels_per_notch"
         | "appearance.theme"
         | "extends"
         | "profile"
@@ -268,7 +270,12 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         }
 
         if let Some(term) = &plan.terminal {
-            for field in ["terminal.scrollback", "terminal.shell"] {
+            for field in [
+                "terminal.scrollback",
+                "terminal.shell",
+                "terminal.scroll_lines_per_notch",
+                "terminal.scroll_pixels_per_notch",
+            ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
                 } else if let Some(policy_src) = policy_fields.get(field) {
@@ -289,6 +296,12 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 match field {
                     "terminal.scrollback" => effective.terminal.scrollback = term.scrollback,
                     "terminal.shell" => effective.terminal.shell.clone_from(&term.shell),
+                    "terminal.scroll_lines_per_notch" => {
+                        effective.terminal.scroll_lines_per_notch = term.scroll_lines_per_notch;
+                    }
+                    "terminal.scroll_pixels_per_notch" => {
+                        effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
                     _ => {}
                 }
                 record_attribution(
@@ -497,6 +510,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "window",
         "terminal.scrollback",
         "terminal.shell",
+        "terminal.scroll_lines_per_notch",
+        "terminal.scroll_pixels_per_notch",
         "terminal",
         "appearance.theme",
         "appearance",
@@ -633,7 +648,12 @@ fn merge_layers_allow_policy_violations(
             attribution.insert("window".to_string(), src.clone());
         }
         if let Some(term) = &plan.terminal {
-            for field in ["terminal.scrollback", "terminal.shell"] {
+            for field in [
+                "terminal.scrollback",
+                "terminal.shell",
+                "terminal.scroll_lines_per_notch",
+                "terminal.scroll_pixels_per_notch",
+            ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
                 } else if let Some(policy_src) = policy_fields.get(field) {
@@ -654,6 +674,12 @@ fn merge_layers_allow_policy_violations(
                 match field {
                     "terminal.scrollback" => effective.terminal.scrollback = term.scrollback,
                     "terminal.shell" => effective.terminal.shell.clone_from(&term.shell),
+                    "terminal.scroll_lines_per_notch" => {
+                        effective.terminal.scroll_lines_per_notch = term.scroll_lines_per_notch;
+                    }
+                    "terminal.scroll_pixels_per_notch" => {
+                        effective.terminal.scroll_pixels_per_notch = term.scroll_pixels_per_notch;
+                    }
                     _ => {}
                 }
                 record_attribution(
@@ -858,6 +884,8 @@ fn merge_layers_allow_policy_violations(
         "window",
         "terminal.scrollback",
         "terminal.shell",
+        "terminal.scroll_lines_per_notch",
+        "terminal.scroll_pixels_per_notch",
         "terminal",
         "appearance.theme",
         "appearance",
@@ -1113,6 +1141,61 @@ mod tests {
         );
         assert_eq!(merge_class_for("font"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("keymaps"), Some(MergeClass::SetById));
+        // CTX-0185: scroll speed keys are scalar-replace like scrollback.
+        assert_eq!(
+            merge_class_for("terminal.scroll_lines_per_notch"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("terminal.scroll_pixels_per_notch"),
+            Some(MergeClass::ScalarReplace)
+        );
         assert_eq!(merge_class_for("unknown"), None);
+    }
+
+    #[test]
+    fn later_layer_wins_terminal_scroll_speed() {
+        // CTX-0185: user scroll keys override defaults; CLI wins over file.
+        use crate::types::TerminalConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                terminal: Some(TerminalConfig {
+                    scrollback: 10_000,
+                    shell: None,
+                    scroll_lines_per_notch: 5,
+                    scroll_pixels_per_notch: 24,
+                }),
+                ..Default::default()
+            },
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                terminal: Some(TerminalConfig {
+                    scrollback: 10_000,
+                    shell: None,
+                    scroll_lines_per_notch: 2,
+                    scroll_pixels_per_notch: 8,
+                }),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, cli]).expect("merge");
+        assert_eq!(merged.effective.terminal.scroll_lines_per_notch, 2);
+        assert_eq!(merged.effective.terminal.scroll_pixels_per_notch, 8);
+        assert_eq!(
+            merged
+                .source_of("terminal.scroll_lines_per_notch")
+                .unwrap()
+                .layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged
+                .conflicts
+                .iter()
+                .any(|c| c.field == "terminal.scroll_lines_per_notch")
+        );
     }
 }

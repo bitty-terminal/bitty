@@ -23,6 +23,21 @@ pub const MAX_KEYMAPS: usize = 1024;
 pub const MAX_PLUGINS: usize = 1024;
 pub const MAX_SHELL_LEN: usize = 1024;
 
+/// Default lines scrolled per wheel notch (LineDelta unit 1.0).
+/// Matches alacritty/ghostty-class `3` lines per tick.
+pub const DEFAULT_SCROLL_LINES_PER_NOTCH: u32 = 3;
+
+/// Maximum lines per wheel notch (per-frame SGR/viewport cap is 32).
+pub const MAX_SCROLL_LINES_PER_NOTCH: u32 = 32;
+
+/// Default smooth-scroll (PixelDelta) pixels per wheel notch.
+/// Matches the default 8x16 cell height (one cell per notch before the
+/// lines multiplier).
+pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
+
+/// Maximum smooth-scroll pixels per wheel notch.
+pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
+
 /// Font configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontConfig {
@@ -108,6 +123,12 @@ pub struct TerminalConfig {
     pub scrollback: u32,
     /// Preferred shell argv[0], if overridden; trimmed non-empty when present.
     pub shell: Option<String>,
+    /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3,
+    /// ghostty/alacritty-class throughput).
+    pub scroll_lines_per_notch: u32,
+    /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16,
+    /// one default cell height per notch before the lines multiplier).
+    pub scroll_pixels_per_notch: u32,
 }
 
 impl Default for TerminalConfig {
@@ -115,6 +136,8 @@ impl Default for TerminalConfig {
         Self {
             scrollback: 10_000,
             shell: None,
+            scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
+            scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
         }
     }
 }
@@ -126,6 +149,18 @@ impl TerminalConfig {
             return Err(ConfigError::validation(
                 "terminal.scrollback",
                 "must be <= 100000",
+            ));
+        }
+        if !(1..=MAX_SCROLL_LINES_PER_NOTCH).contains(&self.scroll_lines_per_notch) {
+            return Err(ConfigError::validation(
+                "terminal.scroll_lines_per_notch",
+                format!("must be within [1, {MAX_SCROLL_LINES_PER_NOTCH}]"),
+            ));
+        }
+        if !(1..=MAX_SCROLL_PIXELS_PER_NOTCH).contains(&self.scroll_pixels_per_notch) {
+            return Err(ConfigError::validation(
+                "terminal.scroll_pixels_per_notch",
+                format!("must be within [1, {MAX_SCROLL_PIXELS_PER_NOTCH}]"),
             ));
         }
         if let Some(s) = &self.shell {
@@ -396,17 +431,48 @@ mod tests {
     fn terminal_validation() {
         TerminalConfig {
             scrollback: 200_000,
-            shell: None,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         TerminalConfig {
             scrollback: 10,
             shell: Some("   ".into()),
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         TerminalConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn terminal_scroll_speed_validation() {
+        // CTX-0185: lines/pixels per notch are validated fail-closed.
+        for bad_lines in [0, MAX_SCROLL_LINES_PER_NOTCH + 1] {
+            TerminalConfig {
+                scroll_lines_per_notch: bad_lines,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+        }
+        for bad_pixels in [0, MAX_SCROLL_PIXELS_PER_NOTCH + 1] {
+            TerminalConfig {
+                scroll_pixels_per_notch: bad_pixels,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+        }
+        for (lines, pixels) in [(1, 1), (3, 16), (32, 256)] {
+            TerminalConfig {
+                scroll_lines_per_notch: lines,
+                scroll_pixels_per_notch: pixels,
+                ..Default::default()
+            }
+            .validate()
+            .expect("boundary scroll speed must be valid");
+        }
     }
 
     #[test]

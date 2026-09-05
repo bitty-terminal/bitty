@@ -558,6 +558,13 @@ pub struct Runtime {
     // Wheel accumulator for pixel scroll (candidate: 4*cell bound)
     wheel_accum_y: f32,
     wheel_accum_x: f32,
+    // CTX-0185: fractional line-notch accumulator. `Lines` deltas are f32
+    // (high-resolution wheels emit fractions of a notch); truncating each
+    // event to `isize` dropped sub-notch motion entirely, which read as lag.
+    // Scaled notches accumulate here and emit whole lines; clamped to one
+    // frame's cap so a spinning wheel cannot bank unbounded drift.
+    wheel_line_accum_y: f32,
+    wheel_line_accum_x: f32,
     // DPI scale
     scale_factor: ScaleFactor,
     is_crossfont: bool,
@@ -773,6 +780,8 @@ impl Runtime {
             ime_cursor: 0,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
+            wheel_line_accum_y: 0.0,
+            wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
             query_overlap: Vec::new(),
@@ -863,6 +872,8 @@ impl Runtime {
             ime_cursor: 0,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
+            wheel_line_accum_y: 0.0,
+            wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
             query_overlap: Vec::new(),
@@ -2068,9 +2079,28 @@ impl Runtime {
         }
     }
 
-    /// Handles wheel scroll: accumulates pixel deltas per Text RFC candidate
-    /// (threshold = cell_height) and emits lines or scrolls viewport.
-    /// Bounded: at most 32 lines per frame, accumulator clamped to 4*cell_height.
+    /// Handles wheel scroll: accumulates line-notch and pixel deltas and
+    /// emits lines or scrolls the viewport, scaled by the configured scroll
+    /// speed (`RuntimeConfig::scroll_lines_per_notch` /
+    /// `scroll_pixels_per_notch`).
+    ///
+    /// CTX-0185 profile (vs ghostty on the same machine): the lag was
+    /// throughput, not redundant work. The `Lines` path moved exactly 1 line
+    /// per notch (`y as isize`) while ghostty-class terminals move 3, and
+    /// fractional `Lines` deltas (`|y| < 1.0` from high-resolution wheels)
+    /// truncated to zero and were dropped outright. Scheduling was already
+    /// coalesced (wheel events only set `pending_full_redraw`; one `tick`
+    /// per event-loop pass presents, so an N-event fling costs one full
+    /// redraw), and the full redraw itself is required — every viewport cell
+    /// changes under scroll. The fix is speed plus a fractional accumulator,
+    /// not fewer presents.
+    ///
+    /// Direction semantics (CTX-0155) are untouched: `y > 0` is up into
+    /// history on both paths.
+    /// Bounded: at most 32 lines per frame per path; the line-notch
+    /// accumulator is clamped to one frame cap and the pixel accumulator to
+    /// 4x the notch threshold, so a spinning wheel cannot bank unbounded
+    /// drift.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
         // CTX-0159: retain a bounded wheel trace for screenshots-free probes.
@@ -2095,11 +2125,21 @@ impl Runtime {
             }
         }
         self.publish_inspect_snapshot();
-        let live = self.live_cell_metrics();
-        let cell_h = live.height as f32;
-        let cell_w = live.width as f32;
+        // Validated `1..=` at construction; `max(1)` keeps release builds
+        // total even if a struct-literal config ever bypasses validation.
+        let lines_per_notch = self.config.scroll_lines_per_notch.max(1) as f32;
+        let pixels_per_notch = self.config.scroll_pixels_per_notch.max(1) as f32;
         match delta {
             ScrollDelta::Lines(x, y) => {
+                // Scale notches into lines and bank the fraction so
+                // sub-notch deltas survive across events instead of
+                // truncating to zero.
+                self.wheel_line_accum_y =
+                    (self.wheel_line_accum_y + y * lines_per_notch).clamp(-32.0, 32.0);
+                self.wheel_line_accum_x =
+                    (self.wheel_line_accum_x + x * lines_per_notch).clamp(-32.0, 32.0);
+                let lines_y = self.wheel_line_accum_y.trunc() as isize;
+                let lines_x = self.wheel_line_accum_x.trunc() as isize;
                 // Shift+wheel or no capture scrolls viewport; otherwise emit mouse wheel SGR when mouse mode active.
                 let capture_scroll = !self.shift_pressed
                     && self.state.modes().mouse_tracking.is_some()
@@ -2107,9 +2147,8 @@ impl Runtime {
                         == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
                 if capture_scroll {
                     // SGR wheel: buttons 64 (up) / 65 (down), horizontal 66/67
-                    let lines = y as isize;
-                    for _ in 0..lines.abs().min(32) as isize {
-                        let btn = if lines > 0 { 64 } else { 65 };
+                    for _ in 0..lines_y.abs().min(32) {
+                        let btn = if lines_y > 0 { 64 } else { 65 };
                         let seq = if let Some(pos) = self.last_cursor {
                             let cell = self.cursor_to_cell(pos);
                             let col = (cell.col as u32 + 1) as u16;
@@ -2120,50 +2159,55 @@ impl Runtime {
                         };
                         self.push_input_bytes(seq.as_bytes());
                     }
-                    for _ in 0..(x.abs() as usize).min(32) {
-                        let btn = if x > 0.0 { 66 } else { 67 };
+                    for _ in 0..lines_x.unsigned_abs().min(32) {
+                        let btn = if lines_x > 0 { 66 } else { 67 };
                         let seq = format!("\x1b[<{btn};1;1M");
                         self.push_input_bytes(seq.as_bytes());
                     }
+                    self.wheel_line_accum_y -= lines_y as f32;
+                    self.wheel_line_accum_x -= lines_x as f32;
                 } else {
+                    // Horizontal has no viewport meaning; drain it so no
+                    // stale fraction survives into a later capture session.
+                    self.wheel_line_accum_x = 0.0;
                     // Viewport scroll
-                    if y != 0.0 {
+                    if lines_y != 0 {
                         // winit LineDelta y>0 = wheel up; View::scroll_by
-                        // positive = up into history, so delta is +y.
-                        let delta = y as isize;
+                        // positive = up into history, so delta is +lines.
                         let max = self.state.scrollback_len();
                         if let Some(view_id) = self.focused_view() {
                             if let Some(view) = self.layout.find_leaf_mut(view_id) {
-                                view.scroll_by(delta, max);
+                                view.scroll_by(lines_y, max);
                             }
                         } else {
                             // Single-window fallback: find leaf 1
                             if let Some(view) = self.layout.find_leaf_mut(ViewId::new(1)) {
-                                view.scroll_by(delta, max);
+                                view.scroll_by(lines_y, max);
                             }
                         }
-                        if delta != 0 {
-                            self.pending_full_redraw = true;
-                        }
+                        self.wheel_line_accum_y -= lines_y as f32;
+                        self.pending_full_redraw = true;
                     }
                 }
             }
             ScrollDelta::Pixels(px, py) => {
-                // Accumulate pixel deltas; threshold = cell size
+                // Accumulate pixel deltas; threshold = configured pixels
+                // per notch (default 16 = one default cell height).
                 self.wheel_accum_x += px as f32;
                 self.wheel_accum_y += py as f32;
-                let bound = 4.0 * cell_h;
+                let bound = 4.0 * pixels_per_notch;
                 self.wheel_accum_y = self.wheel_accum_y.clamp(-bound, bound);
-                self.wheel_accum_x = self.wheel_accum_x.clamp(-4.0 * cell_w, 4.0 * cell_w);
-                let lines_y = (self.wheel_accum_y / cell_h).trunc() as isize;
-                let lines_x = (self.wheel_accum_x / cell_w).trunc() as isize;
-                if lines_y != 0 || lines_x != 0 {
-                    // Use lines path with coalescing
-                    let clamped_y = lines_y.clamp(-32, 32);
-                    let clamped_x = lines_x.clamp(-32, 32) as f32;
-                    self.handle_wheel(ScrollDelta::Lines(clamped_x, clamped_y as f32));
-                    self.wheel_accum_y -= clamped_y as f32 * cell_h;
-                    self.wheel_accum_x -= clamped_x * cell_w;
+                self.wheel_accum_x = self.wheel_accum_x.clamp(-bound, bound);
+                let notches_y = self.wheel_accum_y / pixels_per_notch;
+                let notches_x = self.wheel_accum_x / pixels_per_notch;
+                if notches_y.trunc() != 0.0 || notches_x.trunc() != 0.0 {
+                    // Use lines path with coalescing; the lines multiplier
+                    // applies once, inside the Lines path.
+                    let clamped_y = notches_y.clamp(-32.0, 32.0);
+                    let clamped_x = notches_x.clamp(-32.0, 32.0);
+                    self.handle_wheel(ScrollDelta::Lines(clamped_x, clamped_y));
+                    self.wheel_accum_y -= clamped_y * pixels_per_notch;
+                    self.wheel_accum_x -= clamped_x * pixels_per_notch;
                 }
             }
         }
@@ -6299,6 +6343,10 @@ mod tests {
         // CTX-0155 (#251): winit LineDelta/PixelDelta y>0 = wheel up;
         // View::scroll_by positive = up into history. Wheel-up from live
         // must increase offset; wheel-down must decrease it.
+        // CTX-0185: one notch now moves `scroll_lines_per_notch` (default 3),
+        // not 1 — direction semantics unchanged, throughput fixed.
+        let lines_per_notch = RuntimeConfig::default().scroll_lines_per_notch as usize;
+        let pixels_per_notch = RuntimeConfig::default().scroll_pixels_per_notch as f64;
         let mut rt = make_runtime();
         for i in 0..60 {
             let line = format!("line {i:02}\n");
@@ -6319,28 +6367,165 @@ mod tests {
         assert_eq!(offset(&rt), 0, "must start at live");
         // Lines path.
         rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
-        assert_eq!(offset(&rt), 1, "wheel-up (Lines y>0) must go into history");
+        assert_eq!(
+            offset(&rt),
+            lines_per_notch,
+            "wheel-up (Lines y>0) must go into history by one notch"
+        );
         rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -1.0));
         assert_eq!(
             offset(&rt),
             0,
             "wheel-down (Lines y<0) must return toward live"
         );
-        // Pixels path (accumulator threshold = cell height).
-        let cell_h = rt.live_cell_metrics().height as f64;
-        assert!(cell_h > 0.0, "cell height must be non-zero");
-        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(0.0, cell_h * 2.0));
+        // Pixels path (accumulator threshold = configured pixels per notch).
+        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(
+            0.0,
+            pixels_per_notch * 2.0,
+        ));
         assert_eq!(
             offset(&rt),
-            2,
-            "wheel-up (Pixels py>0) must go into history"
+            lines_per_notch * 2,
+            "wheel-up (Pixels py>0) must go into history by two notches"
         );
-        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(0.0, -(cell_h * 2.0)));
+        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(
+            0.0,
+            -(pixels_per_notch * 2.0),
+        ));
         assert_eq!(
             offset(&rt),
             0,
             "wheel-down (Pixels py<0) must return toward live"
         );
+    }
+
+    #[test]
+    fn wheel_fractional_line_deltas_accumulate_instead_of_dropping() {
+        // CTX-0185: high-resolution wheels emit fractional LineDelta notches
+        // (|y| < 1.0). Truncating each event to `isize` dropped them outright
+        // (read as lag); they must bank across events. Default 3 lines/notch:
+        // 0.25 notch = 0.75 lines banked, second 0.25 completes 1.5 -> 1 line.
+        let mut rt = make_runtime();
+        for i in 0..60 {
+            let line = format!("line {i:02}\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        let view_id = rt.focused_view().unwrap_or(bitty_ui::ViewId::new(1));
+        let offset = |rt: &Runtime| {
+            rt.layout
+                .find_leaf(view_id)
+                .map(|v| v.scroll_offset())
+                .unwrap_or(usize::MAX)
+        };
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 0.25));
+        assert_eq!(offset(&rt), 0, "sub-line fraction must not scroll yet");
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 0.25));
+        assert_eq!(offset(&rt), 1, "banked fractions must complete a line");
+        // Opposite fractions walk back down (direction preserved).
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -0.25));
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -0.25));
+        assert_eq!(offset(&rt), 0, "fractions must unwind toward live");
+    }
+
+    #[test]
+    fn wheel_scroll_speed_config_scales_per_notch_distance() {
+        // CTX-0185: per-notch distance is configurable and validated.
+        fn runtime_with_scroll(lines: u32, pixels: u32) -> Runtime {
+            Runtime::new(RuntimeConfig {
+                scroll_lines_per_notch: lines,
+                scroll_pixels_per_notch: pixels,
+                ..RuntimeConfig::default()
+            })
+            .expect("custom scroll speed must build")
+        }
+        fn fill(rt: &mut Runtime) {
+            for i in 0..60 {
+                let line = format!("line {i:02}\n");
+                rt.handle_pty_bytes(line.as_bytes());
+            }
+        }
+        fn offset_of(rt: &Runtime) -> usize {
+            let view_id = rt.focused_view().unwrap_or(bitty_ui::ViewId::new(1));
+            rt.layout
+                .find_leaf(view_id)
+                .map(|v| v.scroll_offset())
+                .unwrap_or(usize::MAX)
+        }
+        // 1 line/notch restores the pre-CTX-0185 feel exactly.
+        let mut slow = runtime_with_scroll(1, 16);
+        fill(&mut slow);
+        slow.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        assert_eq!(offset_of(&slow), 1);
+        // 5 lines/notch moves five times further per event.
+        let mut fast = runtime_with_scroll(5, 16);
+        fill(&mut fast);
+        fast.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        assert_eq!(offset_of(&fast), 5);
+        // Pixels threshold is configurable: 8px/notch means 16px = 2 notches.
+        let mut touchy = runtime_with_scroll(2, 8);
+        fill(&mut touchy);
+        touchy.handle_wheel(bitty_platform::ScrollDelta::Pixels(0.0, 16.0));
+        assert_eq!(offset_of(&touchy), 4);
+    }
+
+    #[test]
+    fn wheel_fling_coalesces_to_one_present_then_idles() {
+        // CTX-0185 profile evidence: wheel events only set
+        // `pending_full_redraw`; an N-event fling without intermediate ticks
+        // costs exactly one present, and the next tick idles (frame-on-demand
+        // preserved — scroll adds no wakeups).
+        let mut rt = make_runtime();
+        for i in 0..60 {
+            let line = format!("line {i:02}\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        for _ in 0..5 {
+            rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        }
+        let view_id = rt.focused_view().unwrap_or(bitty_ui::ViewId::new(1));
+        let offset = rt
+            .layout
+            .find_leaf(view_id)
+            .map(|v| v.scroll_offset())
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            offset,
+            5 * RuntimeConfig::default().scroll_lines_per_notch as usize
+        );
+        assert!(
+            rt.tick().is_some(),
+            "fling must present exactly once on the next tick"
+        );
+        assert!(
+            rt.tick().is_none(),
+            "must idle after presenting (no scroll wakeups)"
+        );
+    }
+
+    #[test]
+    fn wheel_sgr_capture_scales_with_scroll_speed() {
+        // CTX-0185: mouse-mode SGR wheel emission scales with the configured
+        // lines/notch (one SGR event per line, still capped at 32/frame) and
+        // never scrolls the viewport.
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"\x1b[?1000h");
+        rt.handle_pty_bytes(b"\x1b[?1006h");
+        rt.drain_pending_input();
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        let pending = String::from_utf8_lossy(rt.pending_input()).into_owned();
+        let ups = pending.matches("\x1b[<64;").count();
+        assert_eq!(
+            ups,
+            RuntimeConfig::default().scroll_lines_per_notch as usize,
+            "one SGR 64 per line in the notch, got {pending:?}"
+        );
+        let view_id = rt.focused_view().unwrap_or(bitty_ui::ViewId::new(1));
+        let offset = rt
+            .layout
+            .find_leaf(view_id)
+            .map(|v| v.scroll_offset())
+            .unwrap_or(usize::MAX);
+        assert_eq!(offset, 0, "capture scroll must not move the viewport");
     }
 
     #[test]

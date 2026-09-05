@@ -1997,11 +1997,31 @@ fn track_app_modifiers(mods: &mut AppModifiers, key: &KeyEvent) {
 /// matches the `shift+alt+h` chord.
 fn key_ref_from_event(key: &KeyEvent, mods: &AppModifiers) -> Option<bitty_config::KeyRef> {
     use bitty_config::{KeyName, KeyRef};
+    let mut shift = mods.shift;
     let name = match &key.logical_key {
         LogicalKey::Character(s) => {
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) if c.is_ascii_graphic() => KeyName::Char(c.to_ascii_lowercase()),
+                (Some(c), None) if c.is_ascii_graphic() => {
+                    // CTX-0187 single-owner leak: bare Ctrl+V (lowercase "v",
+                    // Shift NOT physically held, so the compositor reports
+                    // lowercase) must reach the shell as 0x16, never trigger
+                    // the paste arm — even when the app mirror still latches
+                    // shift=true stale (focus loss / race / Sticky Keys).
+                    // Live Wayland capture 2026-09-05: bare "v"/shift=false
+                    // NOMATCH shell, shifted "V"/shift=true MATCH paste; real
+                    // Shift always uppercases even with Ctrl held, so a
+                    // lowercase letter with ctrl+shift-mirror-true is stale,
+                    // not a real chord. Correct it to shell (shift=false) to
+                    // close the leak; uppercase with shift=true still pastes,
+                    // fresh bare (shift=false) still shells, bare Ctrl+C still
+                    // SIGINTs. Applies to all ctrl+letters (also fixes
+                    // ctrl+h/j/k/l resize leak where bare must stay shell).
+                    if mods.control && c.is_ascii_lowercase() && mods.shift {
+                        shift = false;
+                    }
+                    KeyName::Char(c.to_ascii_lowercase())
+                }
                 _ => return None,
             }
         }
@@ -2039,7 +2059,7 @@ fn key_ref_from_event(key: &KeyEvent, mods: &AppModifiers) -> Option<bitty_confi
         key: name,
         ctrl: mods.control,
         alt: mods.alt,
-        shift: mods.shift,
+        shift,
         super_held: mods.super_held,
     })
 }
@@ -3774,6 +3794,56 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, r),
             Some(ChromeAction::PasteFromClipboard)
+        );
+    }
+
+    #[test]
+    fn bare_ctrl_v_with_stale_shift_reaches_shell_not_paste() {
+        // CTX-0187: bare Ctrl+V (lowercase "v", Shift NOT physically held,
+        // so the compositor reports lowercase) must reach the shell as 0x16,
+        // never trigger the paste arm — even when the app modifier mirror
+        // still latches shift=true stale (focus loss / race / Sticky Keys).
+        // Real Ctrl+Shift+V reports uppercase "V" with shift=true (live
+        // ydotool capture 2026-09-05: bare "v"/shift=false NOMATCH shell,
+        // shifted "V"/shift=true MATCH paste) and must still paste.
+        use bitty_config::{ChromeAction, match_keymap, resolve_keymaps};
+        let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+        // Stale mirror: control held, shift latched true stale, but the
+        // physical key reports lowercase "v" (Shift NOT held for typing).
+        let stale = AppModifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let r = key_ref_from_event(&test_char_key("v"), &stale).expect("matchable");
+        assert_eq!(
+            match_keymap(&maps, r),
+            None,
+            "stale-shift bare Ctrl+V (lowercase v) must stay shell input, never paste"
+        );
+        // Real shifted chord (uppercase "V", Shift held) still pastes.
+        let r = key_ref_from_event(&test_char_key("V"), &stale).expect("matchable");
+        assert_eq!(
+            match_keymap(&maps, r),
+            Some(ChromeAction::PasteFromClipboard),
+            "real Ctrl+Shift+V (uppercase V) must still paste"
+        );
+        // Fresh bare (lowercase, no shift) stays shell; bare Ctrl+C stays SIGINT.
+        let fresh_bare = AppModifiers {
+            control: true,
+            ..Default::default()
+        };
+        let r = key_ref_from_event(&test_char_key("v"), &fresh_bare).expect("matchable");
+        assert_eq!(
+            match_keymap(&maps, r),
+            None,
+            "fresh bare Ctrl+V stays shell"
+        );
+        let r = key_ref_from_event(&test_char_key("c"), &stale).expect("matchable");
+        assert_eq!(
+            match_keymap(&maps, r),
+            None,
+            "stale-shift bare Ctrl+C (lowercase c) must stay shell SIGINT, never copy"
         );
     }
 

@@ -2005,10 +2005,9 @@ impl Runtime {
                 } else {
                     // Viewport scroll
                     if y != 0.0 {
-                        // Positive y is scroll down toward live? winit Lines: y>0 is down?
-                        // We treat y>0 as scroll down (toward live) but viewport offset is up.
-                        // So delta for view is -y (down reduces offset). Clamp bounded.
-                        let delta = (-y) as isize;
+                        // winit LineDelta y>0 = wheel up; View::scroll_by
+                        // positive = up into history, so delta is +y.
+                        let delta = y as isize;
                         let max = self.state.scrollback_len();
                         if let Some(view_id) = self.focused_view() {
                             if let Some(view) = self.layout.find_leaf_mut(view_id) {
@@ -6104,6 +6103,55 @@ mod tests {
         assert_eq!(rt.clipboard().headless_contents(), "clip");
         assert_eq!(rt.primary_contents(), "prim");
         assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn wheel_up_scrolls_into_history_and_down_returns_to_live() {
+        // CTX-0155 (#251): winit LineDelta/PixelDelta y>0 = wheel up;
+        // View::scroll_by positive = up into history. Wheel-up from live
+        // must increase offset; wheel-down must decrease it.
+        let mut rt = make_runtime();
+        for i in 0..60 {
+            let line = format!("line {i:02}\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        assert!(
+            rt.state.scrollback_len() > 5,
+            "need scrollback for wheel test, got {}",
+            rt.state.scrollback_len()
+        );
+        let view_id = rt.focused_view().unwrap_or(bitty_ui::ViewId::new(1));
+        let offset = |rt: &Runtime| {
+            rt.layout
+                .find_leaf(view_id)
+                .map(|v| v.scroll_offset())
+                .unwrap_or(usize::MAX)
+        };
+        assert_eq!(offset(&rt), 0, "must start at live");
+        // Lines path.
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        assert_eq!(offset(&rt), 1, "wheel-up (Lines y>0) must go into history");
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -1.0));
+        assert_eq!(
+            offset(&rt),
+            0,
+            "wheel-down (Lines y<0) must return toward live"
+        );
+        // Pixels path (accumulator threshold = cell height).
+        let cell_h = rt.live_cell_metrics().height as f64;
+        assert!(cell_h > 0.0, "cell height must be non-zero");
+        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(0.0, cell_h * 2.0));
+        assert_eq!(
+            offset(&rt),
+            2,
+            "wheel-up (Pixels py>0) must go into history"
+        );
+        rt.handle_wheel(bitty_platform::ScrollDelta::Pixels(0.0, -(cell_h * 2.0)));
+        assert_eq!(
+            offset(&rt),
+            0,
+            "wheel-down (Pixels py<0) must return toward live"
+        );
     }
 
     #[test]

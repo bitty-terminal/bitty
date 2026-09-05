@@ -78,8 +78,9 @@
 //! `CLI > file > profile > defaults`: the file yields a [`LayerKind::User`]
 //! plan, the named profile (`--profile` / `BITTY_PROFILE`, CTX-0169) yields a
 //! [`LayerKind::Profile`] plan UNDER the file (`init.lua` still wins over
-//! it), an explicit `--theme` CLI flag yields a [`LayerKind::Cli`] plan, and
-//! [`merge_layers`](crate::merge_layers) sorts by precedence so the CLI wins.
+//! it), explicit CLI appearance flags (`--theme`, `--font-family`,
+//! `--font-size`, `--opacity`, CTX-0180) yield one [`LayerKind::Cli`] plan,
+//! and [`merge_layers`](crate::merge_layers) sorts by precedence so the CLI wins.
 //! `BITTY_CONFIG` (path) and `BITTY_PROFILE` (name) env overrides sit between
 //! CLI flags and files (CLI wins over env). Missing files are not errors for
 //! the default probe (bare `bitty` keeps working); a missing **explicit**
@@ -94,8 +95,8 @@ use crate::error::ConfigError;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, SelectionConfig, TerminalConfig,
-    WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, SelectionConfig,
+    TerminalConfig, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -263,10 +264,9 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 /// [`crate::merge_layers`] orders above the file layer. Validation happens at
 /// merge time (overlong names fail closed there).
 ///
-/// CTX-0180 extension point: appearance CLI overrides (`--font-family`,
-/// `--font-size`, `--opacity`) should extend [`CliOverrides`] /
-/// [`resolve_effective_full`] (one `Cli` plan carrying every present CLI
-/// field), keeping this single-field helper as a thin delegate.
+/// Theme-only helper (CTX-0169 contract, unchanged by CTX-0180): full CLI
+/// overrides (`--theme` + `--font-family`/`--font-size`/`--opacity`) go
+/// through [`CliOverrides::to_layer_with_base`] via [`resolve_effective_full`].
 #[must_use]
 pub fn cli_theme_layer(theme: Option<&str>) -> Option<LayeredPlan> {
     let overrides = CliOverrides {
@@ -274,33 +274,130 @@ pub fn cli_theme_layer(theme: Option<&str>) -> Option<LayeredPlan> {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string),
+        ..Default::default()
     };
     overrides.to_layer()
 }
 
-/// CLI overrides collected from flags (CTX-0169; extended by CTX-0180).
+/// CLI overrides collected from flags (CTX-0169; appearance extended by
+/// CTX-0180 / #279).
 ///
-/// Today this carries only `theme` (`--theme`); CTX-0180 adds
-/// `font_family` / `font_size` / `opacity` here so the whole CLI layer stays
-/// one [`LayerKind::Cli`] plan built by [`CliOverrides::to_layer`] and merged
-/// by [`resolve_effective_full`]. Pure data; no env/filesystem access.
+/// `theme` comes from `--theme`; `font_family` / `font_size` / `opacity` come
+/// from `--font-family` / `--font-size` / `--opacity`. The numeric raws stay
+/// strings so invalid values fail closed at merge time (never silently
+/// dropped, never warn-ignored). Pure data; no env/filesystem access.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliOverrides {
     /// CLI theme override (`--theme`).
     pub theme: Option<String>,
+    /// CLI font-family override (`--font-family`); blank means absent.
+    pub font_family: Option<String>,
+    /// CLI font-size override (`--font-size`); raw text, parsed at merge
+    /// time (fail-closed, range `(0, 128]`).
+    pub font_size: Option<String>,
+    /// CLI window-opacity override (`--opacity`); raw text, parsed at merge
+    /// time (fail-closed, range `[0.0, 1.0]`).
+    pub opacity: Option<String>,
+}
+
+/// Trims a CLI raw: `None`/empty/whitespace means "no override".
+fn cli_present(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Parses one CLI numeric raw (already trimmed, non-empty) into a finite
+/// `f32`.
+///
+/// # Errors
+///
+/// [`ConfigError::validation`] at `field` when the raw is unparseable or
+/// non-finite. The message names the field and quotes the trimmed raw (the
+/// caller's own argv, never file bytes).
+fn parse_cli_float(field: &str, raw: &str) -> Result<f32, ConfigError> {
+    match raw.parse::<f32>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(ConfigError::validation(
+            field,
+            format!("CLI value {raw:?} is not a finite number"),
+        )),
+    }
 }
 
 impl CliOverrides {
     /// True when no CLI field is set (no `Cli` layer is built).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.theme.as_deref().is_none_or(|t| t.trim().is_empty())
+        cli_present(self.theme.as_deref()).is_none()
+            && cli_present(self.font_family.as_deref()).is_none()
+            && cli_present(self.font_size.as_deref()).is_none()
+            && cli_present(self.opacity.as_deref()).is_none()
     }
 
-    /// Builds the single [`LayerKind::Cli`] plan for every present field.
+    /// True when this overrides `field` (a dotted merge field path).
+    ///
+    /// Only the four CLI-owned scalars report true: `appearance.theme`,
+    /// `font.family`, `font.size`, `window.opacity`. Used after a successful
+    /// [`CliOverrides::to_layer_with_base`] to restore base attribution for
+    /// inherited siblings.
+    #[must_use]
+    pub fn overrides_field(&self, field: &str) -> bool {
+        match field {
+            "appearance.theme" => cli_present(self.theme.as_deref()).is_some(),
+            "font.family" => cli_present(self.font_family.as_deref()).is_some(),
+            "font.size" => cli_present(self.font_size.as_deref()).is_some(),
+            "window.opacity" => cli_present(self.opacity.as_deref()).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Validates the CTX-0180 appearance raws without needing layers.
+    ///
+    /// Checks `--font-family` length and parses `--font-size`/`--opacity`
+    /// through the same typed validators the merge uses, so range violations
+    /// fail closed with the dotted field path. `theme` is intentionally NOT
+    /// checked here (CTX-0169 merge-time behavior stays untouched).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::validation`] at `font.family` / `font.size` /
+    /// `window.opacity` for overlong/unparseable/out-of-range values.
+    pub fn validate_appearance_overrides(&self) -> Result<(), ConfigError> {
+        if let Some(family) = cli_present(self.font_family.as_deref()) {
+            if family.len() > MAX_FONT_FAMILY_LEN {
+                return Err(ConfigError::validation(
+                    "font.family",
+                    format!("CLI value must be <= {MAX_FONT_FAMILY_LEN} bytes"),
+                ));
+            }
+        }
+        if let Some(raw) = cli_present(self.font_size.as_deref()) {
+            let size = parse_cli_float("font.size", &raw)?;
+            FontConfig {
+                family: String::from("cli"),
+                size,
+                ..Default::default()
+            }
+            .validate()?;
+        }
+        if let Some(raw) = cli_present(self.opacity.as_deref()) {
+            let opacity = parse_cli_float("window.opacity", &raw)?;
+            WindowConfig {
+                opacity,
+                ..Default::default()
+            }
+            .validate()?;
+        }
+        Ok(())
+    }
+
+    /// Builds the single [`LayerKind::Cli`] plan for the `--theme` field only.
     ///
     /// Returns `None` when empty (no override). Validation happens at merge
-    /// time (overlong names fail closed there).
+    /// time (overlong names fail closed there). Kept theme-only so CTX-0169
+    /// callers and [`cli_theme_layer`] behave exactly as before; full CLI
+    /// overrides go through [`CliOverrides::to_layer_with_base`].
     #[must_use]
     pub fn to_layer(&self) -> Option<LayeredPlan> {
         let trimmed = self.theme.as_deref()?.trim();
@@ -318,6 +415,98 @@ impl CliOverrides {
             ConfigSource::new(LayerKind::Cli, Some("cli:--theme")),
             plan,
         ))
+    }
+
+    /// Builds the single [`LayerKind::Cli`] plan for every present CLI field
+    /// (CTX-0180 / #279).
+    ///
+    /// Font/window siblings the CLI did not override are inherited from
+    /// `base` (the already-merged lower layers), so one flag never clobbers
+    /// its siblings: `--font-family X` keeps the file's size, spacing, and
+    /// padding. Tables are included only when at least one of their fields
+    /// is overridden. The source label names the active flags (`cli:--theme`
+    /// is preserved verbatim for theme-only overrides).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] from [`CliOverrides::validate_appearance_overrides`]
+    /// (fail-closed raws) or from the final plan validation (fail-closed
+    /// theme length, same as [`CliOverrides::to_layer`] at merge).
+    pub fn to_layer_with_base(
+        &self,
+        base: &crate::types::EffectiveConfig,
+    ) -> Result<Option<LayeredPlan>, ConfigError> {
+        self.validate_appearance_overrides()?;
+        let theme = cli_present(self.theme.as_deref());
+        let family = cli_present(self.font_family.as_deref());
+        let size = match cli_present(self.font_size.as_deref()) {
+            Some(raw) => Some(parse_cli_float("font.size", &raw)?),
+            None => None,
+        };
+        let opacity = match cli_present(self.opacity.as_deref()) {
+            Some(raw) => Some(parse_cli_float("window.opacity", &raw)?),
+            None => None,
+        };
+        if theme.is_none() && family.is_none() && size.is_none() && opacity.is_none() {
+            return Ok(None);
+        }
+        let font = match (family, size) {
+            (None, None) => None,
+            (f, s) => {
+                let cfg = FontConfig {
+                    family: f.unwrap_or_else(|| base.font.family.clone()),
+                    size: s.unwrap_or(base.font.size),
+                    line_height: base.font.line_height,
+                    letter_spacing: base.font.letter_spacing,
+                };
+                cfg.validate()?;
+                Some(cfg)
+            }
+        };
+        let window = match opacity {
+            None => None,
+            Some(o) => {
+                let cfg = WindowConfig {
+                    opacity: o,
+                    padding: base.window.padding,
+                };
+                cfg.validate()?;
+                Some(cfg)
+            }
+        };
+        let appearance = theme.as_deref().map(|t| AppearanceConfig {
+            theme: Some(t.to_string()),
+        });
+        let plan = ConfigPlan {
+            appearance,
+            font,
+            window,
+            schema_version: Some(CURRENT_SCHEMA_VERSION),
+            ..Default::default()
+        };
+        plan.validate()?;
+        let mut flags = Vec::new();
+        if theme.is_some() {
+            flags.push("--theme");
+        }
+        if self.overrides_field("font.family") {
+            flags.push("--font-family");
+        }
+        if self.overrides_field("font.size") {
+            flags.push("--font-size");
+        }
+        if self.overrides_field("window.opacity") {
+            flags.push("--opacity");
+        }
+        let label = if flags.is_empty() {
+            String::from("cli")
+        } else {
+            format!("cli:{}", flags.join(","))
+        };
+        Ok(Some(LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some(label)),
+            plan,
+        )))
     }
 }
 
@@ -468,49 +657,84 @@ pub fn resolve_effective(
     cli_theme: Option<&str>,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
     let cli = CliOverrides {
-        theme: cli_theme
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
+        theme: cli_present(cli_theme),
+        ..Default::default()
     };
     resolve_effective_full(file, None, &cli)
 }
 
 /// Merges optional profile + file (User) layers with CLI overrides into the
-/// effective config (CTX-0169). Pure and headless.
+/// effective config (CTX-0169; appearance overrides extended by CTX-0180).
 ///
 /// Precedence (per `lua-and-xdg.md` §Layers and #271): `CLI > user file >
 /// profile > defaults` via [`crate::merge_layers`] — the merge sorts by
 /// [`LayerKind::precedence`] (`Cli 70 > User 50 > Profile 40`), so input
 /// order never matters. The profile composes the base; `init.lua` (or the
-/// explicit `--config`/`BITTY_CONFIG` file) still wins over it; `--theme`
-/// wins over both. Empty layers merge to core defaults with attribution.
+/// explicit `--config`/`BITTY_CONFIG` file) still wins over it; CLI
+/// appearance flags (`--theme`, `--font-family`, `--font-size`, `--opacity`)
+/// win over both, each flag overriding only its own field (siblings inherit
+/// the merged lower layers, never defaults). Empty layers merge to core
+/// defaults with attribution.
 ///
 /// # Errors
 ///
 /// Returns the first [`ConfigError`] from validation or merge (including
-/// policy violations, which remain hard errors here).
+/// policy violations, which remain hard errors here). Invalid CLI raws fail
+/// closed with their dotted field path (`font.family` / `font.size` /
+/// `window.opacity`).
 pub fn resolve_effective_full(
     file: Option<LayeredPlan>,
     profile: Option<LayeredPlan>,
     cli: &CliOverrides,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
-    let mut layers = Vec::new();
+    let mut lower = Vec::new();
     if let Some(p) = profile {
         debug_assert_eq!(
             p.source.layer,
             LayerKind::Profile,
             "profile layer must use LayerKind::Profile"
         );
-        layers.push(p);
+        lower.push(p);
     }
     if let Some(f) = file {
-        layers.push(f);
+        lower.push(f);
     }
-    if let Some(cli_layer) = cli.to_layer() {
-        layers.push(cli_layer);
+    // Fast path: no CLI override stays a single merge (pre-0180 behavior).
+    if cli.is_empty() {
+        return crate::merge::merge_layers(lower);
     }
-    crate::merge::merge_layers(layers)
+    // Base merge first so profile/file failures surface before CLI enters.
+    let base = crate::merge::merge_layers(lower.clone())?;
+    // Base-aware CLI layer: validates CLI raws fail-closed and inherits
+    // non-overridden font/window siblings from the base.
+    let cli_layer = cli.to_layer_with_base(&base.effective)?;
+    let mut layers = lower;
+    if let Some(c) = cli_layer {
+        layers.push(c);
+    }
+    let mut merged = crate::merge::merge_layers(layers)?;
+    // The CLI tables are atomic at merge, so inherited siblings were
+    // re-attributed to `Cli` with identical values: restore the base source
+    // per non-overridden field and prune the spurious CLI conflicts so
+    // `config check` keeps exact per-field sources.
+    for field in [
+        "font.family",
+        "font.size",
+        "font.line_height",
+        "font.letter_spacing",
+        "window.opacity",
+        "window.padding",
+    ] {
+        if !cli.overrides_field(field) {
+            if let Some(src) = base.attribution.get(field) {
+                merged.attribution.insert(field.to_string(), src.clone());
+            }
+        }
+    }
+    merged
+        .conflicts
+        .retain(|c| !(c.new_source.layer == LayerKind::Cli && !cli.overrides_field(&c.field)));
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,6 +1592,7 @@ mod tests {
         assert!(empty.to_layer().is_none());
         let cli = CliOverrides {
             theme: Some("dark".to_string()),
+            ..Default::default()
         };
         assert!(!cli.is_empty());
         let layer = cli.to_layer().expect("layer");
@@ -1410,10 +1635,12 @@ mod tests {
         // CLI wins over both.
         let cli = CliOverrides {
             theme: Some("cli-theme".to_string()),
+            ..Default::default()
         };
         // Overlong CLI themes fail closed at merge (same as --theme today).
         let long = CliOverrides {
             theme: Some("x".repeat(65)),
+            ..Default::default()
         };
         assert!(resolve_effective_full(None, Some(profile), &long).is_err());
         let user_src2 = test_source();
@@ -1473,5 +1700,292 @@ mod tests {
     fn load_missing_profile_fails_closed() {
         let path = Path::new("/nonexistent-bitty-ctx0169/profiles/ghost.lua");
         assert!(load_profile_layer(path).is_err());
+    }
+
+    // CTX-0180 CLI appearance overrides: each flag overrides only its own
+    // field for one launch (siblings inherit the merged lower layers),
+    // invalid raws fail closed with the dotted field path, precedence stays
+    // CLI > file > profile > defaults with exact per-field attribution.
+
+    fn file_layer_with_appearance() -> LayeredPlan {
+        let src = test_source();
+        let plan = parse_lua_config(
+            r#"return {
+                font = { family = "File Mono", size = 12.0 },
+                window = { opacity = 1.0, padding = 8 },
+            }"#,
+            &src,
+        )
+        .expect("file parses");
+        LayeredPlan::new(src, plan)
+    }
+
+    #[test]
+    fn cli_font_family_overrides_only_family() {
+        let cli = CliOverrides {
+            font_family: Some("Cli Mono".to_string()),
+            ..Default::default()
+        };
+        assert!(!cli.is_empty());
+        let merged =
+            resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "Cli Mono");
+        // Siblings inherit the file, never defaults-clobber.
+        assert!((merged.effective.font.size - 12.0).abs() < f32::EPSILON);
+        assert!((merged.effective.window.opacity - 1.0).abs() < f32::EPSILON);
+        assert_eq!(merged.effective.window.padding, 8);
+        // Attribution stays exact per field.
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged.source_of("font.size").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("window.opacity").unwrap().layer,
+            LayerKind::User
+        );
+        // Genuine conflict kept for the overridden field; no spurious CLI
+        // conflict for inherited siblings.
+        assert!(
+            merged
+                .conflicts
+                .iter()
+                .any(|c| c.field == "font.family" && c.new_source.layer == LayerKind::Cli)
+        );
+        assert!(
+            !merged
+                .conflicts
+                .iter()
+                .any(|c| c.new_source.layer == LayerKind::Cli && c.field != "font.family")
+        );
+    }
+
+    #[test]
+    fn cli_font_size_overrides_only_size() {
+        let cli = CliOverrides {
+            font_size: Some("16".to_string()),
+            ..Default::default()
+        };
+        let merged =
+            resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "File Mono");
+        assert!((merged.effective.font.size - 16.0).abs() < f32::EPSILON);
+        assert_eq!(merged.source_of("font.size").unwrap().layer, LayerKind::Cli);
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn cli_opacity_overrides_only_opacity() {
+        let cli = CliOverrides {
+            opacity: Some("0.9".to_string()),
+            ..Default::default()
+        };
+        let merged =
+            resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
+        assert!((merged.effective.window.opacity - 0.9).abs() < f32::EPSILON);
+        assert_eq!(merged.effective.window.padding, 8);
+        assert_eq!(
+            merged.source_of("window.opacity").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert_eq!(
+            merged.source_of("window.padding").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn cli_appearance_all_flags_override_together() {
+        let cli = CliOverrides {
+            theme: Some("cli-theme".to_string()),
+            font_family: Some("Cli Mono".to_string()),
+            font_size: Some("14.5".to_string()),
+            opacity: Some("0.85".to_string()),
+        };
+        let merged =
+            resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("cli-theme")
+        );
+        assert_eq!(merged.effective.font.family, "Cli Mono");
+        assert!((merged.effective.font.size - 14.5).abs() < f32::EPSILON);
+        assert!((merged.effective.window.opacity - 0.85).abs() < f32::EPSILON);
+        for field in [
+            "appearance.theme",
+            "font.family",
+            "font.size",
+            "window.opacity",
+        ] {
+            assert_eq!(
+                merged.source_of(field).unwrap().layer,
+                LayerKind::Cli,
+                "field {field} must attribute to cli"
+            );
+        }
+        // Untouched siblings keep file sources.
+        assert_eq!(
+            merged.source_of("window.padding").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn cli_appearance_beats_profile_when_no_file() {
+        let profile = profile_layer_for(r#"return { font = { family = "Prof Mono", size = 11 } }"#);
+        let cli = CliOverrides {
+            font_size: Some("18".to_string()),
+            ..Default::default()
+        };
+        let merged = resolve_effective_full(None, Some(profile), &cli).expect("cli over profile");
+        assert!((merged.effective.font.size - 18.0).abs() < f32::EPSILON);
+        assert_eq!(merged.effective.font.family, "Prof Mono");
+        assert_eq!(merged.source_of("font.size").unwrap().layer, LayerKind::Cli);
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::Profile
+        );
+    }
+
+    #[test]
+    fn cli_appearance_blank_means_no_override() {
+        let cli = CliOverrides {
+            font_family: Some("   ".to_string()),
+            font_size: Some(String::new()),
+            opacity: None,
+            ..Default::default()
+        };
+        assert!(cli.is_empty());
+        let merged =
+            resolve_effective_full(Some(file_layer_with_appearance()), None, &cli).expect("merge");
+        assert_eq!(merged.effective.font.family, "File Mono");
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn cli_appearance_invalid_raws_fail_closed_with_field() {
+        // Each invalid raw names its dotted field (never a silent ignore).
+        for cli in [
+            CliOverrides {
+                font_size: Some("abc".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_size: Some("0".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_size: Some("-5".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_size: Some("129".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_size: Some("NaN".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_size: Some("inf".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                opacity: Some("abc".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                opacity: Some("1.5".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                opacity: Some("-0.1".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                opacity: Some("NaN".to_string()),
+                ..Default::default()
+            },
+            CliOverrides {
+                font_family: Some("x".repeat(MAX_FONT_FAMILY_LEN + 1)),
+                ..Default::default()
+            },
+        ] {
+            assert!(!cli.is_empty());
+            let err = resolve_effective_full(Some(file_layer_with_appearance()), None, &cli)
+                .expect_err("invalid CLI raw must fail closed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("font.size")
+                    || msg.contains("window.opacity")
+                    || msg.contains("font.family"),
+                "must name the field: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_appearance_boundary_values_merge() {
+        for (size, opacity) in [("0.5", "0.0"), ("128", "1.0"), ("12.0", "0.95")] {
+            let cli = CliOverrides {
+                font_size: Some(size.to_string()),
+                opacity: Some(opacity.to_string()),
+                ..Default::default()
+            };
+            let merged = resolve_effective_full(Some(file_layer_with_appearance()), None, &cli)
+                .expect("boundary values must merge");
+            assert!(
+                (merged.effective.font.size - size.parse::<f32>().unwrap()).abs() < f32::EPSILON
+            );
+            assert!(
+                (merged.effective.window.opacity - opacity.parse::<f32>().unwrap()).abs()
+                    < f32::EPSILON
+            );
+        }
+    }
+
+    #[test]
+    fn cli_layer_with_base_labels_active_flags() {
+        let base = crate::types::EffectiveConfig::default();
+        let cli = CliOverrides {
+            font_family: Some("Cli Mono".to_string()),
+            opacity: Some("0.9".to_string()),
+            ..Default::default()
+        };
+        let layer = cli
+            .to_layer_with_base(&base)
+            .expect("valid")
+            .expect("non-empty");
+        assert_eq!(layer.source.layer, LayerKind::Cli);
+        assert_eq!(
+            layer.source.path.as_deref(),
+            Some("cli:--font-family,--opacity")
+        );
+        // Theme-only keeps the historical label verbatim.
+        let theme_only = CliOverrides {
+            theme: Some("dark".to_string()),
+            ..Default::default()
+        };
+        let layer = theme_only
+            .to_layer_with_base(&base)
+            .expect("valid")
+            .expect("non-empty");
+        assert_eq!(layer.source.path.as_deref(), Some("cli:--theme"));
+        // Empty overrides build no layer.
+        assert!(
+            CliOverrides::default()
+                .to_layer_with_base(&base)
+                .expect("empty valid")
+                .is_none()
+        );
     }
 }

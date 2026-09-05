@@ -56,7 +56,14 @@
 //!    for the explicit program argument, or via the default shell (`$SHELL`
 //!    fallback `/bin/sh`, see [`resolve_default_shell`]) when no program is
 //!    given. The program is taken as a direct
-//!    `argv[0]` without shell interpolation (P0 posture). Failures are owned
+//!    `argv[0]` without shell interpolation (P0 posture). Every additional
+//!    leaf owns its own shell via
+//!    [`Runtime::spawn_shell_for_view`](bitty_runtime::Runtime::spawn_shell_for_view)
+//!    (CTX-0176, same direct-argv sandbox, sized to the leaf allocation):
+//!    `new_split` and startup multi-leaf layouts spawn per-leaf sessions so
+//!    panes never mirror one shell; input routes to the focused leaf only
+//!    (`Runtime::push_input_bytes`); `close_view` tears the leaf's child down
+//!    (`Runtime::close_pane_session`). Failures are owned
 //!    [`RuntimeError`](bitty_runtime::RuntimeError) values flattened from
 //!    `bitty-pty` (`Unsupported` on Windows before ConPTY, `Upstream`/`Io`
 //!    elsewhere) and are reported without panicking.
@@ -347,7 +354,20 @@ fn spawn_default_shell(
     shell_env: Option<&str>,
 ) -> Result<(), bitty_runtime::RuntimeError> {
     let default = resolve_default_shell(shell_env);
-    match runtime.spawn_shell(default) {
+    spawn_with_fallback(|candidate, _| runtime.spawn_shell(candidate), default)
+}
+
+/// Spawn core with the startup fallback chain: try `default` first; when it
+/// differs from [`FALLBACK_SHELL`] and fails, retry once with the fallback
+/// before surfacing the error. The `spawn` closure performs the direct-argv
+/// exec into the target session (primary shell or one split pane). Callers
+/// log and continue without a child on error so headless smoke still ticks.
+fn spawn_with_fallback(
+    mut spawn: impl FnMut(&str, &[&str]) -> Result<(), bitty_runtime::RuntimeError>,
+    default: &str,
+) -> Result<(), bitty_runtime::RuntimeError> {
+    let no_args: &[&str] = &[];
+    match spawn(default, no_args) {
         Ok(()) => {
             eprintln!("bitty: spawned default shell {default:?}");
             Ok(())
@@ -356,7 +376,7 @@ fn spawn_default_shell(
             eprintln!(
                 "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {FALLBACK_SHELL:?}"
             );
-            match runtime.spawn_shell(FALLBACK_SHELL) {
+            match spawn(FALLBACK_SHELL, no_args) {
                 Ok(()) => {
                     eprintln!("bitty: spawned fallback shell {FALLBACK_SHELL:?}");
                     Ok(())
@@ -370,6 +390,80 @@ fn spawn_default_shell(
         Err(err) => {
             eprintln!("bitty: spawn_shell({default:?}) failed: {err}");
             Err(err)
+        }
+    }
+}
+
+/// Frozen spawn recipe so every split leaf replays the exact startup
+/// resolution (explicit program verbatim, else the default-shell chain).
+/// Captured once at startup from CLI args + `$SHELL`; values are direct
+/// argv throughout, never split, joined, or interpolated.
+#[derive(Debug, Clone, Default)]
+struct SpawnSpec {
+    program: Option<String>,
+    program_args: Vec<String>,
+    shell_env: Option<String>,
+}
+
+impl SpawnSpec {
+    /// Resolves `(program, args)` exactly as startup does: the explicit
+    /// program wins verbatim with its tail args, otherwise the default shell
+    /// from the injected `$SHELL` value. Pure; the caller reads env once and
+    /// injects it.
+    fn resolve(&self) -> (String, Vec<String>) {
+        match self.program.as_deref() {
+            Some(program) => (program.to_string(), self.program_args.clone()),
+            None => (
+                resolve_default_shell(self.shell_env.as_deref()).to_string(),
+                Vec::new(),
+            ),
+        }
+    }
+}
+
+/// Spawns the [`SpawnSpec`] program as leaf `view`'s private shell, sized to
+/// `cols` x `rows` cells (CTX-0176). Same sandbox as startup: direct argv,
+/// explicit program verbatim with no fallback, default shell with the
+/// [`FALLBACK_SHELL`] retry. Failures are logged by the fallback core and
+/// returned so the caller degrades loudly: the pane then shares the primary
+/// grid (never a silent mirror).
+fn spawn_pane_shell(
+    runtime: &mut Runtime,
+    spec: &SpawnSpec,
+    view: ViewId,
+    cols: u16,
+    rows: u16,
+) -> Result<(), bitty_runtime::RuntimeError> {
+    let (program, args) = spec.resolve();
+    if spec.program.is_some() {
+        // Explicit program: verbatim, no fallback (startup parity).
+        let tail: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        return runtime.spawn_shell_for_view(view, &program, &tail, cols, rows);
+    }
+    spawn_with_fallback(
+        |candidate, _| runtime.spawn_shell_for_view(view, candidate, &[], cols, rows),
+        &program,
+    )
+}
+
+/// Spawns a private shell for every layout leaf except the focused one
+/// (CTX-0176), which keeps the already-spawned primary session. Each pane
+/// shell is sized to its leaf allocation. Best-effort: per-leaf failures
+/// warn loudly and leave that pane sharing the primary grid (never a
+/// silent mirror). Call only after a successful primary spawn.
+fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) {
+    let primary = runtime.focused_view();
+    let allocs = runtime.layout_allocations();
+    for (id, rect) in &allocs {
+        if Some(*id) == primary {
+            continue;
+        }
+        if let Err(err) =
+            spawn_pane_shell(runtime, spec, *id, rect.width.max(1), rect.height.max(1))
+        {
+            eprintln!(
+                "warning: startup pane {id:?} shell spawn failed ({err}) — pane shares the primary grid"
+            );
         }
     }
 }
@@ -1694,6 +1788,9 @@ struct TerminalApp {
     app_mods: AppModifiers,
     /// Layout stashed by `toggle_zoom`; `None` when not zoomed.
     zoom_backup: Option<LayoutNode>,
+    /// Frozen startup spawn recipe so `new_split` leaves replay the exact
+    /// program/shell resolution (CTX-0176).
+    spawn_spec: SpawnSpec,
 }
 
 impl TerminalApp {
@@ -1704,6 +1801,7 @@ impl TerminalApp {
         theme_name: &str,
         source: &str,
         keymaps: Vec<bitty_config::ResolvedKeymap>,
+        spawn_spec: SpawnSpec,
     ) -> Self {
         // Keep demo pump as fallback when no real PTY is spawned (headless CI,
         // tests). When a real PTY is spawned via `Runtime::spawn_shell`, the
@@ -1721,6 +1819,7 @@ impl TerminalApp {
             keymaps,
             app_mods: AppModifiers::default(),
             zoom_backup: None,
+            spawn_spec,
         }
     }
 
@@ -2208,12 +2307,31 @@ impl TerminalApp {
                     place_new_first,
                 ) {
                     self.runtime.set_layout(layout);
-                    eprintln!(
-                        "bitty: keymap new_split:{} -> leafs={} focused={:?}",
-                        dir.canonical(),
-                        self.runtime.leaf_count(),
-                        self.runtime.focused_view()
-                    );
+                    // CTX-0176: the fresh leaf gets its own shell/PTY sized
+                    // to its allocation — best-effort (startup parity). On
+                    // failure the pane shares the primary grid with a loud
+                    // warning instead of silently mirroring.
+                    let (cols, rows) = self
+                        .runtime
+                        .layout_allocations()
+                        .iter()
+                        .find(|(id, _)| *id == new_id)
+                        .map(|(_, r)| (r.width.max(1), r.height.max(1)))
+                        .unwrap_or((80, 24));
+                    match spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows)
+                    {
+                        Ok(()) => eprintln!(
+                            "bitty: keymap new_split:{} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
+                            dir.canonical(),
+                            self.runtime.leaf_count(),
+                            self.runtime.focused_view(),
+                            self.runtime.pane_pid(&new_id),
+                        ),
+                        Err(err) => eprintln!(
+                            "warning: keymap new_split:{} pane shell spawn failed ({err}) — pane {new_id:?} shares the primary grid",
+                            dir.canonical(),
+                        ),
+                    }
                 } else {
                     eprintln!("warning: keymap new_split found no focused pane — ignoring");
                 }
@@ -2234,6 +2352,11 @@ impl TerminalApp {
                 let mut layout = self.runtime.layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
                     self.runtime.set_layout(layout);
+                    // CTX-0176: tear down the closed leaf's shell (drop kills
+                    // + reaps the child; no-op when it never owned one).
+                    if self.runtime.close_pane_session(&focused) {
+                        eprintln!("bitty: keymap close_view tore down pane shell {focused:?}");
+                    }
                     eprintln!(
                         "bitty: keymap close_view -> leafs={} focused={:?}",
                         self.runtime.leaf_count(),
@@ -2618,13 +2741,19 @@ fn main() {
         }
     }
 
-    // Single-window vertical slice: one PTY, one shell.
+    // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
     // bare invocation resolves to the default shell ($SHELL or /bin/sh).
     // Headless CI still succeeds even if spawn fails (bounded synthetic smoke).
     // `$SHELL` is read once here and injected into the pure resolver so arg
     // handling stays testable; it is trusted only as a binary path, never split.
     let shell_env = std::env::var("SHELL").ok();
+    // CTX-0176: frozen once so every split leaf replays this resolution.
+    let spawn_spec = SpawnSpec {
+        program: args.program.clone(),
+        program_args: args.program_args.clone(),
+        shell_env: shell_env.clone(),
+    };
     let effective = resolve_spawn_program(&args, shell_env.as_deref());
     eprintln!(
         "bitty: effective program {effective:?} (explicit={})",
@@ -2641,11 +2770,20 @@ fn main() {
         spawn_default_shell(&mut runtime, shell_env.as_deref())
     };
     match spawn_result {
-        Ok(()) => eprintln!(
-            "bitty: PTY shell spawned (has_pty={} has_reader={})",
-            runtime.has_pty(),
-            runtime.has_pty_reader()
-        ),
+        Ok(()) => {
+            eprintln!(
+                "bitty: PTY shell spawned (has_pty={} has_reader={})",
+                runtime.has_pty(),
+                runtime.has_pty_reader()
+            );
+            // CTX-0176: startup multi-leaf layouts (`--split`/`--stack`/
+            // `--layout`) give every non-focused leaf its own shell too; the
+            // focused leaf keeps the primary session spawned above.
+            // Best-effort with loud warnings (spawn failures stay non-fatal,
+            // startup parity). Skipped when the primary spawn failed: the
+            // same resolution would fail the same way per leaf.
+            spawn_startup_pane_shells(&mut runtime, &spawn_spec);
+        }
         Err(err) => eprintln!(
             "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
         ),
@@ -2685,7 +2823,13 @@ fn main() {
     if ipc_serve.is_enabled() {
         eprintln!("bitty: ipc serving {}", ipc_serve.socket_path());
     }
-    let app = TerminalApp::with_theme(runtime, app_config.theme.name, app_config.source, keymaps);
+    let app = TerminalApp::with_theme(
+        runtime,
+        app_config.theme.name,
+        app_config.source,
+        keymaps,
+        spawn_spec,
+    );
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {
@@ -2728,16 +2872,25 @@ fn main() {
         }
         // Preserve program spawn attempt in the fallback when it existed, else
         // resolve the default shell ($SHELL or /bin/sh) for completeness.
-        if let Some(program) = args.program.as_deref() {
+        // CTX-0176: startup panes get their own shells here too (same rule as
+        // the primary path above — panes only when the primary spawn worked).
+        let fallback_spec = SpawnSpec {
+            program: args.program.clone(),
+            program_args: args.program_args.clone(),
+            shell_env: std::env::var("SHELL").ok(),
+        };
+        let fallback_primary_ok = if let Some(program) = args.program.as_deref() {
             let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
             if tail.is_empty() {
-                let _ = rt.spawn_shell(program);
+                rt.spawn_shell(program).is_ok()
             } else {
-                let _ = rt.spawn_shell_with_args(program, &tail);
+                rt.spawn_shell_with_args(program, &tail).is_ok()
             }
         } else {
-            let fallback_shell = std::env::var("SHELL").ok();
-            let _ = spawn_default_shell(&mut rt, fallback_shell.as_deref());
+            spawn_default_shell(&mut rt, fallback_spec.shell_env.as_deref()).is_ok()
+        };
+        if fallback_primary_ok {
+            spawn_startup_pane_shells(&mut rt, &fallback_spec);
         }
         let code = run_headless_smoke(&mut rt);
         std::process::exit(code);
@@ -2922,6 +3075,7 @@ mod tests {
             bitty_config::theme::DEFAULT_THEME_NAME,
             "default",
             Vec::new(),
+            SpawnSpec::default(),
         );
         // Poll the synthetic pump and drive a tick — must not panic and must
         // consume the channel without deadlocking.
@@ -2935,6 +3089,7 @@ mod tests {
             bitty_config::theme::DEFAULT_THEME_NAME,
             "default",
             Vec::new(),
+            SpawnSpec::default(),
         );
         let _ = app2.drive_tick();
         // After first present the second idle tick in the same app may be None.
@@ -3549,8 +3704,13 @@ mod tests {
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let rt = Runtime::with_defaults().expect("must build");
-        let mut app =
-            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default", maps);
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
         app.runtime.set_layout(two_pane_layout());
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
@@ -3570,8 +3730,13 @@ mod tests {
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let rt = Runtime::with_defaults().expect("must build");
-        let mut app =
-            TerminalApp::with_theme(rt, bitty_config::theme::DEFAULT_THEME_NAME, "default", maps);
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
         app.runtime.set_layout(two_pane_layout());
         // Split focused pane right: 2 -> 3 leaves, focus stays.
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
@@ -3594,6 +3759,110 @@ mod tests {
         assert_eq!(app.runtime.leaf_count(), 1);
         app.apply_chrome_action(ChromeAction::CloseView);
         assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    #[test]
+    fn spawn_spec_resolve_prefers_explicit_program() {
+        // CTX-0176: explicit program wins verbatim with its tail args.
+        let spec = SpawnSpec {
+            program: Some("/bin/fish".to_string()),
+            program_args: vec!["-l".to_string()],
+            shell_env: Some("/bin/bash".to_string()),
+        };
+        assert_eq!(
+            spec.resolve(),
+            ("/bin/fish".to_string(), vec!["-l".to_string()])
+        );
+    }
+
+    #[test]
+    fn spawn_spec_resolve_defaults_to_shell_env_then_fallback() {
+        // CTX-0176: no explicit program resolves exactly like startup.
+        let spec = SpawnSpec {
+            program: None,
+            program_args: vec!["-l".to_string()],
+            shell_env: Some("/bin/bash".to_string()),
+        };
+        assert_eq!(spec.resolve(), ("/bin/bash".to_string(), Vec::new()));
+        let spec = SpawnSpec {
+            program: None,
+            program_args: Vec::new(),
+            shell_env: None,
+        };
+        assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
+        let spec = SpawnSpec {
+            program: None,
+            program_args: Vec::new(),
+            shell_env: Some("   ".to_string()),
+        };
+        assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
+    }
+
+    #[test]
+    fn new_split_without_spawnable_shell_keeps_pane_with_warning() {
+        // CTX-0176: spawn failure is loud but non-fatal — the split still
+        // commits (layout ops stay total) with no pane session. Runs
+        // everywhere: the bogus binary fails on every platform.
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let spec = SpawnSpec {
+            program: Some("/nonexistent-bitty-pane-shell-xyz".to_string()),
+            program_args: Vec::new(),
+            shell_env: None,
+        };
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            spec,
+        );
+        app.runtime.set_layout(two_pane_layout());
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.pane_count(), 0);
+        // Closing a session-less leaf is quiet and total.
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(app.runtime.pane_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_split_spawns_private_shell_and_close_tears_it_down() {
+        // CTX-0176 (Issue #274): the fresh leaf owns a live shell; closing
+        // the leaf tears the child down with it.
+        use bitty_config::{ChromeAction, SplitDir};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let spec = SpawnSpec {
+            program: Some("/bin/sh".to_string()),
+            program_args: Vec::new(),
+            shell_env: None,
+        };
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            spec,
+        );
+        app.runtime.set_layout(two_pane_layout());
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        // Fresh leaf is id 3 (one past the previous max).
+        assert!(app.runtime.has_pane_session(&ViewId::new(3)));
+        assert!(app.runtime.pane_pid(&ViewId::new(3)).is_some());
+        // Focus the new leaf, then close it: the child goes down with it.
+        app.apply_chrome_action(ChromeAction::FocusId(3));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(!app.runtime.has_pane_session(&ViewId::new(3)));
+        assert_eq!(app.runtime.pane_count(), 0);
     }
 
     #[test]

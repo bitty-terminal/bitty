@@ -2378,6 +2378,32 @@ impl Runtime {
         }
     }
 
+    /// Scrolls the focused pane by one viewport page (its row count): up
+    /// into scrollback history or down toward live (CTX-0178 Alt+U/I,
+    /// less-like paging behind the `scroll_page_up`/`scroll_page_down`
+    /// chrome actions). Clamped to `[0, scrollback_len]`; bounded to one
+    /// leaf mutation plus a redraw flag. Returns false only when no leaf
+    /// holds the focused id (empty or stale layout).
+    pub fn scroll_focused_page(&mut self, up: bool) -> bool {
+        let max = self.state.scrollback_len();
+        let target = match self.focused_view() {
+            Some(id) => id,
+            None => return false,
+        };
+        let scrolled = match self.layout.find_leaf_mut(target) {
+            Some(view) => {
+                let page = usize::from(view.rows()).max(1) as isize;
+                view.scroll_by(if up { page } else { -page }, max);
+                true
+            }
+            None => false,
+        };
+        if scrolled {
+            self.pending_full_redraw = true;
+        }
+        scrolled
+    }
+
     /// Tracks modifier state from keyboard events (Shift/Ctrl/Alt).
     pub fn track_modifiers_from_key(&mut self, event: &KeyEvent) {
         // Update shift/ctrl/alt pressed state based on named keys.
@@ -5188,6 +5214,51 @@ mod tests {
             Some(vec![0x1b, b'x'])
         );
         assert_eq!(rt.drain_pending_input(), b"\x1bx");
+    }
+
+    #[test]
+    fn scroll_focused_page_moves_viewport_by_page() {
+        // CTX-0178: Alt+U/I pages the focused pane by its viewport height,
+        // clamped to scrollback bounds.
+        let mut rt = make_runtime();
+        for i in 0..200 {
+            let line = format!("line {i:03}\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        rt.tick();
+        assert!(
+            rt.state().scrollback_len() > 0,
+            "history must exist to page through"
+        );
+        let rows = rt
+            .layout()
+            .find_leaf(ViewId::new(1))
+            .expect("single leaf")
+            .rows();
+        assert!(rows > 1, "page must span more than one row");
+        assert!(rt.scroll_focused_page(true), "page up must find the leaf");
+        let offset = rt
+            .layout()
+            .find_leaf(ViewId::new(1))
+            .expect("single leaf")
+            .scroll_offset();
+        assert_eq!(
+            offset,
+            usize::from(rows).min(rt.state().scrollback_len()),
+            "one page up moves by viewport rows"
+        );
+        assert!(
+            rt.scroll_focused_page(false),
+            "page down must find the leaf"
+        );
+        assert_eq!(
+            rt.layout()
+                .find_leaf(ViewId::new(1))
+                .expect("single leaf")
+                .scroll_offset(),
+            0,
+            "one page down returns to live"
+        );
     }
 
     #[test]

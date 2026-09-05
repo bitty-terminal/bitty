@@ -181,6 +181,7 @@ impl TrustStore {
 /// - undeclared fields.
 ///
 /// The allowed subset in this draft: `font`, `window`, `terminal.scrollback`,
+/// `terminal.scroll_lines_per_notch`, `terminal.scroll_pixels_per_notch`,
 /// `appearance`. Expanding this without review would weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {
@@ -303,10 +304,26 @@ mod tests {
             terminal: Some(TerminalConfig {
                 scrollback: 5000,
                 shell: Some("/bin/sh".into()),
+                ..Default::default()
             }),
             ..Default::default()
         };
         assert!(validate_project_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn project_plan_allows_scroll_speed() {
+        // CTX-0185: scroll speed is presentation-only (no process authority
+        // like `shell`), so project layers may set it.
+        let plan = ConfigPlan {
+            terminal: Some(TerminalConfig {
+                scroll_lines_per_notch: 5,
+                scroll_pixels_per_notch: 24,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("scroll speed allowed in project");
     }
 
     #[test]

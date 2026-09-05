@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -115,6 +115,10 @@ pub struct TerminalData {
     pub scrollback: Option<i64>,
     /// Optional shell `argv[0]` (present only when the key is set).
     pub shell: Option<String>,
+    /// Lines per wheel notch (present only when the key is set).
+    pub scroll_lines_per_notch: Option<i64>,
+    /// Smooth-scroll pixels per wheel notch (present only when the key is set).
+    pub scroll_pixels_per_notch: Option<i64>,
 }
 
 /// Plain-data user configuration extracted from the Lua chunk.
@@ -163,9 +167,14 @@ impl ConfigData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigOutcome {
     /// Chunk finished within budgets; data (possibly empty) extracted.
+    ///
+    /// Boxed: `ConfigData` grows with every config key (CTX-0185 pushed the
+    /// inline variant past clippy's large-enum threshold); config evaluation
+    /// is a cold startup path, so one pointer indirection costs nothing and
+    /// keeps future keys from re-tripping the lint.
     Completed {
         /// Extracted plain data.
-        data: ConfigData,
+        data: Box<ConfigData>,
         /// Approx instructions consumed.
         instructions_used: u64,
         /// Wall elapsed ms.
@@ -239,7 +248,7 @@ impl ConfigEval for LuaVm {
                     // Stopped / yielded / already-done without a result:
                     // mirror `execute` leniency and treat as empty config.
                     return Ok(ConfigOutcome::Completed {
-                        data: ConfigData::empty(),
+                        data: Box::new(ConfigData::empty()),
                         instructions_used: self.instructions_used,
                         wall_elapsed_ms: self.wall_elapsed_ms,
                         memory_used: self.memory_used,
@@ -272,7 +281,7 @@ impl ConfigEval for LuaVm {
                     Taken::BadMode(message) => Ok(ConfigOutcome::LuaError { message }),
                     Taken::Values(values) => match ConfigData::from_returns(&values) {
                         Ok(data) => Ok(ConfigOutcome::Completed {
-                            data,
+                            data: Box::new(data),
                             instructions_used: self.instructions_used,
                             wall_elapsed_ms: self.wall_elapsed_ms,
                             memory_used: self.memory_used,
@@ -574,7 +583,16 @@ impl ConfigData {
                 }
                 "terminal" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["scrollback", "shell"])?;
+                    check_nested_keys(
+                        key,
+                        nested,
+                        &[
+                            "scrollback",
+                            "shell",
+                            "scroll_lines_per_notch",
+                            "scroll_pixels_per_notch",
+                        ],
+                    )?;
                     let scrollback = match get_field(nested, "scrollback") {
                         Some(v) => Some(expect_integer("terminal.scrollback", v)?),
                         None => None,
@@ -583,7 +601,21 @@ impl ConfigData {
                         Some(v) => Some(expect_string("terminal.shell", v)?),
                         None => None,
                     };
-                    out.terminal = Some(TerminalData { scrollback, shell });
+                    let scroll_lines_per_notch = match get_field(nested, "scroll_lines_per_notch") {
+                        Some(v) => Some(expect_integer("terminal.scroll_lines_per_notch", v)?),
+                        None => None,
+                    };
+                    let scroll_pixels_per_notch = match get_field(nested, "scroll_pixels_per_notch")
+                    {
+                        Some(v) => Some(expect_integer("terminal.scroll_pixels_per_notch", v)?),
+                        None => None,
+                    };
+                    out.terminal = Some(TerminalData {
+                        scrollback,
+                        shell,
+                        scroll_lines_per_notch,
+                        scroll_pixels_per_notch,
+                    });
                 }
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
@@ -739,7 +771,7 @@ mod tests {
     fn eval_ok(code: &str) -> ConfigData {
         let mut vm = LuaVm::new("test.config");
         match vm.eval_config(code).expect("eval must not refuse") {
-            ConfigOutcome::Completed { data, .. } => data,
+            ConfigOutcome::Completed { data, .. } => *data,
             other => panic!("expected completed, got {other:?}"),
         }
     }
@@ -767,7 +799,7 @@ mod tests {
                 appearance = { theme = "bitty-dark" },
                 font = { family = "JetBrains Mono", size = 13.0 },
                 window = { opacity = 0.95, padding = 8 },
-                terminal = { scrollback = 10000, shell = "/bin/fish" },
+                terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
             }"#,
         );
         assert_eq!(data.appearance_theme.as_deref(), Some("bitty-dark"));
@@ -780,6 +812,21 @@ mod tests {
         let term = data.terminal.unwrap();
         assert_eq!(term.scrollback, Some(10000));
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
+        assert_eq!(term.scroll_lines_per_notch, Some(3));
+        assert_eq!(term.scroll_pixels_per_notch, Some(16));
+    }
+
+    #[test]
+    fn terminal_scroll_keys_absent_means_no_override() {
+        // Scroll keys are optional extras (like `shell`): an absent key is
+        // `None` so merge keeps the lower-precedence value instead of
+        // resetting to a default (fail-closed attribution).
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        let term = data.terminal.unwrap();
+        assert_eq!(term.scrollback, Some(10000));
+        assert_eq!(term.shell, None);
+        assert_eq!(term.scroll_lines_per_notch, None);
+        assert_eq!(term.scroll_pixels_per_notch, None);
     }
 
     #[test]

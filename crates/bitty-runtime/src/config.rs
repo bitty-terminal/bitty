@@ -15,6 +15,23 @@
 
 use crate::error::RuntimeError;
 
+/// Default lines scrolled per wheel notch (CTX-0185).
+/// Mirrors `bitty-config` `DEFAULT_SCROLL_LINES_PER_NOTCH` (kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_SCROLL_LINES_PER_NOTCH: u32 = 3;
+
+/// Maximum lines per wheel notch (matches the per-frame scroll cap).
+pub const MAX_SCROLL_LINES_PER_NOTCH: u32 = 32;
+
+/// Default smooth-scroll pixels per wheel notch (CTX-0185).
+/// Mirrors `bitty-config` `DEFAULT_SCROLL_PIXELS_PER_NOTCH` (see above).
+pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
+
+/// Maximum smooth-scroll pixels per wheel notch.
+pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -32,6 +49,13 @@ pub struct RuntimeConfig {
     pub font_family: String,
     /// Font point size; must be finite and within `(0, 3999]`.
     pub font_size: f32,
+    /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3).
+    /// Applied to `Lines` deltas directly and to `Pixels` deltas via the
+    /// notch equivalence (`scroll_pixels_per_notch` px = one notch).
+    /// Direction semantics are unchanged (positive = up into history).
+    pub scroll_lines_per_notch: u32,
+    /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16).
+    pub scroll_pixels_per_notch: u32,
 }
 
 impl Default for RuntimeConfig {
@@ -44,6 +68,8 @@ impl Default for RuntimeConfig {
             cold_queue_capacity: 256,
             font_family: String::from("monospace"),
             font_size: 12.0,
+            scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
+            scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
         }
     }
 }
@@ -56,6 +82,7 @@ impl RuntimeConfig {
     ///
     /// [`RuntimeError::InvalidConfig`] when any field is outside its
     /// documented range.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cols: usize,
         rows: usize,
@@ -64,6 +91,8 @@ impl RuntimeConfig {
         cold_queue_capacity: usize,
         font_family: impl Into<String>,
         font_size: f32,
+        scroll_lines_per_notch: u32,
+        scroll_pixels_per_notch: u32,
     ) -> Result<Self, RuntimeError> {
         let font_family = font_family.into();
         let cfg = Self {
@@ -74,6 +103,8 @@ impl RuntimeConfig {
             cold_queue_capacity,
             font_family,
             font_size,
+            scroll_lines_per_notch,
+            scroll_pixels_per_notch,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -102,6 +133,16 @@ impl RuntimeConfig {
         if !(self.font_size.is_finite() && self.font_size > 0.0 && self.font_size <= 3999.0) {
             return Err(RuntimeError::InvalidConfig(
                 "font_size must be finite within (0, 3999]",
+            ));
+        }
+        if !(1..=MAX_SCROLL_LINES_PER_NOTCH).contains(&self.scroll_lines_per_notch) {
+            return Err(RuntimeError::InvalidConfig(
+                "scroll_lines_per_notch must be within [1, 32]",
+            ));
+        }
+        if !(1..=MAX_SCROLL_PIXELS_PER_NOTCH).contains(&self.scroll_pixels_per_notch) {
+            return Err(RuntimeError::InvalidConfig(
+                "scroll_pixels_per_notch must be within [1, 256]",
             ));
         }
         if self.cols > 1000 || self.rows > 1000 {
@@ -174,10 +215,23 @@ mod tests {
 
     #[test]
     fn invalid_fields_are_rejected() {
-        assert!(RuntimeConfig::new(0, 24, 8, 16, 256, "mono", 12.0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 0, 16, 256, "mono", 12.0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 0, "mono", 12.0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "   ", 12.0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 0.0).is_err());
+        assert!(RuntimeConfig::new(0, 24, 8, 16, 256, "mono", 12.0, 3, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 0, 16, 256, "mono", 12.0, 3, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 0, "mono", 12.0, 3, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "   ", 12.0, 3, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 0.0, 3, 16).is_err());
+    }
+
+    #[test]
+    fn scroll_speed_fields_are_rejected_out_of_range() {
+        // CTX-0185: scroll speed is validated fail-closed like other config.
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257).is_err());
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1)
+            .expect("scroll speed boundaries must be valid");
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256)
+            .expect("scroll speed boundaries must be valid");
     }
 }

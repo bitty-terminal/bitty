@@ -26,7 +26,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
@@ -35,7 +35,10 @@
 //!
 //! - `[font]`-equivalent tables are atomic: `font` needs both `family` and
 //!   `size`, `window` needs both `opacity` and `padding`, `terminal` needs
-//!   `scrollback` (`shell` optional). Partial tables fail closed rather than
+//!   `scrollback` (`shell`, `scroll_lines_per_notch`,
+//!   `scroll_pixels_per_notch` optional, defaulting to
+//!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
+//!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
 //! - `plugins`, `extends`, and profile names remain non-user layers and are
 //!   rejected as undeclared here.
@@ -319,7 +322,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         .map_err(|e| ConfigError::InvalidInput {
             message: format!("config evaluation refused: {e}"),
         })? {
-        bitty_lua::ConfigOutcome::Completed { data, .. } => data,
+        bitty_lua::ConfigOutcome::Completed { data, .. } => *data,
         bitty_lua::ConfigOutcome::Suspended { reason, .. } => {
             return Err(ConfigError::InvalidInput {
                 message: format!(
@@ -394,9 +397,47 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         format!("must be within [0, 100000] (found {scrollback})"),
                     ));
                 }
+                // CTX-0185: scroll speed keys are optional extras (like
+                // `shell`); absent means "this layer says nothing" so merge
+                // keeps the lower-precedence value. Present values are
+                // range-checked here (fail-closed) and again by
+                // `TerminalConfig::validate` via `plan.validate()`.
+                let defaults = TerminalConfig::default();
+                let scroll_lines_per_notch = match t.scroll_lines_per_notch {
+                    None => defaults.scroll_lines_per_notch,
+                    Some(v) => {
+                        if !(1..=crate::types::MAX_SCROLL_LINES_PER_NOTCH as i64).contains(&v) {
+                            return Err(ConfigError::validation(
+                                "terminal.scroll_lines_per_notch",
+                                format!(
+                                    "must be within [1, {}] (found {v})",
+                                    crate::types::MAX_SCROLL_LINES_PER_NOTCH
+                                ),
+                            ));
+                        }
+                        v as u32
+                    }
+                };
+                let scroll_pixels_per_notch = match t.scroll_pixels_per_notch {
+                    None => defaults.scroll_pixels_per_notch,
+                    Some(v) => {
+                        if !(1..=crate::types::MAX_SCROLL_PIXELS_PER_NOTCH as i64).contains(&v) {
+                            return Err(ConfigError::validation(
+                                "terminal.scroll_pixels_per_notch",
+                                format!(
+                                    "must be within [1, {}] (found {v})",
+                                    crate::types::MAX_SCROLL_PIXELS_PER_NOTCH
+                                ),
+                            ));
+                        }
+                        v as u32
+                    }
+                };
                 Some(TerminalConfig {
                     scrollback: scrollback as u32,
                     shell: t.shell,
+                    scroll_lines_per_notch,
+                    scroll_pixels_per_notch,
                 })
             }
             None => {
@@ -616,9 +657,46 @@ mod tests {
         let term = plan.terminal.unwrap();
         assert_eq!(term.scrollback, 10000);
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
+        // CTX-0185: scroll keys absent -> plan carries defaults (atomic
+        // terminal table, like `shell = None`).
+        assert_eq!(
+            term.scroll_lines_per_notch,
+            crate::types::DEFAULT_SCROLL_LINES_PER_NOTCH
+        );
+        assert_eq!(
+            term.scroll_pixels_per_notch,
+            crate::types::DEFAULT_SCROLL_PIXELS_PER_NOTCH
+        );
         let maps = plan.keymaps.unwrap();
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].chord, "alt+h");
+    }
+
+    #[test]
+    fn lua_terminal_scroll_speed_parses_and_validates() {
+        // CTX-0185: explicit scroll keys parse; out-of-range fails closed
+        // with the field path (never the value beyond the offending line).
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 5, scroll_pixels_per_notch = 24 } }"#,
+            &test_source(),
+        )
+        .expect("scroll keys parse");
+        let term = plan.terminal.unwrap();
+        assert_eq!(term.scroll_lines_per_notch, 5);
+        assert_eq!(term.scroll_pixels_per_notch, 24);
+        for bad in [
+            r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 0 } }"#,
+            r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 33 } }"#,
+            r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 0 } }"#,
+            r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 257 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scroll_lines_per_notch") || msg.contains("scroll_pixels_per_notch"),
+                "must name the field: {msg}"
+            );
+        }
     }
 
     #[test]

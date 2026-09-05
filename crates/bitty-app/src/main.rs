@@ -1188,6 +1188,22 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "terminal.scroll_lines_per_notch",
+                        format!("{}", e.terminal.scroll_lines_per_notch),
+                        &src("terminal.scroll_lines_per_notch")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "terminal.scroll_pixels_per_notch",
+                        format!("{}", e.terminal.scroll_pixels_per_notch),
+                        &src("terminal.scroll_pixels_per_notch")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "keymaps",
                         format!("{} entries", e.keymaps.len()),
                         &src("keymaps")
@@ -1282,9 +1298,10 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
 ///
-/// Grid/cell/queue geometry stays at compiled defaults; font family/size come
-/// from the file/CLI/default chain (already validated by `bitty-config`, so
-/// construction is expected to succeed — failures stay fail-closed).
+/// Grid/cell/queue geometry stays at compiled defaults; font family/size and
+/// scroll speed come from the file/CLI/default chain (already validated by
+/// `bitty-config`, so construction is expected to succeed — failures stay
+/// fail-closed).
 fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
@@ -1297,6 +1314,8 @@ fn runtime_config_from_effective(
         defaults.cold_queue_capacity,
         effective.font.family.clone(),
         effective.font.size,
+        effective.terminal.scroll_lines_per_notch,
+        effective.terminal.scroll_pixels_per_notch,
     )
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
@@ -3557,6 +3576,53 @@ mod tests {
         let defaults = bitty_runtime::RuntimeConfig::default();
         assert_eq!(cfg.cols, defaults.cols);
         assert_eq!(cfg.rows, defaults.rows);
+    }
+
+    #[test]
+    fn runtime_config_inherits_file_scroll_speed() {
+        // CTX-0185: scroll keys flow file -> effective -> runtime; crate
+        // defaults stay equal (bitty-runtime must not depend on bitty-config,
+        // so the pairing is by value, pinned here).
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_SCROLL_LINES_PER_NOTCH,
+            bitty_config::types::DEFAULT_SCROLL_LINES_PER_NOTCH
+        );
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            bitty_config::types::DEFAULT_SCROLL_PIXELS_PER_NOTCH
+        );
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let content = r#"return {
+            terminal = { scrollback = 10000, scroll_lines_per_notch = 5, scroll_pixels_per_notch = 24 },
+        }"#;
+        let plan = parse_lua_config(content, &src).expect("scroll keys parse");
+        let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        assert_eq!(merged.effective.terminal.scroll_lines_per_notch, 5);
+        assert_eq!(merged.effective.terminal.scroll_pixels_per_notch, 24);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!(cfg.scroll_lines_per_notch, 5);
+        assert_eq!(cfg.scroll_pixels_per_notch, 24);
+        // Absent keys ride the defaults end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("minimal terminal parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert_eq!(
+            cfg2.scroll_lines_per_notch,
+            bitty_runtime::config::DEFAULT_SCROLL_LINES_PER_NOTCH
+        );
+        assert_eq!(
+            cfg2.scroll_pixels_per_notch,
+            bitty_runtime::config::DEFAULT_SCROLL_PIXELS_PER_NOTCH
+        );
     }
 
     #[test]

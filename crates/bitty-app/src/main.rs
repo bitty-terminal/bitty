@@ -833,8 +833,8 @@ fn help_text() -> String {
                             gap: runtime still presents via the headless seam\n  \
                             until the attach_gpu slice lands. See module docs.\n\
          \n\
-         Config file (Lua, wezterm-style init.lua):\n  \
-           return {{ theme = \"dark\", font = {{ family = \"Mono\", size = 12 }} }}\n  \
+          Config file (Lua, wezterm-style init.lua):\n  \
+            return {{ theme = \"dark\", font = {{ family = \"JetBrainsMono Nerd Font\", size = 12 }} }}\n  \
                             Evaluated in the bitty-lua sandbox (same budgets as\n  \
                             plugins; no io/os). Unknown keys fail closed.\n  \
          \n\
@@ -1298,19 +1298,23 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
 ///
-/// Grid/cell/queue geometry stays at compiled defaults; font family/size and
-/// scroll speed come from the file/CLI/default chain (already validated by
-/// `bitty-config`, so construction is expected to succeed — failures stay
+/// Cell geometry applies the configured breathing room
+/// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
+/// [`bitty_config::types::FontConfig::effective_cell`], defaults `9x19`);
+/// grid/queue geometry stays at compiled defaults; font family/size and
+/// scroll speed come from the file/CLI/default chain (already validated
+/// by `bitty-config`, so construction is expected to succeed — failures stay
 /// fail-closed).
 fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
     let defaults = bitty_runtime::RuntimeConfig::default();
+    let (cell_width, cell_height) = effective.font.default_effective_cell();
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
-        defaults.cell_width,
-        defaults.cell_height,
+        cell_width,
+        cell_height,
         defaults.cold_queue_capacity,
         effective.font.family.clone(),
         effective.font.size,
@@ -3576,6 +3580,24 @@ mod tests {
         let defaults = bitty_runtime::RuntimeConfig::default();
         assert_eq!(cfg.cols, defaults.cols);
         assert_eq!(cfg.rows, defaults.rows);
+        // Breathing-room defaults: legacy table omits spacing, so effective
+        // 9x19 matches the readable runtime defaults.
+        assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
+    }
+
+    #[test]
+    fn runtime_config_applies_font_spacing() {
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let content = r#"return {
+            font = { family = "Mono", size = 12, line_height = 1.0, letter_spacing = 0 },
+        }"#;
+        let plan = parse_lua_config(content, &src).expect("spacing parses");
+        let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!((cfg.cell_width, cfg.cell_height), (8, 16));
     }
 
     #[test]

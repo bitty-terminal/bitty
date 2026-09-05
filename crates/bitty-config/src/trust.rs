@@ -333,6 +333,7 @@ mod tests {
             font: Some(FontConfig {
                 family: "Mono".into(),
                 size: 12.0,
+                ..Default::default()
             }),
             ..Default::default()
         };

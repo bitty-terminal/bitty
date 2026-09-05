@@ -174,8 +174,8 @@ fn select_all_covers_whole_grid() {
 #[test]
 fn cursor_to_cell_mapping_is_headless_and_clamped() {
     let rt = make_runtime();
-    // Default cell 8x16.
-    let pos = CursorPosition { x: 16.0, y: 32.0 };
+    // Default readable cell 9x19 (CTX-0157).
+    let pos = CursorPosition { x: 18.0, y: 38.0 };
     let cell = rt.cursor_to_cell(pos);
     assert_eq!(cell, CellPos::new(2, 2));
     // Negative and far-outside clamp.
@@ -201,7 +201,7 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     // Simulate winit event flow: cursor moved, then mouse down, drag, up.
     let start = CursorPosition { x: 0.0, y: 0.0 }; // col0 row0
     let end = CursorPosition {
-        x: 8.0 * 4.0,
+        x: 9.0 * 4.0,
         y: 0.0,
     }; // col4 row0
     // Move to start before press (last_cursor needed)
@@ -271,11 +271,11 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
     });
 }
 
-/// Physical position for a grid cell with the default 8x16 cell metrics.
+/// Physical position for a grid cell with the readable 9x19 cell metrics.
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: f64::from(col) * 8.0,
-        y: f64::from(row) * 16.0,
+        x: f64::from(col) * 9.0,
+        y: f64::from(row) * 19.0,
     }
 }
 

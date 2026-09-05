@@ -90,9 +90,9 @@ fn resize_via_platform_event_reconfigures_runtime_and_layout() {
     assert_eq!(rt.surface_extent(), Some(physical));
     assert_eq!(rt.layout_allocations(), via_direct);
     // View sizes were reflowed to match allocations.
-    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 50);
-    // Container recomputed from pixels via RuntimeConfig::grid_from_pixels (8x16 cells).
-    assert_eq!(rt.container(), UiRect::new(0, 0, 100, 37));
+    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 44);
+    // Container recomputed from pixels via RuntimeConfig::grid_from_pixels (9x19 cells).
+    assert_eq!(rt.container(), UiRect::new(0, 0, 88, 31));
     assert!(rt.tick().is_some(), "resize forces full redraw");
 }
 

@@ -5058,11 +5058,12 @@ mod tests {
         let mut rt = make_runtime();
         assert_eq!(rt.dpi_scale(), 1.0);
         // Hyprland scale 1.6, tiled physical extent 2506x1496: scaled cells
-        // are 13x26, so the grid must be 192x57 (not 313x93 unscaled).
+        // are 14x30 (CTX-0157 readable 9x19 base), so the grid must be
+        // 179x49 (not 278x78 unscaled).
         rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
         assert_eq!(rt.dpi_scale(), 1.6);
         let snap = rt.snapshot();
-        assert_eq!((snap.width, snap.height), (192, 57));
+        assert_eq!((snap.width, snap.height), (179, 49));
         assert_eq!(
             rt.surface_extent(),
             Some(PhysicalSize::new(2506, 1496)),
@@ -5088,7 +5089,7 @@ mod tests {
         rt.handle_resize(PhysicalSize::new(2506, 1496))
             .expect("valid resize");
         let snap = rt.snapshot();
-        assert_eq!((snap.width, snap.height), (192, 57));
+        assert_eq!((snap.width, snap.height), (179, 49));
     }
 
     #[test]
@@ -5105,8 +5106,8 @@ mod tests {
             let snap = rt.snapshot();
             assert_eq!(
                 (snap.width, snap.height),
-                (100, 37),
-                "unscaled 8x16 cells over 800x600"
+                (88, 31),
+                "unscaled 9x19 cells over 800x600"
             );
             assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
             assert!(rt.tick().is_some(), "window stays drawable");
@@ -5177,8 +5178,8 @@ mod tests {
         via_physical.handle_resize(physical).expect("valid resize");
         let a = via_logical.snapshot();
         let b = via_physical.snapshot();
-        assert_eq!((a.width, a.height), (192, 57));
-        assert_eq!((b.width, b.height), (192, 57));
+        assert_eq!((a.width, a.height), (179, 49));
+        assert_eq!((b.width, b.height), (179, 49));
     }
 
     #[test]
@@ -5186,12 +5187,12 @@ mod tests {
         let mut rt = make_runtime();
         rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
         let scaled = rt.snapshot();
-        // 8x16 base at 2x -> 16x32 cells: 1600/16=100, 1200/32=37.
-        assert_eq!((scaled.width, scaled.height), (100, 37));
+        // 9x19 base at 2x -> 18x38 cells: 1600/18=88, 1200/38=31.
+        assert_eq!((scaled.width, scaled.height), (88, 31));
         // Back to 1.0 must restore the exact base grid, not a rounded echo.
         rt.apply_dpi_scale(1.0, Some(PhysicalSize::new(1600, 1200)));
         let restored = rt.snapshot();
-        assert_eq!((restored.width, restored.height), (200, 75));
+        assert_eq!((restored.width, restored.height), (177, 63));
         assert_eq!(rt.dpi_scale(), 1.0);
     }
 
@@ -5202,8 +5203,8 @@ mod tests {
         rt.handle_resize(PhysicalSize::new(800, 600))
             .expect("valid resize");
         let snap = rt.snapshot();
-        // 16x32 scaled cells: 800/16=50, 600/32=18 (unscaled would be 100x37).
-        assert_eq!((snap.width, snap.height), (50, 18));
+        // 18x38 scaled cells: 800/18=44, 600/38=15 (unscaled would be 88x31).
+        assert_eq!((snap.width, snap.height), (44, 15));
     }
 
     #[test]
@@ -5214,8 +5215,8 @@ mod tests {
         rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
         let surface = rt.surface_extent().expect("adopted surface");
         let plan = rt.present_plan_extent();
-        // 192x57 grid at 13x26 scaled cells = 2496x1482 draw-list pixels.
-        assert_eq!((plan.width, plan.height), (192 * 13, 57 * 26));
+        // 179x49 grid at 14x30 scaled cells = 2506x1470 draw-list pixels.
+        assert_eq!((plan.width, plan.height), (179 * 14, 49 * 30));
         let scale = derive_scale(surface.width(), surface.height(), plan);
         assert!(
             (scale - 1.0).abs() < 0.05,
@@ -5223,7 +5224,7 @@ mod tests {
         );
         // The stale 1-cell probe extent this replaced clamped to 4x
         // magnification (the dominant blur behind #232).
-        let stale = bitty_render::geometry::ExtentPx::new(13, 26);
+        let stale = bitty_render::geometry::ExtentPx::new(14, 30);
         assert_eq!(
             derive_scale(surface.width(), surface.height(), stale),
             4.0,
@@ -5238,8 +5239,8 @@ mod tests {
         let rt = make_runtime();
         let surface = rt.surface_extent().expect("default surface");
         let plan = rt.present_plan_extent();
-        // Default 80x24 grid at 8x16 base cells = 640x384.
-        assert_eq!((plan.width, plan.height), (640, 384));
+        // Default 80x24 grid at 9x19 readable cells = 720x456.
+        assert_eq!((plan.width, plan.height), (720, 456));
         assert_eq!(derive_scale(surface.width(), surface.height(), plan), 1.0);
     }
 
@@ -5554,15 +5555,15 @@ mod tests {
             LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
         );
         rt.set_layout(split);
-        // Resize to 800x600 pixels with default cell 8x16 => 100x37 cells
+        // Resize to 800x600 pixels with readable cell 9x19 => 88x31 cells
         rt.handle_resize(PhysicalSize::new(800, 600))
             .expect("resize");
-        assert_eq!(rt.container(), UiRect::new(0, 0, 100, 37));
+        assert_eq!(rt.container(), UiRect::new(0, 0, 88, 31));
         let allocs = rt.layout_allocations();
-        // Horizontal split of 100 -> 50 each
-        assert_eq!(allocs[0].1.width, 50);
-        assert_eq!(allocs[1].1.width, 50);
-        assert_eq!(allocs[0].1.height, 37);
+        // Horizontal split of 88 -> 44 each
+        assert_eq!(allocs[0].1.width, 44);
+        assert_eq!(allocs[1].1.width, 44);
+        assert_eq!(allocs[0].1.height, 31);
     }
 
     #[test]
@@ -5580,7 +5581,7 @@ mod tests {
         let allocs = rt.layout_allocations();
         assert_eq!(allocs[0].1, UiRect::new(0, 0, 30, 20));
         assert_eq!(allocs[1].1, UiRect::new(30, 0, 30, 20));
-        // Tick must still present via headless seam (surface is still 640x384,
+        // Tick must still present via headless seam (surface is still 720x456,
         // but layout container is 60x20 cells; rendering will still composite
         // correctly, and no window is required).
         rt.handle_pty_bytes(b"headless");
@@ -6154,7 +6155,7 @@ mod tests {
         rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Left));
         rt.handle_cursor_moved(CursorPosition {
-            x: 8.0 * 4.0,
+            x: 9.0 * 4.0,
             y: 0.0,
         });
         rt.handle_mouse_input(mouse_release(MouseButton::Left));
@@ -6186,7 +6187,7 @@ mod tests {
         rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Left));
         rt.handle_cursor_moved(CursorPosition {
-            x: 8.0 * 4.0,
+            x: 9.0 * 4.0,
             y: 0.0,
         });
         rt.handle_mouse_input(mouse_release(MouseButton::Left));

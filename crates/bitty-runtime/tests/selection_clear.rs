@@ -141,12 +141,12 @@ fn new_drag_replaces_old_selection() {
     select_hello(&mut rt);
     // New drag via the mouse path replaces the old range.
     rt.handle_cursor_moved(CursorPosition {
-        x: 8.0 * 6.0,
+        x: 9.0 * 6.0,
         y: 0.0,
     });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 8.0 * 10.0,
+        x: 9.0 * 10.0,
         y: 0.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
@@ -214,7 +214,7 @@ fn drag_auto_copy_proves_capture_for_wl_paste() {
     rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 8.0 * 4.0,
+        x: 9.0 * 4.0,
         y: 0.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));

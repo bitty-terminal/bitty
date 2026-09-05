@@ -423,8 +423,9 @@ impl Default for RegistryConfig {
             max_terminals: DEFAULT_MAX_TERMINALS,
             max_views_per_workspace: DEFAULT_MAX_VIEWS_PER_WORKSPACE,
             max_workspaces_per_window: DEFAULT_MAX_WORKSPACES_PER_WINDOW,
-            cell_width: 8,
-            cell_height: 16,
+            // CTX-0157 breathing-room cell (matches RuntimeConfig 9x19).
+            cell_width: 9,
+            cell_height: 19,
         }
     }
 }
@@ -3373,7 +3374,7 @@ mod tests {
         let wid = reg.create_workspace().unwrap();
         let vh = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh.id, vh.generation, th.id, th.generation, rect)
             .unwrap();
         assert_eq!(reg.attached_view(th.id), Some(vh.id));
@@ -3401,7 +3402,7 @@ mod tests {
         let vh1 = reg.create_view(wid).unwrap();
         let vh2 = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh1.id, vh1.generation, th.id, th.generation, rect)
             .unwrap();
         let err = reg
@@ -3426,7 +3427,7 @@ mod tests {
         let vh1 = reg.create_view(wid).unwrap();
         let vh2 = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh1.id, vh1.generation, th.id, th.generation, rect)
             .unwrap();
         let before_gen = th.generation;
@@ -3484,7 +3485,7 @@ mod tests {
         assert_eq!(reg.focused_view(wid), Some(vh3.id));
         // Detach focused view -> focus moves to MRU next (vh2)
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh3.id, vh3.generation, th.id, th.generation, rect)
             .unwrap();
         reg.detach(wid, vh3.id, vh3.generation).unwrap();
@@ -3506,7 +3507,7 @@ mod tests {
         let wid = reg.create_workspace().unwrap();
         let vh = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh.id, vh.generation, th.id, th.generation, rect)
             .unwrap();
         // Hidden view still has live terminal with same generation
@@ -3530,7 +3531,7 @@ mod tests {
         let wid = reg.create_workspace().unwrap();
         let vh = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh.id, vh.generation, th.id, th.generation, rect)
             .unwrap();
         let before = reg.terminal_snapshot(th.id, th.generation).unwrap();
@@ -3549,11 +3550,11 @@ mod tests {
     #[test]
     fn logical_rect_to_grid_floor_and_clamp() {
         let reg = default_registry();
-        // 640x384 with cell 8x16 => 80x24
-        let r = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        // 720x456 with cell 9x19 => 80x24
+        let r = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         assert_eq!(reg.logical_rect_to_grid(r).unwrap(), (80, 24));
         // Floor behavior
-        let r2 = LogicalRect::new(0.0, 0.0, 641.9, 385.9).unwrap();
+        let r2 = LogicalRect::new(0.0, 0.0, 721.9, 457.9).unwrap();
         assert_eq!(reg.logical_rect_to_grid(r2).unwrap(), (80, 24));
         // Clamp to 1 when tiny
         let r3 = LogicalRect::new(0.0, 0.0, 4.0, 4.0).unwrap();
@@ -3572,12 +3573,12 @@ mod tests {
         let wid = reg.create_workspace().unwrap();
         let vh = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh.id, vh.generation, th.id, th.generation, rect)
             .unwrap();
         // Storm 70 rects in same tick
         for i in 1..=70 {
-            let r = LogicalRect::new(0.0, 0.0, 640.0 + f64::from(i), 384.0).unwrap();
+            let r = LogicalRect::new(0.0, 0.0, 720.0 + f64::from(i), 456.0).unwrap();
             let _ = reg.handle_view_rect(wid, vh.id, vh.generation, r);
         }
         // Pending queue capped at 64, coalesced dropped at least 6? Actually attach already cleared,
@@ -3626,7 +3627,7 @@ mod tests {
         let vh1 = reg.create_view(wid).unwrap();
         let vh2 = reg.create_view(wid).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid, vh1.id, vh1.generation, th.id, th.generation, rect)
             .unwrap();
         // Detach preserves same TerminalId/RuntimeId
@@ -3718,7 +3719,7 @@ mod tests {
         let wid2 = reg.create_workspace().unwrap();
         let vh = reg.create_view(wid1).unwrap();
         let th = reg.create_terminal(None).unwrap();
-        let rect = LogicalRect::new(0.0, 0.0, 640.0, 384.0).unwrap();
+        let rect = LogicalRect::new(0.0, 0.0, 720.0, 456.0).unwrap();
         reg.attach(wid1, vh.id, vh.generation, th.id, th.generation, rect)
             .unwrap();
         // Switch active to wid2 => wid1 views become InactiveWorkspace

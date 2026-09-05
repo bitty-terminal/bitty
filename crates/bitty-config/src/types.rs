@@ -37,21 +37,98 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
+/// Default font family: Nerd-Font-patched JetBrains Mono.
+///
+/// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
+/// side-by-side vs ghostty must show no material difference) and renders
+/// starship/opencode Nerd glyphs out of the box. System `monospace` remains
+/// the ultimate fallback via [`FONT_FALLBACK_CHAIN`], so bare installs
+/// without the Nerd font still start (headless fallback path in
+/// `bitty-runtime`).
+pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+
+/// Default point size: 12pt on Linux.
+///
+/// Matches ghostty `font-size = 12` (Linux; 13 on macOS) and keeps the
+/// "smaller than normal" complaint closed: 12.0 was already the prior
+/// default and stays. Kitty defaults to 11.0; bitty stays at ghostty parity.
+pub const DEFAULT_FONT_SIZE: f32 = 12.0;
+
+/// Default line-height multiplier: 1.2x.
+///
+/// Legacy design cell was `8x16` with no breathing room. Measured
+/// `JetBrainsMonoNerdFont-Regular.ttf` (`fontTools`, UPM 1000,
+/// ascent 1020 / descent -300): at 12pt (16px em) the true advance is
+/// `0.6 * 16 = 9.6px` and the true line is `1320/1000 * 16 = 21.1px`.
+/// Ghostty defaults to `adjust-cell-height = null` (pure font metrics) and
+/// kitty to no `modify_font` adjustment; bitty's legacy `8x16` is ~20%
+/// too narrow and ~32% too short vs those metrics. `1.2` gives
+/// `round(16 * 1.2) = 19px` — a conservative "slight" breathing room
+/// between legacy 16 and true 21, matching kitty 11pt line (~19.4px).
+pub const DEFAULT_LINE_HEIGHT: f32 = 1.2;
+
+/// Default letter-spacing: 1.0px.
+///
+/// Legacy advance 8px vs true 9.6px at 12pt: `+1px` gives effective width 9,
+/// matching kitty 11pt advance (~8.8px -> 9) and moving toward the true 9.6
+/// without jumping straight to 10. Ghostty `adjust-cell-width = null`;
+/// the `+1` is justified only because the legacy base is cramped.
+pub const DEFAULT_LETTER_SPACING: f32 = 1.0;
+
+/// Legacy design cell (pre-CTX-0157): the compiled base that spacing
+/// applies to. Kept explicit so [`FontConfig::effective_cell`] stays
+/// deterministic and testable.
+pub const BASE_CELL_WIDTH: u32 = 8;
+/// Legacy design cell height (see [`BASE_CELL_WIDTH`]).
+pub const BASE_CELL_HEIGHT: u32 = 16;
+
+/// Documented monospace/Nerd fallback stack.
+///
+/// Order: configured primary (Nerd-patched by default) -> unpatched
+/// `JetBrains Mono` -> system `monospace` (fontconfig/WC) ->
+/// `DejaVu Sans Mono` (widely available). Mirrors ghostty (embedded
+/// JetBrains Mono variable + symbols-only Nerd fallback, always present)
+/// and kitty (`font_family = "monospace"` + builtin Nerd font,
+/// `set_font_family(..., add_builtin_nerd_font=True)`).
+///
+/// Per-glyph fallback shaping stays deferred to the text RFC (ADR-0004
+/// "Wrap" row); this chain is family-level attempt order for embedders:
+/// try each in order until `load_font` succeeds, ending in headless.
+/// [`FontConfig::fallback_chain`] builds the configured-first variant.
+pub const FONT_FALLBACK_CHAIN: [&str; 4] = [
+    DEFAULT_FONT_FAMILY,
+    "JetBrains Mono",
+    "monospace",
+    "DejaVu Sans Mono",
+];
 
 /// Font configuration.
+///
+/// `family`/`size` match ghostty Linux defaults (`JetBrainsMono Nerd Font`
+/// 12pt for the acceptance probe); `line_height`/`letter_spacing` give the
+/// slight breathing room the legacy `8x16` cell lacked. All four are
+/// tunable via `init.lua` `font = { family, size, line_height,
+/// letter_spacing }` (new keys optional, defaulted — existing
+/// `{ family, size }` tables keep working).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontConfig {
     /// Font family, trimmed, non-empty.
     pub family: String,
     /// Point size, finite, `> 0` and `<= 128`.
     pub size: f32,
+    /// Line-height multiplier, finite within `[1.0, 2.0]`.
+    pub line_height: f32,
+    /// Extra advance in px, finite within `[0.0, 8.0]`.
+    pub letter_spacing: f32,
 }
 
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "monospace".to_string(),
-            size: 12.0,
+            family: DEFAULT_FONT_FAMILY.to_string(),
+            size: DEFAULT_FONT_SIZE,
+            line_height: DEFAULT_LINE_HEIGHT,
+            letter_spacing: DEFAULT_LETTER_SPACING,
         }
     }
 }
@@ -78,7 +155,61 @@ impl FontConfig {
                 "must be finite within (0, 128]",
             ));
         }
+        if !(self.line_height.is_finite() && (1.0..=2.0).contains(&self.line_height)) {
+            return Err(ConfigError::validation(
+                "font.line_height",
+                "must be finite within [1.0, 2.0]",
+            ));
+        }
+        if !(self.letter_spacing.is_finite() && (0.0..=8.0).contains(&self.letter_spacing)) {
+            return Err(ConfigError::validation(
+                "font.letter_spacing",
+                "must be finite within [0.0, 8.0]",
+            ));
+        }
         Ok(())
+    }
+
+    /// Family-level fallback attempt order, configured family first.
+    ///
+    /// Starts with `self.family` (trimmed), then the documented
+    /// [`FONT_FALLBACK_CHAIN`] entries not already covered (case-insensitive
+    /// dedup), preserving order. Bounded: at most `1 + CHAIN.len()` entries,
+    /// each `<= MAX_FONT_FAMILY_LEN`.
+    #[must_use]
+    pub fn fallback_chain(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(1 + FONT_FALLBACK_CHAIN.len());
+        let primary = self.family.trim().to_string();
+        out.push(primary.clone());
+        let lower = primary.to_lowercase();
+        for cand in FONT_FALLBACK_CHAIN {
+            if cand.to_lowercase() != lower
+                && !out.iter().any(|e| e.to_lowercase() == cand.to_lowercase())
+            {
+                out.push(cand.to_string());
+            }
+        }
+        out
+    }
+
+    /// Effective cell `(width, height)` after breathing room.
+    ///
+    /// `width = base_width + round(letter_spacing)`,
+    /// `height = round(base_height * line_height)`, each saturated to
+    /// `>= 1`. Defaults give `(9, 19)` from the legacy `(8, 16)` base.
+    #[must_use]
+    pub fn effective_cell(&self, base_width: u32, base_height: u32) -> (u32, u32) {
+        let extra_w = self.letter_spacing.round().clamp(0.0, 8.0) as u32;
+        let width = base_width.saturating_add(extra_w).max(1);
+        let scaled_h = (f64::from(base_height) * f64::from(self.line_height)).round();
+        let height = u32::try_from(scaled_h as i64).unwrap_or(u32::MAX).max(1);
+        (width, height)
+    }
+
+    /// Effective cell from the legacy [`BASE_CELL_WIDTH`]/[`BASE_CELL_HEIGHT`].
+    #[must_use]
+    pub fn default_effective_cell(&self) -> (u32, u32) {
+        self.effective_cell(BASE_CELL_WIDTH, BASE_CELL_HEIGHT)
     }
 }
 
@@ -392,22 +523,98 @@ mod tests {
         FontConfig {
             family: String::new(),
             size: 12.0,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         FontConfig {
             family: "JetBrains Mono".into(),
             size: f32::NAN,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         FontConfig {
             family: "Mono".into(),
             size: 0.0,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        FontConfig {
+            family: "Mono".into(),
+            size: 12.0,
+            line_height: 0.9,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        FontConfig {
+            family: "Mono".into(),
+            size: 12.0,
+            letter_spacing: 9.0,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         FontConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn font_defaults_match_ghostty_linux_acceptance() {
+        let d = FontConfig::default();
+        assert_eq!(d.family, DEFAULT_FONT_FAMILY);
+        assert_eq!(d.family, "JetBrainsMono Nerd Font");
+        assert!((d.size - 12.0).abs() < f32::EPSILON);
+        assert!((d.line_height - 1.2).abs() < f32::EPSILON);
+        assert!((d.letter_spacing - 1.0).abs() < f32::EPSILON);
+        // Effective cell from legacy 8x16 base gives breathing room 9x19.
+        assert_eq!(d.default_effective_cell(), (9, 19));
+        assert_eq!(d.effective_cell(8, 16), (9, 19));
+    }
+
+    #[test]
+    fn font_fallback_chain_is_documented_order() {
+        let d = FontConfig::default();
+        let chain = d.fallback_chain();
+        assert_eq!(
+            chain,
+            vec![
+                "JetBrainsMono Nerd Font".to_string(),
+                "JetBrains Mono".to_string(),
+                "monospace".to_string(),
+                "DejaVu Sans Mono".to_string(),
+            ]
+        );
+        // Custom primary stays first, chain dedups case-insensitively.
+        let custom = FontConfig {
+            family: "monospace".into(),
+            ..Default::default()
+        };
+        let chain = custom.fallback_chain();
+        assert_eq!(chain[0], "monospace");
+        assert_eq!(chain.len(), 4);
+        // No duplicates when primary already in chain.
+        let nerd = FontConfig {
+            family: "  jetbrainsmono nerd font  ".into(),
+            ..Default::default()
+        };
+        let chain = nerd.fallback_chain();
+        assert_eq!(chain.len(), 4);
+    }
+
+    #[test]
+    fn font_effective_cell_math() {
+        let base = FontConfig {
+            line_height: 1.0,
+            letter_spacing: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(base.effective_cell(8, 16), (8, 16));
+        let roomy = FontConfig::default();
+        assert_eq!(roomy.effective_cell(8, 16), (9, 19));
+        // Zero base still saturates to >= 1.
+        assert_eq!(roomy.effective_cell(0, 0), (1, 1));
     }
 
     #[test]

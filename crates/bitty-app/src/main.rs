@@ -1029,9 +1029,11 @@ fn help_text() -> String {
            or numeric ViewId). Keyboard in real mode is keymap-driven (CTX-0153\n  \
            single-owner rule): a bound chord is consumed by its chrome action\n  \
            and never reaches the PTY; unbound keys (Tab, arrows, plain\n  \
-           letters) always go to the shell. Defaults: Alt+h/j/k/l and\n  \
-           Ctrl+Alt+arrows move focus, Alt+w closes, Ctrl+Tab cycles,\n  \
-           Ctrl+Shift+C/V copy/paste;\n  \
+           letters) always go to the shell. Defaults (Alt is the Mod):\n  \
+           Alt+h/j/k/l and Ctrl+Alt+arrows move focus, Alt+1..9 jumps to\n  \
+           view N, Alt+u/Alt+i pages up/down, Shift+Alt+h/j/k/l splits,\n  \
+           Shift+Ctrl+h/j/k/l resizes, Alt+w closes, Alt+z/m/f zooms,\n  \
+           Ctrl+Tab cycles, Ctrl+Shift+C/V copy/paste;\n  \
            see `bitty config check` for the active table.\n\
          \n\
          Modes:\n  \
@@ -1385,12 +1387,19 @@ fn starter_init_lua() -> &'static str {
     "-- bitty user configuration (Lua, wezterm-style).\n\
      -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
      -- Unknown keys fail closed; validate with `bitty config check`.\n\
-     --\n\
-      -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
-      -- consumed by its action and never reaches the shell; unbound keys\n\
-      -- (Tab, arrows, plain letters) always go to the shell. Defaults ship\n\
-      -- Alt+h/j/k/l + Ctrl+Alt+arrows for focus, Alt+w to close,\n\
-      -- Ctrl+Shift+C/V for copy/paste (fish never sees the chord);\n\
+     -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
+     -- consumed by its action and never reaches the shell; unbound keys\n\
+     -- (Tab, arrows, plain letters) always go to the shell. Alt is the Mod\n\
+     -- (Hyprland keeps Super; bitty uses Alt). Shipped defaults:\n\
+     --   Alt+h/j/k/l + Ctrl+Alt+arrows  move focus (vim hjkl)\n\
+     --   Alt+1..9                       jump to view id N\n\
+     --   Alt+u / Alt+i                  page up / down (less-like)\n\
+     --   Shift+Alt+h/j/k/l              split focused pane\n\
+     --   Shift+Ctrl+h/j/k/l             resize focused pane (vim hjkl)\n\
+     --   Alt+w                          close focused pane\n\
+     --   Alt+z / Alt+m / Alt+f          toggle single-pane zoom\n\
+     --   Ctrl+Tab / Ctrl+Shift+Tab      focus next / previous\n\
+     --   Ctrl+Shift+C/V                 copy/paste (fish never sees the chord);\n\
      -- uncomment to override (context + chord identity replaces the default):\n\
      --\n\
      -- Mouse select auto-copies to the clipboard by default (ghostty-class\n\
@@ -1405,6 +1414,9 @@ fn starter_init_lua() -> &'static str {
      \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
+     \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
+     \x20\x20--     { chord = \"alt+u\", action = \"scroll_page_up\", context = \"global\" },\n\
+     \x20\x20--     { chord = \"alt+z\", action = \"toggle_zoom\", context = \"global\" },\n\
      \x20\x20-- },\n\
      }\n"
 }
@@ -2906,6 +2918,20 @@ impl TerminalApp {
                         "warning: keymap focus:{n} not in layout (leaf ids {:?}) — ignoring",
                         self.runtime.layout().leaf_ids()
                     );
+                }
+            }
+            A::ScrollPageUp => {
+                if self.runtime.scroll_focused_page(true) {
+                    eprintln!("bitty: keymap scroll_page_up -> paged");
+                } else {
+                    eprintln!("warning: keymap scroll_page_up has no focused pane — ignoring");
+                }
+            }
+            A::ScrollPageDown => {
+                if self.runtime.scroll_focused_page(false) {
+                    eprintln!("bitty: keymap scroll_page_down -> paged");
+                } else {
+                    eprintln!("warning: keymap scroll_page_down has no focused pane — ignoring");
                 }
             }
             A::NewSplit(dir) => {
@@ -5000,6 +5026,27 @@ mod tests {
             match_keymap(&maps, shell(KeyName::Tab, true, false, false)),
             Some(bitty_config::ChromeAction::FocusNext)
         );
+        // CTX-0178 Alt-as-Mod: number jumps, paging, and zoom resolve.
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('1'), false, true, false)),
+            Some(bitty_config::ChromeAction::FocusId(1))
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('9'), false, true, false)),
+            Some(bitty_config::ChromeAction::FocusId(9))
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
+            Some(bitty_config::ChromeAction::ScrollPageUp)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('i'), false, true, false)),
+            Some(bitty_config::ChromeAction::ScrollPageDown)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('z'), false, true, false)),
+            Some(bitty_config::ChromeAction::ToggleZoom)
+        );
     }
 
     #[test]
@@ -5258,6 +5305,45 @@ mod tests {
         assert_eq!(app.runtime.leaf_count(), 1);
         app.apply_chrome_action(ChromeAction::CloseView);
         assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    #[test]
+    fn chrome_scroll_actions_page_focused_pane() {
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        for i in 0..200 {
+            let line = format!("line {i:03}\n");
+            app.runtime.handle_pty_bytes(line.as_bytes());
+        }
+        app.runtime.tick();
+        assert!(app.runtime.state().scrollback_len() > 0);
+        app.apply_chrome_action(ChromeAction::ScrollPageUp);
+        let offset = app
+            .runtime
+            .layout()
+            .find_leaf(ViewId::new(1))
+            .expect("single leaf")
+            .scroll_offset();
+        assert!(offset > 0, "page up must leave live");
+        app.apply_chrome_action(ChromeAction::ScrollPageDown);
+        assert_eq!(
+            app.runtime
+                .layout()
+                .find_leaf(ViewId::new(1))
+                .expect("single leaf")
+                .scroll_offset(),
+            0,
+            "page down must return to live"
+        );
     }
 
     #[test]

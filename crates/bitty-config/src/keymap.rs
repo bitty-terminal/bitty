@@ -30,20 +30,22 @@
 //!   `new_split:<left|right|up|down>`, `resize_split:<left|right|up|down>`,
 //!   `close_view` (alias `close_surface`), `toggle_zoom` (alias
 //!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`,
-//!   `copy_to_clipboard`, `paste_from_clipboard`.
-//!   Anything else fails closed with the known-action list.
+//!   `copy_to_clipboard`, `paste_from_clipboard`,
+//!   `scroll_page_up`, `scroll_page_down`. Anything else fails closed with
+//!   the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
 //!
 //! # Defaults
 //!
-//! [`DEFAULT_KEYMAPS`] ships the minimal documented map derived from the
-//! ghostty reference (`alt+h/j/k/l` navigate, `alt+w` closes,
-//! `shift+alt` creates, `shift+ctrl` resizes, `alt+m`/`alt+f` zoom,
-//! `ctrl+alt+arrows` navigate, `ctrl+tab` cycles). Plain `Tab`, arrows,
-//! letters, and digits are deliberately unbound so they reach the shell.
-//! A user entry replaces the default with the same `context + chord`
-//! identity (the existing merge rule); anything else appends.
+//! [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
+//! reference (`alt+h/j/k/l` navigate, `alt+1..=9` jump to view id N,
+//! `alt+u`/`alt+i` page up/down less-like, `alt+w` closes, `alt+z`/`alt+m`/
+//! `alt+f` zoom, `shift+alt` creates, `shift+ctrl` resizes, `ctrl+alt+arrows`
+//! navigate, `ctrl+tab` cycles). Plain `Tab`, arrows, letters, and digits
+//! are deliberately unbound so they reach the shell. A user entry replaces
+//! the default with the same `context + chord` identity (the existing merge
+//! rule); anything else appends.
 //!
 //! # Bounds and failure posture (threat T-01)
 //!
@@ -449,6 +451,10 @@ pub enum ChromeAction {
     /// `paste_from_clipboard` equivalent). Suspicious text waits on the
     /// pending-paste confirmation path; there is no silent delivery.
     PasteFromClipboard,
+    /// Scroll the focused pane up by one viewport page (less-like).
+    ScrollPageUp,
+    /// Scroll the focused pane down by one viewport page (less-like).
+    ScrollPageDown,
 }
 
 impl ChromeAction {
@@ -513,6 +519,14 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::PasteFromClipboard)
             }
+            "scroll_page_up" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ScrollPageUp)
+            }
+            "scroll_page_down" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ScrollPageDown)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -534,12 +548,14 @@ impl ChromeAction {
             Self::FocusId(n) => format!("focus:{n}"),
             Self::CopyToClipboard => "copy_to_clipboard".to_string(),
             Self::PasteFromClipboard => "paste_from_clipboard".to_string(),
+            Self::ScrollPageUp => "scroll_page_up".to_string(),
+            Self::ScrollPageDown => "scroll_page_down".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -633,9 +649,10 @@ impl ResolvedKeymap {
     }
 }
 
-/// [`DEFAULT_KEYMAPS`] ships the minimal documented map derived from the
-/// ghostty reference (`alt+h/j/k/l` navigate, `alt+w` closes,
-/// `shift+alt` creates, `shift+ctrl` resizes, `alt+m`/`alt+f` zoom,
+/// [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
+/// reference (`alt+h/j/k/l` navigate, `alt+1..=9` jump to view id N,
+/// `alt+u`/`alt+i` page up/down less-like, `alt+w` closes,
+/// `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates, `shift+ctrl` resizes,
 /// `ctrl+alt+arrows` navigate, `ctrl+tab` cycles, `ctrl+shift+c/v`
 /// copy/paste — ghostty `src/config/Config.zig` default keybinds:
 /// `copy_to_clipboard:mixed` / `paste_from_clipboard` under
@@ -646,6 +663,17 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+j", "goto_split:down"),
     ("alt+k", "goto_split:up"),
     ("alt+l", "goto_split:right"),
+    ("alt+1", "focus:1"),
+    ("alt+2", "focus:2"),
+    ("alt+3", "focus:3"),
+    ("alt+4", "focus:4"),
+    ("alt+5", "focus:5"),
+    ("alt+6", "focus:6"),
+    ("alt+7", "focus:7"),
+    ("alt+8", "focus:8"),
+    ("alt+9", "focus:9"),
+    ("alt+u", "scroll_page_up"),
+    ("alt+i", "scroll_page_down"),
     ("ctrl+alt+left", "goto_split:left"),
     ("ctrl+alt+right", "goto_split:right"),
     ("ctrl+alt+up", "goto_split:up"),
@@ -665,6 +693,7 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+f", "toggle_zoom"),
     ("ctrl+shift+c", "copy_to_clipboard"),
     ("ctrl+shift+v", "paste_from_clipboard"),
+    ("alt+z", "toggle_zoom"),
 ];
 
 /// Build the shipped defaults. Fail-closed only on an internal default typo
@@ -869,6 +898,14 @@ mod tests {
             ChromeAction::parse("paste_from_clipboard").expect("paste"),
             ChromeAction::PasteFromClipboard
         );
+        assert_eq!(
+            ChromeAction::parse("scroll_page_up").expect("page up"),
+            ChromeAction::ScrollPageUp
+        );
+        assert_eq!(
+            ChromeAction::parse("scroll_page_down").expect("page down"),
+            ChromeAction::ScrollPageDown
+        );
     }
 
     #[test]
@@ -916,6 +953,9 @@ mod tests {
             key_ref(KeyName::Char('n'), false, false, false),
             key_ref(KeyName::Char('p'), false, false, false),
             key_ref(KeyName::Char('1'), false, false, false),
+            key_ref(KeyName::Char('u'), false, false, false),
+            key_ref(KeyName::Char('i'), false, false, false),
+            key_ref(KeyName::Char('z'), false, false, false),
             // Ctrl+P is shell input unless the user binds it (CTX-0154
             // single-owner: 0x10 goes to the PTY, focus must not move).
             key_ref(KeyName::Char('p'), true, false, false),
@@ -952,6 +992,73 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Char('v'), true, false, true)),
             Some(ChromeAction::PasteFromClipboard)
         );
+    }
+
+    #[test]
+    fn defaults_alt_number_jump_and_page_and_zoom() {
+        // CTX-0178 Alt-as-Mod: fresh config jumps, pages, and zooms.
+        let maps = default_keymaps().expect("defaults valid");
+        for (digit, id) in [
+            ('1', 1),
+            ('2', 2),
+            ('3', 3),
+            ('4', 4),
+            ('5', 5),
+            ('6', 6),
+            ('7', 7),
+            ('8', 8),
+            ('9', 9),
+        ] {
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char(digit), false, true, false)),
+                Some(ChromeAction::FocusId(id)),
+                "alt+{digit} jumps to view {id}"
+            );
+        }
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('u'), false, true, false)),
+            Some(ChromeAction::ScrollPageUp)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('i'), false, true, false)),
+            Some(ChromeAction::ScrollPageDown)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('z'), false, true, false)),
+            Some(ChromeAction::ToggleZoom)
+        );
+        // Vim hjkl moves stay bound.
+        for (key, dir) in [
+            ('h', SplitDir::Left),
+            ('j', SplitDir::Down),
+            ('k', SplitDir::Up),
+            ('l', SplitDir::Right),
+        ] {
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char(key), false, true, false)),
+                Some(ChromeAction::GotoSplit(dir)),
+                "alt+{key} moves"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_have_unique_chord_identities() {
+        // Collision audit as a test: every default chord identity is unique
+        // so no default shadows another (CTX-0178).
+        let maps = default_keymaps().expect("defaults valid");
+        let mut seen = std::collections::HashSet::new();
+        for m in &maps {
+            assert!(seen.insert(m.id()), "duplicate default id {}", m.id());
+        }
+        // All single-character defaults require a modifier (typing safety).
+        for (chord, _) in DEFAULT_KEYMAPS {
+            let parsed = Chord::parse(chord).expect("default parses");
+            assert!(
+                parsed.ctrl || parsed.alt || parsed.shift || parsed.super_held,
+                "default '{chord}' must hold a modifier"
+            );
+        }
     }
 
     #[test]

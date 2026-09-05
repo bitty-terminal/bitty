@@ -124,10 +124,12 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
         presented > 800,
         "most soak iterations should present, got {presented} presented, {idle} idle"
     );
-    // Wall budget is liveness guard only (functional bounds like caps/determinism remain strict);
-    // CI debug+workspace contention shows ~40s on ubuntu (cargo test --workspace --all-targets, debug)
-    // and ~80s on windows, with spikes to ~70s observed on linux; allow 90s uniform.
-    let budget = Duration::from_secs(90);
+    // Wall budget is liveness guard only (functional bounds like caps/determinism remain strict
+    // and unchanged); measured: local isolated ~3.2s vs CI 94.3s/95.6s on 2 runners (CTX-0193,
+    // PX-0793/94/95/96). CTX-0157 cells contribute only +6-12%. Budget = max-observed 95.6s
+    // + ~25% headroom = 120s uniform. Real hangs are orders of magnitude slower, so liveness
+    // is still guarded.
+    let budget = Duration::from_secs(120);
     assert!(
         elapsed < budget,
         "soak must be fast, took {elapsed:?} (budget {budget:?})"

@@ -343,6 +343,12 @@ impl Selection {
     /// halves. Lines are joined with `\n` when the selection spans multiple rows.
     ///
     /// Wide-char leaders emit their single glyph; spacers are never emitted.
+    /// Trailing blanks are trimmed on any row whose span runs to the row's
+    /// last column (CTX-0168): intermediate rows of a multi-row drag would
+    /// otherwise carry a full grid width of padding spaces into the
+    /// clipboard, polluting pasted shell input. A span that ends mid-row
+    /// keeps its exact cells, so an explicitly selected trailing space is
+    /// preserved.
     #[must_use]
     pub fn text(self, snapshot: &Snapshot) -> String {
         let clamped = self.clamped(snapshot);
@@ -430,6 +436,8 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
         } else {
             snapshot.width.saturating_sub(1)
         };
+        let runs_to_edge = col_end >= snapshot.width.saturating_sub(1);
+        let mut line = String::new();
         let mut col = col_start;
         while col <= col_end && col < snapshot.width {
             let idx = row_usize * snapshot.width + col;
@@ -439,9 +447,9 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
                     continue;
                 }
                 if cell.is_blank() {
-                    out.push(' ');
+                    line.push(' ');
                 } else {
-                    out.push(cell.glyph);
+                    line.push(cell.glyph);
                 }
                 if cell.width == 2 {
                     col += 2;
@@ -450,6 +458,13 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
             }
             col += 1;
         }
+        // CTX-0168: drop blank padding when the span runs to the last
+        // column; only ASCII spaces can be padding (blanks emit ' ').
+        if runs_to_edge {
+            let trimmed = line.trim_end_matches(' ').len();
+            line.truncate(trimmed);
+        }
+        out.push_str(&line);
         if row != end.row {
             out.push('\n');
         }
@@ -698,6 +713,11 @@ impl PersistentSelection {
     /// spacers and emitting `' '` for blanks, joining rows with `\n`. Returns
     /// `None` when the selection is not valid (pruned or drifted).
     ///
+    /// Like [`Selection::text`], trailing blanks are trimmed on any row whose
+    /// span runs to the row's last column (CTX-0168), so multi-row buffer
+    /// selections copy clean newline-joined lines instead of grid-width
+    /// padding; a span ending mid-row keeps its exact cells.
+    ///
     /// For scrollback-anchored endpoints the buffer row is validated against the
     /// stored line id and located by id search; if the stored row no longer
     /// holds the same id (prune shift) the selection is considered pruned.
@@ -775,6 +795,8 @@ impl PersistentSelection {
             } else {
                 width.saturating_sub(1)
             };
+            let runs_to_edge = col_end >= width.saturating_sub(1);
+            let mut line = String::new();
             let mut col = col_start;
             while col <= col_end && col < width {
                 if let Some(cell) = cells.get(col) {
@@ -783,9 +805,9 @@ impl PersistentSelection {
                         continue;
                     }
                     if cell.is_blank() {
-                        out.push(' ');
+                        line.push(' ');
                     } else {
-                        out.push(cell.glyph);
+                        line.push(cell.glyph);
                     }
                     if cell.width == 2 {
                         col += 2;
@@ -794,6 +816,12 @@ impl PersistentSelection {
                 }
                 col += 1;
             }
+            // CTX-0168: same edge-trim rule as `selected_text_for_range`.
+            if runs_to_edge {
+                let trimmed = line.trim_end_matches(' ').len();
+                line.truncate(trimmed);
+            }
+            out.push_str(&line);
             if buffer_row != end_bp.buffer_row {
                 out.push('\n');
             }
@@ -993,5 +1021,38 @@ mod tests {
         let c = sel.clamped(&snap);
         assert_eq!(c.anchor.row, 1);
         assert_eq!(c.anchor.col, 1);
+    }
+
+    #[test]
+    fn selection_text_trims_edge_padding_across_rows() {
+        // CTX-0168 (#270): rows running to the last column must not carry
+        // grid-width blank padding into the clipboard.
+        let snap = make_snapshot(vec![vec!['a', 'b', ' ', ' '], vec!['c', 'd', ' ', ' ']]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(1, 1));
+        assert_eq!(sel.text(&snap), "ab\ncd");
+    }
+
+    #[test]
+    fn selection_text_preserves_explicit_mid_row_space() {
+        // A span ending mid-row keeps its exact cells, including a
+        // genuinely selected trailing space.
+        let snap = make_snapshot(vec![vec!['a', 'b', ' ', ' ', ' ']]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 2));
+        assert_eq!(sel.text(&snap), "ab ");
+        // Same row dragged to the edge trims the padding instead.
+        let edge = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 4));
+        assert_eq!(edge.text(&snap), "ab");
+    }
+
+    #[test]
+    fn selection_text_blank_middle_row_becomes_empty_line() {
+        // A fully blank middle row contributes an empty line, not spaces.
+        let snap = make_snapshot(vec![
+            vec!['a', ' ', ' '],
+            vec![' ', ' ', ' '],
+            vec!['b', ' ', ' '],
+        ]);
+        let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(2, 0));
+        assert_eq!(sel.text(&snap), "a\n\nb");
     }
 }

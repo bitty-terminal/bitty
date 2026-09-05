@@ -78,16 +78,9 @@ fn selection_across_rows_includes_newline() {
     rt.start_selection(CellPos::new(0, 1));
     rt.end_selection(CellPos::new(1, 1));
     let text = rt.selection_text().expect("multi-row");
-    // Selection is row-major inclusive: row0 col1..end, row1 0..1.
-    // Terminal grid is 80 cols; the first row's trailing blanks become
-    // spaces, so we trim trailing spaces per line before compare (matches
-    // bitty-ui's `Selection::text` semantics of emitting spaces for blanks).
-    let trimmed = text
-        .lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(trimmed, "bc\nde");
+    // CTX-0168 (#270): rows running to the grid edge trim blank padding,
+    // so the copied text is exactly the newline-joined lines.
+    assert_eq!(text, "bc\nde");
 }
 
 #[test]
@@ -242,6 +235,168 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     let copied = rt.copy_selection_lossy().expect("copy");
     assert_eq!(copied, "drag ");
     assert_eq!(rt.clipboard().headless_contents(), "drag ");
+}
+
+// CTX-0168 (#270) multi-line mouse selection: drag across rows through the
+// real platform-event path (CursorMoved + MouseInput), with per-row columns,
+// CJK width handling, auto-copy into both clipboards, and paste back through
+// the repeat-confirm gate. No display server needed; headless clipboard seam.
+
+/// Drives a left-drag across rows via platform events (press, motion, release).
+fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPosition]) {
+    let window_id = WindowId::from_raw_public(1);
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(start),
+    });
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(MouseEvent {
+            button: MouseButton::Left,
+            state: PressState::Pressed,
+        }),
+    });
+    for pos in waypoints {
+        rt.handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(*pos),
+        });
+    }
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(MouseEvent {
+            button: MouseButton::Left,
+            state: PressState::Released,
+        }),
+    });
+}
+
+/// Physical position for a grid cell with the default 8x16 cell metrics.
+fn cell_pos(col: u16, row: u16) -> CursorPosition {
+    CursorPosition {
+        x: f64::from(col) * 8.0,
+        y: f64::from(row) * 16.0,
+    }
+}
+
+#[test]
+fn multiline_mouse_drag_selects_row_range_with_newlines() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "line1\r\nline2\r\nline3");
+    // Drag from row 0 col 0 down to row 2 col 4.
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(2, 1), cell_pos(4, 2)]);
+    assert!(!rt.is_selection_dragging());
+    let range = rt.selection().expect("selection").normalized();
+    assert_eq!(range.start, CellPos::new(0, 0));
+    assert_eq!(range.end, CellPos::new(2, 4));
+    assert_eq!(range.row_span(), 3);
+    // Newline-joined lines with no blank padding (exact clipboard bytes).
+    assert_eq!(rt.selection_text().as_deref(), Some("line1\nline2\nline3"));
+    // Ghostty copy-on-select: release auto-copies to both selections.
+    assert_eq!(rt.clipboard().headless_contents(), "line1\nline2\nline3");
+    assert_eq!(rt.primary_contents(), "line1\nline2\nline3");
+    // Highlight must cover the range: the next tick presents with fills.
+    let stats = rt.tick().expect("selection must force a present");
+    assert!(stats.fills > 0);
+}
+
+#[test]
+fn multiline_mouse_drag_respects_partial_columns() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "abcdef\r\nghijkl");
+    // Drag from row 0 col 2 to row 1 col 3: first row runs to the edge
+    // (padding trimmed), last row ends exactly at col 3.
+    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(3, 1)]);
+    let range = rt.selection().expect("selection").normalized();
+    assert_eq!(range.start, CellPos::new(0, 2));
+    assert_eq!(range.end, CellPos::new(1, 3));
+    assert_eq!(rt.selection_text().as_deref(), Some("cdef\nghij"));
+    assert_eq!(rt.clipboard().headless_contents(), "cdef\nghij");
+}
+
+#[test]
+fn multiline_mouse_drag_upward_normalizes() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "abcdef\r\nghijkl");
+    // Press on the lower row, drag upward: same range as downward.
+    mouse_drag(&mut rt, cell_pos(3, 1), &[cell_pos(2, 0)]);
+    let range = rt.selection().expect("selection").normalized();
+    assert_eq!(range.start, CellPos::new(0, 2));
+    assert_eq!(range.end, CellPos::new(1, 3));
+    assert_eq!(rt.selection_text().as_deref(), Some("cdef\nghij"));
+}
+
+#[test]
+fn multiline_mouse_drag_with_wide_chars_keeps_columns() {
+    let mut rt = make_runtime();
+    // Row 0: 'a' col0, '中' lead col1 + spacer col2, 'b' col3.
+    // Row 1: 'c' col0, '好' lead col1 + spacer col2, 'd' col3.
+    feed_text(&mut rt, "a\u{4e2d}b\r\nc\u{597d}d");
+    // Full two-row drag: wide glyphs emitted once, no split pairs.
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("a\u{4e2d}b\nc\u{597d}d")
+    );
+    // Drag starting on a spacer snaps to its leader, per row.
+    rt.clear_selection();
+    mouse_drag(&mut rt, cell_pos(2, 0), &[cell_pos(0, 1)]);
+    let range = rt.selection().expect("selection").normalized();
+    assert_eq!(range.start, CellPos::new(0, 1));
+    assert_eq!(range.end, CellPos::new(1, 0));
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some("\u{4e2d}b\nc"),
+        "spacer snap must not split the wide pair"
+    );
+}
+
+#[test]
+fn multiline_selection_pastes_through_repeat_confirm_gate() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "line1\r\nline2\r\nline3");
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 2)]);
+    assert_eq!(rt.clipboard().headless_contents(), "line1\nline2\nline3");
+    // Right-click paste of newline text waits on the confirmation gate:
+    // held pending with a visible summary, nothing delivered silently.
+    rt.drain_pending_input();
+    rt.handle_cursor_moved(cell_pos(0, 0));
+    rt.handle_mouse_input(MouseEvent {
+        button: MouseButton::Right,
+        state: PressState::Pressed,
+    });
+    assert!(rt.has_pending_paste());
+    assert!(rt.pending_input().is_empty());
+    let summary = rt.pending_paste_summary().expect("summary");
+    assert!(summary.contains("3 lines"), "summary: {summary}");
+    // Repeat-confirm (identical right-click, unchanged clipboard) delivers
+    // every line with newlines intact.
+    rt.handle_mouse_input(MouseEvent {
+        button: MouseButton::Right,
+        state: PressState::Pressed,
+    });
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"line1\nline2\nline3");
+}
+
+#[test]
+fn multiline_primary_pastes_through_repeat_confirm_gate() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "alpha\r\nbeta");
+    mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
+    // Auto-copy synced the primary selection (ghostty copy-on-select).
+    assert_eq!(rt.primary_contents(), "alpha\nbeta");
+    // Middle-click reads the primary selection through the same gate.
+    rt.drain_pending_input();
+    rt.handle_cursor_moved(cell_pos(0, 0));
+    rt.handle_mouse_input(MouseEvent {
+        button: MouseButton::Middle,
+        state: PressState::Pressed,
+    });
+    assert!(rt.has_pending_paste(), "newline primary needs confirm");
+    assert!(rt.pending_input().is_empty());
+    assert!(rt.confirm_pending_paste(true));
+    assert_eq!(rt.pending_input(), b"alpha\nbeta");
 }
 
 #[test]

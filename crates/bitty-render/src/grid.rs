@@ -111,6 +111,12 @@ pub const DEFAULT_CURSOR: Rgba8 = [0xF5, 0xE0, 0xDC, 0xFF];
 /// the background so selected cells read clearly while foreground-colored
 /// text stays legible on top.
 pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
+/// Pending-paste banner background: opaque dark amber, distinct from the
+/// grid background, selection, and cursor so the confirmation prompt reads
+/// as a warning overlay (CTX-0186 presentation-only dialog).
+pub const PENDING_PASTE_BANNER_BG: Rgba8 = [0x5A, 0x4A, 0x00, 0xFF];
+/// Pending-paste banner text: opaque light amber on [`PENDING_PASTE_BANNER_BG`].
+pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
 /// Foreground alpha substituted for faint (`SGR 2`) text.
 pub const FAINT_ALPHA: u8 = 0x7F;
 
@@ -1226,6 +1232,88 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         };
         list.glyphs.push(instance);
         self.counters.glyphs_emitted += 1;
+    }
+
+    /// Rasterizes one line of overlay text at an absolute pixel origin.
+    ///
+    /// Presentation-only embedder primitive (CTX-0186 pending-paste banner):
+    /// each character advances one cell from `origin_px`, clipped to
+    /// `max_cells` characters. Glyph lookup, caching, and atlas placement
+    /// mirror [`Self::render`]'s cell path (same font, same baseline rule),
+    /// so headless and GPU composites sample identical texels. Whitespace,
+    /// missing glyphs, and rasterizer failures are skipped exactly like
+    /// cell glyphs (counted as `blank_cells_skipped`); the caller owns the
+    /// background fill. Returns the glyph instances to push (possibly
+    /// empty). Bounded: at most `max_cells` instances, no I/O, no panics.
+    #[must_use]
+    pub fn overlay_text_glyphs(
+        &mut self,
+        text: &str,
+        origin_px: (i32, i32),
+        max_cells: usize,
+        color: Rgba8,
+    ) -> Vec<GlyphInstance> {
+        if max_cells == 0 {
+            return Vec::new();
+        }
+        let (origin_x, origin_y) = (i64::from(origin_px.0), i64::from(origin_px.1));
+        let baseline = origin_y + i64::from(self.cell.height) * i64::from(BASELINE_NUMERATOR) / 4;
+        let mut out = Vec::new();
+        for (col, character) in text.chars().take(max_cells).enumerate() {
+            if character == ' ' {
+                continue;
+            }
+            let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
+                self.counters.blank_cells_skipped += 1;
+                continue;
+            };
+            let bitmap = match self.cache.glyph(key) {
+                Ok(CachedGlyph::Bitmap(bitmap)) => bitmap,
+                Ok(CachedGlyph::Blank) => {
+                    self.counters.blank_cells_skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    self.counters.blank_cells_skipped += 1;
+                    continue;
+                }
+            };
+            let metrics = bitmap.metrics;
+            let source = self.atlas.ensure(key, bitmap);
+            let dest_x =
+                origin_x + col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
+            let dest_y = baseline - i64::from(metrics.top);
+            let instance = match source {
+                GlyphSource::Atlas { slot } => GlyphInstance {
+                    dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                    size: [
+                        saturating_u32(u64::try_from(metrics.width.max(0)).unwrap_or(u64::MAX)),
+                        saturating_u32(u64::try_from(metrics.height.max(0)).unwrap_or(u64::MAX)),
+                    ],
+                    uv: slot.uv(self.atlas.dims()),
+                    color,
+                    source: GlyphSource::Atlas { slot },
+                },
+                GlyphSource::Inline {
+                    mask,
+                    width,
+                    height,
+                } => GlyphInstance {
+                    dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                    size: [width, height],
+                    uv: [0.0; 4],
+                    color,
+                    source: GlyphSource::Inline {
+                        mask,
+                        width,
+                        height,
+                    },
+                },
+            };
+            out.push(instance);
+            self.counters.glyphs_emitted += 1;
+        }
+        out
     }
 }
 

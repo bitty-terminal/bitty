@@ -536,3 +536,58 @@ fn ctx0186_different_clipboard_while_pending_preserves_first() {
     assert!(rt.confirm_pending_paste(true));
     assert_eq!(rt.pending_input(), b"first\npaste");
 }
+
+#[test]
+fn ctx0186_pending_banner_paints_overlay_delta_without_touching_grid() {
+    // Reviewer wiring proof (PX-0697/0699): while a paste pends, tick() must
+    // paint a presentation-only banner (fills+glyphs delta) without mutating
+    // grid cells; clearing pending removes it and the frame idles again.
+    let mut rt = make_runtime();
+    // Settle to a clean baseline frame.
+    let base = rt.tick().expect("initial frame must present");
+    assert!(rt.tick().is_none(), "clean grid must idle after present");
+    let cells_before = rt.snapshot().cells.clone();
+
+    // Gate a 2-line paste (same entry the chord path uses).
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert!(rt.pending_paste_summary().is_some());
+    // Bounded claim lock: the painted summary never exceeds 512 bytes.
+    assert!(
+        rt.pending_paste_summary().unwrap().len() < 512,
+        "pending summary must stay bounded"
+    );
+
+    // Pending frame carries the banner overlay.
+    let pending = rt.tick().expect("pending paste must force a present");
+    assert!(
+        pending.fills > base.fills,
+        "banner must add fills: base={} pending={}",
+        base.fills,
+        pending.fills
+    );
+    assert!(
+        pending.glyphs > base.glyphs,
+        "banner must add glyphs: base={} pending={}",
+        base.glyphs,
+        pending.glyphs
+    );
+    // Overlay only: grid truth untouched by the paint.
+    assert_eq!(
+        rt.snapshot().cells,
+        cells_before,
+        "banner must not leak into grid cells"
+    );
+
+    // Cancel clears the banner: one repaint back at baseline, then idle.
+    assert!(rt.cancel_pending_paste());
+    let cleared = rt.tick().expect("cancel must repaint without banner");
+    assert_eq!(cleared.fills, base.fills, "banner fill must clear");
+    assert_eq!(cleared.glyphs, base.glyphs, "banner glyphs must clear");
+    assert_eq!(rt.snapshot().cells, cells_before);
+    assert!(rt.tick().is_none(), "must idle once banner clears");
+}

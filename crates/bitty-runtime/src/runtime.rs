@@ -4582,6 +4582,48 @@ impl Runtime {
             }
         }
 
+        // Pending-paste confirmation banner (CTX-0186): presentation-only
+        // overlay on the focused view's bottom row. Gated on
+        // `has_pending_paste()`; text is the bounded `pending_paste_summary()`
+        // (already <512B, clipped to the view width in cells). Overlay only:
+        // pushes fills+glyphs onto the combined frame, never touches grid
+        // cells, scrollback, or the pending bytes. Esc-cancel and
+        // repeat-confirm paths are unchanged; clearing pending repaints once
+        // without the banner via `pending_full_redraw`.
+        if self.has_pending_paste() {
+            if let Some(summary) = self.pending_paste_summary() {
+                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
+                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                        if rect.height > 0 && rect.width > 0 {
+                            let live = self.live_cell_metrics();
+                            let origin_px_x = rect.x as i32 * live.width as i32;
+                            let banner_y =
+                                (rect.y as i32 + rect.height as i32 - 1) * (live.height as i32);
+                            let banner_w = rect.width as u32 * live.width;
+                            combined_fills.push(bitty_render::grid::FillRect {
+                                rect: bitty_render::geometry::RectPx::new(
+                                    origin_px_x,
+                                    banner_y,
+                                    banner_w,
+                                    live.height,
+                                ),
+                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
+                            });
+                            let max_cells = rect.width as usize;
+                            let glyphs = self.renderer.overlay_text_glyphs(
+                                &summary,
+                                (origin_px_x, banner_y),
+                                max_cells,
+                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
+                            );
+                            combined_glyphs.extend(glyphs);
+                            any_needs_draw = true;
+                        }
+                    }
+                }
+            }
+        }
+
         self.pending_full_redraw = false;
 
         if !any_needs_draw && combined_fills.is_empty() && combined_glyphs.is_empty() {

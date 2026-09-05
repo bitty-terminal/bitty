@@ -29,7 +29,8 @@
 //! - `action`: one of `goto_split:<left|right|up|down>`,
 //!   `new_split:<left|right|up|down>`, `resize_split:<left|right|up|down>`,
 //!   `close_view` (alias `close_surface`), `toggle_zoom` (alias
-//!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`.
+//!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`,
+//!   `copy_to_clipboard`, `paste_from_clipboard`.
 //!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
@@ -438,6 +439,16 @@ pub enum ChromeAction {
     FocusPrev,
     /// Focus numeric view id (`focus:3`, `1..=256`).
     FocusId(u64),
+    /// Copy the current selection to the system clipboard
+    /// (`copy_to_clipboard`; ghostty `copy_to_clipboard:mixed` equivalent:
+    /// clipboard write best-effort syncs the primary selection on Linux).
+    /// No selection warns and keeps the layout untouched.
+    CopyToClipboard,
+    /// Paste the system clipboard as terminal input through the
+    /// suspicious-paste inspection gate (`paste_from_clipboard`; ghostty
+    /// `paste_from_clipboard` equivalent). Suspicious text waits on the
+    /// pending-paste confirmation path; there is no silent delivery.
+    PasteFromClipboard,
 }
 
 impl ChromeAction {
@@ -494,6 +505,14 @@ impl ChromeAction {
                 let n = require_focus_id(arg, trimmed)?;
                 Ok(Self::FocusId(n))
             }
+            "copy_to_clipboard" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::CopyToClipboard)
+            }
+            "paste_from_clipboard" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::PasteFromClipboard)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -513,12 +532,14 @@ impl ChromeAction {
             Self::FocusNext => "focus_next".to_string(),
             Self::FocusPrev => "focus_prev".to_string(),
             Self::FocusId(n) => format!("focus:{n}"),
+            Self::CopyToClipboard => "copy_to_clipboard".to_string(),
+            Self::PasteFromClipboard => "paste_from_clipboard".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -612,11 +633,14 @@ impl ResolvedKeymap {
     }
 }
 
-/// Minimal documented default map, derived from the ghostty reference
-/// (`alt+h/j/k/l` navigate, `shift+alt+h/j/k/l` create, `shift+ctrl+h/j/k/l`
-/// resize, `alt+w` closes, `alt+m`/`alt+f` zoom, `ctrl+alt+arrows` navigate,
-/// `ctrl+tab` cycles). Plain Tab, arrows, letters, and digits stay unbound
-/// so they always reach the shell.
+/// [`DEFAULT_KEYMAPS`] ships the minimal documented map derived from the
+/// ghostty reference (`alt+h/j/k/l` navigate, `alt+w` closes,
+/// `shift+alt` creates, `shift+ctrl` resizes, `alt+m`/`alt+f` zoom,
+/// `ctrl+alt+arrows` navigate, `ctrl+tab` cycles, `ctrl+shift+c/v`
+/// copy/paste — ghostty `src/config/Config.zig` default keybinds:
+/// `copy_to_clipboard:mixed` / `paste_from_clipboard` under
+/// `ctrl+shift` on Linux). Plain `Tab`, arrows,
+/// letters, and digits are deliberately unbound so they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+h", "goto_split:left"),
     ("alt+j", "goto_split:down"),
@@ -639,6 +663,8 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+w", "close_view"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
+    ("ctrl+shift+c", "copy_to_clipboard"),
+    ("ctrl+shift+v", "paste_from_clipboard"),
 ];
 
 /// Build the shipped defaults. Fail-closed only on an internal default typo
@@ -835,6 +861,14 @@ mod tests {
             ChromeAction::parse("focus:3").expect("id"),
             ChromeAction::FocusId(3)
         );
+        assert_eq!(
+            ChromeAction::parse("copy_to_clipboard").expect("copy"),
+            ChromeAction::CopyToClipboard
+        );
+        assert_eq!(
+            ChromeAction::parse("paste_from_clipboard").expect("paste"),
+            ChromeAction::PasteFromClipboard
+        );
     }
 
     #[test]
@@ -849,6 +883,8 @@ mod tests {
             "focus:999",
             "focus:abc",
             "goto_split:left:extra",
+            "copy_to_clipboard:mixed",
+            "paste_from_clipboard:1",
         ] {
             let err = ChromeAction::parse(raw).unwrap_err();
             assert!(
@@ -883,6 +919,12 @@ mod tests {
             // Ctrl+P is shell input unless the user binds it (CTX-0154
             // single-owner: 0x10 goes to the PTY, focus must not move).
             key_ref(KeyName::Char('p'), true, false, false),
+            // Ctrl+C (no shift) is SIGINT for the shell: only the shifted
+            // chord is owned by chrome (CTX-0161).
+            key_ref(KeyName::Char('c'), true, false, false),
+            // Ctrl+V is shell input (verbatim/paste in readline); only the
+            // shifted chord is owned by chrome.
+            key_ref(KeyName::Char('v'), true, false, false),
         ];
         for k in shell_keys {
             assert_eq!(match_keymap(&maps, k), None, "shell key {k:?}");
@@ -899,6 +941,16 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
             Some(ChromeAction::CloseView)
+        );
+        // CTX-0161 copy/paste chords: single-owner intercept owns the
+        // shifted chords; the unshifted C0 bytes stay shell input (above).
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('c'), true, false, true)),
+            Some(ChromeAction::CopyToClipboard)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('v'), true, false, true)),
+            Some(ChromeAction::PasteFromClipboard)
         );
     }
 

@@ -185,9 +185,9 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
 use bitty_platform::{
-    App, AppHandler, EventContext, EventWaker, KeyEvent, LogicalKey, LogicalSize, NamedKey,
-    PhysicalSize, PlatformError, PlatformEvent, PressState, WindowConfig, WindowEventKind,
-    WindowHandle, WindowId,
+    App, AppHandler, EventContext, EventWaker, KeyEvent, LogicalKey, LogicalSize, MouseButton,
+    NamedKey, PhysicalSize, PlatformError, PlatformEvent, PressState, WindowConfig,
+    WindowEventKind, WindowHandle, WindowId,
 };
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
@@ -2441,9 +2441,19 @@ impl TerminalApp {
                 // suspicious-paste inspection gate (P0-AC-008): clean text
                 // delivers immediately, suspicious text waits on the pending
                 // confirmation path, clipboard errors warn.
+                //
+                // CTX-0186: a gated paste is never silent. The pending summary
+                // (line count, byte size, reasons, preview) is logged loudly
+                // with confirm/cancel instructions; repeating the identical
+                // chord with an unchanged clipboard confirms delivery, Esc
+                // cancels.
                 match self.runtime.paste_from_clipboard() {
                     Ok(Some(true)) => {
-                        eprintln!("bitty: keymap paste_from_clipboard -> pending confirmation")
+                        let summary = self
+                            .runtime
+                            .pending_paste_summary()
+                            .unwrap_or_else(|| "pending confirmation".to_string());
+                        eprintln!("bitty: keymap paste_from_clipboard -> {summary}");
                     }
                     Ok(Some(false)) => eprintln!("bitty: keymap paste_from_clipboard delivered"),
                     Ok(None) => {
@@ -2553,11 +2563,61 @@ impl AppHandler for TerminalApp {
 
         // Shutdown handling: PlatformEvent::Exiting or CloseRequested/Closed
         // ask the handler to exit the loop.
+        //
+        // CTX-0186: snapshot the paste-dialog state before routing so the
+        // right/middle-click and Esc-cancel paths can report loudly afterwards
+        // (a gated paste is never silent).
+        let paste_probe = match &event {
+            PlatformEvent::Window { window_id: _, kind } => match kind {
+                WindowEventKind::MouseInput(mouse)
+                    if mouse.state == PressState::Pressed
+                        && matches!(mouse.button, MouseButton::Right | MouseButton::Middle) =>
+                {
+                    Some((
+                        "mouse",
+                        self.runtime.has_pending_paste(),
+                        self.runtime.pending_input_len(),
+                    ))
+                }
+                WindowEventKind::KeyboardInput(key)
+                    if key.state == PressState::Pressed
+                        && matches!(&key.logical_key, LogicalKey::Named(NamedKey::Escape)) =>
+                {
+                    Some((
+                        "esc",
+                        self.runtime.has_pending_paste(),
+                        self.runtime.pending_input_len(),
+                    ))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         let should_exit = self.runtime.handle_platform_event(event.clone());
         if should_exit {
             eprintln!("bitty: exit requested ({event:?})");
             ctx.exit();
             return;
+        }
+        // CTX-0186 loud paste-dialog reporting: pending shows the bounded
+        // summary with confirm/cancel instructions; a cleared pending with new
+        // input bytes means the repeat gesture confirmed delivery; an Esc
+        // that cleared pending without new bytes means it was cancelled.
+        if let Some((probe_kind, had_pending, before_len)) = paste_probe {
+            let has_pending = self.runtime.has_pending_paste();
+            let after_len = self.runtime.pending_input_len();
+            if has_pending {
+                if let Some(summary) = self.runtime.pending_paste_summary() {
+                    eprintln!("bitty: paste -> {summary}");
+                }
+            } else if had_pending && after_len > before_len {
+                eprintln!("bitty: paste confirmed -> delivered");
+            } else if had_pending && probe_kind == "esc" {
+                eprintln!("bitty: paste confirmation cancelled (Esc)");
+            }
+            if let Some(win) = self.window.as_ref() {
+                win.request_redraw();
+            }
         }
 
         match event {

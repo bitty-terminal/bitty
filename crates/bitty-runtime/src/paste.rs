@@ -3,10 +3,15 @@
 //! Every paste entering the input pipeline is inspected for adversarial classes
 //! and requires explicit confirmation when any class is present. There is no
 //! silent delivery path: `request_paste` stores a pending paste when inspection
-//! flags are set and only `confirm_pending_paste(true)` delivers it to the PTY
-//! (bounded, headless-deterministic). Bracketed paste (`?2004`) is
-//! defense-in-depth only — it wraps confirmed delivery but never bypasses
-//! confirmation.
+//! flags are set and delivery happens only via explicit confirmation —
+//! `confirm_pending_paste(true)`, repeating the identical paste while pending
+//! (CTX-0186: second chord/right-click press with unchanged clipboard), or the
+//! equivalent bracketed delivery after such confirmation. `Esc` while pending
+//! cancels without delivery and without leaking `Esc` to the PTY. The pending
+//! paste is always visible via `Runtime::pending_paste_summary` (bounded line
+//! count, byte size, reasons, preview), so a gated paste is never silent.
+//! Bracketed paste (`?2004`) is defense-in-depth only — it wraps confirmed
+//! delivery but never bypasses confirmation.
 //!
 //! Adversarial classes (each triggers `needs_confirmation`):
 //! - C0 controls `0x00..0x1F` excluding safe subset (`\t` `0x09` is allowed; all
@@ -57,7 +62,9 @@ impl PasteInspection {
     }
 
     /// Human-readable reasons for inspection (bounded, deterministic order).
-    #[cfg(test)]
+    ///
+    /// Production-visible (CTX-0186): the pending-paste summary surfaces these
+    /// so a gated paste is never silent. At most 7 entries, `&'static str` only.
     #[must_use]
     pub fn reasons(&self) -> Vec<&'static str> {
         let mut out = Vec::new();

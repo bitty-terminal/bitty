@@ -5516,6 +5516,35 @@ mod tests {
     }
 
     #[test]
+    fn left_release_auto_copy_overwrites_divergent_primary() {
+        // Regression pin for the live Wayland gap (select-in-bitty never
+        // reached `wl-paste --primary`): `auto_copy_selection` must replace
+        // a stale/divergent primary with the new selection, not just write
+        // the regular clipboard. The write itself is delivered by the
+        // platform layer's wl-copy-first primary sync (CTX-0160 as fixed
+        // here); the headless seam proves the contract deterministically.
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("zz".to_string())
+            .expect("headless set");
+        rt.set_primary_text("pq".to_string());
+        assert_eq!(rt.clipboard().headless_contents(), "zz");
+        assert_eq!(rt.primary_contents(), "pq");
+        // Drag cells (0,0)..(0,4) = "hello" via the mouse path.
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Left));
+        rt.handle_cursor_moved(CursorPosition {
+            x: 8.0 * 4.0,
+            y: 0.0,
+        });
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+        assert_eq!(rt.clipboard().headless_contents(), "hello");
+        assert_eq!(rt.primary_contents(), "hello");
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
     fn left_release_without_drag_copies_nothing() {
         let mut rt = mouse_headless_runtime("hello world");
         rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });

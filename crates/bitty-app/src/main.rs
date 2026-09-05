@@ -73,10 +73,10 @@
 //!    thread and feeds `Runtime::handle_pty_bytes`. The live pump is wired:
 //!    [`Runtime::take_pty_reader`](bitty_runtime::Runtime::take_pty_reader)
 //!    and [`Runtime::poll_pty`](bitty_runtime::Runtime::poll_pty) exist and
-//!    `TerminalApp::poll_pty_pump` drains the real runtime channel first
-//!    (replies flushed via `Runtime::write_replies`), with the synthetic
-//!    demo pump kept only as a bounded fallback for headless runs without
-//!    a spawned child. Headless smoke exercises `handle_pty_bytes` via
+//!    `TerminalApp::poll_pty_pump` drains the real runtime channel
+//!    (replies flushed via `Runtime::write_replies`). The synthetic demo
+//!    pump is opt-in debug only (`BITTY_DEMO_PUMP=1`, default off) and never
+//!    feeds real sessions. Headless smoke exercises `handle_pty_bytes` via
 //!    synthetic bytes in addition to the live path.
 //! 8. **Platform event loop** (`bitty-platform::App::run`) forwards every
 //!    [`PlatformEvent`](bitty_platform::PlatformEvent) into
@@ -164,10 +164,12 @@
 //! The production pump is `PtyReader::spawn` (kernel → bounded
 //! `sync_channel` 16 × 8 KiB = 128 KiB → `handle_pty_bytes`). Backpressure is
 //! end-to-end: when the consumer stalls the channel fills, the pump blocks,
-//! the kernel PTY buffer fills, and the child's `write` blocks. This binary
-//! demonstrates that contract via a synthetic bounded demo pump (no real child
-//! required), and the live pump is wired: `Runtime::take_pty_reader` and
-//! `Runtime::poll_pty` exist and `TerminalApp::poll_pty_pump` drains them.
+//! the kernel PTY buffer fills, and the child's `write` blocks. The live pump
+//! is wired: `Runtime::take_pty_reader` and `Runtime::poll_pty` exist and
+//! `TerminalApp::poll_pty_pump` drains them. A synthetic bounded demo pump
+//! exists only as an opt-in debug harness (`BITTY_DEMO_PUMP=1`, default off;
+//! `TerminalApp::with_demo_pump` in tests) — real sessions never see it
+//! (CTX-0167 / #269).
 //!
 //! # Security
 //!
@@ -1902,8 +1904,7 @@ fn run_layout_proof(synthetic: &[u8]) -> i32 {
 // Demo PTY pump (bounded, honest seam)
 // ---------------------------------------------------------------------------
 
-/// Synthetic bounded PTY pump that demonstrates the backpressure contract
-/// without requiring a live child.
+/// Synthetic bounded PTY pump: opt-in debug harness only (CTX-0167).
 ///
 /// The pump owns a `sync_channel(16)` holding at most `16` chunks (mirrors
 /// `bitty-pty` `CHANNEL_CAPACITY_CHUNKS`); the main thread drains it via
@@ -1911,12 +1912,15 @@ fn run_layout_proof(synthetic: &[u8]) -> i32 {
 /// consumer stalls the channel fills and the pump's `send` blocks — the same
 /// backpressure that would propagate to the kernel PTY buffer for a real child.
 ///
-/// This exists to keep the composition root's PTY wiring total and testable on
-/// headless CI. It is the bounded fallback only: the live pump is wired —
+/// Real sessions never attach this pump: [`TerminalApp::with_theme`] leaves
+/// `pty_rx` empty and [`TerminalApp::poll_pty_pump`] drains only the real
+/// runtime channel. Attach it explicitly via
+/// [`TerminalApp::with_demo_pump`] (tests) or `BITTY_DEMO_PUMP=1` (manual
+/// debug, see [`demo_pump_enabled_from_env`]). The live pump is wired —
 /// `Runtime::take_pty_reader` and `Runtime::poll_pty` exist and
 /// `TerminalApp::poll_pty_pump` drains the real runtime channel first.
 /// Theme-aware demo pump: the greeting names the resolved theme preset
-/// and its source layer (`default`/`file`/`cli`) so the live window visibly
+/// and its source layer (`default`/`file`/`cli`) so a debug window visibly
 /// proves which config path it took. The green SGR still resolves through the
 /// themed palette (no hardcoded green outside the theme).
 ///
@@ -1949,6 +1953,26 @@ fn spawn_demo_pty_pump_with_theme(
     (rx, handle)
 }
 
+/// Opt-in debug gate for the synthetic demo pump (CTX-0167 / #269).
+///
+/// Default off: real sessions never see `demo pty: ...` bytes. Returns true
+/// only when `BITTY_DEMO_PUMP=1`/`true` (case-insensitive). Pure over the
+/// injected value so tests never touch the environment; the startup path
+/// injects `std::env::var("BITTY_DEMO_PUMP").ok()`.
+fn demo_pump_enabled_from_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_lowercase).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Reads the process environment for the demo-pump debug gate (CTX-0167).
+///
+/// Impure (reads env); total (unset/unparsable means disabled).
+fn demo_pump_enabled_from_env() -> bool {
+    demo_pump_enabled_from_value(std::env::var("BITTY_DEMO_PUMP").ok().as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // App handler
 // ---------------------------------------------------------------------------
@@ -1973,8 +1997,9 @@ struct AppModifiers {
     super_held: bool,
 }
 
-/// The Correct Terminal handler: owns `Runtime`, an optional window, and a
-/// bounded PTY pump (real PTY via `Runtime::poll_pty` plus synthetic fallback).
+/// The Correct Terminal handler: owns `Runtime`, an optional window, and the
+/// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
+/// only when explicitly attached for debug/tests).
 /// All business stays in `bitty-runtime`; this type only wires
 /// `PlatformEvent` → `Runtime` and `tick` → present, with real `GpuContext`
 /// attachment for the single-window vertical slice.
@@ -1984,7 +2009,8 @@ struct TerminalApp {
     window_title: String,
     window: Option<WindowHandle>,
     window_id: Option<WindowId>,
-    /// Demo bounded PTY pump fallback when no real PTY is owned (headless tests).
+    /// Demo pump channel when explicitly attached for debug/tests
+    /// (`None` in real sessions — CTX-0167).
     pty_rx: Option<Receiver<Vec<u8>>>,
     _pty_thread: Option<JoinHandle<()>>,
     /// Count of `tick` calls that presented a frame.
@@ -2006,8 +2032,12 @@ struct TerminalApp {
 }
 
 impl TerminalApp {
-    /// Theme-aware constructor: the demo fallback burst names the resolved
-    /// preset and source so the live window proves its config path.
+    /// Theme-aware constructor for real sessions (CTX-0167).
+    ///
+    /// Never attaches the synthetic demo pump: `pty_rx` stays `None` so
+    /// startup shows only the shell (and shell init output). The window
+    /// title still carries the resolved preset + source layer, so the
+    /// config path remains visible without polluting the grid.
     fn with_theme(
         runtime: Runtime,
         theme_name: &str,
@@ -2015,10 +2045,36 @@ impl TerminalApp {
         keymaps: Vec<bitty_config::ResolvedKeymap>,
         spawn_spec: SpawnSpec,
     ) -> Self {
-        // Keep demo pump as fallback when no real PTY is spawned (headless CI,
-        // tests). When a real PTY is spawned via `Runtime::spawn_shell`, the
-        // real `poll_pty` path handles bytes and the demo pump just delivers a
-        // harmless synthetic burst.
+        Self {
+            runtime,
+            window_title: window_title_for_theme(theme_name, source),
+            window: None,
+            window_id: None,
+            pty_rx: None,
+            _pty_thread: None,
+            presented_frames: 0,
+            keymaps,
+            app_mods: AppModifiers::default(),
+            zoom_backup: None,
+            spawn_spec,
+            log_level: LogLevel::default_level(),
+        }
+    }
+
+    /// Test constructor with the synthetic demo pump attached.
+    ///
+    /// Same as [`Self::with_theme`] plus a bounded `spawn_demo_pty_pump`
+    /// burst naming `theme_name`/`source`. Tests that legitimately need
+    /// synthetic bytes use this instead of `with_theme`; production uses
+    /// [`Self::attach_demo_pump`] behind [`demo_pump_enabled_from_env`].
+    #[cfg(test)]
+    fn with_demo_pump(
+        runtime: Runtime,
+        theme_name: &str,
+        source: &str,
+        keymaps: Vec<bitty_config::ResolvedKeymap>,
+        spawn_spec: SpawnSpec,
+    ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
         Self {
             runtime,
@@ -2034,6 +2090,20 @@ impl TerminalApp {
             spawn_spec,
             log_level: LogLevel::default_level(),
         }
+    }
+
+    /// Attaches the synthetic demo pump to an existing app (CTX-0167).
+    ///
+    /// Debug escape hatch for the real startup path: called only when
+    /// [`demo_pump_enabled_from_env`] is true (`BITTY_DEMO_PUMP=1`).
+    /// No-op when a pump is already attached.
+    fn attach_demo_pump(&mut self, theme_name: &str, source: &str) {
+        if self.pty_rx.is_some() {
+            return;
+        }
+        let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
+        self.pty_rx = Some(pty_rx);
+        self._pty_thread = Some(handle);
     }
 
     /// Sets the stderr verbosity gate (CTX-0190). Call once at startup from
@@ -2098,7 +2168,8 @@ impl TerminalApp {
         ))
     }
 
-    /// Polls real PTY (`Runtime::poll_pty` bounded 128 KiB) and demo pump.
+    /// Polls real PTY (`Runtime::poll_pty` bounded 128 KiB) plus the opt-in
+    /// demo pump when attached (tests / `BITTY_DEMO_PUMP=1` only).
     /// Returns true when bytes were consumed.
     fn poll_pty_pump(&mut self) -> bool {
         let mut consumed = false;
@@ -2108,7 +2179,8 @@ impl TerminalApp {
         if real > 0 {
             consumed = true;
         }
-        // Demo pump fallback (bounded, headless-testable)
+        // Opt-in demo pump (bounded, debug/tests only — `None` in real
+        // sessions so startup shows only the shell).
         if let Some(rx) = self.pty_rx.as_ref() {
             loop {
                 match rx.try_recv() {
@@ -2121,7 +2193,7 @@ impl TerminalApp {
                 }
             }
         }
-        // Flush any replies generated by the demo pump (bounded, best-effort).
+        // Flush any replies generated by PTY bytes (bounded, best-effort).
         // `write_replies` is no-op when no live writer (headless keeps replies for `take_replies`).
         let _ = self.runtime.write_replies();
         consumed
@@ -3241,6 +3313,11 @@ fn main() {
         keymaps,
         spawn_spec,
     );
+    // CTX-0167: the synthetic demo pump stays off in real sessions so
+    // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
+    if demo_pump_enabled_from_env() {
+        app.attach_demo_pump(app_config.theme.name, app_config.source);
+    }
     // CTX-0190: apply the stderr verbosity gate before the event loop so
     // per-frame `bitty tick` lines stay quiet by default and appear only
     // with `--verbose` / `--log-level debug|trace` (or BITTY_LOG/RUST_LOG).
@@ -3653,6 +3730,8 @@ mod tests {
 
     #[test]
     fn terminal_app_poll_and_tick_are_total() {
+        // CTX-0167: default real sessions carry no demo pump — poll drains
+        // only the real PTY (empty here) and ticks stay total.
         let rt = Runtime::with_defaults().expect("must build");
         let mut app = TerminalApp::with_theme(
             rt,
@@ -3661,11 +3740,29 @@ mod tests {
             Vec::new(),
             SpawnSpec::default(),
         );
-        // Poll the synthetic pump and drive a tick — must not panic and must
-        // consume the channel without deadlocking.
-        let consumed = app.poll_pty_pump();
-        assert!(consumed || !consumed); // total: either path is ok
+        assert!(app.pty_rx.is_none());
+        let _ = app.poll_pty_pump();
         let _ = app.drive_tick();
+        // Opt-in debug path still drains the synthetic burst without
+        // deadlocking (pump sends async: bounded yield retries).
+        let rt_demo = Runtime::with_defaults().expect("must build");
+        let mut demo = TerminalApp::with_demo_pump(
+            rt_demo,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        let mut consumed = false;
+        for _ in 0..1000 {
+            if demo.poll_pty_pump() {
+                consumed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(consumed);
+        let _ = demo.drive_tick();
         // Second tick without new bytes should be idle (frame-on-demand).
         let rt2 = Runtime::with_defaults().expect("must build");
         let mut app2 = TerminalApp::with_theme(
@@ -3678,6 +3775,99 @@ mod tests {
         let _ = app2.drive_tick();
         // After first present the second idle tick in the same app may be None.
         // We do not assert presence, only totality (no panic).
+    }
+
+    #[test]
+    fn default_startup_carries_no_demo_line() {
+        // CTX-0167 / #269: real sessions show only the shell — the default
+        // constructor attaches no synthetic pump, so polling consumes
+        // nothing and the grid never sees `demo pty:`.
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        assert!(app.pty_rx.is_none());
+        assert!(!app.poll_pty_pump());
+        app.runtime.select_all();
+        let text = app.runtime.selection_text().unwrap_or_default();
+        assert!(
+            !text.contains("demo pty"),
+            "default startup must not contain demo line, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn demo_pump_gate_defaults_off_and_opts_in() {
+        // CTX-0167: `BITTY_DEMO_PUMP` is default-off; only explicit `1`/`true`
+        // enables the synthetic burst.
+        assert!(!demo_pump_enabled_from_value(None));
+        assert!(!demo_pump_enabled_from_value(Some("")));
+        assert!(!demo_pump_enabled_from_value(Some("0")));
+        assert!(!demo_pump_enabled_from_value(Some("false")));
+        assert!(!demo_pump_enabled_from_value(Some("yes")));
+        assert!(demo_pump_enabled_from_value(Some("1")));
+        assert!(demo_pump_enabled_from_value(Some("true")));
+        assert!(demo_pump_enabled_from_value(Some("TRUE")));
+        assert!(demo_pump_enabled_from_value(Some(" 1 ")));
+    }
+
+    #[test]
+    fn demo_pump_opt_in_delivers_greeting() {
+        // CTX-0167: the gated debug path still delivers the themed greeting
+        // for harnesses that explicitly opt in. The pump thread sends
+        // asynchronously, so drain with bounded retries (no sleep: yield
+        // only) before asserting grid content.
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_demo_pump(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        assert!(app.pty_rx.is_some());
+        let mut consumed = false;
+        for _ in 0..1000 {
+            if app.poll_pty_pump() {
+                consumed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(consumed, "opt-in demo pump must deliver bytes");
+        app.runtime.select_all();
+        let text = app.runtime.selection_text().expect("grid text");
+        assert!(
+            text.contains("demo pty"),
+            "opt-in demo pump must deliver greeting, got {text:?}"
+        );
+        // `attach_demo_pump` is idempotent and also opts in from default.
+        let rt2 = Runtime::with_defaults().expect("must build");
+        let mut app2 = TerminalApp::with_theme(
+            rt2,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        app2.attach_demo_pump(bitty_config::theme::DEFAULT_THEME_NAME, "default");
+        assert!(app2.pty_rx.is_some());
+        let mut consumed2 = false;
+        for _ in 0..1000 {
+            if app2.poll_pty_pump() {
+                consumed2 = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(consumed2, "attached demo pump must deliver bytes");
+        // Second attach is a no-op (does not replace the channel).
+        app2.attach_demo_pump(bitty_config::theme::DEFAULT_THEME_NAME, "default");
+        assert!(app2.pty_rx.is_some());
     }
 
     #[test]

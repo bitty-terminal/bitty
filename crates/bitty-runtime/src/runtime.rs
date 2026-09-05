@@ -1175,6 +1175,18 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0166: any real non-modifier key press clears the selection
+        // highlight (left-click/Esc/typing dismiss). Clearing uses
+        // `clear_selection` so `pending_full_redraw` forces the next tick to
+        // present without the highlight — never a frame late. Modifier-only
+        // and synthetic events never clear; releases never clear.
+        if event.state == PressState::Pressed
+            && !event.is_synthetic
+            && !is_modifier
+            && self.selection.is_some()
+        {
+            self.clear_selection();
+        }
         // CTX-0186: Esc while a paste is pending cancels the confirmation
         // dialog. The Esc is consumed (never reaches the PTY) so a dismissal
         // cannot also drive shell/vim state.
@@ -1221,6 +1233,15 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0166: any real non-modifier key press clears the selection
+        // highlight (see owned path). Additive only; range logic untouched.
+        if event.state == PressState::Pressed
+            && !event.is_synthetic
+            && !is_modifier
+            && self.selection.is_some()
+        {
+            self.clear_selection();
+        }
         // CTX-0186: Esc while a paste is pending cancels (see owned path).
         if self.cancel_pending_on_escape(event) {
             return None;
@@ -1937,6 +1958,12 @@ impl Runtime {
                 self.push_input_bytes(bytes);
             }
             // Still update last_cursor tracking but do not start selection.
+            // CTX-0166: a captured click must still dismiss any stale
+            // highlight so the gray rect never lingers while a mouse-mode app
+            // owns the pointer. Additive clearing only; range logic untouched.
+            if self.selection.is_some() {
+                self.clear_selection();
+            }
             return;
         }
 
@@ -1946,6 +1973,10 @@ impl Runtime {
                 if let Some(pos) = self.last_cursor {
                     let cell = self.cursor_to_cell(pos);
                     self.start_selection(cell);
+                } else if self.selection.is_some() {
+                    // CTX-0166: click without cursor tracking still dismisses
+                    // the highlight (no stale rect when `last_cursor` is None).
+                    self.clear_selection();
                 }
             }
             (MouseButton::Left, PressState::Released) => {
@@ -2235,6 +2266,12 @@ impl Runtime {
         };
         self.ime_preedit = None;
         self.ime_cursor = 0;
+        // CTX-0166: IME commit is typing — dismiss the highlight first so the
+        // rect never lingers a frame past the state. `clear_selection` forces
+        // the next tick to present; the final flag below keeps that promise.
+        if self.selection.is_some() {
+            self.clear_selection();
+        }
         // IME commit shares PTY write queue with keyboard (bounded 8192)
         self.push_input_bytes(bounded.as_bytes());
         self.pending_full_redraw = true;

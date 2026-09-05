@@ -223,6 +223,155 @@ fn child_environment_builder_overrides_defaults() {
 }
 
 #[test]
+fn child_has_term_program_bitty_by_default() {
+    // CTX-0194: TERM_PROGRAM must read `bitty` so term-DB probes fall back
+    // to symbols instead of Kitty-graphics APC. No chafa dependency: assert
+    // the sanitized child environment directly via headless PTY byte capture.
+    let mut pty = PtyBuilder::new("/usr/bin/env").spawn().expect("spawn env");
+
+    let reader = pty.take_reader().expect("reader half");
+    let writer = pty.take_writer().expect("writer half");
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let output = drain(&reader, deadline);
+    reader.join().expect("pump clean");
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("TERM_PROGRAM=bitty"),
+        "expected TERM_PROGRAM=bitty in {text:?}"
+    );
+}
+
+#[test]
+fn child_explicit_term_program_override_wins() {
+    let mut pty = PtyBuilder::new("/usr/bin/env")
+        .env("TERM_PROGRAM", "custom-term")
+        .spawn()
+        .expect("spawn env");
+
+    let reader = pty.take_reader().expect("reader half");
+    let writer = pty.take_writer().expect("writer half");
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let output = drain(&reader, deadline);
+    reader.join().expect("pump clean");
+
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("TERM_PROGRAM=custom-term"),
+        "explicit TERM_PROGRAM should win in {text:?}"
+    );
+    assert!(
+        !text.contains("TERM_PROGRAM=bitty"),
+        "default TERM_PROGRAM must be overridden in {text:?}"
+    );
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn child_graphics_fingerprint_is_sanitized() {
+    // CTX-0194 regression: simulate a bitty launched from ghostty/kitty/
+    // wezterm/iTerm (post-CTX-0165 inherit-then-override) by poisoning the
+    // parent environment, then assert the PTY child is sanitized. Headless
+    // PTY byte capture; chafa is not required as a dependency.
+    let poison: &[(&str, &str)] = &[
+        ("TERM_PROGRAM", "ghostty"),
+        ("TERM_PROGRAM_VERSION", "1.3.1-poison"),
+        ("GHOSTTY_BIN_DIR", "/tmp/bitty-poison"),
+        ("GHOSTTY_RESOURCES_DIR", "/tmp/bitty-poison-res"),
+        ("WEZTERM_PANE", "9-poison"),
+        ("WEZTERM_EXECUTABLE", "/tmp/bitty-poison-wezterm"),
+        ("KITTY_PID", "99999"),
+        ("KITTY_WINDOW_ID", "7-poison"),
+        ("KITTY_LISTEN_ON", "/tmp/bitty-poison-kitty.sock"),
+        ("VTE_VERSION", "7500"),
+        ("ITERM_SESSION_ID", "w0t0p0:POISON"),
+        ("ITERM_PROFILE", "Poison"),
+        ("LC_TERMINAL", "iTerm2"),
+        ("LC_TERMINAL_VERSION", "3.5.0-poison"),
+    ];
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> = poison
+        .iter()
+        .map(|(k, _)| (*k, std::env::var_os(k)))
+        .collect();
+    for (k, v) in poison {
+        // `std::env::set_var` is (correctly) flagged unsafe in Rust 2024
+        // because it races with `getenv` in other threads; the poison window
+        // here is narrowed to spawn-only and restored immediately after.
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+
+    let spawn_result = PtyBuilder::new("/usr/bin/env").spawn();
+
+    // Restore the parent environment immediately: the child snapshot is
+    // taken at spawn time, so later assertions cannot be affected.
+    for (k, prev) in &saved {
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    let mut pty = spawn_result.expect("spawn env with poisoned parent");
+    let reader = pty.take_reader().expect("reader half");
+    let writer = pty.take_writer().expect("writer half");
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + ECHO_TIMEOUT;
+    let output = drain(&reader, deadline);
+    reader.join().expect("pump clean");
+
+    let text = String::from_utf8_lossy(&output);
+    // Sanitized: parent fingerprints must not reach the child; TERM_PROGRAM
+    // is overridden to bitty rather than removed.
+    assert!(
+        text.contains("TERM_PROGRAM=bitty"),
+        "TERM_PROGRAM must be overridden to bitty in {text:?}"
+    );
+    for marker in [
+        "TERM_PROGRAM=ghostty",
+        "TERM_PROGRAM_VERSION=",
+        "GHOSTTY_BIN_DIR=",
+        "GHOSTTY_RESOURCES_DIR=",
+        "WEZTERM_PANE=",
+        "WEZTERM_EXECUTABLE=",
+        "KITTY_PID=",
+        "KITTY_WINDOW_ID=",
+        "KITTY_LISTEN_ON=",
+        "VTE_VERSION=",
+        "ITERM_SESSION_ID=",
+        "ITERM_PROFILE=",
+        "LC_TERMINAL=",
+        "LC_TERMINAL_VERSION=",
+    ] {
+        assert!(
+            !text.contains(marker),
+            "graphics fingerprint {marker:?} must be stripped, got {text:?}"
+        );
+    }
+    // Functional environment still inherits (CTX-0165 posture preserved).
+    assert!(
+        text.contains("PATH="),
+        "inherited PATH must survive sanitization in {text:?}"
+    );
+    assert!(
+        text.contains("TERM=xterm-256color"),
+        "default TERM must survive sanitization in {text:?}"
+    );
+    assert!(
+        text.contains("COLORTERM=truecolor"),
+        "default COLORTERM must survive sanitization in {text:?}"
+    );
+}
+
+#[test]
 fn cwd_is_applied_to_child() {
     let mut pty = PtyBuilder::new("/bin/pwd")
         .cwd("/tmp")

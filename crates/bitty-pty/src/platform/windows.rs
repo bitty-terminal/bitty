@@ -10,8 +10,8 @@
 //!
 //! The future implementation must keep these exact signatures and honor the
 //! same security defaults enforced on Unix: direct argv exec without shell
-//! interpolation, cleared inherited environment with explicit allowlist, and
-//! bounded output buffering.
+//! interpolation, inherited session environment with explicit overrides plus
+//! CTX-0194 graphics-fingerprint sanitization, and bounded output buffering.
 
 use std::io;
 use std::path::PathBuf;

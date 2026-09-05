@@ -24,8 +24,11 @@
 //!   direct argv vector; there is no code path that routes through a shell.
 //! - **Inherited session environment with overrides.** Children inherit the
 //!   session environment by default (DEC-0017, Ghostty/Alacritty reference),
-//!   with default `TERM=xterm-256color` and `COLORTERM=truecolor` entries
-//!   overriding or augmenting the inherited environment.
+//!   with default `TERM=xterm-256color`, `COLORTERM=truecolor`, and
+//!   `TERM_PROGRAM=bitty` entries overriding or augmenting the inherited
+//!   environment. Inherited graphics-fingerprint markers (Ghostty/Kitty/
+//!   WezTerm/VTE/iTerm keys documented in `builder`) are stripped at spawn
+//!   time so term-DB probes fall back to symbols (CTX-0194).
 //! - **fd hygiene.** On Unix the wrapped layer opens both PTY descriptors
 //!   close-on-exec, resets inherited signal dispositions, and starts the
 //!   child in a fresh session with the PTY as controlling terminal.
@@ -97,11 +100,15 @@ pub use builder::DEFAULT_COLORTERM;
 pub use builder::DEFAULT_COLS;
 pub use builder::DEFAULT_ROWS;
 pub use builder::DEFAULT_TERM;
+pub use builder::DEFAULT_TERM_PROGRAM;
+pub use builder::GRAPHICS_FINGERPRINT_EXACT_KEYS;
+pub use builder::GRAPHICS_FINGERPRINT_PREFIXES;
 pub use builder::MAX_ARGS;
 pub use builder::MAX_ARGV_BYTES;
 pub use builder::MAX_ENV_ENTRIES;
 pub use builder::MAX_ENV_VALUE_BYTES;
 pub use builder::PtyBuilder;
+pub use builder::should_strip_graphics_fingerprint;
 pub use error::PtyError;
 pub use platform::ExitStatus;
 pub use pty::Pty;

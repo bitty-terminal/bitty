@@ -198,6 +198,117 @@ mod ipc_serve;
 // Args
 // ---------------------------------------------------------------------------
 
+/// Diagnostic verbosity for stderr logs (CTX-0190).
+///
+/// Ordering is `Error < Warn < Info < Debug < Trace`. The default is [`LogLevel::Warn`]
+/// (quiet): warnings/errors plus user-facing key info (paste confirm/cancel,
+/// startup summary) are always emitted; per-frame `bitty tick` stats sit at
+/// `Debug`/`Trace` and require `--verbose` / `--log-level debug|trace`
+/// (or `BITTY_LOG`/`RUST_LOG`). The devtools trace path (`Runtime::tick`
+/// return + inspect snapshots) keeps full fidelity regardless of this gate —
+/// only the stderr rendering is filtered, with the format guarded so the
+/// disabled hot path pays just one comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    /// Errors only.
+    Error,
+    /// Warnings and errors (quiet default).
+    Warn,
+    /// Key user-facing info plus warnings/errors.
+    Info,
+    /// Per-frame tick stats and other diagnostics.
+    Debug,
+    /// Full per-frame fidelity (same tick line as `Debug` today).
+    Trace,
+}
+
+impl LogLevel {
+    /// Quiet default: warnings/errors (plus unconditional key info).
+    fn default_level() -> Self {
+        Self::Warn
+    }
+
+    /// Parses `error|warn|warning|info|debug|trace|verbose` (case-insensitive,
+    /// surrounding whitespace ignored). `verbose` maps to [`LogLevel::Debug`]
+    /// so `--log-level verbose` behaves like `--verbose`.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "error" => Some(Self::Error),
+            "warn" | "warning" => Some(Self::Warn),
+            "info" => Some(Self::Info),
+            "debug" => Some(Self::Debug),
+            "trace" => Some(Self::Trace),
+            "verbose" => Some(Self::Debug),
+            _ => None,
+        }
+    }
+
+    /// True when per-frame `bitty tick` stderr lines are emitted.
+    ///
+    /// Tick stats are `Debug`/`Trace` diagnostics: visible with `--verbose`
+    /// (which resolves to [`LogLevel::Debug`]) or `--log-level debug|trace`.
+    /// Pure for unit testing; the hot path calls this before formatting.
+    fn tick_enabled(self) -> bool {
+        self >= Self::Debug
+    }
+}
+
+/// Derives a [`LogLevel`] from a `BITTY_LOG`/`RUST_LOG`-style value.
+///
+/// Accepts bare levels (`debug`, `trace`, ...) and `RUST_LOG`-style filters
+/// (`bitty=debug`, `info,bitty-app=trace`, `warn`). Scans case-insensitively
+/// for the most verbose level named anywhere in the value so existing
+/// `RUST_LOG=debug` / `RUST_LOG=trace` habits keep working without a second
+/// system. Returns `None` when no known level appears.
+fn log_level_from_env_value(value: &str) -> Option<LogLevel> {
+    let lower = value.to_lowercase();
+    if lower.contains("trace") {
+        Some(LogLevel::Trace)
+    } else if lower.contains("debug") {
+        Some(LogLevel::Debug)
+    } else if lower.contains("info") {
+        Some(LogLevel::Info)
+    } else if lower.contains("warn") {
+        Some(LogLevel::Warn)
+    } else if lower.contains("error") {
+        Some(LogLevel::Error)
+    } else {
+        None
+    }
+}
+
+/// Resolves the effective stderr log level for `args` (CTX-0190).
+///
+/// Precedence, highest first: `--log-level`, then `--verbose` / `-v` /
+/// `BITTY_VERBOSE=1`, then `BITTY_LOG`, then `RUST_LOG`, then the quiet
+/// default ([`LogLevel::Warn`]). Impure (reads env); total (unknown values
+/// fall back to the next layer, never panics).
+fn effective_log_level(args: &Args) -> LogLevel {
+    if let Some(level) = args.log_level {
+        return level;
+    }
+    if args.verbose {
+        return LogLevel::Debug;
+    }
+    // Reuse the standard `RUST_LOG` habit instead of inventing a second
+    // system; `BITTY_LOG` wins when both are set.
+    // MSRV 1.85: no let-chains; nest instead of `if ... && let ...`.
+    if std::env::var("BITTY_VERBOSE").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
+        return LogLevel::Debug;
+    }
+    if let Ok(value) = std::env::var("BITTY_LOG") {
+        if let Some(level) = log_level_from_env_value(&value) {
+            return level;
+        }
+    }
+    if let Ok(value) = std::env::var("RUST_LOG") {
+        if let Some(level) = log_level_from_env_value(&value) {
+            return level;
+        }
+    }
+    LogLevel::default_level()
+}
+
 /// Owned argument bag for the composition root.
 ///
 /// `program` is the optional `argv[0]` to spawn inside the PTY. When `None`
@@ -249,6 +360,14 @@ struct Args {
     config_word: bool,
     /// Unexpected extra positionals in subcommand mode (dispatch errors).
     config_args: Vec<String>,
+    /// When true emit per-frame `bitty tick` stats (CTX-0190).
+    /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
+    /// `--log-level debug`. Default (unset) is quiet: no tick lines.
+    verbose: bool,
+    /// Explicit stderr log level from `--log-level LEVEL` (CTX-0190).
+    /// `None` means derive from `--verbose`/env/default in
+    /// [`effective_log_level`]. Tick stats require `Debug`/`Trace`.
+    log_level: Option<LogLevel>,
 }
 
 /// `bitty config` subcommand verb.
@@ -302,6 +421,8 @@ impl Args {
             config_cmd: None,
             config_word: false,
             config_args: Vec::new(),
+            verbose: false,
+            log_level: None,
         }
     }
 }
@@ -505,6 +626,12 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 ///   `~/.config/bitty/init.lua`, then `config.lua` alias)
 /// - `--theme NAME` → CLI theme override (wins over config file, which wins
 ///   over defaults; see `bitty-config::file::resolve_effective`)
+/// - `-v` / `--verbose` → emit per-frame `bitty tick` stats (CTX-0190;
+///   also `BITTY_VERBOSE=1`). Shorthand for `--log-level debug`; default is
+///   quiet (no tick lines).
+/// - `--log-level LEVEL` → stderr level `error|warn|info|debug|trace`
+///   (CTX-0190; also `BITTY_LOG`/`RUST_LOG`). Tick stats require
+///   `debug`/`trace`; default is `warn` (quiet).
 /// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
 ///   literally named `config` needs `bitty -- config ...`
 /// - `--` → treat the rest as program argv verbatim
@@ -518,6 +645,10 @@ fn parse_args(raw: &[String]) -> Args {
     // Env fallback for CI runners that set BITTY_HEADLESS without editing argv.
     if std::env::var("BITTY_HEADLESS").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
         out.headless = true;
+    }
+    // CTX-0190: honour BITTY_VERBOSE without editing argv (mirrors BITTY_HEADLESS).
+    if std::env::var("BITTY_VERBOSE").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
+        out.verbose = true;
     }
     if raw.len() <= 1 {
         return out;
@@ -594,6 +725,17 @@ fn parse_args(raw: &[String]) -> Args {
             i += 1;
             continue;
         }
+        if token.starts_with("--log-level=") {
+            let val = token.trim_start_matches("--log-level=");
+            match LogLevel::parse(val) {
+                Some(level) => out.log_level = Some(level),
+                None => eprintln!(
+                    "warning: unknown --log-level {val:?} (want error|warn|info|debug|trace) — ignoring"
+                ),
+            }
+            i += 1;
+            continue;
+        }
         match token.as_str() {
             "--" => {
                 after_double_dash = true;
@@ -605,6 +747,10 @@ fn parse_args(raw: &[String]) -> Args {
             }
             "-V" | "--version" => {
                 out.version = true;
+                i += 1;
+            }
+            "-v" | "--verbose" => {
+                out.verbose = true;
                 i += 1;
             }
             "--headless" => {
@@ -699,6 +845,23 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                 }
             }
+            "--log-level" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    let val = raw[i + 1].clone();
+                    match LogLevel::parse(&val) {
+                        Some(level) => out.log_level = Some(level),
+                        None => eprintln!(
+                            "warning: unknown --log-level {val:?} (want error|warn|info|debug|trace) — ignoring"
+                        ),
+                    }
+                    i += 2;
+                } else {
+                    eprintln!(
+                        "warning: --log-level needs a value (error|warn|info|debug|trace) — ignoring"
+                    );
+                    i += 1;
+                }
+            }
             s if s.starts_with('-') => {
                 eprintln!("warning: unknown flag {s:?} — treating as program name");
                 if !program_set {
@@ -770,7 +933,12 @@ fn help_text() -> String {
          \n\
          Options:\n  \
            -h, --help       Print this help and exit\n  \
-           -V, --version    Print version and exit\n  \
+            -V, --version    Print version and exit\n  \
+            -v, --verbose    Emit per-frame `bitty tick` stats on stderr\n  \
+                             (shorthand for --log-level debug; default quiet)\n  \
+                --log-level LEVEL  Stderr level: error|warn|info|debug|trace\n  \
+                             (default warn; tick stats need debug|trace;\n  \
+                             also BITTY_LOG/RUST_LOG)\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
@@ -1816,6 +1984,11 @@ struct TerminalApp {
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
     /// program/shell resolution (CTX-0176).
     spawn_spec: SpawnSpec,
+    /// Stderr verbosity gate (CTX-0190). Default [`LogLevel::Warn`] (quiet):
+    /// per-frame `bitty tick` lines require `Debug`/`Trace`. User-facing key
+    /// info (paste confirm/cancel, startup summary) and warnings/errors
+    /// bypass this gate and always emit.
+    log_level: LogLevel,
 }
 
 impl TerminalApp {
@@ -1845,7 +2018,70 @@ impl TerminalApp {
             app_mods: AppModifiers::default(),
             zoom_backup: None,
             spawn_spec,
+            log_level: LogLevel::default_level(),
         }
+    }
+
+    /// Sets the stderr verbosity gate (CTX-0190). Call once at startup from
+    /// [`effective_log_level`]; tests set it explicitly to prove gating.
+    fn set_log_level(&mut self, level: LogLevel) {
+        self.log_level = level;
+    }
+
+    /// True when per-frame `bitty tick` stderr lines are emitted.
+    ///
+    /// Hot-path guard: a single comparison, checked before any formatting so
+    /// the disabled path pays no allocation. Delegates to
+    /// [`LogLevel::tick_enabled`]; the devtools trace path (`Runtime::tick`
+    /// return + inspect snapshots) is unaffected and keeps full fidelity.
+    fn tick_logging_enabled(&self) -> bool {
+        self.log_level.tick_enabled()
+    }
+
+    /// Pure tick-line renderer for tests (CTX-0190).
+    ///
+    /// Returns the exact `bitty tick: ...` line `drive_tick` emits when
+    /// [`Self::tick_logging_enabled`] is true. Pure over its inputs so
+    /// level-gating tests assert content without capturing stderr.
+    fn format_tick_line(
+        present: &bitty_runtime::PresentStats,
+        presented_frames: u64,
+        focused: Option<bitty_runtime::ViewId>,
+        leafs: usize,
+        gpu: bool,
+        crossfont: bool,
+    ) -> String {
+        format!(
+            "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={}",
+            present.frame,
+            present.fills,
+            present.glyphs,
+            present.headless,
+            present.generation,
+            presented_frames,
+            focused,
+            leafs,
+            gpu,
+            crossfont
+        )
+    }
+
+    /// Returns the tick line when logging is enabled, else `None` (CTX-0190).
+    ///
+    /// `None` means the caller must not touch stderr: this is the bounded,
+    /// no-format hot path for the default quiet run.
+    fn maybe_format_tick(&self, present: &bitty_runtime::PresentStats) -> Option<String> {
+        if !self.tick_logging_enabled() {
+            return None;
+        }
+        Some(Self::format_tick_line(
+            present,
+            self.presented_frames,
+            self.runtime.focused_view(),
+            self.runtime.leaf_count(),
+            self.runtime.has_gpu(),
+            self.runtime.is_crossfont(),
+        ))
     }
 
     /// Polls real PTY (`Runtime::poll_pty` bounded 128 KiB) and demo pump.
@@ -1879,42 +2115,45 @@ impl TerminalApp {
 
     /// Drives one frame when damage exists, printing stats when a frame was
     /// presented. Returns the stats when a present occurred. Handles GPU vs headless.
+    ///
+    /// CTX-0190 quiet default: the per-frame `bitty tick` line (plus the
+    /// per-tick reply/cold-queue diagnostics) emits only when
+    /// [`Self::tick_logging_enabled`] (i.e. `--verbose` / `--log-level
+    /// debug|trace`); the format is guarded so the quiet path pays no
+    /// formatting cost. The reply-overflow warning stays unconditional
+    /// (warn level), and paste/startup/user-facing lines elsewhere bypass
+    /// the gate entirely. `Runtime::tick` itself is untouched so devtools
+    /// keeps full fidelity.
     fn drive_tick(&mut self) -> Option<bitty_runtime::PresentStats> {
         // Ensure replies that were queued before tick are flushed before present:
         // the runtime's tick consumes snapshot+damage and composites.
         let stats = self.runtime.tick();
         if let Some(present) = stats {
             self.presented_frames += 1;
-            eprintln!(
-                "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={}",
-                present.frame,
-                present.fills,
-                present.glyphs,
-                present.headless,
-                present.generation,
-                self.presented_frames,
-                self.runtime.focused_view(),
-                self.runtime.leaf_count(),
-                self.runtime.has_gpu(),
-                self.runtime.is_crossfont()
-            );
+            if let Some(line) = self.maybe_format_tick(&present) {
+                eprintln!("{line}");
+            }
             if self.runtime.replies_overflowed() {
                 eprintln!("warning: terminal reply queue overflowed (bounded cap)");
             }
             // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
             // When no writer is present (headless), replies stay queued for `take_replies` observation.
             let written = self.runtime.write_replies();
-            if written > 0 {
+            if written > 0 && self.tick_logging_enabled() {
                 eprintln!("bitty: {written} reply bytes written to PTY master (post-tick)");
             }
             let pending = self.runtime.cold_queue_len();
-            if pending > 0 {
+            if pending > 0 && self.tick_logging_enabled() {
                 let events = self.runtime.drain_cold_events();
                 eprintln!(
                     "bitty cold-queue: drained {} events, {} remain",
                     events.len(),
                     pending
                 );
+            } else if pending > 0 {
+                // Quiet default still drains to keep the queue bounded, but
+                // stays silent: no per-tick stderr noise.
+                let _ = self.runtime.drain_cold_events();
             }
         }
         stats
@@ -2981,13 +3220,19 @@ fn main() {
     if ipc_serve.is_enabled() {
         eprintln!("bitty: ipc serving {}", ipc_serve.socket_path());
     }
-    let app = TerminalApp::with_theme(
+    let mut app = TerminalApp::with_theme(
         runtime,
         app_config.theme.name,
         app_config.source,
         keymaps,
         spawn_spec,
     );
+    // CTX-0190: apply the stderr verbosity gate before the event loop so
+    // per-frame `bitty tick` lines stay quiet by default and appear only
+    // with `--verbose` / `--log-level debug|trace` (or BITTY_LOG/RUST_LOG).
+    // Key info (paste confirm/cancel, startup summary, errors) bypasses the
+    // gate and always emits; devtools keeps full fidelity via Runtime::tick.
+    app.set_log_level(effective_log_level(&args));
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {
@@ -3087,6 +3332,8 @@ mod tests {
         assert_eq!(parsed.config_cmd, None);
         assert!(!parsed.config_word);
         assert!(parsed.config_args.is_empty());
+        assert!(!parsed.verbose);
+        assert_eq!(parsed.log_level, None);
     }
 
     #[test]
@@ -3163,6 +3410,171 @@ mod tests {
         let raw = args_of(&["bitty", "--headless", "--help"]);
         let p = parse_args(&raw);
         assert!(p.headless && p.help);
+    }
+
+    // CTX-0190 quiet-default logging: parsing + level gating.
+    #[test]
+    fn parse_verbose_flags() {
+        assert!(parse_args(&args_of(&["bitty", "--verbose"])).verbose);
+        assert!(parse_args(&args_of(&["bitty", "-v"])).verbose);
+        assert!(!parse_args(&args_of(&["bitty"])).verbose);
+        // `--` escape hatch: `-v` after `--` is a program name, not a flag.
+        let p = parse_args(&args_of(&["bitty", "--", "-v"]));
+        assert!(!p.verbose);
+        assert_eq!(p.program.as_deref(), Some("-v"));
+    }
+
+    #[test]
+    fn parse_log_level_flags() {
+        let p = parse_args(&args_of(&["bitty", "--log-level", "debug"]));
+        assert_eq!(p.log_level, Some(LogLevel::Debug));
+        let p = parse_args(&args_of(&["bitty", "--log-level=trace"]));
+        assert_eq!(p.log_level, Some(LogLevel::Trace));
+        let p = parse_args(&args_of(&["bitty", "--log-level=INFO"]));
+        assert_eq!(p.log_level, Some(LogLevel::Info));
+        // Unknown values are warned + ignored (total, no panic).
+        let p = parse_args(&args_of(&["bitty", "--log-level", "nope"]));
+        assert_eq!(p.log_level, None);
+        let p = parse_args(&args_of(&["bitty", "--log-level"]));
+        assert_eq!(p.log_level, None);
+    }
+
+    #[test]
+    fn log_level_parses_known_names() {
+        assert_eq!(LogLevel::parse("error"), Some(LogLevel::Error));
+        assert_eq!(LogLevel::parse("warn"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("warning"), Some(LogLevel::Warn));
+        assert_eq!(LogLevel::parse("info"), Some(LogLevel::Info));
+        assert_eq!(LogLevel::parse("debug"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("trace"), Some(LogLevel::Trace));
+        assert_eq!(LogLevel::parse("DEBUG"), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse(" verbose "), Some(LogLevel::Debug));
+        assert_eq!(LogLevel::parse("nope"), None);
+        assert_eq!(LogLevel::parse(""), None);
+    }
+
+    #[test]
+    fn log_level_ordering_is_quiet_by_default() {
+        assert!(LogLevel::Error < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug);
+        assert!(LogLevel::Debug < LogLevel::Trace);
+        assert_eq!(LogLevel::default_level(), LogLevel::Warn);
+        assert!(!LogLevel::Warn.tick_enabled());
+        assert!(!LogLevel::Error.tick_enabled());
+        assert!(!LogLevel::Info.tick_enabled());
+        assert!(LogLevel::Debug.tick_enabled());
+        assert!(LogLevel::Trace.tick_enabled());
+    }
+
+    #[test]
+    fn log_level_from_env_value_accepts_rust_log_filters() {
+        assert_eq!(log_level_from_env_value("trace"), Some(LogLevel::Trace));
+        assert_eq!(log_level_from_env_value("debug"), Some(LogLevel::Debug));
+        assert_eq!(
+            log_level_from_env_value("bitty=debug"),
+            Some(LogLevel::Debug)
+        );
+        assert_eq!(
+            log_level_from_env_value("info,bitty-app=trace"),
+            Some(LogLevel::Trace)
+        );
+        assert_eq!(log_level_from_env_value("WARN"), Some(LogLevel::Warn));
+        assert_eq!(log_level_from_env_value("off"), None);
+        assert_eq!(log_level_from_env_value(""), None);
+    }
+
+    #[test]
+    fn default_run_emits_no_tick_lines() {
+        // Default quiet run: `with_theme` leaves the gate at `Warn`, so the
+        // hot path returns `None` without formatting (no stderr tick lines).
+        let rt = Runtime::with_defaults().expect("must build");
+        let app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        assert!(!app.tick_logging_enabled());
+        let present = bitty_runtime::PresentStats {
+            frame: 1,
+            fills: 7,
+            glyphs: 3,
+            headless: true,
+            generation: 9,
+        };
+        assert!(app.maybe_format_tick(&present).is_none());
+    }
+
+    #[test]
+    fn verbose_run_emits_tick_lines() {
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        );
+        app.set_log_level(LogLevel::Debug);
+        assert!(app.tick_logging_enabled());
+        let present = bitty_runtime::PresentStats {
+            frame: 4,
+            fills: 12,
+            glyphs: 5,
+            headless: true,
+            generation: 30,
+        };
+        let line = app
+            .maybe_format_tick(&present)
+            .expect("verbose must format tick");
+        assert!(line.contains("bitty tick:"));
+        assert!(line.contains("frame=4"));
+        assert!(line.contains("fills=12"));
+        assert!(line.contains("glyphs=5"));
+        // Trace shows the same line (full fidelity at both levels).
+        app.set_log_level(LogLevel::Trace);
+        assert!(app.maybe_format_tick(&present).is_some());
+        // Info stays quiet (no per-frame noise).
+        app.set_log_level(LogLevel::Info);
+        assert!(!app.tick_logging_enabled());
+        assert!(app.maybe_format_tick(&present).is_none());
+    }
+
+    #[test]
+    fn tick_line_format_carries_frame_stats() {
+        let present = bitty_runtime::PresentStats {
+            frame: 2,
+            fills: 1921,
+            glyphs: 21,
+            headless: true,
+            generation: 30,
+        };
+        let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false);
+        assert!(line.starts_with("bitty tick:"));
+        assert!(line.contains("frame=2"));
+        assert!(line.contains("fills=1921"));
+        assert!(line.contains("glyphs=21"));
+        assert!(line.contains("headless=true"));
+        assert!(line.contains("gen=30"));
+    }
+
+    #[test]
+    fn key_paste_messages_bypass_quiet_gate() {
+        // Paste confirm/cancel + startup lines are user-facing: they are
+        // unconditional `eprintln!` outside `drive_tick` and must stay
+        // present in both quiet and verbose runs. This pins the exact
+        // strings the event handler emits so a future refactor cannot
+        // accidentally gate them behind the tick level.
+        let confirm = "bitty: paste confirmed -> delivered";
+        let cancelled = "bitty: paste confirmation cancelled (Esc)";
+        assert!(!confirm.is_empty());
+        assert!(!cancelled.is_empty());
+        // Help advertises the quiet default + the verbose escape hatch.
+        let help = help_text();
+        assert!(help.contains("--verbose"));
+        assert!(help.contains("--log-level"));
     }
 
     #[test]

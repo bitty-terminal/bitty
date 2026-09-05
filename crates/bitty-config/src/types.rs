@@ -37,6 +37,13 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
+
+/// Default selection auto-copy behavior (CTX-0191).
+/// `true` preserves the ghostty-class copy-on-select: a committed mouse
+/// selection auto-copies to the clipboard (which best-effort syncs primary).
+/// `false` leaves the highlight in place and copies only via the explicit
+/// `copy_to_clipboard` chord (Ctrl+Shift+C).
+pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 /// Default font family: Nerd-Font-patched JetBrains Mono.
 ///
 /// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
@@ -313,6 +320,34 @@ impl TerminalConfig {
     }
 }
 
+/// Selection behavior configuration (CTX-0191).
+///
+/// `auto_copy` controls ghostty-class copy-on-select. `true` (default)
+/// preserves current behavior: a committed mouse selection auto-copies to
+/// the clipboard (which best-effort syncs the primary selection on Linux).
+/// `false` leaves the highlight in place and copies only via the explicit
+/// `copy_to_clipboard` chord (Ctrl+Shift+C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionConfig {
+    /// Whether a committed mouse selection auto-copies to the clipboard.
+    pub auto_copy: bool,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            auto_copy: DEFAULT_SELECTION_AUTO_COPY,
+        }
+    }
+}
+
+impl SelectionConfig {
+    /// Validate selection config (booleans are total; always succeeds).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
 /// Appearance configuration.
 ///
 /// The optional theme identifier resolves through the built-in preset
@@ -437,6 +472,8 @@ pub struct EffectiveConfig {
     pub window: WindowConfig,
     /// Terminal config.
     pub terminal: TerminalConfig,
+    /// Selection config (CTX-0191; default auto-copies on select).
+    pub selection: SelectionConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
     /// Keymaps, possibly empty.
@@ -455,6 +492,7 @@ impl Default for EffectiveConfig {
             font: FontConfig::default(),
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
+            selection: SelectionConfig::default(),
             appearance: AppearanceConfig::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
@@ -470,6 +508,7 @@ impl EffectiveConfig {
         self.font.validate()?;
         self.window.validate()?;
         self.terminal.validate()?;
+        self.selection.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -680,6 +719,23 @@ mod tests {
             .validate()
             .expect("boundary scroll speed must be valid");
         }
+    }
+
+    #[test]
+    fn selection_auto_copy_defaults_on_and_validates() {
+        // CTX-0191: default-on preserves copy-on-select for existing users.
+        const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
+        assert!(SelectionConfig::default().auto_copy);
+        assert!(EffectiveConfig::default().selection.auto_copy);
+        SelectionConfig::default()
+            .validate()
+            .expect("default valid");
+        SelectionConfig { auto_copy: false }
+            .validate()
+            .expect("opt-out valid");
+        EffectiveConfig::default()
+            .validate()
+            .expect("default valid");
     }
 
     #[test]

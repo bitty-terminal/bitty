@@ -61,6 +61,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.shell`          | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
+/// | `selection.auto_copy`     | RestartRequired    |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -82,6 +83,8 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
         | "terminal"
+        | "selection.auto_copy"
+        | "selection"
         | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,
     }
@@ -209,6 +212,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.scroll_pixels_per_notch",
         old.terminal.scroll_pixels_per_notch.to_string(),
         new.terminal.scroll_pixels_per_notch.to_string(),
+    );
+    // CTX-0191: auto-copy is adopted at startup (RuntimeConfig is built once
+    // from the effective config), so changes are restart-required, not live.
+    push_if_changed(
+        "selection.auto_copy",
+        old.selection.auto_copy.to_string(),
+        new.selection.auto_copy.to_string(),
     );
     push_if_changed(
         "appearance.theme",
@@ -401,6 +411,12 @@ mod tests {
             classify_field("terminal.scroll_pixels_per_notch"),
             ReloadClass::RestartRequired
         );
+        // CTX-0191: auto-copy is restart-required (adopted at startup).
+        assert_eq!(
+            classify_field("selection.auto_copy"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("selection"), ReloadClass::RestartRequired);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
 
@@ -428,5 +444,19 @@ mod tests {
                 .iter()
                 .any(|d| d.field == "terminal.scroll_pixels_per_notch")
         );
+    }
+
+    #[test]
+    fn diff_selection_auto_copy_is_restart_required() {
+        // CTX-0191: flipping auto-copy must surface as a restart-required
+        // diff (no silent no-op on reload).
+        let old = EffectiveConfig::default();
+        assert!(old.selection.auto_copy);
+        let mut new = old.clone();
+        new.selection.auto_copy = false;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "selection.auto_copy"));
     }
 }

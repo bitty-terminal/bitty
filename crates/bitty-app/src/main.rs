@@ -1042,6 +1042,11 @@ fn starter_init_lua() -> &'static str {
       -- Alt+h/j/k/l + Ctrl+Alt+arrows for focus, Alt+w to close,\n\
       -- Ctrl+Shift+C/V for copy/paste (fish never sees the chord);\n\
      -- uncomment to override (context + chord identity replaces the default):\n\
+     --\n\
+     -- Mouse select auto-copies to the clipboard by default (ghostty-class\n\
+     -- copy-on-select, syncs primary on Linux). Uncomment to opt out: the\n\
+     -- highlight stays and only Ctrl+Shift+C copies.\n\
+     -- selection = { auto_copy = false },\n\
      return {\n\
      \x20\x20theme = \"dark\",\n\
      \x20\x20-- keymaps = {\n\
@@ -1204,6 +1209,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "selection.auto_copy",
+                        format!("{}", e.selection.auto_copy),
+                        &src("selection.auto_copy")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "keymaps",
                         format!("{} entries", e.keymaps.len()),
                         &src("keymaps")
@@ -1301,10 +1314,10 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 /// Cell geometry applies the configured breathing room
 /// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
 /// [`bitty_config::types::FontConfig::effective_cell`], defaults `9x19`);
-/// grid/queue geometry stays at compiled defaults; font family/size and
-/// scroll speed come from the file/CLI/default chain (already validated
-/// by `bitty-config`, so construction is expected to succeed — failures stay
-/// fail-closed).
+/// grid/queue geometry stays at compiled defaults; font family/size, scroll
+/// speed, and selection auto-copy come from the file/CLI/default chain
+/// (already validated by `bitty-config`, so construction is expected to
+/// succeed — failures stay fail-closed).
 fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
@@ -1320,6 +1333,7 @@ fn runtime_config_from_effective(
         effective.font.size,
         effective.terminal.scroll_lines_per_notch,
         effective.terminal.scroll_pixels_per_notch,
+        effective.selection.auto_copy,
     )
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
@@ -3648,6 +3662,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_inherits_file_selection_auto_copy() {
+        // CTX-0191: `selection.auto_copy` flows file -> effective -> runtime;
+        // crate defaults stay equal (bitty-runtime must not depend on
+        // bitty-config, so the pairing is by value, pinned here). Default
+        // preserves copy-on-select (zero change for existing users).
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_SELECTION_AUTO_COPY,
+            bitty_config::types::DEFAULT_SELECTION_AUTO_COPY
+        );
+        const { assert!(bitty_runtime::config::DEFAULT_SELECTION_AUTO_COPY) }
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(r#"return { selection = { auto_copy = false } }"#, &src)
+            .expect("opt-out parses");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert!(!merged.effective.selection.auto_copy);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert!(!cfg.selection_auto_copy);
+        // Absent table rides the default-on end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no selection table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert!(merged2.effective.selection.auto_copy);
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert!(cfg2.selection_auto_copy);
+        assert_eq!(
+            merged2.source_of("selection.auto_copy").unwrap().layer,
+            bitty_config::plan::LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
     fn window_title_carries_theme_and_source() {
         let t = window_title_for_theme("bitty-dark", "file");
         assert!(t.contains("bitty-dark"));
@@ -3747,6 +3800,10 @@ mod tests {
         let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
         let plan = parse_lua_config(starter_init_lua(), &src).expect("starter valid");
         assert_eq!(plan.appearance.unwrap().theme.as_deref(), Some("dark"));
+        // CTX-0191: starter leaves `selection` unset (commented example only)
+        // so new installs ride the default-on without a file override.
+        assert!(plan.selection.is_none());
+        assert!(starter_init_lua().contains("auto_copy"));
     }
 
     #[test]

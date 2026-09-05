@@ -31,6 +31,7 @@
 //!     --          line_height = 1.2, letter_spacing = 1.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
+//!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
@@ -47,6 +48,10 @@
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch` optional, defaulting to
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
+//!   `selection` is fully optional (absent table/key means "this layer says
+//!   nothing"); when present, `auto_copy` defaults to
+//!   [`SelectionConfig`](crate::types::SelectionConfig) default `true` when
+//!   omitted, so existing configs without `selection` keep working unchanged.
 //!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
 //! - `plugins`, `extends`, and profile names remain non-user layers and are
@@ -78,7 +83,9 @@ use bitty_lua::config::ConfigEval;
 use crate::error::ConfigError;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
-use crate::types::{AppearanceConfig, FontConfig, KeymapEntry, TerminalConfig, WindowConfig};
+use crate::types::{
+    AppearanceConfig, FontConfig, KeymapEntry, SelectionConfig, TerminalConfig, WindowConfig,
+};
 
 /// Config directory name under the XDG config root.
 pub const CONFIG_DIR_NAME: &str = "bitty";
@@ -484,12 +491,23 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             Some(out)
         }
     };
+    // CTX-0191: `selection` is fully optional (absent table means "this layer
+    // says nothing" so merge keeps the lower-precedence value). When the
+    // table is present but `auto_copy` is omitted, default to `true` (like
+    // the CTX-0185 scroll extras inside `terminal`): existing configs without
+    // `selection` keep working unchanged, and `selection = { auto_copy =
+    // false }` is the explicit opt-out. Wrong types already failed closed as
+    // `ShapeError` in `bitty-lua` (never coerced, never echoed).
+    let selection = data.selection.map(|s| SelectionConfig {
+        auto_copy: s.auto_copy.unwrap_or(SelectionConfig::default().auto_copy),
+    });
 
     let plan = ConfigPlan {
         schema_version: None,
         font,
         window,
         terminal,
+        selection,
         appearance,
         keymaps,
         plugins: None,
@@ -718,6 +736,47 @@ mod tests {
                 msg.contains("scroll_lines_per_notch") || msg.contains("scroll_pixels_per_notch"),
                 "must name the field: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn lua_selection_auto_copy_parses_and_validates() {
+        // CTX-0191: explicit bool parses; absent table means "says nothing"
+        // (plan.selection None so merge keeps lower); present-but-empty
+        // defaults to true; wrong types fail closed naming the field.
+        let plan = parse_lua_config(
+            r#"return { selection = { auto_copy = false } }"#,
+            &test_source(),
+        )
+        .expect("opt-out parses");
+        assert!(!plan.selection.unwrap().auto_copy);
+        let plan = parse_lua_config(
+            r#"return { selection = { auto_copy = true } }"#,
+            &test_source(),
+        )
+        .expect("opt-in parses");
+        assert!(plan.selection.unwrap().auto_copy);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no selection table");
+        assert!(plan.selection.is_none());
+        let plan = parse_lua_config(r#"return { selection = {} }"#, &test_source())
+            .expect("empty selection defaults");
+        assert!(plan.selection.unwrap().auto_copy);
+        for bad in [
+            r#"return { selection = { auto_copy = 1 } }"#,
+            r#"return { selection = { auto_copy = "false" } }"#,
+            r#"return { selection = "false" }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("selection.auto_copy") || msg.contains("selection"),
+                "must name the field: {msg}"
+            );
+            assert!(!msg.contains("\"false\""), "must not echo value: {msg}");
         }
     }
 

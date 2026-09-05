@@ -69,11 +69,12 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
+        | "selection.auto_copy"
         | "appearance.theme"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "appearance" => Some(MergeClass::DeepMerge),
+        "font" | "window" | "terminal" | "selection" | "appearance" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -366,6 +367,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("terminal".to_string(), src.clone());
         }
 
+        // CTX-0191: `selection.auto_copy` is scalar-replace like
+        // `terminal.scrollback`; absent table means "says nothing".
+        if let Some(sel) = &plan.selection {
+            let field = "selection.auto_copy";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.selection.auto_copy = sel.auto_copy;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.selection.auto_copy = sel.auto_copy;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("selection".to_string(), src.clone());
+        }
+
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -565,6 +609,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "terminal.scroll_lines_per_notch",
         "terminal.scroll_pixels_per_notch",
         "terminal",
+        "selection.auto_copy",
+        "selection",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -752,6 +798,49 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("terminal".to_string(), src.clone());
         }
+        // CTX-0191: `selection.auto_copy` is scalar-replace like
+        // `terminal.scrollback`; absent table means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(sel) = &plan.selection {
+            let field = "selection.auto_copy";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.selection.auto_copy = sel.auto_copy;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.selection.auto_copy = sel.auto_copy;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("selection".to_string(), src.clone());
+        }
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -948,6 +1037,8 @@ fn merge_layers_allow_policy_violations(
         "terminal.scroll_lines_per_notch",
         "terminal.scroll_pixels_per_notch",
         "terminal",
+        "selection.auto_copy",
+        "selection",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1220,6 +1311,12 @@ mod tests {
             merge_class_for("terminal.scroll_pixels_per_notch"),
             Some(MergeClass::ScalarReplace)
         );
+        // CTX-0191: selection opt-out is scalar-replace like scrollback.
+        assert_eq!(
+            merge_class_for("selection.auto_copy"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(merge_class_for("selection"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("unknown"), None);
     }
 
@@ -1266,6 +1363,56 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.field == "terminal.scroll_lines_per_notch")
+        );
+    }
+
+    #[test]
+    fn later_layer_wins_selection_auto_copy() {
+        // CTX-0191: user opt-out overrides the default-on; CLI wins over file.
+        // Absent table means "says nothing" so defaults survive.
+        use crate::types::SelectionConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                selection: Some(SelectionConfig { auto_copy: false }),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert!(!merged.effective.selection.auto_copy);
+        assert_eq!(
+            merged.source_of("selection.auto_copy").unwrap().layer,
+            LayerKind::User
+        );
+        // No layers at all -> default-on survives with core-defaults source.
+        let merged_default = merge_layers(vec![]).expect("merge");
+        assert!(merged_default.effective.selection.auto_copy);
+        // CLI opt-out wins over a user opt-in.
+        let user_in = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                selection: Some(SelectionConfig { auto_copy: true }),
+                ..Default::default()
+            },
+        );
+        let cli_out = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                selection: Some(SelectionConfig { auto_copy: false }),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user_in, cli_out]).expect("merge");
+        assert!(!merged2.effective.selection.auto_copy);
+        assert_eq!(
+            merged2.source_of("selection.auto_copy").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "selection.auto_copy")
         );
     }
 

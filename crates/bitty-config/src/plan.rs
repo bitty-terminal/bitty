@@ -14,7 +14,8 @@
 
 use crate::error::ConfigError;
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, PluginSpec, TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, PluginSpec, SelectionConfig, TerminalConfig,
+    WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -35,6 +36,8 @@ pub struct ConfigPlan {
     pub window: Option<WindowConfig>,
     /// Terminal configuration.
     pub terminal: Option<TerminalConfig>,
+    /// Selection configuration (CTX-0191 `selection.auto_copy`).
+    pub selection: Option<SelectionConfig>,
     /// Appearance configuration.
     pub appearance: Option<AppearanceConfig>,
     /// Key mappings (full set for this layer).
@@ -84,6 +87,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set selection.
+    #[must_use]
+    pub fn with_selection(mut self, selection: SelectionConfig) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
     /// Convenience builder: set appearance.
     #[must_use]
     pub fn with_appearance(mut self, appearance: AppearanceConfig) -> Self {
@@ -121,6 +131,9 @@ impl ConfigPlan {
         }
         if let Some(t) = &self.terminal {
             t.validate()?;
+        }
+        if let Some(s) = &self.selection {
+            s.validate()?;
         }
         if let Some(a) = &self.appearance {
             a.validate()?;
@@ -164,6 +177,7 @@ impl ConfigPlan {
         self.font.is_none()
             && self.window.is_none()
             && self.terminal.is_none()
+            && self.selection.is_none()
             && self.appearance.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()

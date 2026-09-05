@@ -33,6 +33,7 @@
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
+//!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -67,7 +68,7 @@ pub const MAX_CONFIG_TOP_KEYS: usize = 64;
 pub const MAX_CONFIG_STRING_BYTES: usize = 2048;
 
 /// Maximum keys read from any nested table (`appearance`/`font`/`window`/
-/// `terminal`/keymap entry).
+/// `terminal`/`selection`/keymap entry).
 pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 
 /// Maximum keymap entries read (mirrors `bitty-config` `MAX_KEYMAPS` so the
@@ -128,6 +129,14 @@ pub struct TerminalData {
     pub scroll_pixels_per_notch: Option<i64>,
 }
 
+/// Selection overrides, plain data (CTX-0191; see [`FontData`] for `Option`
+/// semantics).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SelectionData {
+    /// Auto-copy on select (present only when the key is set).
+    pub auto_copy: Option<bool>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -144,6 +153,8 @@ pub struct ConfigData {
     pub window: Option<WindowData>,
     /// `terminal` table.
     pub terminal: Option<TerminalData>,
+    /// `selection` table (CTX-0191).
+    pub selection: Option<SelectionData>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
@@ -166,6 +177,7 @@ impl ConfigData {
             && self.font.is_none()
             && self.window.is_none()
             && self.terminal.is_none()
+            && self.selection.is_none()
             && self.keymaps.is_none()
     }
 }
@@ -648,6 +660,17 @@ impl ConfigData {
                         scroll_pixels_per_notch,
                     });
                 }
+                "selection" => {
+                    // CTX-0191: `selection = { auto_copy = false }` opts out
+                    // of copy-on-select; absent table/key means "says nothing".
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["auto_copy"])?;
+                    let auto_copy = match get_field(nested, "auto_copy") {
+                        Some(v) => Some(expect_bool("selection.auto_copy", v)?),
+                        None => None,
+                    };
+                    out.selection = Some(SelectionData { auto_copy });
+                }
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
@@ -727,6 +750,16 @@ fn expect_integer(path: &str, val: &ValueSnapshot) -> Result<i64, String> {
         ValueSnapshot::Int(i) => Ok(*i),
         ValueSnapshot::Nil => Err(format!("{path}: expected integer (found nil)")),
         other => Err(format!("{path}: expected integer (found {})", other.kind())),
+    }
+}
+
+/// Expect a boolean value (CTX-0191 `selection.auto_copy`; fail-closed on
+/// numbers/strings/nil — never coerces, never echoes the value).
+fn expect_bool(path: &str, val: &ValueSnapshot) -> Result<bool, String> {
+    match val {
+        ValueSnapshot::Bool(b) => Ok(*b),
+        ValueSnapshot::Nil => Err(format!("{path}: expected boolean (found nil)")),
+        other => Err(format!("{path}: expected boolean (found {})", other.kind())),
     }
 }
 
@@ -858,6 +891,42 @@ mod tests {
         assert_eq!(term.shell, None);
         assert_eq!(term.scroll_lines_per_notch, None);
         assert_eq!(term.scroll_pixels_per_notch, None);
+    }
+
+    #[test]
+    fn selection_auto_copy_extracts_and_absent_means_no_override() {
+        // CTX-0191: explicit bool parses; absent table/key is `None` so merge
+        // keeps the lower-precedence value (default true when no layer sets it).
+        let data = eval_ok(r#"return { selection = { auto_copy = false } }"#);
+        assert_eq!(data.selection.unwrap().auto_copy, Some(false));
+        let data = eval_ok(r#"return { selection = { auto_copy = true } }"#);
+        assert_eq!(data.selection.unwrap().auto_copy, Some(true));
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.selection, None);
+        let data = eval_ok(r#"return { selection = {} }"#);
+        assert_eq!(data.selection.unwrap().auto_copy, None);
+    }
+
+    #[test]
+    fn selection_auto_copy_wrong_type_is_shape_error_without_value() {
+        // CTX-0191: fail-closed on non-boolean (no coercion, no value echo).
+        let mut vm = LuaVm::new("test.selection-type");
+        for code in [
+            r#"return { selection = { auto_copy = 1 } }"#,
+            r#"return { selection = { auto_copy = "false" } }"#,
+            r#"return { selection = { auto_copy = 0 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(
+                        message.contains("selection.auto_copy"),
+                        "{code:?}: {message}"
+                    );
+                    assert!(!message.contains("false"), "must not echo value: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

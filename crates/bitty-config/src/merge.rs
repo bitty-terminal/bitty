@@ -61,6 +61,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
     match field {
         "font.family"
         | "font.size"
+        | "font.line_height"
+        | "font.letter_spacing"
         | "window.opacity"
         | "window.padding"
         | "terminal.scrollback"
@@ -229,6 +231,54 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     src,
                     MergeClass::ScalarReplace,
                 );
+            }
+            for (field_sp, is_line_height) in
+                [("font.line_height", true), ("font.letter_spacing", false)]
+            {
+                if is_policy {
+                    policy_fields.insert(field_sp.to_string(), src.clone());
+                    if is_line_height {
+                        effective.font.line_height = font.line_height;
+                    } else {
+                        effective.font.letter_spacing = font.letter_spacing;
+                    }
+                    let prev = attribution.get(field_sp).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field_sp,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field_sp) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field_sp.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field_sp.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field_sp).cloned();
+                    if is_line_height {
+                        effective.font.line_height = font.line_height;
+                    } else {
+                        effective.font.letter_spacing = font.letter_spacing;
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field_sp,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
             }
             attribution.insert("font".to_string(), src.clone());
         }
@@ -504,6 +554,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
     for field in [
         "font.family",
         "font.size",
+        "font.line_height",
+        "font.letter_spacing",
         "font",
         "window.opacity",
         "window.padding",
@@ -563,13 +615,19 @@ fn merge_layers_allow_policy_violations(
         let is_policy = src.layer.is_policy();
 
         if let Some(font) = &plan.font {
-            for (field, is_family) in [("font.family", true), ("font.size", false)] {
+            for (field, which) in [
+                ("font.family", 0u8),
+                ("font.size", 1u8),
+                ("font.line_height", 2u8),
+                ("font.letter_spacing", 3u8),
+            ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
-                    if is_family {
-                        effective.font.family.clone_from(&font.family);
-                    } else {
-                        effective.font.size = font.size;
+                    match which {
+                        0 => effective.font.family.clone_from(&font.family),
+                        1 => effective.font.size = font.size,
+                        2 => effective.font.line_height = font.line_height,
+                        _ => effective.font.letter_spacing = font.letter_spacing,
                     }
                     let prev = attribution.get(field).cloned();
                     record_attribution(
@@ -595,10 +653,11 @@ fn merge_layers_allow_policy_violations(
                     });
                 } else {
                     let prev = attribution.get(field).cloned();
-                    if is_family {
-                        effective.font.family.clone_from(&font.family);
-                    } else {
-                        effective.font.size = font.size;
+                    match which {
+                        0 => effective.font.family.clone_from(&font.family),
+                        1 => effective.font.size = font.size,
+                        2 => effective.font.line_height = font.line_height,
+                        _ => effective.font.letter_spacing = font.letter_spacing,
                     }
                     record_attribution(
                         &mut attribution,
@@ -878,6 +937,8 @@ fn merge_layers_allow_policy_violations(
     for field in [
         "font.family",
         "font.size",
+        "font.line_height",
+        "font.letter_spacing",
         "font",
         "window.opacity",
         "window.padding",
@@ -949,6 +1010,7 @@ mod tests {
             font: Some(FontConfig {
                 family: family.into(),
                 size,
+                ..Default::default()
             }),
             schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
             ..Default::default()
@@ -1139,6 +1201,14 @@ mod tests {
             merge_class_for("font.family"),
             Some(MergeClass::ScalarReplace)
         );
+        assert_eq!(
+            merge_class_for("font.line_height"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("font.letter_spacing"),
+            Some(MergeClass::ScalarReplace)
+        );
         assert_eq!(merge_class_for("font"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("keymaps"), Some(MergeClass::SetById));
         // CTX-0185: scroll speed keys are scalar-replace like scrollback.
@@ -1196,6 +1266,46 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.field == "terminal.scroll_lines_per_notch")
+        );
+    }
+
+    #[test]
+    fn spacing_fields_merge_scalar_replace() {
+        use crate::types::{DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT};
+        let a = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("a.lua")),
+            ConfigPlan {
+                font: Some(FontConfig {
+                    family: "Mono".into(),
+                    size: 12.0,
+                    line_height: 1.0,
+                    letter_spacing: 0.0,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let b = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                font: Some(FontConfig {
+                    family: "Mono".into(),
+                    size: 12.0,
+                    line_height: DEFAULT_LINE_HEIGHT,
+                    letter_spacing: DEFAULT_LETTER_SPACING,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![a, b]).expect("merge");
+        assert!((merged.effective.font.line_height - DEFAULT_LINE_HEIGHT).abs() < f32::EPSILON);
+        assert!(
+            (merged.effective.font.letter_spacing - DEFAULT_LETTER_SPACING).abs() < f32::EPSILON
+        );
+        assert_eq!(
+            merged.source_of("font.line_height").unwrap().layer,
+            LayerKind::Cli
         );
     }
 }

@@ -188,6 +188,7 @@ mod tests {
             font: Some(FontConfig {
                 family: "".into(),
                 size: f32::NAN,
+                ..Default::default()
             }),
             window: Some(WindowConfig {
                 opacity: 2.0,

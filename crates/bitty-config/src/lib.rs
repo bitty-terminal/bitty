@@ -135,6 +135,7 @@ mod integration_tests {
                 font: Some(FontConfig {
                     family: "JetBrains Mono".into(),
                     size: 12.0,
+                    ..Default::default()
                 }),
                 window: Some(WindowConfig {
                     opacity: 0.95,
@@ -150,6 +151,7 @@ mod integration_tests {
                 font: Some(FontConfig {
                     family: "Maple Mono".into(),
                     size: 14.0,
+                    ..Default::default()
                 }),
                 terminal: Some(TerminalConfig {
                     scrollback: 50_000,
@@ -219,6 +221,7 @@ mod integration_tests {
             font: Some(FontConfig {
                 family: "Mono".into(),
                 size: 12.0,
+                ..Default::default()
             }),
             ..Default::default()
         };

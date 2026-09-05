@@ -133,7 +133,7 @@ fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically
     rt.set_layout(split);
     rt.tick().expect("first present");
 
-    // Resize to 800x600 physical pixels: with default cell 8x16 this is 100x37 cells.
+    // Resize to 800x600 physical pixels: with readable cell 9x19 this is 88x31 cells.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("valid resize must succeed");
     assert_eq!(
@@ -142,14 +142,14 @@ fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically
         "resize must reconfigure headless surface"
     );
     // Container is recomputed from pixels via RuntimeConfig::grid_from_pixels.
-    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 100, 37));
+    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 88, 31));
     let allocs = rt.layout_allocations();
-    // Horizontal split of 100 cols -> 50 each; height 37.
-    assert_eq!(allocs[0].1, bitty_ui::Rect::new(0, 0, 50, 37));
-    assert_eq!(allocs[1].1, bitty_ui::Rect::new(50, 0, 50, 37));
+    // Horizontal split of 88 cols -> 44 each; height 31.
+    assert_eq!(allocs[0].1, bitty_ui::Rect::new(0, 0, 44, 31));
+    assert_eq!(allocs[1].1, bitty_ui::Rect::new(44, 0, 44, 31));
     // Views were reflowed to match allocations.
-    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 50);
-    assert_eq!(rt.layout().find_leaf(ViewId::new(2)).unwrap().cols(), 50);
+    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 44);
+    assert_eq!(rt.layout().find_leaf(ViewId::new(2)).unwrap().cols(), 44);
 
     // Resize forces a full redraw: next tick must present even without new bytes.
     let stats = rt.tick().expect("resize must force full redraw");

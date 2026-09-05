@@ -51,6 +51,8 @@ impl std::fmt::Display for ReloadClass {
 /// |---------------------------|--------------------|
 /// | `font.family`             | Live               |
 /// | `font.size`               | Live               |
+/// | `font.line_height`        | Live               |
+/// | `font.letter_spacing`     | Live               |
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `appearance.theme`        | Live               |
@@ -64,8 +66,17 @@ impl std::fmt::Display for ReloadClass {
 #[must_use]
 pub fn classify_field(field: &str) -> ReloadClass {
     match field {
-        "font.family" | "font.size" | "font" | "window.opacity" | "window.padding" | "window"
-        | "appearance.theme" | "appearance" | "keymaps" => ReloadClass::Live,
+        "font.family"
+        | "font.size"
+        | "font.line_height"
+        | "font.letter_spacing"
+        | "font"
+        | "window.opacity"
+        | "window.padding"
+        | "window"
+        | "appearance.theme"
+        | "appearance"
+        | "keymaps" => ReloadClass::Live,
         "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
@@ -155,6 +166,16 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "font.size",
         format!("{:.2}", old.font.size),
         format!("{:.2}", new.font.size),
+    );
+    push_if_changed(
+        "font.line_height",
+        format!("{:.3}", old.font.line_height),
+        format!("{:.3}", new.font.line_height),
+    );
+    push_if_changed(
+        "font.letter_spacing",
+        format!("{:.3}", old.font.letter_spacing),
+        format!("{:.3}", new.font.letter_spacing),
     );
     push_if_changed(
         "window.opacity",
@@ -289,11 +310,24 @@ mod tests {
         new.font = FontConfig {
             family: "JetBrains".into(),
             size: 14.0,
+            ..Default::default()
         };
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "font.family"));
+    }
+
+    #[test]
+    fn diff_spacing_fields_are_live() {
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.font.line_height = 1.0;
+        new.font.letter_spacing = 0.0;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(r.diffs.iter().any(|d| d.field == "font.line_height"));
+        assert!(r.diffs.iter().any(|d| d.field == "font.letter_spacing"));
     }
 
     #[test]
@@ -352,6 +386,8 @@ mod tests {
     #[test]
     fn classify_table() {
         assert_eq!(classify_field("font.family"), ReloadClass::Live);
+        assert_eq!(classify_field("font.line_height"), ReloadClass::Live);
+        assert_eq!(classify_field("font.letter_spacing"), ReloadClass::Live);
         assert_eq!(
             classify_field("terminal.scrollback"),
             ReloadClass::RestartRequired

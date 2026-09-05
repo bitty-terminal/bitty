@@ -24,7 +24,11 @@
 //! return {
 //!     theme = "dark", -- alias for appearance.theme
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
-//!     font = { family = "JetBrains Mono", size = 13.0 },
+//!     font = { family = "JetBrainsMono Nerd Font", size = 12.0 },
+//!     -- Optional breathing room (defaults 1.2 / 1.0 give effective 9x19
+//!     -- from the legacy 8x16 base; see FontConfig docs):
+//!     -- font = { family = "JetBrainsMono Nerd Font", size = 12.0,
+//!     --          line_height = 1.2, letter_spacing = 1.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     keymaps = {
@@ -33,8 +37,13 @@
 //! }
 //! ```
 //!
-//! - `[font]`-equivalent tables are atomic: `font` needs both `family` and
-//!   `size`, `window` needs both `opacity` and `padding`, `terminal` needs
+//! - `[font]`-equivalent tables are atomic for `family`+`size`: `font` needs
+//!   both (partial tables fail closed rather than silently filling defaults,
+//!   which would corrupt attribution). `line_height`/`letter_spacing` are
+//!   optional and default to [`crate::types::DEFAULT_LINE_HEIGHT`]/
+//!   [`crate::types::DEFAULT_LETTER_SPACING`] when omitted, so existing
+//!   `{ family, size }` tables keep working.
+//! - `window` needs both `opacity` and `padding`, `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch` optional, defaulting to
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
@@ -352,10 +361,23 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     let font = match data.font {
         None => None,
         Some(f) => match (f.family, f.size) {
-            (Some(family), Some(size)) => Some(FontConfig {
-                family,
-                size: size as f32,
-            }),
+            (Some(family), Some(size)) => {
+                let line_height = f.line_height.unwrap_or(crate::types::DEFAULT_LINE_HEIGHT);
+                let letter_spacing = f
+                    .letter_spacing
+                    .unwrap_or(crate::types::DEFAULT_LETTER_SPACING);
+                let cfg = FontConfig {
+                    family,
+                    size: size as f32,
+                    line_height,
+                    letter_spacing,
+                };
+                // Fail closed on out-of-range spacing (same as typed validation).
+                cfg.validate().map_err(|e| {
+                    ConfigError::validation(e.field().unwrap_or("font"), e.to_string())
+                })?;
+                Some(cfg)
+            }
             _ => {
                 return Err(ConfigError::validation(
                     "font",
@@ -726,6 +748,34 @@ mod tests {
     fn lua_partial_tables_fail_closed() {
         let err = parse_lua_config(r#"return { font = { family = "Mono" } }"#, &test_source())
             .unwrap_err();
+        assert!(err.to_string().contains("font"));
+    }
+
+    #[test]
+    fn lua_font_spacing_optional_with_defaults() {
+        use crate::types::{DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT};
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12 } }"#,
+            &test_source(),
+        )
+        .expect("legacy table works");
+        let font = plan.font.unwrap();
+        assert!((font.line_height - DEFAULT_LINE_HEIGHT).abs() < f32::EPSILON);
+        assert!((font.letter_spacing - DEFAULT_LETTER_SPACING).abs() < f32::EPSILON);
+        let plan = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12, line_height = 1.0, letter_spacing = 0 } }"#,
+            &test_source(),
+        )
+        .expect("spacing parses");
+        let font = plan.font.unwrap();
+        assert!((font.line_height - 1.0).abs() < f32::EPSILON);
+        assert!((font.letter_spacing - 0.0).abs() < f32::EPSILON);
+        // Out-of-range spacing fails closed.
+        let err = parse_lua_config(
+            r#"return { font = { family = "Mono", size = 12, line_height = 5.0 } }"#,
+            &test_source(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("font"));
     }
 

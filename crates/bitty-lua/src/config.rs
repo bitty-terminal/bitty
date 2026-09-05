@@ -90,13 +90,20 @@ pub struct KeymapData {
 /// Each field is optional so callers can distinguish "table absent" (outer
 /// `Option` on [`ConfigData::font`]) from "key absent inside a present
 /// table" (inner `Option`); partial tables are rejected downstream rather
-/// than silently defaulted.
+/// than silently defaulted — except `line_height`/`letter_spacing`, which
+/// default to [`DEFAULT_LINE_HEIGHT`]/[`DEFAULT_LETTER_SPACING`] when a
+/// `font` table is present but omits them (backwards compatible with
+/// existing `{ family, size }` tables).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FontData {
     /// Font family.
     pub family: Option<String>,
     /// Point size.
     pub size: Option<f64>,
+    /// Line-height multiplier.
+    pub line_height: Option<f32>,
+    /// Extra advance in px.
+    pub letter_spacing: Option<f32>,
 }
 
 /// Window overrides, plain data (see [`FontData`] for `Option` semantics).
@@ -164,6 +171,13 @@ impl ConfigData {
 }
 
 /// Outcome of [`LuaVm::eval_config`].
+///
+/// Box-free by design: config evaluates once per startup/reload (cold path),
+/// so the `Completed` variant's `ConfigData` size costs nothing hot. The
+/// `line_height`/`letter_spacing` fields (CTX-0157) push the enum over
+/// clippy's 200-byte heuristic; boxing would churn the public API for no
+/// runtime benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigOutcome {
     /// Chunk finished within budgets; data (possibly empty) extracted.
@@ -557,7 +571,11 @@ impl ConfigData {
                 }
                 "font" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["family", "size"])?;
+                    check_nested_keys(
+                        key,
+                        nested,
+                        &["family", "size", "line_height", "letter_spacing"],
+                    )?;
                     let family = match get_field(nested, "family") {
                         Some(v) => Some(expect_string("font.family", v)?),
                         None => None,
@@ -566,7 +584,20 @@ impl ConfigData {
                         Some(v) => Some(expect_number("font.size", v)?),
                         None => None,
                     };
-                    out.font = Some(FontData { family, size });
+                    let line_height = match get_field(nested, "line_height") {
+                        Some(v) => Some(expect_number("font.line_height", v)? as f32),
+                        None => None,
+                    };
+                    let letter_spacing = match get_field(nested, "letter_spacing") {
+                        Some(v) => Some(expect_number("font.letter_spacing", v)? as f32),
+                        None => None,
+                    };
+                    out.font = Some(FontData {
+                        family,
+                        size,
+                        line_height,
+                        letter_spacing,
+                    });
                 }
                 "window" => {
                     let nested = expect_table(key, val)?;
@@ -833,6 +864,20 @@ mod tests {
     fn integer_size_accepted_as_number() {
         let data = eval_ok(r#"return { font = { family = "Mono", size = 13 } }"#);
         assert!((data.font.unwrap().size.unwrap() - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn font_spacing_keys_optional_and_parsed() {
+        let data = eval_ok(r#"return { font = { family = "Mono", size = 12 } }"#);
+        let font = data.font.unwrap();
+        assert_eq!(font.line_height, None);
+        assert_eq!(font.letter_spacing, None);
+        let data = eval_ok(
+            r#"return { font = { family = "Mono", size = 12, line_height = 1.2, letter_spacing = 1 } }"#,
+        );
+        let font = data.font.unwrap();
+        assert!((font.line_height.unwrap() - 1.2).abs() < f32::EPSILON);
+        assert!((font.letter_spacing.unwrap() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]

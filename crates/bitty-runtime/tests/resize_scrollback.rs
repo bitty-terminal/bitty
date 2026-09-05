@@ -15,12 +15,12 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     assert_eq!(rt.snapshot().height, 24);
     let gen_before = rt.snapshot().generation;
 
-    // Resize physics: 800x600 at 8x16 cell => 100x37.
+    // Resize physics: 800x600 at 9x19 readable cell => 88x31.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize");
-    assert_eq!(rt.snapshot().width, 100);
-    assert_eq!(rt.snapshot().height, 37);
-    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 100, 37));
+    assert_eq!(rt.snapshot().width, 88);
+    assert_eq!(rt.snapshot().height, 31);
+    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 88, 31));
     assert!(
         rt.snapshot().generation > gen_before,
         "resize must bump generation"
@@ -42,7 +42,7 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     rt.handle_resize(PhysicalSize::new(0, 0))
         .expect("zero no-op");
     assert_eq!(rt.surface_extent(), extent_before);
-    assert_eq!(rt.snapshot().width, 100);
+    assert_eq!(rt.snapshot().width, 88);
 }
 
 #[test]
@@ -59,18 +59,18 @@ fn runtime_resize_updates_scrollback_width_and_views() {
     // Resize wider: scrollback lines must be padded.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize wide");
-    assert_eq!(rt.snapshot().width, 100);
+    assert_eq!(rt.snapshot().width, 88);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 100);
+        assert_eq!(line.cells.len(), 88);
     }
     // Narrower: truncate with repair.
     rt.handle_resize(PhysicalSize::new(320, 240))
         .expect("resize narrow");
-    // 320/8=40 cols, 240/16=15 rows
-    assert_eq!(rt.snapshot().width, 40);
-    assert_eq!(rt.snapshot().height, 15);
+    // 320/9=35 cols, 240/19=12 rows
+    assert_eq!(rt.snapshot().width, 35);
+    assert_eq!(rt.snapshot().height, 12);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 40);
+        assert_eq!(line.cells.len(), 35);
     }
     assert!(rt.state().check_invariants().is_ok());
     // Headless tick still works after multiple resizes.
@@ -127,7 +127,7 @@ fn headless_still_works_after_multiple_resizes_and_prints() {
     for size in [
         PhysicalSize::new(640, 480),
         PhysicalSize::new(1024, 768),
-        PhysicalSize::new(80, 24), // small physical yields fallback cols=10, rows=1? Actually 80/8=10, 24/16=1 => 10x1
+        PhysicalSize::new(80, 24), // small physical yields 80/9=8, 24/19=1 => 8x1
         PhysicalSize::new(800, 600),
     ] {
         rt.handle_resize(size).expect("resize");

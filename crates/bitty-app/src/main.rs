@@ -18,7 +18,8 @@
 //!
 //! 1. **Parse args** (`--help` / `--version` / `--headless`, layout flags
 //!    `--split`/`--stack`/`--overlay`/`--layout`, focus flag `--focus`,
-//!    config flags `--config`/`--theme`, and an optional program to spawn).
+//!    config flags `--config`/`--theme`/`--font-family`/`--font-size`/
+//!    `--opacity`, and an optional program to spawn).
 //!    Flag parsing itself is pure, total, and tested without touching the
 //!    filesystem or network; config-file loading happens in step 2.
 //! 2. **Load user config** (CTX-0148 Lua, DEC-0011): resolve `--config` or
@@ -26,7 +27,7 @@
 //!    `~/.config/bitty/init.lua`, then `config.lua`), evaluate the
 //!    wezterm-style return table in the `bitty-lua` sandbox via
 //!    `bitty-config::file` (never executed as code), validate/migrate/merge
-//!    with precedence `CLI (`--theme`) > file > profile > defaults`. Invalid files
+//!    with precedence `CLI (appearance flags) > file > profile > defaults`. Invalid files
 //!    fail closed (clear stderr, exit 2, no panic, no silent ignore); a
 //!    missing default-path file simply yields defaults.
 //! 3. **Create [`Runtime`](bitty_runtime::Runtime)** via
@@ -355,14 +356,26 @@ struct Args {
     /// [`LayerKind::Profile`](bitty_config::LayerKind::Profile) base UNDER
     /// the user file (`init.lua` still wins; `--theme` wins over both).
     /// Missing/invalid profiles fail closed (exit 2, no fallback).
-    /// CTX-0180 note: keep this + `config_path`/`theme` resolution in
-    /// [`load_merged_config`] so appearance CLI overrides rebase cleanly.
+    /// CTX-0180: keep this + `config_path`/`theme`/appearance resolution in
+    /// [`load_merged_config`] (one `Cli` plan for every present CLI field).
     profile: Option<String>,
     /// CLI theme override (from `--theme`). Wins over the config file and the
     /// named profile, which win over defaults
     /// (`CLI > file > profile > defaults` via `bitty-config` merge;
     /// see [`load_merged_config`] for the CTX-0180 extension point).
     theme: Option<String>,
+    /// CLI font-family override (from `--font-family`, CTX-0180). Raw family
+    /// name; blank means no override. Wins over the file for one launch;
+    /// sibling fields (size, spacing, padding) keep file values.
+    font_family: Option<String>,
+    /// CLI font-size override in points (from `--font-size`, CTX-0180). Raw
+    /// text on purpose: invalid values fail closed at merge time (exit 2
+    /// with usage), never warn-ignored. Wins over the file for one launch.
+    font_size: Option<String>,
+    /// CLI window-opacity override (from `--opacity`, CTX-0180). Raw text on
+    /// purpose: invalid values fail closed at merge time (exit 2 with
+    /// usage), never warn-ignored. Wins over the file for one launch.
+    opacity: Option<String>,
     /// `bitty config <verb>` subcommand (CLI-first management per DEC-0007).
     /// `None` means normal terminal startup. A program literally named
     /// `config` must be invoked as `bitty -- config ...`.
@@ -432,6 +445,9 @@ impl Args {
             config_path: None,
             profile: None,
             theme: None,
+            font_family: None,
+            font_size: None,
+            opacity: None,
             config_cmd: None,
             config_word: false,
             config_args: Vec::new(),
@@ -603,6 +619,18 @@ fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) {
     }
 }
 
+/// True when `token` looks like a negative number (`-5`, `-0.1`) rather
+/// than a flag (`-v`, `--headless`): a leading `-` followed by a digit or
+/// `.`. Lets `--font-size -5` / `--opacity -0.1` reach merge-time validation
+/// (fail-closed) instead of being mistaken for a missing value.
+fn looks_like_negative_number(token: &str) -> bool {
+    let mut chars = token.chars();
+    if chars.next() != Some('-') {
+        return false;
+    }
+    matches!(chars.next(), Some(c) if c.is_ascii_digit() || c == '.')
+}
+
 fn parse_split_axis(s: &str) -> Option<SplitAxis> {
     match s.to_ascii_lowercase().as_str() {
         "horizontal" | "h" | "horiz" | "hor" => Some(SplitAxis::Horizontal),
@@ -645,6 +673,14 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 ///   wins over both. Missing profiles fail closed (exit 2).
 /// - `--theme NAME` → CLI theme override (wins over config file, which wins
 ///   over defaults; see `bitty-config::file::resolve_effective`)
+/// - `--font-family NAME` → CLI font-family override for one launch
+///   (CTX-0180; blank means no override; wins over the file, siblings keep
+///   file values)
+/// - `--font-size PTS` → CLI font-size override for one launch (CTX-0180;
+///   raw text, validated at merge time: invalid values fail closed with
+///   usage instead of launching)
+/// - `--opacity FLOAT` → CLI window-opacity override for one launch
+///   (CTX-0180; raw text, validated at merge time like `--font-size`)
 /// - `-v` / `--verbose` → emit per-frame `bitty tick` stats (CTX-0190;
 ///   also `BITTY_VERBOSE=1`). Shorthand for `--log-level debug`; default is
 ///   quiet (no tick lines).
@@ -751,6 +787,38 @@ fn parse_args(raw: &[String]) -> Args {
         if token.starts_with("--theme=") {
             let val = token.trim_start_matches("--theme=");
             out.theme = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--font-family=") {
+            let val = token.trim_start_matches("--font-family=");
+            if val.trim().is_empty() {
+                eprintln!("warning: --font-family needs a family name — ignoring");
+            } else {
+                out.font_family = Some(val.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--font-size=") {
+            let val = token.trim_start_matches("--font-size=");
+            if val.trim().is_empty() {
+                eprintln!("warning: --font-size needs a point size — ignoring");
+            } else {
+                // Raw on purpose: validated at merge time (fail-closed).
+                out.font_size = Some(val.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--opacity=") {
+            let val = token.trim_start_matches("--opacity=");
+            if val.trim().is_empty() {
+                eprintln!("warning: --opacity needs a value — ignoring");
+            } else {
+                // Raw on purpose: validated at merge time (fail-closed).
+                out.opacity = Some(val.to_string());
+            }
             i += 1;
             continue;
         }
@@ -883,6 +951,39 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                 }
             }
+            "--font-family" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.font_family = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --font-family needs a family name — ignoring");
+                    i += 1;
+                }
+            }
+            "--font-size" => {
+                if i + 1 < raw.len()
+                    && (!raw[i + 1].starts_with('-') || looks_like_negative_number(&raw[i + 1]))
+                {
+                    // Raw on purpose: validated at merge time (fail-closed).
+                    out.font_size = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --font-size needs a point size — ignoring");
+                    i += 1;
+                }
+            }
+            "--opacity" => {
+                if i + 1 < raw.len()
+                    && (!raw[i + 1].starts_with('-') || looks_like_negative_number(&raw[i + 1]))
+                {
+                    // Raw on purpose: validated at merge time (fail-closed).
+                    out.opacity = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --opacity needs a value — ignoring");
+                    i += 1;
+                }
+            }
             "--log-level" => {
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     let val = raw[i + 1].clone();
@@ -1001,7 +1102,19 @@ fn help_text() -> String {
                             Env: BITTY_CONFIG (path), BITTY_PROFILE (name).\n  \
                             Precedence: CLI flags > BITTY_* env > file+profile > defaults.\n  \
                --theme NAME   CLI theme override (e.g. --theme dark). Wins over the\n  \
-                            config file, which wins over defaults.\n  \
+                             config file, which wins over defaults.\n  \
+                --font-family NAME  CLI font family override for one launch\n  \
+                             (e.g. --font-family \"JetBrainsMono Nerd Font\").\n  \
+                             Wins over the file; blank means no override.\n  \
+                --font-size PTS  CLI font size override in points for one launch\n  \
+                             (e.g. --font-size 14; range (0, 128]). Invalid\n  \
+                             values fail closed (exit 2 with this usage).\n  \
+                --opacity FLOAT  CLI window opacity override for one launch\n  \
+                             (e.g. --opacity 0.95; range [0.0, 1.0]). Invalid\n  \
+                             values fail closed (exit 2 with this usage).\n  \
+                             Precedence: CLI flags > file > profile > defaults;\n  \
+                             each flag overrides only its own field (siblings\n  \
+                             keep file values).\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
          Subcommands (CLI-first management, DEC-0007):\n  \
@@ -1110,6 +1223,54 @@ struct LoadedConfig {
     profile_path: Option<std::path::PathBuf>,
 }
 
+/// Builds the single CLI override input from parsed [`Args`] (CTX-0180).
+///
+/// Pure over `args` so the wiring stays hermetic: trims each raw and treats
+/// `None`/empty/whitespace as absent. Numeric raws (`--font-size`,
+/// `--opacity`) stay strings here; [`load_merged_config`] validates them
+/// fail-closed (with usage) before the merge runs, and the merge validates
+/// again, so direct API misuse fails closed too.
+fn cli_overrides_from_args(args: &Args) -> bitty_config::file::CliOverrides {
+    bitty_config::file::CliOverrides {
+        theme: args
+            .theme
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        font_family: args
+            .font_family
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        font_size: args
+            .font_size
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        opacity: args
+            .opacity
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    }
+}
+
+/// Names the CLI flag behind an appearance-override validation error for the
+/// fail-closed message. `theme` keeps its CTX-0169 merge-time path and never
+/// reaches here; anything unexpected falls back to the flag group.
+fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
+    match field {
+        Some("font.family") => "--font-family",
+        Some("font.size") => "--font-size",
+        Some("window.opacity") => "--opacity",
+        _ => "--font-family/--font-size/--opacity",
+    }
+}
+
 /// Shared probe + load + merge behind startup and `config check` (CTX-0169).
 ///
 /// Resolution (per #271 and `lua-and-xdg.md` §Layers):
@@ -1121,16 +1282,16 @@ struct LoadedConfig {
 ///   `$XDG_CONFIG_HOME/bitty/profiles/<name>.lua` as the `Profile` layer
 ///   UNDER the user file (`init.lua` still wins; `--theme` wins over both).
 ///   Requested-but-missing/invalid profiles fail closed (no fallback).
-/// - Merge: `CLI (--theme) > user file > profile > defaults` via
+/// - Merge: `CLI (appearance flags) > user file > profile > defaults` via
 ///   `bitty-config::file::resolve_effective_full` (merge sorts by
 ///   `LayerKind::precedence`, never by load order).
 /// - `--config` + `--profile` together: both layers load (explicit file wins
 ///   over the profile, same as `init.lua` over profile) with a stderr warning.
 ///
-/// CTX-0180 note: CLI appearance overrides (`--font-family`/`--font-size`/
+/// CTX-0180: CLI appearance overrides (`--font-family`/`--font-size`/
 /// `--opacity`) extend the [`bitty_config::file::CliOverrides`] built here —
-/// add fields there, not a second `Cli` layer — so this function's shape
-/// stays stable across the rebase.
+/// one `Cli` plan carrying every present CLI field — so this function's shape
+/// stays stable. Theme/profile resolution is untouched.
 ///
 /// Returns the merged layers plus the probed user path and the resolved
 /// profile identity. impure (filesystem + env); total (all failures become
@@ -1232,16 +1393,16 @@ fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
             );
         }
     }
-    // CTX-0180 extension point: build the single Cli layer here via
-    // CliOverrides (today only --theme lives here).
-    let cli = bitty_config::file::CliOverrides {
-        theme: args
-            .theme
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
-    };
+    // CTX-0180: one Cli layer for every present appearance flag (`--theme`
+    // plus `--font-family`/`--font-size`/`--opacity`). Invalid appearance
+    // raws fail closed here with usage (exit 2 at the caller); the merge
+    // then only sees valid CLI input, so later merge errors stay
+    // file/profile-caused and keep their existing messages.
+    let cli = cli_overrides_from_args(args);
+    if let Err(err) = cli.validate_appearance_overrides() {
+        let flag = appearance_flag_for_field(err.field());
+        return Err(format!("bitty: invalid {flag}: {err}\n{}", help_text()));
+    }
     let merged = bitty_config::file::resolve_effective_full(file_layer, profile_layer, &cli)
         .map_err(|err| {
             if let Some(p) = &used_path {
@@ -1272,7 +1433,7 @@ fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
 /// - A present-but-invalid file (Lua syntax/runtime/budget/shape/validation)
 ///   fails closed with a user-facing message (caller prints to stderr and
 ///   exits non-zero; no panic, no silent ignore).
-/// - Merges `CLI (--theme) > file > profile > defaults` via `bitty-config`
+/// - Merges `CLI (appearance flags) > file > profile > defaults` via `bitty-config`
 ///   and resolves `appearance.theme` through the preset registry.
 ///
 /// impure (filesystem reads + env vars XDG/HOME/BITTY_*); total (all failures
@@ -4379,6 +4540,9 @@ mod tests {
         assert!(help.contains("--config"));
         assert!(help.contains("--theme"));
         assert!(help.contains("--profile"));
+        assert!(help.contains("--font-family"));
+        assert!(help.contains("--font-size"));
+        assert!(help.contains("--opacity"));
         assert!(help.contains("BITTY_CONFIG"));
         assert!(help.contains("BITTY_PROFILE"));
         assert!(help.contains("init.lua"));
@@ -4419,6 +4583,105 @@ mod tests {
         let p = parse_args(&args_of(&["bitty", "--", "--profile"]));
         assert_eq!(p.profile, None);
         assert_eq!(p.program.as_deref(), Some("--profile"));
+    }
+
+    #[test]
+    fn parse_appearance_override_flags() {
+        // CTX-0180: --font-family/--font-size/--opacity space + equals forms.
+        // Raws stay strings (merge-time fail-closed); blanks warn + ignore.
+        let p = parse_args(&args_of(&["bitty", "--font-family", "Cli Mono"]));
+        assert_eq!(p.font_family.as_deref(), Some("Cli Mono"));
+        let p = parse_args(&args_of(&["bitty", "--font-family=Cli Mono"]));
+        assert_eq!(p.font_family.as_deref(), Some("Cli Mono"));
+        let p = parse_args(&args_of(&["bitty", "--font-size", "14"]));
+        assert_eq!(p.font_size.as_deref(), Some("14"));
+        let p = parse_args(&args_of(&["bitty", "--font-size=14.5"]));
+        assert_eq!(p.font_size.as_deref(), Some("14.5"));
+        let p = parse_args(&args_of(&["bitty", "--opacity", "0.9"]));
+        assert_eq!(p.opacity.as_deref(), Some("0.9"));
+        let p = parse_args(&args_of(&["bitty", "--opacity=0.95"]));
+        assert_eq!(p.opacity.as_deref(), Some("0.95"));
+        // Invalid raws are captured, never parsed here (merge fails closed).
+        let p = parse_args(&args_of(&["bitty", "--font-size", "abc"]));
+        assert_eq!(p.font_size.as_deref(), Some("abc"));
+        // Negative numbers reach validation (fail-closed), not "missing".
+        let p = parse_args(&args_of(&["bitty", "--font-size", "-5"]));
+        assert_eq!(p.font_size.as_deref(), Some("-5"));
+        let p = parse_args(&args_of(&["bitty", "--opacity=-0.1"]));
+        assert_eq!(p.opacity.as_deref(), Some("-0.1"));
+        // A real flag after the option still means "missing value".
+        let p = parse_args(&args_of(&["bitty", "--font-size", "--verbose"]));
+        assert_eq!(p.font_size, None);
+        assert!(p.verbose);
+        // Missing/blank values warn + ignore (total, no panic).
+        let p = parse_args(&args_of(&["bitty", "--font-family"]));
+        assert_eq!(p.font_family, None);
+        let p = parse_args(&args_of(&["bitty", "--font-size="]));
+        assert_eq!(p.font_size, None);
+        let p = parse_args(&args_of(&["bitty", "--opacity"]));
+        assert_eq!(p.opacity, None);
+        // Composes with --theme and `config check`.
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--theme",
+            "dark",
+            "--font-size",
+            "14",
+            "config",
+            "check",
+        ]));
+        assert_eq!(p.theme.as_deref(), Some("dark"));
+        assert_eq!(p.font_size.as_deref(), Some("14"));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        // `--` escape hatch: appearance flags after `--` are program argv.
+        let p = parse_args(&args_of(&["bitty", "--", "--font-size"]));
+        assert_eq!(p.font_size, None);
+        assert_eq!(p.program.as_deref(), Some("--font-size"));
+    }
+
+    #[test]
+    fn looks_like_negative_number_guards_flag_values() {
+        assert!(looks_like_negative_number("-5"));
+        assert!(looks_like_negative_number("-0.1"));
+        assert!(looks_like_negative_number("-.5"));
+        assert!(!looks_like_negative_number("-v"));
+        assert!(!looks_like_negative_number("--headless"));
+        assert!(!looks_like_negative_number("-"));
+        assert!(!looks_like_negative_number("14"));
+        assert!(!looks_like_negative_number(""));
+    }
+
+    #[test]
+    fn cli_overrides_from_args_trims_and_passes_raws() {
+        // Pure wiring: trims, blanks become absent, numeric raws untouched.
+        let mut args = Args::new();
+        args.theme = Some("  dark  ".to_string());
+        args.font_family = Some(" Cli Mono ".to_string());
+        args.font_size = Some("abc".to_string());
+        args.opacity = Some(" 0.9 ".to_string());
+        let cli = cli_overrides_from_args(&args);
+        assert_eq!(cli.theme.as_deref(), Some("dark"));
+        assert_eq!(cli.font_family.as_deref(), Some("Cli Mono"));
+        assert_eq!(cli.font_size.as_deref(), Some("abc"));
+        assert_eq!(cli.opacity.as_deref(), Some("0.9"));
+        // Invalid raws fail closed at the override layer (with field path).
+        assert!(cli.validate_appearance_overrides().is_err());
+        let mut args = Args::new();
+        args.font_family = Some("   ".to_string());
+        args.font_size = Some(String::new());
+        let cli = cli_overrides_from_args(&args);
+        assert!(cli.is_empty());
+        assert!(cli.validate_appearance_overrides().is_ok());
+        // Flag naming for the fail-closed message.
+        assert_eq!(appearance_flag_for_field(Some("font.size")), "--font-size");
+        assert_eq!(
+            appearance_flag_for_field(Some("window.opacity")),
+            "--opacity"
+        );
+        assert_eq!(
+            appearance_flag_for_field(Some("font.family")),
+            "--font-family"
+        );
     }
 
     #[test]

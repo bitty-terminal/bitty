@@ -182,7 +182,8 @@ impl TrustStore {
 ///
 /// The allowed subset in this draft: `font`, `window`, `terminal.scrollback`,
 /// `terminal.scroll_lines_per_notch`, `terminal.scroll_pixels_per_notch`,
-/// `appearance`. Expanding this without review would weaken T-08 mitigation.
+/// `selection.auto_copy`, `appearance`. Expanding this without review would
+/// weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {
         return Err(ConfigError::TrustViolation {
@@ -224,6 +225,13 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if let Some(t) = &plan.terminal {
         // scrollback already bounded; just validate
         t.validate().map_err(|e| ConfigError::TrustViolation {
+            message: e.to_string(),
+        })?;
+    }
+    if let Some(s) = &plan.selection {
+        // CTX-0191: auto-copy is presentation/clipboard behavior with no
+        // process authority (like scroll speed), so project layers may set it.
+        s.validate().map_err(|e| ConfigError::TrustViolation {
             message: e.to_string(),
         })?;
     }
@@ -324,6 +332,18 @@ mod tests {
             ..Default::default()
         };
         validate_project_plan(&plan).expect("scroll speed allowed in project");
+    }
+
+    #[test]
+    fn project_plan_allows_selection_auto_copy() {
+        // CTX-0191: auto-copy is presentation/clipboard behavior with no
+        // process authority (like scroll speed), so project layers may set it.
+        use crate::types::SelectionConfig;
+        let plan = ConfigPlan {
+            selection: Some(SelectionConfig { auto_copy: false }),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("auto-copy allowed in project");
     }
 
     #[test]

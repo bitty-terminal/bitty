@@ -1588,6 +1588,10 @@ impl Runtime {
     /// Fail-soft: a system clipboard error is recorded for
     /// [`Self::last_clipboard_error`] while the headless buffers always
     /// update, and headless tests never touch the real clipboard.
+    ///
+    /// Called automatically on left-release only when
+    /// `RuntimeConfig::selection_auto_copy` is `true` (CTX-0191); the explicit
+    /// `copy_to_clipboard` chord calls the same path regardless of the toggle.
     pub fn auto_copy_selection(&mut self) -> Option<String> {
         let text = self.selection_text()?;
         match self.clipboard.set_text(text.clone()) {
@@ -1886,7 +1890,10 @@ impl Runtime {
     /// - Otherwise the event drives presentation selection with ghostty
     ///   copy-on-select: left press starts a drag, left release commits it and
     ///   auto-copies to the platform clipboard (which best-effort syncs the
-    ///   primary selection on Linux, CTX-0160); right press pastes the
+    ///   primary selection on Linux, CTX-0160) — unless
+    ///   `RuntimeConfig::selection_auto_copy` is `false` (CTX-0191 opt-out:
+    ///   the highlight stays and only the explicit `copy_to_clipboard` chord
+    ///   copies); right press pastes the
     ///   standard clipboard (Wayland-first backend) and middle press pastes
     ///   the platform primary selection, both through the suspicious-paste
     ///   inspection gate. All three stay fail-soft (empty source means no
@@ -2004,11 +2011,15 @@ impl Runtime {
                 }
                 // Ghostty copy-on-select: a committed drag auto-copies to
                 // both selections via the platform clipboard (Wayland-first,
-                // CTX-0160). Fail-soft: empty selection pastes nothing and a
-                // system clipboard error is recorded for
-                // `last_clipboard_error` while the headless buffers still
-                // update; the input path never blocks.
-                let _ = self.auto_copy_selection();
+                // CTX-0160) — unless `selection.auto_copy` is false (CTX-0191
+                // opt-out: the highlight stays and only the explicit
+                // `copy_to_clipboard` chord copies). Fail-soft: empty
+                // selection pastes nothing and a system clipboard error is
+                // recorded for `last_clipboard_error` while the headless
+                // buffers still update; the input path never blocks.
+                if self.config.selection_auto_copy {
+                    let _ = self.auto_copy_selection();
+                }
             }
             (MouseButton::Right, PressState::Pressed) => {
                 // Ghostty `paste` right-click action for the standard
@@ -6132,6 +6143,18 @@ mod tests {
         rt
     }
 
+    fn mouse_headless_runtime_no_auto_copy(text: &str) -> Runtime {
+        // CTX-0191: runtime with the opt-out toggle off.
+        let mut rt = Runtime::new(RuntimeConfig {
+            selection_auto_copy: false,
+            ..RuntimeConfig::default()
+        })
+        .expect("opt-out runtime must build");
+        rt.force_headless_clipboard();
+        rt.handle_pty_bytes(text.as_bytes());
+        rt
+    }
+
     fn mouse_press(button: bitty_platform::MouseButton) -> bitty_platform::MouseEvent {
         bitty_platform::MouseEvent {
             button,
@@ -6166,6 +6189,41 @@ mod tests {
         assert_eq!(rt.primary_contents(), "hello");
         // A successful copy clears any recorded clipboard failure.
         assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn left_release_with_auto_copy_off_highlights_without_copying() {
+        // CTX-0191: opt-out leaves the highlight in place but touches
+        // neither clipboard; the explicit chord path still copies.
+        assert!(
+            !RuntimeConfig {
+                selection_auto_copy: false,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        let mut rt = mouse_headless_runtime_no_auto_copy("hello world");
+        assert!(!rt.config().selection_auto_copy);
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Left));
+        rt.handle_cursor_moved(CursorPosition {
+            x: 9.0 * 4.0,
+            y: 0.0,
+        });
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        // Highlight present, drag finished, clipboards untouched.
+        assert!(!rt.is_selection_dragging());
+        assert!(rt.has_selection());
+        assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+        assert_eq!(rt.clipboard().headless_contents(), "");
+        assert_eq!(rt.primary_contents(), "");
+        // Explicit chord path (Ctrl+Shift+C arm) still copies on demand.
+        let copied = rt
+            .copy_selection_to_clipboard()
+            .expect("explicit copy must not error");
+        assert_eq!(copied.as_deref(), Some("hello"));
+        assert_eq!(rt.clipboard().headless_contents(), "hello");
     }
 
     #[test]

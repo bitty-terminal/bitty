@@ -32,6 +32,13 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 
+/// Default selection auto-copy behavior (CTX-0191).
+/// Mirrors `bitty-config` `DEFAULT_SELECTION_AUTO_COPY` (kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -71,6 +78,11 @@ pub struct RuntimeConfig {
     pub scroll_lines_per_notch: u32,
     /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16).
     pub scroll_pixels_per_notch: u32,
+    /// Whether a committed mouse selection auto-copies to the clipboard
+    /// (CTX-0191; default `true` = ghostty-class copy-on-select).
+    /// `false` leaves the highlight in place; the explicit
+    /// `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
+    pub selection_auto_copy: bool,
 }
 
 /// Default font family (CTX-0157 acceptance probe).
@@ -94,6 +106,7 @@ impl Default for RuntimeConfig {
             font_size: 12.0,
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
         }
     }
 }
@@ -117,6 +130,7 @@ impl RuntimeConfig {
         font_size: f32,
         scroll_lines_per_notch: u32,
         scroll_pixels_per_notch: u32,
+        selection_auto_copy: bool,
     ) -> Result<Self, RuntimeError> {
         let font_family = font_family.into();
         let cfg = Self {
@@ -129,6 +143,7 @@ impl RuntimeConfig {
             font_size,
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
+            selection_auto_copy,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -240,24 +255,35 @@ mod tests {
 
     #[test]
     fn invalid_fields_are_rejected() {
-        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16).is_err());
+        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true).is_err());
     }
 
     #[test]
     fn scroll_speed_fields_are_rejected_out_of_range() {
         // CTX-0185: scroll speed is validated fail-closed like other config.
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257).is_err());
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1)
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true).is_err());
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true)
             .expect("scroll speed boundaries must be valid");
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256)
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false)
             .expect("scroll speed boundaries must be valid");
+    }
+
+    #[test]
+    fn selection_auto_copy_defaults_on_and_accepts_both() {
+        // CTX-0191: default-on preserves copy-on-select; both values build.
+        const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
+        assert!(RuntimeConfig::default().selection_auto_copy);
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true)
+            .expect("auto-copy on builds");
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false)
+            .expect("auto-copy off builds");
     }
 
     #[test]

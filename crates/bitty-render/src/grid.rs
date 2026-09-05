@@ -257,14 +257,24 @@ pub fn active_theme(appearance_theme: Option<&str>) -> &'static bitty_config::th
     bitty_config::theme::resolve_theme(appearance_theme)
 }
 
-/// Block-cursor fill for a live cursor, or `None` when the cursor is hidden
+/// Cursor fill for a live cursor, or `None` when the cursor is hidden
 /// or outside the `cols` x `rows` grid.
 ///
-/// The fill color is the theme cursor ([`DEFAULT_CURSOR`]); geometry is one
-/// cell at the cursor position. This is the render-side cursor primitive —
+/// Honors `DECSCUSR` (`CSI Ps SP q`) via the snapshot [`Cursor::cursor_style`]:
+/// `Default`/block paints a full cell, bar paints a left vertical strip,
+/// underline paints a bottom horizontal strip. Blink variants (`Blinking*`)
+/// share their steady shape here; blink timing stays with the embedder's
+/// existing visibility/focus gate. Thickness is 15% of the cell width
+/// (rounded, min 1px, clamped to the cell), matching alacritty's
+/// `cursor.thickness = 0.15` beam/underline geometry and ghostty's
+/// `cursor_bar`/`cursor_underline` thin-rect shapes (`DEC-0017`: ghostty
+/// `src/terminal/cursor.zig` + `src/font/sprite/draw/special.zig`).
+///
+/// The fill color is the theme cursor ([`DEFAULT_CURSOR`]), distinct from
+/// selection ([`DEFAULT_SELECTION`]) and the pending-paste banner, so the
+/// cursor stays findable. This is the render-side cursor primitive —
 /// embedders that paint their own overlay (e.g. the runtime tick path) must
-/// use the same theme color so the cursor never depends on which layer drew
-/// it.
+/// reuse this geometry so the cursor never depends on which layer drew it.
 #[must_use]
 pub fn cursor_fill(
     cursor: &bitty_term_state::Cursor,
@@ -272,6 +282,8 @@ pub fn cursor_fill(
     cols: usize,
     rows: usize,
 ) -> Option<FillRect> {
+    use bitty_term_state::CursorStyle;
+
     if !cursor.visible {
         return None;
     }
@@ -280,15 +292,45 @@ pub fn cursor_fill(
     if row >= rows || col >= cols {
         return None;
     }
-    Some(FillRect {
-        rect: RectPx::new(
-            saturating_i32(u64::from(col as u32).saturating_mul(u64::from(cell.width))),
-            saturating_i32(u64::from(row as u32).saturating_mul(u64::from(cell.height))),
+    let base_x = saturating_i32(u64::from(col as u32).saturating_mul(u64::from(cell.width)));
+    let base_y = saturating_i32(u64::from(row as u32).saturating_mul(u64::from(cell.height)));
+    let thickness = cursor_thickness(cell);
+    let rect = match cursor.cursor_style {
+        CursorStyle::Default | CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock => {
+            RectPx::new(base_x, base_y, cell.width, cell.height)
+        }
+        CursorStyle::BlinkingBar | CursorStyle::SteadyBar => {
+            RectPx::new(base_x, base_y, thickness, cell.height)
+        }
+        CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => RectPx::new(
+            base_x,
+            base_y.saturating_add(cell.height.saturating_sub(thickness) as i32),
             cell.width,
-            cell.height,
+            thickness,
         ),
+    };
+    Some(FillRect {
+        rect,
         color: DEFAULT_CURSOR,
     })
+}
+
+/// Thin-cursor thickness in pixels: 15% of the cell width, rounded, min 1px.
+///
+/// Matches alacritty `cursor.thickness = 0.15` (`thickness * cell_width`,
+/// min 1px) for beam/underline rects; ghostty scales its `cursor_thickness`
+/// metric the same way for `cursor_bar`/`cursor_underline`. Clamped to the
+/// cell so hostile or tiny metrics cannot produce an empty or overflowing
+/// rect. Integer arithmetic keeps the pipeline deterministic.
+fn cursor_thickness(cell: CellMetrics) -> u32 {
+    let rounded = cell
+        .width
+        .saturating_mul(15)
+        .saturating_add(50)
+        .checked_div(100)
+        .unwrap_or(1)
+        .max(1);
+    rounded.min(cell.width).min(cell.height)
 }
 
 /// Selection background fill color: the theme selection ([`DEFAULT_SELECTION`]).

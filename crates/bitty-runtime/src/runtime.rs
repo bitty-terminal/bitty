@@ -4480,25 +4480,31 @@ impl Runtime {
                             .unwrap_or(false);
                         if !is_spacer {
                             let live = self.live_cell_metrics();
-                            let cursor_rect = bitty_render::geometry::RectPx::new(
-                                cur.col as i32 * live.width as i32,
-                                cur.row as i32 * live.height as i32,
-                                live.width,
-                                live.height,
-                            );
-                            // Cursor color: inverse of cell bg/fg? Use resolved color from grid.rs DEFAULT_FG/BG inversion.
-                            // For slice, use white with 0x80 alpha for block cursor, respecting blinking flag;
-                            // if blinking and not focused, we skip (already checked focused).
-                            let cursor_color: bitty_render::grid::Rgba8 =
-                                if view_snapshot.cursor.visible {
-                                    [0xFF, 0xFF, 0xFF, 0xA0]
-                                } else {
-                                    [0, 0, 0, 0]
-                                };
-                            list.fills.push(bitty_render::grid::FillRect {
-                                rect: cursor_rect,
-                                color: cursor_color,
-                            });
+                            // DECSCUSR shape comes from the shared render primitive
+                            // (`bitty_render::grid::cursor_fill`: block = full cell,
+                            // bar = left strip, underline = bottom strip, 15% thickness
+                            // per DEC-0017 ghostty/alacritty refs). Geometry is shared;
+                            // the overlay hue stays the slice's translucent white.
+                            if let Some(fill) = bitty_render::grid::cursor_fill(
+                                &view_snapshot.cursor,
+                                live,
+                                view_snapshot.width,
+                                view_snapshot.height,
+                            ) {
+                                // Cursor color: inverse of cell bg/fg? Use resolved color from grid.rs DEFAULT_FG/BG inversion.
+                                // For slice, use white with 0x80 alpha for cursor, respecting blinking flag;
+                                // if blinking and not focused, we skip (already checked focused).
+                                let cursor_color: bitty_render::grid::Rgba8 =
+                                    if view_snapshot.cursor.visible {
+                                        [0xFF, 0xFF, 0xFF, 0xA0]
+                                    } else {
+                                        [0, 0, 0, 0]
+                                    };
+                                list.fills.push(bitty_render::grid::FillRect {
+                                    rect: fill.rect,
+                                    color: cursor_color,
+                                });
+                            }
                         }
                     }
                 }

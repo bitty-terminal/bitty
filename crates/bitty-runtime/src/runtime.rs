@@ -100,7 +100,7 @@ use bitty_render::{
 use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
-    CellPos, Focus, FocusDirection, LayoutNode, PersistentSelection, Rect as UiRect,
+    CellPos, Focus, FocusDirection, Gaps, LayoutNode, PersistentSelection, Rect as UiRect,
     SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
 };
 use bitty_vt::{ClipboardOp, Parser, SequenceKind};
@@ -1921,27 +1921,114 @@ impl Runtime {
     /// When the position lies far outside the window it clamps to the nearest
     /// cell rather than returning `None`, so drag selections that leave the
     /// window still produce deterministic inclusive ranges.
+    ///
+    /// CTX-0177: the configured outer gap (`gaps_out`) shifts the grid
+    /// origin, so it is subtracted (in live pixels) before dividing by the
+    /// cell metrics — otherwise every mapping would be off by the gap. See
+    /// [`Self::cursor_to_leaf_cell`] for the leaf-aware variant that also
+    /// accounts for inner gap bands in multi-pane layouts.
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
+        let gap_px_x = f64::from(self.config.gaps_out) * cell_w;
+        let gap_px_y = f64::from(self.config.gaps_out) * cell_h;
         let col = if cell_w <= 0.0 {
             0
         } else {
-            (pos.x / cell_w).floor() as i64
+            ((pos.x - gap_px_x) / cell_w).floor() as i64
         };
         let row = if cell_h <= 0.0 {
             0
         } else {
-            (pos.y / cell_h).floor() as i64
+            ((pos.y - gap_px_y) / cell_h).floor() as i64
         };
         let max_col = snap.width.saturating_sub(1) as i64;
         let max_row = snap.height.saturating_sub(1) as i64;
         let clamped_col = col.clamp(0, max_col) as u16;
         let clamped_row = row.clamp(0, max_row) as u16;
         bitty_ui::snap_to_leading(&snap, CellPos::new(clamped_row, clamped_col))
+    }
+
+    /// Active panel gaps from the validated runtime config (CTX-0177).
+    ///
+    /// Threaded into every layout call ([`Self::layout_allocations`],
+    /// [`Self::reflow_layout`], tick reflow, pane-geometry sync, and spatial
+    /// focus) so per-leaf rendering and hit-testing share one gap source.
+    #[must_use]
+    pub fn gaps(&self) -> Gaps {
+        Gaps::new(self.config.gaps_in, self.config.gaps_out)
+    }
+
+    /// Leaf whose gapped allocation contains container-cell `(col, row)`
+    /// (CTX-0177).
+    ///
+    /// Returns `None` for cells inside a gap band (inner or outer) or outside
+    /// every leaf — the mouse is over background, not a pane. Total and
+    /// deterministic; zero gaps reduce to the plain tiling lookup.
+    #[must_use]
+    pub fn leaf_at_container_cell(&self, col: u16, row: u16) -> Option<ViewId> {
+        let c = u32::from(col);
+        let r = u32::from(row);
+        self.layout_allocations()
+            .into_iter()
+            .find(|(_, rect)| {
+                !rect.is_empty()
+                    && c >= u32::from(rect.x)
+                    && r >= u32::from(rect.y)
+                    && c < rect.right()
+                    && r < rect.bottom()
+            })
+            .map(|(id, _)| id)
+    }
+
+    /// Maps a physical cursor position to its leaf and leaf-local cell
+    /// (CTX-0177).
+    ///
+    /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
+    /// is leaf-aware: the outer gap is subtracted in live pixels, the
+    /// remainder is divided by the live cell metrics (0157 math), the
+    /// containing gapped allocation is resolved, and the leaf origin is
+    /// subtracted for the local cell. Positions over a gap band (inner or
+    /// outer) or outside all leaves yield `None`.
+    ///
+    /// No wide-spacer snapping is applied (that needs the target pane's
+    /// snapshot; callers use `bitty_ui::snap_to_leading` with it). Local
+    /// cells are clamped to the leaf allocation defensively.
+    #[must_use]
+    pub fn cursor_to_leaf_cell(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let x = pos.x - f64::from(self.config.gaps_out) * cell_w;
+        let y = pos.y - f64::from(self.config.gaps_out) * cell_h;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let col = (x / cell_w).floor() as i64;
+        let row = (y / cell_h).floor() as i64;
+        if col < 0 || row < 0 || col > u16::MAX as i64 || row > u16::MAX as i64 {
+            return None;
+        }
+        let (id, rect) = self.layout_allocations().into_iter().find(|(_, r)| {
+            !r.is_empty()
+                && (col as u32) >= u32::from(r.x)
+                && (row as u32) >= u32::from(r.y)
+                && (col as u32) < r.right()
+                && (row as u32) < r.bottom()
+        })?;
+        let local_col = (col as u16)
+            .saturating_sub(rect.x)
+            .min(rect.width.saturating_sub(1));
+        let local_row = (row as u16)
+            .saturating_sub(rect.y)
+            .min(rect.height.saturating_sub(1));
+        Some((id, CellPos::new(local_row, local_col)))
     }
 
     /// Handles a mouse button event for selection or terminal mouse tracking.
@@ -3257,8 +3344,12 @@ impl Runtime {
     /// Moves focus in `dir` using the layout's deterministic adjacency.
     ///
     /// Returns the new focused view (if any) and updates internal focus.
+    /// CTX-0177: adjacency is computed over the gapped allocation so spatial
+    /// focus still crosses gap bands.
     pub fn move_focus(&mut self, dir: FocusDirection) -> Option<ViewId> {
-        let next = self.focus.advance(&self.layout, self.container, dir);
+        let next = self
+            .focus
+            .advance_with_gaps(&self.layout, self.container, self.gaps(), dir);
         if let Some(id) = next {
             self.focus.set(id);
         }
@@ -3282,10 +3373,14 @@ impl Runtime {
 
     /// Current leaf allocations `(ViewId, Rect)` in deterministic depth-first
     /// order, computed from the last reflowed layout or the current container
-    /// without mutating the tree (pure `LayoutNode::layout`).
+    /// without mutating the tree (pure `LayoutNode::layout_with_gaps`).
+    ///
+    /// CTX-0177: allocations exclude the configured gap bands, so per-leaf
+    /// rendering translates to gap-aware pixel origins and the bands stay
+    /// background.
     #[must_use]
     pub fn layout_allocations(&self) -> Vec<(ViewId, UiRect)> {
-        self.layout.layout(self.container)
+        self.layout.layout_with_gaps(self.container, self.gaps())
     }
 
     /// Leaf count of the current layout.
@@ -3298,9 +3393,13 @@ impl Runtime {
     /// `View`'s `cols`/`rows`/`origin` to match its allocation. Returns the
     /// allocations for inspection. Deterministic over the same layout and
     /// container.
+    ///
+    /// CTX-0177: reflows with the configured gaps so leaf sizes exclude the
+    /// gap bands.
     pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
-        self.layout.reflow(self.container);
-        self.layout.layout(self.container)
+        let gaps = self.gaps();
+        self.layout.reflow_with_gaps(self.container, gaps);
+        self.layout.layout_with_gaps(self.container, gaps)
     }
 
     /// Spawns `program` inside a PTY sized to the current grid, storing the
@@ -3499,7 +3598,8 @@ impl Runtime {
         if self.pane_sessions.is_empty() {
             return;
         }
-        let allocs = self.layout.layout(self.container);
+        // CTX-0177: gapped allocations so pane grids match the shrunk leaves.
+        let allocs = self.layout.layout_with_gaps(self.container, self.gaps());
         for (id, rect) in &allocs {
             let cols = rect.width.max(1);
             let rows = rect.height.max(1);
@@ -4158,7 +4258,7 @@ impl Runtime {
                 view.clamp_scroll_offset(max_scrollback);
             }
         }
-        self.layout.reflow(self.container);
+        self.layout.reflow_with_gaps(self.container, self.gaps());
         // CTX-0176: the container moved, so every pane session's grid +
         // PTY winsize follows its leaf (primary state/PTY handled below).
         self.sync_pane_geometry();
@@ -4457,8 +4557,8 @@ impl Runtime {
         // Reflow layout tree into container before rendering so leaf Views
         // carry deterministic origins/sizes for this frame. This is headless
         // and deterministic: same layout + container always yields same
-        // allocations.
-        self.layout.reflow(self.container);
+        // allocations. CTX-0177: gap-aware so leaves exclude gap bands.
+        self.layout.reflow_with_gaps(self.container, self.gaps());
 
         let snapshot = self.state.snapshot();
         let pending_full = self.pending_full_redraw;
@@ -4477,7 +4577,8 @@ impl Runtime {
         }
 
         // Collect allocations deterministically; empty layout -> idle (no leaf to present).
-        let allocations = self.layout.layout(self.container);
+        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
+        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
         if allocations.is_empty() {
             self.last_presented_generation = current_gen;
             self.pending_full_redraw = false;
@@ -4988,6 +5089,25 @@ mod tests {
 
     fn make_runtime() -> Runtime {
         Runtime::with_defaults().expect("defaults must build")
+    }
+
+    fn make_gapped_runtime(gaps_in: u16, gaps_out: u16) -> Runtime {
+        // CTX-0177: headless runtime with panel gaps (default 9x19 live cell).
+        Runtime::new(RuntimeConfig {
+            gaps_in,
+            gaps_out,
+            ..RuntimeConfig::default()
+        })
+        .expect("gapped config must build")
+    }
+
+    fn two_pane_layout() -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        )
     }
 
     fn test_char_key(logical: &str, text: Option<&str>, state: PressState) -> KeyEvent {
@@ -5515,6 +5635,105 @@ mod tests {
         let v2 = rt.layout().find_leaf(ViewId::new(2)).unwrap();
         assert_eq!(v2.origin(), bitty_ui::Point::new(40, 0));
         assert_eq!(v2.cols(), 40);
+    }
+
+    #[test]
+    fn gaps_default_zero_and_allocations_tile_edge_to_edge() {
+        // CTX-0177: zero gaps preserve the legacy tiling exactly.
+        let rt = make_runtime();
+        assert_eq!(rt.gaps(), Gaps::ZERO);
+        let mut rt = make_runtime();
+        rt.set_layout(two_pane_layout());
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let allocs = rt.reflow_layout();
+        assert_eq!(allocs[0].1, UiRect::new(0, 0, 40, 24));
+        assert_eq!(allocs[1].1, UiRect::new(40, 0, 40, 24));
+    }
+
+    #[test]
+    fn gaps_allocations_exclude_gap_bands() {
+        // CTX-0177: gapped allocations skip the bands; per-leaf rendering
+        // translates these origins so the bands stay background.
+        let mut rt = make_gapped_runtime(2, 1);
+        rt.set_layout(two_pane_layout());
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        let allocs = rt.reflow_layout();
+        assert_eq!(allocs[0].1, UiRect::new(1, 1, 38, 22));
+        assert_eq!(allocs[1].1, UiRect::new(41, 1, 38, 22));
+        // Reflowed views carry the gapped origins/sizes.
+        let v2 = rt.layout().find_leaf(ViewId::new(2)).unwrap();
+        assert_eq!(v2.origin(), bitty_ui::Point::new(41, 1));
+        assert_eq!((v2.cols(), v2.rows()), (38, 22));
+    }
+
+    #[test]
+    fn cursor_to_cell_subtracts_outer_gap() {
+        // CTX-0177: with gaps_out = 2 cells at the default 9x19 live cell,
+        // the grid origin shifts by (18px, 38px); the mapping must subtract
+        // it (0157 math) instead of drifting by the gap.
+        let rt = make_gapped_runtime(0, 2);
+        // Legacy probe (18, 38) -> (2, 2) now lands on the gap-shifted grid:
+        // col = (36 - 18) / 9 = 2, row = (76 - 38) / 19 = 2.
+        let pos = CursorPosition { x: 36.0, y: 76.0 };
+        assert_eq!(rt.cursor_to_cell(pos), CellPos::new(2, 2));
+        // A click inside the outer gap clamps to the first cell (never
+        // negative, never panics).
+        let in_gap = CursorPosition { x: 9.0, y: 19.0 };
+        assert_eq!(rt.cursor_to_cell(in_gap), CellPos::new(0, 0));
+        // Zero-gap runtime keeps the legacy mapping bit-identical.
+        let plain = make_runtime();
+        assert_eq!(
+            plain.cursor_to_cell(CursorPosition { x: 18.0, y: 38.0 }),
+            CellPos::new(2, 2)
+        );
+    }
+
+    #[test]
+    fn leaf_hit_testing_accounts_for_inner_and_outer_gaps() {
+        // CTX-0177: leaf-aware hit-testing over a gapped two-pane layout
+        // (allocations a=(1,1,38,22), b=(41,1,38,22) at 9x19 live cells).
+        // Physical x for container col c is outer_px + c * 9 + 1.
+        let mut rt = make_gapped_runtime(2, 1);
+        rt.set_layout(two_pane_layout());
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        rt.reflow_layout();
+        let at = |c: u16, r: u16| CursorPosition {
+            x: 9.0 + f64::from(c) * 9.0 + 1.0,
+            y: 19.0 + f64::from(r) * 19.0 + 1.0,
+        };
+        // Inside left leaf: local cell is container minus leaf origin.
+        assert_eq!(
+            rt.cursor_to_leaf_cell(at(1, 5)),
+            Some((ViewId::new(1), CellPos::new(4, 0)))
+        );
+        // Inside right leaf: container col 41 -> local col 0.
+        assert_eq!(
+            rt.cursor_to_leaf_cell(at(41, 5)),
+            Some((ViewId::new(2), CellPos::new(4, 0)))
+        );
+        // Inner gap band (cols 39..41) belongs to no leaf.
+        assert_eq!(rt.cursor_to_leaf_cell(at(39, 5)), None);
+        assert_eq!(rt.cursor_to_leaf_cell(at(40, 5)), None);
+        // Outer gap (col 0 / row 0) belongs to no leaf.
+        assert_eq!(rt.cursor_to_leaf_cell(at(0, 5)), None);
+        assert_eq!(rt.cursor_to_leaf_cell(at(10, 0)), None);
+        // Container-cell lookup agrees.
+        assert_eq!(rt.leaf_at_container_cell(1, 5), Some(ViewId::new(1)));
+        assert_eq!(rt.leaf_at_container_cell(41, 5), Some(ViewId::new(2)));
+        assert_eq!(rt.leaf_at_container_cell(39, 5), None);
+        assert_eq!(rt.leaf_at_container_cell(0, 0), None);
+    }
+
+    #[test]
+    fn move_focus_crosses_gap_band() {
+        // CTX-0177: spatial focus still moves across the inner gap band.
+        let mut rt = make_gapped_runtime(2, 0);
+        rt.set_layout(two_pane_layout());
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        rt.reflow_layout();
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(rt.move_focus(FocusDirection::Right), Some(ViewId::new(2)));
+        assert_eq!(rt.move_focus(FocusDirection::Left), Some(ViewId::new(1)));
     }
 
     #[test]

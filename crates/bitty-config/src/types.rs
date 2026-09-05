@@ -38,6 +38,20 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 
+/// Default inner panel gap (`layout.gaps_in`), in cells: edge-to-edge.
+pub const DEFAULT_LAYOUT_GAPS_IN: u32 = 0;
+
+/// Default outer panel gap (`layout.gaps_out`), in cells: edge-to-edge.
+pub const DEFAULT_LAYOUT_GAPS_OUT: u32 = 0;
+
+/// Maximum panel gap in cells (either axis).
+///
+/// Cells are coarse (one cell is ~9px wide at the default 9x19 cell), so 16
+/// cells (~144px) is already far past tasteful; the bound exists to keep
+/// untrusted input bounded (threat T-01), not to bless huge gaps. Larger
+/// values fail closed like every other config bound.
+pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
+
 /// Default selection auto-copy behavior (CTX-0191).
 /// `true` preserves the ghostty-class copy-on-select: a committed mouse
 /// selection auto-copies to the clipboard (which best-effort syncs primary).
@@ -348,6 +362,58 @@ impl SelectionConfig {
     }
 }
 
+/// Panel-gap layout configuration (CTX-0177).
+///
+/// Hyprland-like spacing between terminal panes, in **cells** (not pixels:
+/// the layout algebra is integer cell-space and glyphs must sit on the cell
+/// grid, so a pixel gap would quantize to cells anyway; hit-testing converts
+/// via the live cell metrics):
+///
+/// - `gaps_in`: background-colored band between sibling panes at every
+///   split (nested splits each insert their own band, matching Hyprland).
+/// - `gaps_out`: background-colored inset between the container edge and all
+///   panes.
+///
+/// Set via `init.lua` `layout = { gaps_in = 1, gaps_out = 2 }` (both keys
+/// optional, defaulting to `0` when the table is present but omits them, so
+/// `layout = {}` keeps edge-to-edge tiling). Both default to `0`, preserving
+/// edge-to-edge tiling for existing users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutConfig {
+    /// Spacing between sibling panes, in cells, `0..=MAX_LAYOUT_GAP_CELLS`.
+    pub gaps_in: u32,
+    /// Inset around the container edge, in cells, `0..=MAX_LAYOUT_GAP_CELLS`.
+    pub gaps_out: u32,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            gaps_in: DEFAULT_LAYOUT_GAPS_IN,
+            gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
+        }
+    }
+}
+
+impl LayoutConfig {
+    /// Validate layout config (fail-closed on oversized gaps).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.gaps_in > MAX_LAYOUT_GAP_CELLS {
+            return Err(ConfigError::validation(
+                "layout.gaps_in",
+                format!("must be within [0, {MAX_LAYOUT_GAP_CELLS}]"),
+            ));
+        }
+        if self.gaps_out > MAX_LAYOUT_GAP_CELLS {
+            return Err(ConfigError::validation(
+                "layout.gaps_out",
+                format!("must be within [0, {MAX_LAYOUT_GAP_CELLS}]"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Appearance configuration.
 ///
 /// The optional theme identifier resolves through the built-in preset
@@ -474,6 +540,8 @@ pub struct EffectiveConfig {
     pub terminal: TerminalConfig,
     /// Selection config (CTX-0191; default auto-copies on select).
     pub selection: SelectionConfig,
+    /// Layout config (CTX-0177 panel gaps; default edge-to-edge).
+    pub layout: LayoutConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
     /// Keymaps, possibly empty.
@@ -493,6 +561,7 @@ impl Default for EffectiveConfig {
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
             selection: SelectionConfig::default(),
+            layout: LayoutConfig::default(),
             appearance: AppearanceConfig::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
@@ -509,6 +578,7 @@ impl EffectiveConfig {
         self.window.validate()?;
         self.terminal.validate()?;
         self.selection.validate()?;
+        self.layout.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -736,6 +806,45 @@ mod tests {
         EffectiveConfig::default()
             .validate()
             .expect("default valid");
+    }
+
+    #[test]
+    fn layout_gaps_default_zero_and_validate_bounds() {
+        // CTX-0177: defaults preserve edge-to-edge tiling; bounds fail closed.
+        const { assert!(DEFAULT_LAYOUT_GAPS_IN == 0) }
+        const { assert!(DEFAULT_LAYOUT_GAPS_OUT == 0) }
+        let d = LayoutConfig::default();
+        assert_eq!(d.gaps_in, 0);
+        assert_eq!(d.gaps_out, 0);
+        d.validate().expect("default valid");
+        EffectiveConfig::default()
+            .validate()
+            .expect("default valid");
+        for (gin, gout) in [(0, 0), (1, 2), (MAX_LAYOUT_GAP_CELLS, MAX_LAYOUT_GAP_CELLS)] {
+            LayoutConfig {
+                gaps_in: gin,
+                gaps_out: gout,
+            }
+            .validate()
+            .expect("boundary gaps must be valid");
+        }
+        for (gin, gout) in [
+            (MAX_LAYOUT_GAP_CELLS + 1, 0),
+            (0, MAX_LAYOUT_GAP_CELLS + 1),
+            (u32::MAX, u32::MAX),
+        ] {
+            LayoutConfig {
+                gaps_in: gin,
+                gaps_out: gout,
+            }
+            .validate()
+            .expect_err("oversized gaps must fail closed");
+        }
+        // Effective-level validation covers layout too.
+        let mut eff = EffectiveConfig::default();
+        eff.layout.gaps_in = MAX_LAYOUT_GAP_CELLS + 1;
+        eff.validate()
+            .expect_err("effective must reject oversized gaps");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use bitty_term_state::{Snapshot, State};
 use bitty_ui::{
-    Focus, LayoutNode, Rect as UiRect, View, ViewId,
+    Focus, Gaps, LayoutNode, Rect as UiRect, View, ViewId,
     panel::{
         CommandRegistry as UiCommandRegistry, OverlayKind as UiOverlayKind,
         OverlayManager as UiOverlayManager, PanelState as UiPanelState, PanelType as UiPanelType,
@@ -1641,10 +1641,22 @@ impl TerminalRegistry {
         workspace_id: WorkspaceId,
         container: UiRect,
     ) -> Result<Vec<(ViewId, UiRect)>, RegistryError> {
+        self.reflow_workspace_with_gaps(workspace_id, container, Gaps::ZERO)
+    }
+
+    /// Gap-aware workspace reflow (CTX-0177): like [`Self::reflow_workspace`]
+    /// but allocates with `LayoutNode::layout_with_gaps`. With [`Gaps::ZERO`]
+    /// this is identical to [`Self::reflow_workspace`].
+    pub fn reflow_workspace_with_gaps(
+        &mut self,
+        workspace_id: WorkspaceId,
+        container: UiRect,
+        gaps: Gaps,
+    ) -> Result<Vec<(ViewId, UiRect)>, RegistryError> {
         self.ensure_not_disposed()?;
         let ws = self.get_workspace_mut(workspace_id)?;
-        ws.layout.reflow(container);
-        Ok(ws.layout.layout(container))
+        ws.layout.reflow_with_gaps(container, gaps);
+        Ok(ws.layout.layout_with_gaps(container, gaps))
     }
 
     // ------------------------------------------------------------------

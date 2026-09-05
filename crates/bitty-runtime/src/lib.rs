@@ -210,7 +210,7 @@ pub use runtime::{
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.
 // The runtime depends on `bitty-ui` only via these owned value types; no
 // render/platform/pty coupling is introduced through them.
-pub use bitty_ui::{Focus, FocusDirection, LayoutNode, SplitAxis, View, ViewId};
+pub use bitty_ui::{Focus, FocusDirection, Gaps, LayoutNode, SplitAxis, View, ViewId};
 pub use bitty_ui::{Point as UiPoint, Rect as UiRect, Size as UiSize};
 
 pub use registry::{

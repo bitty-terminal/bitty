@@ -487,6 +487,17 @@ struct PaneSession {
     writer: PtyWriter,
 }
 
+/// Full compact banner visible duration (CTX-0192).
+///
+/// A gated paste shows the compact one-line summary for this long, then
+/// collapses to [`PASTE_BANNER_FLASH_TEXT`] while the paste still pends.
+/// The flash keeps the never-silent signal without occluding the grid.
+pub const PASTE_BANNER_FULL_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Minimal status flash while a paste pends after the full banner expires
+/// (CTX-0192). Bounded, single-line, always `Some` while pending.
+pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste… repeat=confirm Esc=cancel";
+
 pub struct Runtime {
     config: RuntimeConfig,
     parser: Parser,
@@ -540,6 +551,19 @@ pub struct Runtime {
     last_cursor: Option<CursorPosition>,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
+    /// Wall time when the current pending paste was gated (CTX-0192).
+    ///
+    /// Drives the transient banner: full summary for
+    /// [`PASTE_BANNER_FULL_DURATION`], then a minimal flash while pending.
+    /// `None` when no paste pends. Set with `Instant::now()` in
+    /// `request_paste`; cleared on confirm/cancel.
+    pending_paste_since: Option<std::time::Instant>,
+    /// Whether the banner has collapsed to the flash phase (CTX-0192).
+    ///
+    /// Tracks the last painted phase so `tick` can force exactly one
+    /// repaint on the full→flash transition, then idle with the flash
+    /// retained on screen (never-silent while pending).
+    paste_banner_collapsed: bool,
     osc_clipboard_read_allowed: bool,
     osc_clipboard_write_allowed: bool,
     pending_activation_gesture: Option<ActivationGesture>,
@@ -766,6 +790,8 @@ impl Runtime {
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
+            pending_paste_since: None,
+            paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
             pending_activation_gesture: None,
@@ -858,6 +884,8 @@ impl Runtime {
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
+            pending_paste_since: None,
+            paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
             pending_activation_gesture: None,
@@ -1647,30 +1675,60 @@ impl Runtime {
         self.pending_paste.as_ref().map(|p| p.text.as_str())
     }
 
-    /// Bounded human-readable summary of the pending paste, if any (CTX-0186).
+    /// Bounded human-readable summary of the pending paste, if any (CTX-0186,
+    /// compacted CTX-0192).
     ///
     /// A gated paste is never silent: while [`Self::has_pending_paste`] holds,
-    /// this returns `Some` line of the form
-    /// `Paste 2 lines, 11 bytes [newline, C0] "line1\nline2" — repeat paste
-    /// to confirm, Esc to cancel`.
+    /// this returns `Some` single line of the form
+    /// `Paste 2 lines, 11B [newline] "line1\nline2" (repeat=confirm Esc=cancel)`.
     ///
     /// Bounded and deterministic: the input is already capped at
     /// `CLIPBOARD_MAX_BYTES` (8192), reasons are at most 7 static tokens, and
-    /// the preview keeps the first 64 chars escaped (`escape_debug`) and cut
-    /// to 96 bytes at a char boundary. Total length stays well under 512
-    /// bytes. `O(n)` with `n ≤ 8192`.
+    /// the preview keeps the first 32 chars escaped (`escape_debug`) and cut
+    /// to 48 bytes at a char boundary. Total length stays well under 256
+    /// bytes, single-line (no raw `\n`). `O(n)` with `n ≤ 8192`.
     #[must_use]
     pub fn pending_paste_summary(&self) -> Option<String> {
         let pending = self.pending_paste.as_ref()?;
         let lines = pending.text.bytes().filter(|&b| b == b'\n').count() + 1;
         let bytes = pending.text.len();
         let reasons = pending.inspection.reasons().join(", ");
-        let preview: String = pending.text.chars().take(64).collect();
+        let preview: String = pending.text.chars().take(32).collect();
         let preview = preview.escape_debug().to_string();
-        let preview = truncate_str_to_bytes(&preview, 96);
+        let preview = truncate_str_to_bytes(&preview, 48);
         Some(format!(
-            "Paste {lines} lines, {bytes} bytes [{reasons}] \"{preview}\" — repeat paste to confirm, Esc to cancel"
+            "Paste {lines} lines, {bytes}B [{reasons}] \"{preview}\" (repeat=confirm Esc=cancel)"
         ))
+    }
+
+    /// Whether the banner has collapsed to the minimal flash at `now`
+    /// (CTX-0192). `None` when no paste pends.
+    #[must_use]
+    pub fn paste_banner_collapsed_at(&self, now: std::time::Instant) -> Option<bool> {
+        self.pending_paste.as_ref()?;
+        let since = self.pending_paste_since?;
+        Some(now.saturating_duration_since(since) >= PASTE_BANNER_FULL_DURATION)
+    }
+
+    /// Visible banner text at `now` (CTX-0192): compact summary while fresh,
+    /// [`PASTE_BANNER_FLASH_TEXT`] after [`PASTE_BANNER_FULL_DURATION`].
+    /// Always `Some` while [`Self::has_pending_paste`] holds (never-silent),
+    /// bounded, single-line, overlay-only.
+    #[must_use]
+    pub fn paste_banner_text_at(&self, now: std::time::Instant) -> Option<String> {
+        if !self.has_pending_paste() {
+            return None;
+        }
+        match self.paste_banner_collapsed_at(now) {
+            Some(true) => Some(PASTE_BANNER_FLASH_TEXT.to_string()),
+            _ => self.pending_paste_summary(),
+        }
+    }
+
+    /// Visible banner text now (CTX-0192). See [`Self::paste_banner_text_at`].
+    #[must_use]
+    pub fn paste_banner_text(&self) -> Option<String> {
+        self.paste_banner_text_at(std::time::Instant::now())
     }
 
     /// Pastes text from the system clipboard (or headless buffer) and routes
@@ -1747,6 +1805,8 @@ impl Runtime {
             if pending.text == text {
                 let pending = self.pending_paste.take().expect("checked above");
                 self.deliver_paste_bytes_bracketed(&pending.text);
+                self.pending_paste_since = None;
+                self.paste_banner_collapsed = false;
                 self.pending_full_redraw = true;
                 return false;
             }
@@ -1757,6 +1817,9 @@ impl Runtime {
                 return true;
             }
             self.pending_paste = Some(crate::paste::PendingPaste::new(text, inspection.clone()));
+            // CTX-0192 transient banner starts full now.
+            self.pending_paste_since = Some(std::time::Instant::now());
+            self.paste_banner_collapsed = false;
             self.pending_full_redraw = true;
             return true;
         }
@@ -1775,6 +1838,8 @@ impl Runtime {
         if confirm {
             self.deliver_paste_bytes_bracketed(&pending.text);
         }
+        self.pending_paste_since = None;
+        self.paste_banner_collapsed = false;
         self.pending_full_redraw = true;
         true
     }
@@ -1805,6 +1870,8 @@ impl Runtime {
             return false;
         }
         self.pending_paste = None;
+        self.pending_paste_since = None;
+        self.paste_banner_collapsed = false;
         self.pending_full_redraw = true;
         self.inspect_ring.push_key(
             &key_inspect_label(event),
@@ -4357,6 +4424,36 @@ impl Runtime {
     /// and is not available on headless CI — `is_headless` is `true` for
     /// every present this method emits today.
     pub fn tick(&mut self) -> Option<PresentStats> {
+        self.tick_at(std::time::Instant::now())
+    }
+
+    /// Tick with an explicit wall clock (CTX-0192 virtual-clock seam).
+    ///
+    /// `tick()` delegates with `Instant::now()`; tests pass virtual times to
+    /// prove the transient banner: full summary → flash after
+    /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
+    /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
+    pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // CTX-0192 transient: collapse the full banner to the flash once its
+        // duration expires. Force exactly one repaint for the transition so
+        // the retained frame keeps a visible (smaller) signal while pending.
+        if self.pending_paste.is_some() {
+            match self.pending_paste_since {
+                Some(since) => {
+                    let collapsed =
+                        now.saturating_duration_since(since) >= PASTE_BANNER_FULL_DURATION;
+                    if collapsed != self.paste_banner_collapsed {
+                        self.paste_banner_collapsed = collapsed;
+                        self.pending_full_redraw = true;
+                    }
+                }
+                None => {
+                    self.pending_paste_since = Some(now);
+                    self.paste_banner_collapsed = false;
+                    self.pending_full_redraw = true;
+                }
+            }
+        }
         // Reflow layout tree into container before rendering so leaf Views
         // carry deterministic origins/sizes for this frame. This is headless
         // and deterministic: same layout + container always yields same
@@ -4680,36 +4777,44 @@ impl Runtime {
             }
         }
 
-        // Pending-paste confirmation banner (CTX-0186): presentation-only
-        // overlay on the focused view's bottom row. Gated on
-        // `has_pending_paste()`; text is the bounded `pending_paste_summary()`
-        // (already <512B, clipped to the view width in cells). Overlay only:
-        // pushes fills+glyphs onto the combined frame, never touches grid
-        // cells, scrollback, or the pending bytes. Esc-cancel and
-        // repeat-confirm paths are unchanged; clearing pending repaints once
-        // without the banner via `pending_full_redraw`.
+        // Pending-paste confirmation banner (CTX-0186, transient CTX-0192):
+        // presentation-only overlay on the focused view's bottom row,
+        // right-aligned compact pill (not full-width) to avoid occluding the
+        // grid. Gated on `has_pending_paste()`; text is the bounded compact
+        // `pending_paste_summary()` for `PASTE_BANNER_FULL_DURATION`, then the
+        // minimal `PASTE_BANNER_FLASH_TEXT` while pending (never-silent).
+        // Overlay only: pushes fills+glyphs onto the combined frame, never
+        // touches grid cells, scrollback, or the pending bytes. Esc-cancel
+        // and repeat-confirm paths are unchanged; clearing pending repaints
+        // once without the banner via `pending_full_redraw`.
         if self.has_pending_paste() {
-            if let Some(summary) = self.pending_paste_summary() {
+            if let Some(banner) = self.paste_banner_text_at(now) {
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
                     if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
                         if rect.height > 0 && rect.width > 0 {
                             let live = self.live_cell_metrics();
-                            let origin_px_x = rect.x as i32 * live.width as i32;
+                            let max_cells = rect.width as usize;
+                            // Compact pill: only as wide as the text (clipped
+                            // to the view), right-aligned so most of the row
+                            // stays visible.
+                            let text_cells = banner.chars().count().min(max_cells).max(1);
+                            let pill_w = text_cells as u32 * live.width;
+                            let full_w = rect.width as u32 * live.width;
+                            let origin_px_x = rect.x as i32 * live.width as i32
+                                + (full_w.saturating_sub(pill_w)) as i32;
                             let banner_y =
                                 (rect.y as i32 + rect.height as i32 - 1) * (live.height as i32);
-                            let banner_w = rect.width as u32 * live.width;
                             combined_fills.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
                                     banner_y,
-                                    banner_w,
+                                    pill_w,
                                     live.height,
                                 ),
                                 color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
                             });
-                            let max_cells = rect.width as usize;
                             let glyphs = self.renderer.overlay_text_glyphs(
-                                &summary,
+                                &banner,
                                 (origin_px_x, banner_y),
                                 max_cells,
                                 bitty_render::grid::PENDING_PASTE_BANNER_FG,

@@ -202,8 +202,9 @@ pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::{
     ActivationGesture, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,
-    DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation, PTY_FORWARD_CAPACITY_CHUNKS, PresentStats,
-    PtyWaker, Runtime, UrlActivation,
+    DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation, PASTE_BANNER_FLASH_TEXT,
+    PASTE_BANNER_FULL_DURATION, PTY_FORWARD_CAPACITY_CHUNKS, PresentStats, PtyWaker, Runtime,
+    UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

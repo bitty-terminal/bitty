@@ -591,3 +591,109 @@ fn ctx0186_pending_banner_paints_overlay_delta_without_touching_grid() {
     assert_eq!(rt.snapshot().cells, cells_before);
     assert!(rt.tick().is_none(), "must idle once banner clears");
 }
+
+#[test]
+fn ctx0192_pending_summary_is_compact_single_line_bounded() {
+    // Owner UX: the bottom-row banner was ugly and occluding. The summary
+    // must stay compact, single-line, and tighter than the CTX-0186 <512B
+    // lock so the pill stays small.
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("line1\nline2".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    let summary = rt
+        .pending_paste_summary()
+        .expect("pending must stay visible, never silent");
+    assert!(!summary.contains('\n'), "banner must be single line");
+    assert!(!summary.contains('\r'), "banner must be single line");
+    assert!(
+        summary.len() < 256,
+        "compact summary must stay under 256B, got {}: {summary:?}",
+        summary.len()
+    );
+    assert!(summary.contains("2 lines"), "keep line count: {summary:?}");
+    assert!(summary.contains("newline"), "keep reason: {summary:?}");
+    // Long hostile paste stays bounded too.
+    let mut rt2 = make_runtime();
+    rt2.paste_text(&"A".repeat(8192).replace("AAAA", "AAAA\n"));
+    let long = rt2.pending_paste_summary().expect("long paste gates");
+    assert!(long.len() < 256, "long summary bounded: {}", long.len());
+    assert!(!long.contains('\n'));
+}
+
+#[test]
+fn ctx0192_banner_is_transient_full_then_flash_never_silent_overlay_only() {
+    // State-transition with virtual clock: pending → full banner → timeout →
+    // minimal flash (still pending, still visible) → gone on cancel.
+    use bitty_runtime::PASTE_BANNER_FLASH_TEXT;
+    use bitty_runtime::PASTE_BANNER_FULL_DURATION;
+
+    let mut rt = make_runtime();
+    let base = rt.tick().expect("initial frame must present");
+    assert!(rt.tick().is_none());
+    let cells_before = rt.snapshot().cells.clone();
+
+    rt.clipboard_mut()
+        .set_text("aaa\nbbb\nccc".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+
+    let t0 = std::time::Instant::now();
+    // Full phase: compact summary, overlay delta, grid untouched.
+    let full_text = rt
+        .paste_banner_text_at(t0)
+        .expect("full banner must be visible while pending");
+    assert!(
+        full_text.contains("3 lines"),
+        "full banner names count: {full_text:?}"
+    );
+    let full = rt.tick_at(t0).expect("pending must force a present");
+    assert!(full.fills > base.fills, "full banner adds a fill");
+    assert!(full.glyphs > base.glyphs, "full banner adds glyphs");
+    assert_eq!(rt.snapshot().cells, cells_before, "overlay-only");
+
+    // After the duration: flash phase — still pending, still visible, but
+    // smaller (fewer glyphs than the full summary pill).
+    let t1 = t0 + PASTE_BANNER_FULL_DURATION + std::time::Duration::from_secs(1);
+    let flash_text = rt
+        .paste_banner_text_at(t1)
+        .expect("flash must keep a visible signal while pending");
+    assert_eq!(flash_text, PASTE_BANNER_FLASH_TEXT);
+    assert!(rt.has_pending_paste(), "timeout must not drop the gate");
+    let flash = rt
+        .tick_at(t1)
+        .expect("full→flash transition must repaint once");
+    assert!(
+        flash.fills > base.fills,
+        "flash keeps a fill signal: base={} flash={}",
+        base.fills,
+        flash.fills
+    );
+    assert!(
+        flash.glyphs > base.glyphs,
+        "flash keeps a glyph signal while pending"
+    );
+    assert!(
+        flash.glyphs < full.glyphs,
+        "flash must be smaller than full: full={} flash={}",
+        full.glyphs,
+        flash.glyphs
+    );
+    assert_eq!(rt.snapshot().cells, cells_before, "flash is overlay-only");
+
+    // Flash idles with the signal retained, then cancel clears to baseline.
+    assert!(
+        rt.tick_at(t1).is_none(),
+        "flash must idle once retained on screen"
+    );
+    assert!(rt.cancel_pending_paste());
+    assert!(rt.paste_banner_text_at(t1).is_none(), "gone after cancel");
+    let cleared = rt.tick_at(t1).expect("cancel repaints without banner");
+    assert_eq!(cleared.fills, base.fills);
+    assert_eq!(cleared.glyphs, base.glyphs);
+    assert!(rt.tick_at(t1).is_none());
+}

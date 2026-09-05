@@ -217,6 +217,8 @@ struct ScreenSave {
     cursor_position: CursorPosition,
     pending_wrap: bool,
     style: Style,
+    cursor_style: CursorStyle,
+    cursor_visible: bool,
     origin_mode: bool,
     auto_wrap: bool,
     charsets: Charsets,
@@ -1608,6 +1610,8 @@ impl State {
                 cursor_position: self.cursor.position,
                 pending_wrap: self.cursor.pending_wrap,
                 style: self.cursor.style.clone(),
+                cursor_style: self.cursor.cursor_style,
+                cursor_visible: self.cursor.visible,
                 origin_mode: self.modes.origin,
                 auto_wrap: self.modes.auto_wrap,
                 charsets: self.charsets.clone(),
@@ -1629,6 +1633,8 @@ impl State {
                 self.cursor.position = save.cursor_position;
                 self.cursor.pending_wrap = save.pending_wrap;
                 self.cursor.style = save.style;
+                self.cursor.cursor_style = save.cursor_style;
+                self.cursor.visible = save.cursor_visible;
                 self.charsets = save.charsets;
                 self.modes = save.modes;
             }
@@ -1888,6 +1894,8 @@ fn out_save_cursor_fields(out: &mut CanonicalHasher, save: &ScreenSave) {
     out.u16(save.cursor_position.col);
     out.boolean(save.pending_wrap);
     write_style(out, &save.style);
+    out.u8(cursor_style_discriminant(save.cursor_style));
+    out.boolean(save.cursor_visible);
     out.boolean(save.origin_mode);
     out.boolean(save.auto_wrap);
     write_charsets(out, &save.charsets);
@@ -2187,5 +2195,57 @@ mod tests {
             snap.cells.iter().all(|c| c.style.background.is_none()),
             "BCE blanks after SGR 0 must use the default background"
         );
+    }
+
+    #[test]
+    fn decscusr_tracks_style_in_snapshot_and_ris_resets() {
+        // CTX-0162: `CSI Ps SP q` (0/1 block, 2 steady block, 3/4 underline,
+        // 5/6 bar) lands in the snapshot cursor; RIS restores the default.
+        let mut s = State::new();
+        assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::Default);
+        for style in [
+            CursorStyle::BlinkingBlock,
+            CursorStyle::SteadyBlock,
+            CursorStyle::BlinkingUnderline,
+            CursorStyle::SteadyUnderline,
+            CursorStyle::BlinkingBar,
+            CursorStyle::SteadyBar,
+        ] {
+            s.apply(&TerminalAction::CursorStyle { style });
+            assert_eq!(s.cursor().cursor_style, style);
+            assert_eq!(s.snapshot().cursor.cursor_style, style);
+            assert!(s.check_invariants().is_ok());
+        }
+        s.apply(&TerminalAction::FullReset);
+        assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::Default);
+        assert_eq!(s.state_hash(), State::new().state_hash());
+    }
+
+    #[test]
+    fn alt_screen_exit_restores_saved_cursor_style() {
+        // CTX-0162: alt-screen apps (nvim) set their own DECSCUSR shape;
+        // leaving must restore the primary shape instead of leaking bar.
+        let mut s = State::new();
+        s.apply(&TerminalAction::CursorStyle {
+            style: CursorStyle::SteadyBlock,
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: true,
+        });
+        s.apply(&TerminalAction::CursorStyle {
+            style: CursorStyle::SteadyBar,
+        });
+        assert_eq!(s.snapshot().cursor.cursor_style, CursorStyle::SteadyBar);
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: false,
+        });
+        assert_eq!(
+            s.snapshot().cursor.cursor_style,
+            CursorStyle::SteadyBlock,
+            "primary DECSCUSR shape must survive the alt-screen roundtrip"
+        );
+        assert!(s.check_invariants().is_ok());
     }
 }

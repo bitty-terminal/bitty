@@ -1367,6 +1367,41 @@ mod tests {
     }
 
     #[test]
+    fn decscusr_all_ps_values_map_per_dec0017() {
+        // DEC-0017 (ghostty `src/terminal/cursor.zig`): 0 default, 1/2 block,
+        // 3/4 underline, 5/6 bar. Bare `CSI SP q` defaults to 0.
+        assert_eq!(
+            parse(b"\x1b[ q\x1b[0 q\x1b[1 q\x1b[2 q\x1b[3 q\x1b[4 q\x1b[5 q\x1b[6 q"),
+            vec![
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::Default
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::Default
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::BlinkingBlock
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::SteadyBlock
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::BlinkingUnderline
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::SteadyUnderline
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::BlinkingBar
+                },
+                TerminalAction::CursorStyle {
+                    style: CursorStyle::SteadyBar
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn tab_operations_map() {
         assert_eq!(
             parse(b"\x1b[g\x1b[0g\x1b[3g\x1b[I\x1b[3I\x1b[Z\x1b[2Z\x1bH"),

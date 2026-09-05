@@ -33,7 +33,7 @@
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
 //! | [`HYPERLINK_TABLE_MAX`](state::HYPERLINK_TABLE_MAX) | 1024 | Bounded link table (threat T-01) |
 //! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 1 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 2 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility) |
 //!
 //! # Determinism
 //!
@@ -78,8 +78,8 @@ pub const DEFAULT_TAB_INTERVAL: usize = 8;
 
 pub use bitty_vt::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Color,
-    Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, StatusKind, TerminalAction,
-    UnderlineStyle, ZoneKind,
+    CursorStyle, Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, StatusKind,
+    TerminalAction, UnderlineStyle, ZoneKind,
 };
 pub use cell::{Attributes, Cell, HyperlinkId, Style, char_cell_width};
 pub use cursor::{Cursor, CursorPosition};

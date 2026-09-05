@@ -937,6 +937,71 @@ fn cursor_fill_geometry_and_bounds() {
 }
 
 #[test]
+fn cursor_fill_shapes_per_decscusr() {
+    // CTX-0162 (DEC-0017 ghostty `cursor_bar`/`cursor_underline` + alacritty
+    // 15% thickness): block = full cell, bar = left strip, underline =
+    // bottom strip; all in the theme cursor color, distinct from selection.
+    use super::{DEFAULT_CURSOR, DEFAULT_SELECTION, cursor_fill};
+    use bitty_term_state::{Cursor, CursorPosition, CursorStyle};
+
+    let cell = cell_metrics(); // 8x16 -> thickness max(1, round(8*0.15)) = 1
+    let at = |style: CursorStyle| Cursor {
+        position: CursorPosition { row: 2, col: 3 },
+        visible: true,
+        cursor_style: style,
+        ..Cursor::default()
+    };
+
+    // Block family: full cell.
+    for style in [
+        CursorStyle::Default,
+        CursorStyle::BlinkingBlock,
+        CursorStyle::SteadyBlock,
+    ] {
+        let fill = cursor_fill(&at(style), cell, 80, 24).expect("block visible");
+        assert_eq!(
+            fill.rect,
+            crate::geometry::RectPx::new(24, 32, 8, 16),
+            "style {style:?} must paint a full block"
+        );
+        assert_eq!(fill.color, DEFAULT_CURSOR);
+        assert_ne!(fill.color, DEFAULT_SELECTION);
+    }
+
+    // Bar family: thin left strip, full height (~1-2px at 8px cells).
+    for style in [CursorStyle::BlinkingBar, CursorStyle::SteadyBar] {
+        let fill = cursor_fill(&at(style), cell, 80, 24).expect("bar visible");
+        assert_eq!(
+            fill.rect,
+            crate::geometry::RectPx::new(24, 32, 1, 16),
+            "style {style:?} must paint a thin left bar"
+        );
+        assert_eq!(fill.color, DEFAULT_CURSOR);
+    }
+
+    // Underline family: full width, thin bottom strip.
+    for style in [CursorStyle::BlinkingUnderline, CursorStyle::SteadyUnderline] {
+        let fill = cursor_fill(&at(style), cell, 80, 24).expect("underline visible");
+        assert_eq!(
+            fill.rect,
+            crate::geometry::RectPx::new(24, 32 + 16 - 1, 8, 1),
+            "style {style:?} must paint a bottom underline"
+        );
+        assert_eq!(fill.color, DEFAULT_CURSOR);
+    }
+
+    // Scaled cells keep the fraction: 16x32 -> thickness 2px.
+    let big = super::CellMetrics::new(16, 32).unwrap();
+    let bar = cursor_fill(&at(CursorStyle::SteadyBar), big, 80, 24).expect("scaled bar");
+    assert_eq!(bar.rect.width, 2);
+    assert_eq!(bar.rect.height, 32);
+    let underline =
+        cursor_fill(&at(CursorStyle::SteadyUnderline), big, 80, 24).expect("scaled underline");
+    assert_eq!(underline.rect.width, 16);
+    assert_eq!(underline.rect.height, 2);
+}
+
+#[test]
 fn demo_green_resolves_to_theme_green() {
     // The synthetic demo pump emits `\x1b[32m` (Indexed 2). Render must map
     // it to the preset green, not a hardcoded ad-hoc green.

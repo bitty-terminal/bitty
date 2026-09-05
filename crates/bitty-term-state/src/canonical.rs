@@ -16,7 +16,11 @@ use bitty_vt::{Color, UnderlineStyle};
 use crate::cell::{Attributes, Cell, Style};
 
 /// Version tag mixed into the canonical stream.
-pub const CANONICAL_HASH_VERSION: u32 = 1;
+///
+/// v2 adds the alt-screen save's `DECSCUSR` style + visibility
+/// (`CTX-0162`): prior v1 hashes omitted them, so states differing only in
+/// the saved cursor shape collided.
+pub const CANONICAL_HASH_VERSION: u32 = 2;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -176,6 +180,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 1);
+        assert_eq!(CANONICAL_HASH_VERSION, 2);
     }
 }

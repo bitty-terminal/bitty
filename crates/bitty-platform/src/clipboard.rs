@@ -13,6 +13,14 @@
 //!   primary-selection support, which requires version 2+) never fails the
 //!   overall write when the regular clipboard succeeded. The authoritative
 //!   clipboard error is still surfaced to the caller.
+//! - Primary writes on Wayland go through the `wl-copy --primary` CLI
+//!   (CTX-0158 fix): `arboard`'s in-process fork-daemon for Wayland `copy`
+//!   is unsound from bitty's multithreaded runtime — live proof showed the
+//!   primary `set` returning `Ok` while `wl-paste --primary` stayed empty,
+//!   so middle-click found nothing. `wl-copy` is single-threaded at fork
+//!   time and serves reliably. When `wl-copy` is missing or fails, the write
+//!   falls back to the `arboard` primary path, so behavior never regresses
+//!   below the CTX-0160 contract.
 //! - Reads are authoritative per selection: `get_text` reads the regular
 //!   clipboard and surfaces `PlatformError::ClipboardOperation` on failure;
 //!   `get_primary` reads the primary selection the same way. There is no
@@ -239,7 +247,9 @@ impl Clipboard {
         if let Some(inner) = self.inner.as_mut() {
             let clipboard_result = set_clipboard_text(inner, truncated.clone());
             // Best-effort primary sync (Linux only; no-op elsewhere).
-            let _primary_result = set_primary_text(inner, truncated.clone());
+            // Routed through `set_primary_selection` (wl-copy-first on
+            // Wayland) so the sync benefits from the fork-safe CLI path.
+            let _primary_result = set_primary_selection(inner, &truncated);
             match clipboard_result {
                 Ok(()) => {
                     self.headless_buf = truncated.clone();
@@ -263,8 +273,11 @@ impl Clipboard {
     /// `wl-paste --primary`).
     ///
     /// Truncated to [`CLIPBOARD_MAX_BYTES`] before the system call. On
-    /// non-Linux platforms there is no primary selection: the primary buffer
-    /// is updated headlessly and `Ok` is returned without touching the OS.
+    /// Wayland the write prefers the `wl-copy --primary` CLI (fork-safe from
+    /// multithreaded processes) and falls back to the `arboard` primary path
+    /// when the CLI is missing or fails. On non-Linux platforms there is no
+    /// primary selection: the primary buffer is updated headlessly and `Ok`
+    /// is returned without touching the OS.
     ///
     /// # Errors
     ///
@@ -279,7 +292,7 @@ impl Clipboard {
             return Ok(());
         }
         if let Some(inner) = self.inner.as_mut() {
-            match set_primary_text(inner, truncated.clone()) {
+            match set_primary_selection(inner, &truncated) {
                 Ok(()) => {
                     self.primary_buf = truncated;
                     Ok(())
@@ -472,6 +485,58 @@ fn set_primary_text(inner: &mut arboard::Clipboard, text: String) -> Result<(), 
 )))]
 fn set_primary_text(_inner: &mut arboard::Clipboard, _text: String) -> Result<(), String> {
     Ok(())
+}
+
+/// Primary-selection write with a fork-safe Wayland fast path (CTX-0158).
+///
+/// When a Wayland session is advertised, the write first tries the
+/// `wl-copy --primary` CLI and only falls back to the `arboard` primary
+/// path when the CLI is missing or fails, so behavior never regresses below
+/// the CTX-0160 contract. Everywhere else (X11, headless-adjacent) this is
+/// exactly the `arboard` primary write.
+fn set_primary_selection(inner: &mut arboard::Clipboard, text: &str) -> Result<(), String> {
+    if is_wayland_session() && wl_copy_primary(text).is_ok() {
+        return Ok(());
+    }
+    set_primary_text(inner, text.to_owned())
+}
+
+/// Writes `text` to the Wayland primary selection via the `wl-copy` CLI.
+///
+/// Fixed argv (`wl-copy --primary -- <text>`), no shell, stdio nulled, and
+/// the wait is bounded (2 s) so a wedged compositor cannot hang the caller;
+/// on timeout the child is killed and reaped. Any failure (missing binary,
+/// non-zero exit, timeout) is an `Err` string and the caller falls back to
+/// `arboard`. `text` must already be truncated to [`CLIPBOARD_MAX_BYTES`].
+fn wl_copy_primary(text: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const WL_COPY_WAIT: Duration = Duration::from_secs(2);
+    const WL_COPY_POLL: Duration = Duration::from_millis(10);
+
+    let mut child = Command::new("wl-copy")
+        .arg("--primary")
+        .arg("--")
+        .arg(text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + WL_COPY_WAIT;
+    loop {
+        match child.try_wait().map_err(|err| err.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => return Err(format!("wl-copy --primary exited with {status}")),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("wl-copy --primary timed out".to_string());
+            }
+            None => std::thread::sleep(WL_COPY_POLL),
+        }
+    }
 }
 
 #[cfg(all(

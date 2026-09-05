@@ -491,6 +491,22 @@ pub struct Runtime {
     clipboard: Clipboard,
     selection: Option<Selection>,
     selection_dragging: bool,
+    /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
+    ///
+    /// Ghostty copies a committed left-drag selection to both the standard
+    /// clipboard and the selection/primary clipboard; middle-click then
+    /// pastes from the primary selection. Both selections live in
+    /// `bitty-platform::Clipboard`, which is Wayland-first on Linux
+    /// (`wayland-data-control` backend when `WAYLAND_DISPLAY` is set, X11
+    /// fallback, fail-soft headless buffers otherwise — CTX-0160): there is
+    /// no runtime-side primary buffer, so cross-app copy/paste works in both
+    /// directions without a second source of truth.
+    ///
+    /// Reads/writes on the mouse path stay fail-soft (no paste, no panic,
+    /// no block), but failures are recorded here instead of swallowed, so
+    /// the embedder can surface them. A subsequent successful clipboard
+    /// operation clears the slot. Bounded: at most one retained error.
+    last_clipboard_error: Option<bitty_platform::PlatformError>,
     last_cursor: Option<CursorPosition>,
     search_state: SearchState,
     pending_paste: Option<crate::paste::PendingPaste>,
@@ -707,6 +723,7 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
@@ -795,6 +812,7 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
@@ -1291,6 +1309,7 @@ impl Runtime {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_dragging = false;
+        self.pending_full_redraw = true;
     }
 
     /// Directly sets the selection (headless test seam).
@@ -1299,6 +1318,7 @@ impl Runtime {
         let clamped = selection.clamped(&snap).snapped(Some(&snap));
         self.selection = Some(clamped);
         self.selection_dragging = clamped.active;
+        self.pending_full_redraw = true;
     }
 
     /// Starts a new selection at `pos` (mouse down).
@@ -1313,6 +1333,7 @@ impl Runtime {
             active: true,
         });
         self.selection_dragging = true;
+        self.pending_full_redraw = true;
     }
 
     /// Updates the current selection's focus to `pos` (mouse drag).
@@ -1329,6 +1350,7 @@ impl Runtime {
         sel.focus = snapped;
         sel.active = true;
         self.selection = Some(sel);
+        self.pending_full_redraw = true;
     }
 
     /// Ends the selection at `pos` (mouse up) and leaves it active for copy.
@@ -1348,6 +1370,7 @@ impl Runtime {
         } else {
             self.selection = Some(sel);
         }
+        self.pending_full_redraw = true;
     }
 
     /// Returns selected text for the current selection, if any.
@@ -1359,9 +1382,10 @@ impl Runtime {
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Copies the current selection to the system clipboard (via `arboard`
-    /// with headless fallback). Returns the copied text on success, `None`
-    /// when no selection exists.
+    /// Copies the current selection to the system clipboard (via the
+    /// Wayland-first platform backend with headless fallback, which
+    /// best-effort syncs the primary selection on Linux). Returns the copied
+    /// text on success, `None` when no selection exists.
     ///
     /// # Errors
     ///
@@ -1383,6 +1407,111 @@ impl Runtime {
         let text = self.selection_text()?;
         self.clipboard.set_text_lossy(text.clone());
         Some(text)
+    }
+
+    /// Current contents of the platform primary (selection) clipboard buffer.
+    ///
+    /// Headless-first observation seam for tests: on a live Wayland/X11
+    /// desktop this mirrors the last primary write through
+    /// `bitty-platform::Clipboard`, so unit tests stay deterministic by
+    /// forcing the headless clipboard first (`force_headless_clipboard`).
+    #[must_use]
+    pub fn primary_contents(&self) -> &str {
+        self.clipboard.primary_contents()
+    }
+
+    /// Last clipboard failure observed on the mouse-paste path, if any.
+    ///
+    /// Mouse paste stays fail-soft (no bytes, no panic), but read/write
+    /// failures from the platform clipboard are recorded here instead of
+    /// swallowed, so the embedder can surface them (PR #259 review). A
+    /// subsequent successful clipboard operation clears the slot. Cloned
+    /// because [`Runtime`] is not `Sync`-friendly to borrow across frames.
+    #[must_use]
+    pub fn last_clipboard_error(&self) -> Option<bitty_platform::PlatformError> {
+        self.last_clipboard_error.clone()
+    }
+
+    /// Records a platform clipboard failure for later surfacing.
+    fn record_clipboard_error(&mut self, err: bitty_platform::PlatformError) {
+        self.last_clipboard_error = Some(err);
+    }
+
+    /// Clears the recorded clipboard failure after a successful operation.
+    fn clear_clipboard_error(&mut self) {
+        self.last_clipboard_error = None;
+    }
+
+    /// Directly sets the platform primary clipboard (headless test seam).
+    ///
+    /// Routes through `bitty-platform::Clipboard::set_primary` (Wayland
+    /// primary selection where supported, headless buffer otherwise).
+    /// Fail-soft: a system error is recorded for
+    /// [`Self::last_clipboard_error`] but the headless buffer is still
+    /// updated by the platform layer, so headless tests stay deterministic.
+    pub fn set_primary_text(&mut self, text: String) {
+        if let Err(err) = self.clipboard.set_primary(text) {
+            self.record_clipboard_error(err);
+        } else {
+            self.clear_clipboard_error();
+        }
+    }
+
+    /// Copies the current selection to the platform primary clipboard.
+    /// Returns the copied text, or `None` when no selection exists.
+    /// Fail-soft: a system error is recorded for
+    /// [`Self::last_clipboard_error`] while the void return keeps the
+    /// historic call shape.
+    pub fn copy_selection_to_primary(&mut self) -> Option<String> {
+        let text = self.selection_text()?;
+        if let Err(err) = self.clipboard.set_primary(text.clone()) {
+            self.record_clipboard_error(err);
+        } else {
+            self.clear_clipboard_error();
+        }
+        Some(text)
+    }
+
+    /// Ghostty `setSelectionAndCopy` equivalent (CTX-0158): copies the
+    /// current selection to the standard clipboard, which the platform layer
+    /// best-effort syncs to the primary selection on Linux (CTX-0160).
+    /// Returns the copied text, or `None` when no selection exists.
+    /// Fail-soft: a system clipboard error is recorded for
+    /// [`Self::last_clipboard_error`] while the headless buffers always
+    /// update, and headless tests never touch the real clipboard.
+    pub fn auto_copy_selection(&mut self) -> Option<String> {
+        let text = self.selection_text()?;
+        match self.clipboard.set_text(text.clone()) {
+            Ok(()) => self.clear_clipboard_error(),
+            Err(err) => self.record_clipboard_error(err),
+        }
+        Some(text)
+    }
+
+    /// Pastes from the platform primary selection (middle-click /
+    /// `wl-paste --primary`) through the same suspicious-paste inspection
+    /// gate as clipboard input. Returns `None` when the primary selection is
+    /// empty, otherwise `Some(true)` when the paste requires confirmation or
+    /// `Some(false)` when delivered immediately.
+    ///
+    /// Fail-soft with a surfaced error: a platform read failure pastes
+    /// nothing but is recorded for [`Self::last_clipboard_error`] instead of
+    /// swallowed (PR #259 review); a successful read clears the slot.
+    pub fn paste_from_primary(&mut self) -> Option<bool> {
+        let text = match self.clipboard.get_primary() {
+            Ok(text) => {
+                self.clear_clipboard_error();
+                text
+            }
+            Err(err) => {
+                self.record_clipboard_error(err);
+                return None;
+            }
+        };
+        if text.is_empty() {
+            return None;
+        }
+        Some(self.request_paste(text))
     }
 
     /// Whether the pending paste requires confirmation, if one exists.
@@ -1410,6 +1539,10 @@ impl Runtime {
     /// `Err(PlatformError)` when clipboard acquisition fails, `Ok(None)` when
     /// the clipboard is empty, and `Ok(Some(true))` when confirmation is
     /// required or `Ok(Some(false))` when the text is delivered immediately.
+    ///
+    /// The right-click mouse path records `Err` for
+    /// [`Self::last_clipboard_error`] instead of dropping it (PR #259
+    /// review); direct callers match on the `Result` themselves.
     ///
     /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
     /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
@@ -1504,6 +1637,7 @@ impl Runtime {
         let snap = self.state.snapshot();
         if snap.width == 0 || snap.height == 0 {
             self.selection = None;
+            self.pending_full_redraw = true;
             return;
         }
         let start = CellPos::new(0, 0);
@@ -1516,6 +1650,7 @@ impl Runtime {
         };
         self.selection = Some(sel);
         self.selection_dragging = false;
+        self.pending_full_redraw = true;
     }
 
     /// Converts a physical cursor position to a grid cell coordinate using
@@ -1549,14 +1684,23 @@ impl Runtime {
 
     /// Handles a mouse button event for selection or terminal mouse tracking.
     ///
-    /// Single-window vertical slice semantics (candidate Input RFC):
+    /// Single-window vertical slice semantics (candidate Input RFC, ghostty
+    /// reference `recordings/references/ghostty/src/Surface.zig`):
     /// - When mouse tracking is enabled (`1000`/`1002`/`1003`) + SGR `1006` and
-    ///   not in shift-override, the event encodes to bounded SGR bytes
-    ///   (`ESC[<b;x;yM/m`, ≤32 bytes) and is written to the PTY.
+    ///   not in shift-override, every button event encodes to bounded SGR bytes
+    ///   (`ESC[<b;x;yM/m`, ≤32 bytes) and is written to the PTY. Right/middle
+    ///   paste never fires in this path.
     /// - Holding Shift bypasses capture unconditionally to force selection
     ///   (accessibility escape).
-    /// - Otherwise the event drives presentation selection (Linux copy-on-select
-    ///   is not automatic: callers must call `copy_selection_to_clipboard`).
+    /// - Otherwise the event drives presentation selection with ghostty
+    ///   copy-on-select: left press starts a drag, left release commits it and
+    ///   auto-copies to the platform clipboard (which best-effort syncs the
+    ///   primary selection on Linux, CTX-0160); right press pastes the
+    ///   standard clipboard (Wayland-first backend) and middle press pastes
+    ///   the platform primary selection, both through the suspicious-paste
+    ///   inspection gate. All three stay fail-soft (empty source means no
+    ///   bytes, never a panic or block) but platform failures are recorded
+    ///   for [`Self::last_clipboard_error`] instead of swallowed.
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
         // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
         // Coordinates come from the last known cursor position mapped to cell
@@ -1655,7 +1799,33 @@ impl Runtime {
                         sel.active = false;
                         self.selection = Some(sel);
                     }
+                    self.pending_full_redraw = true;
                 }
+                // Ghostty copy-on-select: a committed drag auto-copies to
+                // both selections via the platform clipboard (Wayland-first,
+                // CTX-0160). Fail-soft: empty selection pastes nothing and a
+                // system clipboard error is recorded for
+                // `last_clipboard_error` while the headless buffers still
+                // update; the input path never blocks.
+                let _ = self.auto_copy_selection();
+            }
+            (MouseButton::Right, PressState::Pressed) => {
+                // Ghostty `paste` right-click action for the standard
+                // clipboard (Wayland-first via the platform backend,
+                // CTX-0160). Fail-soft: empty clipboards paste nothing and
+                // suspicious text waits on the confirmation gate; a read
+                // failure is recorded for `last_clipboard_error` instead of
+                // swallowed (PR #259 review).
+                match self.paste_from_clipboard() {
+                    Ok(_) => self.clear_clipboard_error(),
+                    Err(err) => self.record_clipboard_error(err),
+                }
+            }
+            (MouseButton::Middle, PressState::Pressed) => {
+                // Ghostty `primary-paste` middle-click action for the
+                // platform primary selection (fail-soft like right-click;
+                // read failures are recorded inside `paste_from_primary`).
+                let _ = self.paste_from_primary();
             }
             _ => {}
         }
@@ -1930,8 +2100,13 @@ impl Runtime {
     }
 
     /// Forces the clipboard into headless mode (test helper, deterministic).
+    ///
+    /// Replaces the handle (clearing both the standard and primary headless
+    /// buffers) and drops any recorded clipboard error, so tests start from
+    /// a clean seam and never touch the real clipboard or primary.
     pub fn force_headless_clipboard(&mut self) {
         self.clipboard = Clipboard::new_headless();
+        self.last_clipboard_error = None;
     }
 
     /// Allow or deny OSC 52 clipboard writes (capability-gated, default false).
@@ -3856,6 +4031,51 @@ impl Runtime {
             }
         }
 
+        // Selection highlight overlay (CTX-0158, ghostty selection rendering):
+        // presentation-only fills in the theme selection color, painted above
+        // cell backgrounds. `DrawList` paint order is fills first, then
+        // glyphs, so the highlight tints the background while text stays
+        // legible on top. Bounded: at most one rect per selected row.
+        // Skipped while the focused view is scrolled into history (the live
+        // grid selection does not map to the scrollback viewport).
+        if let Some(sel) = self.selection {
+            if !sel.is_empty() {
+                let norm = sel.normalized();
+                let scrolled = self
+                    .focused_view()
+                    .and_then(|fid| view_map.get(&fid))
+                    .map(|v| v.scroll_offset() != 0)
+                    .unwrap_or(false);
+                if !scrolled {
+                    let live = self.live_cell_metrics();
+                    let fid = self.focused_view().or(view_map.keys().next().copied());
+                    if let Some(focused_id) = fid {
+                        if let Some((_, rect)) =
+                            allocations.iter().find(|(id, _)| *id == focused_id)
+                        {
+                            let rects = bitty_render::grid::selection_fill_rects(
+                                (norm.start.row, norm.start.col),
+                                (norm.end.row, norm.end.col),
+                                snapshot.width,
+                                snapshot.height,
+                                live,
+                            );
+                            if !rects.is_empty() {
+                                let origin_px_x = rect.x as i32 * live.width as i32;
+                                let origin_px_y = rect.y as i32 * live.height as i32;
+                                for mut fill in rects {
+                                    fill.rect.x += origin_px_x;
+                                    fill.rect.y += origin_px_y;
+                                    combined_fills.push(fill);
+                                }
+                                any_needs_draw = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // IME preedit overlay: presentation-only, not state mutation. Paints atop cursor.
         if let Some(preedit) = self.ime_preedit.clone() {
             if !preedit.is_empty() && self.focused {
@@ -5245,5 +5465,260 @@ mod tests {
         let _ = rt.tick();
         assert!(rt.is_headless());
         assert!(rt.plugin_side_len() <= rt.plugin_side_capacity());
+    }
+
+    // CTX-0158 mouse selection/clipboard: ghostty semantics, headless only.
+    //
+    // Every test forces the headless clipboard seam first, so no test touches
+    // the real display server clipboard or primary. Pure/total, no fs/net.
+
+    fn mouse_headless_runtime(text: &str) -> Runtime {
+        let mut rt = make_runtime();
+        rt.force_headless_clipboard();
+        rt.handle_pty_bytes(text.as_bytes());
+        rt
+    }
+
+    fn mouse_press(button: bitty_platform::MouseButton) -> bitty_platform::MouseEvent {
+        bitty_platform::MouseEvent {
+            button,
+            state: PressState::Pressed,
+        }
+    }
+
+    fn mouse_release(button: bitty_platform::MouseButton) -> bitty_platform::MouseEvent {
+        bitty_platform::MouseEvent {
+            button,
+            state: PressState::Released,
+        }
+    }
+
+    #[test]
+    fn left_release_auto_copies_to_clipboard_and_primary() {
+        let mut rt = mouse_headless_runtime("hello world");
+        assert_eq!(rt.clipboard().headless_contents(), "");
+        assert_eq!(rt.primary_contents(), "");
+        // Drag cells (0,0)..(0,4) = "hello" via the mouse path.
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Left));
+        rt.handle_cursor_moved(CursorPosition {
+            x: 8.0 * 4.0,
+            y: 0.0,
+        });
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        assert!(!rt.is_selection_dragging());
+        assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+        // Ghostty copy-on-select: both clipboards hold the selection.
+        assert_eq!(rt.clipboard().headless_contents(), "hello");
+        assert_eq!(rt.primary_contents(), "hello");
+        // A successful copy clears any recorded clipboard failure.
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn left_release_auto_copy_overwrites_divergent_primary() {
+        // Regression pin for the live Wayland gap (select-in-bitty never
+        // reached `wl-paste --primary`): `auto_copy_selection` must replace
+        // a stale/divergent primary with the new selection, not just write
+        // the regular clipboard. The write itself is delivered by the
+        // platform layer's wl-copy-first primary sync (CTX-0160 as fixed
+        // here); the headless seam proves the contract deterministically.
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("zz".to_string())
+            .expect("headless set");
+        rt.set_primary_text("pq".to_string());
+        assert_eq!(rt.clipboard().headless_contents(), "zz");
+        assert_eq!(rt.primary_contents(), "pq");
+        // Drag cells (0,0)..(0,4) = "hello" via the mouse path.
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Left));
+        rt.handle_cursor_moved(CursorPosition {
+            x: 8.0 * 4.0,
+            y: 0.0,
+        });
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+        assert_eq!(rt.clipboard().headless_contents(), "hello");
+        assert_eq!(rt.primary_contents(), "hello");
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn left_release_without_drag_copies_nothing() {
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Left));
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        assert!(!rt.has_selection());
+        assert_eq!(rt.clipboard().headless_contents(), "");
+        assert_eq!(rt.primary_contents(), "");
+    }
+
+    #[test]
+    fn right_click_pastes_clipboard_bytes() {
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("hi".to_string())
+            .expect("headless set");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(!rt.has_pending_paste(), "clean paste needs no confirm");
+        assert_eq!(rt.pending_input(), b"hi");
+        // A successful read leaves no recorded clipboard failure.
+        assert!(rt.last_clipboard_error().is_none());
+        // Release is a no-op: exactly one paste per click.
+        rt.handle_mouse_input(mouse_release(MouseButton::Right));
+        assert_eq!(rt.pending_input(), b"hi");
+    }
+
+    #[test]
+    fn right_click_with_empty_clipboard_pastes_nothing_without_error() {
+        let mut rt = mouse_headless_runtime("hello world");
+        assert!(rt.last_clipboard_error().is_none());
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(rt.pending_input().is_empty());
+        assert!(!rt.has_pending_paste());
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn middle_click_pastes_primary_bytes() {
+        let mut rt = mouse_headless_runtime("hello world");
+        // Standard clipboard holds something else: middle must read primary.
+        // Order matters: the platform `set_text` best-effort syncs the
+        // primary selection (CTX-0160 ghostty copy-on-select), so stage the
+        // standard clipboard first and the primary second.
+        rt.clipboard_mut()
+            .set_text("zz".to_string())
+            .expect("headless set");
+        rt.set_primary_text("pq".to_string());
+        assert_eq!(rt.clipboard().headless_contents(), "zz");
+        assert_eq!(rt.primary_contents(), "pq");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+        assert!(!rt.has_pending_paste());
+        assert_eq!(rt.pending_input(), b"pq");
+        assert!(rt.last_clipboard_error().is_none());
+        rt.handle_mouse_input(mouse_release(MouseButton::Middle));
+        assert_eq!(rt.pending_input(), b"pq");
+        // Right-click still reads the standard clipboard, not primary.
+        rt.drain_pending_input();
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(!rt.has_pending_paste());
+        assert_eq!(rt.pending_input(), b"zz");
+    }
+
+    #[test]
+    fn clipboard_copy_syncs_primary_like_ghostty() {
+        // Platform CTX-0160 contract through the runtime seam: a standard
+        // clipboard write also lands in the primary selection, so a
+        // left-drag auto-copy is middle-pasteable without a second write.
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("synced".to_string())
+            .expect("headless set");
+        assert_eq!(rt.primary_contents(), "synced");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+        assert_eq!(rt.pending_input(), b"synced");
+    }
+
+    #[test]
+    fn middle_click_with_empty_primary_pastes_nothing() {
+        // Fresh headless seam: both buffers start empty, so the primary read
+        // succeeds empty (no error recorded) and pastes nothing.
+        let mut rt = mouse_headless_runtime("hello world");
+        assert_eq!(rt.primary_contents(), "");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+        assert!(rt.pending_input().is_empty());
+        assert!(!rt.has_pending_paste());
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn suspicious_right_paste_waits_for_confirmation() {
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.clipboard_mut()
+            .set_text("a\nb".to_string())
+            .expect("headless set");
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert!(rt.has_pending_paste(), "newline paste needs confirm");
+        assert!(rt.pending_input().is_empty(), "no silent delivery");
+        assert!(rt.confirm_pending_paste(true));
+        assert_eq!(rt.pending_input(), b"a\nb");
+    }
+
+    #[test]
+    fn capture_mode_reports_sgr_and_never_pastes() {
+        let mut rt = mouse_headless_runtime("hello world");
+        rt.handle_pty_bytes(b"\x1b[?1000h");
+        rt.handle_pty_bytes(b"\x1b[?1006h");
+        rt.clipboard_mut()
+            .set_text("clip".to_string())
+            .expect("headless set");
+        rt.set_primary_text("prim".to_string());
+        rt.drain_pending_input();
+        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        // Right press in capture must report SGR, not paste.
+        rt.handle_mouse_input(mouse_press(MouseButton::Right));
+        assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M");
+        assert!(!rt.has_pending_paste());
+        assert!(!rt.has_selection(), "capture must not select");
+        // Middle press likewise reports its own button code.
+        rt.handle_mouse_input(mouse_press(MouseButton::Middle));
+        assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M\x1b[<1;1;1M");
+        assert!(!rt.has_pending_paste());
+        // Left release in capture reports SGR and never auto-copies.
+        rt.handle_mouse_input(mouse_release(MouseButton::Left));
+        assert_eq!(rt.pending_input(), b"\x1b[<2;1;1M\x1b[<1;1;1M\x1b[<0;1;1m");
+        assert_eq!(rt.clipboard().headless_contents(), "clip");
+        assert_eq!(rt.primary_contents(), "prim");
+        assert!(rt.last_clipboard_error().is_none());
+    }
+
+    #[test]
+    fn selection_highlight_renders_end_to_end() {
+        // Render-side primitive: one opaque row rect in the theme color.
+        let cell = bitty_render::grid::CellMetrics::new(8, 16).expect("non-zero cell");
+        let single = bitty_render::grid::selection_fill_rects((0, 0), (0, 4), 80, 24, cell);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].color, bitty_render::grid::selection_fill());
+        assert_eq!(single[0].rect.x, 0);
+        assert_eq!(single[0].rect.y, 0);
+        assert_eq!(single[0].rect.width, 5 * 8);
+        assert_eq!(single[0].rect.height, 16);
+        // Multi-row spans one rect per row, row-major.
+        let multi = bitty_render::grid::selection_fill_rects((0, 1), (1, 1), 80, 24, cell);
+        assert_eq!(multi.len(), 2);
+        assert!(
+            multi
+                .iter()
+                .all(|f| f.color == bitty_render::grid::selection_fill())
+        );
+        // Collapsed and empty grids paint nothing.
+        assert!(bitty_render::grid::selection_fill_rects((2, 2), (2, 2), 80, 24, cell).is_empty());
+        assert!(bitty_render::grid::selection_fill_rects((0, 0), (0, 4), 0, 24, cell).is_empty());
+
+        // Runtime end-to-end: a committed selection forces the next tick to
+        // present (selection-only changes bump the generation gate via
+        // pending_full_redraw, otherwise the highlight would never paint).
+        let mut rt = mouse_headless_runtime("hello world");
+        assert!(rt.tick().is_some(), "first tick presents");
+        assert_eq!(rt.tick(), None, "idle with no changes");
+        rt.start_selection(bitty_ui::CellPos::new(0, 0));
+        rt.end_selection(bitty_ui::CellPos::new(0, 4));
+        let stats = rt.tick().expect("selection must force a present");
+        assert!(stats.fills > 0);
+        assert!(rt.headless_rgba().is_some());
     }
 }

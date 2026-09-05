@@ -70,11 +70,16 @@
 //!
 //! # Precedence
 //!
-//! `CLI > file > defaults`: the file yields a [`LayerKind::User`] plan, an
-//! explicit `--theme` CLI flag yields a [`LayerKind::Cli`] plan, and
+//! `CLI > file > profile > defaults`: the file yields a [`LayerKind::User`]
+//! plan, the named profile (`--profile` / `BITTY_PROFILE`, CTX-0169) yields a
+//! [`LayerKind::Profile`] plan UNDER the file (`init.lua` still wins over
+//! it), an explicit `--theme` CLI flag yields a [`LayerKind::Cli`] plan, and
 //! [`merge_layers`](crate::merge_layers) sorts by precedence so the CLI wins.
-//! Missing files are not errors for the default probe (bare `bitty` keeps
-//! working); a missing **explicit** `--config` path is an error.
+//! `BITTY_CONFIG` (path) and `BITTY_PROFILE` (name) env overrides sit between
+//! CLI flags and files (CLI wins over env). Missing files are not errors for
+//! the default probe (bare `bitty` keeps working); a missing **explicit**
+//! `--config`/`BITTY_CONFIG` path or a requested-but-missing profile is an
+//! error (fail-closed, no fallback guessing).
 
 use std::path::{Path, PathBuf};
 
@@ -95,6 +100,13 @@ pub const INIT_LUA_NAME: &str = "init.lua";
 
 /// Fallback alias accepted when `init.lua` is absent (wezterm-style name).
 pub const FALLBACK_LUA_NAME: &str = "config.lua";
+
+/// Directory under the config root holding named profiles
+/// (`$XDG_CONFIG_HOME/bitty/profiles/<name>.lua`, CTX-0169 / #271).
+pub const PROFILES_DIR_NAME: &str = "profiles";
+
+/// Maximum profile name length (fail-closed; keeps paths bounded).
+pub const MAX_PROFILE_NAME_LEN: usize = 64;
 
 /// Maximum config file size in bytes (fail-closed).
 pub const MAX_CONFIG_FILE_BYTES: usize = 64 * 1024;
@@ -244,30 +256,202 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 /// the file/default wins). Otherwise returns a [`LayerKind::Cli`] plan that
 /// [`crate::merge_layers`] orders above the file layer. Validation happens at
 /// merge time (overlong names fail closed there).
+///
+/// CTX-0180 extension point: appearance CLI overrides (`--font-family`,
+/// `--font-size`, `--opacity`) should extend [`CliOverrides`] /
+/// [`resolve_effective_full`] (one `Cli` plan carrying every present CLI
+/// field), keeping this single-field helper as a thin delegate.
 #[must_use]
 pub fn cli_theme_layer(theme: Option<&str>) -> Option<LayeredPlan> {
-    let raw = theme?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let plan = ConfigPlan {
-        appearance: Some(AppearanceConfig {
-            theme: Some(trimmed.to_string()),
-        }),
-        schema_version: Some(CURRENT_SCHEMA_VERSION),
-        ..Default::default()
+    let overrides = CliOverrides {
+        theme: theme
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
     };
-    Some(LayeredPlan::new(
-        ConfigSource::new(LayerKind::Cli, Some("cli:--theme")),
-        plan,
-    ))
+    overrides.to_layer()
+}
+
+/// CLI overrides collected from flags (CTX-0169; extended by CTX-0180).
+///
+/// Today this carries only `theme` (`--theme`); CTX-0180 adds
+/// `font_family` / `font_size` / `opacity` here so the whole CLI layer stays
+/// one [`LayerKind::Cli`] plan built by [`CliOverrides::to_layer`] and merged
+/// by [`resolve_effective_full`]. Pure data; no env/filesystem access.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CliOverrides {
+    /// CLI theme override (`--theme`).
+    pub theme: Option<String>,
+}
+
+impl CliOverrides {
+    /// True when no CLI field is set (no `Cli` layer is built).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.theme.as_deref().is_none_or(|t| t.trim().is_empty())
+    }
+
+    /// Builds the single [`LayerKind::Cli`] plan for every present field.
+    ///
+    /// Returns `None` when empty (no override). Validation happens at merge
+    /// time (overlong names fail closed there).
+    #[must_use]
+    pub fn to_layer(&self) -> Option<LayeredPlan> {
+        let trimmed = self.theme.as_deref()?.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let plan = ConfigPlan {
+            appearance: Some(AppearanceConfig {
+                theme: Some(trimmed.to_string()),
+            }),
+            schema_version: Some(CURRENT_SCHEMA_VERSION),
+            ..Default::default()
+        };
+        Some(LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli:--theme")),
+            plan,
+        ))
+    }
+}
+
+/// Resolves the explicit config-file override: CLI `--config` wins over
+/// `BITTY_CONFIG` env (CTX-0169 / #271). Pure over injected values so tests
+/// stay hermetic: trims, treats `None`/empty/whitespace as absent.
+///
+/// The caller probes the returned path verbatim (explicit, fail-closed when
+/// missing); `None` means run the default XDG probe.
+#[must_use]
+pub fn resolve_config_explicit(cli: Option<&str>, env: Option<&str>) -> Option<String> {
+    for raw in [cli, env].into_iter().flatten() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Resolves the requested profile name: CLI `--profile` wins over
+/// `BITTY_PROFILE` env (CTX-0169 / #271). Pure over injected values:
+/// trims, treats `None`/empty/whitespace as absent (no profile).
+///
+/// Validation (allowed charset, fail-closed missing file) happens in
+/// [`validate_profile_name`] / [`profile_file_path_with_env`].
+#[must_use]
+pub fn resolve_profile_request(cli: Option<&str>, env: Option<&str>) -> Option<String> {
+    for raw in [cli, env].into_iter().flatten() {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Validates a `--profile` / `BITTY_PROFILE` name (CTX-0169, fail-closed).
+///
+/// Allowed: `1..=MAX_PROFILE_NAME_LEN` chars of `[A-Za-z0-9_-]` only.
+/// Rejects empty/whitespace, path separators, dots, and traversal (`..`,
+/// `/`, `\`) so the name always maps to exactly one file
+/// `profiles/<name>.lua` under the config root. Returns the trimmed name.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidInput`] naming the problem without echoing more
+/// than the offending name.
+pub fn validate_profile_name(name: &str) -> Result<String, ConfigError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::InvalidInput {
+            message: "profile name must be non-empty".to_string(),
+        });
+    }
+    if trimmed.len() > MAX_PROFILE_NAME_LEN {
+        return Err(ConfigError::InvalidInput {
+            message: format!(
+                "profile name exceeds {MAX_PROFILE_NAME_LEN} chars ({} chars)",
+                trimmed.len()
+            ),
+        });
+    }
+    let ok = trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        return Err(ConfigError::InvalidInput {
+            message: format!(
+                "invalid profile name '{trimmed}': use [A-Za-z0-9_-] only (no paths, no extensions)"
+            ),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Config root directory (`$XDG_CONFIG_HOME/bitty` or `~/.config/bitty`)
+/// with injected environment values. Returns `None` only when neither
+/// yields a usable root (no panic).
+#[must_use]
+pub fn config_dir_with_env(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(CONFIG_DIR_NAME));
+        }
+    }
+    if let Some(h) = home {
+        let trimmed = h.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(".config").join(CONFIG_DIR_NAME));
+        }
+    }
+    None
+}
+
+/// Pure profile path for `name` with injected environment values
+/// (CTX-0169): `<config-dir>/profiles/<name>.lua`.
+///
+/// `XDG_CONFIG_DIRS` (system-wide) is never consulted: profiles are
+/// user-level (`$XDG_CONFIG_HOME`, fallback `~/.config`).
+///
+/// # Errors
+///
+/// - Invalid name from [`validate_profile_name`] (fail-closed).
+/// - No usable config root (neither `$XDG_CONFIG_HOME` nor `$HOME` set).
+pub fn profile_file_path_with_env(
+    name: &str,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
+    let valid = validate_profile_name(name)?;
+    let dir =
+        config_dir_with_env(xdg_config_home, home).ok_or_else(|| ConfigError::InvalidInput {
+            message: "no config root ($XDG_CONFIG_HOME or $HOME unset)".to_string(),
+        })?;
+    Ok(dir.join(PROFILES_DIR_NAME).join(format!("{valid}.lua")))
+}
+
+/// Reads the live environment (`$XDG_CONFIG_HOME`, `$HOME`) for the profile
+/// path. Thin wrapper so unit tests stay hermetic (see
+/// [`profile_file_path_with_env`]).
+///
+/// # Errors
+///
+/// Same as [`profile_file_path_with_env`].
+pub fn profile_file_path(name: &str) -> Result<PathBuf, ConfigError> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    profile_file_path_with_env(name, xdg.as_deref(), home.as_deref())
 }
 
 /// Merges an optional file (User) layer with an optional `--theme` CLI layer
 /// into the effective config. Pure and headless: precedence is `CLI > file >
 /// defaults` via [`crate::merge_layers`] (empty layers merge to core
 /// defaults with attribution).
+///
+/// Kept for back-compat (CTX-0148 callers + CTX-0180 rebase): delegates to
+/// [`resolve_effective_full`] with no profile layer. New code should call
+/// [`resolve_effective_full`] directly.
 ///
 /// # Errors
 ///
@@ -277,12 +461,48 @@ pub fn resolve_effective(
     file: Option<LayeredPlan>,
     cli_theme: Option<&str>,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
+    let cli = CliOverrides {
+        theme: cli_theme
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    };
+    resolve_effective_full(file, None, &cli)
+}
+
+/// Merges optional profile + file (User) layers with CLI overrides into the
+/// effective config (CTX-0169). Pure and headless.
+///
+/// Precedence (per `lua-and-xdg.md` §Layers and #271): `CLI > user file >
+/// profile > defaults` via [`crate::merge_layers`] — the merge sorts by
+/// [`LayerKind::precedence`] (`Cli 70 > User 50 > Profile 40`), so input
+/// order never matters. The profile composes the base; `init.lua` (or the
+/// explicit `--config`/`BITTY_CONFIG` file) still wins over it; `--theme`
+/// wins over both. Empty layers merge to core defaults with attribution.
+///
+/// # Errors
+///
+/// Returns the first [`ConfigError`] from validation or merge (including
+/// policy violations, which remain hard errors here).
+pub fn resolve_effective_full(
+    file: Option<LayeredPlan>,
+    profile: Option<LayeredPlan>,
+    cli: &CliOverrides,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
     let mut layers = Vec::new();
+    if let Some(p) = profile {
+        debug_assert_eq!(
+            p.source.layer,
+            LayerKind::Profile,
+            "profile layer must use LayerKind::Profile"
+        );
+        layers.push(p);
+    }
     if let Some(f) = file {
         layers.push(f);
     }
-    if let Some(cli) = cli_theme_layer(cli_theme) {
-        layers.push(cli);
+    if let Some(cli_layer) = cli.to_layer() {
+        layers.push(cli_layer);
     }
     crate::merge::merge_layers(layers)
 }
@@ -539,12 +759,13 @@ fn shape_error_to_config_error(message: &str, src_desc: &str) -> ConfigError {
     }
 }
 
-/// Loads, evaluates, validates, and migrates a user config file into a
+/// Loads, evaluates, validates, and migrates a Lua config file into a
 /// [`LayerKind::User`] plan.
 ///
 /// The file **must** exist; missing files are the caller's decision (default
-/// probe skips, explicit `--config` fails). Oversize/unreadable/budget- or
-/// shape-invalid files fail closed with [`ConfigError`] (no panic).
+/// probe skips, explicit `--config`/`BITTY_CONFIG` fails). Oversize/
+/// unreadable/budget- or shape-invalid files fail closed with [`ConfigError`]
+/// (no panic).
 ///
 /// # Errors
 ///
@@ -552,6 +773,29 @@ fn shape_error_to_config_error(message: &str, src_desc: &str) -> ConfigError {
 ///   budget-exceeding files.
 /// - Parser/validation errors from [`parse_lua_config`].
 pub fn load_user_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
+    load_layer_with_kind(path, LayerKind::User)
+}
+
+/// Loads, evaluates, validates, and migrates a named-profile file into a
+/// [`LayerKind::Profile`] plan (CTX-0169).
+///
+/// Same bounds and fail-closed posture as [`load_user_layer`]; the only
+/// difference is the layer kind (precedence `Profile 40 < User 50`, so
+/// `init.lua` still wins over the profile per `lua-and-xdg.md` §Layers).
+/// The file **must** exist; a missing profile fails closed at the caller
+/// (no silent fallback, exit 2).
+///
+/// # Errors
+///
+/// Same as [`load_user_layer`].
+pub fn load_profile_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
+    load_layer_with_kind(path, LayerKind::Profile)
+}
+
+/// Shared Lua-file loader behind [`load_user_layer`] and
+/// [`load_profile_layer`]: size-bounded read, sandboxed [`parse_lua_config`],
+/// [`crate::migration::migrate`], tagged with `kind`.
+fn load_layer_with_kind(path: &Path, kind: LayerKind) -> Result<LayeredPlan, ConfigError> {
     let meta = std::fs::metadata(path).map_err(|e| ConfigError::InvalidInput {
         message: format!("cannot read config '{}': {e}", path.display()),
     })?;
@@ -578,7 +822,7 @@ pub fn load_user_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
             ),
         });
     }
-    let source = ConfigSource::new(LayerKind::User, Some(path.display().to_string()));
+    let source = ConfigSource::new(kind, Some(path.display().to_string()));
     let plan = parse_lua_config(&content, &source)?;
     let migrated = crate::migration::migrate(plan)?;
     Ok(LayeredPlan::new(source, migrated))
@@ -935,5 +1179,200 @@ mod tests {
     fn load_missing_file_fails_closed() {
         let path = Path::new("/nonexistent-bitty-ctx0148/init.lua");
         assert!(load_user_layer(path).is_err());
+    }
+
+    // CTX-0169 named profiles: precedence CLI > user file > profile >
+    // defaults, plus fail-closed validation.
+
+    #[test]
+    fn profile_name_validation_accepts_simple_names() {
+        assert_eq!(validate_profile_name("work").unwrap(), "work");
+        assert_eq!(
+            validate_profile_name("  coding-2_x ").unwrap(),
+            "coding-2_x"
+        );
+    }
+
+    #[test]
+    fn profile_name_validation_rejects_paths_and_empty() {
+        for bad in [
+            "",
+            "   ",
+            "work.lua",
+            "a/b",
+            "a\\b",
+            "..",
+            "../work",
+            "work..",
+            "a.b",
+            ".hidden",
+            "with space",
+            "semi;colon",
+        ] {
+            assert!(validate_profile_name(bad).is_err(), "must reject {bad:?}");
+        }
+        let long = "x".repeat(MAX_PROFILE_NAME_LEN + 1);
+        assert!(validate_profile_name(&long).is_err());
+    }
+
+    #[test]
+    fn profile_path_resolves_under_config_root() {
+        let p = profile_file_path_with_env("work", Some("/xdg"), Some("/h")).expect("xdg wins");
+        assert_eq!(p, PathBuf::from("/xdg/bitty/profiles/work.lua"));
+        let p =
+            profile_file_path_with_env("work", Some("  "), Some("/home/u")).expect("home fallback");
+        assert_eq!(p, PathBuf::from("/home/u/.config/bitty/profiles/work.lua"));
+        assert!(profile_file_path_with_env("work", None, None).is_err());
+        assert!(profile_file_path_with_env("../evil", Some("/xdg"), Some("/h")).is_err());
+    }
+
+    #[test]
+    fn resolve_explicit_prefers_cli_over_env() {
+        assert_eq!(
+            resolve_config_explicit(Some("/cli.lua"), Some("/env.lua")).as_deref(),
+            Some("/cli.lua")
+        );
+        assert_eq!(
+            resolve_config_explicit(None, Some("/env.lua")).as_deref(),
+            Some("/env.lua")
+        );
+        assert_eq!(
+            resolve_config_explicit(Some("  "), Some("/env.lua")).as_deref(),
+            Some("/env.lua")
+        );
+        assert_eq!(resolve_config_explicit(None, None), None);
+        assert_eq!(resolve_config_explicit(Some("  "), Some(" ")), None);
+    }
+
+    #[test]
+    fn resolve_profile_request_prefers_cli_over_env() {
+        assert_eq!(
+            resolve_profile_request(Some("cli"), Some("env")).as_deref(),
+            Some("cli")
+        );
+        assert_eq!(
+            resolve_profile_request(None, Some("env")).as_deref(),
+            Some("env")
+        );
+        assert_eq!(
+            resolve_profile_request(Some("  "), Some("env")).as_deref(),
+            Some("env")
+        );
+        assert_eq!(resolve_profile_request(None, None), None);
+        assert_eq!(resolve_profile_request(Some(" "), Some("  ")), None);
+    }
+
+    #[test]
+    fn cli_overrides_build_single_cli_layer() {
+        let empty = CliOverrides::default();
+        assert!(empty.is_empty());
+        assert!(empty.to_layer().is_none());
+        let cli = CliOverrides {
+            theme: Some("dark".to_string()),
+        };
+        assert!(!cli.is_empty());
+        let layer = cli.to_layer().expect("layer");
+        assert_eq!(layer.source.layer, LayerKind::Cli);
+    }
+
+    fn profile_layer_for(content: &str) -> LayeredPlan {
+        let src = ConfigSource::new(LayerKind::Profile, Some("profiles/work.lua"));
+        let plan = parse_lua_config(content, &src).expect("profile parses");
+        LayeredPlan::new(src, plan)
+    }
+
+    #[test]
+    fn profile_precedence_user_over_profile_over_default() {
+        // Profile alone beats defaults.
+        let profile = profile_layer_for(r#"return { theme = "dark" }"#);
+        let cli = CliOverrides::default();
+        let merged =
+            resolve_effective_full(None, Some(profile.clone()), &cli).expect("profile>default");
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::Profile
+        );
+        // User file wins over the profile base.
+        let user_src = test_source();
+        let user_plan =
+            parse_lua_config(r#"return { theme = "bitty-dark" }"#, &user_src).expect("user");
+        let user = LayeredPlan::new(user_src, user_plan);
+        let merged =
+            resolve_effective_full(Some(user), Some(profile.clone()), &cli).expect("user>profile");
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("bitty-dark")
+        );
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::User
+        );
+        // CLI wins over both.
+        let cli = CliOverrides {
+            theme: Some("cli-theme".to_string()),
+        };
+        // Overlong CLI themes fail closed at merge (same as --theme today).
+        let long = CliOverrides {
+            theme: Some("x".repeat(65)),
+        };
+        assert!(resolve_effective_full(None, Some(profile), &long).is_err());
+        let user_src2 = test_source();
+        let user_plan2 =
+            parse_lua_config(r#"return { theme = "dark" }"#, &user_src2).expect("user2");
+        let user2 = LayeredPlan::new(user_src2, user_plan2);
+        let profile2 = profile_layer_for(r#"return { theme = "dark" }"#);
+        let merged = resolve_effective_full(Some(user2), Some(profile2), &cli).expect("cli wins");
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("cli-theme")
+        );
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::Cli
+        );
+    }
+
+    #[test]
+    fn profile_deep_merge_composes_with_user() {
+        // Profile sets the font, user sets the theme: both survive (deep
+        // merge across layers, not whole-file replacement).
+        let profile = profile_layer_for(r#"return { font = { family = "Mono", size = 12 } }"#);
+        let user_src = test_source();
+        let user_plan = parse_lua_config(r#"return { theme = "dark" }"#, &user_src).expect("user");
+        let user = LayeredPlan::new(user_src, user_plan);
+        let merged = resolve_effective_full(Some(user), Some(profile), &CliOverrides::default())
+            .expect("compose");
+        assert_eq!(merged.effective.font.family, "Mono");
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            merged.source_of("font.family").unwrap().layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn load_profile_layer_tags_profile_kind() {
+        let dir = std::env::temp_dir().join(format!("bitty-ctx0169-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("work.lua");
+        std::fs::write(&path, r#"return { theme = "dark" }"#).expect("write temp profile");
+        let layer = load_profile_layer(&path).expect("load");
+        assert_eq!(layer.source.layer, LayerKind::Profile);
+        assert_eq!(
+            layer.plan.appearance.unwrap().theme.as_deref(),
+            Some("dark")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_profile_fails_closed() {
+        let path = Path::new("/nonexistent-bitty-ctx0169/profiles/ghost.lua");
+        assert!(load_profile_layer(path).is_err());
     }
 }

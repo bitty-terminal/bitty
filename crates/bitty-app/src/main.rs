@@ -26,7 +26,7 @@
 //!    `~/.config/bitty/init.lua`, then `config.lua`), evaluate the
 //!    wezterm-style return table in the `bitty-lua` sandbox via
 //!    `bitty-config::file` (never executed as code), validate/migrate/merge
-//!    with precedence `CLI (`--theme`) > file > defaults`. Invalid files
+//!    with precedence `CLI (`--theme`) > file > profile > defaults`. Invalid files
 //!    fail closed (clear stderr, exit 2, no panic, no silent ignore); a
 //!    missing default-path file simply yields defaults.
 //! 3. **Create [`Runtime`](bitty_runtime::Runtime)** via
@@ -345,12 +345,23 @@ struct Args {
     layout: Option<String>,
     /// Raw focus spec (from `--focus`), e.g. "next", "prev", "up", "1".
     focus: Option<String>,
-    /// Explicit config file path (from `--config`). When `None` the default
-    /// XDG path is probed (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
+    /// Explicit config file path (from `--config`). When `None` the
+    /// `BITTY_CONFIG` env override is honored next, else the default XDG
+    /// path is probed (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
     /// `~/.config/bitty/init.lua`, then `config.lua`); see `bitty-config::file`.
     config_path: Option<String>,
-    /// CLI theme override (from `--theme`). Wins over the config file, which
-    /// wins over defaults (`CLI > file > defaults` via `bitty-config` merge).
+    /// Named profile (from `--profile`, else `BITTY_PROFILE` env).
+    /// Loads `$XDG_CONFIG_HOME/bitty/profiles/<name>.lua` as the
+    /// [`LayerKind::Profile`](bitty_config::LayerKind::Profile) base UNDER
+    /// the user file (`init.lua` still wins; `--theme` wins over both).
+    /// Missing/invalid profiles fail closed (exit 2, no fallback).
+    /// CTX-0180 note: keep this + `config_path`/`theme` resolution in
+    /// [`load_merged_config`] so appearance CLI overrides rebase cleanly.
+    profile: Option<String>,
+    /// CLI theme override (from `--theme`). Wins over the config file and the
+    /// named profile, which win over defaults
+    /// (`CLI > file > profile > defaults` via `bitty-config` merge;
+    /// see [`load_merged_config`] for the CTX-0180 extension point).
     theme: Option<String>,
     /// `bitty config <verb>` subcommand (CLI-first management per DEC-0007).
     /// `None` means normal terminal startup. A program literally named
@@ -419,6 +430,7 @@ impl Args {
             layout: None,
             focus: None,
             config_path: None,
+            profile: None,
             theme: None,
             config_cmd: None,
             config_word: false,
@@ -624,8 +636,13 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 /// - `--layout SPEC` → explicit layout spec (single, split:h[:ratio], stack[:n], overlay[:x,y,w,h])
 /// - `--focus SPEC` → focus (next|prev|up|down|left|right|<id>)
 /// - `--config PATH` → explicit user config file (`init.lua`); when omitted
-///   the XDG default is probed (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
+///   `BITTY_CONFIG` env is honored next, else the XDG default is probed
+///   (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback
 ///   `~/.config/bitty/init.lua`, then `config.lua` alias)
+/// - `--profile NAME` → named profile
+///   (`$XDG_CONFIG_HOME/bitty/profiles/<name>.lua`, else `BITTY_PROFILE`
+///   env); layered UNDER the user file (`init.lua` still wins), `--theme`
+///   wins over both. Missing profiles fail closed (exit 2).
 /// - `--theme NAME` → CLI theme override (wins over config file, which wins
 ///   over defaults; see `bitty-config::file::resolve_effective`)
 /// - `-v` / `--verbose` → emit per-frame `bitty tick` stats (CTX-0190;
@@ -717,6 +734,16 @@ fn parse_args(raw: &[String]) -> Args {
                 eprintln!("warning: --config needs a file path — ignoring");
             } else {
                 out.config_path = Some(val.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--profile=") {
+            let val = token.trim_start_matches("--profile=");
+            if val.trim().is_empty() {
+                eprintln!("warning: --profile needs a profile name — ignoring");
+            } else {
+                out.profile = Some(val.to_string());
             }
             i += 1;
             continue;
@@ -838,6 +865,15 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                 }
             }
+            "--profile" => {
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.profile = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --profile needs a profile name — ignoring");
+                    i += 1;
+                }
+            }
             "--theme" => {
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.theme = Some(raw[i + 1].clone());
@@ -951,10 +987,19 @@ fn help_text() -> String {
            \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20stack[:N] | overlay[:X,Y,W,H]  (overrides --split/--stack/--overlay)\n  \
                --focus SPEC Focus: next|prev|up|down|left|right|<id> (e.g. --focus next, --focus 2)\n  \
                --config PATH  Explicit user config file (init.lua). When omitted\n  \
-                            the XDG default is probed ($XDG_CONFIG_HOME/bitty/init.lua,\n  \
+                            BITTY_CONFIG is honored next, else the XDG default\n  \
+                            is probed ($XDG_CONFIG_HOME/bitty/init.lua,\n  \
                             fallback ~/.config/bitty/init.lua, then config.lua alias).\n  \
                             Invalid files fail closed (clear stderr, exit non-zero,\n  \
                             no panic).\n  \
+               --profile NAME Named profile ($XDG_CONFIG_HOME/bitty/profiles/<name>.lua,\n  \
+                            else BITTY_PROFILE). Layered UNDER the user file\n  \
+                            (init.lua still wins; --theme wins over both).\n  \
+                            Missing profiles fail closed (exit 2, no fallback).\n  \
+                            With --config + --profile together both layers load\n  \
+                            (explicit file wins) with a stderr warning.\n  \
+                            Env: BITTY_CONFIG (path), BITTY_PROFILE (name).\n  \
+                            Precedence: CLI flags > BITTY_* env > file+profile > defaults.\n  \
                --theme NAME   CLI theme override (e.g. --theme dark). Wins over the\n  \
                             config file, which wins over defaults.\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
@@ -1033,36 +1078,77 @@ fn version_text() -> String {
 /// Owned result of loading the effective user configuration.
 ///
 /// `source` is `"cli"` when `--theme` overrode, `"file"` when the config file
-/// provided the theme, else `"default"`. The resolved `theme` preset is the
-/// single `bitty-config` registry entry the window renders.
+/// provided the theme, `"profile"` when the named profile provided it, else
+/// `"default"`. The resolved `theme` preset is the single `bitty-config`
+/// registry entry the window renders.
 struct AppConfig {
-    /// Merged effective config (`CLI > file > defaults`).
+    /// Merged effective config (`CLI > file > profile > defaults`).
     effective: bitty_config::EffectiveConfig,
     /// Config file path that was used, if any.
     file_path: Option<std::path::PathBuf>,
+    /// Requested profile name (`--profile` over `BITTY_PROFILE`), if any.
+    profile_name: Option<String>,
+    /// Profile file path that was used, if any.
+    profile_path: Option<std::path::PathBuf>,
     /// Resolved theme preset (static registry entry).
     theme: &'static bitty_config::theme::Theme,
     /// How the theme resolved (Default/Named/FallbackUnknown).
     resolution: bitty_config::theme::ThemeResolution,
-    /// `"cli"` / `"file"` / `"default"`: which layer provided the theme.
+    /// `"cli"` / `"file"` / `"profile"` / `"default"`: which layer won the theme.
     source: &'static str,
 }
 
-/// Shared probe + load + merge behind startup and `config check`.
+/// Resolved configuration bundle behind startup and `config check`.
+struct LoadedConfig {
+    /// Merged effective config.
+    merged: bitty_config::MergedConfig,
+    /// Probed user file (explicit or default), if a root exists.
+    probed: Option<bitty_config::file::ProbedConfig>,
+    /// Requested profile name (`--profile` over `BITTY_PROFILE`), if any.
+    profile_name: Option<String>,
+    /// Profile file that was loaded, if any.
+    profile_path: Option<std::path::PathBuf>,
+}
+
+/// Shared probe + load + merge behind startup and `config check` (CTX-0169).
 ///
-/// Returns the merged layers plus the probed path (if any). impure
-/// (filesystem + env); total (all failures become `Err(String)`).
-fn load_merged_config(
-    args: &Args,
-) -> Result<
-    (
-        bitty_config::MergedConfig,
-        Option<bitty_config::file::ProbedConfig>,
-    ),
-    String,
-> {
-    let explicit = args.config_path.as_deref();
-    let probed = bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty()));
+/// Resolution (per #271 and `lua-and-xdg.md` §Layers):
+/// - User file: `--config` CLI wins over `BITTY_CONFIG` env, else the XDG
+///   default probe (`init.lua`, then `config.lua` alias, then canonical
+///   `init.lua`). Missing default-probe files yield defaults; missing
+///   explicit (`--config`/`BITTY_CONFIG`) files fail closed.
+/// - Profile: `--profile` CLI wins over `BITTY_PROFILE` env, loaded from
+///   `$XDG_CONFIG_HOME/bitty/profiles/<name>.lua` as the `Profile` layer
+///   UNDER the user file (`init.lua` still wins; `--theme` wins over both).
+///   Requested-but-missing/invalid profiles fail closed (no fallback).
+/// - Merge: `CLI (--theme) > user file > profile > defaults` via
+///   `bitty-config::file::resolve_effective_full` (merge sorts by
+///   `LayerKind::precedence`, never by load order).
+/// - `--config` + `--profile` together: both layers load (explicit file wins
+///   over the profile, same as `init.lua` over profile) with a stderr warning.
+///
+/// CTX-0180 note: CLI appearance overrides (`--font-family`/`--font-size`/
+/// `--opacity`) extend the [`bitty_config::file::CliOverrides`] built here —
+/// add fields there, not a second `Cli` layer — so this function's shape
+/// stays stable across the rebase.
+///
+/// Returns the merged layers plus the probed user path and the resolved
+/// profile identity. impure (filesystem + env); total (all failures become
+/// `Err(String)`).
+fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
+    // Env overrides (12-factor, test-friendly): BITTY_CONFIG (path),
+    // BITTY_PROFILE (name). CLI flags win over env (pure resolvers).
+    let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+    let bitty_profile_env = std::env::var("BITTY_PROFILE").ok();
+    let explicit = bitty_config::file::resolve_config_explicit(
+        args.config_path.as_deref(),
+        bitty_config_env.as_deref(),
+    );
+    let explicit_from_cli = args
+        .config_path
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    let probed = bitty_config::file::probe_config_path(explicit.as_deref());
     let mut file_layer: Option<bitty_config::LayeredPlan> = None;
     let mut used_path: Option<std::path::PathBuf> = None;
     if let Some(probe) = probed.clone() {
@@ -1080,40 +1166,123 @@ fn load_merged_config(
                 }
             }
         } else if probe.explicit {
+            if explicit_from_cli {
+                return Err(format!(
+                    "bitty: --config '{}' not found",
+                    probe.path.display()
+                ));
+            }
             return Err(format!(
-                "bitty: --config '{}' not found",
+                "bitty: BITTY_CONFIG '{}' not found",
                 probe.path.display()
             ));
         }
     }
-    let merged = bitty_config::file::resolve_effective(file_layer, args.theme.as_deref()).map_err(
-        |err| {
+    // Named profile (fail-closed): validate, resolve under the user-level
+    // XDG root (XDG_CONFIG_DIRS never consulted), load as Profile layer.
+    let profile_request = bitty_config::file::resolve_profile_request(
+        args.profile.as_deref(),
+        bitty_profile_env.as_deref(),
+    );
+    let profile_from_cli = args
+        .profile
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    let mut profile_layer: Option<bitty_config::LayeredPlan> = None;
+    let mut profile_path: Option<std::path::PathBuf> = None;
+    if let Some(requested) = profile_request.clone() {
+        let resolved = bitty_config::file::profile_file_path(&requested).map_err(|err| {
+            if profile_from_cli {
+                format!("bitty: invalid --profile '{requested}': {err}")
+            } else {
+                format!("bitty: invalid BITTY_PROFILE '{requested}': {err}")
+            }
+        })?;
+        if !resolved.exists() {
+            if profile_from_cli {
+                return Err(format!(
+                    "bitty: --profile '{requested}' not found ('{}')",
+                    resolved.display()
+                ));
+            }
+            return Err(format!(
+                "bitty: BITTY_PROFILE '{requested}' not found ('{}')",
+                resolved.display()
+            ));
+        }
+        match bitty_config::file::load_profile_layer(&resolved) {
+            Ok(layer) => {
+                profile_path = Some(resolved.clone());
+                profile_layer = Some(layer);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "bitty: invalid profile file '{}': {err}",
+                    resolved.display()
+                ));
+            }
+        }
+        // `--config` + `--profile` together: both layers stay loaded; the
+        // explicit file wins over the profile (init.lua semantics). Warn so
+        // the composition is never silent.
+        if used_path.is_some() && probed.as_ref().is_some_and(|p| p.explicit) {
+            let name = profile_request.as_deref().unwrap_or_default();
+            eprintln!(
+                "bitty: warning: --config with --profile '{name}': profile layers under the explicit file (explicit file wins)"
+            );
+        }
+    }
+    // CTX-0180 extension point: build the single Cli layer here via
+    // CliOverrides (today only --theme lives here).
+    let cli = bitty_config::file::CliOverrides {
+        theme: args
+            .theme
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    };
+    let merged = bitty_config::file::resolve_effective_full(file_layer, profile_layer, &cli)
+        .map_err(|err| {
             if let Some(p) = &used_path {
                 format!("bitty: invalid config '{}': {err}", p.display())
+            } else if let Some(p) = &profile_path {
+                format!("bitty: invalid profile '{}': {err}", p.display())
             } else {
                 format!("bitty: invalid --theme: {err}")
             }
-        },
-    )?;
-    Ok((merged, probed))
+        })?;
+    Ok(LoadedConfig {
+        merged,
+        probed,
+        profile_name: profile_request,
+        profile_path,
+    })
 }
 
 /// Loads the effective config for `args`.
 ///
-/// - Probes `--config` verbatim, else `init.lua`, else the `config.lua`
-///   alias, else the canonical `init.lua` path.
+/// - User file: `--config` wins over `BITTY_CONFIG`, else `init.lua`, else
+///   the `config.lua` alias, else the canonical `init.lua` path.
+/// - Profile: `--profile` wins over `BITTY_PROFILE`, loaded from
+///   `profiles/<name>.lua` UNDER the user file (`init.lua` still wins).
 /// - A missing **probed** file yields defaults (no error); a missing
-///   **explicit** `--config` file fails closed.
+///   **explicit** `--config`/`BITTY_CONFIG` file, or a requested-but-missing
+///   profile, fails closed.
 /// - A present-but-invalid file (Lua syntax/runtime/budget/shape/validation)
 ///   fails closed with a user-facing message (caller prints to stderr and
 ///   exits non-zero; no panic, no silent ignore).
-/// - Merges `CLI (--theme) > file > defaults` via `bitty-config` and resolves
-///   `appearance.theme` through the preset registry.
+/// - Merges `CLI (--theme) > file > profile > defaults` via `bitty-config`
+///   and resolves `appearance.theme` through the preset registry.
 ///
-/// impure (filesystem reads + env vars XDG/HOME); total (all failures become
-/// `Err(String)`).
+/// impure (filesystem reads + env vars XDG/HOME/BITTY_*); total (all failures
+/// become `Err(String)`).
 fn load_app_config(args: &Args) -> Result<AppConfig, String> {
-    let (merged, probed) = load_merged_config(args)?;
+    let loaded = load_merged_config(args)?;
+    let merged = loaded.merged;
+    let probed = loaded.probed;
+    let profile_request = loaded.profile_name;
+    let profile_path = loaded.profile_path;
     let mut file_path: Option<std::path::PathBuf> = None;
     if let Some(probe) = &probed {
         if probe.path.exists() {
@@ -1132,6 +1301,7 @@ fn load_app_config(args: &Args) -> Result<AppConfig, String> {
     let source: &'static str = match merged.source_of("appearance.theme").map(|s| s.layer) {
         Some(bitty_config::LayerKind::Cli) => "cli",
         Some(bitty_config::LayerKind::User) => "file",
+        Some(bitty_config::LayerKind::Profile) => "profile",
         _ => "default",
     };
     let effective = merged.effective;
@@ -1157,9 +1327,17 @@ fn load_app_config(args: &Args) -> Result<AppConfig, String> {
             args.theme.as_deref().unwrap_or_default()
         );
     }
+    if let (Some(name), Some(path)) = (&profile_request, &profile_path) {
+        eprintln!(
+            "bitty: profile '{name}' from '{}' (source={source})",
+            path.display()
+        );
+    }
     Ok(AppConfig {
         effective,
         file_path,
+        profile_name: profile_request,
+        profile_path,
         theme,
         resolution,
         source,
@@ -1168,14 +1346,16 @@ fn load_app_config(args: &Args) -> Result<AppConfig, String> {
 
 /// Short usage for `bitty config` (stderr, fail-closed exit 2).
 fn config_usage() -> String {
-    "usage: bitty config <path|check|edit> [--config PATH]\n\
+    "usage: bitty config <path|check|edit> [--config PATH] [--profile NAME]\n\
      \n\
      verbs:\n\
      \x20 path   print the resolved config file path\n\
-     \x20 check  load + validate; print per-key sources (cli/file/default)\n\
+     \x20 check  load + validate; print per-key sources (cli/file/profile/default)\n\
      \x20 edit   open the file in $VISUAL/$EDITOR (vi fallback)\n\
      \n\
-     config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)"
+     config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
+     profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua (--profile, else BITTY_PROFILE)\n\
+     env: BITTY_CONFIG (path), BITTY_PROFILE (name); CLI flags win over env"
         .to_string()
 }
 
@@ -1230,18 +1410,23 @@ fn check_row(key: &str, value: String, source: &str) -> String {
     format!("{key} = {value} ({source})")
 }
 
-/// Source label for a merged layer: `cli`, `file: <path>`, `default`, or the
-/// raw layer label for future layers.
+/// Source label for a merged layer: `cli`, `file: <path>`,
+/// `profile: <path>`, `default`, or the raw layer label for future layers.
 fn layer_source_label(
     merged: &bitty_config::MergedConfig,
     field: &str,
     file_path: Option<&std::path::Path>,
+    profile_path: Option<&std::path::Path>,
 ) -> String {
     match merged.source_of(field).map(|s| s.layer) {
         Some(bitty_config::LayerKind::Cli) => "cli".to_string(),
         Some(bitty_config::LayerKind::User) => match file_path {
             Some(p) => format!("file: {}", p.display()),
             None => "file".to_string(),
+        },
+        Some(bitty_config::LayerKind::Profile) => match profile_path {
+            Some(p) => format!("profile: {}", p.display()),
+            None => "profile".to_string(),
         },
         Some(layer) => {
             if layer == bitty_config::LayerKind::CoreDefaults {
@@ -1271,24 +1456,29 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
         );
         return 2;
     }
-    let explicit = args.config_path.as_deref();
+    // BITTY_CONFIG env participates exactly like --config (CLI wins).
+    let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+    let explicit = bitty_config::file::resolve_config_explicit(
+        args.config_path.as_deref(),
+        bitty_config_env.as_deref(),
+    );
     match cmd {
-        ConfigCommand::Path => {
-            match bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty())) {
-                Some(probed) => {
-                    println!("{}", probed.path.display());
-                    0
-                }
-                None => {
-                    eprintln!(
-                        "bitty config path: no config root ($XDG_CONFIG_HOME or $HOME unset)"
-                    );
-                    2
-                }
+        ConfigCommand::Path => match bitty_config::file::probe_config_path(explicit.as_deref()) {
+            Some(probed) => {
+                println!("{}", probed.path.display());
+                0
             }
-        }
+            None => {
+                eprintln!("bitty config path: no config root ($XDG_CONFIG_HOME or $HOME unset)");
+                2
+            }
+        },
         ConfigCommand::Check => match load_merged_config(args) {
-            Ok((merged, probed)) => {
+            Ok(loaded) => {
+                let merged = loaded.merged;
+                let probed = loaded.probed;
+                let profile_request = loaded.profile_name;
+                let profile_path = loaded.profile_path;
                 let file_path = probed
                     .as_ref()
                     .filter(|p| p.path.exists())
@@ -1302,8 +1492,32 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         );
                     }
                 }
+                // Profile identity first so per-key `profile: <path>`
+                // sources have context even when the profile loses every key.
+                if let (Some(name), Some(path)) = (&profile_request, &profile_path) {
+                    println!(
+                        "{}",
+                        check_row(
+                            "profile",
+                            format!("\"{name}\""),
+                            &format!("profile: {}", path.display()),
+                        )
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        check_row("profile", String::from("(none)"), "default")
+                    );
+                }
                 let e = &merged.effective;
-                let src = |field: &str| layer_source_label(&merged, field, file_path.as_deref());
+                let src = |field: &str| {
+                    layer_source_label(
+                        &merged,
+                        field,
+                        file_path.as_deref(),
+                        profile_path.as_deref(),
+                    )
+                };
                 let theme = e
                     .appearance
                     .theme
@@ -1434,8 +1648,7 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
             }
         },
         ConfigCommand::Edit => {
-            let probed =
-                bitty_config::file::probe_config_path(explicit.filter(|p| !p.trim().is_empty()));
+            let probed = bitty_config::file::probe_config_path(explicit.as_deref());
             let target = match probed {
                 Some(p) => p.path,
                 None => {
@@ -3277,13 +3490,18 @@ fn main() {
         // (if any) has been spawned above and will be polled on AboutToWait. For deterministic CI
         // we also keep synthetic smoke proof.
         println!(
-            "bitty headless: theme '{}' source={} file={}",
+            "bitty headless: theme '{}' source={} file={} profile={} profile_file={}",
             app_config.theme.name,
             app_config.source,
             app_config
                 .file_path
                 .as_ref()
-                .map_or(String::from("(none)"), |p| p.display().to_string())
+                .map_or(String::from("(none)"), |p| p.display().to_string()),
+            app_config.profile_name.as_deref().unwrap_or("(none)"),
+            app_config
+                .profile_path
+                .as_ref()
+                .map_or(String::from("(none)"), |p| p.display().to_string()),
         );
         let code = run_headless_smoke(&mut runtime);
         std::process::exit(code);
@@ -3419,6 +3637,7 @@ mod tests {
         assert_eq!(parsed.layout, None);
         assert_eq!(parsed.focus, None);
         assert_eq!(parsed.config_path, None);
+        assert_eq!(parsed.profile, None);
         assert_eq!(parsed.theme, None);
         assert_eq!(parsed.config_cmd, None);
         assert!(!parsed.config_word);
@@ -4126,8 +4345,122 @@ mod tests {
         let help = help_text();
         assert!(help.contains("--config"));
         assert!(help.contains("--theme"));
+        assert!(help.contains("--profile"));
+        assert!(help.contains("BITTY_CONFIG"));
+        assert!(help.contains("BITTY_PROFILE"));
         assert!(help.contains("init.lua"));
         assert!(help.contains("config check"));
+    }
+
+    #[test]
+    fn parse_profile_flags() {
+        // CTX-0169: --profile space + equals forms; blank warns + ignores.
+        let p = parse_args(&args_of(&["bitty", "--profile", "work"]));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        let p = parse_args(&args_of(&["bitty", "--profile=work"]));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        let p = parse_args(&args_of(&["bitty", "--profile", "work", "--theme", "dark"]));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        assert_eq!(p.theme.as_deref(), Some("dark"));
+        // Composes with --config (warn-at-runtime, not parse time).
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--config",
+            "/tmp/c.lua",
+            "--profile",
+            "work",
+        ]));
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.lua"));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        // Composes with `config check` in any order.
+        let p = parse_args(&args_of(&["bitty", "config", "check", "--profile", "work"]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        let p = parse_args(&args_of(&["bitty", "--profile", "work", "config", "check"]));
+        assert_eq!(p.config_cmd, Some(ConfigCommand::Check));
+        assert_eq!(p.profile.as_deref(), Some("work"));
+        // Missing value warns + ignores (total, no panic).
+        let p = parse_args(&args_of(&["bitty", "--profile"]));
+        assert_eq!(p.profile, None);
+        // `--` escape hatch: --profile after `--` is a program name.
+        let p = parse_args(&args_of(&["bitty", "--", "--profile"]));
+        assert_eq!(p.profile, None);
+        assert_eq!(p.program.as_deref(), Some("--profile"));
+    }
+
+    #[test]
+    fn profile_request_resolution_prefers_cli_over_env() {
+        // Pure resolver lives in bitty-config::file; pin the contract here
+        // so Args parsing and env handling cannot drift (CLI > env > none).
+        use bitty_config::file::resolve_profile_request;
+        assert_eq!(
+            resolve_profile_request(Some("cli"), Some("env")).as_deref(),
+            Some("cli")
+        );
+        assert_eq!(
+            resolve_profile_request(None, Some("env")).as_deref(),
+            Some("env")
+        );
+        assert_eq!(resolve_profile_request(None, None), None);
+    }
+
+    #[test]
+    fn profile_layer_stacks_under_user_over_defaults() {
+        // CTX-0169 precedence matrix at the merge level (no fs): profile
+        // beats defaults, user beats profile, CLI beats both.
+        use bitty_config::file::{CliOverrides, parse_lua_config, resolve_effective_full};
+        use bitty_config::plan::{ConfigSource, LayerKind, LayeredPlan};
+        let profile_src = ConfigSource::new(LayerKind::Profile, Some("profiles/work.lua"));
+        let profile_plan =
+            parse_lua_config(r#"return { theme = "dark" }"#, &profile_src).expect("profile");
+        let profile = LayeredPlan::new(profile_src, profile_plan);
+        let cli_none = CliOverrides::default();
+        let merged =
+            resolve_effective_full(None, Some(profile.clone()), &cli_none).expect("profile");
+        assert_eq!(merged.effective.appearance.theme.as_deref(), Some("dark"));
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::Profile
+        );
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let user_plan =
+            parse_lua_config(r#"return { theme = "bitty-dark" }"#, &user_src).expect("user");
+        let user = LayeredPlan::new(user_src, user_plan);
+        let merged =
+            resolve_effective_full(Some(user), Some(profile), &cli_none).expect("user wins");
+        assert_eq!(
+            merged.effective.appearance.theme.as_deref(),
+            Some("bitty-dark")
+        );
+        assert_eq!(
+            merged.source_of("appearance.theme").unwrap().layer,
+            LayerKind::User
+        );
+        // Source labels carry the profile path for `config check`.
+        let profile_src2 = ConfigSource::new(LayerKind::Profile, Some("profiles/work.lua"));
+        let profile_plan2 =
+            parse_lua_config(r#"return { theme = "dark" }"#, &profile_src2).expect("profile2");
+        let profile2 = LayeredPlan::new(profile_src2, profile_plan2);
+        let merged = resolve_effective_full(None, Some(profile2), &cli_none).expect("profile only");
+        let label = layer_source_label(
+            &merged,
+            "appearance.theme",
+            None,
+            Some(std::path::Path::new("profiles/work.lua")),
+        );
+        assert!(label.starts_with("profile:"), "got {label:?}");
+    }
+
+    #[test]
+    fn invalid_profile_name_fails_closed_without_filesystem() {
+        // Traversal names never reach the filesystem: validation rejects.
+        assert!(bitty_config::file::validate_profile_name("../evil").is_err());
+        assert!(bitty_config::file::validate_profile_name("a/b").is_err());
+        assert!(bitty_config::file::validate_profile_name("").is_err());
+        assert!(
+            bitty_config::file::profile_file_path_with_env("../evil", Some("/x"), Some("/h"))
+                .is_err()
+        );
     }
 
     #[test]

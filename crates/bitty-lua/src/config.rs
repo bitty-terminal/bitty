@@ -34,6 +34,7 @@
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
+//!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -68,7 +69,7 @@ pub const MAX_CONFIG_TOP_KEYS: usize = 64;
 pub const MAX_CONFIG_STRING_BYTES: usize = 2048;
 
 /// Maximum keys read from any nested table (`appearance`/`font`/`window`/
-/// `terminal`/`selection`/keymap entry).
+/// `terminal`/`selection`/`layout`/keymap entry).
 pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 
 /// Maximum keymap entries read (mirrors `bitty-config` `MAX_KEYMAPS` so the
@@ -137,6 +138,19 @@ pub struct SelectionData {
     pub auto_copy: Option<bool>,
 }
 
+/// Layout overrides, plain data (CTX-0177; see [`FontData`] for `Option`
+/// semantics).
+///
+/// Hyprland-like panel gaps in cells: `gaps_in` between sibling panes,
+/// `gaps_out` around the container edge (`0` = edge-to-edge tiling).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LayoutData {
+    /// Inner gap in cells (present only when the key is set).
+    pub gaps_in: Option<i64>,
+    /// Outer gap in cells (present only when the key is set).
+    pub gaps_out: Option<i64>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -155,6 +169,8 @@ pub struct ConfigData {
     pub terminal: Option<TerminalData>,
     /// `selection` table (CTX-0191).
     pub selection: Option<SelectionData>,
+    /// `layout` table (CTX-0177 panel gaps).
+    pub layout: Option<LayoutData>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
@@ -178,6 +194,7 @@ impl ConfigData {
             && self.window.is_none()
             && self.terminal.is_none()
             && self.selection.is_none()
+            && self.layout.is_none()
             && self.keymaps.is_none()
     }
 }
@@ -671,6 +688,24 @@ impl ConfigData {
                     };
                     out.selection = Some(SelectionData { auto_copy });
                 }
+                "layout" => {
+                    // CTX-0177: `layout = { gaps_in = 1, gaps_out = 2 }`
+                    // sets Hyprland-like panel gaps in cells; absent
+                    // table/key means "says nothing". Integers only
+                    // (floats rejected like every other cell/count key);
+                    // range-checked downstream in `bitty-config`.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["gaps_in", "gaps_out"])?;
+                    let gaps_in = match get_field(nested, "gaps_in") {
+                        Some(v) => Some(expect_integer("layout.gaps_in", v)?),
+                        None => None,
+                    };
+                    let gaps_out = match get_field(nested, "gaps_out") {
+                        Some(v) => Some(expect_integer("layout.gaps_out", v)?),
+                        None => None,
+                    };
+                    out.layout = Some(LayoutData { gaps_in, gaps_out });
+                }
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
@@ -923,6 +958,47 @@ mod tests {
                         "{code:?}: {message}"
                     );
                     assert!(!message.contains("false"), "must not echo value: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn layout_gaps_extract_and_absent_means_no_override() {
+        // CTX-0177: explicit integers parse; absent table/key is `None` so
+        // merge keeps the lower-precedence value (0 when no layer sets it).
+        let data = eval_ok(r#"return { layout = { gaps_in = 1, gaps_out = 2 } }"#);
+        let layout = data.layout.unwrap();
+        assert_eq!(layout.gaps_in, Some(1));
+        assert_eq!(layout.gaps_out, Some(2));
+        let data = eval_ok(r#"return { layout = { gaps_in = 0 } }"#);
+        let layout = data.layout.unwrap();
+        assert_eq!(layout.gaps_in, Some(0));
+        assert_eq!(layout.gaps_out, None);
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.layout, None);
+        let data = eval_ok(r#"return { layout = {} }"#);
+        let layout = data.layout.unwrap();
+        assert_eq!(layout.gaps_in, None);
+        assert_eq!(layout.gaps_out, None);
+    }
+
+    #[test]
+    fn layout_gaps_wrong_type_is_shape_error_without_value() {
+        // CTX-0177: fail-closed on non-integers (floats/strings/tables never
+        // coerce, values never echoed).
+        let mut vm = LuaVm::new("test.layout-type");
+        for code in [
+            r#"return { layout = { gaps_in = 1.5 } }"#,
+            r#"return { layout = { gaps_in = "1" } }"#,
+            r#"return { layout = { gaps_out = true } }"#,
+            r#"return { layout = "wide" }"#,
+            r#"return { layout = { gaps_in = 1, bogus = 2 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("layout"), "{code:?}: {message}");
                 }
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }

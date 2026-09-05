@@ -1219,6 +1219,10 @@ fn starter_init_lua() -> &'static str {
      -- selection = { auto_copy = false },\n\
      return {\n\
      \x20\x20theme = \"dark\",\n\
+     \x20\x20-- Hyprland-like panel gaps in cells (0 = edge-to-edge tiling).\n\
+     \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
+     \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
+     \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20-- },\n\
@@ -1387,6 +1391,22 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "layout.gaps_in",
+                        format!("{}", e.layout.gaps_in),
+                        &src("layout.gaps_in")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "layout.gaps_out",
+                        format!("{}", e.layout.gaps_out),
+                        &src("layout.gaps_out")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "keymaps",
                         format!("{} entries", e.keymaps.len()),
                         &src("keymaps")
@@ -1485,14 +1505,25 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 /// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
 /// [`bitty_config::types::FontConfig::effective_cell`], defaults `9x19`);
 /// grid/queue geometry stays at compiled defaults; font family/size, scroll
-/// speed, and selection auto-copy come from the file/CLI/default chain
-/// (already validated by `bitty-config`, so construction is expected to
+/// speed, selection auto-copy, and panel gaps come from the file/CLI/default
+/// chain (already validated by `bitty-config`, so construction is expected to
 /// succeed — failures stay fail-closed).
 fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
     let defaults = bitty_runtime::RuntimeConfig::default();
     let (cell_width, cell_height) = effective.font.default_effective_cell();
+    // CTX-0177: `bitty-config` validates `0..=MAX_LAYOUT_GAP_CELLS` (u32) and
+    // `bitty-runtime` mirrors the bound in u16; the clamp below is
+    // defense-in-depth so a future bound drift can never wrap the cast.
+    let gaps_in = effective
+        .layout
+        .gaps_in
+        .min(u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS)) as u16;
+    let gaps_out = effective
+        .layout
+        .gaps_out
+        .min(u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS)) as u16;
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -1504,6 +1535,8 @@ fn runtime_config_from_effective(
         effective.terminal.scroll_lines_per_notch,
         effective.terminal.scroll_pixels_per_notch,
         effective.selection.auto_copy,
+        gaps_in,
+        gaps_out,
     )
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
@@ -4303,6 +4336,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_inherits_file_layout_gaps() {
+        // CTX-0177: `layout.gaps_in`/`gaps_out` flow file -> effective ->
+        // runtime; crate defaults stay equal (bitty-runtime must not depend
+        // on bitty-config, so the pairing is by value, pinned here). Default
+        // preserves edge-to-edge tiling (zero change for existing users).
+        assert_eq!(
+            u32::from(bitty_runtime::config::DEFAULT_LAYOUT_GAPS_IN),
+            bitty_config::types::DEFAULT_LAYOUT_GAPS_IN
+        );
+        assert_eq!(
+            u32::from(bitty_runtime::config::DEFAULT_LAYOUT_GAPS_OUT),
+            bitty_config::types::DEFAULT_LAYOUT_GAPS_OUT
+        );
+        assert_eq!(
+            u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS),
+            bitty_config::types::MAX_LAYOUT_GAP_CELLS
+        );
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(r#"return { layout = { gaps_in = 1, gaps_out = 2 } }"#, &src)
+            .expect("gaps parse");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert_eq!(merged.effective.layout.gaps_in, 1);
+        assert_eq!(merged.effective.layout.gaps_out, 2);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!((cfg.gaps_in, cfg.gaps_out), (1, 2));
+        assert_eq!(
+            merged.source_of("layout.gaps_in").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Absent table rides edge-to-edge end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no layout table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(
+            (
+                merged2.effective.layout.gaps_in,
+                merged2.effective.layout.gaps_out
+            ),
+            (0, 0)
+        );
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert_eq!((cfg2.gaps_in, cfg2.gaps_out), (0, 0));
+        assert_eq!(
+            merged2.source_of("layout.gaps_in").unwrap().layer,
+            bitty_config::plan::LayerKind::CoreDefaults
+        );
+        // Oversized gaps fail closed at the file layer (never reach runtime).
+        let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        parse_lua_config(r#"return { layout = { gaps_in = 17 } }"#, &src3).expect_err("must fail");
+    }
+
+    #[test]
     fn window_title_carries_theme_and_source() {
         let t = window_title_for_theme("bitty-dark", "file");
         assert!(t.contains("bitty-dark"));
@@ -4406,6 +4499,11 @@ mod tests {
         // so new installs ride the default-on without a file override.
         assert!(plan.selection.is_none());
         assert!(starter_init_lua().contains("auto_copy"));
+        // CTX-0177: starter leaves `layout` unset (commented example only)
+        // so new installs ride edge-to-edge without a file override.
+        assert!(plan.layout.is_none());
+        assert!(starter_init_lua().contains("gaps_in"));
+        assert!(starter_init_lua().contains("gaps_out"));
     }
 
     #[test]

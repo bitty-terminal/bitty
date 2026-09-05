@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::geometry::Rect;
+use crate::geometry::{Gaps, Rect};
 use crate::layout::LayoutNode;
 use crate::view::ViewId;
 
@@ -94,6 +94,10 @@ impl Focus {
     /// For spatial directions `Up/Down/Left/Right`, `container` is the bounds
     /// used to compute the rect allocation. The allocation is deterministic
     /// given the same node and container.
+    ///
+    /// Gapless: allocations tile edge-to-edge so adjacency is exact edge
+    /// equality. Use [`Self::advance_with_gaps`] when the tree is laid out
+    /// with gaps.
     #[must_use]
     pub fn advance(
         &self,
@@ -101,13 +105,31 @@ impl Focus {
         container: Rect,
         dir: FocusDirection,
     ) -> Option<ViewId> {
+        self.advance_with_gaps(node, container, Gaps::ZERO, dir)
+    }
+
+    /// Gap-aware focus advance (CTX-0177).
+    ///
+    /// Like [`Self::advance`] but computes allocations with
+    /// `LayoutNode::layout_with_gaps` and tolerates the gap band in spatial
+    /// adjacency: neighbor edges may be up to `gaps.inner` cells apart along
+    /// the movement axis. With [`Gaps::ZERO`] this is identical to
+    /// [`Self::advance`].
+    #[must_use]
+    pub fn advance_with_gaps(
+        &self,
+        node: &LayoutNode,
+        container: Rect,
+        gaps: Gaps,
+        dir: FocusDirection,
+    ) -> Option<ViewId> {
         match dir {
             FocusDirection::Next => self.next(node),
             FocusDirection::Prev => self.prev(node),
-            FocusDirection::Up => self.spatial(node, container, dir),
-            FocusDirection::Down => self.spatial(node, container, dir),
-            FocusDirection::Left => self.spatial(node, container, dir),
-            FocusDirection::Right => self.spatial(node, container, dir),
+            FocusDirection::Up => self.spatial(node, container, gaps, dir),
+            FocusDirection::Down => self.spatial(node, container, gaps, dir),
+            FocusDirection::Left => self.spatial(node, container, gaps, dir),
+            FocusDirection::Right => self.spatial(node, container, gaps, dir),
         }
     }
 
@@ -119,6 +141,21 @@ impl Focus {
         dir: FocusDirection,
     ) -> Option<ViewId> {
         let next = self.advance(node, container, dir);
+        if let Some(id) = next {
+            self.focused = Some(id);
+        }
+        next
+    }
+
+    /// Mutating variant of [`Self::advance_with_gaps`].
+    pub fn move_focus_with_gaps(
+        &mut self,
+        node: &LayoutNode,
+        container: Rect,
+        gaps: Gaps,
+        dir: FocusDirection,
+    ) -> Option<ViewId> {
+        let next = self.advance_with_gaps(node, container, gaps, dir);
         if let Some(id) = next {
             self.focused = Some(id);
         }
@@ -147,12 +184,25 @@ impl Focus {
         Some(ids[next_idx])
     }
 
-    fn spatial(&self, node: &LayoutNode, container: Rect, dir: FocusDirection) -> Option<ViewId> {
+    fn spatial(
+        &self,
+        node: &LayoutNode,
+        container: Rect,
+        gaps: Gaps,
+        dir: FocusDirection,
+    ) -> Option<ViewId> {
         let Some(cur) = self.focused else {
             return self.next(node);
         };
-        let alloc = node.layout(container);
+        let alloc = node.layout_with_gaps(container, gaps);
         let cur_rect = alloc.iter().find(|(id, _)| *id == cur).map(|(_, r)| *r)?;
+        // Gap tolerance along the movement axis: adjacent leaves laid out
+        // with gaps are separated by up to `gaps.inner` cells instead of
+        // sharing an edge. Zero gaps reduce to exact edge equality.
+        let tol = u32::from(gaps.inner);
+        // Returns true when `edge` (the neighbor's facing edge) sits at or
+        // just before `target` (our edge), within the gap tolerance.
+        let adjacent = |edge: u32, target: u32| edge <= target && target - edge <= tol;
         // Build candidates: leaves adjacent in requested direction.
         let mut candidates: Vec<(ViewId, Rect, u32)> = Vec::new();
         for (id, rect) in &alloc {
@@ -161,7 +211,7 @@ impl Focus {
             }
             let is_candidate = match dir {
                 FocusDirection::Up => {
-                    rect.y + rect.height == cur_rect.y
+                    adjacent(rect.y as u32 + rect.height as u32, cur_rect.y as u32)
                         && overlap(
                             rect.x as u32,
                             rect.width as u32,
@@ -170,7 +220,7 @@ impl Focus {
                         ) > 0
                 }
                 FocusDirection::Down => {
-                    cur_rect.y + cur_rect.height == rect.y
+                    adjacent(cur_rect.y as u32 + cur_rect.height as u32, rect.y as u32)
                         && overlap(
                             rect.x as u32,
                             rect.width as u32,
@@ -179,7 +229,7 @@ impl Focus {
                         ) > 0
                 }
                 FocusDirection::Left => {
-                    rect.x + rect.width == cur_rect.x
+                    adjacent(rect.x as u32 + rect.width as u32, cur_rect.x as u32)
                         && overlap(
                             rect.y as u32,
                             rect.height as u32,
@@ -188,7 +238,7 @@ impl Focus {
                         ) > 0
                 }
                 FocusDirection::Right => {
-                    cur_rect.x + cur_rect.width == rect.x
+                    adjacent(cur_rect.x as u32 + cur_rect.width as u32, rect.x as u32)
                         && overlap(
                             rect.y as u32,
                             rect.height as u32,
@@ -380,5 +430,69 @@ mod tests {
         let next = f.move_focus(&node, Rect::new(0, 0, 80, 24), FocusDirection::Next);
         assert_eq!(next, Some(ViewId::new(2)));
         assert_eq!(f.focused(), Some(ViewId::new(2)));
+    }
+
+    #[test]
+    fn focus_zero_gaps_match_gapless_advance() {
+        // CTX-0177: Gaps::ZERO advance is identical to the legacy path.
+        let node = three_pane();
+        let bounds = Rect::new(0, 0, 80, 40);
+        for id in [1, 2, 3] {
+            let f = Focus::with_focus(ViewId::new(id));
+            for dir in [
+                FocusDirection::Up,
+                FocusDirection::Down,
+                FocusDirection::Left,
+                FocusDirection::Right,
+            ] {
+                assert_eq!(
+                    f.advance(&node, bounds, dir),
+                    f.advance_with_gaps(&node, bounds, Gaps::ZERO, dir),
+                    "id {id} dir {dir:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focus_spatial_crosses_gap_band() {
+        // CTX-0177: with gaps_in, adjacent leaves no longer share an edge;
+        // spatial focus must still cross the band (legacy exact-equality
+        // would strand focus on the current leaf).
+        let node = two_pane_horizontal();
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let f = Focus::with_focus(ViewId::new(1));
+        assert_eq!(
+            f.advance_with_gaps(&node, bounds, gaps, FocusDirection::Right),
+            Some(ViewId::new(2))
+        );
+        let f2 = Focus::with_focus(ViewId::new(2));
+        assert_eq!(
+            f2.advance_with_gaps(&node, bounds, gaps, FocusDirection::Left),
+            Some(ViewId::new(1))
+        );
+        // No candidate in the dead direction still stays put.
+        assert_eq!(
+            f.advance_with_gaps(&node, bounds, gaps, FocusDirection::Left),
+            Some(ViewId::new(1))
+        );
+    }
+
+    #[test]
+    fn focus_spatial_crosses_vertical_gap_band() {
+        // CTX-0177: up/down crossing works with gaps_out + gaps_in combined.
+        let node = three_pane();
+        let bounds = Rect::new(0, 0, 80, 40);
+        let gaps = Gaps::new(2, 1);
+        let f1 = Focus::with_focus(ViewId::new(1));
+        assert_eq!(
+            f1.advance_with_gaps(&node, bounds, gaps, FocusDirection::Down),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            f1.advance_with_gaps(&node, bounds, gaps, FocusDirection::Right),
+            Some(ViewId::new(3))
+        );
     }
 }

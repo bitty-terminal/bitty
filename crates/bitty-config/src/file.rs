@@ -32,6 +32,7 @@
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
+//!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
@@ -52,6 +53,10 @@
 //!   nothing"); when present, `auto_copy` defaults to
 //!   [`SelectionConfig`](crate::types::SelectionConfig) default `true` when
 //!   omitted, so existing configs without `selection` keep working unchanged.
+//!   `layout` follows the same fully-optional pattern: absent table/key means
+//!   "this layer says nothing"; when the table is present, omitted keys
+//!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
+//!   edge-to-edge), and out-of-range values fail closed with the field path.
 //!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
 //! - `plugins`, `extends`, and profile names remain non-user layers and are
@@ -84,7 +89,8 @@ use crate::error::ConfigError;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, SelectionConfig, TerminalConfig,
+    WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -501,6 +507,50 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     let selection = data.selection.map(|s| SelectionConfig {
         auto_copy: s.auto_copy.unwrap_or(SelectionConfig::default().auto_copy),
     });
+    // CTX-0177: `layout` follows the same fully-optional pattern: absent
+    // table means "this layer says nothing" (plan.layout None so merge keeps
+    // the lower-precedence value). When the table is present, omitted keys
+    // default to `LayoutConfig` defaults (0 = edge-to-edge) so
+    // `layout = { gaps_in = 1 }` keeps working without forcing `gaps_out`.
+    // Present values are range-checked here (fail-closed with the field path)
+    // and again by `LayoutConfig::validate` via `plan.validate()`.
+    let layout = match data.layout {
+        None => None,
+        Some(l) => {
+            let defaults = LayoutConfig::default();
+            let gaps_in = match l.gaps_in {
+                None => defaults.gaps_in,
+                Some(v) => {
+                    if !(0..=crate::types::MAX_LAYOUT_GAP_CELLS as i64).contains(&v) {
+                        return Err(ConfigError::validation(
+                            "layout.gaps_in",
+                            format!(
+                                "must be within [0, {}] (found {v})",
+                                crate::types::MAX_LAYOUT_GAP_CELLS
+                            ),
+                        ));
+                    }
+                    v as u32
+                }
+            };
+            let gaps_out = match l.gaps_out {
+                None => defaults.gaps_out,
+                Some(v) => {
+                    if !(0..=crate::types::MAX_LAYOUT_GAP_CELLS as i64).contains(&v) {
+                        return Err(ConfigError::validation(
+                            "layout.gaps_out",
+                            format!(
+                                "must be within [0, {}] (found {v})",
+                                crate::types::MAX_LAYOUT_GAP_CELLS
+                            ),
+                        ));
+                    }
+                    v as u32
+                }
+            };
+            Some(LayoutConfig { gaps_in, gaps_out })
+        }
+    };
 
     let plan = ConfigPlan {
         schema_version: None,
@@ -508,6 +558,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         window,
         terminal,
         selection,
+        layout,
         appearance,
         keymaps,
         plugins: None,
@@ -777,6 +828,54 @@ mod tests {
                 "must name the field: {msg}"
             );
             assert!(!msg.contains("\"false\""), "must not echo value: {msg}");
+        }
+    }
+
+    #[test]
+    fn lua_layout_gaps_parse_and_validate() {
+        // CTX-0177: explicit gaps parse; absent table means "says nothing"
+        // (plan.layout None so merge keeps lower); present-but-partial
+        // defaults omitted keys to 0; wrong types and out-of-range fail
+        // closed naming the field (never the value beyond the line).
+        let plan = parse_lua_config(
+            r#"return { layout = { gaps_in = 1, gaps_out = 2 } }"#,
+            &test_source(),
+        )
+        .expect("gaps parse");
+        let layout = plan.layout.expect("layout present");
+        assert_eq!(layout.gaps_in, 1);
+        assert_eq!(layout.gaps_out, 2);
+        let plan = parse_lua_config(r#"return { layout = { gaps_in = 1 } }"#, &test_source())
+            .expect("partial layout parses");
+        let layout = plan.layout.expect("layout present");
+        assert_eq!(layout.gaps_in, 1);
+        assert_eq!(layout.gaps_out, 0);
+        let plan = parse_lua_config(r#"return { layout = {} }"#, &test_source())
+            .expect("empty layout defaults");
+        let layout = plan.layout.expect("layout present");
+        assert_eq!(layout.gaps_in, 0);
+        assert_eq!(layout.gaps_out, 0);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no layout table");
+        assert!(plan.layout.is_none());
+        for bad in [
+            r#"return { layout = { gaps_in = -1 } }"#,
+            r#"return { layout = { gaps_in = 17 } }"#,
+            r#"return { layout = { gaps_out = 100 } }"#,
+            r#"return { layout = { gaps_in = "1" } }"#,
+            r#"return { layout = { gaps_in = 1.5 } }"#,
+            r#"return { layout = "wide" }"#,
+            r#"return { layout = { gaps_in = 1, bogus = 2 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("layout"),
+                "must name the field: {bad} -> {msg}"
+            );
         }
     }
 

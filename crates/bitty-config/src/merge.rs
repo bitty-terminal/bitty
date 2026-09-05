@@ -70,11 +70,15 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
         | "selection.auto_copy"
+        | "layout.gaps_in"
+        | "layout.gaps_out"
         | "appearance.theme"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "selection" | "appearance" => Some(MergeClass::DeepMerge),
+        "font" | "window" | "terminal" | "selection" | "layout" | "appearance" => {
+            Some(MergeClass::DeepMerge)
+        }
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -410,6 +414,59 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("selection".to_string(), src.clone());
         }
 
+        // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
+        // like `selection.auto_copy`; absent table means "says nothing".
+        if let Some(gaps) = &plan.layout {
+            for (field, value) in [
+                ("layout.gaps_in", gaps.gaps_in),
+                ("layout.gaps_out", gaps.gaps_out),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    match field {
+                        "layout.gaps_in" => effective.layout.gaps_in = value,
+                        _ => effective.layout.gaps_out = value,
+                    }
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    match field {
+                        "layout.gaps_in" => effective.layout.gaps_in = value,
+                        _ => effective.layout.gaps_out = value,
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("layout".to_string(), src.clone());
+        }
+
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -611,6 +668,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "terminal",
         "selection.auto_copy",
         "selection",
+        "layout.gaps_in",
+        "layout.gaps_out",
+        "layout",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -841,6 +901,59 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("selection".to_string(), src.clone());
         }
+        // CTX-0177: `layout.gaps_in`/`layout.gaps_out` are scalar-replace
+        // like `selection.auto_copy`; absent table means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(gaps) = &plan.layout {
+            for (field, value) in [
+                ("layout.gaps_in", gaps.gaps_in),
+                ("layout.gaps_out", gaps.gaps_out),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    match field {
+                        "layout.gaps_in" => effective.layout.gaps_in = value,
+                        _ => effective.layout.gaps_out = value,
+                    }
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    match field {
+                        "layout.gaps_in" => effective.layout.gaps_in = value,
+                        _ => effective.layout.gaps_out = value,
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("layout".to_string(), src.clone());
+        }
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -1039,6 +1152,9 @@ fn merge_layers_allow_policy_violations(
         "terminal",
         "selection.auto_copy",
         "selection",
+        "layout.gaps_in",
+        "layout.gaps_out",
+        "layout",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1317,6 +1433,16 @@ mod tests {
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("selection"), Some(MergeClass::DeepMerge));
+        // CTX-0177: panel gaps are scalar-replace leaves under a deep table.
+        assert_eq!(
+            merge_class_for("layout.gaps_in"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("layout.gaps_out"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(merge_class_for("layout"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("unknown"), None);
     }
 
@@ -1453,6 +1579,77 @@ mod tests {
         assert_eq!(
             merged.source_of("font.line_height").unwrap().layer,
             LayerKind::Cli
+        );
+    }
+
+    #[test]
+    fn layout_gaps_merge_scalar_replace_with_attribution() {
+        // CTX-0177: user gaps land in effective with user attribution; CLI
+        // wins over file; absent layers keep core defaults (edge-to-edge).
+        use crate::types::LayoutConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                layout: Some(LayoutConfig {
+                    gaps_in: 1,
+                    gaps_out: 2,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.layout.gaps_in, 1);
+        assert_eq!(merged.effective.layout.gaps_out, 2);
+        assert_eq!(
+            merged.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("layout.gaps_out").unwrap().layer,
+            LayerKind::User
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                layout: Some(LayoutConfig {
+                    gaps_in: 3,
+                    gaps_out: 0,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                layout: Some(LayoutConfig {
+                    gaps_in: 1,
+                    gaps_out: 2,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(merged2.effective.layout.gaps_in, 3);
+        assert_eq!(
+            merged2.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "layout.gaps_in")
+        );
+        // Empty stack keeps zero gaps with core-defaults attribution.
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert_eq!(merged3.effective.layout.gaps_in, 0);
+        assert_eq!(merged3.effective.layout.gaps_out, 0);
+        assert_eq!(
+            merged3.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::CoreDefaults
         );
     }
 }

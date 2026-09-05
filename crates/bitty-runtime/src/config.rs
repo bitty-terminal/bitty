@@ -39,6 +39,19 @@ pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 /// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 
+/// Default inner panel gap in cells (CTX-0177).
+/// Mirrors `bitty-config` `DEFAULT_LAYOUT_GAPS_IN` (kept local for the same
+/// no-dependency reason; paired by value and pinned by a `bitty-app` test).
+pub const DEFAULT_LAYOUT_GAPS_IN: u16 = 0;
+
+/// Default outer panel gap in cells (CTX-0177).
+/// Mirrors `bitty-config` `DEFAULT_LAYOUT_GAPS_OUT` (see above).
+pub const DEFAULT_LAYOUT_GAPS_OUT: u16 = 0;
+
+/// Maximum panel gap in cells (either axis, CTX-0177).
+/// Mirrors `bitty-config` `MAX_LAYOUT_GAP_CELLS` (see above).
+pub const MAX_LAYOUT_GAP_CELLS: u16 = 16;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -83,6 +96,14 @@ pub struct RuntimeConfig {
     /// `false` leaves the highlight in place; the explicit
     /// `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
     pub selection_auto_copy: bool,
+    /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
+    /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
+    /// The gap band shows the window background; per-leaf rendering and
+    /// hit-testing exclude it.
+    pub gaps_in: u16,
+    /// Inset around the container edge in cells (CTX-0177
+    /// `layout.gaps_out`). Same bounds and default as `gaps_in`.
+    pub gaps_out: u16,
 }
 
 /// Default font family (CTX-0157 acceptance probe).
@@ -107,6 +128,8 @@ impl Default for RuntimeConfig {
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
+            gaps_in: DEFAULT_LAYOUT_GAPS_IN,
+            gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
         }
     }
 }
@@ -131,6 +154,8 @@ impl RuntimeConfig {
         scroll_lines_per_notch: u32,
         scroll_pixels_per_notch: u32,
         selection_auto_copy: bool,
+        gaps_in: u16,
+        gaps_out: u16,
     ) -> Result<Self, RuntimeError> {
         let font_family = font_family.into();
         let cfg = Self {
@@ -144,6 +169,8 @@ impl RuntimeConfig {
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
             selection_auto_copy,
+            gaps_in,
+            gaps_out,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -187,6 +214,11 @@ impl RuntimeConfig {
         if self.cols > 1000 || self.rows > 1000 {
             return Err(RuntimeError::InvalidConfig(
                 "grid dimensions must be <= 1000",
+            ));
+        }
+        if self.gaps_in > MAX_LAYOUT_GAP_CELLS || self.gaps_out > MAX_LAYOUT_GAP_CELLS {
+            return Err(RuntimeError::InvalidConfig(
+                "layout gaps must be within [0, 16] cells",
             ));
         }
         Ok(())
@@ -255,23 +287,23 @@ mod tests {
 
     #[test]
     fn invalid_fields_are_rejected() {
-        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true).is_err());
+        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true, 0, 0).is_err());
     }
 
     #[test]
     fn scroll_speed_fields_are_rejected_out_of_range() {
         // CTX-0185: scroll speed is validated fail-closed like other config.
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true).is_err());
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true)
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true, 0, 0).is_err());
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true, 0, 0)
             .expect("scroll speed boundaries must be valid");
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false)
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false, 0, 0)
             .expect("scroll speed boundaries must be valid");
     }
 
@@ -280,9 +312,9 @@ mod tests {
         // CTX-0191: default-on preserves copy-on-select; both values build.
         const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
         assert!(RuntimeConfig::default().selection_auto_copy);
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0)
             .expect("auto-copy on builds");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false, 0, 0)
             .expect("auto-copy off builds");
     }
 
@@ -292,5 +324,38 @@ mod tests {
         assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
         assert_eq!(cfg.font_family, "JetBrainsMono Nerd Font");
         assert!((cfg.font_size - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn layout_gaps_default_zero_and_validate_bounds() {
+        // CTX-0177: defaults preserve edge-to-edge tiling; bounds fail closed.
+        const { assert!(DEFAULT_LAYOUT_GAPS_IN == 0) }
+        const { assert!(DEFAULT_LAYOUT_GAPS_OUT == 0) }
+        const { assert!(MAX_LAYOUT_GAP_CELLS == 16) }
+        let cfg = RuntimeConfig::default();
+        assert_eq!((cfg.gaps_in, cfg.gaps_out), (0, 0));
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0)
+            .expect("zero gaps build");
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 16, 16)
+            .expect("max gaps build");
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 17, 0).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 17).is_err());
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                u16::MAX,
+                u16::MAX
+            )
+            .is_err()
+        );
     }
 }

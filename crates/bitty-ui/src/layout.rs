@@ -4,11 +4,13 @@
 //! This module provides pure, headless, deterministic layout computation: given a
 //! container `Rect` and a `LayoutNode` tree, `LayoutNode::layout` produces an
 //! allocation of `Rect`s to leaf views with no gaps or overlaps (except Stack/Overlay
-//! semantics). Split ratios are clamped and the solver is total over all inputs.
+//! semantics), while `LayoutNode::layout_with_gaps` inserts Hyprland-like
+//! `gaps_in`/`gaps_out` bands (CTX-0177). Split ratios are clamped and the solver
+//! is total over all inputs.
 
 #![forbid(unsafe_code)]
 
-use crate::geometry::{Rect, SplitAxis};
+use crate::geometry::{Gaps, Rect, SplitAxis};
 use crate::view::{View, ViewId};
 
 /// Layout tree for terminal panes.
@@ -230,14 +232,38 @@ impl LayoutNode {
     /// leaf, in deterministic depth-first order. The solver is total: empty spaces
     /// are handled, zero-sized containers produce zero-sized leaves, and split
     /// arithmetic never panics.
+    ///
+    /// Gapless (zero [`Gaps`]): leaves tile edge-to-edge with no gaps or
+    /// overlaps (except Stack/Overlay semantics).
     #[must_use]
     pub fn layout(&self, bounds: Rect) -> Vec<(ViewId, Rect)> {
+        self.layout_with_gaps(bounds, Gaps::ZERO)
+    }
+
+    /// Deterministic layout solver with Hyprland-like gaps (CTX-0177).
+    ///
+    /// `gaps.outer` (`gaps_out`) insets `bounds` once; `gaps.inner`
+    /// (`gaps_in`) reserves a background-colored band between sibling panes
+    /// at every `Split` (nested splits each insert their own band, matching
+    /// Hyprland). `Stack` children share the full inset bounds (only one is
+    /// visible); `Overlay` bases fill the inset bounds while the overlay
+    /// subtree is laid out inside its clipped rect with inner gaps only
+    /// (positioned chrome keeps its explicit position).
+    ///
+    /// With [`Gaps::ZERO`] this is bit-identical to [`Self::layout`]. The
+    /// solver stays total: oversized gaps collapse leaves to zero-size rects
+    /// rather than panicking.
+    #[must_use]
+    pub fn layout_with_gaps(&self, bounds: Rect, gaps: Gaps) -> Vec<(ViewId, Rect)> {
         let mut out = Vec::with_capacity(self.leaf_count());
-        self.layout_into(bounds, &mut out);
+        let inner = gaps.inset_outer(bounds);
+        self.layout_inner(inner, gaps.inner, &mut out);
         out
     }
 
-    fn layout_into(&self, bounds: Rect, out: &mut Vec<(ViewId, Rect)>) {
+    /// Gap-core recursion: `gap_in` applies at every `Split` below this
+    /// point (the outer inset is consumed once by [`Self::layout_with_gaps`]).
+    fn layout_inner(&self, bounds: Rect, gap_in: u16, out: &mut Vec<(ViewId, Rect)>) {
         match self {
             Self::Leaf(v) => {
                 out.push((v.id(), bounds));
@@ -248,13 +274,13 @@ impl LayoutNode {
                 first,
                 second,
             } => {
-                let (a, b) = split_rect(bounds, *axis, *ratio);
-                first.layout_into(a, out);
-                second.layout_into(b, out);
+                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
+                first.layout_inner(a, gap_in, out);
+                second.layout_inner(b, gap_in, out);
             }
             Self::Stack(children) => {
                 for child in children {
-                    child.layout_into(bounds, out);
+                    child.layout_inner(bounds, gap_in, out);
                 }
             }
             Self::Overlay {
@@ -262,7 +288,7 @@ impl LayoutNode {
                 overlay,
                 bounds: overlay_bounds,
             } => {
-                base.layout_into(bounds, out);
+                base.layout_inner(bounds, gap_in, out);
                 // Overlay desired bounds are container-relative and clipped.
                 let clipped = if let Some(inter) = overlay_bounds.clip_to(bounds) {
                     inter
@@ -270,7 +296,7 @@ impl LayoutNode {
                     // Overlay completely outside container -> empty allocation clipped to container.
                     Rect::zero()
                 };
-                overlay.layout_into(clipped, out);
+                overlay.layout_inner(clipped, gap_in, out);
             }
         }
     }
@@ -281,7 +307,14 @@ impl LayoutNode {
     /// This is the primary resize helper: call after a window resize to update
     /// all views deterministically to the new allocation.
     pub fn reflow(&mut self, container: Rect) {
-        let allocations = self.layout(container);
+        self.reflow_with_gaps(container, Gaps::ZERO);
+    }
+
+    /// Gap-aware reflow (CTX-0177): like [`Self::reflow`] but allocates with
+    /// [`Self::layout_with_gaps`], so leaf origins/sizes already exclude the
+    /// gap bands. With [`Gaps::ZERO`] this is identical to [`Self::reflow`].
+    pub fn reflow_with_gaps(&mut self, container: Rect, gaps: Gaps) {
+        let allocations = self.layout_with_gaps(container, gaps);
         for (id, rect) in allocations {
             if let Some(view) = self.find_leaf_mut(id) {
                 view.reflow_to_rect(rect);
@@ -298,8 +331,16 @@ impl LayoutNode {
     /// size. Equivalent to `reflow` but also returns the new allocation list.
     #[must_use]
     pub fn resize(&mut self, container: Rect) -> Vec<(ViewId, Rect)> {
-        self.reflow(container);
-        self.layout(container)
+        self.resize_with_gaps(container, Gaps::ZERO)
+    }
+
+    /// Gap-aware resize (CTX-0177): like [`Self::resize`] but allocates with
+    /// [`Self::layout_with_gaps`]. With [`Gaps::ZERO`] this is identical to
+    /// [`Self::resize`].
+    #[must_use]
+    pub fn resize_with_gaps(&mut self, container: Rect, gaps: Gaps) -> Vec<(ViewId, Rect)> {
+        self.reflow_with_gaps(container, gaps);
+        self.layout_with_gaps(container, gaps)
     }
 
     /// Returns true when the node is a leaf.
@@ -325,8 +366,25 @@ pub fn clamp_ratio(raw: f32) -> f32 {
 /// ratio product and clamps inner sizes to `[1, total-1]` when total >= 2,
 /// otherwise preserves total for the first pane (second gets remainder which
 /// may be zero). This is deterministic across platforms for the same `f32` bits.
+///
+/// Equivalent to [`split_rect_with_gap`] with a zero gap.
 #[must_use]
 pub fn split_rect(bounds: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
+    split_rect_with_gap(bounds, axis, ratio, 0)
+}
+
+/// Deterministic split with a Hyprland-like inner gap band (CTX-0177).
+///
+/// Like [`split_rect`], but reserves `gap_in` cells between the children for
+/// the window background: `first + gap + second` spans `bounds` along the
+/// split axis. The ratio applies to the gap-subtracted space, so a 50/50
+/// split stays symmetric. With `gap_in == 0` this is bit-identical to
+/// [`split_rect`].
+///
+/// Total over all inputs: oversized gaps saturate (leaves collapse to
+/// zero-size rather than panic), empty bounds yield zero rects.
+#[must_use]
+pub fn split_rect_with_gap(bounds: Rect, axis: SplitAxis, ratio: f32, gap_in: u16) -> (Rect, Rect) {
     if bounds.is_empty() {
         return (Rect::zero(), Rect::zero());
     }
@@ -345,15 +403,35 @@ pub fn split_rect(bounds: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
                 );
                 return (a, b);
             }
+            // Reserve the gap first; leaves share what remains (at least 1
+            // cell stays addressable so the solver never inverts).
+            let gap = (u32::from(gap_in)).min(total.saturating_sub(1));
+            let avail = total - gap;
+            if avail < 2 {
+                let a = Rect::new(bounds.x, bounds.y, 1, bounds.height);
+                let b = Rect::new(
+                    bounds
+                        .x
+                        .saturating_add(1)
+                        .saturating_add(gap.min(u32::from(u16::MAX)) as u16),
+                    bounds.y,
+                    0,
+                    bounds.height,
+                );
+                return (a, b);
+            }
             let first_w = {
-                let raw = (total as f32 * r).floor() as u32;
-                // Clamp to [1, total-1] so neither pane collapses.
-                raw.clamp(1, total - 1) as u16
+                let raw = (avail as f32 * r).floor() as u32;
+                // Clamp to [1, avail-1] so neither pane collapses.
+                raw.clamp(1, avail - 1) as u16
             };
-            let second_w = bounds.width - first_w;
+            let second_w = (avail - u32::from(first_w)) as u16;
             let a = Rect::new(bounds.x, bounds.y, first_w, bounds.height);
             let b = Rect::new(
-                bounds.x.saturating_add(first_w),
+                bounds
+                    .x
+                    .saturating_add(first_w)
+                    .saturating_add(gap.min(u32::from(u16::MAX)) as u16),
                 bounds.y,
                 second_w,
                 bounds.height,
@@ -372,15 +450,33 @@ pub fn split_rect(bounds: Rect, axis: SplitAxis, ratio: f32) -> (Rect, Rect) {
                 );
                 return (a, b);
             }
+            let gap = (u32::from(gap_in)).min(total.saturating_sub(1));
+            let avail = total - gap;
+            if avail < 2 {
+                let a = Rect::new(bounds.x, bounds.y, bounds.width, 1);
+                let b = Rect::new(
+                    bounds.x,
+                    bounds
+                        .y
+                        .saturating_add(1)
+                        .saturating_add(gap.min(u32::from(u16::MAX)) as u16),
+                    bounds.width,
+                    0,
+                );
+                return (a, b);
+            }
             let first_h = {
-                let raw = (total as f32 * r).floor() as u32;
-                raw.clamp(1, total - 1) as u16
+                let raw = (avail as f32 * r).floor() as u32;
+                raw.clamp(1, avail - 1) as u16
             };
-            let second_h = bounds.height - first_h;
+            let second_h = (avail - u32::from(first_h)) as u16;
             let a = Rect::new(bounds.x, bounds.y, bounds.width, first_h);
             let b = Rect::new(
                 bounds.x,
-                bounds.y.saturating_add(first_h),
+                bounds
+                    .y
+                    .saturating_add(first_h)
+                    .saturating_add(gap.min(u32::from(u16::MAX)) as u16),
                 bounds.width,
                 second_h,
             );
@@ -597,5 +693,180 @@ mod tests {
         let (a, b) = split_rect(Rect::zero(), SplitAxis::Horizontal, 0.5);
         assert!(a.is_empty());
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn zero_gaps_match_gapless_solver() {
+        // CTX-0177: Gaps::ZERO must be bit-identical to the legacy solver so
+        // existing users see zero change.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.3,
+                LayoutNode::leaf(view(1, 1, 1)),
+                LayoutNode::leaf(view(2, 1, 1)),
+            ),
+            LayoutNode::leaf(view(3, 1, 1)),
+        );
+        assert_eq!(
+            node.layout(bounds),
+            node.layout_with_gaps(bounds, Gaps::ZERO)
+        );
+        let (a, b) = split_rect(bounds, SplitAxis::Horizontal, 0.5);
+        let (ga, gb) = split_rect_with_gap(bounds, SplitAxis::Horizontal, 0.5, 0);
+        assert_eq!((a, b), (ga, gb));
+        let (c, d) = split_rect(bounds, SplitAxis::Vertical, 0.3);
+        let (gc, gd) = split_rect_with_gap(bounds, SplitAxis::Vertical, 0.3, 0);
+        assert_eq!((c, d), (gc, gd));
+    }
+
+    #[test]
+    fn gaps_out_insets_all_leaves() {
+        // CTX-0177: gaps_out shrinks the container once; a single leaf fills
+        // the inset rect.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let node = LayoutNode::leaf(view(1, 1, 1));
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(0, 2));
+        assert_eq!(alloc.len(), 1);
+        assert_eq!(alloc[0].1, Rect::new(2, 2, 76, 20));
+    }
+
+    #[test]
+    fn gaps_in_reserves_background_band_between_siblings() {
+        // CTX-0177: gaps_in splits the gap-subtracted space; first + gap +
+        // second spans the container and the ratio stays symmetric.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(2, 0));
+        assert_eq!(alloc.len(), 2);
+        let (_, a) = alloc[0];
+        let (_, b) = alloc[1];
+        // 80 - 2 gap = 78 shared 39/39.
+        assert_eq!(a, Rect::new(0, 0, 39, 24));
+        assert_eq!(b, Rect::new(41, 0, 39, 24));
+        // The band between them belongs to no leaf (background shows through).
+        assert_eq!(b.x, a.x + a.width + 2);
+        assert_eq!(a.width + 2 + b.width, 80);
+    }
+
+    #[test]
+    fn gaps_in_vertical_split() {
+        // CTX-0177: vertical splits reserve the band along the y axis.
+        let bounds = Rect::new(0, 0, 10, 10);
+        let node = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(2, 0));
+        let (_, a) = alloc[0];
+        let (_, b) = alloc[1];
+        // 10 - 2 = 8 shared 4/4.
+        assert_eq!(a, Rect::new(0, 0, 10, 4));
+        assert_eq!(b, Rect::new(0, 6, 10, 4));
+        assert_eq!(b.y, a.y + a.height + 2);
+    }
+
+    #[test]
+    fn gaps_compose_outer_then_inner() {
+        // CTX-0177: outer insets the container, then inner splits the rest.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(2, 1));
+        let (_, a) = alloc[0];
+        let (_, b) = alloc[1];
+        // Inset to (1,1,78,22); 78 - 2 = 76 shared 38/38.
+        assert_eq!(a, Rect::new(1, 1, 38, 22));
+        assert_eq!(b, Rect::new(41, 1, 38, 22));
+    }
+
+    #[test]
+    fn gaps_nested_splits_each_insert_band() {
+        // CTX-0177: like Hyprland, every Split level inserts its own band.
+        let bounds = Rect::new(0, 0, 81, 24);
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(view(1, 1, 1)),
+                LayoutNode::leaf(view(2, 1, 1)),
+            ),
+            LayoutNode::leaf(view(3, 1, 1)),
+        );
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(1, 0));
+        assert_eq!(alloc.len(), 3);
+        // Outer split: 81 - 1 = 80, floor(80 * 0.5) = 40 left, 40 right.
+        // Inner split of the 40-wide left: 40 - 1 = 39, floor(39 * 0.5) = 19.
+        assert_eq!(alloc[0].1, Rect::new(0, 0, 19, 24));
+        assert_eq!(alloc[1].1, Rect::new(20, 0, 20, 24));
+        assert_eq!(alloc[2].1, Rect::new(41, 0, 40, 24));
+        // Deterministic across runs.
+        assert_eq!(alloc, node.layout_with_gaps(bounds, Gaps::new(1, 0)));
+    }
+
+    #[test]
+    fn gaps_oversized_collapse_total() {
+        // CTX-0177: gaps larger than the container collapse leaves instead of
+        // panicking; the solver stays total.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let node = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout_with_gaps(bounds, Gaps::new(200, 0));
+        assert_eq!(alloc.len(), 2);
+        for (_, r) in &alloc {
+            assert!(r.x as u32 + r.width as u32 <= 80);
+        }
+        // Outer larger than the container: zero-size leaves.
+        let solo = LayoutNode::leaf(view(1, 1, 1));
+        let alloc = solo.layout_with_gaps(bounds, Gaps::new(0, 100));
+        assert!(alloc[0].1.is_empty());
+    }
+
+    #[test]
+    fn gaps_reflow_updates_origins_past_gap_bands() {
+        // CTX-0177: reflowed leaf origins skip the gap bands so per-leaf
+        // rendering translates to the right pixels.
+        let mut root = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 80, 24)),
+        );
+        root.reflow_with_gaps(Rect::new(0, 0, 80, 24), Gaps::new(2, 1));
+        let v1 = root.find_leaf(ViewId::new(1)).unwrap();
+        let v2 = root.find_leaf(ViewId::new(2)).unwrap();
+        assert_eq!(v1.origin().x, 1);
+        assert_eq!(v1.cols(), 38);
+        assert_eq!(v2.origin().x, 41);
+        assert_eq!(v2.cols(), 38);
+        // Gapless reflow is unchanged.
+        let mut plain = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 80, 24)),
+        );
+        plain.reflow(Rect::new(0, 0, 80, 24));
+        assert_eq!(plain.find_leaf(ViewId::new(2)).unwrap().origin().x, 40);
     }
 }

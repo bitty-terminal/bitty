@@ -62,6 +62,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
 /// | `selection.auto_copy`     | RestartRequired    |
+/// | `layout.gaps_in`          | RestartRequired    |
+/// | `layout.gaps_out`         | RestartRequired    |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -85,6 +87,9 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "terminal"
         | "selection.auto_copy"
         | "selection"
+        | "layout.gaps_in"
+        | "layout.gaps_out"
+        | "layout"
         | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,
     }
@@ -219,6 +224,18 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "selection.auto_copy",
         old.selection.auto_copy.to_string(),
         new.selection.auto_copy.to_string(),
+    );
+    // CTX-0177: gaps are adopted at startup (RuntimeConfig carries them into
+    // every layout call), so changes are restart-required, not live.
+    push_if_changed(
+        "layout.gaps_in",
+        old.layout.gaps_in.to_string(),
+        new.layout.gaps_in.to_string(),
+    );
+    push_if_changed(
+        "layout.gaps_out",
+        old.layout.gaps_out.to_string(),
+        new.layout.gaps_out.to_string(),
     );
     push_if_changed(
         "appearance.theme",
@@ -417,6 +434,16 @@ mod tests {
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("selection"), ReloadClass::RestartRequired);
+        // CTX-0177: gaps are restart-required (adopted at startup).
+        assert_eq!(
+            classify_field("layout.gaps_in"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(
+            classify_field("layout.gaps_out"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("layout"), ReloadClass::RestartRequired);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
 
@@ -458,5 +485,24 @@ mod tests {
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "selection.auto_copy"));
+    }
+
+    #[test]
+    fn diff_layout_gaps_is_restart_required() {
+        // CTX-0177: changing either gap must surface as a restart-required
+        // diff (no silent no-op on reload).
+        let old = EffectiveConfig::default();
+        assert_eq!(old.layout.gaps_in, 0);
+        let mut new = old.clone();
+        new.layout.gaps_in = 2;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "layout.gaps_in"));
+        let mut new2 = old.clone();
+        new2.layout.gaps_out = 1;
+        let r2 = diff(&old, &new2);
+        assert_eq!(r2.overall, ReloadClass::RestartRequired);
+        assert!(r2.diffs.iter().any(|d| d.field == "layout.gaps_out"));
     }
 }

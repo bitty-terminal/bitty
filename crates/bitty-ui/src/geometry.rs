@@ -164,6 +164,60 @@ pub enum SplitAxis {
     Vertical,
 }
 
+/// Hyprland-like panel gaps in cell units (CTX-0177).
+///
+/// - `inner` (`gaps_in`): spacing between sibling panes at every `Split`,
+///   in cells. The gap band shows the window background; no leaf paints it.
+/// - `outer` (`gaps_out`): inset between the container edge and all leaves,
+///   in cells.
+///
+/// Cells (not pixels): the layout algebra is integer cell-space and glyphs
+/// must sit on the cell grid, so a pixel gap would quantize to cells anyway.
+/// Hit-testing converts via the live cell metrics (`outer`/`inner` cells
+/// times cell px). All arithmetic is saturating; oversized gaps collapse
+/// leaves to zero-size (total solver) rather than panicking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Gaps {
+    /// Spacing between sibling panes (`gaps_in`), in cells.
+    pub inner: u16,
+    /// Inset around the container edge (`gaps_out`), in cells.
+    pub outer: u16,
+}
+
+impl Gaps {
+    /// Zero gaps: edge-to-edge tiling (the pre-CTX-0177 behavior).
+    pub const ZERO: Self = Self { inner: 0, outer: 0 };
+
+    /// Creates gaps in cells.
+    #[must_use]
+    pub const fn new(inner: u16, outer: u16) -> Self {
+        Self { inner, outer }
+    }
+
+    /// True when both gaps are zero (gapless fast path, bit-identical to the
+    /// legacy solver).
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.inner == 0 && self.outer == 0
+    }
+
+    /// Insets `bounds` by `outer` on all four sides, saturating. When the
+    /// inset exceeds the bounds, the result is a zero-size rect at the
+    /// clamped origin (total, never panics).
+    #[must_use]
+    pub fn inset_outer(self, bounds: Rect) -> Rect {
+        if self.outer == 0 {
+            return bounds;
+        }
+        let o = self.outer;
+        let x = bounds.x.saturating_add(o);
+        let y = bounds.y.saturating_add(o);
+        let width = bounds.width.saturating_sub(o.saturating_mul(2));
+        let height = bounds.height.saturating_sub(o.saturating_mul(2));
+        Rect::new(x, y, width, height)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +248,40 @@ mod tests {
         let r = Rect::new(8, 8, 5, 5);
         assert_eq!(r.clip_to(bounds), Some(Rect::new(8, 8, 2, 2)));
         assert_eq!(Rect::new(20, 20, 2, 2).clip_to(bounds), None);
+    }
+
+    #[test]
+    fn gaps_zero_is_identity() {
+        // CTX-0177: zero gaps preserve edge-to-edge tiling exactly.
+        assert!(Gaps::ZERO.is_zero());
+        assert!(!Gaps::new(1, 0).is_zero());
+        let bounds = Rect::new(0, 0, 80, 24);
+        assert_eq!(Gaps::ZERO.inset_outer(bounds), bounds);
+    }
+
+    #[test]
+    fn gaps_outer_insets_all_sides() {
+        // CTX-0177: gaps_out shrinks the container symmetrically.
+        let gaps = Gaps::new(0, 2);
+        assert_eq!(
+            gaps.inset_outer(Rect::new(0, 0, 80, 24)),
+            Rect::new(2, 2, 76, 20)
+        );
+        // Offset containers shift the origin too.
+        assert_eq!(
+            gaps.inset_outer(Rect::new(10, 10, 80, 24)),
+            Rect::new(12, 12, 76, 20)
+        );
+    }
+
+    #[test]
+    fn gaps_outer_oversized_collapses_total() {
+        // CTX-0177: an outer gap larger than the container saturates to a
+        // zero-size rect instead of panicking.
+        let gaps = Gaps::new(0, 50);
+        let inset = gaps.inset_outer(Rect::new(0, 0, 80, 24));
+        assert!(inset.is_empty());
+        assert_eq!(inset.width, 0);
+        assert_eq!(inset.height, 0);
     }
 }

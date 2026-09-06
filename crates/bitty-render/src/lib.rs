@@ -4,7 +4,9 @@
 //! (ADR-0003): it plans frames from damage descriptors, renders terminal
 //! snapshots into owned draw records through the grid pipeline
 //! ([`grid::GridRenderer`]), owns glyph atlas math and a bounded glyph
-//! cache, and wraps upstream rasterization behind a Bitty-owned trait.
+//! cache, wraps upstream rasterization behind a Bitty-owned trait, and
+//! walks the documented font chain per glyph for TUI-graph coverage
+//! ([`fallback::FallbackRasterizer`]).
 //! Per ADR-0003 dependency rule 3, the grid pipeline reads **only** the
 //! public `Snapshot`/`Damage` surface of `bitty-term-state`; no private
 //! structure is reached into and terminal state is never mutated. Exactly
@@ -146,6 +148,7 @@ pub mod batch;
 pub mod cache;
 pub mod crossfont_backend;
 pub mod error;
+pub mod fallback;
 pub mod frame;
 pub mod geometry;
 pub mod glyph;
@@ -161,6 +164,10 @@ pub mod software;
 pub use cache::GlyphCache;
 pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;
+pub use fallback::{
+    BLOCK_FIRST, BLOCK_LAST, BRAILLE_FIRST, BRAILLE_LAST, FallbackRasterizer, is_block_element,
+    is_braille_pattern, is_tui_graph_scalar,
+};
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{FontId, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey};
 pub use grid::{

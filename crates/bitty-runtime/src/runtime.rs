@@ -87,7 +87,7 @@ use bitty_platform::{
 };
 use bitty_pty::{Pty, PtyBuilder, PtyReader, PtyWriter};
 use bitty_render::{
-    CrossFontRasterizer, RenderError,
+    CrossFontRasterizer, FallbackRasterizer, RenderError,
     frame::{FrameMode, FramePlan},
     glyph::{
         BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
@@ -517,7 +517,7 @@ pub struct Runtime {
     pane_sessions: BTreeMap<ViewId, PaneSession>,
     pending_input: Vec<u8>,
     pending_input_dropped: u64,
-    renderer: GridRenderer<AnyRasterizer>,
+    renderer: GridRenderer<FallbackRasterizer<AnyRasterizer>>,
     surface: Surface,
     gpu: Option<GpuContext>,
     cold_queue: ColdQueue,
@@ -734,17 +734,24 @@ impl Runtime {
             point_size: config.font_size,
         };
         // Vertical slice: prefer crossfont when available, fallback to headless
-        // for CI determinism. Both are bounded and headless-testable. On
+        // for CI determinism. Both are bounded and headless-testable. The
+        // crossfont backend is wrapped in the per-glyph fallback chain
+        // (CTX-0163: braille `U+2800-U+28FF` + blocks `U+2580-U+259F` for
+        // TUI graphs resolve through `Noto Sans Symbols 2` when the primary
+        // face lacks them). On
         // Windows the monospace family may be absent, so a FontNotFound from
         // GridRenderer re-tries deterministically with HeadlessRasterizer
         // instead of failing with_defaults on headless CI.
         let (renderer, is_crossfont) = {
-            let raster = AnyRasterizer::try_crossfont();
-            let is_cf = raster.is_crossfont();
+            let base = AnyRasterizer::try_crossfont();
+            let is_cf = base.is_crossfont();
+            let raster = FallbackRasterizer::with_default_chain(base);
             match GridRenderer::new(raster, &query, cell) {
                 Ok(r) => (r, is_cf),
                 Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let fallback = FallbackRasterizer::with_default_chain(AnyRasterizer::Headless(
+                        HeadlessRasterizer::new(),
+                    ));
                     let r =
                         GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
                     (r, false)
@@ -834,12 +841,15 @@ impl Runtime {
             point_size: config.font_size,
         };
         let (renderer, is_crossfont) = {
-            let raster = AnyRasterizer::try_crossfont();
-            let is_cf = raster.is_crossfont();
+            let base = AnyRasterizer::try_crossfont();
+            let is_cf = base.is_crossfont();
+            let raster = FallbackRasterizer::with_default_chain(base);
             match GridRenderer::new(raster, &query, cell) {
                 Ok(r) => (r, is_cf),
                 Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = AnyRasterizer::Headless(HeadlessRasterizer::new());
+                    let fallback = FallbackRasterizer::with_default_chain(AnyRasterizer::Headless(
+                        HeadlessRasterizer::new(),
+                    ));
                     let r =
                         GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
                     (r, false)

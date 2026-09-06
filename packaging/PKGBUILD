@@ -31,7 +31,7 @@ check() {
 
 package() {
   cd "$pkgname-$pkgver"
-  install -Dm755 "target/release/bitty-app" "$pkgdir/usr/bin/bitty"
+  install -Dm755 "target/release/bitty" "$pkgdir/usr/bin/bitty"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"

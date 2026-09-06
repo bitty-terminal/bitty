@@ -50,7 +50,7 @@ main() {
 	if command -v hyperfine >/dev/null 2>&1; then
 		echo "--- hyperfine comparison (secondary, --help path retained for history, not primary) ---"
 		echo "runner: hyperfine 5 runs, timeout ${TIMEOUT_SECS}s"
-		bin="./target/release/bitty-app"
+		bin="./target/release/bitty"
 		if [ ! -x "${bin}" ]; then
 			cargo build --release -p bitty-app >/dev/null 2>&1 || true
 		fi

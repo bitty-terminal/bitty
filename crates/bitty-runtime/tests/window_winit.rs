@@ -10,7 +10,7 @@
 //! - Close semantics (`CloseRequested`/`Closed` and `Exiting`) are owned and return
 //!   `true` for loop exit, while `RedrawRequested` and `AboutToWait` do not.
 //! - Headless still works: the suite never calls `App::run` or `GpuContext`; it
-//!   proves the same byte -> snapshot -> present path that `bitty-app --headless`
+//!   proves the same byte -> snapshot -> present path that `bitty --headless`
 //!   uses, and would remain green with `cargo test --features headless`.
 
 #![forbid(unsafe_code)]

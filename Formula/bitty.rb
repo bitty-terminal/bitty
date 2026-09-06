@@ -13,7 +13,7 @@ class Bitty < Formula
 
   def install
     system "cargo", "build", "--release", "--locked", "-p", "bitty-app"
-    bin.install "target/release/bitty-app" => "bitty"
+    bin.install "target/release/bitty" => "bitty"
     doc.install "README.md"
     doc.install "CHANGELOG.md"
     (share/"licenses/bitty").install "LICENSE"

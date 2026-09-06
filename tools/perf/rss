@@ -71,7 +71,7 @@ main() {
 	self_kb="$(rss_kb_for_pid "$$")"
 	check_budget "self shell" "${self_kb}" "${PB2_MB}"
 
-	# Headless child RSS: run `bitty-app --help` headless fallback (no Window)
+	# Headless child RSS: run `bitty --help` headless fallback (no Window)
 	# and sample its peak RSS via a short-lived background `ps` poll.
 	if ! command -v cargo >/dev/null 2>&1; then
 		echo "skip: cargo not on PATH"
@@ -101,13 +101,13 @@ main() {
 			wait "${child_pid}" 2>/dev/null || true
 		else
 			# Already exited; sample via `cargo build` artifact if present.
-			if [ -x "./target/release/bitty-app" ]; then
-				timeout 1 ./target/release/bitty-app --help >/dev/null 2>&1 &
+			if [ -x "./target/release/bitty" ]; then
+				timeout 1 ./target/release/bitty --help >/dev/null 2>&1 &
 				bin_pid=$!
 				sleep 0.2
 				if kill -0 "${bin_pid}" 2>/dev/null; then
 					bin_kb="$(rss_kb_for_pid "${bin_pid}")"
-					check_budget "binary ./target/release/bitty-app --help" "${bin_kb}" "${PB2_MB}"
+					check_budget "binary ./target/release/bitty --help" "${bin_kb}" "${PB2_MB}"
 					kill "${bin_pid}" 2>/dev/null || true
 					wait "${bin_pid}" 2>/dev/null || true
 				else

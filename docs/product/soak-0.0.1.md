@@ -59,7 +59,7 @@ status: draft
 
 ### What is exercised
 
-- `bitty-app --headless` composition root: `Runtime::with_defaults` builds
+- `bitty --headless` composition root: `Runtime::with_defaults` builds
   `Surface::headless` extent `640×384` (80×24 at 8×16), deterministic
   `HeadlessRasterizer`, feeds synthetic shell bytes
   (`"bitty"` + SGR + OSC title + BEL), `tick` → `Surface::headless_present`
@@ -322,14 +322,14 @@ Usage: grim [options...] [output-file]
 
 ### Real window attempt + screenshot
 
-`bitty-app` `App::run` was driven on this Hyprland session (`WAYLAND_DISPLAY=wayland-1`,
+`bitty` `App::run` was driven on this Hyprland session (`WAYLAND_DISPLAY=wayland-1`,
 `XDG_SESSION_TYPE=wayland`, Hyprland `Hyprland --watchdog-fd 4`, monitor
 `eDP-1 2560×1600@240 scale 1.6`). On `App::run` → `Resumed`, `bitty` created a
 window via `WindowConfig::new().with_title("bitty — Correct Terminal")
 .with_inner_size(LogicalSize 800×600).with_visible(true)`:
 
 ```text
-$ ./target/debug/bitty-app  # real window, not --headless
+$ ./target/debug/bitty  # real window, not --headless
 bitty: layout installed — leafs=1 ...
 bitty: window created id=1 headless_fallback=true (gpu attach deferred) focused=Some(ViewId(1)) leafs=1
 bitty tick: frame=1 fills=5684 glyphs=18 headless=true gen=25 presented_frames=1
@@ -404,8 +404,8 @@ cargo test -p bitty-platform --test winit_window -- --nocapture
 ### `bitty` as daily driver
 
 - This soak was performed with `bitty` `0.0.1` workspace at `325c42f` as the
-  terminal under test, not only as a library. `bitty-app --headless` and
-  `bitty-app` real window were both exercised on the Hyprland host that
+  terminal under test, not only as a library. `bitty --headless` and
+  `bitty` real window were both exercised on the Hyprland host that
   authored this doc. No `unsafe` is required (`#![forbid(unsafe_code)]`
   workspace, `cargo clippy` 0 warnings).
 - Regression risk: tail crates (`plugin-host` `rich` `ipc` `agent` `runtime`

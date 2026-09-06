@@ -413,21 +413,45 @@ impl ServerInfo {
 }
 
 /// Per-request dispatch context: static server facts plus fresh uptime.
+///
+/// `granted` is the server-evaluated scope set for the authenticated peer
+/// (CLI default plus explicit `BITTY_CTL_ELEVATE` allowlist). Read-only
+/// handlers ignore it (any authenticated same-UID peer may read); control
+/// handlers authorize against it on every request (never ambient authority).
 #[derive(Debug, Clone)]
 pub struct ServeContext {
     /// Server facts.
     pub server: ServerInfo,
     /// Uptime at request time (millis).
     pub uptime_ms: u64,
+    /// Server-evaluated granted scopes for this peer.
+    pub granted: crate::scope::ScopeSet,
 }
 
 impl ServeContext {
     /// Build a context from server facts, stamping uptime now.
+    ///
+    /// Granted scopes default to the CLI interactive set plus the explicit
+    /// `BITTY_CTL_ELEVATE` allowlist (impure: reads one env var; tests that
+    /// need hermetic scopes use [`ServeContext::with_granted`]).
     #[must_use]
     pub fn new(server: &ServerInfo) -> Self {
         Self {
             server: server.clone(),
             uptime_ms: server.uptime_ms(),
+            granted: crate::ctl::elevation_from_env(
+                std::env::var("BITTY_CTL_ELEVATE").ok().as_deref(),
+            ),
+        }
+    }
+
+    /// Build a context with explicit granted scopes (hermetic tests).
+    #[must_use]
+    pub fn with_granted(server: &ServerInfo, granted: crate::scope::ScopeSet) -> Self {
+        Self {
+            server: server.clone(),
+            uptime_ms: server.uptime_ms(),
+            granted,
         }
     }
 }
@@ -993,13 +1017,19 @@ pub struct Dispatcher {
 impl Dispatcher {
     /// Table with the round-trip surface plus CTX-0159 read-only
     /// introspection (`getGridText`, `getInputRing`, `getModifiers`,
-    /// `getFocus`).
+    /// `getFocus`) plus CTX-0171 runtime control (`listWindows`,
+    /// `listViews`, `listTerminals`, `spawnTerminal`, `closeTerminal`,
+    /// `sendInput`, `getTerminalText`, `splitView`, `focusView`,
+    /// `reloadConfig`).
     ///
     /// Introspection handlers register via [`Dispatcher::register`] (the
     /// CTX-0159 hook) so the registration path itself is exercised here, not
     /// just in tests. Method names are statically valid, so a registration
     /// failure here is a programming error surfaced loudly rather than a
-    /// silent partial table.
+    /// silent partial table. Control handlers authorize against
+    /// `context.granted` on every request and enqueue to the cross-thread
+    /// queue for the main thread to apply (the connection thread never
+    /// touches `Runtime`).
     #[must_use]
     pub fn with_defaults() -> Self {
         let mut table = Self {
@@ -1020,6 +1050,24 @@ impl Dispatcher {
         for (method, handler) in introspection {
             if table.register(method, *handler).is_err() {
                 debug_assert!(false, "statically valid introspection method rejected");
+            }
+        }
+        // CTX-0171 runtime control (scope-gated, main-thread applied).
+        let control: &[(&'static str, DevtoolsHandler)] = &[
+            (crate::ctl::METHOD_LIST_WINDOWS, handle_control),
+            (crate::ctl::METHOD_LIST_VIEWS, handle_control),
+            (crate::ctl::METHOD_LIST_TERMINALS, handle_control),
+            (crate::ctl::METHOD_SPAWN_TERMINAL, handle_control),
+            (crate::ctl::METHOD_CLOSE_TERMINAL, handle_control),
+            (crate::ctl::METHOD_SEND_INPUT, handle_control),
+            (crate::ctl::METHOD_GET_TERMINAL_TEXT, handle_control),
+            (crate::ctl::METHOD_SPLIT_VIEW, handle_control),
+            (crate::ctl::METHOD_FOCUS_VIEW, handle_control),
+            (crate::ctl::METHOD_RELOAD_CONFIG, handle_control),
+        ];
+        for (method, handler) in control {
+            if table.register(method, *handler).is_err() {
+                debug_assert!(false, "statically valid control method rejected");
             }
         }
         table
@@ -1715,6 +1763,70 @@ fn handle_get_focus(
     out.push_str(if guard.focus_events { "true" } else { "false" });
     out.push('}');
     Ok(out)
+}
+
+// ── runtime control (CTX-0171) ─────────────────────────────────────────────
+//
+// Control handlers authorize against `context.granted` (server-evaluated,
+// never client-asserted) and enqueue to the cross-thread queue for the main
+// thread — the sole `Runtime` owner — to apply. The connection thread blocks
+// up to 5 s for the reply; timeout becomes `Unavailable` (fail-closed, no
+// partial state). List verbs (`listWindows`, `listViews`, `listTerminals`)
+// also flow through the queue so `view`/`terminal` listings reflect live
+// `Runtime` layout rather than stale startup facts.
+
+/// Shared control handler for all ten `bitty.debug/*` control methods.
+///
+/// Validates params shape via `ctl` parsers (fail-closed `InvalidParams`
+/// before enqueue), authorizes via `context.granted` (fail-closed
+/// `ScopeDenied` without elevation), then enqueues and waits.
+fn handle_control(
+    context: &ServeContext,
+    request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    // Fail fast on malformed params before touching the queue: each verb's
+    // parser enforces its bounds (ids, text, cwd, direction).
+    if let Err(reason) = prevalidate_control_params(&request.method, request.params_raw.as_deref())
+    {
+        return Err(HandlerError::new("usage", "InvalidParams", reason));
+    }
+    let reply = crate::ctl::enqueue_control_and_wait(
+        &request.method,
+        request.params_raw.as_deref(),
+        &request.id_raw,
+        &context.granted,
+    );
+    if reply.ok {
+        Ok(reply.result_json)
+    } else {
+        Err(HandlerError::new(reply.category, reply.code, reply.message))
+    }
+}
+
+/// Pre-enqueue params shape check (bounds only; existence resolves at apply).
+fn prevalidate_control_params(method: &str, params: Option<&str>) -> Result<(), String> {
+    let res: Result<(), crate::error::IpcError> = match method {
+        m if m == crate::ctl::METHOD_CLOSE_TERMINAL
+            || m == crate::ctl::METHOD_GET_TERMINAL_TEXT =>
+        {
+            crate::ctl::parse_terminal_id_params(params).map(|_| ())
+        }
+        m if m == crate::ctl::METHOD_SEND_INPUT => {
+            crate::ctl::parse_send_params(params).map(|_| ())
+        }
+        m if m == crate::ctl::METHOD_SPAWN_TERMINAL => {
+            crate::ctl::parse_spawn_params(params).map(|_| ())
+        }
+        m if m == crate::ctl::METHOD_SPLIT_VIEW => {
+            crate::ctl::parse_split_params(params).map(|_| ())
+        }
+        m if m == crate::ctl::METHOD_FOCUS_VIEW => {
+            crate::ctl::parse_focus_params(params).map(|_| ())
+        }
+        // listWindows/listViews/listTerminals/reloadConfig take no params.
+        _ => Ok(()),
+    };
+    res.map_err(|err| format!("{err}"))
 }
 
 // ── responses ───────────────────────────────────────────────────────────────
@@ -2449,12 +2561,21 @@ mod tests {
         }
         let mut dispatcher = Dispatcher::with_defaults();
         // CTX-0144 (ping, getSnapshot) plus CTX-0159 introspection
-        // (getGridText, getInputRing, getModifiers, getFocus).
-        assert_eq!(dispatcher.method_count(), 6);
+        // (getGridText, getInputRing, getModifiers, getFocus) plus CTX-0171
+        // control (listWindows, listViews, listTerminals, spawnTerminal,
+        // closeTerminal, sendInput, getTerminalText, splitView, focusView,
+        // reloadConfig).
+        assert_eq!(dispatcher.method_count(), 16);
         assert!(dispatcher.contains("bitty.debug/getGridText"));
         assert!(dispatcher.contains("bitty.debug/getInputRing"));
         assert!(dispatcher.contains("bitty.debug/getModifiers"));
         assert!(dispatcher.contains("bitty.debug/getFocus"));
+        for method in crate::ctl::all_control_methods() {
+            assert!(
+                dispatcher.contains(method),
+                "control method {method} must be registered"
+            );
+        }
         dispatcher
             .register("bitty.debug/customProbe", custom)
             .unwrap();

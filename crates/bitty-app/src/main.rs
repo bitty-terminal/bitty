@@ -195,6 +195,7 @@ use bitty_platform::{
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
+mod ctl;
 mod doctor;
 mod ipc_serve;
 mod run;
@@ -422,6 +423,21 @@ struct Args {
     /// Raw tokens after the `run` word (options, `--`, COMMAND) for
     /// [`run::parse_run_request`]. Empty until `run_word` is set.
     run_raw: Vec<String>,
+    /// `bitty ctl` runtime control (CTX-0171, runtime class).
+    /// True once the first positional `ctl` word is seen; a program
+    /// literally named `ctl` needs `bitty run -- ctl ...` or the legacy
+    /// `bitty -- ctl ...`. Tokens after the word land verbatim in
+    /// `ctl_raw` for [`ctl::parse_ctl_request`].
+    ctl_word: bool,
+    /// Raw tokens after the `ctl` word for [`ctl::parse_ctl_request`].
+    /// Empty until `ctl_word` is set.
+    ctl_raw: Vec<String>,
+    /// Global `--socket` before the `ctl` word (merged at dispatch;
+    /// post-`ctl` `--socket` in `ctl_raw` wins when both agree, conflicts
+    /// are usage errors).
+    ctl_socket_pre: Option<String>,
+    /// Global `--instance` before the `ctl` word (merged at dispatch).
+    ctl_instance_pre: Option<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -497,6 +513,10 @@ impl Args {
             doctor_args: Vec::new(),
             run_word: false,
             run_raw: Vec::new(),
+            ctl_word: false,
+            ctl_raw: Vec::new(),
+            ctl_socket_pre: None,
+            ctl_instance_pre: None,
             verbose: false,
             log_level: None,
         }
@@ -788,9 +808,30 @@ fn parse_args(raw: &[String]) -> Args {
         }
         // Handle flags with `=` first
         if let Some(val) = token.strip_prefix("--format=") {
-            // Raw on purpose: validated at doctor dispatch (fail-closed
+            // Raw on purpose: validated at doctor/ctl dispatch (fail-closed
             // exit 2 on unknown shapes, never warn-ignored).
             out.doctor_format = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("--socket=") {
+            // `bitty ctl --socket PATH` global form (before the `ctl` word);
+            // raw on purpose, validated at ctl dispatch (exit 2 on shape).
+            // After the `ctl` word tokens go verbatim to `ctl_raw` instead.
+            if !out.ctl_word {
+                out.ctl_socket_pre = Some(val.to_string());
+            } else {
+                out.ctl_raw.push(token.clone());
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("--instance=") {
+            if !out.ctl_word {
+                out.ctl_instance_pre = Some(val.to_string());
+            } else {
+                out.ctl_raw.push(token.clone());
+            }
             i += 1;
             continue;
         }
@@ -945,14 +986,36 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             "--format" => {
-                // `bitty doctor --format SHAPE`: raw on purpose, validated
-                // at doctor dispatch (fail-closed exit 2). Parsed globally
-                // so it composes before or after the `doctor` word.
+                // `bitty doctor/ctl --format SHAPE`: raw on purpose, validated
+                // at dispatch (fail-closed exit 2). Parsed globally so it
+                // composes before or after the subcommand word.
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.doctor_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
+                    i += 1;
+                }
+            }
+            "--socket" => {
+                // `bitty ctl --socket PATH` global form (before the word).
+                // Raw on purpose, validated at ctl dispatch. After the word
+                // tokens go verbatim to `ctl_raw` (see `ctl` arm below).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.ctl_socket_pre = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --socket needs a path — ignoring");
+                    i += 1;
+                }
+            }
+            "--instance" => {
+                // `bitty ctl --instance ID` global form (before the word).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.ctl_instance_pre = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --instance needs an id — ignoring");
                     i += 1;
                 }
             }
@@ -1121,16 +1184,41 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.config_word
                     && !out.init_word
                     && !out.run_word
+                    && !out.ctl_word
                     && token == "run"
                 {
                     out.run_word = true;
                     out.run_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
+                // `bitty ctl` runtime control (CTX-0171, first positional
+                // only; `--` escape bypasses via after_double_dash). The word
+                // `ctl` is always this subcommand, never a program named
+                // `ctl`: use `bitty run -- ctl ...` (or legacy
+                // `bitty -- ctl ...`) for that program. Tokens after the word
+                // are kept verbatim for `ctl::parse_ctl_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.init_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.doctor_word
+                    && token == "ctl"
+                {
+                    out.ctl_word = true;
+                    out.ctl_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
                 // `bitty config <verb>` subcommand (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `config` needs `bitty -- config`.
-                if !program_set && !out.config_word && !out.doctor_word && token == "config" {
+                if !program_set
+                    && !out.config_word
+                    && !out.doctor_word
+                    && !out.ctl_word
+                    && !out.run_word
+                    && token == "config"
+                {
                     out.config_word = true;
                     if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                         let verb = raw[i + 1].clone();
@@ -1171,7 +1259,13 @@ fn parse_args(raw: &[String]) -> Args {
                 // A program literally named `init` needs `bitty -- init`.
                 // Flags (`--yes`, `--force`, `--config`) compose in any
                 // order around the word.
-                if !program_set && !out.init_word && !out.doctor_word && token == "init" {
+                if !program_set
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.ctl_word
+                    && !out.run_word
+                    && token == "init"
+                {
                     out.init_word = true;
                     i += 1;
                     continue;
@@ -1194,6 +1288,8 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.doctor_word
                     && !out.config_word
                     && !out.init_word
+                    && !out.ctl_word
+                    && !out.run_word
                     && token == "doctor"
                 {
                     out.doctor_word = true;
@@ -1270,9 +1366,12 @@ fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                --format SHAPE  Doctor output shape: table|json|jsonl\n  \
+                --format SHAPE  Doctor/ctl output shape: table|json|jsonl\n  \
                               (default table; parsed globally, consumed by\n  \
-                              `bitty doctor`; ignored by normal startup).\n  \
+                              `bitty doctor` and `bitty ctl`; ignored by startup).\n  \
+               --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
+                              or `bitty ctl --socket P ...`; bypasses discovery).\n  \
+               --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
                 --no-color     Disable ANSI coloring in doctor table output\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
@@ -1281,6 +1380,9 @@ fn help_text() -> String {
                              Runs COMMAND directly (no shell); `--` is required;\n  \
                              exit code is the child's. `bitty htop` never means\n  \
                              `bitty run -- htop`; colliding names need `run --`.\n  \
+            ctl [--socket P] [--instance ID] [--format SHAPE] <resource> <verb>  Control a running instance (runtime)\n  \
+                             instance|window|view|terminal list; terminal spawn|close|send|text;\n  \
+                             view split|focus; config reload. `ctl --help` never needs an instance.\n  \
             config path      Print the resolved config file path\n  \
            config check     Load + validate; print per-key sources\n  \
                             (cli/file/default), exit non-zero on invalid files\n  \
@@ -2877,6 +2979,78 @@ fn run_doctor_subcommand(args: &Args) -> i32 {
     report.exit_code()
 }
 
+/// Runs `bitty ctl`; returns the process exit code.
+///
+/// - `--help` (anywhere in `ctl_raw`) prints help to stdout, exit 0, and
+///   never requires an instance.
+/// - Global `--socket`/`--instance`/`--format` before the `ctl` word merge
+///   with per-`ctl` flags (per-`ctl` wins when only one side sets a value;
+///   conflicting values are usage errors, exit 2).
+/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
+/// - Runtime verbs resolve targeting and speak IPC; exit codes follow the
+///   stable v1 mapping (0 ok, 6 unavailable, 7 permission, 8 conflict).
+fn run_ctl_subcommand(args: &Args) -> i32 {
+    match ctl::parse_ctl_request(&args.ctl_raw) {
+        Err(ctl::CtlParseError::Help) => {
+            print!("{}", ctl::ctl_help_text());
+            0
+        }
+        Err(err) => {
+            eprintln!("{}\n{}", err.message(), ctl::ctl_usage());
+            ctl::EXIT_USAGE
+        }
+        Ok((request, mut targeting)) => {
+            // Merge global pre-`ctl` targeting: per-`ctl` flags win when
+            // only one side sets a value; differing values are conflicts.
+            if let Some(pre) = args.ctl_socket_pre.as_deref() {
+                match targeting.socket.as_deref() {
+                    None => targeting.socket = Some(pre.to_string()),
+                    Some(post) if post == pre => {}
+                    Some(post) => {
+                        eprintln!(
+                            "bitty ctl: conflicting --socket {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
+                            ctl::ctl_usage()
+                        );
+                        return ctl::EXIT_USAGE;
+                    }
+                }
+            }
+            if let Some(pre) = args.ctl_instance_pre.as_deref() {
+                match targeting.instance.as_deref() {
+                    None => targeting.instance = Some(pre.to_string()),
+                    Some(post) if post == pre => {}
+                    Some(post) => {
+                        eprintln!(
+                            "bitty ctl: conflicting --instance {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
+                            ctl::ctl_usage()
+                        );
+                        return ctl::EXIT_USAGE;
+                    }
+                }
+            }
+            // Global --format before `ctl` applies when `ctl` set none.
+            // `parse_ctl_request` defaults to table, so detect an explicit
+            // post-`ctl` format by re-scanning `ctl_raw` for the flag.
+            let post_has_format = args
+                .ctl_raw
+                .iter()
+                .any(|t| t == "--format" || t.starts_with("--format="));
+            if !post_has_format {
+                if let Some(global) = args.doctor_format.as_deref() {
+                    match ctl::CtlFormat::parse(Some(global)) {
+                        Ok(fmt) => targeting.format = fmt,
+                        Err(message) => {
+                            eprintln!("{message}\n{}", ctl::ctl_usage());
+                            return ctl::EXIT_USAGE;
+                        }
+                    }
+                }
+            }
+            ctl::execute_ctl(&request, &targeting)
+        }
+    }
+}
+
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
 ///
 /// Cell geometry applies the configured breathing room
@@ -3622,6 +3796,12 @@ impl TerminalApp {
     /// the gate entirely. `Runtime::tick` itself is untouched so devtools
     /// keeps full fidelity.
     fn drive_tick(&mut self) -> Option<bitty_runtime::PresentStats> {
+        // CTX-0171: drain IPC runtime-control queue before present so
+        // `bitty ctl` mutations (send/split/focus/close/spawn/reload) apply
+        // on the main thread — the sole `Runtime` owner — with server-side
+        // scope enforcement (never ambient authority).
+        let _ =
+            ctl::drain_global_control_queue(&mut self.runtime, &ctl::granted_scopes_for_servo());
         // Ensure replies that were queued before tick are flushed before present:
         // the runtime's tick consumes snapshot+damage and composites.
         let stats = self.runtime.tick();
@@ -4612,6 +4792,15 @@ fn main() {
     // (exit 3), not a startup abort, and no plugin VM is ever loaded.
     if args.doctor_word {
         std::process::exit(run_doctor_subcommand(&args));
+    }
+
+    // `bitty ctl` runtime control (CTX-0171, runtime class). Dispatched
+    // before config load and GUI startup: `--help` never needs an instance;
+    // other verbs resolve `--socket`/`--instance`/inherited/exactly-one
+    // targeting and speak the versioned IPC protocol. Parse failures are
+    // usage errors (exit 2).
+    if args.ctl_word {
+        std::process::exit(run_ctl_subcommand(&args));
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a
@@ -6273,6 +6462,71 @@ mod tests {
         let help = help_text();
         assert!(help.contains("doctor"));
         assert!(help.contains("--format"));
+    }
+
+    #[test]
+    fn parse_ctl_subcommand() {
+        // Bare `ctl` captures no tokens (dispatch fails closed with usage).
+        let p = parse_args(&args_of(&["bitty", "ctl"]));
+        assert!(p.ctl_word);
+        assert!(p.ctl_raw.is_empty());
+        assert_eq!(p.program, None);
+        assert!(!p.run_word);
+        assert!(!p.doctor_word);
+
+        // Tokens after the word go verbatim to `ctl_raw`.
+        let p = parse_args(&args_of(&["bitty", "ctl", "terminal", "list"]));
+        assert!(p.ctl_word);
+        assert_eq!(p.ctl_raw, vec!["terminal".to_string(), "list".to_string()]);
+
+        // Global flags before the word land in pre-fields; post-word flags
+        // stay verbatim in `ctl_raw` for `ctl::parse_ctl_request`.
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--socket",
+            "/tmp/a.sock",
+            "ctl",
+            "terminal",
+            "list",
+        ]));
+        assert!(p.ctl_word);
+        assert_eq!(p.ctl_socket_pre.as_deref(), Some("/tmp/a.sock"));
+        assert_eq!(p.ctl_raw, vec!["terminal".to_string(), "list".to_string()]);
+
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--instance",
+            "demo_1",
+            "ctl",
+            "view",
+            "list",
+        ]));
+        assert!(p.ctl_word);
+        assert_eq!(p.ctl_instance_pre.as_deref(), Some("demo_1"));
+
+        let p = parse_args(&args_of(&["bitty", "ctl", "--socket=/tmp/b.sock"]));
+        assert!(p.ctl_word);
+        assert!(p.ctl_socket_pre.is_none());
+        assert_eq!(p.ctl_raw, vec!["--socket=/tmp/b.sock".to_string()]);
+
+        // Escape hatch: a program literally named `ctl`.
+        let p = parse_args(&args_of(&["bitty", "--", "ctl"]));
+        assert!(!p.ctl_word);
+        assert_eq!(p.program.as_deref(), Some("ctl"));
+
+        // `ctl` after other subcommands belongs to that subcommand.
+        let p = parse_args(&args_of(&["bitty", "config", "ctl"]));
+        assert!(p.config_word);
+        assert!(!p.ctl_word);
+        let p = parse_args(&args_of(&["bitty", "doctor", "ctl"]));
+        assert!(p.doctor_word);
+        assert!(!p.ctl_word);
+
+        // Help mentions the new subcommand.
+        let help = help_text();
+        assert!(help.contains("ctl"));
+        assert!(help.contains("--socket"));
+        assert!(help.contains("--instance"));
     }
 
     #[test]

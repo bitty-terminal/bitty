@@ -20,7 +20,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v2 adds the alt-screen save's `DECSCUSR` style + visibility
 /// (`CTX-0162`): prior v1 hashes omitted them, so states differing only in
 /// the saved cursor shape collided.
-pub const CANONICAL_HASH_VERSION: u32 = 2;
+/// v3 adds each cell's combining buffer (`CTX-0208` CR-TERM-01): prior
+/// versions omitted combining marks, so states differing only in accents
+/// or ZWJ sequences collided.
+pub const CANONICAL_HASH_VERSION: u32 = 3;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -141,6 +144,10 @@ pub(crate) fn write_cell(out: &mut CanonicalHasher, cell: &Cell) {
     write_style(out, &cell.style);
     out.u8(cell.width);
     out.boolean(cell.spacer);
+    out.u32(cell.zerowidth.len() as u32);
+    for mark in &cell.zerowidth {
+        out.char(*mark);
+    }
     out.option_tag(cell.hyperlink.is_some());
     if let Some(link) = cell.hyperlink {
         out.u32(link.as_u32());
@@ -180,6 +187,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 2);
+        assert_eq!(CANONICAL_HASH_VERSION, 3);
     }
 }

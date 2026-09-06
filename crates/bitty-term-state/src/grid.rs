@@ -369,6 +369,7 @@ mod tests {
             width: 1,
             spacer: false,
             hyperlink: None,
+            zerowidth: Vec::new(),
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
                 width: 2,
                 spacer: false,
                 hyperlink: None,
+                zerowidth: Vec::new(),
             },
         );
         g.set(0, 2, Cell::wide_spacer(style));

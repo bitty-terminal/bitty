@@ -156,6 +156,25 @@ pub enum InvariantViolation {
         /// The invalid width.
         width: u8,
     },
+    /// Invariant 2: a cell's combining buffer exceeds its hard cap.
+    ZerowidthOverCapacity {
+        /// Cell row.
+        row: u16,
+        /// Cell column.
+        col: u16,
+        /// Retained combining scalars.
+        len: usize,
+        /// The cap.
+        cap: usize,
+    },
+    /// Invariant 2: a wide-character spacer carries combining marks, which
+    /// belong to the leading half only.
+    SpacerWithZerowidth {
+        /// Spacer row.
+        row: u16,
+        /// Spacer column.
+        col: u16,
+    },
     /// Invariant 4: scrollback exceeds its hard cap.
     ScrollbackOverCapacity {
         /// Retained lines.
@@ -639,6 +658,20 @@ impl State {
                             });
                         }
                     }
+                    if cell.zerowidth.len() > crate::cell::MAX_ZEROWIDTH_CHARS {
+                        return Err(InvariantViolation::ZerowidthOverCapacity {
+                            row: r as u16,
+                            col: c as u16,
+                            len: cell.zerowidth.len(),
+                            cap: crate::cell::MAX_ZEROWIDTH_CHARS,
+                        });
+                    }
+                    if cell.spacer && !cell.zerowidth.is_empty() {
+                        return Err(InvariantViolation::SpacerWithZerowidth {
+                            row: r as u16,
+                            col: c as u16,
+                        });
+                    }
                 }
             }
         }
@@ -1033,10 +1066,16 @@ impl State {
     fn print(&mut self, scalar: char) {
         let table = self.charsets.consume_translation_table();
         let ch = Charsets::translate(table, scalar);
+        if ch == '\0' {
+            return;
+        }
         let glyph_width = char_cell_width(ch);
-        if glyph_width == 0 || ch == '\0' {
-            // Zero-width scalars await grapheme composition from the text
-            // RFC (ADR-0004 open item); dropping them keeps cells total.
+        if glyph_width == 0 {
+            // CR-TERM-01: zero-width scalars (combining marks, ZWJ,
+            // variation selectors) attach to the preceding cell's bounded
+            // combining buffer instead of being silently dropped. The
+            // cursor does not advance and no wrap is consumed.
+            self.attach_zerowidth(ch);
             return;
         }
         let cols = self.width as u16;
@@ -1115,6 +1154,7 @@ impl State {
                 width: glyph_width,
                 spacer: false,
                 hyperlink: link,
+                zerowidth: Vec::new(),
             },
         );
         if glyph_width == 2 {
@@ -1139,6 +1179,46 @@ impl State {
         } else {
             self.cursor.position.col = advanced as u16;
         }
+    }
+
+    /// Attaches a zero-width scalar to the preceding cell (CR-TERM-01).
+    ///
+    /// The target is the last written cell: the cursor cell itself while a
+    /// deferred wrap is latched (the latch is preserved for the next
+    /// full-width print), else the cell left of the cursor, else the last
+    /// column of the previous row. A spacer target steps back to its
+    /// leading half. With no preceding cell (top-left corner) or a full
+    /// combining buffer, the mark is dropped: the buffer stays bounded
+    /// (threat T-01) and the cursor never moves.
+    fn attach_zerowidth(&mut self, mark: char) {
+        let (row, col) = self.cursor_xy();
+        let (target_row, target_col) = if self.cursor.pending_wrap {
+            (row, col)
+        } else if col > 0 {
+            (row, col - 1)
+        } else if row > 0 {
+            (row - 1, self.width - 1)
+        } else {
+            return;
+        };
+        let mut target_col = target_col;
+        if self.screens_active().get(target_row, target_col).spacer {
+            if target_col == 0 {
+                return;
+            }
+            target_col -= 1;
+        }
+        let mut cell = self.screens_active().get(target_row, target_col).clone();
+        if !cell.push_zerowidth(mark) {
+            return;
+        }
+        self.screens_active_mut().set(target_row, target_col, cell);
+        self.damage_grid_rect(
+            target_row as u16,
+            target_col as u16,
+            target_row as u16,
+            target_col as u16,
+        );
     }
 
     fn print_control(&mut self, byte: u8) {
@@ -1993,6 +2073,108 @@ mod tests {
         assert_eq!(snap.cells[2].width, 2);
         assert!(snap.cells[3].spacer);
         assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_preceding_cell_without_advance() {
+        let mut s = State::new();
+        // Decomposed e + acute (CR-TERM-01): the mark must survive on the
+        // base cell instead of being silently dropped.
+        prints(&mut s, "e\u{0301}");
+        assert_eq!(s.cursor().position.col, 1);
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[0].glyph, 'e');
+        assert_eq!(snap.cells[0].zerowidth, vec!['\u{0301}']);
+        assert!(snap.cells[1].is_blank());
+        assert!(s.check_invariants().is_ok());
+        // ZWJ attaches the same way (complex-script joiner).
+        prints(&mut s, "a\u{200D}");
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[1].glyph, 'a');
+        assert_eq!(snap.cells[1].zerowidth, vec!['\u{200D}']);
+        assert_eq!(s.cursor().position.col, 2);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn combining_buffer_is_bounded_and_drops_excess() {
+        use crate::cell::MAX_ZEROWIDTH_CHARS;
+        let mut s = State::new();
+        prints(&mut s, "x");
+        for _ in 0..(MAX_ZEROWIDTH_CHARS + 10) {
+            prints(&mut s, "\u{0301}");
+        }
+        // No unbounded growth: the buffer caps and the cursor never moves.
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[0].glyph, 'x');
+        assert_eq!(snap.cells[0].zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+        assert!(snap.cells[0].zerowidth.iter().all(|m| *m == '\u{0301}'));
+        assert_eq!(s.cursor().position.col, 1);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn leading_combining_mark_without_base_is_dropped() {
+        let mut s = State::new();
+        // No preceding cell exists at the top-left corner: the mark is
+        // dropped and the grid stays blank.
+        prints(&mut s, "\u{0301}");
+        let snap = s.snapshot();
+        assert!(snap.cells[0].is_blank());
+        assert!(snap.cells[0].zerowidth.is_empty());
+        assert_eq!(s.cursor().position.col, 0);
+        assert_eq!(s.cursor().position.row, 0);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn combining_after_wide_char_attaches_to_lead_half() {
+        let mut s = State::new();
+        prints(&mut s, "\u{4E2D}\u{0301}");
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[0].glyph, '\u{4E2D}');
+        assert_eq!(snap.cells[0].zerowidth, vec!['\u{0301}']);
+        assert!(snap.cells[1].spacer);
+        assert!(snap.cells[1].zerowidth.is_empty());
+        assert_eq!(s.cursor().position.col, 2);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn combining_preserves_deferred_wrap_latch() {
+        let mut s = State::new();
+        // Fill the first row so the cursor latches a deferred wrap.
+        for _ in 0..GRID_COLUMNS {
+            prints(&mut s, "x");
+        }
+        assert!(s.cursor().pending_wrap);
+        // A combining mark attaches to the last cell and must NOT consume
+        // the latch: the next full-width print still wraps.
+        prints(&mut s, "\u{0301}");
+        assert!(s.cursor().pending_wrap);
+        assert_eq!(s.cursor().position.row, 0);
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[GRID_COLUMNS - 1].zerowidth, vec!['\u{0301}']);
+        prints(&mut s, "y");
+        assert_eq!(s.cursor().position.row, 1);
+        assert_eq!(s.cursor().position.col, 1);
+        assert!(!s.cursor().pending_wrap);
+        let snap = s.snapshot();
+        assert_eq!(snap.cells[GRID_COLUMNS].glyph, 'y');
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn combining_mark_changes_state_hash() {
+        let mut plain = State::new();
+        prints(&mut plain, "e");
+        let mut marked = State::new();
+        prints(&mut marked, "e\u{0301}");
+        // Combining content is Terminal Truth: it must enter the hash.
+        assert_ne!(plain.state_hash(), marked.state_hash());
+        let mut marked2 = State::new();
+        prints(&mut marked2, "e\u{0301}");
+        assert_eq!(marked.state_hash(), marked2.state_hash());
     }
 
     #[test]

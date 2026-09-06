@@ -32,8 +32,9 @@
 //! | [`DAMAGE_HISTORY_BATCHES`](damage::DAMAGE_HISTORY_BATCHES) | 64 | Bounded `damage_since` window |
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
 //! | [`HYPERLINK_TABLE_MAX`](state::HYPERLINK_TABLE_MAX) | 1024 | Bounded link table (threat T-01) |
+//! | [`MAX_ZEROWIDTH_CHARS`](cell::MAX_ZEROWIDTH_CHARS) | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
 //! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 2 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 3 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers) |
 //!
 //! # Determinism
 //!
@@ -81,7 +82,7 @@ pub use bitty_vt::{
     CursorStyle, Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, StatusKind,
     TerminalAction, UnderlineStyle, ZoneKind,
 };
-pub use cell::{Attributes, Cell, HyperlinkId, Style, char_cell_width};
+pub use cell::{Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, char_cell_width};
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};
 pub use image::{

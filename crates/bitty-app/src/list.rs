@@ -1293,15 +1293,12 @@ mod tests {
     #[test]
     fn scan_lists_stale_and_live_sockets() {
         use std::os::unix::net::UnixListener;
-
-        let base = std::env::temp_dir().join(format!(
-            "bitty-list-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Keep socket paths well under SUN_LEN (104 B on macOS): short
+        // prefix, pid + atomic counter only, no nanos timestamp.
+        static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let uniq = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("blt-{}-{uniq}", std::process::id()));
         let dir = base.join("bitty");
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]

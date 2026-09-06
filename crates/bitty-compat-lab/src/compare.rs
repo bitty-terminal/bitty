@@ -53,24 +53,49 @@ fn workspace_root() -> PathBuf {
 
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
     let ws_tmp = workspace_root().join("tmp/references/bitty");
-    let ws_rec = workspace_root().join("recordings/references/bitty");
+    // Canonical singular `recording/` (workspace rename); legacy plural
+    // `recordings/` retained as fallback only.
+    let ws_rec = workspace_root().join("recording/references/bitty");
+    let ws_rec_legacy = workspace_root().join("recordings/references/bitty");
     let umbrella_tmp =
         PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
     let umbrella_rec =
+        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
+    let umbrella_rec_legacy =
         PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/bitty");
-    vec![ws_tmp, ws_rec, umbrella_tmp, umbrella_rec]
+    vec![
+        ws_tmp,
+        ws_rec,
+        ws_rec_legacy,
+        umbrella_tmp,
+        umbrella_rec,
+        umbrella_rec_legacy,
+    ]
 }
 
 fn reference_dir(backend: &str) -> Vec<PathBuf> {
     let ws_tmp = workspace_root().join(format!("tmp/references/{backend}"));
-    let ws_rec = workspace_root().join(format!("recordings/references/{backend}"));
+    // Canonical singular `recording/` (workspace rename); legacy plural
+    // `recordings/` retained as fallback only.
+    let ws_rec = workspace_root().join(format!("recording/references/{backend}"));
+    let ws_rec_legacy = workspace_root().join(format!("recordings/references/{backend}"));
     let umbrella_tmp = PathBuf::from(format!(
         "/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/{backend}"
     ));
     let umbrella_rec = PathBuf::from(format!(
+        "/mnt/data/Workspace/Projects/bitty-terminal/recording/references/{backend}"
+    ));
+    let umbrella_rec_legacy = PathBuf::from(format!(
         "/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/{backend}"
     ));
-    vec![ws_tmp, ws_rec, umbrella_tmp, umbrella_rec]
+    vec![
+        ws_tmp,
+        ws_rec,
+        ws_rec_legacy,
+        umbrella_tmp,
+        umbrella_rec,
+        umbrella_rec_legacy,
+    ]
 }
 
 /// One parsed bitty dump record.
@@ -420,7 +445,7 @@ pub fn load_bitty_dumps() -> Result<Vec<BittyDump>, String> {
         }
     }
     Err(
-        "no bitty dump directory found at tmp/references/bitty (not found; run collect_dumps)"
+        "no bitty dump directory found at tmp/references/bitty or recording/references/bitty (not found; run collect_dumps)"
             .to_string(),
     )
 }
@@ -749,5 +774,75 @@ mod tests {
         assert!(dump.text.chars().count() <= MAX_TEXT_CHARS);
         assert!(dump.bytes_len <= MAX_CORPUS_BYTES);
         assert!(dump.actions_len <= MAX_ACTIONS);
+    }
+
+    fn pos_of(candidates: &[PathBuf], needle: &str) -> Option<usize> {
+        candidates
+            .iter()
+            .position(|p| p.to_string_lossy().contains(needle))
+    }
+
+    #[test]
+    fn bitty_candidates_prefer_singular_recording_over_legacy_plural() {
+        // CR-COMPAT-01: after the workspace `recordings/` -> `recording/`
+        // rename, singular candidates must exist and precede the legacy
+        // plural fallback (workspace-relative and umbrella mirrors).
+        let candidates = bitty_snapshot_dir_candidates();
+        let ws_singular = pos_of(&candidates, "recording/references/bitty")
+            .expect("singular workspace recording/ candidate missing");
+        let ws_legacy = candidates
+            .iter()
+            .position(|p| p.to_string_lossy().contains("recordings/references/bitty"))
+            .expect("legacy plural fallback candidate missing");
+        assert!(
+            ws_singular < ws_legacy,
+            "singular recording/ ({ws_singular}) must precede legacy recordings/ ({ws_legacy})"
+        );
+        let umbrella_singular = pos_of(&candidates, "bitty-terminal/recording/references/bitty")
+            .expect("singular umbrella recording/ candidate missing");
+        let umbrella_legacy = pos_of(&candidates, "bitty-terminal/recordings/references/bitty")
+            .expect("legacy umbrella plural fallback candidate missing");
+        assert!(
+            umbrella_singular < umbrella_legacy,
+            "singular umbrella recording/ ({umbrella_singular}) must precede legacy recordings/ ({umbrella_legacy})"
+        );
+    }
+
+    #[test]
+    fn reference_dir_prefers_singular_recording_over_legacy_plural() {
+        // Same ordering contract for per-backend reference discovery.
+        let candidates = reference_dir("ghostty");
+        let singular = pos_of(&candidates, "recording/references/ghostty")
+            .expect("singular workspace recording/ reference candidate missing");
+        let legacy = candidates
+            .iter()
+            .position(|p| {
+                p.to_string_lossy()
+                    .contains("recordings/references/ghostty")
+            })
+            .expect("legacy plural reference fallback candidate missing");
+        assert!(
+            singular < legacy,
+            "singular recording/ ({singular}) must precede legacy recordings/ ({legacy})"
+        );
+    }
+
+    #[test]
+    fn load_bitty_dumps_discovers_singular_recording_baselines() {
+        // End-to-end proof of the fix on hosts where the renamed umbrella
+        // `recording/references/bitty/` baselines exist: discovery must
+        // succeed even though no `recordings/` (plural) directory exists.
+        let singular_umbrella =
+            PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
+        if !singular_umbrella.is_dir() {
+            eprintln!("SKIP: singular umbrella recording/ baselines absent on this host");
+            return;
+        }
+        let dumps = load_bitty_dumps()
+            .expect("load_bitty_dumps must discover baselines under singular recording/");
+        assert!(
+            !dumps.is_empty(),
+            "expected >=1 dump from singular recording/ baselines"
+        );
     }
 }

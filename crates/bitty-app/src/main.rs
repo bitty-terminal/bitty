@@ -386,6 +386,17 @@ struct Args {
     config_word: bool,
     /// Unexpected extra positionals in subcommand mode (dispatch errors).
     config_args: Vec<String>,
+    /// `bitty init` opt-in setup wizard (#243, CTX-0149). True once the
+    /// first positional `init` word is seen; extra positionals land in
+    /// `init_args` and fail closed via usage. A program literally named
+    /// `init` must be invoked as `bitty -- init ...`.
+    init_word: bool,
+    /// `--yes`: wizard skips prompts and writes sane defaults.
+    init_yes: bool,
+    /// `--force`: wizard overwrites an existing config (with `.bak` backup).
+    init_force: bool,
+    /// Unexpected extra positionals in init mode (dispatch errors).
+    init_args: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -451,6 +462,10 @@ impl Args {
             config_cmd: None,
             config_word: false,
             config_args: Vec::new(),
+            init_word: false,
+            init_yes: false,
+            init_force: false,
+            init_args: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -687,8 +702,15 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 /// - `--log-level LEVEL` → stderr level `error|warn|info|debug|trace`
 ///   (CTX-0190; also `BITTY_LOG`/`RUST_LOG`). Tick stats require
 ///   `debug`/`trace`; default is `warn` (quiet).
+/// - `--yes` → init-only: skip prompts, write sane defaults (CTX-0149).
+/// - `--force` → init-only: overwrite an existing config file, backing it
+///   up to `<file>.bak` first (CTX-0149).
 /// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
 ///   literally named `config` needs `bitty -- config ...`
+/// - `init [--yes] [--force]` → opt-in setup wizard (#243, CTX-0149);
+///   a program literally named `init` needs `bitty -- init ...`
+/// - `--yes` / `--force` are init-only flags (parsed globally, consumed by
+///   the init dispatch; ignored by normal startup)
 /// - `--` → treat the rest as program argv verbatim
 ///
 /// The first non-flag token becomes `program`; additional non-flag tokens
@@ -860,6 +882,18 @@ fn parse_args(raw: &[String]) -> Args {
             }
             "--overlay" => {
                 out.overlay = true;
+                i += 1;
+            }
+            "--yes" => {
+                // `bitty init --yes`: non-interactive defaults (ignored by
+                // normal startup and the `config` subcommand).
+                out.init_yes = true;
+                i += 1;
+            }
+            "--force" => {
+                // `bitty init --force`: overwrite an existing config file
+                // (with a `.bak` backup). Ignored elsewhere.
+                out.init_force = true;
                 i += 1;
             }
             "--split" => {
@@ -1051,6 +1085,22 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
+                // `bitty init` opt-in setup wizard (first positional only;
+                // `--` escape hatch bypasses this via after_double_dash).
+                // A program literally named `init` needs `bitty -- init`.
+                // Flags (`--yes`, `--force`, `--config`) compose in any
+                // order around the word.
+                if !program_set && !out.init_word && token == "init" {
+                    out.init_word = true;
+                    i += 1;
+                    continue;
+                }
+                if out.init_word {
+                    // Extra positionals in init mode fail closed at dispatch.
+                    out.init_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
                 if !program_set {
                     out.program = Some(token.clone());
                     program_set = true;
@@ -1121,9 +1171,16 @@ fn help_text() -> String {
            config path      Print the resolved config file path\n  \
            config check     Load + validate; print per-key sources\n  \
                             (cli/file/default), exit non-zero on invalid files\n  \
-           config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
-                            creates parents + starter when missing, never\n  \
-                            overwrites existing content\n  \
+            config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
+                             creates parents + starter when missing, never\n  \
+                             overwrites existing content\n  \
+            init [--yes] [--force]  Opt-in interactive setup wizard (never\n  \
+                             auto-runs): mascot greeting, shell/theme/font-size\n  \
+                             picks, vim keybinding preset, writes init.lua.\n  \
+                             --yes skips prompts (sane defaults); without\n  \
+                             --force an existing file is never overwritten\n  \
+                             (--force backs it up to init.lua.bak first).\n  \
+                             Honors --config PATH / BITTY_CONFIG as the target.\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -1881,6 +1938,629 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     1
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `bitty init` opt-in setup wizard (#243, CTX-0149)
+// ---------------------------------------------------------------------------
+
+/// Hamster mascot art, vendored byte-identical from the workspace asset
+/// `recording/bitty-mascot/ascii/bitty_ascii.txt` (DEC-0002). Pure text so
+/// it renders anywhere stdout goes, including piped headless runs; the
+/// sixel/block variants stay out of the binary.
+const INIT_MASCOT_ART: &str = include_str!("../assets/mascot.txt");
+
+/// One-line fallback when the window is too narrow for the art: fail closed
+/// with an honest line instead of a wrapped mess.
+const INIT_MASCOT_FALLBACK: &str = "bitty! (mascot skipped: window too narrow for the art)\n";
+
+/// Maximum prompt attempts per wizard step before aborting. Bounded so piped
+/// garbage or a stuck key can never spin the wizard forever.
+const INIT_MAX_ATTEMPTS: usize = 3;
+
+/// Maximum accepted stdin line length in bytes (mirrors the config
+/// `MAX_LINE_BYTES` posture: overlong lines are truncated, never unbounded).
+const INIT_MAX_LINE_BYTES: usize = 4096;
+
+/// Common shells probed in order when building the shell menu.
+const INIT_COMMON_SHELLS: &[&str] = &[
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/bin/zsh",
+    "/usr/bin/zsh",
+    "/usr/bin/fish",
+    "/bin/fish",
+    "/bin/sh",
+];
+
+/// Widest art line in bytes (the art is pure ASCII, so bytes == columns).
+/// Computed from the vendored asset so an asset refresh cannot silently
+/// break the narrow-window bound.
+fn init_mascot_width() -> usize {
+    INIT_MASCOT_ART
+        .lines()
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Picks the greeting art for a known-or-unknown window width: full art
+/// unless the window is provably too narrow, in which case the one-line
+/// fallback. `None` (unknown width, e.g. piped headless) prints the full
+/// pure-text art — always safe, tested headless.
+fn init_greeting_art(columns: Option<u16>) -> &'static str {
+    match columns {
+        Some(width) if (width as usize) < init_mascot_width() => INIT_MASCOT_FALLBACK,
+        _ => INIT_MASCOT_ART,
+    }
+}
+
+/// Parses a `COLUMNS`-style width value. Pure over the injected string so
+/// tests never touch the environment; `None`/garbage/zero means unknown.
+fn init_columns_from_env(value: Option<&str>) -> Option<u16> {
+    value?.trim().parse::<u16>().ok().filter(|width| *width > 0)
+}
+
+/// Keybinding preset choice (the vim step, CTX-0149 owner note).
+///
+/// The shipped defaults are already the Alt-as-Mod vim-style map (CTX-0178:
+/// `Alt+h/j/k/l`, `Alt+1..9`, `Alt+u/i`, ...). `Default` leaves them
+/// implicit (no `keymaps` section written); `Vim` writes the same map
+/// explicitly as a tweakable starting point for vim users. Both agree by
+/// construction: the explicit block is rendered FROM
+/// [`bitty_config::keymap::DEFAULT_KEYMAPS`], never copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitKeyPreset {
+    /// Shipped defaults apply; write no `keymaps` section.
+    Default,
+    /// Write the shipped map explicitly (one-click vim defaults).
+    Vim,
+}
+
+/// Wizard answers: pure data, rendered to `init.lua` by [`render_init_lua`].
+#[derive(Debug, Clone, PartialEq)]
+struct InitAnswers {
+    /// `terminal.shell` override; `None` leaves the startup default
+    /// (`$SHELL` or `/bin/sh`).
+    shell: Option<String>,
+    /// `appearance.theme` value (always a known preset name).
+    theme: String,
+    /// `font.size` in points, within `(0, 128]`.
+    font_size: f32,
+    /// Keybinding preset choice.
+    key_preset: InitKeyPreset,
+}
+
+/// Validates and normalizes one shell path: trims, rejects empty,
+/// overlong, and control-character input (fail-closed; a shell path with
+/// controls is never written into the config).
+fn init_clean_shell(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("shell must not be empty".to_string());
+    }
+    if trimmed.len() > bitty_config::types::MAX_SHELL_LEN {
+        return Err(format!(
+            "shell path must be <= {} bytes",
+            bitty_config::types::MAX_SHELL_LEN
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("shell path must not contain control characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Sane non-interactive defaults for `--yes`: `$SHELL` when it is a clean
+/// path (else unset so startup falls back), the dark preset, the default
+/// point size, and the implicit shipped keymap defaults.
+fn init_yes_defaults(shell_env: Option<&str>) -> InitAnswers {
+    let shell = shell_env
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| init_clean_shell(s).ok());
+    InitAnswers {
+        shell,
+        theme: bitty_config::theme::DARK_THEME_ALIAS.to_string(),
+        font_size: bitty_config::types::DEFAULT_FONT_SIZE,
+        key_preset: InitKeyPreset::Default,
+    }
+}
+
+/// Builds the shell menu: `$SHELL` first when set, then the common shells
+/// that exist, deduplicated. Always ends with the POSIX fallback so the
+/// menu — and its default — is never empty. `exists` is injected so tests
+/// stay hermetic (no filesystem).
+fn init_shell_candidates(shell_env: Option<&str>, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |value: &str| {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !out.iter().any(|seen| seen == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    };
+    if let Some(env) = shell_env {
+        push_unique(env);
+    }
+    for candidate in INIT_COMMON_SHELLS {
+        if exists(candidate) {
+            push_unique(candidate);
+        }
+    }
+    push_unique(FALLBACK_SHELL);
+    out
+}
+
+/// Parses one shell-step answer: empty takes the menu default (index 0), a
+/// `1`-based number picks a menu entry, anything else is a custom path
+/// through [`init_clean_shell`]. Total: every input maps to a value or a
+/// repromptable error, never a panic.
+fn init_parse_shell_answer(raw: &str, candidates: &[String]) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(candidates.first().cloned());
+    }
+    if let Ok(number) = trimmed.parse::<usize>() {
+        if number >= 1 && number <= candidates.len() {
+            return Ok(Some(candidates[number - 1].clone()));
+        }
+        return Err(format!(
+            "pick 1..={} or type a shell path",
+            candidates.len()
+        ));
+    }
+    init_clean_shell(trimmed).map(Some)
+}
+
+/// Parses one theme-step answer. Only the shipped preset exists today
+/// (`dark`, canonical config value; `bitty-dark` accepted as the registry
+/// name), so empty/`1`/either name resolves to `"dark"` and anything else
+/// reprompts instead of writing a value the resolver would only fall back.
+fn init_parse_theme_answer(raw: &str) -> Result<String, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "dark" | "bitty-dark" => Ok(bitty_config::theme::DARK_THEME_ALIAS.to_string()),
+        _ => Err("unknown theme (only 'dark' is shipped today)".to_string()),
+    }
+}
+
+/// Parses one font-size-step answer: empty takes the default point size,
+/// otherwise a finite number within `(0, 128]` (the `FontConfig` bound, so
+/// the wizard can never emit a size startup would reject).
+fn init_parse_font_size_answer(raw: &str) -> Result<f32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(bitty_config::types::DEFAULT_FONT_SIZE);
+    }
+    match trimmed.parse::<f32>() {
+        Ok(size) if size.is_finite() && size > 0.0 && size <= 128.0 => Ok(size),
+        _ => Err("font size must be a number within (0, 128]".to_string()),
+    }
+}
+
+/// Parses one keybinding-preset-step answer: empty/`1` keeps the implicit
+/// shipped defaults, `2`/`vim` writes them explicitly.
+fn init_parse_preset_answer(raw: &str) -> Result<InitKeyPreset, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "default" => Ok(InitKeyPreset::Default),
+        "2" | "vim" => Ok(InitKeyPreset::Vim),
+        _ => Err("pick 1 (default) or 2 (vim)".to_string()),
+    }
+}
+
+/// Escapes a string for a double-quoted Lua value. Wizard inputs are
+/// control-free by construction ([`init_clean_shell`]), generated values
+/// harder still; backslash and quote are escaped so paths like
+/// `C:\Tools\sh` stay one valid string.
+fn init_lua_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Renders the one-click vim preset block FROM the shipped defaults
+/// ([`bitty_config::keymap::DEFAULT_KEYMAPS`], CTX-0178) so the preset and
+/// the binary defaults cannot drift: any future default change flows into
+/// the wizard output automatically, and
+/// `init_vim_preset_agrees_with_shipped_defaults` pins the agreement.
+fn init_render_vim_keymaps() -> String {
+    let mut out = String::from("    keymaps = {\n");
+    for (chord, action) in bitty_config::keymap::DEFAULT_KEYMAPS {
+        out.push_str(&format!(
+            "        {{ chord = \"{chord}\", action = \"{action}\", context = \"global\" }},\n"
+        ));
+    }
+    out.push_str("    },\n");
+    out
+}
+
+/// Renders wizard answers as an `init.lua` return table. The output always
+/// parses via `bitty-config::file::parse_lua_config` (pinned by
+/// `init_rendered_config_parses`): `theme` + both `font` keys are always
+/// present (the `font`/`window` tables require complete pairs), the
+/// `terminal` table always carries `scrollback` alongside `shell` (the
+/// parser requires `terminal.scrollback`), and the `keymaps` section appears
+/// only for the vim preset.
+fn render_init_lua(answers: &InitAnswers) -> String {
+    let mut out = String::from(
+        "-- bitty user configuration (Lua, wezterm-style), written by `bitty init`.\n\
+         -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
+         -- Unknown keys fail closed; validate with `bitty config check`.\n\
+         return {\n",
+    );
+    out.push_str(&format!(
+        "    theme = \"{}\",\n",
+        init_lua_escape(&answers.theme)
+    ));
+    out.push_str(&format!(
+        "    font = {{ family = \"{}\", size = {} }},\n",
+        init_lua_escape(bitty_config::types::DEFAULT_FONT_FAMILY),
+        answers.font_size,
+    ));
+    if let Some(shell) = &answers.shell {
+        out.push_str(&format!(
+            "    terminal = {{ scrollback = {}, shell = \"{}\" }},\n",
+            bitty_config::TerminalConfig::default().scrollback,
+            init_lua_escape(shell),
+        ));
+    }
+    match answers.key_preset {
+        InitKeyPreset::Default => {
+            out.push_str(
+                "    -- Chrome keys: the shipped Alt-as-Mod defaults apply (Alt+h/j/k/l move,\n\
+                 -- Alt+1..9 jump to view N, Alt+u/i page up/down, Shift+Alt+h/j/k/l split,\n\
+                 -- Shift+Ctrl+h/j/k/l resize, Alt+w close, Alt+z/m/f zoom, Ctrl+Tab cycle,\n\
+                 -- Ctrl+Shift+C/V copy/paste). Re-run `bitty init` and pick the vim preset\n\
+                 -- to pin this map explicitly here.\n",
+            );
+        }
+        InitKeyPreset::Vim => {
+            out.push_str(
+                "    -- Chrome keys: one-click vim preset (Alt+h/j/k/l move, Alt+1..9 jump,\n\
+                 -- Alt+u/i page, Shift+Alt+h/j/k/l split, Alt+w close, Alt+z zoom).\n\
+                 -- This is the map the binary ships; entries here replace defaults by\n\
+                 -- context + chord identity, so tweak freely.\n",
+            );
+            out.push_str(&init_render_vim_keymaps());
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Reads one stdin line without the trailing newline. `None` on EOF or I/O
+/// error (the wizard aborts rather than guessing). Overlong lines are
+/// truncated to [`INIT_MAX_LINE_BYTES`] so a pasted megabyte cannot grow
+/// the answer buffer.
+fn init_read_line(input: &mut dyn std::io::BufRead) -> Option<String> {
+    let mut line = String::new();
+    match input.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => {
+            if line.len() > INIT_MAX_LINE_BYTES {
+                line.truncate(INIT_MAX_LINE_BYTES);
+            }
+            Some(line.trim_end_matches(['\r', '\n']).to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Asks one wizard step: prints `prompt`, reads a line, parses it.
+/// Reprompts up to [`INIT_MAX_ATTEMPTS`] on parse errors, then aborts;
+/// EOF aborts immediately. Prompts go to `output` (stdout at runtime) so
+/// piped-stdin runs still show the questions.
+fn init_ask<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    for attempt in 1..=INIT_MAX_ATTEMPTS {
+        let _ = writeln!(output, "{prompt}");
+        let _ = output.flush();
+        match init_read_line(input) {
+            Some(line) => match parse(&line) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    let _ = writeln!(
+                        output,
+                        "  ({err} — try again [{attempt}/{INIT_MAX_ATTEMPTS}])"
+                    );
+                }
+            },
+            None => return Err("bitty init: aborted (end of input)".to_string()),
+        }
+    }
+    Err(format!(
+        "bitty init: aborted (too many invalid answers, limit {INIT_MAX_ATTEMPTS})"
+    ))
+}
+
+/// Runs the interactive wizard: mascot greeting, then shell / theme /
+/// font-size / keybinding-preset picks. Pure over injected `input`,
+/// `output`, `shell_env`, `columns`, and `shell_exists`, so the whole flow
+/// is headless-testable with piped stdin.
+fn run_init_interactive(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    shell_exists: &dyn Fn(&str) -> bool,
+) -> Result<InitAnswers, String> {
+    let _ = write!(output, "{}", init_greeting_art(columns));
+    let _ = writeln!(
+        output,
+        "Welcome to bitty! This wizard writes your init.lua. (Enter takes the default.)"
+    );
+    let candidates = init_shell_candidates(shell_env, shell_exists);
+    let _ = writeln!(output, "\nShell:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        let marker = if index == 0 { " (default)" } else { "" };
+        let _ = writeln!(output, "  {}) {candidate}{marker}", index + 1);
+    }
+    let shell = init_ask(
+        input,
+        output,
+        "Shell [Enter for default, number, or custom path]:",
+        |line| init_parse_shell_answer(line, &candidates),
+    )?;
+    let theme = init_ask(input, output, "Theme [dark]:", init_parse_theme_answer)?;
+    let font_size = init_ask(
+        input,
+        output,
+        &format!(
+            "Font size in points [{}]:",
+            bitty_config::types::DEFAULT_FONT_SIZE
+        ),
+        init_parse_font_size_answer,
+    )?;
+    let key_preset = init_ask(
+        input,
+        output,
+        "Keybindings [1 default / 2 vim]:\n  1) default — shipped Alt-as-Mod map (Alt+h/j/k/l, Alt+1..9, Alt+u/i)\n  2) vim — write that map explicitly (tweakable starting point):",
+        init_parse_preset_answer,
+    )?;
+    Ok(InitAnswers {
+        shell,
+        theme,
+        font_size,
+        key_preset,
+    })
+}
+
+/// Outcome of [`write_init_config`].
+#[derive(Debug)]
+struct InitWriteOutcome {
+    /// File that was written.
+    path: std::path::PathBuf,
+    /// Backup of the overwritten file, if any (`<file>.lua.bak`).
+    backup: Option<std::path::PathBuf>,
+    /// True when an existing file was replaced via `--force`.
+    updated: bool,
+}
+
+/// Why [`write_init_config`] refused or failed.
+#[derive(Debug)]
+enum InitWriteError {
+    /// Usage-level refusal (exists without `--force`, generated content
+    /// invalid): the caller exits 2.
+    Refused(String),
+    /// Filesystem failure (mkdir/read/backup/write): the caller exits 1.
+    Io(String),
+}
+
+/// Writes wizard output to `target` (idempotent contract):
+///
+/// - The rendered content is validated via `parse_lua_config` BEFORE any
+///   filesystem mutation, so the wizard never writes a file startup would
+///   reject.
+/// - An existing file is never overwritten without `force` ([`InitWriteError::Refused`]).
+/// - With `force`, the previous bytes are copied to `<file>.lua.bak` first
+///   (overwriting any older backup), then the new content is written.
+/// - Parent directories are created as needed.
+///
+/// Total: every failure maps to [`InitWriteError`], never a panic.
+fn write_init_config(
+    target: &std::path::Path,
+    content: &str,
+    force: bool,
+) -> Result<InitWriteOutcome, InitWriteError> {
+    {
+        let source = bitty_config::plan::ConfigSource::new(
+            bitty_config::plan::LayerKind::User,
+            Some(target.display().to_string()),
+        );
+        bitty_config::file::parse_lua_config(content, &source).map_err(|err| {
+            InitWriteError::Refused(format!(
+                "bitty init: generated config is invalid ({err}) — refusing to write"
+            ))
+        })?;
+    }
+    if target.exists() && !force {
+        return Err(InitWriteError::Refused(format!(
+            "bitty init: '{}' already exists (re-run with --force to overwrite; a .bak backup is kept)",
+            target.display()
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                InitWriteError::Io(format!(
+                    "bitty init: cannot create '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let mut backup = None;
+    let mut updated = false;
+    if target.exists() {
+        let backup_path = target.with_extension("lua.bak");
+        let previous = std::fs::read(target).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot read '{}': {err}",
+                target.display()
+            ))
+        })?;
+        std::fs::write(&backup_path, previous).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot write backup '{}': {err}",
+                backup_path.display()
+            ))
+        })?;
+        backup = Some(backup_path);
+        updated = true;
+    }
+    std::fs::write(target, content).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot write '{}': {err}",
+            target.display()
+        ))
+    })?;
+    Ok(InitWriteOutcome {
+        path: target.to_path_buf(),
+        backup,
+        updated,
+    })
+}
+
+/// Short usage for `bitty init` (stdout on `--help`-style flows, stderr on
+/// fail-closed exit 2).
+fn init_usage() -> String {
+    "usage: bitty init [--yes] [--force] [--config PATH]\n\
+     \n\
+     Opt-in setup wizard (never auto-runs): mascot greeting, shell / theme /\n\
+     font-size / keybinding-preset picks, then writes the config file.\n\
+     \n\
+     flags:\n\
+     \x20 --yes     skip prompts; write sane defaults ($SHELL when clean,\n\
+     \x20           dark theme, 12pt, shipped keymap defaults)\n\
+     \x20 --force   overwrite an existing file (backs it up to init.lua.bak)\n\
+     \n\
+     target: --config PATH wins, else BITTY_CONFIG, else\n\
+     $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua).\n\
+     Without --force an existing file is never overwritten (exit 2).\n\
+     Re-runs are idempotent: same answers write the same file.\n\
+     Validate any file any time with `bitty config check`."
+        .to_string()
+}
+
+/// Runs `bitty init`; returns the process exit code.
+///
+/// - `0`: wrote the file (prints the target plus what changed).
+/// - `2`: usage-level refusal (unexpected args, existing file without
+///   `--force`, invalid `$SHELL` handling aside) — nothing was overwritten.
+/// - `1`: aborted prompts (EOF / too many retries) or filesystem failure.
+fn run_init_subcommand(args: &Args) -> i32 {
+    let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+    let shell_env = std::env::var("SHELL").ok();
+    run_init_subcommand_with_env(args, bitty_config_env.as_deref(), shell_env.as_deref())
+}
+
+/// [`run_init_subcommand`] with injected environment values so tests stay
+/// hermetic (no process-env mutation): `bitty_config_env` stands in for
+/// `BITTY_CONFIG`, `shell_env` for `SHELL`.
+fn run_init_subcommand_with_env(
+    args: &Args,
+    bitty_config_env: Option<&str>,
+    shell_env: Option<&str>,
+) -> i32 {
+    if !args.init_args.is_empty() {
+        eprintln!(
+            "bitty init: unexpected argument '{}'\n{}",
+            args.init_args[0],
+            init_usage()
+        );
+        return 2;
+    }
+    // BITTY_CONFIG env participates exactly like --config (CLI wins), same
+    // as the `config` subcommand and startup.
+    let explicit =
+        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), bitty_config_env);
+    let target = match bitty_config::file::probe_config_path(explicit.as_deref()) {
+        Some(probed) => probed.path,
+        None => {
+            eprintln!("bitty init: no config root ($XDG_CONFIG_HOME or $HOME unset)");
+            return 2;
+        }
+    };
+    let answers = if args.init_yes {
+        let answers = init_yes_defaults(shell_env);
+        // Warn when $SHELL existed but was unusable, so the omission is
+        // never silent (the written file simply leaves `shell` unset and
+        // startup falls back to /bin/sh).
+        let raw = shell_env.map(str::trim).unwrap_or_default();
+        if !raw.is_empty() && answers.shell.is_none() {
+            eprintln!("bitty init: ignoring unusable $SHELL {raw:?}; leaving shell unset");
+        }
+        answers
+    } else {
+        let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
+        let stdin = std::io::stdin();
+        let mut stdin_lock = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut stdout_lock = stdout.lock();
+        match run_init_interactive(
+            &mut stdin_lock,
+            &mut stdout_lock,
+            shell_env,
+            columns,
+            &|path| std::path::Path::new(path).exists(),
+        ) {
+            Ok(answers) => answers,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        }
+    };
+    let content = render_init_lua(&answers);
+    match write_init_config(&target, &content, args.init_force) {
+        Ok(outcome) => {
+            if outcome.updated {
+                match &outcome.backup {
+                    Some(backup) => println!(
+                        "bitty init: backed up existing config to '{}'",
+                        backup.display()
+                    ),
+                    None => println!("bitty init: replaced existing config"),
+                }
+            }
+            let shell = answers
+                .shell
+                .as_deref()
+                .map_or("(default)".to_string(), |s| format!("\"{s}\""));
+            let keymaps = match answers.key_preset {
+                InitKeyPreset::Default => "default (shipped)".to_string(),
+                InitKeyPreset::Vim => format!(
+                    "vim ({} explicit entries)",
+                    bitty_config::keymap::DEFAULT_KEYMAPS.len()
+                ),
+            };
+            println!(
+                "bitty init: wrote '{}' (theme=\"{}\", shell={shell}, font.size={}, keymaps={keymaps})",
+                outcome.path.display(),
+                answers.theme,
+                answers.font_size,
+            );
+            println!("bitty init: validate any time with `bitty config check`");
+            0
+        }
+        Err(InitWriteError::Refused(message)) => {
+            eprintln!("{message}");
+            2
+        }
+        Err(InitWriteError::Io(message)) => {
+            eprintln!("{message}");
+            1
         }
     }
 }
@@ -3588,6 +4268,12 @@ fn main() {
         std::process::exit(2);
     }
 
+    // `bitty init` opt-in setup wizard (#243, CTX-0149). Explicit only:
+    // never auto-runs on startup, only via the subcommand word.
+    if args.init_word {
+        std::process::exit(run_init_subcommand(&args));
+    }
+
     // User config first (fail-closed): invalid files exit non-zero with a
     // clear stderr message; missing default-path files yield defaults.
     let app_config = match load_app_config(&args) {
@@ -5126,6 +5812,561 @@ mod tests {
         assert!(plan.layout.is_none());
         assert!(starter_init_lua().contains("gaps_in"));
         assert!(starter_init_lua().contains("gaps_out"));
+    }
+
+    // -- `bitty init` wizard (CTX-0149, #243) --------------------------------
+
+    /// Unique scratch directory per test (process id + atomic counter: tests
+    /// in one binary share the id and run on parallel threads).
+    fn init_test_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx0149-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn parse_init_subcommand() {
+        let p = parse_args(&args_of(&["bitty", "init"]));
+        assert!(p.init_word);
+        assert!(p.init_args.is_empty());
+        assert_eq!(p.program, None);
+        assert!(!p.init_yes);
+        assert!(!p.init_force);
+
+        // Flags compose in any order around the word.
+        let p = parse_args(&args_of(&["bitty", "init", "--yes", "--force"]));
+        assert!(p.init_word);
+        assert!(p.init_yes);
+        assert!(p.init_force);
+
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--config",
+            "/tmp/c.lua",
+            "init",
+            "--yes",
+        ]));
+        assert!(p.init_word);
+        assert!(p.init_yes);
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.lua"));
+
+        let p = parse_args(&args_of(&["bitty", "--yes", "init"]));
+        assert!(p.init_word);
+        assert!(p.init_yes);
+
+        // Extra positionals are recorded for fail-closed dispatch.
+        let p = parse_args(&args_of(&["bitty", "init", "extra"]));
+        assert!(p.init_word);
+        assert_eq!(p.init_args, vec!["extra".to_string()]);
+
+        // Escape hatch: a program literally named `init`.
+        let p = parse_args(&args_of(&["bitty", "--", "init"]));
+        assert!(!p.init_word);
+        assert_eq!(p.program.as_deref(), Some("init"));
+
+        // `init` after `config` belongs to the config subcommand.
+        let p = parse_args(&args_of(&["bitty", "config", "init"]));
+        assert!(p.config_word);
+        assert!(!p.init_word);
+    }
+
+    #[test]
+    fn init_yes_defaults_are_sane() {
+        let d = init_yes_defaults(Some("/bin/bash"));
+        assert_eq!(d.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(d.theme, "dark");
+        assert_eq!(d.font_size, bitty_config::types::DEFAULT_FONT_SIZE);
+        assert_eq!(d.key_preset, InitKeyPreset::Default);
+
+        // Blank $SHELL means "leave unset" (startup falls back to /bin/sh).
+        let d = init_yes_defaults(Some("   "));
+        assert_eq!(d.shell, None);
+        let d = init_yes_defaults(None);
+        assert_eq!(d.shell, None);
+
+        // Unusable $SHELL never becomes a default (warned + omitted at dispatch).
+        let d = init_yes_defaults(Some("/bin/ba\x07sh"));
+        assert_eq!(d.shell, None);
+    }
+
+    #[test]
+    fn init_shell_candidates_order_and_fallback() {
+        // $SHELL first, then existing commons, no duplicates, fallback last.
+        let c = init_shell_candidates(Some("/bin/zsh"), &|p| p == "/bin/bash" || p == "/bin/zsh");
+        assert_eq!(c, vec!["/bin/zsh", "/bin/bash", "/bin/sh"]);
+
+        // Nothing set and nothing exists: still exactly the fallback.
+        let c = init_shell_candidates(None, &|_| false);
+        assert_eq!(c, vec!["/bin/sh"]);
+
+        // Blank env is ignored, not listed.
+        let c = init_shell_candidates(Some("  "), &|p| p == "/bin/sh");
+        assert_eq!(c, vec!["/bin/sh"]);
+    }
+
+    #[test]
+    fn init_step_parsers_accept_and_reject() {
+        let cands = vec!["/bin/bash".to_string(), "/bin/sh".to_string()];
+        // Shell: empty takes the default, numbers pick, customs validate.
+        assert_eq!(
+            init_parse_shell_answer("", &cands).expect("default"),
+            Some("/bin/bash".to_string())
+        );
+        assert_eq!(
+            init_parse_shell_answer("2", &cands).expect("pick"),
+            Some("/bin/sh".to_string())
+        );
+        assert_eq!(
+            init_parse_shell_answer("/usr/bin/fish", &cands).expect("custom"),
+            Some("/usr/bin/fish".to_string())
+        );
+        assert!(init_parse_shell_answer("0", &cands).is_err());
+        assert!(init_parse_shell_answer("9", &cands).is_err());
+        assert!(init_parse_shell_answer("a\x07b", &cands).is_err());
+
+        // Theme: only the shipped preset resolves; typos reprompt.
+        assert_eq!(init_parse_theme_answer("").expect("default"), "dark");
+        assert_eq!(
+            init_parse_theme_answer("Bitty-Dark").expect("registry name"),
+            "dark"
+        );
+        assert!(init_parse_theme_answer("solarized").is_err());
+
+        // Font size: default, valid, and the FontConfig bound.
+        assert_eq!(
+            init_parse_font_size_answer("").expect("default"),
+            bitty_config::types::DEFAULT_FONT_SIZE
+        );
+        assert_eq!(init_parse_font_size_answer("14").expect("int"), 14.0);
+        assert_eq!(init_parse_font_size_answer(" 13.5 ").expect("float"), 13.5);
+        for bad in ["0", "-3", "129", "nan", "inf", "big", "12pt"] {
+            assert!(
+                init_parse_font_size_answer(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+
+        // Preset: default vs vim, nothing else.
+        assert_eq!(
+            init_parse_preset_answer("").expect("default"),
+            InitKeyPreset::Default
+        );
+        assert_eq!(
+            init_parse_preset_answer("2").expect("vim"),
+            InitKeyPreset::Vim
+        );
+        assert_eq!(
+            init_parse_preset_answer("VIM").expect("vim word"),
+            InitKeyPreset::Vim
+        );
+        assert!(init_parse_preset_answer("3").is_err());
+        assert!(init_parse_preset_answer("emacs").is_err());
+
+        // Shell cleaning: trims, bounds, rejects controls.
+        assert_eq!(init_clean_shell("  /bin/bash ").expect("trim"), "/bin/bash");
+        assert!(init_clean_shell("   ").is_err());
+        assert!(init_clean_shell(&"x".repeat(2000)).is_err());
+    }
+
+    #[test]
+    fn init_columns_parse() {
+        assert_eq!(init_columns_from_env(None), None);
+        assert_eq!(init_columns_from_env(Some("80")), Some(80));
+        assert_eq!(init_columns_from_env(Some(" 100 ")), Some(100));
+        assert_eq!(init_columns_from_env(Some("0")), None);
+        assert_eq!(init_columns_from_env(Some("wide")), None);
+        assert_eq!(init_columns_from_env(Some("")), None);
+    }
+
+    #[test]
+    fn init_mascot_is_bounded_with_text_fallback() {
+        // The vendored art is small, pure ASCII, and bounded.
+        let width = init_mascot_width();
+        assert!(width > 0 && width <= 80, "art width {width}");
+        assert!(INIT_MASCOT_ART.lines().count() <= 32);
+        assert!(INIT_MASCOT_ART.is_ascii());
+
+        // Unknown or roomy widths print the full art (headless-safe).
+        assert_eq!(init_greeting_art(None), INIT_MASCOT_ART);
+        assert_eq!(init_greeting_art(Some(80)), INIT_MASCOT_ART);
+        assert_eq!(init_greeting_art(Some(width as u16)), INIT_MASCOT_ART);
+
+        // A tiny window fails closed to one honest line (pure-text fallback).
+        let narrow = init_greeting_art(Some(20));
+        assert_eq!(narrow, INIT_MASCOT_FALLBACK);
+        assert_eq!(narrow.lines().count(), 1);
+        assert!(init_greeting_art(Some(1)).contains("too narrow"));
+    }
+
+    /// Drives the interactive wizard with piped stdin; returns answers plus
+    /// everything the wizard printed.
+    fn drive_init_wizard(
+        stdin_lines: &str,
+        shell_env: Option<&str>,
+        columns: Option<u16>,
+    ) -> (Result<InitAnswers, String>, String) {
+        let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+        let mut output = Vec::new();
+        let result = run_init_interactive(&mut input, &mut output, shell_env, columns, &|p| {
+            p == "/bin/bash" || p == "/bin/sh"
+        });
+        let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+        (result, printed)
+    }
+
+    #[test]
+    fn init_interactive_all_defaults() {
+        // Four Enters: default shell, dark theme, default size, default keys.
+        let (result, printed) = drive_init_wizard("\n\n\n\n", Some("/bin/bash"), None);
+        let answers = result.expect("defaults accepted");
+        assert_eq!(answers.shell.as_deref(), Some("/bin/bash"));
+        assert_eq!(answers.theme, "dark");
+        assert_eq!(answers.font_size, bitty_config::types::DEFAULT_FONT_SIZE);
+        assert_eq!(answers.key_preset, InitKeyPreset::Default);
+
+        // Greeting shows the mascot plus every step prompt.
+        assert!(printed.contains("Welcome to bitty"));
+        assert!(printed.contains("MMMMM"));
+        assert!(printed.contains("Shell"));
+        assert!(printed.contains("Theme"));
+        assert!(printed.contains("Font size"));
+        assert!(printed.contains("Keybindings"));
+    }
+
+    #[test]
+    fn init_interactive_custom_picks() {
+        // Pick /bin/sh (#2), bitty-dark, 14pt, vim preset (#2).
+        let (result, _) = drive_init_wizard("2\nbitty-dark\n14\n2\n", Some("/bin/bash"), None);
+        let answers = result.expect("custom picks accepted");
+        assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+        assert_eq!(answers.theme, "dark");
+        assert_eq!(answers.font_size, 14.0);
+        assert_eq!(answers.key_preset, InitKeyPreset::Vim);
+    }
+
+    #[test]
+    fn init_interactive_retries_then_aborts() {
+        // Bad font size reprompts and then accepts the correction.
+        let (result, printed) = drive_init_wizard("\n\nbanana\n14\n\n", Some("/bin/bash"), None);
+        assert!(result.is_ok());
+        assert!(printed.contains("try again"));
+
+        // Three bad preset answers exhaust the bound and abort.
+        let (result, _) = drive_init_wizard("\n\n\nnope\nnah\nnever\n", Some("/bin/bash"), None);
+        assert!(result.is_err());
+
+        // EOF up front aborts without guessing.
+        let (result, _) = drive_init_wizard("", Some("/bin/bash"), None);
+        assert!(result.is_err());
+
+        // A narrow window still wizards, with the text fallback greeting.
+        let (result, printed) = drive_init_wizard("\n\n\n\n", Some("/bin/bash"), Some(20));
+        assert!(result.is_ok());
+        assert!(printed.contains("too narrow"));
+        assert!(!printed.contains("MMMMM"));
+    }
+
+    #[test]
+    fn init_render_default_and_vim() {
+        let base = InitAnswers {
+            shell: Some("/bin/bash".to_string()),
+            theme: "dark".to_string(),
+            font_size: 12.0,
+            key_preset: InitKeyPreset::Default,
+        };
+        let lua = render_init_lua(&base);
+        assert!(lua.contains("theme = \"dark\""));
+        assert!(lua.contains("JetBrainsMono Nerd Font"));
+        assert!(lua.contains("shell = \"/bin/bash\""));
+        assert!(lua.contains("scrollback"));
+        assert!(!lua.contains("keymaps = {"));
+
+        // No shell: no terminal table at all (startup default applies).
+        let noshell = InitAnswers {
+            shell: None,
+            ..base.clone()
+        };
+        let lua = render_init_lua(&noshell);
+        assert!(!lua.contains("terminal ="));
+
+        // Vim preset writes every shipped binding explicitly.
+        let vim = InitAnswers {
+            key_preset: InitKeyPreset::Vim,
+            ..base
+        };
+        let lua = render_init_lua(&vim);
+        assert!(lua.contains("keymaps = {"));
+        for (chord, action) in bitty_config::keymap::DEFAULT_KEYMAPS {
+            assert!(
+                lua.contains(&format!("chord = \"{chord}\"")),
+                "preset renders {chord}"
+            );
+            assert!(
+                lua.contains(&format!("action = \"{action}\"")),
+                "preset renders {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_rendered_config_parses() {
+        use bitty_config::file::parse_lua_config;
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        // Every preset x shell combination must parse with values intact.
+        for preset in [InitKeyPreset::Default, InitKeyPreset::Vim] {
+            for shell in [Some("/bin/zsh"), None] {
+                let answers = InitAnswers {
+                    shell: shell.map(str::to_string),
+                    theme: "dark".to_string(),
+                    font_size: 14.0,
+                    key_preset: preset,
+                };
+                let lua = render_init_lua(&answers);
+                let plan = parse_lua_config(&lua, &src).expect("wizard output parses");
+                assert_eq!(plan.appearance.unwrap().theme.as_deref(), Some("dark"));
+                let font = plan.font.expect("font table");
+                assert_eq!(font.size, 14.0);
+                assert_eq!(
+                    plan.terminal.as_ref().and_then(|t| t.shell.as_deref()),
+                    shell,
+                    "shell round-trips"
+                );
+                match preset {
+                    InitKeyPreset::Vim => assert_eq!(
+                        plan.keymaps.expect("vim preset writes keymaps").len(),
+                        bitty_config::keymap::DEFAULT_KEYMAPS.len()
+                    ),
+                    InitKeyPreset::Default => assert!(plan.keymaps.is_none()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn init_vim_preset_agrees_with_shipped_defaults() {
+        // The wizard preset is rendered FROM DEFAULT_KEYMAPS (CTX-0178), so
+        // resolving those entries as a user layer must reproduce the shipped
+        // table exactly: same identities, same actions, explicit overrides.
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: bitty_config::keymap::DEFAULT_KEYMAPS
+                .iter()
+                .map(|(chord, action)| bitty_config::KeymapEntry {
+                    chord: chord.to_string(),
+                    action: action.to_string(),
+                    context: "global".to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let resolved = bitty_config::resolve_keymaps(&effective).expect("preset entries resolve");
+        let shipped = bitty_config::default_keymaps().expect("shipped defaults resolve");
+        assert_eq!(resolved.len(), shipped.len());
+        // `resolve_keymaps` sorts by identity while `default_keymaps` keeps
+        // declaration order: compare sorted identities.
+        let mut shipped_ids: Vec<String> = shipped.iter().map(|m| m.id()).collect();
+        shipped_ids.sort();
+        let resolved_ids: Vec<String> = resolved.iter().map(|m| m.id()).collect();
+        assert_eq!(resolved_ids, shipped_ids);
+        for entry in &resolved {
+            // Every preset entry overrode its default (explicit, tweakable).
+            assert!(
+                !entry.from_default,
+                "preset entry {} is explicit",
+                entry.id()
+            );
+            let (_, want_action) = bitty_config::keymap::DEFAULT_KEYMAPS
+                .iter()
+                .find(|(chord, _)| {
+                    bitty_config::Chord::parse(chord)
+                        .expect("shipped chord parses")
+                        .canonical()
+                        == entry.chord.canonical()
+                })
+                .expect("preset chord is a shipped default");
+            assert_eq!(entry.action.canonical(), *want_action);
+        }
+
+        // End to end: the rendered vim config parses and resolves to the
+        // same table (render -> parse -> resolve agreement).
+        use bitty_config::file::parse_lua_config;
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let lua = render_init_lua(&InitAnswers {
+            shell: None,
+            theme: "dark".to_string(),
+            font_size: 12.0,
+            key_preset: InitKeyPreset::Vim,
+        });
+        let plan = parse_lua_config(&lua, &src).expect("vim config parses");
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: plan.keymaps.expect("keymaps"),
+            ..Default::default()
+        };
+        let resolved = bitty_config::resolve_keymaps(&effective).expect("vim config resolves");
+        let resolved_ids: Vec<String> = resolved.iter().map(|m| m.id()).collect();
+        // Same sorted-identity comparison as above (`resolve_keymaps` sorts).
+        assert_eq!(resolved_ids, shipped_ids);
+    }
+
+    #[test]
+    fn init_write_new_refuse_force_backup_idempotent() {
+        let dir = init_test_dir("write");
+        let target = dir.join("init.lua");
+        let content = render_init_lua(&init_yes_defaults(Some("/bin/bash")));
+
+        // Fresh write succeeds.
+        let outcome = write_init_config(&target, &content, false).expect("fresh write");
+        assert_eq!(outcome.path, target);
+        assert!(!outcome.updated);
+        assert!(outcome.backup.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            content
+        );
+
+        // Re-run without --force refuses and leaves the file untouched.
+        let err = write_init_config(&target, &content, false).expect_err("must refuse");
+        assert!(
+            matches!(err, InitWriteError::Refused(_)),
+            "refusal is usage-level"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("untouched"),
+            content
+        );
+
+        // --force backs up the previous bytes, then writes the new content.
+        let updated_content = render_init_lua(&InitAnswers {
+            shell: Some("/bin/zsh".to_string()),
+            theme: "dark".to_string(),
+            font_size: 14.0,
+            key_preset: InitKeyPreset::Vim,
+        });
+        let outcome = write_init_config(&target, &updated_content, true).expect("forced write");
+        assert!(outcome.updated);
+        let backup = outcome.backup.expect("backup path");
+        assert_eq!(backup, target.with_extension("lua.bak"));
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup bytes"),
+            content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("new bytes"),
+            updated_content
+        );
+
+        // Idempotent: writing the same answers again produces byte-identical output.
+        let again = render_init_lua(&InitAnswers {
+            shell: Some("/bin/zsh".to_string()),
+            theme: "dark".to_string(),
+            font_size: 14.0,
+            key_preset: InitKeyPreset::Vim,
+        });
+        assert_eq!(again, updated_content);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_write_rejects_invalid_content_without_touching_fs() {
+        let dir = init_test_dir("invalid");
+        let target = dir.join("init.lua");
+        let err = write_init_config(&target, "return { theme = }", false)
+            .expect_err("invalid content refused");
+        assert!(matches!(err, InitWriteError::Refused(_)));
+        assert!(!target.exists(), "refused write leaves no file");
+
+        // Nested parents are created as needed.
+        let nested = dir.join("a").join("b").join("init.lua");
+        let content = render_init_lua(&init_yes_defaults(None));
+        write_init_config(&nested, &content, false).expect("mkdir parents");
+        assert!(nested.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_dispatch_yes_force_idempotent() {
+        let dir = init_test_dir("dispatch");
+        let target = dir.join("init.lua");
+
+        // --yes writes sane defaults to the explicit target, exit 0.
+        let mut args = Args::new();
+        args.init_word = true;
+        args.init_yes = true;
+        args.config_path = Some(target.display().to_string());
+        assert_eq!(
+            run_init_subcommand_with_env(&args, None, Some("/bin/bash")),
+            0
+        );
+        let written = std::fs::read_to_string(&target).expect("written");
+        assert!(written.contains("shell = \"/bin/bash\""));
+        assert!(written.contains("theme = \"dark\""));
+
+        // Second --yes run refuses without --force (idempotent, exit 2).
+        assert_eq!(
+            run_init_subcommand_with_env(&args, None, Some("/bin/bash")),
+            2
+        );
+
+        // --force overwrites with a backup, exit 0.
+        args.init_force = true;
+        assert_eq!(
+            run_init_subcommand_with_env(&args, None, Some("/bin/sh")),
+            0
+        );
+        let backup = target.with_extension("lua.bak");
+        assert_eq!(std::fs::read_to_string(&backup).expect("backup"), written);
+        assert!(
+            std::fs::read_to_string(&target)
+                .expect("rewritten")
+                .contains("shell = \"/bin/sh\"")
+        );
+
+        // Unexpected positionals fail closed, exit 2.
+        args.init_force = false;
+        args.init_args = vec!["bogus".to_string()];
+        assert_eq!(run_init_subcommand_with_env(&args, None, None), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_lua_escape_keeps_strings_valid() {
+        assert_eq!(init_lua_escape("plain"), "plain");
+        assert_eq!(init_lua_escape("/bin/bash"), "/bin/bash");
+        assert_eq!(init_lua_escape("a\"b"), "a\\\"b");
+        assert_eq!(init_lua_escape("C:\\Tools\\sh"), "C:\\\\Tools\\\\sh");
+
+        // An escaped hostile shell still parses as one string value.
+        use bitty_config::file::parse_lua_config;
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let lua = render_init_lua(&InitAnswers {
+            shell: Some("C:\\Tools\\sh\"x".to_string()),
+            theme: "dark".to_string(),
+            font_size: 12.0,
+            key_preset: InitKeyPreset::Default,
+        });
+        let plan = parse_lua_config(&lua, &src).expect("escaped shell parses");
+        assert_eq!(
+            plan.terminal.expect("terminal").shell.as_deref(),
+            Some("C:\\Tools\\sh\"x")
+        );
+    }
+
+    #[test]
+    fn init_usage_names_flags_and_target() {
+        let usage = init_usage();
+        assert!(usage.contains("--yes"));
+        assert!(usage.contains("--force"));
+        assert!(usage.contains("--config"));
+        assert!(usage.contains("BITTY_CONFIG"));
+        assert!(usage.contains("init.lua"));
     }
 
     #[test]

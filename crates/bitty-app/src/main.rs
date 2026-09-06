@@ -197,6 +197,7 @@ use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View
 
 mod ctl;
 mod doctor;
+mod inspect;
 mod ipc_serve;
 
 mod list;
@@ -462,6 +463,23 @@ struct Args {
     list_no_color: bool,
     /// Unexpected extra positionals in list mode (dispatch errors).
     list_args: Vec<String>,
+    /// `bitty inspect <target> <value>` state and ownership (CTX-0173).
+    /// True once the first positional `inspect` word is seen; a program
+    /// literally named `inspect` must be invoked as `bitty -- inspect ...`.
+    inspect_word: bool,
+    /// Raw target token after `inspect` (validated at dispatch).
+    inspect_target: Option<String>,
+    /// Raw value token after the target (validated at dispatch).
+    inspect_value: Option<String>,
+    /// Raw `--format` value for `inspect` (table|json|jsonl; default table).
+    /// Parsed globally so it composes before or after the `inspect` word;
+    /// consumed only by the inspect dispatch, ignored by normal startup.
+    inspect_format: Option<String>,
+    /// `--no-color` for inspect table output (accepted for script parity;
+    /// tables are plain text).
+    inspect_no_color: bool,
+    /// Unexpected extra positionals in inspect mode (dispatch errors).
+    inspect_args: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -551,6 +569,12 @@ impl Args {
             list_instance: None,
             list_no_color: false,
             list_args: Vec::new(),
+            inspect_word: false,
+            inspect_target: None,
+            inspect_value: None,
+            inspect_format: None,
+            inspect_no_color: false,
+            inspect_args: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -801,9 +825,15 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
-/// - `--format SHAPE` → doctor output shape (parsed globally, consumed by
-///   the doctor dispatch; ignored by normal startup)
-/// - `--no-color` → disable ANSI coloring in doctor table output
+/// - `list <themes|plugins|instances>` → resource enumeration (CTX-0172);
+///   a program literally named `list`/`ls` needs `bitty -- list ...`
+/// - `inspect <target> <value>` → state and ownership (CTX-0173, local
+///   class, safe mode); a program literally named `inspect` needs
+///   `bitty -- inspect ...`
+/// - `--format SHAPE` → doctor/ctl/list/inspect output shape (parsed
+///   globally, consumed by each subcommand dispatch; ignored by startup)
+/// - `--no-color` → disable ANSI coloring in doctor/list table output
+///   (accepted by inspect for parity; its tables are plain text)
 /// - `--yes` / `--force` are init-only flags (parsed globally, consumed by
 ///   the init dispatch; ignored by normal startup)
 /// - `--` → treat the rest as program argv verbatim
@@ -842,12 +872,13 @@ fn parse_args(raw: &[String]) -> Args {
         }
         // Handle flags with `=` first
         if let Some(val) = token.strip_prefix("--format=") {
-            // Raw on purpose: validated at doctor/ctl/list dispatch (fail-closed
-            // exit 2 on unknown shapes, never warn-ignored).
-            // Merged CTX-0171 + CTX-0172: same token feeds both dispatches;
-            // the inactive dispatch ignores its field.
+            // Raw on purpose: validated at doctor/ctl/list/inspect dispatch
+            // (fail-closed exit 2 on unknown shapes, never warn-ignored).
+            // Merged CTX-0171 + CTX-0172 + CTX-0173: same token feeds every
+            // dispatch; the inactive dispatches ignore their field.
             out.doctor_format = Some(val.to_string());
             out.list_format = Some(val.to_string());
+            out.inspect_format = Some(val.to_string());
             i += 1;
             continue;
         }
@@ -988,10 +1019,16 @@ fn parse_args(raw: &[String]) -> Args {
         }
         match token.as_str() {
             "--" => {
-                // In `list` mode `--` is a stray separator (UsageError at
-                // dispatch); elsewhere it ends flags for PROGRAM argv.
+                // In `list`/`inspect` mode `--` is a stray separator
+                // (UsageError at dispatch); elsewhere it ends flags for
+                // PROGRAM argv.
                 if out.list_word {
                     out.list_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.inspect_word {
+                    out.inspect_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1035,18 +1072,21 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             "--format" => {
-                // `bitty doctor/ctl/list --format SHAPE`: raw on purpose, validated
-                // at dispatch (fail-closed exit 2). Parsed globally so it
-                // composes before or after the subcommand word.
-                // Merged CTX-0171 + CTX-0172: same token feeds both; missing
-                // warns (doctor/ctl) and fail-closes list via empty.
+                // `bitty doctor/ctl/list/inspect --format SHAPE`: raw on
+                // purpose, validated at dispatch (fail-closed exit 2). Parsed
+                // globally so it composes before or after the subcommand word.
+                // Merged CTX-0171 + CTX-0172 + CTX-0173: same token feeds
+                // every dispatch; missing warns (doctor/ctl) and fail-closes
+                // list/inspect via empty.
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.doctor_format = Some(raw[i + 1].clone());
                     out.list_format = Some(raw[i + 1].clone());
+                    out.inspect_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
                     out.list_format = Some(String::new());
+                    out.inspect_format = Some(String::new());
                     i += 1;
                 }
             }
@@ -1081,6 +1121,7 @@ fn parse_args(raw: &[String]) -> Args {
             "--no-color" => {
                 out.doctor_no_color = true;
                 out.list_no_color = true;
+                out.inspect_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1224,10 +1265,16 @@ fn parse_args(raw: &[String]) -> Args {
                 }
             }
             s if s.starts_with('-') => {
-                // In `list` mode unknown flags fail closed at dispatch (exit
-                // 2); elsewhere keep the legacy warn-as-program behavior.
+                // In `list`/`inspect` mode unknown flags fail closed at
+                // dispatch (exit 2); elsewhere keep the legacy warn-as-program
+                // behavior.
                 if out.list_word {
                     out.list_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.inspect_word {
+                    out.inspect_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1254,6 +1301,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.ctl_word
                     && !out.list_word
+                    && !out.inspect_word
                     && token == "run"
                 {
                     out.run_word = true;
@@ -1273,6 +1321,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.ctl_word
                     && !out.doctor_word
                     && !out.list_word
+                    && !out.inspect_word
                     && token == "ctl"
                 {
                     out.ctl_word = true;
@@ -1288,6 +1337,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.ctl_word
                     && !out.run_word
                     && !out.list_word
+                    && !out.inspect_word
                     && token == "config"
                 {
                     out.config_word = true;
@@ -1337,6 +1387,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.ctl_word
                     && !out.run_word
                     && !out.list_word
+                    && !out.inspect_word
                     && token == "init"
                 {
                     out.init_word = true;
@@ -1364,6 +1415,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.ctl_word
                     && !out.run_word
                     && !out.list_word
+                    && !out.inspect_word
                     && token == "doctor"
                 {
                     out.doctor_word = true;
@@ -1388,6 +1440,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.doctor_word
                     && !out.run_word
                     && !out.ctl_word
+                    && !out.inspect_word
                     && (token == "list" || token == "ls")
                 {
                     out.list_word = true;
@@ -1407,6 +1460,42 @@ fn parse_args(raw: &[String]) -> Args {
                         out.list_kind = Some(token.clone());
                     } else {
                         out.list_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
+                // `bitty inspect <target> <value>` state and ownership (first
+                // positional only; CTX-0173). A program literally named
+                // `inspect` needs `bitty -- inspect ...` (or
+                // `bitty run -- inspect ...`).
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && token == "inspect"
+                {
+                    out.inspect_word = true;
+                    i += 1;
+                    continue;
+                }
+                if out.inspect_word {
+                    // Target is the first bare token after `inspect`, value
+                    // the second; the rest fail closed at dispatch (including
+                    // stray `--`, which was recorded above as an inspect arg).
+                    if out.inspect_target.is_none() {
+                        // Allow `-h/--help` after `inspect` to flow to the
+                        // global help path (main shows inspect help when both
+                        // are set); any other flag-looking token was already
+                        // captured as an inspect arg above.
+                        out.inspect_target = Some(token.clone());
+                    } else if out.inspect_value.is_none() {
+                        out.inspect_value = Some(token.clone());
+                    } else {
+                        out.inspect_args.push(token.clone());
                     }
                     i += 1;
                     continue;
@@ -1475,13 +1564,15 @@ fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                --format SHAPE  Doctor/ctl output shape: table|json|jsonl\n  \
-                              (default table; parsed globally, consumed by\n  \
-                              `bitty doctor` and `bitty ctl`; ignored by startup).\n  \
+                 --format SHAPE  Doctor/ctl/list/inspect output shape: table|json|jsonl\n  \
+                               (default table; parsed globally, consumed by\n  \
+                               `bitty doctor`, `bitty ctl`, `bitty list`, and\n  \
+                               `bitty inspect`; ignored by startup).\n  \
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
                               or `bitty ctl --socket P ...`; bypasses discovery).\n  \
                --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
-                --no-color     Disable ANSI coloring in doctor table output\n  \
+                 --no-color     Disable ANSI coloring in doctor/list table output\n  \
+                               (accepted by inspect for parity; its tables are plain)\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
           Subcommands (CLI-first management, DEC-0007):\n  \
@@ -1513,9 +1604,12 @@ fn help_text() -> String {
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
-            list <kind>      Enumerate resources: themes|plugins|instances\n  \
-                             (--format table|json|jsonl, --socket/--instance for\n  \
-                             instances; alias `ls`; `bitty list --help` for detail)\n  \
+             list <kind>      Enumerate resources: themes|plugins|instances\n  \
+                              (--format table|json|jsonl, --socket/--instance for\n  \
+                              instances; alias `ls`; `bitty list --help` for detail)\n  \
+             inspect <target> <value>  Explain state and ownership (local, safe mode)\n  \
+                              command|key|plugin|config|protocol\n  \
+                              (--format table|json|jsonl; `bitty inspect --help`)\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -3197,6 +3291,53 @@ fn run_list_subcommand(args: &Args) -> i32 {
         }
     };
     list::run_list(&request)
+}
+
+/// Runs `bitty inspect <target> <value>`; returns the process exit code.
+///
+/// - Extra positionals, unknown targets, missing values, bad `--format`,
+///   stray `--`, and `--socket`/`--instance` alongside `inspect` fail closed
+///   (exit 2, stderr only, no stdout envelope). `inspect` is local-only: no
+///   targeting flag ever applies.
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "inspect"`) on stdout with diagnostics on stderr.
+/// - Well-formed but unknown values emit `ok: false` envelopes for json/jsonl
+///   (exit 1, class `NotFound`) and stderr-only diagnostics for table.
+fn run_inspect_subcommand(args: &Args) -> i32 {
+    if !args.inspect_args.is_empty() {
+        eprintln!(
+            "bitty inspect: unexpected argument '{}'\n{}",
+            args.inspect_args[0],
+            inspect::inspect_usage()
+        );
+        return inspect::EXIT_USAGE;
+    }
+    // Local-only: targeting flags never apply to `inspect` (no instance is
+    // contacted). Fail closed rather than silently ignoring them.
+    if args.ctl_socket_pre.is_some()
+        || args.ctl_instance_pre.is_some()
+        || args.list_socket.is_some()
+        || args.list_instance.is_some()
+    {
+        eprintln!(
+            "bitty inspect: --socket/--instance do not apply (inspect is local, no instance)\n{}",
+            inspect::inspect_usage()
+        );
+        return inspect::EXIT_USAGE;
+    }
+    let request = match inspect::InspectRequest::validate(
+        args.inspect_target.as_deref(),
+        args.inspect_value.as_deref(),
+        args.inspect_format.as_deref(),
+        args.inspect_no_color,
+    ) {
+        Ok(req) => req,
+        Err(message) => {
+            eprintln!("{message}");
+            return inspect::EXIT_USAGE;
+        }
+    };
+    inspect::run_inspect(&request)
 }
 
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
@@ -4883,9 +5024,14 @@ fn main() {
     let args = parse_args(&raw);
 
     // `bitty list --help` shows list help (never needs an instance or VM);
-    // bare `--help` shows the top-level help.
+    // `bitty inspect --help` shows inspect help; bare `--help` shows the
+    // top-level help.
     if args.help && args.list_word {
         println!("{}", list::list_help_text(&args.list_spelling));
+        std::process::exit(0);
+    }
+    if args.help && args.inspect_word {
+        println!("{}", inspect::inspect_help_text());
         std::process::exit(0);
     }
     if args.help {
@@ -4963,6 +5109,14 @@ fn main() {
     // config file (safe-mode clean, no plugin VM).
     if args.list_word {
         std::process::exit(run_list_subcommand(&args));
+    }
+
+    // `bitty inspect <target> <value>` state and ownership (CTX-0173, local
+    // class, safe mode). Runs before config loading so `inspect` works with
+    // a missing or invalid config file: every target resolves from built-in
+    // defaults and static manifests (no file I/O, no instance, no VM).
+    if args.inspect_word {
+        std::process::exit(run_inspect_subcommand(&args));
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a
@@ -6689,6 +6843,75 @@ mod tests {
         assert!(help.contains("ctl"));
         assert!(help.contains("--socket"));
         assert!(help.contains("--instance"));
+    }
+
+    #[test]
+    fn parse_inspect_subcommand() {
+        // Target + value land in dedicated fields (dispatch validates).
+        let p = parse_args(&args_of(&["bitty", "inspect", "command", "core.view.list"]));
+        assert!(p.inspect_word);
+        assert_eq!(p.inspect_target.as_deref(), Some("command"));
+        assert_eq!(p.inspect_value.as_deref(), Some("core.view.list"));
+        assert!(p.inspect_args.is_empty());
+        assert_eq!(p.program, None);
+        assert!(!p.ctl_word);
+        assert!(!p.list_word);
+        assert!(!p.doctor_word);
+
+        // `--format`/`--no-color` compose before or after the word.
+        let p = parse_args(&args_of(&[
+            "bitty", "--format", "json", "inspect", "key", "alt+h",
+        ]));
+        assert!(p.inspect_word);
+        assert_eq!(p.inspect_format.as_deref(), Some("json"));
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "inspect",
+            "config",
+            "font.size",
+            "--format=json",
+        ]));
+        assert_eq!(p.inspect_format.as_deref(), Some("json"));
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "inspect",
+            "key",
+            "alt+h",
+            "--no-color",
+        ]));
+        assert!(p.inspect_no_color);
+
+        // Extra positionals and stray flags fail closed at dispatch.
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "inspect",
+            "command",
+            "core.view.list",
+            "extra",
+        ]));
+        assert_eq!(p.inspect_args, vec!["extra".to_string()]);
+        let p = parse_args(&args_of(&["bitty", "inspect", "command", "x", "--"]));
+        assert_eq!(p.inspect_args, vec!["--".to_string()]);
+        let p = parse_args(&args_of(&["bitty", "inspect", "command", "x", "--bogus"]));
+        assert_eq!(p.inspect_args, vec!["--bogus".to_string()]);
+
+        // Escape hatch: a program literally named `inspect`.
+        let p = parse_args(&args_of(&["bitty", "--", "inspect"]));
+        assert!(!p.inspect_word);
+        assert_eq!(p.program.as_deref(), Some("inspect"));
+
+        // `inspect` after other subcommands belongs to that subcommand.
+        let p = parse_args(&args_of(&["bitty", "list", "inspect"]));
+        assert!(p.list_word);
+        assert!(!p.inspect_word);
+        let p = parse_args(&args_of(&["bitty", "doctor", "inspect"]));
+        assert!(p.doctor_word);
+        assert!(!p.inspect_word);
+
+        // Help mentions the new subcommand.
+        let help = help_text();
+        assert!(help.contains("inspect <target>"));
+        assert!(help.contains("command|key|plugin|config|protocol"));
     }
 
     #[test]

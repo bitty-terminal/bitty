@@ -186,19 +186,48 @@ fn run_title_option_exposed_as_env() {
     assert_eq!(stdout(&output).trim(), "demo-title");
 }
 
+/// Normalizes a reported child dir for cross-platform comparison: folds
+/// `\` to `/`, maps MSYS2/Git-Bash `/c/...` to `c:/...`, strips trailing
+/// `/`, and lowercases (Windows is case-insensitive; Unix unaffected).
+fn normalize_cwd_for_assert(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if normalized.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[2] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+    {
+        normalized = format!("{}:/{}", bytes[1] as char, &normalized[3..]);
+    }
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized.to_lowercase()
+}
+
 #[test]
 fn run_cwd_option_changes_child_dir() {
-    let output = run_bitty(&["run", "--cwd", "/tmp", "--", "pwd"]);
+    // Platform-correct temp dir: hardcoded `/tmp` does not exist on Windows
+    // (os error 267). `temp_dir()` is `/tmp` on Unix, `C:\...\Temp` on Windows.
+    let expected = std::env::temp_dir();
+    let expected_str = expected.to_string_lossy().into_owned();
+    let output = run_bitty(&["run", "--cwd", expected_str.as_str(), "--", "pwd"]);
     assert_eq!(
         output.status.code(),
         Some(0),
-        "--cwd /tmp child must exit 0, stderr={:?}",
+        "--cwd temp_dir child must exit 0, stderr={:?}",
         stderr(&output)
     );
+    let actual = stdout(&output);
+    let actual_norm = normalize_cwd_for_assert(actual.trim());
+    let expected_norm = normalize_cwd_for_assert(expected_str.trim());
+    let leaf = expected
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
     assert!(
-        stdout(&output).trim() == "/tmp" || stdout(&output).trim().ends_with("/tmp"),
-        "--cwd must change the child dir, got {:?}",
-        stdout(&output)
+        actual_norm == expected_norm || actual_norm.ends_with(&format!("/{leaf}")),
+        "--cwd must change the child dir to {expected_str:?}, got {actual:?}",
     );
 }
 
@@ -262,13 +291,12 @@ fn run_missing_program_is_generic_error_not_usage() {
 
 #[test]
 fn run_missing_cwd_is_generic_error() {
-    let output = run_bitty(&[
-        "run",
-        "--cwd",
-        "/bitty-run-definitely-missing-dir-xyz",
-        "--",
-        "true",
-    ]);
+    // Join onto the platform temp dir so the parent is valid on Windows too;
+    // the leaf itself must not exist (spawn failure, exit 1, on every OS).
+    let missing = std::env::temp_dir().join("bitty-run-definitely-missing-dir-xyz");
+    let _ = std::fs::remove_dir_all(&missing);
+    let missing_str = missing.to_string_lossy().into_owned();
+    let output = run_bitty(&["run", "--cwd", missing_str.as_str(), "--", "true"]);
     assert_eq!(
         output.status.code(),
         Some(1),

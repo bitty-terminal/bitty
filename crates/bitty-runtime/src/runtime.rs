@@ -471,6 +471,73 @@ fn pty_forward_loop(reader: PtyReader, tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     let _ = reader.join();
 }
 
+/// OSC 52 read-reply framing overhead: `ESC ] 52 ; c ;` (7 bytes) plus the
+/// `BEL` terminator (1 byte).
+const OSC52_REPLY_FRAMING_BYTES: usize = 8;
+
+/// Maximum raw clipboard bytes encoded into one OSC 52 read reply, so the
+/// framed reply always fits the 4 KiB terminal-state reply cap instead of
+/// being dropped whole by it (which would hang the querier again).
+const OSC52_READ_MAX_RAW_BYTES: usize =
+    (bitty_term_state::REPLY_CAP_BYTES - OSC52_REPLY_FRAMING_BYTES) / 4 * 3;
+
+/// Minimal standard-base64 encoder (RFC 4648 §4, `+/` with `=` padding).
+///
+/// Kept dependency-free on purpose: the only consumer is the OSC 52 read
+/// reply below, and a new supply-chain dependency for ~20 lines is not
+/// justified. Time O(n), space O(n) in the input length.
+fn base64_encode_standard(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((triple >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Builds an OSC 52 clipboard-read reply for `text` (`ESC ] 52 ; c ; <base64> BEL`).
+///
+/// The payload is truncated on a UTF-8 boundary to
+/// [`OSC52_READ_MAX_RAW_BYTES`] so the framed reply never exceeds the reply
+/// cap. Mirrors Ghostty's `clipboard_response` shape: selection `c`, BEL
+/// terminator. Time O(n), space O(n) in the (bounded) clipboard length.
+fn osc52_read_reply(text: &str) -> Vec<u8> {
+    let mut end = text.len().min(OSC52_READ_MAX_RAW_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // `end` is a char boundary, so slicing the UTF-8 bytes is exact.
+    let encoded = base64_encode_standard(&text.as_bytes()[..end]);
+    let mut reply = Vec::with_capacity(OSC52_REPLY_FRAMING_BYTES + encoded.len());
+    reply.extend_from_slice(b"\x1b]52;c;");
+    reply.extend_from_slice(encoded.as_bytes());
+    reply.push(0x07);
+    reply
+}
+
 /// One split pane's private shell session (CTX-0176).
 ///
 /// Each leaf created by a split owns at most one of these: its own VT
@@ -4042,12 +4109,18 @@ impl Runtime {
                         if !self.osc_clipboard_read_allowed {
                             continue;
                         }
-                        // Even when allowed, read consent must be explicit:
-                        // synthesize a read reply only when the caller has set
-                        // `osc_clipboard_read_allowed = true` via policy gate.
-                        // headless path: place clipboard text into reply queue
-                        // bounded via State reply cap; here we push via clipboard read.
-                        let _ = self.clipboard.get_text();
+                        // Allowed (CR-RT-01): answer with the base64-encoded
+                        // clipboard text via the bounded `Reply` queue
+                        // (Ghostty `clipboard_response` pattern), so
+                        // tmux/neovim queries terminate instead of hanging.
+                        // The lossy read keeps the reply path total: a
+                        // system-clipboard failure falls back to the last
+                        // known buffer rather than answering with silence.
+                        let text = self.clipboard.get_text_lossy();
+                        let reply = osc52_read_reply(&text);
+                        self.state.apply(&TerminalAction::Reply {
+                            bytes: reply.into_boxed_slice(),
+                        });
                     }
                 }
             }

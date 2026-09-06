@@ -428,6 +428,60 @@ fn osc52_write_is_bridged_to_clipboard() {
 }
 
 #[test]
+fn osc52_read_denied_queues_no_reply() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("secret".to_string())
+        .expect("headless clipboard write must succeed");
+    // Default: reads are denied without explicit consent (P0-AC-007).
+    rt.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    assert!(
+        rt.take_replies().is_empty(),
+        "denied OSC 52 read must queue no reply"
+    );
+    assert_eq!(rt.clipboard().headless_contents(), "secret");
+}
+
+#[test]
+fn osc52_read_allowed_replies_base64_clipboard() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("hello".to_string())
+        .expect("headless clipboard write must succeed");
+    rt.set_osc_clipboard_read_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    // "hello" -> "aGVsbG8=" per RFC 4648; framed as OSC 52 BEL reply.
+    let replies = rt.take_replies();
+    assert_eq!(replies.len(), 1, "allowed read must answer exactly once");
+    assert_eq!(
+        &replies[0][..],
+        b"\x1b]52;c;aGVsbG8=\x07".as_slice(),
+        "reply must be a well-formed OSC 52 base64 reply"
+    );
+    // The reply path is read-only: clipboard contents are unchanged.
+    assert_eq!(rt.clipboard().headless_contents(), "hello");
+}
+
+#[test]
+fn osc52_read_reply_stays_within_reply_cap() {
+    let mut rt = make_runtime();
+    // Largest clipboard the platform seam retains (8192 bytes); the framed
+    // reply must still fit the 4 KiB reply cap instead of being dropped.
+    let big = "A".repeat(8192);
+    rt.clipboard_mut()
+        .set_text(big)
+        .expect("headless clipboard write must succeed");
+    rt.set_osc_clipboard_read_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    let replies = rt.take_replies();
+    assert_eq!(replies.len(), 1, "allowed read must answer exactly once");
+    let reply = &replies[0];
+    assert!(reply.len() <= 4096, "reply must fit the reply cap");
+    assert!(reply.starts_with(b"\x1b]52;c;"), "reply must be OSC 52");
+    assert!(reply.ends_with(b"\x07"), "reply must be BEL-terminated");
+}
+
+#[test]
 fn deterministic_copy_paste_across_runtimes() {
     let mut a = make_runtime();
     let mut b = make_runtime();

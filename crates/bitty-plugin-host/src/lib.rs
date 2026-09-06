@@ -127,7 +127,9 @@ pub mod install;
 pub mod manifest;
 pub mod registry;
 
-pub use capability::{CapabilityFamily, CapabilityId, effect_statement};
+pub use capability::{
+    CapabilityFamily, CapabilityId, effect_statement, validate_closed_capability,
+};
 pub use error::{ErrorClass, PluginError};
 pub use event::{
     BATCH_MAX_BYTES, BATCH_MAX_EVENTS, BoundedText, BudgetSnapshot, DEFAULT_BATCH_BYTES,

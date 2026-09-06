@@ -278,6 +278,151 @@ impl std::fmt::Display for CapabilityId {
     }
 }
 
+/// Canonical capability families (closed; CR-PKG-03 single source of truth).
+///
+/// `bitty-package` is the leaf crate in the ADR crate graph (`bitty-plugin-host`
+/// depends on it, so a package-to-host dependency would be a cycle). The closed
+/// identifier tables therefore live here and `bitty-plugin-host::capability`
+/// delegates its closed-set check to [`check_closed_capability`]. Any change
+/// here must keep the host accepting exactly the same set (guarded by
+/// cross-crate consistency tests on the host side).
+pub const CAPABILITY_FAMILIES: &[&str] = &[
+    "terminal",
+    "ui",
+    "clipboard",
+    "fs",
+    "process",
+    "network",
+    "runtime",
+    "debug",
+    "platform",
+    "protocol",
+    "panel",
+    "browser",
+    "agent",
+    "mcp",
+    "ai",
+];
+
+/// Every non-parameterized capability head in the closed normative set.
+///
+/// Must equal the union of `CapabilityFamily::closed_identifiers` in
+/// `bitty-plugin-host`; the host consistency test enforces this.
+pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
+    "terminal.semantic-read",
+    "terminal.raw-read",
+    "terminal.input.self",
+    "terminal.input.all",
+    "terminal.manage",
+    "ui.rich",
+    "ui.overlay",
+    "ui.protocol-register",
+    "clipboard.read",
+    "clipboard.write",
+    "fs.read",
+    "fs.write",
+    "process.spawn",
+    "network.connect",
+    "runtime.inspect",
+    "runtime.configure",
+    "runtime.plugin-manage",
+    "debug.inspect",
+    "debug.trace",
+    "debug.control",
+    "platform.notify",
+    "platform.open-url",
+    "platform.image-file",
+    "protocol.register",
+    "panel.provider",
+    "panel.create",
+    "panel.focus",
+    "panel.overlay",
+    "browser.embed",
+    "browser.navigation",
+    "browser.file-url",
+    "browser.storage",
+    "agent.context.terminal",
+    "agent.context.workspace",
+    "agent.memory",
+    "mcp.invoke",
+    "ai.provider",
+    "ai.stream",
+    "ai.model",
+];
+
+/// Whether a closed capability head requires a `:PARAMETER`.
+///
+/// Mirrors the host `param_required` table; heads not listed here must not
+/// carry a parameter.
+#[must_use]
+pub fn capability_requires_param(head: &str) -> bool {
+    matches!(
+        head,
+        "fs.read"
+            | "fs.write"
+            | "process.spawn"
+            | "network.connect"
+            | "mcp.invoke"
+            | "agent.memory"
+    )
+}
+
+/// Closed-set violation kind, shared with the plugin host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosedCapabilityViolation {
+    /// Head is not in [`CLOSED_CAPABILITY_HEADS`].
+    UnknownHead,
+    /// Head requires a `:PARAMETER` but none was supplied.
+    ParamRequired,
+    /// Head must not carry a `:PARAMETER` but one was supplied.
+    ParamForbidden,
+}
+
+/// Canonical closed-set check shared with the plugin host (CR-PKG-03).
+///
+/// Validates the identifier head against [`CLOSED_CAPABILITY_HEADS`] plus the
+/// parameter presence rules; shape checks (segments, lengths, character
+/// classes) stay with the caller so each crate keeps its own error vocabulary.
+pub fn check_closed_capability(
+    head: &str,
+    has_param: bool,
+) -> Result<(), ClosedCapabilityViolation> {
+    if !CLOSED_CAPABILITY_HEADS.contains(&head) {
+        return Err(ClosedCapabilityViolation::UnknownHead);
+    }
+    if capability_requires_param(head) && !has_param {
+        return Err(ClosedCapabilityViolation::ParamRequired);
+    }
+    if !capability_requires_param(head) && has_param {
+        return Err(ClosedCapabilityViolation::ParamForbidden);
+    }
+    Ok(())
+}
+
+/// Canonical closed-set validation producing package errors.
+///
+/// Called from [`validate_capability`] so manifest-time validation enforces
+/// exactly the host install-time set: divergent identifiers fail here instead
+/// of locking successfully and failing at install.
+pub fn validate_closed_capability(head: &str, has_param: bool) -> Result<(), PackageError> {
+    check_closed_capability(head, has_param).map_err(|violation| match violation {
+        ClosedCapabilityViolation::UnknownHead => PackageError::manifest(
+            "capabilities",
+            format!(
+                "unknown capability '{head}' (closed set; forward compat requires explicit RFC)"
+            ),
+        ),
+        ClosedCapabilityViolation::ParamRequired => PackageError::manifest(
+            "capabilities",
+            format!("capability '{head}' requires a ':PARAMETER'"),
+        ),
+        ClosedCapabilityViolation::ParamForbidden => PackageError::manifest(
+            "capabilities",
+            format!("capability '{head}' must not have a ':PARAMETER'"),
+        ),
+    })
+}
+
 fn validate_capability(raw: &str) -> Result<(), PackageError> {
     if raw.is_empty() {
         return Err(PackageError::manifest(
@@ -292,10 +437,10 @@ fn validate_capability(raw: &str) -> Result<(), PackageError> {
             actual: raw.len(),
         });
     }
-    if raw.contains(' ') || raw.contains('\t') || raw.contains('\n') {
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
         return Err(PackageError::manifest(
             "capabilities",
-            "capability must not contain whitespace",
+            "capability must not contain control characters or whitespace",
         ));
     }
     // Split optional param.
@@ -338,6 +483,13 @@ fn validate_capability(raw: &str) -> Result<(), PackageError> {
                 "capability segment must not be empty",
             ));
         }
+        if seg.len() > 64 {
+            return Err(PackageError::LimitExceeded {
+                field: "capabilities.segment".to_string(),
+                limit: 64,
+                actual: seg.len(),
+            });
+        }
         let first = seg.as_bytes()[0];
         if !first.is_ascii_lowercase() {
             return Err(PackageError::manifest(
@@ -354,24 +506,10 @@ fn validate_capability(raw: &str) -> Result<(), PackageError> {
             }
         }
     }
-    let family = parts[0];
-    const KNOWN_FAMILIES: &[&str] = &[
-        "terminal",
-        "ui",
-        "clipboard",
-        "fs",
-        "process",
-        "network",
-        "runtime",
-        "debug",
-        "platform",
-    ];
-    if !KNOWN_FAMILIES.contains(&family) {
-        return Err(PackageError::manifest(
-            "capabilities",
-            format!("unknown capability family '{family}'"),
-        ));
-    }
+    // Closed normative set shared with the plugin host (CR-PKG-03): family
+    // membership alone is never authority — unknown heads fail here instead
+    // of locking successfully and failing at install.
+    validate_closed_capability(head, param.is_some())?;
     Ok(())
 }
 
@@ -756,8 +894,10 @@ mod tests {
     #[test]
     fn duplicate_capability_rejected() {
         let mut m = minimal_manifest();
-        m.capabilities.push(CapabilityId::new("fs.read").unwrap());
-        m.capabilities.push(CapabilityId::new("fs.read").unwrap());
+        m.capabilities
+            .push(CapabilityId::new("fs.read:/tmp/**").unwrap());
+        m.capabilities
+            .push(CapabilityId::new("fs.read:/tmp/**").unwrap());
         assert!(m.validate().is_err());
     }
 
@@ -767,13 +907,13 @@ mod tests {
         let mut m2 = minimal_manifest();
         // Different capability order should still produce same canonical digest (sorted).
         m2.capabilities = vec![
-            CapabilityId::new("network.connect").unwrap(),
-            CapabilityId::new("fs.read").unwrap(),
+            CapabilityId::new("network.connect:example.com:443").unwrap(),
+            CapabilityId::new("fs.read:/tmp/**").unwrap(),
         ];
         let mut m3 = minimal_manifest();
         m3.capabilities = vec![
-            CapabilityId::new("fs.read").unwrap(),
-            CapabilityId::new("network.connect").unwrap(),
+            CapabilityId::new("fs.read:/tmp/**").unwrap(),
+            CapabilityId::new("network.connect:example.com:443").unwrap(),
         ];
         assert_eq!(m2.canonical_digest(), m3.canonical_digest());
         assert_ne!(m1.canonical_digest(), m2.canonical_digest());
@@ -783,9 +923,58 @@ mod tests {
     fn canonical_differs_on_semantic_edit() {
         let mut m1 = minimal_manifest();
         let mut m2 = minimal_manifest();
-        m1.capabilities.push(CapabilityId::new("fs.read").unwrap());
-        m2.capabilities.push(CapabilityId::new("fs.write").unwrap());
+        m1.capabilities
+            .push(CapabilityId::new("fs.read:/tmp/**").unwrap());
+        m2.capabilities
+            .push(CapabilityId::new("fs.write:/tmp/**").unwrap());
         assert_ne!(m1.canonical_digest(), m2.canonical_digest());
+    }
+
+    #[test]
+    fn divergent_identifiers_rejected_at_manifest_time() {
+        // CR-PKG-03: the old family-only check accepted any `terminal.*`
+        // identifier; the closed set must reject unknown heads here instead of
+        // locking successfully and failing at install.
+        assert!(CapabilityId::new("terminal.unknown-thing").is_err());
+        assert!(CapabilityId::new("terminal.semantic-read.evil").is_err());
+        assert!(CapabilityId::new("ui.unknown").is_err());
+        assert!(CapabilityId::new("agent.evil").is_err());
+        // Parameter rules are part of the closed set.
+        assert!(CapabilityId::new("fs.read").is_err());
+        assert!(CapabilityId::new("network.connect").is_err());
+        assert!(CapabilityId::new("terminal.semantic-read:param").is_err());
+        assert!(CapabilityId::new("ui.rich:param").is_err());
+    }
+
+    #[test]
+    fn closed_set_accepts_every_host_identifier() {
+        // The valid set is unchanged: every host closed identifier (with a
+        // parameter where one is required) must validate at manifest time.
+        for head in CLOSED_CAPABILITY_HEADS {
+            let raw = if capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            assert!(
+                CapabilityId::new(&raw).is_ok(),
+                "host identifier '{raw}' must validate at manifest time"
+            );
+        }
+        // New families previously rejected as unknown are now accepted.
+        for raw in [
+            "protocol.register",
+            "panel.create",
+            "browser.embed",
+            "agent.context.terminal",
+            "mcp.invoke:mail.list",
+            "ai.provider",
+        ] {
+            assert!(
+                CapabilityId::new(raw).is_ok(),
+                "'{raw}' must validate at manifest time"
+            );
+        }
     }
 
     #[test]

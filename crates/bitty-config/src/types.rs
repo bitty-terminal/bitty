@@ -63,7 +63,7 @@ pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 /// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
 /// side-by-side vs ghostty must show no material difference) and renders
 /// starship/opencode Nerd glyphs out of the box. System `monospace` remains
-/// the ultimate fallback via [`FONT_FALLBACK_CHAIN`], so bare installs
+/// in the chain via [`FONT_FALLBACK_CHAIN`], so bare installs
 /// without the Nerd font still start (headless fallback path in
 /// `bitty-runtime`).
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
@@ -103,24 +103,41 @@ pub const BASE_CELL_WIDTH: u32 = 8;
 /// Legacy design cell height (see [`BASE_CELL_WIDTH`]).
 pub const BASE_CELL_HEIGHT: u32 = 16;
 
+/// Braille/symbols fallback family (CTX-0163, issue #263).
+///
+/// `fc-query` evidence on the reference host: `DejaVu Sans Mono` covers
+/// `2500-262f` (box drawing + block elements `U+2580-U+259F`) but has no
+/// `28xx` row, so braille patterns `U+2800-U+28FF` (btop CPU graphs) fall
+/// through; `Noto Sans Symbols 2` covers `2800-28ff` and resolves via
+/// fontconfig (`fc-match "Noto Sans Symbols 2"`). Ships in `noto-fonts`,
+/// already an `optdepend` in `packaging/PKGBUILD` — no new dependency.
+pub const SYMBOLS_FALLBACK_FAMILY: &str = "Noto Sans Symbols 2";
+
 /// Documented monospace/Nerd fallback stack.
 ///
 /// Order: configured primary (Nerd-patched by default) -> unpatched
 /// `JetBrains Mono` -> system `monospace` (fontconfig/WC) ->
-/// `DejaVu Sans Mono` (widely available). Mirrors ghostty (embedded
-/// JetBrains Mono variable + symbols-only Nerd fallback, always present)
-/// and kitty (`font_family = "monospace"` + builtin Nerd font,
+/// `DejaVu Sans Mono` (widely available, covers box drawing + block
+/// elements `U+2580-U+259F`) -> [`SYMBOLS_FALLBACK_FAMILY`] (covers braille
+/// patterns `U+2800-U+28FF` for TUI graphs such as btop). Mirrors ghostty
+/// (embedded JetBrains Mono variable + symbols-only Nerd fallback, always
+/// present) and kitty (`font_family = "monospace"` + builtin Nerd font,
 /// `set_font_family(..., add_builtin_nerd_font=True)`).
 ///
-/// Per-glyph fallback shaping stays deferred to the text RFC (ADR-0004
-/// "Wrap" row); this chain is family-level attempt order for embedders:
-/// try each in order until `load_font` succeeds, ending in headless.
+/// Per-glyph coverage fallback is implemented by
+/// `bitty-render::fallback::FallbackRasterizer`, which walks this chain on
+/// a missing glyph (reference: ghostty
+/// `src/font/CodepointResolver.zig`, per-codepoint fallback via discovery).
+/// Full shaping stays deferred to the text RFC (ADR-0004 "Wrap" row); this
+/// chain is family-level attempt order for embedders: try each in order
+/// until `load_font` succeeds, ending in headless.
 /// [`FontConfig::fallback_chain`] builds the configured-first variant.
-pub const FONT_FALLBACK_CHAIN: [&str; 4] = [
+pub const FONT_FALLBACK_CHAIN: [&str; 5] = [
     DEFAULT_FONT_FAMILY,
     "JetBrains Mono",
     "monospace",
     "DejaVu Sans Mono",
+    SYMBOLS_FALLBACK_FAMILY,
 ];
 
 /// Font configuration.
@@ -693,6 +710,7 @@ mod tests {
                 "JetBrains Mono".to_string(),
                 "monospace".to_string(),
                 "DejaVu Sans Mono".to_string(),
+                "Noto Sans Symbols 2".to_string(),
             ]
         );
         // Custom primary stays first, chain dedups case-insensitively.
@@ -702,14 +720,39 @@ mod tests {
         };
         let chain = custom.fallback_chain();
         assert_eq!(chain[0], "monospace");
-        assert_eq!(chain.len(), 4);
+        assert_eq!(chain.len(), 5);
         // No duplicates when primary already in chain.
         let nerd = FontConfig {
             family: "  jetbrainsmono nerd font  ".into(),
             ..Default::default()
         };
         let chain = nerd.fallback_chain();
-        assert_eq!(chain.len(), 4);
+        assert_eq!(chain.len(), 5);
+    }
+
+    #[test]
+    fn font_fallback_chain_covers_tui_graph_slices() {
+        // CTX-0163 (issue #263): btop CPU graphs draw braille patterns
+        // (`U+2800-U+28FF`); block graphs use `U+2580-U+259F`. The chain
+        // must end in a braille-capable symbols face and keep the
+        // block-capable `DejaVu Sans Mono` entry ahead of it, so a
+        // per-glyph fallback walk (see `bitty-render::fallback`) can
+        // resolve both slices on bare installs without the Nerd font.
+        assert_eq!(
+            FONT_FALLBACK_CHAIN[FONT_FALLBACK_CHAIN.len() - 1],
+            SYMBOLS_FALLBACK_FAMILY
+        );
+        assert_eq!(SYMBOLS_FALLBACK_FAMILY, "Noto Sans Symbols 2");
+        assert!(FONT_FALLBACK_CHAIN.contains(&"DejaVu Sans Mono"));
+        // The symbols tail survives a custom primary (dedup only removes
+        // the primary itself, never the tail).
+        let custom = FontConfig {
+            family: "My Mono".into(),
+            ..Default::default()
+        };
+        let chain = custom.fallback_chain();
+        assert_eq!(chain[chain.len() - 1], "Noto Sans Symbols 2");
+        assert!(chain.contains(&"DejaVu Sans Mono".to_string()));
     }
 
     #[test]

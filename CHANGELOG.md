@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### AUR bitty-bin prebuilt package (CTX-0138, issue #227)
+
+- New `packaging/PKGBUILD.bin` template for AUR `bitty-bin`: installs the prebuilt `bitty-x86_64-unknown-linux-gnu` release binary to `/usr/bin/bitty` (no user-side compile), real sha256 filled by the release workflow (never `SKIP` for the binary), `arch=('x86_64')` only, `provides=('bitty')`, `conflicts=('bitty' 'bitty-nightly' 'bitty-git')`, plus `.desktop`/icons from the release source tarball.
+- Release workflow gains an `aur-bin` publish job (same SSH host-key pinning and isolated `BUILD_DIR` pattern as the `aur` job; first push registers `bitty-bin` on AUR; gated on `vars.AUR_BIN_PUBLISH`).
+- New `scripts/check-release-version.sh` keeps the Cargo workspace version aligned with release tags (plus `PKGBUILD*`/`nfpm.yaml` consistency), enforced in the release `validate` job; `scripts/check-pkgbuild-bin.sh` render-tests the template. No version bump in this change; the bump ships with the release that enables the publish job. Asset-name dependency on CTX-0164 (#264) noted in the template: the `bitty-<target>` dist name must stay stable across the `bitty-app` -> `bitty` inner rename.
+
 ### Post-0.0.1 maintenance — triage 2026-09-01 (CTX-0117, docs-only)
 
 - Triage 0.0.1: GitHub Issues 0 open (verified `gh issue list` 2026-09-01, no new bugs from 0.0.1); crates.io 9/9 at 0.0.1 verified (`cargo info bitty-*` all show 0.0.1, docs.rs 302 to `bitty_*`), GitHub Release `v0.0.1` prerelease 3 assets (`bitty-v0.0.1-linux-x64.tar.gz` 3.3 MiB `18f9ceeef4930f08cc825541a63f4e7024bf19ec3ea69ca9621be95407358838`, `SHA256SUMS`, `provenance.json`) downloadCount 0 each (expected immediately post-release, no user feedback yet), `recordings/compat-matrix-2026-09-01.json` 14 surfaces all self PASS.

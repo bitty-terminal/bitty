@@ -198,6 +198,8 @@ use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View
 mod ctl;
 mod doctor;
 mod ipc_serve;
+
+mod list;
 mod run;
 
 // ---------------------------------------------------------------------------
@@ -389,6 +391,7 @@ struct Args {
     config_word: bool,
     /// Unexpected extra positionals in subcommand mode (dispatch errors).
     config_args: Vec<String>,
+
     /// `bitty init` opt-in setup wizard (#243, CTX-0149). True once the
     /// first positional `init` word is seen; extra positionals land in
     /// `init_args` and fail closed via usage. A program literally named
@@ -438,6 +441,27 @@ struct Args {
     ctl_socket_pre: Option<String>,
     /// Global `--instance` before the `ctl` word (merged at dispatch).
     ctl_instance_pre: Option<String>,
+
+    /// `bitty list <kind>` enumeration (CTX-0172). True once the first
+    /// positional `list`/`ls` word is seen; a program literally named
+    /// `list`/`ls` must be invoked as `bitty -- list ...`.
+    list_word: bool,
+    /// Invoked spelling (`list` or `ls`) for envelope `command`.
+    list_spelling: String,
+    /// Raw kind token after `list` (validated at dispatch).
+    list_kind: Option<String>,
+    /// Raw `--format` value for `list` (table|json|jsonl; default table).
+    /// Parsed globally so it composes before or after the `list` word;
+    /// consumed only by the list dispatch, ignored by normal startup.
+    list_format: Option<String>,
+    /// Explicit `--socket` for `list instances` (advisory, OS-authenticated).
+    list_socket: Option<String>,
+    /// Explicit `--instance` for `list instances`.
+    list_instance: Option<String>,
+    /// `--no-color` for list table output (also honours `NO_COLOR`).
+    list_no_color: bool,
+    /// Unexpected extra positionals in list mode (dispatch errors).
+    list_args: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -503,6 +527,7 @@ impl Args {
             config_cmd: None,
             config_word: false,
             config_args: Vec::new(),
+
             init_word: false,
             init_yes: false,
             init_force: false,
@@ -517,6 +542,15 @@ impl Args {
             ctl_raw: Vec::new(),
             ctl_socket_pre: None,
             ctl_instance_pre: None,
+
+            list_word: false,
+            list_spelling: String::from("list"),
+            list_kind: None,
+            list_format: None,
+            list_socket: None,
+            list_instance: None,
+            list_no_color: false,
+            list_args: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -808,18 +842,23 @@ fn parse_args(raw: &[String]) -> Args {
         }
         // Handle flags with `=` first
         if let Some(val) = token.strip_prefix("--format=") {
-            // Raw on purpose: validated at doctor/ctl dispatch (fail-closed
+            // Raw on purpose: validated at doctor/ctl/list dispatch (fail-closed
             // exit 2 on unknown shapes, never warn-ignored).
+            // Merged CTX-0171 + CTX-0172: same token feeds both dispatches;
+            // the inactive dispatch ignores its field.
             out.doctor_format = Some(val.to_string());
+            out.list_format = Some(val.to_string());
             i += 1;
             continue;
         }
         if let Some(val) = token.strip_prefix("--socket=") {
             // `bitty ctl --socket PATH` global form (before the `ctl` word);
-            // raw on purpose, validated at ctl dispatch (exit 2 on shape).
+            // raw on purpose, validated at ctl/list dispatch (exit 2 on shape).
             // After the `ctl` word tokens go verbatim to `ctl_raw` instead.
+            // Merged CTX-0171 + CTX-0172: pre-word form feeds both dispatches.
             if !out.ctl_word {
                 out.ctl_socket_pre = Some(val.to_string());
+                out.list_socket = Some(val.to_string());
             } else {
                 out.ctl_raw.push(token.clone());
             }
@@ -827,8 +866,10 @@ fn parse_args(raw: &[String]) -> Args {
             continue;
         }
         if let Some(val) = token.strip_prefix("--instance=") {
+            // Merged CTX-0171 + CTX-0172: pre-word form feeds both dispatches.
             if !out.ctl_word {
                 out.ctl_instance_pre = Some(val.to_string());
+                out.list_instance = Some(val.to_string());
             } else {
                 out.ctl_raw.push(token.clone());
             }
@@ -901,6 +942,7 @@ fn parse_args(raw: &[String]) -> Args {
             i += 1;
             continue;
         }
+
         if token.starts_with("--font-family=") {
             let val = token.trim_start_matches("--font-family=");
             if val.trim().is_empty() {
@@ -946,6 +988,13 @@ fn parse_args(raw: &[String]) -> Args {
         }
         match token.as_str() {
             "--" => {
+                // In `list` mode `--` is a stray separator (UsageError at
+                // dispatch); elsewhere it ends flags for PROGRAM argv.
+                if out.list_word {
+                    out.list_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
                 after_double_dash = true;
                 i += 1;
             }
@@ -986,41 +1035,52 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             "--format" => {
-                // `bitty doctor/ctl --format SHAPE`: raw on purpose, validated
+                // `bitty doctor/ctl/list --format SHAPE`: raw on purpose, validated
                 // at dispatch (fail-closed exit 2). Parsed globally so it
                 // composes before or after the subcommand word.
+                // Merged CTX-0171 + CTX-0172: same token feeds both; missing
+                // warns (doctor/ctl) and fail-closes list via empty.
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.doctor_format = Some(raw[i + 1].clone());
+                    out.list_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
+                    out.list_format = Some(String::new());
                     i += 1;
                 }
             }
             "--socket" => {
-                // `bitty ctl --socket PATH` global form (before the word).
-                // Raw on purpose, validated at ctl dispatch. After the word
+                // `bitty ctl/list --socket PATH` global form (before the word).
+                // Raw on purpose, validated at dispatch. After the `ctl` word
                 // tokens go verbatim to `ctl_raw` (see `ctl` arm below).
+                // Merged: feeds both; missing warns and fail-closes list.
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.ctl_socket_pre = Some(raw[i + 1].clone());
+                    out.list_socket = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --socket needs a path — ignoring");
+                    out.list_socket = Some(String::new());
                     i += 1;
                 }
             }
             "--instance" => {
-                // `bitty ctl --instance ID` global form (before the word).
+                // `bitty ctl/list --instance ID` global form (before the word).
+                // Merged: feeds both; missing warns and fail-closes list.
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.ctl_instance_pre = Some(raw[i + 1].clone());
+                    out.list_instance = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --instance needs an id — ignoring");
+                    out.list_instance = Some(String::new());
                     i += 1;
                 }
             }
             "--no-color" => {
                 out.doctor_no_color = true;
+                out.list_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1112,6 +1172,7 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                 }
             }
+
             "--font-family" => {
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.font_family = Some(raw[i + 1].clone());
@@ -1163,6 +1224,13 @@ fn parse_args(raw: &[String]) -> Args {
                 }
             }
             s if s.starts_with('-') => {
+                // In `list` mode unknown flags fail closed at dispatch (exit
+                // 2); elsewhere keep the legacy warn-as-program behavior.
+                if out.list_word {
+                    out.list_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
                 eprintln!("warning: unknown flag {s:?} — treating as program name");
                 if !program_set {
                     out.program = Some(token.clone());
@@ -1185,6 +1253,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.init_word
                     && !out.run_word
                     && !out.ctl_word
+                    && !out.list_word
                     && token == "run"
                 {
                     out.run_word = true;
@@ -1203,6 +1272,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.ctl_word
                     && !out.doctor_word
+                    && !out.list_word
                     && token == "ctl"
                 {
                     out.ctl_word = true;
@@ -1217,6 +1287,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.doctor_word
                     && !out.ctl_word
                     && !out.run_word
+                    && !out.list_word
                     && token == "config"
                 {
                     out.config_word = true;
@@ -1254,6 +1325,7 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
+
                 // `bitty init` opt-in setup wizard (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `init` needs `bitty -- init`.
@@ -1264,6 +1336,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.doctor_word
                     && !out.ctl_word
                     && !out.run_word
+                    && !out.list_word
                     && token == "init"
                 {
                     out.init_word = true;
@@ -1290,6 +1363,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.init_word
                     && !out.ctl_word
                     && !out.run_word
+                    && !out.list_word
                     && token == "doctor"
                 {
                     out.doctor_word = true;
@@ -1299,6 +1373,41 @@ fn parse_args(raw: &[String]) -> Args {
                 if out.doctor_word {
                     // Doctor takes no positionals: fail closed at dispatch.
                     out.doctor_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+
+                // `bitty list <kind>` enumeration (first positional only;
+                // CTX-0172). `ls` is the stable alias for `list` per
+                // cli-contract-rfc. A program literally named `list`/`ls`
+                // needs `bitty -- list ...` (or `bitty run -- list ...`).
+                if !program_set
+                    && !out.config_word
+                    && !out.list_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && (token == "list" || token == "ls")
+                {
+                    out.list_word = true;
+                    out.list_spelling = token.clone();
+                    i += 1;
+                    continue;
+                }
+                if out.list_word {
+                    // Kind is the first bare token after `list`; the rest
+                    // fail closed at dispatch (including stray `--`, which
+                    // was recorded above as a list arg).
+                    if out.list_kind.is_none() {
+                        // Allow `-h/--help` after `list` to flow to the
+                        // global help path (main shows list help when both
+                        // are set); any other flag-looking token was already
+                        // captured as a list arg above.
+                        out.list_kind = Some(token.clone());
+                    } else {
+                        out.list_args.push(token.clone());
+                    }
                     i += 1;
                     continue;
                 }
@@ -1376,6 +1485,7 @@ fn help_text() -> String {
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
           Subcommands (CLI-first management, DEC-0007):\n  \
+
             run [--cwd PATH] [--env K=V ...] [--title S] -- COMMAND...  Explicit child launch (local)\n  \
                              Runs COMMAND directly (no shell); `--` is required;\n  \
                              exit code is the child's. `bitty htop` never means\n  \
@@ -1403,6 +1513,9 @@ fn help_text() -> String {
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
+            list <kind>      Enumerate resources: themes|plugins|instances\n  \
+                             (--format table|json|jsonl, --socket/--instance for\n  \
+                             instances; alias `ls`; `bitty list --help` for detail)\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -3049,6 +3162,41 @@ fn run_ctl_subcommand(args: &Args) -> i32 {
             ctl::execute_ctl(&request, &targeting)
         }
     }
+}
+
+/// Runs `bitty list <kind>`; returns the process exit code.
+///
+/// - Extra positionals, unknown kinds, bad `--format`/`--socket`/`--instance`,
+///   and stray `--` fail closed (exit 2, stderr only, no stdout envelope).
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "list"|"ls"`) on stdout with diagnostics on stderr.
+/// - `instances` runtime/permission failures emit ok:false envelopes for
+///   json/jsonl (exit 6/7) and stderr-only for table.
+fn run_list_subcommand(args: &Args) -> i32 {
+    if !args.list_args.is_empty() {
+        eprintln!(
+            "bitty {}: unexpected argument '{}'\n{}",
+            args.list_spelling,
+            args.list_args[0],
+            list::list_usage()
+        );
+        return list::EXIT_USAGE;
+    }
+    let request = match list::ListRequest::validate(
+        args.list_kind.as_deref(),
+        args.list_format.as_deref(),
+        args.list_socket.as_deref(),
+        args.list_instance.as_deref(),
+        args.list_no_color,
+        &args.list_spelling,
+    ) {
+        Ok(req) => req,
+        Err(message) => {
+            eprintln!("{message}");
+            return list::EXIT_USAGE;
+        }
+    };
+    list::run_list(&request)
 }
 
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
@@ -4734,6 +4882,12 @@ fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let args = parse_args(&raw);
 
+    // `bitty list --help` shows list help (never needs an instance or VM);
+    // bare `--help` shows the top-level help.
+    if args.help && args.list_word {
+        println!("{}", list::list_help_text(&args.list_spelling));
+        std::process::exit(0);
+    }
     if args.help {
         println!("{}", help_text());
         std::process::exit(0);
@@ -4801,6 +4955,14 @@ fn main() {
     // usage errors (exit 2).
     if args.ctl_word {
         std::process::exit(run_ctl_subcommand(&args));
+    }
+
+    // `bitty list <kind>` enumeration (CTX-0172). Local kinds never touch
+    // config/instance; `instances` does its own socket discovery. Runs
+    // before config loading so `list` works with a missing or invalid
+    // config file (safe-mode clean, no plugin VM).
+    if args.list_word {
+        std::process::exit(run_list_subcommand(&args));
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a

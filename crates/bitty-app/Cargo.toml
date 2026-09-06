@@ -21,6 +21,7 @@ path = "src/main.rs"
 bitty-config = { path = "../bitty-config" }
 bitty-ipc = { path = "../bitty-ipc" }
 bitty-platform = { path = "../bitty-platform" }
+bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-render = { path = "../bitty-render" }
 pollster = "1.0"

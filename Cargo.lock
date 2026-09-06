@@ -184,6 +184,7 @@ dependencies = [
  "bitty-config",
  "bitty-ipc",
  "bitty-platform",
+ "bitty-plugin-host",
  "bitty-render",
  "bitty-runtime",
  "pollster",

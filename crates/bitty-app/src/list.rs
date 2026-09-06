@@ -15,8 +15,13 @@
 //!   candidates (`fonts|keymaps|actions|commands|protocols`) are not invented
 //!   here: they fail closed as unknown kinds until their owning slice lands.
 //! - Class: `themes` and `plugins` are local (no instance, safe-mode clean,
-//!   no plugin VM loaded). `instances` is runtime discovery (socket-dir scan,
-//!   live connect probe) but fetches no terminal content.
+//!   no plugin VM loaded). `instances` is runtime discovery (registry scan,
+//!   live endpoint probe) but fetches no terminal content.
+//!   Unix scans `$XDG_RUNTIME_DIR/bitty/*.sock` (plus the `BITTY_SOCKET`
+//!   parent) and probes each socket with a `connect`; Windows scans the same
+//!   registry inputs for `<instance>.sock` markers and probes each
+//!   `\\.\pipe\bitty-<instance>` named pipe, merging live pipe-namespace
+//!   enumeration (CTX-0196). Only discovery metadata is reported
 //! - `--format table` (default) is human output, not a machine contract.
 //!   `--format json` / `--format jsonl` emit the versioned envelope (`v: 1`,
 //!   `command: "list"|"ls"`, `ok`, `result`, plus `error` on failure) on
@@ -35,9 +40,10 @@
 //! - Plugins reuse `bitty-plugin-host::bundled` static catalog (staged but
 //!   disabled by default per Default Distribution RFC). No VM is loaded; help
 //!   and listing come from static manifests only.
-//! - Instances reuse `bitty-ipc::devtools` socket discovery (`BITTY_SOCKET`,
+//! - Instances reuse `bitty-ipc::devtools` endpoint discovery (`BITTY_SOCKET`,
 //!   `XDG_RUNTIME_DIR`, `BITTY_INSTANCE_ID` advisory identifiers, portable
-//!   `AF_UNIX` bound, instance grammar). Only discovery metadata is reported
+//!   `AF_UNIX` bound on Unix, `\\.\pipe\bitty-<instance>` naming on Windows,
+//!   instance grammar). Only discovery metadata is reported
 //!   (`instance`, `socket`, `live`, `detail`); terminal content is never
 //!   fetched. Detailed snapshots require `debug.inspect` via `ctl`/DevTools
 //!   and are out of scope here, which is how bearer scoping is respected: no
@@ -68,7 +74,9 @@
 //!   case-insensitive.
 //! - Socket-dir scan caps entries at `MAX_LIST_INSTANCES` (shed oldest
 //!   lexicographically past the cap, counted in `detail`); each file name
-//!   capped at 108 bytes (portable `sun_path` ceiling).
+//!   capped at 108 bytes (portable `sun_path` ceiling). Windows merges live
+//!   `\\.\pipe\bitty-*` enumeration into the same bound via
+//!   [`merge_instance_rows`].
 
 #![forbid(unsafe_code)]
 
@@ -315,7 +323,7 @@ fn validate_instance_value(value: &str) -> Result<(), String> {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn list_usage() -> String {
-    "usage: bitty list <themes|plugins|instances> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live socket discovery: instance, socket, live (runtime, no content fetch)"
+    "usage: bitty list <themes|plugins|instances> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n       bitty ls <themes|plugins|instances> [--format table|json|jsonl] [--no-color]\n\nkinds:\n  themes     built-in theme presets (local, safe-mode clean)\n  plugins    static bundled plugin catalog, no VM (local, safe-mode clean)\n  instances  live instance discovery: instance, socket, live (runtime, no content fetch)"
         .to_string()
 }
 
@@ -332,16 +340,18 @@ pub fn list_help_text(invoked_as: &str) -> String {
                       Local class: no instance, no file I/O, safe-mode clean.\n  \
            plugins    Static bundled plugin catalog (bitty-terminal.*), staged disabled by default.\n  \
                       Local class: manifest metadata only, no plugin VM loaded, safe-mode clean.\n  \
-           instances  Live Unix-socket discovery (instance, socket, live). Runtime class:\n  \
-                      scans the socket directory, probes each socket with a connect,\n  \
-                      reports discovery metadata only. Terminal content is never fetched;\n  \
+            instances  Live instance discovery (instance, socket, live). Runtime class:\n  \
+                       Unix scans the socket directory and probes each socket with a connect;\n  \
+                       Windows scans the instance registry and probes each named pipe, plus\n  \
+                       live pipe-namespace enumeration; every platform reports discovery\n  \
+                       metadata only. Terminal content is never fetched;\n  \
                       detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
                       respected by not reading privileged data here).\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
-           --socket PATH   Explicit socket for `instances` (bypasses directory scan;\n  \
-                           still authenticated by OS file modes/ownership at probe).\n  \
+            --socket PATH   Explicit socket for `instances` (bypasses directory scan;\n  \
+                            still authenticated by the OS at probe).\n  \
            --instance ID   Explicit instance for `instances` (resolved via BITTY_SOCKET /\n  \
                            XDG_RUNTIME_DIR discovery, then probed like --socket).\n  \
            --no-color      Disable ANSI coloring in table output (also honours NO_COLOR).\n  \
@@ -562,20 +572,18 @@ pub fn candidate_socket_dirs(
         .collect()
 }
 
-/// Scan one socket directory for `*.sock` entries (bounded).
+/// Unix POSIX mode gate for the socket directory (fail-closed).
 ///
-/// - Missing directory: empty (no instances yet), not an error.
-/// - Directory present but unreadable: `Unavailable` (exit 6).
-/// - Directory mode `!= 0700` (Unix): `Denied` (exit 7, fail-closed: refuse
-///   to enumerate a directory another user could have planted entries in).
-/// - Past `MAX_LIST_INSTANCES` entries: keep the first N lexicographically,
-///   note the shed count in the last row's `detail` (bounded output).
+/// The directory must be `0700`: enumerating a directory another user could
+/// have planted entries in is refused with `Denied` (exit 7). Missing
+/// directories pass the gate (the scan core reports empty success); every
+/// other violation fails here before any entry is read.
 #[cfg(unix)]
-pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
+fn unix_socket_dir_mode_gate(dir: &Path) -> Result<(), InstanceError> {
     use std::os::unix::fs::MetadataExt;
 
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let meta = std::fs::metadata(dir).map_err(|err| {
         let msg = err.to_string();
@@ -601,6 +609,59 @@ pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
     if mode != 0o700 {
         return Err(InstanceError::denied(format!(
             "bitty list: socket directory '{}' mode {mode:o} != 700 (refusing to enumerate; fix with chmod 700)",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Scan one socket directory for `*.sock` entries (bounded).
+///
+/// - Missing directory: empty (no instances yet), not an error.
+/// - Directory present but unreadable: `Unavailable` (exit 6).
+/// - Directory mode `!= 0700` (Unix): `Denied` (exit 7, fail-closed: refuse
+///   to enumerate a directory another user could have planted entries in).
+/// - Past `MAX_LIST_INSTANCES` entries: keep the first N lexicographically,
+///   note the shed count in the last row's `detail` (bounded output).
+#[cfg(unix)]
+pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
+    unix_socket_dir_mode_gate(dir)?;
+    scan_registry_files_with_probe(dir, &probe_socket_live)
+}
+
+/// Shared registry-file scan core with an injected liveness probe (CTX-0196).
+///
+/// `probe` receives each `*.sock` entry path and returns `(live, detail)`.
+/// Unix passes its `connect` probe; Windows passes its named-pipe probe;
+/// tests pass fakes. Missing directory is empty success (no instances yet);
+/// a non-directory or unreadable directory is `Unavailable`/`Denied`
+/// fail-closed. There is deliberately no POSIX mode gate here: Windows ACLs
+/// carry no `0700` bits, so ownership is enforced at the endpoint probe
+/// (pipe ACL / `Denied` on access-class failures), not at the directory.
+pub fn scan_registry_files_with_probe(
+    dir: &Path,
+    probe: &dyn Fn(&Path) -> (bool, String),
+) -> Result<Vec<InstanceInfo>, InstanceError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let meta = std::fs::metadata(dir).map_err(|err| {
+        let msg = err.to_string();
+        if err.kind() == std::io::ErrorKind::PermissionDenied {
+            InstanceError::denied(format!(
+                "bitty list: socket directory '{}' not accessible: {msg}",
+                dir.display()
+            ))
+        } else {
+            InstanceError::unavailable(format!(
+                "bitty list: cannot read socket directory '{}': {msg}",
+                dir.display()
+            ))
+        }
+    })?;
+    if !meta.is_dir() {
+        return Err(InstanceError::unavailable(format!(
+            "bitty list: socket path '{}' is not a directory",
             dir.display()
         )));
     }
@@ -633,7 +694,7 @@ pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let (live, detail) = probe_socket_live(&path);
+        let (live, detail) = probe(&path);
         out.push(InstanceInfo {
             instance,
             socket: path.to_string_lossy().to_string(),
@@ -653,9 +714,30 @@ pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
     Ok(out)
 }
 
-/// Non-Unix stub: instance discovery is Unix-only (same fail-soft shape as
-/// the IPC servo, but explicit rather than silent for a query command).
-#[cfg(not(unix))]
+/// Windows instance discovery (CTX-0196): registry scan with named-pipe
+/// liveness probes.
+///
+/// Each `<instance>.sock` registry marker maps to
+/// `\\.\pipe\bitty-<instance>` (see
+/// [`bitty_ipc::devtools::windows_pipe_name`]); the marker file itself
+/// carries no liveness, the pipe open does. Live pipe-namespace enumeration
+/// is merged separately in [`discover_instances`].
+#[cfg(windows)]
+pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
+    scan_registry_files_with_probe(dir, &|path| {
+        let instance = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let pipe = bitty_ipc::devtools::windows_pipe_name(&instance);
+        probe_windows_pipe(&pipe)
+    })
+}
+
+/// Non-Unix, non-Windows stub: no registry mechanism exists on this platform
+/// (same fail-soft shape as the IPC servo, but explicit rather than silent
+/// for a query command).
+#[cfg(not(any(unix, windows)))]
 pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
     let _ = dir;
     Err(InstanceError::unavailable(
@@ -688,7 +770,7 @@ fn probe_socket_live(path: &Path) -> (bool, String) {
 }
 
 /// Short stable token for an `io::ErrorKind` (no OS message bytes leaked).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn short_io_kind(kind: std::io::ErrorKind) -> String {
     format!("{kind:?}")
         .chars()
@@ -697,6 +779,141 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
         .to_ascii_lowercase()
 }
 
+/// Probe one Windows named pipe with a bidirectional open (CTX-0196).
+///
+/// Safe-`std` only (no `unsafe` in this crate): a pipe with a listening
+/// server opens; a missing pipe fails `NotFound` (stale registry entry); a
+/// present-but-inaccessible pipe fails `PermissionDenied`. The open never
+/// blocks: with no waiting listener the OS fails fast, mirroring the
+/// fail-fast Unix `connect` probe. The serving side must expose duplex pipes
+/// named `\\.\pipe\bitty-<instance>` for this probe to report `live`.
+#[cfg(windows)]
+fn probe_windows_pipe(pipe_path: &str) -> (bool, String) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe_path)
+    {
+        Ok(_) => (true, "live".to_string()),
+        Err(err) => {
+            let detail = match err.kind() {
+                std::io::ErrorKind::NotFound => "stale: pipe not present".to_string(),
+                std::io::ErrorKind::PermissionDenied => {
+                    "unreachable: permission denied".to_string()
+                }
+                _ => format!("unreachable: {}", short_io_kind(err.kind())),
+            };
+            (false, detail)
+        }
+    }
+}
+
+/// Whether an explicit `--socket` value addresses the Windows pipe namespace
+/// directly (device/UNC paths such as `\\.\pipe\bitty-default`).
+#[cfg(windows)]
+fn is_windows_pipe_path(value: &str) -> bool {
+    value.starts_with(r"\\")
+}
+
+/// Label an explicitly addressed pipe for the instance column (CTX-0196).
+///
+/// Grammar-checked pipe names yield their instance id; anything else falls
+/// back to the trailing path segment so diagnostics echo what was probed.
+#[cfg(windows)]
+fn windows_explicit_instance_label(pipe_path: &str) -> String {
+    let file = pipe_path.rsplit('\\').next().unwrap_or(pipe_path);
+    bitty_ipc::devtools::windows_instance_from_pipe_name(file).unwrap_or_else(|| file.to_string())
+}
+
+/// Convert listed pipe-namespace file names into live instance rows
+/// (CTX-0196).
+///
+/// Pure transform over bare names as listed from `\\.\pipe\` (e.g.
+/// `bitty-default`): foreign or malformed names are skipped, every kept row
+/// is `live: true` — a listed pipe has a server holding a handle, and pipes
+/// (unlike socket files) vanish with their server, so existence implies
+/// liveness. Sorted by socket and capped at [`MAX_LIST_INSTANCES`] with the
+/// shed count folded into the last row's `detail` (same bound shape as the
+/// directory scan).
+pub fn pipe_namespace_rows(pipe_names: &[String]) -> Vec<InstanceInfo> {
+    let mut rows: Vec<InstanceInfo> = pipe_names
+        .iter()
+        .filter_map(|name| {
+            let instance = bitty_ipc::devtools::windows_instance_from_pipe_name(name)?;
+            let socket = format!("{}{}", bitty_ipc::devtools::WINDOWS_PIPE_NAMESPACE, name);
+            Some(InstanceInfo {
+                instance,
+                socket,
+                live: true,
+                detail: "live".to_string(),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.socket.cmp(&b.socket));
+    let total = rows.len();
+    rows.truncate(MAX_LIST_INSTANCES);
+    if total > MAX_LIST_INSTANCES {
+        if let Some(last) = rows.last_mut() {
+            last.detail = format!(
+                "{} (shed {} of {total} entries past cap {MAX_LIST_INSTANCES})",
+                last.detail,
+                total - MAX_LIST_INSTANCES
+            );
+        }
+    }
+    rows
+}
+/// Enumerate live bitty pipes from the Windows pipe namespace (CTX-0196).
+///
+/// Best-effort augmentation to the registry scan: a listing failure yields
+/// empty (the registry scan stays authoritative) rather than failing the
+/// whole command, since sandboxes may hide the namespace while the registry
+/// directory remains readable.
+#[cfg(windows)]
+pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
+    let names: Vec<String> = match std::fs::read_dir(bitty_ipc::devtools::WINDOWS_PIPE_NAMESPACE) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    pipe_namespace_rows(&names)
+}
+
+/// Non-Windows: no pipe namespace exists; the registry scan is authoritative.
+///
+/// Routes through the shared [`pipe_namespace_rows`] transform so the
+/// [`discover_instances`] merge stays uniform across platforms.
+#[cfg(not(windows))]
+pub fn scan_pipe_namespace() -> Vec<InstanceInfo> {
+    pipe_namespace_rows(&[])
+}
+
+/// Merge registry rows with live pipe-namespace rows (CTX-0196).
+///
+/// Dedups by `socket`, sorts by `socket`, truncates past
+/// [`MAX_LIST_INSTANCES`]. A pipe row and a registry row for the same
+/// instance carry different `socket` spellings (pipe path vs registry file),
+/// so both survive the merge; byte-identical paths dedup exactly like
+/// repeated candidate directories do in [`discover_instances`].
+pub fn merge_instance_rows(
+    mut primary: Vec<InstanceInfo>,
+    secondary: Vec<InstanceInfo>,
+) -> Vec<InstanceInfo> {
+    let mut seen: std::collections::BTreeSet<String> =
+        primary.iter().map(|row| row.socket.clone()).collect();
+    for row in secondary {
+        if seen.insert(row.socket.clone()) {
+            primary.push(row);
+        }
+    }
+    primary.sort_by(|a, b| a.socket.cmp(&b.socket));
+    if primary.len() > MAX_LIST_INSTANCES {
+        primary.truncate(MAX_LIST_INSTANCES);
+    }
+    primary
+}
 /// Discover instances honoring explicit overrides.
 ///
 /// - `socket = Some(path)`: probe exactly that path. Missing file is
@@ -706,8 +923,10 @@ fn short_io_kind(kind: std::io::ErrorKind) -> String {
 /// - `instance = Some(id)`: resolve via `devtools::resolve_socket_path`
 ///   (advisory env + portable bound) then probe like `socket`.
 /// - Neither: scan every [`candidate_socket_dirs`] entry, concatenating rows
-///   (dedup by socket path, sorted). Directory-level auth failures abort
-///   fail-closed (first error wins); per-socket probe failures are rows.
+///   (dedup by socket path, sorted). On Windows, live pipe-namespace rows
+///   from [`scan_pipe_namespace`] are merged in as well. Directory-level
+///   auth failures abort fail-closed (first error wins); per-socket probe
+///   failures are rows.
 pub fn discover_instances(
     socket: Option<&str>,
     instance: Option<&str>,
@@ -731,6 +950,9 @@ pub fn discover_instances(
             }
         }
     }
+    // Windows contributes live pipe-namespace rows; elsewhere this is empty
+    // and the merge is a no-op sort/truncate (uniform bound enforcement).
+    merged = merge_instance_rows(merged, scan_pipe_namespace());
     merged.sort_by(|a, b| a.socket.cmp(&b.socket));
     if merged.len() > MAX_LIST_INSTANCES {
         merged.truncate(MAX_LIST_INSTANCES);
@@ -809,8 +1031,100 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
     }
 }
 
-/// Non-Unix stub for explicit probes.
-#[cfg(not(unix))]
+/// Windows explicit probe for `--socket`/`--instance` (CTX-0196).
+///
+/// Pipe-namespace paths (`\\...`) are probed directly; filesystem paths
+/// resolve their file stem to the matching `bitty-<instance>` pipe (the
+/// registry file itself carries no liveness, mirroring how the directory
+/// scan probes pipes rather than files). Missing paths are `Unavailable`
+/// (exit 6, parity with Unix); `PermissionDenied` at stat or open is
+/// `Denied` (exit 7); any other open failure is a single `live: false`
+/// stale row (exit 0, parity with Unix).
+#[cfg(windows)]
+fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceError> {
+    if is_windows_pipe_path(path_str) {
+        let instance = windows_explicit_instance_label(path_str);
+        return match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path_str)
+        {
+            Ok(_) => Ok(vec![InstanceInfo {
+                instance,
+                socket: path_str.to_string(),
+                live: true,
+                detail: "live".to_string(),
+            }]),
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::NotFound => Err(InstanceError::unavailable(format!(
+                    "bitty list: socket '{path_str}' not found"
+                ))),
+                std::io::ErrorKind::PermissionDenied => Err(InstanceError::denied(format!(
+                    "bitty list: socket '{path_str}' not accessible: permission denied"
+                ))),
+                _ => Ok(vec![InstanceInfo {
+                    instance,
+                    socket: path_str.to_string(),
+                    live: false,
+                    detail: format!("stale: {}", short_io_kind(err.kind())),
+                }]),
+            },
+        };
+    }
+    let path = Path::new(path_str);
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let instance = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_str.to_string());
+            let pipe = bitty_ipc::devtools::windows_pipe_name(&instance);
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe)
+            {
+                Ok(_) => Ok(vec![InstanceInfo {
+                    instance,
+                    socket: path_str.to_string(),
+                    live: true,
+                    detail: "live".to_string(),
+                }]),
+                Err(err) => match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => Err(InstanceError::denied(format!(
+                        "bitty list: socket '{path_str}' not accessible: permission denied"
+                    ))),
+                    std::io::ErrorKind::NotFound => Ok(vec![InstanceInfo {
+                        instance,
+                        socket: path_str.to_string(),
+                        live: false,
+                        detail: "stale: pipe not present".to_string(),
+                    }]),
+                    _ => Ok(vec![InstanceInfo {
+                        instance,
+                        socket: path_str.to_string(),
+                        live: false,
+                        detail: format!("stale: {}", short_io_kind(err.kind())),
+                    }]),
+                },
+            }
+        }
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => Err(InstanceError::unavailable(format!(
+                "bitty list: socket '{path_str}' not found"
+            ))),
+            std::io::ErrorKind::PermissionDenied => Err(InstanceError::denied(format!(
+                "bitty list: socket '{path_str}' not accessible: permission denied"
+            ))),
+            _ => Err(InstanceError::unavailable(format!(
+                "bitty list: cannot stat socket '{path_str}': {err}"
+            ))),
+        },
+    }
+}
+
+/// Non-Unix, non-Windows stub for explicit probes.
+#[cfg(not(any(unix, windows)))]
 fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceError> {
     let _ = path_str;
     Err(InstanceError::unavailable(
@@ -1041,7 +1355,7 @@ pub fn format_instances_table(instances: &[InstanceInfo], no_color: bool) -> Str
     out.push_str(&format!("{}\n", bold("INSTANCE SOCKET LIVE DETAIL", color)));
     if instances.is_empty() {
         out.push_str(
-            "(no instances — start bitty to serve a socket, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n",
+            "(no instances — start bitty to serve an endpoint, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n",
         );
         return out;
     }
@@ -1275,6 +1589,143 @@ mod tests {
         assert_eq!(dirs.len(), 2);
         let empty = candidate_socket_dirs(None, None);
         assert!(empty.is_empty());
+    }
+
+    // ── shared registry core + Windows pipe merge (CTX-0196) ─────────────
+    //
+    // These run on every host: the registry scan core takes an injected
+    // probe and the pipe-namespace mapping is a pure transform, so Linux
+    // covers the shared logic while the Windows CI leg arbitrates the real
+    // pipe open / `\\.\pipe\` listing shims.
+
+    static REGISTRY_TEST_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn registry_test_dir() -> PathBuf {
+        let uniq = REGISTRY_TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("blt-reg-{}-{uniq}", std::process::id()))
+    }
+
+    #[test]
+    fn registry_scan_missing_dir_is_empty_success() {
+        let dir = registry_test_dir().join("bitty");
+        let _ = std::fs::remove_dir_all(registry_test_dir());
+        let rows =
+            scan_registry_files_with_probe(&dir, &|_| panic!("probe must not run with no entries"))
+                .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn registry_scan_non_directory_is_unavailable() {
+        let base = registry_test_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let err = scan_registry_files_with_probe(&file, &|_| (false, String::new())).unwrap_err();
+        assert_eq!(err.code, EXIT_RUNTIME);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn registry_scan_lists_entries_via_injected_probe() {
+        let base = registry_test_dir();
+        let dir = base.join("bitty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stale.sock"), b"not a socket").unwrap();
+        std::fs::write(dir.join("live.sock"), b"not a socket").unwrap();
+        std::fs::write(dir.join("ignore.txt"), b"not a socket entry").unwrap();
+        let rows = scan_registry_files_with_probe(&dir, &|path| {
+            let live = path.to_string_lossy().contains("live");
+            (live, if live { "live" } else { "stale" }.to_string())
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].instance, "live");
+        assert!(rows[0].live);
+        assert_eq!(rows[1].instance, "stale");
+        assert!(!rows[1].live);
+        assert!(rows[0].socket < rows[1].socket);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn registry_scan_caps_entries_with_shed_note() {
+        let base = registry_test_dir();
+        let dir = base.join("bitty");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..(MAX_LIST_INSTANCES + 3) {
+            std::fs::write(dir.join(format!("inst-{i:03}.sock")), b"x").unwrap();
+        }
+        let rows = scan_registry_files_with_probe(&dir, &|_| (false, "stale".to_string())).unwrap();
+        assert_eq!(rows.len(), MAX_LIST_INSTANCES);
+        let last = rows.last().unwrap();
+        assert!(
+            last.detail.contains("shed 3 of"),
+            "detail: {:?}",
+            last.detail
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pipe_namespace_rows_maps_live_and_skips_foreign() {
+        let names = [
+            "bitty-default".to_string(),
+            "bitty-live_2".to_string(),
+            "other-pipe".to_string(),
+            "bitty-".to_string(),
+            "bitty-has space".to_string(),
+            "bitty-default.sock".to_string(),
+            "BITTY-default".to_string(),
+        ];
+        let rows = pipe_namespace_rows(&names);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].instance, "default");
+        assert_eq!(rows[1].instance, "live_2");
+        for row in &rows {
+            assert!(row.live);
+            assert_eq!(row.detail, "live");
+            assert!(row.socket.contains(r"\\.\pipe\bitty-"));
+        }
+        assert!(rows[0].socket < rows[1].socket);
+    }
+
+    #[test]
+    fn pipe_namespace_rows_caps_with_shed_note() {
+        let names: Vec<String> = (0..(MAX_LIST_INSTANCES + 5))
+            .map(|i| format!("bitty-inst-{i:03}"))
+            .collect();
+        let rows = pipe_namespace_rows(&names);
+        assert_eq!(rows.len(), MAX_LIST_INSTANCES);
+        assert!(
+            rows.last().unwrap().detail.contains("shed 5 of"),
+            "detail: {:?}",
+            rows.last().unwrap().detail
+        );
+    }
+
+    #[test]
+    fn merge_instance_rows_dedups_sorts_and_caps() {
+        let row = |instance: &str, socket: &str| InstanceInfo {
+            instance: instance.to_string(),
+            socket: socket.to_string(),
+            live: true,
+            detail: "live".to_string(),
+        };
+        let primary = vec![row("b", "b"), row("a", "a")];
+        let secondary = vec![row("a-dup", "a"), row("c", "c")];
+        let merged = merge_instance_rows(primary, secondary);
+        let sockets: Vec<&str> = merged.iter().map(|r| r.socket.as_str()).collect();
+        assert_eq!(sockets, vec!["a", "b", "c"]);
+        // Identical pipe rows dedup; the surviving row keeps primary metadata.
+        assert_eq!(merged[0].instance, "a");
+
+        let big: Vec<InstanceInfo> = (0..(MAX_LIST_INSTANCES + 1))
+            .map(|i| row(&format!("i{i:03}"), &format!("s{i:03}")))
+            .collect();
+        let merged = merge_instance_rows(big, vec![row("z", "z")]);
+        assert_eq!(merged.len(), MAX_LIST_INSTANCES);
     }
 
     #[cfg(unix)]

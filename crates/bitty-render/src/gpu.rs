@@ -507,11 +507,16 @@ pub const MAX_HEADLESS_SURFACE_BYTES: usize = 64 * 1024 * 1024;
 /// # Errors
 ///
 /// [`RenderError::InvalidInput`] when the byte size exceeds the cap or does
-/// not fit the address space. Arithmetic runs in `u64` so extreme `u32`
-/// extents fail closed instead of overflowing `usize` or OOMing the host
-/// (CR-RENDER-01).
+/// not fit the address space. Arithmetic uses checked `u64` multiplication so
+/// extreme `u32` extents fail closed instead of overflowing `usize` or OOMing
+/// the host (CR-RENDER-01).
 fn headless_buffer_len(width: u32, height: u32) -> Result<usize, RenderError> {
-    let bytes = u64::from(width) * u64::from(height) * 4;
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(RenderError::InvalidInput {
+            reason: "headless surface size does not fit the address space",
+        })?;
     if bytes > MAX_HEADLESS_SURFACE_BYTES as u64 {
         return Err(RenderError::InvalidInput {
             reason: "headless surface exceeds the configured byte cap",

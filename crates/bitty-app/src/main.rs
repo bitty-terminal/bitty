@@ -195,6 +195,7 @@ use bitty_platform::{
 use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
+mod doctor;
 mod ipc_serve;
 
 // ---------------------------------------------------------------------------
@@ -397,6 +398,20 @@ struct Args {
     init_force: bool,
     /// Unexpected extra positionals in init mode (dispatch errors).
     init_args: Vec<String>,
+    /// `bitty doctor` installation and compatibility diagnosis (CTX-0175).
+    /// True once the first positional `doctor` word is seen; extra bare
+    /// positionals land in `doctor_args` and fail closed via usage. A
+    /// program literally named `doctor` must be invoked as
+    /// `bitty -- doctor ...`.
+    doctor_word: bool,
+    /// Raw `--format` value for `doctor` (`table|json|jsonl`; default table).
+    /// Parsed globally so it composes before or after the `doctor` word;
+    /// consumed only by the doctor dispatch, ignored by normal startup.
+    doctor_format: Option<String>,
+    /// `--no-color`: disable ANSI coloring in doctor table output.
+    doctor_no_color: bool,
+    /// Unexpected extra positionals in doctor mode (dispatch errors).
+    doctor_args: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -466,6 +481,10 @@ impl Args {
             init_yes: false,
             init_force: false,
             init_args: Vec::new(),
+            doctor_word: false,
+            doctor_format: None,
+            doctor_no_color: false,
+            doctor_args: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -709,6 +728,12 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 ///   literally named `config` needs `bitty -- config ...`
 /// - `init [--yes] [--force]` → opt-in setup wizard (#243, CTX-0149);
 ///   a program literally named `init` needs `bitty -- init ...`
+/// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
+///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
+///   literally named `doctor` needs `bitty -- doctor ...`
+/// - `--format SHAPE` → doctor output shape (parsed globally, consumed by
+///   the doctor dispatch; ignored by normal startup)
+/// - `--no-color` → disable ANSI coloring in doctor table output
 /// - `--yes` / `--force` are init-only flags (parsed globally, consumed by
 ///   the init dispatch; ignored by normal startup)
 /// - `--` → treat the rest as program argv verbatim
@@ -746,6 +771,13 @@ fn parse_args(raw: &[String]) -> Args {
             continue;
         }
         // Handle flags with `=` first
+        if let Some(val) = token.strip_prefix("--format=") {
+            // Raw on purpose: validated at doctor dispatch (fail-closed
+            // exit 2 on unknown shapes, never warn-ignored).
+            out.doctor_format = Some(val.to_string());
+            i += 1;
+            continue;
+        }
         if token.starts_with("--split-ratio=") {
             let val = token.trim_start_matches("--split-ratio=");
             if let Ok(f) = val.parse::<f32>() {
@@ -894,6 +926,22 @@ fn parse_args(raw: &[String]) -> Args {
                 // `bitty init --force`: overwrite an existing config file
                 // (with a `.bak` backup). Ignored elsewhere.
                 out.init_force = true;
+                i += 1;
+            }
+            "--format" => {
+                // `bitty doctor --format SHAPE`: raw on purpose, validated
+                // at doctor dispatch (fail-closed exit 2). Parsed globally
+                // so it composes before or after the `doctor` word.
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.doctor_format = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
+                    i += 1;
+                }
+            }
+            "--no-color" => {
+                out.doctor_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1049,7 +1097,7 @@ fn parse_args(raw: &[String]) -> Args {
                 // `bitty config <verb>` subcommand (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `config` needs `bitty -- config`.
-                if !program_set && !out.config_word && token == "config" {
+                if !program_set && !out.config_word && !out.doctor_word && token == "config" {
                     out.config_word = true;
                     if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                         let verb = raw[i + 1].clone();
@@ -1090,7 +1138,7 @@ fn parse_args(raw: &[String]) -> Args {
                 // A program literally named `init` needs `bitty -- init`.
                 // Flags (`--yes`, `--force`, `--config`) compose in any
                 // order around the word.
-                if !program_set && !out.init_word && token == "init" {
+                if !program_set && !out.init_word && !out.doctor_word && token == "init" {
                     out.init_word = true;
                     i += 1;
                     continue;
@@ -1098,6 +1146,30 @@ fn parse_args(raw: &[String]) -> Args {
                 if out.init_word {
                     // Extra positionals in init mode fail closed at dispatch.
                     out.init_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                // `bitty doctor` diagnosis (first positional only; CTX-0175).
+                // `--` escape hatch bypasses this via after_double_dash.
+                // A program literally named `doctor` needs `bitty -- doctor`.
+                // Flags (`--format`, `--no-color`, `--config`, `--profile`)
+                // compose in any order around the word. Mutual exclusion
+                // with `config`/`init` words falls out naturally: once one
+                // word is seen the other word lands in that mode's extra
+                // args and fails closed at dispatch.
+                if !program_set
+                    && !out.doctor_word
+                    && !out.config_word
+                    && !out.init_word
+                    && token == "doctor"
+                {
+                    out.doctor_word = true;
+                    i += 1;
+                    continue;
+                }
+                if out.doctor_word {
+                    // Doctor takes no positionals: fail closed at dispatch.
+                    out.doctor_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1159,12 +1231,16 @@ fn help_text() -> String {
                 --font-size PTS  CLI font size override in points for one launch\n  \
                              (e.g. --font-size 14; range (0, 128]). Invalid\n  \
                              values fail closed (exit 2 with this usage).\n  \
-                --opacity FLOAT  CLI window opacity override for one launch\n  \
-                             (e.g. --opacity 0.95; range [0.0, 1.0]). Invalid\n  \
-                             values fail closed (exit 2 with this usage).\n  \
-                             Precedence: CLI flags > file > profile > defaults;\n  \
-                             each flag overrides only its own field (siblings\n  \
-                             keep file values).\n  \
+                 --opacity FLOAT  CLI window opacity override for one launch\n  \
+                              (e.g. --opacity 0.95; range [0.0, 1.0]). Invalid\n  \
+                              values fail closed (exit 2 with this usage).\n  \
+                              Precedence: CLI flags > file > profile > defaults;\n  \
+                              each flag overrides only its own field (siblings\n  \
+                              keep file values).\n  \
+                --format SHAPE  Doctor output shape: table|json|jsonl\n  \
+                              (default table; parsed globally, consumed by\n  \
+                              `bitty doctor`; ignored by normal startup).\n  \
+                --no-color     Disable ANSI coloring in doctor table output\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
          Subcommands (CLI-first management, DEC-0007):\n  \
@@ -1174,13 +1250,20 @@ fn help_text() -> String {
             config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
                              creates parents + starter when missing, never\n  \
                              overwrites existing content\n  \
-            init [--yes] [--force]  Opt-in interactive setup wizard (never\n  \
-                             auto-runs): mascot greeting, shell/theme/font-size\n  \
-                             picks, vim keybinding preset, writes init.lua.\n  \
-                             --yes skips prompts (sane defaults); without\n  \
-                             --force an existing file is never overwritten\n  \
-                             (--force backs it up to init.lua.bak first).\n  \
-                             Honors --config PATH / BITTY_CONFIG as the target.\n  \
+             init [--yes] [--force]  Opt-in interactive setup wizard (never\n  \
+                              auto-runs): mascot greeting, shell/theme/font-size\n  \
+                              picks, vim keybinding preset, writes init.lua.\n  \
+                              --yes skips prompts (sane defaults); without\n  \
+                              --force an existing file is never overwritten\n  \
+                              (--force backs it up to init.lua.bak first).\n  \
+                              Honors --config PATH / BITTY_CONFIG as the target.\n  \
+            doctor [--format SHAPE] [--no-color]  Diagnose installation and\n  \
+                              compatibility (local class, safe mode): binary,\n  \
+                              config, keymaps, fonts, display, GPU, clipboard,\n  \
+                              PTY, terminfo, shell, images, plugins.\n  \
+                              Exit 0 when all pass (warns allowed), 1 on\n  \
+                              recoverable failure, else the strongest\n  \
+                              category code (3 config, 5 compat, 8 conflict).\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -1232,9 +1315,11 @@ fn help_text() -> String {
            bitty --headless --split v --focus next\n  \
            bitty --headless --layout stack:2 --focus 2\n  \
            bitty --headless --layout overlay:5,5,20,10\n  \
-           bitty --headless -- /bin/bash\n  \
-           bitty /bin/bash\n  \
-           bitty -- /bin/cat -A\n",
+            bitty --headless -- /bin/bash\n  \
+            bitty /bin/bash\n  \
+            bitty -- /bin/cat -A\n  \
+            bitty doctor\n  \
+            bitty doctor --format json\n",
         version_text()
     )
 }
@@ -2563,6 +2648,193 @@ fn run_init_subcommand_with_env(
             1
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `bitty doctor` installation and compatibility diagnosis (CTX-0175)
+// ---------------------------------------------------------------------------
+
+/// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
+const DOCTOR_CLIPBOARD_CANDIDATES: &[&str] = &["wl-copy", "xclip", "xsel"];
+
+/// Returns true when `path` is executable (Unix exec bits; Windows: exists).
+fn doctor_shell_executable(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        path.exists()
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+}
+
+/// Collects live inputs for one doctor run.
+///
+/// Impure (environment, filesystem, bounded external probes) and total (every
+/// probe degrades to warn/inconclusive instead of panicking). Reuses the
+/// `config check` load path (`load_merged_config`) so an invalid config file
+/// becomes a failing `config` check (exit 3) rather than a startup abort. No
+/// plugin VM is ever loaded (safe-mode posture); all external commands run
+/// under `doctor::run_bounded` (no shell, no pipes, kill by PID on timeout).
+fn collect_doctor_inputs(args: &Args) -> doctor::DoctorInputs {
+    let version = version_text();
+    let (exe_ok, exe_detail) = match std::env::current_exe() {
+        Ok(path) => (true, path.display().to_string()),
+        Err(_) => (false, String::new()),
+    };
+    let (config, keymaps, font_chain) = match load_merged_config(args) {
+        Ok(loaded) => {
+            let file_path = loaded
+                .probed
+                .as_ref()
+                .filter(|probe| probe.path.exists())
+                .map(|probe| probe.path.clone());
+            let config = if let Some(path) = file_path.as_ref() {
+                doctor::ConfigInput::Ok {
+                    source: format!("file: {}", path.display()),
+                }
+            } else if let Some(path) = loaded.profile_path.as_ref() {
+                doctor::ConfigInput::Ok {
+                    source: format!("profile: {}", path.display()),
+                }
+            } else {
+                doctor::ConfigInput::Missing
+            };
+            let keymaps = match bitty_config::keymap::resolve_keymaps(&loaded.merged.effective) {
+                Ok(maps) => doctor::KeymapInput::Ok(maps.len()),
+                Err(err) => doctor::KeymapInput::Err(err.to_string()),
+            };
+            let chain = loaded.merged.effective.font.fallback_chain();
+            (config, keymaps, chain)
+        }
+        Err(message) => {
+            let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            (
+                doctor::ConfigInput::Invalid(message),
+                doctor::KeymapInput::Skipped,
+                chain,
+            )
+        }
+    };
+    let font_tool_available = doctor::find_on_path("fc-match").is_some();
+    let families: Vec<(String, bool)> = font_chain
+        .into_iter()
+        .map(|family| {
+            let present = doctor::probe_font(&family).unwrap_or(false);
+            (family, present)
+        })
+        .collect();
+    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let x11 = std::env::var("DISPLAY").ok();
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let dri_cards = doctor::dri_card_count();
+    let clipboard_backends: Vec<String> = DOCTOR_CLIPBOARD_CANDIDATES
+        .iter()
+        .filter_map(|name| doctor::find_on_path(name).map(|_| (*name).to_string()))
+        .collect();
+    #[cfg(windows)]
+    let (pty_available, pty_detail) = (true, "ConPTY available (Windows)".to_string());
+    #[cfg(not(windows))]
+    let (pty_available, pty_detail) = {
+        let path = std::path::Path::new("/dev/ptmx");
+        if path.exists() {
+            (true, "/dev/ptmx present".to_string())
+        } else {
+            (false, "/dev/ptmx missing".to_string())
+        }
+    };
+    let term = std::env::var("TERM")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let terminfo_found = match term.as_deref() {
+        None => None,
+        Some(name) => doctor::probe_terminfo(name),
+    };
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (shell_exists, shell_executable) = match shell.as_deref() {
+        None => (false, false),
+        Some(name) => {
+            let path = std::path::Path::new(name);
+            let exists = path.exists();
+            let executable = if exists {
+                doctor_shell_executable(path)
+            } else {
+                false
+            };
+            (exists, executable)
+        }
+    };
+    doctor::DoctorInputs {
+        version,
+        exe_ok,
+        exe_detail,
+        config,
+        keymaps,
+        font_tool_available,
+        families,
+        wayland,
+        x11,
+        session_type,
+        dri_cards,
+        clipboard_backends,
+        pty_available,
+        pty_detail,
+        term,
+        terminfo_found,
+        shell,
+        shell_exists,
+        shell_executable,
+    }
+}
+
+/// Runs `bitty doctor`; returns the process exit code.
+///
+/// - Extra positionals and unknown `--format` shapes fail closed (exit 2).
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "doctor"`) on stdout with diagnostics on stderr so
+///   machine output is never corrupted.
+/// - Exit `0` when every check passes (warns allowed), `1` on recoverable
+///   failure, else the strongest category code (3 config, 5 compat, 8
+///   conflict) per the accepted CLI contract.
+fn run_doctor_subcommand(args: &Args) -> i32 {
+    if !args.doctor_args.is_empty() {
+        eprintln!(
+            "bitty doctor: unexpected argument '{}'\n{}",
+            args.doctor_args[0],
+            doctor::doctor_usage()
+        );
+        return doctor::EXIT_USAGE;
+    }
+    let format = match doctor::DoctorFormat::parse(args.doctor_format.as_deref()) {
+        Ok(format) => format,
+        Err(message) => {
+            eprintln!("{message}\n{}", doctor::doctor_usage());
+            return doctor::EXIT_USAGE;
+        }
+    };
+    let inputs = collect_doctor_inputs(args);
+    let report = doctor::assemble_report(&inputs);
+    match format {
+        doctor::DoctorFormat::Table => {
+            let no_color = args.doctor_no_color || std::env::var("NO_COLOR").is_ok();
+            print!("{}", doctor::format_table(&report, no_color));
+        }
+        doctor::DoctorFormat::Json | doctor::DoctorFormat::Jsonl => {
+            println!("{}", doctor::format_json(&report));
+        }
+    }
+    report.exit_code()
 }
 
 /// Derives a [`bitty_runtime::RuntimeConfig`] from the effective config.
@@ -4274,6 +4546,13 @@ fn main() {
         std::process::exit(run_init_subcommand(&args));
     }
 
+    // `bitty doctor` diagnosis (CTX-0175, local class, safe mode). Runs
+    // before config load: an invalid config is a reported failing check
+    // (exit 3), not a startup abort, and no plugin VM is ever loaded.
+    if args.doctor_word {
+        std::process::exit(run_doctor_subcommand(&args));
+    }
+
     // User config first (fail-closed): invalid files exit non-zero with a
     // clear stderr message; missing default-path files yield defaults.
     let app_config = match load_app_config(&args) {
@@ -5871,6 +6150,68 @@ mod tests {
         let p = parse_args(&args_of(&["bitty", "config", "init"]));
         assert!(p.config_word);
         assert!(!p.init_word);
+    }
+
+    #[test]
+    fn parse_doctor_subcommand() {
+        let p = parse_args(&args_of(&["bitty", "doctor"]));
+        assert!(p.doctor_word);
+        assert!(p.doctor_args.is_empty());
+        assert_eq!(p.program, None);
+        assert_eq!(p.doctor_format, None);
+        assert!(!p.doctor_no_color);
+
+        // Flags compose in any order around the word.
+        let p = parse_args(&args_of(&["bitty", "doctor", "--format", "json"]));
+        assert!(p.doctor_word);
+        assert_eq!(p.doctor_format.as_deref(), Some("json"));
+
+        let p = parse_args(&args_of(&["bitty", "--format", "json", "doctor"]));
+        assert!(p.doctor_word);
+        assert_eq!(p.doctor_format.as_deref(), Some("json"));
+
+        let p = parse_args(&args_of(&["bitty", "doctor", "--format=jsonl"]));
+        assert_eq!(p.doctor_format.as_deref(), Some("jsonl"));
+
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--config",
+            "/tmp/c.lua",
+            "doctor",
+            "--no-color",
+        ]));
+        assert!(p.doctor_word);
+        assert!(p.doctor_no_color);
+        assert_eq!(p.config_path.as_deref(), Some("/tmp/c.lua"));
+
+        // Extra positionals are recorded for fail-closed dispatch.
+        let p = parse_args(&args_of(&["bitty", "doctor", "extra"]));
+        assert!(p.doctor_word);
+        assert_eq!(p.doctor_args, vec!["extra".to_string()]);
+
+        // Escape hatch: a program literally named `doctor`.
+        let p = parse_args(&args_of(&["bitty", "--", "doctor"]));
+        assert!(!p.doctor_word);
+        assert_eq!(p.program.as_deref(), Some("doctor"));
+
+        // `doctor` after `config`/`init` belongs to that subcommand.
+        let p = parse_args(&args_of(&["bitty", "config", "doctor"]));
+        assert!(p.config_word);
+        assert!(!p.doctor_word);
+        let p = parse_args(&args_of(&["bitty", "init", "doctor"]));
+        assert!(p.init_word);
+        assert!(!p.doctor_word);
+    }
+
+    #[test]
+    fn doctor_usage_names_format_and_checks() {
+        let usage = doctor::doctor_usage();
+        assert!(usage.contains("doctor"));
+        assert!(usage.contains("--format"));
+        assert!(usage.contains("table|json|jsonl"));
+        let help = help_text();
+        assert!(help.contains("doctor"));
+        assert!(help.contains("--format"));
     }
 
     #[test]

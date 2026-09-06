@@ -186,48 +186,47 @@ fn run_title_option_exposed_as_env() {
     assert_eq!(stdout(&output).trim(), "demo-title");
 }
 
-/// Normalizes a reported child dir for cross-platform comparison: folds
-/// `\` to `/`, maps MSYS2/Git-Bash `/c/...` to `c:/...`, strips trailing
-/// `/`, and lowercases (Windows is case-insensitive; Unix unaffected).
-fn normalize_cwd_for_assert(path: &str) -> String {
-    let mut normalized = path.replace('\\', "/");
-    let bytes = normalized.as_bytes();
-    if normalized.len() >= 3
-        && bytes[0] == b'/'
-        && bytes[2] == b'/'
-        && bytes[1].is_ascii_alphabetic()
-    {
-        normalized = format!("{}:/{}", bytes[1] as char, &normalized[3..]);
-    }
-    while normalized.len() > 1 && normalized.ends_with('/') {
-        normalized.pop();
-    }
-    normalized.to_lowercase()
-}
-
 #[test]
 fn run_cwd_option_changes_child_dir() {
+    // Windows pitfall: the child must print the OS-native cwd. Git-Bash
+    // `pwd` prints POSIX `/c/...` (or `/tmp`, which never maps to the native
+    // `C:\...\Temp` from `temp_dir()`), so no string fold can hold.
+    // `cmd /C cd` on Windows vs `pwd` elsewhere keeps both sides in the same
+    // namespace. Both sides are then `canonicalize`d: Windows folds both to
+    // `\\?\C:\...` (absorbing short-8.3 names, case, separators), while on
+    // Unix canonicalize is symlink/dot normalization (e.g. `/tmp` symlinks).
     // Platform-correct temp dir: hardcoded `/tmp` does not exist on Windows
     // (os error 267). `temp_dir()` is `/tmp` on Unix, `C:\...\Temp` on Windows.
     let expected = std::env::temp_dir();
     let expected_str = expected.to_string_lossy().into_owned();
-    let output = run_bitty(&["run", "--cwd", expected_str.as_str(), "--", "pwd"]);
+    let output = if cfg!(windows) {
+        run_bitty(&[
+            "run",
+            "--cwd",
+            expected_str.as_str(),
+            "--",
+            "cmd",
+            "/C",
+            "cd",
+        ])
+    } else {
+        run_bitty(&["run", "--cwd", expected_str.as_str(), "--", "pwd"])
+    };
     assert_eq!(
         output.status.code(),
         Some(0),
         "--cwd temp_dir child must exit 0, stderr={:?}",
         stderr(&output)
     );
-    let actual = stdout(&output);
-    let actual_norm = normalize_cwd_for_assert(actual.trim());
-    let expected_norm = normalize_cwd_for_assert(expected_str.trim());
-    let leaf = expected
-        .file_name()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    assert!(
-        actual_norm == expected_norm || actual_norm.ends_with(&format!("/{leaf}")),
-        "--cwd must change the child dir to {expected_str:?}, got {actual:?}",
+    let actual_trimmed = stdout(&output).trim().to_owned();
+    let expected_canon = std::fs::canonicalize(&expected)
+        .unwrap_or_else(|err| panic!("canonicalize expected {expected:?}: {err}"));
+    let actual_canon = std::fs::canonicalize(actual_trimmed.as_str()).unwrap_or_else(|err| {
+        panic!("canonicalize child-reported {actual_trimmed:?} (expected {expected:?}): {err}")
+    });
+    assert_eq!(
+        actual_canon, expected_canon,
+        "--cwd must change the child dir to {expected_str:?}, child reported {actual_trimmed:?}",
     );
 }
 

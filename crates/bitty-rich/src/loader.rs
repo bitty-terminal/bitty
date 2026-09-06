@@ -103,12 +103,25 @@ pub struct ResourcePolicy {
 }
 
 impl ResourcePolicy {
-    /// Creates a policy from `roots` (not yet canonicalized).
+    /// Creates a policy from `roots`, canonicalized fail-closed.
     ///
     /// Bounded: at most `MAX_ROOTS` roots.
-    /// Returns `TooLong` if over cap; does not canonicalize here
-    /// so headless tests can use temp dirs without pre-existing
-    /// filesystem state. Canonicalization happens at validation.
+    /// Returns `TooLong` if over cap.
+    /// Fail-closed per-root validation (CR-RICH-02):
+    /// - empty path -> `EmptyPath` (an empty root would grant
+    ///   universal read via `Path::starts_with("")`);
+    /// - over `MAX_PATH_LEN` -> `TooLong`;
+    /// - null byte -> `NullByte`;
+    /// - non-absolute -> `OutsideApprovedRoot`;
+    /// - `..` component -> `PathTraversal`;
+    /// - forbidden prefix (`/proc`, `/sys`, `/dev`) on raw or
+    ///   canonical path -> `ForbiddenPrefix`;
+    /// - un-canonicalizable (missing, dangling, I/O error) -> `Io`.
+    ///
+    /// On success stores canonical absolute roots so `is_allowed`
+    /// is a pure prefix check with no filesystem I/O.
+    ///
+    /// An empty `roots` vec is allowed and denies all (see `deny_all`).
     pub fn new(roots: Vec<PathBuf>) -> Result<Self, ResourceError> {
         if roots.len() > MAX_ROOTS {
             return Err(ResourceError::TooLong {
@@ -116,7 +129,54 @@ impl ResourcePolicy {
                 cap: MAX_ROOTS,
             });
         }
-        Ok(Self { roots })
+        let mut canon_roots = Vec::with_capacity(roots.len());
+        for root in &roots {
+            if root.as_os_str().is_empty() {
+                return Err(ResourceError::EmptyPath);
+            }
+            let len = root.as_os_str().len();
+            if len > MAX_PATH_LEN {
+                return Err(ResourceError::TooLong {
+                    len,
+                    cap: MAX_PATH_LEN,
+                });
+            }
+            if contains_null_byte(root) {
+                return Err(ResourceError::NullByte);
+            }
+            if !root.is_absolute() {
+                let s = root.display().to_string();
+                return Err(ResourceError::OutsideApprovedRoot {
+                    path: s.clone(),
+                    canonical: s,
+                });
+            }
+            for comp in root.components() {
+                if matches!(comp, Component::ParentDir) {
+                    return Err(ResourceError::PathTraversal {
+                        path: root.display().to_string(),
+                    });
+                }
+            }
+            if let Some(prefix) = is_forbidden_prefix(root) {
+                return Err(ResourceError::ForbiddenPrefix {
+                    prefix,
+                    path: root.display().to_string(),
+                });
+            }
+            let canon = root.canonicalize().map_err(|e| ResourceError::Io {
+                path: root.display().to_string(),
+                detail: e.to_string(),
+            })?;
+            if let Some(prefix) = is_forbidden_prefix(&canon) {
+                return Err(ResourceError::ForbiddenPrefix {
+                    prefix,
+                    path: canon.display().to_string(),
+                });
+            }
+            canon_roots.push(canon);
+        }
+        Ok(Self { roots: canon_roots })
     }
 
     /// Deny-by-default empty policy (denies all).
@@ -126,29 +186,32 @@ impl ResourcePolicy {
     }
 
     /// Whether `canonical` is inside any approved root.
+    ///
+    /// Deny-by-default: empty policy denies all. Invalid roots
+    /// (empty, relative) are skipped fail-closed so a stored empty
+    /// root can never grant universal read via
+    /// `Path::starts_with("")` (CR-RICH-02 defense-in-depth;
+    /// `new()` already rejects such roots).
     #[must_use]
     pub fn is_allowed(&self, canonical: &Path) -> bool {
         if self.roots.is_empty() {
             return false;
         }
+        if canonical.as_os_str().is_empty() || !canonical.is_absolute() {
+            return false;
+        }
         for root in &self.roots {
-            // Canonicalize root on the fly for comparison if needed;
-            // if root itself is not canonical, compare raw prefix first,
-            // then try canonicalized form. For determinism we do both:
-            // raw prefix plus canonical prefix when root can be canonicalized.
+            if root.as_os_str().is_empty() || !root.is_absolute() {
+                continue;
+            }
             if canonical.starts_with(root) {
                 return true;
-            }
-            if let Ok(canon_root) = root.canonicalize() {
-                if canonical.starts_with(&canon_root) {
-                    return true;
-                }
             }
         }
         false
     }
 
-    /// Roots slice (raw).
+    /// Roots slice (canonical absolute).
     #[must_use]
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
@@ -616,5 +679,121 @@ mod tests {
             .collect();
         let err3 = ResourcePolicy::new(many).unwrap_err();
         assert!(matches!(err3, ResourceError::TooLong { .. }));
+    }
+
+    #[test]
+    fn cr_rich_02_empty_root_rejected() {
+        // Primitive: empty root grants universal read via `starts_with("")`.
+        assert!(
+            Path::new("/etc/passwd").starts_with(Path::new("")),
+            "empty-root universal-read primitive must hold for this regression to be meaningful"
+        );
+        let err = ResourcePolicy::new(vec![PathBuf::from("")]).unwrap_err();
+        assert!(
+            matches!(err, ResourceError::EmptyPath),
+            "empty root must be rejected fail-closed, got {err:?}"
+        );
+        // Mixed valid + empty still fails closed.
+        let valid = temp_root("cr-rich-02-empty-mixed");
+        let err2 = ResourcePolicy::new(vec![valid, PathBuf::from("")]).unwrap_err();
+        assert!(
+            matches!(err2, ResourceError::EmptyPath),
+            "mixed empty root must be rejected, got {err2:?}"
+        );
+        // Zero roots (empty vec) is allowed and denies all — distinct from
+        // one empty-string root.
+        let empty_vec = ResourcePolicy::new(Vec::new()).expect("empty vec denies all");
+        assert!(empty_vec.roots().is_empty());
+        assert!(!empty_vec.is_allowed(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn cr_rich_02_relative_root_rejected() {
+        for raw in ["relative/root", "a/b", "./tmp", "tmp"] {
+            let err = ResourcePolicy::new(vec![PathBuf::from(raw)]).unwrap_err();
+            assert!(
+                matches!(err, ResourceError::OutsideApprovedRoot { .. }),
+                "relative root {raw} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cr_rich_02_traversal_root_rejected() {
+        let pid = std::process::id();
+        let traversal = PathBuf::from(format!("/tmp/bitty-cr-rich-02-{pid}/../escape"));
+        let err = ResourcePolicy::new(vec![traversal]).unwrap_err();
+        assert!(
+            matches!(err, ResourceError::PathTraversal { .. }),
+            "traversal root must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cr_rich_02_uncanonicalizable_root_rejected() {
+        let pid = std::process::id();
+        let missing = PathBuf::from(format!("/tmp/bitty-cr-rich-02-missing-{pid}"));
+        // Ensure it does not exist so canonicalize fails fail-closed.
+        let _ = std::fs::remove_dir_all(&missing);
+        let _ = std::fs::remove_file(&missing);
+        assert!(!missing.exists(), "missing-root fixture must not exist");
+        let err = ResourcePolicy::new(vec![missing]).unwrap_err();
+        assert!(
+            matches!(err, ResourceError::Io { .. }),
+            "un-canonicalizable root must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cr_rich_02_forbidden_root_rejected() {
+        for raw in ["/proc", "/sys", "/dev"] {
+            let err = ResourcePolicy::new(vec![PathBuf::from(raw)]).unwrap_err();
+            assert!(
+                matches!(err, ResourceError::ForbiddenPrefix { .. }),
+                "forbidden root {raw} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cr_rich_02_valid_absolute_root_still_works() {
+        let approved = temp_root("cr-rich-02-valid");
+        let outside = temp_root("cr-rich-02-valid-outside");
+        let _ = std::fs::create_dir_all(&approved);
+        let _ = std::fs::create_dir_all(&outside);
+        let policy = ResourcePolicy::new(vec![approved.clone()])
+            .expect("valid absolute root must be accepted");
+        // Stored root is canonical absolute.
+        assert_eq!(policy.roots().len(), 1);
+        assert!(policy.roots()[0].is_absolute());
+        let inside_file = write_regular_file(&approved, "inside.txt", b"inside");
+        let outside_file = write_regular_file(&outside, "outside.txt", b"outside");
+        let ok = validate_resource_path(&inside_file, &policy)
+            .expect("inside valid root must be allowed");
+        assert!(ok.starts_with(policy.roots()[0].clone()));
+        assert!(policy.is_allowed(&ok));
+        let canonical_outside = outside_file.canonicalize().unwrap_or(outside_file.clone());
+        assert!(!policy.is_allowed(&canonical_outside));
+        let err = validate_resource_path(&outside_file, &policy).unwrap_err();
+        assert!(
+            matches!(err, ResourceError::OutsideApprovedRoot { .. }),
+            "outside valid root must be denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cr_rich_02_is_allowed_deny_by_default() {
+        let deny_all = ResourcePolicy::deny_all();
+        assert!(!deny_all.is_allowed(Path::new("/etc/passwd")));
+        assert!(!deny_all.is_allowed(Path::new("")));
+        assert!(!deny_all.is_allowed(Path::new("relative/path")));
+        let empty_vec = ResourcePolicy::new(Vec::new()).unwrap();
+        assert!(!empty_vec.is_allowed(Path::new("/etc/passwd")));
+        // Invalid canonical inputs never allow.
+        let approved = temp_root("cr-rich-02-deny-default");
+        let _ = std::fs::create_dir_all(&approved);
+        let policy = ResourcePolicy::new(vec![approved]).unwrap();
+        assert!(!policy.is_allowed(Path::new("")));
+        assert!(!policy.is_allowed(Path::new("relative/path")));
     }
 }

@@ -95,9 +95,11 @@ fn truncate_pattern(pattern: &str) -> String {
 
 /// Extracts line text and per-char col mapping from a slice of `Cell`.
 ///
-/// Returns `(text, col_map)` where `text` concatenates glyphs (skipping spacers,
-/// `' '` for blanks) and `col_map[i]` is the lead column for `text` char `i`.
-/// Wide spacers are never emitted; their leading half's glyph is emitted once.
+/// Returns `(text, col_map)` where `text` concatenates glyphs plus their
+/// combining buffers (skipping spacers, `' '` for blanks) and `col_map[i]`
+/// is the lead column for `text` char `i`. Combining marks share their
+/// base cell's lead column. Wide spacers are never emitted; their leading
+/// half's glyph is emitted once.
 fn line_text_and_map(cells: &[Cell]) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(cells.len());
     let mut map = Vec::new();
@@ -112,10 +114,17 @@ fn line_text_and_map(cells: &[Cell]) -> (String, Vec<usize>) {
         }
         if cell.is_blank() {
             text.push(' ');
+            map.push(col);
         } else {
             text.push(cell.glyph);
+            map.push(col);
+            // Combining marks are part of this cell's cluster and share
+            // its lead column for match anchoring.
+            for mark in &cell.zerowidth {
+                text.push(*mark);
+                map.push(col);
+            }
         }
-        map.push(col);
         if cell.width == 2 {
             // Expect spacer at col+1; advance by 2, but map only for lead.
             // The spacer col is width extension, not a separate char.
@@ -398,6 +407,22 @@ mod tests {
         assert_eq!(m2.len(), 1);
         assert_eq!(m2[0].col_start, 0);
         assert_eq!(m2[0].col_end, 2);
+    }
+
+    #[test]
+    fn search_combining_marks_stay_with_base_cell() {
+        let mut s = State::new();
+        // Decomposed e + acute occupies one cell; the decomposed pattern
+        // matches anchored at the base column.
+        prints(&mut s, "e\u{0301}x");
+        let m = s.search("e\u{0301}", SearchOptions::default());
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].col_start, 0);
+        assert_eq!(m[0].col_end, 0);
+        assert_eq!(m[0].matched_text, "e\u{0301}");
+        // The bare base letter does not match the accented cluster text.
+        let bare = s.search("ex", SearchOptions::default());
+        assert!(bare.is_empty());
     }
 
     #[test]

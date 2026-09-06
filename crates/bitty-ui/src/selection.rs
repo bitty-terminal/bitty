@@ -894,6 +894,7 @@ mod tests {
                             width: 2,
                             spacer: false,
                             hyperlink: None,
+                            zerowidth: Vec::new(),
                         });
                     } else {
                         cells.push(Cell {
@@ -902,6 +903,7 @@ mod tests {
                             width: 1,
                             spacer: false,
                             hyperlink: None,
+                            zerowidth: Vec::new(),
                         });
                     }
                 }

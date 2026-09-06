@@ -7,12 +7,21 @@
 //! [`Cell::wide_spacer`]. No orphan spacers may exist.
 //!
 //! Cell-width resolution uses a compact East Asian Width approximation in
-//! [`char_cell_width`]. The full text domain (grapheme clusters, combining
-//! marks, fallback, shaping) follows the text RFC named by ADR-0004 and is
-//! still open; until it lands, zero-width scalars are dropped by terminal
-//! state (see `state::State` print handling).
+//! [`char_cell_width`]. Zero-width scalars (combining marks, ZWJ, variation
+//! selectors) are stored on the preceding cell's bounded [`Cell::zerowidth`]
+//! buffer (Alacritty zerowidth pattern); the full text domain (grapheme
+//! clusters, fallback, shaping) follows the text RFC named by ADR-0004 and
+//! is still open.
 
 use bitty_vt::{Attribute, Color, UnderlineStyle};
+
+/// Maximum combining scalars retained on one cell (Alacritty zerowidth
+/// parity; CR-TERM-01 remediation).
+///
+/// The cap bounds untrusted-input memory per threat T-01: excess marks are
+/// dropped without advancing the cursor or growing the heap. Five covers
+/// decomposed accents plus ZWJ/variation-selector chains seen in practice.
+pub const MAX_ZEROWIDTH_CHARS: usize = 5;
 
 /// A unique reference from cells into the state's hyperlink table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -125,8 +134,9 @@ pub struct Style {
 pub struct Cell {
     /// Leading Unicode scalar displayed in this cell; `' '` when erased.
     ///
-    /// Grapheme-cluster composition beyond a single scalar awaits the text
-    /// RFC (ADR-0004 open item); see module docs.
+    /// Zero-width scalars that follow this scalar (combining marks, ZWJ,
+    /// variation selectors) accumulate in [`Cell::zerowidth`] instead of
+    /// occupying their own cell.
     pub glyph: char,
     /// Resolved style of this cell.
     pub style: Style,
@@ -137,6 +147,11 @@ pub struct Cell {
     pub spacer: bool,
     /// Hyperlink span reference, if any.
     pub hyperlink: Option<HyperlinkId>,
+    /// Combining scalars attached to [`Cell::glyph`], in arrival order.
+    ///
+    /// Bounded by [`MAX_ZEROWIDTH_CHARS`] (threat T-01); spacers never
+    /// carry combining marks. Empty for erased and spacer cells.
+    pub zerowidth: Vec<char>,
 }
 
 impl Cell {
@@ -149,6 +164,7 @@ impl Cell {
             width: 1,
             spacer: false,
             hyperlink: None,
+            zerowidth: Vec::new(),
         }
     }
 
@@ -161,13 +177,29 @@ impl Cell {
             width: 2,
             spacer: true,
             hyperlink: None,
+            zerowidth: Vec::new(),
         }
     }
 
     /// Whether this cell displays no content (an erased blank).
     #[must_use]
     pub fn is_blank(&self) -> bool {
-        !self.spacer && self.glyph == ' '
+        !self.spacer && self.glyph == ' ' && self.zerowidth.is_empty()
+    }
+
+    /// Appends a zero-width scalar to this cell's combining buffer.
+    ///
+    /// Returns `false` without mutating when the buffer already holds
+    /// [`MAX_ZEROWIDTH_CHARS`] scalars, so untrusted combining runs cannot
+    /// grow the heap (threat T-01). The caller drops the excess scalar.
+    /// Spacers reject every mark (`false`) because marks belong to the
+    /// leading half.
+    pub fn push_zerowidth(&mut self, mark: char) -> bool {
+        if self.spacer || self.zerowidth.len() >= MAX_ZEROWIDTH_CHARS {
+            return false;
+        }
+        self.zerowidth.push(mark);
+        true
     }
 }
 
@@ -289,6 +321,7 @@ mod tests {
         assert_eq!(cell.width, 1);
         assert!(!cell.spacer);
         assert_eq!(cell.glyph, ' ');
+        assert!(cell.zerowidth.is_empty());
     }
 
     #[test]
@@ -296,6 +329,34 @@ mod tests {
         let cell = Cell::wide_spacer(Style::default());
         assert_eq!(cell.width, 2);
         assert!(cell.spacer);
+        assert!(cell.zerowidth.is_empty());
+    }
+
+    #[test]
+    fn zerowidth_buffer_accumulates_in_order_up_to_cap() {
+        let mut cell = Cell::erased(Style::default());
+        cell.glyph = 'e';
+        assert!(cell.push_zerowidth('\u{0301}'));
+        assert!(cell.push_zerowidth('\u{200D}'));
+        assert_eq!(cell.zerowidth, vec!['\u{0301}', '\u{200D}']);
+        for _ in 0..MAX_ZEROWIDTH_CHARS {
+            cell.push_zerowidth('\u{0300}');
+        }
+        assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+        // Full buffer drops without growth.
+        assert!(!cell.push_zerowidth('\u{0302}'));
+        assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+    }
+
+    #[test]
+    fn zerowidth_marks_cell_non_blank_and_spacer_rejects() {
+        let mut cell = Cell::erased(Style::default());
+        assert!(cell.is_blank());
+        assert!(cell.push_zerowidth('\u{0301}'));
+        assert!(!cell.is_blank());
+        let mut spacer = Cell::wide_spacer(Style::default());
+        assert!(!spacer.push_zerowidth('\u{0301}'));
+        assert!(spacer.zerowidth.is_empty());
     }
 
     #[test]

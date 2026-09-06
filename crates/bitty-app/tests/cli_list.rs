@@ -228,6 +228,41 @@ fn list_plugins_json_count_is_ten() {
 #[test]
 fn list_instances_empty_dir_is_success_with_count_zero() {
     let output = run_bitty_isolated(&["list", "instances"]);
+    if cfg!(windows) {
+        // Instance discovery is Unix-only; on Windows the binary reports
+        // Unavailable (exit 6) by design (see `list.rs` non-Unix stub).
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "windows empty instances must exit 6, stderr={:?}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("instance discovery is unavailable on this platform"),
+            "diagnostic must name the platform gate, got {:?}",
+            stderr(&output)
+        );
+        let json = run_bitty_isolated(&["list", "instances", "--format", "json"]);
+        assert_eq!(
+            json.status.code(),
+            Some(6),
+            "windows empty instances json must exit 6, stderr={:?}",
+            stderr(&json)
+        );
+        let doc = parse_stdout_json(&stdout(&json));
+        assert!(doc.contains("\"ok\":false"), "ok field: {:?}", doc.text());
+        assert!(
+            doc.contains("\"class\":\"Unavailable\""),
+            "class: {:?}",
+            doc.text()
+        );
+        assert!(
+            doc.contains("unavailable on this platform"),
+            "message: {:?}",
+            doc.text()
+        );
+        return;
+    }
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -318,7 +353,8 @@ fn list_socket_for_non_instances_is_usage_error() {
 }
 
 #[test]
-#[cfg(unix)]
+// Portable: Unix probes the missing path, Windows hits the platform stub;
+// both report Unavailable (exit 6) with an ok:false envelope.
 fn list_explicit_missing_socket_is_runtime_unavailable() {
     let output = run_bitty_isolated(&[
         "list",

@@ -398,6 +398,70 @@ fn budget_snapshot_compatible_counters() {
     );
 }
 
+// ── CR-LUA-01: mid-run enforcement (tighter slices) ─────────────────────────
+
+#[test]
+fn cr_lua_01_wall_trips_at_deadline_not_at_fuel_exhaustion() {
+    // 1B fuel takes ~5s in one uncapped slice; with `SLICE_FUEL`-capped
+    // slices the 50 ms wall budget must trip after ~50 ms having consumed
+    // far less than the instruction budget. Margins are wide (20x) so this
+    // holds in both debug and release profiles.
+    let mut vm = LuaVm::with_budgets(
+        "xuepoo.cr-lua-01-wall",
+        1_000_000_000,
+        50,
+        8,
+        32 * 1024 * 1024,
+    );
+    let outcome = vm.execute("while true do end").unwrap();
+    match outcome {
+        ExecuteOutcome::Suspended {
+            reason: SuspendReason::WallClockExceeded { budget_ms: 50, .. },
+            instructions_used,
+            wall_elapsed_ms,
+            ..
+        } => {
+            assert!(
+                instructions_used < 500_000_000,
+                "wall must trip long before fuel exhaustion: {instructions_used}"
+            );
+            assert!(
+                wall_elapsed_ms < 5000,
+                "runaway must terminate near the deadline: {wall_elapsed_ms}ms"
+            );
+        }
+        other => panic!("expected wall suspend, got {other:?}"),
+    }
+    assert!(vm.is_suspended());
+    assert_eq!(vm.suspension_count(), 1);
+}
+
+#[test]
+fn cr_lua_01_memory_trips_near_limit_not_after_full_budget() {
+    // Steady table allocation with a 256 KiB limit: uncapped, one slice
+    // allocated ~39 MB before the check ran; capped slices must trip with
+    // usage just over the limit (one slice of growth, bounded generously).
+    let limit = 256 * 1024;
+    let mut vm = LuaVm::with_budgets("xuepoo.cr-lua-01-mem", 10_000_000, 60_000, 8, limit);
+    let outcome = vm
+        .execute(r#"local t = {} for i = 1, 100000000 do t[i] = { i } end"#)
+        .unwrap();
+    match outcome {
+        ExecuteOutcome::Suspended {
+            reason: SuspendReason::MemoryExceeded { used, limit: l },
+            ..
+        } => {
+            assert_eq!(l, limit);
+            assert!(
+                used <= limit + 128 * 1024,
+                "memory must trip near the limit, not after full-budget growth: {used}"
+            );
+        }
+        other => panic!("expected memory suspend, got {other:?}"),
+    }
+    assert!(vm.is_suspended());
+}
+
 // ── no window/GPU/mlua conflict ─────────────────────────────────────────────
 
 #[test]

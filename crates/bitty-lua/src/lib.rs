@@ -27,7 +27,7 @@
 //!
 //! | ID  | Dimension                         | Default                              | Enforcement point |
 //! |-----|-----------------------------------|--------------------------------------|---------------------|
-//! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter checked before each `Executor::step` slice and inside long chunks; exceed => fail-closed suspend |
+//! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | `Lua::total_memory()` / `gc_metrics().total_allocation()` checked before/after each slice; exceed => suspend |
@@ -88,6 +88,31 @@ pub const RC2_MEMORY_AGGREGATE_BYTES: usize = 512 * 1024 * 1024;
 
 /// RC-6 per-plugin FD cap (candidate, exposed for parity): `16`.
 pub const RC6_FD_PER_PLUGIN: usize = 16;
+
+/// Max fuel granted to a single `Executor::step` slice (CR-LUA-01 fix).
+///
+/// Piccolo's `Executor::step` loops internally (up to 64 VM instructions per
+/// `run_vm` batch) until its fuel is exhausted, so passing the whole
+/// instruction budget at once lets one slice burn the entire budget before
+/// the outer loop re-checks wall-clock and memory. Capping each slice to
+/// `1024` fuel bounds every enforcement dimension:
+///
+/// - wall-clock overrun per slice: ~1k instructions (µs, far below the
+///   50 ms budget);
+/// - memory growth per slice: what ~1k instructions can allocate;
+/// - instruction overrun past exhaustion: one trailing `run_vm` batch
+///   (<= 64) plus piccolo per-step constants.
+///
+/// Between slices the loop re-checks wall/memory/instruction budgets and
+/// tops fuel back up (never above the remaining budget), which is exactly
+/// the `step` / re-grant pattern piccolo's [`Fuel`] documents (`refill`
+/// exists for re-using one container across ticks). Fuel is only ever
+/// mutated between `step` calls, never during one, so the VM contract is
+/// preserved. `1024` is 16x piccolo's internal 64-instruction batch: large
+/// enough to keep per-slice `Instant`/`total_memory` overhead negligible
+/// (~10k checks for a full-budget run), small enough to keep check latency
+/// tight.
+pub const SLICE_FUEL: i32 = 1024;
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -297,6 +322,17 @@ pub struct LuaVm {
 enum VmStatus {
     Ready,
     Suspended(SuspendReason),
+}
+
+/// Fuel granted to one `Executor::step` slice: at most [`SLICE_FUEL`], and
+/// never more than the remaining instruction budget.
+///
+/// Always >= 1 when `used < budget` (callers check exhaustion first), so
+/// every slice makes piccolo's guaranteed minimal positive progress and the
+/// stepping loop terminates at the budget. Grants are `i32`-safe by
+/// construction (`SLICE_FUEL` fits with wide margin).
+fn initial_grant(budget: u64, used: u64) -> i32 {
+    budget.saturating_sub(used).min(SLICE_FUEL as u64).max(1) as i32
 }
 
 impl LuaVm {
@@ -558,10 +594,13 @@ impl LuaVm {
         self.memory_used = self.lua.total_memory();
 
         let start = Instant::now();
-        // Fuel is i32; clamp budget to i32::MAX for safety (10M fits).
-        let fuel_budget: i32 = i32::try_from(self.instruction_budget).unwrap_or(i32::MAX);
-        let mut fuel = Fuel::with(fuel_budget);
-        let initial_fuel = fuel.remaining();
+        // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
+        // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
+        // instructions instead of once per whole budget. `total_used` tracks
+        // the true cumulative consumption across slices; fuel is only topped
+        // up between `step` calls (never during), per piccolo's contract.
+        let mut total_used: u64 = 0;
+        let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
 
         // Load closure — deterministic, no I/O beyond source bytes.
         let code_owned = code.to_string();
@@ -629,7 +668,7 @@ impl LuaVm {
                 };
                 self.status = VmStatus::Suspended(reason.clone());
                 self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
+                self.instructions_used = total_used;
                 self.memory_used = self.lua.total_memory();
                 return Ok(DriveOutcome::Suspended {
                     reason,
@@ -649,7 +688,7 @@ impl LuaVm {
                 };
                 self.status = VmStatus::Suspended(reason.clone());
                 self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
+                self.instructions_used = total_used;
                 return Ok(DriveOutcome::Suspended {
                     reason,
                     instructions_used: self.instructions_used,
@@ -658,43 +697,55 @@ impl LuaVm {
                 });
             }
 
-            // Instruction budget via fuel.
-            if !fuel.should_continue() {
+            // Instruction budget via cumulative fuel consumption.
+            if total_used >= self.instruction_budget {
                 let still_normal = self.lua.enter(|ctx| {
                     let exec = ctx.fetch(&stashed);
                     exec.mode() == ExecutorMode::Normal
                 });
                 if still_normal {
-                    let used = (initial_fuel - fuel.remaining().max(0)) as u64;
                     let reason = SuspendReason::InstructionBudgetExceeded {
-                        used,
+                        used: total_used,
                         budget: self.instruction_budget,
                     };
                     self.status = VmStatus::Suspended(reason.clone());
                     self.suspension_count = self.suspension_count.wrapping_add(1);
-                    self.instructions_used = used;
+                    self.instructions_used = total_used;
                     self.memory_used = self.lua.total_memory();
                     return Ok(DriveOutcome::Suspended {
                         reason,
-                        instructions_used: used,
+                        instructions_used: total_used,
                         wall_elapsed_ms: elapsed_ms,
                         memory_used: self.memory_used,
                     });
                 }
-                // Executor is done (Result/Stopped) but fuel exhausted — still done.
+                // Executor is done (Result/Stopped) but budget exhausted —
+                // still done; the strict final check below suspends if the
+                // completed run itself reached the budget.
                 break;
             }
 
-            // Step one slice.
+            // Top up the slice grant (capped at the remaining budget). The
+            // previous slice always exhausts its grant before `step` reports
+            // more work, so this only fires on slice boundaries; the guard
+            // keeps any leftover when piccolo returns early with fuel spare.
+            if fuel.remaining() <= 0 {
+                fuel.set_remaining(initial_grant(self.instruction_budget, total_used));
+            }
+
+            // Step one capped slice. Piccolo runs at most ~`SLICE_FUEL` worth
+            // (64-instruction `run_vm` batches) before returning, so wall and
+            // memory are re-checked promptly after this returns.
+            let fuel_before = fuel.remaining();
             let done = self.lua.enter(|ctx| {
                 let exec = ctx.fetch(&stashed);
                 exec.step(ctx, &mut fuel)
             });
+            let consumed = (fuel_before as i64 - fuel.remaining() as i64).max(0) as u64;
+            total_used = total_used.saturating_add(consumed);
 
-            // Check fuel consumption after step.
-            // If fuel was consumed to <=0 and executor still Normal, next loop
-            // will handle suspension. If done, break.
-
+            // If done, break to mode inspection by the caller (`execute` vs
+            // `eval_config`); the strict final checks below still apply.
             if done {
                 // Step reports the executor finished (Result/Stopped/yielded).
                 // Mode inspection and result extraction belong to the caller
@@ -703,12 +754,10 @@ impl LuaVm {
                 break;
             }
 
-            // If we consumed a lot of fuel in this slice, loop will detect on
-            // next iteration. Avoid spinning forever: if elapsed already large,
-            // continue to wall check.
-            // Also, to keep wall detection granular, we don't batch too many
-            // slices without checking. The executor step already limits to ~64
-            // instructions per VM_GRANULARITY plus overhead, so loop is fine.
+            // Each non-done slice makes minimal positive progress per
+            // piccolo's contract and strictly grows `total_used`, so the
+            // instruction pre-check above guarantees termination. The net
+            // below only guards pathological fuel handling.
 
             // Safety: if total elapsed exceeds wall budget *2, break to avoid
             // infinite loop on pathological fuel handling.
@@ -719,7 +768,7 @@ impl LuaVm {
                 };
                 self.status = VmStatus::Suspended(reason.clone());
                 self.suspension_count = self.suspension_count.wrapping_add(1);
-                self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
+                self.instructions_used = total_used;
                 self.memory_used = self.lua.total_memory();
                 return Ok(DriveOutcome::Suspended {
                     reason,
@@ -731,7 +780,7 @@ impl LuaVm {
         }
 
         // Completed without budget exceed.
-        self.instructions_used = (initial_fuel - fuel.remaining().max(0)) as u64;
+        self.instructions_used = total_used;
         self.wall_elapsed_ms = start.elapsed().as_millis() as u64;
         self.memory_used = self.lua.total_memory();
 
@@ -953,5 +1002,54 @@ mod vm_unit_tests {
         assert!(vm.is_suspended());
         let err = vm.execute("return 1").unwrap_err();
         assert!(matches!(err, VmError::Suspended { .. }));
+    }
+
+    #[test]
+    fn instruction_overrun_bounded_to_one_slice() {
+        // CR-LUA-01: fuel was handed to `step` whole, so one slice could
+        // burn the entire budget before any check ran. Slices are now
+        // capped at `SLICE_FUEL`, so the overrun past exhaustion is at most
+        // one trailing `run_vm` batch (<= 64) plus piccolo per-step
+        // constants. Fuel accounting is exact (no timing), so this bound
+        // is deterministic across profiles.
+        let budget = 1000;
+        let mut vm = LuaVm::with_budgets("xuepoo.slice", budget, 60_000, 8, 32 * 1024 * 1024);
+        let outcome = vm.execute("while true do end").unwrap();
+        match outcome {
+            ExecuteOutcome::Suspended {
+                reason: SuspendReason::InstructionBudgetExceeded { used, budget: b },
+                ..
+            } => {
+                assert_eq!(b, budget);
+                assert!(used >= budget, "must reach the budget: {used}");
+                assert!(
+                    used <= budget + 256,
+                    "single-slice overrun must stay small: {used}"
+                );
+            }
+            other => panic!("expected instruction suspend, got {other:?}"),
+        }
+        assert!(vm.is_suspended());
+    }
+
+    #[test]
+    fn bounded_loop_spanning_many_slices_completes() {
+        // ~30k fuel over many 1024-fuel slices: the top-up path must continue
+        // the same executor to completion with identical results, so normal
+        // scripts are unaffected by slicing.
+        let mut vm = LuaVm::with_budgets("xuepoo.slices", 1_000_000, 60_000, 8, 32 * 1024 * 1024);
+        let outcome = vm
+            .execute("local s = 0 for i = 1, 10000 do s = s + i end return s")
+            .unwrap();
+        match outcome {
+            ExecuteOutcome::Completed {
+                instructions_used, ..
+            } => {
+                assert!(instructions_used > SLICE_FUEL as u64);
+                assert!(instructions_used < 1_000_000);
+            }
+            other => panic!("expected completion, got {other:?}"),
+        }
+        assert!(!vm.is_suspended());
     }
 }

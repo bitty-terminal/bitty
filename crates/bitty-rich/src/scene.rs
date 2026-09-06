@@ -229,24 +229,51 @@ impl SceneNode {
 // ---------------------------------------------------------------------------
 
 /// Versioned, plugin-owned rich region anchored to terminal state.
+///
+/// Fields are private so per-block AST limits (SCN-1..3) cannot be bypassed
+/// by direct struct construction (CR-RICH-01). Build via [`RichBlock::new`];
+/// admit via [`Scene::insert`] / [`Scene::replace_content`], which re-validate
+/// SCN-1..3 at the trust boundary. Read via accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichBlock {
-    /// Stable identifier distinct from its anchor.
-    pub id: BlockId,
-    /// Monotonic version (1 for v1).
-    pub version: u32,
-    /// Anchor.
-    pub anchor: BlockAnchor,
-    /// Root of this block's subtree.
-    pub content: SceneNode,
-    /// Scroll behavior.
-    pub scroll: ScrollBehavior,
-    /// Owner plugin id (attributable).
-    pub owner: u64,
-    /// Lifecycle generation.
-    pub generation: u64,
-    /// Provenance zone id for diagnostics.
-    pub created_at: u64,
+    id: BlockId,
+    version: u32,
+    anchor: BlockAnchor,
+    content: SceneNode,
+    scroll: ScrollBehavior,
+    owner: u64,
+    generation: u64,
+    created_at: u64,
+}
+
+/// Shared per-block AST limit check (SCN-1..3) over block content.
+///
+/// Single choke point used by [`RichBlock::new`], [`Scene::insert`], and
+/// [`Scene::replace_content`] so a block that reaches the scene through any
+/// path is bounded the same way.
+fn check_block_content_limits(content: &SceneNode) -> Result<(), SceneError> {
+    let nodes = content.count_nodes();
+    if nodes > SCENE_MAX_NODES_PER_BLOCK {
+        return Err(SceneError::NodesTooMany {
+            count: nodes,
+            cap: SCENE_MAX_NODES_PER_BLOCK,
+        });
+    }
+    let depth = content.depth();
+    if depth > SCENE_MAX_DEPTH {
+        return Err(SceneError::DepthTooDeep {
+            depth,
+            cap: SCENE_MAX_DEPTH,
+        });
+    }
+    let bytes = content.text_bytes();
+    if bytes > SCENE_MAX_TEXT_BYTES_PER_BLOCK {
+        return Err(SceneError::TextTooLarge {
+            bytes,
+            cap: SCENE_MAX_TEXT_BYTES_PER_BLOCK,
+        });
+    }
+    Ok(())
 }
 
 impl RichBlock {
@@ -263,27 +290,7 @@ impl RichBlock {
         generation: u64,
         created_at: u64,
     ) -> Result<Self, SceneError> {
-        let nodes = content.count_nodes();
-        if nodes > SCENE_MAX_NODES_PER_BLOCK {
-            return Err(SceneError::NodesTooMany {
-                count: nodes,
-                cap: SCENE_MAX_NODES_PER_BLOCK,
-            });
-        }
-        let depth = content.depth();
-        if depth > SCENE_MAX_DEPTH {
-            return Err(SceneError::DepthTooDeep {
-                depth,
-                cap: SCENE_MAX_DEPTH,
-            });
-        }
-        let bytes = content.text_bytes();
-        if bytes > SCENE_MAX_TEXT_BYTES_PER_BLOCK {
-            return Err(SceneError::TextTooLarge {
-                bytes,
-                cap: SCENE_MAX_TEXT_BYTES_PER_BLOCK,
-            });
-        }
+        check_block_content_limits(&content)?;
         Ok(Self {
             id,
             version: RICH_BLOCK_VERSION,
@@ -294,6 +301,82 @@ impl RichBlock {
             generation,
             created_at,
         })
+    }
+
+    /// Test-only bypass constructor (CR-RICH-01 regression harness).
+    ///
+    /// Builds a block without SCN-1..3 validation so tests can prove the
+    /// scene admission boundary ([`Scene::insert`]) rejects oversized ASTs
+    /// even if such a value ever reaches it. Never available in non-test
+    /// builds.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        id: BlockId,
+        anchor: BlockAnchor,
+        content: SceneNode,
+        scroll: ScrollBehavior,
+        owner: u64,
+        generation: u64,
+        created_at: u64,
+    ) -> Self {
+        Self {
+            id,
+            version: RICH_BLOCK_VERSION,
+            anchor,
+            content,
+            scroll,
+            owner,
+            generation,
+            created_at,
+        }
+    }
+
+    /// Stable identifier distinct from its anchor.
+    #[must_use]
+    pub fn id(&self) -> BlockId {
+        self.id
+    }
+
+    /// Monotonic version (1 for v1, incremented by `replace_content`).
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Anchor binding this block to terminal state.
+    #[must_use]
+    pub fn anchor(&self) -> &BlockAnchor {
+        &self.anchor
+    }
+
+    /// Root of this block's subtree.
+    #[must_use]
+    pub fn content(&self) -> &SceneNode {
+        &self.content
+    }
+
+    /// Scroll behavior.
+    #[must_use]
+    pub fn scroll(&self) -> ScrollBehavior {
+        self.scroll
+    }
+
+    /// Owner plugin id (attributable).
+    #[must_use]
+    pub fn owner(&self) -> u64 {
+        self.owner
+    }
+
+    /// Lifecycle generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Provenance zone id for diagnostics.
+    #[must_use]
+    pub fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     /// Node count for this block.
@@ -456,11 +539,12 @@ impl Scene {
 
     /// Inserts a new block, validating SCN-1..5.
     ///
-    /// Validates per-block SCN-1..3 via `RichBlock::new` (caller should have
-    /// constructed the block via that helper), then checks SCN-4 and SCN-5
-    /// at admission. On failure returns a typed diagnostic and retains the
-    /// last good scene (no partial insertion).
+    /// Re-validates per-block SCN-1..3 at admission (CR-RICH-01 defense in
+    /// depth: construction-time checks alone are insufficient), then checks
+    /// SCN-4 and SCN-5. On failure returns a typed diagnostic and retains
+    /// the last good scene (no partial insertion).
     pub fn insert(&mut self, block: RichBlock) -> Result<(), SceneError> {
+        check_block_content_limits(&block.content)?;
         if self.blocks.iter().any(|b| b.id == block.id) {
             return Err(SceneError::DuplicateBlockId(block.id));
         }
@@ -501,27 +585,8 @@ impl Scene {
             .ok_or(SceneError::BlockNotFound(id))?;
 
         // Validate new content per-block limits before mutating aggregated.
-        let nodes = new_content.count_nodes();
-        if nodes > SCENE_MAX_NODES_PER_BLOCK {
-            return Err(SceneError::NodesTooMany {
-                count: nodes,
-                cap: SCENE_MAX_NODES_PER_BLOCK,
-            });
-        }
-        let depth = new_content.depth();
-        if depth > SCENE_MAX_DEPTH {
-            return Err(SceneError::DepthTooDeep {
-                depth,
-                cap: SCENE_MAX_DEPTH,
-            });
-        }
+        check_block_content_limits(&new_content)?;
         let new_bytes = new_content.text_bytes();
-        if new_bytes > SCENE_MAX_TEXT_BYTES_PER_BLOCK {
-            return Err(SceneError::TextTooLarge {
-                bytes: new_bytes,
-                cap: SCENE_MAX_TEXT_BYTES_PER_BLOCK,
-            });
-        }
 
         let old_bytes = self.blocks[pos].text_bytes();
         let new_total = self
@@ -813,13 +878,13 @@ mod tests {
             1,
         )
         .unwrap();
-        let v1 = block.version;
+        let v1 = block.version();
         scene.insert(block).unwrap();
         // Replace with larger but within block cap
         scene
             .replace_content(id, tiny_text(&"b".repeat(100)))
             .unwrap();
-        assert_eq!(scene.get(id).unwrap().version, v1 + 1);
+        assert_eq!(scene.get(id).unwrap().version(), v1 + 1);
         assert_eq!(scene.get(id).unwrap().text_bytes(), 100);
     }
 
@@ -838,13 +903,13 @@ mod tests {
         )
         .unwrap();
         scene.insert(block).unwrap();
-        let before = scene.get(id).unwrap().content.clone();
+        let before = scene.get(id).unwrap().content().clone();
         // Try to replace with over-depth content
         let deep = deep_nodes(SCENE_MAX_DEPTH + 5);
         let err = scene.replace_content(id, deep).unwrap_err();
         assert!(matches!(err, SceneError::DepthTooDeep { .. }));
         // Still old content
-        assert_eq!(scene.get(id).unwrap().content, before);
+        assert_eq!(scene.get(id).unwrap().content(), &before);
     }
 
     #[test]
@@ -1006,5 +1071,107 @@ mod tests {
             .unwrap();
         scene.clear();
         assert!(scene.is_empty());
+    }
+
+    #[test]
+    fn accessors_expose_block_metadata() {
+        let block = RichBlock::new(
+            BlockId(7),
+            BlockAnchor::Zone(9),
+            tiny_text("hi"),
+            ScrollBehavior::PinnedBelow,
+            11,
+            12,
+            13,
+        )
+        .unwrap();
+        assert_eq!(block.id(), BlockId(7));
+        assert_eq!(block.version(), RICH_BLOCK_VERSION);
+        assert_eq!(block.anchor(), &BlockAnchor::Zone(9));
+        assert_eq!(block.content(), &tiny_text("hi"));
+        assert_eq!(block.scroll(), ScrollBehavior::PinnedBelow);
+        assert_eq!(block.owner(), 11);
+        assert_eq!(block.generation(), 12);
+        assert_eq!(block.created_at(), 13);
+    }
+
+    /// CR-RICH-01: admission must reject oversized ASTs even if a block
+    /// value reaches `insert` without going through `RichBlock::new`.
+    #[test]
+    fn cr_rich_01_insert_rejects_unchecked_oversized_nodes() {
+        let mut scene = Scene::new();
+        let content = many_nodes(SCENE_MAX_NODES_PER_BLOCK + 1);
+        assert!(content.count_nodes() > SCENE_MAX_NODES_PER_BLOCK);
+        let block = RichBlock::new_unchecked(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            content,
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        );
+        let err = scene.insert(block).unwrap_err();
+        assert!(matches!(err, SceneError::NodesTooMany { .. }));
+        assert!(scene.is_empty());
+        assert_eq!(scene.aggregated_bytes(), 0);
+    }
+
+    /// CR-RICH-01: admission must reject over-deep ASTs.
+    #[test]
+    fn cr_rich_01_insert_rejects_unchecked_deep_ast() {
+        let mut scene = Scene::new();
+        let content = deep_nodes(SCENE_MAX_DEPTH + 1);
+        assert!(content.depth() > SCENE_MAX_DEPTH);
+        let block = RichBlock::new_unchecked(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            content,
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        );
+        let err = scene.insert(block).unwrap_err();
+        assert!(matches!(err, SceneError::DepthTooDeep { .. }));
+        assert!(scene.is_empty());
+    }
+
+    /// CR-RICH-01: admission must reject over-byte ASTs.
+    #[test]
+    fn cr_rich_01_insert_rejects_unchecked_large_text() {
+        let mut scene = Scene::new();
+        let large = "a".repeat(SCENE_MAX_TEXT_BYTES_PER_BLOCK + 1);
+        let block = RichBlock::new_unchecked(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text(&large),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        );
+        let err = scene.insert(block).unwrap_err();
+        assert!(matches!(err, SceneError::TextTooLarge { .. }));
+        assert!(scene.is_empty());
+    }
+
+    /// CR-RICH-01: legitimate blocks are unaffected by admission checks.
+    #[test]
+    fn cr_rich_01_legit_block_still_admitted() {
+        let mut scene = Scene::new();
+        let block = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text("hello"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        scene.insert(block).unwrap();
+        assert_eq!(scene.len(), 1);
+        assert_eq!(scene.get(BlockId(1)).unwrap().text_bytes(), 5);
     }
 }

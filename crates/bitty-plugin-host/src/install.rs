@@ -411,7 +411,7 @@ mod tests {
         let mut tampered = manifest.clone();
         tampered
             .capabilities
-            .push(CapabilityId::new("fs.read").unwrap());
+            .push(CapabilityId::new("fs.read:/data/**").unwrap());
         let _tampered_digest = tampered.canonical_digest();
         assert_ne!(good_manifest_digest, tampered.canonical_digest());
 
@@ -425,7 +425,7 @@ mod tests {
             manifest: &tampered,
             expected_manifest_digest: &good_manifest_digest,
             granted_capabilities: &[],
-            requested_capabilities: &["fs.read".to_string()],
+            requested_capabilities: &["fs.read:/data/**".to_string()],
             capability_approval: false,
             host_bitty_version: Some("0.6.0"),
             host_plugin_api_version: Some("1.0.0"),
@@ -454,8 +454,11 @@ mod tests {
         let artifact = b"bytes";
         let artifact_digest = sha256_hex(artifact);
 
-        let granted = vec!["fs.read".to_string()];
-        let requested = vec!["fs.read".to_string(), "fs.write".to_string()];
+        let granted = vec!["fs.read:/data/**".to_string()];
+        let requested = vec![
+            "fs.read:/data/**".to_string(),
+            "fs.write:/data/**".to_string(),
+        ];
 
         // Without approval -> blocked before staging (P0-AC-030).
         let inputs = default_inputs(
@@ -496,8 +499,11 @@ mod tests {
         let artifact = b"bytes";
         let artifact_digest = sha256_hex(artifact);
 
-        let granted = vec!["fs.read".to_string(), "fs.write".to_string()];
-        let narrowed = vec!["fs.read".to_string()];
+        let granted = vec![
+            "fs.read:/data/**".to_string(),
+            "fs.write:/data/**".to_string(),
+        ];
+        let narrowed = vec!["fs.read:/data/**".to_string()];
 
         let inputs = default_inputs(
             artifact,

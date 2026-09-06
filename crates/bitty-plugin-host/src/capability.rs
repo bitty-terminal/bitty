@@ -355,89 +355,52 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
     }
 }
 
+/// Canonical closed-identifier validation (CR-PKG-03 export).
+///
+/// The closed tables live in `bitty_package::manifest` (the leaf crate; a
+/// package-to-host dependency would be a dependency cycle), so this validator
+/// delegates head membership and parameter-presence rules to
+/// [`bitty_package::manifest::check_closed_capability`] while keeping the
+/// host's error vocabulary. `bitty-package` manifest validation calls the same
+/// canonical check, so an identifier accepted at manifest (lock) time is
+/// accepted at install (grant) time and vice versa.
+pub fn validate_closed_capability(
+    head: &str,
+    has_param: bool,
+    raw: &str,
+) -> Result<(), PluginError> {
+    bitty_package::manifest::check_closed_capability(head, has_param).map_err(|violation| {
+        match violation {
+            bitty_package::manifest::ClosedCapabilityViolation::UnknownHead => {
+                PluginError::capability(
+                    raw,
+                    format!(
+                        "unknown capability '{head}' (closed set; forward compat requires explicit RFC)"
+                    ),
+                )
+            }
+            bitty_package::manifest::ClosedCapabilityViolation::ParamRequired => {
+                PluginError::capability(
+                    raw,
+                    format!("capability '{head}' requires a ':PARAMETER'"),
+                )
+            }
+            bitty_package::manifest::ClosedCapabilityViolation::ParamForbidden => {
+                PluginError::capability(
+                    raw,
+                    format!("capability '{head}' must not have a ':PARAMETER'"),
+                )
+            }
+        }
+    })
+}
+
 /// Closed identifier validation.
 ///
 /// Returns error if the head is not a known capability; otherwise returns true
 /// for known identifiers (used to avoid silent escalation).
 fn is_known_capability(head: &str, has_param: bool, raw: &str) -> Result<bool, PluginError> {
-    // Families that require a parameter.
-    let param_required = matches!(
-        head,
-        "fs.read"
-            | "fs.write"
-            | "process.spawn"
-            | "network.connect"
-            | "mcp.invoke"
-            | "agent.memory"
-    );
-
-    // Validate param presence rules.
-    if param_required && !has_param {
-        return Err(PluginError::capability(
-            raw,
-            format!("capability '{head}' requires a ':PARAMETER'"),
-        ));
-    }
-    if !param_required && has_param {
-        return Err(PluginError::capability(
-            raw,
-            format!("capability '{head}' must not have a ':PARAMETER'"),
-        ));
-    }
-
-    // Closed set: every accepted head must be one of the known identifiers.
-    let is_known = matches!(
-        head,
-        "terminal.semantic-read"
-            | "terminal.raw-read"
-            | "terminal.input.self"
-            | "terminal.input.all"
-            | "terminal.manage"
-            | "ui.rich"
-            | "ui.overlay"
-            | "ui.protocol-register"
-            | "clipboard.read"
-            | "clipboard.write"
-            | "fs.read"
-            | "fs.write"
-            | "process.spawn"
-            | "network.connect"
-            | "runtime.inspect"
-            | "runtime.configure"
-            | "runtime.plugin-manage"
-            | "debug.inspect"
-            | "debug.trace"
-            | "debug.control"
-            | "platform.notify"
-            | "platform.open-url"
-            | "platform.image-file"
-            | "protocol.register"
-            | "panel.provider"
-            | "panel.create"
-            | "panel.focus"
-            | "panel.overlay"
-            | "browser.embed"
-            | "browser.navigation"
-            | "browser.file-url"
-            | "browser.storage"
-            | "agent.context.terminal"
-            | "agent.context.workspace"
-            | "agent.memory"
-            | "mcp.invoke"
-            | "ai.provider"
-            | "ai.stream"
-            | "ai.model"
-    );
-
-    if !is_known {
-        return Err(PluginError::capability(
-            raw,
-            format!(
-                "unknown capability '{head}' (closed set; forward compat requires explicit RFC)"
-            ),
-        ));
-    }
-
+    validate_closed_capability(head, has_param, raw)?;
     // For fs/process/network, param content could be further validated (glob / host / program)
     // but the draft keeps it as bounded opaque string validated above (length, no colon/space).
     Ok(true)
@@ -573,6 +536,64 @@ mod tests {
     fn parameters_reject_controls_and_unicode_whitespace() {
         for parameter in ["path\0name", "path\u{0007}name", "path\u{2003}name"] {
             assert!(CapabilityId::parse(&format!("fs.read:{parameter}")).is_err());
+        }
+    }
+
+    #[test]
+    fn closed_set_matches_package_manifest_canonical_set() {
+        // CR-PKG-03: the package manifest validator and the host must enforce
+        // exactly the same closed set. The host delegates to the canonical
+        // package tables; this test pins the two sides together.
+        use bitty_package::manifest as package_manifest;
+
+        // Every host closed identifier is accepted by the package validator
+        // (with a parameter where one is required) and vice versa.
+        let mut host_heads: Vec<&str> = Vec::new();
+        for family in [
+            CapabilityFamily::Terminal,
+            CapabilityFamily::Ui,
+            CapabilityFamily::Clipboard,
+            CapabilityFamily::Fs,
+            CapabilityFamily::Process,
+            CapabilityFamily::Network,
+            CapabilityFamily::Runtime,
+            CapabilityFamily::Debug,
+            CapabilityFamily::Platform,
+            CapabilityFamily::Protocol,
+            CapabilityFamily::Panel,
+            CapabilityFamily::Browser,
+            CapabilityFamily::Agent,
+            CapabilityFamily::Mcp,
+            CapabilityFamily::Ai,
+        ] {
+            host_heads.extend(family.closed_identifiers().iter().copied());
+        }
+        let mut host_sorted = host_heads.clone();
+        host_sorted.sort_unstable();
+        let mut package_sorted = package_manifest::CLOSED_CAPABILITY_HEADS.to_vec();
+        package_sorted.sort_unstable();
+        assert_eq!(host_sorted, package_sorted);
+
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            let raw = if package_manifest::capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            assert!(
+                CapabilityId::parse(&raw).is_ok(),
+                "package-accepted '{raw}' must parse on the host"
+            );
+            assert!(
+                bitty_package::CapabilityId::new(&raw).is_ok(),
+                "host-accepted '{raw}' must validate in the package manifest"
+            );
+        }
+
+        // Divergent identifiers are rejected on both sides.
+        for raw in ["terminal.unknown-thing", "ui.unknown", "fs.read"] {
+            assert!(CapabilityId::parse(raw).is_err());
+            assert!(bitty_package::CapabilityId::new(raw).is_err());
         }
     }
 }

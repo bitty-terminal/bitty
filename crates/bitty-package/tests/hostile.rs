@@ -8,8 +8,9 @@
 //! disk-full/budget, capability escalation, key rotation/revoked stale snapshot.
 
 use bitty_package::{
-    CapabilityId, Compat, LockedPackage, Lockfile, PackageDependency, PackageDigests, PackageId,
-    PackageIdentity, PackageManifest, PackageSource, Version, VersionReq, sha256_hex,
+    CLOSED_CAPABILITY_HEADS, CapabilityId, Compat, LockedPackage, Lockfile, PackageDependency,
+    PackageDigests, PackageId, PackageIdentity, PackageManifest, PackageSource, Version,
+    VersionReq, capability_requires_param, sha256_hex,
 };
 use bitty_package::{IndexEntry, PackageIndex, resolve, resolve_preserving_locked};
 use bitty_package::{
@@ -529,8 +530,10 @@ fn corrupt_manifest_duplicate_dep_rejected() {
 #[test]
 fn corrupt_manifest_duplicate_cap_rejected() {
     let mut m = minimal_manifest("xuepoo.pkg");
-    m.capabilities.push(CapabilityId::new("fs.read").unwrap());
-    m.capabilities.push(CapabilityId::new("fs.read").unwrap());
+    m.capabilities
+        .push(CapabilityId::new("fs.read:/tmp/**").unwrap());
+    m.capabilities
+        .push(CapabilityId::new("fs.read:/tmp/**").unwrap());
     assert!(m.validate().is_err());
 }
 
@@ -540,6 +543,51 @@ fn corrupt_package_cap_invalid_family_rejected() {
     // Wildcard in head is rejected; param wildcard like fs.read:/tmp/* is allowed (param), head wildcard is not.
     assert!(CapabilityId::new("fs.*").is_err());
     assert!(CapabilityId::new("fs.read:").is_err());
+}
+
+#[test]
+fn corrupt_package_cap_divergent_head_rejected_at_manifest_time() {
+    // CR-PKG-03: family-only validation used to accept any `terminal.*`
+    // identifier; the closed set must reject unknown heads here.
+    for raw in [
+        "terminal.unknown-thing",
+        "terminal.semantic-read.evil",
+        "ui.unknown",
+        "clipboard.evil",
+        "runtime.evil",
+        "agent.evil",
+        "mcp.evil",
+        "ai.evil",
+        "protocol.evil",
+        "panel.evil",
+        "browser.evil",
+    ] {
+        assert!(
+            CapabilityId::new(raw).is_err(),
+            "'{raw}' must be rejected at manifest time"
+        );
+    }
+    // Parameter presence rules are part of the closed set.
+    assert!(CapabilityId::new("fs.read").is_err());
+    assert!(CapabilityId::new("fs.write").is_err());
+    assert!(CapabilityId::new("process.spawn").is_err());
+    assert!(CapabilityId::new("network.connect").is_err());
+    assert!(CapabilityId::new("mcp.invoke").is_err());
+    assert!(CapabilityId::new("agent.memory").is_err());
+    assert!(CapabilityId::new("terminal.semantic-read:param").is_err());
+    assert!(CapabilityId::new("runtime.inspect:param").is_err());
+    // The full host closed set validates here (param where required).
+    for head in CLOSED_CAPABILITY_HEADS {
+        let raw = if capability_requires_param(head) {
+            format!("{head}:param")
+        } else {
+            (*head).to_string()
+        };
+        assert!(
+            CapabilityId::new(&raw).is_ok(),
+            "host identifier '{raw}' must validate at manifest time"
+        );
+    }
 }
 
 // ── signature mismatch ─────────────────────────────────────────────────────
@@ -947,7 +995,7 @@ fn capability_escalation_tampered_manifest_blocks_via_hb() {
     let mut tampered = m.clone();
     tampered
         .capabilities
-        .push(CapabilityId::new("fs.write").unwrap());
+        .push(CapabilityId::new("fs.write:/data/**").unwrap());
     assert_ne!(tampered.canonical_digest(), good_m_digest);
     let artifact = b"pkg";
     let a_digest = sha256_hex(artifact);
@@ -957,7 +1005,7 @@ fn capability_escalation_tampered_manifest_blocks_via_hb() {
         manifest: &tampered,
         expected_manifest_digest: &good_m_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.write".to_string()],
+        requested_capabilities: &["fs.write:/data/**".to_string()],
         capability_approval: false,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),

@@ -544,7 +544,7 @@ fn final_headless_integration_end_to_end() {
     let pkg_id = PackageId::new("xuepoo.integration-pkg").unwrap();
     let pkg_manifest = package_manifest_with_cap(
         "xuepoo.integration-pkg",
-        vec![PackageCapabilityId::new("fs.read").unwrap()],
+        vec![PackageCapabilityId::new("fs.read:/data/**").unwrap()],
     );
     pkg_manifest.validate().expect("manifest must be valid");
     let artifact = b"package artifact bytes v1";
@@ -556,7 +556,7 @@ fn final_headless_integration_end_to_end() {
         manifest: &pkg_manifest,
         expected_manifest_digest: &manifest_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.read".to_string()],
+        requested_capabilities: &["fs.read:/data/**".to_string()],
         capability_approval: true,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),
@@ -581,7 +581,7 @@ fn final_headless_integration_end_to_end() {
         manifest: &pkg_manifest,
         expected_manifest_digest: &manifest_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.read".to_string()],
+        requested_capabilities: &["fs.read:/data/**".to_string()],
         capability_approval: true,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),
@@ -601,14 +601,14 @@ fn final_headless_integration_end_to_end() {
     let mut tampered_manifest = pkg_manifest.clone();
     tampered_manifest
         .capabilities
-        .push(PackageCapabilityId::new("fs.write").unwrap());
+        .push(PackageCapabilityId::new("fs.write:/data/**").unwrap());
     let inputs_hb = VerificationInputs {
         artifact_bytes: artifact,
         expected_artifact_digest: &artifact_digest,
         manifest: &tampered_manifest,
         expected_manifest_digest: &manifest_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.write".to_string()],
+        requested_capabilities: &["fs.write:/data/**".to_string()],
         capability_approval: true,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),
@@ -654,7 +654,7 @@ fn final_headless_integration_end_to_end() {
         manifest: &pkg_manifest,
         expected_manifest_digest: &manifest_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.read".to_string()],
+        requested_capabilities: &["fs.read:/data/**".to_string()],
         capability_approval: true,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),
@@ -681,7 +681,7 @@ fn final_headless_integration_end_to_end() {
         manifest: &pkg_manifest,
         expected_manifest_digest: &manifest_digest,
         granted_capabilities: &[],
-        requested_capabilities: &["fs.read".to_string()],
+        requested_capabilities: &["fs.read:/data/**".to_string()],
         capability_approval: true,
         host_bitty_version: Some("0.6.0"),
         host_plugin_api_version: Some("1.0.0"),
@@ -727,7 +727,7 @@ fn final_headless_integration_end_to_end() {
             lock,
             BTreeMap::from([(
                 "xuepoo.integration-pkg".to_string(),
-                vec!["fs.read".to_string()],
+                vec!["fs.read:/data/**".to_string()],
             )]),
             1,
         )

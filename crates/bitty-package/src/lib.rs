@@ -143,8 +143,10 @@ pub use lifecycle::{
 };
 pub use lockfile::{LOCKFILE_VERSION, LockedPackage, Lockfile, PackageDigests};
 pub use manifest::{
-    CapabilityId, Compat, MANIFEST_MAX_BYTES, MAX_CAPABILITIES, MAX_DEPENDENCIES,
-    PackageDependency, PackageId, PackageIdentity, PackageManifest,
+    CAPABILITY_FAMILIES, CLOSED_CAPABILITY_HEADS, CapabilityId, ClosedCapabilityViolation, Compat,
+    MANIFEST_MAX_BYTES, MAX_CAPABILITIES, MAX_DEPENDENCIES, PackageDependency, PackageId,
+    PackageIdentity, PackageManifest, capability_requires_param, check_closed_capability,
+    validate_closed_capability,
 };
 pub use requirement::{Comparator, ComparatorOp, MAX_REQUIREMENT_LEN, VersionReq};
 pub use resolver::{
@@ -182,7 +184,7 @@ mod integration_tests {
                 plugin_api: Some("^1.0".to_string()),
             },
             dependencies: Vec::new(),
-            capabilities: vec![CapabilityId::new("fs.read").unwrap()],
+            capabilities: vec![CapabilityId::new("fs.read:/data/**").unwrap()],
             raw_bytes_len: 256,
             undeclared_fields: Vec::new(),
         };
@@ -202,7 +204,7 @@ mod integration_tests {
             manifest: &manifest,
             expected_manifest_digest: &manifest_digest,
             granted_capabilities: &[],
-            requested_capabilities: &["fs.read".to_string()],
+            requested_capabilities: &["fs.read:/data/**".to_string()],
             capability_approval: true,
             host_bitty_version: Some("0.6.0"),
             host_plugin_api_version: Some("1.0.0"),
@@ -240,7 +242,10 @@ mod integration_tests {
         let gen_id = env
             .stage(
                 lock,
-                BTreeMap::from([("xuepoo.theme".to_string(), vec!["fs.read".to_string()])]),
+                BTreeMap::from([(
+                    "xuepoo.theme".to_string(),
+                    vec!["fs.read:/data/**".to_string()],
+                )]),
                 100,
             )
             .unwrap();
@@ -302,14 +307,14 @@ mod integration_tests {
         let mut tampered_manifest = manifest.clone();
         tampered_manifest
             .capabilities
-            .push(CapabilityId::new("fs.write").unwrap());
+            .push(CapabilityId::new("fs.write:/data/**").unwrap());
         let inputs2 = VerificationInputs {
             artifact_bytes: artifact,
             expected_artifact_digest: &good_digest,
             manifest: &tampered_manifest,
             expected_manifest_digest: &manifest_digest,
             granted_capabilities: &[],
-            requested_capabilities: &["fs.write".to_string()],
+            requested_capabilities: &["fs.write:/data/**".to_string()],
             capability_approval: false,
             host_bitty_version: Some("0.6.0"),
             host_plugin_api_version: Some("1.0.0"),
@@ -392,7 +397,7 @@ mod integration_tests {
             },
             compat: Compat::default(),
             dependencies: Vec::new(),
-            capabilities: vec![CapabilityId::new("fs.read").unwrap()],
+            capabilities: vec![CapabilityId::new("fs.read:/data/**").unwrap()],
             raw_bytes_len: 256,
             undeclared_fields: Vec::new(),
         };
@@ -418,15 +423,21 @@ mod integration_tests {
         let id1 = env
             .stage(
                 lock1,
-                BTreeMap::from([("xuepoo.cap".to_string(), vec!["fs.read".to_string()])]),
+                BTreeMap::from([(
+                    "xuepoo.cap".to_string(),
+                    vec!["fs.read:/data/**".to_string()],
+                )]),
                 1,
             )
             .unwrap();
         activate(&mut env, id1, Some("0.6.0"), Some("1.0.0"), None).unwrap();
 
         // Update to broader capability — approval required to stage second gen.
-        let granted = vec!["fs.read".to_string()];
-        let requested = vec!["fs.read".to_string(), "fs.write".to_string()];
+        let granted = vec!["fs.read:/data/**".to_string()];
+        let requested = vec![
+            "fs.read:/data/**".to_string(),
+            "fs.write:/data/**".to_string(),
+        ];
         // Without approval, diff blocks.
         assert!(check_capability_diff(&granted, &requested, false).is_err());
         // With approval, proceed.
@@ -452,7 +463,10 @@ mod integration_tests {
                 lock2,
                 BTreeMap::from([(
                     "xuepoo.cap".to_string(),
-                    vec!["fs.read".to_string(), "fs.write".to_string()],
+                    vec![
+                        "fs.read:/data/**".to_string(),
+                        "fs.write:/data/**".to_string(),
+                    ],
                 )]),
                 2,
             )

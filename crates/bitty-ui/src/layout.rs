@@ -77,6 +77,44 @@ impl LayoutNode {
         }
     }
 
+    /// Creates an adaptive split with a Hyprland dwindle-style axis chosen from
+    /// the container's cell dimensions (CTX-0209, CR-UI-01).
+    ///
+    /// Wide containers split side-by-side (`SplitAxis::Horizontal`, vertical
+    /// divider) and tall containers split stacked (`SplitAxis::Vertical`,
+    /// horizontal divider), keeping new panes squarish. Square containers
+    /// tie-break to side-by-side, matching Hyprland's
+    /// `splitTop = box.h * split_width_multiplier > box.w` (false for a
+    /// square at the default multiplier `1.0`).
+    ///
+    /// Opt-in: [`Self::split`] keeps its explicit axis and is unaffected.
+    /// Ratio clamping is identical (delegates to [`Self::split`]).
+    #[must_use]
+    pub fn smart_split(container: Rect, ratio: f32, first: LayoutNode, second: LayoutNode) -> Self {
+        Self::smart_split_with_multiplier(container, ratio, first, second, 1.0)
+    }
+
+    /// Like [`Self::smart_split`] with an explicit width multiplier, mirroring
+    /// Hyprland's `dwindle:split_width_multiplier`: the container splits
+    /// stacked when `height * width_multiplier > width`, side-by-side
+    /// otherwise. Non-finite or non-positive multipliers fall back to `1.0`
+    /// so the constructor stays total.
+    #[must_use]
+    pub fn smart_split_with_multiplier(
+        container: Rect,
+        ratio: f32,
+        first: LayoutNode,
+        second: LayoutNode,
+        width_multiplier: f32,
+    ) -> Self {
+        Self::split(
+            smart_split_axis(container, width_multiplier),
+            ratio,
+            first,
+            second,
+        )
+    }
+
     /// Creates a stack. Empty stacks are allowed (total solver) but contain no leaves.
     #[must_use]
     pub fn stack(children: Vec<LayoutNode>) -> Self {
@@ -485,6 +523,30 @@ pub fn split_rect_with_gap(bounds: Rect, axis: SplitAxis, ratio: f32, gap_in: u1
     }
 }
 
+/// Picks a [`SplitAxis`] from container cell dimensions, mirroring Hyprland's
+/// dwindle heuristic `splitTop = box.h * split_width_multiplier > box.w`
+/// (CTX-0209, CR-UI-01).
+///
+/// Returns [`SplitAxis::Vertical`] (stacked, top/bottom) when the container is
+/// taller than it is wide after the multiplier, [`SplitAxis::Horizontal`]
+/// (side-by-side, left/right) otherwise — including the square tie. The
+/// comparison runs in `f32` cell space (exact for `u16` ranges); non-finite or
+/// non-positive `width_multiplier` falls back to `1.0`. Total over all inputs,
+/// including empty bounds (which yield [`SplitAxis::Horizontal`]).
+#[must_use]
+pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
+    let mult = if width_multiplier.is_finite() && width_multiplier > 0.0 {
+        width_multiplier
+    } else {
+        1.0
+    };
+    if container.height as f32 * mult > container.width as f32 {
+        SplitAxis::Vertical
+    } else {
+        SplitAxis::Horizontal
+    }
+}
+
 /// Helper used by `focus` for deterministic leaf adjacency.
 #[must_use]
 pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
@@ -868,5 +930,126 @@ mod tests {
         );
         plain.reflow(Rect::new(0, 0, 80, 24));
         assert_eq!(plain.find_leaf(ViewId::new(2)).unwrap().origin().x, 40);
+    }
+
+    #[test]
+    fn smart_split_axis_wide_is_side_by_side() {
+        // CTX-0209: wide containers split left/right (vertical divider), so
+        // new panes stay squarish. Mirrors Hyprland `splitTop = h > w`.
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 80, 24), 1.0),
+            SplitAxis::Horizontal
+        );
+        let node = LayoutNode::smart_split(
+            Rect::new(0, 0, 80, 24),
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout(Rect::new(0, 0, 80, 24));
+        assert_eq!(alloc.len(), 2);
+        let (_, a) = alloc[0];
+        let (_, b) = alloc[1];
+        assert_eq!(a.width + b.width, 80);
+        assert_eq!(a.height, 24);
+        assert_eq!(b.height, 24);
+    }
+
+    #[test]
+    fn smart_split_axis_tall_is_stacked() {
+        // CTX-0209: tall containers split top/bottom (horizontal divider).
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 24, 80), 1.0),
+            SplitAxis::Vertical
+        );
+        let node = LayoutNode::smart_split(
+            Rect::new(0, 0, 24, 80),
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let alloc = node.layout(Rect::new(0, 0, 24, 80));
+        assert_eq!(alloc.len(), 2);
+        let (_, a) = alloc[0];
+        let (_, b) = alloc[1];
+        assert_eq!(a.height + b.height, 80);
+        assert_eq!(a.width, 24);
+        assert_eq!(b.width, 24);
+    }
+
+    #[test]
+    fn smart_split_axis_square_tie_breaks_side_by_side() {
+        // CTX-0209: a square container ties (`h * 1.0 > w` is false) and
+        // splits side-by-side, matching Hyprland's default first split.
+        assert_eq!(
+            smart_split_axis(Rect::new(0, 0, 40, 40), 1.0),
+            SplitAxis::Horizontal
+        );
+    }
+
+    #[test]
+    fn smart_split_multiplier_shifts_threshold() {
+        // CTX-0209: mirrors `dwindle:split_width_multiplier`; 40 * 2.0 > 60
+        // flips a wide container to stacked, while 1.0 keeps it side-by-side.
+        let bounds = Rect::new(0, 0, 60, 40);
+        assert_eq!(smart_split_axis(bounds, 2.0), SplitAxis::Vertical);
+        assert_eq!(smart_split_axis(bounds, 1.0), SplitAxis::Horizontal);
+        // Degenerate multipliers fall back to 1.0 (total constructor).
+        assert_eq!(smart_split_axis(bounds, 0.0), SplitAxis::Horizontal);
+        assert_eq!(smart_split_axis(bounds, f32::NAN), SplitAxis::Horizontal);
+        // Empty bounds are total and deterministic.
+        assert_eq!(smart_split_axis(Rect::zero(), 1.0), SplitAxis::Horizontal);
+    }
+
+    #[test]
+    fn smart_split_matches_explicit_split_layout() {
+        // CTX-0209: the adaptive constructor delegates to `split`, so its
+        // allocations are byte-identical to the equivalent explicit split and
+        // the explicit axis+ratio API is unaffected.
+        let wide = Rect::new(0, 0, 80, 24);
+        let smart = LayoutNode::smart_split(
+            wide,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let explicit = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        assert_eq!(smart, explicit);
+        assert_eq!(smart.layout(wide), explicit.layout(wide));
+
+        let tall = Rect::new(0, 0, 24, 80);
+        let smart = LayoutNode::smart_split(
+            tall,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let explicit = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        assert_eq!(smart, explicit);
+        assert_eq!(smart.layout(tall), explicit.layout(tall));
+
+        // Ratio clamping flows through the same path as `split`.
+        let clamped = LayoutNode::smart_split(
+            wide,
+            5.0,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        if let LayoutNode::Split { axis, ratio, .. } = clamped {
+            assert_eq!(axis, SplitAxis::Horizontal);
+            assert_eq!(ratio, LayoutNode::MAX_RATIO);
+        } else {
+            panic!("expected split");
+        }
     }
 }

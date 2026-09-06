@@ -183,10 +183,12 @@ version = "0.0.1"
 dependencies = [
  "bitty-config",
  "bitty-ipc",
+ "bitty-perf",
  "bitty-platform",
  "bitty-plugin-host",
  "bitty-render",
  "bitty-runtime",
+ "bitty-term-state",
  "pollster",
 ]
 

@@ -196,6 +196,7 @@ use bitty_render::gpu::GpuContext;
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
 mod ctl;
+mod dev;
 mod doctor;
 mod inspect;
 mod ipc_serve;
@@ -480,6 +481,24 @@ struct Args {
     inspect_no_color: bool,
     /// Unexpected extra positionals in inspect mode (dispatch errors).
     inspect_args: Vec<String>,
+    /// `bitty dev` tracing, captures, dumps, and overlays (CTX-0174).
+    /// True once the first positional `dev` word is seen; a program
+    /// literally named `dev` must be invoked as `bitty -- dev ...`.
+    dev_word: bool,
+    /// Raw tokens after the `dev` word for [`dev::parse_dev_request`].
+    /// Empty until `dev_word` is set.
+    dev_raw: Vec<String>,
+    /// Raw `--format` value for `dev` (table|json|jsonl; default table).
+    /// Parsed globally so it composes before or after the `dev` word;
+    /// consumed only by the dev dispatch, ignored by normal startup.
+    dev_format: Option<String>,
+    /// `--no-color` for dev output (accepted for parity; tables are plain).
+    dev_no_color: bool,
+    /// Global `--socket` before the `dev` word (rejected at dispatch:
+    /// dev is local-only).
+    dev_socket_pre: Option<String>,
+    /// Global `--instance` before the `dev` word (rejected at dispatch).
+    dev_instance_pre: Option<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -575,6 +594,12 @@ impl Args {
             inspect_format: None,
             inspect_no_color: false,
             inspect_args: Vec::new(),
+            dev_word: false,
+            dev_raw: Vec::new(),
+            dev_format: None,
+            dev_no_color: false,
+            dev_socket_pre: None,
+            dev_instance_pre: None,
             verbose: false,
             log_level: None,
         }
@@ -872,13 +897,22 @@ fn parse_args(raw: &[String]) -> Args {
         }
         // Handle flags with `=` first
         if let Some(val) = token.strip_prefix("--format=") {
-            // Raw on purpose: validated at doctor/ctl/list/inspect dispatch
+            // Raw on purpose: validated at doctor/ctl/list/inspect/dev dispatch
             // (fail-closed exit 2 on unknown shapes, never warn-ignored).
-            // Merged CTX-0171 + CTX-0172 + CTX-0173: same token feeds every
-            // dispatch; the inactive dispatches ignore their field.
+            // Merged CTX-0171 + CTX-0172 + CTX-0173 + CTX-0174: same token feeds
+            // every dispatch; the inactive dispatches ignore their field.
+            // CTX-0174: post-`dev` tokens stay verbatim for
+            // `dev::parse_dev_request`, which owns `--format` validation
+            // there; pre-word values feed `dev_format`.
+            if out.dev_word {
+                out.dev_raw.push(token.clone());
+                i += 1;
+                continue;
+            }
             out.doctor_format = Some(val.to_string());
             out.list_format = Some(val.to_string());
             out.inspect_format = Some(val.to_string());
+            out.dev_format = Some(val.to_string());
             i += 1;
             continue;
         }
@@ -887,9 +921,18 @@ fn parse_args(raw: &[String]) -> Args {
             // raw on purpose, validated at ctl/list dispatch (exit 2 on shape).
             // After the `ctl` word tokens go verbatim to `ctl_raw` instead.
             // Merged CTX-0171 + CTX-0172: pre-word form feeds both dispatches.
+            // CTX-0174: post-`dev` tokens stay verbatim for
+            // `dev::parse_dev_request` (rejected local-only there); pre-word
+            // values are stashed for the dev dispatch to reject explicitly.
+            if out.dev_word {
+                out.dev_raw.push(token.clone());
+                i += 1;
+                continue;
+            }
             if !out.ctl_word {
                 out.ctl_socket_pre = Some(val.to_string());
                 out.list_socket = Some(val.to_string());
+                out.dev_socket_pre = Some(val.to_string());
             } else {
                 out.ctl_raw.push(token.clone());
             }
@@ -898,9 +941,18 @@ fn parse_args(raw: &[String]) -> Args {
         }
         if let Some(val) = token.strip_prefix("--instance=") {
             // Merged CTX-0171 + CTX-0172: pre-word form feeds both dispatches.
+            // CTX-0174: post-`dev` tokens stay verbatim for
+            // `dev::parse_dev_request` (rejected local-only there); pre-word
+            // values are stashed for the dev dispatch to reject explicitly.
+            if out.dev_word {
+                out.dev_raw.push(token.clone());
+                i += 1;
+                continue;
+            }
             if !out.ctl_word {
                 out.ctl_instance_pre = Some(val.to_string());
                 out.list_instance = Some(val.to_string());
+                out.dev_instance_pre = Some(val.to_string());
             } else {
                 out.ctl_raw.push(token.clone());
             }
@@ -1019,7 +1071,7 @@ fn parse_args(raw: &[String]) -> Args {
         }
         match token.as_str() {
             "--" => {
-                // In `list`/`inspect` mode `--` is a stray separator
+                // In `list`/`inspect`/`dev` mode `--` is a stray separator
                 // (UsageError at dispatch); elsewhere it ends flags for
                 // PROGRAM argv.
                 if out.list_word {
@@ -1029,6 +1081,11 @@ fn parse_args(raw: &[String]) -> Args {
                 }
                 if out.inspect_word {
                     out.inspect_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.dev_word {
+                    out.dev_raw.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1072,21 +1129,36 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             "--format" => {
-                // `bitty doctor/ctl/list/inspect --format SHAPE`: raw on
+                // `bitty doctor/ctl/list/inspect/dev --format SHAPE`: raw on
                 // purpose, validated at dispatch (fail-closed exit 2). Parsed
                 // globally so it composes before or after the subcommand word.
-                // Merged CTX-0171 + CTX-0172 + CTX-0173: same token feeds
-                // every dispatch; missing warns (doctor/ctl) and fail-closes
-                // list/inspect via empty.
+                // Merged CTX-0171 + CTX-0172 + CTX-0173 + CTX-0174: same token
+                // feeds every dispatch; missing warns (doctor/ctl) and
+                // fail-closes list/inspect/dev via empty.
+                // CTX-0174: post-`dev` pairs stay verbatim for
+                // `dev::parse_dev_request`; pre-word values feed `dev_format`.
+                if out.dev_word {
+                    out.dev_raw.push(token.clone());
+                    if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                        out.dev_raw.push(raw[i + 1].clone());
+                        i += 2;
+                    } else {
+                        out.dev_raw.push(String::new());
+                        i += 1;
+                    }
+                    continue;
+                }
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.doctor_format = Some(raw[i + 1].clone());
                     out.list_format = Some(raw[i + 1].clone());
                     out.inspect_format = Some(raw[i + 1].clone());
+                    out.dev_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
                     out.list_format = Some(String::new());
                     out.inspect_format = Some(String::new());
+                    out.dev_format = Some(String::new());
                     i += 1;
                 }
             }
@@ -1095,26 +1167,56 @@ fn parse_args(raw: &[String]) -> Args {
                 // Raw on purpose, validated at dispatch. After the `ctl` word
                 // tokens go verbatim to `ctl_raw` (see `ctl` arm below).
                 // Merged: feeds both; missing warns and fail-closes list.
+                // CTX-0174: post-`dev` pairs stay verbatim for
+                // `dev::parse_dev_request` (rejected local-only there);
+                // pre-word values are stashed for the dev dispatch to reject.
+                if out.dev_word {
+                    out.dev_raw.push(token.clone());
+                    if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                        out.dev_raw.push(raw[i + 1].clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.ctl_socket_pre = Some(raw[i + 1].clone());
                     out.list_socket = Some(raw[i + 1].clone());
+                    out.dev_socket_pre = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --socket needs a path — ignoring");
                     out.list_socket = Some(String::new());
+                    out.dev_socket_pre = Some(String::new());
                     i += 1;
                 }
             }
             "--instance" => {
                 // `bitty ctl/list --instance ID` global form (before the word).
                 // Merged: feeds both; missing warns and fail-closes list.
+                // CTX-0174: post-`dev` pairs stay verbatim for
+                // `dev::parse_dev_request` (rejected local-only there);
+                // pre-word values are stashed for the dev dispatch to reject.
+                if out.dev_word {
+                    out.dev_raw.push(token.clone());
+                    if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                        out.dev_raw.push(raw[i + 1].clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.ctl_instance_pre = Some(raw[i + 1].clone());
                     out.list_instance = Some(raw[i + 1].clone());
+                    out.dev_instance_pre = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --instance needs an id — ignoring");
                     out.list_instance = Some(String::new());
+                    out.dev_instance_pre = Some(String::new());
                     i += 1;
                 }
             }
@@ -1122,6 +1224,7 @@ fn parse_args(raw: &[String]) -> Args {
                 out.doctor_no_color = true;
                 out.list_no_color = true;
                 out.inspect_no_color = true;
+                out.dev_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1265,9 +1368,11 @@ fn parse_args(raw: &[String]) -> Args {
                 }
             }
             s if s.starts_with('-') => {
-                // In `list`/`inspect` mode unknown flags fail closed at
+                // In `list`/`inspect`/`dev` mode unknown flags fail closed at
                 // dispatch (exit 2); elsewhere keep the legacy warn-as-program
-                // behavior.
+                // behavior. (`dev` normally breaks verbatim at its word, so
+                // this arm only fires for flags before the word — kept for
+                // parity.)
                 if out.list_word {
                     out.list_args.push(token.clone());
                     i += 1;
@@ -1275,6 +1380,11 @@ fn parse_args(raw: &[String]) -> Args {
                 }
                 if out.inspect_word {
                     out.inspect_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.dev_word {
+                    out.dev_raw.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1302,6 +1412,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.ctl_word
                     && !out.list_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && token == "run"
                 {
                     out.run_word = true;
@@ -1322,6 +1433,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.doctor_word
                     && !out.list_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && token == "ctl"
                 {
                     out.ctl_word = true;
@@ -1338,6 +1450,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.list_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && token == "config"
                 {
                     out.config_word = true;
@@ -1388,6 +1501,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.list_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && token == "init"
                 {
                     out.init_word = true;
@@ -1416,6 +1530,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.list_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && token == "doctor"
                 {
                     out.doctor_word = true;
@@ -1441,6 +1556,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.ctl_word
                     && !out.inspect_word
+                    && !out.dev_word
                     && (token == "list" || token == "ls")
                 {
                     out.list_word = true;
@@ -1476,6 +1592,7 @@ fn parse_args(raw: &[String]) -> Args {
                     && !out.run_word
                     && !out.ctl_word
                     && !out.list_word
+                    && !out.dev_word
                     && token == "inspect"
                 {
                     out.inspect_word = true;
@@ -1499,6 +1616,27 @@ fn parse_args(raw: &[String]) -> Args {
                     }
                     i += 1;
                     continue;
+                }
+                // `bitty dev` tracing, captures, dumps, overlays (first
+                // positional only; CTX-0174). The word `dev` is always this
+                // subcommand, never a program named `dev`: use
+                // `bitty run -- dev ...` (or legacy `bitty -- dev ...`) for
+                // that program. Tokens after the word are kept verbatim for
+                // `dev::parse_dev_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && token == "dev"
+                {
+                    out.dev_word = true;
+                    out.dev_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
                 }
                 if !program_set {
                     out.program = Some(token.clone());
@@ -1610,6 +1748,9 @@ fn help_text() -> String {
              inspect <target> <value>  Explain state and ownership (local, safe mode)\n  \
                               command|key|plugin|config|protocol\n  \
                               (--format table|json|jsonl; `bitty inspect --help`)\n  \
+            dev <verb>       Developer tracing, captures, dumps, overlays\n  \
+                             (trace|capture|dump|overlay; local only, no\n  \
+                             instance; `bitty dev --help` for detail)\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -3254,6 +3395,70 @@ fn run_ctl_subcommand(args: &Args) -> i32 {
                 }
             }
             ctl::execute_ctl(&request, &targeting)
+        }
+    }
+}
+
+/// Runs `bitty dev <verb>`; returns the process exit code.
+///
+/// - `--help` (anywhere in `dev_raw`, or `bitty --help dev`) prints help to
+///   stdout, exit 0, and never builds a runtime.
+/// - Global `--format`/`--no-color` before the `dev` word compose with
+///   post-`dev` flags (post-`dev` `--format` wins when both set it; both
+///   unset means table).
+/// - Global `--socket`/`--instance` before the `dev` word are usage errors
+///   (exit 2): dev is local-only and never touches IPC discovery.
+/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
+/// - Post-parse failures (headless runtime/renderer) are generic errors
+///   (exit 1) with ok:false envelopes for json/jsonl.
+fn run_dev_subcommand(args: &Args) -> i32 {
+    match dev::parse_dev_request(&args.dev_raw) {
+        Err(dev::DevParseError::Help) => {
+            print!("{}", dev::dev_help_text());
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", err.message());
+            dev::EXIT_USAGE
+        }
+        Ok((request, mut options)) => {
+            // Global --format before `dev` applies when `dev` set none.
+            let post_has_format = args
+                .dev_raw
+                .iter()
+                .any(|t| t == "--format" || t.starts_with("--format="));
+            if !post_has_format {
+                if let Some(global) = args.dev_format.as_deref() {
+                    match dev::DevFormat::parse(Some(global)) {
+                        Ok(fmt) => options.format = fmt,
+                        Err(message) => {
+                            eprintln!("{message}\n{}", dev::dev_usage());
+                            return dev::EXIT_USAGE;
+                        }
+                    }
+                }
+            }
+            // Global --no-color composes (tables are plain; accepted for parity).
+            if args.dev_no_color {
+                options.no_color = true;
+            }
+            // Local-only: pre-word --socket/--instance are rejected (post-word
+            // spellings are already rejected by `parse_dev_request`).
+            if let Some(socket) = args.dev_socket_pre.as_deref() {
+                eprintln!(
+                    "bitty dev: --socket {socket:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
+                    dev::dev_usage()
+                );
+                return dev::EXIT_USAGE;
+            }
+            if let Some(instance) = args.dev_instance_pre.as_deref() {
+                eprintln!(
+                    "bitty dev: --instance {instance:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
+                    dev::dev_usage()
+                );
+                return dev::EXIT_USAGE;
+            }
+            dev::run_dev(&request, &options)
         }
     }
 }
@@ -5034,6 +5239,12 @@ fn main() {
         println!("{}", inspect::inspect_help_text());
         std::process::exit(0);
     }
+    // `bitty dev --help` shows dev help (never needs an instance or VM and
+    // never builds a runtime); bare `--help` shows the top-level help.
+    if args.help && args.dev_word {
+        println!("{}", dev::dev_help_text());
+        std::process::exit(0);
+    }
     if args.help {
         println!("{}", help_text());
         std::process::exit(0);
@@ -5117,6 +5328,14 @@ fn main() {
     // defaults and static manifests (no file I/O, no instance, no VM).
     if args.inspect_word {
         std::process::exit(run_inspect_subcommand(&args));
+    }
+
+    // `bitty dev <verb>` tracing, captures, dumps, overlays (CTX-0174,
+    // local class). Dispatched before config load and GUI startup: no
+    // instance, no IPC, no plugin VM. Parse failures are usage errors
+    // (exit 2); post-parse failures are generic errors (exit 1).
+    if args.dev_word {
+        std::process::exit(run_dev_subcommand(&args));
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a
@@ -6912,6 +7131,103 @@ mod tests {
         let help = help_text();
         assert!(help.contains("inspect <target>"));
         assert!(help.contains("command|key|plugin|config|protocol"));
+    }
+
+    #[test]
+    fn parse_dev_subcommand() {
+        // Bare `dev` captures no tokens (dispatch fails closed with usage).
+        let p = parse_args(&args_of(&["bitty", "dev"]));
+        assert!(p.dev_word);
+        assert!(p.dev_raw.is_empty());
+        assert_eq!(p.program, None);
+        assert!(!p.run_word);
+        assert!(!p.ctl_word);
+        assert!(!p.list_word);
+
+        // Tokens after the word go verbatim to `dev_raw`.
+        let p = parse_args(&args_of(&["bitty", "dev", "trace", "startup"]));
+        assert!(p.dev_word);
+        assert_eq!(p.dev_raw, vec!["trace".to_string(), "startup".to_string()]);
+
+        // Post-word flags stay verbatim for `dev::parse_dev_request`.
+        let p = parse_args(&args_of(&[
+            "bitty", "dev", "capture", "--layout", "split", "--format", "json",
+        ]));
+        assert!(p.dev_word);
+        assert_eq!(
+            p.dev_raw,
+            vec![
+                "capture".to_string(),
+                "--layout".to_string(),
+                "split".to_string(),
+                "--format".to_string(),
+                "json".to_string()
+            ]
+        );
+        assert_eq!(p.dev_format, None);
+
+        // Global flags before the word land in dev pre-fields.
+        let p = parse_args(&args_of(&["bitty", "--format", "json", "dev", "capture"]));
+        assert!(p.dev_word);
+        assert_eq!(p.dev_format.as_deref(), Some("json"));
+        assert_eq!(p.dev_raw, vec!["capture".to_string()]);
+
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "--socket",
+            "/tmp/a.sock",
+            "dev",
+            "capture",
+        ]));
+        assert!(p.dev_word);
+        assert_eq!(p.dev_socket_pre.as_deref(), Some("/tmp/a.sock"));
+        assert_eq!(p.dev_raw, vec!["capture".to_string()]);
+
+        // `--no-color` before the word lands in the dev pre-field; after the
+        // word it stays verbatim for `dev::parse_dev_request`.
+        let p = parse_args(&args_of(&["bitty", "--no-color", "dev", "capture"]));
+        assert!(p.dev_word);
+        assert!(p.dev_no_color);
+        assert_eq!(p.dev_raw, vec!["capture".to_string()]);
+
+        let p = parse_args(&args_of(&["bitty", "dev", "--no-color", "overlay", "list"]));
+        assert!(p.dev_word);
+        assert!(!p.dev_no_color);
+        assert_eq!(
+            p.dev_raw,
+            vec![
+                "--no-color".to_string(),
+                "overlay".to_string(),
+                "list".to_string()
+            ]
+        );
+
+        // Escape hatch: a program literally named `dev`.
+        let p = parse_args(&args_of(&["bitty", "--", "dev"]));
+        assert!(!p.dev_word);
+        assert_eq!(p.program.as_deref(), Some("dev"));
+
+        // `dev` after other subcommands belongs to that subcommand.
+        let p = parse_args(&args_of(&["bitty", "config", "dev"]));
+        assert!(p.config_word);
+        assert!(!p.dev_word);
+        let p = parse_args(&args_of(&["bitty", "doctor", "dev"]));
+        assert!(p.doctor_word);
+        assert!(!p.dev_word);
+        let p = parse_args(&args_of(&["bitty", "ctl", "dev"]));
+        assert!(p.ctl_word);
+        assert!(!p.dev_word);
+
+        // Other words after `dev` stay verbatim (dev dispatch rejects them).
+        let p = parse_args(&args_of(&["bitty", "dev", "ctl"]));
+        assert!(p.dev_word);
+        assert!(!p.ctl_word);
+        assert_eq!(p.dev_raw, vec!["ctl".to_string()]);
+
+        // Help mentions the new subcommand.
+        let help = help_text();
+        assert!(help.contains("dev <verb>"));
+        assert!(help.contains("bitty dev --help"));
     }
 
     #[test]

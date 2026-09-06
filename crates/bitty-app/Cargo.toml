@@ -20,8 +20,10 @@ path = "src/main.rs"
 [dependencies]
 bitty-config = { path = "../bitty-config" }
 bitty-ipc = { path = "../bitty-ipc" }
+bitty-perf = { path = "../bitty-perf" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-render = { path = "../bitty-render" }
+bitty-term-state = { path = "../bitty-term-state" }
 pollster = "1.0"

@@ -286,16 +286,19 @@ pub fn verify_install(inputs: &InstallInputs<'_>) -> Result<VerificationReport, 
                 inputs.expected_artifact_digest,
             )?;
             // V-C subsumes V-B for signed sources: if a TOFU store is present, also enforce pin check.
+            // Fail closed when the store is present but no candidate identity was supplied:
+            // silently skipping the pin check would let any valid keystore key rotate
+            // identity (CR-PKG-02). Mirrors V-B which requires a candidate identity.
             if let Some(store) = inputs.trust_store {
-                if let Some(candidate) = inputs.candidate_identity {
-                    let pid = bitty_package::PackageId::new(inputs.package_id).map_err(|e| {
-                        PackageError::source(format!(
-                            "invalid package id '{}': {e}",
-                            inputs.package_id
-                        ))
-                    })?;
-                    store.check(&pid, candidate)?;
-                }
+                let candidate = inputs.candidate_identity.ok_or_else(|| {
+                    PackageError::source(
+                        "trust V-C requires candidate identity when trust store is present (fail-closed: missing identity rejected)",
+                    )
+                })?;
+                let pid = bitty_package::PackageId::new(inputs.package_id).map_err(|e| {
+                    PackageError::source(format!("invalid package id '{}': {e}", inputs.package_id))
+                })?;
+                store.check(&pid, candidate)?;
             }
         }
     }
@@ -700,6 +703,154 @@ mod tests {
             ..inputs.clone()
         };
         assert!(verify_install(&inputs_rotated).is_ok());
+    }
+
+    #[test]
+    fn trust_vc_missing_candidate_with_store_fail_closed() {
+        // CR-PKG-02 regression: TrustMode::Signed with a trust store present but
+        // `candidate_identity == None` must fail closed, not silently skip pinning.
+        // Otherwise any valid keystore key could rotate publisher identity.
+        let manifest = minimal_package_manifest("xuepoo.c");
+        let manifest_digest = manifest.canonical_digest();
+        let artifact = b"artifact for signing";
+        let artifact_digest = sha256_hex(artifact);
+
+        let mut keys = KeyStore::new();
+        keys.insert(KeyRecord {
+            key_id: "k1".to_string(),
+            public_key_hex: "a".repeat(64),
+            revoked: false,
+        })
+        .unwrap();
+        let valid_sig = SignatureRecord {
+            key_id: "k1".to_string(),
+            signature_hex: stub_sign("k1", &manifest_digest, &artifact_digest),
+            manifest_digest: manifest_digest.clone(),
+            artifact_digest: artifact_digest.clone(),
+        };
+
+        let mut pinned_store = TrustStore::new();
+        pinned_store
+            .pin(TrustPin {
+                package: bitty_package::PackageId::new("xuepoo.c").unwrap(),
+                identity: "publisher-key".to_string(),
+                mode: TrustMode::TrustOnFirstUse,
+                first_seen: 1,
+            })
+            .unwrap();
+
+        #[allow(clippy::too_many_arguments)]
+        fn signed_inputs<'a>(
+            artifact: &'a [u8],
+            artifact_digest: &'a str,
+            manifest: &'a PackageManifest,
+            manifest_digest: &'a str,
+            candidate: Option<&'a str>,
+            store: Option<&'a TrustStore>,
+            sig: Option<&'a SignatureRecord>,
+            keys: Option<&'a KeyStore>,
+        ) -> InstallInputs<'a> {
+            InstallInputs {
+                artifact_bytes: artifact,
+                expected_artifact_digest: artifact_digest,
+                manifest,
+                expected_manifest_digest: manifest_digest,
+                granted_capabilities: &[],
+                requested_capabilities: &[],
+                capability_approval: false,
+                host_bitty_version: Some("0.6.0"),
+                host_plugin_api_version: Some("1.0.0"),
+                expected_content_root: None,
+                fetch_bytes: artifact.len(),
+                fetch_elapsed_ms: 10,
+                max_fetch_bytes: 10 * 1024 * 1024,
+                max_fetch_ms: 5000,
+                package_id: "xuepoo.c",
+                trust_mode: TrustMode::Signed,
+                candidate_identity: candidate,
+                trust_store: store,
+                signature: sig,
+                key_store: keys,
+                environment: None,
+            }
+        }
+
+        // 1. Pinned store + missing candidate must fail closed (the bypass).
+        let inputs_missing = signed_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            None,
+            Some(&pinned_store),
+            Some(&valid_sig),
+            Some(&keys),
+        );
+        let err = verify_install(&inputs_missing).unwrap_err();
+        assert!(
+            err.to_string().contains("candidate identity"),
+            "expected missing-identity fail-closed, got: {err}"
+        );
+
+        // 2. Empty store (first install) + missing candidate must also fail closed.
+        let empty_store = TrustStore::new();
+        let inputs_empty_missing = signed_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            None,
+            Some(&empty_store),
+            Some(&valid_sig),
+            Some(&keys),
+        );
+        let err = verify_install(&inputs_empty_missing).unwrap_err();
+        assert!(
+            err.to_string().contains("candidate identity"),
+            "expected missing-identity fail-closed on empty store, got: {err}"
+        );
+
+        // 3. TOFU unchanged: no store + no candidate still passes with a valid signature.
+        let inputs_no_store = signed_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            None,
+            None,
+            Some(&valid_sig),
+            Some(&keys),
+        );
+        assert!(verify_install(&inputs_no_store).is_ok());
+
+        // 4. Valid flow green: pinned store + matching candidate passes.
+        let inputs_matching = signed_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            Some("publisher-key"),
+            Some(&pinned_store),
+            Some(&valid_sig),
+            Some(&keys),
+        );
+        assert!(verify_install(&inputs_matching).is_ok());
+
+        // 5. Pin enforcement intact: pinned store + rotated candidate still blocks.
+        let inputs_rotated = signed_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            Some("attacker-key"),
+            Some(&pinned_store),
+            Some(&valid_sig),
+            Some(&keys),
+        );
+        let err = verify_install(&inputs_rotated).unwrap_err();
+        let doctor = DoctorIssue::from_package_error("xuepoo.c", &err);
+        assert_eq!(doctor.stage, "trust_pin");
+        assert_eq!(doctor.error_class, "trust");
     }
 
     #[test]

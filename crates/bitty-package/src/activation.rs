@@ -262,20 +262,22 @@ impl Environment {
     /// rollback targets if policy allows, but always enforces the bound.
     /// Returns the list of pruned ids.
     pub fn prune(&mut self) -> Vec<u64> {
-        if self.generations.len() <= self.policy.max_generations {
-            return Vec::new();
-        }
-        // Oldest first (by id).
-        let mut ids: Vec<u64> = self.generations.keys().copied().collect();
-        ids.sort_unstable();
-        let to_remove = self.generations.len() - self.policy.max_generations;
         let mut pruned = Vec::new();
-        for id in ids.into_iter().take(to_remove) {
-            if Some(id) == self.current {
-                continue;
-            }
-            self.generations.remove(&id);
-            pruned.push(id);
+        // Remove oldest non-current generations until within the bound.
+        // The current generation is filtered out of the candidates first so
+        // skipping it cannot leave the map over the ceiling (rollback cycles
+        // that pin `current` to an old generation must still converge).
+        while self.generations.len() > self.policy.max_generations {
+            let Some(oldest) = self
+                .generations
+                .keys()
+                .copied()
+                .find(|id| Some(*id) != self.current)
+            else {
+                break;
+            };
+            self.generations.remove(&oldest);
+            pruned.push(oldest);
         }
         pruned
     }
@@ -687,6 +689,78 @@ mod tests {
         assert!(!env.is_retained(id1) || env.retained_count() <= 2);
         assert!(env.is_retained(id3));
         assert_eq!(env.current, Some(id3));
+    }
+
+    #[test]
+    fn prune_with_current_oldest_still_respects_ceiling() {
+        // CR-PKG-01: `prune` computed `take(to_remove)` before filtering
+        // `current`, so pinning `current` to the oldest generation left the
+        // map over the ceiling. Filter current first, loop while over bound.
+        let mut env = Environment::with_policy(RetentionPolicy {
+            max_generations: 3,
+            max_bytes: 0,
+        })
+        .unwrap();
+        let id1 = env.stage(test_lock(), BTreeMap::new(), 1).unwrap();
+        activate(&mut env, id1, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        let id2 = env.stage(test_lock(), BTreeMap::new(), 2).unwrap();
+        activate(&mut env, id2, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        let id3 = env.stage(test_lock(), BTreeMap::new(), 3).unwrap();
+        activate(&mut env, id3, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        // Pin current to the oldest retained generation (as a rollback does),
+        // then overfill with staged-but-not-yet-active generations.
+        rollback_full(&mut env, id1, None).unwrap();
+        assert_eq!(env.current, Some(id1));
+        env.stage(test_lock(), BTreeMap::new(), 4).unwrap();
+        env.stage(test_lock(), BTreeMap::new(), 5).unwrap();
+        assert_eq!(env.retained_count(), 5);
+        let pruned = env.prune();
+        assert!(env.is_retained(id1), "current must never be pruned");
+        assert_eq!(
+            env.retained_count(),
+            3,
+            "prune must converge to ceiling even when current is oldest"
+        );
+        // Oldest non-current generations go first.
+        assert!(!env.is_retained(id2));
+        assert!(!env.is_retained(id3));
+        assert_eq!(pruned.len(), 2);
+    }
+
+    #[test]
+    fn rollback_cycles_remain_bounded() {
+        // CR-PKG-01: failed activations leave staged generations behind
+        // without pruning; a later rollback pins `current` to an old
+        // generation and the old `take`-before-filter left the map over the
+        // ceiling, so repeated cycles grew generations without bound.
+        let mut env = Environment::with_policy(RetentionPolicy {
+            max_generations: 3,
+            max_bytes: 0,
+        })
+        .unwrap();
+        let id1 = env.stage(test_lock(), BTreeMap::new(), 1).unwrap();
+        activate(&mut env, id1, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        for i in 0..10u64 {
+            let id = env.stage(test_lock(), BTreeMap::new(), 100 + i).unwrap();
+            // Alternate success / Wake failure: failures keep the staged
+            // generation retained with no prune, mimicking real churn.
+            let fail = if i % 2 == 0 {
+                None
+            } else {
+                Some(ActivationPhase::Wake)
+            };
+            activate(&mut env, id, Some("0.6.0"), Some("1.0.0"), fail).unwrap();
+            // Roll back to the earliest still-retained generation each cycle.
+            let earliest = *env.generations.keys().next().unwrap();
+            rollback_full(&mut env, earliest, None).unwrap();
+            assert_eq!(env.current, Some(earliest));
+            assert!(env.is_retained(earliest), "current must never be pruned");
+            assert!(
+                env.retained_count() <= 3,
+                "cycle {i}: retained {} exceeds ceiling 3",
+                env.retained_count()
+            );
+        }
     }
 
     #[test]

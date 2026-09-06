@@ -341,6 +341,11 @@ struct Args {
     /// `PtyBuilder::arg` because `Runtime::spawn_shell` currently takes a
     /// single `&str` — documented as a follow-up).
     program_args: Vec<String>,
+    /// First unknown pre-`--` dash-flag (CR-APP-01 fail-closed, exit 2).
+    /// A `-`-prefixed token before any positional program is never a
+    /// program to spawn (a typo must not execute a binary); after a
+    /// program is set, dash-tokens are that program's argv tail instead.
+    unknown_flag: Option<String>,
     /// Optional split axis (from `--split`).
     split_axis: Option<SplitAxis>,
     /// Optional split ratio (from `--split-ratio` or `--split` colon form).
@@ -549,6 +554,7 @@ impl Args {
             version: false,
             program: None,
             program_args: Vec::new(),
+            unknown_flag: None,
             split_axis: None,
             split_ratio: None,
             stack: false,
@@ -1369,10 +1375,12 @@ fn parse_args(raw: &[String]) -> Args {
             }
             s if s.starts_with('-') => {
                 // In `list`/`inspect`/`dev` mode unknown flags fail closed at
-                // dispatch (exit 2); elsewhere keep the legacy warn-as-program
-                // behavior. (`dev` normally breaks verbatim at its word, so
-                // this arm only fires for flags before the word — kept for
-                // parity.)
+                // dispatch (exit 2); elsewhere a `-`-prefixed token before
+                // any positional program is a usage error (CR-APP-01, exit
+                // 2), never a program to spawn. Once a program is set,
+                // dash-tokens are that program's argv tail (e.g. `cat -A`).
+                // (`dev` normally breaks verbatim at its word, so this arm
+                // only fires for flags before the word — kept for parity.)
                 if out.list_word {
                     out.list_args.push(token.clone());
                     i += 1;
@@ -1388,12 +1396,13 @@ fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
-                eprintln!("warning: unknown flag {s:?} — treating as program name");
-                if !program_set {
-                    out.program = Some(token.clone());
-                    program_set = true;
-                } else {
+                if program_set {
                     out.program_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.unknown_flag.is_none() {
+                    out.unknown_flag = Some(token.clone());
                 }
                 i += 1;
             }
@@ -5254,6 +5263,14 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Unknown pre-`--` dash-flags are usage errors (CR-APP-01, exit 2):
+    // a typo must never be spawned as a program. Only post-`--` tokens
+    // (parsed above into `program`/`program_args`) may name a program.
+    if let Some(flag) = args.unknown_flag.as_deref() {
+        eprintln!("bitty: unknown flag '{flag}'\n{}", help_text());
+        std::process::exit(2);
+    }
+
     // `bitty run -- COMMAND...` explicit child launch (CTX-0170, local
     // class). Dispatched before config load and GUI startup: no instance,
     // no IPC, no plugin VM. Exit code is the child's (passthrough);
@@ -5883,6 +5900,49 @@ mod tests {
         assert!(p.headless);
         assert!(!p.help);
         assert_eq!(p.program.as_deref(), Some("--help"));
+    }
+
+    #[test]
+    fn parse_unknown_flag_fails_closed_never_a_program() {
+        // CR-APP-01: a typo'd flag must not be spawned as a program.
+        // Dispatch rejects via usage + exit 2; parse records the flag.
+        let p = parse_args(&args_of(&["bitty", "--bogus"]));
+        assert_eq!(p.unknown_flag.as_deref(), Some("--bogus"));
+        assert_eq!(p.program, None);
+        assert!(p.program_args.is_empty());
+
+        let p = parse_args(&args_of(&["bitty", "-x"]));
+        assert_eq!(p.unknown_flag.as_deref(), Some("-x"));
+        assert_eq!(p.program, None);
+
+        // Unknown `=` flags are rejected the same way.
+        let p = parse_args(&args_of(&["bitty", "--bogus=1"]));
+        assert_eq!(p.unknown_flag.as_deref(), Some("--bogus=1"));
+        assert_eq!(p.program, None);
+
+        // Known flags still parse; the first unknown flag is recorded.
+        let p = parse_args(&args_of(&["bitty", "--headless", "--bogus"]));
+        assert!(p.headless);
+        assert_eq!(p.unknown_flag.as_deref(), Some("--bogus"));
+        assert_eq!(p.program, None);
+
+        // Post-`--` dash-tokens are program argv (escape hatch intact).
+        let p = parse_args(&args_of(&["bitty", "--", "--bogus"]));
+        assert_eq!(p.unknown_flag, None);
+        assert_eq!(p.program.as_deref(), Some("--bogus"));
+
+        // Dash-tokens after an explicit program are that program's args
+        // (e.g. `bitty /bin/cat -A` keeps working).
+        let p = parse_args(&args_of(&["bitty", "/bin/cat", "-A"]));
+        assert_eq!(p.unknown_flag, None);
+        assert_eq!(p.program.as_deref(), Some("/bin/cat"));
+        assert_eq!(p.program_args, vec!["-A"]);
+
+        // `run -- <prog>` escape hatch stays intact (verbatim raw tail).
+        let p = parse_args(&args_of(&["bitty", "run", "--", "--bogus"]));
+        assert!(p.run_word);
+        assert_eq!(p.unknown_flag, None);
+        assert_eq!(p.program, None);
     }
 
     #[test]

@@ -4044,13 +4044,26 @@ pub fn prepare_socket_dir(socket_path: &str) -> Result<DirAttestation, IpcError>
 }
 
 /// Read owner/mode attestation for an existing directory.
+///
+/// CR-IPC-01 (fail-closed): uses `symlink_metadata` and rejects symlinks
+/// outright. `std::fs::metadata` follows symlinks, which would let a second
+/// local user redirect the socket directory to an attacker-controlled target
+/// on a multi-user machine and have its mode/owner attested as ours.
 #[cfg(unix)]
 fn attestation_for(parent: &std::path::Path) -> Result<DirAttestation, IpcError> {
     use std::os::unix::fs::MetadataExt;
 
-    let meta = std::fs::metadata(parent).map_err(|err| IpcError::Unavailable {
+    let meta = std::fs::symlink_metadata(parent).map_err(|err| IpcError::Unavailable {
         reason: format!("cannot stat socket directory {}: {err}", parent.display()),
     })?;
+    if meta.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket directory {} is a symlink (refusing to serve)",
+                parent.display()
+            ),
+        });
+    }
     let dir_mode = meta.mode() & 0o777;
     if dir_mode != DIR_MODE {
         return Err(IpcError::Unauthenticated {
@@ -4066,7 +4079,30 @@ fn attestation_for(parent: &std::path::Path) -> Result<DirAttestation, IpcError>
     })
 }
 
+/// Fail-closed pre-check: reject a symlinked socket path before chmod.
+///
+/// `set_permissions` follows symlinks, so without this guard a symlinked
+/// socket path would chmod an attacker-chosen target. Missing paths map to
+/// `Unavailable` (filesystem failure); symlinks map to `Unauthenticated`.
+#[cfg(unix)]
+fn reject_socket_symlink(socket_path: &str) -> Result<(), IpcError> {
+    let pre = std::fs::symlink_metadata(socket_path).map_err(|err| IpcError::Unavailable {
+        reason: format!("cannot stat bound socket: {err}"),
+    })?;
+    if pre.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: "bound socket is a symlink (refusing to serve)".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Attest a freshly bound socket: enforce `0600` and verify endpoint.
+///
+/// CR-IPC-01 (fail-closed): the socket path is `symlink_metadata`-checked
+/// and symlink-rejected both before `set_permissions` (so a symlink can never
+/// redirect the `0600` chmod onto another owner's file) and after (so a
+/// swapped-in symlink is never attested as the bound socket).
 ///
 /// The socket file owner is the serving euid (this process just created it),
 /// so `runtime_uid` is established here without `getuid`. Requires the
@@ -4082,14 +4118,20 @@ fn attestation_for(parent: &std::path::Path) -> Result<DirAttestation, IpcError>
 pub fn attest_bound_socket(socket_path: &str, dir: &DirAttestation) -> Result<u32, IpcError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    reject_socket_symlink(socket_path)?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE)).map_err(
         |err| IpcError::Unavailable {
             reason: format!("cannot set socket mode 0600: {err}"),
         },
     )?;
-    let meta = std::fs::metadata(socket_path).map_err(|err| IpcError::Unavailable {
+    let meta = std::fs::symlink_metadata(socket_path).map_err(|err| IpcError::Unavailable {
         reason: format!("cannot stat bound socket: {err}"),
     })?;
+    if meta.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: "bound socket is a symlink (refusing to serve)".into(),
+        });
+    }
     let sock_mode = meta.mode() & 0o777;
     if sock_mode != SOCKET_MODE {
         return Err(IpcError::Unauthenticated {
@@ -4929,6 +4971,68 @@ mod tests {
         let socket_str = leaf.join("t.sock").to_str().unwrap().to_string();
         let err = prepare_socket_dir(&socket_str).unwrap_err();
         assert!(matches!(err, IpcError::Unauthenticated { .. }));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// CR-IPC-01: a symlinked socket directory must fail closed even when the
+    /// link target is a well-formed `0700` directory owned by us.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_socket_dir_rejects_symlinked_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "bitty-ctx0203-{}-{}",
+            std::process::id(),
+            "symlink-leaf"
+        ));
+        let target = base.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.join("bitty");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let socket_str = link.join("t.sock").to_str().unwrap().to_string();
+        let err = prepare_socket_dir(&socket_str).unwrap_err();
+        assert!(
+            matches!(err, IpcError::Unauthenticated { .. }),
+            "symlinked leaf must fail closed, got: {err:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// CR-IPC-01: a symlinked socket path must fail closed before any chmod
+    /// is applied to its target.
+    #[cfg(unix)]
+    #[test]
+    fn attest_bound_socket_rejects_symlink() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "bitty-ctx0203-{}-{}",
+            std::process::id(),
+            "symlink-sock"
+        ));
+        let dir_path = base.join("bitty");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_str = dir_path.join("t.sock").to_str().unwrap().to_string();
+        let attestation = prepare_socket_dir(&socket_str).unwrap();
+
+        let real = dir_path.join("real.sock");
+        std::fs::write(&real, b"x").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link_path = dir_path.join("link.sock");
+        std::os::unix::fs::symlink(&real, &link_path).unwrap();
+        let link_str = link_path.to_str().unwrap();
+
+        let err = attest_bound_socket(link_str, &attestation).unwrap_err();
+        assert!(
+            matches!(err, IpcError::Unauthenticated { .. }),
+            "symlinked socket must fail closed, got: {err:?}"
+        );
+        // Fail-closed before chmod: the link target keeps its pre-existing mode.
+        let target_mode = std::fs::metadata(&real).unwrap().mode() & 0o777;
+        assert_eq!(target_mode, 0o644);
         std::fs::remove_dir_all(&base).ok();
     }
 

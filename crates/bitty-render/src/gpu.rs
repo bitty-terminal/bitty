@@ -491,6 +491,44 @@ impl SurfaceState {
     }
 }
 
+/// Hard cap on headless surface bytes (64 MiB): a 4-byte-per-pixel RGBA
+/// surface can therefore never exceed 16 Mi pixels.
+///
+/// Mirrors [`crate::software::MAX_SURFACE_BYTES`]. It lives here (rather than
+/// importing from `software`) because `software` is gated behind the
+/// `sw-fallback` feature while the headless fake compiles in every build: a
+/// `#[cfg(feature = "sw-fallback")]` test below pins the two values together
+/// so the mirror cannot drift silently.
+pub const MAX_HEADLESS_SURFACE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Checked headless RGBA buffer length for `width` x `height` (4 bytes per
+/// pixel), bounded by [`MAX_HEADLESS_SURFACE_BYTES`].
+///
+/// # Errors
+///
+/// [`RenderError::InvalidInput`] when the byte size exceeds the cap or does
+/// not fit the address space. Arithmetic uses checked `u64` multiplication so
+/// extreme `u32` extents fail closed instead of overflowing `usize` or OOMing
+/// the host (CR-RENDER-01).
+fn headless_buffer_len(width: u32, height: u32) -> Result<usize, RenderError> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(RenderError::InvalidInput {
+            reason: "headless surface size does not fit the address space",
+        })?;
+    if bytes > MAX_HEADLESS_SURFACE_BYTES as u64 {
+        return Err(RenderError::InvalidInput {
+            reason: "headless surface exceeds the configured byte cap",
+        });
+    }
+    // The cap check above bounds the allocation; conversion back to `usize`
+    // cannot fail on any supported target.
+    usize::try_from(bytes).map_err(|_| RenderError::InvalidInput {
+        reason: "headless surface size does not fit the address space",
+    })
+}
+
 /// An owned GPU surface: either a real `wgpu` surface created from a
 /// [`SurfaceTarget`] or a headless fake for unit tests.
 ///
@@ -829,7 +867,10 @@ impl Surface {
                 // feature is not required for headless tests.
                 let width = config.extent.width();
                 let height = config.extent.height();
-                let mut rgba = vec![0u8; width as usize * height as usize * 4];
+                // CR-RENDER-01: fail closed before allocating; extreme extents
+                // must not reach `vec!` unchecked.
+                let len = headless_buffer_len(width, height)?;
+                let mut rgba = vec![0u8; len];
                 // Clear to the theme background (premultiplied) — Bitty Dark
                 // via `crate::grid::DEFAULT_BG`; matches the GPU clear
                 // color above.
@@ -1104,7 +1145,10 @@ impl Surface {
         }
         let width = config.extent.width();
         let height = config.extent.height();
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        // CR-RENDER-01: fail closed before allocating; extreme extents must
+        // not reach `vec!` unchecked.
+        let len = headless_buffer_len(width, height)?;
+        let mut rgba = vec![0u8; len];
         {
             let bg = crate::grid::DEFAULT_BG;
             let pr = premultiply(bg[0], bg[3]);
@@ -1669,5 +1713,73 @@ mod tests {
         assert!(rgba.chunks_exact(4).all(|px| px == &rgba[0..4]));
         // And the render-side default matches the same preset entry.
         assert_eq!(crate::grid::DEFAULT_BG[..3], theme_bg);
+    }
+
+    #[test]
+    fn headless_buffer_len_enforces_byte_cap_without_allocating() {
+        // CR-RENDER-01: `u64` checked arithmetic — no `as usize` overflow,
+        // no allocation in this unit test.
+        assert_eq!(headless_buffer_len(4, 2).unwrap(), 32);
+        // Exactly at the cap is allowed: 4096 * 4096 * 4 == 64 MiB.
+        assert_eq!(
+            headless_buffer_len(4096, 4096).unwrap(),
+            MAX_HEADLESS_SURFACE_BYTES
+        );
+        // One row over the cap fails closed.
+        assert!(matches!(
+            headless_buffer_len(4097, 4096),
+            Err(RenderError::InvalidInput { .. })
+        ));
+        // Extreme `u32` extents fail closed instead of overflowing or OOMing.
+        assert!(matches!(
+            headless_buffer_len(u32::MAX, u32::MAX),
+            Err(RenderError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            headless_buffer_len(u32::MAX, 1),
+            Err(RenderError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn headless_present_rejects_extreme_extents_without_allocating() {
+        // CR-RENDER-01 regression: 5000 * 5000 * 4 = 100 MiB > 64 MiB cap.
+        // Creation only validates non-zero extents; the present path must
+        // fail closed *before* allocating.
+        let surface = Surface::headless(PhysicalSize::new(5000, 5000)).expect("valid extent");
+        let empty = crate::grid::DrawList {
+            generation: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(5000, 5000),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![],
+            },
+            fills: vec![],
+            glyphs: vec![],
+        };
+        let err = surface
+            .headless_present(&empty, None)
+            .expect_err("over-cap present must fail");
+        assert!(matches!(err, RenderError::InvalidInput { .. }));
+        // No partial buffer is stored ...
+        assert!(surface.headless_rgba().is_none());
+        // ... and the surface still serves normal frames afterwards.
+        surface
+            .headless_resize(PhysicalSize::new(32, 16))
+            .expect("resize to normal extent");
+        surface
+            .headless_present(&empty, None)
+            .expect("normal present after rejected extreme");
+        assert_eq!(surface.headless_rgba().unwrap().len(), 32 * 16 * 4);
+    }
+
+    #[cfg(feature = "sw-fallback")]
+    #[test]
+    fn headless_cap_matches_software_cap() {
+        // The headless mirror must not drift from the canonical software cap.
+        assert_eq!(
+            MAX_HEADLESS_SURFACE_BYTES,
+            crate::software::MAX_SURFACE_BYTES
+        );
     }
 }

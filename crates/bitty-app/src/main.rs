@@ -197,6 +197,7 @@ use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View
 
 mod doctor;
 mod ipc_serve;
+mod run;
 
 // ---------------------------------------------------------------------------
 // Args
@@ -412,6 +413,15 @@ struct Args {
     doctor_no_color: bool,
     /// Unexpected extra positionals in doctor mode (dispatch errors).
     doctor_args: Vec<String>,
+    /// `bitty run -- COMMAND...` explicit child launch (CTX-0170).
+    /// True once the first positional `run` word is seen (subcommand mode);
+    /// a program literally named `run` needs `bitty run -- run ...` or the
+    /// legacy `bitty -- run ...`. Tokens after the word land verbatim in
+    /// `run_raw` for [`run::parse_run_request`]; `--` is required there.
+    run_word: bool,
+    /// Raw tokens after the `run` word (options, `--`, COMMAND) for
+    /// [`run::parse_run_request`]. Empty until `run_word` is set.
+    run_raw: Vec<String>,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -485,6 +495,8 @@ impl Args {
             doctor_format: None,
             doctor_no_color: false,
             doctor_args: Vec::new(),
+            run_word: false,
+            run_raw: Vec::new(),
             verbose: false,
             log_level: None,
         }
@@ -724,6 +736,10 @@ fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>) {
 /// - `--yes` → init-only: skip prompts, write sane defaults (CTX-0149).
 /// - `--force` → init-only: overwrite an existing config file, backing it
 ///   up to `<file>.bak` first (CTX-0149).
+/// - `run [OPTIONS] -- COMMAND...` → explicit child launch (CTX-0170);
+///   a program literally named `run` needs `bitty run -- run ...` or
+///   `bitty -- run ...`. Tokens after `run` are kept verbatim for
+///   `run::parse_run_request`, which requires `--` before COMMAND.
 /// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
 ///   literally named `config` needs `bitty -- config ...`
 /// - `init [--yes] [--force]` → opt-in setup wizard (#243, CTX-0149);
@@ -1094,6 +1110,23 @@ fn parse_args(raw: &[String]) -> Args {
                 i += 1;
             }
             _ => {
+                // `bitty run -- COMMAND...` explicit child launch (CTX-0170,
+                // first positional only; `--` escape bypasses via
+                // after_double_dash). The word `run` is always this
+                // subcommand, never a program named `run`: use
+                // `bitty run -- run ...` (or legacy `bitty -- run ...`) for
+                // that program. Tokens after the word are kept verbatim for
+                // `run::parse_run_request`, which enforces the required `--`.
+                if !program_set
+                    && !out.config_word
+                    && !out.init_word
+                    && !out.run_word
+                    && token == "run"
+                {
+                    out.run_word = true;
+                    out.run_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
                 // `bitty config <verb>` subcommand (first positional only;
                 // `--` escape hatch bypasses this via after_double_dash).
                 // A program literally named `config` needs `bitty -- config`.
@@ -1243,8 +1276,12 @@ fn help_text() -> String {
                 --no-color     Disable ANSI coloring in doctor table output\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
-         Subcommands (CLI-first management, DEC-0007):\n  \
-           config path      Print the resolved config file path\n  \
+          Subcommands (CLI-first management, DEC-0007):\n  \
+            run [--cwd PATH] [--env K=V ...] [--title S] -- COMMAND...  Explicit child launch (local)\n  \
+                             Runs COMMAND directly (no shell); `--` is required;\n  \
+                             exit code is the child's. `bitty htop` never means\n  \
+                             `bitty run -- htop`; colliding names need `run --`.\n  \
+            config path      Print the resolved config file path\n  \
            config check     Load + validate; print per-key sources\n  \
                             (cli/file/default), exit non-zero on invalid files\n  \
             config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
@@ -1311,6 +1348,9 @@ fn help_text() -> String {
          Examples:\n  \
            bitty --help\n  \
            bitty --version\n  \
+           bitty run --help\n  \
+           bitty run -- htop\n  \
+           bitty run --cwd /tmp --env FOO=bar -- printenv FOO\n  \
            bitty --headless\n  \
            bitty --headless --split v --focus next\n  \
            bitty --headless --layout stack:2 --focus 2\n  \
@@ -4521,6 +4561,27 @@ fn main() {
     if args.version {
         println!("{}", version_text());
         std::process::exit(0);
+    }
+
+    // `bitty run -- COMMAND...` explicit child launch (CTX-0170, local
+    // class). Dispatched before config load and GUI startup: no instance,
+    // no IPC, no plugin VM. Exit code is the child's (passthrough);
+    // parse failures are usage errors (exit 2).
+    if args.run_word {
+        match run::parse_run_request(&args.run_raw) {
+            Err(run::RunParseError::Help) => {
+                print!("{}", run::run_help_text());
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("{}\n{}", err.message(), run::run_usage());
+                std::process::exit(2);
+            }
+            Ok(req) => {
+                let code = run::execute_run(&req);
+                std::process::exit(code);
+            }
+        }
     }
 
     // `bitty config` subcommand first (CLI-first management per DEC-0007).

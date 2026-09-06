@@ -113,6 +113,7 @@
 
 pub mod auth;
 pub mod channel;
+pub mod ctl;
 pub mod devtools;
 pub mod error;
 pub mod frame;

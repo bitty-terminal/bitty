@@ -943,16 +943,28 @@ impl State {
             }
             TerminalAction::TabClearAll => self.tabs.clear_all(),
             TerminalAction::TabForward { n } => {
+                // CR-TERM-02: break at the right margin so a 65535-count
+                // tab run from untrusted input cannot burn 65k lattice
+                // scans; iterations past the margin are no-ops.
+                let last = self.width - 1;
                 let mut col = self.cursor.position.col as usize;
                 for _ in 0..effective_count(*n) {
-                    col = self.tabs.next_after(col).unwrap_or(self.width - 1);
+                    if col >= last {
+                        break;
+                    }
+                    col = self.tabs.next_after(col).unwrap_or(last);
                 }
                 self.cursor.position.col = col as u16;
                 self.cursor.pending_wrap = false;
             }
             TerminalAction::TabBackward { n } => {
+                // CR-TERM-02: symmetric left-margin break for the same
+                // amplification class (iterations at column 0 are no-ops).
                 let mut col = self.cursor.position.col as usize;
                 for _ in 0..effective_count(*n) {
+                    if col == 0 {
+                        break;
+                    }
                     col = self.tabs.prev_before(col).unwrap_or(0);
                 }
                 self.cursor.position.col = col as u16;
@@ -1188,37 +1200,51 @@ impl State {
                 self.cursor.position.row = row.saturating_add(n).min(ceiling).min(last_row);
             }
             Direction::Right => {
+                // CR-TERM-02: break at the right margin so a 65535-count
+                // CUF from untrusted input cannot amplify into 65k grid
+                // probes; iterations past the margin are no-ops.
+                let last = last_col as usize;
                 let mut c = col as usize;
                 for _ in 0..n {
-                    if c < last_col as usize {
-                        c += 1;
-                        // Hop across a wide pair's trailing half so the
-                        // cursor never rests on a spacer (invariant 3);
-                        // a pair ending at the last column returns the
-                        // cursor to its leading half.
-                        if self
-                            .screens_active()
-                            .get(self.cursor.position.row as usize, c)
-                            .spacer
-                        {
-                            c = if c < last_col as usize { c + 1 } else { c - 1 };
+                    if c >= last {
+                        break;
+                    }
+                    c += 1;
+                    // Hop across a wide pair's trailing half so the
+                    // cursor never rests on a spacer (invariant 3).
+                    if self
+                        .screens_active()
+                        .get(self.cursor.position.row as usize, c)
+                        .spacer
+                    {
+                        if c < last {
+                            c += 1;
+                        } else {
+                            // A pair ending at the last column returns the
+                            // cursor to its leading half: a fixed point, so
+                            // every remaining step is a no-op.
+                            c -= 1;
+                            break;
                         }
                     }
                 }
                 self.cursor.position.col = c as u16;
             }
             Direction::Left => {
+                // CR-TERM-02: symmetric left-margin break for CUB
+                // (iterations at column 0 are no-ops).
                 let mut c = col as usize;
                 for _ in 0..n {
-                    if c > 0 {
-                        c -= 1;
-                        if self
-                            .screens_active()
-                            .get(self.cursor.position.row as usize, c)
-                            .spacer
-                        {
-                            c = c.saturating_sub(1);
-                        }
+                    if c == 0 {
+                        break;
+                    }
+                    c -= 1;
+                    if self
+                        .screens_active()
+                        .get(self.cursor.position.row as usize, c)
+                        .spacer
+                    {
+                        c = c.saturating_sub(1);
                     }
                 }
                 self.cursor.position.col = c as u16;
@@ -1279,9 +1305,15 @@ impl State {
     }
 
     fn tab_forward_steps(&mut self, steps: u16) {
+        // CR-TERM-02: break at the right margin (same rationale as the
+        // TabForward dispatch arm above).
+        let last = self.width - 1;
         let mut col = self.cursor.position.col as usize;
         for _ in 0..steps {
-            col = self.tabs.next_after(col).unwrap_or(self.width - 1);
+            if col >= last {
+                break;
+            }
+            col = self.tabs.next_after(col).unwrap_or(last);
         }
         self.cursor.position.col = col as u16;
         self.cursor.pending_wrap = false;
@@ -2299,6 +2331,108 @@ mod tests {
                 .all(|c| c.style.background == Some(Color::Indexed(4))),
             "every fullscreen row must be blue after EL fills"
         );
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_large_cursor_right_stops_at_margin() {
+        // CR-TERM-02: a 65535-count CUF must terminate at the right margin
+        // instead of burning 65k grid probes.
+        let mut s = State::new();
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Right,
+            n: Count(u16::MAX),
+        });
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_small_cursor_moves_stay_exact() {
+        // Normal moves keep exact step semantics after the margin breaks.
+        let mut s = State::new();
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Right,
+            n: Count(3),
+        });
+        assert_eq!(s.cursor().position.col, 3);
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Left,
+            n: Count(2),
+        });
+        assert_eq!(s.cursor().position.col, 1);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_large_cursor_left_stops_at_zero() {
+        // CR-TERM-02: symmetric CUB bound at the left margin.
+        let mut s = State::new();
+        s.apply(&TerminalAction::CursorPosition {
+            row: Row::SENTINEL,
+            col: Col(71),
+        });
+        assert_eq!(s.cursor().position.col, 70);
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Left,
+            n: Count(u16::MAX),
+        });
+        assert_eq!(s.cursor().position.col, 0);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_wide_pair_at_margin_right_is_stable() {
+        // A wide pair ending at the last column is the Right fixed point:
+        // stepping right returns to the leading half and must terminate.
+        let mut s = State::new();
+        prints(&mut s, &"a".repeat(GRID_COLUMNS - 2));
+        prints(&mut s, "中");
+        s.apply(&TerminalAction::CursorPosition {
+            row: Row::SENTINEL,
+            col: Col(GRID_COLUMNS as u16 - 1),
+        });
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 2);
+        s.apply(&TerminalAction::CursorMove {
+            dir: Direction::Right,
+            n: Count(u16::MAX),
+        });
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 2);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_large_tab_forward_stops_at_margin() {
+        // CR-TERM-02: a 65535-count tab run must terminate at the right
+        // margin instead of burning 65k lattice scans.
+        let mut s = State::new();
+        s.apply(&TerminalAction::TabForward { n: Count(u16::MAX) });
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_small_tab_steps_stay_exact() {
+        // Normal tab steps keep exact lattice semantics after the breaks.
+        let mut s = State::new();
+        s.apply(&TerminalAction::TabForward { n: Count(1) });
+        assert_eq!(s.cursor().position.col, 8);
+        s.apply(&TerminalAction::TabBackward { n: Count(1) });
+        assert_eq!(s.cursor().position.col, 0);
+        assert!(s.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn ctx_0205_large_tab_backward_stops_at_zero() {
+        // CR-TERM-02: symmetric backward-tab bound at column 0.
+        let mut s = State::new();
+        s.apply(&TerminalAction::CursorPosition {
+            row: Row::SENTINEL,
+            col: Col(GRID_COLUMNS as u16),
+        });
+        assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
+        s.apply(&TerminalAction::TabBackward { n: Count(u16::MAX) });
+        assert_eq!(s.cursor().position.col, 0);
         assert!(s.check_invariants().is_ok());
     }
 }

@@ -15,7 +15,7 @@
 //!   return `PlatformError::DisplayUnavailable` instead of panicking. The
 //!   test accepts both the live-window path and the headless error path so
 //!   `cargo test` stays green in either environment (feature flag `headless`
-//!   or default). See `headless` feature in `Cargo.toml` and `bitty-app`
+//!   or default). See `headless` feature in `Cargo.toml` and `bitty`
 //!   `--headless` fallback.
 //!
 //! The owned headless logic (DPI conversions, resize-extent mapping) is also

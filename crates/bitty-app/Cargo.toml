@@ -13,6 +13,10 @@ publish = false
 [lints]
 workspace = true
 
+[[bin]]
+name = "bitty"
+path = "src/main.rs"
+
 [dependencies]
 bitty-config = { path = "../bitty-config" }
 bitty-ipc = { path = "../bitty-ipc" }

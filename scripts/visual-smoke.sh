@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # visual-smoke.sh — Hyprland workspace-4 visual smoke for render/UI slices.
 # Codifies the DEC-0005 loop so every render task shares one workflow instead
-# of re-deriving hyprctl Lua syntax: build bitty-app, launch on workspace 4,
+# of re-deriving hyprctl Lua syntax: build bitty binary, launch on workspace 4,
 # wait for first frames, grim screenshot to a given path, print the window
 # class/title, close the window, restore the previously focused workspace.
 # The window is never stranded: an EXIT trap closes it and restores focus.
@@ -59,7 +59,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-BIN="$ROOT/target/debug/bitty-app"
+BIN="$ROOT/target/debug/bitty"
 LOG="$(mktemp /tmp/bitty-visual-smoke.XXXXXX.log)"
 
 CHILD_PID=""
@@ -99,7 +99,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "visual-smoke: building bitty-app"
+echo "visual-smoke: building bitty binary (crate bitty-app)"
 cargo build -p bitty-app --locked --quiet
 if [ ! -x "$BIN" ]; then
 	echo "build produced no binary at $BIN" >&2

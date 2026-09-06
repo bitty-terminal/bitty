@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn cr_rich_02_traversal_root_rejected() {
         let pid = std::process::id();
-        let traversal = PathBuf::from(format!("/tmp/bitty-cr-rich-02-{pid}/../escape"));
+        let traversal = std::env::temp_dir().join(format!("bitty-cr-rich-02-{pid}/../escape"));
         let err = ResourcePolicy::new(vec![traversal]).unwrap_err();
         assert!(
             matches!(err, ResourceError::PathTraversal { .. }),
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn cr_rich_02_uncanonicalizable_root_rejected() {
         let pid = std::process::id();
-        let missing = PathBuf::from(format!("/tmp/bitty-cr-rich-02-missing-{pid}"));
+        let missing = std::env::temp_dir().join(format!("bitty-cr-rich-02-missing-{pid}"));
         // Ensure it does not exist so canonicalize fails fail-closed.
         let _ = std::fs::remove_dir_all(&missing);
         let _ = std::fs::remove_file(&missing);
@@ -746,12 +746,17 @@ mod tests {
 
     #[test]
     fn cr_rich_02_forbidden_root_rejected() {
-        for raw in ["/proc", "/sys", "/dev"] {
-            let err = ResourcePolicy::new(vec![PathBuf::from(raw)]).unwrap_err();
-            assert!(
-                matches!(err, ResourceError::ForbiddenPrefix { .. }),
-                "forbidden root {raw} must be rejected, got {err:?}"
-            );
+        // Windows has no /proc|/sys|/dev prefixes; device-namespace
+        // hardening there is out of scope.
+        #[cfg(unix)]
+        {
+            for raw in ["/proc", "/sys", "/dev"] {
+                let err = ResourcePolicy::new(vec![PathBuf::from(raw)]).unwrap_err();
+                assert!(
+                    matches!(err, ResourceError::ForbiddenPrefix { .. }),
+                    "forbidden root {raw} must be rejected, got {err:?}"
+                );
+            }
         }
     }
 

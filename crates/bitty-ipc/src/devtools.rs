@@ -128,6 +128,50 @@ pub const SOCKET_LEAF_DIR: &str = "bitty";
 /// Default instance id (`auth.ts` falls back to `"default"`).
 pub const DEFAULT_INSTANCE_ID: &str = "default";
 
+/// Windows named-pipe namespace hosting instance endpoints (CTX-0196).
+pub const WINDOWS_PIPE_NAMESPACE: &str = r"\\.\pipe\";
+
+/// Windows pipe-name prefix scoping bitty instances (`\\.\pipe\bitty-<id>`).
+///
+/// Mirrors [`SOCKET_LEAF_DIR`]: the kernel pipe namespace is the Windows
+/// registry the way the socket directory is the Unix registry. Only pipes
+/// carrying this prefix are enumerated by `bitty list instances`; foreign
+/// pipes are never touched.
+pub const WINDOWS_PIPE_PREFIX: &str = "bitty-";
+
+/// Map an instance id to its Windows named-pipe path (CTX-0196).
+///
+/// Pure string logic (no I/O, no `unsafe`): `\\.\pipe\bitty-<instance>`.
+/// The caller must have validated `instance` against the shared grammar
+/// (1..=[`MAX_INSTANCE_ID_LEN`], `^[a-z0-9_-]+$` case-insensitive); this
+/// function maps verbatim so probes fail fast on malformed input rather
+/// than inventing a second grammar.
+#[must_use]
+pub fn windows_pipe_name(instance: &str) -> String {
+    format!("{WINDOWS_PIPE_NAMESPACE}{WINDOWS_PIPE_PREFIX}{instance}")
+}
+
+/// Parse an instance id out of a Windows pipe file name (CTX-0196).
+///
+/// Accepts the bare pipe name as listed from the pipe namespace (e.g.
+/// `bitty-default`); the `.sock` suffix is never part of a pipe name.
+/// Returns `None` for foreign pipes (wrong prefix) or ids violating the
+/// shared grammar, so enumeration skips entries another application owns.
+#[must_use]
+pub fn windows_instance_from_pipe_name(pipe_name: &str) -> Option<String> {
+    let id = pipe_name.strip_prefix(WINDOWS_PIPE_PREFIX)?;
+    if id.is_empty() || id.len() > MAX_INSTANCE_ID_LEN {
+        return None;
+    }
+    let ok = id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        return None;
+    }
+    Some(id.to_string())
+}
+
 /// Read-idle timeout applied by the servo to each connection (seconds).
 /// Candidate value for this slice; CTX-0159 may tune it with RFC numbers.
 pub const CONN_IDLE_TIMEOUT_SECS: u64 = 60;
@@ -2389,6 +2433,43 @@ mod tests {
         let (path, instance) = resolve_socket_path_from_env(&env, None).unwrap();
         assert_eq!(path, "/tmp/x.sock");
         assert_eq!(instance, "ignored");
+    }
+
+    // ── windows pipe naming (CTX-0196) ──────────────────────────────────
+
+    #[test]
+    fn windows_pipe_name_maps_instance_verbatim() {
+        assert_eq!(
+            windows_pipe_name("default"),
+            r"\\.\pipe\bitty-default".to_string()
+        );
+        assert_eq!(
+            windows_pipe_name("my-inst_1"),
+            r"\\.\pipe\bitty-my-inst_1".to_string()
+        );
+    }
+
+    #[test]
+    fn windows_pipe_name_roundtrips_through_parser() {
+        for id in ["default", "a", "my-inst_1", "ABC-9_z"] {
+            let pipe = windows_pipe_name(id);
+            let file = pipe.rsplit('\\').next().unwrap();
+            assert_eq!(windows_instance_from_pipe_name(file).as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn windows_pipe_parser_skips_foreign_and_malformed() {
+        assert_eq!(windows_instance_from_pipe_name("bitty-"), None);
+        assert_eq!(windows_instance_from_pipe_name("other-pipe"), None);
+        assert_eq!(windows_instance_from_pipe_name(""), None);
+        assert_eq!(windows_instance_from_pipe_name("bitty-has space"), None);
+        assert_eq!(windows_instance_from_pipe_name("bitty-bad/id"), None);
+        assert_eq!(windows_instance_from_pipe_name("BITTY-default"), None);
+        let long = format!("bitty-{}", "a".repeat(MAX_INSTANCE_ID_LEN + 1));
+        assert_eq!(windows_instance_from_pipe_name(&long), None);
+        // Pipe names never carry the socket suffix.
+        assert_eq!(windows_instance_from_pipe_name("bitty-default.sock"), None);
     }
 
     // ── parsing ─────────────────────────────────────────────────────────

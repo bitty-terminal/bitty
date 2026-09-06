@@ -50,8 +50,10 @@
 //! terminal truth); every query is read-only. The
 //! [`Dispatcher`] remains an extensible method table: new `bitty.debug/*`
 //! handlers register via [`Dispatcher::register`] without reworking framing,
-//! parsing, or the connection loop. Input injection is explicitly out of
-//! scope (separate next slice after introspection lands, DEC-0018).
+//! parsing, or the connection loop. CTX-0188 adds test automation
+//! (`synthesizeInput` + `captureFrame`, bearer-scoped per Amendment A1):
+//! key/mouse/wheel/paste synthesis and redacted frame capture for the
+//! headless verify harness; profiling stays owned by CTX-0189.
 //!
 //! # Trust posture
 //!
@@ -211,6 +213,65 @@ pub const MAX_PARAMS_BYTES: usize = 4096;
 /// Maximum rendered introspection JSON bytes per response (fail-closed; grid
 /// text dominates and is truncated row-first to fit).
 pub const MAX_INSPECT_JSON_BYTES: usize = 32 * 1024;
+
+// ── test-automation bounds (CTX-0188, Amendment A1 candidate) ────────────────
+//
+// `synthesizeInput` (`debug.control` + bearer) and `captureFrame`
+// (`debug.trace` + bearer) are the only keystroke-injection / frame-capture
+// surface. Both require the debug scope, the terminal capability, and a
+// per-session single-terminal bearer; unscoped callers get `ScopeDenied`
+// with zero partial state (fail closed everywhere).
+
+/// Wire method for `synthesizeInput` (key/mouse/wheel/paste synthesis).
+pub const METHOD_SYNTHESIZE_INPUT: &str = "bitty.debug/synthesizeInput";
+
+/// Wire method for `captureFrame` (bounded redacted frame capture).
+pub const METHOD_CAPTURE_FRAME: &str = "bitty.debug/captureFrame";
+
+/// Maximum synthetic events per `synthesizeInput` call (Amendment A1).
+pub const MAX_SYNTH_EVENTS_PER_CALL: usize = 64;
+
+/// Sustained `synthesizeInput` calls per second per bearer (Amendment A1).
+pub const MAX_SYNTH_CALLS_PER_SEC: usize = 10;
+
+/// Sustained `captureFrame` frames per second per bearer (Amendment A1).
+pub const MAX_CAPTURE_FPS: usize = 10;
+
+/// Automation bearer TTL in ms (candidate default 10 minutes, never exceeds
+/// the owning session lifetime; expiry revokes immediately).
+pub const AUTOMATION_BEARER_TTL_MS: u64 = 600_000;
+
+/// Maximum automation bearers tracked (parity with consent-ledger scale;
+/// fail-closed at capacity, never evicted silently).
+pub const MAX_AUTOMATION_BEARERS: usize = 64;
+
+/// Maximum bytes for the raw automation `params` object (`synthesizeInput`
+/// with 64 events needs more than the 4 KiB introspection bound; still well
+/// under the 256 KiB frame bound).
+pub const MAX_AUTOMATION_PARAMS_BYTES: usize = 32 * 1024;
+
+/// Maximum characters for `originLabel` (audit attribution, required).
+pub const MAX_ORIGIN_LABEL_CHARS: usize = 64;
+
+/// Maximum bytes for one synthetic paste-text event (text-only, T-04 parity;
+/// well under the frame bound).
+pub const MAX_SYNTH_PASTE_BYTES: usize = 16 * 1024;
+
+/// Maximum characters for a synthetic key name.
+pub const MAX_SYNTH_KEY_CHARS: usize = 64;
+
+/// Maximum characters for an automation bearer token (opaque, unguessable,
+/// never persisted).
+pub const MAX_BEARER_TOKEN_CHARS: usize = 128;
+
+/// Maximum grid cells per axis for synthetic mouse coordinates (fail-closed).
+pub const MAX_SYNTH_CELL: u16 = 1024;
+
+/// Maximum absolute wheel delta rows/cols per event (fail-closed).
+pub const MAX_SYNTH_WHEEL_DELTA: i32 = 64;
+
+/// Redaction marker replacing sensitive frame lines (P0-AC-026 parity).
+pub const REDACTED_MARKER: &str = "[redacted]";
 
 // ── socket path ─────────────────────────────────────────────────────────────
 
@@ -461,15 +522,22 @@ impl ServerInfo {
 /// `granted` is the server-evaluated scope set for the authenticated peer
 /// (CLI default plus explicit `BITTY_CTL_ELEVATE` allowlist). Read-only
 /// handlers ignore it (any authenticated same-UID peer may read); control
-/// handlers authorize against it on every request (never ambient authority).
+/// and automation handlers authorize against it on every request (never
+/// ambient authority). `session_id` binds automation bearers to one debug
+/// session: a bearer issued for another session fails closed with
+/// `ScopeDenied` even when the token is otherwise valid.
 #[derive(Debug, Clone)]
 pub struct ServeContext {
     /// Server facts.
     pub server: ServerInfo,
-    /// Uptime at request time (millis).
+    /// Uptime at request time (millis). Automation handlers reuse this as
+    /// the deterministic bearer/rate clock (headless, no wall-clock).
     pub uptime_ms: u64,
     /// Server-evaluated granted scopes for this peer.
     pub granted: crate::scope::ScopeSet,
+    /// Opaque debug-session identity for bearer binding (per connection;
+    /// the servo must set a distinct id per accepted connection).
+    pub session_id: String,
 }
 
 impl ServeContext {
@@ -478,6 +546,8 @@ impl ServeContext {
     /// Granted scopes default to the CLI interactive set plus the explicit
     /// `BITTY_CTL_ELEVATE` allowlist (impure: reads one env var; tests that
     /// need hermetic scopes use [`ServeContext::with_granted`]).
+    /// `session_id` defaults to `"local"`; the servo overrides it per
+    /// connection before dispatch.
     #[must_use]
     pub fn new(server: &ServerInfo) -> Self {
         Self {
@@ -486,6 +556,7 @@ impl ServeContext {
             granted: crate::ctl::elevation_from_env(
                 std::env::var("BITTY_CTL_ELEVATE").ok().as_deref(),
             ),
+            session_id: String::from("local"),
         }
     }
 
@@ -496,6 +567,30 @@ impl ServeContext {
             server: server.clone(),
             uptime_ms: server.uptime_ms(),
             granted,
+            session_id: String::from("local"),
+        }
+    }
+
+    /// Build a context with explicit scopes and session binding (hermetic
+    /// automation tests). `session_id` is truncated to 64 chars.
+    #[must_use]
+    pub fn with_granted_session(
+        server: &ServerInfo,
+        granted: crate::scope::ScopeSet,
+        session_id: &str,
+    ) -> Self {
+        let mut id = session_id.to_string();
+        if id.chars().count() > 64 {
+            id = id.chars().take(64).collect();
+        }
+        if id.is_empty() {
+            id = String::from("local");
+        }
+        Self {
+            server: server.clone(),
+            uptime_ms: server.uptime_ms(),
+            granted,
+            session_id: id,
         }
     }
 }
@@ -946,19 +1041,26 @@ pub fn parse_request(payload: &[u8]) -> Result<DevtoolsRequest, RequestFault> {
     })?;
 
     // Capture the raw `params` object when present so method handlers can
-    // parse per-method scopes (`rows`/`cols`/`limit`) without a JSON
-    // dependency. The slice is bounded before retention: oversize params fail
-    // closed here rather than reaching dispatch.
+    // parse per-method scopes (`rows`/`cols`/`limit`, automation payloads)
+    // without a JSON dependency. The slice is bounded before retention:
+    // oversize params fail closed here rather than reaching dispatch.
+    // Automation methods (`synthesizeInput`, `captureFrame`) carry up to 64
+    // events and allow 32 KiB; all other methods stay at 4 KiB.
     let params_raw = match keys.values.get("params") {
         None => None,
         Some((start, end)) => {
             let raw = text[*start..*end].trim().to_string();
-            if raw.len() > MAX_PARAMS_BYTES {
+            let cap = if method == METHOD_SYNTHESIZE_INPUT || method == METHOD_CAPTURE_FRAME {
+                MAX_AUTOMATION_PARAMS_BYTES
+            } else {
+                MAX_PARAMS_BYTES
+            };
+            if raw.len() > cap {
                 return Err(RequestFault::new(
                     keys.id_raw.clone(),
                     "transport",
                     "PayloadTooLarge",
-                    format!("params {} exceeds limit {MAX_PARAMS_BYTES}", raw.len()),
+                    format!("params {} exceeds limit {cap}", raw.len()),
                 ));
             }
             // `params` must be an object or null; arrays and scalars are
@@ -1064,7 +1166,8 @@ impl Dispatcher {
     /// `getFocus`) plus CTX-0171 runtime control (`listWindows`,
     /// `listViews`, `listTerminals`, `spawnTerminal`, `closeTerminal`,
     /// `sendInput`, `getTerminalText`, `splitView`, `focusView`,
-    /// `reloadConfig`).
+    /// `reloadConfig`) plus CTX-0188 test automation (`synthesizeInput`,
+    /// `captureFrame`, bearer-scoped per Amendment A1).
     ///
     /// Introspection handlers register via [`Dispatcher::register`] (the
     /// CTX-0159 hook) so the registration path itself is exercised here, not
@@ -1112,6 +1215,16 @@ impl Dispatcher {
         for (method, handler) in control {
             if table.register(method, *handler).is_err() {
                 debug_assert!(false, "statically valid control method rejected");
+            }
+        }
+        // CTX-0188 test automation (bearer-scoped, rate-capped, redacted).
+        let automation: &[(&'static str, DevtoolsHandler)] = &[
+            (METHOD_SYNTHESIZE_INPUT, handle_synthesize_input),
+            (METHOD_CAPTURE_FRAME, handle_capture_frame),
+        ];
+        for (method, handler) in automation {
+            if table.register(method, *handler).is_err() {
+                debug_assert!(false, "statically valid automation method rejected");
             }
         }
         table
@@ -1871,6 +1984,1216 @@ fn prevalidate_control_params(method: &str, params: Option<&str>) -> Result<(), 
         _ => Ok(()),
     };
     res.map_err(|err| format!("{err}"))
+}
+
+// ── test automation (CTX-0188, Amendment A1 candidate) ───────────────────────
+//
+// `synthesizeInput` (keystroke injection) and `captureFrame` (frame capture)
+// for the headless verify harness. Security lens mandatory: fail closed
+// everywhere.
+//
+// - Scopes: `synthesizeInput` requires `debug.control` + `terminal.input`;
+//   `captureFrame` requires `debug.trace` + `terminal.inspect` (capability-
+//   plus-scope intersection, `getSnapshot` parity). Either missing yields
+//   `scope`/`ScopeDenied` with zero partial state.
+// - Bearers: per-session single-terminal sub-grants, consent-issued via
+//   [`issue_automation_bearer`] (no IPC issuance method, no env/config/flag
+//   path, never persisted, 10 min TTL). Unscoped callers (absent, expired,
+//   wrong-session, wrong-terminal, wrong-family) get `scope`/`ScopeDenied`.
+// - Bounds: 64 events/call, 10 calls/s (`synthesizeInput`), 10 fps
+//   (`captureFrame`), params 32 KiB, responses 32 KiB, frames 256 KiB.
+// - Redaction: P0-AC-026 parity before any frame enters a response;
+//   `pixels` is masked (zero text), per-call opt-in, audited.
+// - Headless receipt semantics: `synthesizeInput` success means validated,
+//   authorized, rate-checked, and marked synthetic (input-ring publish with
+//   indelible `[synthetic]` marker); the servo applies injection on the main
+//   thread as follow-up. `captureFrame` serves the redacted grid store.
+
+/// Automation method family bound into each bearer (never widened: a
+/// synthesize bearer cannot capture and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationFamily {
+    /// `synthesizeInput` family (`debug.control`).
+    Synthesize,
+    /// `captureFrame` family (`debug.trace`).
+    Capture,
+}
+
+impl AutomationFamily {
+    /// Canonical family token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Synthesize => "synthesize",
+            Self::Capture => "capture",
+        }
+    }
+}
+
+/// One issued automation bearer (server-side only, never persisted).
+#[derive(Debug, Clone)]
+struct AutomationBearerRecord {
+    /// Debug-session identity it was issued to.
+    session_id: String,
+    /// Single terminal it may address (`t:N`).
+    terminal_id: String,
+    /// Method family it may call.
+    family: AutomationFamily,
+    /// Expiry time (issuance + TTL, saturating; bearer-clock base matches
+    /// `ServeContext::uptime_ms`).
+    expires_at_ms: u64,
+}
+
+/// One audited pixels-capture entry (bounded, drop-oldest).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameAuditEntry {
+    /// Caller session identity.
+    pub session_id: String,
+    /// Addressed terminal.
+    pub terminal_id: String,
+    /// Capture format (`semantic` or `pixels`).
+    pub format: String,
+    /// Bearer-clock time of capture.
+    pub now_ms: u64,
+}
+
+/// Automation store: bearers plus per-bearer rate windows, synthetic sequence,
+/// and pixels audit. In-memory only (never persisted, never exported).
+#[derive(Debug, Default)]
+struct AutomationStore {
+    /// Token to record.
+    bearers: BTreeMap<String, AutomationBearerRecord>,
+    /// Per-token `synthesizeInput` timestamps (1 s window).
+    synth_hits: BTreeMap<String, std::collections::VecDeque<u64>>,
+    /// Per-token `captureFrame` timestamps (1 s window).
+    capture_hits: BTreeMap<String, std::collections::VecDeque<u64>>,
+    /// Issuance counter (token uniqueness).
+    counter: u64,
+    /// Monotonic synthetic-event sequence.
+    synth_seq: u64,
+    /// Bounded pixels/semantic audit (drop-oldest at 64).
+    audit: Vec<FrameAuditEntry>,
+}
+
+/// Global automation store (empty until consent issuance).
+fn automation_store() -> &'static Mutex<AutomationStore> {
+    static STORE: OnceLock<Mutex<AutomationStore>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(AutomationStore::default()))
+}
+
+/// 64-bit FNV-1a (std-only, deterministic token mixing, not a security hash
+/// on its own: uniqueness comes from the per-process counter + time + pid).
+fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = seed;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// Render a 32-hex bearer token from issuance coordinates.
+fn render_bearer_token(
+    session_id: &str,
+    terminal_id: &str,
+    family: AutomationFamily,
+    counter: u64,
+    now_ms: u64,
+) -> String {
+    let pid = std::process::id();
+    let mut material = Vec::with_capacity(128);
+    material.extend_from_slice(session_id.as_bytes());
+    material.push(0);
+    material.extend_from_slice(terminal_id.as_bytes());
+    material.push(0);
+    material.extend_from_slice(family.as_str().as_bytes());
+    material.push(0);
+    material.extend_from_slice(&counter.to_le_bytes());
+    material.extend_from_slice(&now_ms.to_le_bytes());
+    material.extend_from_slice(&pid.to_le_bytes());
+    let h1 = fnv1a64(&material, 0xcbf29ce484222325);
+    let h2 = fnv1a64(&material, 0x84222325cbf29ce4);
+    format!("{h1:016x}{h2:016x}")
+}
+
+/// Validate a session id for bearer binding (1..=64 chars, no NUL/control).
+fn validate_session_id(session_id: &str) -> Result<(), IpcError> {
+    if session_id.is_empty() || session_id.len() > 64 {
+        return Err(IpcError::InvalidRequest {
+            reason: "session_id must be 1..=64 bytes".into(),
+        });
+    }
+    if session_id.contains('\0') || session_id.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(IpcError::InvalidRequest {
+            reason: "session_id must not contain control bytes".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a bearer token shape (opaque, bounded, no control).
+fn validate_bearer_shape(token: &str) -> Result<(), ()> {
+    if token.is_empty() || token.len() > MAX_BEARER_TOKEN_CHARS {
+        return Err(());
+    }
+    let ok = token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok { Ok(()) } else { Err(()) }
+}
+
+/// Issue an automation bearer for one session/terminal/family (consent path).
+///
+/// Called server-side after explicit local-user consent (DevTools gesture or
+/// `bitty dev` prompt). There is deliberately no IPC method, env var, config
+/// key, flag, or child-inheritance path that issues bearers (P0-AC-023
+/// parity; no-bypass audit). The bearer lives in-memory only and expires
+/// after [`AUTOMATION_BEARER_TTL_MS`].
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` for bad session/terminal ids and `LimitExceeded`
+/// when the store is at capacity (fail-closed, no silent eviction).
+pub fn issue_automation_bearer(
+    session_id: &str,
+    terminal_id: &str,
+    family: AutomationFamily,
+    now_ms: u64,
+) -> Result<String, IpcError> {
+    issue_automation_bearer_with_ttl(
+        session_id,
+        terminal_id,
+        family,
+        now_ms,
+        AUTOMATION_BEARER_TTL_MS,
+    )
+}
+
+/// Issue with an explicit TTL (capped to [`AUTOMATION_BEARER_TTL_MS`]).
+///
+/// # Errors
+///
+/// Same as [`issue_automation_bearer`], plus `InvalidRequest` when `ttl_ms`
+/// is zero or exceeds the cap.
+pub fn issue_automation_bearer_with_ttl(
+    session_id: &str,
+    terminal_id: &str,
+    family: AutomationFamily,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Result<String, IpcError> {
+    validate_session_id(session_id)?;
+    crate::ctl::parse_terminal_id(terminal_id)?;
+    if ttl_ms == 0 || ttl_ms > AUTOMATION_BEARER_TTL_MS {
+        return Err(IpcError::InvalidRequest {
+            reason: format!("ttl_ms must be 1..={AUTOMATION_BEARER_TTL_MS}"),
+        });
+    }
+    let mut store = automation_store()
+        .lock()
+        .map_err(|_| IpcError::Unavailable {
+            reason: "automation store unavailable".into(),
+        })?;
+    if store.bearers.len() >= MAX_AUTOMATION_BEARERS && !store.bearers.is_empty() {
+        // At capacity and no expiry drain helps yet: prune expired first,
+        // then fail closed if still full (never silent eviction).
+        let expired: Vec<String> = store
+            .bearers
+            .iter()
+            .filter_map(|(tok, rec)| {
+                if now_ms >= rec.expires_at_ms {
+                    Some(tok.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for tok in expired {
+            store.bearers.remove(&tok);
+            store.synth_hits.remove(&tok);
+            store.capture_hits.remove(&tok);
+        }
+        if store.bearers.len() >= MAX_AUTOMATION_BEARERS {
+            return Err(IpcError::LimitExceeded {
+                field: "automation_bearers".into(),
+                limit: MAX_AUTOMATION_BEARERS,
+                actual: store.bearers.len() + 1,
+            });
+        }
+    }
+    store.counter = store.counter.wrapping_add(1);
+    let token = render_bearer_token(session_id, terminal_id, family, store.counter, now_ms);
+    if store.bearers.contains_key(&token) {
+        return Err(IpcError::Internal {
+            reason: "bearer token collision (retry issuance)".into(),
+        });
+    }
+    let record = AutomationBearerRecord {
+        session_id: session_id.to_string(),
+        terminal_id: terminal_id.to_string(),
+        family,
+        expires_at_ms: now_ms.saturating_add(ttl_ms),
+    };
+    store.bearers.insert(token.clone(), record);
+    Ok(token)
+}
+
+/// Revoke one bearer immediately (explicit revoke + session-end parity).
+/// Returns true when a bearer was present.
+pub fn revoke_automation_bearer(token: &str) -> bool {
+    let Ok(mut store) = automation_store().lock() else {
+        return false;
+    };
+    let existed = store.bearers.remove(token).is_some();
+    store.synth_hits.remove(token);
+    store.capture_hits.remove(token);
+    existed
+}
+
+/// Clear all automation state (test helper only; production never calls it).
+pub fn clear_automation_for_tests() {
+    if let Ok(mut store) = automation_store().lock() {
+        store.bearers.clear();
+        store.synth_hits.clear();
+        store.capture_hits.clear();
+        store.counter = 0;
+        store.synth_seq = 0;
+        store.audit.clear();
+    }
+    // Input/grid/focus stores are cleared by the caller's introspection
+    // helper; automation never clears them here (no cross-module coupling).
+}
+
+/// Number of live bearers (test probe only).
+pub fn automation_bearer_count_for_tests() -> usize {
+    automation_store()
+        .lock()
+        .map(|s| s.bearers.len())
+        .unwrap_or(0)
+}
+
+/// Current synthetic sequence (test probe only).
+pub fn synthetic_seq_for_tests() -> u64 {
+    automation_store().lock().map(|s| s.synth_seq).unwrap_or(0)
+}
+
+/// Number of audited frame captures (test probe only).
+pub fn frame_audit_len_for_tests() -> usize {
+    automation_store()
+        .lock()
+        .map(|s| s.audit.len())
+        .unwrap_or(0)
+}
+
+/// Authorize one automation call: scope intersection, bearer binding, expiry,
+/// and per-method rate ceiling, atomically under one lock (no TOCTOU).
+///
+/// `required` holds the two scopes the caller must possess (debug + terminal
+/// capability). Bearer failures and scope failures share the typed
+/// `scope`/`ScopeDenied` shape (no oracle distinguishing token validity from
+/// authority). Rate overruns yield `budget`/`RateLimited` with zero partial
+/// state.
+fn authorize_automation(
+    granted: &crate::scope::ScopeSet,
+    required: &[crate::scope::Scope; 2],
+    token_opt: Option<&str>,
+    session_id: &str,
+    terminal_id: &str,
+    family: AutomationFamily,
+    now_ms: u64,
+) -> Result<(), HandlerError> {
+    for scope in required {
+        if !granted.contains(*scope) {
+            return Err(HandlerError::new(
+                "scope",
+                "ScopeDenied",
+                format!(
+                    "permission denied: scope '{}' denied for automation (needs elevation)",
+                    scope.as_str()
+                ),
+            ));
+        }
+    }
+    let Some(token) = token_opt else {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: missing automation bearer".to_string(),
+        ));
+    };
+    if validate_bearer_shape(token).is_err() {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: invalid automation bearer".to_string(),
+        ));
+    }
+    let mut store = automation_store().lock().map_err(|_| {
+        HandlerError::new(
+            "transport",
+            "Unavailable",
+            "automation store unavailable".to_string(),
+        )
+    })?;
+    let record = match store.bearers.get(token) {
+        Some(rec) => rec.clone(),
+        None => {
+            return Err(HandlerError::new(
+                "scope",
+                "ScopeDenied",
+                "permission denied: unknown automation bearer".to_string(),
+            ));
+        }
+    };
+    if record.session_id != session_id {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: bearer bound to another session".to_string(),
+        ));
+    }
+    if record.terminal_id != terminal_id {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: bearer bound to another terminal".to_string(),
+        ));
+    }
+    if record.family != family {
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: bearer family mismatch".to_string(),
+        ));
+    }
+    if now_ms >= record.expires_at_ms {
+        store.bearers.remove(token);
+        store.synth_hits.remove(token);
+        store.capture_hits.remove(token);
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: automation bearer expired".to_string(),
+        ));
+    }
+    let (cap, hits) = match family {
+        AutomationFamily::Synthesize => (MAX_SYNTH_CALLS_PER_SEC, &mut store.synth_hits),
+        AutomationFamily::Capture => (MAX_CAPTURE_FPS, &mut store.capture_hits),
+    };
+    let queue = hits.entry(token.to_string()).or_default();
+    while let Some(&front) = queue.front() {
+        if now_ms.saturating_sub(front) >= 1_000 {
+            queue.pop_front();
+        } else {
+            break;
+        }
+    }
+    if queue.len() >= cap {
+        return Err(HandlerError::new(
+            "budget",
+            "RateLimited",
+            format!("rate limited: automation ceiling {cap}/s exceeded"),
+        ));
+    }
+    queue.push_back(now_ms);
+    Ok(())
+}
+
+// ── automation params parsing (bounded, no JSON deps) ───────────────────────
+
+/// Extract a top-level string field from a flat params object (bounded,
+/// quote-aware; nested objects for the key are rejected).
+fn extract_top_string(params: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut search = 0usize;
+    let bytes = params.as_bytes();
+    while let Some(pos) = params[search..].find(&needle) {
+        let abs = search + pos;
+        let mut i = abs + needle.len();
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            search = abs + needle.len();
+            continue;
+        }
+        i += 1;
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            return None;
+        }
+        i += 1;
+        let mut out = String::new();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => return Some(out),
+                b'\\' => {
+                    i += 1;
+                    if i >= bytes.len() {
+                        return None;
+                    }
+                    match bytes[i] {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            if i + 4 >= bytes.len() {
+                                return None;
+                            }
+                            let hex = &params[i + 1..i + 5];
+                            let code = u32::from_str_radix(hex, 16).ok()?;
+                            out.push(char::from_u32(code)?);
+                            i += 4;
+                        }
+                        _ => return None,
+                    }
+                    i += 1;
+                }
+                _ => {
+                    let ch = params[i..].chars().next()?;
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// Extract a top-level boolean field (`true`/`false`); `None` when absent or
+/// not a bare boolean.
+fn extract_top_bool(params: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let pos = params.find(&needle)?;
+    let after = &params[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let value = after[colon + 1..].trim_start();
+    if value.starts_with("true") {
+        Some(true)
+    } else if value.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Extract a top-level signed integer field; `None` when absent or malformed.
+fn extract_top_int(params: &str, key: &str) -> Option<i64> {
+    let needle = format!("\"{key}\"");
+    let pos = params.find(&needle)?;
+    let after = &params[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let mut value = after[colon + 1..].trim_start();
+    if value.starts_with('"') || value.starts_with('{') || value.starts_with('[') {
+        return None;
+    }
+    let negative = value.starts_with('-');
+    if negative || value.starts_with('+') {
+        value = &value[1..];
+    }
+    let mut len = 0usize;
+    for b in value.bytes() {
+        if b.is_ascii_digit() {
+            len += 1;
+        } else {
+            break;
+        }
+    }
+    if len == 0 || len > 10 {
+        return None;
+    }
+    let digits = &value[..len];
+    let parsed: i64 = digits.parse().ok()?;
+    Some(if negative { -parsed } else { parsed })
+}
+
+/// Extract a top-level unsigned integer field; `None` when absent/malformed.
+fn extract_top_uint(params: &str, key: &str) -> Option<u64> {
+    let value = extract_top_int(params, key)?;
+    u64::try_from(value).ok()
+}
+
+/// Terminal id accepting Amendment A1 camelCase (`terminalId`) and the
+/// CTX-0171 snake_case (`terminal_id`) harness shape.
+fn extract_terminal_id(params: &str) -> Option<String> {
+    extract_top_string(params, "terminalId").or_else(|| extract_top_string(params, "terminal_id"))
+}
+
+/// Origin label accepting `originLabel` (Amendment A1) and `origin_label`.
+fn extract_origin_label(params: &str) -> Option<String> {
+    extract_top_string(params, "originLabel").or_else(|| extract_top_string(params, "origin_label"))
+}
+
+/// Locate the `events` array span `(inner_start, inner_end)` inside `params`.
+fn find_events_array(params: &str) -> Option<(usize, usize)> {
+    let needle = "\"events\"";
+    let pos = params.find(needle)?;
+    let after_key = &params[pos + needle.len()..];
+    let colon_rel = after_key.find(':')?;
+    let mut i = pos + needle.len() + colon_rel + 1;
+    let bytes = params.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'[') {
+        return None;
+    }
+    i += 1;
+    let inner_start = i;
+    let mut depth = 1usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // Skip strings (escape-aware).
+                i += 1;
+                let mut escape = false;
+                while i < bytes.len() {
+                    if escape {
+                        escape = false;
+                    } else if bytes[i] == b'\\' {
+                        escape = true;
+                    } else if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((inner_start, i));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split top-level `{...}` objects inside an array inner slice.
+fn split_top_objects(inner: &str) -> Result<Vec<String>, ()> {
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'{' {
+            return Err(());
+        }
+        let start = i;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => {
+                    i += 1;
+                    let mut escape = false;
+                    while i < bytes.len() {
+                        if escape {
+                            escape = false;
+                        } else if bytes[i] == b'\\' {
+                            escape = true;
+                        } else if bytes[i] == b'"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        return Err(());
+                    }
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return Err(());
+        }
+        out.push(inner[start..i].to_string());
+        if out.len() > MAX_SYNTH_EVENTS_PER_CALL {
+            return Err(());
+        }
+    }
+    Ok(out)
+}
+
+/// Validated synthetic event (headless; the servo maps it to input encoding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyntheticEvent {
+    /// Key press/release.
+    Key {
+        /// Key name (bounded).
+        key: String,
+        /// Modifier summary (bounded, e.g. `ctrl+shift`).
+        mods: String,
+        /// Pressed (`true`) or released (`false`).
+        pressed: bool,
+    },
+    /// Mouse button action at a cell.
+    Mouse {
+        /// `Left`, `Right`, or `Middle`.
+        button: String,
+        /// `pressed`, `released`, `click`, `drag`, or `move`.
+        action: String,
+        /// Cell column.
+        col: u16,
+        /// Cell row.
+        row: u16,
+    },
+    /// Wheel scroll delta (cells).
+    Wheel {
+        /// Row delta (-64..=64).
+        delta_rows: i32,
+        /// Column delta (-64..=64).
+        delta_cols: i32,
+        /// Optional cell column.
+        col: Option<u16>,
+        /// Optional cell row.
+        row: Option<u16>,
+    },
+    /// Paste-text (T-04 text-only parity).
+    Paste {
+        /// Pasted text (bounded, no NUL).
+        text: String,
+    },
+}
+
+/// Validate one event object; fail-closed with a bounded reason.
+fn validate_synthetic_event(obj: &str) -> Result<SyntheticEvent, String> {
+    let kind = extract_top_string(obj, "type")
+        .ok_or_else(|| "event.type must be key|mouse|wheel|paste".to_string())?;
+    match kind.as_str() {
+        "key" => {
+            let key = extract_top_string(obj, "key")
+                .ok_or_else(|| "key event requires string key".to_string())?;
+            if key.is_empty() || key.chars().count() > MAX_SYNTH_KEY_CHARS {
+                return Err(format!("key must be 1..={MAX_SYNTH_KEY_CHARS} chars"));
+            }
+            if key.contains('\0') || key.bytes().any(|b| b < 0x20 && b != b'\t') {
+                return Err("key must not contain control bytes".to_string());
+            }
+            let mods = extract_top_string(obj, "mods").unwrap_or_default();
+            if mods.chars().count() > 16 {
+                return Err("key mods must be <= 16 chars".to_string());
+            }
+            if !mods
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'_')
+            {
+                return Err("key mods must be alphanumeric with +-|_".to_string());
+            }
+            let pressed = extract_top_bool(obj, "pressed").unwrap_or(true);
+            Ok(SyntheticEvent::Key { key, mods, pressed })
+        }
+        "mouse" => {
+            let button = extract_top_string(obj, "button")
+                .ok_or_else(|| "mouse event requires button".to_string())?;
+            if !matches!(button.as_str(), "Left" | "Right" | "Middle") {
+                return Err("mouse button must be Left|Right|Middle".to_string());
+            }
+            let action = extract_top_string(obj, "action").unwrap_or_else(|| "click".to_string());
+            if !matches!(
+                action.as_str(),
+                "pressed" | "released" | "click" | "drag" | "move"
+            ) {
+                return Err("mouse action must be pressed|released|click|drag|move".to_string());
+            }
+            let col = extract_top_uint(obj, "col")
+                .ok_or_else(|| "mouse event requires col".to_string())?;
+            let row = extract_top_uint(obj, "row")
+                .ok_or_else(|| "mouse event requires row".to_string())?;
+            if col > u64::from(MAX_SYNTH_CELL) || row > u64::from(MAX_SYNTH_CELL) {
+                return Err(format!("mouse col/row must be 0..={MAX_SYNTH_CELL}"));
+            }
+            Ok(SyntheticEvent::Mouse {
+                button,
+                action,
+                col: col as u16,
+                row: row as u16,
+            })
+        }
+        "wheel" => {
+            let delta_rows = extract_top_int(obj, "deltaRows")
+                .or_else(|| extract_top_int(obj, "delta_rows"))
+                .ok_or_else(|| "wheel event requires deltaRows".to_string())?;
+            let delta_cols = extract_top_int(obj, "deltaCols")
+                .or_else(|| extract_top_int(obj, "delta_cols"))
+                .unwrap_or(0);
+            if delta_rows < i64::from(-MAX_SYNTH_WHEEL_DELTA)
+                || delta_rows > i64::from(MAX_SYNTH_WHEEL_DELTA)
+                || delta_cols < i64::from(-MAX_SYNTH_WHEEL_DELTA)
+                || delta_cols > i64::from(MAX_SYNTH_WHEEL_DELTA)
+            {
+                return Err(format!(
+                    "wheel delta must be -{MAX_SYNTH_WHEEL_DELTA}..={MAX_SYNTH_WHEEL_DELTA}"
+                ));
+            }
+            if delta_rows == 0 && delta_cols == 0 {
+                return Err("wheel delta must be non-zero".to_string());
+            }
+            let col = match extract_top_uint(obj, "col") {
+                Some(v) => {
+                    if v > u64::from(MAX_SYNTH_CELL) {
+                        return Err(format!("wheel col must be 0..={MAX_SYNTH_CELL}"));
+                    }
+                    Some(v as u16)
+                }
+                None => None,
+            };
+            let row = match extract_top_uint(obj, "row") {
+                Some(v) => {
+                    if v > u64::from(MAX_SYNTH_CELL) {
+                        return Err(format!("wheel row must be 0..={MAX_SYNTH_CELL}"));
+                    }
+                    Some(v as u16)
+                }
+                None => None,
+            };
+            Ok(SyntheticEvent::Wheel {
+                delta_rows: delta_rows as i32,
+                delta_cols: delta_cols as i32,
+                col,
+                row,
+            })
+        }
+        "paste" => {
+            let text = extract_top_string(obj, "text")
+                .ok_or_else(|| "paste event requires string text".to_string())?;
+            if text.is_empty() || text.len() > MAX_SYNTH_PASTE_BYTES {
+                return Err(format!(
+                    "paste text must be 1..={MAX_SYNTH_PASTE_BYTES} bytes"
+                ));
+            }
+            if text.contains('\0') {
+                return Err("paste text must not contain NUL".to_string());
+            }
+            Ok(SyntheticEvent::Paste { text })
+        }
+        other => Err(format!(
+            "event.type must be key|mouse|wheel|paste, got {}",
+            echo_snippet(other)
+        )),
+    }
+}
+
+/// Whether a frame line carries sensitive content (P0-AC-026 parity: secrets,
+/// clipboard bytes, environment bytes never appear in default outputs).
+fn is_sensitive_frame_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "clipboard",
+        "bearer",
+        "aws_",
+        "begin private",
+        "env=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Redact one frame line (whole-line replacement, fail-closed minimizing).
+fn redact_frame_line(line: &str) -> String {
+    if is_sensitive_frame_line(line) {
+        REDACTED_MARKER.to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+/// `bitty.debug/synthesizeInput`: bearer-scoped input synthesis.
+///
+/// Params (object, `<= 32 KiB`): `{ terminalId|terminal_id: "t:N", bearer:
+/// "<token>", originLabel|origin_label: "...", events: [...] }` with 1..=64
+/// events of type key/mouse/wheel/paste. Requires `debug.control` +
+/// `terminal.input` plus a live `synthesize` bearer for the addressed
+/// terminal/session. Success publishes indelible `[synthetic]` markers into
+/// the input ring (harness/user distinguishable) and returns a receipt with
+/// `accepted`, `rejected: 0`, and the new `syntheticSeq`.
+fn handle_synthesize_input(
+    context: &ServeContext,
+    request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    use crate::scope::Scope::{DebugControl, TerminalInput};
+    let params = request.params_raw.as_deref().ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "synthesizeInput requires params".to_string(),
+        )
+    })?;
+    let terminal_id = extract_terminal_id(params).ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "synthesizeInput requires terminalId \"t:N\"".to_string(),
+        )
+    })?;
+    if crate::ctl::parse_terminal_id(&terminal_id).is_err() {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "terminalId must match ^t:[0-9]+$ (no wildcards)".to_string(),
+        ));
+    }
+    let origin = extract_origin_label(params).ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "synthesizeInput requires originLabel".to_string(),
+        )
+    })?;
+    if origin.is_empty() || origin.chars().count() > MAX_ORIGIN_LABEL_CHARS {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            format!("originLabel must be 1..={MAX_ORIGIN_LABEL_CHARS} chars"),
+        ));
+    }
+    if origin.contains('\0') || origin.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "originLabel must not contain control bytes".to_string(),
+        ));
+    }
+    let bearer = extract_top_string(params, "bearer");
+    let (inner_start, inner_end) = find_events_array(params).ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "synthesizeInput requires events array".to_string(),
+        )
+    })?;
+    let inner = &params[inner_start..inner_end];
+    let objects = split_top_objects(inner).map_err(|()| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "events must be objects".to_string(),
+        )
+    })?;
+    if objects.is_empty() || objects.len() > MAX_SYNTH_EVENTS_PER_CALL {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            format!("events must be 1..={MAX_SYNTH_EVENTS_PER_CALL}"),
+        ));
+    }
+    // Validate every event before touching any state (transactional: no
+    // partial publish on a malformed call).
+    let mut validated: Vec<SyntheticEvent> = Vec::with_capacity(objects.len());
+    for obj in &objects {
+        match validate_synthetic_event(obj) {
+            Ok(event) => validated.push(event),
+            Err(reason) => {
+                return Err(HandlerError::new("usage", "InvalidParams", reason));
+            }
+        }
+    }
+    // Authorize (scope intersection + bearer binding + rate ceiling) before
+    // any observable effect.
+    authorize_automation(
+        &context.granted,
+        &[DebugControl, TerminalInput],
+        bearer.as_deref(),
+        &context.session_id,
+        &terminal_id,
+        AutomationFamily::Synthesize,
+        context.uptime_ms,
+    )?;
+    // Publish indelible synthetic markers into the input ring (drop-oldest,
+    // bounded). A poisoned mutex fails closed without a receipt.
+    let accepted = validated.len();
+    let synth_seq = {
+        let mut store = automation_store().lock().map_err(|_| {
+            HandlerError::new(
+                "transport",
+                "Unavailable",
+                "automation store unavailable".to_string(),
+            )
+        })?;
+        store.synth_seq = store.synth_seq.saturating_add(accepted as u64);
+        store.synth_seq
+    };
+    {
+        let mut ring = live_input_store().lock().map_err(|_| {
+            HandlerError::new(
+                "transport",
+                "Unavailable",
+                "introspection store unavailable".to_string(),
+            )
+        })?;
+        for event in &validated {
+            let (kind, label) = match event {
+                SyntheticEvent::Key { key, mods, pressed } => (
+                    "key".to_string(),
+                    format!("[synthetic:{origin}] key:{key} mods:{mods} pressed:{pressed}"),
+                ),
+                SyntheticEvent::Mouse {
+                    button,
+                    action,
+                    col,
+                    row,
+                } => (
+                    "mouse".to_string(),
+                    format!("[synthetic:{origin}] mouse:{button} {action} col={col} row={row}"),
+                ),
+                SyntheticEvent::Wheel {
+                    delta_rows,
+                    delta_cols,
+                    col,
+                    row,
+                } => (
+                    "wheel".to_string(),
+                    format!(
+                        "[synthetic:{origin}] wheel rows={delta_rows} cols={delta_cols} col={} row={}",
+                        col.map_or(String::from("-"), |c| c.to_string()),
+                        row.map_or(String::from("-"), |r| r.to_string()),
+                    ),
+                ),
+                SyntheticEvent::Paste { text } => {
+                    let preview: String = text.chars().take(32).collect();
+                    (
+                        "paste".to_string(),
+                        format!("[synthetic:{origin}] paste:{preview}"),
+                    )
+                }
+            };
+            ring.push(InputEventPublish {
+                seq: synth_seq,
+                kind: truncate_chars(&kind, 16),
+                label: truncate_chars(&label, MAX_INPUT_LABEL_CHARS),
+                shift: false,
+                control: false,
+                alt: false,
+                button: None,
+                col: None,
+                row: None,
+                pressed: None,
+            });
+            while ring.len() > MAX_INPUT_RING {
+                ring.remove(0);
+            }
+        }
+    }
+    let mut out = String::with_capacity(256);
+    out.push_str("{\"version\":\"");
+    out.push_str(DEVTOOLS_PROTOCOL_VERSION);
+    out.push_str("\",\"receipt\":\"synthesize\",\"terminalId\":\"");
+    json_escape_into(&mut out, &terminal_id);
+    out.push_str("\",\"accepted\":");
+    out.push_str(&accepted.to_string());
+    out.push_str(",\"rejected\":0,\"syntheticSeq\":");
+    out.push_str(&synth_seq.to_string());
+    out.push_str(",\"originLabel\":\"");
+    json_escape_into(&mut out, &origin);
+    out.push_str("\",\"synthetic\":true}");
+    Ok(out)
+}
+
+/// `bitty.debug/captureFrame`: bearer-scoped redacted frame capture.
+///
+/// Params (object, `<= 32 KiB`): `{ terminalId|terminal_id: "t:N", bearer:
+/// "<token>", format: "semantic"|"pixels" (default semantic),
+/// explicitOptIn: true (required for pixels), rows/cols viewport caps }.
+/// Requires `debug.trace` + `terminal.inspect` plus a live `capture` bearer.
+/// `semantic` returns redacted grid text; `pixels` returns a masked record
+/// with zero text (audited with caller identity). Every response carries
+/// `"trust":"untrusted-observation"` (T-10 parity).
+fn handle_capture_frame(
+    context: &ServeContext,
+    request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    use crate::scope::Scope::{DebugTrace, TerminalInspect};
+    let params = request.params_raw.as_deref().ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "captureFrame requires params".to_string(),
+        )
+    })?;
+    let terminal_id = extract_terminal_id(params).ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "captureFrame requires terminalId \"t:N\"".to_string(),
+        )
+    })?;
+    if crate::ctl::parse_terminal_id(&terminal_id).is_err() {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "terminalId must match ^t:[0-9]+$ (no wildcards)".to_string(),
+        ));
+    }
+    let bearer = extract_top_string(params, "bearer");
+    let format = extract_top_string(params, "format").unwrap_or_else(|| "semantic".to_string());
+    if format != "semantic" && format != "pixels" {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "format must be semantic|pixels".to_string(),
+        ));
+    }
+    if format == "pixels" && extract_top_bool(params, "explicitOptIn") != Some(true) {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "pixels capture requires explicitOptIn true".to_string(),
+        ));
+    }
+    authorize_automation(
+        &context.granted,
+        &[DebugTrace, TerminalInspect],
+        bearer.as_deref(),
+        &context.session_id,
+        &terminal_id,
+        AutomationFamily::Capture,
+        context.uptime_ms,
+    )?;
+    // Viewport caps reuse the introspection bounds (fail-closed).
+    let rows = parse_optional_uint_param(
+        request.params_raw.as_deref(),
+        "rows",
+        MAX_INSPECT_ROWS,
+        MAX_INSPECT_ROWS,
+    )?;
+    let cols = parse_optional_uint_param(
+        request.params_raw.as_deref(),
+        "cols",
+        MAX_INSPECT_COLS,
+        MAX_INSPECT_COLS,
+    )?;
+    let guard = live_grid_store().lock().map_err(|_| {
+        HandlerError::new(
+            "transport",
+            "Unavailable",
+            "introspection store unavailable".to_string(),
+        )
+    })?;
+    let grid_cols = if guard.cols == 0 {
+        context.server.cols
+    } else {
+        guard.cols
+    };
+    let grid_rows = if guard.rows == 0 {
+        context.server.rows
+    } else {
+        guard.rows
+    };
+    let frame_seq = guard.generation;
+    // Audit every capture with caller identity (pixels mandatory, semantic
+    // uniform). Bounded drop-oldest; poison fails closed without a record.
+    {
+        if let Ok(mut store) = automation_store().lock() {
+            store.audit.push(FrameAuditEntry {
+                session_id: context.session_id.clone(),
+                terminal_id: terminal_id.clone(),
+                format: format.clone(),
+                now_ms: context.uptime_ms,
+            });
+            while store.audit.len() > MAX_AUTOMATION_BEARERS {
+                store.audit.remove(0);
+            }
+        }
+    }
+    if format == "pixels" {
+        let mut out = String::with_capacity(256);
+        out.push_str("{\"version\":\"");
+        out.push_str(DEVTOOLS_PROTOCOL_VERSION);
+        out.push_str("\",\"snapshot\":\"frame\",\"format\":\"pixels\",\"terminalId\":\"");
+        json_escape_into(&mut out, &terminal_id);
+        out.push_str("\",\"masked\":true,\"cols\":");
+        out.push_str(&grid_cols.to_string());
+        out.push_str(",\"rows\":");
+        out.push_str(&grid_rows.to_string());
+        out.push_str(",\"frameSeq\":");
+        out.push_str(&frame_seq.to_string());
+        out.push_str(",\"trust\":\"untrusted-observation\",\"caller\":\"");
+        json_escape_into(&mut out, &context.session_id);
+        out.push_str("\",\"audited\":true}");
+        return Ok(out);
+    }
+    let take = rows.min(guard.lines.len());
+    let mut out = String::with_capacity(1024.min(MAX_INSPECT_JSON_BYTES));
+    out.push_str("{\"version\":\"");
+    out.push_str(DEVTOOLS_PROTOCOL_VERSION);
+    out.push_str("\",\"snapshot\":\"frame\",\"format\":\"semantic\",\"terminalId\":\"");
+    json_escape_into(&mut out, &terminal_id);
+    out.push_str("\",\"lines\":[");
+    for (i, line) in guard.lines.iter().take(take).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let cut = truncate_line(line, cols);
+        let redacted = redact_frame_line(&cut);
+        out.push('"');
+        json_escape_into(&mut out, &redacted);
+        out.push('"');
+        if out.len() > MAX_INSPECT_JSON_BYTES {
+            return Err(HandlerError::new(
+                "transport",
+                "PayloadTooLarge",
+                "frame snapshot exceeds response bound".to_string(),
+            ));
+        }
+    }
+    out.push_str("],\"cursor\":{\"row\":");
+    out.push_str(&guard.cursor_row.to_string());
+    out.push_str(",\"col\":");
+    out.push_str(&guard.cursor_col.to_string());
+    out.push_str(",\"visible\":");
+    out.push_str(if guard.cursor_visible {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str("},\"cols\":");
+    out.push_str(&grid_cols.to_string());
+    out.push_str(",\"rows\":");
+    out.push_str(&grid_rows.to_string());
+    out.push_str(",\"frameSeq\":");
+    out.push_str(&frame_seq.to_string());
+    out.push_str(",\"trust\":\"untrusted-observation\"}");
+    if out.len() > MAX_INSPECT_JSON_BYTES {
+        return Err(HandlerError::new(
+            "transport",
+            "PayloadTooLarge",
+            "frame snapshot exceeds response bound".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 // ── responses ───────────────────────────────────────────────────────────────
@@ -2645,12 +3968,15 @@ mod tests {
         // (getGridText, getInputRing, getModifiers, getFocus) plus CTX-0171
         // control (listWindows, listViews, listTerminals, spawnTerminal,
         // closeTerminal, sendInput, getTerminalText, splitView, focusView,
-        // reloadConfig).
-        assert_eq!(dispatcher.method_count(), 16);
+        // reloadConfig) plus CTX-0188 automation (synthesizeInput,
+        // captureFrame).
+        assert_eq!(dispatcher.method_count(), 18);
         assert!(dispatcher.contains("bitty.debug/getGridText"));
         assert!(dispatcher.contains("bitty.debug/getInputRing"));
         assert!(dispatcher.contains("bitty.debug/getModifiers"));
         assert!(dispatcher.contains("bitty.debug/getFocus"));
+        assert!(dispatcher.contains(METHOD_SYNTHESIZE_INPUT));
+        assert!(dispatcher.contains(METHOD_CAPTURE_FRAME));
         for method in crate::ctl::all_control_methods() {
             assert!(
                 dispatcher.contains(method),
@@ -3248,5 +4574,579 @@ mod tests {
         let text = String::from_utf8(outcome.response).unwrap();
         assert!(text.len() <= MAX_INSPECT_JSON_BYTES + 512);
         clear_introspection_for_tests();
+    }
+
+    // ── test automation (CTX-0188, Amendment A1 candidate) ──────────────────
+    //
+    // Bearer matrix, scope intersection, bounds, redaction, and rate shedding
+    // for `synthesizeInput` + `captureFrame`. Every test holds the serial
+    // guard (automation shares the input/grid stores) and clears automation
+    // plus introspection before and after.
+
+    fn automation_scopes_synthesize() -> crate::scope::ScopeSet {
+        let mut set = crate::scope::ScopeSet::new();
+        set.insert(crate::scope::Scope::DebugControl);
+        set.insert(crate::scope::Scope::TerminalInput);
+        set
+    }
+
+    fn automation_scopes_capture() -> crate::scope::ScopeSet {
+        let mut set = crate::scope::ScopeSet::new();
+        set.insert(crate::scope::Scope::DebugTrace);
+        set.insert(crate::scope::Scope::TerminalInspect);
+        set
+    }
+
+    fn automation_context(
+        server: &ServerInfo,
+        granted: crate::scope::ScopeSet,
+        session: &str,
+        now_ms: u64,
+    ) -> ServeContext {
+        let mut ctx = ServeContext::with_granted_session(server, granted, session);
+        ctx.uptime_ms = now_ms;
+        ctx
+    }
+
+    fn synth_envelope(id: u64, params: &str) -> Vec<u8> {
+        format!(
+            "{{\"id\":{id},\"method\":\"{METHOD_SYNTHESIZE_INPUT}\",\"version\":\"1.0\",\"params\":{params}}}"
+        )
+        .into_bytes()
+    }
+
+    fn capture_envelope(id: u64, params: &str) -> Vec<u8> {
+        format!(
+            "{{\"id\":{id},\"method\":\"{METHOD_CAPTURE_FRAME}\",\"version\":\"1.0\",\"params\":{params}}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn automation_unscoped_synthesize_is_scope_denied_no_partial_state() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let seq_before = synthetic_seq_for_tests();
+        // Empty scopes + no bearer: fail fast ScopeDenied.
+        let ctx = automation_context(&server, crate::scope::ScopeSet::new(), "s1", 1000);
+        let outcome = handle_envelope(
+            &synth_envelope(
+                1,
+                r#"{"terminalId":"t:1","bearer":"nope","originLabel":"harness","events":[{"type":"key","key":"a"}]}"#,
+            ),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(outcome.was_error);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("ScopeDenied"), "got: {text}");
+        assert_eq!(synthetic_seq_for_tests(), seq_before);
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_bearer_matrix_fails_closed() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let synth_scopes = automation_scopes_synthesize();
+        let capture_scopes = automation_scopes_capture();
+        // Issue valid bearers at t=1000.
+        let synth_tok =
+            issue_automation_bearer("sess-a", "t:1", AutomationFamily::Synthesize, 1000).unwrap();
+        let capture_tok =
+            issue_automation_bearer("sess-a", "t:1", AutomationFamily::Capture, 1000).unwrap();
+        // Absent bearer.
+        let ctx = automation_context(&server, synth_scopes.clone(), "sess-a", 1000);
+        let outcome = handle_envelope(
+            &synth_envelope(
+                1,
+                r#"{"terminalId":"t:1","originLabel":"h","events":[{"type":"key","key":"a"}]}"#,
+            ),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        assert!(outcome.was_error);
+        // Wrong-session bearer.
+        let ctx_other = automation_context(&server, synth_scopes.clone(), "sess-b", 1000);
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{synth_tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(2, &params), &dispatcher, &ctx_other);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // Wrong-terminal bearer.
+        let ctx = automation_context(&server, synth_scopes.clone(), "sess-a", 1000);
+        let params = format!(
+            "{{\"terminalId\":\"t:2\",\"bearer\":\"{synth_tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(3, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // Wrong-family bearer (capture token on synthesize).
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{capture_tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(4, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // Expired bearer.
+        let mut ctx_expired = automation_context(&server, synth_scopes.clone(), "sess-a", 1000);
+        ctx_expired.uptime_ms = 1000 + AUTOMATION_BEARER_TTL_MS;
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{synth_tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(5, &params), &dispatcher, &ctx_expired);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("ScopeDenied"), "expired must deny: {text}");
+        // Capture wrong-family (synthesize token on capture): re-issue a live
+        // synthesize token to prove family mismatch distinctly (the earlier
+        // synth token was consumed by the expiry check above).
+        publish_grid_text(vec!["hello".to_string()], 0, 5, true, 3, 80, 24);
+        let ctx_cap = automation_context(&server, capture_scopes, "sess-a", 1000);
+        let live_synth =
+            issue_automation_bearer("sess-a", "t:1", AutomationFamily::Synthesize, 1000).unwrap();
+        let params2 = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{live_synth}\",\"format\":\"semantic\"}}"
+        );
+        let outcome = handle_envelope(&capture_envelope(6, &params2), &dispatcher, &ctx_cap);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        let _ = capture_tok;
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_scope_intersection_requires_debug_plus_terminal() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 500).unwrap();
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        // DebugControl alone (missing TerminalInput) denies.
+        let mut only_debug = crate::scope::ScopeSet::new();
+        only_debug.insert(crate::scope::Scope::DebugControl);
+        let ctx = automation_context(&server, only_debug, "s1", 500);
+        let outcome = handle_envelope(&synth_envelope(1, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // TerminalInput alone (missing DebugControl) denies.
+        let mut only_term = crate::scope::ScopeSet::new();
+        only_term.insert(crate::scope::Scope::TerminalInput);
+        let ctx = automation_context(&server, only_term, "s1", 500);
+        let outcome = handle_envelope(&synth_envelope(2, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // Capture: DebugTrace alone denies, TerminalInspect alone denies.
+        let cap_tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Capture, 500).unwrap();
+        publish_grid_text(vec!["x".to_string()], 0, 1, true, 1, 80, 24);
+        let cap_params =
+            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{cap_tok}\",\"format\":\"semantic\"}}");
+        let mut only_trace = crate::scope::ScopeSet::new();
+        only_trace.insert(crate::scope::Scope::DebugTrace);
+        let ctx = automation_context(&server, only_trace, "s1", 500);
+        let outcome = handle_envelope(&capture_envelope(3, &cap_params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_synthesize_bounds_fail_closed() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+        let ctx = automation_context(&server, automation_scopes_synthesize(), "s1", 0);
+        // Zero events.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(1, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // 65 events exceeds the 64/call ceiling.
+        let many: Vec<String> = (0..65)
+            .map(|_| "{\"type\":\"key\",\"key\":\"a\"}".to_string())
+            .collect();
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{}]}}",
+            many.join(",")
+        );
+        let outcome = handle_envelope(&synth_envelope(2, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // Wildcard terminal fails closed (exactly one t:N per call).
+        let params = format!(
+            "{{\"terminalId\":\"*\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(3, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // Unknown event type.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"teleport\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(4, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // Bad mouse button.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"mouse\",\"button\":\"Side\",\"action\":\"click\",\"col\":1,\"row\":1}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(5, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // Zero wheel delta.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"wheel\",\"deltaRows\":0}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(6, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // Paste with NUL.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"paste\",\"text\":\"a\\u0000b\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(7, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        // Missing originLabel.
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(8, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_synthesize_success_marks_synthetic_origin() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok =
+            issue_automation_bearer("harness", "t:1", AutomationFamily::Synthesize, 2000).unwrap();
+        let ctx = automation_context(&server, automation_scopes_synthesize(), "harness", 2000);
+        let seq_before = synthetic_seq_for_tests();
+        let params = format!(
+            concat!(
+                "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"e2e-harness\",",
+                "\"events\":[{{\"type\":\"key\",\"key\":\"Enter\",\"pressed\":true}},",
+                "{{\"type\":\"mouse\",\"button\":\"Left\",\"action\":\"click\",\"col\":10,\"row\":5}},",
+                "{{\"type\":\"wheel\",\"deltaRows\":-3}},",
+                "{{\"type\":\"paste\",\"text\":\"echo hi\"}}]}}"
+            ),
+            tok = tok
+        );
+        let outcome = handle_envelope(&synth_envelope(1, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("\"accepted\":4"), "got: {text}");
+        assert!(text.contains("\"rejected\":0"), "got: {text}");
+        assert!(text.contains("\"synthetic\":true"), "got: {text}");
+        assert!(synthetic_seq_for_tests() > seq_before);
+        // Input-ring observability carries the indelible synthetic marker.
+        let ring_ctx = automation_context(
+            &server,
+            crate::scope::ScopeSet::cli_default(),
+            "harness",
+            2000,
+        );
+        let _ = ring_ctx;
+        let guard = live_input_store().lock().unwrap();
+        assert!(guard.len() >= 4);
+        assert!(
+            guard
+                .iter()
+                .all(|e| e.label.contains("[synthetic:e2e-harness]"))
+        );
+        drop(guard);
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_synthesize_rate_sheds_with_budget_error() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+        let ctx = automation_context(&server, automation_scopes_synthesize(), "s1", 0);
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        for id in 1..=MAX_SYNTH_CALLS_PER_SEC as u64 {
+            let outcome = handle_envelope(&synth_envelope(id, &params), &dispatcher, &ctx);
+            assert!(!outcome.was_error, "call {id} must pass under ceiling");
+        }
+        let outcome = handle_envelope(
+            &synth_envelope(MAX_SYNTH_CALLS_PER_SEC as u64 + 1, &params),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(outcome.was_error);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("RateLimited"), "got: {text}");
+        // A different bearer (benign concurrent session) is unaffected.
+        let tok2 = issue_automation_bearer("s2", "t:2", AutomationFamily::Synthesize, 0).unwrap();
+        let ctx2 = automation_context(&server, automation_scopes_synthesize(), "s2", 0);
+        let params2 = format!(
+            "{{\"terminalId\":\"t:2\",\"bearer\":\"{tok2}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(100, &params2), &dispatcher, &ctx2);
+        assert!(!outcome.was_error);
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_capture_semantic_redacts_and_labels_untrusted() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        publish_grid_text(
+            vec![
+                "$ echo hello".to_string(),
+                "hello".to_string(),
+                "DB_PASSWORD=hunter2".to_string(),
+                "clipboard bytes leak".to_string(),
+            ],
+            1,
+            5,
+            true,
+            9,
+            80,
+            24,
+        );
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Capture, 7000).unwrap();
+        let ctx = automation_context(&server, automation_scopes_capture(), "s1", 7000);
+        let params =
+            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"semantic\"}}");
+        let outcome = handle_envelope(&capture_envelope(1, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("\"snapshot\":\"frame\""), "got: {text}");
+        assert!(
+            text.contains("\"trust\":\"untrusted-observation\""),
+            "got: {text}"
+        );
+        assert!(text.contains("hello"), "got: {text}");
+        assert!(!text.contains("hunter2"), "secret leaked: {text}");
+        assert!(
+            !text.contains("clipboard bytes leak"),
+            "clipboard leaked: {text}"
+        );
+        assert!(text.contains(REDACTED_MARKER), "got: {text}");
+        assert!(text.contains("\"frameSeq\":9"), "got: {text}");
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_capture_pixels_requires_opt_in_masks_and_audits() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        publish_grid_text(vec!["SECRET=topsecret".to_string()], 0, 1, true, 11, 80, 24);
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Capture, 8000).unwrap();
+        let ctx = automation_context(&server, automation_scopes_capture(), "s1", 8000);
+        // Without explicit opt-in: fail closed.
+        let params =
+            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"pixels\"}}");
+        let outcome = handle_envelope(&capture_envelope(1, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("InvalidParams")
+        );
+        // With opt-in: masked record, zero text, audited caller.
+        let audit_before = frame_audit_len_for_tests();
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"pixels\",\"explicitOptIn\":true}}"
+        );
+        let outcome = handle_envelope(&capture_envelope(2, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error);
+        let text = String::from_utf8(outcome.response).unwrap();
+        assert!(text.contains("\"format\":\"pixels\""), "got: {text}");
+        assert!(text.contains("\"masked\":true"), "got: {text}");
+        assert!(text.contains("\"audited\":true"), "got: {text}");
+        assert!(text.contains("\"caller\":\"s1\""), "got: {text}");
+        assert!(!text.contains("topsecret"), "pixels leaked text: {text}");
+        assert!(
+            !text.contains("\"lines\""),
+            "pixels must carry zero text: {text}"
+        );
+        assert!(frame_audit_len_for_tests() > audit_before);
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_capture_rate_sheds_at_fps_ceiling() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        publish_grid_text(vec!["f".to_string()], 0, 1, true, 1, 80, 24);
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Capture, 0).unwrap();
+        let ctx = automation_context(&server, automation_scopes_capture(), "s1", 0);
+        let params =
+            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"semantic\"}}");
+        for id in 1..=MAX_CAPTURE_FPS as u64 {
+            let outcome = handle_envelope(&capture_envelope(id, &params), &dispatcher, &ctx);
+            assert!(!outcome.was_error, "frame {id} must pass under ceiling");
+        }
+        let outcome = handle_envelope(
+            &capture_envelope(MAX_CAPTURE_FPS as u64 + 1, &params),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("RateLimited")
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_bearer_lifecycle_revoke_ttl_cap_and_no_env_issuance() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        // TTL bounds hold fail-closed.
+        assert!(
+            issue_automation_bearer_with_ttl("s", "t:1", AutomationFamily::Synthesize, 0, 0)
+                .is_err()
+        );
+        assert!(
+            issue_automation_bearer_with_ttl(
+                "s",
+                "t:1",
+                AutomationFamily::Synthesize,
+                0,
+                AUTOMATION_BEARER_TTL_MS + 1
+            )
+            .is_err()
+        );
+        // Revocation takes effect immediately.
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+        assert!(revoke_automation_bearer(&tok));
+        let ctx = automation_context(&server, automation_scopes_synthesize(), "s1", 0);
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(1, &params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // No-bypass: elevation alone never substitutes for a bearer. Even
+        // with every scope granted, a forged token still fails closed, and
+        // issuance has no env/config/flag path (code inspection: only
+        // `issue_automation_bearer` inserts into the memory-only store).
+        let ctx = automation_context(&server, crate::scope::ScopeSet::all(), "s1", 0);
+        let params = r#"{"terminalId":"t:1","bearer":"forged-token","originLabel":"h","events":[{"type":"key","key":"a"}]}"#;
+        let outcome = handle_envelope(&synth_envelope(2, params), &dispatcher, &ctx);
+        assert!(
+            String::from_utf8(outcome.response)
+                .unwrap()
+                .contains("ScopeDenied")
+        );
+        // Bearers are never persisted: the store is memory-only.
+        assert_eq!(automation_bearer_count_for_tests(), 0);
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn automation_params_two_tier_envelope_bound() {
+        // Automation methods admit larger params than the 4 KiB
+        // introspection bound (up to 32 KiB); other methods stay capped.
+        let big_pad = "p".repeat(MAX_PARAMS_BYTES);
+        let auto_payload = format!(
+            "{{\"id\":1,\"method\":\"{METHOD_SYNTHESIZE_INPUT}\",\"version\":\"1.0\",\"params\":{{\"pad\":\"{big_pad}\"}}}}"
+        );
+        assert!(parse_request(auto_payload.as_bytes()).is_ok());
+        let plain_payload = format!(
+            "{{\"id\":1,\"method\":\"bitty.debug/getGridText\",\"version\":\"1.0\",\"params\":{{\"pad\":\"{big_pad}\"}}}}"
+        );
+        assert!(parse_request(plain_payload.as_bytes()).is_err());
     }
 }

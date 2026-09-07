@@ -286,6 +286,7 @@ dependencies = [
  "bitty-platform",
  "bitty-term-state",
  "bitty-vt",
+ "getrandom 0.3.4",
 ]
 
 [[package]]

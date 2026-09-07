@@ -17,6 +17,9 @@ workspace = true
 bitty-term-state = { path = "../bitty-term-state" }
 bitty-vt = { path = "../bitty-vt" }
 bitty-platform = { path = "../bitty-platform" }
+# 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
+# 0.3.x line; no other RNG is used so token entropy is auditable in one place.
+getrandom = "0.3"
 
 
 [dev-dependencies]

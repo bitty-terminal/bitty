@@ -187,6 +187,7 @@ pub mod git_panel;
 pub mod inspect;
 pub mod mail_panel;
 pub mod palette;
+pub mod panels_async;
 pub mod paste;
 pub mod project;
 pub mod queries;

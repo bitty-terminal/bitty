@@ -832,4 +832,31 @@ mod tests {
                 || filtered.len() <= FILE_MANAGER_MAX_ENTRIES
         );
     }
+
+    #[test]
+    fn fs_scan_runs_off_tick_behind_bounded_worker() {
+        use crate::panels_async::{PANEL_WORKER_DEFAULT_QUEUE_CAP, PanelWorker};
+        use std::time::{Duration, Instant};
+        let mut worker = PanelWorker::try_spawn(
+            "file-manager",
+            None,
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_millis(20),
+            || vec![FileEntry::from_path("~/projects/foo".to_string(), None).expect("valid entry")],
+        )
+        .expect("valid worker config");
+        // Tick path never blocks: no snapshot before the scan completes.
+        assert!(worker.latest().is_none());
+        worker.request_refresh();
+        let start = Instant::now();
+        while worker.latest().is_none() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let entries = worker.latest().expect("fs snapshot delivered");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "foo");
+        assert!(worker.generation() >= 1);
+        worker.shutdown();
+        assert!(!worker.is_alive());
+    }
 }

@@ -318,6 +318,32 @@ mod tests {
     }
 
     #[test]
+    fn tab_snapshot_served_off_tick_behind_bounded_worker() {
+        use crate::panels_async::{PANEL_WORKER_DEFAULT_QUEUE_CAP, PanelWorker};
+        use std::time::{Duration, Instant};
+        let mut worker = PanelWorker::try_spawn(
+            "tabs",
+            None,
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_millis(20),
+            || vec![ViewId::new(1), ViewId::new(2)],
+        )
+        .expect("valid worker config");
+        // Tick path never blocks: no snapshot before the probe completes.
+        assert!(worker.latest().is_none());
+        worker.request_refresh();
+        let start = Instant::now();
+        while worker.latest().is_none() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ids = worker.latest().expect("tab snapshot delivered");
+        assert_eq!(ids, vec![ViewId::new(1), ViewId::new(2)]);
+        assert!(worker.generation() >= 1);
+        worker.shutdown();
+        assert!(!worker.is_alive());
+    }
+
+    #[test]
     fn layout_reuse_no_hardcoded_tabs_primitive() {
         // Prove tabs are Stack/Split only: no enum variant named Tabs exists.
         // LayoutNode variants are Leaf/Split/Stack/Overlay only.

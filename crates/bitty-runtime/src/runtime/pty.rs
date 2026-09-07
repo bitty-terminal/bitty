@@ -13,7 +13,11 @@ use super::*;
 ///   pump channel, which fills the kernel PTY buffer, which blocks the child.
 /// - Fail-closed: a dropped consumer breaks `send` and ends the thread with
 ///   no loss beyond already-queued chunks and no unbounded growth.
-fn pty_forward_loop(reader: PtyReader, tx: std::sync::mpsc::SyncSender<Vec<u8>>, waker: PtyWaker) {
+pub(super) fn pty_forward_loop(
+    reader: PtyReader,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    waker: PtyWaker,
+) {
     loop {
         match reader.recv() {
             Some(chunk) => {
@@ -179,7 +183,8 @@ fn osc52_read_reply(text: &str) -> Vec<u8> {
 
 impl Runtime {
     /// Installs the cross-thread PTY readability callback and promotes the
-    /// direct reader into the wakeup forwarder pump.
+    /// direct reader into the wakeup forwarder pump (pane sessions promote
+    /// alongside; see `set_pty_waker` body, CTX-0230).
     ///
     /// The forwarder is the sole consumer of the bounded pump channel from
     /// this point: it blocks in `recv` (zero wakeups when quiet), forwards
@@ -194,6 +199,16 @@ impl Runtime {
     pub fn set_pty_waker(&mut self, waker: PtyWaker) {
         self.pty_waker = Some(waker);
         self.promote_pty_reader_to_forwarder();
+        // CTX-0230: pane readers promote too. A fresh split shell emits its
+        // `ESC[c` (Primary DA) immediately; without a per-pane forwarder
+        // nothing wakes a `ControlFlow::Wait` loop for pane-only output, so
+        // the query sat unanswered until an incidental wakeup (~10 s stall).
+        // Each promoted pane invokes the same waker, and `poll_pty` already
+        // drains every pane session on each call.
+        let ids: Vec<ViewId> = self.pane_sessions.keys().copied().collect();
+        for id in ids {
+            self.promote_pane_reader_to_forwarder(id);
+        }
     }
 
     /// Whether a readability waker is installed.
@@ -353,7 +368,9 @@ impl Runtime {
                 rx.recv_timeout(timeout).ok()
             } else {
                 let Some(reader) = self.pty_reader.as_ref() else {
-                    return 0;
+                    // CTX-0230: no primary reader must not starve panes.
+                    // (`poll_pty` already pumps panes in this case.)
+                    return self.pump_pane_sessions();
                 };
                 match reader.recv_timeout(timeout) {
                     Ok(Some(chunk)) => Some(chunk),
@@ -366,7 +383,10 @@ impl Runtime {
                 self.handle_pty_bytes(&chunk);
                 1 + self.poll_pty()
             }
-            None => 0,
+            // CTX-0230: a quiet primary must not starve panes. Drain every
+            // pane session before reporting idle so split-shell queries
+            // (e.g. fish `ESC[c` at startup) are answered on this path too.
+            None => self.pump_pane_sessions(),
         }
     }
 

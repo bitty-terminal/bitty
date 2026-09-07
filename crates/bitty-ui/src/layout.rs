@@ -13,6 +13,77 @@
 use crate::geometry::{Gaps, Rect, SplitAxis};
 use crate::view::{View, ViewId};
 
+/// Z-index tier for floating overlays (CTX-0217, FIND-0002).
+///
+/// Tiers order stacked overlays deterministically, lowest paints first
+/// (bottom) and highest paints last (top):
+///
+/// - `Editor`: base-level editor chrome; paints directly above the base node,
+///   below all floats.
+/// - `Float`: generic floating panes. This is the default tier used by
+///   [`LayoutNode::overlay`], so overlays built before tiers existed keep
+///   their legacy paint position.
+/// - `Popup`: transient popups (completion menus, hovers, context menus)
+///   above floats.
+/// - `Messages`: notifications and banners; always topmost.
+///
+/// The enum derives `Ord`, so `Editor < Float < Popup < Messages` and tiers
+/// sort with [`slice::sort`] / [`slice::sort_by_key`]. Discriminants are
+/// explicit (`0..=3`) to keep the order stable across refactors.
+///
+/// Conflict rule: overlays on different tiers compose strictly in tier order,
+/// independent of construction order. Overlays on the *same* tier resolve by
+/// construction order (stable): the later-constructed overlay paints above
+/// (after) the earlier one, matching [`LayoutNode::Stack`]'s "last is
+/// top-most" convention. [`LayoutNode::overlay_stack`] applies both rules;
+/// hand-nested [`LayoutNode::Overlay`] trees keep legacy depth-first paint
+/// order (inner before outer) and tiers on such trees are annotations only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OverlayTier {
+    /// Base-level editor chrome (bottom, `0`).
+    Editor = 0,
+    /// Generic floating panes; legacy default (`1`).
+    Float = 1,
+    /// Transient popups above floats (`2`).
+    Popup = 2,
+    /// Notifications and banners; always topmost (`3`).
+    Messages = 3,
+}
+
+impl OverlayTier {
+    /// Lowest paint tier ([`OverlayTier::Editor`]).
+    pub const BOTTOM: Self = Self::Editor;
+    /// Highest paint tier ([`OverlayTier::Messages`]).
+    pub const TOP: Self = Self::Messages;
+}
+
+impl Default for OverlayTier {
+    /// Legacy default: un-tiered overlays behave as [`OverlayTier::Float`].
+    fn default() -> Self {
+        Self::Float
+    }
+}
+
+/// One floating layer composed above a base node by
+/// [`LayoutNode::overlay_stack`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayLayer {
+    /// Z-index tier of this layer.
+    pub tier: OverlayTier,
+    /// Layer content.
+    pub node: LayoutNode,
+    /// Desired layer bounds in container-local coordinates (clipped to container).
+    pub bounds: Rect,
+}
+
+impl OverlayLayer {
+    /// Creates a floating layer at `tier`.
+    #[must_use]
+    pub fn new(tier: OverlayTier, node: LayoutNode, bounds: Rect) -> Self {
+        Self { tier, node, bounds }
+    }
+}
+
 /// Layout tree for terminal panes.
 ///
 /// Each leaf holds an owned `View`. Interiors describe composition:
@@ -23,6 +94,9 @@ use crate::view::{View, ViewId};
 /// - `Stack`: tab-like stacking where every child occupies the full container bounds;
 ///   the last element is considered top-most for focus/visual order.
 /// - `Overlay`: a base layer plus a floating overlay clipped to the container.
+///   The overlay carries an [`OverlayTier`]; stacked overlays composed with
+///   [`LayoutNode::overlay_stack`] paint in tier order (see [`OverlayTier`]
+///   for the same-tier conflict rule).
 ///
 /// The tree is deterministic: the same `LayoutNode` laid out in the same
 /// `Rect` always produces the same allocation, independent of platform or HashMap ordering.
@@ -51,6 +125,8 @@ pub enum LayoutNode {
         overlay: Box<LayoutNode>,
         /// Desired overlay bounds in container-local coordinates (clipped to container).
         bounds: Rect,
+        /// Z-index tier of the overlay (see [`OverlayTier`]).
+        tier: OverlayTier,
     },
 }
 
@@ -121,13 +197,62 @@ impl LayoutNode {
         Self::Stack(children)
     }
 
-    /// Creates an overlay.
+    /// Creates an overlay at the legacy default tier ([`OverlayTier::Float`]).
+    ///
+    /// Tiering is annotation-only for a single overlay: the solver output is
+    /// byte-identical to [`Self::overlay_tiered`] with [`OverlayTier::Float`].
     #[must_use]
     pub fn overlay(base: LayoutNode, overlay: LayoutNode, bounds: Rect) -> Self {
+        Self::overlay_tiered(base, overlay, bounds, OverlayTier::default())
+    }
+
+    /// Creates an overlay at an explicit [`OverlayTier`].
+    ///
+    /// The tier does not change this node's geometry or its position in the
+    /// solver output; it orders the overlay against sibling tiers when the
+    /// tree is composed with [`Self::overlay_stack`].
+    #[must_use]
+    pub fn overlay_tiered(
+        base: LayoutNode,
+        overlay: LayoutNode,
+        bounds: Rect,
+        tier: OverlayTier,
+    ) -> Self {
         Self::Overlay {
             base: Box::new(base),
             overlay: Box::new(overlay),
             bounds,
+            tier,
+        }
+    }
+
+    /// Composes `base` with stacked floating `layers`, deterministically.
+    ///
+    /// Layers are stable-sorted by [`OverlayTier`] (lowest first), so paint
+    /// order is always `base`, then tiers `Editor < Float < Popup <
+    /// Messages`, regardless of input order. Layers on the same tier keep
+    /// their input order with later entries painting above (after) earlier
+    /// ones. The result folds into nested [`LayoutNode::Overlay`] nodes
+    /// (lowest tier innermost), so the gapless and gap-aware solvers traverse
+    /// it exactly like a hand-built overlay chain: a single-layer stack is
+    /// structurally identical to [`Self::overlay_tiered`], and an empty
+    /// `layers` vec returns `base` unchanged.
+    #[must_use]
+    pub fn overlay_stack(base: LayoutNode, mut layers: Vec<OverlayLayer>) -> Self {
+        layers.sort_by_key(|l| l.tier);
+        layers.into_iter().fold(base, |acc, l| {
+            Self::overlay_tiered(acc, l.node, l.bounds, l.tier)
+        })
+    }
+
+    /// Returns the [`OverlayTier`] of an [`LayoutNode::Overlay`] node, or
+    /// `None` for any other variant.
+    #[must_use]
+    pub fn overlay_tier(&self) -> Option<OverlayTier> {
+        if let Self::Overlay { tier, .. } = self {
+            Some(*tier)
+        } else {
+            None
         }
     }
 
@@ -325,6 +450,7 @@ impl LayoutNode {
                 base,
                 overlay,
                 bounds: overlay_bounds,
+                ..
             } => {
                 base.layout_inner(bounds, gap_in, out);
                 // Overlay desired bounds are container-relative and clipped.
@@ -1051,5 +1177,158 @@ mod tests {
         } else {
             panic!("expected split");
         }
+    }
+
+    #[test]
+    fn overlay_tier_ordering_and_defaults() {
+        // CTX-0217: tiers order Editor < Float < Popup < Messages with stable
+        // explicit discriminants; the legacy constructor defaults to Float.
+        assert!(OverlayTier::Editor < OverlayTier::Float);
+        assert!(OverlayTier::Float < OverlayTier::Popup);
+        assert!(OverlayTier::Popup < OverlayTier::Messages);
+        assert_eq!(OverlayTier::Editor as u8, 0);
+        assert_eq!(OverlayTier::Float as u8, 1);
+        assert_eq!(OverlayTier::Popup as u8, 2);
+        assert_eq!(OverlayTier::Messages as u8, 3);
+        assert_eq!(OverlayTier::default(), OverlayTier::Float);
+        assert_eq!(OverlayTier::BOTTOM, OverlayTier::Editor);
+        assert_eq!(OverlayTier::TOP, OverlayTier::Messages);
+
+        let node = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            Rect::new(0, 0, 5, 5),
+        );
+        assert_eq!(node.overlay_tier(), Some(OverlayTier::Float));
+        let tiered = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            Rect::new(0, 0, 5, 5),
+            OverlayTier::Messages,
+        );
+        assert_eq!(tiered.overlay_tier(), Some(OverlayTier::Messages));
+        assert_eq!(LayoutNode::leaf(view(1, 1, 1)).overlay_tier(), None);
+    }
+
+    #[test]
+    fn single_overlay_layout_byte_identical() {
+        // CTX-0217: tiering must not change existing single-overlay behavior.
+        // `overlay()` and `overlay_tiered(..., Float)` produce identical
+        // allocations, pinned to exact rects.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let over_bounds = Rect::new(10, 5, 20, 10);
+        let legacy = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            over_bounds,
+        );
+        let tiered = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            over_bounds,
+            OverlayTier::Float,
+        );
+        // Same tier default => structurally identical trees.
+        assert_eq!(legacy, tiered);
+        let a = legacy.layout(bounds);
+        let b = tiered.layout(bounds);
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            vec![(ViewId::new(1), bounds), (ViewId::new(2), over_bounds),]
+        );
+        // Gap-aware solver agrees as well.
+        assert_eq!(
+            legacy.layout_with_gaps(bounds, Gaps::ZERO),
+            tiered.layout_with_gaps(bounds, Gaps::ZERO)
+        );
+    }
+
+    #[test]
+    fn overlay_stack_single_layer_matches_overlay() {
+        // CTX-0217: a one-layer stack is exactly `overlay_tiered`.
+        let base = LayoutNode::leaf(view(1, 1, 1));
+        let over_bounds = Rect::new(70, 20, 20, 10);
+        let stacked = LayoutNode::overlay_stack(
+            base,
+            vec![OverlayLayer::new(
+                OverlayTier::Popup,
+                LayoutNode::leaf(view(2, 1, 1)),
+                over_bounds,
+            )],
+        );
+        let direct = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            over_bounds,
+            OverlayTier::Popup,
+        );
+        assert_eq!(stacked, direct);
+        // Empty stacks return the base unchanged (total constructor).
+        let bare = LayoutNode::leaf(view(1, 1, 1));
+        assert_eq!(LayoutNode::overlay_stack(bare.clone(), vec![]), bare);
+    }
+
+    #[test]
+    fn overlay_stack_orders_by_tier_regardless_of_input() {
+        // CTX-0217: paint order follows tiers even when layers arrive
+        // scrambled; the run is deterministic.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let layer = |tier, id: u64| {
+            OverlayLayer::new(
+                tier,
+                LayoutNode::leaf(view(id, 1, 1)),
+                Rect::new(0, 0, 10, 5),
+            )
+        };
+        let scrambled = vec![
+            layer(OverlayTier::Messages, 40),
+            layer(OverlayTier::Editor, 10),
+            layer(OverlayTier::Popup, 30),
+            layer(OverlayTier::Float, 20),
+        ];
+        let node = LayoutNode::overlay_stack(LayoutNode::leaf(view(1, 1, 1)), scrambled);
+        let alloc = node.layout(bounds);
+        let ids: Vec<ViewId> = alloc.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ViewId::new(1),
+                ViewId::new(10),
+                ViewId::new(20),
+                ViewId::new(30),
+                ViewId::new(40),
+            ]
+        );
+        // Determinism check: second run identical.
+        assert_eq!(alloc, node.layout(bounds));
+        // Tiers are recorded outermost-first (Messages on top).
+        assert_eq!(node.overlay_tier(), Some(OverlayTier::Messages));
+    }
+
+    #[test]
+    fn overlay_stack_same_tier_is_stable_later_on_top() {
+        // CTX-0217 conflict rule: same-tier ties keep construction order and
+        // later entries paint above (after) earlier ones.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let layer = |id: u64| {
+            OverlayLayer::new(
+                OverlayTier::Float,
+                LayoutNode::leaf(view(id, 1, 1)),
+                Rect::new(0, 0, 10, 5),
+            )
+        };
+        let fwd =
+            LayoutNode::overlay_stack(LayoutNode::leaf(view(1, 1, 1)), vec![layer(2), layer(3)]);
+        let ids: Vec<ViewId> = fwd.layout(bounds).iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![ViewId::new(1), ViewId::new(2), ViewId::new(3)]);
+
+        let rev =
+            LayoutNode::overlay_stack(LayoutNode::leaf(view(1, 1, 1)), vec![layer(3), layer(2)]);
+        let rev_ids: Vec<ViewId> = rev.layout(bounds).iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            rev_ids,
+            vec![ViewId::new(1), ViewId::new(3), ViewId::new(2)]
+        );
     }
 }

@@ -74,9 +74,11 @@ const QUOTED_REDACTED: &str = "\"[redacted]\"";
 /// Return `true` when a tool-argument/result key likely carries a secret.
 ///
 /// Matching is case-insensitive and intentionally fail-closed (over-redact
-/// rather than leak). Bare short tokens (`auth`, `key`, `pwd`) match only on
-/// exact equality or explicit `_key`/`_token`/`_secret` suffixes so legit
-/// keys like `author`, `path`, or `description` pass through.
+/// rather than leak). Bare short tokens (`auth`, `key`, `pwd`, `pass`, `pw`)
+/// match only on exact equality or explicit suffixes so legit
+/// keys like `author`, `path`, `bypass`, or `description` pass through
+/// (`pw` is exact/suffix-only to avoid mangling ordinary words containing
+/// `pw`/`pass` such as `power` or `bypass`).
 #[must_use]
 pub fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
@@ -85,6 +87,8 @@ pub fn is_sensitive_key(key: &str) -> bool {
         l,
         "auth"
             | "pwd"
+            | "pass"
+            | "pw"
             | "key"
             | "token"
             | "secret"
@@ -116,6 +120,10 @@ pub fn is_sensitive_key(key: &str) -> bool {
         "-passwd",
         "_password",
         "-password",
+        "_pass",
+        "-pass",
+        "_pw",
+        "-pw",
     ] {
         if l.ends_with(suffix) {
             return true;
@@ -210,13 +218,44 @@ pub fn looks_like_secret_token(value: &str) -> bool {
         }
     }
     if v.len() >= 12 {
-        if v.contains("sk-") {
+        if contains_gated_sk_token(v) {
             return true;
         }
         let lower = v.to_ascii_lowercase();
         if lower.contains("bearer ") || lower.contains("basic ") {
             return true;
         }
+    }
+    false
+}
+
+/// Return `true` when `v` contains a plausible `sk-` secret token.
+///
+/// Bare `sk-` also appears inside ordinary words (`mask-service`,
+/// `task-name`), so a match requires a token boundary (preceding byte is
+/// not ASCII alphanumeric) and a minimum token run (`sk-` + suffix of at
+/// least 9 token chars, 12 total) mirroring the unstructured redactor's
+/// gate. Short fragments and mid-word occurrences pass through.
+fn contains_gated_sk_token(v: &str) -> bool {
+    let bytes = v.as_bytes();
+    let mut search_from = 0usize;
+    while search_from < bytes.len() {
+        let Some(rel) = v[search_from..].find("sk-") else {
+            return false;
+        };
+        let found = search_from + rel;
+        if found > 0 && bytes[found - 1].is_ascii_alphanumeric() {
+            search_from = found + 3;
+            continue;
+        }
+        let mut end = found + 3;
+        while end < bytes.len() && is_token_char(bytes[end]) {
+            end += 1;
+        }
+        if end - found >= 12 {
+            return true;
+        }
+        search_from = found + 3;
     }
     false
 }
@@ -668,30 +707,74 @@ fn redact_prefixed_tokens(input: &str) -> String {
         "sk-",
         "eyJ",
     ];
+    /// Short generic prefixes also match ordinary words, so they need the
+    /// same boundary/length gate as [`looks_like_secret_token`].
+    fn is_gated(prefix: &str) -> bool {
+        matches!(prefix, "sk-" | "eyJ")
+    }
+    fn token_run_end(s: &str, start: usize) -> usize {
+        let mut end = start;
+        while end < s.len() && is_token_char(s.as_bytes()[end]) {
+            // `eyJ` JWTs also carry `.` separators; `is_token_char` covers `.`.
+            end += 1;
+        }
+        // Extend through trailing `=` padding for base64 JWT segments.
+        while end < s.len() && s.as_bytes()[end] == b'=' {
+            end += 1;
+        }
+        end
+    }
     let mut current = input.to_string();
     for prefix in PREFIXES {
-        while let Some(found) = current.find(prefix) {
+        if !is_gated(prefix) {
+            while let Some(found) = current.find(prefix) {
+                // Never redact inside our own marker.
+                if current[..found].ends_with("[redacted")
+                    || current[found..].starts_with(REDACTED_MARKER)
+                {
+                    break;
+                }
+                let mut end = token_run_end(&current, found + prefix.len());
+                if end <= found + prefix.len() {
+                    // Bare prefix with no token run (e.g. truncated): still redact it.
+                    end = found + prefix.len();
+                }
+                current.replace_range(found..end, REDACTED_MARKER);
+            }
+            continue;
+        }
+        // Gated `sk-`/`eyJ`: skip mid-word hits (`mask-service`,
+        // `task-name`) and short fragments; offset scan so a skipped word
+        // never hides a later real token.
+        let mut search_from = 0usize;
+        while search_from <= current.len() {
+            let Some(rel) = current[search_from..].find(prefix) else {
+                break;
+            };
+            let found = search_from + rel;
             // Never redact inside our own marker.
             if current[..found].ends_with("[redacted")
                 || current[found..].starts_with(REDACTED_MARKER)
             {
                 break;
             }
-            let bytes_len = current.len();
-            let mut end = found + prefix.len();
-            while end < bytes_len && is_token_char(current.as_bytes()[end]) {
-                // `eyJ` JWTs also carry `.` separators; `is_token_char` covers `.`.
-                end += 1;
+            if found > 0 && current.as_bytes()[found - 1].is_ascii_alphanumeric() {
+                search_from = found + prefix.len();
+                continue;
             }
-            // Extend through trailing `=` padding for base64 JWT segments.
-            while end < bytes_len && current.as_bytes()[end] == b'=' {
-                end += 1;
-            }
-            if end <= found + prefix.len() {
-                // Bare prefix with no token run (e.g. truncated): still redact it.
-                end = found + prefix.len();
+            let end = token_run_end(&current, found + prefix.len());
+            let token_len = end - found;
+            let ok = if *prefix == "sk-" {
+                token_len >= 12
+            } else {
+                token_len >= 20 && current[found..end].contains('.')
+            };
+            if !ok {
+                search_from = found + prefix.len();
+                continue;
             }
             current.replace_range(found..end, REDACTED_MARKER);
+            search_from = found + REDACTED_MARKER.len();
         }
     }
     current
@@ -1413,5 +1496,87 @@ mod tests {
         for k in ["path", "command", "author", "description", "message", "cwd"] {
             assert!(!is_sensitive_key(k), "should pass through: {k}");
         }
+    }
+
+    #[test]
+    fn pass_pw_key_family_is_sensitive() {
+        // Leak vectors: `pass`/`pw` exact + `_pass`/`-pass`/`_pw`/`-pw`.
+        for k in [
+            "pass",
+            "Pass",
+            "PASS",
+            "pw",
+            "Pw",
+            "PW",
+            "db_pass",
+            "DB_PASS",
+            "db-pass",
+            "db_pw",
+            "db-pw",
+            "user_pass",
+            "smtp-pass",
+        ] {
+            assert!(is_sensitive_key(k), "should be sensitive: {k}");
+        }
+        // `password` still sensitive; `bypass` (ordinary word ending in
+        // `pass` without a delimiter) still passes through.
+        assert!(is_sensitive_key("password"));
+        assert!(is_sensitive_key("Password"));
+        assert!(!is_sensitive_key("bypass"), "bypass must not be sensitive");
+        assert!(!is_sensitive_key("power"), "power must not be sensitive");
+    }
+
+    #[test]
+    fn scrub_redacts_pass_pw_vectors_everywhere() {
+        let out = scrub_text(r#"{"pass":"hunter2"}"#);
+        assert!(!out.contains("hunter2"), "pass leak: {out}");
+        assert!(out.contains(REDACTED_MARKER));
+        let out2 = scrub_text("db_pass=hunter2-value-123");
+        assert!(!out2.contains("hunter2"), "db_pass leak: {out2}");
+        assert!(out2.contains(REDACTED_MARKER));
+        let out3 = scrub_text(r#"{"pw":"hunter2"}"#);
+        assert!(!out3.contains("hunter2"), "pw leak: {out3}");
+        // Debug / log_safe / scrubbed paths share the same scrubber.
+        let call = ToolCall::new("id1", "read_file", r#"{"pass":"hunter2"}"#).unwrap();
+        let debug = format!("{call:?}");
+        assert!(!debug.contains("hunter2"), "debug leak: {debug}");
+        assert!(debug.contains(REDACTED_MARKER));
+        assert!(!call.log_safe().contains("hunter2"));
+        assert!(!call.scrubbed_arguments().contains("hunter2"));
+        let res = ToolResult::new("id1", "db_pass=hunter2-value-123", false).unwrap();
+        assert!(!res.scrubbed_content().contains("hunter2"));
+    }
+
+    #[test]
+    fn scrub_prefixed_tokens_ignore_everyday_words() {
+        // False-positive vectors must pass through byte-identical.
+        for legit in [
+            "mask-service --port 8080",
+            "task-name cleanup",
+            r#"{"command":"mask-service --port 8080"}"#,
+        ] {
+            let out = scrub_text(legit);
+            assert_eq!(out, legit, "everyday words altered: {legit} -> {out}");
+        }
+        assert!(!looks_like_secret_token("mask-service --port 8080"));
+        assert!(!looks_like_secret_token("task-name cleanup"));
+        // A skipped everyday word must not hide a later real token.
+        let mixed = scrub_text("mask-service sk-abcdefgh12345678");
+        assert!(
+            !mixed.contains("sk-abcdefgh12345678"),
+            "real token leaked: {mixed}"
+        );
+        assert!(mixed.contains("mask-service"), "legit prefix lost: {mixed}");
+        assert!(mixed.contains(REDACTED_MARKER));
+        // Real tokens are still caught.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature";
+        let jwt_out = scrub_text(jwt);
+        assert!(!jwt_out.contains("eyJhbGci"), "jwt leak: {jwt_out}");
+        assert!(jwt_out.contains(REDACTED_MARKER));
+        let sk = "deploy sk-abcdefgh12345678 now";
+        let sk_out = scrub_text(sk);
+        assert!(!sk_out.contains("sk-abcdefgh12345678"), "sk leak: {sk_out}");
+        assert!(sk_out.contains(REDACTED_MARKER));
+        assert!(looks_like_secret_token("sk-abcdefgh12345678"));
     }
 }

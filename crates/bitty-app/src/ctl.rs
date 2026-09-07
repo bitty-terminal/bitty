@@ -1657,11 +1657,17 @@ pub fn apply_control(
                 String::from("no focused view to split"),
             ));
         };
+        // Canonical axis semantics (CTX-0224): `SplitAxis::Horizontal` is
+        // left/right (side-by-side, vertical divider) and
+        // `SplitAxis::Vertical` is top/bottom (stacked, horizontal
+        // divider), matching `geometry.rs`, the layout solver, CTX-0209
+        // `smart_split_axis`, and the keymap path (`split_dir_to_axis` in
+        // `main.rs`: Left/Right -> Horizontal, Up/Down -> Vertical).
         let (axis, place_new_first) = match direction {
-            ipc_ctl::SplitDirection::Left => (SplitAxis::Vertical, true),
-            ipc_ctl::SplitDirection::Right => (SplitAxis::Vertical, false),
-            ipc_ctl::SplitDirection::Up => (SplitAxis::Horizontal, true),
-            ipc_ctl::SplitDirection::Down => (SplitAxis::Horizontal, false),
+            ipc_ctl::SplitDirection::Left => (SplitAxis::Horizontal, true),
+            ipc_ctl::SplitDirection::Right => (SplitAxis::Horizontal, false),
+            ipc_ctl::SplitDirection::Up => (SplitAxis::Vertical, true),
+            ipc_ctl::SplitDirection::Down => (SplitAxis::Vertical, false),
         };
         let next_id = runtime
             .layout()
@@ -2088,6 +2094,10 @@ mod tests {
         assert!(done.ok, "split must succeed: {done:?}");
         assert_eq!(rt.layout().leaf_ids().len(), before + 1);
         assert!(done.result_json.contains("new_view"));
+        // CTX-0224: split Right must tile side-by-side (canonical
+        // `SplitAxis::Horizontal`), not stacked — a 90° axis rotation here
+        // regresses silently under leaf-count-only assertions.
+        assert_side_by_side(&rt, 1, 2, "split Right");
         // Focus the new leaf.
         let new_id = rt
             .layout()
@@ -2105,6 +2115,67 @@ mod tests {
         let missing = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&bad), &cli);
         assert!(!missing.ok);
         assert_eq!(missing.code, "NotFound");
+    }
+
+    /// Allocation rect of leaf `id` in the runtime's live container.
+    fn leaf_rect(rt: &bitty_runtime::Runtime, id: u64) -> bitty_runtime::UiRect {
+        rt.layout_allocations()
+            .into_iter()
+            .find(|(vid, _)| vid.0 == id)
+            .unwrap_or_else(|| panic!("leaf v:{id} must have an allocation"))
+            .1
+    }
+
+    /// Assert leaves `first`/`second` tile side-by-side in that x order
+    /// (shared y/height band, ordered x, non-overlapping).
+    fn assert_side_by_side(rt: &bitty_runtime::Runtime, first: u64, second: u64, ctx: &str) {
+        let a = leaf_rect(rt, first);
+        let b = leaf_rect(rt, second);
+        assert_eq!((a.y, a.height), (b.y, b.height), "{ctx}: shared row band");
+        assert!(a.x + a.width <= b.x, "{ctx}: x-ordered, no overlap");
+        assert!(a.width > 0 && b.width > 0, "{ctx}: both panes visible");
+    }
+
+    /// Assert leaves `first`/`second` tile stacked in that y order
+    /// (shared x/width band, ordered y, non-overlapping).
+    fn assert_stacked(rt: &bitty_runtime::Runtime, first: u64, second: u64, ctx: &str) {
+        let a = leaf_rect(rt, first);
+        let b = leaf_rect(rt, second);
+        assert_eq!((a.x, a.width), (b.x, b.width), "{ctx}: shared column band");
+        assert!(a.y + a.height <= b.y, "{ctx}: y-ordered, no overlap");
+        assert!(a.height > 0 && b.height > 0, "{ctx}: both panes visible");
+    }
+
+    #[test]
+    fn control_view_split_axes_match_canonical_keymap() {
+        // CTX-0224: the IPC `splitView` arm must use the same axis
+        // semantics as the keymap path (`split_dir_to_axis` in `main.rs`):
+        // Left/Right -> Horizontal (side-by-side), Up/Down -> Vertical
+        // (stacked). Verified spatially via live layout allocations so a
+        // 90° rotation cannot regress (leaf-count-only assertions miss it;
+        // see CTX-0220-D1).
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        for (direction, place_new_first, stacked) in [
+            (ipc_ctl::SplitDirection::Right, false, false),
+            (ipc_ctl::SplitDirection::Left, true, false),
+            (ipc_ctl::SplitDirection::Down, false, true),
+            (ipc_ctl::SplitDirection::Up, true, true),
+        ] {
+            let mut rt = headless_runtime();
+            let params = ipc_ctl::params_split(direction);
+            let done =
+                apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&params), &cli);
+            let name = direction.as_str();
+            assert!(done.ok, "split {name} must succeed: {done:?}");
+            assert_eq!(rt.layout().leaf_ids().len(), 2, "split {name}");
+            // Fresh runtime splits v:1 into v:1 + v:2; placement decides order.
+            let (first, second) = if place_new_first { (2, 1) } else { (1, 2) };
+            if stacked {
+                assert_stacked(&rt, first, second, &format!("split {name}"));
+            } else {
+                assert_side_by_side(&rt, first, second, &format!("split {name}"));
+            }
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use bitty_render::batch::{
     FILL_VERTEX_SIZE_BYTES, GLYPH_VERTEX_SIZE_BYTES, INLINE_TEXTURE_SIZE, MAX_FILL_QUADS_PER_BATCH,
     MAX_GLYPH_QUADS_PER_BATCH, chunk_atlas_glyphs, chunk_fills, chunk_inline_glyphs,
     compute_atlas_dirty, derive_scale, pack_inline_glyphs, padded_bytes_per_row, quad_indices_for,
-    rgba8_to_float4, validate_atlas_dims,
+    validate_atlas_dims,
 };
 use bitty_render::error::RenderError;
 use bitty_render::geometry::{ExtentPx, RectPx};
@@ -218,7 +218,7 @@ fn inline_glyphs_pack_into_the_fixed_transient_texture() {
             dest: [i * 10, 0],
             size: [8, 8],
             uv: [0.0; 4],
-            color: rgba8_to_float4([0xE5, 0xE5, 0xE5, 0xFF]).map(|v| (v * 255.0) as u8),
+            color: [0xE5, 0xE5, 0xE5, 0xFF],
             source: GlyphSource::Inline {
                 mask: vec![128; 64],
                 width: 8,

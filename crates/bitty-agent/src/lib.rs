@@ -223,8 +223,9 @@ pub use queue::SideQueue;
 pub use session::{AgentSession, DEFAULT_SIDE_QUEUE_CAPACITY, SessionState};
 pub use tool::{
     MAX_TOOL_ARGS_BYTES, MAX_TOOL_CALL_ID_LEN, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_DESCRIPTION_LEN,
-    MAX_TOOL_NAME_LEN, MAX_TOOL_RESULT_BYTES, MAX_TOOL_SCHEMA_BYTES, MAX_TOOLS_PER_AGENT, ToolCall,
-    ToolRegistry, ToolResult, ToolSpec,
+    MAX_TOOL_NAME_LEN, MAX_TOOL_RESULT_BYTES, MAX_TOOL_SCHEMA_BYTES, MAX_TOOLS_PER_AGENT,
+    REDACTED_MARKER, ToolCall, ToolRegistry, ToolResult, ToolSpec, is_sensitive_key,
+    looks_like_secret_token, scrub_text, scrub_tool_args, scrub_tool_result,
 };
 
 #[cfg(test)]

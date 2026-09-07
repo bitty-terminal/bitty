@@ -4795,6 +4795,18 @@ impl TerminalApp {
                     eprintln!("warning: keymap scroll_page_down has no focused pane — ignoring");
                 }
             }
+            A::OpenComposer => {
+                // CTX-0227 (008 route P4): manual composer open through the
+                // single-owner keymap (suggested chord `alt+e`). The chord
+                // is consumed here so its bytes never reach the PTY; the
+                // composer session itself lives in `bitty-rich` (headless,
+                // tested there) and the overlay/panel presentation is a
+                // follow-up — until then the open signal is logged and no
+                // input routing changes (Normal Mode stays byte-identical).
+                eprintln!(
+                    "bitty: keymap open_composer -> composer open requested (manual open only; Normal Mode input still goes to the PTY)"
+                );
+            }
             A::NewSplit(dir) => {
                 self.restore_zoom();
                 let focused = match self.runtime.focused_view() {

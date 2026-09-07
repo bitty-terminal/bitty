@@ -144,10 +144,22 @@ fn constant_time_eq(
 }
 
 /// One outstanding (unredeemed) read grant.
-#[derive(Debug, Clone)]
+///
+/// Raw token bytes are redacted from [`Debug`] so grant entropy never leaks
+/// through state dumps or logs.
+#[derive(Clone)]
 struct OutstandingGrant {
     token: [u8; CLIPBOARD_READ_TOKEN_LEN],
     scope: ClipboardGrantScope,
+}
+
+impl std::fmt::Debug for OutstandingGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutstandingGrant")
+            .field("scope", &self.scope)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// One bounded clipboard request remembered in history.
@@ -165,13 +177,29 @@ pub struct ClipboardRequest {
 ///
 /// Oldest request is dropped when at capacity (FIFO), mirroring the
 /// terminal-state reply and zone policies (bounded memory per T-01).
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] redacts outstanding grant entropy: it reports only the grant
+/// count, never token bytes, so `format!("{:?}", state)` cannot bypass the
+/// [`ClipboardReadToken`] redaction.
+#[derive(Clone)]
 pub struct ClipboardState {
     history: Vec<ClipboardRequest>,
     grants: Vec<OutstandingGrant>,
     next_ordinal: u64,
     pub(crate) denied_reads: u64,
     pub(crate) captured_writes: u64,
+}
+
+impl std::fmt::Debug for ClipboardState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClipboardState")
+            .field("history", &self.history)
+            .field("outstanding_grants", &self.grants.len())
+            .field("next_ordinal", &self.next_ordinal)
+            .field("denied_reads", &self.denied_reads)
+            .field("captured_writes", &self.captured_writes)
+            .finish()
+    }
 }
 
 impl Default for ClipboardState {
@@ -599,6 +627,33 @@ mod tests {
             "token bytes leaked: {rendered}"
         );
         assert!(rendered.contains("42"));
+    }
+
+    #[test]
+    fn state_debug_redacts_live_grant_entropy() {
+        let mut state = ClipboardState::new();
+        let token = grant(&mut state, 99);
+        let rendered = format!("{state:?}");
+        // Grant count stays observable; raw entropy must not.
+        assert!(
+            rendered.contains("outstanding_grants"),
+            "grant count missing: {rendered}"
+        );
+        let raw_decimal = format!("{:?}", token.bytes);
+        assert!(
+            !rendered.contains(&raw_decimal),
+            "grant bytes leaked as decimal array: {rendered}"
+        );
+        let hex_lower: String = token.bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = token.bytes.iter().map(|b| format!("{b:02X}")).collect();
+        assert!(
+            !rendered.contains(&hex_lower),
+            "grant bytes leaked as hex: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&hex_upper),
+            "grant bytes leaked as hex: {rendered}"
+        );
     }
 
     #[test]

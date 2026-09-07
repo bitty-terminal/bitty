@@ -454,6 +454,24 @@ impl Runtime {
             return;
         }
 
+        // CTX-0181: overlay scrollbar chrome sits above selection. A left
+        // press on the painted thumb/track starts a drag-to-scroll and
+        // consumes the event (Shift still forces the selection path — the
+        // accessibility escape wins over chrome too).
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.scrollbar_press()
+        {
+            return;
+        }
+        // A left release always ends a thumb drag; the selection release
+        // path below then runs harmlessly (`end_selection` early-returns
+        // with no selection, and no selection was started while dragging).
+        if event.button == MouseButton::Left && event.state == PressState::Released {
+            self.scrollbar_release();
+        }
+
         // Selection path (including shift override)
         match (event.button, event.state) {
             (MouseButton::Left, PressState::Pressed) => {
@@ -523,6 +541,17 @@ impl Runtime {
     /// Handles cursor movement for drag selection or mouse-tracking motion.
     pub fn handle_cursor_moved(&mut self, pos: CursorPosition) {
         self.last_cursor = Some(pos);
+        // CTX-0181: an active thumb drag consumes motion (a selection drag
+        // cannot coexist — the press routed exclusively). Otherwise an
+        // `auto` visibility transition repaints exactly once; steady
+        // hover costs no present.
+        self.scrollbar_cursor_left = false;
+        if self.scrollbar_drag_to(pos) {
+            return;
+        }
+        if self.scrollbar_should_paint() != self.scrollbar_visible {
+            self.pending_full_redraw = true;
+        }
         if self.selection_dragging {
             let cell = self.cursor_to_cell(pos);
             self.update_selection(cell);

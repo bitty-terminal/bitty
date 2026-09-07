@@ -57,6 +57,7 @@ pub mod focus;
 pub mod geometry;
 pub mod layout;
 pub mod panel;
+pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod view;
@@ -73,6 +74,10 @@ pub use panel::{
     MAX_OVERLAY_TEXT_LEN, MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError,
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
+};
+pub use scrollbar::{
+    MIN_THUMB_HEIGHT_PX, SCROLLBAR_PROXIMITY_PX, ScrollbarHit, ScrollbarMode, ThumbSpan, TrackRect,
+    TrackSpec, hit_test, is_visible, offset_for_thumb_y, thumb_geometry, track_rect,
 };
 pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{

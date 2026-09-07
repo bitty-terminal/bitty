@@ -35,6 +35,7 @@
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
+//!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -69,7 +70,7 @@ pub const MAX_CONFIG_TOP_KEYS: usize = 64;
 pub const MAX_CONFIG_STRING_BYTES: usize = 2048;
 
 /// Maximum keys read from any nested table (`appearance`/`font`/`window`/
-/// `terminal`/`selection`/`layout`/keymap entry).
+/// `terminal`/`selection`/`layout`/`scrollbar`/keymap entry).
 pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 
 /// Maximum keymap entries read (mirrors `bitty-config` `MAX_KEYMAPS` so the
@@ -151,6 +152,21 @@ pub struct LayoutData {
     pub gaps_out: Option<i64>,
 }
 
+/// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
+/// semantics).
+///
+/// Overlay scrollback thumb: `mode` is `"hidden"` (default,
+/// geometry-neutral), `"always"`, or `"auto"` (revealed on mouse
+/// proximity/hover/drag); `width` is the thumb width in logical pixels.
+/// Range-checked downstream in `bitty-config` (fail-closed).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScrollbarData {
+    /// Display mode string (present only when the key is set).
+    pub mode: Option<String>,
+    /// Thumb width in logical pixels (present only when the key is set).
+    pub width: Option<i64>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -171,6 +187,8 @@ pub struct ConfigData {
     pub selection: Option<SelectionData>,
     /// `layout` table (CTX-0177 panel gaps).
     pub layout: Option<LayoutData>,
+    /// `scrollbar` table (CTX-0181 overlay scrollbar).
+    pub scrollbar: Option<ScrollbarData>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
@@ -195,6 +213,7 @@ impl ConfigData {
             && self.terminal.is_none()
             && self.selection.is_none()
             && self.layout.is_none()
+            && self.scrollbar.is_none()
             && self.keymaps.is_none()
     }
 }
@@ -706,6 +725,25 @@ impl ConfigData {
                     };
                     out.layout = Some(LayoutData { gaps_in, gaps_out });
                 }
+                "scrollbar" => {
+                    // CTX-0181: `scrollbar = { mode = "auto", width = 8 }`
+                    // sets the overlay scrollback thumb; absent table/key
+                    // means "says nothing". `mode` is a free string here
+                    // (exact-spelling check lives in `bitty-config`,
+                    // fail-closed); `width` is an integer (floats rejected
+                    // like every other count key); range-checked downstream.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["mode", "width"])?;
+                    let mode = match get_field(nested, "mode") {
+                        Some(v) => Some(expect_string("scrollbar.mode", v)?),
+                        None => None,
+                    };
+                    let width = match get_field(nested, "width") {
+                        Some(v) => Some(expect_integer("scrollbar.width", v)?),
+                        None => None,
+                    };
+                    out.scrollbar = Some(ScrollbarData { mode, width });
+                }
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
@@ -999,6 +1037,49 @@ mod tests {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {
                     assert!(message.contains("layout"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_extract_and_absent_means_no_override() {
+        // CTX-0181: explicit mode/width parse; absent table/key is `None`
+        // so merge keeps the lower-precedence value (hidden/8 when no layer
+        // sets it).
+        let data = eval_ok(r#"return { scrollbar = { mode = "auto", width = 12 } }"#);
+        let bar = data.scrollbar.unwrap();
+        assert_eq!(bar.mode.as_deref(), Some("auto"));
+        assert_eq!(bar.width, Some(12));
+        let data = eval_ok(r#"return { scrollbar = { mode = "always" } }"#);
+        let bar = data.scrollbar.unwrap();
+        assert_eq!(bar.mode.as_deref(), Some("always"));
+        assert_eq!(bar.width, None);
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.scrollbar, None);
+        let data = eval_ok(r#"return { scrollbar = {} }"#);
+        let bar = data.scrollbar.unwrap();
+        assert_eq!(bar.mode, None);
+        assert_eq!(bar.width, None);
+    }
+
+    #[test]
+    fn scrollbar_wrong_type_is_shape_error_without_value() {
+        // CTX-0181: fail-closed on non-string mode / non-integer width
+        // (never coerce, never echo the value).
+        let mut vm = LuaVm::new("test.scrollbar-type");
+        for code in [
+            r#"return { scrollbar = { mode = true } }"#,
+            r#"return { scrollbar = { mode = 1 } }"#,
+            r#"return { scrollbar = { width = 8.5 } }"#,
+            r#"return { scrollbar = { width = "8" } }"#,
+            r#"return { scrollbar = "auto" }"#,
+            r#"return { scrollbar = { mode = "auto", bogus = 1 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("scrollbar"), "{code:?}: {message}");
                 }
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }

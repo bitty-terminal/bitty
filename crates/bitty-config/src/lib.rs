@@ -113,7 +113,7 @@ pub use theme::{
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{
     AppearanceConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig, PluginSpec,
-    SelectionConfig, TerminalConfig, WindowConfig,
+    ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 

@@ -655,6 +655,20 @@ impl Runtime {
             }
         }
 
+        // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect
+        // on the focused leaf's right edge, painted above grid content like
+        // the selection highlight. Never grid truth: no layout, container,
+        // or cell mutation, and `hidden` (default) resolves to no fill.
+        // Visibility is latched so `auto` hover/proximity transitions stay
+        // headless-observable without screenshots.
+        let scrollbar_now = self.scrollbar_thumb_fill();
+        let paints = scrollbar_now.is_some();
+        if let Some(fill) = scrollbar_now {
+            combined_fills.push(fill);
+            any_needs_draw = true;
+        }
+        self.scrollbar_visible = paints;
+
         self.pending_full_redraw = false;
 
         if !any_needs_draw && combined_fills.is_empty() && combined_glyphs.is_empty() {

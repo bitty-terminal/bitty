@@ -2217,6 +2217,9 @@ fn starter_init_lua() -> &'static str {
      \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
      \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
      \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
+     \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
+     \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
+     \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
@@ -2433,6 +2436,22 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "layout.gaps_out",
                         format!("{}", e.layout.gaps_out),
                         &src("layout.gaps_out")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "scrollbar.mode",
+                        e.scrollbar.mode.as_str().to_string(),
+                        &src("scrollbar.mode")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "scrollbar.width",
+                        format!("{}", e.scrollbar.width),
+                        &src("scrollbar.width")
                     )
                 );
                 println!(
@@ -3589,6 +3608,19 @@ fn runtime_config_from_effective(
         .window
         .padding
         .min(bitty_runtime::config::MAX_WINDOW_PADDING);
+    // CTX-0181: `scrollbar` flows the same way. The mode enum is paired by
+    // value (`bitty-runtime` owns no `bitty-config` dependency); the match
+    // is total with a hidden-default fallback so a future variant drift can
+    // never misroute chrome into visibility.
+    let scrollbar_mode = match effective.scrollbar.mode.as_str() {
+        "always" => bitty_runtime::ScrollbarMode::Always,
+        "auto" => bitty_runtime::ScrollbarMode::Auto,
+        _ => bitty_runtime::ScrollbarMode::Hidden,
+    };
+    let scrollbar_width = effective
+        .scrollbar
+        .width
+        .min(bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX);
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -3603,6 +3635,8 @@ fn runtime_config_from_effective(
         gaps_in,
         gaps_out,
         window_padding,
+        scrollbar_mode,
+        scrollbar_width,
     )
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
@@ -6277,6 +6311,75 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_inherits_file_scrollbar() {
+        // CTX-0181: `scrollbar.mode`/`scrollbar.width` flow file ->
+        // effective -> runtime; crate defaults stay equal (bitty-runtime
+        // must not depend on bitty-config, so the pairing is by value,
+        // pinned here). Default preserves hidden (zero change for existing
+        // users).
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_SCROLLBAR_WIDTH,
+            bitty_config::types::DEFAULT_SCROLLBAR_WIDTH
+        );
+        assert_eq!(
+            bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX,
+            bitty_config::types::MAX_SCROLLBAR_WIDTH_PX
+        );
+        assert_eq!(
+            bitty_runtime::ScrollbarMode::Hidden.as_str(),
+            bitty_config::ScrollbarMode::Hidden.as_str()
+        );
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(
+            r#"return { scrollbar = { mode = "auto", width = 12 } }"#,
+            &src,
+        )
+        .expect("scrollbar parses");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert_eq!(
+            merged.effective.scrollbar.mode,
+            bitty_config::ScrollbarMode::Auto
+        );
+        assert_eq!(merged.effective.scrollbar.width, 12);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!(cfg.scrollbar_mode, bitty_runtime::ScrollbarMode::Auto);
+        assert_eq!(cfg.scrollbar_width, 12);
+        assert_eq!(
+            merged.source_of("scrollbar.mode").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Absent table rides hidden end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no scrollbar table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(
+            merged2.effective.scrollbar.mode,
+            bitty_config::ScrollbarMode::Hidden
+        );
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert_eq!(cfg2.scrollbar_mode, bitty_runtime::ScrollbarMode::Hidden);
+        assert_eq!(
+            merged2.source_of("scrollbar.mode").unwrap().layer,
+            bitty_config::plan::LayerKind::CoreDefaults
+        );
+        // Unknown modes and oversized widths fail closed at the file layer
+        // (never reach runtime).
+        let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        parse_lua_config(r#"return { scrollbar = { mode = "overlay" } }"#, &src3)
+            .expect_err("must fail");
+        let src4 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        parse_lua_config(r#"return { scrollbar = { width = 33 } }"#, &src4).expect_err("must fail");
+    }
+
+    #[test]
     fn runtime_config_inherits_file_window_padding() {
         // CTX-0223: `window.padding` flows file -> effective -> runtime;
         // crate defaults stay equal (bitty-runtime must not depend on
@@ -6474,6 +6577,10 @@ mod tests {
         assert!(plan.layout.is_none());
         assert!(starter_init_lua().contains("gaps_in"));
         assert!(starter_init_lua().contains("gaps_out"));
+        // CTX-0181: starter leaves `scrollbar` unset (commented example
+        // only) so new installs ride hidden without a file override.
+        assert!(plan.scrollbar.is_none());
+        assert!(starter_init_lua().contains("scrollbar"));
     }
 
     // -- `bitty init` wizard (CTX-0149, #243) --------------------------------

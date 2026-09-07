@@ -2268,6 +2268,9 @@ mod tests {
         // Full stack over real framing: client bytes -> `serve_connection`
         // -> scope check -> cross-thread queue -> main-thread `Runtime`
         // apply -> reply -> client parse. `Runtime` never leaves this thread.
+        // CTX-0220: hold the file-local serial guard — the control queue is
+        // process-global and the `wm_*` socket tests drain it concurrently.
+        let _wm_guard = hold_wm_lock();
         let mut rt = headless_runtime();
         // Ensure a clean queue (other tests may have left entries on timeout).
         while ipc_ctl::pop_pending_control().is_some() {}
@@ -2374,5 +2377,669 @@ mod tests {
         let stats = handle.join().unwrap().unwrap();
         assert!(stats.requests >= 3, "server must see all requests");
         assert!(stats.denied >= 1, "denial must be counted");
+    }
+
+    // ── CTX-0220: headless WM-flow coverage over the devtools IPC surface ──
+    //
+    // Seat-contested: no GUI driving, no ydotool, no screenshots. A real Unix
+    // socket is served by `serve_connection` on a server thread while the
+    // test thread owns `Runtime` and drains the global control queue — the
+    // same code path the live servo drives. Synchronization is
+    // reply-correlation plus deadline-bounded `yield_now` polls (no sleeps);
+    // the process-global control queue (and automation/introspection stores)
+    // serialize on the file-local guard (CTX-0179 pattern).
+    //
+    // Where no IPC verb exists for an assertion (directional focus-move,
+    // zoom, resize, layout-leaf removal), the Runtime seam is driven directly
+    // and the missing method is recorded in
+    // `recording/ctx-0220/missing-ipc-methods.md` for the CTX-0188 follow-up.
+    // No new IPC methods are added here (out of scope).
+
+    /// Serial guard for the process-global control queue + automation stores.
+    #[cfg(unix)]
+    fn wm_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn hold_wm_lock() -> std::sync::MutexGuard<'static, ()> {
+        wm_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Short temp socket path (macOS SUN_LEN: payload < 100 bytes).
+    #[cfg(unix)]
+    fn wm_socket_path(tag: &str) -> String {
+        let path = format!("/tmp/btw{}{tag}/s.sock", std::process::id());
+        assert!(
+            path.len() < 100,
+            "socket path must fit macOS SUN_LEN: {path} ({} bytes)",
+            path.len()
+        );
+        path
+    }
+
+    /// Connect with a deadline via `yield_now` retries (no sleeps): the
+    /// server thread binds concurrently, so the first attempts may race it.
+    #[cfg(unix)]
+    fn wm_connect(path: &str) -> std::os::unix::net::UnixStream {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(err) => panic!("connect {path} within deadline: {err}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wm_owner_uid(path: &str) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
+    }
+
+    /// Serve one connection on a real socket with explicit granted scopes.
+    /// Returns the server thread; it asserts request/response parity itself.
+    #[cfg(unix)]
+    fn spawn_wm_server(
+        socket_path: String,
+        granted: bitty_ipc::ScopeSet,
+        session: &str,
+        min_requests: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let session = session.to_string();
+        std::thread::spawn(move || {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let verified = bitty_ipc::devtools::transport_attested_peer(wm_owner_uid(&socket_path));
+            let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
+            let server = bitty_ipc::devtools::ServerInfo::new(
+                "wm-proof".to_string(),
+                socket_path.clone(),
+                80,
+                24,
+            );
+            let context =
+                bitty_ipc::devtools::ServeContext::with_granted_session(&server, granted, &session);
+            let mut limiter = bitty_ipc::RateLimiter::rc9_default();
+            let clock = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(0)
+            };
+            let stats = bitty_ipc::devtools::serve_connection(
+                &mut stream,
+                verified,
+                &dispatcher,
+                &context,
+                &mut limiter,
+                &clock,
+            )
+            .unwrap();
+            assert!(
+                stats.requests >= min_requests,
+                "expected at least {min_requests} requests, saw {}",
+                stats.requests
+            );
+            assert_eq!(stats.responses, stats.requests);
+        })
+    }
+
+    /// Test-thread side of the WM harness: owns `Runtime` (it is `!Send`)
+    /// and drains the global control queue so the server thread's
+    /// `enqueue_control_and_wait` unblocks with a correlated reply.
+    #[cfg(unix)]
+    struct WmHarness {
+        stream: std::os::unix::net::UnixStream,
+        next_id: u64,
+        rt: bitty_runtime::Runtime,
+        granted: bitty_ipc::ScopeSet,
+    }
+
+    #[cfg(unix)]
+    impl WmHarness {
+        fn new(stream: std::os::unix::net::UnixStream, granted: bitty_ipc::ScopeSet) -> Self {
+            // Clean slate: other tests may have left queue entries behind.
+            while bitty_ipc::ctl::pop_pending_control().is_some() {}
+            Self {
+                stream,
+                next_id: 1,
+                rt: headless_runtime(),
+                granted,
+            }
+        }
+
+        fn send_envelope(&mut self, method: &str, params: Option<&str>) -> u64 {
+            use std::io::Write;
+
+            let id = self.next_id;
+            self.next_id += 1;
+            let params_part = match params {
+                None => String::new(),
+                Some(p) => format!(",\"params\":{p}"),
+            };
+            let envelope = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+            );
+            let wire = bitty_ipc::encode_frame(envelope.as_bytes()).unwrap();
+            self.stream.write_all(&wire).unwrap();
+            self.stream.flush().unwrap();
+            id
+        }
+
+        fn read_reply(&mut self, id: u64) -> String {
+            use std::io::Read;
+
+            let mut header = [0u8; 4];
+            self.stream.read_exact(&mut header).unwrap();
+            let len = u32::from_be_bytes(header) as usize;
+            let mut body = vec![0u8; len];
+            self.stream.read_exact(&mut body).unwrap();
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                text.contains(&format!("\"id\":{id}")),
+                "response lost correlation id {id}: {text}"
+            );
+            text
+        }
+
+        /// Control verbs (`splitView`, `focusView`, …) enqueue and block the
+        /// server thread: drain until the queue yields work (deadline-bound,
+        /// well under the 5 s enqueue timeout), then read the reply the
+        /// drain produced. The reply itself is the generation-wait — when it
+        /// arrives, the mutation has been applied.
+        fn ctl(&mut self, method: &str, params: Option<&str>) -> String {
+            let id = self.send_envelope(method, params);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            loop {
+                if drain_global_control_queue(&mut self.rt, &self.granted) > 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drain deadline hit for {method} (no live runtime draining?)"
+                );
+                std::thread::yield_now();
+            }
+            self.read_reply(id)
+        }
+
+        /// Direct verbs (`synthesizeInput`, `captureFrame`, `getInputRing`)
+        /// answer without the control queue: plain request/response.
+        fn direct(&mut self, method: &str, params: &str) -> String {
+            let id = self.send_envelope(method, Some(params));
+            self.read_reply(id)
+        }
+
+        fn leaf_ids(&self) -> Vec<u64> {
+            self.rt.layout().leaf_ids().iter().map(|id| id.0).collect()
+        }
+    }
+
+    /// Remove `target` from a split tree, collapsing its parent to the
+    /// sibling — the same semantics as `TerminalApp::close_focused_leaf`
+    /// (`main.rs`). There is no Runtime/IPC leaf-removal verb today (see the
+    /// CTX-0188-followup note), so close→survivor asserts through this seam
+    /// plus `Runtime::set_layout` (whose first-leaf refocus rule is product
+    /// code under test).
+    fn wm_prune_split_leaf(
+        node: &mut bitty_runtime::LayoutNode,
+        target: bitty_runtime::ViewId,
+    ) -> bool {
+        use bitty_runtime::LayoutNode;
+
+        match node {
+            LayoutNode::Leaf(_) => false,
+            LayoutNode::Split { first, second, .. } => {
+                let first_hit = matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == target);
+                let second_hit = matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == target);
+                if first_hit {
+                    *node = (**second).clone();
+                    true
+                } else if second_hit {
+                    *node = (**first).clone();
+                    true
+                } else {
+                    wm_prune_split_leaf(first, target) || wm_prune_split_leaf(second, target)
+                }
+            }
+            LayoutNode::Stack(children) => {
+                if let Some(pos) = children
+                    .iter()
+                    .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == target))
+                {
+                    if children.len() <= 1 {
+                        return false;
+                    }
+                    children.remove(pos);
+                    true
+                } else {
+                    children.iter_mut().any(|c| wm_prune_split_leaf(c, target))
+                }
+            }
+            LayoutNode::Overlay { base, overlay, .. } => {
+                wm_prune_split_leaf(base, target) || wm_prune_split_leaf(overlay, target)
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wm_split_routing_close_survivor_over_socket() {
+        let _guard = hold_wm_lock();
+        let granted = bitty_ipc::ScopeSet::all();
+        let socket_path = wm_socket_path("sr");
+        bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
+        // 8 control verbs below: list, split, list, send-denied, focus,
+        // send-ok, text, close-denied = 8 requests.
+        let server = spawn_wm_server(socket_path.clone(), granted.clone(), "wm-flow", 8);
+        let mut h = WmHarness::new(wm_connect(&socket_path), granted);
+
+        // Single leaf, focused.
+        let body = h.ctl(ipc_ctl::METHOD_LIST_VIEWS, None);
+        assert!(body.contains("\"result\""), "view list: {body}");
+        assert!(
+            body.contains("\"id\":\"v:1\",\"focused\":true"),
+            "one focused leaf: {body}"
+        );
+
+        // Split right over IPC: new leaf appears, focus stays on v:1.
+        let params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let body = h.ctl(ipc_ctl::METHOD_SPLIT_VIEW, Some(&params));
+        assert!(
+            body.contains("\"new_view\":\"v:2\""),
+            "split names v:2: {body}"
+        );
+        assert_eq!(h.leaf_ids(), vec![1, 2]);
+        let body = h.ctl(ipc_ctl::METHOD_LIST_VIEWS, None);
+        assert!(
+            body.contains("\"id\":\"v:1\",\"focused\":true"),
+            "focus stays: {body}"
+        );
+        assert!(
+            body.contains("\"id\":\"v:2\",\"focused\":false"),
+            "new leaf unfocused: {body}"
+        );
+
+        // Focused-only routing: sending to the unfocused leaf fails closed
+        // and names the focus verb instead of retargeting input.
+        let params = ipc_ctl::params_send_input("t:2", "hi");
+        let body = h.ctl(ipc_ctl::METHOD_SEND_INPUT, Some(&params));
+        assert!(
+            body.contains("\"error\""),
+            "unfocused send must fail: {body}"
+        );
+        assert!(body.contains("Conflict"), "must be Conflict: {body}");
+        assert!(
+            body.contains("view focus"),
+            "must name the focus verb: {body}"
+        );
+        assert!(
+            h.rt.drain_pending_input().is_empty(),
+            "denied bytes must not queue"
+        );
+
+        // Focus the new leaf over IPC, then input routes.
+        let params = ipc_ctl::params_focus("v:2");
+        let body = h.ctl(ipc_ctl::METHOD_FOCUS_VIEW, Some(&params));
+        assert!(body.contains("\"focused\":\"v:2\""), "focus moves: {body}");
+        let params = ipc_ctl::params_send_input("t:2", "wm-proof");
+        let body = h.ctl(ipc_ctl::METHOD_SEND_INPUT, Some(&params));
+        assert!(body.contains("\"sent_to\":\"t:2\""), "send routes: {body}");
+        assert!(body.contains("\"bytes\":8"), "byte count: {body}");
+        assert!(!h.rt.drain_pending_input().is_empty(), "bytes must queue");
+        let params = ipc_ctl::params_terminal_id("t:2");
+        let body = h.ctl(ipc_ctl::METHOD_GET_TERMINAL_TEXT, Some(&params));
+        assert!(
+            body.contains("\"terminal_id\":\"t:2\""),
+            "text serves: {body}"
+        );
+
+        // Close over IPC tears down the pane *session*, not the leaf: with
+        // no live PTY session headlessly this fails closed (Conflict) and
+        // the layout is untouched — never a half-removed leaf.
+        let params = ipc_ctl::params_terminal_id("t:2");
+        let body = h.ctl(ipc_ctl::METHOD_CLOSE_TERMINAL, Some(&params));
+        assert!(
+            body.contains("\"error\""),
+            "session-less close must fail: {body}"
+        );
+        assert!(body.contains("Conflict"), "must be Conflict: {body}");
+        assert!(
+            body.contains("no live session"),
+            "must name the gap: {body}"
+        );
+        assert_eq!(h.leaf_ids(), vec![1, 2], "layout untouched by failed close");
+
+        drop(h);
+        server.join().unwrap();
+        std::fs::remove_file(&socket_path).ok();
+    }
+
+    #[test]
+    fn wm_close_survivor_via_runtime_seam() {
+        // Portable close→survivor half (the socket half above proves
+        // `closeTerminal` fails closed without a session): split via the IPC
+        // handler, prune the focused leaf via the Runtime seam (no
+        // leaf-removal IPC verb exists — see the CTX-0188-followup note),
+        // and let `Runtime::set_layout` refocus the survivor.
+        let mut rt = headless_runtime();
+        let elevated = bitty_ipc::ScopeSet::all();
+        let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let done =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &elevated);
+        assert!(done.ok, "split must succeed: {done:?}");
+        assert_eq!(rt.layout().leaf_ids().len(), 2);
+        let focus = ipc_ctl::params_focus("v:2");
+        let moved =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&focus), &elevated);
+        assert!(moved.ok, "focus must succeed: {moved:?}");
+
+        let mut layout = rt.layout().clone();
+        assert!(wm_prune_split_leaf(
+            &mut layout,
+            bitty_runtime::ViewId::new(2)
+        ));
+        // Pruning a missing leaf or the last leaf refuses (no empty tree).
+        assert!(!wm_prune_split_leaf(
+            &mut layout.clone(),
+            bitty_runtime::ViewId::new(9)
+        ));
+        rt.set_layout(layout);
+        assert_eq!(rt.leaf_count(), 1);
+        assert_eq!(
+            rt.focused_view(),
+            Some(bitty_runtime::ViewId::new(1)),
+            "refocus to survivor"
+        );
+        let allocs = rt.layout_allocations();
+        assert_eq!(allocs.len(), 1);
+        assert_eq!(allocs[0].1, rt.container(), "survivor reflows full-bleed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wm_focus_move_across_leaves_over_socket() {
+        let _guard = hold_wm_lock();
+        let granted = bitty_ipc::ScopeSet::all();
+        let socket_path = wm_socket_path("fm");
+        bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
+        // split, focus, split, then one focus+list pair per leaf (3) = 9.
+        let server = spawn_wm_server(socket_path.clone(), granted.clone(), "wm-focus", 9);
+        let mut h = WmHarness::new(wm_connect(&socket_path), granted);
+
+        // Three leaves: v:1 left, v:2 top-right, v:3 bottom-right.
+        let params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let body = h.ctl(ipc_ctl::METHOD_SPLIT_VIEW, Some(&params));
+        assert!(body.contains("\"new_view\":\"v:2\""), "first split: {body}");
+        let params = ipc_ctl::params_focus("v:2");
+        let body = h.ctl(ipc_ctl::METHOD_FOCUS_VIEW, Some(&params));
+        assert!(body.contains("\"focused\":\"v:2\""), "focus v:2: {body}");
+        let params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Down);
+        let body = h.ctl(ipc_ctl::METHOD_SPLIT_VIEW, Some(&params));
+        assert!(
+            body.contains("\"new_view\":\"v:3\""),
+            "second split: {body}"
+        );
+        assert_eq!(h.leaf_ids(), vec![1, 2, 3]);
+
+        // `focusView` reaches every leaf; exactly one flag is set each time.
+        for target in ["v:1", "v:2", "v:3"] {
+            let params = ipc_ctl::params_focus(target);
+            let body = h.ctl(ipc_ctl::METHOD_FOCUS_VIEW, Some(&params));
+            assert!(
+                body.contains(&format!("\"focused\":\"{target}\"")),
+                "focus {target}: {body}"
+            );
+            let body = h.ctl(ipc_ctl::METHOD_LIST_VIEWS, None);
+            for leaf in ["v:1", "v:2", "v:3"] {
+                let want = leaf == target;
+                assert!(
+                    body.contains(&format!("\"id\":\"{leaf}\",\"focused\":{want}")),
+                    "flags after focusing {target}: {body}"
+                );
+            }
+        }
+
+        // Directional `move_focus` has no IPC verb (owed follow-up), so it
+        // is proven via the Runtime seam on the IPC-built layout. Spatial
+        // assertions stay orientation-agnostic on purpose: defect CTX-0220-D1
+        // (filed, not fixed here) — the IPC split axis mapping is rotated
+        // 90° vs the canonical keymap path (`split_dir_to_axis` in main.rs
+        // maps Right→Horizontal/left-right, while `apply_control` maps
+        // Right→Vertical/top-bottom), so exact spatial expectations would
+        // enshrine the bug.
+        use bitty_runtime::{FocusDirection, ViewId};
+
+        let leaves = h.leaf_ids();
+        // Depth-first cycling reaches the whole leaf set and wraps.
+        assert!(h.rt.set_focus(ViewId::new(1)));
+        assert_eq!(h.rt.move_focus(FocusDirection::Prev), Some(ViewId::new(3)));
+        assert!(h.rt.set_focus(ViewId::new(3)));
+        assert_eq!(h.rt.move_focus(FocusDirection::Next), Some(ViewId::new(1)));
+        // Spatial moves from every leaf never leave the leaf set (edge
+        // moves may return `None`, keeping focus) and are deterministic
+        // (pure function of layout + container + focus).
+        for id in 1..=3u64 {
+            assert!(h.rt.set_focus(ViewId::new(id)));
+            for dir in [
+                FocusDirection::Up,
+                FocusDirection::Down,
+                FocusDirection::Left,
+                FocusDirection::Right,
+            ] {
+                assert!(h.rt.set_focus(ViewId::new(id)));
+                let first = h.rt.move_focus(dir);
+                assert!(
+                    first.is_none_or(|v| leaves.contains(&v.0)),
+                    "spatial move {dir:?} from v:{id} must stay in-set, got {first:?}"
+                );
+                let focused = h.rt.focused_view().expect("focus must persist");
+                assert!(leaves.contains(&focused.0), "focus must stay valid");
+                assert!(h.rt.set_focus(ViewId::new(id)));
+                let second = h.rt.move_focus(dir);
+                assert_eq!(second, first, "spatial move must be deterministic");
+            }
+        }
+
+        drop(h);
+        server.join().unwrap();
+        std::fs::remove_file(&socket_path).ok();
+    }
+
+    #[test]
+    fn wm_zoom_on_off_reflow_via_runtime_seam() {
+        // No zoom IPC verb exists (canonical zoom is
+        // `TerminalApp::apply_chrome_action(ToggleZoom)` in main.rs, already
+        // unit-covered there); the Runtime seam replicates its exact
+        // stash→single-leaf→restore steps while `listViews` keeps the IPC
+        // handler in the loop.
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
+        assert!(done.ok, "split must succeed: {done:?}");
+        assert_eq!(rt.leaf_count(), 2);
+
+        let container = rt.container();
+        let before = rt.layout_allocations();
+        assert_eq!(before.len(), 2);
+        let focused = rt.focused_view().expect("focus must exist");
+
+        // Zoom on: stash the tree, present only the focused leaf.
+        let backup = rt.layout().clone();
+        let view = rt
+            .layout()
+            .find_leaf(focused)
+            .cloned()
+            .expect("focused leaf");
+        rt.set_layout(bitty_runtime::LayoutNode::leaf(view));
+        assert_eq!(rt.leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(focused));
+        let zoomed = rt.layout_allocations();
+        assert_eq!(zoomed.len(), 1);
+        assert_eq!(zoomed[0].0, focused);
+        // Zero-gap default tiles edge-to-edge: the zoomed leaf is full-bleed.
+        assert_eq!(zoomed[0].1, container);
+        let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &cli);
+        assert!(views.ok, "listViews while zoomed: {views:?}");
+        assert!(views.result_json.contains("\"focused\":true"));
+
+        // Zoom off: restore the tree bit-identically, focus preserved.
+        rt.set_layout(backup);
+        assert_eq!(rt.leaf_count(), 2);
+        assert_eq!(rt.focused_view(), Some(focused));
+        assert_eq!(
+            rt.layout_allocations(),
+            before,
+            "restore must reflow identically"
+        );
+    }
+
+    #[test]
+    fn wm_resize_reflow_via_runtime_seam() {
+        // No resize IPC verb exists; `set_container` + `reflow_layout` is the
+        // documented headless seam (no physical surface required).
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
+        assert!(done.ok, "split must succeed: {done:?}");
+        let focused = rt.focused_view().expect("focus must exist");
+
+        let area = |rt: &bitty_runtime::Runtime| {
+            rt.layout_allocations()
+                .iter()
+                .find(|(id, _)| *id == focused)
+                .map(|(_, r)| u32::from(r.width) * u32::from(r.height))
+                .unwrap_or(0)
+        };
+        let before = area(&rt);
+        assert!(before > 0, "focused leaf must have area");
+
+        // Grow: the focused leaf gains cells and stays inside the container.
+        rt.set_container(bitty_runtime::UiRect::new(0, 0, 160, 48));
+        let grown_allocs = rt.reflow_layout();
+        assert_eq!(rt.container(), bitty_runtime::UiRect::new(0, 0, 160, 48));
+        for (_, rect) in &grown_allocs {
+            assert!(
+                rect.x + rect.width <= 160 && rect.y + rect.height <= 48,
+                "in bounds: {rect:?}"
+            );
+        }
+        assert!(
+            area(&rt) > before,
+            "grow must add cells to the focused leaf"
+        );
+        let view = rt.layout().find_leaf(focused).expect("focused leaf");
+        let alloc = grown_allocs
+            .iter()
+            .find(|(id, _)| *id == focused)
+            .expect("alloc");
+        assert_eq!(
+            (view.cols(), view.rows()),
+            (alloc.1.width, alloc.1.height),
+            "view tracks alloc"
+        );
+
+        // Shrink: cells are taken back, leaf count and focus untouched.
+        rt.set_container(bitty_runtime::UiRect::new(0, 0, 40, 12));
+        rt.reflow_layout();
+        assert!(area(&rt) <= before, "shrink must take cells back");
+        assert_eq!(rt.leaf_count(), 2);
+        assert_eq!(rt.focused_view(), Some(focused));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wm_automation_surface_tracks_split_layout() {
+        // `synthesizeInput`/`captureFrame` (CTX-0188) against an IPC-split
+        // layout: automation addressing follows the new leaf, and the frame
+        // surface keeps serving (redacted) after WM mutations.
+        use bitty_ipc::devtools::{
+            AutomationFamily, clear_automation_for_tests, clear_introspection_for_tests,
+            issue_automation_bearer, publish_grid_text,
+        };
+
+        let _guard = hold_wm_lock();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        publish_grid_text(
+            vec!["$ echo wm".to_string(), "wm".to_string()],
+            1,
+            7,
+            true,
+            41,
+            80,
+            24,
+        );
+
+        let granted = bitty_ipc::ScopeSet::all();
+        let socket_path = wm_socket_path("au");
+        bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
+        // split, synth, ring, capture = 4 requests.
+        let server = spawn_wm_server(socket_path.clone(), granted.clone(), "wm-auto", 4);
+        let mut h = WmHarness::new(wm_connect(&socket_path), granted);
+
+        let params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let body = h.ctl(ipc_ctl::METHOD_SPLIT_VIEW, Some(&params));
+        assert!(body.contains("\"new_view\":\"v:2\""), "split first: {body}");
+
+        // Bearers bind (session, terminal, family); the servo stamps uptime
+        // near zero at spawn, so issue at zero like the CTX-0188 harness.
+        let synth = issue_automation_bearer("wm-auto", "t:2", AutomationFamily::Synthesize, 0)
+            .expect("synth bearer");
+        let params = format!(
+            "{{\"terminalId\":\"t:2\",\"bearer\":\"{synth}\",\"originLabel\":\"wm-harness\",\"events\":[{{\"type\":\"key\",\"key\":\"Enter\"}}]}}"
+        );
+        let receipt = h.direct("bitty.debug/synthesizeInput", &params);
+        assert!(
+            receipt.contains("\"accepted\":1"),
+            "synth receipt: {receipt}"
+        );
+        assert!(
+            receipt.contains("\"synthetic\":true"),
+            "synthetic flag: {receipt}"
+        );
+        let ring = h.direct("bitty.debug/getInputRing", "{\"limit\":10}");
+        assert!(
+            ring.contains("[synthetic:wm-harness]"),
+            "synthetic marker for the new leaf: {ring}"
+        );
+
+        let cap = issue_automation_bearer("wm-auto", "t:2", AutomationFamily::Capture, 0)
+            .expect("capture bearer");
+        let params =
+            format!("{{\"terminalId\":\"t:2\",\"bearer\":\"{cap}\",\"format\":\"semantic\"}}");
+        let frame = h.direct("bitty.debug/captureFrame", &params);
+        assert!(
+            frame.contains("\"snapshot\":\"frame\""),
+            "frame serves post-split: {frame}"
+        );
+        assert!(
+            frame.contains("\"trust\":\"untrusted-observation\""),
+            "untrusted label: {frame}"
+        );
+
+        drop(h);
+        server.join().unwrap();
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+        std::fs::remove_file(&socket_path).ok();
     }
 }

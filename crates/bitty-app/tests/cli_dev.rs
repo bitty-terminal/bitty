@@ -488,3 +488,40 @@ fn jsonl_matches_json_single_line_shape() {
     let stdout = stdout_text(&output);
     assert_dev_envelope(&stdout, "capture");
 }
+
+#[test]
+fn capture_split_layout_differs_from_single_headless() {
+    // CTX-0220: the `dev` surface distinguishes WM states without a seat —
+    // split-layout capture must render a different surface than single, and
+    // the JSON envelope must carry the requested layout name.
+    let single = spawn_dev(&["dev", "capture", "--layout", "single"], &[]);
+    assert_eq!(single.status.code(), Some(0));
+    let split = spawn_dev(&["dev", "capture", "--layout", "split"], &[]);
+    assert_eq!(split.status.code(), Some(0));
+    let surface = |output: &std::process::Output| {
+        stdout_text(output)
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("surface:").map(str::to_string))
+            .unwrap_or_default()
+    };
+    let single_surface = surface(&single);
+    let split_surface = surface(&split);
+    assert!(!single_surface.is_empty(), "single must report a surface");
+    assert!(!split_surface.is_empty(), "split must report a surface");
+    assert_ne!(
+        single_surface, split_surface,
+        "split must render differently from single"
+    );
+
+    let json = spawn_dev(
+        &["dev", "capture", "--layout", "split", "--format", "json"],
+        &[],
+    );
+    assert_eq!(json.status.code(), Some(0));
+    let stdout = stdout_text(&json);
+    assert_dev_envelope(&stdout, "capture");
+    assert!(
+        stdout.contains("\"layout\":\"split\""),
+        "envelope names the layout: {stdout:?}"
+    );
+}

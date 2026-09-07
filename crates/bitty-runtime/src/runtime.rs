@@ -5597,7 +5597,10 @@ mod tests {
         // of a hardcoded white, so the out-of-box cursor matches the
         // palette. Headless fills overwrite with premultiplied bytes:
         // cursor cell (col 1, row 0) after one printed cell, default live
-        // cell 9x19 over the default 80x24 grid (extent 720x456, no gaps).
+        // cell 9x19 over the default 80x24 grid. CTX-0223: the window
+        // padding inset (default 8px, physical 8px at scale 1.0) shifts
+        // grid content by the inset inside the window surface (736x472 =
+        // 720x456 grid plus 8px per side), so probe the padded origin.
         let mut rt = make_runtime();
         rt.handle_pty_bytes(b"A");
         let stats = rt.tick().expect("damage from bytes must present");
@@ -5605,9 +5608,12 @@ mod tests {
         let rgba = rt.headless_rgba().expect("rgba after tick");
         let cfg = RuntimeConfig::default();
         assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
-        let width = cfg.cell_width as usize * 80;
-        let cx = cfg.cell_width as usize + 4;
-        let cy = 9;
+        let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+        assert_eq!(pad, 8, "default padding inset is 8px at scale 1.0");
+        let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
+        assert_eq!(width, 736, "window width is grid 720 plus 8px per side");
+        let cx = pad + cfg.cell_width as usize + 4;
+        let cy = pad + 9;
         let idx = (cy * width + cx) * 4;
         // Theme cursor #f5e0dc at 0xA0 alpha, premultiplied by the headless
         // composite: (245*160/255, 224*160/255, 220*160/255, 160).

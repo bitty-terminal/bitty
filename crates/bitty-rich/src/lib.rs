@@ -33,6 +33,7 @@
 //! | [`shell::SHELL_ZONE_MAX`] mirrors `ZONE_RECORDS_MAX` | 1024 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_HISTORY`] | 16 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_PAYLOAD_BYTES`] | 4096 | truncation at cap |
+//! | [`clipboard::CLIPBOARD_MAX_OUTSTANDING_GRANTS`] | 16 | oldest grant evicted (token dies) |
 //! | [`kitty::KITTY_MAX_PLACEHOLDERS`] (legacy) | 64 | oldest evicted |
 //! | [`kitty::KITTY_MAX_PAYLOAD_BYTES`] (legacy) | 4096 | truncation |
 //! | [`image::IMAGE_STORE_MAX_COUNT`] (IMG-5) | 256 | oldest evicted on admission |
@@ -69,7 +70,9 @@ pub mod presentation;
 pub mod scene;
 pub mod shell;
 
-pub use clipboard::{ClipboardPolicy, ClipboardRequest, ClipboardState};
+pub use clipboard::{
+    ClipboardGrantScope, ClipboardPolicy, ClipboardReadToken, ClipboardRequest, ClipboardState,
+};
 pub use geometry::{CellMetrics, ExtentPx, RectPx};
 pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{

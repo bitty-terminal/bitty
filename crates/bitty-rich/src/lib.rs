@@ -48,6 +48,8 @@
 //! | [`scene::SCENE_MAX_TEXT_BYTES_PER_BLOCK`] (SCN-3) | 256 KiB | typed error |
 //! | [`scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL`] (SCN-4) | 2 MiB | typed error |
 //! | [`scene::SCENE_MAX_BLOCKS_PER_TERMINAL`] (SCN-5) | 64 | typed error |
+//! | [`blocks::COMMAND_BLOCK_MAX`] command blocks | 256 | newest retained, oldest dropped |
+//! | [`blocks::FOLD_MAX`] folded ids | 256 | fold fails closed at cap |
 //!
 //! # Headless seam
 //!
@@ -60,6 +62,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod clipboard;
 pub mod geometry;
 pub mod hyperlink;
@@ -70,6 +73,10 @@ pub mod presentation;
 pub mod scene;
 pub mod shell;
 
+pub use blocks::{
+    COMMAND_BLOCK_MAX, CommandBlock, CommandId, CommandState, FOLD_MAX, FoldState, SemanticRange,
+    block_by_id, block_count, blocks, hidden_blocks, is_output_kind, list_blocks, visible_blocks,
+};
 pub use clipboard::{
     ClipboardGrantScope, ClipboardPolicy, ClipboardReadToken, ClipboardRequest, ClipboardState,
 };

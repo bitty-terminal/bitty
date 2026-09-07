@@ -8,6 +8,7 @@
 use bitty_term_state::{Snapshot, State};
 
 use crate::RectPx;
+use crate::blocks::{CommandBlock, blocks};
 use crate::geometry::CellMetrics;
 use crate::hyperlink::{HyperlinkSpan, hyperlink_overlay_rects, hyperlink_spans};
 use crate::kitty::KittyGraphicsStub;
@@ -16,7 +17,8 @@ use crate::shell::{CommandRegion, ShellIntegration};
 /// An owned, headless rich presentation derived from one `Snapshot`.
 ///
 /// Bounded: hyperlink spans ≤ grid cells (≤ 1920), shell regions ≤ zone
-/// count (≤ 1024), clipboard history ≤ 16, kitty placeholders ≤ 64.
+/// count (≤ 1024), command blocks ≤ 256 (newest retained), clipboard
+/// history ≤ 16, kitty placeholders ≤ 64.
 /// Deterministic for fixed `(state, snapshot, metrics, stub)` inputs.
 #[derive(Debug, Clone)]
 pub struct RichPresentation {
@@ -32,6 +34,11 @@ pub struct RichPresentation {
     pub hyperlink_rects: Vec<RectPx>,
     /// Command regions grouped from the zone log.
     pub command_regions: Vec<CommandRegion>,
+    /// Command blocks bridged from the regions (stable ids, CTX-0225).
+    ///
+    /// Presentation derivation only: folding itself lives in
+    /// [`FoldState`](crate::blocks::FoldState) outside this snapshot.
+    pub command_blocks: Vec<CommandBlock>,
     /// Total retained zone count (for instrumentation).
     pub zone_count: usize,
     /// Whether the kitty stub currently holds any placeholders.
@@ -53,6 +60,7 @@ impl RichPresentation {
         let spans = hyperlink_spans(snapshot, state);
         let rects = hyperlink_overlay_rects(snapshot, state, metrics);
         let regions = ShellIntegration::command_regions(state);
+        let command_blocks = blocks(state);
         let zone_count = ShellIntegration::zone_count(state);
         Self {
             generation: snapshot.generation,
@@ -61,6 +69,7 @@ impl RichPresentation {
             hyperlink_spans: spans,
             hyperlink_rects: rects,
             command_regions: regions,
+            command_blocks,
             zone_count,
             kitty_len: kitty.len(),
         }
@@ -82,6 +91,12 @@ impl RichPresentation {
     #[must_use]
     pub fn command_region_count(&self) -> usize {
         self.command_regions.len()
+    }
+
+    /// Number of command blocks (≤ 256, newest retained).
+    #[must_use]
+    pub fn command_block_count(&self) -> usize {
+        self.command_blocks.len()
     }
 }
 

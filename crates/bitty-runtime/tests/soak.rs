@@ -138,7 +138,7 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
     // Post-soak: surface extent unchanged (no resize in this leg), RGBA valid.
     assert_eq!(
         rt.surface_extent(),
-        Some(RuntimeConfig::default().pixel_extent())
+        Some(RuntimeConfig::default().window_extent())
     );
     let rgba_last = rt.headless_rgba().expect("rgba after soak");
     assert!(!rgba_last.is_empty());
@@ -198,10 +198,11 @@ fn soak_resize_spam_headless_deterministic_and_honest_zero_skip() {
                 Some(*size),
                 "non-zero resize must reconfigure at iter {i}"
             );
-            // Container recomputed via RuntimeConfig::grid_from_pixels (8x16 cells).
+            // Container recomputed from window pixels minus the default 8px
+            // padding inset (CTX-0223; 9x19 cells).
             let expected_container = {
                 let cfg = RuntimeConfig::default();
-                let (cols, rows) = cfg.grid_from_pixels(*size);
+                let (cols, rows) = cfg.grid_from_window_pixels(*size);
                 bitty_ui::Rect::new(0, 0, cols as u16, rows as u16)
             };
             assert_eq!(rt.container(), expected_container, "container at iter {i}");

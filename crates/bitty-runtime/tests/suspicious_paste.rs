@@ -466,7 +466,8 @@ fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
         .set_text("aaa\nbbb\nccc".to_string())
         .unwrap();
     rt.drain_pending_input();
-    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    // CTX-0223: (8, 8) is grid cell (0, 0) under the default 8px padding.
+    rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
     // Same entry the right-click mouse path uses.
     rt.handle_mouse_input(MouseEvent {
         button: MouseButton::Right,

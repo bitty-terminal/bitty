@@ -62,6 +62,18 @@ fn mouse_release(button: MouseButton) -> MouseEvent {
     }
 }
 
+/// Physical position for a grid cell with the readable 9x19 cell metrics.
+///
+/// CTX-0223: includes the default 8px window padding inset (grid origin at
+/// physical (8, 8)); raw `col * 9` coordinates would select the wrong cell.
+fn cell_pos(col: u16, row: u16) -> CursorPosition {
+    const PAD: f64 = 8.0;
+    CursorPosition {
+        x: PAD + f64::from(col) * 9.0,
+        y: PAD + f64::from(row) * 19.0,
+    }
+}
+
 fn select_hello(rt: &mut Runtime) {
     feed_text(rt, "hello world");
     rt.start_selection(CellPos::new(0, 0));
@@ -78,7 +90,7 @@ fn left_click_clears_selection_and_forces_present() {
     assert!(rt.tick().is_some());
     assert_eq!(rt.tick(), None);
     // Single left-click elsewhere (press+release same cell, no drag).
-    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     // Press replaces the old range with a collapsed empty selection, so the
     // highlight is already gone even before release.
@@ -140,15 +152,9 @@ fn new_drag_replaces_old_selection() {
     let mut rt = make_runtime();
     select_hello(&mut rt);
     // New drag via the mouse path replaces the old range.
-    rt.handle_cursor_moved(CursorPosition {
-        x: 9.0 * 6.0,
-        y: 0.0,
-    });
+    rt.handle_cursor_moved(cell_pos(6, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
-    rt.handle_cursor_moved(CursorPosition {
-        x: 9.0 * 10.0,
-        y: 0.0,
-    });
+    rt.handle_cursor_moved(cell_pos(10, 0));
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert!(rt.has_selection());
     assert_eq!(rt.selection_text().as_deref(), Some("world"));
@@ -183,7 +189,7 @@ fn capture_mode_click_clears_stale_highlight() {
     rt.handle_pty_bytes(b"\x1b[?1000h");
     rt.handle_pty_bytes(b"\x1b[?1006h");
     rt.drain_pending_input();
-    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     assert!(
         !rt.has_selection(),
@@ -211,12 +217,9 @@ fn drag_auto_copy_proves_capture_for_wl_paste() {
     // (live `wl-paste` / `wl-paste --primary` observe the same via CTX-0160).
     let mut rt = make_runtime();
     feed_text(&mut rt, "hello world");
-    rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+    rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
-    rt.handle_cursor_moved(CursorPosition {
-        x: 9.0 * 4.0,
-        y: 0.0,
-    });
+    rt.handle_cursor_moved(cell_pos(4, 0));
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
     assert_eq!(rt.clipboard().headless_contents(), "hello");

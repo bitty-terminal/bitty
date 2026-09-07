@@ -184,8 +184,10 @@ fn persistent_selection_survives_resize_clamping_headless() {
     rt.end_selection(CellPos::new(0, 4));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
     let pers = rt.persistent_selection().unwrap();
-    // Resize to smaller grid: 4 cols x 2 rows -> selection col 4 clamped to 3
-    rt.handle_resize(PhysicalSize::new(8 * 4, 16 * 2))
+    // Resize to smaller grid: 4 cols x 2 rows -> selection col 4 clamped to 3.
+    // CTX-0223: the window carries the default 8px padding inset on every
+    // side, so the window is grid pixels + 16: 4*9+16 x 2*19+16.
+    rt.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
         .expect("resize small must succeed");
     // Persistent selection columns should be clamped to new width (3)
     let clamped = pers.clamped(rt.state());
@@ -198,7 +200,8 @@ fn persistent_selection_survives_resize_clamping_headless() {
     rt2.start_selection(CellPos::new(0, 0));
     rt2.end_selection(CellPos::new(0, 4));
     let _pers2 = rt2.persistent_selection().unwrap();
-    rt2.handle_resize(PhysicalSize::new(8 * 4, 16 * 2)).unwrap();
+    rt2.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
+        .unwrap();
     // Runtime's automatic clamping after resize should keep selection valid and non-empty
     assert!(rt2.has_selection());
     let sel = rt2.selection().unwrap();

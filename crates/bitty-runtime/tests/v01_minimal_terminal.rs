@@ -120,7 +120,7 @@ fn v01_shell_echo_headless_and_deterministic_replay() {
 fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically() {
     let mut rt = make_runtime();
     let before_extent = rt.surface_extent().expect("extent after build");
-    assert_eq!(before_extent, RuntimeConfig::default().pixel_extent());
+    assert_eq!(before_extent, RuntimeConfig::default().window_extent());
     assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 80, 24));
 
     // Build a split layout so we can observe per-leaf reflow after resize.
@@ -133,7 +133,8 @@ fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically
     rt.set_layout(split);
     rt.tick().expect("first present");
 
-    // Resize to 800x600 physical pixels: with readable cell 9x19 this is 88x31 cells.
+    // Resize to 800x600 physical pixels: minus the default 8px window
+    // padding on every side, with readable cell 9x19 this is 87x30 cells.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("valid resize must succeed");
     assert_eq!(
@@ -141,14 +142,14 @@ fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically
         Some(PhysicalSize::new(800, 600)),
         "resize must reconfigure headless surface"
     );
-    // Container is recomputed from pixels via RuntimeConfig::grid_from_pixels.
-    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 88, 31));
+    // Container is recomputed from window pixels minus the padding inset.
+    assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 87, 30));
     let allocs = rt.layout_allocations();
-    // Horizontal split of 88 cols -> 44 each; height 31.
-    assert_eq!(allocs[0].1, bitty_ui::Rect::new(0, 0, 44, 31));
-    assert_eq!(allocs[1].1, bitty_ui::Rect::new(44, 0, 44, 31));
+    // Horizontal split of 87 cols -> 43 + 44; height 30.
+    assert_eq!(allocs[0].1, bitty_ui::Rect::new(0, 0, 43, 30));
+    assert_eq!(allocs[1].1, bitty_ui::Rect::new(43, 0, 44, 30));
     // Views were reflowed to match allocations.
-    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 44);
+    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 43);
     assert_eq!(rt.layout().find_leaf(ViewId::new(2)).unwrap().cols(), 44);
 
     // Resize forces a full redraw: next tick must present even without new bytes.

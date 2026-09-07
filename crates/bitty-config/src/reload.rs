@@ -444,7 +444,35 @@ mod tests {
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("layout"), ReloadClass::RestartRequired);
+        // CTX-0223: padding/opacity are Live — the running instance adopts
+        // them without restart (`Runtime::set_window_padding` re-derives the
+        // grid in place; `WindowHandle::set_opacity` retoggles the winit
+        // transparency flag). No end-to-end `ctl` trigger yet (same as every
+        // other Live field), but the apply path itself needs no restart.
+        assert_eq!(classify_field("window.opacity"), ReloadClass::Live);
+        assert_eq!(classify_field("window.padding"), ReloadClass::Live);
+        assert_eq!(classify_field("window"), ReloadClass::Live);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
+    }
+
+    #[test]
+    fn diff_window_fields_are_live_and_reconcile() {
+        // CTX-0223: changing padding/opacity must surface as a Live diff
+        // (the dead-knob finding), and reconcile must apply it to the plan.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.window.padding = 4;
+        new.window.opacity = 0.9;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "window.padding"));
+        assert!(r.diffs.iter().any(|d| d.field == "window.opacity"));
+        let mut cur = old;
+        let applied = reconcile_live(&mut cur, &new).expect("live must reconcile");
+        assert_eq!(applied.overall, ReloadClass::Live);
+        assert_eq!(cur.window.padding, 4);
+        assert!((cur.window.opacity - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]

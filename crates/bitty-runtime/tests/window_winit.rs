@@ -34,7 +34,7 @@ fn window_creation_config_maps_to_physical_extent_and_runtime_surface() {
 
     let mut rt = make_runtime();
     let before = rt.surface_extent().expect("extent");
-    assert_eq!(before, RuntimeConfig::default().pixel_extent());
+    assert_eq!(before, RuntimeConfig::default().window_extent());
 
     // Simulate winit Resumed -> create_window success -> runtime surface already exists;
     // the first post-creation step in a real app would be a resize to the window size.
@@ -90,9 +90,10 @@ fn resize_via_platform_event_reconfigures_runtime_and_layout() {
     assert_eq!(rt.surface_extent(), Some(physical));
     assert_eq!(rt.layout_allocations(), via_direct);
     // View sizes were reflowed to match allocations.
-    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 44);
-    // Container recomputed from pixels via RuntimeConfig::grid_from_pixels (9x19 cells).
-    assert_eq!(rt.container(), UiRect::new(0, 0, 88, 31));
+    assert_eq!(rt.layout().find_leaf(ViewId::new(1)).unwrap().cols(), 43);
+    // Container recomputed from window pixels minus the default 8px
+    // padding inset ((800-16)/9 x (600-16)/19 = 87x30).
+    assert_eq!(rt.container(), UiRect::new(0, 0, 87, 30));
     assert!(rt.tick().is_some(), "resize forces full redraw");
 }
 

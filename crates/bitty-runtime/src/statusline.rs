@@ -307,6 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn statusline_snapshot_served_off_tick_behind_bounded_worker() {
+        use crate::panels_async::{PANEL_WORKER_DEFAULT_QUEUE_CAP, PanelWorker};
+        use std::time::{Duration, Instant};
+        let mut worker = PanelWorker::try_spawn(
+            "statusline",
+            Some(String::new()),
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_millis(20),
+            || "cwd:~/projects | title:hi".to_string(),
+        )
+        .expect("valid worker config");
+        // Last-known-good is served immediately without blocking on a probe.
+        assert_eq!(worker.latest().as_deref(), Some(""));
+        worker.request_refresh();
+        let start = Instant::now();
+        while worker.latest().as_deref() != Some("cwd:~/projects | title:hi")
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let rendered = worker.latest().expect("statusline snapshot delivered");
+        assert!(StatuslineIntegration::is_render_bounded(&rendered));
+        assert!(worker.generation() >= 1);
+        worker.shutdown();
+        assert!(!worker.is_alive());
+    }
+
+    #[test]
     fn panel_reactive_no_hot_path_no_grid_mutation() {
         // Statusline is observation-only: re-rendering never mutates State.
         let mut state = State::new();

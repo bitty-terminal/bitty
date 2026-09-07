@@ -184,6 +184,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -4121,6 +4122,14 @@ struct TerminalApp {
     keymaps: Vec<bitty_config::ResolvedKeymap>,
     /// App-side modifier mirror for chord matching.
     app_mods: AppModifiers,
+    /// Chrome-owned keys with an unreleased press (CTX-0229 press-to-release
+    /// ownership). A consumed chord owns its key until the physical release:
+    /// repeats/duplicates arriving after modifier decay stay swallowed
+    /// instead of leaking shell bytes (e.g. `Ctrl+Shift+V` paste followed by
+    /// a `V` repeat with `Ctrl` already released must not type `V`).
+    /// Releases and focus transitions clear entries (same staleness bound as
+    /// the CTX-0187 mirror clear); bounded by simultaneously held keys.
+    chrome_held: HashSet<bitty_config::KeyName>,
     /// Layout stashed by `toggle_zoom`; `None` when not zoomed.
     zoom_backup: Option<LayoutNode>,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -4158,6 +4167,7 @@ impl TerminalApp {
             presented_frames: 0,
             keymaps,
             app_mods: AppModifiers::default(),
+            chrome_held: HashSet::new(),
             zoom_backup: None,
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -4190,6 +4200,7 @@ impl TerminalApp {
             presented_frames: 0,
             keymaps,
             app_mods: AppModifiers::default(),
+            chrome_held: HashSet::new(),
             zoom_backup: None,
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -4992,6 +5003,94 @@ impl TerminalApp {
     }
 }
 
+impl TerminalApp {
+    /// Single-owner chrome intercept (CTX-0153): resolve bound chrome keys
+    /// BEFORE `Runtime` routing. Returns `true` when the event was consumed
+    /// (a bound chord ran, or a chrome-owned key repeat/duplicate was
+    /// swallowed) and must NOT reach `Runtime`; `false` means route normally
+    /// (unbound keys like Tab, arrows, plain letters fall through to shell
+    /// input). Modifier tracking stays in sync because modifier-only keys
+    /// and `ModifiersChanged` update the mirror here AND are always routed
+    /// (this method returns `false` for them), never consumed.
+    ///
+    /// CTX-0229 press-to-release ownership: a consumed press owns its key
+    /// until the physical release. Auto-repeat (or a duplicate press) that
+    /// arrives after the chord decayed — e.g. `V` still held while `Ctrl` was
+    /// already released after a `Ctrl+Shift+V` paste — stays swallowed
+    /// instead of leaking a literal `V` into the PTY right after the pasted
+    /// text. A genuine re-press is physically impossible without an
+    /// intervening release, so swallowing duplicates cannot eat real typing;
+    /// the next press after the release re-matches against the live mirror.
+    /// Focus transitions clear ownership alongside the CTX-0187 mirror clear
+    /// (missed releases while unfocused must not swallow future typing).
+    fn intercept_chrome_key(&mut self, kind: &WindowEventKind) -> bool {
+        match kind {
+            WindowEventKind::KeyboardInput(key) => {
+                track_app_modifiers(&mut self.app_mods, key);
+                // Release ends press-to-release ownership; the key returns to
+                // normal matching on its next press. Releases always route
+                // (the runtime encodes no bytes for them).
+                if key.state != PressState::Pressed {
+                    if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
+                        self.chrome_held.remove(&keyref.key);
+                    }
+                    return false;
+                }
+                if is_modifier_key(key) {
+                    return false;
+                }
+                if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
+                    // Still physically held from a consumed chord press: stay
+                    // swallowed even when the mirror decayed (release cascade).
+                    // No action re-runs; the PTY never sees the key.
+                    if self.chrome_held.contains(&keyref.key) {
+                        if let Some(win) = self.window.as_ref() {
+                            win.request_redraw();
+                        }
+                        return true;
+                    }
+                    if let Some(action) = bitty_config::match_keymap(&self.keymaps, keyref) {
+                        // The press is chrome-owned from here until release.
+                        self.chrome_held.insert(keyref.key);
+                        // Repeats of a bound chord stay owned by chrome
+                        // (no action, no PTY bytes).
+                        if !key.repeat {
+                            self.apply_chrome_action(action);
+                        }
+                        if let Some(win) = self.window.as_ref() {
+                            win.request_redraw();
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
+            WindowEventKind::ModifiersChanged(mods) => {
+                self.app_mods = AppModifiers {
+                    shift: mods.shift,
+                    control: mods.control,
+                    alt: mods.alt,
+                    super_held: mods.super_pressed,
+                };
+                false
+            }
+            WindowEventKind::Focused(focused) => {
+                // CTX-0187 exit B root-cause fix: focus transitions are where
+                // the mirror goes stale (missed releases while unfocused), so
+                // clear here before delegating to Runtime (which records focus
+                // via set_focused). Fail-closed to shell until the
+                // authoritative ModifiersChanged stream re-latches.
+                clear_app_modifiers_on_focus(&mut self.app_mods, *focused);
+                // CTX-0229: a missed key release while unfocused must not
+                // leave a stale ownership entry swallowing future typing.
+                self.chrome_held.clear();
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
 impl AppHandler for TerminalApp {
     fn set_event_waker(&mut self, waker: EventWaker) {
         // Bridge the platform proxy into the runtime's bounded wakeup pump:
@@ -5013,44 +5112,11 @@ impl AppHandler for TerminalApp {
         // visible to the state machine before the tick.
         self.poll_pty_pump();
 
-        // CTX-0153 single-owner intercept: resolve bound chrome keys BEFORE
-        // `Runtime` routing. A bound chord is consumed here — its action runs
-        // and the PTY never sees the key — while unbound keys (Tab, arrows,
-        // plain letters) fall through to `Runtime` (shell input). Modifier
-        // tracking stays in sync because modifier-only keys and
-        // `ModifiersChanged` are always routed, never consumed.
+        // CTX-0153 single-owner intercept (see `intercept_chrome_key`): a
+        // consumed event never reaches `Runtime`.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
-            if let WindowEventKind::KeyboardInput(key) = kind {
-                track_app_modifiers(&mut self.app_mods, key);
-                if !is_modifier_key(key) && key.state == PressState::Pressed {
-                    if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
-                        if let Some(action) = bitty_config::match_keymap(&self.keymaps, keyref) {
-                            // Repeats of a bound chord stay owned by chrome
-                            // (no action, no PTY bytes).
-                            if !key.repeat {
-                                self.apply_chrome_action(action);
-                            }
-                            if let Some(win) = self.window.as_ref() {
-                                win.request_redraw();
-                            }
-                            return;
-                        }
-                    }
-                }
-            } else if let WindowEventKind::ModifiersChanged(mods) = kind {
-                self.app_mods = AppModifiers {
-                    shift: mods.shift,
-                    control: mods.control,
-                    alt: mods.alt,
-                    super_held: mods.super_pressed,
-                };
-            } else if let WindowEventKind::Focused(focused) = kind {
-                // CTX-0187 exit B root-cause fix: focus transitions are where
-                // the mirror goes stale (missed releases while unfocused), so
-                // clear here before delegating to Runtime (which records focus
-                // via set_focused). Fail-closed to shell until the
-                // authoritative ModifiersChanged stream re-latches.
-                clear_app_modifiers_on_focus(&mut self.app_mods, *focused);
+            if self.intercept_chrome_key(kind) {
+                return;
             }
         }
 
@@ -8284,6 +8350,232 @@ mod tests {
         app.apply_chrome_action(ChromeAction::PasteFromClipboard);
         assert!(!app.runtime.has_pending_paste());
         assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
+    }
+
+    // CTX-0229 headless chord driver: the same dispatch `handle_event`
+    // performs (single-owner intercept first, `Runtime` routing only for
+    // unconsumed events), minus the `EventContext` (redraw/exit plumbing
+    // carries no bytes). Returns `true` when chrome consumed the event.
+    fn drive_chrome(app: &mut TerminalApp, kind: WindowEventKind) -> bool {
+        let consumed = app.intercept_chrome_key(&kind);
+        if !consumed {
+            match kind {
+                WindowEventKind::KeyboardInput(key) => {
+                    app.runtime.handle_key_event(key);
+                }
+                WindowEventKind::ModifiersChanged(_)
+                | WindowEventKind::Focused(_)
+                | WindowEventKind::Resized(_)
+                | WindowEventKind::ScaleFactorChanged(_)
+                | WindowEventKind::CloseRequested
+                | WindowEventKind::Closed
+                | WindowEventKind::RedrawRequested
+                | WindowEventKind::MouseInput(_)
+                | WindowEventKind::MouseWheel(_)
+                | WindowEventKind::CursorMoved(_)
+                | WindowEventKind::CursorLeft
+                | WindowEventKind::Ime(_) => {
+                    app.runtime.handle_platform_event(PlatformEvent::Window {
+                        window_id: WindowId::from_raw_public(1),
+                        kind,
+                    });
+                }
+            }
+        }
+        consumed
+    }
+
+    fn mods_event(shift: bool, control: bool) -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift,
+            control,
+            alt: false,
+            super_pressed: false,
+        })
+    }
+
+    fn char_press(logical: &str, text: &str, repeat: bool) -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Character(logical.to_string()),
+            text: Some(text.to_string()),
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat,
+            is_synthetic: false,
+        })
+    }
+
+    fn char_release(logical: &str) -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Character(logical.to_string()),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Released,
+            repeat: false,
+            is_synthetic: false,
+        })
+    }
+
+    fn named_press(named: NamedKey) -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Named(named),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        })
+    }
+
+    fn paste_test_app(clipboard_text: &str) -> TerminalApp {
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.force_headless_clipboard();
+        rt.clipboard_mut()
+            .set_text(clipboard_text.to_string())
+            .expect("headless set");
+        TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+    }
+
+    /// Drives the live `Ctrl+Shift+V` shape (uppercase logical + text, as
+    /// winit reports with Shift applied and Ctrl excluded) through the real
+    /// intercept: consumed, clipboard bytes delivered, zero stray PTY bytes.
+    fn press_paste_chord(app: &mut TerminalApp) {
+        // Mirror updates and modifier presses route (never consumed)...
+        assert!(!drive_chrome(app, mods_event(false, true)));
+        assert!(!drive_chrome(app, named_press(NamedKey::Control)));
+        assert!(!drive_chrome(app, mods_event(true, true)));
+        assert!(!drive_chrome(app, named_press(NamedKey::Shift)));
+        // ...while the chorded press itself is chrome-owned.
+        assert!(drive_chrome(app, char_press("V", "V", false)));
+    }
+
+    #[test]
+    fn paste_chord_delivers_clipboard_with_zero_pty_stray() {
+        // CTX-0229 dogfood shape (PX-1233+, shot 07): the chord must deliver
+        // exactly the clipboard bytes — never `PASTE-FROM-CLIPBOARD-OKV`.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        press_paste_chord(&mut app);
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"PASTE-FROM-CLIPBOARD-OK",
+            "paste delivers clipboard bytes with zero trailing key bytes"
+        );
+        // Clean release cascade: nothing further reaches the PTY.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"",
+            "release cascade after paste stays silent"
+        );
+    }
+
+    #[test]
+    fn paste_chord_repeat_after_ctrl_release_stays_swallowed() {
+        // CTX-0229 root-cause regression: the `V` press is chrome-owned until
+        // its physical release. A repeat arriving after `Ctrl` was released
+        // first (release cascade, `Shift` still held) no longer matches the
+        // full chord — without press-to-release ownership it fell through to
+        // the PTY as a literal `V` right after the pasted text.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        press_paste_chord(&mut app);
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"PASTE-FROM-CLIPBOARD-OK"
+        );
+        // Operator releases `Ctrl` while `V` is still held (auto-repeat
+        // continues); the decayed repeat must stay chrome-owned.
+        assert!(!drive_chrome(&mut app, mods_event(true, false)));
+        assert!(
+            drive_chrome(&mut app, char_press("V", "V", true)),
+            "decayed repeat of a chrome-held key stays swallowed"
+        );
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"",
+            "no trailing V may reach the PTY after the paste"
+        );
+        // The physical release ends ownership; later typing works again.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"v");
+    }
+
+    #[test]
+    fn bare_v_still_reaches_shell() {
+        // CTX-0229 no-breakage guard: unmatched keys never enter chrome
+        // ownership — bare `v` (press and held repeat) always types.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
+        assert!(!drive_chrome(&mut app, char_press("v", "v", true)));
+        assert_eq!(app.runtime.drain_pending_input(), b"vv");
+        // Bare `Ctrl+V` (no shift) stays shell input as `0x16` (CTX-0187).
+        assert!(!drive_chrome(&mut app, mods_event(false, true)));
+        assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"\x16");
+    }
+
+    #[test]
+    fn ctrl_shift_c_still_copies_unaffected() {
+        // CTX-0229: the sibling chord keeps its behavior — consumed, no PTY
+        // bytes — and its own release ends its ownership independently.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        assert!(!drive_chrome(&mut app, mods_event(true, true)));
+        assert!(drive_chrome(&mut app, char_press("C", "C", false)));
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"",
+            "copy chord never types into the PTY"
+        );
+        assert!(!drive_chrome(&mut app, char_release("C")));
+        // Bare `c` afterwards is fresh shell input, not swallowed.
+        assert!(!drive_chrome(&mut app, mods_event(false, false)));
+        assert!(!drive_chrome(&mut app, char_press("c", "c", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"c");
+    }
+
+    #[test]
+    fn chrome_held_clears_on_focus() {
+        // CTX-0229 staleness bound (mirrors the CTX-0187 mirror clear): a
+        // missed release while unfocused must not swallow future typing.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        press_paste_chord(&mut app);
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"PASTE-FROM-CLIPBOARD-OK"
+        );
+        // Focus loss with `V` still "held" (release missed while unfocused).
+        assert!(!drive_chrome(&mut app, WindowEventKind::Focused(false)));
+        // A later `Shift+V` is fresh typing, not a chrome duplicate.
+        assert!(!drive_chrome(&mut app, mods_event(true, false)));
+        assert!(!drive_chrome(&mut app, char_press("V", "V", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"V");
+    }
+
+    #[test]
+    fn second_chord_press_after_release_pastes_again() {
+        // CTX-0229 intent guard: ownership ends at release, so a deliberate
+        // second chord press pastes again — no bytes lost, no stray added.
+        let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
+        press_paste_chord(&mut app);
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"PASTE-FROM-CLIPBOARD-OK"
+        );
+        press_paste_chord(&mut app);
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"PASTE-FROM-CLIPBOARD-OK"
+        );
     }
 
     fn two_pane_layout() -> LayoutNode {

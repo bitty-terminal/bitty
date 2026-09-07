@@ -666,6 +666,21 @@ pub struct Runtime {
     plugin_host: PluginHost,
     last_presented_generation: u64,
     pending_full_redraw: bool,
+    /// Last presented leaf allocations (CTX-0228).
+    ///
+    /// Geometry-only layout changes (tree edits via `layout_mut`,
+    /// `reflow_layout`, split/zoom) must force a full present even when
+    /// no PTY bytes advanced the generation. `tick` compares the current
+    /// allocations against this snapshot; any difference forces the full
+    /// per-leaf path. Updated on every present (and on empty-layout idle
+    /// so a frameless tree does not spin).
+    last_presented_allocations: Vec<(ViewId, UiRect)>,
+    /// Focused view at the last present (CTX-0228).
+    ///
+    /// Cursor/focus moves change which pane paints the cursor even when
+    /// allocations and generations are identical, so a focus change also
+    /// forces a full present. Updated alongside the allocations.
+    last_presented_focus: Option<ViewId>,
     cols: usize,
     rows: usize,
     layout: LayoutNode,
@@ -939,6 +954,8 @@ impl Runtime {
             plugin_host,
             last_presented_generation: u64::MAX,
             pending_full_redraw: true,
+            last_presented_allocations: Vec::new(),
+            last_presented_focus: None,
             layout,
             focus,
             container,
@@ -1038,6 +1055,8 @@ impl Runtime {
             plugin_host,
             last_presented_generation: u64::MAX,
             pending_full_redraw: true,
+            last_presented_allocations: Vec::new(),
+            last_presented_focus: None,
             layout,
             focus,
             container,
@@ -3489,9 +3508,27 @@ impl Runtime {
     }
 
     /// Mutable view of the owned layout tree.
+    ///
+    /// CTX-0228: mutating the tree through this borrow is a geometry-only
+    /// change with no PTY damage. `tick` detects allocation differences
+    /// against the last presented frame and forces a full present, so a
+    /// manual `mark_layout_dirty` call is not required — but prefer
+    /// [`Self::set_layout`] (which also re-syncs pane geometry and focus)
+    /// for split/close/zoom mutations.
     #[must_use]
     pub fn layout_mut(&mut self) -> &mut LayoutNode {
         &mut self.layout
+    }
+
+    /// Forces a full redraw on the next `tick` (CTX-0228).
+    ///
+    /// Call after mutating the tree through [`Self::layout_mut`] or focus
+    /// through [`Self::focus_mut`] when the change must present even if no
+    /// PTY bytes arrive. `tick` also detects allocation/focus differences
+    /// automatically, so this is defense in depth for embedders that want
+    /// an explicit dirty signal.
+    pub fn mark_layout_dirty(&mut self) {
+        self.pending_full_redraw = true;
     }
 
     /// Replaces the owned layout tree.
@@ -3525,6 +3562,12 @@ impl Runtime {
     }
 
     /// Mutable focus state.
+    ///
+    /// CTX-0228: `tick` detects focus differences against the last
+    /// presented frame and forces a full present (the cursor moves panes
+    /// with no PTY damage). Prefer [`Self::set_focus`]/[`Self::move_focus`]
+    /// which dirty explicitly; see [`Self::mark_layout_dirty`] for manual
+    /// borrows.
     #[must_use]
     pub fn focus_mut(&mut self) -> &mut Focus {
         &mut self.focus
@@ -3538,9 +3581,18 @@ impl Runtime {
 
     /// Sets focus to `id` when it exists in the current layout; otherwise
     /// leaves focus unchanged and returns `false`.
+    ///
+    /// CTX-0228: a focus change moves the cursor/highlight with no PTY
+    /// damage, so a successful change forces a full redraw on the next
+    /// `tick`.
     pub fn set_focus(&mut self, id: ViewId) -> bool {
         if self.layout.leaf_ids().contains(&id) {
-            self.focus.set(id);
+            // Only dirty when the focus actually moves; re-selecting the
+            // focused pane is a no-op present-wise.
+            if self.focus.focused() != Some(id) {
+                self.focus.set(id);
+                self.pending_full_redraw = true;
+            }
             true
         } else {
             false
@@ -3552,12 +3604,18 @@ impl Runtime {
     /// Returns the new focused view (if any) and updates internal focus.
     /// CTX-0177: adjacency is computed over the gapped allocation so spatial
     /// focus still crosses gap bands.
+    ///
+    /// CTX-0228: a focus move forces a full redraw (cursor/highlight moves
+    /// with no PTY damage).
     pub fn move_focus(&mut self, dir: FocusDirection) -> Option<ViewId> {
         let next = self
             .focus
             .advance_with_gaps(&self.layout, self.container, self.gaps(), dir);
         if let Some(id) = next {
-            self.focus.set(id);
+            if self.focus.focused() != Some(id) {
+                self.focus.set(id);
+                self.pending_full_redraw = true;
+            }
         }
         next
     }
@@ -3602,9 +3660,13 @@ impl Runtime {
     ///
     /// CTX-0177: reflows with the configured gaps so leaf sizes exclude the
     /// gap bands.
+    ///
+    /// CTX-0228: leaf geometry is presentation state — a reflow forces a
+    /// full redraw on the next `tick` even when no PTY bytes arrive.
     pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
         let gaps = self.gaps();
         self.layout.reflow_with_gaps(self.container, gaps);
+        self.pending_full_redraw = true;
         self.layout.layout_with_gaps(self.container, gaps)
     }
 
@@ -4880,7 +4942,7 @@ impl Runtime {
         self.layout.reflow_with_gaps(self.container, self.gaps());
 
         let snapshot = self.state.snapshot();
-        let pending_full = self.pending_full_redraw;
+        let mut pending_full = self.pending_full_redraw;
         let last = self.last_presented_generation;
         // CTX-0176: the presented generation tracks the newest grid across
         // the primary state and every pane session, so frame-on-demand idles
@@ -4890,16 +4952,32 @@ impl Runtime {
             current_gen = current_gen.max(sess.state.generation());
         }
 
+        // Collect allocations deterministically BEFORE the idle check so
+        // geometry-only changes are visible (CTX-0228). `layout_with_gaps`
+        // is pure and bounded by the leaf count.
+        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
+        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
+        let focused = self.focus.focused();
+        // CTX-0228: a layout or focus change forces a full present even
+        // when no PTY bytes advanced the generation. This covers tree edits
+        // through `layout_mut`/`focus_mut` borrows and any future
+        // geometry-only path that misses an explicit dirty flag
+        // (over-damage is safe; under-damage leaves a stale frame until
+        // the next PTY output, which is the reported bug).
+        if allocations != self.last_presented_allocations || focused != self.last_presented_focus {
+            pending_full = true;
+        }
+
         // Frame-on-demand: no new generation and no forced redraw -> idle.
         if !pending_full && current_gen == last && last != u64::MAX {
             return None;
         }
 
-        // Collect allocations deterministically; empty layout -> idle (no leaf to present).
-        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
-        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
+        // Empty layout -> idle (no leaf to present).
         if allocations.is_empty() {
             self.last_presented_generation = current_gen;
+            self.last_presented_allocations = allocations;
+            self.last_presented_focus = focused;
             self.pending_full_redraw = false;
             return None;
         }
@@ -5267,6 +5345,8 @@ impl Runtime {
             // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
             // But ensure generation advances for idle detection.
             self.last_presented_generation = current_gen;
+            self.last_presented_allocations = allocations;
+            self.last_presented_focus = focused;
             return None;
         }
 
@@ -5346,6 +5426,8 @@ impl Runtime {
 
         if !combined_list.needs_draw() {
             self.last_presented_generation = current_gen;
+            self.last_presented_allocations = allocations;
+            self.last_presented_focus = focused;
             return None;
         }
 
@@ -5378,6 +5460,8 @@ impl Runtime {
             }
         };
         self.last_presented_generation = current_gen;
+        self.last_presented_allocations = allocations;
+        self.last_presented_focus = focused;
         // CTX-0159: publish grid plus latched input/focus so socket probes see
         // typed text without screenshots (`&self` only, bounded).
         self.publish_inspect_snapshot();

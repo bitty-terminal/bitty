@@ -518,6 +518,81 @@ fn base64_encode_standard(input: &[u8]) -> String {
     out
 }
 
+/// Minimal standard-base64 decoder (RFC 4648 §4, `+/` with `=` padding),
+/// mirroring [`base64_encode_standard`] without a new dependency.
+///
+/// Accepts padded and unpadded input; rejects non-alphabet bytes, misplaced
+/// padding, and lengths congruent to 1 mod 4. Empty input decodes to empty.
+/// Trailing bits of a short final quantum are masked (lenient), but garbage
+/// alphabet or bad padding is always an error so callers can fail closed.
+/// Time O(n), space O(n) in the input length.
+fn base64_decode_standard(input: &[u8]) -> Result<Vec<u8>, &'static str> {
+    fn sextet(byte: u8) -> Result<u32, &'static str> {
+        match byte {
+            b'A'..=b'Z' => Ok(u32::from(byte - b'A')),
+            b'a'..=b'z' => Ok(u32::from(byte - b'a' + 26)),
+            b'0'..=b'9' => Ok(u32::from(byte - b'0' + 52)),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err("invalid base64 character"),
+        }
+    }
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.len() % 4 == 1 {
+        return Err("invalid base64 length");
+    }
+    let mut pad = 0_usize;
+    for &byte in input.iter().rev() {
+        if byte == b'=' {
+            pad += 1;
+        } else {
+            break;
+        }
+    }
+    if pad > 2 {
+        return Err("invalid base64 padding");
+    }
+    let body_len = input.len() - pad;
+    if input[..body_len].contains(&b'=') {
+        return Err("misplaced base64 padding");
+    }
+    if pad == 1 && body_len % 4 != 3 {
+        return Err("invalid base64 padding");
+    }
+    if pad == 2 && body_len % 4 != 2 {
+        return Err("invalid base64 padding");
+    }
+    let body = &input[..body_len];
+    let (full, tail) = body.split_at(body.len() / 4 * 4);
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    for chunk in full.chunks_exact(4) {
+        let triple = (sextet(chunk[0])? << 18)
+            | (sextet(chunk[1])? << 12)
+            | (sextet(chunk[2])? << 6)
+            | sextet(chunk[3])?;
+        out.push((triple >> 16) as u8);
+        out.push((triple >> 8) as u8);
+        out.push(triple as u8);
+    }
+    match tail.len() {
+        0 => {}
+        2 => {
+            let bits = (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12);
+            out.push((bits >> 16) as u8);
+        }
+        3 => {
+            let bits =
+                (sextet(tail[0])? << 18) | (sextet(tail[1])? << 12) | (sextet(tail[2])? << 6);
+            out.push((bits >> 16) as u8);
+            out.push((bits >> 8) as u8);
+        }
+        _ => return Err("invalid base64 length"),
+    }
+    Ok(out)
+}
+
 /// Builds an OSC 52 clipboard-read reply for `text` (`ESC ] 52 ; c ; <base64> BEL`).
 ///
 /// The payload is truncated on a UTF-8 boundary to
@@ -633,6 +708,13 @@ pub struct Runtime {
     paste_banner_collapsed: bool,
     osc_clipboard_read_allowed: bool,
     osc_clipboard_write_allowed: bool,
+    /// Count of OSC 52 writes rejected for invalid base64 (CTX-0212).
+    ///
+    /// Fail-closed telemetry: the clipboard is left unchanged and a loud
+    /// `eprintln!` warn fires per rejection, while this monotonic counter
+    /// (wrapping) lets headless tests and the embedder observe the event
+    /// without touching the real clipboard.
+    osc52_rejected_writes: u64,
     pending_activation_gesture: Option<ActivationGesture>,
     next_activation_gesture: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
@@ -868,6 +950,7 @@ impl Runtime {
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            osc52_rejected_writes: 0,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
             kitty_flags: 0,
@@ -965,6 +1048,7 @@ impl Runtime {
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            osc52_rejected_writes: 0,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
             kitty_flags: 0,
@@ -2638,6 +2722,15 @@ impl Runtime {
         self.osc_clipboard_read_allowed
     }
 
+    /// Count of OSC 52 writes rejected for invalid base64 (CTX-0212).
+    ///
+    /// Monotonic (wrapping); each rejection leaves the clipboard unchanged
+    /// and emits a loud `eprintln!` warn.
+    #[must_use]
+    pub fn osc52_rejected_writes(&self) -> u64 {
+        self.osc52_rejected_writes
+    }
+
     // ------------------------------------------------------------------
     // Scrollback search and selection persistence (CTX-0060) — headless
     // ------------------------------------------------------------------
@@ -4100,8 +4193,26 @@ impl Runtime {
                         if !self.osc_clipboard_write_allowed {
                             continue;
                         }
-                        let raw = String::from_utf8_lossy(data.as_bytes()).into_owned();
-                        self.clipboard.set_text_lossy(raw);
+                        // CTX-0212: the OSC 52 write payload is base64
+                        // (RFC 4648 §4). Decode before storing so an encoded
+                        // write lands decoded and write-then-read
+                        // round-trips exact instead of double-encoding.
+                        // Fail-closed: invalid base64 leaves the clipboard
+                        // unchanged, bumps `osc52_rejected_writes`, and warns
+                        // loudly; garbage is never raw-stored.
+                        let decoded = match base64_decode_standard(data.as_bytes()) {
+                            Ok(bytes) => bytes,
+                            Err(reason) => {
+                                self.osc52_rejected_writes =
+                                    self.osc52_rejected_writes.wrapping_add(1);
+                                eprintln!(
+                                    "bitty: rejecting invalid OSC 52 clipboard write ({reason}): no clipboard change"
+                                );
+                                continue;
+                            }
+                        };
+                        let text = String::from_utf8_lossy(&decoded).into_owned();
+                        self.clipboard.set_text_lossy(text);
                     }
                     ClipboardOp::Read => {
                         // Denied without explicit read consent (P0-AC-007):

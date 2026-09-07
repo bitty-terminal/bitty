@@ -403,14 +403,15 @@ fn multiline_primary_pastes_through_repeat_confirm_gate() {
 fn osc52_write_is_bridged_to_clipboard() {
     let mut rt = make_runtime();
     // Default: writes are denied without explicit capability grant (P0-AC-007).
-    let osc = b"\x1b]52;c;hello\x07";
+    // "hello" -> "aGVsbG8=" per RFC 4648; the write path must decode.
+    let osc = b"\x1b]52;c;aGVsbG8=\x07";
     rt.handle_pty_bytes(osc);
     assert_eq!(
         rt.clipboard().headless_contents(),
         "",
         "write must be denied without grant"
     );
-    // Grant write, then it forwards.
+    // Grant write, then it forwards decoded.
     rt.set_osc_clipboard_write_allowed(true);
     rt.handle_pty_bytes(osc);
     assert_eq!(rt.clipboard().headless_contents(), "hello");
@@ -425,6 +426,65 @@ fn osc52_write_is_bridged_to_clipboard() {
     assert!(!rt.osc_clipboard_read_allowed());
     rt.set_osc_clipboard_read_allowed(true);
     assert!(rt.osc_clipboard_read_allowed());
+}
+
+#[test]
+fn osc52_write_decodes_base64_payload() {
+    let mut rt = make_runtime();
+    rt.set_osc_clipboard_write_allowed(true);
+    // Padded payload decodes before storing (no double-encode on read).
+    rt.handle_pty_bytes(b"\x1b]52;c;aGVsbG8sIHdvcmxkIQ==\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "hello, world!");
+    // Unpadded payload is accepted too (missing `=` implied).
+    rt.handle_pty_bytes(b"\x1b]52;c;aGVsbG8\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "hello");
+    // Empty payload clears to empty (valid decode, not a rejection).
+    rt.handle_pty_bytes(b"\x1b]52;c;\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "");
+    assert_eq!(rt.osc52_rejected_writes(), 0);
+}
+
+#[test]
+fn osc52_write_invalid_base64_fails_closed() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("keep".to_string())
+        .expect("headless clipboard write must succeed");
+    rt.set_osc_clipboard_write_allowed(true);
+    assert_eq!(rt.osc52_rejected_writes(), 0);
+    // Invalid alphabet: never raw-stored, clipboard unchanged.
+    rt.handle_pty_bytes(b"\x1b]52;c;!!!\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "keep");
+    assert_eq!(rt.osc52_rejected_writes(), 1);
+    // Impossible length (1 mod 4) is rejected as well.
+    rt.handle_pty_bytes(b"\x1b]52;c;abcde\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "keep");
+    assert_eq!(rt.osc52_rejected_writes(), 2);
+    // Misplaced padding is rejected too.
+    rt.handle_pty_bytes(b"\x1b]52;c;ab=c\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "keep");
+    assert_eq!(rt.osc52_rejected_writes(), 3);
+    // No reply is queued by a write (valid or not).
+    assert!(rt.take_replies().is_empty());
+}
+
+#[test]
+fn osc52_write_then_read_round_trips_exact() {
+    let mut rt = make_runtime();
+    rt.set_osc_clipboard_write_allowed(true);
+    rt.set_osc_clipboard_read_allowed(true);
+    // Write the base64 of "round-trip ✓" then read it back: the reply must
+    // carry the same base64, proving no double-encode on the write path.
+    rt.handle_pty_bytes(b"\x1b]52;c;cm91bmQtdHJpcCDinJM=\x07");
+    assert_eq!(rt.clipboard().headless_contents(), "round-trip ✓");
+    rt.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    let replies = rt.take_replies();
+    assert_eq!(replies.len(), 1, "allowed read must answer exactly once");
+    assert_eq!(
+        &replies[0][..],
+        b"\x1b]52;c;cm91bmQtdHJpcCDinJM=\x07".as_slice(),
+        "write-then-read must round-trip the exact base64 payload"
+    );
 }
 
 #[test]

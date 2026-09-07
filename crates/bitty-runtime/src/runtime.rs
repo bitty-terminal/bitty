@@ -873,7 +873,10 @@ impl Runtime {
         if pipeline_capacity == 0 || side_capacity == 0 {
             return Err(RuntimeError::InvalidQueueCapacity);
         }
-        let extent = config.pixel_extent();
+        // CTX-0223: the headless surface spans the window (grid pixels plus
+        // the padding inset on every side); tick translates grid content by
+        // the inset origin and the padding band keeps the clear color.
+        let extent = config.window_extent();
         let surface = Surface::headless(extent).map_err(RuntimeError::from)?;
         let cell = CellMetrics::new(config.cell_width, config.cell_height)
             .expect("validated config guarantees non-zero cell metrics");
@@ -981,7 +984,8 @@ impl Runtime {
         plugin_host: PluginHost,
     ) -> Result<Self, RuntimeError> {
         config.validate()?;
-        let extent = config.pixel_extent();
+        // CTX-0223: window-sized surface (see `with_plugin_host_capacity`).
+        let extent = config.window_extent();
         let surface = Surface::headless(extent).map_err(RuntimeError::from)?;
         let cell = CellMetrics::new(config.cell_width, config.cell_height)
             .expect("validated config guarantees non-zero cell metrics");
@@ -2088,23 +2092,27 @@ impl Runtime {
     /// cell metrics — otherwise every mapping would be off by the gap. See
     /// [`Self::cursor_to_leaf_cell`] for the leaf-aware variant that also
     /// accounts for inner gap bands in multi-pane layouts.
+    ///
+    /// CTX-0223: the window padding inset shifts the grid origin the same
+    /// way, so it is subtracted first (physical pixels at the live scale).
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
+        let pad_px = f64::from(self.window_padding_physical());
         let gap_px_x = f64::from(self.config.gaps_out) * cell_w;
         let gap_px_y = f64::from(self.config.gaps_out) * cell_h;
         let col = if cell_w <= 0.0 {
             0
         } else {
-            ((pos.x - gap_px_x) / cell_w).floor() as i64
+            ((pos.x - pad_px - gap_px_x) / cell_w).floor() as i64
         };
         let row = if cell_h <= 0.0 {
             0
         } else {
-            ((pos.y - gap_px_y) / cell_h).floor() as i64
+            ((pos.y - pad_px - gap_px_y) / cell_h).floor() as i64
         };
         let max_col = snap.width.saturating_sub(1) as i64;
         let max_row = snap.height.saturating_sub(1) as i64;
@@ -2149,11 +2157,12 @@ impl Runtime {
     /// (CTX-0177).
     ///
     /// Unlike [`Self::cursor_to_cell`] (global, clamped, single-grid), this
-    /// is leaf-aware: the outer gap is subtracted in live pixels, the
-    /// remainder is divided by the live cell metrics (0157 math), the
-    /// containing gapped allocation is resolved, and the leaf origin is
-    /// subtracted for the local cell. Positions over a gap band (inner or
-    /// outer) or outside all leaves yield `None`.
+    /// is leaf-aware: the window padding inset (CTX-0223) and the outer gap
+    /// are subtracted in live pixels, the remainder is divided by the live
+    /// cell metrics (0157 math), the containing gapped allocation is
+    /// resolved, and the leaf origin is subtracted for the local cell.
+    /// Positions over the padding band, a gap band (inner or outer), or
+    /// outside all leaves yield `None`.
     ///
     /// No wide-spacer snapping is applied (that needs the target pane's
     /// snapshot; callers use `bitty_ui::snap_to_leading` with it). Local
@@ -2166,8 +2175,9 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let x = pos.x - f64::from(self.config.gaps_out) * cell_w;
-        let y = pos.y - f64::from(self.config.gaps_out) * cell_h;
+        let pad_px = f64::from(self.window_padding_physical());
+        let x = pos.x - pad_px - f64::from(self.config.gaps_out) * cell_w;
+        let y = pos.y - pad_px - f64::from(self.config.gaps_out) * cell_h;
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -4376,29 +4386,118 @@ impl Runtime {
         self.scale_factor.get()
     }
 
-    /// Derives `cols`/`rows` from a physical extent over the live (possibly
-    /// DPI-scaled) cell metrics, saturating to at least 1x1 and capping at
-    /// the 1000x1000 grid bound so hostile extents cannot grow grid memory
-    /// without limit (mirrors [`RuntimeConfig::grid_from_pixels`]).
+    /// Derives `cols`/`rows` from a physical window extent over the live
+    /// (possibly DPI-scaled) cell metrics, saturating to at least 1x1 and
+    /// capping at the 1000x1000 grid bound so hostile extents cannot grow
+    /// grid memory without limit (mirrors [`RuntimeConfig::grid_from_pixels`]).
+    ///
+    /// CTX-0223: the window padding inset is removed on every side before
+    /// dividing, so the window — not the grid — absorbs the inset. A
+    /// padding that covers the window still addresses one cell.
     fn grid_from_physical(&self, extent: PhysicalSize) -> (usize, usize) {
-        let (cols, rows) = grid_from_surface_extent(extent, self.live_cell_metrics());
+        let pad = self.window_padding_physical();
+        let content = PhysicalSize::new(
+            extent.width().saturating_sub(pad.saturating_mul(2)),
+            extent.height().saturating_sub(pad.saturating_mul(2)),
+        );
+        let (cols, rows) = grid_from_surface_extent(content, self.live_cell_metrics());
         (cols.clamp(1, 1000), rows.clamp(1, 1000))
     }
 
+    /// Configured window padding in logical pixels (CTX-0223
+    /// `window.padding`; `0..=64`, default `8`).
+    #[must_use]
+    pub fn window_padding(&self) -> u32 {
+        self.config.window_padding
+    }
+
+    /// Window padding in physical pixels at the live DPI scale (CTX-0223).
+    ///
+    /// The configured logical padding scaled by the sanitized live factor,
+    /// rounded half away from zero. Tick translates grid content by this
+    /// offset and [`Self::grid_from_physical`] removes twice it before
+    /// dividing, so render placement and grid derivation share one source.
+    #[must_use]
+    pub fn window_padding_physical(&self) -> u32 {
+        let scaled = f64::from(
+            self.config
+                .window_padding
+                .min(crate::config::MAX_WINDOW_PADDING),
+        ) * sanitize_dpi_scale(self.dpi_scale());
+        let rounded = scaled.round();
+        if rounded < 1.0 {
+            // Zero padding stays zero (no 1px floor: unlike scaled cells,
+            // a zero inset is meaningful and must not shift content).
+            0
+        } else if rounded >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            rounded as u32
+        }
+    }
+
+    /// Live-applies a new window padding without restart (CTX-0223).
+    ///
+    /// This is the `window.padding` side of the `Live` reload class: the
+    /// running instance adopts the value, re-derives the grid from the
+    /// current surface extent (the window keeps its size; the grid absorbs
+    /// the inset), and repaints fully on the next tick. No restart, no
+    /// surface reconfiguration — the extent is unchanged, only the
+    /// content translation and grid division move.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when `padding > 64`; any
+    /// [`RuntimeError`] from the grid reflow (surface/PTY resize) after
+    /// the value is stored — the padding itself is already adopted then,
+    /// and the next resize reconciles the remainder.
+    pub fn set_window_padding(&mut self, padding: u32) -> Result<(), RuntimeError> {
+        if padding > crate::config::MAX_WINDOW_PADDING {
+            return Err(RuntimeError::InvalidConfig(
+                "window_padding must be within [0, 64] logical pixels",
+            ));
+        }
+        if padding == self.config.window_padding {
+            return Ok(());
+        }
+        self.config.window_padding = padding;
+        // Re-derive the grid from the live surface extent (window size is
+        // fixed; the grid absorbs the new inset). Without a configured
+        // surface yet, the next resize/tick reconciles instead.
+        if let Some(extent) = self.surface.extent() {
+            if bitty_platform::map_resize_to_surface_extent(extent).is_some() {
+                let (cols, rows) = self.grid_from_physical(extent);
+                self.reflow_to_grid(cols, rows, extent)?;
+            }
+        }
+        self.pending_full_redraw = true;
+        Ok(())
+    }
+
     /// Pixel extent the combined frame's plan covers: container cells at the
-    /// live (DPI-scaled) cell metrics.
+    /// live (DPI-scaled) cell metrics, plus the window padding inset on
+    /// every side (CTX-0223).
     ///
     /// The GPU present path recovers its per-frame NDC factor as
     /// `surface / plan` ([`bitty_render::batch::derive_scale`]), so this
     /// must describe the DrawList's own pixel space — not the 1x1 probe the
     /// combined list is synthesized from (a stale 1-cell extent clamps the
     /// factor to 4x and magnifies the whole frame, the dominant blur behind
-    /// #232 alongside the unscaled surface/grid/atlas).
+    /// #232 alongside the unscaled surface/grid/atlas). Tick translates all
+    /// content by the padding origin, so the plan spans the window extent.
     fn present_plan_extent(&self) -> bitty_render::geometry::ExtentPx {
-        self.live_cell_metrics().extent_for(
+        let grid = self.live_cell_metrics().extent_for(
             usize::from(self.container.width),
             usize::from(self.container.height),
-        )
+        );
+        let inset = u64::from(self.window_padding_physical()).saturating_mul(2);
+        let width = u64::from(grid.width)
+            .saturating_add(inset)
+            .min(u64::from(u32::MAX)) as u32;
+        let height = u64::from(grid.height)
+            .saturating_add(inset)
+            .min(u64::from(u32::MAX)) as u32;
+        bitty_render::geometry::ExtentPx::new(width, height)
     }
 
     /// Adopts a DPI scale change (fail-safe, headless-testable, no I/O).
@@ -4847,6 +4946,12 @@ impl Runtime {
             m
         };
 
+        // CTX-0223: window padding translates every content origin below
+        // (leaf grids, selection, IME, banner) by the inset; the padding
+        // band itself keeps the surface clear color. Physical pixels at the
+        // live scale so HiDPI placement matches grid derivation.
+        let pad_px = self.window_padding_physical() as i32;
+
         for (view_id, rect) in &allocations {
             if rect.is_empty() {
                 continue;
@@ -4995,8 +5100,8 @@ impl Runtime {
             any_needs_draw = true;
 
             let live = self.live_cell_metrics();
-            let origin_px_x = rect.x as i32 * live.width as i32;
-            let origin_px_y = rect.y as i32 * live.height as i32;
+            let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
+            let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
             for mut fill in list.fills {
                 fill.rect.x += origin_px_x;
                 fill.rect.y += origin_px_y;
@@ -5039,8 +5144,8 @@ impl Runtime {
                                 live,
                             );
                             if !rects.is_empty() {
-                                let origin_px_x = rect.x as i32 * live.width as i32;
-                                let origin_px_y = rect.y as i32 * live.height as i32;
+                                let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
+                                let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
                                 for mut fill in rects {
                                     fill.rect.x += origin_px_x;
                                     fill.rect.y += origin_px_y;
@@ -5069,8 +5174,8 @@ impl Runtime {
                             .and_then(|focused| self.pane_sessions.get(&focused))
                             .map(|sess| sess.state.snapshot().cursor.position)
                             .unwrap_or(snapshot.cursor.position);
-                        let origin_px_x = rect.x as i32 * live.width as i32;
-                        let origin_px_y = rect.y as i32 * live.height as i32;
+                        let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
+                        let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
                         let base_x = origin_px_x + cur.col as i32 * live.width as i32;
                         let base_y = origin_px_y + cur.row as i32 * live.height as i32;
                         // Simple IME overlay: underline background rect plus glyphs for preedit chars.
@@ -5128,9 +5233,11 @@ impl Runtime {
                             let pill_w = text_cells as u32 * live.width;
                             let full_w = rect.width as u32 * live.width;
                             let origin_px_x = rect.x as i32 * live.width as i32
-                                + (full_w.saturating_sub(pill_w)) as i32;
-                            let banner_y =
-                                (rect.y as i32 + rect.height as i32 - 1) * (live.height as i32);
+                                + (full_w.saturating_sub(pill_w)) as i32
+                                + pad_px;
+                            let banner_y = (rect.y as i32 + rect.height as i32 - 1)
+                                * (live.height as i32)
+                                + pad_px;
                             combined_fills.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
@@ -5490,7 +5597,10 @@ mod tests {
         // of a hardcoded white, so the out-of-box cursor matches the
         // palette. Headless fills overwrite with premultiplied bytes:
         // cursor cell (col 1, row 0) after one printed cell, default live
-        // cell 9x19 over the default 80x24 grid (extent 720x456, no gaps).
+        // cell 9x19 over the default 80x24 grid. CTX-0223: the window
+        // padding inset (default 8px, physical 8px at scale 1.0) shifts
+        // grid content by the inset inside the window surface (736x472 =
+        // 720x456 grid plus 8px per side), so probe the padded origin.
         let mut rt = make_runtime();
         rt.handle_pty_bytes(b"A");
         let stats = rt.tick().expect("damage from bytes must present");
@@ -5498,9 +5608,12 @@ mod tests {
         let rgba = rt.headless_rgba().expect("rgba after tick");
         let cfg = RuntimeConfig::default();
         assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
-        let width = cfg.cell_width as usize * 80;
-        let cx = cfg.cell_width as usize + 4;
-        let cy = 9;
+        let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+        assert_eq!(pad, 8, "default padding inset is 8px at scale 1.0");
+        let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
+        assert_eq!(width, 736, "window width is grid 720 plus 8px per side");
+        let cx = pad + cfg.cell_width as usize + 4;
+        let cy = pad + 9;
         let idx = (cy * width + cx) * 4;
         // Theme cursor #f5e0dc at 0xA0 alpha, premultiplied by the headless
         // composite: (245*160/255, 224*160/255, 220*160/255, 160).
@@ -5520,7 +5633,8 @@ mod tests {
     fn handle_resize_reconfigures_surface_and_keeps_grid_pending_full_redraw() {
         let mut rt = make_runtime();
         let before = rt.surface_extent().expect("surface must have extent");
-        assert_eq!(before, RuntimeConfig::default().pixel_extent());
+        // CTX-0223: the surface spans the window (grid + padding inset).
+        assert_eq!(before, RuntimeConfig::default().window_extent());
         rt.handle_resize(PhysicalSize::new(800, 600))
             .expect("valid resize");
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
@@ -5534,7 +5648,7 @@ mod tests {
             .expect("zero resize must not error");
         assert_eq!(
             rt.surface_extent(),
-            Some(RuntimeConfig::default().pixel_extent()),
+            Some(RuntimeConfig::default().window_extent()),
             "zero resize must not reconfigure"
         );
     }
@@ -5598,12 +5712,13 @@ mod tests {
         let mut rt = make_runtime();
         assert_eq!(rt.dpi_scale(), 1.0);
         // Hyprland scale 1.6, tiled physical extent 2506x1496: scaled cells
-        // are 14x30 (CTX-0157 readable 9x19 base), so the grid must be
-        // 179x49 (not 278x78 unscaled).
+        // are 14x30 (CTX-0157 readable 9x19 base) and the physical padding
+        // is round(8 * 1.6) = 13px per side (CTX-0223), so the grid is
+        // (2506-26)/14 x (1496-26)/30 = 177x49 (not 278x78 unscaled).
         rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
         assert_eq!(rt.dpi_scale(), 1.6);
         let snap = rt.snapshot();
-        assert_eq!((snap.width, snap.height), (179, 49));
+        assert_eq!((snap.width, snap.height), (177, 49));
         assert_eq!(
             rt.surface_extent(),
             Some(PhysicalSize::new(2506, 1496)),
@@ -5629,7 +5744,7 @@ mod tests {
         rt.handle_resize(PhysicalSize::new(2506, 1496))
             .expect("valid resize");
         let snap = rt.snapshot();
-        assert_eq!((snap.width, snap.height), (179, 49));
+        assert_eq!((snap.width, snap.height), (177, 49));
     }
 
     #[test]
@@ -5646,8 +5761,8 @@ mod tests {
             let snap = rt.snapshot();
             assert_eq!(
                 (snap.width, snap.height),
-                (88, 31),
-                "unscaled 9x19 cells over 800x600"
+                (87, 30),
+                "unscaled 9x19 cells over 800x600 minus the 8px padding inset"
             );
             assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
             assert!(rt.tick().is_some(), "window stays drawable");
@@ -5718,8 +5833,8 @@ mod tests {
         via_physical.handle_resize(physical).expect("valid resize");
         let a = via_logical.snapshot();
         let b = via_physical.snapshot();
-        assert_eq!((a.width, a.height), (179, 49));
-        assert_eq!((b.width, b.height), (179, 49));
+        assert_eq!((a.width, a.height), (177, 49));
+        assert_eq!((b.width, b.height), (177, 49));
     }
 
     #[test]
@@ -5727,12 +5842,14 @@ mod tests {
         let mut rt = make_runtime();
         rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
         let scaled = rt.snapshot();
-        // 9x19 base at 2x -> 18x38 cells: 1600/18=88, 1200/38=31.
-        assert_eq!((scaled.width, scaled.height), (88, 31));
+        // 9x19 base at 2x -> 18x38 cells, physical padding round(8 * 2) =
+        // 16px per side (CTX-0223): (1600-32)/18=87, (1200-32)/38=30.
+        assert_eq!((scaled.width, scaled.height), (87, 30));
         // Back to 1.0 must restore the exact base grid, not a rounded echo.
+        // Padding is 8px per side again: (1600-16)/9=176, (1200-16)/19=62.
         rt.apply_dpi_scale(1.0, Some(PhysicalSize::new(1600, 1200)));
         let restored = rt.snapshot();
-        assert_eq!((restored.width, restored.height), (177, 63));
+        assert_eq!((restored.width, restored.height), (176, 62));
         assert_eq!(rt.dpi_scale(), 1.0);
     }
 
@@ -5743,8 +5860,10 @@ mod tests {
         rt.handle_resize(PhysicalSize::new(800, 600))
             .expect("valid resize");
         let snap = rt.snapshot();
-        // 18x38 scaled cells: 800/18=44, 600/38=15 (unscaled would be 88x31).
-        assert_eq!((snap.width, snap.height), (44, 15));
+        // 18x38 scaled cells minus the 16px physical padding per side
+        // (CTX-0223): (800-32)/18=42, (600-32)/38=14 (unscaled w/o padding
+        // would be 88x31).
+        assert_eq!((snap.width, snap.height), (42, 14));
     }
 
     #[test]
@@ -5755,8 +5874,9 @@ mod tests {
         rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
         let surface = rt.surface_extent().expect("adopted surface");
         let plan = rt.present_plan_extent();
-        // 179x49 grid at 14x30 scaled cells = 2506x1470 draw-list pixels.
-        assert_eq!((plan.width, plan.height), (179 * 14, 49 * 30));
+        // 177x49 grid at 14x30 scaled cells plus the 13px physical padding
+        // per side (CTX-0223) = 2504x1496 draw-list pixels.
+        assert_eq!((plan.width, plan.height), (177 * 14 + 26, 49 * 30 + 26));
         let scale = derive_scale(surface.width(), surface.height(), plan);
         assert!(
             (scale - 1.0).abs() < 0.05,
@@ -5779,8 +5899,9 @@ mod tests {
         let rt = make_runtime();
         let surface = rt.surface_extent().expect("default surface");
         let plan = rt.present_plan_extent();
-        // Default 80x24 grid at 9x19 readable cells = 720x456.
-        assert_eq!((plan.width, plan.height), (720, 456));
+        // Default 80x24 grid at 9x19 readable cells plus the 8px window
+        // padding per side (CTX-0223) = 736x472 window pixels.
+        assert_eq!((plan.width, plan.height), (736, 472));
         assert_eq!(derive_scale(surface.width(), surface.height(), plan), 1.0);
     }
 
@@ -5974,18 +6095,24 @@ mod tests {
     fn cursor_to_cell_subtracts_outer_gap() {
         // CTX-0177: with gaps_out = 2 cells at the default 9x19 live cell,
         // the grid origin shifts by (18px, 38px); the mapping must subtract
-        // it (0157 math) instead of drifting by the gap.
+        // it (0157 math) instead of drifting by the gap. CTX-0223: the
+        // default 8px window padding shifts it first, so the probe moves to
+        // pad + gap + 2 cells = (44, 84).
         let rt = make_gapped_runtime(0, 2);
         // Legacy probe (18, 38) -> (2, 2) now lands on the gap-shifted grid:
-        // col = (36 - 18) / 9 = 2, row = (76 - 38) / 19 = 2.
-        let pos = CursorPosition { x: 36.0, y: 76.0 };
+        // col = (44 - 8 - 18) / 9 = 2, row = (84 - 8 - 38) / 19 = 2.
+        let pos = CursorPosition { x: 44.0, y: 84.0 };
         assert_eq!(rt.cursor_to_cell(pos), CellPos::new(2, 2));
         // A click inside the outer gap clamps to the first cell (never
         // negative, never panics).
         let in_gap = CursorPosition { x: 9.0, y: 19.0 };
         assert_eq!(rt.cursor_to_cell(in_gap), CellPos::new(0, 0));
-        // Zero-gap runtime keeps the legacy mapping bit-identical.
-        let plain = make_runtime();
+        // Zero-gap, zero-padding runtime keeps the legacy mapping bit-identical.
+        let plain = Runtime::new(RuntimeConfig {
+            window_padding: 0,
+            ..RuntimeConfig::default()
+        })
+        .expect("zero padding builds");
         assert_eq!(
             plain.cursor_to_cell(CursorPosition { x: 18.0, y: 38.0 }),
             CellPos::new(2, 2)
@@ -5996,14 +6123,15 @@ mod tests {
     fn leaf_hit_testing_accounts_for_inner_and_outer_gaps() {
         // CTX-0177: leaf-aware hit-testing over a gapped two-pane layout
         // (allocations a=(1,1,38,22), b=(41,1,38,22) at 9x19 live cells).
-        // Physical x for container col c is outer_px + c * 9 + 1.
+        // Physical x for container col c is pad + outer_px + c * 9 + 1
+        // (CTX-0223: the default 8px window padding inset comes first).
         let mut rt = make_gapped_runtime(2, 1);
         rt.set_layout(two_pane_layout());
         rt.set_container(UiRect::new(0, 0, 80, 24));
         rt.reflow_layout();
         let at = |c: u16, r: u16| CursorPosition {
-            x: 9.0 + f64::from(c) * 9.0 + 1.0,
-            y: 19.0 + f64::from(r) * 19.0 + 1.0,
+            x: 8.0 + 9.0 + f64::from(c) * 9.0 + 1.0,
+            y: 8.0 + 19.0 + f64::from(r) * 19.0 + 1.0,
         };
         // Inside left leaf: local cell is container minus leaf origin.
         assert_eq!(
@@ -6194,15 +6322,16 @@ mod tests {
             LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
         );
         rt.set_layout(split);
-        // Resize to 800x600 pixels with readable cell 9x19 => 88x31 cells
+        // Resize to 800x600 pixels with readable cell 9x19, minus the
+        // default 8px window padding inset (CTX-0223) => 87x30 cells
         rt.handle_resize(PhysicalSize::new(800, 600))
             .expect("resize");
-        assert_eq!(rt.container(), UiRect::new(0, 0, 88, 31));
+        assert_eq!(rt.container(), UiRect::new(0, 0, 87, 30));
         let allocs = rt.layout_allocations();
-        // Horizontal split of 88 -> 44 each
-        assert_eq!(allocs[0].1.width, 44);
+        // Horizontal split of 87 -> 43 + 44
+        assert_eq!(allocs[0].1.width, 43);
         assert_eq!(allocs[1].1.width, 44);
-        assert_eq!(allocs[0].1.height, 31);
+        assert_eq!(allocs[0].1.height, 30);
     }
 
     #[test]
@@ -6802,12 +6931,13 @@ mod tests {
         let mut rt = mouse_headless_runtime("hello world");
         assert_eq!(rt.clipboard().headless_contents(), "");
         assert_eq!(rt.primary_contents(), "");
-        // Drag cells (0,0)..(0,4) = "hello" via the mouse path.
-        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        // Drag cells (0,0)..(0,4) = "hello" via the mouse path (CTX-0223:
+        // coords include the default 8px window padding inset).
+        rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Left));
         rt.handle_cursor_moved(CursorPosition {
-            x: 9.0 * 4.0,
-            y: 0.0,
+            x: 8.0 + 9.0 * 4.0,
+            y: 8.0,
         });
         rt.handle_mouse_input(mouse_release(MouseButton::Left));
         assert!(!rt.is_selection_dragging());
@@ -6833,11 +6963,12 @@ mod tests {
         );
         let mut rt = mouse_headless_runtime_no_auto_copy("hello world");
         assert!(!rt.config().selection_auto_copy);
-        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        // CTX-0223: mouse coords include the 8px window padding inset.
+        rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Left));
         rt.handle_cursor_moved(CursorPosition {
-            x: 9.0 * 4.0,
-            y: 0.0,
+            x: 8.0 + 9.0 * 4.0,
+            y: 8.0,
         });
         rt.handle_mouse_input(mouse_release(MouseButton::Left));
         // Highlight present, drag finished, clipboards untouched.
@@ -6869,12 +7000,13 @@ mod tests {
         rt.set_primary_text("pq".to_string());
         assert_eq!(rt.clipboard().headless_contents(), "zz");
         assert_eq!(rt.primary_contents(), "pq");
-        // Drag cells (0,0)..(0,4) = "hello" via the mouse path.
-        rt.handle_cursor_moved(CursorPosition { x: 0.0, y: 0.0 });
+        // Drag cells (0,0)..(0,4) = "hello" via the mouse path (CTX-0223:
+        // coords include the default 8px window padding inset).
+        rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
         rt.handle_mouse_input(mouse_press(MouseButton::Left));
         rt.handle_cursor_moved(CursorPosition {
-            x: 9.0 * 4.0,
-            y: 0.0,
+            x: 8.0 + 9.0 * 4.0,
+            y: 8.0,
         });
         rt.handle_mouse_input(mouse_release(MouseButton::Left));
         assert_eq!(rt.selection_text().as_deref(), Some("hello"));

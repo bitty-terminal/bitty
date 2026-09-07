@@ -189,6 +189,22 @@ impl WindowHandle {
         self.window.request_redraw();
     }
 
+    /// Live-applies a window opacity without restart (CTX-0223).
+    ///
+    /// This is the `window.opacity` side of the `Live` reload class: it
+    /// toggles the winit `transparent` flag to match the sanitized opacity
+    /// (see [`opacity_requests_transparency`]). Fail-soft by construction —
+    /// winit's setter is infallible and platforms without compositor
+    /// blending ignore the flag, so an unsupported platform keeps an opaque
+    /// window instead of erroring.
+    ///
+    /// Returns whether transparency was requested (for logging/diagnostics).
+    pub fn set_opacity(&self, opacity: f32) -> bool {
+        let transparent = opacity_requests_transparency(opacity);
+        self.window.set_transparent(transparent);
+        transparent
+    }
+
     /// Current inner size in physical pixels.
     pub fn inner_size(&self) -> PhysicalSize {
         let size = self.window.inner_size();
@@ -231,6 +247,34 @@ pub struct WindowConfig {
     max_inner_size: Option<LogicalSize>,
     resizable: bool,
     visible: bool,
+    /// Window opacity `0.0..=1.0` (CTX-0223 `window.opacity`; default `1.0`
+    /// = opaque). Always sanitized (see [`sanitize_opacity`]).
+    opacity: f32,
+}
+
+/// Coerces any opacity into the honored range (CTX-0223).
+///
+/// Non-finite inputs become `1.0` (opaque); finite values clamp to
+/// `[0.0, 1.0]`. Total for every `f32`, so untrusted config values can
+/// never poison window creation or a live update.
+#[must_use]
+pub fn sanitize_opacity(opacity: f32) -> f32 {
+    if !opacity.is_finite() {
+        1.0
+    } else {
+        opacity.clamp(0.0, 1.0)
+    }
+}
+
+/// Whether `opacity` needs a transparent window (CTX-0223).
+///
+/// winit 0.30 exposes no per-window opacity knob — translucency flows
+/// through the `transparent` window flag (compositor-blended where the
+/// platform supports it, ignored where it does not). Fully opaque windows
+/// stay non-transparent so compositors keep the fast path.
+#[must_use]
+pub fn opacity_requests_transparency(opacity: f32) -> bool {
+    sanitize_opacity(opacity) < 1.0
 }
 
 impl Default for WindowConfig {
@@ -242,12 +286,14 @@ impl Default for WindowConfig {
             max_inner_size: None,
             resizable: true,
             visible: true,
+            opacity: 1.0,
         }
     }
 }
 
 impl WindowConfig {
-    /// Defaults: empty title, platform-chosen size, resizable and visible.
+    /// Defaults: empty title, platform-chosen size, resizable, visible, and
+    /// opaque.
     pub fn new() -> Self {
         Self::default()
     }
@@ -288,11 +334,35 @@ impl WindowConfig {
         self
     }
 
+    /// Sets the window opacity (CTX-0223 `window.opacity`).
+    ///
+    /// Sanitized via [`sanitize_opacity`], so out-of-range and non-finite
+    /// inputs degrade to the nearest honored value instead of failing
+    /// window creation. Values below `1.0` mark the window transparent at
+    /// creation (see [`opacity_requests_transparency`]); `1.0` keeps the
+    /// opaque fast path.
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = sanitize_opacity(opacity);
+        self
+    }
+
+    /// The configured (sanitized) window opacity.
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    /// Whether this config requests a transparent window.
+    pub fn is_transparent(&self) -> bool {
+        opacity_requests_transparency(self.opacity)
+    }
+
     fn into_attributes(self) -> WindowAttributes {
+        let transparent = opacity_requests_transparency(self.opacity);
         let mut attributes = WinitWindow::default_attributes()
             .with_title(self.title)
             .with_resizable(self.resizable)
-            .with_visible(self.visible);
+            .with_visible(self.visible)
+            .with_transparent(transparent);
         attributes = apply_optional_size(attributes, self.inner_size, SizeKind::Inner);
         attributes = apply_optional_size(attributes, self.min_inner_size, SizeKind::Min);
         attributes = apply_optional_size(attributes, self.max_inner_size, SizeKind::Max);
@@ -465,7 +535,8 @@ mod tests {
             .with_min_inner_size(LogicalSize::new(320.0, 240.0).expect("valid"))
             .with_max_inner_size(LogicalSize::new(3840.0, 2160.0).expect("valid"))
             .with_resizable(false)
-            .with_visible(false);
+            .with_visible(false)
+            .with_opacity(0.9);
 
         assert_eq!(
             config,
@@ -476,8 +547,39 @@ mod tests {
                 max_inner_size: Some(LogicalSize::new(3840.0, 2160.0).expect("valid")),
                 resizable: false,
                 visible: false,
+                opacity: 0.9,
             }
         );
         assert_eq!(WindowConfig::default(), WindowConfig::new());
+        // Default is opaque with the fast (non-transparent) path.
+        assert_eq!(WindowConfig::default().opacity(), 1.0);
+        assert!(!WindowConfig::default().is_transparent());
+        assert!(config.is_transparent());
+    }
+
+    #[test]
+    fn opacity_sanitize_is_total_and_fail_soft() {
+        // CTX-0223: every f32 maps somewhere honored; non-finite degrades
+        // to opaque, out-of-range clamps, and only sub-1.0 requests
+        // transparency (unsupported platforms ignore the flag and stay
+        // opaque — the fail-soft path).
+        assert_eq!(sanitize_opacity(1.0), 1.0);
+        assert_eq!(sanitize_opacity(0.0), 0.0);
+        assert_eq!(sanitize_opacity(0.95), 0.95);
+        assert_eq!(sanitize_opacity(-0.5), 0.0);
+        assert_eq!(sanitize_opacity(2.0), 1.0);
+        assert_eq!(sanitize_opacity(f32::NAN), 1.0);
+        assert_eq!(sanitize_opacity(f32::INFINITY), 1.0);
+        assert_eq!(sanitize_opacity(f32::NEG_INFINITY), 1.0);
+        assert!(!opacity_requests_transparency(1.0));
+        assert!(!opacity_requests_transparency(2.0));
+        assert!(!opacity_requests_transparency(f32::NAN));
+        assert!(opacity_requests_transparency(0.99));
+        assert!(opacity_requests_transparency(0.0));
+        // The builder sanitizes at the boundary, so creation never fails.
+        assert_eq!(WindowConfig::new().with_opacity(2.0).opacity(), 1.0);
+        assert_eq!(WindowConfig::new().with_opacity(f32::NAN).opacity(), 1.0);
+        assert!(!WindowConfig::new().with_opacity(2.0).is_transparent());
+        assert!(WindowConfig::new().with_opacity(0.5).is_transparent());
     }
 }

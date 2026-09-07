@@ -157,6 +157,7 @@ pub mod gpu;
 pub mod grid;
 pub mod hidpi;
 pub(crate) mod pipeline;
+pub mod window;
 
 #[cfg(feature = "sw-fallback")]
 pub mod software;
@@ -179,3 +180,4 @@ pub use hidpi::{
     sanitize_dpi_scale, scaled_cell_metrics, scaled_cell_side, scaled_point_size,
     surface_extent_for_grid,
 };
+pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

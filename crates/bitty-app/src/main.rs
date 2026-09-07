@@ -3579,6 +3579,13 @@ fn runtime_config_from_effective(
         .layout
         .gaps_out
         .min(u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS)) as u16;
+    // CTX-0223: `window.padding` flows file -> effective -> runtime the same
+    // way (validated `0..=64` by `bitty-config`; clamped here so a future
+    // bound drift can never wrap the cast).
+    let window_padding = effective
+        .window
+        .padding
+        .min(bitty_runtime::config::MAX_WINDOW_PADDING);
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -3592,6 +3599,7 @@ fn runtime_config_from_effective(
         effective.selection.auto_copy,
         gaps_in,
         gaps_out,
+        window_padding,
     )
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
@@ -4095,6 +4103,12 @@ struct TerminalApp {
     runtime: Runtime,
     /// Window title carrying the resolved theme preset + source layer.
     window_title: String,
+    /// Window opacity from the effective config (CTX-0223
+    /// `window.opacity`; default `1.0` = opaque). Applied to the platform
+    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation; values
+    /// below `1.0` request a transparent window where the platform supports
+    /// it and stay opaque (fail-soft) where it does not.
+    window_opacity: f32,
     window: Option<WindowHandle>,
     window_id: Option<WindowId>,
     /// Demo pump channel when explicitly attached for debug/tests
@@ -4136,6 +4150,7 @@ impl TerminalApp {
         Self {
             runtime,
             window_title: window_title_for_theme(theme_name, source),
+            window_opacity: 1.0,
             window: None,
             window_id: None,
             pty_rx: None,
@@ -4167,6 +4182,7 @@ impl TerminalApp {
         Self {
             runtime,
             window_title: window_title_for_theme(theme_name, source),
+            window_opacity: 1.0,
             window: None,
             window_id: None,
             pty_rx: Some(pty_rx),
@@ -4198,6 +4214,15 @@ impl TerminalApp {
     /// [`effective_log_level`]; tests set it explicitly to prove gating.
     fn set_log_level(&mut self, level: LogLevel) {
         self.log_level = level;
+    }
+
+    /// Sets the window opacity applied at creation (CTX-0223). Call once at
+    /// startup from the effective config; the value is sanitized by the
+    /// platform [`WindowConfig`](bitty_platform::WindowConfig), so
+    /// out-of-range inputs degrade instead of failing creation.
+    fn with_window_opacity(mut self, opacity: f32) -> Self {
+        self.window_opacity = opacity;
+        self
     }
 
     /// True when per-frame `bitty tick` stderr lines are emitted.
@@ -5095,6 +5120,7 @@ impl AppHandler for TerminalApp {
                     let config = WindowConfig::new()
                         .with_title(self.window_title.clone())
                         .with_inner_size(default_size)
+                        .with_opacity(self.window_opacity)
                         .with_visible(true);
                     match ctx.create_window(config) {
                         Ok(handle) => {
@@ -5517,7 +5543,10 @@ fn main() {
         app_config.source,
         keymaps,
         spawn_spec,
-    );
+    )
+    // CTX-0223: `window.opacity` flows effective -> window creation
+    // (sanitized by the platform config; fail-soft where unsupported).
+    .with_window_opacity(app_config.effective.window.opacity);
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
     if demo_pump_enabled_from_env() {
@@ -6825,6 +6854,95 @@ mod tests {
         // Oversized gaps fail closed at the file layer (never reach runtime).
         let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
         parse_lua_config(r#"return { layout = { gaps_in = 17 } }"#, &src3).expect_err("must fail");
+    }
+
+    #[test]
+    fn runtime_config_inherits_file_window_padding() {
+        // CTX-0223: `window.padding` flows file -> effective -> runtime;
+        // crate defaults stay equal (bitty-runtime must not depend on
+        // bitty-config, so the pairing is by value, pinned here). Default
+        // preserves the 8px breathing room for existing users.
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_WINDOW_PADDING,
+            bitty_config::EffectiveConfig::default().window.padding
+        );
+        assert_eq!(
+            bitty_runtime::config::MAX_WINDOW_PADDING,
+            64,
+            "runtime bound must match config validation (`must be <= 64`)"
+        );
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 0.9, padding = 4 } }"#,
+            &src,
+        )
+        .expect("window parses");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert_eq!(merged.effective.window.padding, 4);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!(cfg.window_padding, 4);
+        assert_eq!(
+            merged.source_of("window.padding").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Absent table rides the default end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no window table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(
+            merged2.effective.window.padding,
+            bitty_runtime::config::DEFAULT_WINDOW_PADDING
+        );
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert_eq!(
+            cfg2.window_padding,
+            bitty_runtime::config::DEFAULT_WINDOW_PADDING
+        );
+        // Oversized padding fails closed at the file layer (never runtime).
+        let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 65 } }"#,
+            &src3,
+        )
+        .expect_err("must fail");
+    }
+
+    #[test]
+    fn window_opacity_reaches_platform_config() {
+        // CTX-0223: `window.opacity` flows effective -> platform window
+        // creation; platform defaults match the config default (opaque),
+        // and sub-1.0 values request transparency (fail-soft where the
+        // platform ignores the flag).
+        assert!(
+            (bitty_platform::WindowConfig::default().opacity()
+                - bitty_config::EffectiveConfig::default().window.opacity)
+                .abs()
+                < f32::EPSILON
+        );
+        let app_opacity = bitty_config::EffectiveConfig::default().window.opacity;
+        let config = bitty_platform::WindowConfig::new().with_opacity(app_opacity);
+        assert!(!config.is_transparent());
+        let faded = bitty_platform::WindowConfig::new().with_opacity(0.9);
+        assert!(faded.is_transparent());
+        // The composition root carries the effective value to creation.
+        let rt = bitty_runtime::Runtime::with_defaults().expect("runtime builds");
+        let app = TerminalApp::with_theme(
+            rt,
+            "bitty-dark",
+            "default",
+            Vec::new(),
+            SpawnSpec::default(),
+        )
+        .with_window_opacity(0.9);
+        assert!((app.window_opacity - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -162,8 +162,10 @@ fn select_all_covers_whole_grid() {
     assert!(!rt.has_selection());
     rt.select_all();
     assert!(rt.has_selection());
-    // Resize to smaller grid clamps selection.
-    rt.handle_resize(PhysicalSize::new(8 * 4, 16 * 2))
+    // Resize to smaller grid clamps selection (CTX-0223: the window
+    // carries the default 8px padding inset, so 4 cols x 2 rows needs a
+    // 4*9+16 x 2*19+16 window).
+    rt.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
         .expect("resize small");
     assert!(rt.has_selection());
     // New selection should be within new bounds (4 cols x 2 rows).
@@ -174,8 +176,9 @@ fn select_all_covers_whole_grid() {
 #[test]
 fn cursor_to_cell_mapping_is_headless_and_clamped() {
     let rt = make_runtime();
-    // Default readable cell 9x19 (CTX-0157).
-    let pos = CursorPosition { x: 18.0, y: 38.0 };
+    // Default readable cell 9x19 (CTX-0157) plus the default 8px window
+    // padding inset (CTX-0223): cell (2, 2) starts at (8 + 18, 8 + 38).
+    let pos = CursorPosition { x: 26.0, y: 46.0 };
     let cell = rt.cursor_to_cell(pos);
     assert_eq!(cell, CellPos::new(2, 2));
     // Negative and far-outside clamp.
@@ -199,11 +202,9 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     let mut rt = make_runtime();
     feed_text(&mut rt, "drag via winit");
     // Simulate winit event flow: cursor moved, then mouse down, drag, up.
-    let start = CursorPosition { x: 0.0, y: 0.0 }; // col0 row0
-    let end = CursorPosition {
-        x: 9.0 * 4.0,
-        y: 0.0,
-    }; // col4 row0
+    // CTX-0223: cell_pos includes the window padding inset.
+    let start = cell_pos(0, 0);
+    let end = cell_pos(4, 0);
     // Move to start before press (last_cursor needed)
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
@@ -272,10 +273,15 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
 }
 
 /// Physical position for a grid cell with the readable 9x19 cell metrics.
+///
+/// CTX-0223: includes the default 8px window padding inset — the grid
+/// origin sits at (8, 8) physical pixels, so raw `col * 9` coordinates
+/// would land one cell off (or inside the padding band).
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
+    const PAD: f64 = 8.0;
     CursorPosition {
-        x: f64::from(col) * 9.0,
-        y: f64::from(row) * 19.0,
+        x: PAD + f64::from(col) * 9.0,
+        y: PAD + f64::from(row) * 19.0,
     }
 }
 

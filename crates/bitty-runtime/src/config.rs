@@ -52,6 +52,18 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u16 = 0;
 /// Mirrors `bitty-config` `MAX_LAYOUT_GAP_CELLS` (see above).
 pub const MAX_LAYOUT_GAP_CELLS: u16 = 16;
 
+/// Default window padding in logical pixels (CTX-0223).
+/// Mirrors `bitty-config` `WindowConfig` default (`padding: 8`; kept as a
+/// local constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_WINDOW_PADDING: u32 = 8;
+
+/// Maximum window padding in logical pixels (CTX-0223).
+/// Mirrors `bitty-config` `WindowConfig::validate` (`must be <= 64`;
+/// see above).
+pub const MAX_WINDOW_PADDING: u32 = 64;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -104,6 +116,14 @@ pub struct RuntimeConfig {
     /// Inset around the container edge in cells (CTX-0177
     /// `layout.gaps_out`). Same bounds and default as `gaps_in`.
     pub gaps_out: u16,
+    /// Window padding in logical pixels on every side (CTX-0223
+    /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
+    /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
+    /// room). The padding band shows the window background; the grid is
+    /// translated by the inset origin and grid derivation subtracts twice
+    /// the padding before dividing by the cell metrics, so the window —
+    /// not the grid — absorbs the inset.
+    pub window_padding: u32,
 }
 
 /// Default font family (CTX-0157 acceptance probe).
@@ -130,6 +150,7 @@ impl Default for RuntimeConfig {
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
+            window_padding: DEFAULT_WINDOW_PADDING,
         }
     }
 }
@@ -156,6 +177,7 @@ impl RuntimeConfig {
         selection_auto_copy: bool,
         gaps_in: u16,
         gaps_out: u16,
+        window_padding: u32,
     ) -> Result<Self, RuntimeError> {
         let font_family = font_family.into();
         let cfg = Self {
@@ -171,6 +193,7 @@ impl RuntimeConfig {
             selection_auto_copy,
             gaps_in,
             gaps_out,
+            window_padding,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -221,10 +244,19 @@ impl RuntimeConfig {
                 "layout gaps must be within [0, 16] cells",
             ));
         }
+        if self.window_padding > MAX_WINDOW_PADDING {
+            return Err(RuntimeError::InvalidConfig(
+                "window_padding must be within [0, 64] logical pixels",
+            ));
+        }
         Ok(())
     }
 
-    /// Pixel extent for the current grid geometry.
+    /// Pixel extent for the current grid geometry, excluding window padding.
+    ///
+    /// Unchanged by CTX-0223: this stays the grid-space extent so existing
+    /// geometry (grid derivation round-trips, resize math) keeps its
+    /// meaning. Use [`Self::window_extent`] for the surface/window size.
     #[must_use]
     pub fn pixel_extent(&self) -> bitty_platform::PhysicalSize {
         let w = u64::from(self.cell_width) * self.cols as u64;
@@ -249,6 +281,42 @@ impl RuntimeConfig {
         let cols = (size.width() / self.cell_width).max(1) as usize;
         let rows = (size.height() / self.cell_height).max(1) as usize;
         (cols.min(1000), rows.min(1000))
+    }
+
+    /// Window (surface) extent: grid pixels plus the padding inset on every
+    /// side (CTX-0223). Saturates instead of overflowing on hostile inputs.
+    /// At scale 1.0 logical pixels equal physical pixels, so this is the
+    /// extent [`crate::Runtime`] configures its surface with; HiDPI callers
+    /// scale the padding via the live scale factor first (see
+    /// [`crate::Runtime::window_padding_physical`]).
+    #[must_use]
+    pub fn window_extent(&self) -> bitty_platform::PhysicalSize {
+        let grid = self.pixel_extent();
+        let inset = u64::from(self.window_padding.min(MAX_WINDOW_PADDING)).saturating_mul(2);
+        let w = u64::from(grid.width()).saturating_add(inset);
+        let h = u64::from(grid.height()).saturating_add(inset);
+        bitty_platform::PhysicalSize::new(
+            w.min(u32::MAX as u64) as u32,
+            h.min(u32::MAX as u64) as u32,
+        )
+    }
+
+    /// Derives `cols`/`rows` from a window (surface) size by first removing
+    /// the padding inset on every side, then dividing by the cell metrics
+    /// (CTX-0223). Saturates to at least 1x1; a padding that covers the
+    /// window still addresses one cell (the caller keeps the previous
+    /// geometry when the inset leaves no drawable content).
+    #[must_use]
+    pub fn grid_from_window_pixels(&self, size: bitty_platform::PhysicalSize) -> (usize, usize) {
+        let inset = self
+            .window_padding
+            .min(MAX_WINDOW_PADDING)
+            .saturating_mul(2);
+        let content = bitty_platform::PhysicalSize::new(
+            size.width().saturating_sub(inset),
+            size.height().saturating_sub(inset),
+        );
+        self.grid_from_pixels(content)
     }
 }
 
@@ -287,23 +355,31 @@ mod tests {
 
     #[test]
     fn invalid_fields_are_rejected() {
-        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true, 0, 0).is_err());
+        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err());
+        assert!(
+            RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err()
+        );
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true, 0, 0, 8).is_err());
+        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true, 0, 0, 8).is_err());
     }
 
     #[test]
     fn scroll_speed_fields_are_rejected_out_of_range() {
         // CTX-0185: scroll speed is validated fail-closed like other config.
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true, 0, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true, 0, 0).is_err());
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true, 0, 0)
+        assert!(
+            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true, 0, 0, 8).is_err()
+        );
+        assert!(
+            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true, 0, 0, 8).is_err()
+        );
+        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true, 0, 0, 8).is_err());
+        assert!(
+            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true, 0, 0, 8).is_err()
+        );
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true, 0, 0, 8)
             .expect("scroll speed boundaries must be valid");
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false, 0, 0)
+        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false, 0, 0, 8)
             .expect("scroll speed boundaries must be valid");
     }
 
@@ -312,9 +388,9 @@ mod tests {
         // CTX-0191: default-on preserves copy-on-select; both values build.
         const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
         assert!(RuntimeConfig::default().selection_auto_copy);
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8)
             .expect("auto-copy on builds");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false, 0, 0)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false, 0, 0, 8)
             .expect("auto-copy off builds");
     }
 
@@ -334,12 +410,16 @@ mod tests {
         const { assert!(MAX_LAYOUT_GAP_CELLS == 16) }
         let cfg = RuntimeConfig::default();
         assert_eq!((cfg.gaps_in, cfg.gaps_out), (0, 0));
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8)
             .expect("zero gaps build");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 16, 16)
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 16, 16, 8)
             .expect("max gaps build");
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 17, 0).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 17).is_err());
+        assert!(
+            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 17, 0, 8).is_err()
+        );
+        assert!(
+            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 17, 8).is_err()
+        );
         assert!(
             RuntimeConfig::new(
                 80,
@@ -353,9 +433,82 @@ mod tests {
                 16,
                 true,
                 u16::MAX,
-                u16::MAX
+                u16::MAX,
+                8
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn window_padding_default_and_bounds() {
+        // CTX-0223: default 8px mirrors `bitty-config` `WindowConfig`
+        // (pinned by value in `bitty-app`); bounds fail closed.
+        const { assert!(DEFAULT_WINDOW_PADDING == 8) }
+        const { assert!(MAX_WINDOW_PADDING == 64) }
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.window_padding, DEFAULT_WINDOW_PADDING);
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 0)
+            .expect("zero padding builds");
+        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 64)
+            .expect("max padding builds");
+        assert!(
+            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 65).is_err()
+        );
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                u32::MAX
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn window_extent_adds_padding_around_grid() {
+        // 80x24 at 9x19 = 720x456 grid; default 8px padding => 736x472 window.
+        let cfg = RuntimeConfig::default();
+        assert_eq!(
+            cfg.pixel_extent(),
+            bitty_platform::PhysicalSize::new(720, 456)
+        );
+        assert_eq!(
+            cfg.window_extent(),
+            bitty_platform::PhysicalSize::new(736, 472)
+        );
+        let bare = RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 0)
+            .expect("zero padding builds");
+        assert_eq!(bare.window_extent(), bare.pixel_extent());
+    }
+
+    #[test]
+    fn grid_from_window_pixels_removes_padding_first() {
+        let cfg = RuntimeConfig::default();
+        // 736x472 window minus 2x8px padding = 720x456 grid = 80x24 cells.
+        assert_eq!(
+            cfg.grid_from_window_pixels(bitty_platform::PhysicalSize::new(736, 472)),
+            (80, 24)
+        );
+        // Resize math: 800x600 window => (800-16)/9 x (600-16)/19 = 87x30.
+        assert_eq!(
+            cfg.grid_from_window_pixels(bitty_platform::PhysicalSize::new(800, 600)),
+            (87, 30)
+        );
+        // Padding-covered windows still address one cell (fail-soft floor).
+        assert_eq!(
+            cfg.grid_from_window_pixels(bitty_platform::PhysicalSize::new(10, 10)),
+            (1, 1)
         );
     }
 }

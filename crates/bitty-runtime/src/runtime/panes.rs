@@ -9,14 +9,18 @@ use super::*;
 /// Each leaf created by a split owns at most one of these: its own VT
 /// parser, terminal grid state, query-overlap tail, and PTY triple. The
 /// owned [`Pty`] keeps the child alive — dropping the session kills and
-/// reaps it without leaking a zombie. The reader stays direct (drained by
-/// [`Runtime::poll_pty`]); no wakeup-forwarder promotion applies to panes.
+/// reaps it without leaking a zombie. The reader starts direct (drained by
+/// [`Runtime::poll_pty`]) and is promoted into a wakeup forwarder by
+/// [`Runtime::set_pty_waker`](super::Runtime::set_pty_waker), exactly like
+/// the primary reader, so pane-only output wakes the event loop (CTX-0230).
 pub(super) struct PaneSession {
     pub(super) parser: Parser,
     pub(super) state: State,
     pub(super) query_overlap: Vec<u8>,
     pub(super) pty: Pty,
-    pub(super) reader: PtyReader,
+    pub(super) reader: Option<PtyReader>,
+    pub(super) forward_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    pub(super) forward_handle: Option<std::thread::JoinHandle<()>>,
     pub(super) writer: PtyWriter,
 }
 
@@ -102,10 +106,12 @@ impl Runtime {
     /// ([`State::resize`] clamps to `1..=1000` per dimension; zero dims
     /// clamp to 1).
     ///
-    /// The pane reader stays direct (no wakeup-forwarder promotion):
+    /// The pane reader starts direct and is promoted into a wakeup
+    /// forwarder when a waker is installed (CTX-0230):
     /// [`poll_pty`](Self::poll_pty) drains every pane session on each call,
-    /// so live panes need no waker. Pane replies flush to the pane's own
-    /// writer on the same path.
+    /// and a promoted pane additionally wakes the event loop per chunk so
+    /// pane-only output (e.g. a fresh split shell's `ESC[c`) is answered
+    /// promptly. Pane replies flush to the pane's own writer on the same path.
     ///
     /// # Errors
     ///
@@ -148,12 +154,65 @@ impl Runtime {
                 state,
                 query_overlap: Vec::new(),
                 pty,
-                reader,
+                reader: Some(reader),
+                forward_rx: None,
+                forward_handle: None,
                 writer,
             },
         );
+        // If a waker is already installed (split after `set_pty_waker`),
+        // promote immediately so the new pane wakes the loop too (CTX-0230).
+        if self.pty_waker.is_some() {
+            self.promote_pane_reader_to_forwarder(view);
+        }
         self.pending_full_redraw = true;
         Ok(())
+    }
+
+    /// Moves one pane's direct [`PtyReader`] into a wakeup-forwarder thread
+    /// when a waker is installed (CTX-0230). Mirrors
+    /// [`promote_pty_reader_to_forwarder`](Self::promote_pty_reader_to_forwarder):
+    /// the forwarder blocks in `recv` (zero wakeups when quiet), forwards
+    /// each chunk into a bounded channel
+    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes the shared waker once
+    /// per chunk plus once on EOF. [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// drains the forwarding channel, so the bounded-drain contract holds
+    /// end to end. Idempotent: no-op without a session, without a waker, or
+    /// when already promoted.
+    pub(super) fn promote_pane_reader_to_forwarder(&mut self, view: ViewId) {
+        if self.pty_waker.is_none() {
+            return;
+        }
+        let Some(sess) = self.pane_sessions.get_mut(&view) else {
+            return;
+        };
+        if sess.forward_rx.is_some() || sess.reader.is_none() {
+            return;
+        }
+        let Some(reader) = sess.reader.take() else {
+            return;
+        };
+        let Some(waker) = self.pty_waker.clone() else {
+            sess.reader = Some(reader);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
+        let handle = std::thread::Builder::new()
+            .name("bitty-pty-wakeup".to_owned())
+            .spawn(move || super::pty::pty_forward_loop(reader, tx, waker))
+            .expect("std thread spawn cannot fail with default builder options");
+        sess.forward_rx = Some(rx);
+        sess.forward_handle = Some(handle);
+    }
+
+    /// Whether one pane's reader is promoted into a wakeup forwarder
+    /// (implies a pane session exists). Introspection parity with
+    /// [`has_pty_forwarder`](Self::has_pty_forwarder).
+    #[must_use]
+    pub fn has_pane_forwarder(&self, view: &ViewId) -> bool {
+        self.pane_sessions
+            .get(view)
+            .is_some_and(|sess| sess.forward_rx.is_some())
     }
 
     /// Whether leaf `view` owns a private shell session.
@@ -227,8 +286,10 @@ impl Runtime {
         }
     }
 
-    /// Drains every pane session's direct reader into its private grid via
-    /// the shared PTY pipeline (see [`handle_pane_bytes`](Self::handle_pane_bytes)),
+    /// Drains every pane session's reader — the wakeup-forwarder channel
+    /// when [`promote_pane_reader_to_forwarder`](Self::promote_pane_reader_to_forwarder)
+    /// promoted the pump, otherwise the direct reader — into its private
+    /// grid via the shared PTY pipeline (see [`handle_pane_bytes`](Self::handle_pane_bytes)),
     /// flushes pane replies to each pane's own writer, and re-syncs the
     /// global input-mode caches to the focused leaf. Returns the drained
     /// chunk count. No-op when no pane session exists.
@@ -243,7 +304,17 @@ impl Runtime {
         for (id, sess) in self.pane_sessions.iter() {
             let mut per_pane = 0usize;
             while per_pane < 1024 {
-                match sess.reader.try_recv() {
+                // Promoted panes drain the forwarder channel; direct panes
+                // drain the pump channel. Either way the bound holds
+                // (`CHANNEL_CAPACITY_CHUNKS` x `READ_CHUNK_SIZE` per stage).
+                let chunk = if let Some(rx) = sess.forward_rx.as_ref() {
+                    rx.try_recv().ok()
+                } else if let Some(reader) = sess.reader.as_ref() {
+                    reader.try_recv()
+                } else {
+                    None
+                };
+                match chunk {
                     Some(chunk) => {
                         debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                         pending.push((*id, chunk));
@@ -298,10 +369,16 @@ impl Runtime {
         std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
     }
 
-    /// Flushes one pane's queued terminal replies to that pane's own writer
-    /// (bounded, fail-closed — the per-pane mirror of
-    /// [`write_replies`](Self::write_replies)). No-op without a session.
-    pub(super) fn write_pane_replies(&mut self, view: ViewId) -> usize {
+    /// Flushes one pane's queued terminal replies (DA/DECRQM/XTGETTCAP,
+    /// OSC 52 read answers) to that pane's own PTY master.
+    ///
+    /// Per-pane mirror of [`write_replies`](Self::write_replies): bounded
+    /// (4 KiB reply cap, fail-closed), no-op without a session or when
+    /// empty. Returns bytes written. [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// already calls this per drained pane; embedders also call it after
+    /// `tick` (like the primary post-tick flush) so replies queued outside
+    /// the pump still reach the pane's shell promptly.
+    pub fn write_pane_replies(&mut self, view: ViewId) -> usize {
         let Some(sess) = self.pane_sessions.get_mut(&view) else {
             return 0;
         };

@@ -4341,6 +4341,18 @@ impl TerminalApp {
             if written > 0 && self.tick_logging_enabled() {
                 eprintln!("bitty: {written} reply bytes written to PTY master (post-tick)");
             }
+            // CTX-0230: same post-tick flush for every pane session, so a
+            // split shell's query answers never wait for the next pump.
+            // Bounded per pane (reply cap, fail-closed); no-op when quiet.
+            let mut pane_written = 0usize;
+            for id in self.runtime.pane_session_ids() {
+                pane_written += self.runtime.write_pane_replies(id);
+            }
+            if pane_written > 0 && self.tick_logging_enabled() {
+                eprintln!(
+                    "bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)"
+                );
+            }
             let pending = self.runtime.cold_queue_len();
             if pending > 0 && self.tick_logging_enabled() {
                 let events = self.runtime.drain_cold_events();

@@ -92,13 +92,37 @@ pub const VERTICES_PER_QUAD: usize = 4;
 /// Indices per quad (two triangles).
 pub const INDICES_PER_QUAD: usize = 6;
 
+/// Decodes one sRGB-encoded byte to linear-light float.
+///
+/// Terminal colors arrive as sRGB bytes (theme entries, SGR parameters),
+/// but the swap-chain target is an `Srgb` format (`Bgra8UnormSrgb`-first in
+/// `gpu::pick_format`), so the hardware applies the sRGB EOTF encode on
+/// every store. Uploading `byte / 255.0` feeds sRGB-encoded values into a
+/// linear pipe and the single store-encode lifts every mid-tone
+/// (CTX-0222: gray 128 presented as 188, theme `#1e1e2e` as `(96,96,118)`).
+/// Decoding here keeps the `Srgb` target (and its correct blending) while
+/// presenting byte-exact colors.
+#[must_use]
+pub fn srgb8_to_linear(byte: u8) -> f32 {
+    let v = f32::from(byte) / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Converts straight-alpha `Rgba8` bytes to normalized shader floats.
+///
+/// RGB channels are sRGB-decoded to linear light for the `Srgb`
+/// swap-chain target (see [`srgb8_to_linear`]); alpha is already linear
+/// and stays a unit fraction.
 #[must_use]
 pub fn rgba8_to_float4(color: Rgba8) -> [f32; 4] {
     [
-        f32::from(color[0]) / 255.0,
-        f32::from(color[1]) / 255.0,
-        f32::from(color[2]) / 255.0,
+        srgb8_to_linear(color[0]),
+        srgb8_to_linear(color[1]),
+        srgb8_to_linear(color[2]),
         f32::from(color[3]) / 255.0,
     ]
 }
@@ -694,11 +718,77 @@ mod tests {
     }
 
     #[test]
-    fn rgba_bytes_normalize_to_unit_floats() {
+    fn srgb_decode_maps_endpoints_exactly() {
+        // EOTF fixed points: no lift possible on pure black/white.
+        assert_eq!(srgb8_to_linear(0), 0.0);
+        assert_eq!(srgb8_to_linear(255), 1.0);
+        // Low-end linear branch (v <= 0.04045, i.e. byte <= 10).
+        assert!((srgb8_to_linear(10) - (10.0 / 255.0) / 12.92).abs() < 1e-7);
+    }
+
+    #[test]
+    fn rgba_bytes_decode_srgb_to_linear_light() {
+        // CTX-0222: RGB channels decode to linear light for the `Srgb`
+        // swap-chain target; alpha is already linear and stays a fraction.
         assert_eq!(rgba8_to_float4([0, 0, 0, 0]), [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(rgba8_to_float4([255, 255, 255, 255]), [1.0, 1.0, 1.0, 1.0]);
-        let half = rgba8_to_float4([128, 0, 0, 255]);
-        assert!((half[0] - 128.0 / 255.0).abs() < 1e-6);
+        // Probe gray 128 must upload as linear ~0.216 (it presented as 188
+        // when fed as 128/255 without decoding).
+        let gray = rgba8_to_float4([128, 128, 128, 255]);
+        assert!((gray[0] - 0.21586).abs() < 1e-4, "gray[0]={}", gray[0]);
+        assert!((gray[1] - 0.21586).abs() < 1e-4, "gray[1]={}", gray[1]);
+        assert!((gray[2] - 0.21586).abs() < 1e-4, "gray[2]={}", gray[2]);
+        assert_eq!(gray[3], 1.0);
+        // Theme bg bytes decode dark (30 -> ~0.013), not 30/255 ~= 0.118.
+        let bg = rgba8_to_float4(crate::grid::DEFAULT_BG);
+        assert!((bg[0] - 0.01298).abs() < 1e-4, "bg[0]={}", bg[0]);
+        assert!(
+            bg[0] < 30.0 / 255.0,
+            "decoded bg must sit below the raw fraction"
+        );
+        // Alpha is untouched by the decode.
+        let half_alpha = rgba8_to_float4([200, 100, 50, 128]);
+        assert!((half_alpha[3] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn srgb_round_trip_is_byte_exact() {
+        // Decoding on upload + the hardware store-encode must present the
+        // original bytes. Pin with the exact sRGB EOTF encode side.
+        fn srgb_encode(linear: f32) -> u8 {
+            let v = if linear <= 0.0031308 {
+                12.92 * linear
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            };
+            (v * 255.0).round().clamp(0.0, 255.0) as u8
+        }
+        for byte in [0x00, 0x1E, 0x2E, 0x80, 0xE5, 0xF5, 0xFF] {
+            assert_eq!(srgb_encode(srgb8_to_linear(byte)), byte, "byte {byte:#04X}");
+        }
+    }
+
+    #[test]
+    fn fill_and_glyph_uploads_share_the_linear_decode() {
+        // The fill vertex path and the glyph tint path both flow through
+        // `rgba8_to_float4`; pin the serialized vertex floats for each.
+        let fills = [FillRect {
+            rect: RectPx::new(0, 0, 8, 16),
+            color: [128, 128, 128, 255],
+        }];
+        let chunks = chunk_fills(&fills, 640, 384, 1.0);
+        assert_eq!(chunks.len(), 1);
+        let first = &chunks[0].bytes[..FILL_VERTEX_SIZE_BYTES];
+        let r = f32::from_le_bytes(first[8..12].try_into().unwrap());
+        assert!((r - 0.21586).abs() < 1e-4, "fill red channel {r}");
+
+        let glyphs = [atlas_glyph([0, 0], [8, 8])];
+        let chunks = chunk_atlas_glyphs(&glyphs, 640, 384, 1.0);
+        assert_eq!(chunks.len(), 1);
+        let first = &chunks[0].bytes[..GLYPH_VERTEX_SIZE_BYTES];
+        let r = f32::from_le_bytes(first[16..20].try_into().unwrap());
+        let expect = srgb8_to_linear(0xE5);
+        assert!((r - expect).abs() < 1e-6, "glyph tint red channel {r}");
     }
 
     #[test]

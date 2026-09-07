@@ -771,11 +771,20 @@ impl Surface {
                                 // Bitty Dark clear color (single source of
                                 // truth: `bitty_config::theme::BITTY_DARK`
                                 // via `crate::grid::DEFAULT_BG`); the 0.06
-                                // hardcoded gray is gone.
+                                // hardcoded gray is gone. Channels are
+                                // sRGB-decoded to linear light for the
+                                // `Srgb` swap-chain target (CTX-0222), so
+                                // the store-encode presents byte-exact bg.
                                 load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: f64::from(crate::grid::DEFAULT_BG[0]) / 255.0,
-                                    g: f64::from(crate::grid::DEFAULT_BG[1]) / 255.0,
-                                    b: f64::from(crate::grid::DEFAULT_BG[2]) / 255.0,
+                                    r: f64::from(crate::batch::srgb8_to_linear(
+                                        crate::grid::DEFAULT_BG[0],
+                                    )),
+                                    g: f64::from(crate::batch::srgb8_to_linear(
+                                        crate::grid::DEFAULT_BG[1],
+                                    )),
+                                    b: f64::from(crate::batch::srgb8_to_linear(
+                                        crate::grid::DEFAULT_BG[2],
+                                    )),
                                     a: 1.0,
                                 }),
                                 store: wgpu::StoreOp::Store,
@@ -1043,12 +1052,14 @@ impl Surface {
                     config.extent.height(),
                     draw_list.plan.extent,
                 );
-                // Theme clear color: Bitty Dark via `crate::grid::DEFAULT_BG`.
+                // Theme clear color: Bitty Dark via `crate::grid::DEFAULT_BG`,
+                // sRGB-decoded to linear light for the `Srgb` swap-chain
+                // target (CTX-0222), matching the clear-only path above.
                 let bg = crate::grid::DEFAULT_BG;
                 let clear = wgpu::Color {
-                    r: f64::from(bg[0]) / 255.0,
-                    g: f64::from(bg[1]) / 255.0,
-                    b: f64::from(bg[2]) / 255.0,
+                    r: f64::from(crate::batch::srgb8_to_linear(bg[0])),
+                    g: f64::from(crate::batch::srgb8_to_linear(bg[1])),
+                    b: f64::from(crate::batch::srgb8_to_linear(bg[2])),
                     a: 1.0,
                 };
                 {

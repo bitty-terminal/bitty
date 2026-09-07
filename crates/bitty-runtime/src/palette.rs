@@ -201,10 +201,11 @@ pub fn validate_palette_panel_config(
 // agree with the grid pipeline on hue. It performs no I/O and allocates
 // nothing.
 //
-// Follow-up (out of scope here: `runtime.rs` is owned by another task): the
-// runtime tick's cursor overlay still paints its legacy hardcoded white. It
-// should adopt [`theme_cursor_rgba`] (with its existing alpha compositing)
-// and selection fills should adopt [`theme_selection_rgba`].
+// Follow-up (CTX-0219 adopted the cursor half: the runtime tick cursor
+// overlay now uses [`theme_cursor_rgba`] at its existing translucent
+// alpha). Selection fills already agree with the grid pipeline
+// (`bitty_render::grid::selection_fill_rects` paints
+// [`theme_selection_rgba`]'s hue).
 
 /// Theme background as straight-alpha RGBA (Bitty Dark `#1e1e2e`).
 #[must_use]

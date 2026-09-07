@@ -14,8 +14,8 @@
 
 use crate::error::ConfigError;
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, PluginSpec, SelectionConfig,
-    TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig,
+    SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -40,6 +40,8 @@ pub struct ConfigPlan {
     pub selection: Option<SelectionConfig>,
     /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`).
     pub layout: Option<LayoutConfig>,
+    /// Scrollbar configuration (CTX-0181 `scrollbar.mode`/`scrollbar.width`).
+    pub scrollbar: Option<ScrollbarConfig>,
     /// Appearance configuration.
     pub appearance: Option<AppearanceConfig>,
     /// Key mappings (full set for this layer).
@@ -103,6 +105,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set scrollbar.
+    #[must_use]
+    pub fn with_scrollbar(mut self, scrollbar: ScrollbarConfig) -> Self {
+        self.scrollbar = Some(scrollbar);
+        self
+    }
+
     /// Convenience builder: set appearance.
     #[must_use]
     pub fn with_appearance(mut self, appearance: AppearanceConfig) -> Self {
@@ -146,6 +155,9 @@ impl ConfigPlan {
         }
         if let Some(l) = &self.layout {
             l.validate()?;
+        }
+        if let Some(s) = &self.scrollbar {
+            s.validate()?;
         }
         if let Some(a) = &self.appearance {
             a.validate()?;
@@ -191,6 +203,7 @@ impl ConfigPlan {
             && self.terminal.is_none()
             && self.selection.is_none()
             && self.layout.is_none()
+            && self.scrollbar.is_none()
             && self.appearance.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()

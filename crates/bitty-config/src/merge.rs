@@ -72,11 +72,13 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "selection.auto_copy"
         | "layout.gaps_in"
         | "layout.gaps_out"
+        | "scrollbar.mode"
+        | "scrollbar.width"
         | "appearance.theme"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "selection" | "layout" | "appearance" => {
+        "font" | "window" | "terminal" | "selection" | "layout" | "scrollbar" | "appearance" => {
             Some(MergeClass::DeepMerge)
         }
         "keymaps" | "plugins" => Some(MergeClass::SetById),
@@ -467,6 +469,58 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("layout".to_string(), src.clone());
         }
 
+        // CTX-0181: `scrollbar.mode`/`scrollbar.width` are scalar-replace
+        // like `layout.gaps_in`; absent table means "says nothing".
+        if let Some(bar) = &plan.scrollbar {
+            for (field, is_mode) in [("scrollbar.mode", true), ("scrollbar.width", false)] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    if is_mode {
+                        effective.scrollbar.mode = bar.mode;
+                    } else {
+                        effective.scrollbar.width = bar.width;
+                    }
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    if is_mode {
+                        effective.scrollbar.mode = bar.mode;
+                    } else {
+                        effective.scrollbar.width = bar.width;
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("scrollbar".to_string(), src.clone());
+        }
+
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -671,6 +725,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "layout.gaps_in",
         "layout.gaps_out",
         "layout",
+        "scrollbar.mode",
+        "scrollbar.width",
+        "scrollbar",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1155,6 +1212,9 @@ fn merge_layers_allow_policy_violations(
         "layout.gaps_in",
         "layout.gaps_out",
         "layout",
+        "scrollbar.mode",
+        "scrollbar.width",
+        "scrollbar",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1242,6 +1302,43 @@ mod tests {
             LayerKind::Cli
         );
         assert!(!merged.conflicts.is_empty());
+    }
+
+    #[test]
+    fn scrollbar_merges_scalar_replace_with_attribution() {
+        // CTX-0181: user layer wins with per-field attribution; absent
+        // table keeps the lower-precedence value (hidden default).
+        use crate::types::{ScrollbarConfig, ScrollbarMode};
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                scrollbar: Some(ScrollbarConfig {
+                    mode: ScrollbarMode::Auto,
+                    width: 12,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.scrollbar.mode, ScrollbarMode::Auto);
+        assert_eq!(merged.effective.scrollbar.width, 12);
+        assert_eq!(
+            merged.source_of("scrollbar.mode").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("scrollbar.width").unwrap().layer,
+            LayerKind::User
+        );
+        // Absent table rides the hidden default with core-defaults
+        // attribution (like every other field).
+        let merged2 = merge_layers(vec![]).expect("merge");
+        assert_eq!(merged2.effective.scrollbar.mode, ScrollbarMode::Hidden);
+        assert_eq!(
+            merged2.source_of("scrollbar.mode").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
     }
 
     #[test]

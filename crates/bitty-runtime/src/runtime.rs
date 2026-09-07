@@ -121,6 +121,7 @@ pub mod plugin;
 pub mod present;
 pub mod pty;
 pub mod resize;
+pub mod scrollbar;
 pub mod search;
 pub mod selection;
 
@@ -129,6 +130,7 @@ pub use self::present::PresentStats;
 use self::layout_focus::{default_container, default_layout};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer};
+use self::scrollbar::ScrollbarDrag;
 
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
 /// renderer, surface, and the bounded cold-path queue.
@@ -272,6 +274,25 @@ pub struct Runtime {
     clipboard: Clipboard,
     selection: Option<Selection>,
     selection_dragging: bool,
+    /// Active overlay-scrollbar thumb drag (CTX-0181).
+    ///
+    /// Press+move on the painted thumb scrolls the focused view through the
+    /// existing [`View::scroll_by`] (no scroll-semantics change). `None`
+    /// when no drag is active; cleared on release and when the cursor leaves
+    /// the window. Presentation-only: never grid truth.
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// Whether the cursor has left the window since the last motion event
+    /// (CTX-0181 `auto` disengagement).
+    ///
+    /// Set on `CursorLeft`, cleared on the next `CursorMoved`. Tracked
+    /// separately from the shared `last_cursor` so the selection/mouse path
+    /// keeps its meaning while the auto-hide thumb provably disengages.
+    scrollbar_cursor_left: bool,
+    /// Whether the scrollbar painted on the last present (CTX-0181).
+    ///
+    /// Compared on cursor moves so `auto` hover/proximity transitions
+    /// repaint exactly once instead of presenting on every motion event.
+    scrollbar_visible: bool,
     /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
     ///
     /// Ghostty copies a committed left-drag selection to both the standard
@@ -545,6 +566,9 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            scrollbar_drag: None,
+            scrollbar_cursor_left: false,
+            scrollbar_visible: false,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
@@ -646,6 +670,9 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            scrollbar_drag: None,
+            scrollbar_cursor_left: false,
+            scrollbar_visible: false,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),

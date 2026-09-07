@@ -64,6 +64,21 @@ pub const DEFAULT_WINDOW_PADDING: u32 = 8;
 /// see above).
 pub const MAX_WINDOW_PADDING: u32 = 64;
 
+/// Default scrollbar thumb width in logical pixels (CTX-0181).
+/// Mirrors `bitty-config` `DEFAULT_SCROLLBAR_WIDTH` (kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_SCROLLBAR_WIDTH: u32 = 8;
+
+/// Minimum scrollbar thumb width in logical pixels (CTX-0181).
+/// Mirrors `bitty-config` `MIN_SCROLLBAR_WIDTH_PX` (see above).
+pub const MIN_SCROLLBAR_WIDTH_PX: u32 = 1;
+
+/// Maximum scrollbar thumb width in logical pixels (CTX-0181).
+/// Mirrors `bitty-config` `MAX_SCROLLBAR_WIDTH_PX` (see above).
+pub const MAX_SCROLLBAR_WIDTH_PX: u32 = 32;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -124,6 +139,17 @@ pub struct RuntimeConfig {
     /// the padding before dividing by the cell metrics, so the window —
     /// not the grid — absorbs the inset.
     pub window_padding: u32,
+    /// Overlay scrollbar display mode (CTX-0181 `scrollbar.mode`).
+    /// Default `Hidden` = geometry-neutral (zero pixels, zero layout delta).
+    /// `Always` paints the thumb whenever scrollback exists; `Auto` reveals
+    /// it on mouse proximity/hover/drag.
+    pub scrollbar_mode: bitty_ui::ScrollbarMode,
+    /// Overlay scrollbar thumb width in logical pixels (CTX-0181
+    /// `scrollbar.width`). `MIN_SCROLLBAR_WIDTH_PX..=MAX_SCROLLBAR_WIDTH_PX`;
+    /// default `DEFAULT_SCROLLBAR_WIDTH` (`8`). Scaled by the live DPI
+    /// factor exactly like `window_padding`; the track lives inside the
+    /// leaf allocation so the grid never absorbs it.
+    pub scrollbar_width: u32,
 }
 
 /// Default font family (CTX-0157 acceptance probe).
@@ -151,6 +177,8 @@ impl Default for RuntimeConfig {
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             window_padding: DEFAULT_WINDOW_PADDING,
+            scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
+            scrollbar_width: DEFAULT_SCROLLBAR_WIDTH,
         }
     }
 }
@@ -178,6 +206,8 @@ impl RuntimeConfig {
         gaps_in: u16,
         gaps_out: u16,
         window_padding: u32,
+        scrollbar_mode: bitty_ui::ScrollbarMode,
+        scrollbar_width: u32,
     ) -> Result<Self, RuntimeError> {
         let font_family = font_family.into();
         let cfg = Self {
@@ -194,6 +224,8 @@ impl RuntimeConfig {
             gaps_in,
             gaps_out,
             window_padding,
+            scrollbar_mode,
+            scrollbar_width,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -247,6 +279,11 @@ impl RuntimeConfig {
         if self.window_padding > MAX_WINDOW_PADDING {
             return Err(RuntimeError::InvalidConfig(
                 "window_padding must be within [0, 64] logical pixels",
+            ));
+        }
+        if !(MIN_SCROLLBAR_WIDTH_PX..=MAX_SCROLLBAR_WIDTH_PX).contains(&self.scrollbar_width) {
+            return Err(RuntimeError::InvalidConfig(
+                "scrollbar_width must be within [1, 32] logical pixels",
             ));
         }
         Ok(())
@@ -355,32 +392,227 @@ mod tests {
 
     #[test]
     fn invalid_fields_are_rejected() {
-        assert!(RuntimeConfig::new(0, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err());
         assert!(
-            RuntimeConfig::new(80, 24, 0, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err()
+            RuntimeConfig::new(
+                0,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 0, "mono", 12.0, 3, 16, true, 0, 0, 8).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "   ", 12.0, 3, 16, true, 0, 0, 8).is_err());
-        assert!(RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 0.0, 3, 16, true, 0, 0, 8).is_err());
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                0,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                0,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "   ",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                0.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn scroll_speed_fields_are_rejected_out_of_range() {
         // CTX-0185: scroll speed is validated fail-closed like other config.
         assert!(
-            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 0, 16, true, 0, 0, 8).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                8,
+                16,
+                256,
+                "mono",
+                12.0,
+                0,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
         assert!(
-            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 33, 16, true, 0, 0, 8).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                8,
+                16,
+                256,
+                "mono",
+                12.0,
+                33,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
-        assert!(RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 0, true, 0, 0, 8).is_err());
         assert!(
-            RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 3, 257, true, 0, 0, 8).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                8,
+                16,
+                256,
+                "mono",
+                12.0,
+                3,
+                0,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 1, 1, true, 0, 0, 8)
-            .expect("scroll speed boundaries must be valid");
-        RuntimeConfig::new(80, 24, 8, 16, 256, "mono", 12.0, 32, 256, false, 0, 0, 8)
-            .expect("scroll speed boundaries must be valid");
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                8,
+                16,
+                256,
+                "mono",
+                12.0,
+                3,
+                257,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
+        );
+        RuntimeConfig::new(
+            80,
+            24,
+            8,
+            16,
+            256,
+            "mono",
+            12.0,
+            1,
+            1,
+            true,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("scroll speed boundaries must be valid");
+        RuntimeConfig::new(
+            80,
+            24,
+            8,
+            16,
+            256,
+            "mono",
+            12.0,
+            32,
+            256,
+            false,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("scroll speed boundaries must be valid");
     }
 
     #[test]
@@ -388,10 +620,112 @@ mod tests {
         // CTX-0191: default-on preserves copy-on-select; both values build.
         const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
         assert!(RuntimeConfig::default().selection_auto_copy);
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8)
-            .expect("auto-copy on builds");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, false, 0, 0, 8)
-            .expect("auto-copy off builds");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("auto-copy on builds");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            false,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("auto-copy off builds");
+    }
+
+    #[test]
+    fn scrollbar_defaults_hidden_and_validates_bounds() {
+        // CTX-0181: hidden-by-default keeps geometry neutral; width bounds
+        // fail closed (mirrors `bitty-config` bounds, pinned in `bitty-app`).
+        const { assert!(DEFAULT_SCROLLBAR_WIDTH == 8) }
+        const { assert!(MIN_SCROLLBAR_WIDTH_PX == 1) }
+        const { assert!(MAX_SCROLLBAR_WIDTH_PX == 32) }
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.scrollbar_mode, bitty_ui::ScrollbarMode::Hidden);
+        assert_eq!(cfg.scrollbar_width, DEFAULT_SCROLLBAR_WIDTH);
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Auto,
+            12,
+        )
+        .expect("auto scrollbar builds");
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                33,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -410,15 +744,81 @@ mod tests {
         const { assert!(MAX_LAYOUT_GAP_CELLS == 16) }
         let cfg = RuntimeConfig::default();
         assert_eq!((cfg.gaps_in, cfg.gaps_out), (0, 0));
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 8)
-            .expect("zero gaps build");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 16, 16, 8)
-            .expect("max gaps build");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("zero gaps build");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            16,
+            16,
+            8,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("max gaps build");
         assert!(
-            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 17, 0, 8).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                17,
+                0,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
         assert!(
-            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 17, 8).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                17,
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
         assert!(
             RuntimeConfig::new(
@@ -434,7 +834,9 @@ mod tests {
                 true,
                 u16::MAX,
                 u16::MAX,
-                8
+                8,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
             )
             .is_err()
         );
@@ -448,12 +850,61 @@ mod tests {
         const { assert!(MAX_WINDOW_PADDING == 64) }
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.window_padding, DEFAULT_WINDOW_PADDING);
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 0)
-            .expect("zero padding builds");
-        RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 64)
-            .expect("max padding builds");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            0,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("zero padding builds");
+        RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            64,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("max padding builds");
         assert!(
-            RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 65).is_err()
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                65,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
+            )
+            .is_err()
         );
         assert!(
             RuntimeConfig::new(
@@ -469,7 +920,9 @@ mod tests {
                 true,
                 0,
                 0,
-                u32::MAX
+                u32::MAX,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH
             )
             .is_err()
         );
@@ -487,8 +940,24 @@ mod tests {
             cfg.window_extent(),
             bitty_platform::PhysicalSize::new(736, 472)
         );
-        let bare = RuntimeConfig::new(80, 24, 9, 19, 256, "mono", 12.0, 3, 16, true, 0, 0, 0)
-            .expect("zero padding builds");
+        let bare = RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            0,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("zero padding builds");
         assert_eq!(bare.window_extent(), bare.pixel_extent());
     }
 

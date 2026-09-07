@@ -64,6 +64,8 @@ impl std::fmt::Display for ReloadClass {
 /// | `selection.auto_copy`     | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
 /// | `layout.gaps_out`         | RestartRequired    |
+/// | `scrollbar.mode`          | RestartRequired    |
+/// | `scrollbar.width`         | RestartRequired    |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -90,6 +92,9 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "layout.gaps_in"
         | "layout.gaps_out"
         | "layout"
+        | "scrollbar.mode"
+        | "scrollbar.width"
+        | "scrollbar"
         | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,
     }
@@ -236,6 +241,19 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "layout.gaps_out",
         old.layout.gaps_out.to_string(),
         new.layout.gaps_out.to_string(),
+    );
+    // CTX-0181: scrollbar chrome is adopted at startup (RuntimeConfig is
+    // built once from the effective config), so changes are
+    // restart-required, not live.
+    push_if_changed(
+        "scrollbar.mode",
+        old.scrollbar.mode.as_str().to_string(),
+        new.scrollbar.mode.as_str().to_string(),
+    );
+    push_if_changed(
+        "scrollbar.width",
+        old.scrollbar.width.to_string(),
+        new.scrollbar.width.to_string(),
     );
     push_if_changed(
         "appearance.theme",
@@ -513,6 +531,26 @@ mod tests {
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "selection.auto_copy"));
+    }
+
+    #[test]
+    fn diff_scrollbar_is_restart_required() {
+        // CTX-0181: changing mode or width must surface as a
+        // restart-required diff (chrome is adopted at startup).
+        use crate::types::ScrollbarMode;
+        let old = EffectiveConfig::default();
+        assert_eq!(old.scrollbar.mode, ScrollbarMode::Hidden);
+        let mut new = old.clone();
+        new.scrollbar.mode = ScrollbarMode::Auto;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "scrollbar.mode"));
+        let mut new2 = old.clone();
+        new2.scrollbar.width = 12;
+        let r2 = diff(&old, &new2);
+        assert_eq!(r2.overall, ReloadClass::RestartRequired);
+        assert!(r2.diffs.iter().any(|d| d.field == "scrollbar.width"));
     }
 
     #[test]

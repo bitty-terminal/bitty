@@ -58,6 +58,30 @@ pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
 /// `false` leaves the highlight in place and copies only via the explicit
 /// `copy_to_clipboard` chord (Ctrl+Shift+C).
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
+
+/// Default scrollbar mode (CTX-0181): `hidden`.
+///
+/// Hidden-by-default keeps the grid geometry-neutral for existing users:
+/// no track, no thumb, zero fills, zero layout delta. `always` paints the
+/// overlay thumb whenever scrollback exists; `auto` reveals it on mouse
+/// proximity/hover/drag like modern terminals.
+pub const DEFAULT_SCROLLBAR_MODE: &str = "hidden";
+
+/// Default scrollbar thumb width in logical pixels (CTX-0181).
+///
+/// Scaled by the live DPI factor exactly like `window.padding`, so the
+/// overlay keeps its physical size across displays.
+pub const DEFAULT_SCROLLBAR_WIDTH: u32 = 8;
+
+/// Minimum scrollbar thumb width in logical pixels (CTX-0181).
+pub const MIN_SCROLLBAR_WIDTH_PX: u32 = 1;
+
+/// Maximum scrollbar thumb width in logical pixels (CTX-0181).
+///
+/// An overlay wider than a cell would swallow grid readability; 32px stays
+/// well under one default cell row while keeping untrusted input bounded
+/// (threat T-01). Larger values fail closed like every other config bound.
+pub const MAX_SCROLLBAR_WIDTH_PX: u32 = 32;
 /// Default font family: Nerd-Font-patched JetBrains Mono.
 ///
 /// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
@@ -431,6 +455,88 @@ impl LayoutConfig {
     }
 }
 
+/// Scrollbar display mode (CTX-0181).
+///
+/// Mirrors `bitty-ui`'s mode by value (`bitty-config` owns no workspace
+/// dependencies, so the pairing is by string, pinned by a `bitty-app`
+/// cross-crate test): `hidden` (default, geometry-neutral), `always`
+/// (overlay thumb whenever scrollback exists), `auto` (revealed on mouse
+/// proximity/hover/drag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarMode {
+    /// Never painted (default; zero pixels, zero geometry delta).
+    #[default]
+    Hidden,
+    /// Painted whenever scrollback exists.
+    Always,
+    /// Painted only while engaged (hover/proximity/drag).
+    Auto,
+}
+
+impl ScrollbarMode {
+    /// Parses a config `mode` string (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"hidden"`, `"always"`, `"auto"`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "hidden" => Some(Self::Hidden),
+            "always" => Some(Self::Always),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Always => "always",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Overlay scrollbar configuration (CTX-0181).
+///
+/// The scrollbar is a presentation-only overlay for the scrollback viewport:
+/// the thumb is painted in the present layer (like the selection highlight),
+/// never grid truth, and the track lives inside the leaf allocation so grid
+/// geometry is untouched. Set via `init.lua`
+/// `scrollbar = { mode = "auto", width = 8 }` (both keys optional,
+/// defaulting to hidden/`8` when the table is present but omits them, so
+/// `scrollbar = {}` keeps the geometry-neutral default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollbarConfig {
+    /// Display mode; default [`ScrollbarMode::Hidden`].
+    pub mode: ScrollbarMode,
+    /// Thumb width in logical pixels, `1..=MAX_SCROLLBAR_WIDTH_PX`.
+    pub width: u32,
+}
+
+impl Default for ScrollbarConfig {
+    fn default() -> Self {
+        Self {
+            mode: ScrollbarMode::Hidden,
+            width: DEFAULT_SCROLLBAR_WIDTH,
+        }
+    }
+}
+
+impl ScrollbarConfig {
+    /// Validate scrollbar config (fail-closed on bad mode/width).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(MIN_SCROLLBAR_WIDTH_PX..=MAX_SCROLLBAR_WIDTH_PX).contains(&self.width) {
+            return Err(ConfigError::validation(
+                "scrollbar.width",
+                format!("must be within [{MIN_SCROLLBAR_WIDTH_PX}, {MAX_SCROLLBAR_WIDTH_PX}]"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Appearance configuration.
 ///
 /// The optional theme identifier resolves through the built-in preset
@@ -559,6 +665,8 @@ pub struct EffectiveConfig {
     pub selection: SelectionConfig,
     /// Layout config (CTX-0177 panel gaps; default edge-to-edge).
     pub layout: LayoutConfig,
+    /// Scrollbar config (CTX-0181 overlay scrollbar; default hidden).
+    pub scrollbar: ScrollbarConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
     /// Keymaps, possibly empty.
@@ -579,6 +687,7 @@ impl Default for EffectiveConfig {
             terminal: TerminalConfig::default(),
             selection: SelectionConfig::default(),
             layout: LayoutConfig::default(),
+            scrollbar: ScrollbarConfig::default(),
             appearance: AppearanceConfig::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
@@ -596,6 +705,7 @@ impl EffectiveConfig {
         self.terminal.validate()?;
         self.selection.validate()?;
         self.layout.validate()?;
+        self.scrollbar.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -846,6 +956,44 @@ mod tests {
         SelectionConfig { auto_copy: false }
             .validate()
             .expect("opt-out valid");
+        EffectiveConfig::default()
+            .validate()
+            .expect("default valid");
+    }
+
+    #[test]
+    fn scrollbar_defaults_hidden_and_validates_bounds() {
+        // CTX-0181: hidden-by-default keeps grid geometry-neutral; width
+        // bounds fail closed.
+        const { assert!(DEFAULT_SCROLLBAR_WIDTH == 8) }
+        const { assert!(MIN_SCROLLBAR_WIDTH_PX == 1) }
+        const { assert!(MAX_SCROLLBAR_WIDTH_PX == 32) }
+        assert_eq!(DEFAULT_SCROLLBAR_MODE, "hidden");
+        let d = ScrollbarConfig::default();
+        assert_eq!(d.mode, ScrollbarMode::Hidden);
+        assert_eq!(d.width, DEFAULT_SCROLLBAR_WIDTH);
+        d.validate().expect("default valid");
+        assert_eq!(ScrollbarMode::parse("hidden"), Some(ScrollbarMode::Hidden));
+        assert_eq!(ScrollbarMode::parse("always"), Some(ScrollbarMode::Always));
+        assert_eq!(ScrollbarMode::parse("auto"), Some(ScrollbarMode::Auto));
+        assert_eq!(ScrollbarMode::parse("overlay"), None);
+        assert_eq!(ScrollbarMode::parse("AUTO"), None);
+        for bad in [0, MAX_SCROLLBAR_WIDTH_PX + 1] {
+            ScrollbarConfig {
+                width: bad,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+        }
+        for good in [MIN_SCROLLBAR_WIDTH_PX, 8, MAX_SCROLLBAR_WIDTH_PX] {
+            ScrollbarConfig {
+                mode: ScrollbarMode::Auto,
+                width: good,
+            }
+            .validate()
+            .expect("boundary width must be valid");
+        }
         EffectiveConfig::default()
             .validate()
             .expect("default valid");

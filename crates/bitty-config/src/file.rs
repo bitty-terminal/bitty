@@ -33,6 +33,7 @@
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
+//!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
@@ -57,6 +58,10 @@
 //!   "this layer says nothing"; when the table is present, omitted keys
 //!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
 //!   edge-to-edge), and out-of-range values fail closed with the field path.
+//!   `scrollbar` follows it too: absent means "says nothing"; when present,
+//!   omitted keys default to [`ScrollbarConfig`](crate::types::ScrollbarConfig)
+//!   defaults (`hidden` mode, width `8`), unknown `mode` strings and
+//!   out-of-range `width` fail closed with the field path.
 //!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
 //! - `plugins`, `extends`, and profile names remain non-user layers and are
@@ -95,8 +100,8 @@ use crate::error::ConfigError;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, SelectionConfig,
-    TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, ScrollbarConfig,
+    ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -995,6 +1000,52 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             Some(LayoutConfig { gaps_in, gaps_out })
         }
     };
+    // CTX-0181: `scrollbar` follows the same fully-optional pattern: absent
+    // table means "this layer says nothing" (plan.scrollbar None so merge
+    // keeps the lower-precedence value). When the table is present, omitted
+    // keys default to `ScrollbarConfig` defaults (hidden mode, width 8) so
+    // `scrollbar = { mode = "auto" }` keeps working without forcing `width`.
+    // `mode` is an exact lowercase string (unknown spellings fail closed
+    // with the field path); `width` is range-checked here and again by
+    // `ScrollbarConfig::validate` via `plan.validate()`.
+    let scrollbar = match data.scrollbar {
+        None => None,
+        Some(b) => {
+            let defaults = ScrollbarConfig::default();
+            let mode = match b.mode {
+                None => defaults.mode,
+                Some(raw) => match ScrollbarMode::parse(raw.trim()) {
+                    Some(m) => m,
+                    None => {
+                        return Err(ConfigError::validation(
+                            "scrollbar.mode",
+                            "must be one of \"hidden\", \"always\", \"auto\"",
+                        ));
+                    }
+                },
+            };
+            let width = match b.width {
+                None => defaults.width,
+                Some(v) => {
+                    if !(crate::types::MIN_SCROLLBAR_WIDTH_PX as i64
+                        ..=crate::types::MAX_SCROLLBAR_WIDTH_PX as i64)
+                        .contains(&v)
+                    {
+                        return Err(ConfigError::validation(
+                            "scrollbar.width",
+                            format!(
+                                "must be within [{}, {}] (found {v})",
+                                crate::types::MIN_SCROLLBAR_WIDTH_PX,
+                                crate::types::MAX_SCROLLBAR_WIDTH_PX
+                            ),
+                        ));
+                    }
+                    v as u32
+                }
+            };
+            Some(ScrollbarConfig { mode, width })
+        }
+    };
 
     let plan = ConfigPlan {
         schema_version: None,
@@ -1003,6 +1054,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         terminal,
         selection,
         layout,
+        scrollbar,
         appearance,
         keymaps,
         plugins: None,
@@ -1342,6 +1394,61 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("layout"),
+                "must name the field: {bad} -> {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_scrollbar_parses_and_validates() {
+        // CTX-0181: explicit mode/width parse; absent table means "says
+        // nothing" (plan.scrollbar None so merge keeps lower);
+        // present-but-partial defaults omitted keys (hidden/8); unknown
+        // modes, wrong types, and out-of-range widths fail closed naming
+        // the field (never echoing the value).
+        let plan = parse_lua_config(
+            r#"return { scrollbar = { mode = "auto", width = 12 } }"#,
+            &test_source(),
+        )
+        .expect("scrollbar parses");
+        let bar = plan.scrollbar.expect("scrollbar present");
+        assert_eq!(bar.mode, ScrollbarMode::Auto);
+        assert_eq!(bar.width, 12);
+        let plan = parse_lua_config(
+            r#"return { scrollbar = { mode = "always" } }"#,
+            &test_source(),
+        )
+        .expect("partial scrollbar parses");
+        let bar = plan.scrollbar.expect("scrollbar present");
+        assert_eq!(bar.mode, ScrollbarMode::Always);
+        assert_eq!(bar.width, crate::types::DEFAULT_SCROLLBAR_WIDTH);
+        let plan = parse_lua_config(r#"return { scrollbar = {} }"#, &test_source())
+            .expect("empty scrollbar defaults");
+        let bar = plan.scrollbar.expect("scrollbar present");
+        assert_eq!(bar.mode, ScrollbarMode::Hidden);
+        assert_eq!(bar.width, crate::types::DEFAULT_SCROLLBAR_WIDTH);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no scrollbar table");
+        assert!(plan.scrollbar.is_none());
+        for bad in [
+            r#"return { scrollbar = { mode = "overlay" } }"#,
+            r#"return { scrollbar = { mode = "AUTO" } }"#,
+            r#"return { scrollbar = { mode = true } }"#,
+            r#"return { scrollbar = { width = 0 } }"#,
+            r#"return { scrollbar = { width = 33 } }"#,
+            r#"return { scrollbar = { width = -1 } }"#,
+            r#"return { scrollbar = { width = 8.5 } }"#,
+            r#"return { scrollbar = { width = "8" } }"#,
+            r#"return { scrollbar = "auto" }"#,
+            r#"return { scrollbar = { mode = "auto", bogus = 1 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scrollbar"),
                 "must name the field: {bad} -> {msg}"
             );
         }

@@ -339,6 +339,12 @@ impl Runtime {
                     self.handle_mouse_input(mouse);
                     if mouse.button == MouseButton::Left && mouse.state == PressState::Released {
                         if let Some(pos) = self.last_cursor {
+                            // CTX-0181: a release over the painted scrollbar
+                            // ends a scroll gesture — it must not activate a
+                            // hyperlink beneath the mapped cell.
+                            if self.scrollbar_hit_at(pos) {
+                                return false;
+                            }
                             let cell = self.cursor_to_cell(pos);
                             let snapshot = self.state.snapshot();
                             let Some(index) = (cell.row as usize)
@@ -378,6 +384,15 @@ impl Runtime {
                             sel.active = false;
                             self.selection = Some(sel);
                         }
+                    }
+                    // CTX-0181: leaving the window ends a thumb drag and
+                    // disengages auto-hide (tracked separately from
+                    // `last_cursor`, whose selection-path meaning is kept).
+                    // A painted thumb needs one repaint to clear.
+                    self.scrollbar_cursor_left = true;
+                    self.scrollbar_release();
+                    if self.scrollbar_visible {
+                        self.pending_full_redraw = true;
                     }
                     false
                 }

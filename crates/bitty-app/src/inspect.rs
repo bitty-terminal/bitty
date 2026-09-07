@@ -702,6 +702,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
+        "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
+        "scrollbar.width" => defaults.scrollbar.width.to_string(),
         _ => return None,
     };
     Some(ConfigInfo {
@@ -1158,7 +1160,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode)",
                     request.value,
                 );
                 if emit_json {

@@ -14,10 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Test-heavy jobs (quality, linux-x11, linux-wayland, macos, windows) run the
+  # full debug suite, measured at 11-15m on 2026-09-06/07 (CTX-0218; precedent
+  # CTX-0193 raised soak 90s->120s the same way). Budget is 30m; do not reduce
+  # to 15m. Fast jobs (msrv, supply-chain) stay at 15m.
   quality:
     name: Quality gates
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,7 +84,7 @@ jobs:
   linux-x11:
     name: Linux X11 (xvfb)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       DISPLAY: :99
     steps:
@@ -106,7 +110,7 @@ jobs:
   linux-wayland:
     name: Linux Wayland
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       WAYLAND_DISPLAY: wayland-0
       XDG_SESSION_TYPE: wayland
@@ -132,7 +136,7 @@ jobs:
   macos:
     name: macOS ARM64 check and test
     runs-on: macos-14
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,7 +185,7 @@ jobs:
   windows:
     name: Windows check and test
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

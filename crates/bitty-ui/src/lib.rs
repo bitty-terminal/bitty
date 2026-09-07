@@ -64,7 +64,10 @@ pub mod view;
 // Re-exports for ergonomic root access.
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
-pub use layout::{LayoutNode, clamp_ratio, smart_split_axis, split_rect, split_rect_with_gap};
+pub use layout::{
+    LayoutNode, OverlayLayer, OverlayTier, clamp_ratio, smart_split_axis, split_rect,
+    split_rect_with_gap,
+};
 pub use panel::{
     BrowserSurfaceId, CommandError, CommandRegistry, InputTarget, MAX_COMMANDS_PER_PANEL_TYPE,
     MAX_OVERLAY_TEXT_LEN, MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError,

@@ -50,6 +50,9 @@
 //! | [`scene::SCENE_MAX_BLOCKS_PER_TERMINAL`] (SCN-5) | 64 | typed error |
 //! | [`blocks::COMMAND_BLOCK_MAX`] command blocks | 256 | newest retained, oldest dropped |
 //! | [`blocks::FOLD_MAX`] folded ids | 256 | fold fails closed at cap |
+//! | [`hints::HINT_TARGET_MAX`] hint targets / labels | 256 | register fails closed; batch sheds sorted tail |
+//! | hint label text per batch | [`hints::HINT_TEXT_MAX_BYTES`] (8 KiB) | allocation stops at budget, remainder shed |
+//! | hint batches as overlays | `0` slots | single annotation layer bypasses (never consumes) the `4+1` bound |
 //!
 //! # Headless seam
 //!
@@ -65,6 +68,7 @@
 pub mod blocks;
 pub mod clipboard;
 pub mod geometry;
+pub mod hints;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
@@ -81,6 +85,14 @@ pub use clipboard::{
     ClipboardGrantScope, ClipboardPolicy, ClipboardReadToken, ClipboardRequest, ClipboardState,
 };
 pub use geometry::{CellMetrics, ExtentPx, RectPx};
+pub use hints::{
+    ChordError, DispatchError, DispatchOutcome, HINT_LABEL_ALPHABET, HINT_LABEL_MAX_CHARS,
+    HINT_OPERATOR_KEYS, HINT_TARGET_MAX, HINT_TEXT_MAX_BYTES, HintAction, HintActions, HintAnchor,
+    HintBatch, HintChord, HintFeedError, HintKind, HintLabel, HintOperator, HintRegistry,
+    HintScope, HintSession, HintTarget, OperatorConflict, TargetId, allocate_labels,
+    check_operator_conflicts, collect_command_targets, collect_panel_targets, collect_view_targets,
+    dispatch, label_for_index, parse_hint_chord,
+};
 pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{
     AlternateScope, ClipRect, DecodedImage, ImageId, ImagePlacement, ImageSource, ImageStore,

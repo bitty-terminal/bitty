@@ -31,8 +31,10 @@
 //!   `close_view` (alias `close_surface`), `toggle_zoom` (alias
 //!   `toggle_split_zoom`), `focus_next`, `focus_prev`, `focus:<1..=256>`,
 //!   `copy_to_clipboard`, `paste_from_clipboard`,
-//!   `scroll_page_up`, `scroll_page_down`. Anything else fails closed with
-//!   the known-action list.
+//!   `scroll_page_up`, `scroll_page_down`, `open_composer` (Command Composer
+//!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
+//!   so Normal Mode stays byte-identical until the user opts in).
+//!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
 //!
@@ -455,6 +457,14 @@ pub enum ChromeAction {
     ScrollPageUp,
     /// Scroll the focused pane down by one viewport page (less-like).
     ScrollPageDown,
+    /// Open the Command Composer (CTX-0227, 008 route P4).
+    ///
+    /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
+    /// fresh config keeps Normal Mode byte-identical (the 008 §14 boundary).
+    /// The user opts in with `{ chord = "alt+e", action = "open_composer" }`;
+    /// the single-character schema rule already forces a modifier, so the
+    /// open chord can never shadow bare shell typing.
+    OpenComposer,
 }
 
 impl ChromeAction {
@@ -527,6 +537,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ScrollPageDown)
             }
+            "open_composer" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::OpenComposer)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -550,12 +564,13 @@ impl ChromeAction {
             Self::PasteFromClipboard => "paste_from_clipboard".to_string(),
             Self::ScrollPageUp => "scroll_page_up".to_string(),
             Self::ScrollPageDown => "scroll_page_down".to_string(),
+            Self::OpenComposer => "open_composer".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, open_composer";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -992,6 +1007,28 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Char('v'), true, false, true)),
             Some(ChromeAction::PasteFromClipboard)
         );
+    }
+
+    #[test]
+    fn open_composer_parses_but_is_never_a_default() {
+        // CTX-0227 boundary: fresh configs keep Normal Mode byte-identical
+        // (no Enter hijack, no auto-open). `open_composer` only exists when
+        // the user binds it explicitly (suggested chord `alt+e`).
+        assert_eq!(
+            ChromeAction::parse("open_composer").expect("parses"),
+            ChromeAction::OpenComposer
+        );
+        assert_eq!(ChromeAction::OpenComposer.canonical(), "open_composer");
+        let maps = default_keymaps().expect("defaults valid");
+        assert!(
+            !maps.iter().any(|m| m.action == ChromeAction::OpenComposer),
+            "defaults must not bind open_composer"
+        );
+        // Bare `e` can never be a chord (schema rule), so the open key
+        // cannot shadow shell typing even when bound.
+        assert!(Chord::parse("e").is_err());
+        let open = Chord::parse("alt+e").expect("alt+e parses");
+        assert_eq!(open.canonical(), "alt+e");
     }
 
     #[test]

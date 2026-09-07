@@ -1,28 +1,60 @@
-//! Kitty graphics protocol stub (bounded, headless-testable, no decode).
+//! Streaming Kitty graphics intake (bounded, headless-testable, no decode).
 //!
 //! OQ-008 decision remains **open**. The image RFC has not landed, so this
-//! module provides only an inert placeholder store that mirrors the bounds
-//! of `bitty_term_state::image::ImageStore` (64 entries, 4096 bytes each,
-//! oldest eviction). No base64 decode, no pixel allocation, no placement
-//! calculation, and no renderer coupling occur here.
+//! module performs intake and bounds only: chunked `APC G` payloads are
+//! assembled exactly, held inertly, and exposed for headless queries. No
+//! base64 decode, no pixel allocation, no placement calculation, and no
+//! renderer coupling occur here. Full Kitty rendering stays a separate epic.
 //!
-//! # What is implemented
+//! # Chunk state machine (`m=`)
 //!
-//! - A bounded FIFO of [`KittyPlaceholder`] records, each holding a
-//!   truncated APC payload prefix and placeholder dimensions (1×1 cells).
-//! - Headless ingestion via [`KittyGraphicsStub::ingest`] that truncates
-//!   payloads deterministically (`same bytes → same prefix → same id` when
-//!   insertion order is equal).
-//! - Pure queries (`get`, `iter`, `len`) for tests and a future
-//!   `presentation` layer that can turn placeholders into [`RectPx`] via
-//!   supplied [`CellMetrics`].
+//! The Kitty graphics protocol streams large images as `m=1` continuation
+//! chunks followed by one `m=0` final chunk (Ghostty parity:
+//! `graphics_storage.zig`, `graphics_image.zig`). The mapping here is:
+//!
+//! | Wire | API |
+//! |---|---|
+//! | first `m=1` chunk (carries the `G` params) | [`KittyGraphicsStub::begin_chunk`] |
+//! | middle `m=1` chunk (payload only) | [`KittyGraphicsStub::append_chunk`] with `more = true` |
+//! | final `m=0` chunk (payload tail) | [`KittyGraphicsStub::append_chunk`] with `more = false` |
+//! | lone `m=0` transmission (no chunking) | [`KittyGraphicsStub::ingest`] (single-shot path) |
+//!
+//! At most one transmission is in flight per ledger. [`KittyChunkOutcome`]
+//! reports `NeedMore` while chunks accumulate and `Completed` with the new
+//! [`KittyPlaceholderId`] once the `m=0` tail assembles. [`KittyPlaceholder`]
+//! records from the chunked path hold the **exact** assembled bytes
+//! (`assembled == true`); the single-shot [`KittyGraphicsStub::ingest`] path
+//! keeps its historical truncation at [`KITTY_MAX_PAYLOAD_BYTES`]
+//! (`assembled == false`) and is otherwise unchanged.
+//!
+//! # Bounds (threat T-01/T-02)
+//!
+//! - Count cap: [`KITTY_MAX_PLACEHOLDERS`] (64) entries, oldest evicted.
+//! - Single-shot per-entry cap: [`KITTY_MAX_PAYLOAD_BYTES`] (4096) bytes,
+//!   deterministic truncation.
+//! - Ledger cap: [`KITTY_LEDGER_MAX_BYTES`] (320 MiB, Ghostty `total_limit`
+//!   parity) over **stored + in-flight** bytes. Admission evicts the oldest
+//!   entries first (FIFO, Ghostty "prune prior to reserving" pattern); a
+//!   single transmission larger than the cap is rejected.
+//!
+//! # Fail-closed behavior
+//!
+//! | Condition | Result |
+//! |---|---|
+//! | `append_chunk` with no open stream (orphan `m=1`/`m=0`) | `Err(Orphan)`, state unchanged |
+//! | `begin_chunk` while a stream is open (gap/overlap) | `Err(AlreadyInProgress)`, open stream kept |
+//! | chunk growth past the ledger cap | `Err(Oversize)`, in-flight stream dropped, nothing stored |
+//! | single transmission larger than the cap | `Err(Oversize)`, nothing stored |
+//!
+//! Length checks run **before** any buffer growth (`checked_add` against the
+//! cap), so a hostile chunk can never force an over-cap allocation.
 //!
 //! # What is not implemented
 //!
-//! Placement row/col, z-index, animation, chunked transmission (`m=`),
-//! compression, fallback rendering, and any `APC G`/`DCS` parser
-//! integration are all **deferred** to the image RFC. Until then every
-//! placeholder is inert for rendering.
+//! Placement row/col, z-index, animation, compression, base64 decode,
+//! fallback rendering, pixel decoding, and any `APC G`/`DCS` parser
+//! integration are all **deferred** to the image RFC / rendering epic. Until
+//! then every placeholder is inert for rendering.
 
 use std::collections::VecDeque;
 
@@ -31,9 +63,20 @@ use crate::geometry::{CellMetrics, RectPx};
 /// Maximum kitty placeholders retained (matches `IMAGE_STORE_MAX_ENTRIES`).
 pub const KITTY_MAX_PLACEHOLDERS: usize = bitty_term_state::IMAGE_STORE_MAX_ENTRIES;
 
-/// Maximum payload bytes per placeholder (matches
+/// Maximum payload bytes per single-shot placeholder (matches
 /// `IMAGE_STORE_MAX_PAYLOAD_BYTES` / `BoundedBytes::MAX_LEN`).
+///
+/// Applies to [`KittyGraphicsStub::ingest`] only. Chunked transmissions
+/// assemble exactly up to [`KITTY_LEDGER_MAX_BYTES`].
 pub const KITTY_MAX_PAYLOAD_BYTES: usize = bitty_term_state::IMAGE_STORE_MAX_PAYLOAD_BYTES;
+
+/// Maximum total bytes per ledger: stored placeholders plus the in-flight
+/// chunk buffer.
+///
+/// Ghostty `total_limit` parity (`320 * 1000 * 1000`). Use
+/// [`KittyGraphicsStub::with_ledger_cap`] to configure a smaller ledger
+/// (Kitty allows a configured limit); the default is this constant.
+pub const KITTY_LEDGER_MAX_BYTES: usize = 320 * 1000 * 1000;
 
 /// Opaque handle for a kitty placeholder (mirrors `ImageId`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,17 +92,22 @@ impl KittyPlaceholderId {
 
 /// Inert placeholder for a kitty graphics payload.
 ///
-/// Payload is the truncated APC bytes as delivered; no decode has occurred
-/// and `width`/`height` are placeholder 1×1 until the image RFC defines
+/// Single-shot payloads are the truncated APC bytes as delivered; chunked
+/// payloads are the exact assembled bytes. No decode has occurred either
+/// way, and `width`/`height` are placeholder 1×1 until the image RFC defines
 /// placement semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KittyPlaceholder {
     /// Stable handle.
     pub id: KittyPlaceholderId,
-    /// Truncated payload length.
+    /// Stored payload length. Bounded by [`KITTY_MAX_PAYLOAD_BYTES`] on the
+    /// single-shot path, by the ledger cap on the chunked path.
     pub payload_len: usize,
-    /// Truncated payload bytes (bounded, inert).
+    /// Stored payload bytes (bounded, inert).
     pub payload: Box<[u8]>,
+    /// Whether this entry assembled from an `m=` chunk stream (`true`) or
+    /// arrived via the single-shot path (`false`).
+    pub assembled: bool,
     /// Placeholder width in cells (always 1 in this milestone).
     pub width_cells: u16,
     /// Placeholder height in cells (always 1 in this milestone).
@@ -69,15 +117,84 @@ pub struct KittyPlaceholder {
     pub anchor_row: Option<usize>,
 }
 
-/// Bounded, deterministic kitty graphics stub (headless).
+/// Outcome of [`KittyGraphicsStub::append_chunk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyChunkOutcome {
+    /// More chunks are still expected (`m=1`); `buffered` is the total bytes
+    /// held in flight. No placeholder was admitted.
+    NeedMore {
+        /// In-flight buffered bytes after this chunk.
+        buffered: usize,
+    },
+    /// The `m=0` tail completed the stream. The exact assembled payload was
+    /// admitted as one placeholder.
+    Completed {
+        /// Handle of the admitted placeholder.
+        id: KittyPlaceholderId,
+        /// Exact assembled payload length.
+        total_len: usize,
+    },
+}
+
+/// Typed intake rejection for the `m=` chunk state machine.
 ///
-/// Oldest placeholder is evicted when at capacity (FIFO). Ingestion is
-/// deterministic: same payload bytes and same insertion order always yield
-/// the same `KittyPlaceholderId` and the same retained set.
+/// Every variant fails closed: `Orphan` and `AlreadyInProgress` leave the
+/// ledger untouched, while `Oversize` drops only the offending in-flight
+/// stream and stores nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyChunkError {
+    /// `append_chunk` arrived with no open stream (orphan continuation or
+    /// orphan final). Ledger unchanged.
+    Orphan,
+    /// `begin_chunk` arrived while a stream is already open (gap/overlap).
+    /// The open stream is kept; abort it explicitly first.
+    AlreadyInProgress,
+    /// Growth to `needed` bytes would exceed the ledger `cap`. The in-flight
+    /// stream (if any) is dropped and nothing is stored.
+    Oversize {
+        /// Bytes the ledger would have had to hold.
+        needed: usize,
+        /// Ledger cap that refused them.
+        cap: usize,
+    },
+}
+
+impl std::fmt::Display for KittyChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Orphan => write!(f, "kitty chunk without an open stream"),
+            Self::AlreadyInProgress => write!(f, "kitty stream already in flight"),
+            Self::Oversize { needed, cap } => {
+                write!(
+                    f,
+                    "kitty stream of {needed} bytes exceeds ledger cap of {cap} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for KittyChunkError {}
+
+/// In-flight `m=1` transmission awaiting its `m=0` tail.
+#[derive(Debug, Clone)]
+struct PendingTransmission {
+    buf: Vec<u8>,
+    anchor_row: Option<usize>,
+}
+
+/// Bounded, deterministic kitty graphics intake (headless).
+///
+/// Oldest placeholder is evicted when at capacity (FIFO). Single-shot
+/// ingestion is deterministic: same payload bytes and same insertion order
+/// always yield the same `KittyPlaceholderId` and the same retained set.
+/// Chunked ingestion assembles byte-exact payloads under the ledger cap.
 #[derive(Debug, Clone)]
 pub struct KittyGraphicsStub {
     entries: VecDeque<KittyPlaceholder>,
     next_id: u64,
+    pending: Option<PendingTransmission>,
+    ledger_cap: usize,
 }
 
 impl Default for KittyGraphicsStub {
@@ -87,12 +204,29 @@ impl Default for KittyGraphicsStub {
 }
 
 impl KittyGraphicsStub {
-    /// An empty stub.
+    /// An empty ledger with the default [`KITTY_LEDGER_MAX_BYTES`] cap.
     #[must_use]
     pub fn new() -> Self {
         Self {
             entries: VecDeque::new(),
             next_id: 1,
+            pending: None,
+            ledger_cap: KITTY_LEDGER_MAX_BYTES,
+        }
+    }
+
+    /// An empty ledger with a custom total-bytes cap (Kitty parity: the
+    /// limit is configurable).
+    ///
+    /// Intended for embedders with tighter budgets and for tests that must
+    /// exercise cap behavior without allocating hundreds of megabytes.
+    #[must_use]
+    pub fn with_ledger_cap(ledger_cap: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            next_id: 1,
+            pending: None,
+            ledger_cap,
         }
     }
 
@@ -114,31 +248,189 @@ impl KittyGraphicsStub {
         KITTY_MAX_PLACEHOLDERS
     }
 
-    /// Ingests a raw APC payload as an inert placeholder.
+    /// Ledger cap (max stored + in-flight bytes).
+    #[must_use]
+    pub const fn ledger_cap(&self) -> usize {
+        self.ledger_cap
+    }
+
+    /// Bytes currently held by stored placeholders.
+    #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.entries.iter().map(|entry| entry.payload_len).sum()
+    }
+
+    /// Bytes currently buffered in the in-flight chunk stream (`0` when idle).
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.as_ref().map_or(0, |stream| stream.buf.len())
+    }
+
+    /// Whether an `m=1` stream is open awaiting more chunks.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Total ledger pressure: stored plus in-flight bytes.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.stored_bytes().saturating_add(self.pending_len())
+    }
+
+    /// Ingests a raw APC payload as an inert placeholder (single-shot `m=0`).
     ///
     /// `payload` is truncated to [`KITTY_MAX_PAYLOAD_BYTES`] deterministically.
     /// No base64 decode occurs. Returns the assigned id. `anchor_row` is
     /// optional in this draft; future placement semantics will require an
-    /// explicit grid anchor.
+    /// explicit grid anchor. Oldest entries are evicted first to stay within
+    /// the count and ledger caps.
     pub fn ingest(&mut self, payload: &[u8], anchor_row: Option<usize>) -> KittyPlaceholderId {
         let id = KittyPlaceholderId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
         let truncated_len = payload.len().min(KITTY_MAX_PAYLOAD_BYTES);
-        let placeholder = KittyPlaceholder {
-            id,
-            payload_len: truncated_len,
-            payload: payload[..truncated_len].to_vec().into_boxed_slice(),
-            width_cells: 1,
-            height_cells: 1,
-            anchor_row,
-        };
-
+        self.evict_to_fit(truncated_len);
         if self.entries.len() >= KITTY_MAX_PLACEHOLDERS {
             self.entries.pop_front();
         }
-        self.entries.push_back(placeholder);
+        self.entries.push_back(KittyPlaceholder {
+            id,
+            payload_len: truncated_len,
+            payload: payload[..truncated_len].to_vec().into_boxed_slice(),
+            assembled: false,
+            width_cells: 1,
+            height_cells: 1,
+            anchor_row,
+        });
         id
+    }
+
+    /// Opens an `m=1` chunk stream with its first payload piece.
+    ///
+    /// Evicts oldest entries first to reserve `first.len()` bytes under the
+    /// ledger cap (FIFO, Ghostty "prune prior to reserving" pattern).
+    ///
+    /// # Errors
+    ///
+    /// - [`KittyChunkError::AlreadyInProgress`] when a stream is already
+    ///   open; the open stream is kept.
+    /// - [`KittyChunkError::Oversize`] when `first` alone exceeds the ledger
+    ///   cap; nothing is stored and no stream opens.
+    pub fn begin_chunk(
+        &mut self,
+        first: &[u8],
+        anchor_row: Option<usize>,
+    ) -> Result<(), KittyChunkError> {
+        if self.pending.is_some() {
+            return Err(KittyChunkError::AlreadyInProgress);
+        }
+        if first.len() > self.ledger_cap {
+            return Err(KittyChunkError::Oversize {
+                needed: first.len(),
+                cap: self.ledger_cap,
+            });
+        }
+        self.evict_to_fit(first.len());
+        self.pending = Some(PendingTransmission {
+            buf: first.to_vec(),
+            anchor_row,
+        });
+        Ok(())
+    }
+
+    /// Feeds the next `m=` chunk into the open stream.
+    ///
+    /// `more == true` buffers the piece and reports
+    /// [`KittyChunkOutcome::NeedMore`]; `more == false` treats the piece as
+    /// the `m=0` tail, admits the exact assembled payload as one placeholder
+    /// (evicting oldest first to fit), and reports
+    /// [`KittyChunkOutcome::Completed`].
+    ///
+    /// Lengths are checked before any buffer growth, so oversize input can
+    /// never force an over-cap allocation.
+    ///
+    /// # Errors
+    ///
+    /// - [`KittyChunkError::Orphan`] when no stream is open; ledger unchanged.
+    /// - [`KittyChunkError::Oversize`] when growth would exceed the ledger
+    ///   cap; the in-flight stream is dropped and nothing is stored.
+    pub fn append_chunk(
+        &mut self,
+        next: &[u8],
+        more: bool,
+    ) -> Result<KittyChunkOutcome, KittyChunkError> {
+        if self.pending.is_none() {
+            return Err(KittyChunkError::Orphan);
+        }
+        let cap = self.ledger_cap;
+        let needed = self.pending_len().saturating_add(next.len());
+        if needed > cap {
+            self.pending = None;
+            return Err(KittyChunkError::Oversize { needed, cap });
+        }
+        if !more {
+            let stream = self.pending.take().expect("open stream");
+            return Ok(self.admit_assembled(stream, next));
+        }
+        self.evict_to_fit(needed);
+        let stream = self.pending.as_mut().expect("open stream");
+        stream.buf.extend_from_slice(next);
+        Ok(KittyChunkOutcome::NeedMore {
+            buffered: stream.buf.len(),
+        })
+    }
+
+    /// Admits a completed stream's exact bytes as one placeholder.
+    ///
+    /// The stream was already taken and `tail` length-checked by
+    /// `append_chunk`; eviction here only re-checks the fit after the
+    /// reservation made while buffering.
+    fn admit_assembled(
+        &mut self,
+        mut stream: PendingTransmission,
+        tail: &[u8],
+    ) -> KittyChunkOutcome {
+        stream.buf.extend_from_slice(tail);
+        let total_len = stream.buf.len();
+        self.evict_to_fit(total_len);
+        if self.entries.len() >= KITTY_MAX_PLACEHOLDERS {
+            self.entries.pop_front();
+        }
+        let id = KittyPlaceholderId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.entries.push_back(KittyPlaceholder {
+            id,
+            payload_len: total_len,
+            payload: stream.buf.into_boxed_slice(),
+            assembled: true,
+            width_cells: 1,
+            height_cells: 1,
+            anchor_row: stream.anchor_row,
+        });
+        KittyChunkOutcome::Completed { id, total_len }
+    }
+
+    /// Abandons the open `m=1` stream without storing anything.
+    ///
+    /// Returns `true` when a stream was actually discarded.
+    pub fn abort_chunk(&mut self) -> bool {
+        self.pending.take().is_some()
+    }
+
+    /// Evicts oldest placeholders until `needed` more bytes fit the ledger.
+    ///
+    /// No-op for `needed == 0`. Callers guarantee `needed <= ledger_cap`, so
+    /// the loop always terminates with room.
+    fn evict_to_fit(&mut self, needed: usize) {
+        if needed == 0 {
+            return;
+        }
+        while self.stored_bytes().saturating_add(needed) > self.ledger_cap {
+            if self.entries.pop_front().is_none() {
+                break;
+            }
+        }
     }
 
     /// Looks up a placeholder by id.
@@ -154,9 +446,10 @@ impl KittyGraphicsStub {
         self.entries.len() != before
     }
 
-    /// Clears all placeholders.
+    /// Clears all placeholders and abandons any open chunk stream.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.pending = None;
     }
 
     /// Iterates placeholders oldest first.
@@ -198,6 +491,9 @@ mod tests {
         assert!(stub.is_empty());
         assert_eq!(stub.len(), 0);
         assert_eq!(stub.capacity(), IMAGE_STORE_MAX_ENTRIES);
+        assert_eq!(stub.ledger_cap(), KITTY_LEDGER_MAX_BYTES);
+        assert!(!stub.has_pending());
+        assert_eq!(stub.total_bytes(), 0);
     }
 
     #[test]
@@ -209,6 +505,8 @@ mod tests {
         assert_eq!(entry.payload_len, 19);
         assert_eq!(&*entry.payload, b"APC G fancy payload");
         assert_eq!(entry.anchor_row, Some(2));
+        assert!(!entry.assembled);
+        assert_eq!(stub.stored_bytes(), 19);
     }
 
     #[test]
@@ -287,5 +585,193 @@ mod tests {
     fn caps_match_term_state_image_store() {
         assert_eq!(KITTY_MAX_PLACEHOLDERS, IMAGE_STORE_MAX_ENTRIES);
         assert_eq!(KITTY_MAX_PAYLOAD_BYTES, IMAGE_STORE_MAX_PAYLOAD_BYTES);
+        assert_eq!(KITTY_LEDGER_MAX_BYTES, 320 * 1000 * 1000);
+    }
+
+    #[test]
+    fn chunked_assembly_is_exact() {
+        let mut stub = KittyGraphicsStub::new();
+        let full: Vec<u8> = (0..5000_u32).map(|i| (i % 251) as u8).collect();
+        stub.begin_chunk(&full[..1000], Some(4)).unwrap();
+        assert!(stub.has_pending());
+        assert_eq!(stub.pending_len(), 1000);
+        assert_eq!(stub.len(), 0);
+
+        let outcome = stub.append_chunk(&full[1000..3000], true).unwrap();
+        assert_eq!(outcome, KittyChunkOutcome::NeedMore { buffered: 3000 });
+
+        let outcome = stub.append_chunk(&full[3000..], false).unwrap();
+        let (id, total_len) = match outcome {
+            KittyChunkOutcome::Completed { id, total_len } => (id, total_len),
+            KittyChunkOutcome::NeedMore { .. } => panic!("expected completion"),
+        };
+        assert_eq!(total_len, 5000);
+        assert!(!stub.has_pending());
+        let entry = stub.get(id).unwrap();
+        assert!(entry.assembled);
+        assert_eq!(entry.payload_len, 5000);
+        assert_eq!(&*entry.payload, &full[..]);
+        assert_eq!(entry.anchor_row, Some(4));
+        assert_eq!(stub.stored_bytes(), 5000);
+    }
+
+    #[test]
+    fn chunked_ids_are_deterministic() {
+        let chunks: [&[u8]; 3] = [b"alpha-", b"beta-", b"gamma"];
+        let run = || {
+            let mut stub = KittyGraphicsStub::new();
+            stub.begin_chunk(chunks[0], None).unwrap();
+            stub.append_chunk(chunks[1], true).unwrap();
+            match stub.append_chunk(chunks[2], false).unwrap() {
+                KittyChunkOutcome::Completed { id, .. } => {
+                    (id, stub.get(id).unwrap().payload.to_vec())
+                }
+                KittyChunkOutcome::NeedMore { .. } => panic!("expected completion"),
+            }
+        };
+        let (id_a, payload_a) = run();
+        let (id_b, payload_b) = run();
+        assert_eq!(id_a, id_b);
+        assert_eq!(payload_a, b"alpha-beta-gamma");
+        assert_eq!(payload_a, payload_b);
+    }
+
+    #[test]
+    fn orphan_append_fails_closed() {
+        let mut stub = KittyGraphicsStub::new();
+        assert_eq!(
+            stub.append_chunk(b"m=1 orphan", true),
+            Err(KittyChunkError::Orphan)
+        );
+        assert_eq!(
+            stub.append_chunk(b"m=0 orphan", false),
+            Err(KittyChunkError::Orphan)
+        );
+        assert!(!stub.has_pending());
+        assert_eq!(stub.len(), 0);
+        // Ledger still usable afterwards.
+        let id = stub.ingest(b"fine", None);
+        assert_eq!(&*stub.get(id).unwrap().payload, b"fine");
+    }
+
+    #[test]
+    fn begin_twice_keeps_open_stream() {
+        let mut stub = KittyGraphicsStub::new();
+        stub.begin_chunk(b"first-", None).unwrap();
+        assert_eq!(
+            stub.begin_chunk(b"second-", None),
+            Err(KittyChunkError::AlreadyInProgress)
+        );
+        // Original stream is intact and completes exactly.
+        stub.append_chunk(b"middle-", true).unwrap();
+        match stub.append_chunk(b"tail", false).unwrap() {
+            KittyChunkOutcome::Completed { id, total_len } => {
+                assert_eq!(total_len, 17);
+                assert_eq!(&*stub.get(id).unwrap().payload, b"first-middle-tail");
+            }
+            KittyChunkOutcome::NeedMore { .. } => panic!("expected completion"),
+        }
+    }
+
+    #[test]
+    fn oversize_chunk_drops_stream_and_stores_nothing() {
+        let mut stub = KittyGraphicsStub::with_ledger_cap(32);
+        stub.begin_chunk(b"0123456789", None).unwrap();
+        assert_eq!(
+            stub.append_chunk(b"012345678901234567890123456789", true),
+            Err(KittyChunkError::Oversize {
+                needed: 40,
+                cap: 32
+            })
+        );
+        assert!(!stub.has_pending());
+        assert_eq!(stub.pending_len(), 0);
+        assert_eq!(stub.len(), 0);
+        // Stub is reusable after the fail-closed drop.
+        stub.begin_chunk(b"ok", None).unwrap();
+        match stub.append_chunk(b"!", false).unwrap() {
+            KittyChunkOutcome::Completed { id, total_len } => {
+                assert_eq!(total_len, 3);
+                assert_eq!(&*stub.get(id).unwrap().payload, b"ok!");
+            }
+            KittyChunkOutcome::NeedMore { .. } => panic!("expected completion"),
+        }
+    }
+
+    #[test]
+    fn first_chunk_over_cap_rejected() {
+        let mut stub = KittyGraphicsStub::with_ledger_cap(8);
+        assert_eq!(
+            stub.begin_chunk(b"0123456789", None),
+            Err(KittyChunkError::Oversize { needed: 10, cap: 8 })
+        );
+        assert!(!stub.has_pending());
+        assert_eq!(stub.len(), 0);
+    }
+
+    #[test]
+    fn ledger_evicts_oldest_to_fit_assembled() {
+        let mut stub = KittyGraphicsStub::with_ledger_cap(32);
+        let old = stub.ingest(b"old-entry-1234567", None);
+        assert_eq!(stub.stored_bytes(), 17);
+        stub.begin_chunk(b"0123456789", None).unwrap();
+        stub.append_chunk(b"ab", true).unwrap();
+        match stub.append_chunk(b"cdef", false).unwrap() {
+            KittyChunkOutcome::Completed { id, total_len } => {
+                assert_eq!(total_len, 16);
+                assert_eq!(&*stub.get(id).unwrap().payload, b"0123456789abcdef");
+            }
+            KittyChunkOutcome::NeedMore { .. } => panic!("expected completion"),
+        }
+        // 17 + 16 > 32, so the oldest entry was evicted to fit.
+        assert!(stub.get(old).is_none());
+        assert!(stub.total_bytes() <= 32);
+    }
+
+    #[test]
+    fn abort_discards_stream() {
+        let mut stub = KittyGraphicsStub::new();
+        assert!(!stub.abort_chunk());
+        stub.begin_chunk(b"partial-", None).unwrap();
+        assert!(stub.abort_chunk());
+        assert!(!stub.has_pending());
+        assert!(!stub.abort_chunk());
+        assert_eq!(
+            stub.append_chunk(b"tail", false),
+            Err(KittyChunkError::Orphan)
+        );
+        assert_eq!(stub.len(), 0);
+    }
+
+    #[test]
+    fn clear_abandons_open_stream() {
+        let mut stub = KittyGraphicsStub::new();
+        stub.begin_chunk(b"partial-", None).unwrap();
+        stub.clear();
+        assert!(!stub.has_pending());
+        assert_eq!(
+            stub.append_chunk(b"tail", false),
+            Err(KittyChunkError::Orphan)
+        );
+    }
+
+    #[test]
+    fn chunk_error_display() {
+        assert_eq!(
+            KittyChunkError::Orphan.to_string(),
+            "kitty chunk without an open stream"
+        );
+        assert_eq!(
+            KittyChunkError::AlreadyInProgress.to_string(),
+            "kitty stream already in flight"
+        );
+        assert_eq!(
+            KittyChunkError::Oversize {
+                needed: 40,
+                cap: 32
+            }
+            .to_string(),
+            "kitty stream of 40 bytes exceeds ledger cap of 32 bytes"
+        );
     }
 }

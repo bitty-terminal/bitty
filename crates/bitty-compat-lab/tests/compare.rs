@@ -11,8 +11,8 @@
 //! skip when absent (no network, no `winit`/`wgpu`/`Window`/`Surface`).
 
 use bitty_compat_lab::compare::{
-    MAX_ACTIONS, MAX_CORPUS_BYTES, MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOTS, MAX_TEXT_CHARS,
-    compare_all, format_report, load_bitty_dumps,
+    EXPECTED_HASH_VERSION, MAX_ACTIONS, MAX_CORPUS_BYTES, MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOTS,
+    MAX_TEXT_CHARS, compare_all, format_report, load_bitty_dumps,
 };
 
 #[test]
@@ -80,7 +80,11 @@ fn load_bitty_dumps_is_bounded_and_sorted() {
         );
         assert_eq!(d.width, 80, "{} width", d.file_name);
         assert_eq!(d.height, 24, "{} height", d.file_name);
-        assert_eq!(d.state_hash_version, 1, "{} hash version", d.file_name);
+        assert_eq!(
+            d.state_hash_version, EXPECTED_HASH_VERSION,
+            "{} hash version",
+            d.file_name
+        );
     }
     // 30 dumps as of CTX-0086; guard only when fixtures are present (CI may have none).
     if dumps.len() < 30 {

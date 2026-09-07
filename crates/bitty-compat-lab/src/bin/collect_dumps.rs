@@ -96,11 +96,11 @@ fn json_escape(input: &str) -> String {
 fn main() {
     let ws = workspace_root();
     let out_worktree_tmp = ws.join("tmp/references/bitty");
-    let out_worktree_rec = ws.join("recordings/references/bitty");
+    let out_worktree_rec = ws.join("recording/references/bitty");
     let out_umbrella_tmp =
         PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
     let out_umbrella_rec =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/bitty");
+        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
 
     for dir in [
         &out_worktree_tmp,

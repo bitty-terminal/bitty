@@ -45,7 +45,11 @@ pub const EXPECTED_WIDTH: usize = 80;
 pub const EXPECTED_HEIGHT: usize = 24;
 
 /// Canonical hash version pinned by Term-State.
-pub const EXPECTED_HASH_VERSION: u32 = 1;
+///
+/// Tracks `bitty_term_state::canonical_public::CANONICAL_HASH_VERSION` as the
+/// single source of truth (CTX-0211: literal `1` drifted behind the v2/v3
+/// bumps and rejected regenerated baselines).
+pub const EXPECTED_HASH_VERSION: u32 = bitty_term_state::canonical_public::CANONICAL_HASH_VERSION;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

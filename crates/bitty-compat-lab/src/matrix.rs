@@ -9,7 +9,7 @@
 //! Each entry maps to a bounded corpus under `tests/compat/<category>/corpus/`
 //! (≤8 KiB, ≤4096 actions) and a deterministic `state_hash`. The matrix is
 //! consumed by `tests/compat_matrix.rs` for CI regression and by
-//! `recordings/compat-matrix-2026-09-01.json` (machine-readable artifact).
+//! `recording/compat-matrix-2026-09-01.json` (machine-readable artifact).
 
 use std::path::PathBuf;
 
@@ -185,7 +185,10 @@ pub fn generate_matrix_json() -> Result<String, String> {
     out.push_str("    \"MAX_ACTIONS\": 4096,\n");
     out.push_str("    \"MAX_SNAPSHOT_JSON_BYTES\": 16384,\n");
     out.push_str("    \"GRID\": \"80x24\",\n");
-    out.push_str("    \"CANONICAL_HASH_VERSION\": 1\n");
+    out.push_str(&format!(
+        "    \"CANONICAL_HASH_VERSION\": {}\n",
+        crate::compare::EXPECTED_HASH_VERSION
+    ));
     out.push_str("  },\n");
     out.push_str("  \"entries\": [\n");
     for (idx, entry) in MATRIX.iter().enumerate() {

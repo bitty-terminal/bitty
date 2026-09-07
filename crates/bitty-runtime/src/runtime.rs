@@ -4957,19 +4957,25 @@ impl Runtime {
                             // (`bitty_render::grid::cursor_fill`: block = full cell,
                             // bar = left strip, underline = bottom strip, 15% thickness
                             // per DEC-0017 ghostty/alacritty refs). Geometry is shared;
-                            // the overlay hue stays the slice's translucent white.
+                            // the overlay hue is the designed theme cursor
+                            // (`crate::palette::theme_cursor_rgba`, Bitty Dark
+                            // rosewater) so the live cursor matches the palette
+                            // out of the box (CTX-0219: no hardcoded white).
                             if let Some(fill) = bitty_render::grid::cursor_fill(
                                 &view_snapshot.cursor,
                                 live,
                                 view_snapshot.width,
                                 view_snapshot.height,
                             ) {
-                                // Cursor color: inverse of cell bg/fg? Use resolved color from grid.rs DEFAULT_FG/BG inversion.
-                                // For slice, use white with 0x80 alpha for cursor, respecting blinking flag;
-                                // if blinking and not focused, we skip (already checked focused).
+                                // Cursor color: the theme cursor hue at the existing
+                                // translucent alpha (blinks stay with the
+                                // embedder's visibility/focus gate, already
+                                // checked above).
                                 let cursor_color: bitty_render::grid::Rgba8 =
                                     if view_snapshot.cursor.visible {
-                                        [0xFF, 0xFF, 0xFF, 0xA0]
+                                        let mut themed = crate::palette::theme_cursor_rgba();
+                                        themed[3] = 0xA0;
+                                        themed
                                     } else {
                                         [0, 0, 0, 0]
                                     };
@@ -5475,6 +5481,39 @@ mod tests {
         let stats = rt.tick().expect("damage from bytes must present");
         assert!(stats.glyphs > 0);
         assert_eq!(rt.tick(), None, "must return to idle after present");
+    }
+
+    #[test]
+    fn tick_cursor_overlay_uses_theme_cursor_hue() {
+        // CTX-0219: the live cursor overlay paints the designed theme
+        // cursor hue (rosewater) at the existing translucent alpha instead
+        // of a hardcoded white, so the out-of-box cursor matches the
+        // palette. Headless fills overwrite with premultiplied bytes:
+        // cursor cell (col 1, row 0) after one printed cell, default live
+        // cell 9x19 over the default 80x24 grid (extent 720x456, no gaps).
+        let mut rt = make_runtime();
+        rt.handle_pty_bytes(b"A");
+        let stats = rt.tick().expect("damage from bytes must present");
+        assert!(stats.headless);
+        let rgba = rt.headless_rgba().expect("rgba after tick");
+        let cfg = RuntimeConfig::default();
+        assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
+        let width = cfg.cell_width as usize * 80;
+        let cx = cfg.cell_width as usize + 4;
+        let cy = 9;
+        let idx = (cy * width + cx) * 4;
+        // Theme cursor #f5e0dc at 0xA0 alpha, premultiplied by the headless
+        // composite: (245*160/255, 224*160/255, 220*160/255, 160).
+        assert_eq!(
+            &rgba[idx..idx + 4],
+            &[153, 140, 138, 160],
+            "cursor cell must carry the theme hue, not legacy white"
+        );
+        // Bridge agrees with the render default (single source of truth).
+        assert_eq!(
+            crate::palette::theme_cursor_rgba(),
+            bitty_render::grid::DEFAULT_CURSOR
+        );
     }
 
     #[test]

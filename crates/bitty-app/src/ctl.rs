@@ -287,9 +287,12 @@ pub fn ctl_help_text() -> String {
            view focus v:N                core.view.focus (view.manage)\n  \
            config reload                 core.config.reload (config.modify, elevation)\n\
          \n\
-         Elevation: terminal.manage and config.modify need BITTY_CTL_ELEVATE\n\
+         Elevation: only terminal spawn, terminal close (terminal.manage) and\n\
+         \x20 config reload (config.modify) need BITTY_CTL_ELEVATE\n\
          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
-         \x20 Without it those verbs fail closed (exit 7, no partial state).\n\
+         \x20 Without it those three verbs fail closed (exit 7, no partial state).\n\
+         \x20 All other verbs — including view split / view focus (view.manage)\n\
+         \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
          \n\
          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
          \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
@@ -1478,6 +1481,19 @@ fn ipc_error_triple(err: &bitty_ipc::IpcError) -> (&'static str, &'static str, S
             "ScopeDenied",
             format!("permission denied: {err} (needs elevation via BITTY_CTL_ELEVATE)"),
         ),
+        // Generic denials and unauthenticated peers are permission failures
+        // (CLI exit 7), never transport timeouts: surface the denial with
+        // the elevation hint instead of exit 6.
+        bitty_ipc::IpcError::Denied { code, reason } => (
+            "auth",
+            "Denied",
+            format!("permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"),
+        ),
+        bitty_ipc::IpcError::Unauthenticated { .. } => (
+            "auth",
+            "Unauthenticated",
+            format!("permission denied: {err}"),
+        ),
         bitty_ipc::IpcError::NotFound { .. } => ("usage", "NotFound", format!("{err}")),
         bitty_ipc::IpcError::InvalidMethod { .. } => ("usage", "InvalidMethod", format!("{err}")),
         bitty_ipc::IpcError::InvalidRequest { .. } => ("usage", "InvalidParams", format!("{err}")),
@@ -2242,6 +2258,151 @@ mod tests {
                 "{method} must be ScopeDenied, got {reply:?}"
             );
         }
+    }
+
+    #[test]
+    fn control_denial_surfaces_as_permission_for_every_verb() {
+        // CTX-0231: every denial must surface as a permission error (exit 7,
+        // class Denied, message naming the missing scope and the elevation
+        // surface) — never as a timeout/unavailable mapping. Headless and
+        // queue-free: `apply_control_envelope` authorizes inline, so no
+        // timing asserts are needed.
+        let mut rt = headless_runtime();
+        let empty = bitty_ipc::ScopeSet::new();
+        let cases: Vec<(&str, Option<String>, &str)> = vec![
+            (ipc_ctl::METHOD_LIST_WINDOWS, None, "view.inspect"),
+            (ipc_ctl::METHOD_LIST_VIEWS, None, "view.inspect"),
+            (ipc_ctl::METHOD_LIST_TERMINALS, None, "terminal.inspect"),
+            (
+                ipc_ctl::METHOD_SPAWN_TERMINAL,
+                Some(ipc_ctl::params_spawn(None)),
+                "terminal.manage",
+            ),
+            (
+                ipc_ctl::METHOD_CLOSE_TERMINAL,
+                Some(ipc_ctl::params_terminal_id("t:1")),
+                "terminal.manage",
+            ),
+            (
+                ipc_ctl::METHOD_SEND_INPUT,
+                Some(ipc_ctl::params_send_input("t:1", "hi")),
+                "terminal.input",
+            ),
+            (
+                ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+                Some(ipc_ctl::params_terminal_id("t:1")),
+                "terminal.inspect",
+            ),
+            (
+                ipc_ctl::METHOD_SPLIT_VIEW,
+                Some(ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+                "view.manage",
+            ),
+            (
+                ipc_ctl::METHOD_FOCUS_VIEW,
+                Some(ipc_ctl::params_focus("v:1")),
+                "view.manage",
+            ),
+            (ipc_ctl::METHOD_RELOAD_CONFIG, None, "config.modify"),
+        ];
+        for (method, params, scope) in cases {
+            let reply = apply_control_envelope(&mut rt, method, params.as_deref(), &empty);
+            assert!(!reply.ok, "{method} with empty scopes must fail");
+            assert_eq!(
+                reply.category, "auth",
+                "{method} denial must be auth, got {reply:?}"
+            );
+            assert_eq!(
+                reply.code, "ScopeDenied",
+                "{method} denial must be ScopeDenied, got {reply:?}"
+            );
+            assert!(
+                reply.message.contains(scope),
+                "{method} denial must name scope '{scope}', got {:?}",
+                reply.message
+            );
+            assert!(
+                reply.message.contains("BITTY_CTL_ELEVATE"),
+                "{method} denial must name the elevation surface, got {:?}",
+                reply.message
+            );
+            assert!(
+                !reply.message.contains("timed out"),
+                "{method} denial must never read as a timeout, got {:?}",
+                reply.message
+            );
+            assert_eq!(
+                exit_for_server_error(reply.category, reply.code),
+                EXIT_PERM,
+                "{method} denial must exit {EXIT_PERM}, got {reply:?}"
+            );
+            assert_eq!(
+                class_for_server_error(reply.category, reply.code),
+                "Denied",
+                "{method} denial must classify Denied, got {reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_client_denial_envelope_maps_to_permission_exit() {
+        // CTX-0231: the IPC client must parse a server ScopeDenied envelope
+        // into a permission outcome (exit 7), while a genuine queue timeout
+        // (transport/Unavailable) stays exit 6. Pins the boundary so a
+        // denial can never be misread as a timeout client-side.
+        let denied = br#"{"jsonrpc":"2.0","id":1,"error":{"category":"auth","code":"ScopeDenied","message":"permission denied: scope 'view.manage' denied for action 'bitty.debug/splitView' (needs elevation via BITTY_CTL_ELEVATE)"},"version":"1.0"}"#;
+        let outcome = parse_ctl_response(denied).expect("denial envelope must parse");
+        assert!(!outcome.ok, "denial must not parse as success");
+        assert_eq!(outcome.category, "auth");
+        assert_eq!(outcome.code, "ScopeDenied");
+        assert!(outcome.message.contains("view.manage"));
+        assert!(outcome.message.contains("BITTY_CTL_ELEVATE"));
+        assert_eq!(
+            exit_for_server_error(&outcome.category, &outcome.code),
+            EXIT_PERM
+        );
+        assert_eq!(
+            class_for_server_error(&outcome.category, &outcome.code),
+            "Denied"
+        );
+
+        let timed_out = br#"{"jsonrpc":"2.0","id":1,"error":{"category":"transport","code":"Unavailable","message":"control timed out (no live runtime draining)"},"version":"1.0"}"#;
+        let slow = parse_ctl_response(timed_out).expect("timeout envelope must parse");
+        assert!(!slow.ok, "timeout must not parse as success");
+        assert_eq!(
+            exit_for_server_error(&slow.category, &slow.code),
+            EXIT_RUNTIME,
+            "a genuine timeout stays exit {EXIT_RUNTIME}"
+        );
+    }
+
+    #[test]
+    fn control_help_names_exact_elevation_verbs() {
+        // CTX-0231: help must state exactly which verbs need elevation (the
+        // cli_default-excluded scopes) and exempt view.* explicitly, so a
+        // future view denial reads as a behavior bug, not docs ambiguity.
+        let help = ctl_help_text();
+        assert!(
+            help.contains("only terminal spawn, terminal close (terminal.manage) and"),
+            "help must scope elevation to the exact verbs, got {help:?}"
+        );
+        assert!(
+            help.contains("config reload (config.modify) need BITTY_CTL_ELEVATE"),
+            "help must name config reload elevation, got {help:?}"
+        );
+        assert!(
+            help.contains("those three verbs fail closed (exit 7"),
+            "help must pin denial exit 7, got {help:?}"
+        );
+        assert!(
+            help.contains("view split / view focus (view.manage)"),
+            "help must exempt view verbs, got {help:?}"
+        );
+        assert!(
+            help.contains("need no elevation"),
+            "help must state the no-elevation set, got {help:?}"
+        );
     }
 
     #[test]

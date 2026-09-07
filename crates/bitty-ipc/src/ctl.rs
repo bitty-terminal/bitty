@@ -687,6 +687,51 @@ mod tests {
         let err = authorize_ctl_method("bitty.debug/rmRf", &cli).unwrap_err();
         assert!(matches!(err, IpcError::NotFound { .. }));
     }
+
+    #[test]
+    fn denial_returns_permission_without_enqueue() {
+        // CTX-0231: a scope denial must fail fast as a permission error and
+        // must never touch the control queue (no enqueue means no 5 s drain
+        // wait, so a denial can never surface as a timeout). No timing
+        // asserts: the queue-emptiness check is the proof.
+        while pop_pending_control().is_some() {}
+        let empty = ScopeSet::new();
+        for method in all_control_methods() {
+            let required = required_scope_for_ctl_method(method).expect("known method");
+            let reply = enqueue_control_and_wait(method, None, "1", &empty);
+            assert!(!reply.ok, "{method} with empty scopes must fail");
+            assert_eq!(
+                reply.category, "auth",
+                "{method} denial must be auth, got {:?}",
+                reply.category
+            );
+            assert_eq!(
+                reply.code, "ScopeDenied",
+                "{method} denial must be ScopeDenied, got {:?}",
+                reply.code
+            );
+            assert!(
+                reply.message.contains(required.as_str()),
+                "{method} denial must name scope '{}', got {:?}",
+                required.as_str(),
+                reply.message
+            );
+            assert!(
+                reply.message.contains("BITTY_CTL_ELEVATE"),
+                "{method} denial must name the elevation surface, got {:?}",
+                reply.message
+            );
+            assert!(
+                !reply.message.contains("timed out"),
+                "{method} denial must never read as a timeout, got {:?}",
+                reply.message
+            );
+        }
+        assert!(
+            pop_pending_control().is_none(),
+            "denials must not enqueue (nothing to drain, nothing to time out)"
+        );
+    }
 }
 
 // ── elevation allowlist (pre-granted per-instance, explicit) ───────────────
@@ -797,6 +842,21 @@ pub fn enqueue_control_and_wait(
                 "auth",
                 "ScopeDenied",
                 format!("permission denied: {ipc_err} (needs elevation via BITTY_CTL_ELEVATE)"),
+            ),
+            // Auth-family failures are permission errors (CLI exit 7), never
+            // transport timeouts or usage errors: name the denial and the
+            // elevation surface so operators never read them as timeouts.
+            IpcError::Denied { code, reason } => (
+                "auth",
+                "Denied",
+                format!(
+                    "permission denied: [{code}] {reason} (needs elevation via BITTY_CTL_ELEVATE)"
+                ),
+            ),
+            IpcError::Unauthenticated { .. } => (
+                "auth",
+                "Unauthenticated",
+                format!("permission denied: {ipc_err}"),
             ),
             IpcError::NotFound { .. } => ("usage", "NotFound", format!("{ipc_err}")),
             _ => ("usage", "InvalidMethod", format!("{ipc_err}")),

@@ -699,8 +699,54 @@ impl Runtime {
             }
         }
 
-        // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect
-        // on the focused leaf's right edge, painted above grid content like
+        // Pending workspace-close confirmation banner (CTX-0257): same
+        // presentation-only overlay pill as the paste banner (steady text
+        // while the arm holds — no full/flash phases — reusing the paste
+        // pill colors so no new theme token is needed for the entry slice).
+        // Gated on `has_pending_ws_close()`; text is the bounded
+        // `ws_close_banner_text()`. Overlay only, never grid truth;
+        // repeat-confirm and Esc-cancel paths repaint via
+        // `pending_full_redraw`.
+        if self.has_pending_ws_close() {
+            if let Some(banner) = self.ws_close_banner_text() {
+                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
+                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                        if rect.height > 0 && rect.width > 0 {
+                            let live = self.live_cell_metrics();
+                            let max_cells = rect.width as usize;
+                            let text_cells = banner.chars().count().min(max_cells).max(1);
+                            let pill_w = text_cells as u32 * live.width;
+                            let full_w = rect.width as u32 * live.width;
+                            let origin_px_x = rect.x as i32 * live.width as i32
+                                + (full_w.saturating_sub(pill_w)) as i32
+                                + pad_px;
+                            let banner_y = (rect.y as i32 + rect.height as i32 - 1)
+                                * (live.height as i32)
+                                + pad_px;
+                            combined_fills.push(bitty_render::grid::FillRect {
+                                rect: bitty_render::geometry::RectPx::new(
+                                    origin_px_x,
+                                    banner_y,
+                                    pill_w,
+                                    live.height,
+                                ),
+                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
+                            });
+                            let glyphs = self.renderer.overlay_text_glyphs(
+                                &banner,
+                                (origin_px_x, banner_y),
+                                max_cells,
+                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
+                            );
+                            combined_glyphs.extend(glyphs);
+                            any_needs_draw = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect        // on the focused leaf's right edge, painted above grid content like
         // the selection highlight. Never grid truth: no layout, container,
         // or cell mutation, and `hidden` (default) resolves to no fill.
         // Visibility is latched so `auto` hover/proximity transitions stay

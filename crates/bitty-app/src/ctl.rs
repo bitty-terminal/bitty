@@ -21,6 +21,10 @@
 //! bitty ctl terminal text t:1 --format json
 //! bitty ctl view split --right
 //! bitty ctl view focus v:3
+//! bitty ctl workspace list --format json
+//! bitty ctl workspace new
+//! bitty ctl workspace close ws:2
+//! bitty ctl workspace focus ws:1
 //! bitty ctl config reload
 //! ```
 //!
@@ -41,6 +45,8 @@
 //! - `terminal send`: `terminal.input`
 //! - `terminal spawn|close`: `terminal.manage` (explicit elevation)
 //! - `view list`: `view.inspect`; `view split|focus`: `view.manage`
+//! - `workspace list`: `view.inspect`; `workspace new|focus`: `view.manage`
+//! - `workspace close`: `terminal.manage` (explicit elevation: kills live sessions)
 //! - `window list`: `view.inspect`
 //! - `config reload`: `config.modify` (explicit elevation)
 //! - `instance list`: local discovery, no IPC, no scope (same-UID only)
@@ -154,6 +160,10 @@ pub enum CtlRequest {
     TerminalText { terminal_id: String },
     ViewSplit { direction: ipc_ctl::SplitDirection },
     ViewFocus { view_id: String },
+    WorkspaceList,
+    WorkspaceNew,
+    WorkspaceClose { workspace_id: String },
+    WorkspaceFocus { workspace_id: String },
     ConfigReload,
 }
 
@@ -172,6 +182,10 @@ impl CtlRequest {
             Self::TerminalText { .. } => "core.terminal.text",
             Self::ViewSplit { .. } => "core.view.split",
             Self::ViewFocus { .. } => "core.view.focus",
+            Self::WorkspaceList => "core.workspace.list",
+            Self::WorkspaceNew => "core.workspace.new",
+            Self::WorkspaceClose { .. } => "core.workspace.close",
+            Self::WorkspaceFocus { .. } => "core.workspace.focus",
             Self::ConfigReload => "core.config.reload",
         }
     }
@@ -190,6 +204,10 @@ impl CtlRequest {
             Self::TerminalText { .. } => Some(ipc_ctl::METHOD_GET_TERMINAL_TEXT),
             Self::ViewSplit { .. } => Some(ipc_ctl::METHOD_SPLIT_VIEW),
             Self::ViewFocus { .. } => Some(ipc_ctl::METHOD_FOCUS_VIEW),
+            Self::WorkspaceList => Some(ipc_ctl::METHOD_LIST_WORKSPACES),
+            Self::WorkspaceNew => Some(ipc_ctl::METHOD_NEW_WORKSPACE),
+            Self::WorkspaceClose { .. } => Some(ipc_ctl::METHOD_CLOSE_WORKSPACE),
+            Self::WorkspaceFocus { .. } => Some(ipc_ctl::METHOD_FOCUS_WORKSPACE),
             Self::ConfigReload => Some(ipc_ctl::METHOD_RELOAD_CONFIG),
         }
     }
@@ -202,6 +220,8 @@ impl CtlRequest {
             | Self::WindowList
             | Self::ViewList
             | Self::TerminalList
+            | Self::WorkspaceList
+            | Self::WorkspaceNew
             | Self::ConfigReload => None,
             Self::TerminalSpawn { cwd } => Some(ipc_ctl::params_spawn(cwd.as_deref())),
             Self::TerminalClose { terminal_id } => Some(ipc_ctl::params_terminal_id(terminal_id)),
@@ -211,6 +231,9 @@ impl CtlRequest {
             Self::TerminalText { terminal_id } => Some(ipc_ctl::params_terminal_id(terminal_id)),
             Self::ViewSplit { direction } => Some(ipc_ctl::params_split(*direction)),
             Self::ViewFocus { view_id } => Some(ipc_ctl::params_focus(view_id)),
+            Self::WorkspaceClose { workspace_id } | Self::WorkspaceFocus { workspace_id } => {
+                Some(ipc_ctl::params_workspace(workspace_id))
+            }
         }
     }
 }
@@ -250,6 +273,7 @@ pub fn ctl_usage() -> String {
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
+         \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N\n\
          \x20 config reload\n\
          examples:\n\
          \x20 bitty ctl instance list\n\
@@ -275,24 +299,30 @@ pub fn ctl_help_text() -> String {
            -h, --help       Print this help and exit (never needs an instance)\n\
          \n\
          Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
-           instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
-           window list                   core.window.list (view.inspect)\n  \
-           view list                     core.view.list (view.inspect)\n  \
-           terminal list                 core.terminal.list (terminal.inspect)\n  \
-           terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
-           terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
-           terminal send t:N TEXT        core.terminal.send (terminal.input; focused leaf only)\n  \
-           terminal text t:N             core.terminal.text (terminal.inspect; untrusted output)\n  \
-           view split [--dir]            core.view.split (view.manage; default --right)\n  \
-           view focus v:N                core.view.focus (view.manage)\n  \
-           config reload                 core.config.reload (config.modify, elevation)\n\
+            instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
+            window list                   core.window.list (view.inspect)\n  \
+            view list                     core.view.list (view.inspect)\n  \
+            terminal list                 core.terminal.list (terminal.inspect)\n  \
+            terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
+            terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
+            terminal send t:N TEXT        core.terminal.send (terminal.input; focused leaf only)\n  \
+            terminal text t:N             core.terminal.text (terminal.inspect; untrusted output)\n  \
+            view split [--dir]            core.view.split (view.manage; default --right)\n  \
+            view focus v:N                core.view.focus (view.manage)\n  \
+            workspace list                core.workspace.list (view.inspect)\n  \
+            workspace new                 core.workspace.new (view.manage)\n  \
+            workspace close ws:N          core.workspace.close (terminal.manage, elevation; kills live sessions)\n  \
+            workspace focus ws:N          core.workspace.focus (view.manage)\n  \
+            config reload                 core.config.reload (config.modify, elevation)\n\
          \n\
-         Elevation: only terminal spawn, terminal close (terminal.manage) and\n\
+         Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
+            workspace close (terminal.manage), and\n\
          \x20 config reload (config.modify) need BITTY_CTL_ELEVATE\n\
          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
-         \x20 Without it those three verbs fail closed (exit 7, no partial state).\n\
+         \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
          \x20 All other verbs — including view split / view focus (view.manage)\n\
-         \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
+         \x20 and workspace list / new / focus, and every list, terminal send,\n\
+         \x20 and terminal text verb — need no elevation.\n\
          \n\
          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
          \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
@@ -590,6 +620,42 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             Ok((
                 CtlRequest::ViewFocus {
                     view_id: id.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("workspace"), Some("list")) => {
+            reject_extra(rest, "workspace list")?;
+            reject_ctl_options_for("workspace list", split_dir.is_some(), spawn_cwd.is_some())?;
+            Ok((CtlRequest::WorkspaceList, targeting))
+        }
+        (Some("workspace"), Some("new")) => {
+            reject_extra(rest, "workspace new")?;
+            reject_ctl_options_for("workspace new", split_dir.is_some(), spawn_cwd.is_some())?;
+            Ok((CtlRequest::WorkspaceNew, targeting))
+        }
+        (Some("workspace"), Some("close")) => {
+            reject_ctl_options_for("workspace close", split_dir.is_some(), spawn_cwd.is_some())?;
+            let id = single_arg(rest, "workspace close", "ws:N (e.g. ws:2)")?;
+            ipc_ctl::parse_workspace_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid workspace id {id:?}: {err}"),
+            })?;
+            Ok((
+                CtlRequest::WorkspaceClose {
+                    workspace_id: id.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("workspace"), Some("focus")) => {
+            reject_ctl_options_for("workspace focus", split_dir.is_some(), spawn_cwd.is_some())?;
+            let id = single_arg(rest, "workspace focus", "ws:N (e.g. ws:1)")?;
+            ipc_ctl::parse_workspace_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid workspace id {id:?}: {err}"),
+            })?;
+            Ok((
+                CtlRequest::WorkspaceFocus {
+                    workspace_id: id.to_string(),
                 },
                 targeting,
             ))
@@ -1386,6 +1452,22 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         CtlRequest::ViewFocus { view_id } => {
             out.push_str(&format!("focused {view_id} on {}\n", target.instance));
         }
+        CtlRequest::WorkspaceList => {
+            out.push_str(result_json);
+            out.push('\n');
+        }
+        CtlRequest::WorkspaceNew => {
+            out.push_str(&format!(
+                "new workspace on {} — result: {result_json}\n",
+                target.instance
+            ));
+        }
+        CtlRequest::WorkspaceClose { workspace_id } => {
+            out.push_str(&format!("closed {workspace_id} on {}\n", target.instance));
+        }
+        CtlRequest::WorkspaceFocus { workspace_id } => {
+            out.push_str(&format!("focused {workspace_id} on {}\n", target.instance));
+        }
         CtlRequest::ConfigReload => {
             out.push_str(&format!(
                 "reloaded on {} — result: {result_json}\n",
@@ -1719,6 +1801,83 @@ pub fn apply_control(
         }
         return Err(("usage", "NotFound", format!("no such view {view_id}")));
     }
+    if method == ipc_ctl::METHOD_LIST_WORKSPACES {
+        // Tabline truth: names + indices + focused marker + count, the same
+        // string the overlay renders (`workspaceline_text`).
+        let names = workspace_names_json(runtime);
+        let active = runtime.active_workspace_index() + 1;
+        return Ok(format!(
+            "{{\"workspaces\":{names},\"active\":{active},\"count\":{},\"tabline\":\"{}\"}}",
+            runtime.workspace_count(),
+            json_escape(&runtime.workspaceline_text()),
+        ));
+    }
+    if method == ipc_ctl::METHOD_NEW_WORKSPACE {
+        if params.is_some() {
+            // Strict arity: `workspace new` takes no params object (a
+            // misplaced `{"cwd":...}` or split direction fails closed here,
+            // not as a silent ignore).
+            return Err((
+                "usage",
+                "InvalidParams",
+                String::from("workspace new takes no params"),
+            ));
+        }
+        match runtime.workspace_new() {
+            Ok(index) => {
+                return Ok(format!(
+                    "{{\"created\":\"ws:{}\",\"tabline\":\"{}\"}}",
+                    index + 1,
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
+            Err(message) => {
+                return Err((
+                    "usage",
+                    "Conflict",
+                    format!("workspace new refused: {message}"),
+                ));
+            }
+        }
+    }
+    if method == ipc_ctl::METHOD_CLOSE_WORKSPACE {
+        let workspace_id = ipc_ctl::parse_workspace_params(params)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let num = ipc_ctl::parse_workspace_id(&workspace_id)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        // Non-interactive path: elevation (terminal.manage, authorized
+        // upstream) is the gate, so close is immediate — the pending-confirm
+        // gate is the interactive key-chord UX only.
+        match runtime.workspace_close_index(u64::from(num)) {
+            Ok(killed) => {
+                return Ok(format!(
+                    "{{\"closed\":\"{workspace_id}\",\"killed\":{killed},\"tabline\":\"{}\"}}",
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
+            Err(message) => {
+                return Err(("usage", "NotFound", message));
+            }
+        }
+    }
+    if method == ipc_ctl::METHOD_FOCUS_WORKSPACE {
+        let workspace_id = ipc_ctl::parse_workspace_params(params)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let num = ipc_ctl::parse_workspace_id(&workspace_id)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let index = (u64::from(num) - 1) as usize;
+        if runtime.workspace_switch(index) {
+            return Ok(format!(
+                "{{\"focused\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
+                json_escape(&runtime.workspaceline_text()),
+            ));
+        }
+        return Err((
+            "usage",
+            "NotFound",
+            format!("no such workspace {workspace_id}"),
+        ));
+    }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
         // Validate the config file (same probe the startup path uses) and
         // report its path; live hot-swap is a documented follow-up.
@@ -1775,6 +1934,24 @@ fn split_leaf(
                 || split_leaf(overlay, focused, axis, new_id, place_new_first)
         }
     }
+}
+
+/// Workspace names as a JSON string array for `workspace list`.
+///
+/// Bounded: at most 16 names, each JSON-escaped. Names are runtime-issued
+/// (`ws{seq}`) until rename lands as a follow-up.
+fn workspace_names_json(runtime: &bitty_runtime::Runtime) -> String {
+    let mut out = String::from("[");
+    for (idx, name) in runtime.workspace_names().iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(name));
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 /// Extract printable text from a terminal snapshot (rows joined, bounded).
@@ -1955,6 +2132,42 @@ mod tests {
     }
 
     #[test]
+    fn workspace_verbs_parse_and_validate_ids() {
+        let (req, _) = parse_ctl_request(&words(&["workspace", "list"])).expect("must parse");
+        assert_eq!(req, CtlRequest::WorkspaceList);
+        let (req, _) = parse_ctl_request(&words(&["workspace", "new"])).expect("must parse");
+        assert_eq!(req, CtlRequest::WorkspaceNew);
+        let (req, _) =
+            parse_ctl_request(&words(&["workspace", "close", "ws:2"])).expect("must parse");
+        assert_eq!(
+            req,
+            CtlRequest::WorkspaceClose {
+                workspace_id: String::from("ws:2"),
+            }
+        );
+        let (req, _) =
+            parse_ctl_request(&words(&["workspace", "focus", "ws:1"])).expect("must parse");
+        assert_eq!(
+            req,
+            CtlRequest::WorkspaceFocus {
+                workspace_id: String::from("ws:1"),
+            }
+        );
+        // Fail closed: missing/extra args, wrong id shapes, misplaced flags.
+        assert!(parse_ctl_request(&words(&["workspace"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "close"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "focus"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "close", "ws:2", "extra"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "list", "extra"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "new", "extra"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "close", "v:2"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "focus", "t:1"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "close", "ws:007"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "close", "ws:2", "--right"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "dance"])).is_err());
+    }
+
+    #[test]
     fn config_reload_takes_no_args() {
         let (req, _) = parse_ctl_request(&words(&["config", "reload"])).expect("must parse");
         assert_eq!(req, CtlRequest::ConfigReload);
@@ -1986,6 +2199,25 @@ mod tests {
             }
             .registry_id(),
             "core.view.split"
+        );
+        assert_eq!(
+            CtlRequest::WorkspaceList.registry_id(),
+            "core.workspace.list"
+        );
+        assert_eq!(CtlRequest::WorkspaceNew.registry_id(), "core.workspace.new");
+        assert_eq!(
+            CtlRequest::WorkspaceClose {
+                workspace_id: String::from("ws:2"),
+            }
+            .registry_id(),
+            "core.workspace.close"
+        );
+        assert_eq!(
+            CtlRequest::WorkspaceFocus {
+                workspace_id: String::from("ws:1"),
+            }
+            .registry_id(),
+            "core.workspace.focus"
         );
         assert_eq!(CtlRequest::ConfigReload.registry_id(), "core.config.reload");
     }
@@ -2204,6 +2436,16 @@ mod tests {
             apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_TERMINAL, Some(&close), &cli);
         assert!(!denied.ok);
         assert_eq!(denied.code, "ScopeDenied");
+        // CTX-0257: workspace.close needs terminal.manage too (kill power).
+        let ws_close = ipc_ctl::params_workspace("ws:1");
+        let denied = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_CLOSE_WORKSPACE,
+            Some(&ws_close),
+            &cli,
+        );
+        assert!(!denied.ok);
+        assert_eq!(denied.code, "ScopeDenied");
         // terminal.spawn needs terminal.manage.
         let spawn = ipc_ctl::params_spawn(None);
         let denied =
@@ -2247,6 +2489,16 @@ mod tests {
             (
                 ipc_ctl::METHOD_FOCUS_VIEW,
                 Some(ipc_ctl::params_focus("v:1")),
+            ),
+            (ipc_ctl::METHOD_LIST_WORKSPACES, None),
+            (ipc_ctl::METHOD_NEW_WORKSPACE, None),
+            (
+                ipc_ctl::METHOD_CLOSE_WORKSPACE,
+                Some(ipc_ctl::params_workspace("ws:1")),
+            ),
+            (
+                ipc_ctl::METHOD_FOCUS_WORKSPACE,
+                Some(ipc_ctl::params_workspace("ws:1")),
             ),
             (ipc_ctl::METHOD_RELOAD_CONFIG, None),
         ];
@@ -2301,6 +2553,18 @@ mod tests {
             (
                 ipc_ctl::METHOD_FOCUS_VIEW,
                 Some(ipc_ctl::params_focus("v:1")),
+                "view.manage",
+            ),
+            (ipc_ctl::METHOD_LIST_WORKSPACES, None, "view.inspect"),
+            (ipc_ctl::METHOD_NEW_WORKSPACE, None, "view.manage"),
+            (
+                ipc_ctl::METHOD_CLOSE_WORKSPACE,
+                Some(ipc_ctl::params_workspace("ws:1")),
+                "terminal.manage",
+            ),
+            (
+                ipc_ctl::METHOD_FOCUS_WORKSPACE,
+                Some(ipc_ctl::params_workspace("ws:1")),
                 "view.manage",
             ),
             (ipc_ctl::METHOD_RELOAD_CONFIG, None, "config.modify"),
@@ -2382,17 +2646,22 @@ mod tests {
         // CTX-0231: help must state exactly which verbs need elevation (the
         // cli_default-excluded scopes) and exempt view.* explicitly, so a
         // future view denial reads as a behavior bug, not docs ambiguity.
+        // CTX-0257: workspace close joins the elevated set (kill power).
         let help = ctl_help_text();
         assert!(
-            help.contains("only terminal spawn, terminal close (terminal.manage) and"),
+            help.contains("only terminal spawn, terminal close (terminal.manage),"),
             "help must scope elevation to the exact verbs, got {help:?}"
+        );
+        assert!(
+            help.contains("workspace close (terminal.manage)"),
+            "help must name workspace close elevation, got {help:?}"
         );
         assert!(
             help.contains("config reload (config.modify) need BITTY_CTL_ELEVATE"),
             "help must name config reload elevation, got {help:?}"
         );
         assert!(
-            help.contains("those three verbs fail closed (exit 7"),
+            help.contains("those four verbs fail closed (exit 7"),
             "help must pin denial exit 7, got {help:?}"
         );
         assert!(
@@ -2400,8 +2669,86 @@ mod tests {
             "help must exempt view verbs, got {help:?}"
         );
         assert!(
+            help.contains("workspace list / new / focus"),
+            "help must exempt non-destructive workspace verbs, got {help:?}"
+        );
+        assert!(
             help.contains("need no elevation"),
             "help must state the no-elevation set, got {help:?}"
+        );
+    }
+
+    #[test]
+    fn control_workspace_list_new_focus_close_headless() {
+        // CTX-0257 entry over the control plane: list pins the tabline,
+        // new/focus ride view.manage (no elevation), close needs elevation
+        // and is immediate there (the pending-confirm gate is key UX only).
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let all = bitty_ipc::ScopeSet::all();
+
+        let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
+        assert!(list.ok, "workspace list must succeed: {list:?}");
+        assert!(list.result_json.contains("\"count\":1"));
+        assert!(
+            list.result_json.contains("1:ws1* (1)"),
+            "tabline pinned: {list:?}"
+        );
+
+        let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+        assert!(created.ok, "workspace new must succeed: {created:?}");
+        assert!(created.result_json.contains("\"created\":\"ws:2\""));
+        assert!(created.result_json.contains("1:ws1 2:ws2* (2)"));
+
+        let focus = ipc_ctl::params_workspace("ws:1");
+        let moved =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_WORKSPACE, Some(&focus), &cli);
+        assert!(moved.ok, "workspace focus must succeed: {moved:?}");
+        assert!(moved.result_json.contains("1:ws1* 2:ws2 (2)"));
+
+        // Unknown workspace is NotFound (no partial state).
+        let bad = ipc_ctl::params_workspace("ws:9");
+        let missing =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_WORKSPACE, Some(&bad), &cli);
+        assert!(!missing.ok);
+        assert_eq!(missing.code, "NotFound");
+
+        // Close without elevation denies (kill power); with elevation it
+        // closes immediately and the tabline follows.
+        let close = ipc_ctl::params_workspace("ws:2");
+        let denied =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&close), &cli);
+        assert!(!denied.ok);
+        assert_eq!(denied.code, "ScopeDenied");
+        let done =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&close), &all);
+        assert!(done.ok, "elevated close must succeed: {done:?}");
+        assert!(done.result_json.contains("\"closed\":\"ws:2\""));
+        assert!(done.result_json.contains("1:ws1* (1)"));
+
+        // Closing an unknown workspace is NotFound (auth passed).
+        let gone =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&bad), &all);
+        assert!(!gone.ok);
+        assert_eq!(gone.code, "NotFound");
+    }
+
+    #[test]
+    fn control_workspace_new_fails_closed_at_capacity() {
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        for _ in 1..bitty_runtime::MAX_WORKSPACES {
+            let created =
+                apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+            assert!(created.ok, "new within capacity: {created:?}");
+        }
+        let full = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+        assert!(!full.ok);
+        assert_eq!(full.code, "Conflict");
+        assert_eq!(
+            exit_for_server_error(full.category, full.code),
+            EXIT_CONFLICT,
+            "capacity refusal must exit {EXIT_CONFLICT}"
         );
     }
 

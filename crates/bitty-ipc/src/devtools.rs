@@ -1234,7 +1234,9 @@ impl Dispatcher {
     /// `getFocus`) plus CTX-0171 runtime control (`listWindows`,
     /// `listViews`, `listTerminals`, `spawnTerminal`, `closeTerminal`,
     /// `sendInput`, `getTerminalText`, `splitView`, `focusView`,
-    /// `reloadConfig`) plus CTX-0188 test automation (`synthesizeInput`,
+    /// `reloadConfig`) plus CTX-0257 workspace entry (`listWorkspaces`,
+    /// `createWorkspace`, `closeWorkspace`, `focusWorkspace`) plus CTX-0188
+    /// test automation (`synthesizeInput`,
     /// `captureFrame`, bearer-scoped per Amendment A1) plus CTX-0189 live
     /// profiling (`getProcessStats`, `getFrameStats`, `streamProcessStats`,
     /// `streamFrameStats`; sampling-only, scope-gated per Amendment A1).
@@ -1280,6 +1282,10 @@ impl Dispatcher {
             (crate::ctl::METHOD_GET_TERMINAL_TEXT, handle_control),
             (crate::ctl::METHOD_SPLIT_VIEW, handle_control),
             (crate::ctl::METHOD_FOCUS_VIEW, handle_control),
+            (crate::ctl::METHOD_LIST_WORKSPACES, handle_control),
+            (crate::ctl::METHOD_NEW_WORKSPACE, handle_control),
+            (crate::ctl::METHOD_CLOSE_WORKSPACE, handle_control),
+            (crate::ctl::METHOD_FOCUS_WORKSPACE, handle_control),
             (crate::ctl::METHOD_RELOAD_CONFIG, handle_control),
         ];
         for (method, handler) in control {
@@ -2088,7 +2094,7 @@ fn handle_get_focus(
 // also flow through the queue so `view`/`terminal` listings reflect live
 // `Runtime` layout rather than stale startup facts.
 
-/// Shared control handler for all ten `bitty.debug/*` control methods.
+/// Shared control handler for all fourteen `bitty.debug/*` control methods.
 ///
 /// Validates params shape via `ctl` parsers (fail-closed `InvalidParams`
 /// before enqueue), authorizes via `context.granted` (fail-closed
@@ -5052,11 +5058,13 @@ mod tests {
         // (getGridText, getInputRing, getModifiers, getFocus) plus CTX-0171
         // control (listWindows, listViews, listTerminals, spawnTerminal,
         // closeTerminal, sendInput, getTerminalText, splitView, focusView,
-        // reloadConfig) plus CTX-0188 automation (synthesizeInput,
+        // reloadConfig) plus CTX-0257 workspace entry (listWorkspaces,
+        // createWorkspace, closeWorkspace, focusWorkspace) plus CTX-0188
+        // automation (synthesizeInput,
         // captureFrame) plus CTX-0244 digest (frameHash) plus CTX-0189
         // profiling (getProcessStats, getFrameStats, streamProcessStats,
         // streamFrameStats).
-        assert_eq!(dispatcher.method_count(), 23);
+        assert_eq!(dispatcher.method_count(), 27);
         assert!(dispatcher.contains("bitty.debug/getGridText"));
         assert!(dispatcher.contains("bitty.debug/getInputRing"));
         assert!(dispatcher.contains("bitty.debug/getModifiers"));

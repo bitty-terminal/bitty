@@ -200,3 +200,55 @@ fn ctl_word_is_subcommand_not_program() {
         stdout(&output)
     );
 }
+
+#[test]
+fn ctl_help_names_workspace_verbs() {
+    // CTX-0257 entry: help lists the workspace verbs with their id shape.
+    let output = run_bitty(&["ctl", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        text.contains("workspace list")
+            && text.contains("workspace new")
+            && text.contains("workspace close ws:N")
+            && text.contains("workspace focus ws:N"),
+        "help must name workspace verbs, got {text:?}"
+    );
+}
+
+#[test]
+fn ctl_workspace_bad_id_is_usage_error() {
+    for args in [
+        &["ctl", "workspace", "close", "v:2"] as &[&str],
+        &["ctl", "workspace", "focus", "t:1"],
+        &["ctl", "workspace", "close", "ws:007"],
+        &["ctl", "workspace", "focus"] as &[&str],
+        &["ctl", "workspace", "close", "ws:2", "extra"] as &[&str],
+    ] {
+        let output = run_bitty(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} must be UsageError (exit 2), stderr={:?}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn ctl_workspace_verb_without_instance_is_unavailable() {
+    // Like other runtime verbs: no live instance fails closed with exit 6.
+    let output = run_bitty(&[
+        "ctl",
+        "--socket",
+        "/tmp/bitty-ctl-test-nonexistent.sock",
+        "workspace",
+        "list",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "missing socket must be Unavailable (exit 6), stderr={:?}",
+        stderr(&output)
+    );
+}

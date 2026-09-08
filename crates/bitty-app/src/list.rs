@@ -433,7 +433,7 @@ pub fn list_themes() -> Vec<ThemeInfo> {
 /// One plugin row (static manifest metadata only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginInfo {
-    /// Fully qualified id (e.g. `bitty-terminal.tabs`).
+    /// Fully qualified id (e.g. `bitty-terminal.workspace`).
     pub id: String,
     /// Human name.
     pub name: String,
@@ -1510,7 +1510,13 @@ mod tests {
             assert!(p.bundled);
             assert!(!p.enabled);
         }
-        assert!(ids.contains(&"bitty-terminal.tabs"));
+        assert!(ids.contains(&"bitty-terminal.workspace"));
+        // Deprecated alias is not a separate list row (canonical list only),
+        // but still resolves as bundled.
+        assert!(!ids.contains(&"bitty-terminal.tabs"));
+        assert!(bitty_plugin_host::bundled::is_bundled(
+            &bitty_plugin_host::PluginId::new("bitty-terminal.tabs").unwrap()
+        ));
     }
 
     #[test]

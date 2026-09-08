@@ -210,7 +210,7 @@ fn list_plugins_table_contains_bundled() {
     );
     let text = stdout(&output);
     assert!(
-        text.contains("bitty-terminal.tabs"),
+        text.contains("bitty-terminal.workspace"),
         "plugins table must carry bundled ids, got {text:?}"
     );
 }

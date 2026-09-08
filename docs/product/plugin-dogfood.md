@@ -1,6 +1,6 @@
 ---
 title: Plugin Dogfood — First-Party Bundled-Disabled Set (CTX-0096)
-description: Verified dogfood of the public Plugin API via the five v1 bundled-disabled first-party plugins (shell-integration, tabs, statusline, palette, project) with manifest/capability/lifecycle parity, safe-mode, Terminal Truth, and bounded cold-path evidence
+description: Verified dogfood of the public Plugin API via the five v1 bundled-disabled first-party plugins (shell-integration, workspace, statusline, palette, project) with manifest/capability/lifecycle parity, safe-mode, Terminal Truth, and bounded cold-path evidence
 category: product
 audience: maintainer
 document_type: research
@@ -27,7 +27,7 @@ status: draft
 - Ownership: bitty **CTX-0096** — _Dogfood Plugin API with first-party plugins_.
   - Priority: P2 | Area: extensibility/dogfooding | Labels: feat,area:plugin,P2 | Milestone: v0.1.0 | RFC: OQ-011, OQ-012, OQ-013 | Task: CTX-0096
 - Scope: the **exact** accepted `v1` bundled-disabled set
-  (`shell-integration`, `tabs`, `statusline`, `palette`, `project`) kept
+  (`shell-integration`, `workspace`, `statusline`, `palette`, `project`) kept
   **bundled != enabled**, verified via the public `PluginManifest` /
   `CapabilityId` / `PluginHost` / `Runtime` surface with no private channel.
   `splits` and `search` remain **future candidates** (not implemented).
@@ -120,13 +120,13 @@ host path for every plugin is identical:
 
 ### Catalog for `v1` — bundled, disabled
 
-| Plugin ID                          | Policy                                                             | Core mechanism                                         | Capability sketch                                                                             | Lazy triggers                                                                                                          |
-| ---------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------ | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `bitty-terminal.shell-integration` | OSC 7/133 zones, cwd/title propagation, fail-closed fallback       | VT parser OSC 7/133, `ImageStore` anchor fallback      | `terminal.semantic-read`                                                                      | `terminal.cwd-changed`, `terminal.title-changed`, `terminal.bell`                                                      |
-| `bitty-terminal.tabs`              | tab commands, tabline presentation, ordering, closing policy       | `LayoutNode` split primitives, tabline exclusive claim | `ui.rich` + claim `tabline`                                                                   | commands `bitty-terminal.tabs:new`, `close`, `next`; events `terminal.title-changed`, `focus.changed`; claim `tabline` |
-| `bitty-terminal.statusline`        | cwd, mode, Git/task presentation, status-component composition     | statusline slot composition, semantic snapshot         | `terminal.semantic-read`, `ui.rich`                                                           | `terminal.cwd-changed`, `terminal.title-changed`                                                                       |
-| `bitty-terminal.palette`           | command palette and picker via overlay, declarative list/text only | overlay slot, command registry, declarative primitives | `ui.overlay`                                                                                  | command `bitty-terminal.palette:toggle`; event `focus.changed`                                                         |
-| `bitty-terminal.project`           | project discovery and session presentation                         | constrained project discovery                          | `terminal.semantic-read` + `fs.read:~/projects/**` (`FilesystemRequest` read `~/projects/**`) | commands `bitty-terminal.project:open`, `switch`; event `terminal.cwd-changed`                                         |
+| Plugin ID                          | Policy                                                                   | Core mechanism                                                                            | Capability sketch                                                                             | Lazy triggers                                                                                                                                                                                |
+| ---------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bitty-terminal.shell-integration` | OSC 7/133 zones, cwd/title propagation, fail-closed fallback             | VT parser OSC 7/133, `ImageStore` anchor fallback                                         | `terminal.semantic-read`                                                                      | `terminal.cwd-changed`, `terminal.title-changed`, `terminal.bell`                                                                                                                            |
+| `bitty-terminal.workspace`         | workspace commands, workspaceline presentation, ordering, closing policy | `LayoutNode` split primitives, workspaceline exclusive claim (`tabline` deprecated alias) | `ui.rich` + claim `workspaceline` (`tabline` alias)                                           | commands `bitty-terminal.workspace:new`, `close`, `next` (+ deprecated `bitty-terminal.tabs:*` aliases); events `terminal.title-changed`, `focus.changed`; claims `workspaceline`, `tabline` |
+| `bitty-terminal.statusline`        | cwd, mode, Git/task presentation, status-component composition           | statusline slot composition, semantic snapshot                                            | `terminal.semantic-read`, `ui.rich`                                                           | `terminal.cwd-changed`, `terminal.title-changed`                                                                                                                                             |
+| `bitty-terminal.palette`           | command palette and picker via overlay, declarative list/text only       | overlay slot, command registry, declarative primitives                                    | `ui.overlay`                                                                                  | command `bitty-terminal.palette:toggle`; event `focus.changed`                                                                                                                               |
+| `bitty-terminal.project`           | project discovery and session presentation                               | constrained project discovery                                                             | `terminal.semantic-read` + `fs.read:~/projects/**` (`FilesystemRequest` read `~/projects/**`) | commands `bitty-terminal.project:open`, `switch`; event `terminal.cwd-changed`                                                                                                               |
 
 Accepted `v1` rule preserved: **bundled does not mean enabled**. A fresh
 install with no user configuration (`EffectiveConfig::default` has empty
@@ -136,9 +136,15 @@ explicit user action:
 ```lua
 -- init.lua -> ConfigPlan -> merge -> EffectiveConfig
 plugins = {
-  ["bitty-terminal.tabs"] = { enabled = true }, -- explicit opt-in, consent UX, permission-diff gate on capability increase
+  ["bitty-terminal.workspace"] = { enabled = true }, -- explicit opt-in, consent UX, permission-diff gate on capability increase
 }
 ```
+
+> A bitty workspace is a tab group within a window (wezterm inverts this:
+> workspace > window > tab > pane).
+>
+> Compat: old id `bitty-terminal.tabs`, old commands `bitty-terminal.tabs:*`,
+> and old claim `tabline` remain as deprecated aliases (removal ≥ v0.2.0).
 
 Project-scoped or workspace configuration may **narrow** the enabled set but
 may never add a capability the user has not granted (workspace narrowing

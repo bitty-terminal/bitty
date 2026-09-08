@@ -18,9 +18,9 @@ use bitty_plugin_host::{
     PluginHost, PluginId,
     bundled::{
         ai_panel_manifest, all_bundled_manifests, browser_panel_manifest, bundled_ids_sorted,
-        bundled_manifest_for, file_manager_manifest, git_panel_manifest, is_bundled,
-        mail_panel_manifest, palette_manifest, project_manifest, shell_integration_manifest,
-        statusline_manifest, tabs_manifest,
+        bundled_manifest_for, deprecated_alias_warning, file_manager_manifest, git_panel_manifest,
+        is_bundled, is_deprecated_bundled_alias, mail_panel_manifest, palette_manifest,
+        project_manifest, shell_integration_manifest, statusline_manifest, workspace_manifest,
     },
 };
 
@@ -57,7 +57,7 @@ fn bundled_manifests_are_five_and_validate() {
             "bitty-terminal.project",
             "bitty-terminal.shell-integration",
             "bitty-terminal.statusline",
-            "bitty-terminal.tabs",
+            "bitty-terminal.workspace",
         ]
     );
     for m in all {
@@ -65,6 +65,14 @@ fn bundled_manifests_are_five_and_validate() {
         assert!(bundled_manifest_for(m.id().as_str()).is_some());
     }
     assert!(!is_bundled(&PluginId::new("xuepoo.third").unwrap()));
+    // Deprecated alias still resolves + is_bundled, with a warning; canonical does not warn.
+    assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
+    assert!(is_deprecated_bundled_alias("bitty-terminal.tabs"));
+    assert!(!is_deprecated_bundled_alias("bitty-terminal.workspace"));
+    assert!(deprecated_alias_warning("bitty-terminal.tabs").is_some());
+    assert!(deprecated_alias_warning("bitty-terminal.workspace").is_none());
+    assert!(bundled_manifest_for("bitty-terminal.tabs").is_some());
+    assert!(bundled_manifest_for("bitty-terminal.workspace").is_some());
 }
 
 #[test]
@@ -151,7 +159,7 @@ fn bundled_plugins_are_observation_only_and_use_bounded_side_queue() {
             host.subscribe(&id, EventKind::TerminalTitleChanged)
                 .unwrap();
             host.subscribe(&id, EventKind::TerminalCwdChanged).unwrap();
-        } else if id.as_str() == "bitty-terminal.tabs" {
+        } else if id.as_str() == "bitty-terminal.workspace" {
             host.subscribe(&id, EventKind::TerminalTitleChanged)
                 .unwrap();
         }
@@ -197,7 +205,17 @@ fn default_disabled_safe_mode_leaves_host_functional() {
     let mut safe = PluginHost::new(DropPolicy::DropOldest, 16);
     safe.set_safe_mode(true);
     assert!(safe.declare(shell_integration_manifest()).is_err());
-    assert!(safe.declare(tabs_manifest()).is_err());
+    assert!(safe.declare(workspace_manifest()).is_err());
+    // Deprecated alias preserves the reject-shape: still rejected, still tickable
+    // after rejection (no builtin promotion for the new id).
+    assert!(
+        safe.declare(bundled_manifest_for("bitty-terminal.tabs").unwrap())
+            .is_err()
+    );
+    assert!(
+        safe.declare(bundled_manifest_for("bitty-terminal.workspace").unwrap())
+            .is_err()
+    );
     assert!(safe.declare(statusline_manifest()).is_err());
     assert!(safe.declare(palette_manifest()).is_err());
     assert!(safe.declare(project_manifest()).is_err());

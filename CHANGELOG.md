@@ -26,6 +26,25 @@ frameSeq_be64 || headless_rgba`, answering the CTX-0242 V1-V3 equality
   is `#[ignore]`-gated local-manual only. Raw pixel channel stays
   deferred indefinitely (no pixel bytes cross IPC under any grant).
 
+### Panel live V1-V3 gates on `frameHash` equality (CTX-0242)
+
+- New `crates/bitty-runtime/tests/panel_live_framehash.rs`: headless,
+  deterministic, synthetic-only equality gates wiring V1-V3 to the CTX-0244
+  digest (`frame_digest_hex`, the same function the server hashes with).
+  V1 pins the gap-band paint contract (gapped digest differs from the
+  no-gap baseline for identical content, fresh re-run reproduces it
+  exactly, plus a direct gap-pixel == theme bg assertion); V2 pins
+  focus-switch diff plus switch-back restore (primary follows focus,
+  CTX-0234); V3 pins workspace-alias vs tabs-shim digest equality for
+  identical content (layout parity consequence of the `tabs_compat` guard).
+- New socket-level lossless proof in the same file (CTX-0188 harness
+  pattern: real Unix socket, file-local serial guard, reply correlation):
+  a real `Runtime` headless frame published via `publish_frame_rgba`
+  digests identically through `bitty.debug/frameHash`, with zero pixel
+  bytes on the wire. The live-grant ws4 ceremony (V1 gaps, V2 tab focus,
+  V3 alias parity per focus step, expiry `ScopeDenied`, digest audit) is
+  `#[ignore]`-gated local-manual only and never runs in CI.
+
 ### AUR bitty-bin prebuilt package (CTX-0138, issue #227)
 
 - New `packaging/PKGBUILD.bin` template for AUR `bitty-bin`: installs the prebuilt `bitty-x86_64-unknown-linux-gnu` release binary to `/usr/bin/bitty` (no user-side compile), real sha256 filled by the release workflow (never `SKIP` for the binary), `arch=('x86_64')` only, `provides=('bitty')`, `conflicts=('bitty' 'bitty-nightly' 'bitty-git')`, plus `.desktop`/icons from the release source tarball.

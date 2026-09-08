@@ -732,6 +732,91 @@ mod tests {
             "denials must not enqueue (nothing to drain, nothing to time out)"
         );
     }
+
+    /// RAII hermeticity for the process-global queue + waker slot: other
+    /// tests share both, so restore unconditionally on drop.
+    struct ControlWakeGuard;
+
+    impl ControlWakeGuard {
+        fn take() -> Self {
+            while pop_pending_control().is_some() {}
+            set_control_waker(None);
+            Self
+        }
+    }
+
+    impl Drop for ControlWakeGuard {
+        fn drop(&mut self) {
+            set_control_waker(None);
+            while pop_pending_control().is_some() {}
+        }
+    }
+
+    #[test]
+    fn enqueue_fires_control_waker_without_any_drain() {
+        // CTX-0235 regression: on an idle window the event loop sleeps in
+        // `Wait` with no PTY damage, so nothing drains the control queue and
+        // every verb times out. The enqueue path must therefore wake the
+        // loop. This crate has no runtime and no render tick, so a wake that
+        // fires here proves the wakeup precedes any drain.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _guard = ControlWakeGuard::take();
+        let wakes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+        let probe = std::sync::Arc::clone(&wakes);
+        set_control_waker(Some(std::sync::Arc::new(move || {
+            probe.fetch_add(1, Ordering::SeqCst);
+            let _ = wake_tx.send(());
+        })));
+
+        let granted = ScopeSet::cli_default();
+        let worker = std::thread::spawn(move || {
+            enqueue_control_and_wait(METHOD_LIST_VIEWS, None, "1", &granted)
+        });
+
+        // The wakeup must fire promptly while the waiter is still blocked
+        // and nothing has drained: pre-fix this times out (no waker exists).
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("enqueue must wake the event loop without any drain running");
+        assert!(
+            wakes.load(Ordering::SeqCst) >= 1,
+            "waker must fire at least once per enqueue"
+        );
+
+        // Complete the waiter's reply with a single pop (the drain side is
+        // the app's job; here we only prove the waiter unblocks with the
+        // reply it was given).
+        let item = pop_pending_control().expect("enqueue must have queued one action");
+        assert_eq!(item.method, METHOD_LIST_VIEWS);
+        item.reply
+            .send(ControlReply {
+                ok: true,
+                result_json: String::from("{\"views\":[]}"),
+                category: "",
+                code: "",
+                message: String::new(),
+            })
+            .expect("waiter must still be blocked on the reply");
+        let reply = worker.join().expect("worker thread must finish");
+        assert!(reply.ok, "waiter must receive the drained reply: {reply:?}");
+
+        // Security lens: denials authorize-fail before enqueue, so they must
+        // neither queue nor wake (the wakeup grants nothing and fires only
+        // on successful enqueue).
+        let wakes_before = wakes.load(Ordering::SeqCst);
+        let empty = ScopeSet::new();
+        let denied = enqueue_control_and_wait(METHOD_CLOSE_TERMINAL, None, "2", &empty);
+        assert!(!denied.ok);
+        assert_eq!(denied.code, "ScopeDenied");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            wakes_before,
+            "scope denials must not wake the event loop"
+        );
+        assert!(pop_pending_control().is_none());
+    }
 }
 
 // ── elevation allowlist (pre-granted per-instance, explicit) ───────────────
@@ -824,6 +909,49 @@ pub fn clear_control_queue_for_tests() {
     }
 }
 
+/// Cross-thread event-loop wakeup hook (CTX-0235).
+///
+/// The control queue is drained by the main thread inside its event loop
+/// (`drive_tick`), which sleeps in `ControlFlow::Wait` when idle. Without a
+/// wakeup, an enqueue on an idle window sits until incidental damage wakes
+/// the loop, so every verb times out. The hook is plain `std` (no winit
+/// dependency in this crate): the app installs a closure that pings its
+/// `EventLoopProxy`, and [`enqueue_control_and_wait`] fires it once per
+/// successful enqueue, after the item is queued. Best-effort: a missing or
+/// failed wake only restores the pre-CTX-0235 timing behavior; the drain
+/// path and its scope/elevation checks are unchanged.
+pub type ControlWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
+
+fn control_waker_slot() -> &'static std::sync::Mutex<Option<ControlWaker>> {
+    static WAKER: std::sync::OnceLock<std::sync::Mutex<Option<ControlWaker>>> =
+        std::sync::OnceLock::new();
+    WAKER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Install (or clear with `None`) the event-loop wakeup hook.
+///
+/// Called once by the app when it receives its event-loop proxy; tests use
+/// `None` to restore the hermetic default.
+pub fn set_control_waker(waker: Option<ControlWaker>) {
+    if let Ok(mut slot) = control_waker_slot().lock() {
+        *slot = waker;
+    }
+}
+
+/// Fire the installed wakeup hook once (best-effort, never panics).
+///
+/// The slot lock is released before invoking the hook so a waker can never
+/// deadlock against queue operations.
+fn wake_event_loop_for_control() {
+    let waker: Option<ControlWaker> = control_waker_slot()
+        .lock()
+        .map(|slot| (*slot).clone())
+        .unwrap_or(None);
+    if let Some(wake) = waker {
+        wake();
+    }
+}
+
 /// Enqueue a control action and wait for the main thread to apply it.
 ///
 /// Called on IPC connection threads (via `devtools` handlers). Authorizes
@@ -890,6 +1018,11 @@ pub fn enqueue_control_and_wait(
         }
         guard.push_back(pending);
     }
+    // CTX-0235: wake the event loop after queueing (never while holding the
+    // queue lock) so an idle window drains promptly instead of timing out.
+    // Authorization already passed above and re-runs at drain; the wakeup
+    // grants nothing and bypasses no check.
+    wake_event_loop_for_control();
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(reply) => reply,
         Err(_) => ControlReply {

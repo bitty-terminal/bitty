@@ -4473,12 +4473,26 @@ impl AppHandler for TerminalApp {
         // signal (plus once on EOF). `Mutex` keeps the closure `Send + Sync`
         // even if the proxy is only `Send`.
         let shared = std::sync::Arc::new(std::sync::Mutex::new(waker));
+        let shared_pty = std::sync::Arc::clone(&shared);
         let pty_waker: bitty_runtime::PtyWaker = std::sync::Arc::new(move || {
-            if let Ok(w) = shared.lock() {
+            if let Ok(w) = shared_pty.lock() {
                 w.wake_pty();
             }
         });
         self.runtime.set_pty_waker(pty_waker);
+        // CTX-0235: wake the same event loop when an IPC control action is
+        // enqueued, so an idle window (`ControlFlow::Wait`, no PTY damage)
+        // drains the control queue promptly instead of letting every verb
+        // time out. The wakeup reuses the PTY-readability signal because
+        // that arm already drains the control queue first via `drive_tick`;
+        // it grants nothing — `drain_global_control_queue` re-authorizes
+        // every action against the servo scopes before applying.
+        if let Ok(w) = shared.lock() {
+            let control_proxy = w.clone();
+            bitty_ipc::ctl::set_control_waker(Some(std::sync::Arc::new(move || {
+                control_proxy.wake_pty();
+            })));
+        }
         eprintln!("bitty: pty wakeup armed (event-loop proxy)");
     }
 

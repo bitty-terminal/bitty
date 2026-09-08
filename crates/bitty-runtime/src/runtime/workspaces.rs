@@ -581,6 +581,9 @@ mod tests {
         assert!(!rt.has_pending_ws_close());
     }
 
+    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest
+    // (Windows ConPTY backend is unimplemented, so spawn fails there).
+    #[cfg(unix)]
     #[test]
     fn live_close_needs_repeat_confirm_and_kills() {
         let mut rt = fresh();
@@ -640,6 +643,9 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
     }
 
+    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest
+    // (Windows ConPTY backend is unimplemented, so spawn fails there).
+    #[cfg(unix)]
     #[test]
     fn pending_arm_survives_switch_and_dies_with_workspace() {
         let mut rt = fresh();

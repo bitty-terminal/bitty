@@ -64,6 +64,17 @@ pub const DEFAULT_WINDOW_PADDING: u32 = 8;
 /// see above).
 pub const MAX_WINDOW_PADDING: u32 = 64;
 
+/// Default window corner radius in physical px (CTX-0241 S0).
+/// Mirrors `bitty-config` `DEFAULT_WINDOW_RADIUS_PX` (`0`; kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_WINDOW_RADIUS_PX: u32 = 0;
+
+/// Maximum window corner radius in physical px (CTX-0241 S0).
+/// Mirrors `bitty-config` `MAX_WINDOW_RADIUS_PX` (`0..=24`; see above).
+pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
+
 /// Default scrollbar thumb width in logical pixels (CTX-0181).
 /// Mirrors `bitty-config` `DEFAULT_SCROLLBAR_WIDTH` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
@@ -139,6 +150,12 @@ pub struct RuntimeConfig {
     /// the padding before dividing by the cell metrics, so the window —
     /// not the grid — absorbs the inset.
     pub window_padding: u32,
+    /// Window corner radius in physical px (CTX-0241 S0 `window.radius_px`).
+    /// `0..=MAX_WINDOW_RADIUS_PX`; default `DEFAULT_WINDOW_RADIUS_PX` (`0`
+    /// = square corners). S0 is a parsed no-op: accepted, stored, and
+    /// reported, with zero render effect (no DrawList/present consumer reads
+    /// this field). Default 0 keeps every path on the zero-cost fast path.
+    pub window_radius_px: u32,
     /// Overlay scrollbar display mode (CTX-0181 `scrollbar.mode`).
     /// Default `Hidden` = geometry-neutral (zero pixels, zero layout delta).
     /// `Always` paints the thumb whenever scrollback exists; `Auto` reveals
@@ -177,6 +194,7 @@ impl Default for RuntimeConfig {
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             window_padding: DEFAULT_WINDOW_PADDING,
+            window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
             scrollbar_width: DEFAULT_SCROLLBAR_WIDTH,
         }
@@ -206,6 +224,7 @@ impl RuntimeConfig {
         gaps_in: u16,
         gaps_out: u16,
         window_padding: u32,
+        window_radius_px: u32,
         scrollbar_mode: bitty_ui::ScrollbarMode,
         scrollbar_width: u32,
     ) -> Result<Self, RuntimeError> {
@@ -224,6 +243,7 @@ impl RuntimeConfig {
             gaps_in,
             gaps_out,
             window_padding,
+            window_radius_px,
             scrollbar_mode,
             scrollbar_width,
         };
@@ -279,6 +299,11 @@ impl RuntimeConfig {
         if self.window_padding > MAX_WINDOW_PADDING {
             return Err(RuntimeError::InvalidConfig(
                 "window_padding must be within [0, 64] logical pixels",
+            ));
+        }
+        if self.window_radius_px > MAX_WINDOW_RADIUS_PX {
+            return Err(RuntimeError::InvalidConfig(
+                "window_radius_px must be within [0, 24] physical pixels",
             ));
         }
         if !(MIN_SCROLLBAR_WIDTH_PX..=MAX_SCROLLBAR_WIDTH_PX).contains(&self.scrollbar_width) {
@@ -407,6 +432,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -427,6 +453,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -447,6 +474,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -467,6 +495,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -487,6 +516,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -512,6 +542,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -532,6 +563,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -552,6 +584,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -572,6 +605,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -591,6 +625,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -609,6 +644,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -634,6 +670,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -652,6 +689,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -682,6 +720,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Auto,
             12,
         )
@@ -701,6 +740,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 0,
             )
@@ -721,6 +761,7 @@ mod tests {
                 0,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 33,
             )
@@ -758,6 +799,7 @@ mod tests {
             0,
             0,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -776,6 +818,7 @@ mod tests {
             16,
             16,
             8,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -795,6 +838,7 @@ mod tests {
                 17,
                 0,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -815,6 +859,7 @@ mod tests {
                 0,
                 17,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -835,6 +880,7 @@ mod tests {
                 u16::MAX,
                 u16::MAX,
                 8,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -864,6 +910,7 @@ mod tests {
             0,
             0,
             0,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -882,6 +929,7 @@ mod tests {
             0,
             0,
             64,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -901,6 +949,7 @@ mod tests {
                 0,
                 0,
                 65,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -921,6 +970,7 @@ mod tests {
                 0,
                 0,
                 u32::MAX,
+                DEFAULT_WINDOW_RADIUS_PX,
                 bitty_ui::ScrollbarMode::Hidden,
                 DEFAULT_SCROLLBAR_WIDTH
             )
@@ -954,6 +1004,7 @@ mod tests {
             0,
             0,
             0,
+            DEFAULT_WINDOW_RADIUS_PX,
             bitty_ui::ScrollbarMode::Hidden,
             DEFAULT_SCROLLBAR_WIDTH,
         )
@@ -979,5 +1030,83 @@ mod tests {
             cfg.grid_from_window_pixels(bitty_platform::PhysicalSize::new(10, 10)),
             (1, 1)
         );
+    }
+
+    #[test]
+    fn window_radius_default_and_bounds() {
+        // CTX-0241 S0: default 0 = square no-op (zero-cost fast path);
+        // bounds `0..=24` fail closed. Radius never affects extents
+        // (no-op proof lives in `tests/window_radius_noop.rs`).
+        const { assert!(DEFAULT_WINDOW_RADIUS_PX == 0) }
+        const { assert!(MAX_WINDOW_RADIUS_PX == 24) }
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.window_radius_px, DEFAULT_WINDOW_RADIUS_PX);
+        for radius in [0, 1, 12, MAX_WINDOW_RADIUS_PX] {
+            RuntimeConfig::new(
+                80,
+                24,
+                9,
+                19,
+                256,
+                "mono",
+                12.0,
+                3,
+                16,
+                true,
+                0,
+                0,
+                8,
+                radius,
+                bitty_ui::ScrollbarMode::Hidden,
+                DEFAULT_SCROLLBAR_WIDTH,
+            )
+            .expect("radius in range builds");
+        }
+        for bad in [MAX_WINDOW_RADIUS_PX + 1, u32::MAX] {
+            assert!(
+                RuntimeConfig::new(
+                    80,
+                    24,
+                    9,
+                    19,
+                    256,
+                    "mono",
+                    12.0,
+                    3,
+                    16,
+                    true,
+                    0,
+                    0,
+                    8,
+                    bad,
+                    bitty_ui::ScrollbarMode::Hidden,
+                    DEFAULT_SCROLLBAR_WIDTH,
+                )
+                .is_err(),
+                "radius {bad} must fail closed"
+            );
+        }
+        // Radius never changes the grid/window extents (parsed no-op).
+        let with_radius = RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            12,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("radius builds");
+        assert_eq!(with_radius.pixel_extent(), cfg.pixel_extent());
+        assert_eq!(with_radius.window_extent(), cfg.window_extent());
     }
 }

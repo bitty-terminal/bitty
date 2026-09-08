@@ -2385,6 +2385,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "window.radius_px",
+                        format!("{}", e.window.radius_px),
+                        &src("window.radius_px")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "terminal.scrollback",
                         format!("{}", e.terminal.scrollback),
                         &src("terminal.scrollback")
@@ -3619,6 +3627,10 @@ fn runtime_config_from_effective(
         .window
         .padding
         .min(bitty_runtime::config::MAX_WINDOW_PADDING);
+    // CTX-0241 S0: `window.radius_px` flows the same way (validated
+    // `0..=24` by `bitty-config`; clamped here so a future bound drift can
+    // never wrap the cast). S0 is a parsed no-op: stored on the runtime
+    // config with zero render effect (default 0 = zero-cost everywhere).
     // CTX-0181: `scrollbar` flows the same way. The mode enum is paired by
     // value (`bitty-runtime` owns no `bitty-config` dependency); the match
     // is total with a hidden-default fallback so a future variant drift can
@@ -3632,6 +3644,10 @@ fn runtime_config_from_effective(
         .scrollbar
         .width
         .min(bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX);
+    let window_radius_px = effective
+        .window
+        .radius_px
+        .min(bitty_runtime::config::MAX_WINDOW_RADIUS_PX);
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -3646,6 +3662,7 @@ fn runtime_config_from_effective(
         gaps_in,
         gaps_out,
         window_padding,
+        window_radius_px,
         scrollbar_mode,
         scrollbar_width,
     )
@@ -6422,9 +6439,21 @@ mod tests {
         // crate defaults stay equal (bitty-runtime must not depend on
         // bitty-config, so the pairing is by value, pinned here). Default
         // preserves the 8px breathing room for existing users.
+        // CTX-0241 S0: `window.radius_px` rides the same path as a parsed
+        // no-op (default 0, zero render effect); existing `{ opacity,
+        // padding }` tables default it to 0 end to end.
         assert_eq!(
             bitty_runtime::config::DEFAULT_WINDOW_PADDING,
             bitty_config::EffectiveConfig::default().window.padding
+        );
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_WINDOW_RADIUS_PX,
+            bitty_config::EffectiveConfig::default().window.radius_px
+        );
+        assert_eq!(
+            bitty_runtime::config::MAX_WINDOW_RADIUS_PX,
+            bitty_config::types::MAX_WINDOW_RADIUS_PX,
+            "runtime bound must match config validation (`must be <= 24`)"
         );
         assert_eq!(
             bitty_runtime::config::MAX_WINDOW_PADDING,
@@ -6444,6 +6473,13 @@ mod tests {
         assert_eq!(merged.effective.window.padding, 4);
         let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
         assert_eq!(cfg.window_padding, 4);
+        // CTX-0241 S0: legacy table without `radius_px` defaults to 0.
+        assert_eq!(merged.effective.window.radius_px, 0);
+        assert_eq!(cfg.window_radius_px, 0);
+        assert_eq!(
+            merged.source_of("window.radius_px").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
         assert_eq!(
             merged.source_of("window.padding").unwrap().layer,
             bitty_config::plan::LayerKind::User
@@ -6466,6 +6502,14 @@ mod tests {
             cfg2.window_padding,
             bitty_runtime::config::DEFAULT_WINDOW_PADDING
         );
+        assert_eq!(
+            merged2.effective.window.radius_px,
+            bitty_runtime::config::DEFAULT_WINDOW_RADIUS_PX
+        );
+        assert_eq!(
+            cfg2.window_radius_px,
+            bitty_runtime::config::DEFAULT_WINDOW_RADIUS_PX
+        );
         // Oversized padding fails closed at the file layer (never runtime).
         let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
         parse_lua_config(
@@ -6473,6 +6517,46 @@ mod tests {
             &src3,
         )
         .expect_err("must fail");
+    }
+
+    #[test]
+    fn runtime_config_inherits_file_window_radius_noop() {
+        // CTX-0241 S0: `window.radius_px` (physical px, `0..=24`, default 0)
+        // flows file -> effective -> runtime as a parsed no-op: accepted,
+        // stored, reported, zero render effect (proved in
+        // `bitty-runtime/tests/window_radius_noop.rs`).
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 12 } }"#,
+            &src,
+        )
+        .expect("window radius parses");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert_eq!(merged.effective.window.radius_px, 12);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime builds");
+        assert_eq!(cfg.window_radius_px, 12);
+        assert_eq!(
+            merged.source_of("window.radius_px").unwrap().layer,
+            LayerKind::User
+        );
+        // Fail-closed validation: negative / oversized / float radius never
+        // reaches runtime (file layer rejects with the field path).
+        for bad in [
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = -1 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 25 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 100 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 1.5 } }"#,
+        ] {
+            let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+            let err = parse_lua_config(bad, &src).expect_err("must fail");
+            assert!(
+                err.to_string().contains("window.radius_px"),
+                "bad radius must name field: {err}"
+            );
+        }
     }
 
     #[test]

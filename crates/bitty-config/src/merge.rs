@@ -65,6 +65,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "font.letter_spacing"
         | "window.opacity"
         | "window.padding"
+        | "window.radius_px"
         | "terminal.scrollback"
         | "terminal.shell"
         | "terminal.scroll_lines_per_notch"
@@ -292,7 +293,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         }
 
         if let Some(win) = &plan.window {
-            for field in ["window.opacity", "window.padding"] {
+            for field in ["window.opacity", "window.padding", "window.radius_px"] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
                 } else if let Some(policy_src) = policy_fields.get(field) {
@@ -313,6 +314,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 match field {
                     "window.opacity" => effective.window.opacity = win.opacity,
                     "window.padding" => effective.window.padding = win.padding,
+                    "window.radius_px" => effective.window.radius_px = win.radius_px,
                     _ => {}
                 }
                 record_attribution(
@@ -757,6 +759,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "font",
         "window.opacity",
         "window.padding",
+        "window.radius_px",
         "window",
         "terminal.scrollback",
         "terminal.shell",
@@ -878,7 +881,7 @@ fn merge_layers_allow_policy_violations(
             }
         }
         if let Some(win) = &plan.window {
-            for field in ["window.opacity", "window.padding"] {
+            for field in ["window.opacity", "window.padding", "window.radius_px"] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
                 } else if let Some(policy_src) = policy_fields.get(field) {
@@ -899,6 +902,7 @@ fn merge_layers_allow_policy_violations(
                 match field {
                     "window.opacity" => effective.window.opacity = win.opacity,
                     "window.padding" => effective.window.padding = win.padding,
+                    "window.radius_px" => effective.window.radius_px = win.radius_px,
                     _ => {}
                 }
                 record_attribution(
@@ -1286,6 +1290,7 @@ fn merge_layers_allow_policy_violations(
         "font",
         "window.opacity",
         "window.padding",
+        "window.radius_px",
         "window",
         "terminal.scrollback",
         "terminal.shell",
@@ -1485,6 +1490,7 @@ mod tests {
                 window: Some(WindowConfig {
                     opacity: 0.9,
                     padding: 4,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1496,6 +1502,7 @@ mod tests {
                 window: Some(WindowConfig {
                     opacity: 1.0,
                     padding: 8,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1513,6 +1520,7 @@ mod tests {
                 window: Some(WindowConfig {
                     opacity: 0.9,
                     padding: 4,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1524,6 +1532,7 @@ mod tests {
                 window: Some(WindowConfig {
                     opacity: 1.0,
                     padding: 8,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1662,6 +1671,12 @@ mod tests {
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("layout"), Some(MergeClass::DeepMerge));
+        // CTX-0241 S0: window radius is a scalar-replace leaf under `window`.
+        assert_eq!(
+            merge_class_for("window.radius_px"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(merge_class_for("window"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("unknown"), None);
     }
 
@@ -1868,6 +1883,72 @@ mod tests {
         assert_eq!(merged3.effective.layout.gaps_out, 0);
         assert_eq!(
             merged3.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn window_radius_merges_scalar_replace_with_attribution() {
+        // CTX-0241 S0: user radius lands in effective with user attribution;
+        // later layers win; empty stack keeps 0 with core-defaults source.
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 12,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.window.radius_px, 12);
+        assert_eq!(
+            merged.source_of("window.radius_px").unwrap().layer,
+            LayerKind::User
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 6,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                window: Some(WindowConfig {
+                    opacity: 1.0,
+                    padding: 8,
+                    radius_px: 12,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(merged2.effective.window.radius_px, 6);
+        assert_eq!(
+            merged2.source_of("window.radius_px").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "window.radius_px")
+        );
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert_eq!(merged3.effective.window.radius_px, 0);
+        assert_eq!(
+            merged3.source_of("window.radius_px").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

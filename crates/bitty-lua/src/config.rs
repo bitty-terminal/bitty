@@ -117,6 +117,8 @@ pub struct WindowData {
     pub opacity: Option<f64>,
     /// Padding.
     pub padding: Option<i64>,
+    /// Corner radius in physical px (CTX-0241 S0: parsed no-op, default 0).
+    pub radius_px: Option<i64>,
 }
 
 /// Terminal overrides, plain data (see [`FontData`] for `Option` semantics).
@@ -654,7 +656,7 @@ impl ConfigData {
                 }
                 "window" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["opacity", "padding"])?;
+                    check_nested_keys(key, nested, &["opacity", "padding", "radius_px"])?;
                     let opacity = match get_field(nested, "opacity") {
                         Some(v) => Some(expect_number("window.opacity", v)?),
                         None => None,
@@ -663,7 +665,15 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("window.padding", v)?),
                         None => None,
                     };
-                    out.window = Some(WindowData { opacity, padding });
+                    let radius_px = match get_field(nested, "radius_px") {
+                        Some(v) => Some(expect_integer("window.radius_px", v)?),
+                        None => None,
+                    };
+                    out.window = Some(WindowData {
+                        opacity,
+                        padding,
+                        radius_px,
+                    });
                 }
                 "terminal" => {
                     let nested = expect_table(key, val)?;
@@ -955,11 +965,24 @@ mod tests {
         let window = data.window.unwrap();
         assert!((window.opacity.unwrap() - 0.95).abs() < f64::EPSILON);
         assert_eq!(window.padding, Some(8));
+        // CTX-0241 S0: absent radius key means "says nothing" (None).
+        assert_eq!(window.radius_px, None);
         let term = data.terminal.unwrap();
         assert_eq!(term.scrollback, Some(10000));
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
         assert_eq!(term.scroll_lines_per_notch, Some(3));
         assert_eq!(term.scroll_pixels_per_notch, Some(16));
+    }
+
+    #[test]
+    fn window_radius_extracts_and_absent_means_no_override() {
+        // CTX-0241 S0: explicit integer parses; absent key is `None` so
+        // merge keeps the lower-precedence value (0 when no layer sets it).
+        let data = eval_ok(r#"return { window = { opacity = 1.0, padding = 8, radius_px = 12 } }"#);
+        let window = data.window.unwrap();
+        assert_eq!(window.radius_px, Some(12));
+        let data = eval_ok(r#"return { window = { opacity = 1.0, padding = 8 } }"#);
+        assert_eq!(data.window.unwrap().radius_px, None);
     }
 
     #[test]

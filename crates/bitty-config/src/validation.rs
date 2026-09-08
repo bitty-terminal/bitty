@@ -203,6 +203,7 @@ mod tests {
             window: Some(WindowConfig {
                 opacity: 2.0,
                 padding: 0,
+                ..Default::default()
             }),
             undeclared_fields: vec!["oops".into()],
             ..Default::default()

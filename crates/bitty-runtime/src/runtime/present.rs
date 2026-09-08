@@ -389,10 +389,19 @@ impl Runtime {
             // one shell across N tiles (live three-column repeat + marker
             // in an unexpected tile after zoom-off). The single-pane path
             // is unchanged (the sole leaf is focused, so it keeps primary).
+            // CTX-0255: mixed shape (session-less primary home plus live
+            // pane sessions — the keymap-split live path) must co-paint:
+            // every session-less leaf keeps the shared primary grid even
+            // while unfocused, otherwise focusing the pane blanks the
+            // primary home tile (live 02-focus-v2 left blank, 03-refocus-v1
+            // both repaint). Pure session-less shape (no session anywhere)
+            // keeps the CTX-0234 focused-only fallback so one grid never
+            // duplicates across N tiles.
             let focused_id = self.focus.focused();
             let pane_snap: Option<Snapshot> = match self.pane_sessions.get(view_id) {
                 Some(sess) => Some(sess.state.snapshot()),
                 None if Some(*view_id) == focused_id => Some(snapshot.clone()),
+                None if !self.pane_sessions.is_empty() => Some(snapshot.clone()),
                 None => None,
             };
             // Erased source for session-less, unfocused leaves;

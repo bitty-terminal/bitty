@@ -1486,6 +1486,8 @@ mod tests {
         )
     }
 
+    // POSIX-only: the live-close test below spawns /bin/sh (absent on Windows).
+    #[cfg(unix)]
     fn esc_press() -> WindowEventKind {
         WindowEventKind::KeyboardInput(KeyEvent {
             logical_key: LogicalKey::Named(NamedKey::Escape),
@@ -1523,6 +1525,8 @@ mod tests {
         assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
     }
 
+    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest.
+    #[cfg(unix)]
     #[test]
     fn chrome_workspace_close_live_pends_esc_cancels_repeat_kills() {
         use bitty_config::ChromeAction;

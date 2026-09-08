@@ -654,6 +654,33 @@ pub enum TerminalAction {
         /// Remaining payload segments re-joined with `;`, length-bounded.
         data: BoundedBytes,
     },
+    /// Completed Kitty graphics transmission (`APC G ... ST`, CTX-0256).
+    ///
+    /// The parser pre-scans `APC` (which `vte` 0.15 leaves inert), parses the
+    /// `G` control parameters, base64-decodes the payload with a fail-closed
+    /// alphabet check, reassembles chunked `m=1`/`m=0` streams under the
+    /// ledger cap, and emits exactly one action per completed transmission.
+    /// Terminal state treats this as inert (images live in the runtime
+    /// `KittyImageLayer`); the runtime routes it to
+    /// `kitty_transmit`/`kitty_display_image`, preserving transmit-only
+    /// (`a=t` stores without painting) and unknown-action
+    /// (stored-not-painted) semantics from CTX-0248.
+    KittyGraphics {
+        /// Wire `f=` format value (`100` PNG, `24` RGB, `32` RGBA).
+        format_f: u32,
+        /// Wire `s=` width for raw formats (`None` when absent; ignored for PNG).
+        width_s: Option<u32>,
+        /// Wire `v=` height for raw formats (`None` when absent; ignored for PNG).
+        height_v: Option<u32>,
+        /// Wire `a=` display action (`None` when absent means transmit-and-display).
+        action_a: Option<char>,
+        /// Wire `c=` explicit cell columns (`0` derives from pixels).
+        cols_c: u16,
+        /// Wire `r=` explicit cell rows (`0` derives from pixels).
+        rows_r: u16,
+        /// Base64-decoded payload bytes (assembled across `m=` chunks).
+        payload: Box<[u8]>,
+    },
 
     // Unknown escape families
     /// A CSI/ESC/DCS sequence with no mapped action family (coverage-rule

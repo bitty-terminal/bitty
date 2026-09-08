@@ -1024,6 +1024,10 @@ impl State {
                 self.record_zone(*kind, *exit_code);
             }
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
+            // Kitty graphics (CTX-0256): grid truth is untouched. Images live
+            // in the runtime `KittyImageLayer`, which routes this action to
+            // `kitty_display_image`; state stays inert by design.
+            TerminalAction::KittyGraphics { .. } => {}
 
             TerminalAction::Unknown(report) => match report.kind {
                 SequenceKind::Csi => self.telemetry.unknown_csi += 1,

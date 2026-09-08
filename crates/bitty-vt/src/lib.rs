@@ -21,6 +21,11 @@
 //! - **Zero unsafe.** The workspace denies `unsafe_code`; this crate adds no
 //!   exception to that rule.
 //!
+//! Kitty `APC G` wiring (CTX-0256) pre-scans `APC` (which `vte` 0.15 leaves
+//! inert), base64-decodes with a fail-closed alphabet check, and reassembles
+//! `m=` chunks under the ledger cap. Rejections warn via `stderr`
+//! (diagnostic only, no state change) and emit no action.
+//!
 //! # Example
 //!
 //! ```
@@ -48,6 +53,7 @@
 
 mod action;
 mod bounded;
+pub mod kitty_apc;
 mod parser;
 
 pub use action::{
@@ -57,4 +63,9 @@ pub use action::{
     StatusKind, TabTargets, TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
+pub use kitty_apc::{
+    KITTY_APC_DECODE_MAX_BYTES, KITTY_APC_DECODE_MAX_DIMENSION, KITTY_APC_DECODE_MAX_PIXELS,
+    KITTY_APC_LEDGER_CAP, KittyApcAssembler, KittyApcParams, KittyApcReject, KittyCompleted,
+    KittyFeedOutcome,
+};
 pub use parser::Parser;

@@ -505,6 +505,29 @@ impl Runtime {
                     }
                 }
             }
+            // Kitty graphics (CTX-0256): the parser already base64-unwrapped
+            // and reassembled `m=` chunks under the ledger cap, so `payload`
+            // is decoded bytes ready for the existing intake seam. Route to
+            // `kitty_display_image`, preserving transmit-only (`a=t` stores
+            // without painting) and unknown-action (stored-not-painted)
+            // semantics from CTX-0248. Failures store nothing and paint
+            // nothing; warn loudly (parser already warned on base64/caps).
+            if let TerminalAction::KittyGraphics {
+                format_f,
+                width_s,
+                height_v,
+                action_a,
+                cols_c,
+                rows_r,
+                payload,
+            } = &action
+            {
+                if let Err(err) = self.kitty_display_image(
+                    *format_f, *width_s, *height_v, *action_a, *cols_c, *rows_r, payload, 0,
+                ) {
+                    eprintln!("bitty: rejecting kitty image ({err}): stored nothing");
+                }
+            }
             let damage = self.state.apply(&action);
             // Keep input-related mode caches in sync (Kitty, mouse capture)
             self.kitty_flags = self.state.modes().kitty_keyboard;

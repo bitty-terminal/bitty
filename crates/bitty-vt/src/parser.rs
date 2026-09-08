@@ -26,6 +26,7 @@ use crate::action::{
     StatusKind, TabTargets, TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
+use crate::kitty_apc::{KittyApcAssembler, KittyFeedOutcome};
 use vte::{Params, Perform};
 
 /// Stateful byte-stream parser: wraps a `vte::Parser` and translates its
@@ -33,15 +34,30 @@ use vte::{Params, Perform};
 ///
 /// No terminal state lives here; see the crate-level documentation for the
 /// parser/state split mandated by ADR-0003.
+///
+/// Kitty `APC G` is pre-scanned here because `vte` 0.15 leaves
+/// `SOS/PM/APC` strings inert with no callback. Complete `APC` buffers are
+/// fed to [`KittyApcAssembler`] (base64 unwrap, `m=` reassembly under the
+/// ledger cap); completed transmissions emit
+/// [`TerminalAction::KittyGraphics`]. All other `APC` (and `PM`/`SOS`,
+/// which stay with `vte`) remain inert.
 pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
+    kitty: KittyApcAssembler,
+    apc_buf: Vec<u8>,
+    in_apc: bool,
+    apc_discarding: bool,
+    held_esc: bool,
+    held_in_apc: bool,
 }
 
 impl std::fmt::Debug for Parser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Parser")
             .field("dcs", &self.dcs)
+            .field("in_apc", &self.in_apc)
+            .field("kitty_pending", &self.kitty.has_pending())
             .finish_non_exhaustive()
     }
 }
@@ -62,7 +78,41 @@ impl Parser {
         Self {
             state_machine: vte::Parser::new(),
             dcs: PendingDcs::default(),
+            kitty: KittyApcAssembler::new(),
+            apc_buf: Vec::new(),
+            in_apc: false,
+            apc_discarding: false,
+            held_esc: false,
+            held_in_apc: false,
         }
+    }
+
+    /// Creates a parser with a custom kitty ledger cap (tests exercise cap
+    /// behavior without allocating hundreds of megabytes).
+    #[must_use]
+    pub fn with_ledger_cap(ledger_cap: usize) -> Self {
+        Self {
+            state_machine: vte::Parser::new(),
+            dcs: PendingDcs::default(),
+            kitty: KittyApcAssembler::with_ledger_cap(ledger_cap),
+            apc_buf: Vec::new(),
+            in_apc: false,
+            apc_discarding: false,
+            held_esc: false,
+            held_in_apc: false,
+        }
+    }
+
+    /// Kitty ledger cap in effect (max raw `APC` / encoded bytes in flight).
+    #[must_use]
+    pub const fn ledger_cap(&self) -> usize {
+        self.kitty.ledger_cap()
+    }
+
+    /// Whether a kitty `m=1` stream is open awaiting more chunks.
+    #[must_use]
+    pub fn has_pending_kitty(&self) -> bool {
+        self.kitty.has_pending()
     }
 
     /// Feeds raw PTY bytes into the parser, emitting one [`TerminalAction`]
@@ -70,14 +120,181 @@ impl Parser {
     ///
     /// Parsing may be resumed across arbitrary chunk boundaries; splitting
     /// the same byte stream differently does not change the emitted action
-    /// sequence.
+    /// sequence. `APC` (`ESC _ ... ST`) never reaches `vte`: complete
+    /// buffers are routed to the kitty assembler, and completed `G`
+    /// transmissions emit [`TerminalAction::KittyGraphics`] in stream order.
+    /// Unterminated `APC` and held trailing `ESC` are buffered for the next
+    /// call.
     pub fn advance<F>(&mut self, bytes: &[u8], emit: F)
     where
         F: FnMut(TerminalAction),
     {
-        let Self { state_machine, dcs } = self;
+        let Self {
+            state_machine,
+            dcs,
+            kitty,
+            apc_buf,
+            in_apc,
+            apc_discarding,
+            held_esc,
+            held_in_apc,
+        } = self;
         let mut bridge = Bridge { emit, dcs };
-        state_machine.advance(&mut bridge, bytes);
+        let mut i = 0;
+
+        // Resolve a trailing ESC held from the previous call.
+        if *held_esc {
+            if bytes.is_empty() {
+                return;
+            }
+            let next = bytes[0];
+            if *held_in_apc {
+                *held_esc = false;
+                if next == b'\\' {
+                    i = 1;
+                    terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                } else if *apc_discarding {
+                    // Over-cap discard continues: the held ESC was payload.
+                    i = 1;
+                } else {
+                    // Abort the raw APC (malformed: ESC without ST).
+                    apc_buf.clear();
+                    *in_apc = false;
+                    if next == b'_' {
+                        *in_apc = true;
+                        *apc_discarding = false;
+                        i = 1;
+                    } else {
+                        state_machine.advance(&mut bridge, &[0x1B]);
+                        i = 0;
+                    }
+                }
+            } else {
+                *held_esc = false;
+                if next == b'_' {
+                    *in_apc = true;
+                    *apc_discarding = false;
+                    apc_buf.clear();
+                    i = 1;
+                } else {
+                    state_machine.advance(&mut bridge, &[0x1B]);
+                    i = 0;
+                }
+            }
+        }
+
+        while i < bytes.len() {
+            if *in_apc {
+                let b = bytes[i];
+                if b == 0x1B {
+                    if i + 1 >= bytes.len() {
+                        *held_esc = true;
+                        *held_in_apc = true;
+                        break;
+                    }
+                    let nxt = bytes[i + 1];
+                    if nxt == b'\\' {
+                        i += 2;
+                        terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                    } else if *apc_discarding {
+                        // Stay discarding; the ESC was over-cap payload.
+                        i += 1;
+                    } else {
+                        apc_buf.clear();
+                        *in_apc = false;
+                        if nxt == b'_' {
+                            *in_apc = true;
+                            *apc_discarding = false;
+                            i += 2;
+                        } else {
+                            state_machine.advance(&mut bridge, &[0x1B]);
+                            i += 1;
+                        }
+                    }
+                } else if b == 0x07 || b == 0x9C {
+                    i += 1;
+                    terminate_apc(&mut bridge, kitty, apc_buf, in_apc, apc_discarding);
+                } else if b == 0x18 || b == 0x1A {
+                    i += 1;
+                    apc_buf.clear();
+                    *in_apc = false;
+                    *apc_discarding = false;
+                    state_machine.advance(&mut bridge, &[b]);
+                } else if *apc_discarding {
+                    i += 1;
+                } else if apc_buf.len() >= kitty.ledger_cap() {
+                    apc_buf.clear();
+                    *apc_discarding = true;
+                    // The current chunk is lost, so any in-flight `m=` stream
+                    // it belonged to is corrupted: drop it fail-closed too.
+                    kitty.abort();
+                    eprintln!("bitty: rejecting kitty APC: raw exceeds ledger cap: stored nothing");
+                    i += 1;
+                } else {
+                    apc_buf.push(b);
+                    i += 1;
+                }
+            } else {
+                let b = bytes[i];
+                if b == 0x1B {
+                    if i + 1 >= bytes.len() {
+                        *held_esc = true;
+                        *held_in_apc = false;
+                        break;
+                    }
+                    if bytes[i + 1] == b'_' {
+                        *in_apc = true;
+                        *apc_discarding = false;
+                        apc_buf.clear();
+                        i += 2;
+                    } else {
+                        state_machine.advance(&mut bridge, &[0x1B]);
+                        i += 1;
+                    }
+                } else {
+                    // Note: C1 APC (0x9F) is intentionally not intercepted:
+                    // it overlaps UTF-8 continuation bytes (e.g. `🎉` contains
+                    // 0x9F), and kitty/chafa always use `ESC _`.
+                    state_machine.advance(&mut bridge, &[b]);
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Completes one `APC` buffer: routes `G` through the kitty assembler and
+/// emits [`TerminalAction::KittyGraphics`] on success. Over-cap discards
+/// clear silently here (already warned at overflow); assembler rejections
+/// already warned inside [`KittyApcAssembler`].
+fn terminate_apc<F: FnMut(TerminalAction)>(
+    bridge: &mut Bridge<'_, F>,
+    kitty: &mut KittyApcAssembler,
+    apc_buf: &mut Vec<u8>,
+    in_apc: &mut bool,
+    apc_discarding: &mut bool,
+) {
+    if *apc_discarding {
+        *in_apc = false;
+        *apc_discarding = false;
+        apc_buf.clear();
+        return;
+    }
+    let raw = std::mem::take(apc_buf);
+    *in_apc = false;
+    match kitty.feed(&raw) {
+        KittyFeedOutcome::NeedMore { .. } | KittyFeedOutcome::Rejected(_) => {}
+        KittyFeedOutcome::Completed(done) => {
+            bridge.emit(TerminalAction::KittyGraphics {
+                format_f: done.format_f,
+                width_s: done.width_s,
+                height_v: done.height_v,
+                action_a: done.action_a,
+                cols_c: done.cols_c,
+                rows_r: done.rows_r,
+                payload: done.payload,
+            });
+        }
     }
 }
 
@@ -2098,5 +2315,179 @@ mod tests {
             p.advance(std::slice::from_ref(b), |a| chunked.push(a));
         }
         assert_eq!(a1, chunked);
+    }
+
+    // — CTX-0256 APC G wiring: valid/invalid/base64-bad/oversize-claim at the
+    // parser level, chunked reassembly, and split-across-advance invariance.
+
+    fn kitty_action(actions: &[TerminalAction]) -> &TerminalAction {
+        assert_eq!(actions.len(), 1, "expected one action, got {actions:?}");
+        &actions[0]
+    }
+
+    #[test]
+    fn apc_g_valid_single_shot_emits_decoded_payload() {
+        // 2x2 opaque red RGBA (`f=32,s=2,v=2`), base64 `/wAA//8AAP//AAD//wAA/w==`.
+        let seq = b"\x1b_Gf=32,s=2,v=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\";
+        let actions = parse(seq);
+        match kitty_action(&actions) {
+            TerminalAction::KittyGraphics {
+                format_f,
+                width_s,
+                height_v,
+                action_a,
+                cols_c,
+                rows_r,
+                payload,
+            } => {
+                assert_eq!(*format_f, 32);
+                assert_eq!(*width_s, Some(2));
+                assert_eq!(*height_v, Some(2));
+                assert_eq!(*action_a, None);
+                assert_eq!(*cols_c, 0);
+                assert_eq!(*rows_r, 0);
+                assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+            }
+            other => panic!("expected KittyGraphics, got {other:?}"),
+        }
+        assert_eq!(parse(seq), actions, "re-parse must be deterministic");
+    }
+
+    #[test]
+    fn apc_g_bel_terminator_and_transmit_only() {
+        let seq = b"\x1b_Gf=32,s=1,v=1,a=t,m=0;/wAA/w==\x07";
+        match kitty_action(&parse(seq)) {
+            TerminalAction::KittyGraphics {
+                action_a, payload, ..
+            } => {
+                assert_eq!(*action_a, Some('t'));
+                assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF]);
+            }
+            other => panic!("expected KittyGraphics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apc_g_non_g_and_malformed_are_inert() {
+        // Non-G APC commands stay inert (pre-existing behavior preserved).
+        for seq in [
+            b"\x1b_Thello\x1b\\".as_slice(),
+            b"\x1b_ APC payload \x1b\\".as_slice(),
+            b"\x1b_Gf=abc,m=0;AA==\x1b\\".as_slice(),
+            b"\x1b_Gs=2,m=0;AA==\x1b\\".as_slice(),
+            b"\x1b_Gf=32,a=TT,m=0;AA==\x1b\\".as_slice(),
+            b"\x1b_Gf=32,m=2;AA==\x1b\\".as_slice(),
+        ] {
+            assert!(parse(seq).is_empty(), "inert failed for {seq:?}");
+            assert_eq!(parse(seq), parse(seq));
+        }
+    }
+
+    #[test]
+    fn apc_g_bad_base64_fails_closed() {
+        for seq in [
+            b"\x1b_Gf=32,s=1,v=1,m=0;!!!!\x1b\\".as_slice(),
+            b"\x1b_Gf=32,s=1,v=1,m=0;abcde\x1b\\".as_slice(),
+        ] {
+            let actions = parse(seq);
+            assert!(
+                actions.is_empty(),
+                "bad base64 must emit nothing for {seq:?}"
+            );
+            assert_eq!(parse(seq), actions);
+        }
+        // Parser holds no poisoned stream afterwards: a valid APC still routes.
+        let valid = b"\x1b_Gf=32,s=1,v=1,m=0;/wAA/w==\x1b\\";
+        assert_eq!(parse(valid).len(), 1);
+    }
+
+    #[test]
+    fn apc_g_oversize_claim_fails_closed_without_alloc() {
+        // 9000px side and 5000x5000 area exceed decode caps; payloads are two
+        // bytes, proving the claim gate fires before any pixel buffer.
+        for seq in [
+            b"\x1b_Gf=32,s=9000,v=1,m=0;AA==\x1b\\".as_slice(),
+            b"\x1b_Gf=32,s=5000,v=5000,m=0;AA==\x1b\\".as_slice(),
+        ] {
+            let actions = parse(seq);
+            assert!(
+                actions.is_empty(),
+                "oversize claim must emit nothing for {seq:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apc_g_oversize_accumulation_fails_closed() {
+        // Raw control overhead (~18B) must fit while encoded accumulation
+        // overflows: cap 40 fits first raw (26B) but rejects 8+33>40.
+        let mut parser = Parser::with_ledger_cap(40);
+        let mut actions = Vec::new();
+        parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+            actions.push(a)
+        });
+        assert!(actions.is_empty());
+        assert!(parser.has_pending_kitty());
+        // 8 + 33 > 40: drops the stream, emits nothing.
+        parser.advance(b"\x1b_Gm=1;AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x1b\\", |a| {
+            actions.push(a);
+        });
+        assert!(actions.is_empty());
+        assert!(!parser.has_pending_kitty());
+    }
+
+    #[test]
+    fn apc_g_chunked_reassembly_through_parser() {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(b"\x1b_Gf=32,s=2,v=2,m=1;/wAA//8A\x1b\\", |a| {
+            actions.push(a)
+        });
+        assert!(actions.is_empty());
+        parser.advance(b"middle-text", |a| actions.push(a));
+        // `middle-text` is 11 prints interleaved before completion.
+        assert_eq!(actions.len(), 11);
+        parser.advance(b"\x1b_Gm=1;AP//AAD/\x1b\\", |a| actions.push(a));
+        assert_eq!(actions.len(), 11, "middle chunk emits nothing");
+        parser.advance(b"\x1b_Gm=0;/wAA/w==\x1b\\", |a| actions.push(a));
+        assert_eq!(actions.len(), 12);
+        match &actions[11] {
+            TerminalAction::KittyGraphics { payload, .. } => {
+                assert_eq!(&**payload, &[0xFF, 0, 0, 0xFF].repeat(4));
+            }
+            other => panic!("expected KittyGraphics tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apc_g_split_across_advances_is_invariant() {
+        let seq = b"\x1b_Gf=32,s=2,v=2,a=T,c=2,r=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\";
+        let whole = parse(seq);
+        assert_eq!(whole.len(), 1);
+        // Byte-wise feed must match.
+        let mut parser = Parser::new();
+        let mut byte_wise = Vec::new();
+        for b in seq.iter() {
+            parser.advance(std::slice::from_ref(b), |a| byte_wise.push(a));
+        }
+        assert_eq!(whole, byte_wise);
+        // Split inside the ST terminator (ESC held across calls).
+        let mut parser = Parser::new();
+        let mut split_st = Vec::new();
+        let cut = seq.len() - 1;
+        parser.advance(&seq[..cut], |a| split_st.push(a));
+        assert!(split_st.is_empty(), "ESC held without ST emits nothing yet");
+        parser.advance(&seq[cut..], |a| split_st.push(a));
+        assert_eq!(whole, split_st);
+        // Surrounding text keeps order: Print, KittyGraphics, Print.
+        let mut mixed = Vec::new();
+        mixed.extend_from_slice(b"A");
+        mixed.extend_from_slice(seq);
+        mixed.extend_from_slice(b"B");
+        let actions = parse(&mixed);
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], TerminalAction::Print(_)));
+        assert!(matches!(actions[1], TerminalAction::KittyGraphics { .. }));
+        assert!(matches!(actions[2], TerminalAction::Print(_)));
     }
 }

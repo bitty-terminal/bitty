@@ -117,6 +117,7 @@ pub mod ctl;
 pub mod devtools;
 pub mod error;
 pub mod frame;
+pub mod frame_digest;
 pub mod limits;
 pub mod mcp;
 pub mod scope;

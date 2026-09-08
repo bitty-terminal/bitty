@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### `frameHash` lossless frame digest (CTX-0244, issue #420)
+
+- New `bitty.debug/frameHash` IPC method: SHA-256 (std-only, no new
+  dependency) over canonical `BFH1 || width_be32 || height_be32 ||
+frameSeq_be64 || headless_rgba`, answering the CTX-0242 V1-V3 equality
+  question in 32 bytes with zero pixel bytes on the wire.
+- Same CTX-0188 consent minter, no new scope (`debug.trace` +
+  `terminal.inspect`), new `AutomationFamily::FrameDigest` (never widens
+  `Capture`), TTL cap 120 s (default minter refuses digest grants),
+  2 digests/s rate ceiling, local-attested transport only (fail-closed
+  `ScopeDenied` otherwise), `Unavailable` on empty surfaces (never a hash
+  of nothing), granted AND denied calls audited in the existing bounded
+  (64, drop-oldest) log with the served digest hex.
+- Runtime publishes the presented headless frame only while a digest grant
+  is live (zero clone cost otherwise) and only for headless presents.
+- Digest tests run headless/in-process in CI; the live-grant ceremony test
+  is `#[ignore]`-gated local-manual only. Raw pixel channel stays
+  deferred indefinitely (no pixel bytes cross IPC under any grant).
+
 ### AUR bitty-bin prebuilt package (CTX-0138, issue #227)
 
 - New `packaging/PKGBUILD.bin` template for AUR `bitty-bin`: installs the prebuilt `bitty-x86_64-unknown-linux-gnu` release binary to `/usr/bin/bitty` (no user-side compile), real sha256 filled by the release workflow (never `SKIP` for the binary), `arch=('x86_64')` only, `provides=('bitty')`, `conflicts=('bitty' 'bitty-nightly' 'bitty-git')`, plus `.desktop`/icons from the release source tarball.

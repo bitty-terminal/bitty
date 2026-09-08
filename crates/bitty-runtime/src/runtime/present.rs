@@ -827,6 +827,23 @@ impl Runtime {
         self.last_presented_generation = current_gen;
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
+        // CTX-0244: publish the presented headless frame for `frameHash`
+        // digesting — only while a digest grant is live (zero clone cost
+        // otherwise) and only for headless presents (`stats.headless`;
+        // the GPU path keeps no RGBA, and a stale buffer must never bind
+        // a new frame number). Same-process publish, `&self` only.
+        if stats.headless && bitty_ipc::devtools::frame_digest_publish_wanted() {
+            if let (Some(extent), Some(rgba)) =
+                (self.surface.extent(), self.surface.headless_rgba())
+            {
+                bitty_ipc::devtools::publish_frame_rgba(
+                    extent.width(),
+                    extent.height(),
+                    stats.frame,
+                    rgba,
+                );
+            }
+        }
         // CTX-0159: publish grid plus latched input/focus so socket probes see
         // typed text without screenshots (`&self` only, bounded).
         self.publish_inspect_snapshot();

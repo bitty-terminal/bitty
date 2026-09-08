@@ -20,6 +20,15 @@ bitty-platform = { path = "../bitty-platform" }
 # 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
 # 0.3.x line; no other RNG is used so token entropy is auditable in one place.
 getrandom = "0.3"
+# Bounded Kitty PNG decode (CTX-0247). std-only cannot do this: PNG needs
+# DEFLATE decompression plus unfiltering across five filter types, Adam7
+# deinterlacing, and palette/tRNS/16-bit normalization. Hand-rolling that is
+# an attack surface of its own, so decoding delegates to the minimal `png`
+# crate instead of the full `image` facade (no format autodetect, no codecs
+# beyond PNG, no color-management stack). `png 0.18.1` is already in the
+# lockfile via `arboard`, so this direct edge adds no new supply-chain
+# surface; licenses (MIT/Apache-2.0) are in the `cargo-deny` allow list.
+png = "0.18"
 
 
 [dev-dependencies]

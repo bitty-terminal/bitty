@@ -41,6 +41,9 @@
 //! | [`clipboard::CLIPBOARD_MAX_OUTSTANDING_GRANTS`] | 16 | oldest grant evicted (token dies) |
 //! | [`kitty::KITTY_MAX_PLACEHOLDERS`] (legacy) | 64 | oldest evicted |
 //! | [`kitty::KITTY_MAX_PAYLOAD_BYTES`] (legacy) | 4096 | truncation |
+//! | [`kitty_decode::KITTY_DECODE_MAX_DIMENSION`] | 8192 px/side | typed error, no allocation |
+//! | [`kitty_decode::KITTY_DECODE_MAX_PIXELS`] (4096² area) | 16.7M px | typed error, no allocation |
+//! | [`kitty_decode::KITTY_DECODE_MAX_BYTES`] decoded RGBA | 64 MiB | typed error, no allocation |
 //! | [`image::IMAGE_STORE_MAX_COUNT`] (IMG-5) | 256 | oldest evicted on admission |
 //! | [`image::IMAGE_STORE_MAX_BYTES`] (IMG-4) | 256 MiB | oldest evicted on admission |
 //! | [`image::IMAGE_MAX_DECODED_BYTES`] (IMG-3) | 64 MiB | typed error, no placement |
@@ -63,8 +66,10 @@
 //!
 //! # Headless seam
 //!
-//! No window system, no adapter, no clipboard I/O, and no image decoding
-//! are performed here. All tests run on GPU-less CI via pure logic on
+//! No window system, no adapter, no clipboard I/O, and no GPU presentation
+//! are performed here. The only decoding is the bounded Kitty PNG/RGB/RGBA
+//! to RGBA8 step in [`kitty_decode`] (fail-closed, allocation-checked, no
+//! renderer coupling). All tests run on GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the composer external-editor round-trip
 //! (OS temp file plus `$VISUAL`/`$EDITOR` child process, exercised with
 //! fake editor scripts). Where rendering geometry is needed (hyperlink
@@ -82,6 +87,7 @@ pub mod hints;
 pub mod hyperlink;
 pub mod image;
 pub mod kitty;
+pub mod kitty_decode;
 pub mod loader;
 pub mod presentation;
 pub mod scene;
@@ -118,6 +124,11 @@ pub use image::{
     ScrollBehavior as ImageScrollBehavior,
 };
 pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
+pub use kitty_decode::{
+    KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
+    KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KittyDecodeError, KittyDecodedImage, KittyTransmitFormat,
+    decode_kitty_payload,
+};
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,

@@ -50,7 +50,8 @@
 //! - **Scrollback viewport rendering**: this surface is the active screen.
 //! - **Shaped clusters, color fonts, synthetic bold**: await the text RFC
 //!   named by ADR-0004. One glyph per cell (the leading Unicode scalar),
-//!   placed on a fixed baseline (see [`BASELINE_NUMERATOR`]).
+//!   placed on a metric-aware baseline with a fixed-rule fallback (see
+//!   [`BASELINE_NUMERATOR`] and [`resolve_baseline_offset`]).
 //! - **Subpixel RGB antialiasing policy**: upstream coverage is averaged to
 //!   luminance exactly like [`crate::software::SurfaceRgba::blend_glyph`].
 //!
@@ -122,9 +123,36 @@ pub const FAINT_ALPHA: u8 = 0x7F;
 
 /// Numerator of the fixed baseline rule: the pen baseline sits at
 /// `row_top + cell_height * BASELINE_NUMERATOR / 4`. Metric-aware baselines
-/// arrive with the text RFC; this constant rule keeps placement
-/// deterministic today.
+/// take precedence whenever the rasterizer measures the face (see
+/// [`resolve_baseline_offset`]); this constant rule stays as the
+/// deterministic fallback for backends without measurements.
 pub const BASELINE_NUMERATOR: u32 = 3;
+
+/// Resolves the pen-baseline offset below the row top for `cell_height`.
+///
+/// With usable face measurements the baseline sits one ascent below the row
+/// top (`line_height_px + descent_px`, upstream descent-negative sign —
+/// the alacritty reference pattern), clamped into the cell so hostile
+/// metrics can never push text off-grid; without measurements the legacy
+/// `cell_height * BASELINE_NUMERATOR / 4` rule keeps placement
+/// deterministic. The resolved offset is total over all inputs.
+#[must_use]
+pub fn resolve_baseline_offset(
+    cell_height: u32,
+    metrics: Option<crate::glyph::FontMetrics>,
+) -> i64 {
+    let cell = i64::from(cell_height);
+    let measured = metrics.filter(|m| m.is_usable()).map(|m| {
+        // `as` rounds toward zero; ascent is non-negative by construction
+        // (`is_usable` guarantees a finite positive line and finite
+        // descent), so the cast truncates at most one sub-pixel row.
+        (f64::from(m.line_height_px) + f64::from(m.descent_px)) as i64
+    });
+    match measured {
+        Some(ascent) => ascent.clamp(0, cell),
+        None => cell * i64::from(BASELINE_NUMERATOR) / 4,
+    }
+}
 
 /// Pixel size of one grid cell.
 ///
@@ -871,6 +899,12 @@ pub struct GridRenderer<R: GlyphRasterizer> {
     font: FontId,
     point_size: f32,
     cell: CellMetrics,
+    /// Pen-baseline offset below the row top (see [`resolve_baseline_offset`]):
+    /// metric-aware when the rasterizer measures the face, legacy 3/4 rule
+    /// otherwise. Glyph instances keep their full bitmap size at
+    /// `baseline - metrics.top`, so tall glyphs overhang into adjacent
+    /// padding instead of being clipped to the cell.
+    baseline_offset: i64,
     counters: RenderCounters,
 }
 
@@ -901,12 +935,21 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         query.validate()?;
         let mut cache = GlyphCache::new(rasterizer, crate::cache::DEFAULT_GLYPH_CACHE_CAPACITY)?;
         let font = cache.load_font(query)?;
+        // Face measurement is best-effort: backends without metrics (or a
+        // failed measurement) resolve to the legacy fallback, never an error.
+        let measured = cache
+            .rasterizer()
+            .font_metrics(font, query.point_size)
+            .ok()
+            .flatten();
+        let baseline_offset = resolve_baseline_offset(cell.height, measured);
         Ok(Self {
             cache,
             atlas: GlyphAtlas::new(dimension)?,
             font,
             point_size: query.point_size,
             cell,
+            baseline_offset,
             counters: RenderCounters::default(),
         })
     }
@@ -915,6 +958,13 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     #[must_use]
     pub const fn cell_metrics(&self) -> CellMetrics {
         self.cell
+    }
+
+    /// Pen-baseline offset below the row top (metric-aware when measured,
+    /// legacy 3/4 rule otherwise; see [`resolve_baseline_offset`]).
+    #[must_use]
+    pub const fn baseline_offset(&self) -> i64 {
+        self.baseline_offset
     }
 
     /// Applies a DPI scale change so atlas rasterization matches the scaled cell.
@@ -954,9 +1004,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         };
         scaled_query.validate()?;
         let font = self.cache.load_font(&scaled_query)?;
+        let measured = self
+            .cache
+            .rasterizer()
+            .font_metrics(font, point_size)
+            .ok()
+            .flatten();
         self.cell = cell;
         self.point_size = point_size;
         self.font = font;
+        self.baseline_offset = resolve_baseline_offset(cell.height, measured);
         self.cache.clear();
         self.atlas.clear();
         Ok(AppliedDpiScale {
@@ -1241,8 +1298,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let metrics = bitmap.metrics;
         let source = self.atlas.ensure(key, bitmap);
         let dest_x = col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
-        let baseline = row as i64 * i64::from(self.cell.height)
-            + i64::from(self.cell.height) * i64::from(BASELINE_NUMERATOR) / 4;
+        let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
         let dest_y = baseline - i64::from(metrics.top);
 
         let instance = match source {
@@ -1299,7 +1355,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             return Vec::new();
         }
         let (origin_x, origin_y) = (i64::from(origin_px.0), i64::from(origin_px.1));
-        let baseline = origin_y + i64::from(self.cell.height) * i64::from(BASELINE_NUMERATOR) / 4;
+        let baseline = origin_y + self.baseline_offset;
         let mut out = Vec::new();
         for (col, character) in text.chars().take(max_cells).enumerate() {
             if character == ' ' {

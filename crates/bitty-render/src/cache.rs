@@ -118,6 +118,14 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
         self.rasterizer.load_font(query)
     }
 
+    /// Borrowed access to the wrapped rasterizer (the grid pipeline uses
+    /// this to read font-wide metrics for baseline placement without
+    /// disturbing cached entries or counters).
+    #[must_use]
+    pub const fn rasterizer(&self) -> &R {
+        &self.rasterizer
+    }
+
     /// Drops all cached entries (bitmaps and blanks) without resetting the
     /// cumulative hit/miss counters.
     ///

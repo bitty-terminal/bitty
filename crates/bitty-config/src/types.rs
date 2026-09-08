@@ -47,7 +47,7 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u32 = 0;
 
 /// Maximum panel gap in cells (either axis).
 ///
-/// Cells are coarse (one cell is ~9px wide at the default 9x19 cell), so 16
+/// Cells are coarse (one cell is ~10px wide at the default 10x22 cell), so 16
 /// cells (~144px) is already far past tasteful; the bound exists to keep
 /// untrusted input bounded (threat T-01), not to bless huge gaps. Larger
 /// values fail closed like every other config bound.
@@ -100,7 +100,7 @@ pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
 /// default and stays. Kitty defaults to 11.0; bitty stays at ghostty parity.
 pub const DEFAULT_FONT_SIZE: f32 = 12.0;
 
-/// Default line-height multiplier: 1.2x.
+/// Default line-height multiplier: 1.375x.
 ///
 /// Legacy design cell was `8x16` with no breathing room. Measured
 /// `JetBrainsMonoNerdFont-Regular.ttf` (`fontTools`, UPM 1000,
@@ -108,18 +108,26 @@ pub const DEFAULT_FONT_SIZE: f32 = 12.0;
 /// `0.6 * 16 = 9.6px` and the true line is `1320/1000 * 16 = 21.1px`.
 /// Ghostty defaults to `adjust-cell-height = null` (pure font metrics) and
 /// kitty to no `modify_font` adjustment; bitty's legacy `8x16` is ~20%
-/// too narrow and ~32% too short vs those metrics. `1.2` gives
-/// `round(16 * 1.2) = 19px` — a conservative "slight" breathing room
-/// between legacy 16 and true 21, matching kitty 11pt line (~19.4px).
-pub const DEFAULT_LINE_HEIGHT: f32 = 1.2;
-
-/// Default letter-spacing: 1.0px.
+/// too narrow and ~32% too short vs those metrics.
 ///
-/// Legacy advance 8px vs true 9.6px at 12pt: `+1px` gives effective width 9,
-/// matching kitty 11pt advance (~8.8px -> 9) and moving toward the true 9.6
-/// without jumping straight to 10. Ghostty `adjust-cell-width = null`;
-/// the `+1` is justified only because the legacy base is cramped.
-pub const DEFAULT_LETTER_SPACING: f32 = 1.0;
+/// CTX-0237 raster truth (headless crossfont probe on the live seat,
+/// FreeType-rounded): average advance `10px`, line `22px`, descent `-5px`;
+/// block/powerline glyphs rasterize `top=17, h=22`. The CTX-0157 compromise
+/// (`1.2` -> `round(16 * 1.2) = 19px`, kitty-11pt-like) left tall glyphs
+/// overflowing the cell, and neighbor-row repaints erased the overhang
+/// ("tops cut off"). `1.375` gives `round(16 * 1.375) = 22px` — the full
+/// measured line box, so in-font tall glyphs fit with zero overhang while
+/// outliers (box drawing) keep the permitted overdraw path.
+pub const DEFAULT_LINE_HEIGHT: f32 = 1.375;
+
+/// Default letter-spacing: 2.0px.
+///
+/// Legacy advance 8px vs measured 10px at 12pt (CTX-0237 probe): `+2px`
+/// gives effective width 10, matching the rounded raster advance so glyphs
+/// sit on their natural grid instead of crowding one pixel per cell.
+/// Ghostty `adjust-cell-width = null`; the `+2` closes the cramped legacy
+/// base exactly instead of stopping at the CTX-0157 compromise (`+1`).
+pub const DEFAULT_LETTER_SPACING: f32 = 2.0;
 
 /// Legacy design cell (pre-CTX-0157): the compiled base that spacing
 /// applies to. Kept explicit so [`FontConfig::effective_cell`] stays
@@ -259,7 +267,8 @@ impl FontConfig {
     ///
     /// `width = base_width + round(letter_spacing)`,
     /// `height = round(base_height * line_height)`, each saturated to
-    /// `>= 1`. Defaults give `(9, 19)` from the legacy `(8, 16)` base.
+    /// `>= 1`. Defaults give `(10, 22)` from the legacy `(8, 16)` base
+    /// (CTX-0237 measured raster truth at 12pt).
     #[must_use]
     pub fn effective_cell(&self, base_width: u32, base_height: u32) -> (u32, u32) {
         let extra_w = self.letter_spacing.round().clamp(0.0, 8.0) as u32;
@@ -807,11 +816,12 @@ mod tests {
         assert_eq!(d.family, DEFAULT_FONT_FAMILY);
         assert_eq!(d.family, "JetBrainsMono Nerd Font");
         assert!((d.size - 12.0).abs() < f32::EPSILON);
-        assert!((d.line_height - 1.2).abs() < f32::EPSILON);
-        assert!((d.letter_spacing - 1.0).abs() < f32::EPSILON);
-        // Effective cell from legacy 8x16 base gives breathing room 9x19.
-        assert_eq!(d.default_effective_cell(), (9, 19));
-        assert_eq!(d.effective_cell(8, 16), (9, 19));
+        assert!((d.line_height - 1.375).abs() < f32::EPSILON);
+        assert!((d.letter_spacing - 2.0).abs() < f32::EPSILON);
+        // Effective cell from legacy 8x16 base covers the measured 12pt
+        // raster truth (CTX-0237: advance 10, line 22).
+        assert_eq!(d.default_effective_cell(), (10, 22));
+        assert_eq!(d.effective_cell(8, 16), (10, 22));
     }
 
     #[test]
@@ -879,9 +889,10 @@ mod tests {
         };
         assert_eq!(base.effective_cell(8, 16), (8, 16));
         let roomy = FontConfig::default();
-        assert_eq!(roomy.effective_cell(8, 16), (9, 19));
-        // Zero base still saturates to >= 1.
-        assert_eq!(roomy.effective_cell(0, 0), (1, 1));
+        assert_eq!(roomy.effective_cell(8, 16), (10, 22));
+        // Zero base still saturates to >= 1 (width keeps the +2px
+        // letter-spacing floor, height saturates from zero).
+        assert_eq!(roomy.effective_cell(0, 0), (2, 1));
     }
 
     #[test]

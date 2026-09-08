@@ -28,8 +28,8 @@ use crossfont::{
 
 use crate::error::RenderError;
 use crate::glyph::{
-    BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
-    RasterKey,
+    BitmapFormat, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics,
+    GlyphRasterizer, RasterKey,
 };
 
 /// [`GlyphRasterizer`] implementation wrapping the platform rasterizer that
@@ -100,6 +100,27 @@ impl GlyphRasterizer for CrossFontRasterizer {
         match self.inner.get_glyph(glyph_key) {
             Ok(glyph) => convert_glyph(glyph).map(Some),
             Err(UpstreamError::MissingGlyph(_)) => Ok(None),
+            Err(err) => Err(map_upstream_error(err)),
+        }
+    }
+
+    fn font_metrics(
+        &self,
+        font: FontId,
+        point_size: f32,
+    ) -> Result<Option<FontMetrics>, RenderError> {
+        if !(point_size.is_finite() && point_size > 0.0) {
+            return Err(RenderError::InvalidInput {
+                reason: "raster size must be finite and positive",
+            });
+        }
+        let font_key = self.upstream_key(font)?;
+        match self.inner.metrics(font_key, UpstreamSize::new(point_size)) {
+            Ok(upstream) => Ok(Some(FontMetrics {
+                average_advance_px: upstream.average_advance as f32,
+                line_height_px: upstream.line_height as f32,
+                descent_px: upstream.descent,
+            })),
             Err(err) => Err(map_upstream_error(err)),
         }
     }
@@ -283,6 +304,30 @@ mod tests {
         assert!(matches!(
             query.validate(),
             Err(RenderError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn font_metrics_rejects_bad_sizes_and_stale_handles() {
+        // Needs a live font stack (FreeType+fontconfig); bare CI runners
+        // skip gracefully instead of failing on missing platform fonts.
+        let backend = match CrossFontRasterizer::new() {
+            Ok(backend) => backend,
+            Err(_) => return,
+        };
+        let stale = FontId::next(&mut 9999);
+        for bad in [0.0, -12.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                matches!(
+                    backend.font_metrics(stale, bad),
+                    Err(RenderError::InvalidInput { .. })
+                ),
+                "{bad} must be rejected before handle lookup"
+            );
+        }
+        assert!(matches!(
+            backend.font_metrics(stale, 12.0),
+            Err(RenderError::UnknownFontHandle)
         ));
     }
 }

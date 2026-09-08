@@ -203,6 +203,17 @@ impl<R: GlyphRasterizer> GlyphRasterizer for FallbackRasterizer<R> {
         }
         Ok(None)
     }
+
+    fn font_metrics(
+        &self,
+        font: FontId,
+        point_size: f32,
+    ) -> Result<Option<crate::glyph::FontMetrics>, RenderError> {
+        // Outer handles are inner handles (see `load_font`), so the primary
+        // face measurement forwards directly; the chain tails share the
+        // primary's line box by terminal-monospace construction.
+        self.inner.font_metrics(font, point_size)
+    }
 }
 
 #[cfg(test)]

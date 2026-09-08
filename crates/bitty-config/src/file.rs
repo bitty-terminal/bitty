@@ -25,10 +25,10 @@
 //!     theme = "dark", -- alias for appearance.theme
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrainsMono Nerd Font", size = 12.0 },
-//!     -- Optional breathing room (defaults 1.2 / 1.0 give effective 9x19
+//!     -- Optional breathing room (defaults 1.375 / 2.0 give effective 10x22
 //!     -- from the legacy 8x16 base; see FontConfig docs):
 //!     -- font = { family = "JetBrainsMono Nerd Font", size = 12.0,
-//!     --          line_height = 1.2, letter_spacing = 1.0 },
+//!     --          line_height = 1.375, letter_spacing = 2.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)

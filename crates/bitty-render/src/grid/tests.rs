@@ -25,11 +25,14 @@ use crate::grid::{GlyphSource, GridRenderer};
 
 /// Deterministic fake: bitmap width varies with the character code (6..=8),
 /// height is fixed at 6, and `' '`/`'\t'` rasterize to cached blanks. A
-/// one-shot error switch simulates upstream failures.
+/// one-shot error switch simulates upstream failures. `face_metrics` is
+/// `None` by default (legacy fixed-baseline path); [`FakeRasterizer::with_metrics`]
+/// serves the CTX-0237 measured face plus measured tall glyphs.
 struct FakeRasterizer {
     next_id: u64,
     blank_chars: Vec<char>,
     fail_next: bool,
+    face_metrics: Option<crate::glyph::FontMetrics>,
 }
 
 impl FakeRasterizer {
@@ -38,10 +41,34 @@ impl FakeRasterizer {
             next_id: 0,
             blank_chars: vec![' ', '\t'],
             fail_next: false,
+            face_metrics: None,
+        }
+    }
+
+    /// Fake serving the CTX-0237 measured face (JetBrainsMono Nerd Font
+    /// 12pt probe truth: line 22, descent -5) for metric-baseline tests.
+    fn with_metrics() -> Self {
+        Self {
+            face_metrics: Some(crate::glyph::FontMetrics {
+                average_advance_px: 10.0,
+                line_height_px: 22.0,
+                descent_px: -5.0,
+            }),
+            ..Self::new()
         }
     }
 
     fn bitmap_for(character: char) -> GlyphBitmap {
+        // CTX-0237 measured tall glyphs (live raster truth at 12pt):
+        // full block U+2588 (top=17, h=22) and box vertical U+2502
+        // (top=18, h=25, deliberately taller than the 22px line box so the
+        // overhang-permission lock has a real shape to hold).
+        if character == '\u{2588}' {
+            return tall_bitmap(0, 17, 10, 22, 0x2588);
+        }
+        if character == '\u{2502}' {
+            return tall_bitmap(4, 18, 2, 25, 0x2502);
+        }
         let code = u32::from(character) as usize;
         let width: i32 = i32::try_from(code % 3 + 6).unwrap();
         let height: i32 = 6;
@@ -65,6 +92,25 @@ impl FakeRasterizer {
     }
 }
 
+/// Builds a deterministic tall-glyph bitmap with the given bearings.
+fn tall_bitmap(left: i32, top: i32, width: i32, height: i32, seed: usize) -> GlyphBitmap {
+    let data: Vec<u8> = (0..(width as usize) * (height as usize) * 3)
+        .map(|i| (0x40 + ((seed + i) % 0x40)) as u8)
+        .collect();
+    GlyphBitmap::try_new(
+        GlyphMetrics {
+            left,
+            top,
+            width,
+            height,
+            advance: [10, 0],
+        },
+        BitmapFormat::Rgb,
+        data,
+    )
+    .unwrap()
+}
+
 impl GlyphRasterizer for FakeRasterizer {
     fn load_font(&mut self, _query: &FontQuery) -> Result<FontId, RenderError> {
         Ok(FontId::next(&mut self.next_id))
@@ -79,6 +125,14 @@ impl GlyphRasterizer for FakeRasterizer {
             return Ok(None);
         }
         Ok(Some(Self::bitmap_for(key.character)))
+    }
+
+    fn font_metrics(
+        &self,
+        _font: FontId,
+        _point_size: f32,
+    ) -> Result<Option<crate::glyph::FontMetrics>, RenderError> {
+        Ok(self.face_metrics)
     }
 }
 
@@ -1007,4 +1061,133 @@ fn demo_green_resolves_to_theme_green() {
     // it to the preset green, not a hardcoded ad-hoc green.
     let themed = resolve_color(Some(&Color::Indexed(2)), DEFAULT_FG);
     assert_eq!(themed, [0xA6, 0xE3, 0xA1, 0xFF]);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-0237: metric-aware baseline + permitted overhang
+// ---------------------------------------------------------------------------
+
+/// 10x22 cells covering the measured JetBrainsMono Nerd Font 12pt line box
+/// (advance 10, ascent 17 + descent 5): tall glyphs fit with zero overhang.
+fn metric_cell() -> CellMetrics {
+    CellMetrics::new(10, 22).unwrap()
+}
+
+fn metric_renderer() -> GridRenderer<FakeRasterizer> {
+    GridRenderer::new(FakeRasterizer::with_metrics(), &font_query(), metric_cell()).unwrap()
+}
+
+#[test]
+fn resolve_baseline_offset_prefers_measured_ascent() {
+    use super::resolve_baseline_offset;
+    use crate::glyph::FontMetrics;
+
+    let face = FontMetrics {
+        average_advance_px: 10.0,
+        line_height_px: 22.0,
+        descent_px: -5.0,
+    };
+    // Measured ascent (22 - 5) places the pen 17 below the row top, so the
+    // measured full block (top=17, h=22) lands exactly on the cell.
+    assert_eq!(resolve_baseline_offset(22, Some(face)), 17);
+    // Legacy 3/4 rule stays for backends without measurements.
+    assert_eq!(resolve_baseline_offset(16, None), 12);
+    assert_eq!(resolve_baseline_offset(19, None), 14);
+    assert_eq!(resolve_baseline_offset(22, None), 16);
+    // Hostile measurements clamp into the cell, never off-grid.
+    let huge = FontMetrics {
+        line_height_px: 220.0,
+        ..face
+    };
+    assert_eq!(resolve_baseline_offset(22, Some(huge)), 22);
+    let below = FontMetrics {
+        descent_px: -30.0,
+        ..face
+    };
+    assert_eq!(resolve_baseline_offset(22, Some(below)), 0);
+    let above = FontMetrics {
+        descent_px: 5.0,
+        ..face
+    };
+    assert_eq!(resolve_baseline_offset(22, Some(above)), 22);
+    // Unusable values fall back to the legacy rule (total, no panics).
+    for bad in [
+        FontMetrics {
+            line_height_px: f32::NAN,
+            ..face
+        },
+        FontMetrics {
+            line_height_px: 0.0,
+            ..face
+        },
+        FontMetrics {
+            average_advance_px: -1.0,
+            ..face
+        },
+        FontMetrics {
+            descent_px: f32::INFINITY,
+            ..face
+        },
+    ] {
+        assert_eq!(
+            resolve_baseline_offset(22, Some(bad)),
+            16,
+            "{bad:?} must fall back"
+        );
+    }
+}
+
+#[test]
+fn renderer_adopts_metric_baseline_and_keeps_legacy_fallback() {
+    // Measured face: ascent 17 wins over the 3/4 rule (22*3/4 = 16).
+    assert_eq!(metric_renderer().baseline_offset(), 17);
+    // Unmeasured fake: legacy rule untouched (8x16 -> 12).
+    assert_eq!(renderer().baseline_offset(), 12);
+}
+
+#[test]
+fn metric_baseline_fits_measured_tall_glyphs_with_zero_overhang() {
+    // Full block U+2588 measured top=17 h=22: dest lands exactly on the
+    // cell origin and the bitmap spans exactly the cell — no overhang for
+    // neighbor repaints to erase (the CTX-0237 clip mechanism).
+    let state = state_from(&[print('\u{2588}')]);
+    let damage = damage_all(&state);
+    let mut grid = metric_renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    assert_eq!(list.glyphs.len(), 1);
+    let glyph = &list.glyphs[0];
+    assert_eq!(glyph.dest, [0, 0]);
+    assert_eq!(glyph.size, [10, 22]);
+}
+
+#[test]
+fn over_tall_glyphs_overhang_instead_of_clipping() {
+    // Box vertical U+2502 (top=18, h=25) exceeds even the measured 22px
+    // line box: the pipeline must still emit the whole bitmap at
+    // `baseline - top` (negative dest allowed) — cells never clip glyphs
+    // (alacritty/ghostty overdraw pattern), so line-drawing joints stay
+    // continuous across rows.
+    let state = state_from(&[print('\u{2502}')]);
+    let damage = damage_all(&state);
+    let mut grid = metric_renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    assert_eq!(list.glyphs.len(), 1);
+    let glyph = &list.glyphs[0];
+    assert_eq!(glyph.dest, [4, -1]);
+    assert_eq!(glyph.size, [2, 25]);
+}
+
+#[test]
+fn dpi_rescale_re_resolves_the_baseline() {
+    // Rescaling rebuilds cells and re-reads the face: the baseline follows
+    // the new cell instead of going stale (the blur/scale audit companion:
+    // raster size and cell stay matched so the NDC factor stays 1.0).
+    let mut grid = metric_renderer();
+    let base_cell = metric_cell();
+    let applied = grid.apply_dpi_scale(base_cell, &font_query(), 2.0).unwrap();
+    assert_eq!(applied.cell, CellMetrics::new(20, 44).unwrap());
+    // The fake serves constant (unscaled) metrics: ascent 17 clamps into
+    // the 44px cell unchanged. Live backends measure at the scaled size.
+    assert_eq!(grid.baseline_offset(), 17);
+    assert_eq!(grid.cell_metrics(), applied.cell);
 }

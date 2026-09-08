@@ -315,6 +315,56 @@ fn zoom_off_does_not_duplicate_primary_into_sessionless_leaves() {
 
 #[cfg(unix)]
 #[test]
+fn mixed_primary_plus_session_copaints_on_focus_v2() {
+    // CTX-0255 live repro (02-focus-v2 left blank, 03-refocus-v1 both paint):
+    // keymap-split shape is mixed — v:1 session-less shows the shared
+    // primary grid, v:2 owns a pane session. Focusing v:2 must NOT blank
+    // the primary home tile; both tiles co-paint. Refocus v:1 keeps both.
+    let mut rt = Runtime::with_defaults().expect("build");
+    write_primary_marker(&mut rt, 2, b'M');
+    assert!(rt.tick().is_some(), "first tick presents");
+    rt.set_layout(two_pane());
+    assert_full_present(rt.tick(), "split");
+    rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &["-c", "sleep 30"], 40, 24)
+        .expect("pane shell must spawn");
+    let mut seq = vec![0x1b, b'[', b'6', b';', b'1', b'H'];
+    seq.extend(std::iter::repeat_n(b'P', 40));
+    rt.handle_pane_bytes(ViewId::new(2), &seq);
+    assert_full_present(rt.tick(), "pane bytes present");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "primary home keeps ink before focus move"
+    );
+    assert!(
+        tile_has_ink(&rt, ViewId::new(2)),
+        "pane tile keeps ink before focus move"
+    );
+    assert!(rt.set_focus(ViewId::new(2)));
+    assert_full_present(rt.tick(), "focus v:2");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(2)),
+        "focused pane tile keeps its own grid"
+    );
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "CTX-0255: unfocused primary home must co-paint, not blank"
+    );
+    assert_eq!(rt.tick(), None);
+    assert!(rt.set_focus(ViewId::new(1)));
+    assert_full_present(rt.tick(), "refocus v:1");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "refocused primary home keeps ink"
+    );
+    assert!(
+        tile_has_ink(&rt, ViewId::new(2)),
+        "pane tile keeps ink after refocus"
+    );
+    assert_eq!(rt.tick(), None);
+}
+
+#[cfg(unix)]
+#[test]
 fn pane_session_tile_shows_only_its_own_grid() {
     // Guard for the sessioned path (live L1 keymap splits): each tile shows
     // exactly its own grid — primary marker in the primary tile only, pane

@@ -3580,7 +3580,7 @@ fn run_inspect_subcommand(args: &Args) -> i32 {
 ///
 /// Cell geometry applies the configured breathing room
 /// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
-/// [`bitty_config::types::FontConfig::effective_cell`], defaults `9x19`);
+/// [`bitty_config::types::FontConfig::effective_cell`], defaults `10x22`);
 /// grid/queue geometry stays at compiled defaults; font family/size, scroll
 /// speed, selection auto-copy, and panel gaps come from the file/CLI/default
 /// chain (already validated by `bitty-config`, so construction is expected to
@@ -6145,8 +6145,10 @@ mod tests {
         assert_eq!(cfg.cols, defaults.cols);
         assert_eq!(cfg.rows, defaults.rows);
         // Breathing-room defaults: legacy table omits spacing, so effective
-        // 9x19 matches the readable runtime defaults.
-        assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
+        // 10x22 covers the measured 12pt raster truth (CTX-0237: advance
+        // 10, line 22). This intentionally differs from the headless
+        // RuntimeConfig 9x19 compiled defaults.
+        assert_eq!((cfg.cell_width, cfg.cell_height), (10, 22));
     }
 
     #[test]

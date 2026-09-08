@@ -170,7 +170,9 @@ pub use fallback::{
     is_braille_pattern, is_tui_graph_scalar,
 };
 pub use geometry::{ExtentPx, RectPx};
-pub use glyph::{FontId, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey};
+pub use glyph::{
+    FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer, RasterKey,
+};
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
     RenderCounters, SnapshotDamage,

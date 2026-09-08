@@ -273,6 +273,41 @@ impl fmt::Display for GlyphBitmap {
     }
 }
 
+/// Font-wide metrics in pixels at one rasterized size, owned by this crate.
+///
+/// Mirrors the upstream face metrics (alacritty `compute_cell_size`
+/// reference pattern): the cell derives from the measured face
+/// (`average_advance_px` wide, `line_height_px` tall) and the pen baseline
+/// sits `line_height_px + descent_px` below the cell top (descent keeps the
+/// upstream sign convention: negative below the baseline, so ascent equals
+/// `line_height_px + descent_px`). Glyph bitmaps are then drawn unclipped
+/// at cell origin plus their per-glyph bearings, free to overhang into
+/// adjacent padding — cells never clip glyphs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FontMetrics {
+    /// Mean horizontal advance in pixels (cell-width source).
+    pub average_advance_px: f32,
+    /// Distance between consecutive baselines in pixels (cell-height source).
+    pub line_height_px: f32,
+    /// Descent below the baseline in pixels (upstream sign: negative below).
+    pub descent_px: f32,
+}
+
+impl FontMetrics {
+    /// True when every field is finite with a positive line height and a
+    /// non-negative advance (the minimum the renderer needs to trust the
+    /// values for placement; anything else falls back to the legacy
+    /// fixed-baseline rule so hostile metrics can never misplace text).
+    #[must_use]
+    pub fn is_usable(self) -> bool {
+        self.average_advance_px.is_finite()
+            && self.average_advance_px >= 0.0
+            && self.line_height_px.is_finite()
+            && self.line_height_px > 0.0
+            && self.descent_px.is_finite()
+    }
+}
+
 /// The Bitty-owned rasterization contract (see module docs).
 ///
 /// Implementors must be deterministic per session: identical keys yield
@@ -300,6 +335,29 @@ pub trait GlyphRasterizer {
     /// [`RenderError::UnknownFontHandle`] for stale handles,
     /// [`RenderError::UpstreamRasterizer`] for engine failures.
     fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError>;
+
+    /// Reports font-wide metrics at `point_size`, when the backend can
+    /// measure the face (CTX-0237: the crossfont backend answers from
+    /// upstream face metrics; deterministic fakes keep the default).
+    ///
+    /// The default returns `Ok(None)` — "no measurement" — so existing
+    /// implementors keep compiling and the renderer falls back to the
+    /// legacy fixed-baseline rule. Returning `Ok(None)` is always valid;
+    /// callers treat `None` and unusable values identically (fallback).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::UnknownFontHandle`] for stale handles,
+    /// [`RenderError::InvalidInput`] for non-finite/non-positive sizes,
+    /// [`RenderError::UpstreamRasterizer`] for engine failures.
+    fn font_metrics(
+        &self,
+        font: FontId,
+        point_size: f32,
+    ) -> Result<Option<FontMetrics>, RenderError> {
+        let _ = (font, point_size);
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +410,61 @@ mod tests {
             GlyphBitmap::try_new(m, BitmapFormat::Rgba, vec![0; 4]),
             Err(RenderError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn font_metrics_usability_gate() {
+        // Measured JetBrainsMono Nerd Font 12pt truth (CTX-0237 probe).
+        let live = FontMetrics {
+            average_advance_px: 10.0,
+            line_height_px: 22.0,
+            descent_px: -5.0,
+        };
+        assert!(live.is_usable());
+        for bad in [
+            FontMetrics {
+                average_advance_px: f32::NAN,
+                ..live
+            },
+            FontMetrics {
+                line_height_px: 0.0,
+                ..live
+            },
+            FontMetrics {
+                line_height_px: -22.0,
+                ..live
+            },
+            FontMetrics {
+                line_height_px: f32::INFINITY,
+                ..live
+            },
+            FontMetrics {
+                descent_px: f32::NAN,
+                ..live
+            },
+            FontMetrics {
+                average_advance_px: -1.0,
+                ..live
+            },
+        ] {
+            assert!(!bad.is_usable(), "{bad:?} must fall back");
+        }
+    }
+
+    #[test]
+    fn font_metrics_default_is_no_measurement() {
+        struct Bare;
+        impl GlyphRasterizer for Bare {
+            fn load_font(&mut self, _query: &FontQuery) -> Result<FontId, RenderError> {
+                Ok(FontId::next(&mut 0))
+            }
+            fn rasterize(&mut self, _key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+                Ok(None)
+            }
+        }
+        let bare = Bare;
+        let id = FontId::next(&mut 7);
+        assert_eq!(bare.font_metrics(id, 12.0).unwrap(), None);
     }
 
     #[test]

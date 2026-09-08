@@ -125,6 +125,7 @@ pub mod resize;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
+pub mod workspaces;
 
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::PresentStats;
@@ -133,6 +134,7 @@ use self::layout_focus::{default_container, default_layout};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer};
 use self::scrollbar::ScrollbarDrag;
+use self::workspaces::{PendingWsClose, WorkspaceSlot};
 
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
 /// renderer, surface, and the bounded cold-path queue.
@@ -272,6 +274,18 @@ pub struct Runtime {
     rows: usize,
     layout: LayoutNode,
     focus: Focus,
+    /// Named workspace slots (CTX-0257 entry): stashed layout + focus per
+    /// workspace; the live `layout`/`focus` above mirror the active slot.
+    /// At least one slot always exists; see `runtime::workspaces`.
+    workspaces: Vec<WorkspaceSlot>,
+    /// Active workspace index into `workspaces` (display is 1-based).
+    active_workspace: usize,
+    /// MRU workspace indices, active fronted, each live index exactly once.
+    workspace_mru: std::collections::VecDeque<usize>,
+    /// Pending kill-confirm close arm, if any (never silent kill).
+    pending_ws_close: Option<PendingWsClose>,
+    /// Next workspace creation sequence (display names `ws{seq}`).
+    next_workspace_seq: u64,
     container: UiRect,
     clipboard: Clipboard,
     selection: Option<Selection>,
@@ -428,6 +442,9 @@ impl std::fmt::Debug for Runtime {
             .field("pending_full_redraw", &self.pending_full_redraw)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
+            .field("workspace_count", &self.workspaces.len())
+            .field("active_workspace", &self.active_workspace)
+            .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("container", &self.container)
             .field(
                 "plugin_drop_policy",
@@ -549,7 +566,7 @@ impl Runtime {
         let focus = Focus::with_focus(ViewId::new(1));
         let container = default_container(cols, rows);
         let plugin_host = PluginHost::with_capacity(drop_policy, pipeline_capacity, side_capacity);
-        Ok(Self {
+        let mut runtime = Self {
             cols,
             rows,
             config: config.clone(),
@@ -611,7 +628,14 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_alt_screen_latched: false,
-        })
+            workspaces: Vec::new(),
+            active_workspace: 0,
+            workspace_mru: std::collections::VecDeque::new(),
+            pending_ws_close: None,
+            next_workspace_seq: 2,
+        };
+        runtime.init_workspaces();
+        Ok(runtime)
     }
 
     /// Creates a runtime that takes ownership of an already-constructed [`PluginHost`].
@@ -655,7 +679,7 @@ impl Runtime {
         let layout = default_layout(cols, rows);
         let focus = Focus::with_focus(ViewId::new(1));
         let container = default_container(cols, rows);
-        Ok(Self {
+        let mut runtime = Self {
             cols,
             rows,
             config: config.clone(),
@@ -717,7 +741,14 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_alt_screen_latched: false,
-        })
+            workspaces: Vec::new(),
+            active_workspace: 0,
+            workspace_mru: std::collections::VecDeque::new(),
+            pending_ws_close: None,
+            next_workspace_seq: 2,
+        };
+        runtime.init_workspaces();
+        Ok(runtime)
     }
 
     /// Convenience: default config runtime.

@@ -477,6 +477,10 @@ impl Runtime {
     /// any pending indicator clears, and the caller must not forward the key
     /// to the PTY. Returns `false` otherwise (no pending paste, not `Esc`, or
     /// not a press), leaving existing key routing untouched.
+    ///
+    /// CTX-0257: the same press also cancels a pending workspace-close arm
+    /// (kill-confirm gate). Either cancellation consumes the `Esc`; both are
+    /// dropped together when both pend (loud, no partial state).
     pub(super) fn cancel_pending_on_escape(&mut self, event: &KeyEvent) -> bool {
         if event.state != PressState::Pressed {
             return false;
@@ -487,8 +491,15 @@ impl Runtime {
         ) {
             return false;
         }
+        let mut cancelled = false;
+        if self.pending_ws_close.is_some() {
+            // CTX-0243: Esc-cancel is user intent — snap to live (key handler
+            // already snapped; idempotent).
+            self.snap_focused_to_live();
+            cancelled = self.cancel_pending_ws_close();
+        }
         if self.pending_paste.is_none() {
-            return false;
+            return cancelled;
         }
         // CTX-0243: Esc-cancel is user intent — snap to live (key handler
         // already snapped; idempotent).

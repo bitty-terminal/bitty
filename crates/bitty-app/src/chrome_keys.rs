@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
-use bitty_runtime::{FocusDirection, LayoutNode, SplitAxis, View, ViewId};
+use bitty_runtime::{FocusDirection, LayoutNode, SplitAxis, View, ViewId, WsCloseRequest};
 
 use super::{TerminalApp, spawn_pane_shell};
 
@@ -586,6 +586,72 @@ impl TerminalApp {
                     ),
                 }
             }
+            A::WorkspaceNew => {
+                // CTX-0257 (DEC-0034 entry): fresh workspace, switched to it.
+                match self.runtime.workspace_new() {
+                    Ok(index) => eprintln!(
+                        "bitty: keymap workspace_new -> workspace {} ({})",
+                        index + 1,
+                        self.runtime.workspaceline_text()
+                    ),
+                    Err(err) => {
+                        eprintln!("warning: keymap workspace_new refused ({err}) — ignoring")
+                    }
+                }
+            }
+            A::WorkspaceClose => {
+                // CTX-0257: idle closes immediately; live arms a pending
+                // confirm (loud banner), repeat confirms the kill, Esc
+                // cancels via the runtime key path. Never a silent kill.
+                match self.runtime.workspace_close_request() {
+                    WsCloseRequest::Closed { killed } => eprintln!(
+                        "bitty: keymap workspace_close -> ({}) killed={killed}",
+                        self.runtime.workspaceline_text()
+                    ),
+                    WsCloseRequest::Pending { summary } => {
+                        eprintln!("bitty: keymap workspace_close PENDING -> {summary}")
+                    }
+                }
+            }
+            A::WorkspacePrev => {
+                let index = self.runtime.workspace_prev();
+                eprintln!(
+                    "bitty: keymap workspace_prev -> workspace {} ({})",
+                    index + 1,
+                    self.runtime.workspaceline_text()
+                );
+            }
+            A::WorkspaceNext => {
+                let index = self.runtime.workspace_next();
+                eprintln!(
+                    "bitty: keymap workspace_next -> workspace {} ({})",
+                    index + 1,
+                    self.runtime.workspaceline_text()
+                );
+            }
+            A::WorkspaceLast => {
+                let index = self.runtime.workspace_last();
+                eprintln!(
+                    "bitty: keymap workspace_last -> workspace {} ({})",
+                    index + 1,
+                    self.runtime.workspaceline_text()
+                );
+            }
+            A::WorkspaceFocus(n) => {
+                let index = n.saturating_sub(1) as usize;
+                if self.runtime.workspace_switch(index) {
+                    eprintln!(
+                        "bitty: keymap workspace_focus:{n} -> workspace {} ({})",
+                        index + 1,
+                        self.runtime.workspaceline_text()
+                    );
+                } else {
+                    eprintln!(
+                        "warning: keymap workspace_focus:{n} has no such workspace ({}) — ignoring",
+                        self.runtime.workspaceline_text()
+                    );
+                }
+            }
             A::ToggleZoom => {
                 if let Some(backup) = self.zoom_backup.take() {
                     self.runtime.set_layout(backup);
@@ -835,13 +901,35 @@ mod tests {
             Some(bitty_config::ChromeAction::FocusNext)
         );
         // CTX-0178 Alt-as-Mod: number jumps, paging, and zoom resolve.
+        // CTX-0257: alt+1..=9 jumps WORKSPACES (DEC-0034 entry).
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('1'), false, true, false)),
-            Some(bitty_config::ChromeAction::FocusId(1))
+            Some(bitty_config::ChromeAction::WorkspaceFocus(1))
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('9'), false, true, false)),
-            Some(bitty_config::ChromeAction::FocusId(9))
+            Some(bitty_config::ChromeAction::WorkspaceFocus(9))
+        );
+        // CTX-0257 DEC entry set: new/close/prev/next/last.
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('n'), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceNew)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('w'), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceClose)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('-'), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspacePrev)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Char('='), false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceNext)
+        );
+        assert_eq!(
+            match_keymap(&maps, shell(KeyName::Tab, false, true, false)),
+            Some(bitty_config::ChromeAction::WorkspaceLast)
         );
         assert_eq!(
             match_keymap(&maps, shell(KeyName::Char('u'), false, true, false)),
@@ -1375,10 +1463,106 @@ mod tests {
     fn close_last_leaf_helper_refuses() {
         let mut single = LayoutNode::leaf(View::new(ViewId::new(1), 80, 24));
         assert!(!close_focused_leaf(&mut single, ViewId::new(1)));
-        assert!(!close_focused_leaf(&mut single, ViewId::new(9)));
+        assert!(!close_focused_leaf(&mut two_pane_layout(), ViewId::new(9)));
         let mut two = two_pane_layout();
         assert!(!close_focused_leaf(&mut two, ViewId::new(9)));
         assert!(close_focused_leaf(&mut two, ViewId::new(2)));
         assert_eq!(two.leaf_count(), 1);
+    }
+
+    // CTX-0257 workspace ops entry (DEC-0034): keys + tabline through the
+    // chrome arms, headless (no window).
+    // -----------------------------------------------------------------------
+
+    fn workspace_test_app() -> TerminalApp {
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        TerminalApp::with_theme(
+            Runtime::with_defaults().expect("must build"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+    }
+
+    // POSIX-only: the live-close test below spawns /bin/sh (absent on Windows).
+    #[cfg(unix)]
+    fn esc_press() -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Named(NamedKey::Escape),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        })
+    }
+
+    #[test]
+    fn chrome_workspace_ops_move_active_and_tabline_follows() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+        app.apply_chrome_action(ChromeAction::WorkspaceNext);
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        app.apply_chrome_action(ChromeAction::WorkspacePrev);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        app.apply_chrome_action(ChromeAction::WorkspaceLast);
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        // Unknown workspace warns and keeps state.
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1 2:ws2* (2)");
+        // Idle close is immediate (never pends, never kills).
+        app.apply_chrome_action(ChromeAction::WorkspaceClose);
+        assert!(!app.runtime.has_pending_ws_close());
+        assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+    }
+
+    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest.
+    #[cfg(unix)]
+    #[test]
+    fn chrome_workspace_close_live_pends_esc_cancels_repeat_kills() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        // Live session in the active workspace: manual split (headless) +
+        // a real shell in the new leaf (pane_sessions.rs pattern).
+        let new_id = ViewId::new(2);
+        let mut layout = app.runtime.layout().clone();
+        let focused = app.runtime.focused_view().expect("focus");
+        let old = layout.find_leaf(focused).cloned().expect("leaf");
+        let fresh_leaf = View::new(new_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        app.runtime.set_layout(layout);
+        app.runtime
+            .spawn_shell_for_view(new_id, "/bin/sh", &[], 40, 12)
+            .expect("pane shell must spawn headless");
+        // First Alt+W arms pending (never silent kill).
+        app.apply_chrome_action(ChromeAction::WorkspaceClose);
+        assert!(app.runtime.has_pending_ws_close());
+        assert!(app.runtime.has_pane_session(&new_id));
+        // Esc through the real intercept cancels: unconsumed as chrome
+        // (routes to Runtime) and the arm drops with no kill.
+        assert!(!drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_ws_close());
+        assert!(app.runtime.has_pane_session(&new_id));
+        // Re-arm, then repeat-to-confirm kills and closes.
+        app.apply_chrome_action(ChromeAction::WorkspaceClose);
+        assert!(app.runtime.has_pending_ws_close());
+        app.apply_chrome_action(ChromeAction::WorkspaceClose);
+        assert!(!app.runtime.has_pending_ws_close());
+        assert!(!app.runtime.has_pane_session(&new_id));
+        assert_eq!(app.runtime.workspace_count(), 1);
     }
 }

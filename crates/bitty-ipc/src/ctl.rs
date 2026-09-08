@@ -32,6 +32,10 @@
 //! | `terminal text` | `bitty.debug/getTerminalText` | `terminal.inspect` |
 //! | `view split` | `bitty.debug/splitView` | `view.manage` |
 //! | `view focus` | `bitty.debug/focusView` | `view.manage` |
+//! | `workspace list` | `bitty.debug/listWorkspaces` | `view.inspect` |
+//! | `workspace new` | `bitty.debug/createWorkspace` | `view.manage` |
+//! | `workspace close` | `bitty.debug/closeWorkspace` | `terminal.manage` (elevation) |
+//! | `workspace focus` | `bitty.debug/focusWorkspace` | `view.manage` |
 //! | `config reload` | `bitty.debug/reloadConfig` | `config.modify` (elevation) |
 //!
 //! `terminal.manage`, `config.modify` require explicit elevation per the IPC
@@ -42,6 +46,7 @@
 //! # Bounds (T-01 parity, fail closed)
 //!
 //! - Terminal ids: `t:<1..10 digits>` (e.g. `t:3`). View ids: `v:<1..10 digits>`.
+//! - Workspace ids: `ws:<1..10 digits>` (1-based display index, e.g. `ws:2`).
 //! - Send text: 1..=`MAX_SEND_TEXT_BYTES` bytes, no NUL, valid UTF-8 (checked by caller).
 //! - `--cwd`: 1..=`MAX_CTL_CWD_LEN` bytes, no NUL.
 //! - Split direction: `--left` | `--right` | `--up` | `--down` (exactly one; default `--right`).
@@ -87,6 +92,14 @@ pub const METHOD_GET_TERMINAL_TEXT: &str = "bitty.debug/getTerminalText";
 pub const METHOD_SPLIT_VIEW: &str = "bitty.debug/splitView";
 /// Wire method for `ctl view focus`.
 pub const METHOD_FOCUS_VIEW: &str = "bitty.debug/focusView";
+/// Wire method for `ctl workspace list`.
+pub const METHOD_LIST_WORKSPACES: &str = "bitty.debug/listWorkspaces";
+/// Wire method for `ctl workspace new`.
+pub const METHOD_NEW_WORKSPACE: &str = "bitty.debug/createWorkspace";
+/// Wire method for `ctl workspace close`.
+pub const METHOD_CLOSE_WORKSPACE: &str = "bitty.debug/closeWorkspace";
+/// Wire method for `ctl workspace focus`.
+pub const METHOD_FOCUS_WORKSPACE: &str = "bitty.debug/focusWorkspace";
 /// Wire method for `ctl config reload`.
 pub const METHOD_RELOAD_CONFIG: &str = "bitty.debug/reloadConfig";
 
@@ -103,6 +116,10 @@ pub fn all_control_methods() -> &'static [&'static str] {
         METHOD_GET_TERMINAL_TEXT,
         METHOD_SPLIT_VIEW,
         METHOD_FOCUS_VIEW,
+        METHOD_LIST_WORKSPACES,
+        METHOD_NEW_WORKSPACE,
+        METHOD_CLOSE_WORKSPACE,
+        METHOD_FOCUS_WORKSPACE,
         METHOD_RELOAD_CONFIG,
     ]
 }
@@ -118,6 +135,13 @@ pub fn required_scope_for_ctl_method(method: &str) -> Option<Scope> {
         METHOD_SEND_INPUT => Some(Scope::TerminalInput),
         METHOD_SPAWN_TERMINAL | METHOD_CLOSE_TERMINAL => Some(Scope::TerminalManage),
         METHOD_SPLIT_VIEW | METHOD_FOCUS_VIEW => Some(Scope::ViewManage),
+        // Workspace entry (CTX-0257): list/new/focus ride the view scopes
+        // (no elevation, like view list/split/focus); close can kill live
+        // pane sessions, so it needs `terminal.manage` elevation exactly
+        // like `terminal close`.
+        METHOD_LIST_WORKSPACES => Some(Scope::ViewInspect),
+        METHOD_NEW_WORKSPACE | METHOD_FOCUS_WORKSPACE => Some(Scope::ViewManage),
+        METHOD_CLOSE_WORKSPACE => Some(Scope::TerminalManage),
         METHOD_RELOAD_CONFIG => Some(Scope::ConfigModify),
         _ => None,
     }
@@ -207,6 +231,19 @@ pub fn parse_view_id(raw: &str) -> Result<u32, IpcError> {
             reason: format!("view id must match ^v:[0-9]+$, got '{raw}'"),
         })?;
     parse_id_digits(digits, "v")
+}
+
+/// Validate a workspace id (`ws:<digits>`, 1-based display index),
+/// returning the numeric id.
+///
+/// Shape-only: existence resolves server-side (`NotFound` when absent).
+pub fn parse_workspace_id(raw: &str) -> Result<u32, IpcError> {
+    let digits = raw
+        .strip_prefix("ws:")
+        .ok_or_else(|| IpcError::InvalidRequest {
+            reason: format!("workspace id must match ^ws:[0-9]+$, got '{raw}'"),
+        })?;
+    parse_id_digits(digits, "ws")
 }
 
 fn parse_id_digits(digits: &str, prefix: &str) -> Result<u32, IpcError> {
@@ -370,6 +407,15 @@ pub fn params_split(direction: SplitDirection) -> String {
 pub fn params_focus(view_id: &str) -> String {
     let mut out = String::from("{\"view_id\":\"");
     json_escape_into(&mut out, view_id);
+    out.push_str("\"}");
+    out
+}
+
+/// Build `{ "workspace_id": "ws:N" }` params for workspace close/focus.
+#[must_use]
+pub fn params_workspace(workspace_id: &str) -> String {
+    let mut out = String::from("{\"workspace_id\":\"");
+    json_escape_into(&mut out, workspace_id);
     out.push_str("\"}");
     out
 }
@@ -550,6 +596,25 @@ pub fn parse_focus_params(params: Option<&str>) -> Result<String, IpcError> {
     Ok(id)
 }
 
+/// Parse workspace `close`/`focus` params (`{ "workspace_id": "ws:N" }`).
+pub fn parse_workspace_params(params: Option<&str>) -> Result<String, IpcError> {
+    let raw = params.ok_or_else(|| IpcError::InvalidRequest {
+        reason: "missing params.workspace_id".into(),
+    })?;
+    if raw.len() > MAX_CTL_PARAMS_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "params".into(),
+            limit: MAX_CTL_PARAMS_BYTES,
+            actual: raw.len(),
+        });
+    }
+    let id = extract_string_field(raw, "workspace_id").ok_or_else(|| IpcError::InvalidRequest {
+        reason: "params.workspace_id must be a string like \"ws:2\"".into(),
+    })?;
+    parse_workspace_id(&id)?;
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +646,25 @@ mod tests {
             required_scope_for_ctl_method(METHOD_RELOAD_CONFIG),
             Some(Scope::ConfigModify)
         );
+        // Workspace entry (CTX-0257): list rides view.inspect, new/focus
+        // ride view.manage (no elevation), close needs terminal.manage
+        // (kill power, elevation — like terminal close).
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_LIST_WORKSPACES),
+            Some(Scope::ViewInspect)
+        );
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_NEW_WORKSPACE),
+            Some(Scope::ViewManage)
+        );
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_FOCUS_WORKSPACE),
+            Some(Scope::ViewManage)
+        );
+        assert_eq!(
+            required_scope_for_ctl_method(METHOD_CLOSE_WORKSPACE),
+            Some(Scope::TerminalManage)
+        );
         assert_eq!(
             required_scope_for_ctl_method(METHOD_LIST_TERMINALS),
             Some(Scope::TerminalInspect)
@@ -601,6 +685,13 @@ mod tests {
         assert!(authorize_ctl_method(METHOD_FOCUS_VIEW, &cli).is_ok());
         assert!(authorize_ctl_method(METHOD_GET_TERMINAL_TEXT, &cli).is_ok());
         assert!(authorize_ctl_method(METHOD_LIST_TERMINALS, &cli).is_ok());
+        // CTX-0257: workspace list/new/focus ride the view scopes (no
+        // elevation); workspace close needs terminal.manage like the other
+        // kill verb.
+        assert!(authorize_ctl_method(METHOD_LIST_WORKSPACES, &cli).is_ok());
+        assert!(authorize_ctl_method(METHOD_NEW_WORKSPACE, &cli).is_ok());
+        assert!(authorize_ctl_method(METHOD_FOCUS_WORKSPACE, &cli).is_ok());
+        assert!(authorize_ctl_method(METHOD_CLOSE_WORKSPACE, &cli).is_err());
         // Require explicit elevation: unscoped CLI callers are rejected.
         assert!(authorize_ctl_method(METHOD_CLOSE_TERMINAL, &cli).is_err());
         assert!(authorize_ctl_method(METHOD_SPAWN_TERMINAL, &cli).is_err());
@@ -623,8 +714,12 @@ mod tests {
     fn mcp_readonly_cannot_send_or_manage() {
         let mcp = ScopeSet::mcp_default();
         assert!(authorize_ctl_method(METHOD_LIST_TERMINALS, &mcp).is_ok());
+        assert!(authorize_ctl_method(METHOD_LIST_WORKSPACES, &mcp).is_ok());
         assert!(authorize_ctl_method(METHOD_SEND_INPUT, &mcp).is_err());
+        assert!(authorize_ctl_method(METHOD_NEW_WORKSPACE, &mcp).is_err());
+        assert!(authorize_ctl_method(METHOD_FOCUS_WORKSPACE, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_CLOSE_TERMINAL, &mcp).is_err());
+        assert!(authorize_ctl_method(METHOD_CLOSE_WORKSPACE, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_RELOAD_CONFIG, &mcp).is_err());
     }
 
@@ -643,6 +738,7 @@ mod tests {
     fn terminal_and_view_ids_validate_shape_only() {
         assert_eq!(parse_terminal_id("t:3").unwrap(), 3);
         assert_eq!(parse_view_id("v:12").unwrap(), 12);
+        assert_eq!(parse_workspace_id("ws:2").unwrap(), 2);
         assert!(parse_terminal_id("t:0").is_ok());
         assert!(parse_terminal_id("t:").is_err());
         assert!(parse_terminal_id("t:007").is_err());
@@ -651,6 +747,16 @@ mod tests {
         assert!(parse_terminal_id("t:1;rm").is_err());
         assert!(parse_view_id("v:").is_err());
         assert!(parse_view_id("t:3").is_err());
+        assert!(parse_workspace_id("ws:").is_err());
+        assert!(parse_workspace_id("ws:007").is_err());
+        assert!(
+            parse_workspace_id("ws:0").is_ok(),
+            "shape-only; existence is server-side"
+        );
+        assert!(parse_workspace_id("v:2").is_err());
+        assert!(parse_workspace_id("t:2").is_err());
+        assert!(parse_workspace_id("2").is_err());
+        assert!(parse_workspace_id("ws:abc").is_err());
     }
 
     #[test]
@@ -668,6 +774,15 @@ mod tests {
         let (id, text) = parse_send_params(Some(&params)).unwrap();
         assert_eq!(id, "t:1");
         assert_eq!(text, "cargo test");
+    }
+
+    #[test]
+    fn workspace_params_roundtrip() {
+        let params = params_workspace("ws:2");
+        assert_eq!(parse_workspace_params(Some(&params)).unwrap(), "ws:2");
+        assert!(parse_workspace_params(None).is_err());
+        assert!(parse_workspace_params(Some("{\"workspace_id\":\"v:2\"}")).is_err());
+        assert!(parse_workspace_params(Some("{\"workspace_id\":\"ws:007\"}")).is_err());
     }
 
     #[test]

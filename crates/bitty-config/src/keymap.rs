@@ -45,7 +45,12 @@
 //!   `copy_to_clipboard`, `paste_from_clipboard`,
 //!   `scroll_page_up`, `scroll_page_down`, `open_composer` (Command Composer
 //!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
-//!   so Normal Mode stays byte-identical until the user opts in).
+//!   so Normal Mode stays byte-identical until the user opts in),
+//!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
+//!   `workspace_last`, `workspace_focus:<1..=16>` (CTX-0257 workspace ops
+//!   entry per DEC-0034: `alt+n` new, `alt+w` close with kill-confirm,
+//!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
+//!   last-used, `alt+1..=9` jump to workspace N).
 //!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
@@ -53,10 +58,17 @@
 //! # Defaults
 //!
 //! [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
-//! reference (`alt+h/j/k/l` navigate, `alt+1..=9` jump to view id N,
-//! `alt+u`/`alt+i` page up/down less-like, `alt+w` closes, `alt+z`/`alt+m`/
-//! `alt+f` zoom, `shift+alt` creates, `shift+ctrl` resizes, `ctrl+alt+arrows`
-//! navigate, `ctrl+tab` cycles). Plain `Tab`, arrows, letters, and digits
+//! reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
+//! less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
+//! `shift+ctrl` resizes, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
+//! `ctrl+shift+c/v` copy/paste) plus the DEC-0034 workspace entry
+//! (CTX-0257): `alt+n` new workspace, `alt+1..=9` jump to workspace N,
+//! `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+w` close with
+//! kill-confirm. `alt+w` and `alt+1..=9` previously drove pane ops
+//! (`close_view`, `focus:<n>`); those actions stay parseable and
+//! user-bindable but are no longer bound by default — workspace numbers won
+//! the Alt slot per the owner spec, panes navigate spatially (`goto_split`,
+//! `focus_next`/`focus_prev`). Plain `Tab`, arrows, letters, and digits
 //! are deliberately unbound so they reach the shell.
 //!
 //! The table is the canonical Alt spelling (kept byte-identical for the
@@ -85,6 +97,13 @@ pub const MAX_ACTION_LEN: usize = 64;
 
 /// Maximum focus id accepted by the `focus:<n>` action.
 pub const MAX_FOCUS_ID: u64 = 256;
+
+/// Maximum workspace index accepted by the `workspace_focus:<n>` action.
+///
+/// Parse-time bound only: the runtime enforces its live capacity
+/// (`<= 16`, mirroring `bitty_runtime::registry::MAX_WORKSPACES_PER_WINDOW`)
+/// fail-closed at apply, exactly like `MAX_FOCUS_ID` vs leaf counts.
+pub const MAX_WORKSPACE_INDEX: u64 = 16;
 
 /// Only supported keymap context today. Unknown contexts fail closed.
 pub const GLOBAL_CONTEXT: &str = "global";
@@ -540,6 +559,10 @@ pub enum ChromeAction {
     /// Nudge the enclosing split ratio (`resize_split:left`, ...).
     ResizeSplit(SplitDir),
     /// Close the focused pane (`close_view`, alias `close_surface`).
+    ///
+    /// No longer bound by default (CTX-0257: `alt+w` closes the workspace);
+    /// stays parseable so users keep pane-granularity close via an explicit
+    /// bind, and `ctl terminal close` is unchanged.
     CloseView,
     /// Toggle single-pane zoom (`toggle_zoom`, alias `toggle_split_zoom`).
     ToggleZoom,
@@ -548,6 +571,10 @@ pub enum ChromeAction {
     /// Focus previous pane in depth-first order.
     FocusPrev,
     /// Focus numeric view id (`focus:3`, `1..=256`).
+    ///
+    /// No longer bound by default (CTX-0257: `alt+1..=9` jumps workspaces);
+    /// stays parseable so users keep pane-number jump via an explicit bind,
+    /// and `ctl view focus v:N` is unchanged.
     FocusId(u64),
     /// Copy the current selection to the system clipboard
     /// (`copy_to_clipboard`; ghostty `copy_to_clipboard:mixed` equivalent:
@@ -571,6 +598,30 @@ pub enum ChromeAction {
     /// the single-character schema rule already forces a modifier, so the
     /// open chord can never shadow bare shell typing.
     OpenComposer,
+    /// Create a fresh workspace and switch to it (`workspace_new`, CTX-0257
+    /// DEC-0034 entry, default chord `alt+n`). The new workspace starts as
+    /// a single idle leaf; no shell spawns until the user splits or types
+    /// (lazy spawn is a follow-up).
+    WorkspaceNew,
+    /// Close the active workspace (`workspace_close`, default `alt+w`).
+    ///
+    /// Workspaces with live pane sessions never die silently: the first
+    /// press arms a pending-confirm (loud banner), repeating the chord
+    /// confirms the kill, `Esc` cancels. Idle workspaces close immediately.
+    /// Closing the last workspace resets it to a fresh idle leaf so the
+    /// layout never strands empty.
+    WorkspaceClose,
+    /// Switch to the previous workspace (`workspace_prev`, default `alt+-`).
+    WorkspacePrev,
+    /// Switch to the next workspace (`workspace_next`, default `alt+=` —
+    /// the unshifted DEC `+` spelling, since `+` cannot be a chord key).
+    WorkspaceNext,
+    /// Switch to the last-used workspace (`workspace_last`, default
+    /// `alt+tab`, MRU order). No-op with a single workspace.
+    WorkspaceLast,
+    /// Jump to workspace N (`workspace_focus:<1..=16>`, defaults
+    /// `alt+1..=9`). Unknown indices warn and keep the current workspace.
+    WorkspaceFocus(u64),
 }
 
 impl ChromeAction {
@@ -647,6 +698,30 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::OpenComposer)
             }
+            "workspace_new" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspaceNew)
+            }
+            "workspace_close" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspaceClose)
+            }
+            "workspace_prev" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspacePrev)
+            }
+            "workspace_next" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspaceNext)
+            }
+            "workspace_last" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::WorkspaceLast)
+            }
+            "workspace_focus" => {
+                let n = require_workspace_index(arg, trimmed)?;
+                Ok(Self::WorkspaceFocus(n))
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -671,12 +746,18 @@ impl ChromeAction {
             Self::ScrollPageUp => "scroll_page_up".to_string(),
             Self::ScrollPageDown => "scroll_page_down".to_string(),
             Self::OpenComposer => "open_composer".to_string(),
+            Self::WorkspaceNew => "workspace_new".to_string(),
+            Self::WorkspaceClose => "workspace_close".to_string(),
+            Self::WorkspacePrev => "workspace_prev".to_string(),
+            Self::WorkspaceNext => "workspace_next".to_string(),
+            Self::WorkspaceLast => "workspace_last".to_string(),
+            Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, open_composer";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -713,6 +794,25 @@ fn require_focus_id(arg: Option<&str>, raw: &str) -> Result<u64, ConfigError> {
         _ => Err(ConfigError::validation(
             "keymaps[].action",
             format!("action '{raw}' needs a view id (e.g. 'focus:2')"),
+        )),
+    }
+}
+
+/// Require a `workspace_focus:<n>` index argument.
+fn require_workspace_index(arg: Option<&str>, raw: &str) -> Result<u64, ConfigError> {
+    match arg {
+        Some(n) if !n.is_empty() => match n.parse::<u64>() {
+            Ok(id) if (1..=MAX_WORKSPACE_INDEX).contains(&id) => Ok(id),
+            _ => Err(ConfigError::validation(
+                "keymaps[].action",
+                format!(
+                    "action '{raw}' needs a workspace index 1..={MAX_WORKSPACE_INDEX} (e.g. 'workspace_focus:2')"
+                ),
+            )),
+        },
+        _ => Err(ConfigError::validation(
+            "keymaps[].action",
+            format!("action '{raw}' needs a workspace index (e.g. 'workspace_focus:2')"),
         )),
     }
 }
@@ -771,28 +871,28 @@ impl ResolvedKeymap {
 }
 
 /// [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
-/// reference (`alt+h/j/k/l` navigate, `alt+1..=9` jump to view id N,
-/// `alt+u`/`alt+i` page up/down less-like, `alt+w` closes,
-/// `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates, `shift+ctrl` resizes,
-/// `ctrl+alt+arrows` navigate, `ctrl+tab` cycles, `ctrl+shift+c/v`
-/// copy/paste — ghostty `src/config/Config.zig` default keybinds:
-/// `copy_to_clipboard:mixed` / `paste_from_clipboard` under
-/// `ctrl+shift` on Linux). Plain `Tab`, arrows,
-/// letters, and digits are deliberately unbound so they reach the shell.
+/// reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
+/// less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
+/// `shift+ctrl` resizes, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
+/// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
+/// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
+/// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
+/// Plain `Tab`, arrows, letters, and digits are deliberately unbound so
+/// they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+h", "goto_split:left"),
     ("alt+j", "goto_split:down"),
     ("alt+k", "goto_split:up"),
     ("alt+l", "goto_split:right"),
-    ("alt+1", "focus:1"),
-    ("alt+2", "focus:2"),
-    ("alt+3", "focus:3"),
-    ("alt+4", "focus:4"),
-    ("alt+5", "focus:5"),
-    ("alt+6", "focus:6"),
-    ("alt+7", "focus:7"),
-    ("alt+8", "focus:8"),
-    ("alt+9", "focus:9"),
+    ("alt+1", "workspace_focus:1"),
+    ("alt+2", "workspace_focus:2"),
+    ("alt+3", "workspace_focus:3"),
+    ("alt+4", "workspace_focus:4"),
+    ("alt+5", "workspace_focus:5"),
+    ("alt+6", "workspace_focus:6"),
+    ("alt+7", "workspace_focus:7"),
+    ("alt+8", "workspace_focus:8"),
+    ("alt+9", "workspace_focus:9"),
     ("alt+u", "scroll_page_up"),
     ("alt+i", "scroll_page_down"),
     ("ctrl+alt+left", "goto_split:left"),
@@ -809,12 +909,16 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+ctrl+j", "resize_split:down"),
     ("shift+ctrl+k", "resize_split:up"),
     ("shift+ctrl+l", "resize_split:right"),
-    ("alt+w", "close_view"),
+    ("alt+w", "workspace_close"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
     ("ctrl+shift+c", "copy_to_clipboard"),
     ("ctrl+shift+v", "paste_from_clipboard"),
     ("alt+z", "toggle_zoom"),
+    ("alt+n", "workspace_new"),
+    ("alt+-", "workspace_prev"),
+    ("alt+=", "workspace_next"),
+    ("alt+tab", "workspace_last"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -1018,7 +1122,11 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('w'), false, false)),
-            Some(ChromeAction::CloseView)
+            Some(ChromeAction::WorkspaceClose)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
+            Some(ChromeAction::WorkspaceNew)
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('m'), false, false)),
@@ -1026,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('1'), false, false)),
-            Some(ChromeAction::FocusId(1))
+            Some(ChromeAction::WorkspaceFocus(1))
         );
         assert_eq!(
             match_keymap(&maps, key_ref_super(KeyName::Char('h'), false, true)),
@@ -1214,6 +1322,34 @@ mod tests {
             ChromeAction::parse("scroll_page_down").expect("page down"),
             ChromeAction::ScrollPageDown
         );
+        assert_eq!(
+            ChromeAction::parse("workspace_new").expect("ws new"),
+            ChromeAction::WorkspaceNew
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_close").expect("ws close"),
+            ChromeAction::WorkspaceClose
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_prev").expect("ws prev"),
+            ChromeAction::WorkspacePrev
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_next").expect("ws next"),
+            ChromeAction::WorkspaceNext
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_last").expect("ws last"),
+            ChromeAction::WorkspaceLast
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_focus:3").expect("ws focus"),
+            ChromeAction::WorkspaceFocus(3)
+        );
+        assert_eq!(
+            ChromeAction::WorkspaceFocus(2).canonical(),
+            "workspace_focus:2"
+        );
     }
 
     #[test]
@@ -1227,6 +1363,12 @@ mod tests {
             "focus:0",
             "focus:999",
             "focus:abc",
+            "workspace_focus",
+            "workspace_focus:0",
+            "workspace_focus:17",
+            "workspace_focus:abc",
+            "workspace_new:1",
+            "workspace_close:1",
             "goto_split:left:extra",
             "copy_to_clipboard:mixed",
             "paste_from_clipboard:1",
@@ -1264,6 +1406,10 @@ mod tests {
             key_ref(KeyName::Char('u'), false, false, false),
             key_ref(KeyName::Char('i'), false, false, false),
             key_ref(KeyName::Char('z'), false, false, false),
+            // CTX-0257: the workspace-entry keys stay shell-bound when bare
+            // (only the Alt chords are chrome-owned).
+            key_ref(KeyName::Char('-'), false, false, false),
+            key_ref(KeyName::Char('='), false, false, false),
             // Ctrl+P is shell input unless the user binds it (CTX-0154
             // single-owner: 0x10 goes to the PTY, focus must not move).
             key_ref(KeyName::Char('p'), true, false, false),
@@ -1288,7 +1434,7 @@ mod tests {
         );
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
-            Some(ChromeAction::CloseView)
+            Some(ChromeAction::WorkspaceClose)
         );
         // CTX-0161 copy/paste chords: single-owner intercept owns the
         // shifted chords; the unshifted C0 bytes stay shell input (above).
@@ -1327,8 +1473,10 @@ mod tests {
     #[test]
     fn defaults_alt_number_jump_and_page_and_zoom() {
         // CTX-0178 Alt-as-Mod: fresh config jumps, pages, and zooms.
+        // CTX-0257: alt+1..=9 jumps WORKSPACES now (DEC-0034); pane-number
+        // jump (`focus:<n>`) stays parseable for explicit binds.
         let maps = default_keymaps().expect("defaults valid");
-        for (digit, id) in [
+        for (digit, idx) in [
             ('1', 1),
             ('2', 2),
             ('3', 3),
@@ -1341,8 +1489,8 @@ mod tests {
         ] {
             assert_eq!(
                 match_keymap(&maps, key_ref(KeyName::Char(digit), false, true, false)),
-                Some(ChromeAction::FocusId(id)),
-                "alt+{digit} jumps to view {id}"
+                Some(ChromeAction::WorkspaceFocus(idx)),
+                "alt+{digit} jumps to workspace {idx}"
             );
         }
         assert_eq!(
@@ -1375,18 +1523,103 @@ mod tests {
     #[test]
     fn defaults_have_unique_chord_identities() {
         // Collision audit as a test: every default chord identity is unique
-        // so no default shadows another (CTX-0178).
+        // so no default shadows another (CTX-0178). CTX-0257 extends the
+        // audit to the DEC-0034 entry set: 35 shipped + 4 new (alt+n/-/=/tab;
+        // alt+w and alt+1..=9 are rebinds, not new identities) = 39 total,
+        // and the full DEC set resolves.
         let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            maps.len(),
+            39,
+            "35 shipped + 4 workspace-entry chords (alt+n/-/=/tab)"
+        );
         let mut seen = std::collections::HashSet::new();
         for m in &maps {
             assert!(seen.insert(m.id()), "duplicate default id {}", m.id());
         }
+        // The DEC-0034 entry set resolves through the shipped table.
+        let dec: &[(&str, bool, bool, ChromeAction)] = &[
+            ("n", false, false, ChromeAction::WorkspaceNew),
+            ("w", false, false, ChromeAction::WorkspaceClose),
+            ("-", false, false, ChromeAction::WorkspacePrev),
+            ("=", false, false, ChromeAction::WorkspaceNext),
+        ];
+        for (key, ctrl, shift, want) in dec {
+            let key = KeyName::Char(key.chars().next().expect("single"));
+            assert_eq!(
+                match_keymap(&maps, key_ref(key, *ctrl, true, *shift)),
+                Some(*want),
+                "DEC chord alt+{key:?}"
+            );
+        }
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Tab, false, true, false)),
+            Some(ChromeAction::WorkspaceLast),
+            "alt+tab is last-used workspace"
+        );
         // All single-character defaults require a modifier (typing safety).
         for (chord, _) in DEFAULT_KEYMAPS {
             let parsed = Chord::parse(chord).expect("default parses");
             assert!(
                 parsed.ctrl || parsed.alt || parsed.shift || parsed.super_held,
                 "default '{chord}' must hold a modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_entry_survives_super_flip() {
+        // CTX-0257 Req-5: the new Alt-chords go through the same alt-slot
+        // substitution (`default_keymaps_with_mod`), so the Super flip keeps
+        // working for workspace ops exactly like pane ops.
+        let maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        assert_eq!(maps.len(), DEFAULT_KEYMAPS.len());
+        let mut seen = std::collections::HashSet::new();
+        for m in &maps {
+            assert!(seen.insert(m.id()), "duplicate rebound id {}", m.id());
+        }
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('n'), false, false)),
+            Some(ChromeAction::WorkspaceNew)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('-'), false, false)),
+            Some(ChromeAction::WorkspacePrev)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('='), false, false)),
+            Some(ChromeAction::WorkspaceNext)
+        );
+        assert_eq!(
+            match_keymap(
+                &maps,
+                KeyRef {
+                    key: KeyName::Tab,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::WorkspaceLast)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('9'), false, false)),
+            Some(ChromeAction::WorkspaceFocus(9))
+        );
+        // Old Alt spellings are unbound (back to the shell) under Super.
+        for key in [
+            KeyName::Char('n'),
+            KeyName::Char('w'),
+            KeyName::Char('-'),
+            KeyName::Char('='),
+            KeyName::Tab,
+            KeyName::Char('1'),
+        ] {
+            assert_eq!(
+                match_keymap(&maps, key_ref(key, false, true, false)),
+                None,
+                "alt+{key:?} unbound under super mod"
             );
         }
     }

@@ -593,7 +593,6 @@ impl LuaVm {
         self.wall_elapsed_ms = 0;
         self.memory_used = self.lua.total_memory();
 
-        let start = Instant::now();
         // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
         // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
         // instructions instead of once per whole budget. `total_used` tracks
@@ -628,6 +627,16 @@ impl LuaVm {
                 });
             }
         };
+
+        // Execution wall-clock starts after chunk load: the RC-1 50 ms budget
+        // bounds VM execution (what the fuel/instruction budget also bounds),
+        // not compile + host scheduling stalls around `Closure::load`. Compile
+        // input sizes are bounded at call sites (config: 64 KiB / 2048 lines;
+        // plugin events: 8 KiB), so excluding load cannot hide unbounded work.
+        // This fixes trivial configs suspending with WallClockExceeded on
+        // loaded hosts (e.g. 252 parallel tests on CI) where the thread can
+        // sit descheduled for the whole budget before stepping once.
+        let start = Instant::now();
 
         // Pre-check memory before stepping (fail-closed per FS-7).
         let mem_before = self.lua.total_memory();

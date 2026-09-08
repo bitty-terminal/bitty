@@ -11,11 +11,23 @@
 //!
 //! ```lua
 //! return {
+//!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super"
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
 //! }
 //! ```
+//!
+//! - `mod_key`: which modifier the shipped defaults are expressed against
+//!   (CTX-0236). `"alt"` (default; aliases `opt`/`option`) keeps the
+//!   Alt-as-Mod map byte-identical; `"super"` (aliases `meta`/`cmd`/
+//!   `command`/`win`/`windows`) rebinds every `alt`-bearing default to Super
+//!   (`alt+h` becomes `super+h`, `shift+alt+h` becomes `shift+super+h`,
+//!   `ctrl+alt+left` becomes `ctrl+super+left`). Anything else — including
+//!   `ctrl`/`shift`, which would silently steal shell typing and shadow the
+//!   mod-independent fixed chords — fails closed. Explicit `keymaps` entries
+//!   keep their exact spelling and overlay by the existing `context + chord`
+//!   identity, so they survive a mod flip untouched.
 //!
 //! - `chord`: `<mod>+...+<key>` with mods from
 //!   `ctrl/control`, `alt/opt/option`, `shift`, `super/meta/cmd/win`
@@ -45,7 +57,12 @@
 //! `alt+u`/`alt+i` page up/down less-like, `alt+w` closes, `alt+z`/`alt+m`/
 //! `alt+f` zoom, `shift+alt` creates, `shift+ctrl` resizes, `ctrl+alt+arrows`
 //! navigate, `ctrl+tab` cycles). Plain `Tab`, arrows, letters, and digits
-//! are deliberately unbound so they reach the shell. A user entry replaces
+//! are deliberately unbound so they reach the shell.
+//!
+//! The table is the canonical Alt spelling (kept byte-identical for the
+//! CTX-0178 wizard pin); [`default_keymaps_with_mod`] renders it against one
+//! [`ModKey`] so flipping `mod_key` rebinds the chrome map without touching
+//! this source. A user entry replaces
 //! the default with the same `context + chord` identity (the existing merge
 //! rule); anything else appends.
 //!
@@ -71,6 +88,95 @@ pub const MAX_FOCUS_ID: u64 = 256;
 
 /// Only supported keymap context today. Unknown contexts fail closed.
 pub const GLOBAL_CONTEXT: &str = "global";
+
+/// Maximum raw `mod_key` string length in bytes (fail-closed, before parsing).
+pub const MAX_MOD_KEY_LEN: usize = 32;
+
+/// Leader/Mod key the shipped chrome map is expressed against (CTX-0236).
+///
+/// [`DEFAULT_KEYMAPS`] is the canonical Alt spelling; [`resolve_keymaps`]
+/// renders it through [`default_keymaps_with_mod`], so flipping one
+/// `mod_key` setting rebinds every `alt`-bearing default while chords
+/// without `alt` (`ctrl+tab` cycles, `shift+ctrl` resizes, `ctrl+shift`
+/// copy/paste) pass through as mod-independent fixed chords. Explicit user
+/// entries keep their exact spelling and overlay by the existing
+/// `context + chord` identity, so a mod flip never rewrites user intent.
+///
+/// Only `alt` (default) and `super` are accepted. `ctrl`/`shift` fail closed
+/// at parse time: they would silently steal shell typing (`ctrl+w`,
+/// `ctrl+h`, ...) and collide with the fixed chords, shadowing defaults
+/// instead of rebinding the map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ModKey {
+    /// Alt / Option (default): the shipped Alt-as-Mod map, byte-identical.
+    #[default]
+    Alt,
+    /// Super / Meta / Cmd / Win: the full chrome map on Super.
+    Super,
+}
+
+impl ModKey {
+    /// Canonical setting spelling (`"alt"` / `"super"`), used by
+    /// `config check` attribution and reload diffs.
+    #[must_use]
+    pub fn canonical(self) -> &'static str {
+        match self {
+            Self::Alt => "alt",
+            Self::Super => "super",
+        }
+    }
+
+    /// Parse a raw `mod_key` value (trimmed, case-insensitive, chord-mod
+    /// aliases accepted: `opt`/`option` for Alt, `meta`/`cmd`/`command`/
+    /// `win`/`windows` for Super).
+    ///
+    /// Fail-closed [`ConfigError`] on empty, overlong, or unknown values —
+    /// including `ctrl`/`shift`, which would shadow shell input and the
+    /// mod-independent fixed chords (never a panic, never a silent ignore).
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::validation(
+                "mod_key",
+                "must not be empty; expected one of 'alt', 'super'",
+            ));
+        }
+        if trimmed.len() > MAX_MOD_KEY_LEN {
+            return Err(ConfigError::validation(
+                "mod_key",
+                format!("must be <= {MAX_MOD_KEY_LEN} bytes"),
+            ));
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "alt" | "opt" | "option" => Ok(Self::Alt),
+            "super" | "meta" | "cmd" | "command" | "win" | "windows" => Ok(Self::Super),
+            _ => Err(ConfigError::validation(
+                "mod_key",
+                format!(
+                    "unknown mod '{trimmed}'; expected one of 'alt', 'super' ('ctrl'/'shift' are rejected: they would steal shell typing and shadow the fixed chords)"
+                ),
+            )),
+        }
+    }
+
+    /// Rebind one parsed default chord against this mod: move the `alt` slot
+    /// to the mod. Chords without `alt` are returned unchanged
+    /// (mod-independent fixed chords).
+    #[must_use]
+    pub fn apply_to(self, chord: Chord) -> Chord {
+        if !chord.alt {
+            return chord;
+        }
+        match self {
+            Self::Alt => chord,
+            Self::Super => Chord {
+                alt: false,
+                super_held: true,
+                ..chord
+            },
+        }
+    }
+}
 
 /// Named key identity used by chords and by the app-side matcher.
 ///
@@ -711,9 +817,14 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+z", "toggle_zoom"),
 ];
 
-/// Build the shipped defaults. Fail-closed only on an internal default typo
-/// (covered by `defaults_parse`; user input never reaches this path).
-pub fn default_keymaps() -> Result<Vec<ResolvedKeymap>, ConfigError> {
+/// Build the shipped defaults against one [`ModKey`] (CTX-0236).
+///
+/// [`DEFAULT_KEYMAPS`] is the canonical Alt spelling (kept byte-identical
+/// for the CTX-0178 wizard pin): every entry carrying `alt` is rebound
+/// through [`ModKey::apply_to`], entries without `alt` pass through
+/// unchanged. Fail-closed only on an internal default typo (covered by
+/// `defaults_parse`; user input never reaches this path).
+pub fn default_keymaps_with_mod(mod_key: ModKey) -> Result<Vec<ResolvedKeymap>, ConfigError> {
     let mut out = Vec::with_capacity(DEFAULT_KEYMAPS.len());
     for (chord_raw, action_raw) in DEFAULT_KEYMAPS {
         let chord = Chord::parse(chord_raw).map_err(|e| ConfigError::InvalidInput {
@@ -723,13 +834,19 @@ pub fn default_keymaps() -> Result<Vec<ResolvedKeymap>, ConfigError> {
             message: format!("internal default keymap invalid: {e}"),
         })?;
         out.push(ResolvedKeymap {
-            chord,
+            chord: mod_key.apply_to(chord),
             action,
             context: GLOBAL_CONTEXT.to_string(),
             from_default: true,
         });
     }
     Ok(out)
+}
+
+/// Build the shipped defaults. Fail-closed only on an internal default typo
+/// (covered by `defaults_parse`; user input never reaches this path).
+pub fn default_keymaps() -> Result<Vec<ResolvedKeymap>, ConfigError> {
+    default_keymaps_with_mod(ModKey::default())
 }
 
 /// Validate one raw entry's context (only `"global"` today).
@@ -750,14 +867,19 @@ pub fn validate_context(raw: &str) -> Result<String, ConfigError> {
     Ok(GLOBAL_CONTEXT.to_string())
 }
 
-/// Resolve the effective keymap table: shipped defaults overridden by user
-/// entries with the same `context + chord` identity (the existing merge
+/// Resolve the effective keymap table: shipped defaults (rendered against
+/// `effective.mod_key`, so one setting rebinds the chrome map) overridden by
+/// user entries with the same `context + chord` identity (the existing merge
 /// rule), then sorted deterministically by identity.
+///
+/// Explicit user chords keep their exact spelling: under a non-default mod
+/// they coexist with the rebound defaults (same identity replaces, anything
+/// else appends).
 ///
 /// Fail-closed on unknown contexts, chords, or actions, and on duplicate
 /// normalized chords within the user config.
 pub fn resolve_keymaps(effective: &EffectiveConfig) -> Result<Vec<ResolvedKeymap>, ConfigError> {
-    let mut table = default_keymaps()?;
+    let mut table = default_keymaps_with_mod(effective.mod_key)?;
     let mut seen_user: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &effective.keymaps {
         let context = validate_context(&entry.context)?;
@@ -818,6 +940,177 @@ mod tests {
             shift,
             super_held: false,
         }
+    }
+
+    fn key_ref_super(key: KeyName, ctrl: bool, shift: bool) -> KeyRef {
+        KeyRef {
+            key,
+            ctrl,
+            alt: false,
+            shift,
+            super_held: true,
+        }
+    }
+
+    #[test]
+    fn mod_key_parse_accepts_aliases_case_insensitive() {
+        for raw in ["alt", "Alt", " ALT ", "opt", "OPT", "option", "Option"] {
+            assert_eq!(ModKey::parse(raw).expect("alt alias"), ModKey::Alt);
+        }
+        for raw in [
+            "super", "Super", " SUPER ", "meta", "Meta", "cmd", "command", "win", "Win", "windows",
+        ] {
+            assert_eq!(ModKey::parse(raw).expect("super alias"), ModKey::Super);
+        }
+        assert_eq!(ModKey::default(), ModKey::Alt);
+        assert_eq!(ModKey::Alt.canonical(), "alt");
+        assert_eq!(ModKey::Super.canonical(), "super");
+    }
+
+    #[test]
+    fn mod_key_parse_rejects_fail_closed() {
+        // Empty, overlong, unknown, and ctrl/shift (shell-shadow mods) all
+        // fail closed on the `mod_key` field.
+        let mut bad: Vec<String> = vec![
+            "".into(),
+            "   ".into(),
+            "ctrl".into(),
+            "control".into(),
+            "shift".into(),
+            "hyper".into(),
+            "altgraph".into(),
+            "banana".into(),
+            "alt+shift".into(),
+        ];
+        bad.push("a".repeat(MAX_MOD_KEY_LEN + 1));
+        for raw in &bad {
+            let err = ModKey::parse(raw).unwrap_err();
+            assert!(
+                err.to_string().contains("mod_key"),
+                "must name field for {raw:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mod_is_identity_over_shipped_map() {
+        // `ModKey::Alt` renders the canonical map byte-identically, so the
+        // CTX-0178 wizard pin and existing tests keep passing untouched.
+        let shipped = default_keymaps().expect("defaults valid");
+        let via_mod = default_keymaps_with_mod(ModKey::Alt).expect("alt mod valid");
+        assert_eq!(shipped, via_mod);
+        assert_eq!(shipped.len(), DEFAULT_KEYMAPS.len());
+    }
+
+    #[test]
+    fn super_mod_flip_rebinds_chrome_map() {
+        let maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
+        assert_eq!(maps.len(), DEFAULT_KEYMAPS.len());
+        // No rebound default shadows another.
+        let mut seen = std::collections::HashSet::new();
+        for m in &maps {
+            assert!(seen.insert(m.id()), "duplicate rebound id {}", m.id());
+        }
+        // Alt-bearing defaults moved to Super ...
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('h'), false, false)),
+            Some(ChromeAction::GotoSplit(SplitDir::Left))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('w'), false, false)),
+            Some(ChromeAction::CloseView)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('m'), false, false)),
+            Some(ChromeAction::ToggleZoom)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('1'), false, false)),
+            Some(ChromeAction::FocusId(1))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('h'), false, true)),
+            Some(ChromeAction::NewSplit(SplitDir::Left))
+        );
+        assert_eq!(
+            match_keymap(
+                &maps,
+                KeyRef {
+                    key: KeyName::Left,
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::GotoSplit(SplitDir::Left))
+        );
+        // ... the old Alt chords are unbound (back to the shell) ...
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('h'), false, true, false)),
+            None,
+            "alt+h unbound under super mod"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('w'), false, true, false)),
+            None,
+            "alt+w unbound under super mod"
+        );
+        // ... and the mod-independent fixed chords are untouched.
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Tab, true, false, false)),
+            Some(ChromeAction::FocusNext)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('h'), true, false, true)),
+            Some(ChromeAction::ResizeSplit(SplitDir::Left))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('c'), true, false, true)),
+            Some(ChromeAction::CopyToClipboard)
+        );
+    }
+
+    #[test]
+    fn super_mod_leaves_shell_keys_unbound() {
+        let maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
+        for k in [
+            key_ref(KeyName::Tab, false, false, false),
+            key_ref(KeyName::Up, false, false, false),
+            key_ref(KeyName::Char('h'), false, false, false),
+            key_ref(KeyName::Char('p'), true, false, false),
+            key_ref(KeyName::Char('w'), true, false, false),
+            key_ref_super(KeyName::Char('p'), false, false),
+        ] {
+            assert_eq!(match_keymap(&maps, k), None, "shell key {k:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_chords_survive_mod_flip_by_exact_identity() {
+        // An explicit `alt+h` override replaces the default under the
+        // default mod, and coexists with the rebound defaults under Super
+        // (exact-match identity is preserved, never rewritten).
+        let flip = EffectiveConfig {
+            mod_key: ModKey::Super,
+            keymaps: vec![KeymapEntry {
+                chord: "alt+h".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&flip).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('h'), false, true, false)),
+            Some(ChromeAction::FocusNext),
+            "explicit alt+h wins"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('h'), false, false)),
+            Some(ChromeAction::GotoSplit(SplitDir::Left)),
+            "rebound super+h default intact"
+        );
     }
 
     #[test]

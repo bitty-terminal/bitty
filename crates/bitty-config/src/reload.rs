@@ -56,6 +56,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `appearance.theme`        | Live               |
+/// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
@@ -81,6 +82,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "window"
         | "appearance.theme"
         | "appearance"
+        | "mod_key"
         | "keymaps" => ReloadClass::Live,
         "terminal.scrollback"
         | "terminal.shell"
@@ -260,6 +262,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         format!("{:?}", old.appearance.theme),
         format!("{:?}", new.appearance.theme),
     );
+    // CTX-0236: the mod rebinds the resolved chrome map, exactly like an
+    // explicit keymap edit, so it reconciles live with the keymaps.
+    push_if_changed(
+        "mod_key",
+        old.mod_key.canonical().to_string(),
+        new.mod_key.canonical().to_string(),
+    );
     // Keymaps and plugins: compare sorted ids, not raw order (merge already
     // sorts them).
     let old_kms: Vec<String> = old.keymaps.iter().map(|k| k.id()).collect();
@@ -373,6 +382,23 @@ mod tests {
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(r.diffs.iter().any(|d| d.field == "font.line_height"));
         assert!(r.diffs.iter().any(|d| d.field == "font.letter_spacing"));
+    }
+
+    #[test]
+    fn diff_mod_flip_is_live_and_reconciles() {
+        // CTX-0236: flipping the mod rebinds the resolved chrome map like
+        // an explicit keymap edit, so it is live-reconcilable, not restart.
+        use crate::keymap::ModKey;
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.mod_key = ModKey::Super;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "mod_key"));
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("mod flip reconciles live");
+        assert_eq!(cur.mod_key, ModKey::Super);
     }
 
     #[test]

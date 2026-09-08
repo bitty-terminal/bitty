@@ -200,6 +200,13 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare keymaps".into(),
         });
     }
+    // CTX-0236: the mod rebinds the chrome map, so it is keymap-adjacent
+    // and stays out of project layers with the keymaps themselves.
+    if plan.mod_key.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare mod_key".into(),
+        });
+    }
     if plan.extends.is_some() {
         return Err(ConfigError::TrustViolation {
             message: "project config must not declare extends".into(),
@@ -378,6 +385,19 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_project_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn project_plan_rejects_mod_key() {
+        // CTX-0236: the mod rebinds the chrome map, so it stays out of
+        // project layers with the keymaps themselves.
+        use crate::keymap::ModKey;
+        let plan = ConfigPlan {
+            mod_key: Some(ModKey::Super),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("mod_key"));
     }
 
     #[test]

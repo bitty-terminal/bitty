@@ -13,6 +13,7 @@
 //! move with the RFC.
 
 use crate::error::ConfigError;
+use crate::keymap::ModKey;
 use crate::types::{
     AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig,
     SelectionConfig, TerminalConfig, WindowConfig,
@@ -44,6 +45,10 @@ pub struct ConfigPlan {
     pub scrollbar: Option<ScrollbarConfig>,
     /// Appearance configuration.
     pub appearance: Option<AppearanceConfig>,
+    /// Leader/Mod key for the shipped chrome map (CTX-0236; scalar-replace).
+    /// `None` means "this layer says nothing" (lower-precedence value wins);
+    /// the file layer parses it from the top-level `mod_key` string.
+    pub mod_key: Option<ModKey>,
     /// Key mappings (full set for this layer).
     pub keymaps: Option<Vec<KeymapEntry>>,
     /// Plugin set (full set for this layer).
@@ -205,6 +210,7 @@ impl ConfigPlan {
             && self.layout.is_none()
             && self.scrollbar.is_none()
             && self.appearance.is_none()
+            && self.mod_key.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
             && self.extends.is_none()

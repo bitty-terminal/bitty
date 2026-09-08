@@ -2193,9 +2193,12 @@ fn starter_init_lua() -> &'static str {
      -- Evaluated in the bitty-lua sandbox (same budgets as plugins; no io/os).\n\
      -- Unknown keys fail closed; validate with `bitty config check`.\n\
      -- Chrome keys are keymap-driven (single-owner rule): a bound chord is\n\
-     -- consumed by its action and never reaches the shell; unbound keys\n\
-     -- (Tab, arrows, plain letters) always go to the shell. Alt is the Mod\n\
-     -- (Hyprland keeps Super; bitty uses Alt). Shipped defaults:\n\
+      -- consumed by its action and never reaches the shell; unbound keys\n\
+      -- (Tab, arrows, plain letters) always go to the shell. Alt is the Mod\n\
+      -- (Hyprland keeps Super; bitty uses Alt). Flip one setting to rebind\n\
+      -- the shipped map to Super (Alt+h/j/k/l -> Super+h/j/k/l, ...):\n\
+      -- mod_key = \"super\",\n\
+      -- Shipped defaults:\n\
      --   Alt+h/j/k/l + Ctrl+Alt+arrows  move focus (vim hjkl)\n\
      --   Alt+1..9                       jump to view id N\n\
      --   Alt+u / Alt+i                  page up / down (less-like)\n\
@@ -2452,6 +2455,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "scrollbar.width",
                         format!("{}", e.scrollbar.width),
                         &src("scrollbar.width")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "mod_key",
+                        format!("\"{}\"", e.mod_key.canonical()),
+                        &src("mod_key")
                     )
                 );
                 println!(

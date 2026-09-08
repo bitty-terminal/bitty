@@ -970,6 +970,13 @@ impl Surface {
                         }
                     }
                 }
+                // Kitty images (CTX-0248): topmost present-layer blits,
+                // above fills and glyphs, never grid truth. The real GPU
+                // pipeline ignores `images` until a texture-upload path
+                // lands; both CPU compositors blend them.
+                for blit in &draw_list.images {
+                    blend_rgba_blit_rgba(&mut rgba, width, height, blit);
+                }
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
                 state.headless_rgba = Some(rgba);
@@ -1244,6 +1251,11 @@ impl Surface {
                 }
             }
         }
+        // Kitty images (CTX-0248): topmost present-layer blits (see the
+        // `present_draw_list` headless branch for the z-order contract).
+        for blit in &draw_list.images {
+            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
+        }
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
@@ -1424,6 +1436,62 @@ fn blend_coverage_mask_rgba(
     }
 }
 
+/// Composites one straight-alpha RGBA blit onto the premultiplied headless
+/// buffer with src-over (CTX-0248 Kitty present layer).
+///
+/// Fully clipped; out-of-surface and empty rects are no-ops. A blit whose
+/// bytes do not match its destination extent is skipped (fail closed —
+/// [`crate::grid::ImageBlit::try_new`] normally prevents this, but
+/// `DrawList` literals can carry anything).
+fn blend_rgba_blit_rgba(rgba: &mut [u8], width: u32, height: u32, blit: &crate::grid::ImageBlit) {
+    let dest = blit.dest;
+    if dest.width == 0 || dest.height == 0 {
+        return;
+    }
+    let expected = (u64::from(dest.width) * u64::from(dest.height)).checked_mul(4);
+    if expected.is_none_or(|n| n as usize != blit.rgba.len()) {
+        return;
+    }
+    let dst_left = i64::from(-dest.x).max(0);
+    let dst_top = i64::from(-dest.y).max(0);
+    let dst_right = (i64::from(width) - i64::from(dest.x))
+        .max(0)
+        .min(i64::from(dest.width));
+    let dst_bottom = (i64::from(height) - i64::from(dest.y))
+        .max(0)
+        .min(i64::from(dest.height));
+    if dst_right <= dst_left || dst_bottom <= dst_top {
+        return;
+    }
+    let stride = dest.width as usize;
+    for gy in dst_top..dst_bottom {
+        for gx in dst_left..dst_right {
+            let s = (gy as usize * stride + gx as usize) * 4;
+            let (sr, sg, sb, sa) = (
+                blit.rgba[s],
+                blit.rgba[s + 1],
+                blit.rgba[s + 2],
+                blit.rgba[s + 3],
+            );
+            if sa == 0 {
+                continue;
+            }
+            // Straight -> premultiplied on the fly, then src-over.
+            let ps_r = (u32::from(sr) * u32::from(sa) / 255) as u8;
+            let ps_g = (u32::from(sg) * u32::from(sa) / 255) as u8;
+            let ps_b = (u32::from(sb) * u32::from(sa) / 255) as u8;
+            let sx = (i64::from(dest.x) + gx) as usize;
+            let sy = (i64::from(dest.y) + gy) as usize;
+            let d = (sy * width as usize + sx) * 4;
+            let inv = 255 - u32::from(sa);
+            rgba[d] = ps_r.saturating_add((u32::from(rgba[d]) * inv / 255) as u8);
+            rgba[d + 1] = ps_g.saturating_add((u32::from(rgba[d + 1]) * inv / 255) as u8);
+            rgba[d + 2] = ps_b.saturating_add((u32::from(rgba[d + 2]) * inv / 255) as u8);
+            rgba[d + 3] = sa.saturating_add((u32::from(rgba[d + 3]) * inv / 255) as u8);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: headless fake surface (no GPU required, runs on CI)
 // ---------------------------------------------------------------------------
@@ -1535,6 +1603,7 @@ mod tests {
             },
             fills: vec![],
             glyphs: vec![],
+            images: vec![],
         };
         assert!(surface.config().is_none());
     }
@@ -1713,6 +1782,7 @@ mod tests {
             },
             fills: vec![],
             glyphs: vec![],
+            images: vec![],
         };
         surface
             .headless_present(&empty, None)
@@ -1767,6 +1837,7 @@ mod tests {
             },
             fills: vec![],
             glyphs: vec![],
+            images: vec![],
         };
         let err = surface
             .headless_present(&empty, None)
@@ -1792,5 +1863,131 @@ mod tests {
             MAX_HEADLESS_SURFACE_BYTES,
             crate::software::MAX_SURFACE_BYTES
         );
+    }
+
+    fn image_test_list(images: Vec<crate::grid::ImageBlit>) -> crate::grid::DrawList {
+        crate::grid::DrawList {
+            generation: 7,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 8),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
+            },
+            fills: vec![],
+            glyphs: vec![],
+            images,
+        }
+    }
+
+    #[test]
+    fn image_blit_validation_rejects_mismatch() {
+        use crate::geometry::RectPx;
+        use crate::grid::ImageBlit;
+        // Exact bytes accepted.
+        assert!(ImageBlit::try_new(RectPx::new(0, 0, 2, 2), vec![9; 16]).is_ok());
+        // Zero span rejected.
+        assert!(matches!(
+            ImageBlit::try_new(RectPx::new(0, 0, 0, 2), vec![9; 1]),
+            Err(RenderError::InvalidInput { .. })
+        ));
+        // Short and long buffers rejected.
+        assert!(matches!(
+            ImageBlit::try_new(RectPx::new(0, 0, 2, 2), vec![9; 15]),
+            Err(RenderError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            ImageBlit::try_new(RectPx::new(0, 0, 2, 2), vec![9; 17]),
+            Err(RenderError::InvalidInput { .. })
+        ));
+        // Images count toward draw work.
+        let with_image = image_test_list(vec![
+            ImageBlit::try_new(RectPx::new(0, 0, 1, 1), vec![1, 2, 3, 4]).unwrap(),
+        ]);
+        assert!(with_image.needs_draw());
+        assert!(!image_test_list(vec![]).needs_draw());
+    }
+
+    #[test]
+    fn headless_present_composites_image_blits_topmost() {
+        use crate::geometry::RectPx;
+        use crate::grid::ImageBlit;
+        let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+        // 2x2 opaque red at (2, 2); the rest stays theme background.
+        let list = image_test_list(vec![
+            ImageBlit::try_new(RectPx::new(2, 2, 2, 2), [0xFF, 0, 0, 0xFF].repeat(4)).unwrap(),
+        ]);
+        surface.headless_present(&list, None).expect("blit present");
+        let rgba = surface.headless_rgba().expect("rgba after present");
+        assert_eq!(rgba.len(), 8 * 8 * 4);
+        let bg = crate::grid::DEFAULT_BG;
+        // Background pixel untouched (opaque theme bg, premultiply-identity).
+        assert_eq!(&rgba[0..4], &[bg[0], bg[1], bg[2], 0xFF]);
+        // Blit pixels are opaque red (premultiplied identity at alpha 255).
+        for (ry, rx) in [(2, 2), (2, 3), (3, 2), (3, 3)] {
+            let idx = (ry * 8 + rx) * 4;
+            assert_eq!(&rgba[idx..idx + 4], &[0xFF, 0, 0, 0xFF], "{rx},{ry}");
+        }
+        // Deterministic: same frame re-presents byte-identical.
+        surface.headless_present(&list, None).expect("re-present");
+        assert_eq!(surface.headless_rgba().unwrap(), rgba);
+    }
+
+    #[test]
+    fn headless_present_blends_half_alpha_and_clips() {
+        use crate::geometry::RectPx;
+        use crate::grid::ImageBlit;
+        let surface = Surface::headless(PhysicalSize::new(4, 4)).expect("valid extent");
+        // Half-alpha white at (-1, -1) size 2x2: only (0, 0) intersects.
+        let list = image_test_list(vec![
+            ImageBlit::try_new(
+                RectPx::new(-1, -1, 2, 2),
+                [0xFF, 0xFF, 0xFF, 0x80].repeat(4),
+            )
+            .unwrap(),
+        ]);
+        surface.headless_present(&list, None).expect("clip present");
+        let rgba = surface.headless_rgba().expect("rgba");
+        let bg = crate::grid::DEFAULT_BG;
+        // out = src*a/255 + dst*(255-a)/255 per channel, alpha likewise.
+        let a = 0x80_u32;
+        let expect = |dst: u8| {
+            ((255 * a / 255) as u8).saturating_add((u32::from(dst) * (255 - a) / 255) as u8)
+        };
+        let alpha = (a as u8).saturating_add((255_u32 * (255 - a) / 255) as u8);
+        assert_eq!(rgba[0], expect(bg[0]));
+        assert_eq!(rgba[1], expect(bg[1]));
+        assert_eq!(rgba[2], expect(bg[2]));
+        assert_eq!(rgba[3], alpha);
+        // Every other pixel is untouched background.
+        for idx in 1..16 {
+            let o = idx * 4;
+            assert_eq!(&rgba[o..o + 4], &[bg[0], bg[1], bg[2], 0xFF], "px {idx}");
+        }
+        // Fully off-surface blits are safe no-ops.
+        let off = image_test_list(vec![
+            ImageBlit::try_new(RectPx::new(99, 99, 2, 2), vec![1; 16]).unwrap(),
+        ]);
+        let before = rgba.clone();
+        surface.headless_present(&off, None).expect("off-surface");
+        let bg_only = surface.headless_rgba().expect("rgba");
+        assert_eq!(&bg_only[0..4], &[bg[0], bg[1], bg[2], 0xFF]);
+        assert_ne!(bg_only, before, "off-surface blit must not paint");
+    }
+
+    #[test]
+    fn headless_present_skips_mismatched_blit_bytes() {
+        use crate::geometry::RectPx;
+        // A hand-built literal with lying bytes must not panic and must not
+        // paint: fail closed, clear-only frame.
+        let mut list = image_test_list(vec![]);
+        list.images.push(crate::grid::ImageBlit {
+            dest: RectPx::new(0, 0, 2, 2),
+            rgba: vec![1; 7],
+        });
+        let surface = Surface::headless(PhysicalSize::new(4, 4)).expect("valid extent");
+        surface.headless_present(&list, None).expect("present");
+        let rgba = surface.headless_rgba().expect("rgba");
+        let bg = crate::grid::DEFAULT_BG;
+        assert!(rgba.chunks_exact(4).all(|px| px == [bg[0], bg[1], bg[2], 0xFF]));
     }
 }

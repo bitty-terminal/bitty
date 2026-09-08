@@ -115,6 +115,7 @@ use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod input;
+pub mod kitty_images;
 pub mod layout_focus;
 pub mod panes;
 pub mod plugin;
@@ -125,6 +126,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 
+pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::PresentStats;
 
 use self::layout_focus::{default_container, default_layout};
@@ -369,6 +371,17 @@ pub struct Runtime {
     /// (CTX-0159, Issue #258). Published read-only to the `BITTY_SOCKET`
     /// introspection store; never affects terminal truth or PTY bytes.
     inspect_ring: crate::inspect::InputRing,
+    /// Stored Kitty images plus cursor-anchored placements (CTX-0248).
+    ///
+    /// Presentation-only: composited topmost in the tick overlay path,
+    /// never grid truth. Cleared on alternate-screen entry.
+    kitty_images: bitty_rich::KittyImageLayer,
+    /// Alternate-screen state at the last present (CTX-0248).
+    ///
+    /// A change forces a full present even when the grid generation is
+    /// unchanged, so entering alt clears painted images (and leaving alt
+    /// repaints the restored grid) instead of idling on a stale frame.
+    kitty_alt_screen_latched: bool,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -596,6 +609,8 @@ impl Runtime {
             is_crossfont,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
+            kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_alt_screen_latched: false,
         })
     }
 
@@ -700,6 +715,8 @@ impl Runtime {
             is_crossfont,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
+            kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_alt_screen_latched: false,
         })
     }
 

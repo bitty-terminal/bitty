@@ -214,6 +214,7 @@ fn real_wgpu_surface_present_is_env_gated() {
                 },
                 fills: vec![],
                 glyphs: vec![],
+                images: vec![],
             };
             let stats = surface
                 .headless_present(&empty, None)

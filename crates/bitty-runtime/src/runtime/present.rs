@@ -278,6 +278,15 @@ impl Runtime {
 
         let snapshot = self.state.snapshot();
         let mut pending_full = self.pending_full_redraw;
+        // CTX-0248: an alternate-screen transition forces a full present
+        // even when the grid generation is unchanged, so entering alt
+        // clears painted images (and leaving alt repaints the restored
+        // grid) instead of idling on a stale frame.
+        let alt_active = self.state.alt_screen_active();
+        if alt_active != self.kitty_alt_screen_latched {
+            self.kitty_alt_screen_latched = alt_active;
+            pending_full = true;
+        }
         let last = self.last_presented_generation;
         // CTX-0176: the presented generation tracks the newest grid across
         // the primary state and every pane session, so frame-on-demand idles
@@ -704,9 +713,81 @@ impl Runtime {
         }
         self.scrollbar_visible = paints;
 
+        // Kitty images (CTX-0248): topmost present-layer blits on the
+        // focused leaf, composited after fills and glyphs. Never grid
+        // truth: no cell, scrollback, or layout mutation. Each visible
+        // placement is scaled by the rich layer to its clamped cell-rect
+        // pixel extent and translated to the leaf origin (plus the window
+        // padding inset, like every other overlay). Skipped while the
+        // focused view inspects scrollback (live-grid anchors do not map
+        // to the history viewport) and cleared on alternate-screen entry.
+        // Multi-pane sessions are not fed yet: images anchor to the
+        // primary state only (parser `APC G` wiring is follow-up work).
+        let mut combined_images: Vec<bitty_render::grid::ImageBlit> = Vec::new();
+        if self.state.alt_screen_active() {
+            self.kitty_images.clear();
+        } else if !self.kitty_images.placement_is_empty() {
+            let scrolled = self
+                .focused_view()
+                .and_then(|fid| view_map.get(&fid))
+                .map(|v| v.scroll_offset() != 0)
+                .unwrap_or(false);
+            if !scrolled {
+                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
+                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                        if rect.width > 0 && rect.height > 0 {
+                            let live = self.live_cell_metrics();
+                            let rich_metrics = bitty_rich::CellMetrics {
+                                width: live.width,
+                                height: live.height,
+                            };
+                            let scrollback = self.state.scrollback_len();
+                            let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
+                            let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
+                            for placement in self.kitty_images.placements_in_paint_order() {
+                                let Some(img) = self.kitty_images.get(placement.image) else {
+                                    continue;
+                                };
+                                let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
+                                    placement,
+                                    rich_metrics,
+                                    rect.width,
+                                    rect.height,
+                                    scrollback,
+                                ) else {
+                                    continue;
+                                };
+                                let Some(scaled) = bitty_rich::rasterize(img, rect_px) else {
+                                    continue;
+                                };
+                                let dest = bitty_render::geometry::RectPx::new(
+                                    rect_px.x + origin_px_x,
+                                    rect_px.y + origin_px_y,
+                                    rect_px.width,
+                                    rect_px.height,
+                                );
+                                if let Ok(blit) =
+                                    bitty_render::grid::ImageBlit::try_new(dest, scaled)
+                                {
+                                    combined_images.push(blit);
+                                }
+                            }
+                            if !combined_images.is_empty() {
+                                any_needs_draw = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.pending_full_redraw = false;
 
-        if !any_needs_draw && combined_fills.is_empty() && combined_glyphs.is_empty() {
+        if !any_needs_draw
+            && combined_fills.is_empty()
+            && combined_glyphs.is_empty()
+            && combined_images.is_empty()
+        {
             // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
             // But ensure generation advances for idle detection.
             self.last_presented_generation = current_gen;
@@ -765,6 +846,7 @@ impl Runtime {
                     },
                     fills: Vec::new(),
                     glyphs: Vec::new(),
+                    images: Vec::new(),
                 });
             // Now replace fills/glyphs with combined, and reset the plan to
             // describe the combined pixel space: the 1x1 probe's extent must
@@ -773,6 +855,7 @@ impl Runtime {
             tmp_list.generation = current_gen;
             tmp_list.fills = combined_fills;
             tmp_list.glyphs = combined_glyphs;
+            tmp_list.images = combined_images;
             let plan_extent = self.present_plan_extent();
             tmp_list.plan.extent = plan_extent;
             if tmp_list.fills.is_empty() && tmp_list.glyphs.is_empty() {

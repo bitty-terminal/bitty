@@ -282,10 +282,61 @@ impl SurfaceRgba {
             }
         }
     }
+
+    /// Composites a straight-alpha RGBA blit onto the surface with src-over
+    /// (CTX-0248 Kitty present layer). Out-of-surface regions are clipped.
+    ///
+    /// `rgba` must be exactly `w * h * 4` bytes; mismatched or zero spans
+    /// are skipped (fail closed).
+    pub fn blend_rgba_image(&mut self, rgba: &[u8], w: u32, h: u32, x: i32, y: i32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let expected = (u64::from(w) * u64::from(h)).checked_mul(4);
+        if expected.is_none_or(|n| n as usize != rgba.len()) {
+            return;
+        }
+        let dst_left = i64::from(-x).max(0);
+        let dst_top = i64::from(-y).max(0);
+        let dst_right = (i64::from(self.width) - i64::from(x))
+            .max(0)
+            .min(i64::from(w));
+        let dst_bottom = (i64::from(self.height) - i64::from(y))
+            .max(0)
+            .min(i64::from(h));
+        if dst_right <= dst_left || dst_bottom <= dst_top {
+            return;
+        }
+        let stride = w as usize;
+        for gy in dst_top..dst_bottom {
+            for gx in dst_left..dst_right {
+                let s = (gy as usize * stride + gx as usize) * 4;
+                let (sr, sg, sb, sa) = (rgba[s], rgba[s + 1], rgba[s + 2], rgba[s + 3]);
+                if sa == 0 {
+                    continue;
+                }
+                let ps_r = (u32::from(sr) * u32::from(sa) / 255) as u8;
+                let ps_g = (u32::from(sg) * u32::from(sa) / 255) as u8;
+                let ps_b = (u32::from(sb) * u32::from(sa) / 255) as u8;
+                let sx = (i64::from(x) + gx) as usize;
+                let sy = (i64::from(y) + gy) as usize;
+                let d = (sy * self.width as usize + sx) * 4;
+                let inv = 255 - u32::from(sa);
+                self.data[d] = saturating_add_u8(ps_r, (u32::from(self.data[d]) * inv / 255) as u8);
+                self.data[d + 1] =
+                    saturating_add_u8(ps_g, (u32::from(self.data[d + 1]) * inv / 255) as u8);
+                self.data[d + 2] =
+                    saturating_add_u8(ps_b, (u32::from(self.data[d + 2]) * inv / 255) as u8);
+                self.data[d + 3] =
+                    saturating_add_u8(sa, (u32::from(self.data[d + 3]) * inv / 255) as u8);
+            }
+        }
+    }
 }
 
 /// Composites a grid-pipeline [`DrawList`] onto a surface: fills first,
-/// then glyphs, preserving vector order. Atlas instances sample
+/// then glyphs, then RGBA image blits (CTX-0248, topmost), preserving
+/// vector order. Atlas instances sample
 /// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
 ///
 /// # Errors
@@ -344,6 +395,15 @@ pub fn draw_list_onto(
                 );
             }
         }
+    }
+    for blit in &list.images {
+        surface.blend_rgba_image(
+            &blit.rgba,
+            blit.dest.width,
+            blit.dest.height,
+            blit.dest.x,
+            blit.dest.y,
+        );
     }
     Ok(())
 }
@@ -483,6 +543,27 @@ mod tests {
         let blank = GlyphBitmap::try_new(metrics(0, 0), BitmapFormat::Rgb, Vec::new()).unwrap();
         surface.blend_glyph(&blank, 0, 0).unwrap();
         assert_eq!(surface.as_bytes()[3], 9);
+    }
+
+    #[test]
+    fn rgba_image_blits_topmost_clipped_and_validated() {
+        // Opaque green 2x2 at (1, 0) on a 3x2 surface.
+        let mut surface = SurfaceRgba::try_new(3, 2).unwrap();
+        surface.clear([0, 0, 0, 255]);
+        surface.blend_rgba_image(&[0, 0xFF, 0, 0xFF].repeat(4), 2, 2, 1, 0);
+        for (x, y) in [(1, 0), (2, 0), (1, 1), (2, 1)] {
+            let o = (y * 3 + x) * 4;
+            assert_eq!(&surface.as_bytes()[o..o + 4], &[0, 255, 0, 255]);
+        }
+        assert_eq!(&surface.as_bytes()[0..4], &[0, 0, 0, 255]);
+        // Mismatched bytes and zero spans are safe no-ops.
+        surface.blend_rgba_image(&[1; 15], 2, 2, 0, 0);
+        surface.blend_rgba_image(&[], 0, 2, 0, 0);
+        assert_eq!(&surface.as_bytes()[0..4], &[0, 0, 0, 255]);
+        // Fully off-surface is a safe no-op (painted pixels survive).
+        surface.blend_rgba_image(&[9; 4], 1, 1, 9, 9);
+        let o = (1 * 3 + 2) * 4;
+        assert_eq!(&surface.as_bytes()[o..o + 4], &[0, 255, 0, 255]);
     }
 
     #[test]

@@ -88,6 +88,7 @@ pub mod hyperlink;
 pub mod image;
 pub mod kitty;
 pub mod kitty_decode;
+pub mod kitty_place;
 pub mod loader;
 pub mod presentation;
 pub mod scene;
@@ -128,6 +129,11 @@ pub use kitty_decode::{
     KITTY_DECODE_MAX_BYTES, KITTY_DECODE_MAX_DIMENSION, KITTY_DECODE_MAX_PIXELS, KITTY_FORMAT_PNG,
     KITTY_FORMAT_RGB, KITTY_FORMAT_RGBA, KittyDecodeError, KittyDecodedImage, KittyTransmitFormat,
     decode_kitty_payload,
+};
+pub use kitty_place::{
+    KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS, KittyAction,
+    KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
+    KittyPlacementId, placement_rect_for, rasterize, viewport_extent,
 };
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,

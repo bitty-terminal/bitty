@@ -53,7 +53,10 @@
 //!   optional and default to [`crate::types::DEFAULT_LINE_HEIGHT`]/
 //!   [`crate::types::DEFAULT_LETTER_SPACING`] when omitted, so existing
 //!   `{ family, size }` tables keep working.
-//! - `window` needs both `opacity` and `padding`, `terminal` needs
+//! - `window` needs both `opacity` and `padding` (`radius_px` optional,
+//!   defaulting to [`crate::types::DEFAULT_WINDOW_RADIUS_PX`] (`0`, square
+//!   no-op, CTX-0241 S0) when omitted, so existing `{ opacity, padding }`
+//!   tables keep working), `terminal` needs
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch` optional, defaulting to
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
@@ -482,6 +485,7 @@ impl CliOverrides {
                 let cfg = WindowConfig {
                     opacity: o,
                     padding: base.window.padding,
+                    radius_px: base.window.radius_px,
                 };
                 cfg.validate()?;
                 Some(cfg)
@@ -737,6 +741,7 @@ pub fn resolve_effective_full(
         "font.letter_spacing",
         "window.opacity",
         "window.padding",
+        "window.radius_px",
     ] {
         if !cli.overrides_field(field) {
             if let Some(src) = base.attribution.get(field) {
@@ -866,9 +871,30 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                         format!("must be within [0, 64] (found {padding})"),
                     ));
                 }
+                // CTX-0241 S0: `radius_px` is optional (absent means "this
+                // layer says nothing" only at merge — here it defaults to 0
+                // so existing `{ opacity, padding }` tables keep working).
+                // Present values are range-checked fail-closed here and
+                // again by `WindowConfig::validate` via `plan.validate()`.
+                let radius_px = match w.radius_px {
+                    None => crate::types::DEFAULT_WINDOW_RADIUS_PX,
+                    Some(v) => {
+                        if !(0..=crate::types::MAX_WINDOW_RADIUS_PX as i64).contains(&v) {
+                            return Err(ConfigError::validation(
+                                "window.radius_px",
+                                format!(
+                                    "must be within [0, {}] (found {v})",
+                                    crate::types::MAX_WINDOW_RADIUS_PX
+                                ),
+                            ));
+                        }
+                        v as u32
+                    }
+                };
                 Some(WindowConfig {
                     opacity: opacity as f32,
                     padding: padding as u32,
+                    radius_px,
                 })
             }
             _ => {
@@ -1285,6 +1311,8 @@ mod tests {
         let window = plan.window.unwrap();
         assert!((window.opacity - 0.95).abs() < f32::EPSILON);
         assert_eq!(window.padding, 8);
+        // CTX-0241 S0: legacy table without `radius_px` defaults to 0.
+        assert_eq!(window.radius_px, crate::types::DEFAULT_WINDOW_RADIUS_PX);
         let term = plan.terminal.unwrap();
         assert_eq!(term.scrollback, 10000);
         assert_eq!(term.shell.as_deref(), Some("/bin/fish"));
@@ -1502,6 +1530,40 @@ mod tests {
         let err = parse_lua_config(r#"return { font = { family = "Mono" } }"#, &test_source())
             .unwrap_err();
         assert!(err.to_string().contains("font"));
+    }
+
+    #[test]
+    fn lua_window_radius_optional_with_default_and_bounds() {
+        // CTX-0241 S0: `radius_px` is optional in the atomic `window` table
+        // (legacy `{ opacity, padding }` keeps working, defaulting to 0);
+        // explicit values parse, out-of-range fails closed with the field
+        // path (never reaching runtime).
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8 } }"#,
+            &test_source(),
+        )
+        .expect("legacy table works");
+        assert_eq!(
+            plan.window.unwrap().radius_px,
+            crate::types::DEFAULT_WINDOW_RADIUS_PX
+        );
+        let plan = parse_lua_config(
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 12 } }"#,
+            &test_source(),
+        )
+        .expect("radius parses");
+        assert_eq!(plan.window.unwrap().radius_px, 12);
+        for bad in [
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = -1 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 25 } }"#,
+            r#"return { window = { opacity = 1.0, padding = 8, radius_px = 100 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            assert!(
+                err.to_string().contains("window.radius_px"),
+                "must name the field: {err}"
+            );
+        }
     }
 
     #[test]

@@ -410,6 +410,33 @@ mod tests {
     }
 
     #[test]
+    fn project_plan_allows_window_radius_and_rejects_oob() {
+        // CTX-0241 S0: `window` (incl. `radius_px`) is presentation-only
+        // chrome with no process authority, so project layers may set it;
+        // out-of-range values still fail closed via `WindowConfig::validate`.
+        use crate::types::WindowConfig;
+        let plan = ConfigPlan {
+            window: Some(WindowConfig {
+                opacity: 1.0,
+                padding: 8,
+                radius_px: 12,
+            }),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("radius allowed in project");
+        let bad = ConfigPlan {
+            window: Some(WindowConfig {
+                opacity: 1.0,
+                padding: 8,
+                radius_px: crate::types::MAX_WINDOW_RADIUS_PX + 1,
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&bad).unwrap_err();
+        assert!(err.to_string().contains("window.radius_px"));
+    }
+
+    #[test]
     fn trust_store_insert_remove() {
         let mut s = TrustStore::new();
         assert!(s.is_empty());

@@ -55,6 +55,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `font.letter_spacing`     | Live               |
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
+/// | `window.radius_px`        | Live               |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -79,6 +80,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "font"
         | "window.opacity"
         | "window.padding"
+        | "window.radius_px"
         | "window"
         | "appearance.theme"
         | "appearance"
@@ -201,6 +203,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "window.padding",
         old.window.padding.to_string(),
         new.window.padding.to_string(),
+    );
+    // CTX-0241 S0: radius is a parsed no-op (stored + reported, zero render
+    // effect), so changes reconcile live without restart.
+    push_if_changed(
+        "window.radius_px",
+        old.window.radius_px.to_string(),
+        new.window.radius_px.to_string(),
     );
     push_if_changed(
         "terminal.scrollback",
@@ -495,6 +504,9 @@ mod tests {
         // other Live field), but the apply path itself needs no restart.
         assert_eq!(classify_field("window.opacity"), ReloadClass::Live);
         assert_eq!(classify_field("window.padding"), ReloadClass::Live);
+        // CTX-0241 S0: radius is a parsed no-op, still Live (reconciles
+        // without restart, zero render effect).
+        assert_eq!(classify_field("window.radius_px"), ReloadClass::Live);
         assert_eq!(classify_field("window"), ReloadClass::Live);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
@@ -503,20 +515,25 @@ mod tests {
     fn diff_window_fields_are_live_and_reconcile() {
         // CTX-0223: changing padding/opacity must surface as a Live diff
         // (the dead-knob finding), and reconcile must apply it to the plan.
+        // CTX-0241 S0 extends the same Live class to `window.radius_px`
+        // (parsed no-op: stored + reported, zero render effect).
         let old = EffectiveConfig::default();
         let mut new = old.clone();
         new.window.padding = 4;
         new.window.opacity = 0.9;
+        new.window.radius_px = 12;
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "window.padding"));
         assert!(r.diffs.iter().any(|d| d.field == "window.opacity"));
+        assert!(r.diffs.iter().any(|d| d.field == "window.radius_px"));
         let mut cur = old;
         let applied = reconcile_live(&mut cur, &new).expect("live must reconcile");
         assert_eq!(applied.overall, ReloadClass::Live);
         assert_eq!(cur.window.padding, 4);
         assert!((cur.window.opacity - 0.9).abs() < f32::EPSILON);
+        assert_eq!(cur.window.radius_px, 12);
     }
 
     #[test]

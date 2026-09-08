@@ -140,6 +140,7 @@ mod integration_tests {
                 window: Some(WindowConfig {
                     opacity: 0.95,
                     padding: 8,
+                    ..Default::default()
                 }),
                 schema_version: Some(CURRENT_SCHEMA_VERSION),
                 ..Default::default()

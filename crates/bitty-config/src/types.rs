@@ -83,6 +83,19 @@ pub const MIN_SCROLLBAR_WIDTH_PX: u32 = 1;
 /// well under one default cell row while keeping untrusted input bounded
 /// (threat T-01). Larger values fail closed like every other config bound.
 pub const MAX_SCROLLBAR_WIDTH_PX: u32 = 32;
+
+/// Default window corner radius in physical px (CTX-0241 S0).
+///
+/// Zero means square corners (zero-cost integer fast path everywhere);
+/// rounding itself is a later stage. The value is parsed, validated,
+/// merged, and reported, with no render effect in S0.
+pub const DEFAULT_WINDOW_RADIUS_PX: u32 = 0;
+
+/// Maximum window corner radius in physical px (CTX-0241 S0: `0..=24`).
+///
+/// 24px covers tasteful rounding at terminal window sizes while keeping
+/// untrusted input bounded (threat T-01). Larger values fail closed.
+pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
 /// Default font family: Nerd-Font-patched JetBrains Mono.
 ///
 /// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
@@ -292,6 +305,9 @@ pub struct WindowConfig {
     pub opacity: f32,
     /// Padding in logical pixels `0..=64`.
     pub padding: u32,
+    /// Corner radius in physical px `0..=24` (CTX-0241 S0: parsed no-op,
+    /// default 0 = square, zero render effect; later stages add rounding).
+    pub radius_px: u32,
 }
 
 impl Default for WindowConfig {
@@ -299,6 +315,7 @@ impl Default for WindowConfig {
         Self {
             opacity: 1.0,
             padding: 8,
+            radius_px: DEFAULT_WINDOW_RADIUS_PX,
         }
     }
 }
@@ -314,6 +331,12 @@ impl WindowConfig {
         }
         if self.padding > 64 {
             return Err(ConfigError::validation("window.padding", "must be <= 64"));
+        }
+        if self.radius_px > MAX_WINDOW_RADIUS_PX {
+            return Err(ConfigError::validation(
+                "window.radius_px",
+                format!("must be <= {MAX_WINDOW_RADIUS_PX}"),
+            ));
         }
         Ok(())
     }
@@ -900,16 +923,50 @@ mod tests {
         WindowConfig {
             opacity: 2.0,
             padding: 8,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         WindowConfig {
             opacity: 0.5,
             padding: 100,
+            ..Default::default()
         }
         .validate()
         .unwrap_err();
         WindowConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn window_radius_validation() {
+        // CTX-0241 S0: physical px `0..=24`, default 0 = square no-op.
+        assert_eq!(WindowConfig::default().radius_px, DEFAULT_WINDOW_RADIUS_PX);
+        assert_eq!(DEFAULT_WINDOW_RADIUS_PX, 0);
+        assert_eq!(MAX_WINDOW_RADIUS_PX, 24);
+        WindowConfig {
+            radius_px: 0,
+            ..Default::default()
+        }
+        .validate()
+        .expect("zero valid");
+        WindowConfig {
+            radius_px: MAX_WINDOW_RADIUS_PX,
+            ..Default::default()
+        }
+        .validate()
+        .expect("max valid");
+        WindowConfig {
+            radius_px: MAX_WINDOW_RADIUS_PX + 1,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        WindowConfig {
+            radius_px: u32::MAX,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
     }
 
     #[test]

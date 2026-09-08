@@ -90,6 +90,38 @@ impl Runtime {
         self.config.window_padding
     }
 
+    /// Configured window corner radius in physical px (CTX-0241 S0
+    /// `window.radius_px`; `0..=24`, default `0`).
+    ///
+    /// S0 is a parsed no-op: the value is accepted, stored, and reported
+    /// (config check, reload diff) but no DrawList/present consumer reads
+    /// it, so any value renders identically to the default.
+    #[must_use]
+    pub fn window_radius_px(&self) -> u32 {
+        self.config.window_radius_px
+    }
+
+    /// Live-adopts a new window corner radius without restart (CTX-0241 S0).
+    ///
+    /// This is the `window.radius_px` side of the `Live` reload class: the
+    /// running instance stores the value and nothing else changes — no grid
+    /// re-derivation, no surface reconfiguration, no forced redraw — because
+    /// S0 has zero render effect by contract. Later stages add the present
+    /// consumer; this setter stays total so the contract lock holds.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when `radius > 24`.
+    pub fn set_window_radius_px(&mut self, radius: u32) -> Result<(), RuntimeError> {
+        if radius > crate::config::MAX_WINDOW_RADIUS_PX {
+            return Err(RuntimeError::InvalidConfig(
+                "window_radius_px must be within [0, 24] physical pixels",
+            ));
+        }
+        self.config.window_radius_px = radius;
+        Ok(())
+    }
+
     /// Window padding in physical pixels at the live DPI scale (CTX-0223).
     ///
     /// The configured logical padding scaled by the sanitized live factor,

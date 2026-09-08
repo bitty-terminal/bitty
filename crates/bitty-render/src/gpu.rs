@@ -1988,6 +1988,9 @@ mod tests {
         surface.headless_present(&list, None).expect("present");
         let rgba = surface.headless_rgba().expect("rgba");
         let bg = crate::grid::DEFAULT_BG;
-        assert!(rgba.chunks_exact(4).all(|px| px == [bg[0], bg[1], bg[2], 0xFF]));
+        assert!(
+            rgba.chunks_exact(4)
+                .all(|px| px == [bg[0], bg[1], bg[2], 0xFF])
+        );
     }
 }

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Kitty placement + rasterize + composite into present path (CTX-0248, issue #426)
+
+- New `bitty-rich` `kitty_place` layer: `a=t`/`T`/unsupported action mapping, cursor-anchored cell rects, scroll-with-content, alt-screen clear, CTX-0247 decode caps reused, no allocation before validation.
+- New `DrawList.images` present layer in `bitty-render`: topmost blits above fills and glyphs, never grid truth; software and headless CPU compositors blend them. Runtime tick overlay feeds placed images into the present path.
+- Known limitation: the real-GPU (wgpu) path ignores `DrawList.images` until a texture-upload path lands (documented in `crates/bitty-render/src/gpu.rs`); software/headless paths composite.
+- Tests: 21 rich + 5 render + 8 runtime present tests, all headless.
+
 ### `frameHash` lossless frame digest (CTX-0244, issue #420)
 
 - New `bitty.debug/frameHash` IPC method: SHA-256 (std-only, no new

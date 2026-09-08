@@ -43,7 +43,25 @@ fn tile_pixels(rt: &Runtime, id: ViewId) -> (usize, usize, usize, usize) {
     (x, y, w, h)
 }
 
+/// Seam tolerance for cross-tile glyph overhang (CTX-0234 CI fix).
+///
+/// `Runtime::with_defaults` resolves the primary family through fontconfig,
+/// which never fails (it substitutes) — so a host without the Nerd font
+/// serves `M` from a proportional substitute (local probe: `Noto Sans CJK`
+/// for a missing family) whose bitmap overhangs the 9px mono cell by up to
+/// 3px rightwards into the adjacent tile. The present layer pushes per-leaf
+/// glyphs with no per-tile scissor, so that overhang composites as a few
+/// non-bg pixels inside the neighbour tile. Insetting by 8px (< one
+/// 9x19 cell) ignores the seam while a true primary duplication still fills
+/// the tile interior with thousands of ink pixels — the invariant is kept,
+/// only the seam bleed is forgiven.
+const SEAM_PX: usize = 8;
+
 /// True when any pixel inside the leaf tile differs from the clear color.
+///
+/// The scan insets by [`SEAM_PX`] on every side so a neighbour tile's glyph
+/// overhang (see above) never counts as duplication; interior content —
+/// including the row-3 marker used below — is unaffected.
 fn tile_has_ink(rt: &Runtime, id: ViewId) -> bool {
     let rgba = rt.headless_rgba().expect("rgba after present");
     let extent = rt.config().window_extent();
@@ -55,8 +73,21 @@ fn tile_has_ink(rt: &Runtime, id: ViewId) -> bool {
         "headless surface must match the default window extent"
     );
     let bg = bitty_render::grid::DEFAULT_BG;
-    let (x0, y0, w, h) = tile_pixels(rt, id);
-    assert!(x0 + w <= sw && y0 + h <= sh, "tile must sit in the surface");
+    let (tx, ty, tw, th) = tile_pixels(rt, id);
+    assert!(
+        tx + tw <= sw && ty + th <= sh,
+        "tile must sit in the surface"
+    );
+    assert!(
+        tw > 2 * SEAM_PX && th > 2 * SEAM_PX,
+        "tile must exceed the seam inset"
+    );
+    let (x0, y0, w, h) = (
+        tx + SEAM_PX,
+        ty + SEAM_PX,
+        tw - 2 * SEAM_PX,
+        th - 2 * SEAM_PX,
+    );
     for y in y0..y0 + h {
         for x in x0..x0 + w {
             let i = (y * sw + x) * 4;

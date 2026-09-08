@@ -258,6 +258,11 @@ fn final_headless_integration_end_to_end() {
     let leaf_c2 = LayoutNode::leaf(View::new(ViewId::new(3), 40, 12));
     let split2 = LayoutNode::split(SplitAxis::Vertical, 0.5, leaf_a2, leaf_b2);
     rt2.set_layout(LayoutNode::stack(vec![split2, leaf_c2]));
+    // CTX-0234: the focused session-less leaf shows the primary grid, so a
+    // faithful replay must mirror focus too (rt focuses v2 above) — focus is
+    // frame state, and the unfocused session-less tiles stay erased instead
+    // of duplicating primary.
+    assert!(rt2.set_focus(ViewId::new(2)));
     rt2.tick().expect("initial must present");
     rt2.handle_pty_bytes(payload);
     for _ in 0..10 {

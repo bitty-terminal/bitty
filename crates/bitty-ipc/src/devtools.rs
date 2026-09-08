@@ -228,6 +228,10 @@ pub const METHOD_SYNTHESIZE_INPUT: &str = "bitty.debug/synthesizeInput";
 /// Wire method for `captureFrame` (bounded redacted frame capture).
 pub const METHOD_CAPTURE_FRAME: &str = "bitty.debug/captureFrame";
 
+/// Wire method for `frameHash` (CTX-0244: SHA-256 digest over canonical
+/// `headless_rgba` + geometry header; 32-byte digest, zero pixel bytes).
+pub const METHOD_FRAME_HASH: &str = "bitty.debug/frameHash";
+
 /// Maximum synthetic events per `synthesizeInput` call (Amendment A1).
 pub const MAX_SYNTH_EVENTS_PER_CALL: usize = 64;
 
@@ -580,6 +584,13 @@ pub struct ServeContext {
     /// Opaque debug-session identity for bearer binding (per connection;
     /// the servo must set a distinct id per accepted connection).
     pub session_id: String,
+    /// Local-transport attestation (CTX-0244): true only when the serving
+    /// path verified the peer is local — the Unix-socket accept boundary
+    /// (`transport_attested_peer`, P0-AC-021) or same-process in-process
+    /// dispatch. Fail-closed default `false`: `frameHash` denies without
+    /// it, so a future non-local dispatch path can never serve digests by
+    /// accident (no TCP listener exists today — keep it that way).
+    pub local_attested: bool,
 }
 
 impl ServeContext {
@@ -599,7 +610,17 @@ impl ServeContext {
                 std::env::var("BITTY_CTL_ELEVATE").ok().as_deref(),
             ),
             session_id: String::from("local"),
+            local_attested: false,
         }
+    }
+
+    /// Mark this context as served over a verified-local transport
+    /// (CTX-0244): call after [`transport_attested_peer`] at the
+    /// Unix-socket accept boundary, or for same-process in-process
+    /// dispatch (the headless verify harness). `frameHash` denies without
+    /// this mark; all other methods ignore it.
+    pub fn attest_local_peer(&mut self) {
+        self.local_attested = true;
     }
 
     /// Build a context with explicit granted scopes (hermetic tests).
@@ -610,6 +631,7 @@ impl ServeContext {
             uptime_ms: server.uptime_ms(),
             granted,
             session_id: String::from("local"),
+            local_attested: false,
         }
     }
 
@@ -633,6 +655,7 @@ impl ServeContext {
             uptime_ms: server.uptime_ms(),
             granted,
             session_id: id,
+            local_attested: false,
         }
     }
 }
@@ -1086,13 +1109,16 @@ pub fn parse_request(payload: &[u8]) -> Result<DevtoolsRequest, RequestFault> {
     // parse per-method scopes (`rows`/`cols`/`limit`, automation payloads)
     // without a JSON dependency. The slice is bounded before retention:
     // oversize params fail closed here rather than reaching dispatch.
-    // Automation methods (`synthesizeInput`, `captureFrame`) carry up to 64
-    // events and allow 32 KiB; all other methods stay at 4 KiB.
+    // Automation methods (`synthesizeInput`, `captureFrame`, `frameHash`)
+    // carry up to 64 events and allow 32 KiB; all other methods stay at 4 KiB.
     let params_raw = match keys.values.get("params") {
         None => None,
         Some((start, end)) => {
             let raw = text[*start..*end].trim().to_string();
-            let cap = if method == METHOD_SYNTHESIZE_INPUT || method == METHOD_CAPTURE_FRAME {
+            let cap = if method == METHOD_SYNTHESIZE_INPUT
+                || method == METHOD_CAPTURE_FRAME
+                || method == METHOD_FRAME_HASH
+            {
                 MAX_AUTOMATION_PARAMS_BYTES
             } else {
                 MAX_PARAMS_BYTES
@@ -1262,9 +1288,12 @@ impl Dispatcher {
             }
         }
         // CTX-0188 test automation (bearer-scoped, rate-capped, redacted).
+        // CTX-0244 adds `frameHash` (digest-only, new `FrameDigest` family;
+        // the `Capture` family is never widened).
         let automation: &[(&'static str, DevtoolsHandler)] = &[
             (METHOD_SYNTHESIZE_INPUT, handle_synthesize_input),
             (METHOD_CAPTURE_FRAME, handle_capture_frame),
+            (METHOD_FRAME_HASH, handle_frame_hash),
         ];
         for (method, handler) in automation {
             if table.register(method, *handler).is_err() {
@@ -1655,6 +1684,73 @@ pub fn publish_focus(snapshot: FocusPublish) {
     }
 }
 
+// ── frame-digest live store (CTX-0244) ──────────────────────────────────────
+//
+// The runtime publishes the last presented headless RGBA frame here (only
+// while a `FrameDigest` bearer is live — see
+// [`frame_digest_publish_wanted`]); `handle_frame_hash` digests it without
+// ever placing pixel bytes in a response. Same `&self`-only, bounded,
+// drop-on-poison posture as the grid store.
+
+/// Hard cap on RGBA bytes retained for digesting (64 MiB): mirrors
+/// `bitty-render`'s `MAX_HEADLESS_SURFACE_BYTES` (CR-RENDER-01 parity — the
+/// canonical RGBA read reuses the present-path allocation cap, no new
+/// unbounded surface allocation). A local const (not an import) keeps
+/// `bitty-ipc` dependency-free; the value is pinned by the digest tests
+/// against multi-megapixel frames.
+pub const MAX_DIGEST_RGBA_BYTES: usize = 64 * 1024 * 1024;
+
+/// Stored headless frame for digesting (private; validated on entry).
+#[derive(Debug, Clone, Default)]
+struct StoredRgba {
+    /// Frame width in physical pixels.
+    width_px: u32,
+    /// Frame height in physical pixels.
+    height_px: u32,
+    /// Present-path frame sequence bound into the digest.
+    frame_seq: u64,
+    /// Premultiplied RGBA bytes (`width*height*4`), never served raw.
+    rgba: Vec<u8>,
+}
+
+/// Live RGBA store (empty until the runtime publishes after a present).
+fn live_rgba_store() -> &'static Mutex<StoredRgba> {
+    static STORE: OnceLock<Mutex<StoredRgba>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(StoredRgba::default()))
+}
+
+/// Publish one presented headless frame for digesting (called by
+/// `bitty-runtime` after a successful headless present, gated on
+/// [`frame_digest_publish_wanted`] so idle production pays nothing).
+///
+/// Fail-closed validation: zero extents, `rgba.len() != w*h*4` (checked
+/// arithmetic, no overflow), or `rgba.len() > MAX_DIGEST_RGBA_BYTES` all
+/// drop the publish (the next present republishes). A poisoned mutex drops
+/// the publish. Pixel bytes are stored, never served: only the digest
+/// leaves over IPC.
+pub fn publish_frame_rgba(width_px: u32, height_px: u32, frame_seq: u64, rgba: Vec<u8>) {
+    if width_px == 0 || height_px == 0 {
+        return;
+    }
+    let expect = u64::from(width_px)
+        .checked_mul(u64::from(height_px))
+        .and_then(|pixels| pixels.checked_mul(4));
+    let Some(expect) = expect else {
+        return;
+    };
+    if expect == 0 || expect > MAX_DIGEST_RGBA_BYTES as u64 || rgba.len() as u64 != expect {
+        return;
+    }
+    if let Ok(mut guard) = live_rgba_store().lock() {
+        *guard = StoredRgba {
+            width_px,
+            height_px,
+            frame_seq,
+            rgba,
+        };
+    }
+}
+
 /// Clear the live introspection store (test helper only).
 ///
 /// Tests publish known snapshots and must not leak them into parallel tests:
@@ -1671,6 +1767,9 @@ pub fn clear_introspection_for_tests() {
     }
     if let Ok(mut guard) = live_focus_store().lock() {
         *guard = StoredFocus::default();
+    }
+    if let Ok(mut guard) = live_rgba_store().lock() {
+        *guard = StoredRgba::default();
     }
 }
 
@@ -2067,13 +2166,18 @@ fn prevalidate_control_params(method: &str, params: Option<&str>) -> Result<(), 
 //   thread as follow-up. `captureFrame` serves the redacted grid store.
 
 /// Automation method family bound into each bearer (never widened: a
-/// synthesize bearer cannot capture and vice versa).
+/// synthesize bearer cannot capture, a capture bearer cannot digest, and
+/// vice versa — CTX-0244: widening `Capture` would silently upgrade every
+/// outstanding 10-minute bearer into a digest oracle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomationFamily {
     /// `synthesizeInput` family (`debug.control`).
     Synthesize,
     /// `captureFrame` family (`debug.trace`).
     Capture,
+    /// `frameHash` digest family (CTX-0244; `debug.trace` +
+    /// `terminal.inspect`, 2 min TTL cap, 2 digests/s).
+    FrameDigest,
 }
 
 impl AutomationFamily {
@@ -2083,6 +2187,7 @@ impl AutomationFamily {
         match self {
             Self::Synthesize => "synthesize",
             Self::Capture => "capture",
+            Self::FrameDigest => "frame-digest",
         }
     }
 }
@@ -2101,17 +2206,23 @@ struct AutomationBearerRecord {
     expires_at_ms: u64,
 }
 
-/// One audited pixels-capture entry (bounded, drop-oldest).
+/// One audited frame-observation entry (bounded, drop-oldest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameAuditEntry {
     /// Caller session identity.
     pub session_id: String,
     /// Addressed terminal.
     pub terminal_id: String,
-    /// Capture format (`semantic` or `pixels`).
+    /// Observation format (`semantic`, `pixels`, or `digest`).
     pub format: String,
     /// Bearer-clock time of capture.
     pub now_ms: u64,
+    /// Presented frame sequence the entry attests to (`0` when no frame
+    /// was observed, e.g. a denied digest call or a text capture).
+    pub frame_seq: u64,
+    /// Served digest hex for `digest` entries (uninvertible, safe to log);
+    /// empty for `semantic`/`pixels` entries and denied calls.
+    pub digest_hex: String,
 }
 
 /// Automation store: bearers plus per-bearer rate windows, synthetic sequence,
@@ -2124,6 +2235,8 @@ struct AutomationStore {
     synth_hits: BTreeMap<String, std::collections::VecDeque<u64>>,
     /// Per-token `captureFrame` timestamps (1 s window).
     capture_hits: BTreeMap<String, std::collections::VecDeque<u64>>,
+    /// Per-token `frameHash` timestamps (1 s window, CTX-0244).
+    digest_hits: BTreeMap<String, std::collections::VecDeque<u64>>,
     /// Issuance counter (token uniqueness).
     counter: u64,
     /// Monotonic synthetic-event sequence.
@@ -2208,6 +2321,12 @@ fn validate_bearer_shape(token: &str) -> Result<(), ()> {
 /// parity; no-bypass audit). The bearer lives in-memory only and expires
 /// after [`AUTOMATION_BEARER_TTL_MS`].
 ///
+/// CTX-0244: [`AutomationFamily::FrameDigest`] cannot use this minter — its
+/// 10-minute default TTL exceeds the 2-minute digest cap, so digest grants
+/// require an explicit `ttl_ms` via
+/// [`issue_automation_bearer_with_ttl`] (fail-closed `InvalidRequest`
+/// here).
+///
 /// # Errors
 ///
 /// Returns `InvalidRequest` for bad session/terminal ids and `LimitExceeded`
@@ -2218,6 +2337,14 @@ pub fn issue_automation_bearer(
     family: AutomationFamily,
     now_ms: u64,
 ) -> Result<String, IpcError> {
+    if family == AutomationFamily::FrameDigest {
+        return Err(IpcError::InvalidRequest {
+            reason: format!(
+                "frame-digest bearers require an explicit ttl_ms of 1..={}",
+                crate::frame_digest::FRAME_DIGEST_TTL_MS
+            ),
+        });
+    }
     issue_automation_bearer_with_ttl(
         session_id,
         terminal_id,
@@ -2228,6 +2355,10 @@ pub fn issue_automation_bearer(
 }
 
 /// Issue with an explicit TTL (capped to [`AUTOMATION_BEARER_TTL_MS`]).
+///
+/// CTX-0244: [`AutomationFamily::FrameDigest`] bearers carry their own
+/// stricter cap ([`crate::frame_digest::FRAME_DIGEST_TTL_MS`], 2 min);
+/// larger digest TTLs fail closed.
 ///
 /// # Errors
 ///
@@ -2242,9 +2373,14 @@ pub fn issue_automation_bearer_with_ttl(
 ) -> Result<String, IpcError> {
     validate_session_id(session_id)?;
     crate::ctl::parse_terminal_id(terminal_id)?;
-    if ttl_ms == 0 || ttl_ms > AUTOMATION_BEARER_TTL_MS {
+    let ttl_cap = if family == AutomationFamily::FrameDigest {
+        crate::frame_digest::FRAME_DIGEST_TTL_MS
+    } else {
+        AUTOMATION_BEARER_TTL_MS
+    };
+    if ttl_ms == 0 || ttl_ms > ttl_cap {
         return Err(IpcError::InvalidRequest {
-            reason: format!("ttl_ms must be 1..={AUTOMATION_BEARER_TTL_MS}"),
+            reason: format!("ttl_ms must be 1..={ttl_cap}"),
         });
     }
     let mut store = automation_store()
@@ -2270,6 +2406,7 @@ pub fn issue_automation_bearer_with_ttl(
             store.bearers.remove(&tok);
             store.synth_hits.remove(&tok);
             store.capture_hits.remove(&tok);
+            store.digest_hits.remove(&tok);
         }
         if store.bearers.len() >= MAX_AUTOMATION_BEARERS {
             return Err(IpcError::LimitExceeded {
@@ -2305,6 +2442,7 @@ pub fn revoke_automation_bearer(token: &str) -> bool {
     let existed = store.bearers.remove(token).is_some();
     store.synth_hits.remove(token);
     store.capture_hits.remove(token);
+    store.digest_hits.remove(token);
     existed
 }
 
@@ -2314,12 +2452,30 @@ pub fn clear_automation_for_tests() {
         store.bearers.clear();
         store.synth_hits.clear();
         store.capture_hits.clear();
+        store.digest_hits.clear();
         store.counter = 0;
         store.synth_seq = 0;
         store.audit.clear();
     }
     // Input/grid/focus stores are cleared by the caller's introspection
     // helper; automation never clears them here (no cross-module coupling).
+}
+
+/// Whether any live [`AutomationFamily::FrameDigest`] bearer exists.
+///
+/// Production probe for the present path: the runtime publishes RGBA into
+/// the digest store only while a digest grant is live, so the multi-MB
+/// clone costs nothing when no test holds a grant. Expiry is enforced at
+/// authorize time, not here — a stale record only causes bounded extra
+/// publishing, never an extra served digest.
+#[must_use]
+pub fn frame_digest_publish_wanted() -> bool {
+    automation_store().lock().is_ok_and(|store| {
+        store
+            .bearers
+            .values()
+            .any(|rec| rec.family == AutomationFamily::FrameDigest)
+    })
 }
 
 /// Number of live bearers (test probe only).
@@ -2341,6 +2497,16 @@ pub fn frame_audit_len_for_tests() -> usize {
         .lock()
         .map(|s| s.audit.len())
         .unwrap_or(0)
+}
+
+/// Snapshot of the frame audit log, oldest first (test probe only).
+/// Lets digest tests verify `format:"digest"` entries carry the served
+/// digest hex; production callers never read the log.
+pub fn frame_audit_snapshot_for_tests() -> Vec<FrameAuditEntry> {
+    automation_store()
+        .lock()
+        .map(|s| s.audit.clone())
+        .unwrap_or_default()
 }
 
 /// Authorize one automation call: scope intersection, bearer binding, expiry,
@@ -2428,6 +2594,7 @@ fn authorize_automation(
         store.bearers.remove(token);
         store.synth_hits.remove(token);
         store.capture_hits.remove(token);
+        store.digest_hits.remove(token);
         return Err(HandlerError::new(
             "scope",
             "ScopeDenied",
@@ -2437,6 +2604,10 @@ fn authorize_automation(
     let (cap, hits) = match family {
         AutomationFamily::Synthesize => (MAX_SYNTH_CALLS_PER_SEC, &mut store.synth_hits),
         AutomationFamily::Capture => (MAX_CAPTURE_FPS, &mut store.capture_hits),
+        AutomationFamily::FrameDigest => (
+            crate::frame_digest::MAX_FRAME_DIGEST_PER_SEC,
+            &mut store.digest_hits,
+        ),
     };
     let queue = hits.entry(token.to_string()).or_default();
     while let Some(&front) = queue.front() {
@@ -3179,6 +3350,8 @@ fn handle_capture_frame(
                 terminal_id: terminal_id.clone(),
                 format: format.clone(),
                 now_ms: context.uptime_ms,
+                frame_seq,
+                digest_hex: String::new(),
             });
             while store.audit.len() > MAX_AUTOMATION_BEARERS {
                 store.audit.remove(0);
@@ -3250,6 +3423,181 @@ fn handle_capture_frame(
             "frame snapshot exceeds response bound".to_string(),
         ));
     }
+    Ok(out)
+}
+
+/// Append one `digest` audit entry to the bounded log (64, drop-oldest).
+///
+/// Poisoned store fails closed without a record (existing parity). Called
+/// for every attributable `frameHash` call — granted AND denied — so the
+/// digest oracle leaves a per-call trace with caller identity, frame
+/// sequence, and the served digest (uninvertible, safe to log).
+fn audit_digest_attempt(
+    session_id: &str,
+    terminal_id: &str,
+    now_ms: u64,
+    frame_seq: u64,
+    digest_hex: &str,
+) {
+    if let Ok(mut store) = automation_store().lock() {
+        store.audit.push(FrameAuditEntry {
+            session_id: session_id.to_string(),
+            terminal_id: terminal_id.to_string(),
+            format: String::from("digest"),
+            now_ms,
+            frame_seq,
+            digest_hex: digest_hex.to_string(),
+        });
+        while store.audit.len() > MAX_AUTOMATION_BEARERS {
+            store.audit.remove(0);
+        }
+    }
+}
+
+/// `bitty.debug/frameHash`: bearer-scoped lossless frame digest (CTX-0244).
+///
+/// Params (object, `<= 32 KiB`): `{ terminalId|terminal_id: "t:N", bearer:
+/// "<token>" }`. Requires `debug.trace` + `terminal.inspect` plus a live
+/// `frame-digest` bearer for the addressed terminal/session, a
+/// local-attested transport ([`ServeContext::local_attested`], P0-AC-021
+/// parity), and a published headless frame. Returns the SHA-256 hex digest
+/// over `canonical_frame_bytes(width_px, height_px, frame_seq, rgba)` — 32
+/// bytes that prove frame equality with zero pixel bytes on the wire —
+/// plus the bound geometry and `"trust":"untrusted-observation"` (T-10
+/// parity). No `explicitOptIn`: nothing human-readable is returned, grant
+/// possession IS the opt-in.
+///
+/// Fail-closed ordering (no oracle, zero partial state): params shape, then
+/// local attestation, then scope+bearer+expiry+rate (all `ScopeDenied`),
+/// then frame availability (`Unavailable` — never a hash of nothing, which
+/// would read as false equality). A `Capture` bearer MUST NOT authorize
+/// here (family-mismatch `ScopeDenied`, never widened).
+fn handle_frame_hash(
+    context: &ServeContext,
+    request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    use crate::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
+    use crate::scope::Scope::{DebugTrace, TerminalInspect};
+    let params = request.params_raw.as_deref().ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "frameHash requires params".to_string(),
+        )
+    })?;
+    let terminal_id = extract_terminal_id(params).ok_or_else(|| {
+        HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "frameHash requires terminalId \"t:N\"".to_string(),
+        )
+    })?;
+    if crate::ctl::parse_terminal_id(&terminal_id).is_err() {
+        return Err(HandlerError::new(
+            "usage",
+            "InvalidParams",
+            "terminalId must match ^t:[0-9]+$ (no wildcards)".to_string(),
+        ));
+    }
+    // Local-only transport, revalidated per call before any digest work:
+    // the Unix-socket accept boundary (`transport_attested_peer`) or
+    // same-process dispatch must have marked this context. Never over TCP
+    // (no listener exists) and never for a foreign user.
+    if !context.local_attested {
+        audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+        return Err(HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            "permission denied: frameHash requires a local attested transport".to_string(),
+        ));
+    }
+    let bearer = extract_top_string(params, "bearer");
+    if let Err(err) = authorize_automation(
+        &context.granted,
+        &[DebugTrace, TerminalInspect],
+        bearer.as_deref(),
+        &context.session_id,
+        &terminal_id,
+        AutomationFamily::FrameDigest,
+        context.uptime_ms,
+    ) {
+        audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+        return Err(err);
+    }
+    // Snapshot the published present source (clone under the lock, hash
+    // after release). An empty/unpresented surface is `Unavailable`, which
+    // reads as indeterminate — never as false equality.
+    let (width_px, height_px, frame_seq, rgba) = {
+        let guard = live_rgba_store().lock().map_err(|_| {
+            HandlerError::new(
+                "transport",
+                "Unavailable",
+                "frame store unavailable".to_string(),
+            )
+        })?;
+        if guard.rgba.is_empty() {
+            audit_digest_attempt(&context.session_id, &terminal_id, context.uptime_ms, 0, "");
+            return Err(HandlerError::new(
+                "transport",
+                "Unavailable",
+                "no presented frame to digest".to_string(),
+            ));
+        }
+        (
+            guard.width_px,
+            guard.height_px,
+            guard.frame_seq,
+            guard.rgba.clone(),
+        )
+    };
+    let digest = frame_digest_hex(width_px, height_px, frame_seq, &rgba);
+    audit_digest_attempt(
+        &context.session_id,
+        &terminal_id,
+        context.uptime_ms,
+        frame_seq,
+        &digest,
+    );
+    // Informational grid geometry (captureFrame parity: grid store, server
+    // fallback on poison — the digest itself already binds pixel geometry
+    // plus frameSeq, so no security decision depends on these numbers).
+    let (grid_cols, grid_rows) =
+        live_grid_store()
+            .lock()
+            .map_or((context.server.cols, context.server.rows), |guard| {
+                (
+                    if guard.cols == 0 {
+                        context.server.cols
+                    } else {
+                        guard.cols
+                    },
+                    if guard.rows == 0 {
+                        context.server.rows
+                    } else {
+                        guard.rows
+                    },
+                )
+            });
+    let mut out = String::with_capacity(256);
+    out.push_str("{\"version\":\"");
+    out.push_str(DEVTOOLS_PROTOCOL_VERSION);
+    out.push_str("\",\"snapshot\":\"frameHash\",\"terminalId\":\"");
+    json_escape_into(&mut out, &terminal_id);
+    out.push_str("\",\"cols\":");
+    out.push_str(&grid_cols.to_string());
+    out.push_str(",\"rows\":");
+    out.push_str(&grid_rows.to_string());
+    out.push_str(",\"widthPx\":");
+    out.push_str(&width_px.to_string());
+    out.push_str(",\"heightPx\":");
+    out.push_str(&height_px.to_string());
+    out.push_str(",\"frameSeq\":");
+    out.push_str(&frame_seq.to_string());
+    out.push_str(",\"algo\":\"");
+    out.push_str(FRAME_DIGEST_ALGO);
+    out.push_str("\",\"digest\":\"");
+    out.push_str(&digest);
+    out.push_str("\",\"trust\":\"untrusted-observation\"}");
     Ok(out)
 }
 
@@ -4705,15 +5053,17 @@ mod tests {
         // control (listWindows, listViews, listTerminals, spawnTerminal,
         // closeTerminal, sendInput, getTerminalText, splitView, focusView,
         // reloadConfig) plus CTX-0188 automation (synthesizeInput,
-        // captureFrame) plus CTX-0189 profiling (getProcessStats,
-        // getFrameStats, streamProcessStats, streamFrameStats).
-        assert_eq!(dispatcher.method_count(), 22);
+        // captureFrame) plus CTX-0244 digest (frameHash) plus CTX-0189
+        // profiling (getProcessStats, getFrameStats, streamProcessStats,
+        // streamFrameStats).
+        assert_eq!(dispatcher.method_count(), 23);
         assert!(dispatcher.contains("bitty.debug/getGridText"));
         assert!(dispatcher.contains("bitty.debug/getInputRing"));
         assert!(dispatcher.contains("bitty.debug/getModifiers"));
         assert!(dispatcher.contains("bitty.debug/getFocus"));
         assert!(dispatcher.contains(METHOD_SYNTHESIZE_INPUT));
         assert!(dispatcher.contains(METHOD_CAPTURE_FRAME));
+        assert!(dispatcher.contains(METHOD_FRAME_HASH));
         assert!(dispatcher.contains(METHOD_GET_PROCESS_STATS));
         assert!(dispatcher.contains(METHOD_GET_FRAME_STATS));
         assert!(dispatcher.contains(METHOD_STREAM_PROCESS_STATS));
@@ -5423,6 +5773,541 @@ mod tests {
             "{{\"id\":{id},\"method\":\"{METHOD_CAPTURE_FRAME}\",\"version\":\"1.0\",\"params\":{params}}}"
         )
         .into_bytes()
+    }
+
+    // ── frameHash digest (CTX-0244) ─────────────────────────────────────────
+    //
+    // Digest equality vs local computation, full denial matrix, TTL cap,
+    // 2/s rate ceiling, fail-closed publish validation, bounded audit with
+    // served-digest content, and no-bypass isolation in both family
+    // directions. Every test holds the serial guard and clears automation
+    // plus introspection (incl. the RGBA store) before and after. All
+    // content is synthetic fixture bytes — never secrets (P0-AC-026
+    // harness rule).
+
+    fn digest_envelope(id: u64, params: &str) -> Vec<u8> {
+        format!(
+            "{{\"id\":{id},\"method\":\"{METHOD_FRAME_HASH}\",\"version\":\"1.0\",\"params\":{params}}}"
+        )
+        .into_bytes()
+    }
+
+    fn digest_context(
+        server: &ServerInfo,
+        granted: crate::scope::ScopeSet,
+        session: &str,
+        now_ms: u64,
+    ) -> ServeContext {
+        // Attested like the production accept boundary
+        // (`transport_attested_peer` + `attest_local_peer`): same-process
+        // in-process dispatch is local by construction.
+        let mut ctx = automation_context(server, granted, session, now_ms);
+        ctx.attest_local_peer();
+        ctx
+    }
+
+    /// Deterministic synthetic RGBA fixture (never secrets): a gradient
+    /// over `w*h*4` bytes with an ASCII marker row to prove no pixel bytes
+    /// reach the response.
+    fn fixture_rgba(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        let len = width as usize * height as usize * 4;
+        let mut rgba = Vec::with_capacity(len);
+        for i in 0..len {
+            rgba.push(
+                (i as u8)
+                    .wrapping_add(seed)
+                    .wrapping_mul(31)
+                    .wrapping_add(7),
+            );
+        }
+        // ASCII marker the response must never contain (uninvertibility
+        // spot-check, not a proof — the proof is the 32-byte digest).
+        let marker = b"FRAMEHASH-MARKER-NEVER-ON-WIRE";
+        let at = len.min(256);
+        for (i, b) in marker.iter().enumerate() {
+            if at + i < len {
+                rgba[at + i] = *b;
+            }
+        }
+        rgba
+    }
+
+    fn response_text(outcome: &HandleOutcome) -> String {
+        String::from_utf8(outcome.response.clone()).unwrap()
+    }
+
+    #[test]
+    fn frame_hash_digest_equals_local_computation_across_geometries() {
+        use crate::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        // Three geometries (tiny, odd-sized, and multi-kilopixel) with
+        // distinct seeds and frame sequences.
+        for (id, (w, h, seq, seed)) in [(80u32, 60u32, 9u64, 1u8), (17, 5, 41, 2), (320, 200, 7, 3)]
+            .into_iter()
+            .enumerate()
+        {
+            let rgba = fixture_rgba(w, h, seed);
+            publish_frame_rgba(w, h, seq, rgba.clone());
+            publish_grid_text(vec!["synthetic".to_string()], 0, 0, true, seq, 80, 24);
+            let tok = issue_automation_bearer_with_ttl(
+                "digest-eq",
+                "t:1",
+                AutomationFamily::FrameDigest,
+                0,
+                60_000,
+            )
+            .unwrap();
+            let ctx = digest_context(&server, automation_scopes_capture(), "digest-eq", 0);
+            let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+            let outcome =
+                handle_envelope(&digest_envelope(id as u64 + 1, &params), &dispatcher, &ctx);
+            assert!(!outcome.was_error, "geometry {w}x{h} must verify");
+            let text = response_text(&outcome);
+            let expect = frame_digest_hex(w, h, seq, &rgba);
+            assert!(text.contains("\"snapshot\":\"frameHash\""), "got: {text}");
+            assert!(
+                text.contains(&format!("\"algo\":\"{FRAME_DIGEST_ALGO}\"")),
+                "got: {text}"
+            );
+            assert!(
+                text.contains(&format!("\"digest\":\"{expect}\"")),
+                "digest mismatch at {w}x{h}: {text}"
+            );
+            assert!(text.contains(&format!("\"frameSeq\":{seq}")), "got: {text}");
+            assert!(
+                text.contains("\"trust\":\"untrusted-observation\""),
+                "got: {text}"
+            );
+            assert!(text.len() < 512, "digest response must stay tiny: {text}");
+            assert!(
+                !text.contains("FRAMEHASH-MARKER-NEVER-ON-WIRE"),
+                "pixel bytes reached the wire: {text}"
+            );
+            clear_automation_for_tests();
+        }
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_auth_matrix_denies_everything_unauthorized() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        publish_frame_rgba(8, 8, 3, fixture_rgba(8, 8, 9));
+        let digest_tok =
+            issue_automation_bearer_with_ttl("m", "t:1", AutomationFamily::FrameDigest, 0, 60_000)
+                .unwrap();
+        let capture_tok =
+            issue_automation_bearer("m", "t:1", AutomationFamily::Capture, 0).unwrap();
+
+        // (label, scopes, session, terminal-in-params, token, now, attest)
+        let full = automation_scopes_capture();
+        let mut no_trace = automation_scopes_capture();
+        no_trace.remove(crate::scope::Scope::DebugTrace);
+        let mut no_inspect = automation_scopes_capture();
+        no_inspect.remove(crate::scope::Scope::TerminalInspect);
+        let cases: Vec<(&str, crate::scope::ScopeSet, &str, &str, String, u64, bool)> = vec![
+            (
+                "no-bearer",
+                full.clone(),
+                "m",
+                "t:1",
+                String::new(),
+                0,
+                true,
+            ),
+            (
+                "wrong-family-capture-token",
+                full.clone(),
+                "m",
+                "t:1",
+                capture_tok.clone(),
+                0,
+                true,
+            ),
+            (
+                "wrong-terminal",
+                full.clone(),
+                "m",
+                "t:2",
+                digest_tok.clone(),
+                0,
+                true,
+            ),
+            (
+                "wrong-session",
+                full.clone(),
+                "other",
+                "t:1",
+                digest_tok.clone(),
+                0,
+                true,
+            ),
+            (
+                "missing-debug-trace",
+                no_trace,
+                "m",
+                "t:1",
+                digest_tok.clone(),
+                0,
+                true,
+            ),
+            (
+                "missing-terminal-inspect",
+                no_inspect,
+                "m",
+                "t:1",
+                digest_tok.clone(),
+                0,
+                true,
+            ),
+            (
+                "unattested-transport",
+                full.clone(),
+                "m",
+                "t:1",
+                digest_tok.clone(),
+                0,
+                false,
+            ),
+            (
+                "forged-token-full-scopes",
+                crate::scope::ScopeSet::all(),
+                "m",
+                "t:1",
+                "forged-token".to_string(),
+                0,
+                true,
+            ),
+        ];
+        for (label, scopes, session, term, token, now, attest) in cases {
+            let mut ctx = automation_context(&server, scopes, session, now);
+            if attest {
+                ctx.attest_local_peer();
+            }
+            let params = if token.is_empty() {
+                format!("{{\"terminalId\":\"{term}\"}}")
+            } else {
+                format!("{{\"terminalId\":\"{term}\",\"bearer\":\"{token}\"}}")
+            };
+            let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+            assert!(outcome.was_error, "{label} must fail");
+            assert!(
+                response_text(&outcome).contains("ScopeDenied"),
+                "{label}: bearer-vs-scope failures must share the ScopeDenied shape, got: {}",
+                response_text(&outcome)
+            );
+        }
+        // Malformed shape fails closed without attribution (no audit needed).
+        let ctx = digest_context(&server, automation_scopes_capture(), "m", 0);
+        let outcome = handle_envelope(&digest_envelope(2, "{}"), &dispatcher, &ctx);
+        assert!(response_text(&outcome).contains("InvalidParams"));
+        let outcome = handle_envelope(
+            &digest_envelope(3, r#"{"terminalId":"t:*"}"#),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(response_text(&outcome).contains("InvalidParams"));
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_ttl_capped_at_two_minutes_and_expiry_revokes() {
+        use crate::frame_digest::FRAME_DIGEST_TTL_MS;
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        assert_eq!(FRAME_DIGEST_TTL_MS, 120_000);
+        // The default 10-minute minter refuses digest grants fail-closed:
+        // a digest TTL must be explicit.
+        assert!(issue_automation_bearer("ttl", "t:1", AutomationFamily::FrameDigest, 0).is_err());
+        // Zero and over-cap TTLs fail closed.
+        assert!(
+            issue_automation_bearer_with_ttl("ttl", "t:1", AutomationFamily::FrameDigest, 0, 0)
+                .is_err()
+        );
+        assert!(
+            issue_automation_bearer_with_ttl(
+                "ttl",
+                "t:1",
+                AutomationFamily::FrameDigest,
+                0,
+                FRAME_DIGEST_TTL_MS + 1
+            )
+            .is_err()
+        );
+        // Cap edge issues; sibling families still enjoy the 10-minute cap.
+        let tok = issue_automation_bearer_with_ttl(
+            "ttl",
+            "t:1",
+            AutomationFamily::FrameDigest,
+            500,
+            FRAME_DIGEST_TTL_MS,
+        )
+        .unwrap();
+        assert!(
+            issue_automation_bearer_with_ttl(
+                "ttl",
+                "t:1",
+                AutomationFamily::Synthesize,
+                0,
+                AUTOMATION_BEARER_TTL_MS
+            )
+            .is_ok()
+        );
+        // Grant valid at issuance, denied exactly at issue+TTL
+        // (virtual clock: no sleeps, no wall-clock).
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        publish_frame_rgba(4, 4, 1, fixture_rgba(4, 4, 5));
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+        let ctx = digest_context(&server, automation_scopes_capture(), "ttl", 500);
+        let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error, "grant must verify at issuance");
+        let ctx = digest_context(
+            &server,
+            automation_scopes_capture(),
+            "ttl",
+            500 + FRAME_DIGEST_TTL_MS,
+        );
+        let outcome = handle_envelope(&digest_envelope(2, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "expired digest grant must deny: {}",
+            response_text(&outcome)
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_rate_sheds_third_digest_per_second() {
+        use crate::frame_digest::MAX_FRAME_DIGEST_PER_SEC;
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        assert_eq!(MAX_FRAME_DIGEST_PER_SEC, 2);
+        publish_frame_rgba(4, 4, 1, fixture_rgba(4, 4, 5));
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok =
+            issue_automation_bearer_with_ttl("rl", "t:1", AutomationFamily::FrameDigest, 0, 60_000)
+                .unwrap();
+        let ctx = digest_context(&server, automation_scopes_capture(), "rl", 0);
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+        for id in 1..=MAX_FRAME_DIGEST_PER_SEC as u64 {
+            let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+            assert!(!outcome.was_error, "digest {id} must pass under ceiling");
+        }
+        let outcome = handle_envelope(
+            &digest_envelope(MAX_FRAME_DIGEST_PER_SEC as u64 + 1, &params),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("RateLimited"),
+            "third digest in one window must shed: {}",
+            response_text(&outcome)
+        );
+        // Window slides: one second later the ceiling admits again.
+        let ctx = digest_context(&server, automation_scopes_capture(), "rl", 1_000);
+        let outcome = handle_envelope(&digest_envelope(9, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error, "window must slide after 1 s");
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_unavailable_without_presented_frame_and_rejects_bad_publish() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let tok =
+            issue_automation_bearer_with_ttl("np", "t:1", AutomationFamily::FrameDigest, 0, 60_000)
+                .unwrap();
+        // Authorized-but-unavailable calls still consume the rate budget
+        // (authorize runs first), so each probe advances the virtual clock.
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+        // Never a hash of nothing: empty store reads as indeterminate.
+        let ctx = digest_context(&server, automation_scopes_capture(), "np", 0);
+        let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("Unavailable"),
+            "got: {}",
+            response_text(&outcome)
+        );
+        // Fail-closed publish validation: zero extents, length mismatch,
+        // and over-cap frames never become digestable.
+        publish_frame_rgba(0, 8, 1, vec![0u8; 32]);
+        publish_frame_rgba(8, 8, 1, vec![0u8; 8 * 8 * 4 - 1]);
+        publish_frame_rgba(8, 8, 1, vec![0u8; 8 * 8 * 4 + 1]);
+        publish_frame_rgba(u32::MAX, u32::MAX, 1, vec![0u8; 16]);
+        let ctx = digest_context(&server, automation_scopes_capture(), "np", 1_000);
+        let outcome = handle_envelope(&digest_envelope(2, &params), &dispatcher, &ctx);
+        assert!(
+            response_text(&outcome).contains("Unavailable"),
+            "bad publishes must not become digestable: {}",
+            response_text(&outcome)
+        );
+        // A valid publish after bad ones still verifies (drop, not poison).
+        publish_frame_rgba(8, 8, 2, fixture_rgba(8, 8, 1));
+        let ctx = digest_context(&server, automation_scopes_capture(), "np", 2_000);
+        let outcome = handle_envelope(&digest_envelope(3, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error, "valid publish must verify");
+        assert!(
+            response_text(&outcome).contains("\"frameSeq\":2"),
+            "got: {}",
+            response_text(&outcome)
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_audit_covers_granted_and_denied_and_stays_bounded() {
+        use crate::frame_digest::frame_digest_hex;
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        let rgba = fixture_rgba(8, 8, 4);
+        publish_frame_rgba(8, 8, 55, rgba.clone());
+        let tok = issue_automation_bearer_with_ttl(
+            "au",
+            "t:1",
+            AutomationFamily::FrameDigest,
+            0,
+            120_000,
+        )
+        .unwrap();
+        // Granted call appends a digest entry carrying the served digest.
+        let before = frame_audit_len_for_tests();
+        let ctx = digest_context(&server, automation_scopes_capture(), "au", 0);
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+        let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error);
+        let text = response_text(&outcome);
+        let served = frame_digest_hex(8, 8, 55, &rgba);
+        assert!(text.contains(&served));
+        assert_eq!(frame_audit_len_for_tests(), before + 1);
+        let snap = frame_audit_snapshot_for_tests();
+        let entry = snap.last().unwrap();
+        assert_eq!(entry.format, "digest");
+        assert_eq!(entry.session_id, "au");
+        assert_eq!(entry.terminal_id, "t:1");
+        assert_eq!(entry.frame_seq, 55);
+        assert_eq!(entry.digest_hex, served);
+        // Denied calls append too (attributable terminal): wrong-terminal
+        // denials are unbounded by rate (auth fails first), so 65 of them
+        // prove the 64-entry drop-oldest bound deterministically.
+        for id in 2..=66u64 {
+            let bad = format!("{{\"terminalId\":\"t:9\",\"bearer\":\"{tok}\"}}");
+            let outcome = handle_envelope(&digest_envelope(id, &bad), &dispatcher, &ctx);
+            assert!(outcome.was_error);
+        }
+        assert_eq!(frame_audit_len_for_tests(), MAX_AUTOMATION_BEARERS);
+        let snap = frame_audit_snapshot_for_tests();
+        assert!(snap.iter().all(|e| e.format == "digest"));
+        assert!(
+            snap.iter().all(|e| e.digest_hex.is_empty()),
+            "denied entries carry no digest"
+        );
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_hash_family_isolation_holds_in_both_directions() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        let server = test_server_info();
+        let dispatcher = Dispatcher::with_defaults();
+        publish_frame_rgba(8, 8, 1, fixture_rgba(8, 8, 6));
+        publish_grid_text(vec!["ok".to_string()], 0, 0, true, 1, 80, 24);
+        let digest_tok = issue_automation_bearer_with_ttl(
+            "iso",
+            "t:1",
+            AutomationFamily::FrameDigest,
+            0,
+            60_000,
+        )
+        .unwrap();
+        let capture_tok =
+            issue_automation_bearer("iso", "t:1", AutomationFamily::Capture, 0).unwrap();
+        let ctx = digest_context(&server, automation_scopes_capture(), "iso", 0);
+        // Capture bearer on frameHash: denied (never widened).
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{capture_tok}\"}}");
+        let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+        assert!(response_text(&outcome).contains("ScopeDenied"));
+        // Digest bearer on captureFrame: denied (never widened).
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{digest_tok}\",\"format\":\"semantic\"}}"
+        );
+        let outcome = handle_envelope(&capture_envelope(2, &params), &dispatcher, &ctx);
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "digest bearer must not capture: {}",
+            response_text(&outcome)
+        );
+        // Digest bearer on frameHash: verifies (control case).
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{digest_tok}\"}}");
+        let outcome = handle_envelope(&digest_envelope(3, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error);
+        // No-bypass: even every scope granted, a forged digest token denies,
+        // and revocation takes effect immediately.
+        let all = digest_context(&server, crate::scope::ScopeSet::all(), "iso", 0);
+        let params = r#"{"terminalId":"t:1","bearer":"forged-digest-token"}"#;
+        let outcome = handle_envelope(&digest_envelope(4, params), &dispatcher, &all);
+        assert!(response_text(&outcome).contains("ScopeDenied"));
+        assert!(revoke_automation_bearer(&digest_tok));
+        let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{digest_tok}\"}}");
+        let outcome = handle_envelope(&digest_envelope(5, &params), &dispatcher, &ctx);
+        assert!(response_text(&outcome).contains("ScopeDenied"));
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
+    }
+
+    #[test]
+    fn frame_digest_publish_gate_arms_only_with_live_grant() {
+        let _guard = lock_introspection_for_test();
+        clear_introspection_for_tests();
+        clear_automation_for_tests();
+        assert!(!frame_digest_publish_wanted());
+        let synth =
+            issue_automation_bearer("gate", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+        let cap = issue_automation_bearer("gate", "t:1", AutomationFamily::Capture, 0).unwrap();
+        // Other families never arm the RGBA publish path.
+        assert!(!frame_digest_publish_wanted());
+        let digest = issue_automation_bearer_with_ttl(
+            "gate",
+            "t:1",
+            AutomationFamily::FrameDigest,
+            0,
+            60_000,
+        )
+        .unwrap();
+        assert!(frame_digest_publish_wanted());
+        assert!(revoke_automation_bearer(&digest));
+        assert!(!frame_digest_publish_wanted());
+        assert!(revoke_automation_bearer(&synth));
+        assert!(revoke_automation_bearer(&cap));
+        clear_automation_for_tests();
+        clear_introspection_for_tests();
     }
 
     #[test]

@@ -319,7 +319,11 @@ fn serve_stream(
     // Accept-boundary verification: attested marker first, serving second.
     // No credential-typed value survives past this line.
     let verified = bitty_ipc::devtools::transport_attested_peer(runtime_uid);
-    let context = bitty_ipc::devtools::ServeContext::new(server);
+    let mut context = bitty_ipc::devtools::ServeContext::new(server);
+    // CTX-0244: this connection passed peer-credential verification at the
+    // Unix-socket accept boundary (P0-AC-021), so per-call local-only
+    // methods (`frameHash`) may serve it.
+    context.attest_local_peer();
     let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
     let clock = || {
         SystemTime::now()

@@ -2540,6 +2540,72 @@ mod tests {
         assert!(stats.denied >= 1, "denial must be counted");
     }
 
+    /// RAII hermeticity for the process-global control queue + waker slot.
+    #[cfg(unix)]
+    struct ControlWakeGuard;
+
+    #[cfg(unix)]
+    impl ControlWakeGuard {
+        fn take() -> Self {
+            while ipc_ctl::pop_pending_control().is_some() {}
+            ipc_ctl::set_control_waker(None);
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ControlWakeGuard {
+        fn drop(&mut self) {
+            ipc_ctl::set_control_waker(None);
+            while ipc_ctl::pop_pending_control().is_some() {}
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_enqueue_wakes_then_drains_without_render_tick() {
+        // CTX-0235 regression (live evidence PX-1296..PX-1311): an idle
+        // window drains nothing — every verb returns `control timed out (no
+        // live runtime draining)` because the `Wait`-sleeping event loop is
+        // never woken. This headless proof mirrors that idle window: an
+        // enqueue on a worker thread must first wake the loop (observed
+        // here via the waker channel), and a single
+        // `drain_global_control_queue` — with no `Runtime::tick`, no
+        // `drive_tick`, and no render anywhere — must then apply the verb
+        // and unblock the waiter with the live result.
+        let _wm_guard = hold_wm_lock();
+        let _wake_guard = ControlWakeGuard::take();
+        let mut rt = headless_runtime();
+
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+        ipc_ctl::set_control_waker(Some(std::sync::Arc::new(move || {
+            let _ = wake_tx.send(());
+        })));
+        let granted = bitty_ipc::ScopeSet::cli_default();
+        let worker = std::thread::spawn(move || {
+            ipc_ctl::enqueue_control_and_wait(ipc_ctl::METHOD_LIST_VIEWS, None, "1", &granted)
+        });
+
+        // Idle-window proof part 1: the wakeup fires promptly with no tick
+        // running (pre-fix this times out — nothing wakes the loop).
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("enqueue must wake the event loop on an idle window");
+
+        // Idle-window proof part 2: one drain, no render tick, applies the
+        // verb against the live `Runtime` and unblocks the waiter. The drain
+        // re-authorizes at apply (defense in depth); only the wakeup is new.
+        let drained = drain_global_control_queue(&mut rt, &bitty_ipc::ScopeSet::cli_default());
+        assert_eq!(drained, 1, "exactly the enqueued verb must drain");
+        let reply = worker.join().expect("worker thread must finish");
+        assert!(reply.ok, "drained verb must succeed: {reply:?}");
+        assert!(
+            reply.result_json.contains("v:1"),
+            "view list must reflect live layout: {reply:?}"
+        );
+        assert!(ipc_ctl::pop_pending_control().is_none());
+    }
+
     // ── CTX-0220: headless WM-flow coverage over the devtools IPC surface ──
     //
     // Seat-contested: no GUI driving, no ydotool, no screenshots. A real Unix

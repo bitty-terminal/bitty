@@ -584,13 +584,60 @@ pub struct GlyphInstance {
     pub source: GlyphSource,
 }
 
+/// One RGBA image to composite, fully described in owned data (CTX-0248).
+///
+/// Produced by the runtime present path from placed Kitty images that the
+/// rich layer rasterized to the exact destination extent. `rgba` is
+/// straight-alpha RGBA8, row-major, exactly
+/// `dest.width * dest.height * 4` bytes. Paint order is after fills and
+/// glyphs: images are the topmost present-layer content (above cells,
+/// text, and fill overlays such as selection/cursor), and they never
+/// mutate grid truth. The GPU pipeline ignores this vector until a
+/// texture-upload path lands; both CPU compositors (`headless_present`
+/// and the `sw-fallback` `draw_list_onto`) blend every entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBlit {
+    /// Destination top-left in logical pixels plus span.
+    pub dest: RectPx,
+    /// Straight-alpha RGBA8 bytes, row-major, `dest.area() * 4` long.
+    pub rgba: Vec<u8>,
+}
+
+impl ImageBlit {
+    /// Builds a blit, validating the byte length with checked arithmetic
+    /// before accepting the allocation the caller already made.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::RenderError::InvalidInput`] when the span is zero
+    /// or `rgba.len() != dest.width * dest.height * 4` (including
+    /// overflow, which can never satisfy the equality).
+    pub fn try_new(dest: RectPx, rgba: Vec<u8>) -> Result<Self, crate::error::RenderError> {
+        if dest.width == 0 || dest.height == 0 {
+            return Err(crate::error::RenderError::InvalidInput {
+                reason: "image blit destination must be non-zero",
+            });
+        }
+        let expected = (u64::from(dest.width) * u64::from(dest.height))
+            .checked_mul(4)
+            .filter(|&n| n <= usize::MAX as u64);
+        let ok = expected.is_some_and(|n| n as usize == rgba.len());
+        if !ok {
+            return Err(crate::error::RenderError::InvalidInput {
+                reason: "image blit bytes do not match destination extent",
+            });
+        }
+        Ok(Self { dest, rgba })
+    }
+}
+
 /// Owned record of everything one frame needs to draw.
 ///
 /// Produced by [`GridRenderer::render`]; consumed by a GPU backend seam or,
 /// under the `sw-fallback` feature, by
 /// [`crate::software::draw_list_onto`]. Paint order is fills first, then
-/// glyphs; each vector preserves cell scan order so identical inputs give
-/// byte-identical records.
+/// glyphs, then images; each vector preserves cell scan order so identical
+/// inputs give byte-identical records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawList {
     /// Snapshot generation this list was built from.
@@ -601,13 +648,15 @@ pub struct DrawList {
     pub fills: Vec<FillRect>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
+    /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
+    pub images: Vec<ImageBlit>,
 }
 
 impl DrawList {
     /// True when the frame carries any drawing work.
     #[must_use]
     pub fn needs_draw(&self) -> bool {
-        !self.fills.is_empty() || !self.glyphs.is_empty()
+        !self.fills.is_empty() || !self.glyphs.is_empty() || !self.images.is_empty()
     }
 }
 
@@ -1098,6 +1147,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             generation: snapshot.generation,
             fills: Vec::new(),
             glyphs: Vec::new(),
+            // Grid truth carries no images; the runtime present path pushes
+            // placed Kitty blits onto the combined list (CTX-0248).
+            images: Vec::new(),
             plan,
         };
         if !list.plan.needs_draw() {

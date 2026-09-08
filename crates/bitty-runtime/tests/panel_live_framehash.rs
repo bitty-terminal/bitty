@@ -46,8 +46,14 @@ use bitty_runtime::{
 };
 
 /// Serial guard for the process-global automation + introspection stores
-/// (CTX-0179 pattern). Only the socket round-trip test takes it; the
-/// headless digest gates touch no global state (`Runtime` + pure digest fn).
+/// (CTX-0179 pattern). EVERY test in this file takes it for its whole body:
+/// `Runtime::tick` auto-publishes the presented frame into the global RGBA
+/// digest store whenever a `FrameDigest` bearer is live
+/// (`frame_digest_publish_wanted`), so a parallel V1/V2/V3 tick landing
+/// inside the socket test's bearer window would overwrite the published
+/// frame (served `frameSeq`/digest diverge from the local expectation —
+/// the macOS-only CI flake). The headless digest gates are pure only while
+/// no bearer exists; the guard makes that unconditional.
 fn live_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -118,6 +124,10 @@ fn rgba_at(rgba: &[u8], stride_px: usize, x: usize, y: usize) -> [u8; 4] {
 
 #[test]
 fn v1_gap_digest_differs_from_no_gap_and_matches_rerun() {
+    // Serialized: ticks auto-publish into the global digest store while a
+    // digest bearer is live (see `live_lock`), so this must not interleave
+    // with the socket round-trip's bearer window.
+    let _guard = hold_live_lock();
     // Gapped run: identical content, gaps_in=2/gaps_out=1.
     let mut gapped = Runtime::new(RuntimeConfig {
         gaps_in: 2,
@@ -206,6 +216,10 @@ fn v1_gap_digest_differs_from_no_gap_and_matches_rerun() {
 
 #[test]
 fn v2_focus_switch_changes_digest_and_switchback_restores() {
+    // Serialized: see V1 — this test ticks one runtime three times
+    // (frames 1, 2, 3), so an interleaved tick would overwrite the socket
+    // test's published frame mid-window.
+    let _guard = hold_live_lock();
     let mut rt = Runtime::with_defaults().expect("build");
     rt.set_layout(two_pane_split());
     rt.set_container(UiRect::new(0, 0, 80, 24));
@@ -251,6 +265,8 @@ fn v2_focus_switch_changes_digest_and_switchback_restores() {
 
 #[test]
 fn v3_workspace_alias_and_tabs_shim_digests_equal() {
+    // Serialized: see V1.
+    let _guard = hold_live_lock();
     let views = vec![
         View::new(ViewId::new(1), 80, 24),
         View::new(ViewId::new(2), 80, 24),
@@ -331,6 +347,9 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
     rt.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut rt, 3, b'M');
     let (w, h, seq, rgba) = present_frame(&mut rt, "socket-proof frame");
+    // Quiesce: exactly one present must be pending-published. A second tick
+    // here would mean the published frame is already stale before serving.
+    assert_eq!(rt.tick(), None, "must idle after socket-proof present");
 
     publish_frame_rgba(w, h, seq, rgba.clone());
     publish_grid_text(
@@ -437,6 +456,13 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
     assert!(
         proof.contains(&format!("\"digest\":\"{expect}\"")),
         "socket digest must equal the local present-path digest: {proof}"
+    );
+    // Pin the sequence too: digest equality is only meaningful for the exact
+    // frame the local present produced (single present → single publish →
+    // single serve, no ticks in between).
+    assert!(
+        proof.contains(&format!("\"frameSeq\":{seq}")),
+        "served frameSeq must equal the locally hashed seq: {proof}"
     );
     assert!(
         proof.contains("\"trust\":\"untrusted-observation\""),

@@ -196,7 +196,9 @@ pub mod registry;
 pub mod runtime;
 pub mod shell_integration;
 pub mod statusline;
+#[deprecated(since = "0.1.0", note = "use workspace (tabs alias removal >= v0.2.0)")]
 pub mod tabs;
+pub mod workspace;
 
 pub use config::RuntimeConfig;
 pub use error::RuntimeError;

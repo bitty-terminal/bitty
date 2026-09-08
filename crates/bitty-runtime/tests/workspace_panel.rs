@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
-//! Tabs via Panel Runtime — public API verification (CTX-0104, OQ-011).
+//! Workspace via Panel Runtime — public API verification (CTX-0104, OQ-011).
 //!
-//! Verifies `bitty-terminal.tabs` as a generic Panel Runtime consumer with
-//! no hardcoded tabs primitive (reuses `LayoutNode::stack`/`split`), verifying
+//! Verifies `bitty-terminal.workspace` as a generic Panel Runtime consumer with
+//! no hardcoded workspace primitive (reuses `LayoutNode::stack`/`split`), verifying
 //! `TerminalRegistry`/`View`/`Workspace`/`Focus` lifecycle via the Panel API
 //! public path only (`PanelRegistry::new` → `create_panel` → `mount_panel` →
 //! `focus_panel` with `PanelType::Helper` and `TerminalRegistry`
@@ -12,7 +12,7 @@
 //! window, default disabled, safe-mode reject, `forbid(unsafe)`.
 
 use bitty_plugin_host::{
-    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::tabs_manifest,
+    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::workspace_manifest,
 };
 use bitty_runtime::{
     Runtime,
@@ -20,7 +20,7 @@ use bitty_runtime::{
         LogicalRect, PanelRegistry, PanelRegistryConfig, RegistryConfig, TerminalRegistry,
         WorkspaceId,
     },
-    tabs::{TabsIntegration, create_tabs_panel, validate_tabs_panel_config},
+    workspace::{WorkspaceIntegration, create_workspace_panel, validate_workspace_panel_config},
 };
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::{View, ViewId};
@@ -63,16 +63,17 @@ fn default_disabled_zero_panels_and_no_plugin() {
     assert!(rt2.tick().is_some());
 }
 
-// --- public PluginHost path for tabs --------------------------------------
+// --- public PluginHost path for workspace --------------------------------------
 
 #[test]
-fn tabs_via_public_plugin_host_path() {
-    let manifest = tabs_manifest();
+fn workspace_via_public_plugin_host_path() {
+    let manifest = workspace_manifest();
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
     assert!(granted.contains(&CapabilityId::parse("ui.rich").unwrap()));
-    // Claim tabline is declared via lazy claims.
+    // Claim workspaceline is declared via lazy claims (tabline remains as deprecated alias).
+    assert!(manifest.lazy.claims.contains(&"workspaceline".to_string()));
     assert!(manifest.lazy.claims.contains(&"tabline".to_string()));
 
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
@@ -96,7 +97,7 @@ fn tabs_via_public_plugin_host_path() {
     assert_eq!(report.revoked.len(), 1);
     assert!(!host.is_granted(&id, &hash, &cap));
     // Hash changed (version bump) → grant no longer matches.
-    let mut bumped = tabs_manifest();
+    let mut bumped = workspace_manifest();
     bumped.identity.version = "0.2.0".to_string();
     assert_ne!(bumped.manifest_hash(), hash);
     assert!(!host.is_granted(&id, &bumped.manifest_hash(), &cap));
@@ -105,8 +106,8 @@ fn tabs_via_public_plugin_host_path() {
 // --- subscribe → publish → drain via bounded PanelEventBus DropOldest -------
 
 #[test]
-fn tabs_subscribe_publish_drain_bounded_drop_oldest() {
-    let manifest = tabs_manifest();
+fn workspace_subscribe_publish_drain_bounded_drop_oldest() {
+    let manifest = workspace_manifest();
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
@@ -118,27 +119,29 @@ fn tabs_subscribe_publish_drain_bounded_drop_oldest() {
     host.activate(&id).unwrap();
     // Subscribe to declared events only (undeclared must fail).
     host.subscribe(&id, EventKind::TerminalTitleChanged)
-        .expect("title is declared for tabs");
+        .expect("title is declared for workspace");
     assert!(
         host.subscribe(&id, EventKind::InterceptPaste).is_err(),
         "undeclared intercept must be rejected"
     );
 
-    // Panel EventBus bounded: per-sub 64 DropOldest via tabs panel.
+    // Panel EventBus bounded: per-sub 64 DropOldest via workspace panel.
     let mut preg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = ViewId::new(100);
     let h = preg
         .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
-        .expect("create tabs panel");
+        .expect("create workspace panel");
     preg.mount_panel(h.id, h.generation, view).expect("mount");
-    let topic = preg.declare_topic("xuepoo.tabs:tab-changed").unwrap();
+    let topic = preg
+        .declare_topic("bitty-terminal.workspace:workspace-changed")
+        .unwrap();
     preg.subscribe(h.id, h.generation, &topic)
         .expect("subscribe");
     for i in 0..80 {
         preg.publish(
             &topic,
-            bitty_runtime::registry::BoundedPayload::try_new(format!("tab{i}")).unwrap(),
+            bitty_runtime::registry::BoundedPayload::try_new(format!("ws{i}")).unwrap(),
         )
         .unwrap();
     }
@@ -146,9 +149,9 @@ fn tabs_subscribe_publish_drain_bounded_drop_oldest() {
     assert!(preg.bus_total_events() <= 8192);
     let batch = preg.drain_batch(h.id, topic.as_str(), 32, 8192);
     assert_eq!(batch.len(), 32);
-    // FIFO DropOldest: first batch should contain tab16..tab47 (oldest 16 dropped if payload small)
-    // With 80 published and 64 cap, oldest 16 dropped, so first surviving is tab16.
-    assert_eq!(batch[0].payload.as_str(), "tab16");
+    // FIFO DropOldest: first batch should contain ws16..ws47 (oldest 16 dropped if payload small)
+    // With 80 published and 64 cap, oldest 16 dropped, so first surviving is ws16.
+    assert_eq!(batch[0].payload.as_str(), "ws16");
 }
 
 // --- TerminalRegistry/View/Workspace/focus lifecycle via Panel API ---------
@@ -183,14 +186,14 @@ fn terminal_registry_view_workspace_focus_via_panel_api() {
     treg.set_focus(wid, vh1.id, vh1.generation)
         .expect("focus vh1");
     assert_eq!(treg.focused_view(wid), Some(vh1.id));
-    // Tabs as Stack reuse LayoutNode::stack (no hardcoded tabs).
-    let layout = TabsIntegration::stack_for_tabs(vec![
+    // Workspace as Stack reuse LayoutNode::stack (no hardcoded workspace).
+    let layout = WorkspaceIntegration::stack_for_workspace(vec![
         View::new(vh1.id, 80, 24),
         View::new(vh2.id, 80, 24),
         View::new(vh3.id, 80, 24),
     ]);
-    assert!(TabsIntegration::is_stack(&layout));
-    assert_eq!(TabsIntegration::tab_count(&layout), 3);
+    assert!(WorkspaceIntegration::is_stack(&layout));
+    assert_eq!(WorkspaceIntegration::workspace_count(&layout), 3);
     // Commit stack to workspace via TerminalRegistry public path.
     treg.set_workspace_layout(wid, layout)
         .expect("set stack layout");
@@ -198,13 +201,13 @@ fn terminal_registry_view_workspace_focus_via_panel_api() {
         .reflow_workspace(wid, bitty_ui::Rect::new(0, 0, 80, 24))
         .expect("reflow");
     assert_eq!(allocs.len(), 3);
-    // Split reuse: two tab groups side-by-side via LayoutNode::split.
-    let split = TabsIntegration::split_for_tabs(
+    // Split reuse: two workspace groups side-by-side via LayoutNode::split.
+    let split = WorkspaceIntegration::split_for_workspace(
         vec![View::new(vh1.id, 40, 24)],
         vec![View::new(vh2.id, 40, 24)],
         0.5,
     );
-    assert_eq!(TabsIntegration::tab_count(&split), 2);
+    assert_eq!(WorkspaceIntegration::workspace_count(&split), 2);
     let split_allocs = split.layout(bitty_ui::Rect::new(0, 0, 80, 24));
     assert_eq!(split_allocs.len(), 2);
     // Panel focus via PanelRegistry public path (MRU per workspace).
@@ -251,20 +254,22 @@ fn terminal_registry_view_workspace_focus_via_panel_api() {
     assert!(treg.terminal_snapshot(th1.id, th1.generation).is_err());
 }
 
-// --- tabs panel via Panel Runtime public path, bounded ---------------------
+// --- workspace panel via Panel Runtime public path, bounded ---------------------
 
 #[test]
-fn tabs_panel_via_panel_runtime_public_path_bounded() {
+fn workspace_panel_via_panel_runtime_public_path_bounded() {
     let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = ViewId::new(1);
-    // Create tabs panel via public API (no private channel).
-    let pid = create_tabs_panel(&mut reg, ws, view).expect("create tabs panel");
+    // Create workspace panel via public API (no private channel).
+    let pid = create_workspace_panel(&mut reg, ws, view).expect("create workspace panel");
     assert_eq!(reg.panel_count(), 1);
     // PanelId distinct newtype with no From bridge.
     let _raw = pid.get();
     // Bounded queues via PanelEventBus: per-sub 64 / per-panel 1024+256KiB / global 8192+2MiB.
-    let topic = reg.declare_topic("xuepoo.tabs:focus-changed").unwrap();
+    let topic = reg
+        .declare_topic("bitty-terminal.workspace:focus-changed")
+        .unwrap();
     // Need generation for subscribe; we have pid but need generation.
     // For this test, create a fresh panel where we keep generation.
     let mut reg2 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
@@ -274,7 +279,9 @@ fn tabs_panel_via_panel_runtime_public_path_bounded() {
         .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws2))
         .unwrap();
     reg2.mount_panel(h.id, h.generation, view2).unwrap();
-    let topic2 = reg2.declare_topic("xuepoo.tabs:tab-changed").unwrap();
+    let topic2 = reg2
+        .declare_topic("bitty-terminal.workspace:workspace-changed")
+        .unwrap();
     reg2.subscribe(h.id, h.generation, &topic2).unwrap();
     for i in 0..80 {
         reg2.publish(
@@ -296,8 +303,8 @@ fn tabs_panel_via_panel_runtime_public_path_bounded() {
         max_panels_per_workspace: 0,
         ..Default::default()
     };
-    assert!(validate_tabs_panel_config(&bad).is_err());
-    assert!(validate_tabs_panel_config(&PanelRegistryConfig::default()).is_ok());
+    assert!(validate_workspace_panel_config(&bad).is_err());
+    assert!(validate_workspace_panel_config(&PanelRegistryConfig::default()).is_ok());
     // Second mount same view → AlreadyMounted.
     let h2 = reg2
         .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws2))
@@ -306,16 +313,16 @@ fn tabs_panel_via_panel_runtime_public_path_bounded() {
     let _ = topic;
 }
 
-// --- Layout reuse: split/stack determinism, no hardcoded tabs ------------
+// --- Layout reuse: split/stack determinism, no hardcoded workspace ------------
 
 #[test]
-fn tabs_reuse_layout_split_stack_determinism() {
-    // Tabs reuse LayoutNode primitives only; no new Tabs node.
+fn workspace_reuse_layout_split_stack_determinism() {
+    // Workspace reuse LayoutNode primitives only; no new Workspace node.
     let v1 = View::new(ViewId::new(1), 80, 24);
     let v2 = View::new(ViewId::new(2), 80, 24);
     let v3 = View::new(ViewId::new(3), 80, 24);
-    let stack = TabsIntegration::stack_for_tabs(vec![v1.clone(), v2.clone(), v3.clone()]);
-    assert!(TabsIntegration::is_stack(&stack));
+    let stack = WorkspaceIntegration::stack_for_workspace(vec![v1.clone(), v2.clone(), v3.clone()]);
+    assert!(WorkspaceIntegration::is_stack(&stack));
     assert_eq!(stack.leaf_count(), 3);
     // Determinism: same layout, same container → same allocation.
     let a1 = stack.layout(bitty_ui::Rect::new(0, 0, 80, 24));
@@ -326,7 +333,7 @@ fn tabs_reuse_layout_split_stack_determinism() {
         assert_eq!(*rect, bitty_ui::Rect::new(0, 0, 80, 24));
     }
     // Split reuses LayoutNode::split with clamped ratio.
-    let split = TabsIntegration::split_for_tabs(vec![v1], vec![v2, v3], 0.5);
+    let split = WorkspaceIntegration::split_for_workspace(vec![v1], vec![v2, v3], 0.5);
     let allocs = split.layout(bitty_ui::Rect::new(0, 0, 80, 24));
     assert_eq!(allocs.len(), 3);
     // Horizontal split then stack: left 40, right stacked 40 each sharing.
@@ -336,7 +343,7 @@ fn tabs_reuse_layout_split_stack_determinism() {
     widths.sort();
     assert!(widths.contains(&40));
     // Ratio clamping: extreme ratios don't collapse pane below 1.
-    let extreme = TabsIntegration::split_for_tabs(
+    let extreme = WorkspaceIntegration::split_for_workspace(
         vec![View::new(ViewId::new(10), 80, 24)],
         vec![View::new(ViewId::new(11), 80, 24)],
         0.01,
@@ -345,17 +352,17 @@ fn tabs_reuse_layout_split_stack_determinism() {
     assert!(e_allocs[0].1.width >= 1 && e_allocs[1].1.width >= 1);
 }
 
-// --- tab title bounded, observation-only ---------------------------------
+// --- workspace title bounded, observation-only ---------------------------------
 
 #[test]
-fn tab_title_bounded_observation_only() {
+fn workspace_title_bounded_observation_only() {
     let mut state = State::new();
-    assert_eq!(TabsIntegration::tab_title(&state), None);
+    assert_eq!(WorkspaceIntegration::workspace_title(&state), None);
     state.apply(&TerminalAction::OscTitle {
         text: BoundedString::new("hello"),
     });
     assert_eq!(
-        TabsIntegration::tab_title(&state),
+        WorkspaceIntegration::workspace_title(&state),
         Some("hello".to_string())
     );
     // Bounded at 128 chars.
@@ -363,7 +370,7 @@ fn tab_title_bounded_observation_only() {
     state.apply(&TerminalAction::OscTitle {
         text: BoundedString::new(long.clone()),
     });
-    let title = TabsIntegration::tab_title(&state).unwrap();
+    let title = WorkspaceIntegration::workspace_title(&state).unwrap();
     assert_eq!(title.chars().count(), 128);
     assert!(title.len() <= 512);
     // Observation is via committed state (title), never grid mutation.
@@ -371,14 +378,14 @@ fn tab_title_bounded_observation_only() {
     assert_eq!(snap.title.as_str(), state.title());
 }
 
-// --- safe-mode: tabs is non-builtin and must be rejected -------------------
+// --- safe-mode: workspace is non-builtin and must be rejected -------------------
 
 #[test]
-fn safe_mode_rejects_tabs_without_panic() {
-    let manifest = tabs_manifest();
+fn safe_mode_rejects_workspace_without_panic() {
+    let manifest = workspace_manifest();
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
     host.set_safe_mode(true);
-    // bitty-terminal.tabs is not bitty.* → treated as non-builtin, rejected.
+    // bitty-terminal.workspace is not bitty.* → treated as non-builtin, rejected.
     assert!(host.declare(manifest.clone()).is_err());
     host.set_safe_mode(false);
     assert!(host.declare(manifest).is_ok());
@@ -387,8 +394,8 @@ fn safe_mode_rejects_tabs_without_panic() {
     let mut rt = Runtime::with_defaults().unwrap();
     rt.set_plugin_safe_mode(true);
     assert!(
-        rt.register_plugin(tabs_manifest()).is_err(),
-        "safe mode must reject tabs"
+        rt.register_plugin(workspace_manifest()).is_err(),
+        "safe mode must reject workspace"
     );
     assert!(
         rt.tick().is_some(),
@@ -396,7 +403,7 @@ fn safe_mode_rejects_tabs_without_panic() {
     );
     rt.set_plugin_safe_mode(false);
     assert!(
-        rt.register_plugin(tabs_manifest()).is_ok(),
+        rt.register_plugin(workspace_manifest()).is_ok(),
         "after safe-mode off, registration allowed"
     );
 }
@@ -404,10 +411,10 @@ fn safe_mode_rejects_tabs_without_panic() {
 // --- no private channel: third-party parity --------------------------------
 
 #[test]
-fn tabs_has_no_private_channel_parity_with_third_party() {
-    let bundled = tabs_manifest();
+fn workspace_has_no_private_channel_parity_with_third_party() {
+    let bundled = workspace_manifest();
     let mut third = bundled.clone();
-    third.identity.id = bitty_plugin_host::PluginId::new("xuepoo.tabs-mirror").unwrap();
+    third.identity.id = bitty_plugin_host::PluginId::new("xuepoo.workspace-mirror").unwrap();
     third.identity.name = "Third Party Mirror".to_string();
     // Same capabilities/lazy/compat shape must have identical validation and lifecycle.
     for (label, manifest) in [("bundled", bundled), ("third", third)] {
@@ -429,7 +436,7 @@ fn tabs_has_no_private_channel_parity_with_third_party() {
 // --- single-process winit, one registry per window, headless ---------------
 
 #[test]
-fn tabs_is_headless_and_forbids_unsafe_single_process_winit() {
+fn workspace_is_headless_and_forbids_unsafe_single_process_winit() {
     // Compile-time proof is #![forbid(unsafe_code)] at crate and test file.
     // Runtime proof: host and panel registry are headless constructible without display.
     let host = PluginHost::new(DropPolicy::DropOldest, 8);
@@ -450,8 +457,8 @@ fn tabs_is_headless_and_forbids_unsafe_single_process_winit() {
     // Runtime is headless by construction (Surface::headless).
     let rt = Runtime::with_defaults().unwrap();
     assert!(rt.is_headless());
-    // Tabs stack is headless determinism without window/GPU.
-    let stack = TabsIntegration::stack_for_tabs(vec![
+    // Workspace stack is headless determinism without window/GPU.
+    let stack = WorkspaceIntegration::stack_for_workspace(vec![
         View::new(ViewId::new(1), 80, 24),
         View::new(ViewId::new(2), 80, 24),
     ]);

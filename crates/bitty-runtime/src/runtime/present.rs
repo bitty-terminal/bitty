@@ -131,6 +131,22 @@ impl From<RenderPresentStats> for PresentStats {
     }
 }
 
+/// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
+/// leaf allocation with erased cells. Cursor/modes/title ride along so the
+/// overlay gates (cursor paints on the focused view only) stay total.
+fn erased_snapshot(base: &Snapshot) -> Snapshot {
+    Snapshot {
+        version: base.version,
+        generation: base.generation,
+        width: 0,
+        height: 0,
+        cells: Vec::new().into_boxed_slice(),
+        cursor: base.cursor.clone(),
+        modes: base.modes.clone(),
+        title: base.title.clone(),
+    }
+}
+
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
 ///
 /// The viewport is the top-left `cols x rows` window of the active screen,
@@ -209,11 +225,14 @@ impl Runtime {
     /// Multi-pane: the layout tree is reflowed into the current container;
     /// each leaf `View`'s `cols`/`rows`/`origin` are updated via
     /// `LayoutNode::reflow`. Then each leaf is rendered: a viewport snapshot
-    /// sized to the leaf's dimensions is built from the shared `State`
-    /// snapshot (headless seam, no GPU/window required), rendered through the
-    /// shared `GridRenderer` with a full-damage hint, and its `DrawList`
-    /// translated to the leaf's pixel origin. The per-leaf `DrawList`s are
-    /// combined and presented once via `Surface::headless_present`.
+    /// sized to the leaf's dimensions is built from its own pane-session
+    /// grid when it owns a shell, from the shared `State` snapshot when it
+    /// is the focused session-less leaf (input routes there), and erased
+    /// otherwise (CTX-0234: never duplicate one grid across tiles),
+    /// rendered through the shared `GridRenderer` with a full-damage hint,
+    /// and its `DrawList` translated to the leaf's pixel origin. The
+    /// per-leaf `DrawList`s are combined and presented once via
+    /// `Surface::headless_present`.
     ///
     /// The software seam composites `DrawList + Atlas` onto an owned RGBA
     /// buffer via `Surface::headless_present`; no display server or adapter
@@ -351,21 +370,37 @@ impl Runtime {
                 continue;
             }
             // CTX-0176: a leaf with its own shell renders that session's
-            // grid; leaves without a session share the primary snapshot
-            // (the unchanged single-pane path while no session exists).
-            let pane_snap: Option<Snapshot> = if self.pane_sessions.is_empty() {
-                None
-            } else {
-                Some(match self.pane_sessions.get(view_id) {
-                    Some(sess) => sess.state.snapshot(),
-                    None => snapshot.clone(),
-                })
+            // grid. CTX-0234: a leaf WITHOUT a session renders the shared
+            // primary snapshot ONLY while focused — multipane input routing
+            // (`push_input_bytes_multipane`) sends typing to the primary
+            // shell exactly through the focused session-less leaf, so the
+            // fallback is what-you-see-is-what-you-type there. Every other
+            // session-less leaf (ctl splits spawn no shell; spawn failures)
+            // presents erased: cloning primary into all of them duplicates
+            // one shell across N tiles (live three-column repeat + marker
+            // in an unexpected tile after zoom-off). The single-pane path
+            // is unchanged (the sole leaf is focused, so it keeps primary).
+            let focused_id = self.focus.focused();
+            let pane_snap: Option<Snapshot> = match self.pane_sessions.get(view_id) {
+                Some(sess) => Some(sess.state.snapshot()),
+                None if Some(*view_id) == focused_id => Some(snapshot.clone()),
+                None => None,
             };
-            let base_snap: &Snapshot = pane_snap.as_ref().unwrap_or(&snapshot);
+            // Erased source for session-less, unfocused leaves;
+            // `viewport_snapshot` pads it to the allocation below.
+            let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
+                Some(erased_snapshot(&snapshot))
+            } else {
+                None
+            };
+            let base_snap: &Snapshot = pane_snap
+                .as_ref()
+                .or(erased_snap.as_ref())
+                .unwrap_or(&snapshot);
             // Determine viewport snapshot: when view scroll_offset !=0, visible_cells composites scrollback.
             let view = view_map.get(view_id);
             let view_snapshot = if let Some(v) = view {
-                if v.scroll_offset() != 0 {
+                if v.scroll_offset() != 0 && pane_snap.is_some() {
                     let cells = match self.pane_sessions.get(view_id) {
                         Some(sess) => v.visible_cells(&sess.state),
                         None => v.visible_cells(&self.state),

@@ -123,8 +123,21 @@ pub const MAX_DUMP_COLS: usize = 256;
 /// Identical to the `--headless` smoke payload so dev captures stay comparable
 /// with the CI smoke proof: printable text, SGR color, OSC title, erase.
 /// Fixed internal constant — never user input, no wall clock, no font file.
+///
+/// CTX-0234: rows 1..=6 are full-width marker rows (80 cells each) so
+/// layout captures stay distinguishable without relying on primary-grid
+/// duplication (session-less unfocused tiles present erased): split shows
+/// markers on the left tile only, overlay blanks rows 5..=6 at cols 5..=24,
+/// stack/single cover the grid. Sparse first-row-only bytes rendered
+/// split and single bit-identical.
 pub const DEV_SYNTHETIC_CORPUS: &[u8] =
-    b"bitty headless smoke \x1b[31mred\x1b[0m \x1b]0;bitty-smoke\x07\r\n";
+    b"bitty headless smoke \x1b[31mred\x1b[0m \x1b]0;bitty-smoke\x07\r\n\
+    11111111111111111111111111111111111111111111111111111111111111111111111111111111\r\n\
+    22222222222222222222222222222222222222222222222222222222222222222222222222222222\r\n\
+    33333333333333333333333333333333333333333333333333333333333333333333333333333333\r\n\
+    44444444444444444444444444444444444444444444444444444444444444444444444444444444\r\n\
+    55555555555555555555555555555555555555555555555555555555555555555555555555555555\r\n\
+    66666666666666666666666666666666666666666666666666666666666666666666666666666666\r\n";
 
 /// Synthetic multi-line paste that trips the paste inspection gate (embedded
 /// newline) so `overlay show banner` can prove the transient banner paint

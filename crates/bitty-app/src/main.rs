@@ -5791,8 +5791,18 @@ mod tests {
 
     #[test]
     fn layout_proof_is_deterministic_and_distinct() {
-        let synthetic = b"layout proof test";
-        let code = run_layout_proof(synthetic);
+        // CTX-0234: session-less unfocused tiles present erased (no primary
+        // duplication), so sparse bytes render identically across
+        // compositions. Full-width marker rows 1..=10 keep split / stack /
+        // overlay pairwise distinct: the overlay leaf blanks rows 5..=10 at
+        // cols 5..=24, the split right tile stays blank, the stack covers
+        // the grid — while same-layout replays stay bit-identical.
+        let mut synthetic = Vec::new();
+        for row in 1..=10u32 {
+            synthetic.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            synthetic.extend(std::iter::repeat_n(b'A'.wrapping_add((row % 26) as u8), 80));
+        }
+        let code = run_layout_proof(&synthetic);
         assert_eq!(code, 0);
     }
 

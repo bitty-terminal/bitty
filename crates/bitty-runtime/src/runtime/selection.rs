@@ -411,6 +411,11 @@ impl Runtime {
     ///
     /// No silent delivery path exists for `needs_confirmation() == true`.
     pub fn request_paste(&mut self, text: String) -> bool {
+        // CTX-0243: paste is typing — snap to live so the pending banner and
+        // the eventual echo land on the visible window (delivery via
+        // `write_input` also snaps; explicit here for the pending-confirm path
+        // with no bytes yet).
+        self.snap_focused_to_live();
         let text = truncate_paste_text(text);
         // Explicit confirmation: identical re-paste while pending delivers.
         if let Some(pending) = self.pending_paste.as_ref() {
@@ -444,6 +449,10 @@ impl Runtime {
     ///
     /// Returns `true` when a pending paste existed and was handled.
     pub fn confirm_pending_paste(&mut self, confirm: bool) -> bool {
+        // CTX-0243: confirming/cancelling is user intent — snap to live
+        // (confirm delivers via `write_input` which also snaps; cancel has
+        // no bytes so needs the explicit snap).
+        self.snap_focused_to_live();
         let Some(pending) = self.pending_paste.take() else {
             return false;
         };
@@ -481,6 +490,9 @@ impl Runtime {
         if self.pending_paste.is_none() {
             return false;
         }
+        // CTX-0243: Esc-cancel is user intent — snap to live (key handler
+        // already snapped; idempotent).
+        self.snap_focused_to_live();
         self.pending_paste = None;
         self.pending_paste_since = None;
         self.paste_banner_collapsed = false;

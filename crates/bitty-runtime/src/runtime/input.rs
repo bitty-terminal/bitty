@@ -140,6 +140,12 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0243: any non-modifier press snaps to live (covers Esc-cancel
+        // with no bytes and unmapped keys with no encoding; normal typing
+        // also snaps via `push_input_bytes` below — idempotent).
+        if event.state == PressState::Pressed && !is_modifier {
+            self.snap_focused_to_live();
+        }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (left-click/Esc/typing dismiss). Clearing uses
         // `clear_selection` so `pending_full_redraw` forces the next tick to
@@ -198,6 +204,10 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0243: any non-modifier press snaps to live (see owned path).
+        if event.state == PressState::Pressed && !is_modifier {
+            self.snap_focused_to_live();
+        }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (see owned path). Additive only; range logic untouched.
         if event.state == PressState::Pressed
@@ -234,12 +244,40 @@ impl Runtime {
         Some(bytes)
     }
 
+    /// Snaps the focused view to live (CTX-0243).
+    ///
+    /// Typing, IME, and paste must return the viewport to the live bottom:
+    /// otherwise a scrolled viewport keeps showing history while new input
+    /// echoes into the live grid, so the typed text is invisible and the
+    /// screen looks frozen (the cursor gate also hides the cursor when
+    /// scrolled). Output (`handle_pty_bytes`) deliberately does NOT snap —
+    /// reading history while output continues must not yank.
+    /// Idempotent: no-op when already live or when no focused leaf exists;
+    /// sets `pending_full_redraw` when it actually moved so the live frame
+    /// presents even before the echo.
+    pub(super) fn snap_focused_to_live(&mut self) {
+        let Some(fid) = self.focus.focused() else {
+            return;
+        };
+        let Some(view) = self.layout.find_leaf_mut(fid) else {
+            return;
+        };
+        if view.scroll_offset() != 0 {
+            view.scroll_to_live();
+            self.pending_full_redraw = true;
+        }
+    }
+
     /// Pushes raw input bytes into the pending queue and, when a PTY writer
     /// is live, writes them through.
     pub fn push_input_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+        // CTX-0243: any input bytes snap the focused viewport to live so
+        // the echo lands in the visible window (typing while scrolled must
+        // not stay stuck showing history with invisible input).
+        self.snap_focused_to_live();
         // CTX-0176: with per-pane sessions live, input routes to the focused
         // leaf's shell only — never broadcast. Leaves without a session (the
         // primary leaf) keep the original writer path below.
@@ -267,6 +305,9 @@ impl Runtime {
     /// buffer. Best-effort, never panics.
     pub(super) fn push_input_bytes_multipane(&mut self, bytes: &[u8]) {
         use std::io::Write as _;
+        // CTX-0243: direct multipane sends must also snap (normally already
+        // snapped by `push_input_bytes`; idempotent second snap is a no-op).
+        self.snap_focused_to_live();
         if let Some(focused) = self.focus.focused() {
             if let Some(sess) = self.pane_sessions.get_mut(&focused) {
                 let _ = sess.writer.write_all(bytes);
@@ -794,6 +835,9 @@ impl Runtime {
 
     /// Handles IME preedit (presentation overlay, not Terminal Truth).
     pub fn handle_ime_preedit(&mut self, text: Option<String>, cursor: Option<usize>) {
+        // CTX-0243: preedit is typing — snap to live so the overlay lands on
+        // the visible window instead of a scrolled history viewport.
+        self.snap_focused_to_live();
         // Bounded: preedit ≤128 chars or 256 bytes per candidate TXT-10/11; truncate at char boundary.
         if let Some(t) = text {
             const MAX: usize = 128;
@@ -845,6 +889,9 @@ impl Runtime {
         };
         self.ime_preedit = None;
         self.ime_cursor = 0;
+        // CTX-0243: IME commit is typing — snap to live (also snaps via
+        // `push_input_bytes` below; explicit for empty commits with no bytes).
+        self.snap_focused_to_live();
         // CTX-0166: IME commit is typing — dismiss the highlight first so the
         // rect never lingers a frame past the state. `clear_selection` forces
         // the next tick to present; the final flag below keeps that promise.

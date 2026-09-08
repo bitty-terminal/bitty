@@ -75,6 +75,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "scrollbar.mode"
         | "scrollbar.width"
         | "appearance.theme"
+        | "mod_key"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
@@ -560,6 +561,48 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
                 attribution.insert("appearance".to_string(), src.clone());
+            }
+        }
+
+        // CTX-0236: `mod_key` is scalar-replace like `appearance.theme`;
+        // absent means "says nothing" (lower-precedence value wins).
+        if let Some(mod_key) = &plan.mod_key {
+            let field = "mod_key";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mod_key = *mod_key;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mod_key = *mod_key;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
             }
         }
 
@@ -1052,6 +1095,48 @@ fn merge_layers_allow_policy_violations(
                 attribution.insert("appearance".to_string(), src.clone());
             }
         }
+        // CTX-0236: `mod_key` is scalar-replace like `appearance.theme`;
+        // absent means "says nothing" (lower-precedence value wins).
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(mod_key) = &plan.mod_key {
+            let field = "mod_key";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mod_key = *mod_key;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mod_key = *mod_key;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
         if let Some(kms) = &plan.keymaps {
             let field = "keymaps";
             if is_policy {
@@ -1302,6 +1387,43 @@ mod tests {
             LayerKind::Cli
         );
         assert!(!merged.conflicts.is_empty());
+    }
+
+    #[test]
+    fn mod_key_merges_scalar_replace_with_attribution() {
+        // CTX-0236: user layer wins with per-field attribution; absent
+        // keeps the lower-precedence value (Alt default).
+        use crate::keymap::ModKey;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mod_key: Some(ModKey::Super),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.mod_key, ModKey::Super);
+        assert_eq!(merged.source_of("mod_key").unwrap().layer, LayerKind::User);
+        assert_eq!(
+            crate::merge::merge_class_for("mod_key"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // Absent rides the Alt default.
+        let empty = merge_layers(vec![]).expect("empty merges");
+        assert_eq!(empty.effective.mod_key, ModKey::Alt);
+        // try_merge_layers agrees (second merge path).
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mod_key: Some(ModKey::Super),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = try_merge_layers(vec![user2]).expect("try merge");
+        assert_eq!(merged2.effective.mod_key, ModKey::Super);
+        assert_eq!(merged2.source_of("mod_key").unwrap().layer, LayerKind::User);
     }
 
     #[test]

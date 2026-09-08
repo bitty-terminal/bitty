@@ -94,8 +94,8 @@ pub mod validation;
 
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
-    Chord, ChromeAction, KeyName, KeyRef, ResolvedKeymap, SplitDir, default_keymaps, match_keymap,
-    resolve_keymaps,
+    Chord, ChromeAction, KeyName, KeyRef, ModKey, ResolvedKeymap, SplitDir, default_keymaps,
+    default_keymaps_with_mod, match_keymap, resolve_keymaps,
 };
 pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,

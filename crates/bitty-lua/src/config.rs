@@ -36,6 +36,7 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
+//!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -189,6 +190,9 @@ pub struct ConfigData {
     pub layout: Option<LayoutData>,
     /// `scrollbar` table (CTX-0181 overlay scrollbar).
     pub scrollbar: Option<ScrollbarData>,
+    /// Top-level `mod_key` scalar (CTX-0236 leader/mod for the shipped
+    /// chrome map; raw string, parsed fail-closed downstream).
+    pub mod_key: Option<String>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
@@ -214,6 +218,7 @@ impl ConfigData {
             && self.selection.is_none()
             && self.layout.is_none()
             && self.scrollbar.is_none()
+            && self.mod_key.is_none()
             && self.keymaps.is_none()
     }
 }
@@ -747,6 +752,10 @@ impl ConfigData {
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
+                // CTX-0236: top-level `mod_key` scalar (raw string; typed
+                // parsing and fail-closed validation live downstream in
+                // `bitty-config`, like the `theme` alias).
+                "mod_key" => out.mod_key = Some(expect_string(key, val)?),
                 _ => out.undeclared.push(key.clone()),
             }
         }
@@ -999,6 +1008,29 @@ mod tests {
                 }
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn mod_key_scalar_extracts_and_absent_means_no_override() {
+        // CTX-0236: top-level `mod_key` extracts as a raw string (typed
+        // parsing lives downstream); absent means `None` so merge keeps the
+        // lower-precedence value (Alt when no layer sets it).
+        let data = eval_ok(r#"return { mod_key = "super" }"#);
+        assert_eq!(data.mod_key.as_deref(), Some("super"));
+        assert!(!data.is_empty());
+        let data = eval_ok(r#"return { theme = "dark" }"#);
+        assert_eq!(data.mod_key, None);
+        // Wrong type is a shape error naming the key, without echoing values.
+        let mut vm = LuaVm::new("test.modkey-type");
+        match vm
+            .eval_config(r#"return { mod_key = 42 }"#)
+            .expect("no refuse")
+        {
+            ConfigOutcome::ShapeError { message } => {
+                assert!(message.contains("mod_key"), "{message}");
+            }
+            other => panic!("expected shape error, got {other:?}"),
         }
     }
 

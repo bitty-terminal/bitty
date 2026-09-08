@@ -704,6 +704,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
         "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
         "scrollbar.width" => defaults.scrollbar.width.to_string(),
+        // CTX-0236: leader/mod for the shipped chrome map (default Alt).
+        "mod_key" => defaults.mod_key.canonical().to_string(),
         _ => return None,
     };
     Some(ConfigInfo {
@@ -1160,7 +1162,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode, mod_key)",
                     request.value,
                 );
                 if emit_json {
@@ -1362,6 +1364,10 @@ mod tests {
         assert_eq!(theme.key, "appearance.theme");
         let dotted = inspect_config("appearance.theme").expect("dotted theme");
         assert_eq!(dotted.key, "appearance.theme");
+        // CTX-0236: the leader/mod default is inspectable like every scalar.
+        let mod_key = inspect_config("mod_key").expect("mod_key");
+        assert_eq!(mod_key.key, "mod_key");
+        assert_eq!(mod_key.value, "alt");
         assert!(inspect_config("font.nope").is_none());
         assert!(inspect_config("").is_none());
     }

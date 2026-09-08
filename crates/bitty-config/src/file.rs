@@ -34,11 +34,18 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
+//!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
 //! }
 //! ```
+//!
+//! - `mod_key` is a fully-optional top-level scalar (absent means "this layer
+//!   says nothing", so existing configs without it keep working). When
+//!   present it must be `"alt"` or `"super"` (case-insensitive, chord-mod
+//!   aliases accepted); anything else — including `ctrl`/`shift` — fails
+//!   closed with the field path.
 //!
 //! - `[font]`-equivalent tables are atomic for `family`+`size`: `font` needs
 //!   both (partial tables fail closed rather than silently filling defaults,
@@ -97,6 +104,7 @@ use std::path::{Path, PathBuf};
 use bitty_lua::config::ConfigEval;
 
 use crate::error::ConfigError;
+use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
@@ -1047,6 +1055,17 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
+    // CTX-0236: `mod_key` is a fully-optional top-level scalar: absent
+    // means "this layer says nothing" (plan.mod_key None so merge keeps the
+    // lower-precedence value). When present it parses fail-closed
+    // (`ModKey::parse` rejects unknown values, including ctrl/shift, with
+    // the field path) so existing configs without `mod_key` keep working
+    // unchanged.
+    let mod_key = match data.mod_key.as_deref() {
+        None => None,
+        Some(raw) => Some(ModKey::parse(raw)?),
+    };
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
@@ -1056,6 +1075,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         layout,
         scrollbar,
         appearance,
+        mod_key,
         keymaps,
         plugins: None,
         profile_name: None,
@@ -1588,6 +1608,39 @@ mod tests {
         let merged = resolve_effective(Some(layer), None).expect("merge");
         assert_eq!(merged.effective.keymaps.len(), 1);
         assert_eq!(merged.effective.keymaps[0].action, "focus_next");
+    }
+
+    #[test]
+    fn lua_mod_key_parses_absent_means_silent_and_bad_fails_closed() {
+        // CTX-0236: absent says nothing (merge keeps lower); present parses
+        // to the typed mod; unknown values fail closed on `mod_key`.
+        let src = test_source();
+        let plan = parse_lua_config(r#"return { theme = "dark" }"#, &src).expect("no mod");
+        assert!(plan.mod_key.is_none());
+        let plan = parse_lua_config(r#"return { mod_key = "super" }"#, &src).expect("super mod");
+        assert_eq!(plan.mod_key, Some(ModKey::Super));
+        let plan = parse_lua_config(r#"return { mod_key = "Meta" }"#, &src).expect("alias mod");
+        assert_eq!(plan.mod_key, Some(ModKey::Super));
+        for content in [
+            r#"return { mod_key = "ctrl" }"#,
+            r#"return { mod_key = "hyper" }"#,
+            r#"return { mod_key = "" }"#,
+            r#"return { mod_key = 42 }"#,
+        ] {
+            let err = parse_lua_config(content, &src).unwrap_err();
+            assert!(
+                err.to_string().contains("mod_key"),
+                "must name field for {content:?}: {err}"
+            );
+        }
+        // End to end: the file layer's mod reaches the effective config
+        // with user attribution.
+        let src = test_source();
+        let plan = parse_lua_config(r#"return { mod_key = "super" }"#, &src).expect("super mod");
+        let layer = LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        assert_eq!(merged.effective.mod_key, ModKey::Super);
+        assert_eq!(merged.source_of("mod_key").unwrap().layer, LayerKind::User);
     }
 
     #[test]

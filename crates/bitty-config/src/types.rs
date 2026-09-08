@@ -13,6 +13,7 @@
 //! table.
 
 use crate::error::ConfigError;
+use crate::keymap::ModKey;
 
 /// Upper bounds that keep every structure bounded against untrusted input
 /// (threat T-01).
@@ -669,6 +670,9 @@ pub struct EffectiveConfig {
     pub scrollbar: ScrollbarConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
+    /// Leader/Mod key the shipped chrome map is expressed against (CTX-0236;
+    /// default Alt). Honored by [`crate::keymap::resolve_keymaps`].
+    pub mod_key: ModKey,
     /// Keymaps, possibly empty.
     pub keymaps: Vec<KeymapEntry>,
     /// Plugins, possibly empty.
@@ -689,6 +693,7 @@ impl Default for EffectiveConfig {
             layout: LayoutConfig::default(),
             scrollbar: ScrollbarConfig::default(),
             appearance: AppearanceConfig::default(),
+            mod_key: ModKey::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
             profile: None,

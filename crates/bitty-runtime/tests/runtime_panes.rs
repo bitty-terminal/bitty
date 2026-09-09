@@ -1,5 +1,9 @@
 //! Runtime Pane-session tests.
 //!
+//! pty-gate-exempt-file: every spawn call in this file asserts rejection
+//! (blank program or unknown view; validation precedes any spawn, no PTY is
+//! ever created), so no live-spawn gate is needed (CTX-0267).
+//!
 //! Moved verbatim from the inline `runtime.rs` unit tests as part of
 //! the CTX-0232 pure-move split. Adaptations are wiring only:
 //! `super::*` became explicit imports and the private `layout` field

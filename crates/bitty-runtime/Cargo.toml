@@ -33,3 +33,4 @@ bitty-rich = { path = "../bitty-rich" }
 bitty-agent = { path = "../bitty-agent" }
 bitty-package = { path = "../bitty-package" }
 bitty-config = { path = "../bitty-config" }
+bitty-test-support = { path = "../bitty-test-support" }

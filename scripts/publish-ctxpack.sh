@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# publish-ctxpack.sh — publish a ctxpack snapshot to the workflow-mirror repo.
+#
+# On every PR merge the commander runs `just workflow-publish` from a bitty
+# checkout (the trigger is the merge closeout, NOT a git hook: GitHub
+# squash-merges never fire local git hooks, and `carryctx hooks install`
+# behavior is intentionally left untouched).
+#
+# What it does:
+#   1. Exports `carryctx export --pack-format dir` from this repo into a
+#      staging clone of bitty-terminal/bitty-workflow as
+#      <UTC-date>-<bitty-main-sha>/.
+#   2. Refreshes the mirror README.md pointer + LATEST file.
+#   3. Commits and pushes to the mirror repo main branch.
+#
+# Privacy (accepted, commander-scanned before first publish): the pack
+# contains agent display names and absolute workspace paths, and no real
+# secrets (only ULID fragments + fake test-vector tokens in notes). This is
+# intentional — the mirror makes the whole engineering workflow transparent,
+# not just the code. Do NOT publish if a future scan finds real secrets;
+# fix/redact first, then publish.
+#
+# Usage:
+#   scripts/publish-ctxpack.sh [--dry-run] [--mirror DIR] [--url URL]
+#                              [--git-timeout SECS] [--keep-tmp]
+#   --dry-run      export + validate (incl. round-trip self-test) only;
+#                  no clone, no commit, no push.
+#   --mirror DIR   staging clone location
+#                  (default: $WORKFLOW_MIRROR_DIR or <repo>/../bitty-workflow).
+#   --url URL      mirror remote for a fresh clone
+#                  (default: $WORKFLOW_MIRROR_URL or
+#                  https://github.com/bitty-terminal/bitty-workflow.git).
+#   --git-timeout SECS  timeout for every git/carryctx network or heavy op
+#                  (default: $GIT_TIMEOUT or 120).
+#   --keep-tmp     keep temp dirs on exit (debug aid; prints paths).
+#
+# Guarantees: idempotent (re-running for the same bitty SHA reuses the
+# existing snapshot dir and no-ops when the mirror is already current);
+# fail-closed with clear errors; never writes to the bitty repo's own git
+# state (only read-only rev-parse/branch queries there).
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MIRROR_DEFAULT="$REPO_ROOT/../bitty-workflow"
+MIRROR_URL_DEFAULT="https://github.com/bitty-terminal/bitty-workflow.git"
+
+DRY_RUN=0
+MIRROR="${WORKFLOW_MIRROR_DIR:-$MIRROR_DEFAULT}"
+MIRROR_URL="${WORKFLOW_MIRROR_URL:-$MIRROR_URL_DEFAULT}"
+GIT_TIMEOUT="${GIT_TIMEOUT:-120}"
+KEEP_TMP=0
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--dry-run)
+		DRY_RUN=1
+		shift
+		;;
+	--mirror)
+		MIRROR="${2:?--mirror requires a directory}"
+		shift 2
+		;;
+	--mirror=*)
+		MIRROR="${1#--mirror=}"
+		shift
+		;;
+	--url)
+		MIRROR_URL="${2:?--url requires a remote URL}"
+		shift 2
+		;;
+	--url=*)
+		MIRROR_URL="${1#--url=}"
+		shift
+		;;
+	--git-timeout)
+		GIT_TIMEOUT="${2:?--git-timeout requires seconds}"
+		shift 2
+		;;
+	--git-timeout=*)
+		GIT_TIMEOUT="${1#--git-timeout=}"
+		shift
+		;;
+	--keep-tmp)
+		KEEP_TMP=1
+		shift
+		;;
+	--help | -h)
+		sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}"
+		exit 0
+		;;
+	*)
+		echo "publish-ctxpack: FAIL: unknown flag $1 (see --help)" >&2
+		exit 2
+		;;
+	esac
+done
+
+fail() {
+	echo "publish-ctxpack: FAIL: $1" >&2
+	exit 1
+}
+
+log() {
+	echo "publish-ctxpack: $1"
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have git || fail "git not on PATH"
+have carryctx || fail "carryctx not on PATH"
+have timeout || fail "timeout not on PATH"
+
+# Read-only introspection of the bitty checkout. Never a write op here:
+# no checkout, reset, commit, stash, or index/worktree mutation.
+BITTY_SHA="$(timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null)" ||
+	fail "cannot read bitty HEAD (not a git checkout?)"
+BITTY_SHORT="$(timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)" ||
+	fail "cannot read bitty short SHA"
+BITTY_BRANCH="$(timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)"
+if [[ "${BITTY_BRANCH:-}" != "main" ]]; then
+	log "WARN: bitty checkout is on branch '${BITTY_BRANCH:-detached}', snapshotting HEAD anyway"
+fi
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+SNAPSHOT="${STAMP}-${BITTY_SHORT}"
+
+TMP_ROOT=""
+cleanup() {
+	if [[ "$KEEP_TMP" == 0 && -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
+		rm -rf "$TMP_ROOT"
+	elif [[ -n "$TMP_ROOT" ]]; then
+		log "keeping tmp dir $TMP_ROOT (--keep-tmp)"
+	fi
+}
+trap cleanup EXIT
+
+# Mirror git ops always go through this wrapper: timeout-wrapped and
+# confined to the staging clone. $REPO_ROOT is never a write target.
+mirror_git() {
+	timeout "$GIT_TIMEOUT" git -C "$MIRROR" "$@"
+}
+
+ensure_mirror() {
+	if [[ -d "$MIRROR/.git" ]]; then
+		local remote
+		remote="$(mirror_git remote get-url origin 2>/dev/null)" ||
+			fail "staging clone $MIRROR has no origin remote"
+		case "$remote" in
+		*bitty-workflow*)
+			;;
+		*)
+			fail "staging clone origin ($remote) does not look like bitty-workflow; refusing to push (override with --mirror/--url)"
+			;;
+		esac
+		if [[ -n "$(mirror_git status --porcelain 2>/dev/null)" ]]; then
+			fail "staging clone $MIRROR has uncommitted changes; clean it up and re-run"
+		fi
+		mirror_git fetch origin --prune ||
+			fail "git fetch failed in staging clone (network/auth?)"
+		if mirror_git rev-parse --verify HEAD >/dev/null 2>&1; then
+			mirror_git checkout -q main 2>/dev/null ||
+				mirror_git checkout -q -b main --track origin/main ||
+				fail "cannot check out main in staging clone"
+			mirror_git reset -q --hard origin/main ||
+				fail "cannot fast-forward staging clone to origin/main"
+		else
+			# Freshly cloned empty repo (or brand-new mirror): start main here.
+			mirror_git checkout -q -b main ||
+				fail "cannot create main branch in empty staging clone"
+		fi
+		return 0
+	fi
+	if [[ -e "$MIRROR" ]]; then
+		fail "$MIRROR exists but is not a git clone; move it aside or pass --mirror"
+	fi
+	log "cloning mirror $MIRROR_URL -> $MIRROR"
+	timeout "$GIT_TIMEOUT" git clone -q "$MIRROR_URL" "$MIRROR" ||
+		fail "git clone failed (network/auth?); set --url or pre-clone --mirror yourself"
+	ensure_mirror
+}
+
+write_mirror_readme() {
+	# Refresh the mirror-root pointer only when the template changes
+	# (keeps re-publishes idempotent: no churn commit for identical text).
+	local readme="$MIRROR/README.md" tmp
+	tmp="$(mktemp)"
+	cat >"$tmp" <<'EOF'
+# bitty-workflow — engineering workflow mirror
+
+Transparent companion to [bitty](https://github.com/bitty-terminal/bitty):
+every PR merge publishes a CarryCtx ctxpack snapshot here, so the whole
+engineering workflow (tasks, sessions, decisions, checkpoints) is reviewable,
+not just the code.
+
+- Each `<UTC-timestamp>-<bitty-sha>/` directory is one
+  `carryctx export --pack-format dir` snapshot (manifest.json + project.json
+  + per-table `*.jsonl`).
+- `LATEST` names the newest snapshot directory.
+- Each snapshot carries a `source.json` with the bitty commit/branch it was
+  taken from.
+- The mirror is publish-only: CarryCtx merge mode is unsupported (v1), so
+  snapshots are never merged back; re-import is a manual, replace-mode affair.
+- Trigger: the commander's merge closeout runs `just workflow-publish` in
+  the bitty repo. No git hook drives this (squash-merges never fire local
+  hooks).
+
+## Privacy notice
+
+Snapshots intentionally contain agent display names and absolute workspace
+paths. The corpus was scanned for secrets before the first publish (only
+ULID fragments and fake test-vector tokens in notes; no real secrets). Do
+not publish a snapshot that introduces real secrets — redact first.
+EOF
+	if [[ -f "$readme" ]] && cmp -s "$tmp" "$readme"; then
+		rm -f "$tmp"
+	else
+		mv "$tmp" "$readme"
+	fi
+}
+
+run_export() {
+	local dest="$1"
+	log "exporting ctxpack -> $dest"
+	timeout "$GIT_TIMEOUT" carryctx export --pack-format dir -o "$dest" --project "$REPO_ROOT" ||
+		fail "carryctx export failed"
+	[[ -f "$dest/manifest.json" && -f "$dest/project.json" ]] ||
+		fail "export incomplete (manifest.json/project.json missing)"
+}
+
+run_selftest() {
+	local dest="$1"
+	log "validating snapshot (self-test)"
+	bash "$REPO_ROOT/scripts/publish-ctxpack-selftest.sh" "$dest" ||
+		fail "snapshot self-test failed; mirror left untouched"
+}
+
+if [[ "$DRY_RUN" == 1 ]]; then
+	TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ctxpack-dry.XXXXXX")"
+	SNAP_DIR="$TMP_ROOT/$SNAPSHOT"
+	run_export "$SNAP_DIR"
+	run_selftest "$SNAP_DIR"
+	log "dry-run PASS: snapshot $SNAPSHOT exports + validates; nothing pushed"
+	exit 0
+fi
+
+ensure_mirror
+
+# Idempotency: a snapshot for this bitty SHA already published? Reuse it so
+# a re-run converges instead of duplicating history.
+EXISTING=""
+shopt -s nullglob
+candidates=("$MIRROR"/*-"$BITTY_SHORT")
+if ((${#candidates[@]} > 0)) && [[ -d "${candidates[0]}" ]]; then
+	EXISTING="$(basename "${candidates[0]}")"
+fi
+shopt -u nullglob
+
+if [[ -n "$EXISTING" ]]; then
+	log "snapshot for $BITTY_SHORT already exists ($EXISTING); refreshing pointers"
+	SNAP_DIR="$MIRROR/$EXISTING"
+else
+	SNAP_DIR="$MIRROR/$SNAPSHOT"
+	run_export "$SNAP_DIR"
+fi
+
+run_selftest "$SNAP_DIR"
+
+SOURCE_JSON="$SNAP_DIR/source.json"
+if ! [[ -f "$SOURCE_JSON" ]] || ! grep -q "\"bitty_commit\":\"$BITTY_SHA\"" "$SOURCE_JSON"; then
+	printf '{"snapshot":"%s","bitty_commit":"%s","bitty_branch":"%s","exported_at":"%s","tool":"scripts/publish-ctxpack.sh"}\n' \
+		"$(basename "$SNAP_DIR")" "$BITTY_SHA" "${BITTY_BRANCH:-detached}" "$STAMP" >"$SOURCE_JSON"
+fi
+
+write_mirror_readme
+printf '%s\n' "$(basename "$SNAP_DIR")" >"$MIRROR/LATEST"
+
+mirror_git add -A ||
+	fail "git add failed in staging clone"
+if mirror_git diff --cached --quiet; then
+	log "mirror already current at $(cat "$MIRROR/LATEST"); nothing to push"
+	exit 0
+fi
+mirror_git -c user.name="${GIT_AUTHOR_NAME:-bitty-publisher}" \
+	-c user.email="${GIT_AUTHOR_EMAIL:-bitty-publisher@users.noreply.github.com}" \
+	commit -q -m "chore(ctxpack): snapshot $(basename "$SNAP_DIR")" ||
+	fail "git commit failed in staging clone"
+mirror_git push origin main ||
+	fail "git push failed (network/auth/permissions?)"
+log "published $(basename "$SNAP_DIR") (bitty $BITTY_SHORT); LATEST updated"

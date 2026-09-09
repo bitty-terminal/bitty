@@ -116,6 +116,11 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(e);
         }
     }
+    if let Some(v) = &plan.mouse {
+        if let Err(e) = v.validate() {
+            out.push(e);
+        }
+    }
     if let Some(v) = &plan.appearance {
         if let Err(e) = v.validate() {
             out.push(e);

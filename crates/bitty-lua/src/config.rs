@@ -36,6 +36,7 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
+//!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
@@ -71,7 +72,7 @@ pub const MAX_CONFIG_TOP_KEYS: usize = 64;
 pub const MAX_CONFIG_STRING_BYTES: usize = 2048;
 
 /// Maximum keys read from any nested table (`appearance`/`font`/`window`/
-/// `terminal`/`selection`/`layout`/`scrollbar`/keymap entry).
+/// `terminal`/`selection`/`layout`/`scrollbar`/`mouse`/keymap entry).
 pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 
 /// Maximum keymap entries read (mirrors `bitty-config` `MAX_KEYMAPS` so the
@@ -170,6 +171,18 @@ pub struct ScrollbarData {
     pub width: Option<i64>,
 }
 
+/// Mouse overrides, plain data (CTX-0260; see [`FontData`] for `Option`
+/// semantics).
+///
+/// `focus_follows_mouse` opts into hover moving keyboard focus
+/// (default-off preserves click-to-focus). Wrong types fail closed as
+/// `ShapeError` downstream (never coerced).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MouseData {
+    /// Hover-focus opt-in (present only when the key is set).
+    pub focus_follows_mouse: Option<bool>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -192,6 +205,8 @@ pub struct ConfigData {
     pub layout: Option<LayoutData>,
     /// `scrollbar` table (CTX-0181 overlay scrollbar).
     pub scrollbar: Option<ScrollbarData>,
+    /// `mouse` table (CTX-0260 focus-follows-mouse).
+    pub mouse: Option<MouseData>,
     /// Top-level `mod_key` scalar (CTX-0236 leader/mod for the shipped
     /// chrome map; raw string, parsed fail-closed downstream).
     pub mod_key: Option<String>,
@@ -220,6 +235,7 @@ impl ConfigData {
             && self.selection.is_none()
             && self.layout.is_none()
             && self.scrollbar.is_none()
+            && self.mouse.is_none()
             && self.mod_key.is_none()
             && self.keymaps.is_none()
     }
@@ -759,6 +775,22 @@ impl ConfigData {
                     };
                     out.scrollbar = Some(ScrollbarData { mode, width });
                 }
+                "mouse" => {
+                    // CTX-0260: `mouse = { focus_follows_mouse = true }`
+                    // opts into hover moving keyboard focus; absent
+                    // table/key means "says nothing" (default-off
+                    // click-to-focus preserved). Booleans only (never
+                    // coerced); validated downstream in `bitty-config`.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["focus_follows_mouse"])?;
+                    let focus_follows_mouse = match get_field(nested, "focus_follows_mouse") {
+                        Some(v) => Some(expect_bool("mouse.focus_follows_mouse", v)?),
+                        None => None,
+                    };
+                    out.mouse = Some(MouseData {
+                        focus_follows_mouse,
+                    });
+                }
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
@@ -1135,6 +1167,41 @@ mod tests {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {
                     assert!(message.contains("scrollbar"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_focus_follows_mouse_extracts_and_absent_means_no_override() {
+        // CTX-0260: explicit opt-in parses; absent table/key is `None` so
+        // merge keeps the lower-precedence value (false when no layer sets
+        // it, preserving click-to-focus).
+        let data = eval_ok(r#"return { mouse = { focus_follows_mouse = true } }"#);
+        assert_eq!(data.mouse.unwrap().focus_follows_mouse, Some(true));
+        let data = eval_ok(r#"return { mouse = { focus_follows_mouse = false } }"#);
+        assert_eq!(data.mouse.unwrap().focus_follows_mouse, Some(false));
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.mouse, None);
+        let data = eval_ok(r#"return { mouse = {} }"#);
+        assert_eq!(data.mouse.unwrap().focus_follows_mouse, None);
+    }
+
+    #[test]
+    fn mouse_focus_follows_mouse_wrong_type_is_shape_error_without_value() {
+        // CTX-0260: fail-closed on non-boolean values (never coerce, never
+        // echo the value).
+        let mut vm = LuaVm::new("test.mouse-type");
+        for code in [
+            r#"return { mouse = { focus_follows_mouse = 1 } }"#,
+            r#"return { mouse = { focus_follows_mouse = "true" } }"#,
+            r#"return { mouse = true }"#,
+            r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("mouse"), "{code:?}: {message}");
                 }
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }

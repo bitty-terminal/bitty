@@ -68,6 +68,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `layout.gaps_out`         | RestartRequired    |
 /// | `scrollbar.mode`          | RestartRequired    |
 /// | `scrollbar.width`         | RestartRequired    |
+/// | `mouse.focus_follows_mouse` | RestartRequired  |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -99,6 +100,8 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "scrollbar.mode"
         | "scrollbar.width"
         | "scrollbar"
+        | "mouse.focus_follows_mouse"
+        | "mouse"
         | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,
     }
@@ -265,6 +268,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "scrollbar.width",
         old.scrollbar.width.to_string(),
         new.scrollbar.width.to_string(),
+    );
+    // CTX-0260: hover-focus is adopted at startup (RuntimeConfig is built
+    // once from the effective config), so changes are restart-required.
+    push_if_changed(
+        "mouse.focus_follows_mouse",
+        old.mouse.focus_follows_mouse.to_string(),
+        new.mouse.focus_follows_mouse.to_string(),
     );
     push_if_changed(
         "appearance.theme",
@@ -594,6 +604,29 @@ mod tests {
         let r2 = diff(&old, &new2);
         assert_eq!(r2.overall, ReloadClass::RestartRequired);
         assert!(r2.diffs.iter().any(|d| d.field == "scrollbar.width"));
+    }
+
+    #[test]
+    fn diff_mouse_focus_follows_mouse_is_restart_required() {
+        // CTX-0260: flipping hover-focus must surface as a restart-required
+        // diff (chrome is adopted at startup into RuntimeConfig).
+        let old = EffectiveConfig::default();
+        assert!(!old.mouse.focus_follows_mouse);
+        assert_eq!(
+            classify_field("mouse.focus_follows_mouse"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("mouse"), ReloadClass::RestartRequired);
+        let mut new = old.clone();
+        new.mouse.focus_follows_mouse = true;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(
+            r.diffs
+                .iter()
+                .any(|d| d.field == "mouse.focus_follows_mouse")
+        );
     }
 
     #[test]

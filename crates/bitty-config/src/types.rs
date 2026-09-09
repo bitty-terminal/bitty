@@ -60,6 +60,11 @@ pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
 /// `copy_to_clipboard` chord (Ctrl+Shift+C).
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 
+/// Default focus-follows-mouse behavior (CTX-0260).
+/// `false` preserves click-to-focus: hovering never moves keyboard focus.
+/// `true` opts into hover moving keyboard focus to the hovered pane.
+pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE: bool = false;
+
 /// Default scrollbar mode (CTX-0181): `hidden`.
 ///
 /// Hidden-by-default keeps the grid geometry-neutral for existing users:
@@ -570,6 +575,35 @@ impl ScrollbarConfig {
     }
 }
 
+/// Mouse behavior configuration (CTX-0260).
+///
+/// `focus_follows_mouse` controls Hyprland-like hover focus: `false`
+/// (default) preserves click-to-focus (hover never moves keyboard focus);
+/// `true` moves keyboard focus to the hovered pane. Set via `init.lua`
+/// `mouse = { focus_follows_mouse = true }` (key optional, defaulting to
+/// `false` when the table is present but omits it, so `mouse = {}` keeps
+/// click-to-focus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseConfig {
+    /// Whether hover moves keyboard focus to the hovered pane.
+    pub focus_follows_mouse: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            focus_follows_mouse: DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE,
+        }
+    }
+}
+
+impl MouseConfig {
+    /// Validate mouse config (booleans are total; always succeeds).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        Ok(())
+    }
+}
+
 /// Appearance configuration.
 ///
 /// The optional theme identifier resolves through the built-in preset
@@ -700,6 +734,8 @@ pub struct EffectiveConfig {
     pub layout: LayoutConfig,
     /// Scrollbar config (CTX-0181 overlay scrollbar; default hidden).
     pub scrollbar: ScrollbarConfig,
+    /// Mouse config (CTX-0260 focus-follows-mouse; default off).
+    pub mouse: MouseConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
     /// Leader/Mod key the shipped chrome map is expressed against (CTX-0236;
@@ -724,6 +760,7 @@ impl Default for EffectiveConfig {
             selection: SelectionConfig::default(),
             layout: LayoutConfig::default(),
             scrollbar: ScrollbarConfig::default(),
+            mouse: MouseConfig::default(),
             appearance: AppearanceConfig::default(),
             mod_key: ModKey::default(),
             keymaps: Vec::new(),
@@ -743,6 +780,7 @@ impl EffectiveConfig {
         self.selection.validate()?;
         self.layout.validate()?;
         self.scrollbar.validate()?;
+        self.mouse.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -1067,6 +1105,23 @@ mod tests {
             .validate()
             .expect("boundary width must be valid");
         }
+        EffectiveConfig::default()
+            .validate()
+            .expect("default valid");
+    }
+
+    #[test]
+    fn mouse_focus_follows_mouse_defaults_off_and_validates() {
+        // CTX-0260: default-off preserves click-to-focus for existing users.
+        const { assert!(!DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE) }
+        assert!(!MouseConfig::default().focus_follows_mouse);
+        assert!(!EffectiveConfig::default().mouse.focus_follows_mouse);
+        MouseConfig::default().validate().expect("default valid");
+        MouseConfig {
+            focus_follows_mouse: true,
+        }
+        .validate()
+        .expect("opt-in valid");
         EffectiveConfig::default()
             .validate()
             .expect("default valid");

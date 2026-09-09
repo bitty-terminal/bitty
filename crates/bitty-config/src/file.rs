@@ -34,6 +34,7 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
+//!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
@@ -72,6 +73,9 @@
 //!   omitted keys default to [`ScrollbarConfig`](crate::types::ScrollbarConfig)
 //!   defaults (`hidden` mode, width `8`), unknown `mode` strings and
 //!   out-of-range `width` fail closed with the field path.
+//!   `mouse` follows it as well: absent means "says nothing"; when present,
+//!   omitted `focus_follows_mouse` defaults to `false` (click-to-focus,
+//!   CTX-0260), so existing configs without `mouse` keep working unchanged.
 //!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
 //! - `plugins`, `extends`, and profile names remain non-user layers and are
@@ -111,8 +115,8 @@ use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, ScrollbarConfig,
-    ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, MouseConfig,
+    ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1081,6 +1085,18 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
+    // CTX-0260: `mouse` follows the same fully-optional pattern: absent
+    // table means "this layer says nothing" (plan.mouse None so merge keeps
+    // the lower-precedence value). When the table is present but
+    // `focus_follows_mouse` is omitted, default to `false` (click-to-focus
+    // preserved) so `mouse = {}` keeps working unchanged. Wrong types
+    // already failed closed as `ShapeError` in `bitty-lua` (never coerced).
+    let mouse = data.mouse.map(|m| MouseConfig {
+        focus_follows_mouse: m
+            .focus_follows_mouse
+            .unwrap_or(MouseConfig::default().focus_follows_mouse),
+    });
+
     // CTX-0236: `mod_key` is a fully-optional top-level scalar: absent
     // means "this layer says nothing" (plan.mod_key None so merge keeps the
     // lower-precedence value). When present it parses fail-closed
@@ -1100,6 +1116,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         selection,
         layout,
         scrollbar,
+        mouse,
         appearance,
         mod_key,
         keymaps,
@@ -1499,6 +1516,45 @@ mod tests {
                 msg.contains("scrollbar"),
                 "must name the field: {bad} -> {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn lua_mouse_focus_follows_mouse_parses_and_validates() {
+        // CTX-0260: explicit opt-in parses; absent table means "says
+        // nothing" (plan.mouse None so merge keeps lower precedence);
+        // present-but-empty defaults to off (click-to-focus preserved);
+        // wrong types and unknown keys fail closed naming the field.
+        let plan = parse_lua_config(
+            r#"return { mouse = { focus_follows_mouse = true } }"#,
+            &test_source(),
+        )
+        .expect("mouse parses");
+        assert!(plan.mouse.expect("mouse present").focus_follows_mouse);
+        let plan = parse_lua_config(
+            r#"return { mouse = { focus_follows_mouse = false } }"#,
+            &test_source(),
+        )
+        .expect("explicit off parses");
+        assert!(!plan.mouse.expect("mouse present").focus_follows_mouse);
+        let plan = parse_lua_config(r#"return { mouse = {} }"#, &test_source())
+            .expect("empty mouse defaults off");
+        assert!(!plan.mouse.expect("mouse present").focus_follows_mouse);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no mouse table");
+        assert!(plan.mouse.is_none());
+        for bad in [
+            r#"return { mouse = { focus_follows_mouse = 1 } }"#,
+            r#"return { mouse = { focus_follows_mouse = "true" } }"#,
+            r#"return { mouse = true }"#,
+            r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("mouse"), "must name the field: {bad} -> {msg}");
         }
     }
 

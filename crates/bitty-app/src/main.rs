@@ -2199,11 +2199,11 @@ fn starter_init_lua() -> &'static str {
       -- the shipped map to Super (Alt+h/j/k/l -> Super+h/j/k/l, ...):\n\
       -- mod_key = \"super\",\n\
       -- Shipped defaults:\n\
-     --   Alt+h/j/k/l + Ctrl+Alt+arrows  move focus (vim hjkl)\n\
+     --   Alt+h/j/k/l or Alt+arrows + Ctrl+Alt+arrows  move focus (vim hjkl)\n\
      --   Alt+1..9                       jump to view id N\n\
      --   Alt+u / Alt+i                  page up / down (less-like)\n\
-     --   Shift+Alt+h/j/k/l              split focused pane\n\
-     --   Shift+Ctrl+h/j/k/l             resize focused pane (vim hjkl)\n\
+     --   Shift+Alt+h/j/k/l or Shift+Alt+arrows  split focused pane\n\
+     --   Shift+Ctrl+h/j/k/l or Shift+Ctrl+arrows  resize focused pane (vim hjkl)\n\
      --   Alt+w                          close focused pane\n\
      --   Alt+z / Alt+m / Alt+f          toggle single-pane zoom\n\
      --   Ctrl+Tab / Ctrl+Shift+Tab      focus next / previous\n\

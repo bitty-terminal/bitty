@@ -58,10 +58,12 @@
 //! # Defaults
 //!
 //! [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
-//! reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
-//! less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
-//! `shift+ctrl` resizes plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
-//! Mod-aware resize variant (pure `shift+alt` stays creation: it cannot
+//! reference (`alt+h/j/k/l` navigate plus CTX-0262 `alt+arrows` aliases,
+//! `alt+u`/`alt+i` page up/down
+//! less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates plus
+//! CTX-0262 `shift+alt+arrows` aliases,
+//! `shift+ctrl` resizes plus CTX-0262 `shift+ctrl+arrows` aliases plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
+//! Mod-aware resize variant plus CTX-0262 `ctrl+shift+alt+arrows` aliases (pure `shift+alt` stays creation: it cannot
 //! also resize under the single-owner rule), `ctrl+alt+arrows` navigate,
 //! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
 //! workspace entry (CTX-0257): `alt+n` new workspace, `alt+1..=9` jump to
@@ -70,7 +72,7 @@
 //! ops (`close_view`, `focus:<n>`); those actions stay parseable and
 //! user-bindable but are no longer bound by default — workspace numbers won
 //! the Alt slot per the owner spec, panes navigate spatially (`goto_split`,
-//! `focus_next`/`focus_prev`). Plain `Tab`, arrows, letters, and digits
+//! `focus_next`/`focus_prev`). Plain `Tab`, bare arrows, letters, and digits
 //! are deliberately unbound so they reach the shell.
 //!
 //! The table is the canonical Alt spelling (kept byte-identical for the
@@ -119,8 +121,9 @@ pub const MAX_MOD_KEY_LEN: usize = 32;
 /// renders it through [`default_keymaps_with_mod`], so flipping one
 /// `mod_key` setting rebinds every `alt`-bearing default (including the
 /// CTX-0258 `ctrl+shift+alt+h/j/k/l` resize variant, which becomes
-/// `ctrl+shift+super+h/j/k/l`) while chords without `alt` (`ctrl+tab`
-/// cycles, `shift+ctrl` legacy resizes, `ctrl+shift` copy/paste) pass
+/// `ctrl+shift+super+h/j/k/l`, and the CTX-0262 `alt+arrows`,
+/// `shift+alt+arrows`, `ctrl+shift+alt+arrows` aliases) while chords without `alt` (`ctrl+tab`
+/// cycles, `shift+ctrl` legacy resizes including CTX-0262 `shift+ctrl+arrows`, `ctrl+shift` copy/paste) pass
 /// through as mod-independent fixed chords. Explicit user
 /// entries keep their exact spelling and overlay by the existing
 /// `context + chord` identity, so a mod flip never rewrites user intent.
@@ -875,20 +878,28 @@ impl ResolvedKeymap {
 }
 
 /// [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
-/// reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
-/// less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
-/// `shift+ctrl` resizes plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
-/// Mod-aware resize variant, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
+/// reference (`alt+h/j/k/l` navigate plus CTX-0262 `alt+arrows` aliases, `alt+u`/`alt+i` page up/down
+/// less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates plus
+/// CTX-0262 `shift+alt+arrows` aliases,
+/// `shift+ctrl` resizes plus CTX-0262 `shift+ctrl+arrows` aliases plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
+/// Mod-aware resize variant plus CTX-0262 `ctrl+shift+alt+arrows` aliases, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
 /// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
 /// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
 /// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
-/// Plain `Tab`, arrows, letters, and digits are deliberately unbound so
+/// Plain `Tab`, bare arrows, letters, and digits are deliberately unbound so
 /// they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+h", "goto_split:left"),
     ("alt+j", "goto_split:down"),
     ("alt+k", "goto_split:up"),
     ("alt+l", "goto_split:right"),
+    // CTX-0262 arrow-key defaults for the HJKL focus actions (DEC-0035):
+    // arrows are non-Vim aliases for the same actions (multi-bind: one
+    // action supports multiple chords; each chord identity stays unique).
+    ("alt+left", "goto_split:left"),
+    ("alt+down", "goto_split:down"),
+    ("alt+up", "goto_split:up"),
+    ("alt+right", "goto_split:right"),
     ("alt+1", "workspace_focus:1"),
     ("alt+2", "workspace_focus:2"),
     ("alt+3", "workspace_focus:3"),
@@ -910,10 +921,21 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+alt+j", "new_split:down"),
     ("shift+alt+k", "new_split:up"),
     ("shift+alt+l", "new_split:right"),
+    // CTX-0262 arrow-key defaults for the HJKL split actions.
+    ("shift+alt+left", "new_split:left"),
+    ("shift+alt+down", "new_split:down"),
+    ("shift+alt+up", "new_split:up"),
+    ("shift+alt+right", "new_split:right"),
     ("shift+ctrl+h", "resize_split:left"),
     ("shift+ctrl+j", "resize_split:down"),
     ("shift+ctrl+k", "resize_split:up"),
     ("shift+ctrl+l", "resize_split:right"),
+    // CTX-0262 arrow-key defaults for the legacy HJKL resize actions
+    // (mod-independent fixed chords: no `alt` slot, pass Super flip through).
+    ("shift+ctrl+left", "resize_split:left"),
+    ("shift+ctrl+down", "resize_split:down"),
+    ("shift+ctrl+up", "resize_split:up"),
+    ("shift+ctrl+right", "resize_split:right"),
     // CTX-0258 Mod-aware resize variant: `ctrl+shift+alt` carries the Mod
     // slot so a Super flip rebinds it to `ctrl+shift+super` (pure
     // `shift+alt` cannot be reused: it already creates via `new_split`
@@ -922,6 +944,12 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+alt+j", "resize_split:down"),
     ("ctrl+shift+alt+k", "resize_split:up"),
     ("ctrl+shift+alt+l", "resize_split:right"),
+    // CTX-0262 arrow-key defaults for the Mod-aware HJKL resize variant
+    // (carries the Mod slot so a Super flip rebinds to `ctrl+shift+super`).
+    ("ctrl+shift+alt+left", "resize_split:left"),
+    ("ctrl+shift+alt+down", "resize_split:down"),
+    ("ctrl+shift+alt+up", "resize_split:up"),
+    ("ctrl+shift+alt+right", "resize_split:right"),
     ("alt+w", "workspace_close"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
@@ -1410,9 +1438,14 @@ mod tests {
         let maps = default_keymaps().expect("defaults valid");
         assert!(!maps.is_empty());
         // Tab, plain arrows, plain letters/digits reach the shell.
+        // CTX-0262: bare arrows stay shell-bound (only Alt/Shift+Alt/etc.
+        // combos are chrome).
         let shell_keys = [
             key_ref(KeyName::Tab, false, false, false),
             key_ref(KeyName::Up, false, false, false),
+            key_ref(KeyName::Down, false, false, false),
+            key_ref(KeyName::Left, false, false, false),
+            key_ref(KeyName::Right, false, false, false),
             key_ref(KeyName::Char('n'), false, false, false),
             key_ref(KeyName::Char('p'), false, false, false),
             key_ref(KeyName::Char('1'), false, false, false),
@@ -1540,14 +1573,15 @@ mod tests {
         // cover the Super-rebound map as well). CTX-0257 extends the
         // audit to the DEC-0034 entry set: 35 shipped + 4 new (alt+n/-/=/tab;
         // alt+w and alt+1..=9 are rebinds, not new identities) = 39, plus
-        // CTX-0258's 4 Mod-aware resize chords = 43 total, and the full DEC
-        // set resolves.
+        // CTX-0258's 4 Mod-aware resize chords = 43, plus CTX-0262's 16
+        // arrow-key aliases (4 focus + 4 split + 4 legacy resize + 4
+        // Mod-aware resize) = 59 total, and the full DEC set resolves.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                43,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords"
+                59,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -1586,6 +1620,134 @@ mod tests {
             assert!(
                 parsed.ctrl || parsed.alt || parsed.shift || parsed.super_held,
                 "default '{chord}' must hold a modifier"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_aliases_mirror_hjkl_both_mods() {
+        // CTX-0262 (DEC-0035): arrows are non-Vim aliases for the HJKL
+        // directional actions (multi-bind: same action, distinct chords).
+        // Alt+arrows focus, Shift+Alt+arrows split, Shift+Ctrl+arrows
+        // legacy-resize, Ctrl+Shift+Alt+arrows Mod-aware-resize. Bare
+        // arrows stay shell-bound; Super flip rebinds the `alt`-bearing
+        // arrow variants while legacy `shift+ctrl` passes through.
+        let alt_maps = default_keymaps_with_mod(ModKey::Alt).expect("alt valid");
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        let dirs = [
+            (KeyName::Left, SplitDir::Left),
+            (KeyName::Down, SplitDir::Down),
+            (KeyName::Up, SplitDir::Up),
+            (KeyName::Right, SplitDir::Right),
+        ];
+        for (key, dir) in dirs {
+            // Focus: alt+arrows like alt+h/j/k/l.
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(key, false, true, false)),
+                Some(ChromeAction::GotoSplit(dir)),
+                "alt+{key:?} focuses"
+            );
+            // Split: shift+alt+arrows like shift+alt+h/j/k/l.
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(key, false, true, true)),
+                Some(ChromeAction::NewSplit(dir)),
+                "shift+alt+{key:?} splits"
+            );
+            // Legacy resize: shift+ctrl+arrows (mod-independent fixed).
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(key, true, false, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "shift+ctrl+{key:?} resizes (alt map)"
+            );
+            assert_eq!(
+                match_keymap(&super_maps, key_ref(key, true, false, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "shift+ctrl+{key:?} resizes (super map)"
+            );
+            // Mod-aware resize: ctrl+shift+alt+arrows under Alt ...
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(key, true, true, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "ctrl+shift+alt+{key:?} resizes"
+            );
+            // ... rebound to ctrl+shift+super+arrows under Super ...
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key,
+                        ctrl: true,
+                        alt: false,
+                        shift: true,
+                        super_held: true,
+                    }
+                ),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "ctrl+shift+super+{key:?} resizes"
+            );
+            // ... and the old alt spelling is unbound under Super.
+            assert_eq!(
+                match_keymap(&super_maps, key_ref(key, true, true, true)),
+                None,
+                "ctrl+shift+alt+{key:?} unbound under super mod"
+            );
+            // Super-flipped focus/split arrows.
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key,
+                        ctrl: false,
+                        alt: false,
+                        shift: false,
+                        super_held: true,
+                    }
+                ),
+                Some(ChromeAction::GotoSplit(dir)),
+                "super+{key:?} focuses"
+            );
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key,
+                        ctrl: false,
+                        alt: false,
+                        shift: true,
+                        super_held: true,
+                    }
+                ),
+                Some(ChromeAction::NewSplit(dir)),
+                "shift+super+{key:?} splits"
+            );
+            // Old alt arrow spellings are unbound under Super (shell).
+            assert_eq!(
+                match_keymap(&super_maps, key_ref(key, false, true, false)),
+                None,
+                "alt+{key:?} unbound under super mod"
+            );
+        }
+        // Bare arrows stay shell-bound under both mods (single-owner:
+        // only Alt/Shift+Alt/etc. combos are chrome).
+        for key in [KeyName::Left, KeyName::Down, KeyName::Up, KeyName::Right] {
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(key, false, false, false)),
+                None,
+                "bare {key:?} is shell (alt map)"
+            );
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key,
+                        ctrl: false,
+                        alt: false,
+                        shift: false,
+                        super_held: false,
+                    }
+                ),
+                None,
+                "bare {key:?} is shell (super map)"
             );
         }
     }

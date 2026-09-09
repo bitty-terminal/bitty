@@ -47,3 +47,11 @@ commit-check message:
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
 check: fmt-check clippy test pty-gate actionlint markdownlint
+
+# Publish a ctxpack snapshot to the bitty-workflow mirror (commander merge
+# closeout only; never a git hook). Dry run exports + validates without push.
+workflow-publish *args:
+    bash scripts/publish-ctxpack.sh {{args}}
+
+workflow-publish-dry *args:
+    bash scripts/publish-ctxpack.sh --dry-run {{args}}

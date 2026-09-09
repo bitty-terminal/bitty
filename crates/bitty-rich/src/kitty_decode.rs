@@ -37,9 +37,19 @@
 //!
 //! A decoded bitmap can therefore never rival stored-plus-in-flight ledger
 //! pressure, and oversize input is rejected without allocating. Placement
-//! (CTX-0248) still enforces the exact RFC admission caps (4096/side,
-//! 64 MiB, 4 MiB compressed) before any bitmap reaches the store, and the
-//! decoder attack surface gets its own review (CTX-0249).
+//! (CTX-0248) re-enforces these same decode ceilings (8192 px/side,
+//! 4096 x 4096 px area, 64 MiB RGBA) before any bitmap reaches the store;
+//! the wire `compressed_len` is carried as diagnostics only, never as an
+//! admission bound (see [`crate::kitty_place`]). The generic RFC store
+//! ([`crate::image`]: IMG-1 4 MiB compressed, IMG-2 4096 px/side) is
+//! stricter, but the Kitty path intentionally admits wide panoramas up to
+//! 8192 px/side within the same 4096²-pixel / 64 MiB area budget, so the
+//! memory ceiling is identical either way: 8192 x 2048 x 4 and 4096 x 4096
+//! x 4 are both exactly 64 MiB. Tightening this path to the RFC side cap
+//! would reject legitimate panoramas without lowering the memory ceiling,
+//! and a wire-length cap would misfire on PNG (compressed size is unrelated
+//! to decoded size; the IHDR + output-size checks above are the bomb
+//! defense). The decoder attack surface gets its own review (CTX-0249).
 //!
 //! # Fail-closed behavior
 //!

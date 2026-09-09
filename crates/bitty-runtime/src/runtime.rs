@@ -421,6 +421,18 @@ pub struct Runtime {
     /// Presentation-only: composited topmost in the tick overlay path,
     /// never grid truth. Cleared on alternate-screen entry.
     kitty_images: bitty_rich::KittyImageLayer,
+    /// Scaled-blit cache across present frames (CTX-0252 F2).
+    ///
+    /// Keyed by placement + image identity, destination rect, source dims,
+    /// scrollback sequence, and geometry; scroll/geometry changes miss
+    /// instead of painting stale pixels. Cleared with the image layer on
+    /// alternate-screen entry.
+    kitty_raster_cache: bitty_rich::KittyRasterCache,
+    /// Image blits composited on the last presented frame (CTX-0252 F2).
+    ///
+    /// Latched on every successful present; idle ticks leave it unchanged.
+    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`].
+    kitty_last_frame_images: usize,
     /// Alternate-screen state at the last present (CTX-0248).
     ///
     /// A change forces a full present even when the grid generation is
@@ -662,6 +674,8 @@ impl Runtime {
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
+            kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,
             workspaces: Vec::new(),
             active_workspace: 0,
@@ -779,6 +793,8 @@ impl Runtime {
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
+            kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,
             workspaces: Vec::new(),
             active_workspace: 0,

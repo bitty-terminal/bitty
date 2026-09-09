@@ -785,19 +785,30 @@ impl Runtime {
         }
         self.scrollbar_visible = paints;
 
-        // Kitty images (CTX-0248): topmost present-layer blits on the
-        // focused leaf, composited after fills and glyphs. Never grid
-        // truth: no cell, scrollback, or layout mutation. Each visible
-        // placement is scaled by the rich layer to its clamped cell-rect
-        // pixel extent and translated to the leaf origin (plus the window
-        // padding inset, like every other overlay). Skipped while the
-        // focused view inspects scrollback (live-grid anchors do not map
-        // to the history viewport) and cleared on alternate-screen entry.
-        // Multi-pane sessions are not fed yet: images anchor to the
-        // primary state only (parser `APC G` wiring is follow-up work).
+        // Kitty images (CTX-0248, budget + cache CTX-0252 F2): topmost
+        // present-layer blits on the focused leaf, composited after fills
+        // and glyphs. Never grid truth: no cell, scrollback, or layout
+        // mutation. Each visible placement is scaled by the rich layer to
+        // its clamped cell-rect pixel extent and translated to the leaf
+        // origin (plus the window padding inset, like every other overlay).
+        // Skipped while the focused view inspects scrollback (live-grid
+        // anchors do not map to the history viewport) and cleared on
+        // alternate-screen entry. Multi-pane sessions are not fed yet:
+        // images anchor to the primary state only (parser `APC G` wiring
+        // is follow-up work).
+        //
+        // Per-frame budget ([`bitty_rich::KittyFrameBudget`]): at most 32
+        // blits / 64 MiB of scaled bytes per frame, checked before
+        // rasterizing so refused bytes are never allocated; over-budget
+        // placements are skipped for the frame only (retained in paint
+        // order). Raster cache ([`bitty_rich::KittyRasterCache`]): scaled
+        // bytes keyed by placement + image identity, destination rect,
+        // source dims, scrollback sequence, and geometry, so static frames
+        // reuse blits while scroll/geometry changes miss (never stale).
         let mut combined_images: Vec<bitty_render::grid::ImageBlit> = Vec::new();
         if self.state.alt_screen_active() {
             self.kitty_images.clear();
+            self.kitty_raster_cache.clear();
         } else if !self.kitty_images.placement_is_empty() {
             let scrolled = self
                 .focused_view()
@@ -816,6 +827,7 @@ impl Runtime {
                             let scrollback = self.state.scrollback_len();
                             let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
                             let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
+                            let mut budget = bitty_rich::KittyFrameBudget::new();
                             for placement in self.kitty_images.placements_in_paint_order() {
                                 let Some(img) = self.kitty_images.get(placement.image) else {
                                     continue;
@@ -829,7 +841,32 @@ impl Runtime {
                                 ) else {
                                     continue;
                                 };
-                                let Some(scaled) = bitty_rich::rasterize(img, rect_px) else {
+                                // Budget before rasterize: refused bytes are
+                                // never allocated, bounding the pathological
+                                // 128-placement transient per frame.
+                                let need = (u64::from(rect_px.width) * u64::from(rect_px.height))
+                                    .checked_mul(4)
+                                    .filter(|&n| n <= usize::MAX as u64)
+                                    .map(|n| n as usize);
+                                let Some(need) = need else { continue };
+                                if !budget.admit(need) {
+                                    continue;
+                                }
+                                let key = bitty_rich::KittyRasterKey {
+                                    placement: placement.id.0,
+                                    image: placement.image.0,
+                                    rect: rect_px,
+                                    src_w: img.width,
+                                    src_h: img.height,
+                                    scrollback,
+                                    cell: rich_metrics,
+                                    viewport_cols: rect.width,
+                                    viewport_rows: rect.height,
+                                };
+                                let Some(scaled) = self
+                                    .kitty_raster_cache
+                                    .get_or_rasterize(key, || bitty_rich::rasterize(img, rect_px))
+                                else {
                                     continue;
                                 };
                                 let dest = bitty_render::geometry::RectPx::new(
@@ -871,6 +908,8 @@ impl Runtime {
         // Synthesize a DrawList for the combined frame. Plan is not used by
         // headless_present beyond fill/glyph counts, so we create a minimal
         // plan that reports needs_draw == true when we have content.
+        // CTX-0252 F2: latch the presented blit count before the move below.
+        let kitty_blits = combined_images.len();
         let combined_list = {
             // We need a FramePlan; construct via a dummy damage descriptor that
             // indicates full. Simplest: reuse empty plan but set dirty_rects
@@ -982,6 +1021,7 @@ impl Runtime {
         self.last_presented_generation = current_gen;
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
+        self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
         // digesting — only while a digest grant is live (zero clone cost
         // otherwise) and only for headless presents (`stats.headless`;

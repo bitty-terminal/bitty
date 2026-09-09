@@ -81,6 +81,25 @@ impl Runtime {
         self.kitty_images.placement_len()
     }
 
+    /// Image blits composited on the last presented frame (CTX-0252 F2).
+    ///
+    /// Latched on every successful present; idle ticks leave it unchanged.
+    /// Bound by [`bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME`].
+    #[must_use]
+    pub fn kitty_last_frame_images(&self) -> usize {
+        self.kitty_last_frame_images
+    }
+
+    /// Raster-cache counters: hits, misses, entries, bytes (CTX-0252 F2).
+    ///
+    /// Headless-observable proof that static frames reuse cached blits
+    /// (hits grow, misses do not) and that scroll/geometry changes
+    /// invalidate (misses grow, no stale pixels).
+    #[must_use]
+    pub fn kitty_raster_stats(&self) -> bitty_rich::KittyRasterStats {
+        self.kitty_raster_cache.stats()
+    }
+
     /// Decodes `payload` and stores the bitmap without placing it.
     ///
     /// `format_f` is the wire `f=` value (`100` PNG, `24` RGB, `32` RGBA);

@@ -76,12 +76,24 @@
 //! RFC IMG-8 parity), oldest evicted first. A single image larger than the
 //! byte cap is rejected.
 //!
+//! # Per-frame budget + raster cache (CTX-0252 F2)
+//!
+//! The present loop composites at most [`KITTY_PRESENT_MAX_BLITS_PER_FRAME`]
+//! blits / [`KITTY_PRESENT_MAX_BYTES_PER_FRAME`] bytes per frame
+//! ([`KittyFrameBudget`], skip-and-continue in paint order), so the
+//! pathological 128-placement transient (128 x 64 MiB) can never
+//! materialize. Scaled blits are cached across frames in
+//! [`KittyRasterCache`] keyed by [`KittyRasterKey`] (placement + image
+//! identity, destination rect, source dimensions, scrollback sequence, cell
+//! metrics, viewport): static frames hit and skip re-rasterizing, while
+//! scroll or geometry changes miss instead of painting stale pixels.
+//!
 //! # Determinism
 //!
 //! Storage and placement are pure functions of insertion order: same calls
 //! always yield the same ids and the same retained set.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::geometry::{CellMetrics, ExtentPx, RectPx};
 use crate::kitty_decode::{
@@ -658,6 +670,265 @@ pub fn rasterize(image: &KittyPlacedImage, rect: RectPx) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-frame blit budget + raster cache (CTX-0252 F2)
+// ---------------------------------------------------------------------------
+
+/// Maximum image blits composited in one present frame.
+///
+/// The layer retains up to [`KITTY_PLACE_MAX_ITEMS`] (128) placements and
+/// every visible one rasterizes to its viewport-clamped rect; without a
+/// frame cap the pathological transient is 128 x 64 MiB of scaled bytes per
+/// frame. The budget sheds deterministically in paint order (ascending `z`,
+/// stable): the first 32 visible placements paint and the rest are skipped
+/// for that frame only (retained, repainted when earlier placements hide or
+/// the budget grows). Ordinary frames carry a handful of images and never
+/// touch the cap.
+pub const KITTY_PRESENT_MAX_BLITS_PER_FRAME: usize = 32;
+
+/// Maximum scaled blit bytes composited in one present frame (64 MiB).
+///
+/// Mirrors [`KITTY_DECODE_MAX_BYTES`]: any single viewport-clamped blit the
+/// store admits also fits the frame, so the byte cap only sheds
+/// pathological multiplicity, never a lone image. Checked **before**
+/// rasterizing, so refused bytes are never allocated.
+pub const KITTY_PRESENT_MAX_BYTES_PER_FRAME: usize = 64 * 1024 * 1024;
+
+/// Maximum cached raster entries (one per placement cap).
+pub const KITTY_RASTER_CACHE_MAX_ENTRIES: usize = KITTY_PLACE_MAX_ITEMS;
+
+/// Maximum cached raster bytes (one max image worth of scaled output).
+pub const KITTY_RASTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-frame blit budget: deterministic shed for pathological placement counts.
+///
+/// Created fresh each frame. [`KittyFrameBudget::admit`] returns `true` and
+/// accounts `need` bytes while both the blit count and the byte total stay
+/// within [`KITTY_PRESENT_MAX_BLITS_PER_FRAME`] /
+/// [`KITTY_PRESENT_MAX_BYTES_PER_FRAME`], `false` otherwise (the caller skips
+/// that placement for this frame only). Skip-and-continue in paint order
+/// keeps small placements painting even when a huge one is shed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KittyFrameBudget {
+    blits: usize,
+    used_bytes: usize,
+}
+
+impl KittyFrameBudget {
+    /// An empty budget for one frame.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a blit of `need` bytes fits; accounts it on success.
+    ///
+    /// `need` is the checked `rect.width * rect.height * 4` for the
+    /// candidate rect. Callers compute it before rasterizing so refused
+    /// bytes are never allocated. A single blit larger than the whole byte
+    /// cap never fits and is skipped every frame (fail-safe for absurd
+    /// viewports; the grid still presents).
+    pub fn admit(&mut self, need: usize) -> bool {
+        if self.blits >= KITTY_PRESENT_MAX_BLITS_PER_FRAME {
+            return false;
+        }
+        let next = self.used_bytes.saturating_add(need);
+        if next > KITTY_PRESENT_MAX_BYTES_PER_FRAME {
+            return false;
+        }
+        self.blits += 1;
+        self.used_bytes = next;
+        true
+    }
+
+    /// Blits admitted so far this frame.
+    #[must_use]
+    pub fn blits(&self) -> usize {
+        self.blits
+    }
+
+    /// Scaled bytes admitted so far this frame.
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+}
+
+/// Cache key for one rasterized placement blit.
+///
+/// Identity (`placement`, `image`) plus everything that shapes the output:
+/// the clamped destination `rect` (position and extent), the source bitmap
+/// `src` dimensions (guards image-id reuse), and the frame context — the
+/// `scrollback` sequence (content position), `cell` metrics, and `viewport`
+/// grid size. Scroll or geometry changes therefore miss instead of painting
+/// stale pixels; identical frames hit and skip re-rasterizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KittyRasterKey {
+    /// Placement being painted.
+    pub placement: u64,
+    /// Image the placement binds.
+    pub image: u64,
+    /// Clamped destination rect (position + extent).
+    pub rect: RectPx,
+    /// Source bitmap width.
+    pub src_w: u32,
+    /// Source bitmap height.
+    pub src_h: u32,
+    /// `State::scrollback_len()` this frame (content sequence).
+    pub scrollback: usize,
+    /// Cell metrics this frame (geometry).
+    pub cell: CellMetrics,
+    /// Viewport grid width this frame (geometry).
+    pub viewport_cols: u16,
+    /// Viewport grid height this frame (geometry).
+    pub viewport_rows: u16,
+}
+
+/// Snapshot of [`KittyRasterCache`] counters (headless-observable).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KittyRasterStats {
+    /// Lookups served without rasterizing.
+    pub hits: u64,
+    /// Lookups that rasterized (including first fills).
+    pub misses: u64,
+    /// Entries currently cached.
+    pub entries: usize,
+    /// Scaled bytes currently cached.
+    pub bytes: usize,
+}
+
+/// Bounded per-placement raster cache: scaled blits keyed by [`KittyRasterKey`].
+///
+/// The present loop used to rasterize every visible placement every frame
+/// (one nearest-neighbor scale per blit); this cache keeps the scaled bytes
+/// so static frames pay the scale once. Bounded to
+/// [`KITTY_RASTER_CACHE_MAX_ENTRIES`] entries /
+/// [`KITTY_RASTER_CACHE_MAX_BYTES`] bytes, oldest evicted first (FIFO,
+/// deterministic for fixed insertion order). Entries are immutable scaled
+/// bytes: source bitmaps never mutate under an image id, and every context
+/// input rides in the key, so a hit can never paint stale pixels.
+/// Structural resets ([`KittyImageLayer::clear`], alternate-screen entry)
+/// clear the cache explicitly via [`KittyRasterCache::clear`]; evicted
+/// placements simply stop being looked up (their entries age out under the
+/// caps and are never served, because lookups are driven by the live
+/// placement list).
+#[derive(Debug, Clone, Default)]
+pub struct KittyRasterCache {
+    entries: HashMap<KittyRasterKey, Vec<u8>>,
+    order: VecDeque<KittyRasterKey>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl KittyRasterCache {
+    /// An empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Entries currently cached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Scaled bytes currently cached.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Cumulative cache hits.
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cumulative cache misses (each rasterized at most once).
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Counter snapshot.
+    #[must_use]
+    pub fn stats(&self) -> KittyRasterStats {
+        KittyRasterStats {
+            hits: self.hits,
+            misses: self.misses,
+            entries: self.entries.len(),
+            bytes: self.bytes,
+        }
+    }
+
+    /// Cached scaled bytes for `key`, if present (cloned).
+    #[must_use]
+    pub fn get(&self, key: &KittyRasterKey) -> Option<Vec<u8>> {
+        self.entries.get(key).cloned()
+    }
+
+    /// Returns cached bytes on hit; on miss runs `rasterize`, caches the
+    /// output on success, and returns it. Failures (`None`) are never
+    /// cached and count as misses without poisoning the key.
+    pub fn get_or_rasterize(
+        &mut self,
+        key: KittyRasterKey,
+        rasterize: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        if let Some(hit) = self.entries.get(&key) {
+            self.hits = self.hits.wrapping_add(1);
+            return Some(hit.clone());
+        }
+        self.misses = self.misses.wrapping_add(1);
+        let bytes = rasterize()?;
+        self.insert(key, bytes.clone());
+        Some(bytes)
+    }
+
+    /// Inserts scaled bytes, evicting oldest first to hold the entry and
+    /// byte caps. Every [`rasterize`] output fits the byte cap (at most
+    /// [`KITTY_DECODE_MAX_BYTES`]), so the loop always terminates with room;
+    /// a lone over-cap insert would still store alone rather than thrash.
+    fn insert(&mut self, key: KittyRasterKey, bytes: Vec<u8>) {
+        if let Some(old) = self.entries.get(&key) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+        } else {
+            self.order.push_back(key);
+        }
+        while self.entries.len() >= KITTY_RASTER_CACHE_MAX_ENTRIES
+            || self.bytes.saturating_add(bytes.len()) > KITTY_RASTER_CACHE_MAX_BYTES
+        {
+            if let Some(evicted) = self.order.pop_front() {
+                if let Some(removed) = self.entries.remove(&evicted) {
+                    self.bytes = self.bytes.saturating_sub(removed.len());
+                }
+                if evicted == key {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        self.entries.insert(key, bytes);
+    }
+
+    /// Drops all cached entries without resetting hit/miss counters.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Small integer helpers (mirror the grid pipeline's saturating style)
 // ---------------------------------------------------------------------------
 
@@ -1020,5 +1291,247 @@ mod tests {
             })
         );
         assert!(layer.is_empty());
+    }
+
+    #[test]
+    fn placement_admits_wide_panorama_within_area_budget() {
+        // F1 (CTX-0252, doc->code): the enforced side cap is 8192, not the
+        // 4096 the old decode doc overclaimed. 8192x2048 is exactly the
+        // 4096^2 area cap (64 MiB RGBA): the side/area/byte edge, admitted.
+        let mut layer = KittyImageLayer::new();
+        let id = layer
+            .store(8192, 2048, vec![0x7F; 8192_usize * 2048 * 4], 1_000_000)
+            .expect("wide panorama within area budget must be admitted");
+        let img = layer.get(id).unwrap();
+        assert_eq!((img.width, img.height), (8192, 2048));
+        assert_eq!(layer.total_bytes(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn side_cap_matches_decode_ceiling() {
+        // F1: placement re-enforces exactly the decode ceilings (8192/side).
+        let mut layer = KittyImageLayer::new();
+        assert_eq!(
+            layer.store(8193, 1, vec![0; 4], 4),
+            Err(KittyPlacementError::DimensionsTooLarge {
+                width: 8193,
+                height: 1,
+                cap: KITTY_DECODE_MAX_DIMENSION,
+            })
+        );
+        assert_eq!(KITTY_DECODE_MAX_DIMENSION, 8192);
+        assert!(layer.is_empty());
+    }
+
+    #[test]
+    fn compressed_len_is_diagnostic_only() {
+        // F1: the wire payload length never gates admission — a 10 MiB claim
+        // (2.5x the generic IMG-1 4 MiB cap) stores exactly like 0. Memory
+        // is bounded by decoded output caps, not wire length.
+        let mut layer = KittyImageLayer::new();
+        let (w, h, rgba) = tiny_red();
+        let big = layer
+            .store(w, h, rgba.clone(), 10 * 1024 * 1024)
+            .expect("large compressed_len must not refuse admission");
+        let zero = layer
+            .store(w, h, rgba, 0)
+            .expect("zero compressed_len must not refuse admission");
+        assert_eq!(layer.get(big).unwrap().compressed_len, 10 * 1024 * 1024);
+        assert_eq!(layer.get(zero).unwrap().compressed_len, 0);
+    }
+
+    #[test]
+    fn frame_budget_admits_within_caps_and_sheds_beyond() {
+        let mut budget = KittyFrameBudget::new();
+        assert!(budget.admit(1024));
+        assert!(budget.admit(2048));
+        assert_eq!(budget.blits(), 2);
+        assert_eq!(budget.used_bytes(), 3072);
+        // Byte cap: exactly the cap admits once, one more byte sheds.
+        let mut full = KittyFrameBudget::new();
+        assert!(full.admit(KITTY_PRESENT_MAX_BYTES_PER_FRAME));
+        assert_eq!(full.blits(), 1);
+        assert!(!full.admit(1));
+        // A single blit larger than the whole cap never fits.
+        let mut huge = KittyFrameBudget::new();
+        assert!(!huge.admit(KITTY_PRESENT_MAX_BYTES_PER_FRAME + 1));
+        assert_eq!(huge.blits(), 0);
+        assert_eq!(huge.used_bytes(), 0);
+        // Count cap over 128 pathological candidates: 32 paint, rest shed.
+        let mut many = KittyFrameBudget::new();
+        let mut admitted = 0;
+        for _ in 0..KITTY_PLACE_MAX_ITEMS {
+            if many.admit(4) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, KITTY_PRESENT_MAX_BLITS_PER_FRAME);
+        assert_eq!(many.blits(), KITTY_PRESENT_MAX_BLITS_PER_FRAME);
+        assert_eq!(KITTY_PRESENT_MAX_BLITS_PER_FRAME, 32);
+        assert_eq!(KITTY_PRESENT_MAX_BYTES_PER_FRAME, 64 * 1024 * 1024);
+    }
+
+    fn raster_key_fixture() -> KittyRasterKey {
+        KittyRasterKey {
+            placement: 7,
+            image: 3,
+            rect: RectPx::new(0, 0, 2, 2),
+            src_w: 2,
+            src_h: 2,
+            scrollback: 100,
+            cell: METRICS,
+            viewport_cols: 80,
+            viewport_rows: 24,
+        }
+    }
+
+    #[test]
+    fn raster_cache_hits_without_rerasterizing() {
+        let mut cache = KittyRasterCache::new();
+        assert!(cache.is_empty());
+        let key = raster_key_fixture();
+        let mut calls = 0;
+        let first = cache
+            .get_or_rasterize(key, || {
+                calls += 1;
+                Some(vec![1, 2, 3, 4])
+            })
+            .unwrap();
+        let second = cache
+            .get_or_rasterize(key, || {
+                calls += 1;
+                Some(vec![9, 9, 9, 9])
+            })
+            .unwrap();
+        assert_eq!(first, vec![1, 2, 3, 4]);
+        assert_eq!(second, vec![1, 2, 3, 4]);
+        assert_eq!(calls, 1, "second identical frame must not re-rasterize");
+        assert_eq!(
+            cache.stats(),
+            KittyRasterStats {
+                hits: 1,
+                misses: 1,
+                entries: 1,
+                bytes: 4,
+            }
+        );
+        assert_eq!(cache.get(&key).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn raster_cache_misses_on_scroll_geometry_and_identity_change() {
+        let mut cache = KittyRasterCache::new();
+        let base = raster_key_fixture();
+        let mut calls = 0;
+        let mut raster = |cache: &mut KittyRasterCache, key: KittyRasterKey| {
+            calls += 1;
+            cache
+                .get_or_rasterize(key, || Some(vec![calls as u8; 4]))
+                .unwrap()
+        };
+        let first = raster(&mut cache, base);
+        // Scroll sequence change (content moved): miss, fresh bytes.
+        let scrolled = KittyRasterKey {
+            scrollback: 103,
+            ..base
+        };
+        let second = raster(&mut cache, scrolled);
+        assert_ne!(first, second);
+        // Geometry change (cell metrics): miss.
+        let resized = KittyRasterKey {
+            cell: CellMetrics {
+                width: 9,
+                height: 19,
+            },
+            ..base
+        };
+        raster(&mut cache, resized);
+        // Viewport change: miss.
+        let reflowed = KittyRasterKey {
+            viewport_cols: 100,
+            ..base
+        };
+        raster(&mut cache, reflowed);
+        // Identity change (another placement, same geometry): miss.
+        let other = KittyRasterKey {
+            placement: 8,
+            ..base
+        };
+        raster(&mut cache, other);
+        assert_eq!(calls, 5);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 5);
+        assert_eq!(cache.len(), 5);
+        // The original key still hits with its original bytes (no stale).
+        let again = cache.get(&base).unwrap();
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn raster_cache_failures_are_not_cached() {
+        let mut cache = KittyRasterCache::new();
+        let key = raster_key_fixture();
+        let mut calls = 0;
+        for _ in 0..2 {
+            assert_eq!(
+                cache.get_or_rasterize(key, || {
+                    calls += 1;
+                    None
+                }),
+                None
+            );
+        }
+        assert_eq!(calls, 2, "failures must re-run, never poison the key");
+        assert_eq!(cache.misses(), 2);
+        assert!(cache.is_empty());
+        // Recovery caches normally afterwards.
+        assert_eq!(
+            cache.get_or_rasterize(key, || Some(vec![5; 4])),
+            Some(vec![5; 4])
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn raster_cache_evicts_oldest_within_caps() {
+        let mut cache = KittyRasterCache::new();
+        let base = raster_key_fixture();
+        let total = KITTY_RASTER_CACHE_MAX_ENTRIES + 5;
+        for i in 0..total {
+            let key = KittyRasterKey {
+                placement: 1000 + i as u64,
+                ..base
+            };
+            cache
+                .get_or_rasterize(key, || Some(vec![i as u8; 16]))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), KITTY_RASTER_CACHE_MAX_ENTRIES);
+        assert!(cache.bytes() <= KITTY_RASTER_CACHE_MAX_BYTES);
+        // Oldest five aged out; the newest survived.
+        let first = KittyRasterKey {
+            placement: 1000,
+            ..base
+        };
+        assert_eq!(cache.get(&first), None);
+        let last = KittyRasterKey {
+            placement: 1000 + total as u64 - 1,
+            ..base
+        };
+        assert!(cache.get(&last).is_some());
+    }
+
+    #[test]
+    fn raster_cache_clear_drops_entries_keeps_counters() {
+        let mut cache = KittyRasterCache::new();
+        cache
+            .get_or_rasterize(raster_key_fixture(), || Some(vec![1; 8]))
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.misses(), 1, "counters survive clear");
+        assert_eq!(cache.hits(), 0);
     }
 }

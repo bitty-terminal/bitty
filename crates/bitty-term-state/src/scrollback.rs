@@ -16,6 +16,12 @@ use crate::cell::Cell;
 pub const SCROLLBACK_MAX_LINES: usize = 10_000;
 
 /// One immutable scrollback line with its monotonically assigned id.
+///
+/// `wrapped` is true when this line soft-wraps onto the next line in the
+/// combined scrollback + grid order (the last scrollback line wraps onto
+/// grid row 0). Hard breaks leave false. Resize reflow unwraps via these
+/// flags and rewraps to the new width; ids are reassigned on reflow (still
+/// monotonic) because the physical row count changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollbackLine {
     /// Monotonic id assigned when the line entered scrollback; ids never
@@ -23,6 +29,8 @@ pub struct ScrollbackLine {
     pub id: u64,
     /// Cell content, exactly `width` cells wide.
     pub cells: Box<[Cell]>,
+    /// Soft-wrap continuation to the next line.
+    pub wrapped: bool,
 }
 
 /// The bounded scrollback buffer.
@@ -93,6 +101,13 @@ impl Scrollback {
     /// Panics if `cells.len()` differs from the grid width; production
     /// callers derive lengths from the grid itself.
     pub fn push(&mut self, cells: Vec<Cell>) -> (u64, ClearedRange) {
+        self.push_with_wrap(cells, false)
+    }
+
+    /// Appends one line with an explicit soft-wrap continuation flag.
+    /// `wrapped` travels from the grid row that scrolled off (see
+    /// `Grid::remove_lines_up`); reflow rebuilds use fresh ids via this path.
+    pub fn push_with_wrap(&mut self, cells: Vec<Cell>, wrapped: bool) -> (u64, ClearedRange) {
         debug_assert!(!cells.is_empty());
         let id = self.next_id;
         self.next_id += 1;
@@ -100,6 +115,7 @@ impl Scrollback {
         self.lines.push_back(ScrollbackLine {
             id,
             cells: cells.into_boxed_slice(),
+            wrapped,
         });
         let evicted = if self.lines.len() > SCROLLBACK_MAX_LINES {
             let overflow = self.lines.len() - SCROLLBACK_MAX_LINES;
@@ -129,60 +145,10 @@ impl Scrollback {
         }
     }
 
-    /// Resizes every retained line to `new_cols` cells deterministically.
-    /// Wider lines are truncated with wide-pair orphan repair at the boundary;
-    /// narrower lines are padded with `erase_style` blanks. Ids are preserved
-    /// (reflow mutates cells but not line identity). This is the singular
-    /// resize reflow for scrollback: the environment-declared geometry change
-    /// is the only time retained lines are rewritten (RFC damage model:
-    /// resize reflow range).
-    pub(crate) fn resize(&mut self, new_cols: usize, erase_style: &crate::cell::Style) {
-        let new_cols = new_cols.max(1);
-        for line in &mut self.lines {
-            let old_len = line.cells.len();
-            if old_len == new_cols {
-                continue;
-            }
-            let mut new_cells = Vec::with_capacity(new_cols);
-            if new_cols < old_len {
-                // Truncate, then repair possible orphan at boundary.
-                for c in line.cells.iter().take(new_cols).cloned() {
-                    new_cells.push(c);
-                }
-                // Orphan repair for the truncated tail: same scan as Grid::repair_row but on line slice.
-                let mut i = 0;
-                while i < new_cols {
-                    let cell = new_cells[i].clone();
-                    if cell.spacer {
-                        let paired = i > 0 && {
-                            let lead = &new_cells[i - 1];
-                            lead.width == 2 && !lead.spacer
-                        };
-                        if !paired {
-                            new_cells[i] = crate::cell::Cell::erased(erase_style.clone());
-                        }
-                    } else if cell.width == 2 {
-                        let paired_trailer = i + 1 < new_cols && new_cells[i + 1].spacer;
-                        if !paired_trailer {
-                            new_cells[i] = crate::cell::Cell::erased(erase_style.clone());
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    i += 1;
-                }
-            } else {
-                // Pad: copy existing plus erased fill.
-                for c in line.cells.iter().cloned() {
-                    new_cells.push(c);
-                }
-                for _ in old_len..new_cols {
-                    new_cells.push(crate::cell::Cell::erased(erase_style.clone()));
-                }
-            }
-            line.cells = new_cells.into_boxed_slice();
-        }
-    }
+    // Note (CTX-0266): scrollback width changes happen only through
+    // `State::resize` reflow (unwrap logical lines via `wrapped` flags,
+    // rewrap to the new width, rebuild with fresh monotonic ids). The old
+    // truncate/pad `resize` primitive was removed: it dropped line tails.
 }
 
 impl Default for Scrollback {

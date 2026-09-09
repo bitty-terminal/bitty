@@ -67,32 +67,91 @@ fn resize_preserves_overlapping_content_and_repairs_wide_pairs() {
     assert_eq!(snap_before.cells[2].width, 2);
     assert!(snap_before.cells[3].spacer);
 
-    // Shrink width to 3: truncation cuts the wide pair's spacer at col3, leading at col2 becomes orphan -> erased.
+    // CTX-0266 reflow: narrowing rewraps instead of truncating. The 5-column
+    // logical "AB中X" (A1+B1+中2+X1) cannot fit in 3 cols, so it splits with
+    // wide atomicity; overflow goes to scrollback (bottom-aligned grid).
+    // No content is dropped and no orphan halves exist anywhere.
     s.resize(3, 24);
     assert_eq!(s.width(), 3);
     assert!(s.check_invariants().is_ok());
-    let snap = s.snapshot();
-    // After repair, col2 (0-indexed) must not be a leading wide without spacer nor spacer alone.
-    assert!(
-        !snap.cells[2].spacer || {
-            // if col2 is spacer, its lead at col1 must be wide (but col1 is 'B' narrow, so col2 cannot be spacer).
-            false
+    // Combined scrollback+grid must still contain A, B, 中, X in order.
+    let mut flat = String::new();
+    for line in s.scrollback() {
+        for cell in line.cells.iter() {
+            if cell.spacer {
+                continue;
+            }
+            flat.push(cell.glyph);
         }
-    );
+        flat.push('\n');
+    }
+    let snap = s.snapshot();
+    for r in 0..snap.height {
+        for c in 0..snap.width {
+            let cell = &snap.cells[r * snap.width + c];
+            if cell.spacer {
+                continue;
+            }
+            flat.push(cell.glyph);
+        }
+        flat.push('\n');
+    }
+    let condensed: String = flat.chars().filter(|c| *c != '\n' && *c != ' ').collect();
     assert!(
-        snap.cells[2].is_blank() || snap.cells[2].width == 1,
-        "orphaned wide leading must be demoted to blank single width"
+        condensed.contains("AB"),
+        "rewrap must keep AB, got {condensed:?}"
     );
-    // Overlapping content still present at cols 0,1
-    assert_eq!(snap.cells[0].glyph, 'A');
-    assert_eq!(snap.cells[1].glyph, 'B');
+    assert!(condensed.contains('中'), "rewrap must keep wide 中");
+    assert!(
+        condensed.contains('X'),
+        "rewrap must keep tail X (no truncation)"
+    );
+    // No orphan wide halves in grid or scrollback.
+    for line in s.scrollback() {
+        for (i, cell) in line.cells.iter().enumerate() {
+            if cell.spacer {
+                assert!(i > 0 && line.cells[i - 1].width == 2);
+            } else if cell.width == 2 {
+                assert!(i + 1 < line.cells.len() && line.cells[i + 1].spacer);
+            }
+        }
+    }
+    for r in 0..snap.height {
+        for c in 0..snap.width {
+            let cell = &snap.cells[r * snap.width + c];
+            if cell.spacer {
+                assert!(c > 0);
+                assert_eq!(snap.cells[r * snap.width + c - 1].width, 2);
+            } else if cell.width == 2 {
+                assert!(c + 1 < snap.width);
+                assert!(snap.cells[r * snap.width + c + 1].spacer);
+            }
+        }
+    }
 
-    // Grow again, new area must be blank.
+    // Grow again: content still present, far right blank, invariants hold.
     s.resize(80, 24);
     let snap2 = s.snapshot();
-    // Far right columns must be blank.
     assert!(snap2.cells[79].is_blank());
     assert!(s.check_invariants().is_ok());
+    let mut flat2 = String::new();
+    for line in s.scrollback() {
+        for cell in line.cells.iter() {
+            if !cell.spacer {
+                flat2.push(cell.glyph);
+            }
+        }
+        flat2.push('\n');
+    }
+    for c in snap2.cells.iter() {
+        if !c.spacer {
+            flat2.push(c.glyph);
+        }
+    }
+    let condensed2: String = flat2.chars().filter(|c| *c != '\n' && *c != ' ').collect();
+    assert!(condensed2.contains("AB"));
+    assert!(condensed2.contains('中'));
+    assert!(condensed2.contains('X'));
 }
 
 #[test]
@@ -141,17 +200,19 @@ fn scrollback_lines_resize_to_new_width_and_stay_monotonic() {
         assert_eq!(line.cells.len(), 80);
     }
 
-    // Resize wider: each line must pad to new width.
+    // Resize wider: each line must rewrap to new width (short lines stay 1:1).
     s.resize(100, 24);
     assert_eq!(s.width(), 100);
     for line in s.scrollback() {
         assert_eq!(
             line.cells.len(),
             100,
-            "wider resize must pad scrollback lines"
+            "wider resize must rewrap scrollback lines to new width"
         );
     }
-    // Ids must stay monotonic after resize (reflow preserves ids).
+    // Ids must stay monotonic after reflow (reflow reassigns fresh ids because
+    // the physical row count can change; monotonicity + coherence is the
+    // contract, not identity preservation).
     let mut prev: Option<u64> = None;
     for line in s.scrollback() {
         if let Some(p) = prev {
@@ -161,16 +222,42 @@ fn scrollback_lines_resize_to_new_width_and_stay_monotonic() {
     }
     assert!(s.check_invariants().is_ok());
 
-    // Resize narrower: truncation with repair.
+    // Resize narrower: rewrap (not truncate). Widths match, monotonic holds,
+    // history stays coherent (no duplication/loss of logical content).
+    // Count may change when logical lines split/merge, so assert coherence
+    // instead of exact preservation.
     s.resize(40, 24);
     for line in s.scrollback() {
         assert_eq!(line.cells.len(), 40);
     }
     assert!(s.check_invariants().is_ok());
-    assert_eq!(
-        s.scrollback_len(),
-        sb_len,
-        "shrink should not prune scrollback count"
+    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_MAX_LINES);
+    let mut prev2: Option<u64> = None;
+    for line in s.scrollback() {
+        if let Some(p) = prev2 {
+            assert!(line.id > p, "ids must stay monotonic after narrow reflow");
+        }
+        prev2 = Some(line.id);
+    }
+    // Spot-check coherence: an early logical line's text is still findable.
+    let mut combined = String::new();
+    for line in s.scrollback() {
+        for cell in line.cells.iter() {
+            if !cell.spacer {
+                combined.push(cell.glyph);
+            }
+        }
+        combined.push('\n');
+    }
+    let snap = s.snapshot();
+    for cell in snap.cells.iter() {
+        if !cell.spacer {
+            combined.push(cell.glyph);
+        }
+    }
+    assert!(
+        combined.contains("line00"),
+        "history must stay coherent after reflow"
     );
 }
 
@@ -275,11 +362,14 @@ fn scrollback_bounded_pruning_still_headless() {
     assert_eq!(s.scrollback_len(), bitty_term_state::SCROLLBACK_MAX_LINES);
     assert!(s.check_invariants().is_ok());
 
-    // Resize after pruned should keep bounded length and remap widths.
+    // Resize after pruned: reflow keeps total rows (scrollback+grid) coherent,
+    // bottom-aligned. Growing the grid pulls history back (scrollback shrinks
+    // by the height delta); widths remap and the cap still holds.
     let len_before = s.scrollback_len();
+    let total_before = len_before + 24;
     s.resize(120, 40);
-    assert_eq!(s.scrollback_len(), len_before);
-    assert_eq!(s.scrollback_len(), bitty_term_state::SCROLLBACK_MAX_LINES);
+    assert_eq!(s.scrollback_len() + s.height(), total_before);
+    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_MAX_LINES);
     for line in s.scrollback() {
         assert_eq!(line.cells.len(), 120);
     }

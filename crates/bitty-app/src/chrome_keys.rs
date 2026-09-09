@@ -766,6 +766,23 @@ impl TerminalApp {
                     );
                 }
             }
+            A::WorkspaceMove(n) => {
+                // CTX-0259 (DEC-0034 follow-through): reparent the focused
+                // leaf into workspace N. Never kills, never removes a slot;
+                // invalid N warns fail-closed. Zoom restores first so the
+                // move operates on the real tiled tree, not the zoom proxy.
+                self.restore_zoom();
+                match self.runtime.workspace_move_focused_to_one_based(n) {
+                    Ok((moved, from, to)) => eprintln!(
+                        "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
+                        self.runtime.workspaceline_text()
+                    ),
+                    Err(err) => eprintln!(
+                        "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
+                        self.runtime.workspaceline_text()
+                    ),
+                }
+            }
             A::ToggleZoom => {
                 if let Some(backup) = self.zoom_backup.take() {
                     self.runtime.set_layout(backup);
@@ -1808,6 +1825,43 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(!app.runtime.has_pending_ws_close());
         assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
+    }
+
+    #[test]
+    fn chrome_workspace_move_reparents_focused_leaf() {
+        // CTX-0259: Mod+Shift+Number through the chrome arms reparents the
+        // focused leaf (no kill, no switch, last-workspace guard holds).
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert!(app.runtime.workspace_switch(0));
+        // Split ws1 so the source has two leaves; focus the second.
+        let moved_id = ViewId::new(9);
+        let mut layout = app.runtime.layout().clone();
+        let focused = app.runtime.focused_view().expect("focus");
+        let old = layout.find_leaf(focused).cloned().expect("leaf");
+        let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        app.runtime.set_layout(layout);
+        assert!(app.runtime.set_focus(moved_id));
+        app.apply_chrome_action(ChromeAction::WorkspaceMove(2));
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert!(!app.runtime.has_pending_ws_close());
+        assert!(app.runtime.workspace_switch(1));
+        assert!(app.runtime.layout().leaf_ids().contains(&moved_id));
+        assert_eq!(app.runtime.focused_view(), Some(moved_id));
+        // Invalid N warns fail-closed (state untouched).
+        let tabline = app.runtime.workspaceline_text();
+        app.apply_chrome_action(ChromeAction::WorkspaceMove(9));
+        assert_eq!(app.runtime.workspaceline_text(), tabline);
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
     }
 
     // Live-spawn: runs a real shell; skips (not fails) where no PTY backend

@@ -1,6 +1,8 @@
 //! App workspaces: named layout slots with MRU order and kill-confirm close.
 //!
 //! CTX-0257 workspace ops entry per DEC-0034 (tiling-first, no float mode).
+//! CTX-0259 move-focused-window-to-workspace-N per DEC-0034 follow-through
+//! (`Mod+Shift+Number` / `ctl workspace move ws:N`).
 //! A workspace is a named [`LayoutNode`] + [`Focus`](bitty_ui::Focus) slot.
 //! The live `Runtime::layout`/`Runtime::focus` always mirror the active slot;
 //! every switch stashes the live pair into the outgoing slot first, so
@@ -24,7 +26,16 @@
 //! PTY is runtime-global, not workspace-owned, so closing never tears it
 //! down; primary-shell teardown on workspace close is a follow-up.
 //!
-//! Move/resize/focus-follows-mouse/Alt-drag are follow-ups, not this task.
+//! Move discipline (CTX-0259, never a kill): [`Runtime::workspace_move_focused_to`]
+//! reparents the focused leaf (with its pane session, untouched) into the
+//! target slot. Same-workspace is a no-op; unknown targets fail closed with
+//! state untouched. A single-leaf source leaves a fresh idle leaf behind so
+//! no workspace ever strands empty and the `>= 1` workspace invariant holds
+//! without removing a slot. The pending close arm (if any) is preserved
+//! untouched — kill-confirm stays with close, not move. The primary PTY is
+//! never touched.
+//!
+//! Resize/focus-follows-mouse/Alt-drag are follow-ups, not this task.
 //! All bounds mirror the registry (`MAX_WORKSPACES_PER_WINDOW` = 16);
 //! rendering is the pure [`Runtime::workspaceline_text`] overlay string,
 //! never grid truth.
@@ -88,6 +99,58 @@ fn truncate_ws_name(name: &str) -> String {
         return name.to_string();
     }
     name.chars().take(WORKSPACE_NAME_MAX_CHARS).collect()
+}
+
+/// Remove leaf `id` from `node`, promoting its sibling (tiling-first close
+/// semantics, mirroring the chrome helper). Returns the removed
+/// [`View`](bitty_ui::View) on success, `None` when missing or when `node`
+/// is a single leaf (the caller owns the empty-source policy).
+fn remove_leaf_view(node: &mut LayoutNode, id: ViewId) -> Option<View> {
+    match node {
+        LayoutNode::Leaf(_) => None,
+        LayoutNode::Split { first, second, .. } => {
+            if matches!(first.as_ref(), LayoutNode::Leaf(v) if v.id() == id) {
+                let removed = match first.as_ref() {
+                    LayoutNode::Leaf(v) => v.clone(),
+                    _ => return None,
+                };
+                let sibling = (**second).clone();
+                *node = sibling;
+                Some(removed)
+            } else if matches!(second.as_ref(), LayoutNode::Leaf(v) if v.id() == id) {
+                let removed = match second.as_ref() {
+                    LayoutNode::Leaf(v) => v.clone(),
+                    _ => return None,
+                };
+                let sibling = (**first).clone();
+                *node = sibling;
+                Some(removed)
+            } else if let Some(v) = remove_leaf_view(first, id) {
+                Some(v)
+            } else {
+                remove_leaf_view(second, id)
+            }
+        }
+        LayoutNode::Stack(children) => {
+            if let Some(pos) = children
+                .iter()
+                .position(|c| matches!(c, LayoutNode::Leaf(v) if v.id() == id))
+            {
+                if children.len() <= 1 {
+                    return None;
+                }
+                match children.remove(pos) {
+                    LayoutNode::Leaf(v) => Some(v),
+                    _ => None,
+                }
+            } else {
+                children.iter_mut().find_map(|c| remove_leaf_view(c, id))
+            }
+        }
+        LayoutNode::Overlay { base, overlay, .. } => {
+            remove_leaf_view(base, id).or_else(|| remove_leaf_view(overlay, id))
+        }
+    }
 }
 
 impl Runtime {
@@ -434,6 +497,111 @@ impl Runtime {
         Ok(killed)
     }
 
+    /// Move the focused window (leaf) into workspace `index` (0-based).
+    ///
+    /// CTX-0259 DEC-0034 follow-through (`Mod+Shift+Number`): reparents the
+    /// focused leaf — with its pane session untouched — into the target slot.
+    /// Returns the moved [`ViewId`](bitty_ui::ViewId).
+    ///
+    /// - Same-workspace is a no-op `Ok` (focus preserved).
+    /// - Unknown `index` fails closed (`Err`, state untouched).
+    /// - No focused pane, or a focused id missing from the live layout,
+    ///   fails closed.
+    /// - A single-leaf source leaves a fresh idle leaf behind (new
+    ///   [`ViewId`](bitty_ui::ViewId), no session), so no workspace ever
+    ///   strands empty and the workspace count never drops.
+    /// - The target slot gains the moved leaf alongside its existing tree
+    ///   (tiling-first horizontal 50/50 wrap) and its focus moves to the
+    ///   moved window; the source focus falls back to its first remaining
+    ///   leaf. Pane sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
+    ///   and are never killed here — the runtime-global primary PTY is never
+    ///   touched and kill-confirm stays with close (the pending close arm,
+    ///   if any, is preserved untouched).
+    pub fn workspace_move_focused_to(&mut self, index: usize) -> Result<ViewId, String> {
+        if index >= self.workspaces.len() {
+            return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
+        }
+        if index == self.active_workspace {
+            let focused = self
+                .focused_view()
+                .ok_or_else(|| String::from("no focused pane to move"))?;
+            if self.layout.find_leaf(focused).is_none() {
+                return Err(String::from("focused pane not in layout"));
+            }
+            return Ok(focused);
+        }
+        let focused = self
+            .focused_view()
+            .ok_or_else(|| String::from("no focused pane to move"))?;
+        let moved_view = self
+            .layout
+            .find_leaf(focused)
+            .cloned()
+            .ok_or_else(|| String::from("focused pane not in layout"))?;
+        // Remove from the live (source) layout. Single-leaf sources leave a
+        // fresh idle leaf behind; multi-leaf sources promote the sibling.
+        if self.layout.leaf_count() <= 1 {
+            let fresh_id = self.next_view_id_global();
+            debug_assert_ne!(fresh_id, focused, "fresh id must not collide");
+            let fresh = View::new(fresh_id, self.cols, self.rows);
+            self.layout = LayoutNode::leaf(fresh);
+            self.focus = Focus::with_focus(fresh_id);
+        } else {
+            let mut source = self.layout.clone();
+            let removed = remove_leaf_view(&mut source, focused)
+                .ok_or_else(|| String::from("focused pane not in layout"))?;
+            debug_assert_eq!(removed.id(), focused, "removed id must match focus");
+            self.layout = source;
+            let first = self
+                .layout
+                .leaf_ids()
+                .into_iter()
+                .next()
+                .ok_or_else(|| String::from("source workspace stranded empty after move"))?;
+            self.focus = Focus::with_focus(first);
+        }
+        // Mirror the live source into its slot so stashed copies never hold
+        // a duplicate of the moved id (ids stay unique across slots).
+        self.stash_active_slot();
+        // Insert into the target slot (inactive by the early return above).
+        let target_root = self
+            .workspaces
+            .get(index)
+            .map(|s| s.layout.clone())
+            .ok_or_else(|| String::from("target workspace vanished"))?;
+        let wrapped = LayoutNode::split(
+            crate::SplitAxis::Horizontal,
+            0.5,
+            target_root,
+            LayoutNode::leaf(moved_view),
+        );
+        if let Some(slot) = self.workspaces.get_mut(index) {
+            slot.layout = wrapped;
+            slot.focus = Focus::with_focus(focused);
+        }
+        self.pending_full_redraw = true;
+        Ok(focused)
+    }
+
+    /// Move the focused window to workspace `one_based` (1-based display
+    /// index, `key` + `ctl` path). Returns `(moved_id, from_1based, to_1based)`.
+    /// Unknown indices fail closed.
+    pub fn workspace_move_focused_to_one_based(
+        &mut self,
+        one_based: u64,
+    ) -> Result<(ViewId, usize, usize), String> {
+        if one_based == 0 {
+            return Err(String::from("workspace index starts at 1 (e.g. ws:1)"));
+        }
+        let index = (one_based - 1) as usize;
+        if index >= self.workspaces.len() {
+            return Err(format!("no such workspace ws:{one_based}"));
+        }
+        let from = self.active_workspace.saturating_add(1);
+        let moved = self.workspace_move_focused_to(index)?;
+        Ok((moved, from, index.saturating_add(1)))
+    }
+
     /// Confirm a pending close (delivers the kill). `false` when none pends.
     pub fn confirm_pending_ws_close(&mut self) -> bool {
         let Some(pending) = self.pending_ws_close.take() else {
@@ -695,5 +863,138 @@ mod tests {
         assert!(rt.workspace_new().is_err(), "16 is max");
         assert!(rt.workspace_close_index(0).is_err(), "index starts at 1");
         assert!(rt.workspace_close_index(99).is_err(), "unknown index");
+    }
+
+    #[test]
+    fn move_multi_leaf_preserves_focus_and_tabline() {
+        // CTX-0259: two workspaces, ws1 split into two leaves; moving the
+        // focused leaf to ws2 reparents it without killing or switching.
+        let mut rt = fresh();
+        let focused_ws1 = rt.focused_view().expect("focus");
+        let moved_id = ViewId::new(2);
+        let mut layout = rt.layout().clone();
+        let old = layout.find_leaf(focused_ws1).cloned().expect("leaf");
+        let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        rt.set_layout(layout);
+        assert!(rt.set_focus(moved_id));
+        rt.workspace_new().expect("new ws2");
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(moved_id));
+        let count_before = rt.workspace_count();
+        let moved = rt.workspace_move_focused_to(1).expect("move to ws2");
+        assert_eq!(moved, moved_id);
+        // Source (active ws1) lost one leaf; focus fell back to survivor.
+        assert_eq!(rt.layout().leaf_count(), 1);
+        assert_ne!(rt.focused_view(), Some(moved_id));
+        assert_eq!(
+            rt.workspace_count(),
+            count_before,
+            "move never removes a slot"
+        );
+        assert_eq!(rt.active_workspace_index(), 0, "move does not switch");
+        assert!(!rt.has_pending_ws_close(), "move never arms close");
+        // Target (inactive ws2) gained the leaf and focuses it.
+        assert!(rt.workspace_switch(1));
+        assert_eq!(rt.layout().leaf_count(), 2);
+        assert!(rt.layout().leaf_ids().contains(&moved_id));
+        assert_eq!(rt.focused_view(), Some(moved_id));
+        // Same-workspace move is a no-op success.
+        let same = rt
+            .workspace_move_focused_to(1)
+            .expect("same-workspace no-op");
+        assert_eq!(same, moved_id);
+        assert_eq!(rt.layout().leaf_count(), 2);
+        // Invalid targets fail closed with state untouched.
+        let tabline = rt.workspaceline_text();
+        assert!(rt.workspace_move_focused_to(9).is_err());
+        assert!(rt.workspace_move_focused_to_one_based(0).is_err());
+        assert!(rt.workspace_move_focused_to_one_based(99).is_err());
+        assert_eq!(rt.workspaceline_text(), tabline);
+        assert_eq!(rt.layout().leaf_count(), 2);
+    }
+
+    #[test]
+    fn move_single_leaf_source_leaves_fresh_idle() {
+        // CTX-0259 last-workspace guard: moving the sole leaf out of a
+        // workspace leaves a fresh idle leaf behind (no empty slot, no slot
+        // removal, `>= 1` holds).
+        let mut rt = fresh();
+        let sole = rt.focused_view().expect("focus");
+        rt.workspace_new().expect("new ws2");
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(sole));
+        let moved = rt.workspace_move_focused_to(1).expect("move sole leaf");
+        assert_eq!(moved, sole);
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.layout().leaf_count(), 1, "source keeps one leaf");
+        let survivor = rt.focused_view().expect("source focus valid");
+        assert_ne!(survivor, sole, "source focuses the fresh leaf");
+        assert!(!rt.layout().leaf_ids().contains(&sole));
+        assert!(rt.workspace_switch(1));
+        assert_eq!(rt.layout().leaf_count(), 2);
+        assert!(rt.layout().leaf_ids().contains(&sole));
+        assert_eq!(rt.focused_view(), Some(sole), "target focuses moved window");
+    }
+
+    #[test]
+    fn move_single_workspace_self_is_noop_and_invalid_fails_closed() {
+        // With one workspace the only valid target is itself (no-op); any
+        // other N fails closed and the layout is untouched.
+        let mut rt = fresh();
+        let sole = rt.focused_view().expect("focus");
+        let same = rt.workspace_move_focused_to(0).expect("self move no-op");
+        assert_eq!(same, sole);
+        assert_eq!(rt.workspace_count(), 1);
+        assert_eq!(rt.layout().leaf_count(), 1);
+        assert!(rt.workspace_move_focused_to(1).is_err());
+        assert!(rt.workspace_move_focused_to_one_based(2).is_err());
+        assert_eq!(rt.workspace_count(), 1);
+        assert_eq!(rt.layout().leaf_count(), 1);
+        assert_eq!(rt.focused_view(), Some(sole));
+    }
+
+    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
+    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
+    #[test]
+    fn live_move_preserves_session_without_kill() {
+        require_pty!();
+        let mut rt = fresh();
+        // Live session in ws1's second leaf.
+        let moved_id = ViewId::new(2);
+        let mut layout = rt.layout().clone();
+        let focused = rt.focused_view().expect("focus");
+        let old = layout.find_leaf(focused).cloned().expect("leaf");
+        let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        rt.set_layout(layout);
+        rt.spawn_shell_for_view(moved_id, "/bin/sh", &[], 40, 12)
+            .expect("pane shell must spawn headless");
+        assert!(rt.set_focus(moved_id));
+        rt.workspace_new().expect("new ws2");
+        assert!(rt.workspace_switch(0));
+        assert!(rt.set_focus(moved_id));
+        assert_eq!(rt.workspace_live_count(0), 1);
+        let moved = rt.workspace_move_focused_to(1).expect("live move");
+        assert_eq!(moved, moved_id);
+        // Session survived (never killed); primary PTY untouched (move never
+        // calls the kill path); source is idle, target holds the live leaf.
+        assert!(rt.has_pane_session(&moved_id), "move preserves session");
+        assert_eq!(rt.workspace_live_count(0), 0, "source drained");
+        assert_eq!(rt.workspace_live_count(1), 1, "target gained live leaf");
+        assert!(rt.workspace_switch(1));
+        assert!(rt.has_pane_session(&moved_id));
+        assert!(rt.layout().leaf_ids().contains(&moved_id));
+        assert_eq!(rt.focused_view(), Some(moved_id));
     }
 }

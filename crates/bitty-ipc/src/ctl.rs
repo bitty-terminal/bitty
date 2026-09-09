@@ -36,6 +36,7 @@
 //! | `workspace new` | `bitty.debug/createWorkspace` | `view.manage` |
 //! | `workspace close` | `bitty.debug/closeWorkspace` | `terminal.manage` (elevation) |
 //! | `workspace focus` | `bitty.debug/focusWorkspace` | `view.manage` |
+//! | `workspace move` | `bitty.debug/moveWorkspace` | `view.manage` |
 //! | `config reload` | `bitty.debug/reloadConfig` | `config.modify` (elevation) |
 //!
 //! `terminal.manage`, `config.modify` require explicit elevation per the IPC
@@ -100,6 +101,8 @@ pub const METHOD_NEW_WORKSPACE: &str = "bitty.debug/createWorkspace";
 pub const METHOD_CLOSE_WORKSPACE: &str = "bitty.debug/closeWorkspace";
 /// Wire method for `ctl workspace focus`.
 pub const METHOD_FOCUS_WORKSPACE: &str = "bitty.debug/focusWorkspace";
+/// Wire method for `ctl workspace move` (CTX-0259: move focused window to ws:N).
+pub const METHOD_MOVE_WORKSPACE: &str = "bitty.debug/moveWorkspace";
 /// Wire method for `ctl config reload`.
 pub const METHOD_RELOAD_CONFIG: &str = "bitty.debug/reloadConfig";
 
@@ -120,6 +123,7 @@ pub fn all_control_methods() -> &'static [&'static str] {
         METHOD_NEW_WORKSPACE,
         METHOD_CLOSE_WORKSPACE,
         METHOD_FOCUS_WORKSPACE,
+        METHOD_MOVE_WORKSPACE,
         METHOD_RELOAD_CONFIG,
     ]
 }
@@ -138,9 +142,12 @@ pub fn required_scope_for_ctl_method(method: &str) -> Option<Scope> {
         // Workspace entry (CTX-0257): list/new/focus ride the view scopes
         // (no elevation, like view list/split/focus); close can kill live
         // pane sessions, so it needs `terminal.manage` elevation exactly
-        // like `terminal close`.
+        // like `terminal close`. CTX-0259 move never kills (session moves
+        // with the leaf), so it rides `view.manage` like new/focus.
         METHOD_LIST_WORKSPACES => Some(Scope::ViewInspect),
-        METHOD_NEW_WORKSPACE | METHOD_FOCUS_WORKSPACE => Some(Scope::ViewManage),
+        METHOD_NEW_WORKSPACE | METHOD_FOCUS_WORKSPACE | METHOD_MOVE_WORKSPACE => {
+            Some(Scope::ViewManage)
+        }
         METHOD_CLOSE_WORKSPACE => Some(Scope::TerminalManage),
         METHOD_RELOAD_CONFIG => Some(Scope::ConfigModify),
         _ => None,
@@ -662,6 +669,10 @@ mod tests {
             Some(Scope::ViewManage)
         );
         assert_eq!(
+            required_scope_for_ctl_method(METHOD_MOVE_WORKSPACE),
+            Some(Scope::ViewManage)
+        );
+        assert_eq!(
             required_scope_for_ctl_method(METHOD_CLOSE_WORKSPACE),
             Some(Scope::TerminalManage)
         );
@@ -687,10 +698,11 @@ mod tests {
         assert!(authorize_ctl_method(METHOD_LIST_TERMINALS, &cli).is_ok());
         // CTX-0257: workspace list/new/focus ride the view scopes (no
         // elevation); workspace close needs terminal.manage like the other
-        // kill verb.
+        // kill verb. CTX-0259 move rides view.manage (no kill, no elevation).
         assert!(authorize_ctl_method(METHOD_LIST_WORKSPACES, &cli).is_ok());
         assert!(authorize_ctl_method(METHOD_NEW_WORKSPACE, &cli).is_ok());
         assert!(authorize_ctl_method(METHOD_FOCUS_WORKSPACE, &cli).is_ok());
+        assert!(authorize_ctl_method(METHOD_MOVE_WORKSPACE, &cli).is_ok());
         assert!(authorize_ctl_method(METHOD_CLOSE_WORKSPACE, &cli).is_err());
         // Require explicit elevation: unscoped CLI callers are rejected.
         assert!(authorize_ctl_method(METHOD_CLOSE_TERMINAL, &cli).is_err());
@@ -718,6 +730,7 @@ mod tests {
         assert!(authorize_ctl_method(METHOD_SEND_INPUT, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_NEW_WORKSPACE, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_FOCUS_WORKSPACE, &mcp).is_err());
+        assert!(authorize_ctl_method(METHOD_MOVE_WORKSPACE, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_CLOSE_TERMINAL, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_CLOSE_WORKSPACE, &mcp).is_err());
         assert!(authorize_ctl_method(METHOD_RELOAD_CONFIG, &mcp).is_err());

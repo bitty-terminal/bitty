@@ -47,10 +47,12 @@
 //!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
 //!   so Normal Mode stays byte-identical until the user opts in),
 //!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
-//!   `workspace_last`, `workspace_focus:<1..=16>` (CTX-0257 workspace ops
-//!   entry per DEC-0034: `alt+n` new, `alt+w` close with kill-confirm,
+//!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
+//!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move:
+//!   `alt+n` new, `alt+w` close with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
-//!   last-used, `alt+1..=9` jump to workspace N).
+//!   last-used, `alt+1..=9` jump to workspace N,
+//!   `shift+alt+1..=9` move focused window to workspace N).
 //!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.
@@ -645,6 +647,15 @@ pub enum ChromeAction {
     /// Jump to workspace N (`workspace_focus:<1..=16>`, defaults
     /// `alt+1..=9`). Unknown indices warn and keep the current workspace.
     WorkspaceFocus(u64),
+    /// Move the focused window to workspace N (`workspace_move:<1..=16>`,
+    /// defaults `shift+alt+1..=9` per DEC-0034, CTX-0259).
+    ///
+    /// Reparents the focused leaf (with its pane session) into the target
+    /// workspace slot. Same-workspace is a no-op; unknown indices warn and
+    /// keep state untouched. Never kills (kill-confirm stays with close),
+    /// never removes a workspace (last-workspace `>= 1` holds), and never
+    /// touches the runtime-global primary PTY.
+    WorkspaceMove(u64),
 }
 
 impl ChromeAction {
@@ -757,6 +768,10 @@ impl ChromeAction {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceFocus(n))
             }
+            "workspace_move" | "workspace_move_window" => {
+                let n = require_workspace_index(arg, trimmed)?;
+                Ok(Self::WorkspaceMove(n))
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -790,12 +805,13 @@ impl ChromeAction {
             Self::WorkspaceNext => "workspace_next".to_string(),
             Self::WorkspaceLast => "workspace_last".to_string(),
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
+            Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -917,6 +933,10 @@ impl ResolvedKeymap {
 /// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
 /// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
 /// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
+/// CTX-0259 adds `shift+alt+1..=9` move-window-to-workspace-N
+/// (`workspace_move:<1..=9>`, Mod+Shift+Number per DEC-0034; carries the Mod
+/// slot so a Super flip rebinds to `shift+super+1..=9`; digits stay free
+/// under the single-owner rule — `shift+alt+h/j/k/l` remain creation).
 /// CTX-0263 adds mod-independent `ctrl+=`/`ctrl+plus` (plus shifted
 /// spellings) to grow, `ctrl+-` to shrink, and `ctrl+0` to reset the
 /// per-window font size; bare `+`/`-`/`=`/`0` stay shell input.
@@ -943,6 +963,18 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+7", "workspace_focus:7"),
     ("alt+8", "workspace_focus:8"),
     ("alt+9", "workspace_focus:9"),
+    // CTX-0259 Mod+Shift+Number move window across workspaces (DEC-0034):
+    // `shift+alt+1..=9` reparents the focused leaf into workspace N.
+    // Digits are free under single-owner (`shift+alt+h/j/k/l` stay creation).
+    ("shift+alt+1", "workspace_move:1"),
+    ("shift+alt+2", "workspace_move:2"),
+    ("shift+alt+3", "workspace_move:3"),
+    ("shift+alt+4", "workspace_move:4"),
+    ("shift+alt+5", "workspace_move:5"),
+    ("shift+alt+6", "workspace_move:6"),
+    ("shift+alt+7", "workspace_move:7"),
+    ("shift+alt+8", "workspace_move:8"),
+    ("shift+alt+9", "workspace_move:9"),
     ("alt+u", "scroll_page_up"),
     ("alt+i", "scroll_page_down"),
     ("ctrl+alt+left", "goto_split:left"),
@@ -1438,6 +1470,18 @@ mod tests {
             "workspace_focus:2"
         );
         assert_eq!(
+            ChromeAction::parse("workspace_move:3").expect("ws move"),
+            ChromeAction::WorkspaceMove(3)
+        );
+        assert_eq!(
+            ChromeAction::parse("workspace_move_window:2").expect("ws move alias"),
+            ChromeAction::WorkspaceMove(2)
+        );
+        assert_eq!(
+            ChromeAction::WorkspaceMove(2).canonical(),
+            "workspace_move:2"
+        );
+        assert_eq!(
             ChromeAction::parse("increase_font_size").expect("zoom in"),
             ChromeAction::IncreaseFontSize
         );
@@ -1487,6 +1531,10 @@ mod tests {
             "workspace_focus:0",
             "workspace_focus:17",
             "workspace_focus:abc",
+            "workspace_move",
+            "workspace_move:0",
+            "workspace_move:17",
+            "workspace_move:abc",
             "workspace_new:1",
             "workspace_close:1",
             "goto_split:left:extra",
@@ -1682,6 +1730,52 @@ mod tests {
     }
 
     #[test]
+    fn defaults_mod_shift_number_moves_window() {
+        // CTX-0259 DEC-0034 follow-through: Mod+Shift+Number moves the
+        // focused window across workspaces (distinct from Alt+Number jump).
+        let maps = default_keymaps().expect("defaults valid");
+        for (digit, idx) in [
+            ('1', 1),
+            ('2', 2),
+            ('3', 3),
+            ('4', 4),
+            ('5', 5),
+            ('6', 6),
+            ('7', 7),
+            ('8', 8),
+            ('9', 9),
+        ] {
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char(digit), false, true, true)),
+                Some(ChromeAction::WorkspaceMove(idx)),
+                "shift+alt+{digit} moves to workspace {idx}"
+            );
+        }
+        // Super flip carries the Mod slot (shift+super+digit).
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        assert_eq!(
+            match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::Char('2'),
+                    ctrl: false,
+                    alt: false,
+                    shift: true,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::WorkspaceMove(2)),
+            "shift+super+2 moves under Super mod"
+        );
+        // Old shift+alt chord is unbound under Super (back to shell).
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::Char('2'), false, true, true)),
+            None,
+            "shift+alt+2 unbound under super mod"
+        );
+    }
+
+    #[test]
     fn defaults_have_unique_chord_identities() {
         // Collision audit as a test: every default chord identity is unique
         // so no default shadows another (CTX-0178, extended CTX-0258 to
@@ -1691,14 +1785,15 @@ mod tests {
         // CTX-0258's 4 Mod-aware resize chords = 43, plus CTX-0262's 16
         // arrow-key aliases (4 focus + 4 split + 4 legacy resize + 4
         // Mod-aware resize) = 59, plus CTX-0263's 7 mod-independent font-zoom
-        // chords = 66 total, and the full DEC set resolves. Zoom chords carry
+        // chords = 66, plus CTX-0259's 9 Mod+Shift+Number move chords
+        // (shift+alt+1..=9) = 75 total, and the full DEC set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                66,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords"
+                75,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {

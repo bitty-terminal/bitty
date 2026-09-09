@@ -1,15 +1,13 @@
-//! Platform backend compile seams.
+//! Platform backend implementations.
 //!
-//! ADR-0002 makes Unix the Tier-1 launch platform with Windows following in a
-//! later Tier-1 slice. The public API in this crate is therefore
-//! cfg-independent, while the actual PTY mechanics live behind exactly one
-//! internal module per platform:
+//! ADR-0002 makes Unix and Windows (ConPTY) Tier-1 platforms. The public API
+//! in this crate is therefore cfg-independent, while the actual PTY mechanics
+//! live behind exactly one internal module per platform:
 //!
 //! - `unix`: real implementation wrapping `portable-pty`'s Unix/POSIX PTY.
-//! - `windows`: ConPTY compile seam. Types and signatures exist so dependent
-//!   code compiles, but every operation reports
-//!   [`PtyError::Unsupported`] until the dedicated Windows slice implements
-//!   it (task CTX-0011 scope: implement Unix only).
+//! - `windows`: real implementation wrapping `portable-pty`'s ConPTY backend
+//!   (CTX-0268 Tier-1 slice). ConPTY exposes no device path, so `tty_name`
+//!   is always `None`, and exit statuses never carry a signal name.
 
 #[cfg(unix)]
 pub(crate) mod unix;

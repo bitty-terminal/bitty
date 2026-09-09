@@ -124,13 +124,6 @@ pub fn should_strip_graphics_fingerprint(key: &OsStr) -> bool {
 }
 
 /// Validated spawn configuration handed to the platform backend.
-//
-// On Windows the ConPTY backend is not yet implemented (ADR-0002, Tier-1
-// Windows follow-up slice); `platform::windows::open_pty_and_spawn` touches
-// the validated fields so the seam remains exercisable, and this
-// `cfg_attr` keeps `cargo check --target x86_64-pc-windows-gnu`
-// warning-free without hiding real dead code on Unix.
-#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct SpawnConfig {
     pub(crate) program: OsString,

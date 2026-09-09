@@ -2,16 +2,20 @@
 # check-pty-gated-tests.sh — CTX-0267 repo lint.
 #
 # Fails when *test code* references live-spawn markers without a gate.
-# Live-spawn tests spawn a real shell/PTY through `portable-pty` on Unix.
-# The Windows ConPTY backend is unimplemented per ADR-0002, so an ungated
-# live spawn fails on `windows-latest` CI instead of skipping (CTX-0227
-# sh-fakes, CTX-0257 workspace live-close whack-a-mole).
+# Live-spawn tests spawn a real shell/PTY through `portable-pty` (Unix and
+# Windows ConPTY, both Tier-1 per ADR-0002 / CTX-0268). Tests spawning
+# POSIX-only programs (`/bin/sh`, `#!/bin/sh` scripts) still fail on
+# `windows-latest` CI without a gate (CTX-0227 sh-fakes, CTX-0257 workspace
+# live-close whack-a-mole), so an ungated live spawn fails CI instead of
+# skipping.
 #
 # Every live-spawn test must either:
 #   1. call `require_pty!()` first (preferred: compiles everywhere, skips
 #      with a SKIP notice where no PTY backend exists), or
-#   2. carry `#[cfg(unix)]` / `#![cfg(unix)]` (accepted legacy gate: the
-#      test is compiled out on Windows).
+#   2. carry `#[cfg(unix)]` / `#![cfg(unix)]` (accepted gate for
+#      POSIX-program tests: the test is compiled out on Windows; ConPTY
+#      coverage for the same behavior lives in
+#      crates/bitty-pty/tests/spawn_windows.rs).
 #
 # Markers are live-spawn *call sites* (fixed strings): spawn_shell_for_view,
 # spawn_shell_with_args, spawn_shell(, PtyBuilder::new, fake_editor_script,

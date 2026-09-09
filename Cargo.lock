@@ -265,6 +265,7 @@ dependencies = [
 name = "bitty-pty"
 version = "0.0.1"
 dependencies = [
+ "bitty-test-support",
  "portable-pty",
 ]
 

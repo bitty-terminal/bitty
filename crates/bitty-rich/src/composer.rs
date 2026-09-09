@@ -1373,6 +1373,9 @@ pub fn edit_externally(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the POSIX-shell live-spawn tests below use this (all
+    // `#[cfg(unix)]`); without the gate the import is unused on Windows.
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     fn workdir() -> PathBuf {
@@ -1629,10 +1632,12 @@ mod tests {
     // -- editor round-trip with fake editor script ----------------------------
 
     // Live-spawn tests: fake editors are `#!/bin/sh` scripts executed
-    // directly. Windows has no `/bin/sh` (ConPTY backend unimplemented per
-    // ADR-0002), so each test below calls `require_pty!()` first and skips
-    // there instead of failing (CTX-0267; replaces the old `#[cfg(unix)]`
-    // gates so Windows still compiles these tests).
+    // directly (no Windows equivalent). Each test below calls
+    // `require_pty!()` first and carries `#[cfg(unix)]`, which keeps it off
+    // Windows CI while Windows still compiles the helper (CTX-0268; the
+    // ConPTY backend cannot run POSIX scripts).
+    // POSIX-only helper: executed scripts are `#!/bin/sh`.
+    #[cfg(unix)]
     fn fake_editor_script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join(format!(
             "fake-editor-{}-{}.sh",
@@ -1661,6 +1666,8 @@ mod tests {
     /// failure, so retry the spawn a bounded number of times; every other
     /// error (including `Timeout` and `NonZeroExit`) returns immediately
     /// and keeps its deterministic assertion value.
+    /// POSIX-only helper: only the `#[cfg(unix)]` editor tests use it.
+    #[cfg(unix)]
     fn edit_with_spawn_retry(
         buf: &mut CommandBuffer,
         editor: &str,
@@ -1682,6 +1689,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn editor_round_trip_with_fake_editor() {
         require_pty!();
         let dir = workdir();
@@ -1709,6 +1717,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn editor_failure_preserves_buffer_and_still_cleans_temp() {
         require_pty!();
         let dir = workdir();
@@ -1784,6 +1793,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn editor_timeout_kills_and_preserves_buffer() {
         require_pty!();
         let dir = workdir();

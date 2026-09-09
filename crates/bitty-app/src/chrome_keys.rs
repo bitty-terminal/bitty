@@ -1065,6 +1065,9 @@ mod tests {
     use super::*;
     use bitty_platform::{PlatformEvent, WindowId};
     use bitty_runtime::Runtime;
+    // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
+    // without the gate the import is unused on Windows.
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     // CTX-0153 keymap-driven chrome keys: single-owner rule + layout surgery.
@@ -1842,10 +1845,10 @@ mod tests {
         )
     }
 
-    // Live-spawn helper: the live-close test below spawns /bin/sh. It calls
-    // `require_pty!()` first and skips where no PTY backend exists
-    // (Windows ConPTY unimplemented per ADR-0002; CTX-0267), so this helper
-    // stays compiled on all platforms instead of hiding behind `#[cfg(unix)]`.
+    // Live-spawn helper: the live-close test below spawns /bin/sh. The test
+    // calls `require_pty!()` first and carries `#[cfg(unix)]` (POSIX program;
+    // Windows ConPTY coverage lives in bitty-pty/tests/spawn_windows.rs),
+    // so this helper stays compiled on all platforms.
     fn esc_press() -> WindowEventKind {
         WindowEventKind::KeyboardInput(KeyEvent {
             logical_key: LogicalKey::Named(NamedKey::Escape),
@@ -1949,9 +1952,13 @@ mod tests {
         assert_eq!(app.runtime.layout().leaf_count(), 2);
     }
 
-    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
-    // exists (Windows; CTX-0267).
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path. ConPTY coverage lives in
+    // bitty-pty/tests/spawn_windows.rs (CTX-0268); porting this test to a
+    // platform-neutral spawn is deferred follow-up.
     #[test]
+    #[cfg(unix)]
     fn chrome_workspace_close_live_pends_esc_cancels_repeat_kills() {
         require_pty!();
         use bitty_config::ChromeAction;

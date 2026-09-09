@@ -661,6 +661,9 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::SplitAxis;
+    // Only the POSIX-shell live-spawn tests below use this (all
+    // `#[cfg(unix)]`); without the gate the import is unused on Windows.
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     fn fresh() -> Runtime {
@@ -750,9 +753,13 @@ mod tests {
         assert!(!rt.has_pending_ws_close());
     }
 
-    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
-    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path. ConPTY coverage lives in
+    // bitty-pty/tests/spawn_windows.rs (CTX-0268); porting this test to a
+    // platform-neutral spawn is deferred follow-up.
     #[test]
+    #[cfg(unix)]
     fn live_close_needs_repeat_confirm_and_kills() {
         require_pty!();
         let mut rt = fresh();
@@ -812,9 +819,13 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
     }
 
-    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
-    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path. ConPTY coverage lives in
+    // bitty-pty/tests/spawn_windows.rs (CTX-0268); porting this test to a
+    // platform-neutral spawn is deferred follow-up.
     #[test]
+    #[cfg(unix)]
     fn pending_arm_survives_switch_and_dies_with_workspace() {
         require_pty!();
         let mut rt = fresh();
@@ -959,9 +970,13 @@ mod tests {
         assert_eq!(rt.focused_view(), Some(sole));
     }
 
-    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
-    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
+    // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
+    // equivalent). `#[cfg(unix)]` keeps it off Windows CI; `require_pty!()`
+    // keeps the force-no-PTY simulation path. ConPTY coverage lives in
+    // bitty-pty/tests/spawn_windows.rs (CTX-0268); porting this test to a
+    // platform-neutral spawn is deferred follow-up.
     #[test]
+    #[cfg(unix)]
     fn live_move_preserves_session_without_kill() {
         require_pty!();
         let mut rt = fresh();

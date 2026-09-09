@@ -48,10 +48,10 @@
 //!
 //! # Platform support
 //!
-//! Unix (Linux CI target) is implemented. Windows ConPTY sits behind a
-//! compile seam that compiles the full public API but returns
-//! [`PtyError::Unsupported`] at runtime until the Tier-1 Windows slice
-//! lands; other platforms fail to compile rather than silently misbehave.
+//! Unix and Windows (ConPTY) are both implemented Tier-1 backends
+//! (ADR-0002); other platforms fail to compile rather than silently
+//! misbehave. ConPTY exposes no terminal device path, so `tty_name` is
+//! always `None` there, and exit statuses never carry a signal name.
 //!
 //! # Example
 //!

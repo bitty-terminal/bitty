@@ -32,9 +32,11 @@
 //! - `chord`: `<mod>+...+<key>` with mods from
 //!   `ctrl/control`, `alt/opt/option`, `shift`, `super/meta/cmd/win`
 //!   (case-insensitive, any order) and one key: a named key (`tab`, `enter`,
-//!   `escape`, `space`, `backspace`, `delete`, `insert`, `home`, `end`,
-//!   `pageup`, `pagedown`, `up`, `down`, `left`, `right`, `f1`..`f35`) or a
-//!   single ASCII character (`h`, `p`, `1`, ...). A single-character key
+//!   `escape`, `space`, `backspace`, `delete` (`del`), `insert` (`ins`),
+//!   `home` (`hm`), `end`, `pageup` (`pgup`/`pu`), `pagedown` (`pgdn`/`pd`),
+//!   `up`, `down`, `left`, `right`, `f1`..`f35`) or a
+//!   single ASCII character (`h`, `p`, `1`, ...). Short cap-label aliases
+//!   (CTX-0264) canonicalize to the long names. A single-character key
 //!   requires at least one modifier so a binding can never silently steal
 //!   shell typing; named keys (including `tab`) may be unmodified by explicit
 //!   user choice.
@@ -458,10 +460,14 @@ fn parse_key_token(token: &str, raw_chord: &str) -> Result<KeyName, ConfigError>
         "backspace" | "bs" => Ok(KeyName::Backspace),
         "delete" | "del" => Ok(KeyName::Delete),
         "insert" | "ins" => Ok(KeyName::Insert),
-        "home" => Ok(KeyName::Home),
+        // CTX-0264: short cap-label aliases for the six editing/navigation
+        // keys so `alt+hm`/`alt+pu`/`alt+pd` (and any-case variants) bind
+        // exactly like the long spellings. Canonical forms stay the long
+        // names (`home`/`pageup`/`pagedown`) so merge identity is stable.
+        "home" | "hm" => Ok(KeyName::Home),
         "end" => Ok(KeyName::End),
-        "pageup" | "pgup" => Ok(KeyName::PageUp),
-        "pagedown" | "pgdn" => Ok(KeyName::PageDown),
+        "pageup" | "pgup" | "pu" => Ok(KeyName::PageUp),
+        "pagedown" | "pgdn" | "pd" => Ok(KeyName::PageDown),
         "up" | "arrowup" | "arrow_up" | "arrow-up" => Ok(KeyName::Up),
         "down" | "arrowdown" | "arrow_down" | "arrow-down" => Ok(KeyName::Down),
         "left" | "arrowleft" | "arrow_left" | "arrow-left" => Ok(KeyName::Left),
@@ -2297,6 +2303,235 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_keymaps(&dup).is_err());
+    }
+
+    #[test]
+    fn fkey_special_aliases_parse_and_canonicalize() {
+        // CTX-0264: F-keys plus the six editing/navigation keys
+        // (INS/DEL/HM/END/PU/PD) are first-class chord segments. Short
+        // cap-label aliases resolve exactly like the long spellings and
+        // canonicalize to the long names so merge identity is stable.
+        let specials: &[(&[&str], &str)] = &[
+            (&["insert", "ins", "INS", "Ins"], "insert"),
+            (&["delete", "del", "DEL"], "delete"),
+            (&["home", "hm", "HM", "Hm"], "home"),
+            (&["end", "END"], "end"),
+            (&["pageup", "pgup", "pu", "PU", "PgUp"], "pageup"),
+            (&["pagedown", "pgdn", "pd", "PD", "PgDn"], "pagedown"),
+        ];
+        for (spellings, canonical_key) in specials {
+            for spelling in *spellings {
+                let raw = format!("alt+{spelling}");
+                assert_eq!(
+                    Chord::parse(&raw).expect("special parses").canonical(),
+                    format!("alt+{canonical_key}"),
+                    "chord {raw:?}"
+                );
+            }
+        }
+        // F-keys across the practical range plus the schema boundary.
+        for n in [1u8, 2, 5, 9, 10, 11, 12, 13, 24, 35] {
+            let raw = format!("alt+f{n}");
+            assert_eq!(
+                Chord::parse(&raw).expect("f-key parses").canonical(),
+                format!("alt+f{n}"),
+                "chord {raw:?}"
+            );
+        }
+        assert_eq!(Chord::parse("ALT+F5").expect("case").canonical(), "alt+f5");
+        assert_eq!(
+            Chord::parse("Ctrl+Shift+F12").expect("mods").canonical(),
+            "ctrl+shift+f12"
+        );
+        assert_eq!(
+            Chord::parse("super+home").expect("super").canonical(),
+            "super+home"
+        );
+        assert_eq!(
+            Chord::parse("shift+alt+pd")
+                .expect("alias+mods")
+                .canonical(),
+            "alt+shift+pagedown"
+        );
+        // Out-of-range F-keys fail closed with the known-key hint
+        // (`alt+f` stays valid: it is the Alt+F letter chord).
+        for raw in ["alt+f0", "alt+f36", "alt+f99", "alt+fx"] {
+            let err = Chord::parse(raw).unwrap_err();
+            assert!(
+                err.to_string().contains("keymaps[].chord"),
+                "must name field for {raw:?}: {err}"
+            );
+        }
+        // Bare named keys parse (explicit user choice may bind them) but
+        // stay unbound by default (shell-safety test below pins that).
+        for raw in ["f5", "insert", "hm", "pu", "pd", "home", "end"] {
+            Chord::parse(raw).expect("bare named parses");
+        }
+    }
+
+    #[test]
+    fn fkey_special_user_binds_resolve_and_audit_both_mods() {
+        // CTX-0264 bindability + uniqueness audit: explicit Mod+F-key and
+        // Mod+special binds resolve under both Alt and Super, each chord
+        // owns exactly one action, no identity collides (with each other or
+        // with the shipped defaults), and the Super rebound keeps the
+        // explicit Alt spellings intact while the Super spellings stay free.
+        // This task allocates NO new shipped defaults (CTX-0259 owns
+        // Mod+Shift+Number, CTX-0265 owns Mod+backtick/Mod+?), so the
+        // default count stays pinned at 75 under both mods (35 shipped
+        // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom).
+        let entries: &[(&str, &str)] = &[
+            ("alt+f1", "goto_split:left"),
+            ("alt+f5", "goto_split:right"),
+            ("alt+f12", "toggle_zoom"),
+            ("alt+ins", "workspace_new"),
+            ("alt+del", "workspace_close"),
+            ("alt+hm", "workspace_prev"),
+            ("alt+end", "workspace_next"),
+            ("alt+pu", "scroll_page_up"),
+            ("alt+pd", "scroll_page_down"),
+        ];
+        let mk_effective = |mod_key| EffectiveConfig {
+            mod_key,
+            keymaps: entries
+                .iter()
+                .map(|(chord, action)| KeymapEntry {
+                    chord: (*chord).into(),
+                    action: (*action).into(),
+                    context: "global".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            assert_eq!(
+                defaults.len(),
+                75,
+                "no new shipped defaults under mod {:?}",
+                mod_key
+            );
+            let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
+            assert_eq!(
+                maps.len(),
+                75 + entries.len(),
+                "explicit binds append, never shadow, under mod {:?}",
+                mod_key
+            );
+            let mut seen = std::collections::HashSet::new();
+            for m in &maps {
+                assert!(
+                    seen.insert(m.id()),
+                    "duplicate id {} under mod {:?}",
+                    m.id(),
+                    mod_key
+                );
+            }
+        }
+        // Alt map: every explicit chord matches its action.
+        let alt_maps = resolve_keymaps(&mk_effective(ModKey::Alt)).expect("alt resolves");
+        let want: &[(&str, ChromeAction)] = &[
+            ("alt+f1", ChromeAction::GotoSplit(SplitDir::Left)),
+            ("alt+f5", ChromeAction::GotoSplit(SplitDir::Right)),
+            ("alt+f12", ChromeAction::ToggleZoom),
+            ("alt+insert", ChromeAction::WorkspaceNew),
+            ("alt+delete", ChromeAction::WorkspaceClose),
+            ("alt+home", ChromeAction::WorkspacePrev),
+            ("alt+end", ChromeAction::WorkspaceNext),
+            ("alt+pageup", ChromeAction::ScrollPageUp),
+            ("alt+pagedown", ChromeAction::ScrollPageDown),
+        ];
+        for (chord, action) in want {
+            let parsed = Chord::parse(chord).expect("audit chord parses");
+            let keyref = KeyRef {
+                key: parsed.key,
+                ctrl: parsed.ctrl,
+                alt: parsed.alt,
+                shift: parsed.shift,
+                super_held: parsed.super_held,
+            };
+            assert_eq!(
+                match_keymap(&alt_maps, keyref),
+                Some(*action),
+                "chord {chord:?}"
+            );
+        }
+        // Super map: explicit Alt spellings coexist with the rebound
+        // defaults; the Super-spelled twins stay unbound (free allocation
+        // space, no shadow).
+        let super_maps = resolve_keymaps(&mk_effective(ModKey::Super)).expect("super resolves");
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::F(5), false, true, false)),
+            Some(ChromeAction::GotoSplit(SplitDir::Right)),
+            "explicit alt+f5 survives super flip"
+        );
+        assert_eq!(
+            match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::F(5),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            None,
+            "super+f5 stays free under super mod"
+        );
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::Home, false, true, false)),
+            Some(ChromeAction::WorkspacePrev),
+            "explicit alt+home survives super flip"
+        );
+    }
+
+    #[test]
+    fn bare_fkey_special_presses_stay_shell_both_mods() {
+        // CTX-0264 shell-safety: bare F-keys and bare INS/DEL/HM/END/PU/PD
+        // are never chrome-owned under either default map, so they fall
+        // through the intercept to terminal encoding (platform xterm table)
+        // unchanged. Binding them requires an explicit user chord.
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            for n in 1..=35u8 {
+                let bare = KeyRef {
+                    key: KeyName::F(n),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: false,
+                };
+                assert_eq!(
+                    match_keymap(&maps, bare),
+                    None,
+                    "bare f{n} is shell under mod {:?}",
+                    mod_key
+                );
+            }
+            for key in [
+                KeyName::Insert,
+                KeyName::Delete,
+                KeyName::Home,
+                KeyName::End,
+                KeyName::PageUp,
+                KeyName::PageDown,
+            ] {
+                let bare = KeyRef {
+                    key,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                    super_held: false,
+                };
+                assert_eq!(
+                    match_keymap(&maps, bare),
+                    None,
+                    "bare {key:?} is shell under mod {:?}",
+                    mod_key
+                );
+            }
+        }
     }
 
     #[test]

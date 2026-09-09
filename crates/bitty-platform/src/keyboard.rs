@@ -484,6 +484,49 @@ mod tests {
             encode_key_event(&make_named(NamedKey::F5, None, PressState::Pressed, false)),
             Some(b"\x1b[15~".to_vec())
         );
+        // CTX-0264 shell-safety: bare editing/navigation keys and the top
+        // of the F-row keep their legacy bytes (the chrome intercept never
+        // consumes bare presses, so these paths must stay pinned).
+        assert_eq!(
+            encode_key_event(&make_named(
+                NamedKey::Insert,
+                None,
+                PressState::Pressed,
+                false
+            )),
+            Some(b"\x1b[2~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(&make_named(
+                NamedKey::Delete,
+                None,
+                PressState::Pressed,
+                false
+            )),
+            Some(b"\x1b[3~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(&make_named(
+                NamedKey::PageUp,
+                None,
+                PressState::Pressed,
+                false
+            )),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(&make_named(
+                NamedKey::PageDown,
+                None,
+                PressState::Pressed,
+                false
+            )),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(&make_named(NamedKey::F12, None, PressState::Pressed, false)),
+            Some(b"\x1b[24~".to_vec())
+        );
     }
 
     #[test]

@@ -114,6 +114,7 @@ use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
+pub mod help;
 pub mod input;
 pub mod kitty_images;
 pub mod layout_focus;
@@ -286,6 +287,19 @@ pub struct Runtime {
     workspace_mru: std::collections::VecDeque<usize>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
+    /// Whether the help popup (CTX-0265) is currently shown.
+    ///
+    /// Presentation-only overlay state: toggled by the `toggle_help`
+    /// chrome action, dismissed by `Esc` or the same chord. Never grid
+    /// truth; see `runtime::help`.
+    help_visible: bool,
+    /// Help popup rows (CTX-0265), regenerated from the live keymap
+    /// registry by the app on every show.
+    ///
+    /// Plain display strings (`"alt+h  goto_split:left"`); bounded by
+    /// [`help::HELP_MAX_ROWS`]. Painted only while `help_visible`; the
+    /// paint truncates to the panel with a `+N more` tail.
+    help_rows: Vec<String>,
     /// Next workspace creation sequence (display names `ws{seq}`).
     next_workspace_seq: u64,
     container: UiRect,
@@ -462,6 +476,8 @@ impl std::fmt::Debug for Runtime {
             .field("workspace_count", &self.workspaces.len())
             .field("active_workspace", &self.active_workspace)
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
+            .field("help_visible", &self.help_visible)
+            .field("help_rows", &self.help_rows.len())
             .field("container", &self.container)
             .field(
                 "plugin_drop_policy",
@@ -651,6 +667,8 @@ impl Runtime {
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             pending_ws_close: None,
+            help_visible: false,
+            help_rows: Vec::new(),
             next_workspace_seq: 2,
         };
         runtime.init_workspaces();
@@ -766,6 +784,8 @@ impl Runtime {
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             pending_ws_close: None,
+            help_visible: false,
+            help_rows: Vec::new(),
             next_workspace_seq: 2,
         };
         runtime.init_workspaces();

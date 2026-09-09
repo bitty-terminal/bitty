@@ -118,6 +118,16 @@ pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
 pub const PENDING_PASTE_BANNER_BG: Rgba8 = [0x5A, 0x4A, 0x00, 0xFF];
 /// Pending-paste banner text: opaque light amber on [`PENDING_PASTE_BANNER_BG`].
 pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
+/// Help popup panel background (CTX-0265): opaque dark indigo, one step
+/// above [`DEFAULT_BG`] so the floating panel reads above the grid while
+/// staying inside the Bitty Dark family.
+pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
+/// Help popup panel border (CTX-0265): opaque lavender, mirroring the
+/// Bitty Dark accent so the 1-cell outline reads as chrome, not content.
+pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
+/// Help popup panel text (CTX-0265): opaque Bitty Dark foreground on
+/// [`HELP_PANEL_BG`].
+pub const HELP_PANEL_FG: Rgba8 = [0xCD, 0xD6, 0xF4, 0xFF];
 /// Foreground alpha substituted for faint (`SGR 2`) text.
 pub const FAINT_ALPHA: u8 = 0x7F;
 

@@ -814,6 +814,20 @@ impl TerminalApp {
                     }
                 }
             }
+            A::ToggleHelp => {
+                // CTX-0265 which-key help popup: rows regenerate from the
+                // live keymap table on EVERY show, so the overlay lists
+                // exactly what is bound (user rebinds, added chords, and
+                // the Super-flip spelling included) — never a hardcoded
+                // copy. Repeating the chord hides it again; `Esc`
+                // dismisses through the runtime key path; the overlay is
+                // present-layer only (never grid truth).
+                let rows = bitty_config::keymap::help_rows_from_keymaps(&self.keymaps);
+                let bindings = rows.len();
+                self.runtime.set_help_rows(rows);
+                let visible = self.runtime.toggle_help();
+                eprintln!("bitty: keymap toggle_help -> visible={visible} bindings={bindings}");
+            }
             A::IncreaseFontSize => {
                 // CTX-0263 per-window font zoom: mutates only this window's
                 // live `RuntimeConfig.font_size` (never the config file),
@@ -2264,5 +2278,180 @@ mod tests {
         app.apply_chrome_action(ChromeAction::ResetFontSize);
         assert!((app.runtime.font_size() - 12.0).abs() < f32::EPSILON);
         assert_eq!(app.runtime.leaf_count(), leafs_before);
+    }
+
+    // CTX-0265 which-key help popup: toggle gestures, registry rows, Esc.
+    // -------------------------------------------------------------------
+
+    fn help_test_app(maps: Vec<bitty_config::ResolvedKeymap>) -> TerminalApp {
+        let rt = Runtime::with_defaults().expect("must build");
+        TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+    }
+
+    fn alt_mods() -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: false,
+            alt: true,
+            super_pressed: false,
+        })
+    }
+
+    fn alt_shift_mods() -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: true,
+            control: false,
+            alt: true,
+            super_pressed: false,
+        })
+    }
+
+    fn no_mods() -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: false,
+            alt: false,
+            super_pressed: false,
+        })
+    }
+
+    #[test]
+    fn help_toggle_action_shows_live_registry_rows() {
+        // `toggle_help` regenerates rows from the live table on every
+        // show: the default navigate row and the backtick row are listed,
+        // and repeating the action hides the popup again.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        assert!(!app.runtime.help_visible());
+        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
+        assert!(app.runtime.help_visible());
+        let rows = app.runtime.help_rows();
+        assert!(
+            rows.iter().any(|r| r == "alt+h  goto_split:left"),
+            "navigate row listed: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r == "alt+`  toggle_help"),
+            "backtick row listed: {rows:?}"
+        );
+        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
+        assert!(!app.runtime.help_visible(), "same chord dismisses");
+    }
+
+    #[test]
+    fn help_popup_lists_added_chord_by_construction() {
+        // Registry-generated content proof through the app path: a user
+        // chord appended to the live table appears in the popup with no
+        // second source.
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: vec![bitty_config::KeymapEntry {
+                chord: "alt+e".into(),
+                action: "open_composer".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let mut app = help_test_app(maps);
+        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
+        assert!(app.runtime.help_visible());
+        assert!(
+            app.runtime
+                .help_rows()
+                .iter()
+                .any(|r| r == "alt+e  open_composer"),
+            "added chord listed: {:?}",
+            app.runtime.help_rows()
+        );
+    }
+
+    #[test]
+    fn help_toggle_gestures_drive_intercept_and_esc_dismisses() {
+        // End-to-end through the real intercept: Mod+backtick shows,
+        // `Esc` (unbound, routed to `Runtime`) dismisses without PTY
+        // bytes, and the same chord re-arms afterwards.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        assert!(!drive_chrome(&mut app, alt_mods()));
+        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
+        assert!(app.runtime.help_visible(), "Mod+backtick shows");
+        assert!(!drive_chrome(&mut app, char_release("`")));
+        // Release the Mod before dismissing (physical truth).
+        assert!(!drive_chrome(&mut app, no_mods()));
+        assert!(!drive_chrome(&mut app, named_press(NamedKey::Escape)));
+        assert!(!app.runtime.help_visible(), "Esc dismisses");
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "dismissal Esc never reaches the PTY"
+        );
+        // Same-chord toggle still works after an Esc dismissal.
+        assert!(!drive_chrome(&mut app, alt_mods()));
+        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
+        assert!(app.runtime.help_visible(), "re-arms after Esc");
+        assert!(!drive_chrome(&mut app, char_release("`")));
+        assert!(!drive_chrome(&mut app, no_mods()));
+    }
+
+    #[test]
+    fn help_question_gesture_matches_physical_shift() {
+        // `?` physically carries Shift (winit reports `?` with shift
+        // held): the `alt+shift+?` registry spelling matches that press
+        // exactly and toggles the popup.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        assert!(!drive_chrome(&mut app, alt_shift_mods()));
+        assert!(drive_chrome(&mut app, char_press("?", "?", false)));
+        assert!(app.runtime.help_visible(), "Mod+? shows");
+        assert!(
+            app.runtime
+                .help_rows()
+                .iter()
+                .any(|r| r == "alt+shift+?  toggle_help"),
+            "physical spelling listed: {:?}",
+            app.runtime.help_rows()
+        );
+        assert!(!drive_chrome(&mut app, char_release("?")));
+    }
+
+    #[test]
+    fn help_super_flip_spelling_toggles_and_lists() {
+        // Super flip re-spells the whole gesture: Super+backtick toggles
+        // and the popup lists the Super spellings (never stale Alt).
+        use bitty_config::ModKey;
+        let effective = bitty_config::EffectiveConfig {
+            mod_key: ModKey::Super,
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let mut app = help_test_app(maps);
+        assert!(!drive_chrome(
+            &mut app,
+            WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+                shift: false,
+                control: false,
+                alt: false,
+                super_pressed: true,
+            })
+        ));
+        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
+        assert!(app.runtime.help_visible(), "Super+backtick shows");
+        let rows = app.runtime.help_rows();
+        assert!(
+            rows.iter().any(|r| r == "super+`  toggle_help"),
+            "super spelling listed: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.starts_with("alt+")),
+            "no Alt spellings survive the flip: {rows:?}"
+        );
     }
 }

@@ -15,6 +15,33 @@ use crate::manifest::{PluginId, PluginManifest, QualifiedName};
 /// All runtime resources are owned by one generation; reload increments it.
 pub type Generation = u64;
 
+/// Whether a provided service version satisfies a version requirement.
+///
+/// Uses the canonical package evaluator (`bitty_package::VersionReq`, the same
+/// grammar family as plugin dependencies): caret/tilde expansion plus
+/// comparator intersection. Fail-closed: unparseable versions or requirements
+/// never satisfy. Prerelease candidates require an explicit prerelease opt-in
+/// in the requirement text (same rule as the package resolver); a stable-only
+/// requirement never matches a prerelease build.
+fn service_version_satisfies(provided: &str, requirement: &str) -> bool {
+    let (Ok(version), Ok(req)) = (
+        bitty_package::Version::parse(provided),
+        bitty_package::VersionReq::parse(requirement),
+    ) else {
+        return false;
+    };
+    req.matches(&version) && req.allows_prerelease_for(&version)
+}
+
+/// Render a cycle path with stable quoting (`'a' -> 'b' -> 'a'`).
+fn quoted_path(nodes: &[String]) -> String {
+    nodes
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
 /// Lifecycle state per
 /// `Declared -> Resolved -> Registered -> Activated -> (Suspended) -> Disposed`
 /// with reload creating generation `N+1`.
@@ -145,6 +172,12 @@ impl Registry {
     /// are structurally consistent (detailed resolver evaluation is deferred,
     /// but arity and duplicate detection happen here). Transitions
     /// `Declared -> Resolved`.
+    ///
+    /// Service requirements (`required_services`) are NOT evaluated here:
+    /// providers may be declared after the requirer, so satisfaction,
+    /// missing-service, and service-cycle checks run at graph scope in
+    /// `resolve_all` (mirroring how missing plugin dependencies defer to
+    /// `resolve_all`).
     pub fn resolve(&mut self, id: &PluginId) -> Result<(), PluginError> {
         let entry = self
             .get_mut(id)
@@ -172,7 +205,22 @@ impl Registry {
         Ok(())
     }
 
-    /// Resolve all declared plugins (graph-level check: cycles, missing deps).
+    /// Resolve all declared plugins (graph-level check: cycles, missing deps,
+    /// service requirements).
+    ///
+    /// In addition to the plugin-dependency checks, every live
+    /// (non-Disposed) plugin's `required_services` must be satisfied by the
+    /// provides side of the declared graph: the plugin itself (self-provision
+    /// needs no edge) or another live plugin whose provided version matches
+    /// the requirement under the canonical package evaluator. Anything else
+    /// fails closed with no state mutation: unknown interfaces, version
+    /// mismatches, unparseable versions/requirements, and requirement cycles
+    /// (over the combined dependency + service graph). Service
+    /// lookup/invocation at runtime is explicitly out of scope.
+    ///
+    /// Note the requirement grammar is the closed comparator grammar (same
+    /// family as plugin dependencies): wildcard `*` and disjunction `||`
+    /// pass manifest syntax but never satisfy at resolve time (fail-closed).
     pub fn resolve_all(&mut self) -> Result<(), PluginError> {
         // Collect ids to avoid borrow issues.
         let ids: Vec<PluginId> = self
@@ -231,6 +279,163 @@ impl Registry {
             }
         }
 
+        // Service requirement satisfaction (requires-side of the loop).
+        //
+        // Provider index over live (non-Disposed) plugins: interface ->
+        // (plugin id, provided version). Checked for every live plugin with
+        // requirements (not just Declared), so a singly-resolved requirer
+        // cannot dodge the graph gate: `resolve_all` is the backstop.
+        let mut providers: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (pid, entry) in &self.plugins {
+            if entry.state == PluginState::Disposed {
+                continue;
+            }
+            for (iface, ver) in &entry.manifest.provided_services {
+                providers
+                    .entry(iface.clone())
+                    .or_default()
+                    .push((pid.clone(), ver.clone()));
+            }
+        }
+        // Requirer -> satisfying cross-plugin providers. Self-provision with
+        // a satisfying version needs no edge (no self-loop).
+        let mut service_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Deterministic plugin order (BTreeMap key order).
+        let live_ids: Vec<String> = self
+            .plugins
+            .iter()
+            .filter(|(_, e)| e.state != PluginState::Disposed)
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in &live_ids {
+            let entry = self.plugins.get(pid).unwrap();
+            if entry.manifest.required_services.is_empty() {
+                continue;
+            }
+            for (iface, req) in &entry.manifest.required_services {
+                if entry
+                    .manifest
+                    .provided_services
+                    .iter()
+                    .any(|(p_iface, p_ver)| {
+                        p_iface == iface && service_version_satisfies(p_ver, req)
+                    })
+                {
+                    continue;
+                }
+                let mut satisfied_by = Vec::new();
+                let mut seen_versions = Vec::new();
+                if let Some(candidates) = providers.get(iface) {
+                    for (provider_pid, p_ver) in candidates {
+                        if provider_pid == pid {
+                            // Self provides the interface but not at a
+                            // satisfying version (checked above): report the
+                            // version without adding a self-loop edge.
+                            seen_versions.push(format!("'{provider_pid}'={p_ver}"));
+                            continue;
+                        }
+                        seen_versions.push(format!("'{provider_pid}'={p_ver}"));
+                        if service_version_satisfies(p_ver, req) {
+                            satisfied_by.push(provider_pid.clone());
+                        }
+                    }
+                }
+                if satisfied_by.is_empty() {
+                    if seen_versions.is_empty() {
+                        return Err(PluginError::registry(format!(
+                            "plugin '{pid}' requires unknown service '{iface}' ('{req}')"
+                        )));
+                    }
+                    return Err(PluginError::registry(format!(
+                        "plugin '{pid}' requires service '{iface}' ('{req}'): no provider satisfies (saw {})",
+                        seen_versions.join(", ")
+                    )));
+                }
+                service_edges
+                    .entry(pid.clone())
+                    .or_default()
+                    .extend(satisfied_by);
+            }
+        }
+        // Cycle detection over the combined dependency + service graph.
+        // Dependency-only cycles among Declared plugins are already rejected
+        // above with their stable message; this pass only runs when service
+        // edges exist, so pure dependency graphs keep byte-identical behavior.
+        if !service_edges.is_empty() {
+            // Combined adjacency over live plugins (sorted, deduplicated).
+            let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (pid, entry) in &self.plugins {
+                if entry.state == PluginState::Disposed {
+                    continue;
+                }
+                let mut outs = Vec::new();
+                for (dep, _) in &entry.manifest.dependencies {
+                    if self.plugins.contains_key(dep.as_str()) {
+                        outs.push(dep.as_str().to_string());
+                    }
+                }
+                if let Some(svcs) = service_edges.get(pid) {
+                    outs.extend(svcs.iter().cloned());
+                }
+                outs.sort();
+                outs.dedup();
+                adjacency.insert(pid.clone(), outs);
+            }
+            // Iterative 3-color DFS from every service requirer (WHITE = 0,
+            // GRAY = 1, BLACK = 2). Deterministic: BTreeMap order + sorted edges.
+            let mut color: BTreeMap<String, u8> = BTreeMap::new();
+            let mut roots: Vec<String> = service_edges.keys().cloned().collect();
+            roots.sort();
+            for root in &roots {
+                // Stack frames: (node, next child index). Index 0 = first visit.
+                let mut stack: Vec<(String, usize)> = vec![(root.clone(), 0)];
+                let mut path: Vec<String> = Vec::new();
+                while let Some((node, next_idx)) = stack.pop() {
+                    if next_idx == 0 {
+                        match color.get(&node).copied().unwrap_or(0) {
+                            // Already fully explored via another root.
+                            2 => continue,
+                            // Ancestor on the current path: back edge.
+                            1 => {
+                                let pos = path.iter().position(|n| n == &node).unwrap_or(0);
+                                let mut cyc = path[pos..].to_vec();
+                                cyc.push(node.clone());
+                                return Err(PluginError::registry(format!(
+                                    "dependency cycle: {}",
+                                    quoted_path(&cyc)
+                                )));
+                            }
+                            _ => {
+                                color.insert(node.clone(), 1);
+                                path.push(node.clone());
+                            }
+                        }
+                    }
+                    let neighbors = adjacency.get(&node).cloned().unwrap_or_default();
+                    if next_idx < neighbors.len() {
+                        stack.push((node.clone(), next_idx + 1));
+                        let child = neighbors[next_idx].clone();
+                        match color.get(&child).copied().unwrap_or(0) {
+                            2 => {}
+                            1 => {
+                                let pos = path.iter().position(|n| n == &child).unwrap_or(0);
+                                let mut cyc = path[pos..].to_vec();
+                                cyc.push(child);
+                                return Err(PluginError::registry(format!(
+                                    "dependency cycle: {}",
+                                    quoted_path(&cyc)
+                                )));
+                            }
+                            _ => stack.push((child, 0)),
+                        }
+                    } else {
+                        color.insert(node.clone(), 2);
+                        path.pop();
+                    }
+                }
+            }
+        }
+
         for id in ids {
             // Each still Declared becomes Resolved.
             if let Some(entry) = self.plugins.get_mut(id.as_str()) {
@@ -241,7 +446,6 @@ impl Registry {
         }
         Ok(())
     }
-
     /// Register a resolved plugin: reserve commands, event subscriptions, claims,
     /// and service provisions so conflicts cannot appear at event time.
     ///
@@ -483,6 +687,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             provided_services: Vec::new(),
+            required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
             lazy: LazyTriggers {
                 commands: commands
@@ -604,5 +809,147 @@ mod tests {
         reg.register(&PluginId::new("xuepoo.a").unwrap()).unwrap();
         reg.dispose(&PluginId::new("xuepoo.a").unwrap()).unwrap();
         assert!(!reg.is_command_owned("xuepoo.a:cmd"));
+    }
+
+    fn manifest_with_services(
+        id: &str,
+        provided: Vec<(&str, &str)>,
+        required: Vec<(&str, &str)>,
+    ) -> PluginManifest {
+        let mut m = minimal_manifest(id, vec![]);
+        m.provided_services = provided
+            .into_iter()
+            .map(|(iface, ver)| (iface.to_string(), ver.to_string()))
+            .collect();
+        m.required_services = required
+            .into_iter()
+            .map(|(iface, req)| (iface.to_string(), req.to_string()))
+            .collect();
+        m
+    }
+
+    fn state_of(reg: &Registry, id: &str) -> PluginState {
+        reg.get(&PluginId::new(id).unwrap()).unwrap().state
+    }
+
+    #[test]
+    fn service_requirements_valid_graph_resolves() {
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.provider",
+            vec![("markdown.render", "1.2.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("markdown.render", "^1.0")],
+        ))
+        .unwrap();
+        reg.resolve_all().unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Resolved);
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+    }
+
+    #[test]
+    fn service_requirements_missing_service_fails_closed() {
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("nosuch.svc", "^1.0")],
+        ))
+        .unwrap();
+        let err = reg.resolve_all().unwrap_err();
+        assert!(format!("{err}").contains("unknown service"));
+        // Fail-closed: no state mutation.
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Declared);
+    }
+
+    #[test]
+    fn service_requirements_version_mismatch_fails_closed() {
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.provider",
+            vec![("markdown.render", "1.0.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("markdown.render", "^2.0")],
+        ))
+        .unwrap();
+        let err = reg.resolve_all().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("no provider satisfies"), "{msg}");
+        assert!(msg.contains("xuepoo.provider"), "{msg}");
+        assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Declared);
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Declared);
+    }
+
+    #[test]
+    fn service_requirements_cycle_fails_closed() {
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.a",
+            vec![("svc.a", "1.0.0")],
+            vec![("svc.b", "^1.0")],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.b",
+            vec![("svc.b", "1.0.0")],
+            vec![("svc.a", "^1.0")],
+        ))
+        .unwrap();
+        let err = reg.resolve_all().unwrap_err();
+        assert!(format!("{err}").contains("cycle"));
+        assert_eq!(state_of(&reg, "xuepoo.a"), PluginState::Declared);
+        assert_eq!(state_of(&reg, "xuepoo.b"), PluginState::Declared);
+    }
+
+    #[test]
+    fn service_requirements_self_provision_resolves() {
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.solo",
+            vec![("svc.solo", "1.0.0")],
+            vec![("svc.solo", "^1.0")],
+        ))
+        .unwrap();
+        reg.resolve_all().unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.solo"), PluginState::Resolved);
+    }
+
+    #[test]
+    fn service_requirements_single_resolve_defers_to_graph() {
+        // Single `resolve` stays lenient (providers may be declared later),
+        // mirroring missing plugin dependencies; `resolve_all` is the backstop.
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("markdown.render", "^1.0")],
+        ))
+        .unwrap();
+        reg.resolve(&PluginId::new("xuepoo.consumer").unwrap())
+            .unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+        // Backstop still enforces: missing service fails even for Resolved entries.
+        let err = reg.resolve_all().unwrap_err();
+        assert!(format!("{err}").contains("unknown service"));
+        // Late provider satisfies the graph.
+        reg.declare(manifest_with_services(
+            "xuepoo.provider",
+            vec![("markdown.render", "1.2.0")],
+            vec![],
+        ))
+        .unwrap();
+        reg.resolve_all().unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Resolved);
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
     }
 }

@@ -23,6 +23,8 @@ pub const MAX_EVENT_TYPES: usize = 256;
 pub const MAX_FS_PATTERNS_PER_KIND: usize = 32;
 /// Maximum provided services.
 pub const MAX_PROVIDED_SERVICES: usize = 16;
+/// Maximum required services.
+pub const MAX_REQUIRED_SERVICES: usize = 16;
 /// Maximum plugin dependencies.
 pub const MAX_DEPENDENCIES: usize = 8;
 /// Maximum total pattern text in bytes (8 KiB).
@@ -586,6 +588,36 @@ impl LazyTriggers {
     }
 }
 
+/// Validate one service interface name (shared provides/requires grammar).
+///
+/// Dot-separated segments (e.g. `markdown.render`), 1..128 bytes total,
+/// 1..64 bytes per segment, no NUL or space. The manifest is
+/// attacker-controlled input so every interface string is bounded before use.
+fn validate_service_iface(iface: &str, field: &str) -> Result<(), PluginError> {
+    if iface.is_empty() || iface.len() > 128 {
+        return Err(PluginError::manifest(
+            field,
+            "interface name must be 1..128 bytes",
+        ));
+    }
+    if iface.contains('\0') || iface.contains(' ') {
+        return Err(PluginError::manifest(
+            field,
+            "interface name must not contain NUL or space",
+        ));
+    }
+    // Interface naming: allow dot-separated lowercase (e.g. `markdown.render`).
+    for seg in iface.split('.') {
+        if seg.is_empty() || seg.len() > 64 {
+            return Err(PluginError::manifest(
+                field,
+                "interface segment must be 1..64 bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The full candidate manifest for `bitty-plugin.toml`.
 ///
 /// This is the in-memory, already-parsed shape. TOML parsing itself is
@@ -601,6 +633,15 @@ pub struct PluginManifest {
     pub dependencies: Vec<(PluginId, String)>,
     /// Optional provided services `interface -> version`.
     pub provided_services: Vec<(String, String)>,
+    /// Optional required services `interface -> version requirement`.
+    ///
+    /// The consumes side of the provide/require loop: each entry names a
+    /// service interface (same dot-separated grammar as provided services)
+    /// plus a version requirement in the closed comparator grammar (same
+    /// syntax class as plugin dependencies). Satisfaction is checked at
+    /// resolve time against the provides side of the declared graph; service
+    /// lookup/invocation at runtime is explicitly out of scope.
+    pub required_services: Vec<(String, String)>,
     /// Requested capabilities.
     pub capabilities: CapabilityRequests,
     /// Lazy trigger declarations.
@@ -610,16 +651,16 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v1`).
+    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v2`).
     ///
     /// Sorted, cross-platform, no wall-clock. Covers identity, compat, resolved
     /// capability set (including filesystem `fs.read:PARAM`/`fs.write:PARAM` expansion),
-    /// dependencies, and services. Used to bind grant records to the exact manifest
+    /// dependencies, provided services, and required services. Used to bind grant records to the exact manifest
     /// that was approved (`hash(manifest) == record.manifest_hash`).
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = String::new();
-        buf.push_str("bitty-manifest-v1\n");
+        buf.push_str("bitty-manifest-v2\n");
         buf.push_str(self.identity.id.as_str());
         buf.push('|');
         buf.push_str(&self.identity.version);
@@ -677,6 +718,18 @@ impl PluginManifest {
             buf.push_str(&s);
             buf.push(',');
         }
+        buf.push('|');
+        // Required services sorted (v2 segment: requires-side of the loop).
+        let mut reqs: Vec<String> = self
+            .required_services
+            .iter()
+            .map(|(iface, req)| format!("{iface}={req}"))
+            .collect();
+        reqs.sort_unstable();
+        for s in reqs {
+            buf.push_str(&s);
+            buf.push(',');
+        }
         buf.into_bytes()
     }
 
@@ -696,6 +749,8 @@ impl PluginManifest {
     /// - `compat` version requirement syntax,
     /// - dependency count and version req syntax (8 max, cycle check is in registry),
     /// - provided services count and identifier syntax (16 max),
+    /// - required services count, identifier syntax, and requirement syntax
+    ///   (16 max, duplicate interfaces rejected; satisfaction is resolve-time),
     /// - capability closed-set validation (unknown identifiers fail, no wildcards),
     /// - filesystem pattern bounds,
     /// - lazy trigger bounds,
@@ -745,28 +800,32 @@ impl PluginManifest {
             });
         }
         for (iface, ver) in &self.provided_services {
-            if iface.is_empty() || iface.len() > 128 {
-                return Err(PluginError::manifest(
-                    "services.provided",
-                    "interface name must be 1..128 bytes",
-                ));
-            }
-            if iface.contains('\0') || iface.contains(' ') {
-                return Err(PluginError::manifest(
-                    "services.provided",
-                    "interface name must not contain NUL or space",
-                ));
-            }
-            // Interface naming: allow dot-separated lowercase (e.g. `markdown.render`).
-            for seg in iface.split('.') {
-                if seg.is_empty() || seg.len() > 64 {
-                    return Err(PluginError::manifest(
-                        "services.provided",
-                        "interface segment must be 1..64 bytes",
-                    ));
+            validate_service_iface(iface, "services.provided")?;
+            validate_semver(ver, "services.provided")?;
+        }
+
+        if self.required_services.len() > MAX_REQUIRED_SERVICES {
+            return Err(PluginError::LimitExceeded {
+                field: "services.required".to_string(),
+                limit: MAX_REQUIRED_SERVICES,
+                actual: self.required_services.len(),
+            });
+        }
+        for (iface, req) in &self.required_services {
+            validate_service_iface(iface, "services.required")?;
+            validate_version_req(req, "services.required")?;
+        }
+        // Duplicate required interfaces rejected (would be silent shadowing otherwise).
+        {
+            let mut seen = BTreeSet::new();
+            for (iface, _) in &self.required_services {
+                if !seen.insert(iface.clone()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "required-service".to_string(),
+                        value: iface.clone(),
+                    });
                 }
             }
-            validate_semver(ver, "services.provided")?;
         }
 
         self.capabilities.validate()?;
@@ -812,6 +871,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             provided_services: Vec::new(),
+            required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
             lazy: LazyTriggers::default(),
             raw_bytes_len: 512,
@@ -916,6 +976,64 @@ mod tests {
             .map(|i| QualifiedName::new(&format!("xuepoo.test:cmd{i}")).unwrap())
             .collect();
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn required_services_valid() {
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("markdown.render".to_string(), "^1.0".to_string()));
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn required_services_limit() {
+        let mut m = minimal_manifest("xuepoo.test");
+        for i in 0..(MAX_REQUIRED_SERVICES + 1) {
+            m.required_services
+                .push((format!("svc.iface{i}"), ">=1.0,<2.0".to_string()));
+        }
+        let err = m.validate().unwrap_err();
+        assert!(format!("{err}").contains("services.required"));
+    }
+
+    #[test]
+    fn required_services_reject_bad_iface_and_req() {
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("".to_string(), "^1.0".to_string()));
+        assert!(m.validate().is_err());
+
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("bad iface".to_string(), "^1.0".to_string()));
+        assert!(m.validate().is_err());
+
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("markdown.render".to_string(), String::new()));
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn required_services_reject_duplicates() {
+        let mut m = minimal_manifest("xuepoo.test");
+        m.required_services
+            .push(("markdown.render".to_string(), "^1.0".to_string()));
+        m.required_services
+            .push(("markdown.render".to_string(), "^2.0".to_string()));
+        let err = m.validate().unwrap_err();
+        assert!(format!("{err}").contains("required-service"));
+    }
+
+    #[test]
+    fn manifest_hash_covers_required_services() {
+        let m1 = minimal_manifest("xuepoo.hash");
+        let mut m2 = minimal_manifest("xuepoo.hash");
+        m2.required_services
+            .push(("markdown.render".to_string(), "^1.0".to_string()));
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
+        assert_eq!(m2.manifest_hash(), m2.clone().manifest_hash());
     }
 
     #[test]

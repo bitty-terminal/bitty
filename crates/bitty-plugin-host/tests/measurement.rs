@@ -58,6 +58,7 @@ fn minimal_manifest(id: &str, events: Vec<&str>) -> bitty_plugin_host::PluginMan
         },
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: CapabilityRequests::default(),
         lazy: LazyTriggers {
             commands: Vec::new(),

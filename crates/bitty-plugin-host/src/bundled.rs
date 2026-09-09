@@ -89,6 +89,7 @@ pub fn shell_integration_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: Vec::new(),
@@ -240,6 +241,7 @@ pub fn workspace_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
@@ -272,6 +274,7 @@ pub fn tabs_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
@@ -300,6 +303,7 @@ pub fn statusline_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: Vec::new(),
@@ -332,6 +336,7 @@ pub fn palette_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
@@ -366,6 +371,7 @@ pub fn project_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![
@@ -413,6 +419,7 @@ pub fn file_manager_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![
@@ -466,6 +473,7 @@ pub fn git_panel_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![
@@ -525,6 +533,7 @@ pub fn browser_panel_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![
@@ -593,6 +602,7 @@ pub fn ai_panel_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![
@@ -668,6 +678,7 @@ pub fn mail_panel_manifest() -> PluginManifest {
         compat: bundled_compat(),
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: caps,
         lazy: LazyTriggers {
             commands: vec![

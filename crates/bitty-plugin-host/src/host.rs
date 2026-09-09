@@ -787,6 +787,7 @@ mod tests {
             },
             dependencies: Vec::new(),
             provided_services: Vec::new(),
+            required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
             lazy: LazyTriggers {
                 commands: Vec::new(),

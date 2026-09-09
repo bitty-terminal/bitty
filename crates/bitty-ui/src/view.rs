@@ -9,6 +9,7 @@
 use bitty_term_state::{Cell, Snapshot, State, Style};
 
 use crate::geometry::{Point, Rect, Size};
+use crate::presentation::PresentationMode;
 
 /// Opaque identifier for a view leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -34,6 +35,13 @@ impl std::fmt::Display for ViewId {
 /// scrollback history. Horizontal offset is retained for completeness but
 /// terminal grids rarely use it; it is clamped similarly.
 ///
+/// Each leaf also carries a [`PresentationMode`] (CTX-0276): the requested
+/// per-leaf display mode (`Tiled` live; `Floating`/`Fullscreen`/`Scratchpad`
+/// parseable but transition-gated). The layout solver ignores the field, so
+/// stamping a mode never moves allocations. This is deliberately distinct
+/// from `Visibility` (computed display state in the `bitty-runtime`
+/// registry) — the two are never flattened into one enum.
+///
 /// All methods are deterministic and total: out-of-range inputs are clamped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
@@ -51,6 +59,9 @@ pub struct View {
     /// Kept inside View for convenient reflow without separate allocation maps,
     /// but layout also returns external allocations for runtime composition.
     origin: Point,
+    /// Requested per-leaf display mode (CTX-0276). Defaults to
+    /// [`PresentationMode::Tiled`]; ignored by the layout solver.
+    presentation: PresentationMode,
 }
 
 impl View {
@@ -62,7 +73,8 @@ impl View {
     /// Creates a new view with the given id and cell dimensions.
     ///
     /// Dimensions are clamped to at least [`View::MIN_COLS`] x [`View::MIN_ROWS`]
-    /// and to `u16::MAX` (grid bounds). Scroll starts at live (0).
+    /// and to `u16::MAX` (grid bounds). Scroll starts at live (0) and
+    /// presentation starts at [`PresentationMode::Tiled`].
     #[must_use]
     pub fn new(id: ViewId, cols: usize, rows: usize) -> Self {
         let cols = clamp_dim(cols, Self::MIN_COLS);
@@ -74,7 +86,18 @@ impl View {
             scroll_offset: 0,
             col_offset: 0,
             origin: Point::new(0, 0),
+            presentation: PresentationMode::Tiled,
         }
+    }
+
+    /// Creates a new view with an explicit [`PresentationMode`] (CTX-0276).
+    /// Non-`Tiled` modes are stored verbatim; entering them at runtime stays
+    /// gated by [`PresentationMode::can_transition`] (follow-up).
+    #[must_use]
+    pub fn with_presentation(id: ViewId, cols: usize, rows: usize, mode: PresentationMode) -> Self {
+        let mut view = Self::new(id, cols, rows);
+        view.presentation = mode;
+        view
     }
 
     /// Returns the view id.
@@ -110,6 +133,22 @@ impl View {
     /// Sets the allocation origin. Used by layout reflow.
     pub fn set_origin(&mut self, origin: Point) {
         self.origin = origin;
+    }
+
+    /// Requested per-leaf display mode (CTX-0276). Always
+    /// [`PresentationMode::Tiled`] unless explicitly stamped; distinct from
+    /// `Visibility` (computed display state, `bitty-runtime` registry).
+    #[must_use]
+    pub fn presentation(&self) -> PresentationMode {
+        self.presentation
+    }
+
+    /// Stamps a [`PresentationMode`] on this leaf. Stored verbatim and
+    /// ignored by the layout solver (allocations byte-identical); runtime
+    /// entry into non-`Tiled` modes stays gated by
+    /// [`PresentationMode::can_transition`].
+    pub fn set_presentation(&mut self, mode: PresentationMode) {
+        self.presentation = mode;
     }
 
     /// Current scroll offset (0 = live bottom, `n` = `n` lines up into scrollback).
@@ -448,5 +487,29 @@ mod tests {
         let vis = v.visible_snapshot_rect(&s);
         assert_eq!(vis.width as usize, s.width.min(100));
         assert_eq!(vis.height as usize, s.height.min(40));
+    }
+
+    #[test]
+    fn presentation_defaults_to_tiled() {
+        use crate::presentation::PresentationMode;
+        let v = View::new(ViewId::new(1), 80, 24);
+        assert_eq!(v.presentation(), PresentationMode::Tiled);
+        assert!(v.presentation().is_tiled());
+    }
+
+    #[test]
+    fn presentation_set_and_with_roundtrip() {
+        use crate::presentation::PresentationMode;
+        let mut v = View::new(ViewId::new(1), 80, 24);
+        v.set_presentation(PresentationMode::Floating);
+        assert_eq!(v.presentation(), PresentationMode::Floating);
+        // Geometry untouched by stamping a mode.
+        assert_eq!(v.cols(), 80);
+        assert_eq!(v.rows(), 24);
+        let w = View::with_presentation(ViewId::new(2), 80, 24, PresentationMode::Scratchpad);
+        assert_eq!(w.presentation(), PresentationMode::Scratchpad);
+        assert_eq!(w.id(), ViewId::new(2));
+        // Mode participates in leaf identity (distinct leaves compare unequal).
+        assert_ne!(v, View::new(ViewId::new(1), 80, 24));
     }
 }

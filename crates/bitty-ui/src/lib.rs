@@ -35,6 +35,11 @@
 //!   view-aware highlight mapping, `PersistentSelection` conversion, and
 //!   scroll-to-current for the viewport.
 //! - [`geometry`] — integer `Rect`, `Point`, `Size`, `SplitAxis`.
+//! - [`presentation::PresentationMode`] — per-leaf display mode unifying the
+//!   zoom/overlay/visibility special-cases toward one mode field (CTX-0276):
+//!   `Tiled` live, `Floating`/`Fullscreen`/`Scratchpad` parseable but
+//!   transition-gated; deliberately distinct from `Visibility` (computed
+//!   display state in `bitty-runtime`).
 //!
 //! # Determinism
 //!
@@ -57,6 +62,7 @@ pub mod focus;
 pub mod geometry;
 pub mod layout;
 pub mod panel;
+pub mod presentation;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
@@ -75,6 +81,7 @@ pub use panel::{
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
 };
+pub use presentation::PresentationMode;
 pub use scrollbar::{
     MIN_THUMB_HEIGHT_PX, SCROLLBAR_PROXIMITY_PX, ScrollbarHit, ScrollbarMode, ThumbSpan, TrackRect,
     TrackSpec, hit_test, is_visible, offset_for_thumb_y, thumb_geometry, track_rect,

@@ -197,14 +197,18 @@ impl Runtime {
             return false;
         };
         let live = self.live_cell_metrics();
-        let cw = live.width as i32;
-        let ch = live.height as i32;
-        let origin_px_x = rect.x as i32 * cw + pad_px;
-        let origin_px_y = rect.y as i32 * ch + pad_px;
-        let panel_px_x = origin_px_x + panel.x as i32 * cw;
-        let panel_px_y = origin_px_y + panel.y as i32 * ch;
-        let panel_px_w = panel.w as u32 * live.width;
-        let panel_px_h = panel.h as u32 * live.height;
+        // CTX-0253 F4: saturating origin/span math (see `super::present`
+        // helpers) — hostile cell metrics must clip like compositors do,
+        // never wrap the old `as i32` casts.
+        use super::present::{px_add, px_offset_cells, px_origin, px_side, px_span};
+        let cw = px_side(live.width);
+        let ch = px_side(live.height);
+        let origin_px_x = px_origin(rect.x, live.width, pad_px);
+        let origin_px_y = px_origin(rect.y, live.height, pad_px);
+        let panel_px_x = px_offset_cells(origin_px_x, panel.x, live.width);
+        let panel_px_y = px_offset_cells(origin_px_y, panel.y, live.height);
+        let panel_px_w = px_span(panel.w, live.width);
+        let panel_px_h = px_span(panel.h, live.height);
         // Border: full-bleed fill, then the inset background leaves a
         // 1-cell outline.
         fills.push(bitty_render::grid::FillRect {
@@ -215,46 +219,53 @@ impl Runtime {
         });
         fills.push(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(
-                panel_px_x + cw,
-                panel_px_y + ch,
-                panel_px_w.saturating_sub(2 * live.width),
-                panel_px_h.saturating_sub(2 * live.height),
+                px_add(panel_px_x, cw),
+                px_add(panel_px_y, ch),
+                panel_px_w.saturating_sub(live.width.saturating_mul(2)),
+                panel_px_h.saturating_sub(live.height.saturating_mul(2)),
             ),
             color: bitty_render::grid::HELP_PANEL_BG,
         });
         let inner_cells = usize::from(panel.w.saturating_sub(2));
-        let text_x = panel_px_x + cw;
+        let text_x = px_add(panel_px_x, cw);
         let title = self.renderer.overlay_text_glyphs(
             HELP_PANEL_TITLE,
-            (text_x, panel_px_y + ch),
+            (text_x, px_add(panel_px_y, ch)),
             inner_cells,
             bitty_render::grid::HELP_PANEL_FG,
         );
         glyphs.extend(title);
         for (i, row) in self.help_rows.iter().take(panel.visible_rows).enumerate() {
+            // `i` is bounded by `visible_rows` (<= view rows, `u16`
+            // range), so the `i32` row offset below cannot wrap; the cell
+            // multiply still saturates via `px_offset_cells`.
+            let row_cells = u16::try_from(2 + i).unwrap_or(u16::MAX);
+            let row_y = px_offset_cells(panel_px_y, row_cells, live.height);
             let row_glyphs = self.renderer.overlay_text_glyphs(
                 row,
-                (text_x, panel_px_y + (2 + i as i32) * ch),
+                (text_x, row_y),
                 inner_cells,
                 bitty_render::grid::HELP_PANEL_FG,
             );
             glyphs.extend(row_glyphs);
         }
-        let mut footer_row = 2 + panel.visible_rows as i32;
+        // Row indices stay small (bounded by the laid-out panel), but the
+        // pixel products still saturate so no `i32` multiply can wrap.
+        let mut footer_row = 2 + i32::try_from(panel.visible_rows).unwrap_or(i32::MAX);
         if panel.overflow > 0 {
             let tail = format!("+{} more", panel.overflow);
             let tail_glyphs = self.renderer.overlay_text_glyphs(
                 &tail,
-                (text_x, panel_px_y + footer_row * ch),
+                (text_x, px_add(panel_px_y, footer_row.saturating_mul(ch))),
                 inner_cells,
                 bitty_render::grid::HELP_PANEL_FG,
             );
             glyphs.extend(tail_glyphs);
-            footer_row += 1;
+            footer_row = footer_row.saturating_add(1);
         }
         let footer = self.renderer.overlay_text_glyphs(
             HELP_PANEL_FOOTER,
-            (text_x, panel_px_y + footer_row * ch),
+            (text_x, px_add(panel_px_y, footer_row.saturating_mul(ch))),
             inner_cells,
             bitty_render::grid::HELP_PANEL_FG,
         );

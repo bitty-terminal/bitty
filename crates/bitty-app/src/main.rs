@@ -4323,7 +4323,7 @@ impl TerminalApp {
         crossfont: bool,
     ) -> String {
         format!(
-            "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={}",
+            "bitty tick: frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={} images={} images_skipped={}",
             present.frame,
             present.fills,
             present.glyphs,
@@ -4333,7 +4333,9 @@ impl TerminalApp {
             focused,
             leafs,
             gpu,
-            crossfont
+            crossfont,
+            present.images,
+            present.images_skipped
         )
     }
 
@@ -5347,6 +5349,8 @@ mod tests {
             glyphs: 3,
             headless: true,
             generation: 9,
+            images: 0,
+            images_skipped: 0,
         };
         assert!(app.maybe_format_tick(&present).is_none());
     }
@@ -5369,6 +5373,8 @@ mod tests {
             glyphs: 5,
             headless: true,
             generation: 30,
+            images: 1,
+            images_skipped: 0,
         };
         let line = app
             .maybe_format_tick(&present)
@@ -5394,6 +5400,8 @@ mod tests {
             glyphs: 21,
             headless: true,
             generation: 30,
+            images: 0,
+            images_skipped: 0,
         };
         let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false);
         assert!(line.starts_with("bitty tick:"));
@@ -5402,6 +5410,10 @@ mod tests {
         assert!(line.contains("glyphs=21"));
         assert!(line.contains("headless=true"));
         assert!(line.contains("gen=30"));
+        // CTX-0253 F3: the image gate counters ride the verbose tick line
+        // so a real-GPU skip is user-visible in logs, never silent.
+        assert!(line.contains("images=0"));
+        assert!(line.contains("images_skipped=0"));
     }
 
     #[test]

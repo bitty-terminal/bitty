@@ -698,6 +698,13 @@ impl GpuResources {
                 reason: "atlas instance requires atlas texels",
             });
         }
+        // CTX-0253 F3 display gate: the textured image-upload path has not
+        // landed, so this pipeline draws fills + glyphs only and skips
+        // `draw_list.images` fail-closed. The skip is observable — the
+        // `Surface::present_draw_list` real-GPU branch reports it in
+        // `PresentStats::images_skipped` and warns loudly (single warn
+        // site per frame) — never a silent divergence from the CPU
+        // compositors that blend every blit.
 
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
         let atlas_chunks =

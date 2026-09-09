@@ -176,6 +176,48 @@ fn headless_present_draw_list_validates_atlas_requirement() {
     assert!(surface.headless_present(&list, None).is_err());
 }
 
+#[test]
+fn headless_image_parity_is_observable_not_silent() {
+    // CTX-0253 F3: CPU/GPU parity for Kitty image blits must be observable
+    // headlessly. The headless fake blends the blit (pixels prove it) and
+    // reports it drawn; the display gate (`gpu_image_skip`) proves the
+    // real-GPU branch would report the same blit skipped — an explicit,
+    // logged divergence, never a silent one.
+    use bitty_render::gpu::gpu_image_skip;
+    let blit = bitty_render::grid::ImageBlit::try_new(
+        bitty_render::geometry::RectPx::new(1, 1, 2, 2),
+        [0xFF, 0, 0, 0xFF].repeat(4),
+    )
+    .expect("blit bytes match extent");
+    let list = bitty_render::grid::DrawList {
+        generation: 7,
+        plan: bitty_render::frame::FramePlan {
+            extent: bitty_render::geometry::ExtentPx::new(8, 8),
+            mode: bitty_render::frame::FrameMode::Full,
+            dirty_rects: vec![bitty_render::geometry::RectPx::new(0, 0, 8, 8)],
+        },
+        fills: vec![],
+        glyphs: vec![],
+        images: vec![blit],
+    };
+    let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("headless");
+    let stats = surface.headless_present(&list, None).expect("present");
+    assert!(stats.headless);
+    assert_eq!(stats.images, 1);
+    assert_eq!(stats.images_skipped, 0);
+    // Pixel proof: the 2x2 opaque-red blit really blended.
+    let rgba = surface.headless_rgba().expect("rgba");
+    for (ry, rx) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+        let idx = (ry * 8 + rx) * 4;
+        assert_eq!(&rgba[idx..idx + 4], &[0xFF, 0, 0, 0xFF], "{rx},{ry}");
+    }
+    // Gate proof: the same frame on a real surface reports the blit
+    // skipped (fail-closed + loud warn at the call site), so the two paths
+    // disagree observably instead of silently.
+    assert_eq!(gpu_image_skip(true, list.images.len()), 0);
+    assert_eq!(gpu_image_skip(false, list.images.len()), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Real GPU: env-gated, skipped on CI headless
 // ---------------------------------------------------------------------------

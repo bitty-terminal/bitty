@@ -450,6 +450,33 @@ pub struct PresentStats {
     pub glyphs: usize,
     /// True when the surface is a headless fake (no swap-chain acquire).
     pub headless: bool,
+    /// Number of Kitty image blits in the presented `DrawList`.
+    pub images: usize,
+    /// Image blits skipped by the real-GPU path (CTX-0253 F3 display gate).
+    ///
+    /// Always `0` on headless fakes (every blit is blended) and on
+    /// clear-only presents. Non-zero only on a real surface while the
+    /// texture-upload path is pending — the skip is fail-closed and loud
+    /// (see [`gpu_image_skip`]), never a silent CPU/GPU divergence.
+    pub images_skipped: usize,
+}
+
+/// Fail-closed display gate for Kitty image blits on the real-GPU path
+/// (CTX-0253 F3).
+///
+/// The textured upload path has not landed, so the real GPU cannot paint
+/// `DrawList.images` while both CPU compositors (`headless_present` and the
+/// `sw-fallback` `draw_list_onto`) blend every entry. This helper makes the
+/// divergence explicit instead of silent: headless draws everything
+/// (`0` skipped), a real surface skips everything (`image_count` skipped)
+/// and the caller warns loudly plus reports the count in
+/// [`PresentStats::images_skipped`].
+///
+/// Headless-testable by design: no adapter or window is required to prove
+/// the two paths disagree observably (see the `gpu_image_gate_*` tests).
+#[must_use]
+pub const fn gpu_image_skip(is_headless: bool, image_count: usize) -> usize {
+    if is_headless { 0 } else { image_count }
 }
 
 #[derive(Debug)]
@@ -714,6 +741,8 @@ impl Surface {
                     fills: 0,
                     glyphs: 0,
                     headless: true,
+                    images: 0,
+                    images_skipped: 0,
                 })
             }
             SurfaceKind::Gpu { surface, .. } => {
@@ -804,6 +833,8 @@ impl Surface {
                     fills: 0,
                     glyphs: 0,
                     headless: false,
+                    images: 0,
+                    images_skipped: 0,
                 })
             }
         }
@@ -971,9 +1002,10 @@ impl Surface {
                     }
                 }
                 // Kitty images (CTX-0248): topmost present-layer blits,
-                // above fills and glyphs, never grid truth. The real GPU
-                // pipeline ignores `images` until a texture-upload path
-                // lands; both CPU compositors blend them.
+                // above fills and glyphs, never grid truth. The headless
+                // CPU compositor blends every entry; the real-GPU branch
+                // below skips them fail-closed via the CTX-0253 F3 gate
+                // (`PresentStats::images_skipped` + loud warn).
                 for blit in &draw_list.images {
                     blend_rgba_blit_rgba(&mut rgba, width, height, blit);
                 }
@@ -985,6 +1017,8 @@ impl Surface {
                     fills: draw_list.fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: true,
+                    images: draw_list.images.len(),
+                    images_skipped: gpu_image_skip(true, draw_list.images.len()),
                 })
             }
             SurfaceKind::Gpu { surface, .. } => {
@@ -1088,6 +1122,18 @@ impl Surface {
                         )
                         .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
                 }
+                // CTX-0253 F3 display gate: the textured image-upload path
+                // has not landed, so this branch cannot paint
+                // `draw_list.images` (see `GpuResources::draw_frame`). The
+                // skip is fail-closed and loud — `images_skipped` carries
+                // the count and a warn names it — so CPU (headless) and GPU
+                // presents never diverge silently.
+                let images_skipped = gpu_image_skip(false, draw_list.images.len());
+                if images_skipped > 0 {
+                    eprintln!(
+                        "bitty: real-GPU present skips {images_skipped} kitty image blit(s) (texture-upload pending; headless CPU blends them)"
+                    );
+                }
                 frame.present();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
@@ -1096,6 +1142,8 @@ impl Surface {
                     fills: draw_list.fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: false,
+                    images: draw_list.images.len(),
+                    images_skipped,
                 })
             }
         }
@@ -1253,6 +1301,8 @@ impl Surface {
         }
         // Kitty images (CTX-0248): topmost present-layer blits (see the
         // `present_draw_list` headless branch for the z-order contract).
+        // CTX-0253 F3: headless blends every entry (`images_skipped` stays
+        // 0); the real-GPU branch skips via `gpu_image_skip`.
         for blit in &draw_list.images {
             blend_rgba_blit_rgba(&mut rgba, width, height, blit);
         }
@@ -1264,6 +1314,8 @@ impl Surface {
             fills: draw_list.fills.len(),
             glyphs: draw_list.glyphs.len(),
             headless: true,
+            images: draw_list.images.len(),
+            images_skipped: gpu_image_skip(true, draw_list.images.len()),
         })
     }
 
@@ -1992,5 +2044,54 @@ mod tests {
             rgba.chunks_exact(4)
                 .all(|px| px == [bg[0], bg[1], bg[2], 0xFF])
         );
+    }
+
+    #[test]
+    fn gpu_image_gate_is_explicit_never_silent() {
+        // CTX-0253 F3: the CPU/GPU divergence decision is a pure,
+        // headless-testable function. Headless blends everything (nothing
+        // skipped); a real surface skips everything while the
+        // texture-upload path is pending. Both outcomes are observable via
+        // `PresentStats::images_skipped` — no silent branch exists.
+        assert_eq!(gpu_image_skip(true, 0), 0);
+        assert_eq!(gpu_image_skip(true, 3), 0);
+        assert_eq!(gpu_image_skip(false, 0), 0);
+        assert_eq!(gpu_image_skip(false, 1), 1);
+        assert_eq!(gpu_image_skip(false, 64), 64);
+    }
+
+    #[test]
+    fn headless_present_stats_report_images_drawn_not_skipped() {
+        use crate::geometry::RectPx;
+        use crate::grid::ImageBlit;
+        // Two blits: headless must blend both and report them drawn.
+        let list = image_test_list(vec![
+            ImageBlit::try_new(RectPx::new(0, 0, 1, 1), vec![0xFF, 0, 0, 0xFF]).unwrap(),
+            ImageBlit::try_new(RectPx::new(2, 2, 1, 1), vec![0, 0xFF, 0, 0xFF]).unwrap(),
+        ]);
+        let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+        let stats = surface.headless_present(&list, None).expect("present");
+        assert!(stats.headless);
+        assert_eq!(stats.images, 2);
+        assert_eq!(stats.images_skipped, 0);
+        // ... and the pixels prove the blend really happened.
+        let rgba = surface.headless_rgba().expect("rgba");
+        assert_eq!(&rgba[0..4], &[0xFF, 0, 0, 0xFF]);
+        let idx = (2 * 8 + 2) * 4;
+        assert_eq!(&rgba[idx..idx + 4], &[0, 0xFF, 0, 0xFF]);
+        // NOTE: the `present_draw_list` headless branch builds the same
+        // `images`/`images_skipped` fields but needs a live `GpuContext`,
+        // so it is covered by inspection + the env-gated real-GPU tests,
+        // not by this headless unit test.
+    }
+
+    #[test]
+    fn present_without_draw_list_reports_no_images() {
+        // Clear-only presents carry no blits on either path.
+        let surface = Surface::headless(PhysicalSize::new(16, 16)).expect("valid extent");
+        let empty = image_test_list(vec![]);
+        let stats = surface.headless_present(&empty, None).expect("present");
+        assert_eq!(stats.images, 0);
+        assert_eq!(stats.images_skipped, 0);
     }
 }

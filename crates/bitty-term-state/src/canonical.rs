@@ -23,7 +23,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v3 adds each cell's combining buffer (`CTX-0208` CR-TERM-01): prior
 /// versions omitted combining marks, so states differing only in accents
 /// or ZWJ sequences collided.
-pub const CANONICAL_HASH_VERSION: u32 = 3;
+/// v4 adds soft-wrap continuation flags (`CTX-0266` reflow): grid `wraps`
+/// plus scrollback `wrapped`. Prior versions omitted them, so states
+/// differing only in wrap continuation collided and reflow was not replayable.
+pub const CANONICAL_HASH_VERSION: u32 = 4;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -187,6 +190,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 3);
+        assert_eq!(CANONICAL_HASH_VERSION, 4);
     }
 }

@@ -516,7 +516,7 @@ mod tests {
         let ids: Vec<CommandId> = before.iter().map(|b| b.id).collect();
         let exits: Vec<Option<i32>> = before.iter().map(|b| b.exit_code).collect();
         let cwds: Vec<Option<String>> = before.iter().map(|b| b.cwd.clone()).collect();
-        let scroll_ids_before: Vec<u64> = state.scrollback().map(|l| l.id).collect();
+        let _scroll_ids_before: Vec<u64> = state.scrollback().map(|l| l.id).collect();
 
         state.resize(100, 30);
         let after_wide = blocks(&state);
@@ -534,9 +534,17 @@ mod tests {
             cwds,
             "cwd report survives resize"
         );
-        // Scrollback line identity preserved across reflow (cells rewritten).
+        // CTX-0266 reflow reassigns scrollback ids (physical row count changes),
+        // so assert monotonicity + width coherence, not identity preservation.
+        // Block identity (semantic zones) must still survive.
         let scroll_ids_wide: Vec<u64> = state.scrollback().map(|l| l.id).collect();
-        assert_eq!(scroll_ids_wide, scroll_ids_before);
+        assert!(
+            scroll_ids_wide.windows(2).all(|w| w[0] < w[1]),
+            "scrollback ids must stay monotonic after wide reflow"
+        );
+        for line in state.scrollback() {
+            assert_eq!(line.cells.len(), 100);
+        }
 
         state.resize(40, 10);
         let after_narrow = blocks(&state);

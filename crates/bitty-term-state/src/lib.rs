@@ -25,7 +25,7 @@
 //!
 //! | Constant | Value | Contract |
 //! |---|---|---|
-//! | [`GRID_COLUMNS`] / [`GRID_ROWS`] | 80 x 24 | Initial geometry; resize awaits the singular reflow algorithm deferred under RFC "Open items remaining under OQ-007" |
+//! | [`GRID_COLUMNS`] / [`GRID_ROWS`] | 80 x 24 | Initial geometry; width resizes reflow primary logical lines via soft-wrap flags (CTX-0266), alt screen truncates (xterm) |
 //! | [`DEFAULT_TAB_INTERVAL`] | 8 | RFC invariant 6: default tab lattice; `FullReset` restores it |
 //! | [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) | 10 000 | RFC invariant 4: bounded pruning, oldest first |
 //! | [`REPLY_CAP_BYTES`](replies::REPLY_CAP_BYTES) | 4096 | RFC invariant 7: reply bounds, drop-and-flag |
@@ -34,7 +34,7 @@
 //! | [`HYPERLINK_TABLE_MAX`](state::HYPERLINK_TABLE_MAX) | 1024 | Bounded link table (threat T-01) |
 //! | [`MAX_ZEROWIDTH_CHARS`](cell::MAX_ZEROWIDTH_CHARS) | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
 //! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 3 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 4 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers, v4 adds soft-wrap continuation flags for CTX-0266 reflow) |
 //!
 //! # Determinism
 //!

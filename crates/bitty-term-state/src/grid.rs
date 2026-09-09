@@ -11,11 +11,20 @@
 use crate::cell::{Cell, Style};
 
 /// A dense `rows x cols` matrix of cells.
+///
+/// `wraps[r]` is true when row `r` soft-wraps onto row `r + 1` (DECAWM
+/// continuation). The last row's flag is always false (no next grid row;
+/// continuation beyond the screen is carried by scrollback's wrapped flag
+/// after a scroll). Hard breaks (LF, ED, cursor motion) leave false;
+/// only soft-wrap printing sets true. Resize reflow unwraps via these
+/// flags and rewraps to the new width; the alternate screen ignores them
+/// (truncate/pad, xterm behavior).
 #[derive(Debug, Clone)]
 pub(crate) struct Grid {
     rows: usize,
     cols: usize,
     cells: Vec<Cell>,
+    wraps: Vec<bool>,
 }
 
 impl Grid {
@@ -25,7 +34,28 @@ impl Grid {
             rows,
             cols,
             cells: vec![Cell::erased(crate::cell::Style::default()); rows * cols],
+            wraps: vec![false; rows],
         }
+    }
+
+    /// Whether row `row` soft-wraps onto the next row.
+    #[inline]
+    pub(crate) fn wrapped(&self, row: usize) -> bool {
+        self.wraps.get(row).copied().unwrap_or(false)
+    }
+
+    /// Sets the soft-wrap continuation flag for one row.
+    #[inline]
+    pub(crate) fn set_wrapped(&mut self, row: usize, value: bool) {
+        if let Some(slot) = self.wraps.get_mut(row) {
+            *slot = value;
+        }
+    }
+
+    /// Borrow the wrap flags (row-major, length `rows`).
+    #[inline]
+    pub(crate) fn wraps_slice(&self) -> &[bool] {
+        &self.wraps
     }
 
     #[inline]
@@ -81,9 +111,16 @@ impl Grid {
         for slot in &mut self.cells {
             *slot = Cell::erased(erase_style.clone());
         }
+        for w in &mut self.wraps {
+            *w = false;
+        }
     }
 
     /// Fills the inclusive rectangle with `fill`. Bounds are caller-clamped.
+    ///
+    /// Clears soft-wrap flags for every touched row (content changed, so any
+    /// prior continuation is no longer trustworthy) plus the incoming edge
+    /// `top - 1` whose continuation into the cleared region is broken.
     pub fn fill_rect(&mut self, top: u16, left: u16, bottom: u16, right: u16, erase_style: &Style) {
         let (rows, cols) = (self.rows as u16, self.cols as u16);
         let top = top.min(rows.saturating_sub(1));
@@ -94,6 +131,12 @@ impl Grid {
             for c in left..=right {
                 self.set(r as usize, c as usize, Cell::erased(erase_style.clone()));
             }
+        }
+        for r in top..=bottom {
+            self.set_wrapped(r as usize, false);
+        }
+        if top > 0 {
+            self.set_wrapped(top as usize - 1, false);
         }
     }
 
@@ -126,6 +169,10 @@ impl Grid {
         for c in start..=end {
             self.set(row, c, Cell::erased(erase_style.clone()));
         }
+        // Row content changed: break any soft continuation starting here.
+        // Incoming continuation is preserved (the previous row still flows
+        // into this edited row).
+        self.set_wrapped(row, false);
     }
 
     /// Shifts cells in one row right by `n` starting at `col`, blanking the
@@ -166,6 +213,7 @@ impl Grid {
         for c in col..(col + n).min(last + 1) {
             self.set(row, c, Cell::erased(erase_style.clone()));
         }
+        self.set_wrapped(row, false);
     }
 
     /// Deletes `n` cells at `col` shifting the tail left (`DCH`), blanking
@@ -202,6 +250,7 @@ impl Grid {
             };
             self.set(row, target, cell);
         }
+        self.set_wrapped(row, false);
     }
 
     /// Deterministic orphan-repair pass over one row — the mechanical
@@ -242,25 +291,29 @@ impl Grid {
     /// Removes and returns rows `top..=top + count - 1`, shifting the rows
     /// above `bottom` down into their place and blanking the freed bottom
     /// rows. This is "scroll region up"; returned rows may be captured into
-    /// scrollback by the caller.
+    /// scrollback by the caller. Wrap flags travel with their rows; the
+    /// freed bottom rows reset to unwrapped.
     pub fn remove_lines_up(
         &mut self,
         top: usize,
         bottom: usize,
         count: usize,
         erase_style: &Style,
-    ) -> Vec<Vec<Cell>> {
+    ) -> Vec<(Vec<Cell>, bool)> {
         let span = bottom - top + 1;
         let count = count.min(span);
         let mut removed = Vec::with_capacity(count);
         for _ in 0..count {
-            removed.push(self.snapshot_row(top));
+            removed.push((self.snapshot_row(top), self.wrapped(top)));
             for r in top..bottom {
                 let mut carried: Vec<Cell> = self.row(r + 1).to_vec();
                 self.replace_row(r, &mut carried);
+                let w = self.wrapped(r + 1);
+                self.set_wrapped(r, w);
             }
             let mut blank = vec![Cell::erased(erase_style.clone()); self.cols];
             self.replace_row(bottom, &mut blank);
+            self.set_wrapped(bottom, false);
         }
         removed
     }
@@ -268,6 +321,8 @@ impl Grid {
     /// Inserts `count` blank lines at `top` pushing existing rows within
     /// `top..=bottom` down; displaced rows are discarded (they never enter
     /// scrollback: RFC invariant 4 restricts capture to scroll-under-region).
+    /// Wrap flags travel with their rows; inserted rows are unwrapped and the
+    /// incoming edge `top - 1` is broken.
     pub fn insert_blank_lines_down(
         &mut self,
         top: usize,
@@ -281,17 +336,48 @@ impl Grid {
             for r in (top..bottom).rev() {
                 let mut carried: Vec<Cell> = self.row(r).to_vec();
                 self.replace_row(r + 1, &mut carried);
+                let w = self.wrapped(r);
+                self.set_wrapped(r + 1, w);
             }
             let mut blank = vec![Cell::erased(erase_style.clone()); self.cols];
             self.replace_row(top, &mut blank);
+            self.set_wrapped(top, false);
         }
+        if top > 0 {
+            // Inserted blanks break continuation from above.
+            self.set_wrapped(top - 1, false);
+        }
+    }
+
+    /// Bulk-replaces the grid after a width reflow: exactly `new_rows` rows
+    /// of `new_cols` cells plus their wrap flags. The last row's flag is
+    /// forced false (no next grid row). Caller guarantees lengths.
+    pub(crate) fn replace_grid(
+        &mut self,
+        new_rows: usize,
+        new_cols: usize,
+        new_cells: Vec<Cell>,
+        mut new_wraps: Vec<bool>,
+    ) {
+        debug_assert_eq!(new_cells.len(), new_rows * new_cols);
+        debug_assert_eq!(new_wraps.len(), new_rows);
+        if !new_wraps.is_empty() {
+            let last = new_wraps.len() - 1;
+            new_wraps[last] = false;
+        }
+        self.rows = new_rows;
+        self.cols = new_cols;
+        self.cells = new_cells;
+        self.wraps = new_wraps;
     }
 
     /// Resizes the grid to `new_rows x new_cols`, preserving overlapping cells
     /// and repairing wide-character pairs that would otherwise straddle the new
     /// boundary (RFC invariant 2). New area is filled with `erase_style`.
-    /// This is the singular reflow primitive for resize: truncate/pad with
-    /// orphan repair, deterministically identical on all platforms.
+    /// This is the truncate/pad primitive for the alternate screen (xterm:
+    /// the application owns alt content, so no rewrapping) and for
+    /// height-only primary resizes. Primary width changes use the reflow path
+    /// in `State::resize` instead. Deterministic on all platforms.
     pub(crate) fn resize(&mut self, new_rows: usize, new_cols: usize, erase_style: &Style) {
         let new_rows = new_rows.max(1);
         let new_cols = new_cols.max(1);
@@ -337,6 +423,8 @@ impl Grid {
         self.rows = new_rows;
         self.cols = new_cols;
         self.cells = new_cells;
+        // Truncation breaks all continuations (no rewrapping here).
+        self.wraps = vec![false; new_rows];
     }
 }
 
@@ -441,9 +529,11 @@ mod tests {
     fn remove_lines_up_returns_removed_rows() {
         let mut g = Grid::new(3, 2);
         g.set(0, 0, glyph('x'));
+        g.set_wrapped(0, true);
         let removed = g.remove_lines_up(0, 2, 1, &Style::default());
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0][0].glyph, 'x');
+        assert_eq!(removed[0].0[0].glyph, 'x');
+        assert!(removed[0].1, "wrap flag travels with removed row");
         assert!(g.get(0, 0).is_blank());
         assert!(g.row(2).iter().all(Cell::is_blank));
     }

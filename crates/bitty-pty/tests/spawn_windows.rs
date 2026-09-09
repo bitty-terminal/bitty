@@ -24,6 +24,19 @@
 //!   our reader. Environment assertions therefore run against an interactive
 //!   `cmd.exe` that stays alive until the markers are observed; only the
 //!   exit-code test (which needs no output) uses one-shot `cmd /C exit N`.
+//! - **Answer conhost's DSR or the child freezes (win469d lesson).**
+//!   ConPTY owns no cursor grid: when the console client queries cursor
+//!   state (which `cmd.exe` does during startup), conhost emits `ESC[6n`
+//!   (DSR, device-status-report request) into the output pipe and blocks
+//!   the client until the terminal answers `ESC[{row};{col}R` (CPR,
+//!   cursor-position report) on the input pipe. A byte-collecting harness
+//!   that never answers leaves the child frozen pre-prompt: the only bytes
+//!   that ever arrive are the 4 DSR bytes, `set`/`echo` input sits
+//!   unprocessed, and even one-shot `cmd /C exit N` never exits. Every
+//!   read/wait loop below therefore replies `ESC[1;1R` once per observed
+//!   DSR via [`reply_to_dsrs`]. A real terminal answers with its actual
+//!   cursor position; `1;1` is a stub that only unblocks client progress,
+//!   which is all these Tier-1 tests assert.
 //! - **Drop the `Pty` (ClosePseudoConsole) before `join`.** The pump thread
 //!   sits in a kernel read on a pipe conhost owns; tearing the console down
 //!   first guarantees the read terminates and `join` returns promptly. After
@@ -54,13 +67,51 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(15);
 /// the loop re-check the overall deadline instead of sleeping past it.
 const RECV_TICK: Duration = Duration::from_millis(500);
 
+/// ConPTY cursor-query request: conhost emits this when the console client
+/// needs cursor state (see module docs). Each occurrence must be answered
+/// once or the child stays frozen.
+const DSR_REQUEST: &[u8] = b"\x1b[6n";
+/// Stub cursor-position report answering [`DSR_REQUEST`]: row 1, column 1.
+/// A real terminal reports its live cursor; these Tier-1 tests only need
+/// client progress, so the origin stub suffices.
+const CPR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Answers every not-yet-answered [`DSR_REQUEST`] occurrence in `buf` by
+/// writing [`CPR_REPLY`] once per occurrence. `answered` counts replies
+/// already sent for this buffer, so split or repeated requests each get
+/// exactly one reply. Write failures are ignored: the child may have
+/// exited (one-shot tests) or been killed, in which case there is nobody
+/// left to unblock and the caller asserts on bytes already collected.
+fn reply_to_dsrs(writer: &mut bitty_pty::PtyWriter, buf: &[u8], answered: &mut usize) {
+    let mut occurrences = 0;
+    for window in buf.windows(DSR_REQUEST.len()) {
+        if window == DSR_REQUEST {
+            occurrences += 1;
+        }
+    }
+    while *answered < occurrences {
+        let _ = writer.write_all(CPR_REPLY);
+        let _ = writer.flush();
+        *answered += 1;
+    }
+}
+
 /// Reads until `needle` is observed, EOF, or `deadline` — whichever comes
 /// first — and returns whatever arrived. Never blocks past the deadline.
 /// Callers assert on the returned bytes (with byte count and lossy text in
 /// the message) so a missing marker fails with evidence, not a hang.
-fn read_until(reader: &bitty_pty::PtyReader, needle: &[u8], deadline: Instant) -> Vec<u8> {
+///
+/// Replies to conhost DSR requests along the way (see [`reply_to_dsrs`]):
+/// without the CPR answers the child never produces the marker at all.
+fn read_until(
+    reader: &bitty_pty::PtyReader,
+    writer: &mut bitty_pty::PtyWriter,
+    needle: &[u8],
+    deadline: Instant,
+) -> Vec<u8> {
     debug_assert!(!needle.is_empty(), "read_until needs a non-empty marker");
     let mut out = Vec::new();
+    let mut dsrs_answered = 0;
     while !contains(&out, needle) {
         if Instant::now() >= deadline {
             break;
@@ -74,6 +125,7 @@ fn read_until(reader: &bitty_pty::PtyReader, needle: &[u8], deadline: Instant) -
                     bitty_pty::READ_CHUNK_SIZE
                 );
                 out.extend_from_slice(&chunk);
+                reply_to_dsrs(writer, &out, &mut dsrs_answered);
             }
             // EOF (child gone and pump drained) or pump ended: whatever we
             // have is all there is; the caller asserts on it.
@@ -103,6 +155,50 @@ fn reap_bounded(pty: &mut bitty_pty::Pty, what: &str) -> bitty_pty::ExitStatus {
     }
 }
 
+/// Bounded reap for one-shot children that must exit on their own while
+/// answering conhost DSR requests.
+///
+/// Even `cmd /C exit N` initializes the console and can stall behind an
+/// unanswered DSR (win469d: `cmd /C exit 0` never exited within 30s with
+/// no harness replies). So this polls `wait_timeout` in [`RECV_TICK`]
+/// slices while draining whatever the pump delivered and answering DSRs;
+/// output bytes are discarded (this path asserts exit codes, not output).
+/// On timeout kills the child, reaps it, and panics with the final status.
+/// The overall bound is [`WAIT_TIMEOUT`]; no path blocks past it.
+fn reap_one_shot_with_dsr_pump(
+    pty: &mut bitty_pty::Pty,
+    reader: &bitty_pty::PtyReader,
+    writer: &mut bitty_pty::PtyWriter,
+    what: &str,
+) -> bitty_pty::ExitStatus {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    let mut seen = Vec::new();
+    let mut dsrs_answered = 0;
+    loop {
+        match pty.wait_timeout(RECV_TICK).expect("wait_timeout slice") {
+            Some(status) => return status,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = pty.kill();
+                    let after = pty
+                        .wait_timeout(KILL_REAP_TIMEOUT)
+                        .expect("reap after kill");
+                    panic!("{what} did not exit within {WAIT_TIMEOUT:?}; killed, reap: {after:?}");
+                }
+                // Child still alive: drain any DSR request and answer it so
+                // console init can proceed; discard the bytes themselves.
+                while let Ok(Some(chunk)) = reader.recv_timeout(RECV_TICK) {
+                    seen.extend_from_slice(&chunk);
+                    reply_to_dsrs(writer, &seen, &mut dsrs_answered);
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Kill, bounded reap, console teardown, then pump join.
 ///
 /// Takes ownership so the `Pty` (and its ConPTY handles) can be dropped
@@ -127,13 +223,17 @@ fn shutdown_and_join(mut pty: bitty_pty::Pty, reader: bitty_pty::PtyReader, what
 #[test]
 fn cmd_exit_code_round_trips() {
     require_pty!();
-    // One-shot success: `cmd /C exit 0` must reap cleanly.
+    // One-shot success: `cmd /C exit 0` must reap cleanly. The DSR pump
+    // is required even though no output is asserted: console init stalls
+    // behind an unanswered DSR (win469d).
     let mut pty = PtyBuilder::new("cmd.exe")
         .arg("/C")
         .arg("exit 0")
         .spawn()
         .expect("spawn cmd /C exit 0");
-    let status = reap_bounded(&mut pty, "cmd /C exit 0");
+    let reader = pty.take_reader().expect("reader half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let status = reap_one_shot_with_dsr_pump(&mut pty, &reader, &mut writer, "cmd /C exit 0");
     assert!(status.is_success(), "exit 0 must succeed: {status:?}");
     assert_eq!(status.code(), 0);
     // ConPTY has no signals; the signal slot is always empty.
@@ -145,7 +245,9 @@ fn cmd_exit_code_round_trips() {
         .arg("exit 3")
         .spawn()
         .expect("spawn cmd /C exit 3");
-    let status = reap_bounded(&mut pty, "cmd /C exit 3");
+    let reader = pty.take_reader().expect("reader half");
+    let mut writer = pty.take_writer().expect("writer half");
+    let status = reap_one_shot_with_dsr_pump(&mut pty, &reader, &mut writer, "cmd /C exit 3");
     assert!(!status.is_success(), "exit 3 must fail: {status:?}");
     assert_eq!(status.code(), 3);
     assert_eq!(status.signal(), None);
@@ -210,7 +312,7 @@ fn child_environment_inherits_session_with_overrides() {
     // `set` separates with `\r\n`; byte-substring search is agnostic.
     // Bounded: on timeout the partial bytes below show what arrived.
     let deadline = Instant::now() + CMD_TIMEOUT;
-    let output = read_until(&reader, b"BITTY_PROBE=1", deadline);
+    let output = read_until(&reader, &mut writer, b"BITTY_PROBE=1", deadline);
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains("BITTY_PROBE=1"),
@@ -252,7 +354,7 @@ fn child_explicit_term_program_override_wins() {
     writer.flush().expect("flush");
 
     let deadline = Instant::now() + CMD_TIMEOUT;
-    let output = read_until(&reader, b"TERM_PROGRAM=custom-term", deadline);
+    let output = read_until(&reader, &mut writer, b"TERM_PROGRAM=custom-term", deadline);
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains("TERM_PROGRAM=custom-term"),
@@ -303,7 +405,7 @@ fn cmd_echo_flows_through_bounded_channel() {
     writer.flush().expect("flush");
 
     let deadline = Instant::now() + CMD_TIMEOUT;
-    let echoed = read_until(&reader, b"hello-bitty-pty", deadline);
+    let echoed = read_until(&reader, &mut writer, b"hello-bitty-pty", deadline);
     assert!(
         contains(&echoed, b"hello-bitty-pty"),
         "expected echo after {CMD_TIMEOUT:?} ({} bytes): {:?}",

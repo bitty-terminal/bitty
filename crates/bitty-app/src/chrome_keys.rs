@@ -797,6 +797,34 @@ impl TerminalApp {
                     }
                 }
             }
+            A::IncreaseFontSize => {
+                // CTX-0263 per-window font zoom: mutates only this window's
+                // live `RuntimeConfig.font_size` (never the config file),
+                // re-derives the renderer at the live DPI scale, and reflows
+                // the grid from the current surface extent. Bounded and
+                // fail-closed at the ends (warn + keep current size).
+                match self.runtime.zoom_in() {
+                    Ok(()) => eprintln!(
+                        "bitty: keymap increase_font_size -> {:.1}pt",
+                        self.runtime.font_size()
+                    ),
+                    Err(err) => eprintln!("warning: keymap increase_font_size refused ({err})"),
+                }
+            }
+            A::DecreaseFontSize => match self.runtime.zoom_out() {
+                Ok(()) => eprintln!(
+                    "bitty: keymap decrease_font_size -> {:.1}pt",
+                    self.runtime.font_size()
+                ),
+                Err(err) => eprintln!("warning: keymap decrease_font_size refused ({err})"),
+            },
+            A::ResetFontSize => {
+                self.runtime.reset_zoom();
+                eprintln!(
+                    "bitty: keymap reset_font_size -> {:.1}pt",
+                    self.runtime.font_size()
+                );
+            }
         }
     }
 }
@@ -2048,5 +2076,68 @@ mod tests {
         assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    fn chrome_font_zoom_round_trip_headless() {
+        // CTX-0263: font zoom is per-window live size (not pane
+        // `toggle_zoom`, not a config write). Chords resolve through the
+        // single-owner intercept path and the layout is untouched.
+        use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        // Every Ctrl spelling hits the zoom actions (US Shift+= covered).
+        for (key, shift, action) in [
+            ('=', false, ChromeAction::IncreaseFontSize),
+            ('+', false, ChromeAction::IncreaseFontSize),
+            ('=', true, ChromeAction::IncreaseFontSize),
+            ('+', true, ChromeAction::IncreaseFontSize),
+            ('-', false, ChromeAction::DecreaseFontSize),
+            ('-', true, ChromeAction::DecreaseFontSize),
+            ('0', false, ChromeAction::ResetFontSize),
+        ] {
+            let r = KeyRef {
+                key: KeyName::Char(key),
+                ctrl: true,
+                alt: false,
+                shift,
+                super_held: false,
+            };
+            assert_eq!(
+                match_keymap(&maps, r),
+                Some(action),
+                "chord {key:?}+shift={shift}"
+            );
+        }
+        // Bare keys stay shell.
+        for key in ['+', '-', '=', '0'] {
+            let r = KeyRef {
+                key: KeyName::Char(key),
+                ctrl: false,
+                alt: false,
+                shift: false,
+                super_held: false,
+            };
+            assert_eq!(match_keymap(&maps, r), None, "bare {key:?} stays shell");
+        }
+        // Actions drive the live runtime without touching the tree.
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        let leafs_before = app.runtime.leaf_count();
+        app.apply_chrome_action(ChromeAction::IncreaseFontSize);
+        assert!((app.runtime.font_size() - 13.0).abs() < f32::EPSILON);
+        assert_eq!(app.runtime.leaf_count(), leafs_before);
+        app.apply_chrome_action(ChromeAction::DecreaseFontSize);
+        assert!((app.runtime.font_size() - 12.0).abs() < f32::EPSILON);
+        app.apply_chrome_action(ChromeAction::IncreaseFontSize);
+        app.apply_chrome_action(ChromeAction::ResetFontSize);
+        assert!((app.runtime.font_size() - 12.0).abs() < f32::EPSILON);
+        assert_eq!(app.runtime.leaf_count(), leafs_before);
     }
 }

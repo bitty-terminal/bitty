@@ -376,6 +376,11 @@ pub struct Runtime {
     // DPI scale
     scale_factor: ScaleFactor,
     is_crossfont: bool,
+    /// Startup font size in points (CTX-0263 font zoom reset baseline).
+    ///
+    /// Per-window: cloned from the validated config at construction, never
+    /// written back to the config file. `reset_zoom` restores this value.
+    base_font_size: f32,
     /// Tail of previously seen PTY bytes retained so a terminal query split
     /// over two PTY reads is still recognized (CTX-0146). Bounded by
     /// [`crate::queries::QUERY_OVERLAP_MAX`]; raw query scans never retain
@@ -624,6 +629,7 @@ impl Runtime {
             wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
+            base_font_size: config.font_size,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
@@ -737,6 +743,7 @@ impl Runtime {
             wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
             is_crossfont,
+            base_font_size: config.font_size,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),

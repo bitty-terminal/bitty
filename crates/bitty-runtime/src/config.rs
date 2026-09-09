@@ -90,6 +90,20 @@ pub const MIN_SCROLLBAR_WIDTH_PX: u32 = 1;
 /// Mirrors `bitty-config` `MAX_SCROLLBAR_WIDTH_PX` (see above).
 pub const MAX_SCROLLBAR_WIDTH_PX: u32 = 32;
 
+/// Per-window font zoom step in points (CTX-0263).
+///
+/// One mainstream step per chord press (Alacritty/Ghostty-class `1pt`);
+/// the `0.5pt` finer alternative stays available via a direct
+/// `set_font_size` call, but the default chord moves a full point so each
+/// press is visibly distinct on HiDPI and headless captures.
+pub const FONT_ZOOM_STEP_PT: f32 = 1.0;
+
+/// Minimum live font size reachable by zoom (CTX-0263, fail-closed).
+pub const FONT_ZOOM_MIN_PT: f32 = 6.0;
+
+/// Maximum live font size reachable by zoom (CTX-0263, fail-closed).
+pub const FONT_ZOOM_MAX_PT: f32 = 32.0;
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {

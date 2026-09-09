@@ -464,6 +464,16 @@ fn parse_key_token(token: &str, raw_chord: &str) -> Result<KeyName, ConfigError>
         "down" | "arrowdown" | "arrow_down" | "arrow-down" => Ok(KeyName::Down),
         "left" | "arrowleft" | "arrow_left" | "arrow-left" => Ok(KeyName::Left),
         "right" | "arrowright" | "arrow_right" | "arrow-right" => Ok(KeyName::Right),
+        // CTX-0263: word spellings for keys the `+`-split chord syntax
+        // cannot spell literally. `ctrl++` splits into empty segments and
+        // fails, and `+` is Shift+= on US layouts (the compositor reports
+        // either `=`+shift or `+`+shift depending on platform), so both
+        // `equal`/`plus` spellings must resolve. Canonical forms stay the
+        // single characters (`=`/`+`/`-`) so merge identity is stable.
+        "plus" => Ok(KeyName::Char('+')),
+        "minus" => Ok(KeyName::Char('-')),
+        "equal" | "equals" | "eq" => Ok(KeyName::Char('=')),
+        "underscore" => Ok(KeyName::Char('_')),
         _ => {
             if KeyName::is_modifier_name(token) {
                 return Err(ConfigError::validation(
@@ -597,6 +607,12 @@ pub enum ChromeAction {
     ScrollPageUp,
     /// Scroll the focused pane down by one viewport page (less-like).
     ScrollPageDown,
+    /// Increase the per-window font size one step (CTX-0263 font zoom).
+    IncreaseFontSize,
+    /// Decrease the per-window font size one step (CTX-0263 font zoom).
+    DecreaseFontSize,
+    /// Reset the per-window font size to the startup value (CTX-0263).
+    ResetFontSize,
     /// Open the Command Composer (CTX-0227, 008 route P4).
     ///
     /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
@@ -701,6 +717,18 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ScrollPageDown)
             }
+            "increase_font_size" | "zoom_in" | "font_zoom_in" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::IncreaseFontSize)
+            }
+            "decrease_font_size" | "zoom_out" | "font_zoom_out" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::DecreaseFontSize)
+            }
+            "reset_font_size" | "zoom_reset" | "font_zoom_reset" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ResetFontSize)
+            }
             "open_composer" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::OpenComposer)
@@ -752,6 +780,9 @@ impl ChromeAction {
             Self::PasteFromClipboard => "paste_from_clipboard".to_string(),
             Self::ScrollPageUp => "scroll_page_up".to_string(),
             Self::ScrollPageDown => "scroll_page_down".to_string(),
+            Self::IncreaseFontSize => "increase_font_size".to_string(),
+            Self::DecreaseFontSize => "decrease_font_size".to_string(),
+            Self::ResetFontSize => "reset_font_size".to_string(),
             Self::OpenComposer => "open_composer".to_string(),
             Self::WorkspaceNew => "workspace_new".to_string(),
             Self::WorkspaceClose => "workspace_close".to_string(),
@@ -764,7 +795,7 @@ impl ChromeAction {
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -886,6 +917,9 @@ impl ResolvedKeymap {
 /// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
 /// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
 /// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
+/// CTX-0263 adds mod-independent `ctrl+=`/`ctrl+plus` (plus shifted
+/// spellings) to grow, `ctrl+-` to shrink, and `ctrl+0` to reset the
+/// per-window font size; bare `+`/`-`/`=`/`0` stay shell input.
 /// Plain `Tab`, bare arrows, letters, and digits are deliberately unbound so
 /// they reach the shell.
 pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
@@ -960,6 +994,18 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
     ("alt+tab", "workspace_last"),
+    // CTX-0263 font zoom (per-window, Ctrl-held so bare typing stays
+    // shell): `=` covers the unshifted `=` key, `plus` covers `+`
+    // (Shift+= on US reports `+`+shift or `=`+shift depending on platform,
+    // hence both the plain and shifted spellings), `-` covers minus,
+    // `0` resets to the startup size (free: no shipped default uses it).
+    ("ctrl+equal", "increase_font_size"),
+    ("ctrl+plus", "increase_font_size"),
+    ("ctrl+shift+equal", "increase_font_size"),
+    ("ctrl+shift+plus", "increase_font_size"),
+    ("ctrl+minus", "decrease_font_size"),
+    ("ctrl+shift+minus", "decrease_font_size"),
+    ("ctrl+0", "reset_font_size"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -1391,6 +1437,39 @@ mod tests {
             ChromeAction::WorkspaceFocus(2).canonical(),
             "workspace_focus:2"
         );
+        assert_eq!(
+            ChromeAction::parse("increase_font_size").expect("zoom in"),
+            ChromeAction::IncreaseFontSize
+        );
+        assert_eq!(
+            ChromeAction::parse("zoom_in").expect("zoom_in alias"),
+            ChromeAction::IncreaseFontSize
+        );
+        assert_eq!(
+            ChromeAction::parse("decrease_font_size").expect("zoom out"),
+            ChromeAction::DecreaseFontSize
+        );
+        assert_eq!(
+            ChromeAction::parse("zoom_out").expect("zoom_out alias"),
+            ChromeAction::DecreaseFontSize
+        );
+        assert_eq!(
+            ChromeAction::parse("reset_font_size").expect("zoom reset"),
+            ChromeAction::ResetFontSize
+        );
+        assert_eq!(
+            ChromeAction::parse("zoom_reset").expect("zoom_reset alias"),
+            ChromeAction::ResetFontSize
+        );
+        assert_eq!(
+            ChromeAction::IncreaseFontSize.canonical(),
+            "increase_font_size"
+        );
+        assert_eq!(
+            ChromeAction::DecreaseFontSize.canonical(),
+            "decrease_font_size"
+        );
+        assert_eq!(ChromeAction::ResetFontSize.canonical(), "reset_font_size");
     }
 
     #[test]
@@ -1465,6 +1544,12 @@ mod tests {
             // Ctrl+V is shell input (verbatim/paste in readline); only the
             // shifted chord is owned by chrome.
             key_ref(KeyName::Char('v'), true, false, false),
+            // CTX-0263: bare `+`/`-`/`=`/`0` stay shell typing; only the
+            // Ctrl-held chords zoom.
+            key_ref(KeyName::Char('+'), false, false, false),
+            key_ref(KeyName::Char('-'), false, false, false),
+            key_ref(KeyName::Char('='), false, false, false),
+            key_ref(KeyName::Char('0'), false, false, false),
         ];
         for k in shell_keys {
             assert_eq!(match_keymap(&maps, k), None, "shell key {k:?}");
@@ -1491,6 +1576,36 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('v'), true, false, true)),
             Some(ChromeAction::PasteFromClipboard)
+        );
+        // CTX-0263 font zoom: every Ctrl spelling resolves, bare keys
+        // above stay shell.
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('='), true, false, false)),
+            Some(ChromeAction::IncreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('+'), true, false, false)),
+            Some(ChromeAction::IncreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('='), true, false, true)),
+            Some(ChromeAction::IncreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('+'), true, false, true)),
+            Some(ChromeAction::IncreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('-'), true, false, false)),
+            Some(ChromeAction::DecreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('-'), true, false, true)),
+            Some(ChromeAction::DecreaseFontSize)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('0'), true, false, false)),
+            Some(ChromeAction::ResetFontSize)
         );
     }
 
@@ -1575,13 +1690,15 @@ mod tests {
         // alt+w and alt+1..=9 are rebinds, not new identities) = 39, plus
         // CTX-0258's 4 Mod-aware resize chords = 43, plus CTX-0262's 16
         // arrow-key aliases (4 focus + 4 split + 4 legacy resize + 4
-        // Mod-aware resize) = 59 total, and the full DEC set resolves.
+        // Mod-aware resize) = 59, plus CTX-0263's 7 mod-independent font-zoom
+        // chords = 66 total, and the full DEC set resolves. Zoom chords carry
+        // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                59,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases"
+                66,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -1592,6 +1709,11 @@ mod tests {
                     mod_key
                 );
             }
+        }
+        let maps = default_keymaps().expect("defaults valid");
+        let mut seen = std::collections::HashSet::new();
+        for m in &maps {
+            assert!(seen.insert(m.id()), "duplicate default id {}", m.id());
         }
         let maps = default_keymaps().expect("defaults valid");
         // The DEC-0034 entry set resolves through the shipped table.
@@ -1955,6 +2077,80 @@ mod tests {
                 match_keymap(&super_maps, k),
                 None,
                 "shell key {k:?} (super map)"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_chord_spellings_cover_us_layout() {
+        // CTX-0263: `+` is Shift+= on US, and the `+`-split syntax cannot
+        // spell a literal `+` (`ctrl++` has an empty segment), so word
+        // spellings must resolve to the same single-character chords.
+        assert_eq!(
+            Chord::parse("ctrl+equal").expect("equal").canonical(),
+            "ctrl+="
+        );
+        assert_eq!(Chord::parse("ctrl+=").expect("=").canonical(), "ctrl+=");
+        assert_eq!(
+            Chord::parse("ctrl+plus").expect("plus").canonical(),
+            "ctrl++"
+        );
+        assert_eq!(
+            Chord::parse("ctrl+minus").expect("minus").canonical(),
+            "ctrl+-"
+        );
+        assert_eq!(Chord::parse("ctrl+-").expect("-").canonical(), "ctrl+-");
+        assert_eq!(
+            Chord::parse("ctrl+shift+equal")
+                .expect("shifted equal")
+                .canonical(),
+            "ctrl+shift+="
+        );
+        assert_eq!(
+            Chord::parse("ctrl+shift+plus")
+                .expect("shifted plus")
+                .canonical(),
+            "ctrl+shift++"
+        );
+        assert_eq!(Chord::parse("ctrl+0").expect("reset").canonical(), "ctrl+0");
+        // Word spellings are case-insensitive like every other chord.
+        assert_eq!(
+            Chord::parse("Ctrl+Plus").expect("case").canonical(),
+            "ctrl++"
+        );
+        // Bare zoom keys still go to the shell (schema rule).
+        for raw in ["+", "-", "=", "0", "plus", "minus", "equal"] {
+            assert!(Chord::parse(raw).is_err(), "bare {raw:?} must stay shell");
+        }
+        // A literal `ctrl++` stays rejected (empty segment) — users must
+        // write `ctrl+plus`; the error names the field.
+        let err = Chord::parse("ctrl++").unwrap_err();
+        assert!(err.to_string().contains("keymaps[].chord"));
+    }
+
+    #[test]
+    fn zoom_defaults_survive_mod_flip() {
+        // CTX-0263: font zoom is Ctrl-held and mod-independent, so a
+        // `super` mod flip must leave every zoom chord bound identically.
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char('='), true, false, false)),
+                Some(ChromeAction::IncreaseFontSize),
+                "zoom-in survives mod {:?}",
+                mod_key.canonical()
+            );
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char('-'), true, false, false)),
+                Some(ChromeAction::DecreaseFontSize),
+                "zoom-out survives mod {:?}",
+                mod_key.canonical()
+            );
+            assert_eq!(
+                match_keymap(&maps, key_ref(KeyName::Char('0'), true, false, false)),
+                Some(ChromeAction::ResetFontSize),
+                "zoom-reset survives mod {:?}",
+                mod_key.canonical()
             );
         }
     }

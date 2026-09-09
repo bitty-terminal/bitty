@@ -328,9 +328,26 @@ fn search_ui_refresh_preserves_current_clamped_and_auto_refresh_headless() {
     // Resize larger should also refresh (search inactive remains inactive, active would clamp)
     rt.search_set("needle", SearchOptions::default());
     let cnt = rt.search_match_count();
+    // Height-only resize keeps column width, so no rewrap happens and the
+    // per-row match count is preserved exactly (refresh only clamps).
+    // 736x586 maps to 80x30 under the default 9x19 cells and 8px padding:
+    // same 80 columns, 24 -> 30 rows.
+    rt.handle_resize(PhysicalSize::new(736, 586))
+        .expect("resize must succeed");
+    assert_eq!(rt.state().width(), 80);
+    assert_eq!(rt.state().height(), 30);
+    assert!(rt.search_is_active());
+    assert_eq!(rt.search_match_count(), cnt);
+    assert!(rt.search_current_index().unwrap() < rt.search_match_count());
+    // Width-changing resize reflows (CTX-0266 rewrap): physical rows change,
+    // so per-row match counts may legitimately change (e.g. matches split
+    // across a wrap seam rejoin). Assert refresh correctness instead of
+    // exact stability: still active, bounded, current clamped.
     rt.handle_resize(PhysicalSize::new(8 * 120, 16 * 30))
         .expect("resize must succeed");
-    assert_eq!(rt.search_match_count(), cnt);
+    assert!(rt.search_is_active());
+    assert!(rt.search_match_count() <= SEARCH_MAX_RESULTS);
+    assert!(rt.search_current_index().unwrap() < rt.search_match_count());
     // After resize, visible highlights still bounded
     let view = View::new(ViewId::new(1), rt.state().width(), rt.state().height());
     assert!(rt.search_visible_highlights(&view).len() <= SEARCH_MAX_RESULTS);

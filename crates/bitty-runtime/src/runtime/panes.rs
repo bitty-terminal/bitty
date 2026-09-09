@@ -240,6 +240,20 @@ impl Runtime {
         self.pane_sessions.get(view).and_then(|sess| sess.pty.pid())
     }
 
+    /// Current kernel winsize of the leaf's PTY, when the session exists.
+    ///
+    /// Introspection for split/resize verification (CTX-0269):
+    /// [`sync_pane_geometry`](Self::sync_pane_geometry) resizes the winsize
+    /// alongside the grid, so this must track the leaf allocation after any
+    /// layout change. Best-effort (`None` without a session or when the
+    /// kernel query fails).
+    #[must_use]
+    pub fn pane_pty_size(&self, view: &ViewId) -> Option<(u16, u16)> {
+        self.pane_sessions
+            .get(view)
+            .and_then(|sess| sess.pty.size().ok())
+    }
+
     /// Read-only snapshot of the leaf's private grid, when it owns a
     /// session. Leaves without a session share the primary
     /// [`snapshot`](Self::snapshot).

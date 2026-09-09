@@ -189,6 +189,7 @@ dependencies = [
  "bitty-render",
  "bitty-runtime",
  "bitty-term-state",
+ "bitty-test-support",
  "pollster",
 ]
 
@@ -285,6 +286,7 @@ version = "0.0.1"
 dependencies = [
  "bitty-platform",
  "bitty-term-state",
+ "bitty-test-support",
  "bitty-vt",
  "getrandom 0.3.4",
  "png",
@@ -304,6 +306,7 @@ dependencies = [
  "bitty-render",
  "bitty-rich",
  "bitty-term-state",
+ "bitty-test-support",
  "bitty-ui",
  "bitty-vt",
 ]
@@ -316,6 +319,10 @@ dependencies = [
  "bitty-vt",
  "proptest",
 ]
+
+[[package]]
+name = "bitty-test-support"
+version = "0.0.1"
 
 [[package]]
 name = "bitty-ui"

@@ -32,4 +32,5 @@ png = "0.18"
 
 
 [dev-dependencies]
+bitty-test-support = { path = "../bitty-test-support" }
 bitty-vt = { path = "../bitty-vt" }

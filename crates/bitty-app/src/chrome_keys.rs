@@ -781,6 +781,7 @@ mod tests {
     use super::*;
     use bitty_platform::{PlatformEvent, WindowId};
     use bitty_runtime::Runtime;
+    use bitty_test_support::require_pty;
 
     // CTX-0153 keymap-driven chrome keys: single-owner rule + layout surgery.
     // -----------------------------------------------------------------------
@@ -1486,8 +1487,10 @@ mod tests {
         )
     }
 
-    // POSIX-only: the live-close test below spawns /bin/sh (absent on Windows).
-    #[cfg(unix)]
+    // Live-spawn helper: the live-close test below spawns /bin/sh. It calls
+    // `require_pty!()` first and skips where no PTY backend exists
+    // (Windows ConPTY unimplemented per ADR-0002; CTX-0267), so this helper
+    // stays compiled on all platforms instead of hiding behind `#[cfg(unix)]`.
     fn esc_press() -> WindowEventKind {
         WindowEventKind::KeyboardInput(KeyEvent {
             logical_key: LogicalKey::Named(NamedKey::Escape),
@@ -1525,10 +1528,11 @@ mod tests {
         assert_eq!(app.runtime.workspaceline_text(), "1:ws1* (1)");
     }
 
-    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest.
-    #[cfg(unix)]
+    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
+    // exists (Windows; CTX-0267).
     #[test]
     fn chrome_workspace_close_live_pends_esc_cancels_repeat_kills() {
+        require_pty!();
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         // Live session in the active workspace: manual split (headless) +

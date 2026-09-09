@@ -493,6 +493,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::SplitAxis;
+    use bitty_test_support::require_pty;
 
     fn fresh() -> Runtime {
         Runtime::with_defaults().expect("defaults must build headless")
@@ -581,11 +582,11 @@ mod tests {
         assert!(!rt.has_pending_ws_close());
     }
 
-    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest
-    // (Windows ConPTY backend is unimplemented, so spawn fails there).
-    #[cfg(unix)]
+    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
+    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
     #[test]
     fn live_close_needs_repeat_confirm_and_kills() {
+        require_pty!();
         let mut rt = fresh();
         // Live session: split ws1 and spawn a real shell in the new leaf
         // (headless-safe, same pattern as pane_sessions.rs).
@@ -643,11 +644,11 @@ mod tests {
         assert_eq!(rt.workspace_count(), 1);
     }
 
-    // POSIX-only: spawns /bin/sh, which does not exist on windows-latest
-    // (Windows ConPTY backend is unimplemented, so spawn fails there).
-    #[cfg(unix)]
+    // Live-spawn: runs a real shell; skips (not fails) where no PTY backend
+    // exists (Windows ConPTY unimplemented per ADR-0002; CTX-0267).
     #[test]
     fn pending_arm_survives_switch_and_dies_with_workspace() {
+        require_pty!();
         let mut rt = fresh();
         rt.workspace_new().expect("new");
         // Live session in ws2 (active).

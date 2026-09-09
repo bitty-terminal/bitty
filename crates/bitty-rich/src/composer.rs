@@ -1373,6 +1373,7 @@ pub fn edit_externally(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_test_support::require_pty;
 
     fn workdir() -> PathBuf {
         // Unique subdir per call: tests run in parallel in one process, so
@@ -1627,10 +1628,11 @@ mod tests {
 
     // -- editor round-trip with fake editor script ----------------------------
 
-    // POSIX-only: fake editors are `#!/bin/sh` scripts executed directly.
-    // Windows has no `/bin/sh`, so `Command::new(*.sh)` fails with
-    // SpawnFailed. Gate helper + tests on unix (PX-1232).
-    #[cfg(unix)]
+    // Live-spawn tests: fake editors are `#!/bin/sh` scripts executed
+    // directly. Windows has no `/bin/sh` (ConPTY backend unimplemented per
+    // ADR-0002), so each test below calls `require_pty!()` first and skips
+    // there instead of failing (CTX-0267; replaces the old `#[cfg(unix)]`
+    // gates so Windows still compiles these tests).
     fn fake_editor_script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join(format!(
             "fake-editor-{}-{}.sh",
@@ -1659,7 +1661,6 @@ mod tests {
     /// failure, so retry the spawn a bounded number of times; every other
     /// error (including `Timeout` and `NonZeroExit`) returns immediately
     /// and keeps its deterministic assertion value.
-    #[cfg(unix)]
     fn edit_with_spawn_retry(
         buf: &mut CommandBuffer,
         editor: &str,
@@ -1681,8 +1682,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn editor_round_trip_with_fake_editor() {
+        require_pty!();
         let dir = workdir();
         let script = fake_editor_script(
             &dir,
@@ -1708,8 +1709,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn editor_failure_preserves_buffer_and_still_cleans_temp() {
+        require_pty!();
         let dir = workdir();
         // Failing editor: exits 1 without touching the file.
         let script = fake_editor_script(&dir, "#!/bin/sh\nexit 1\n");
@@ -1783,8 +1784,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn editor_timeout_kills_and_preserves_buffer() {
+        require_pty!();
         let dir = workdir();
         // Sleeper editor: sleeps 30 s; we allow 200 ms.
         let script = fake_editor_script(&dir, "#!/bin/sh\nsleep 30\n");

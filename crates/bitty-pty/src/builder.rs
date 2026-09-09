@@ -500,6 +500,8 @@ mod tests {
 
     #[test]
     fn empty_program_is_rejected() {
+        // pty-gate-exempt: builder validation only (`validate()` never
+        // spawns); passes on every platform without a PTY (CTX-0267).
         let err = PtyBuilder::new("").validate().unwrap_err();
         assert!(matches!(err, PtyError::EmptyProgram));
     }

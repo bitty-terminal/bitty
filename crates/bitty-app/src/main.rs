@@ -5128,6 +5128,7 @@ fn main() {
 mod tests {
     use super::chrome_keys::two_pane_layout;
     use super::*;
+    use bitty_test_support::require_pty;
 
     fn args_of(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| (*s).to_string()).collect()
@@ -7665,9 +7666,12 @@ mod tests {
         assert_eq!(app.runtime.pane_count(), 0);
     }
 
-    #[cfg(unix)]
+    // Live-spawn: the fresh leaf owns a real shell; skips (not fails) where
+    // no PTY backend exists (Windows ConPTY unimplemented per ADR-0002;
+    // CTX-0267).
     #[test]
     fn new_split_spawns_private_shell_and_close_tears_it_down() {
+        require_pty!();
         // CTX-0176 (Issue #274): the fresh leaf owns a live shell; closing
         // the leaf tears the child down with it.
         use bitty_config::{ChromeAction, SplitDir};

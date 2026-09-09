@@ -18,6 +18,9 @@ typecheck:
 actionlint:
     actionlint -color
 
+pty-gate:
+    ./scripts/check-pty-gated-tests.sh
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
@@ -43,4 +46,4 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test actionlint markdownlint
+check: fmt-check clippy test pty-gate actionlint markdownlint

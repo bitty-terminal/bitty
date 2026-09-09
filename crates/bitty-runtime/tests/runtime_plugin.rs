@@ -38,6 +38,7 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
         },
         dependencies: Vec::new(),
         provided_services: Vec::new(),
+        required_services: Vec::new(),
         capabilities: CapabilityRequests::default(),
         lazy: LazyTriggers {
             commands: commands

@@ -5151,6 +5151,9 @@ fn main() {
 mod tests {
     use super::chrome_keys::two_pane_layout;
     use super::*;
+    // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
+    // without the gate the import is unused on Windows.
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     fn args_of(words: &[&str]) -> Vec<String> {
@@ -7750,10 +7753,13 @@ mod tests {
         assert_eq!(app.runtime.pane_count(), 0);
     }
 
-    // Live-spawn: the fresh leaf owns a real shell; skips (not fails) where
-    // no PTY backend exists (Windows ConPTY unimplemented per ADR-0002;
-    // CTX-0267).
+    // Live-spawn: the fresh leaf owns a real POSIX shell (`/bin/sh` has no
+    // Windows equivalent). `#[cfg(unix)]` keeps it off Windows CI;
+    // `require_pty!()` keeps the force-no-PTY simulation path. ConPTY
+    // coverage lives in bitty-pty/tests/spawn_windows.rs (CTX-0268);
+    // porting this test to a platform-neutral spawn is deferred follow-up.
     #[test]
+    #[cfg(unix)]
     fn new_split_spawns_private_shell_and_close_tears_it_down() {
         require_pty!();
         // CTX-0176 (Issue #274): the fresh leaf owns a live shell; closing

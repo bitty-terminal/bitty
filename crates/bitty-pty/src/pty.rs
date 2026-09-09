@@ -64,7 +64,8 @@ impl Pty {
         self.session.size()
     }
 
-    /// Terminal device name (Unix), when available.
+    /// Terminal device name, when the platform exposes one (always `None`
+    /// on Windows: ConPTY has no device path).
     pub fn tty_name(&self) -> Option<std::path::PathBuf> {
         self.session.tty_name()
     }
@@ -97,7 +98,8 @@ impl Pty {
         Ok(PtyWriter::new(inner))
     }
 
-    /// Terminates the child immediately (SIGKILL-equivalent on Unix).
+    /// Terminates the child immediately (SIGKILL on Unix,
+    /// terminate-process on Windows).
     ///
     /// Does not reap; follow with [`Pty::wait`] or use [`Pty::shutdown`].
     pub fn kill(&mut self) -> Result<(), PtyError> {

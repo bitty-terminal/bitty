@@ -419,8 +419,18 @@ pub struct Runtime {
     /// Stored Kitty images plus cursor-anchored placements (CTX-0248).
     ///
     /// Presentation-only: composited topmost in the tick overlay path,
-    /// never grid truth. Cleared on alternate-screen entry.
+    /// never grid truth. Cleared per origin on alternate-screen entry
+    /// (CTX-0254).
     kitty_images: bitty_rich::KittyImageLayer,
+    /// Origin token of the PTY stream currently being drained (CTX-0254).
+    ///
+    /// `None` is the primary grid; `Some(view.0)` is the split-pane
+    /// session swapped into the primary slots by `handle_pane_bytes`.
+    /// Read by `kitty_display_image` to tag placements with their
+    /// emitting pane, so the present layer confines each image to its
+    /// own leaf (cross-pane spoof prevention). Always restored after
+    /// the pane pump; never observed outside the drain path.
+    kitty_origin: Option<u64>,
     /// Scaled-blit cache across present frames (CTX-0252 F2).
     ///
     /// Keyed by placement + image identity, destination rect, source dims,
@@ -674,6 +684,7 @@ impl Runtime {
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_origin: None,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,
@@ -793,6 +804,7 @@ impl Runtime {
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
+            kitty_origin: None,
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,

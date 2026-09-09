@@ -208,11 +208,14 @@ fn alt_screen_clears_and_suppresses() {
         probe(&rt.headless_rgba().expect("rgba"), width, pad + 1, pad + 1),
         [0xFF, 0, 0, 0xFF,]
     );
-    // Enter alternate screen: the layer clears and the repaint carries no
-    // image pixels even though the grid generation may not advance.
+    // Enter alternate screen: the origin's placements clear and the repaint
+    // carries no image pixels even though the grid generation may not
+    // advance. CTX-0254: the clear is per-origin — the stored image survives
+    // inertly (same model as the suppressed-display path below), only the
+    // placement is dropped.
     rt.handle_pty_bytes(b"\x1b[?1049h");
     rt.tick().expect("alt transition forces a present");
-    assert_eq!(rt.kitty_image_count(), 0);
+    assert_eq!(rt.kitty_image_count(), 1, "stored image survives inertly");
     assert_eq!(rt.kitty_placement_count(), 0);
     let rgba = rt.headless_rgba().expect("rgba");
     // Cursor rests at (0,0): cursor fill, not background — assert non-red.
@@ -221,7 +224,9 @@ fn alt_screen_clears_and_suppresses() {
         [0xFF, 0, 0, 0xFF],
         "alt screen must carry no image pixels"
     );
-    // Display while alt is active stores without placing.
+    // Display while alt is active stores without placing. CTX-0254: the
+    // pre-alt image is still in the store (per-origin clear), so the
+    // suppressed store brings the count to two.
     let outcome = rt
         .kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
         .expect("alt display must store");
@@ -229,13 +234,15 @@ fn alt_screen_clears_and_suppresses() {
         outcome,
         KittyDisplayOutcome::SuppressedAlternateScreen { .. }
     ));
-    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_image_count(), 2);
     assert_eq!(rt.kitty_placement_count(), 0);
-    // Leave alternate screen: the stored-but-never-placed image survives
-    // inertly (placements stay empty, nothing paints).
+    // Leave alternate screen: both stored-but-never-placed images survive
+    // inertly (placements stay empty, nothing paints). CTX-0254: the
+    // pre-alt image is no longer wiped by the alt entry, so the count is
+    // two here (pre-alt + alt-suppressed), not one.
     rt.handle_pty_bytes(b"\x1b[?1049l");
     rt.tick();
-    assert_eq!(rt.kitty_image_count(), 1, "stored image survives inertly");
+    assert_eq!(rt.kitty_image_count(), 2, "stored images survive inertly");
     assert_eq!(rt.kitty_placement_count(), 0);
 }
 

@@ -44,6 +44,10 @@
 //! | [`kitty_decode::KITTY_DECODE_MAX_DIMENSION`] | 8192 px/side | typed error, no allocation |
 //! | [`kitty_decode::KITTY_DECODE_MAX_PIXELS`] (4096² area) | 16.7M px | typed error, no allocation |
 //! | [`kitty_decode::KITTY_DECODE_MAX_BYTES`] decoded RGBA | 64 MiB | typed error, no allocation |
+//! | [`kitty_place::KITTY_PRESENT_MAX_BLITS_PER_FRAME`] per-frame blits | 32 | skip-for-frame in paint order |
+//! | [`kitty_place::KITTY_PRESENT_MAX_BYTES_PER_FRAME`] per-frame blit bytes | 64 MiB | skip-for-frame before rasterize |
+//! | [`kitty_place::KITTY_RASTER_CACHE_MAX_ENTRIES`] cached rasters | 128 | oldest evicted |
+//! | [`kitty_place::KITTY_RASTER_CACHE_MAX_BYTES`] cached raster bytes | 64 MiB | oldest evicted |
 //! | [`image::IMAGE_STORE_MAX_COUNT`] (IMG-5) | 256 | oldest evicted on admission |
 //! | [`image::IMAGE_STORE_MAX_BYTES`] (IMG-4) | 256 MiB | oldest evicted on admission |
 //! | [`image::IMAGE_MAX_DECODED_BYTES`] (IMG-3) | 64 MiB | typed error, no placement |
@@ -131,9 +135,12 @@ pub use kitty_decode::{
     decode_kitty_payload,
 };
 pub use kitty_place::{
-    KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS, KittyAction,
+    KITTY_PLACE_MAX_BYTES, KITTY_PLACE_MAX_IMAGES, KITTY_PLACE_MAX_ITEMS,
+    KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
+    KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyAction, KittyFrameBudget,
     KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
-    KittyPlacementId, placement_rect_for, rasterize, viewport_extent,
+    KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_rect_for,
+    rasterize, viewport_extent,
 };
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,

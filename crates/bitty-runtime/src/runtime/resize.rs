@@ -261,6 +261,115 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
+    /// Live font size in points (CTX-0263 per-window font zoom).
+    ///
+    /// Starts at the validated config value; chrome zoom steps mutate this
+    /// without touching the config file (per-window, not a global write).
+    #[must_use]
+    pub fn font_size(&self) -> f32 {
+        self.config.font_size
+    }
+
+    /// Startup font size this window resets to (CTX-0263 `ctrl+0`).
+    #[must_use]
+    pub fn base_font_size(&self) -> f32 {
+        self.base_font_size
+    }
+
+    /// Live-apply a font size without restart (CTX-0263).
+    ///
+    /// Fail-closed: non-finite or out-of-range sizes (`[MIN, MAX]` below)
+    /// return [`RuntimeError::InvalidConfig`] with no mutation. Valid sizes
+    /// update the per-window config, re-derive the renderer at the live DPI
+    /// scale, reflow the grid from the current surface extent (the window
+    /// keeps its size; the grid absorbs the new cell), and repaint fully —
+    /// so zoom survives reflow/resize (later resizes derive from the new
+    /// base). Renderer font-load failures keep the previous cells/grid
+    /// (fail-safe, window stays drawable) while the requested size is still
+    /// stored so the next resize reconciles.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when `size` is non-finite or outside
+    /// `[FONT_ZOOM_MIN_PT, FONT_ZOOM_MAX_PT]`.
+    pub fn set_font_size(&mut self, size: f32) -> Result<(), RuntimeError> {
+        if !(size.is_finite()
+            && (crate::config::FONT_ZOOM_MIN_PT..=crate::config::FONT_ZOOM_MAX_PT).contains(&size))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "font_size must be finite within [6.0, 32.0]",
+            ));
+        }
+        if (size - self.config.font_size).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        self.config.font_size = size;
+        // Re-adopt at the live DPI scale so renderer + grid follow the new
+        // base (same path as a DPI change; absorbs reflow errors).
+        let scale = self.scale_factor.get();
+        let extent = self.surface.extent();
+        self.apply_dpi_scale(scale, extent);
+        Ok(())
+    }
+
+    /// Grow the per-window font one step (CTX-0263 `ctrl+=`/`ctrl+plus`).
+    ///
+    /// Fail-closed at [`crate::config::FONT_ZOOM_MAX_PT`]: no wrap, no
+    /// clamp-past-the-end, the size is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when already at the maximum.
+    pub fn zoom_in(&mut self) -> Result<(), RuntimeError> {
+        let next = self.config.font_size + crate::config::FONT_ZOOM_STEP_PT;
+        if next > crate::config::FONT_ZOOM_MAX_PT + f32::EPSILON {
+            return Err(RuntimeError::InvalidConfig(
+                "font_size already at maximum zoom",
+            ));
+        }
+        self.set_font_size(next.min(crate::config::FONT_ZOOM_MAX_PT))
+    }
+
+    /// Shrink the per-window font one step (CTX-0263 `ctrl+-`).
+    ///
+    /// Fail-closed at [`crate::config::FONT_ZOOM_MIN_PT`].
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] when already at the minimum.
+    pub fn zoom_out(&mut self) -> Result<(), RuntimeError> {
+        let next = self.config.font_size - crate::config::FONT_ZOOM_STEP_PT;
+        if next < crate::config::FONT_ZOOM_MIN_PT - f32::EPSILON {
+            return Err(RuntimeError::InvalidConfig(
+                "font_size already at minimum zoom",
+            ));
+        }
+        self.set_font_size(next.max(crate::config::FONT_ZOOM_MIN_PT))
+    }
+
+    /// Reset the per-window font to the startup size (CTX-0263 `ctrl+0`).
+    ///
+    /// Total: always succeeds for a validated runtime (the stored base came
+    /// from a validated config).
+    pub fn reset_zoom(&mut self) {
+        let base = self.base_font_size;
+        // Base came from a validated config inside the zoom range for all
+        // shipped defaults; if a custom startup size sits outside the zoom
+        // window (e.g. a 48pt accessibility config), still restore it
+        // directly instead of failing the reset.
+        if (base - self.config.font_size).abs() < f32::EPSILON {
+            return;
+        }
+        if (crate::config::FONT_ZOOM_MIN_PT..=crate::config::FONT_ZOOM_MAX_PT).contains(&base) {
+            let _ = self.set_font_size(base);
+        } else {
+            self.config.font_size = base;
+            let scale = self.scale_factor.get();
+            let extent = self.surface.extent();
+            self.apply_dpi_scale(scale, extent);
+        }
+    }
+
     /// Reflows terminal state, layout, surface, and PTY to `cols`/`rows`
     /// with `surface_extent` as the configured extent. Shared by
     /// [`Self::handle_resize`] and [`Self::apply_dpi_scale`] so both paths

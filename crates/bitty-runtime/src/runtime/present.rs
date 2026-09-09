@@ -117,6 +117,13 @@ pub struct PresentStats {
     pub headless: bool,
     /// Snapshot generation that was presented.
     pub generation: u64,
+    /// Number of Kitty image blits in the presented draw list.
+    pub images: usize,
+    /// Image blits skipped by the real-GPU path (CTX-0253 F3 display gate).
+    ///
+    /// Always `0` on the headless seam (every blit is blended); non-zero
+    /// only on a real surface while the texture-upload path is pending.
+    pub images_skipped: usize,
 }
 
 impl From<RenderPresentStats> for PresentStats {
@@ -127,8 +134,54 @@ impl From<RenderPresentStats> for PresentStats {
             glyphs: value.glyphs,
             headless: value.headless,
             generation: 0,
+            images: value.images,
+            images_skipped: value.images_skipped,
         }
     }
+}
+
+// CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
+//
+// Compositors clip in `i64`; mirror that here. The old
+// `rect.x as i32 * live.width as i32 + pad_px` chains could wrap: `live`
+// cell metrics come from local config (extreme values are hostile input),
+// so a `u32` cell side above `i32::MAX` truncated on the `as i32` cast and
+// the `i32` multiply/add then wrapped (debug panic / release wrap).
+// Every helper below is total: products accumulate in `u64`, sums in
+// `i64`, results clamp to the `i32`/`u32` ranges.
+
+/// Leaf pixel origin: `axis_cells * cell_px + pad_px`, saturated to `i32`.
+pub(super) fn px_origin(axis_cells: u16, cell_px: u32, pad_px: i32) -> i32 {
+    let v = u64::from(axis_cells)
+        .saturating_mul(u64::from(cell_px))
+        .saturating_add(u64::try_from(pad_px.max(0)).unwrap_or(0));
+    i32::try_from(v).unwrap_or(i32::MAX)
+}
+
+/// Saturating `i32` add for translated rect/glyph destinations.
+pub(super) fn px_add(a: i32, b: i32) -> i32 {
+    a.saturating_add(b)
+}
+
+/// Cell-span width in pixels (`cells * cell_px`), saturated to `u32`.
+pub(super) fn px_span(cells: u16, cell_px: u32) -> u32 {
+    u32::try_from(u64::from(cells).saturating_mul(u64::from(cell_px))).unwrap_or(u32::MAX)
+}
+
+/// `usize` cell-span width in pixels (banner pills), saturated to `u32`.
+fn px_span_usize(cells: usize, cell_px: u32) -> u32 {
+    u32::try_from((cells as u64).saturating_mul(u64::from(cell_px))).unwrap_or(u32::MAX)
+}
+
+/// Offset from a pixel base by a cell count (`base + cells * cell_px`).
+pub(super) fn px_offset_cells(base: i32, cells: u16, cell_px: u32) -> i32 {
+    let delta = u64::from(cells).saturating_mul(u64::from(cell_px));
+    base.saturating_add(i32::try_from(delta).unwrap_or(i32::MAX))
+}
+
+/// Saturating `u32` -> `i32` for pixel sides that feed `i32` geometry.
+pub(super) fn px_side(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 /// Zero-size erased snapshot (CTX-0234): [`viewport_snapshot`] pads it to the
@@ -372,7 +425,9 @@ impl Runtime {
         // (leaf grids, selection, IME, banner) by the inset; the padding
         // band itself keeps the surface clear color. Physical pixels at the
         // live scale so HiDPI placement matches grid derivation.
-        let pad_px = self.window_padding_physical() as i32;
+        // CTX-0253 F4: saturating conversion — the physical inset is
+        // `u32` and must never wrap into a negative `i32` origin.
+        let pad_px = i32::try_from(self.window_padding_physical()).unwrap_or(i32::MAX);
 
         for (view_id, rect) in &allocations {
             if rect.is_empty() {
@@ -547,16 +602,16 @@ impl Runtime {
             any_needs_draw = true;
 
             let live = self.live_cell_metrics();
-            let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
-            let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
+            let origin_px_x = px_origin(rect.x, live.width, pad_px);
+            let origin_px_y = px_origin(rect.y, live.height, pad_px);
             for mut fill in list.fills {
-                fill.rect.x += origin_px_x;
-                fill.rect.y += origin_px_y;
+                fill.rect.x = px_add(fill.rect.x, origin_px_x);
+                fill.rect.y = px_add(fill.rect.y, origin_px_y);
                 combined_fills.push(fill);
             }
             for mut glyph in list.glyphs {
-                glyph.dest[0] += origin_px_x;
-                glyph.dest[1] += origin_px_y;
+                glyph.dest[0] = px_add(glyph.dest[0], origin_px_x);
+                glyph.dest[1] = px_add(glyph.dest[1], origin_px_y);
                 combined_glyphs.push(glyph);
             }
         }
@@ -591,11 +646,11 @@ impl Runtime {
                                 live,
                             );
                             if !rects.is_empty() {
-                                let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
-                                let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
+                                let origin_px_x = px_origin(rect.x, live.width, pad_px);
+                                let origin_px_y = px_origin(rect.y, live.height, pad_px);
                                 for mut fill in rects {
-                                    fill.rect.x += origin_px_x;
-                                    fill.rect.y += origin_px_y;
+                                    fill.rect.x = px_add(fill.rect.x, origin_px_x);
+                                    fill.rect.y = px_add(fill.rect.y, origin_px_y);
                                     combined_fills.push(fill);
                                 }
                                 any_needs_draw = true;
@@ -621,16 +676,24 @@ impl Runtime {
                             .and_then(|focused| self.pane_sessions.get(&focused))
                             .map(|sess| sess.state.snapshot().cursor.position)
                             .unwrap_or(snapshot.cursor.position);
-                        let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
-                        let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
-                        let base_x = origin_px_x + cur.col as i32 * live.width as i32;
-                        let base_y = origin_px_y + cur.row as i32 * live.height as i32;
+                        let origin_px_x = px_origin(rect.x, live.width, pad_px);
+                        let origin_px_y = px_origin(rect.y, live.height, pad_px);
+                        let base_x = px_offset_cells(origin_px_x, cur.col, live.width);
+                        let base_y = px_offset_cells(origin_px_y, cur.row, live.height);
                         // Simple IME overlay: underline background rect plus glyphs for preedit chars.
                         // For slice, render preedit as single underline fill plus per-char glyphs via renderer? Simplified: add a fill rect for underline.
-                        let preedit_width = (preedit.chars().count() as u32 * live.width).min(1024);
+                        // CTX-0253 F4: the char count times the cell width
+                        // accumulates in `u64` before the 1024 clamp so a
+                        // hostile count can never wrap the `u32` product.
+                        let preedit_width = u32::try_from(
+                            (preedit.chars().count() as u64)
+                                .saturating_mul(u64::from(live.width))
+                                .min(1024),
+                        )
+                        .unwrap_or(1024);
                         let underline_rect = bitty_render::geometry::RectPx::new(
                             base_x,
-                            base_y + live.height as i32 - 2,
+                            px_add(base_y, px_side(live.height).saturating_sub(2)),
                             preedit_width,
                             2,
                         );
@@ -677,14 +740,24 @@ impl Runtime {
                             // to the view), right-aligned so most of the row
                             // stays visible.
                             let text_cells = banner.chars().count().min(max_cells).max(1);
-                            let pill_w = text_cells as u32 * live.width;
-                            let full_w = rect.width as u32 * live.width;
-                            let origin_px_x = rect.x as i32 * live.width as i32
-                                + (full_w.saturating_sub(pill_w)) as i32
-                                + pad_px;
-                            let banner_y = (rect.y as i32 + rect.height as i32 - 1)
-                                * (live.height as i32)
-                                + pad_px;
+                            // CTX-0253 F4: pill/full widths and the
+                            // right-aligned origin accumulate in `u64`/`i64`
+                            // (see `px_span_usize`/`px_span`) so hostile cell
+                            // metrics cannot wrap the products or the sums.
+                            let pill_w = px_span_usize(text_cells, live.width);
+                            let full_w = px_span(rect.width, live.width);
+                            let origin_px_x = px_add(
+                                px_origin(rect.x, live.width, pad_px),
+                                px_side(full_w.saturating_sub(pill_w)),
+                            );
+                            let banner_y = px_add(
+                                px_offset_cells(
+                                    px_origin(rect.y, live.height, 0),
+                                    rect.height.saturating_sub(1),
+                                    live.height,
+                                ),
+                                pad_px,
+                            );
                             combined_fills.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
@@ -724,14 +797,20 @@ impl Runtime {
                             let live = self.live_cell_metrics();
                             let max_cells = rect.width as usize;
                             let text_cells = banner.chars().count().min(max_cells).max(1);
-                            let pill_w = text_cells as u32 * live.width;
-                            let full_w = rect.width as u32 * live.width;
-                            let origin_px_x = rect.x as i32 * live.width as i32
-                                + (full_w.saturating_sub(pill_w)) as i32
-                                + pad_px;
-                            let banner_y = (rect.y as i32 + rect.height as i32 - 1)
-                                * (live.height as i32)
-                                + pad_px;
+                            let pill_w = px_span_usize(text_cells, live.width);
+                            let full_w = px_span(rect.width, live.width);
+                            let origin_px_x = px_add(
+                                px_origin(rect.x, live.width, pad_px),
+                                px_side(full_w.saturating_sub(pill_w)),
+                            );
+                            let banner_y = px_add(
+                                px_offset_cells(
+                                    px_origin(rect.y, live.height, 0),
+                                    rect.height.saturating_sub(1),
+                                    live.height,
+                                ),
+                                pad_px,
+                            );
                             combined_fills.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
@@ -825,8 +904,8 @@ impl Runtime {
                                 height: live.height,
                             };
                             let scrollback = self.state.scrollback_len();
-                            let origin_px_x = rect.x as i32 * live.width as i32 + pad_px;
-                            let origin_px_y = rect.y as i32 * live.height as i32 + pad_px;
+                            let origin_px_x = px_origin(rect.x, live.width, pad_px);
+                            let origin_px_y = px_origin(rect.y, live.height, pad_px);
                             let mut budget = bitty_rich::KittyFrameBudget::new();
                             for placement in self.kitty_images.placements_in_paint_order() {
                                 let Some(img) = self.kitty_images.get(placement.image) else {
@@ -870,8 +949,8 @@ impl Runtime {
                                     continue;
                                 };
                                 let dest = bitty_render::geometry::RectPx::new(
-                                    rect_px.x + origin_px_x,
-                                    rect_px.y + origin_px_y,
+                                    px_add(rect_px.x, origin_px_x),
+                                    px_add(rect_px.y, origin_px_y),
                                     rect_px.width,
                                     rect_px.height,
                                 );
@@ -1048,6 +1127,46 @@ impl Runtime {
             glyphs: stats.glyphs,
             headless: stats.headless,
             generation: current_gen,
+            images: stats.images,
+            images_skipped: stats.images_skipped,
         })
+    }
+}
+
+#[cfg(test)]
+mod present_origin_tests {
+    use super::{px_add, px_offset_cells, px_origin, px_side, px_span, px_span_usize};
+
+    #[test]
+    fn origins_are_exact_on_normal_config() {
+        // 9x19 cells (default geometry), 8px pad: the helpers must agree
+        // with plain arithmetic where nothing overflows.
+        assert_eq!(px_origin(0, 9, 8), 8);
+        assert_eq!(px_origin(80, 9, 8), 728);
+        assert_eq!(px_origin(24, 19, 8), 464);
+        assert_eq!(px_add(100, 728), 828);
+        assert_eq!(px_offset_cells(8, 3, 9), 35);
+        assert_eq!(px_span(80, 9), 720);
+        assert_eq!(px_span_usize(10, 9), 90);
+        assert_eq!(px_side(19), 19);
+    }
+
+    #[test]
+    fn origins_saturate_on_hostile_config() {
+        // CTX-0253 F4: extreme cell metrics from hostile local config must
+        // clip like compositors do (saturate), never wrap the old `as i32`
+        // casts or overflow `i32` multiply/add (debug panic / release wrap).
+        assert_eq!(px_origin(u16::MAX, u32::MAX, i32::MAX), i32::MAX);
+        assert_eq!(px_origin(1, u32::MAX, 0), i32::MAX);
+        assert_eq!(px_origin(u16::MAX, 1, 0), u16::MAX as i32);
+        assert_eq!(px_add(i32::MAX, 1), i32::MAX);
+        assert_eq!(px_add(i32::MAX, i32::MAX), i32::MAX);
+        assert_eq!(px_offset_cells(i32::MAX, u16::MAX, u32::MAX), i32::MAX);
+        assert_eq!(px_offset_cells(0, 1, u32::MAX), i32::MAX);
+        assert_eq!(px_span(u16::MAX, u32::MAX), u32::MAX);
+        assert_eq!(px_span_usize(usize::MAX, u32::MAX), u32::MAX);
+        assert_eq!(px_side(u32::MAX), i32::MAX);
+        // Zero stays zero (no 1px floor: a zero inset is meaningful).
+        assert_eq!(px_origin(0, 9, 0), 0);
     }
 }

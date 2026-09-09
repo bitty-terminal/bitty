@@ -463,6 +463,12 @@ impl KittyGraphicsStub {
     /// `(0, anchor_row * cell.height)` with size `width_cells * width` by
     /// `height_cells * height` (always 1×1 in this draft). Unanchored
     /// placeholders contribute no rectangle — placement is deferred.
+    ///
+    /// All arithmetic saturates (CTX-0253 F4): hostile local config can
+    /// carry extreme cell metrics, and `anchor_row` is `usize`, so the raw
+    /// `as i32` / `as u32` casts they replaced could wrap. Compositors clip
+    /// in `i64`; this mirrors that by computing in `u64` and clamping to
+    /// the `i32`/`u32` ranges.
     #[must_use]
     pub fn placeholder_rects(&self, metrics: CellMetrics) -> Vec<(KittyPlaceholderId, RectPx)> {
         let mut rects = Vec::new();
@@ -470,13 +476,35 @@ impl KittyGraphicsStub {
             let Some(row) = entry.anchor_row else {
                 continue;
             };
-            let width = u32::from(entry.width_cells) * metrics.width;
-            let height = u32::from(entry.height_cells) * metrics.height;
+            let width = saturating_u32(
+                u64::from(entry.width_cells).saturating_mul(u64::from(metrics.width)),
+            );
+            let height = saturating_u32(
+                u64::from(entry.height_cells).saturating_mul(u64::from(metrics.height)),
+            );
             let x = 0;
-            let y = (row as u64 * u64::from(metrics.height)) as i32;
+            let y = saturating_i32((row as u64).saturating_mul(u64::from(metrics.height)));
             rects.push((entry.id, RectPx::new(x, y, width, height)));
         }
         rects
+    }
+}
+
+/// Saturating `u64` -> `i32` (mirrors `kitty_place` and the grid pipeline).
+const fn saturating_i32(value: u64) -> i32 {
+    if value > i32::MAX as u64 {
+        i32::MAX
+    } else {
+        value as i32
+    }
+}
+
+/// Saturating `u64` -> `u32` (mirrors `kitty_place` and the grid pipeline).
+const fn saturating_u32(value: u64) -> u32 {
+    if value > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        value as u32
     }
 }
 
@@ -569,6 +597,42 @@ mod tests {
         let rects = stub.placeholder_rects(metrics);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].1.y, 3 * 16);
+        assert_eq!(rects[0].1.width, 8);
+        assert_eq!(rects[0].1.height, 16);
+    }
+
+    #[test]
+    fn placeholder_rects_saturate_on_hostile_config() {
+        // CTX-0253 F4: extreme cell metrics (hostile local config) plus a
+        // huge anchor row must saturate, never wrap the old `as i32` /
+        // `as u32` casts (debug panic / release wrap). Compositors clip in
+        // `i64`; the rect clamps to the `i32`/`u32` maxima instead.
+        let mut stub = KittyGraphicsStub::new();
+        stub.ingest(b"hostile", Some(usize::MAX));
+        let metrics = CellMetrics {
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        let rects = stub.placeholder_rects(metrics);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].1.x, 0);
+        assert_eq!(rects[0].1.y, i32::MAX);
+        assert_eq!(rects[0].1.width, u32::MAX);
+        assert_eq!(rects[0].1.height, u32::MAX);
+    }
+
+    #[test]
+    fn placeholder_rects_saturate_huge_row_normal_metrics() {
+        // Row overflow alone (normal metrics) still clamps the `y` origin.
+        let mut stub = KittyGraphicsStub::new();
+        stub.ingest(b"far", Some(usize::MAX));
+        let metrics = CellMetrics {
+            width: 8,
+            height: 16,
+        };
+        let rects = stub.placeholder_rects(metrics);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].1.y, i32::MAX);
         assert_eq!(rects[0].1.width, 8);
         assert_eq!(rects[0].1.height, 16);
     }

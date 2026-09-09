@@ -327,3 +327,25 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
         "old anchor row must not keep a stale blit"
     );
 }
+
+#[test]
+fn tick_stats_report_images_drawn_not_skipped() {
+    // CTX-0253 F3: CPU/GPU image parity is observable end to end. The
+    // headless seam blends the blit, so the tick stats must report it
+    // drawn (`images == 1`, `images_skipped == 0`); a real-GPU present of
+    // the same frame would report `images_skipped == 1` via the display
+    // gate instead of diverging silently.
+    let mut rt = make_runtime();
+    rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
+        .expect("display must succeed");
+    let stats = rt.tick().expect("display forces a present");
+    assert!(stats.headless);
+    assert_eq!(stats.images, 1);
+    assert_eq!(stats.images_skipped, 0);
+    // A frame with no images reports zeroes on both counters.
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(b"A");
+    let stats = rt.tick().expect("text forces a present");
+    assert_eq!(stats.images, 0);
+    assert_eq!(stats.images_skipped, 0);
+}

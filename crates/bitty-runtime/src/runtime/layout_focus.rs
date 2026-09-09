@@ -170,10 +170,21 @@ impl Runtime {
 
     /// Replaces the owned layout tree.
     ///
-    /// The new tree's leaf `View`s are kept as provided; `tick` will reflow
-    /// them into the current container on the next frame. Focus is retained
-    /// when the focused `ViewId` still exists, otherwise it moves to the
-    /// first leaf (if any) or clears.
+    /// The new tree's leaf `View`s are reflowed into the current container
+    /// immediately (tick repeats this every frame; idempotent), and every
+    /// grid follows its leaf: pane sessions via
+    /// [`Self::sync_pane_geometry`](super::Runtime::sync_pane_geometry), and
+    /// the shared primary grid (+ primary PTY winsize) via the focused
+    /// leaf's allocation. Focus is retained when the focused `ViewId` still
+    /// exists, otherwise it moves to the first leaf (if any) or clears.
+    ///
+    /// CTX-0269: session-less leaves share the primary grid and the focused
+    /// one owns input/cursor, so the primary must shrink/grow with the
+    /// focused allocation — previously `set_layout` left the stale
+    /// pre-split grid and `tick` only clipped it via `viewport_snapshot`
+    /// (live split showed a ~155-col grid in a ~77-col pane, tails
+    /// invisible, reflow never firing). Best-effort like the pane sync:
+    /// matching dims skip, PTY errors never fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
@@ -185,6 +196,27 @@ impl Runtime {
             }
         } else {
             self.focus.set(leaf_ids[0]);
+        }
+        // Leaf Views carry their allocation from here (not deferred to the
+        // next tick) so per-leaf geometry is inspectable immediately.
+        self.layout.reflow_with_gaps(self.container, self.gaps());
+        // Primary grid + primary PTY winsize (SIGWINCH path) follow the
+        // focused leaf — the tile that shows primary input/cursor.
+        if let Some(focused) = self.focus.focused() {
+            if let Some((_, rect)) = self
+                .layout_allocations()
+                .into_iter()
+                .find(|(id, _)| *id == focused)
+            {
+                let cols = rect.width.max(1) as usize;
+                let rows = rect.height.max(1) as usize;
+                if self.state.width() != cols || self.state.height() != rows {
+                    let _ = self.state.resize(cols, rows);
+                    if let Some(pty) = self.pty.as_mut() {
+                        let _ = pty.resize(rect.width.max(1), rect.height.max(1));
+                    }
+                }
+            }
         }
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.

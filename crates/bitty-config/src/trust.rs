@@ -182,7 +182,7 @@ impl TrustStore {
 ///
 /// The allowed subset in this draft: `font`, `window`, `terminal.scrollback`,
 /// `terminal.scroll_lines_per_notch`, `terminal.scroll_pixels_per_notch`,
-/// `selection.auto_copy`, `scrollbar`, `appearance`. Expanding this without review would
+/// `selection.auto_copy`, `scrollbar`, `mouse`, `appearance`. Expanding this without review would
 /// weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {
@@ -246,6 +246,13 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
         // CTX-0181: the scrollbar is presentation-only chrome (like
         // auto-copy), so project layers may set it.
         b.validate().map_err(|e| ConfigError::TrustViolation {
+            message: e.to_string(),
+        })?;
+    }
+    if let Some(m) = &plan.mouse {
+        // CTX-0260: hover-focus is presentation-only chrome (like
+        // auto-copy), so project layers may set it.
+        m.validate().map_err(|e| ConfigError::TrustViolation {
             message: e.to_string(),
         })?;
     }
@@ -358,6 +365,20 @@ mod tests {
             ..Default::default()
         };
         validate_project_plan(&plan).expect("auto-copy allowed in project");
+    }
+
+    #[test]
+    fn project_plan_allows_mouse_focus_follows_mouse() {
+        // CTX-0260: hover-focus is presentation-only chrome with no process
+        // authority (like auto-copy), so project layers may set it.
+        use crate::types::MouseConfig;
+        let plan = ConfigPlan {
+            mouse: Some(MouseConfig {
+                focus_follows_mouse: true,
+            }),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("hover-focus allowed in project");
     }
 
     #[test]

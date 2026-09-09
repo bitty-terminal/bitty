@@ -39,6 +39,14 @@ pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 /// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 
+/// Default focus-follows-mouse behavior (CTX-0260).
+/// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE` (kept as a
+/// local constant because `bitty-runtime` must not depend on
+/// `bitty-config`; `bitty-app` maps the effective value across at startup
+/// and the two defaults must stay equal — covered by a cross-crate test in
+/// `bitty-app`). `false` preserves click-to-focus.
+pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = false;
+
 /// Default inner panel gap in cells (CTX-0177).
 /// Mirrors `bitty-config` `DEFAULT_LAYOUT_GAPS_IN` (kept local for the same
 /// no-dependency reason; paired by value and pinned by a `bitty-app` test).
@@ -134,6 +142,12 @@ pub struct RuntimeConfig {
     /// `false` leaves the highlight in place; the explicit
     /// `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
     pub selection_auto_copy: bool,
+    /// Whether hover moves keyboard focus to the hovered pane (CTX-0260
+    /// `mouse.focus_follows_mouse`; default `false` = click-to-focus).
+    /// When `false`, hover never touches focus; when `true`, cursor motion
+    /// over another pane moves keyboard focus there (Shift still forces the
+    /// selection path and suppresses hover-focus).
+    pub focus_follows_mouse: bool,
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -191,6 +205,7 @@ impl Default for RuntimeConfig {
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
+            focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             window_padding: DEFAULT_WINDOW_PADDING,
@@ -204,6 +219,10 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     /// Validates and builds a config. All fields are checked for
     /// total, deterministic construction.
+    ///
+    /// CTX-0260: `focus_follows_mouse` is not a `new()` parameter (adding
+    /// one would churn every call site); it defaults off here and the app
+    /// layer sets it post-construction from the effective config.
     ///
     /// # Errors
     ///
@@ -240,6 +259,7 @@ impl RuntimeConfig {
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
             selection_auto_copy,
+            focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in,
             gaps_out,
             window_padding,
@@ -649,6 +669,45 @@ mod tests {
             DEFAULT_SCROLLBAR_WIDTH,
         )
         .expect("scroll speed boundaries must be valid");
+    }
+
+    #[test]
+    fn focus_follows_mouse_defaults_off_and_accepts_both() {
+        // CTX-0260: default-off preserves click-to-focus; both values are
+        // total (booleans always validate). `new()` defaults off; callers
+        // opt in post-construction.
+        const { assert!(!DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+        assert!(!RuntimeConfig::default().focus_follows_mouse);
+        let cfg = RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            DEFAULT_WINDOW_RADIUS_PX,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("new defaults hover-focus off");
+        assert!(!cfg.focus_follows_mouse);
+        let opt_in = RuntimeConfig {
+            focus_follows_mouse: true,
+            ..RuntimeConfig::default()
+        };
+        opt_in.validate().expect("opt-in valid");
+        let opt_out = RuntimeConfig {
+            focus_follows_mouse: false,
+            ..RuntimeConfig::default()
+        };
+        opt_out.validate().expect("opt-out valid");
     }
 
     #[test]

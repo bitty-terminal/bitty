@@ -721,6 +721,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
         "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
         "scrollbar.width" => defaults.scrollbar.width.to_string(),
+        // CTX-0260: hover-focus opt-in (default off = click-to-focus).
+        "mouse.focus_follows_mouse" => defaults.mouse.focus_follows_mouse.to_string(),
         // CTX-0236: leader/mod for the shipped chrome map (default Alt).
         "mod_key" => defaults.mod_key.canonical().to_string(),
         _ => return None,
@@ -1186,7 +1188,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode, mod_key)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode, mouse.focus_follows_mouse, mod_key)",
                     request.value,
                 );
                 if emit_json {
@@ -1411,6 +1413,10 @@ mod tests {
         let mod_key = inspect_config("mod_key").expect("mod_key");
         assert_eq!(mod_key.key, "mod_key");
         assert_eq!(mod_key.value, "alt");
+        // CTX-0260: hover-focus default (off) is inspectable.
+        let hover = inspect_config("mouse.focus_follows_mouse").expect("mouse key");
+        assert_eq!(hover.key, "mouse.focus_follows_mouse");
+        assert_eq!(hover.value, "false");
         assert!(inspect_config("font.nope").is_none());
         assert!(inspect_config("").is_none());
     }

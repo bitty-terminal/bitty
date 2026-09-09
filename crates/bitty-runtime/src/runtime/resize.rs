@@ -421,8 +421,10 @@ impl Runtime {
                     // disengages auto-hide (tracked separately from
                     // `last_cursor`, whose selection-path meaning is kept).
                     // A painted thumb needs one repaint to clear.
+                    // CTX-0260: leaving also ends an Alt+drag move.
                     self.scrollbar_cursor_left = true;
                     self.scrollbar_release();
+                    self.end_alt_drag();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
                     }

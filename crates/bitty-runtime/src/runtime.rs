@@ -117,6 +117,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 pub mod input;
 pub mod kitty_images;
 pub mod layout_focus;
+pub mod mouse_chrome;
 pub mod panes;
 pub mod plugin;
 pub mod present;
@@ -131,6 +132,7 @@ pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::PresentStats;
 
 use self::layout_focus::{default_container, default_layout};
+use self::mouse_chrome::AltDragState;
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer};
 use self::scrollbar::ScrollbarDrag;
@@ -309,6 +311,16 @@ pub struct Runtime {
     /// Compared on cursor moves so `auto` hover/proximity transitions
     /// repaint exactly once instead of presenting on every motion event.
     scrollbar_visible: bool,
+    /// Active Alt+drag floating-pane move (CTX-0260).
+    ///
+    /// Alt+Left-press on a floating overlay grabs it; motion offsets the
+    /// overlay bounds (tiled layouts have no movable position, so the grab
+    /// is a fail-soft no-op there and the press falls through to
+    /// selection). `None` when no drag is active; cleared on release and
+    /// when the cursor leaves the window. Presentation-only: never grid
+    /// truth. Shift still forces the selection path (the grab never starts
+    /// while Shift is held, per the CTX-0181 precedent).
+    alt_drag: Option<AltDragState>,
     /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
     ///
     /// Ghostty copies a committed left-drag selection to both the standard
@@ -599,6 +611,7 @@ impl Runtime {
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
+            alt_drag: None,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
@@ -712,6 +725,7 @@ impl Runtime {
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
+            alt_drag: None,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),

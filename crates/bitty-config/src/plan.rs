@@ -15,8 +15,8 @@
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig,
-    SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MouseConfig, PluginSpec,
+    ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -43,6 +43,8 @@ pub struct ConfigPlan {
     pub layout: Option<LayoutConfig>,
     /// Scrollbar configuration (CTX-0181 `scrollbar.mode`/`scrollbar.width`).
     pub scrollbar: Option<ScrollbarConfig>,
+    /// Mouse configuration (CTX-0260 `mouse.focus_follows_mouse`).
+    pub mouse: Option<MouseConfig>,
     /// Appearance configuration.
     pub appearance: Option<AppearanceConfig>,
     /// Leader/Mod key for the shipped chrome map (CTX-0236; scalar-replace).
@@ -117,6 +119,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set mouse.
+    #[must_use]
+    pub fn with_mouse(mut self, mouse: MouseConfig) -> Self {
+        self.mouse = Some(mouse);
+        self
+    }
+
     /// Convenience builder: set appearance.
     #[must_use]
     pub fn with_appearance(mut self, appearance: AppearanceConfig) -> Self {
@@ -164,6 +173,9 @@ impl ConfigPlan {
         if let Some(s) = &self.scrollbar {
             s.validate()?;
         }
+        if let Some(m) = &self.mouse {
+            m.validate()?;
+        }
         if let Some(a) = &self.appearance {
             a.validate()?;
         }
@@ -209,6 +221,7 @@ impl ConfigPlan {
             && self.selection.is_none()
             && self.layout.is_none()
             && self.scrollbar.is_none()
+            && self.mouse.is_none()
             && self.appearance.is_none()
             && self.mod_key.is_none()
             && self.keymaps.is_none()

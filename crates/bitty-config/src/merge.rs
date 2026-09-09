@@ -75,14 +75,14 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "layout.gaps_out"
         | "scrollbar.mode"
         | "scrollbar.width"
+        | "mouse.focus_follows_mouse"
         | "appearance.theme"
         | "mod_key"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "selection" | "layout" | "scrollbar" | "appearance" => {
-            Some(MergeClass::DeepMerge)
-        }
+        "font" | "window" | "terminal" | "selection" | "layout" | "scrollbar" | "mouse"
+        | "appearance" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -524,6 +524,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("scrollbar".to_string(), src.clone());
         }
 
+        // CTX-0260: `mouse.focus_follows_mouse` is scalar-replace like
+        // `selection.auto_copy`; absent table means "says nothing".
+        if let Some(mouse) = &plan.mouse {
+            let field = "mouse.focus_follows_mouse";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("mouse".to_string(), src.clone());
+        }
+
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -774,6 +817,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "scrollbar.mode",
         "scrollbar.width",
         "scrollbar",
+        "mouse.focus_follows_mouse",
+        "mouse",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1058,6 +1103,49 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("layout".to_string(), src.clone());
         }
+        // CTX-0260: `mouse.focus_follows_mouse` is scalar-replace like
+        // `selection.auto_copy`; absent table means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(mouse) = &plan.mouse {
+            let field = "mouse.focus_follows_mouse";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("mouse".to_string(), src.clone());
+        }
         if let Some(app) = &plan.appearance {
             let field = "appearance.theme";
             if is_policy {
@@ -1305,6 +1393,8 @@ fn merge_layers_allow_policy_violations(
         "scrollbar.mode",
         "scrollbar.width",
         "scrollbar",
+        "mouse.focus_follows_mouse",
+        "mouse",
         "appearance.theme",
         "appearance",
         "keymaps",
@@ -1465,6 +1555,68 @@ mod tests {
         assert_eq!(
             merged2.source_of("scrollbar.mode").unwrap().layer,
             LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn mouse_focus_follows_mouse_merges_scalar_replace_with_attribution() {
+        // CTX-0260: user opt-in wins with per-field attribution; absent
+        // table keeps the lower-precedence value (off default).
+        use crate::types::MouseConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfig {
+                    focus_follows_mouse: true,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert!(merged.effective.mouse.focus_follows_mouse);
+        assert_eq!(
+            merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
+            LayerKind::User
+        );
+        // Absent table rides the off default with core-defaults attribution.
+        let merged2 = merge_layers(vec![]).expect("merge");
+        assert!(!merged2.effective.mouse.focus_follows_mouse);
+        assert_eq!(
+            merged2
+                .source_of("mouse.focus_follows_mouse")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+        // Later layer wins with a reported conflict.
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, None::<String>),
+            ConfigPlan {
+                mouse: Some(MouseConfig {
+                    focus_follows_mouse: false,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfig {
+                    focus_follows_mouse: true,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged3 = merge_layers(vec![user2, cli]).expect("merge");
+        assert!(!merged3.effective.mouse.focus_follows_mouse);
+        assert!(
+            merged3
+                .conflicts
+                .iter()
+                .any(|c| c.field == "mouse.focus_follows_mouse")
         );
     }
 
@@ -1677,6 +1829,12 @@ mod tests {
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("window"), Some(MergeClass::DeepMerge));
+        // CTX-0260: hover-focus is a scalar-replace leaf under `mouse`.
+        assert_eq!(
+            merge_class_for("mouse.focus_follows_mouse"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(merge_class_for("mouse"), Some(MergeClass::DeepMerge));
         assert_eq!(merge_class_for("unknown"), None);
     }
 

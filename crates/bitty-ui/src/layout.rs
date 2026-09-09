@@ -256,6 +256,83 @@ impl LayoutNode {
         }
     }
 
+    /// Moves the floating overlay containing leaf `id` by (`dx`, `dy`) cells.
+    ///
+    /// CTX-0260 (Alt+drag): only [`LayoutNode::Overlay`] bounds move; tiled
+    /// `Split`/`Stack`/`Leaf` trees have no movable position, so the call is
+    /// a fail-soft no-op returning `false` there ("where the layout model
+    /// permits"). The innermost overlay whose overlay subtree owns the leaf
+    /// moves; origins clamp inside `container` (at least the origin cell stays
+    /// visible) while the size is preserved. Total and deterministic.
+    /// Returns `true` when an owning overlay was found (bounds updated,
+    /// possibly clamped to the same value when already at the edge).
+    pub fn move_overlay_containing(
+        &mut self,
+        id: ViewId,
+        dx: i32,
+        dy: i32,
+        container: Rect,
+    ) -> bool {
+        if container.is_empty() {
+            return false;
+        }
+        // Innermost wins: try the overlay subtree first so nested floats
+        // move the layer the leaf actually lives on.
+        match self {
+            Self::Overlay {
+                base,
+                overlay,
+                bounds,
+                ..
+            } => {
+                if overlay.move_overlay_containing(id, dx, dy, container) {
+                    return true;
+                }
+                if overlay.contains_leaf(id) {
+                    let max_x = container.x as i32 + container.width as i32 - 1;
+                    let max_y = container.y as i32 + container.height as i32 - 1;
+                    let nx = (bounds.x as i32 + dx)
+                        .clamp(container.x as i32, max_x.max(container.x as i32));
+                    let ny = (bounds.y as i32 + dy)
+                        .clamp(container.y as i32, max_y.max(container.y as i32));
+                    bounds.x = nx.max(0) as u16;
+                    bounds.y = ny.max(0) as u16;
+                    return true;
+                }
+                // The leaf lives in (or below) the base: a nested float
+                // there may own it; otherwise this layer cannot move it.
+                base.move_overlay_containing(id, dx, dy, container)
+            }
+            Self::Split { first, second, .. } => {
+                first.move_overlay_containing(id, dx, dy, container)
+                    || second.move_overlay_containing(id, dx, dy, container)
+            }
+            Self::Stack(children) => {
+                for c in children {
+                    if c.move_overlay_containing(id, dx, dy, container) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Self::Leaf(_) => false,
+        }
+    }
+
+    /// Whether any leaf in this subtree owns `id`.
+    fn contains_leaf(&self, id: ViewId) -> bool {
+        match self {
+            Self::Leaf(v) => v.id() == id,
+            Self::Split { first, second, .. } => {
+                first.contains_leaf(id) || second.contains_leaf(id)
+            }
+            Self::Stack(children) => children.iter().any(|c| c.contains_leaf(id)),
+            Self::Overlay { base, overlay, .. } => {
+                base.contains_leaf(id) || overlay.contains_leaf(id)
+            }
+        }
+    }
+
     /// Number of leaf views in this subtree.
     #[must_use]
     pub fn leaf_count(&self) -> usize {
@@ -1330,5 +1407,64 @@ mod tests {
             rev_ids,
             vec![ViewId::new(1), ViewId::new(3), ViewId::new(2)]
         );
+    }
+
+    #[test]
+    fn move_overlay_containing_shifts_bounds_and_clamps() {
+        // CTX-0260: Alt+drag moves the owning float by cell deltas; the
+        // size is preserved and origins clamp inside the container.
+        let container = Rect::new(0, 0, 80, 24);
+        let mut tree = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 10, 5)),
+            Rect::new(10, 5, 10, 5),
+        );
+        assert!(tree.move_overlay_containing(ViewId::new(2), 3, 2, container));
+        let bounds = match &tree {
+            LayoutNode::Overlay { bounds, .. } => *bounds,
+            _ => panic!("must stay an overlay"),
+        };
+        assert_eq!(bounds, Rect::new(13, 7, 10, 5));
+        // Clamp at the container edge (origin stays visible).
+        assert!(tree.move_overlay_containing(ViewId::new(2), 1000, 1000, container));
+        let bounds = match &tree {
+            LayoutNode::Overlay { bounds, .. } => *bounds,
+            _ => panic!("must stay an overlay"),
+        };
+        assert_eq!(bounds, Rect::new(79, 23, 10, 5));
+        // Negative drags clamp at the container origin.
+        assert!(tree.move_overlay_containing(ViewId::new(2), -1000, -1000, container));
+        let bounds = match &tree {
+            LayoutNode::Overlay { bounds, .. } => *bounds,
+            _ => panic!("must stay an overlay"),
+        };
+        assert_eq!(bounds, Rect::new(0, 0, 10, 5));
+    }
+
+    #[test]
+    fn move_overlay_containing_is_noop_without_float() {
+        // CTX-0260: tiled trees have no movable position — fail-soft false.
+        let container = Rect::new(0, 0, 80, 24);
+        let mut tiled = LayoutNode::split(
+            crate::geometry::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert!(!tiled.move_overlay_containing(ViewId::new(1), 3, 2, container));
+        assert!(!tiled.move_overlay_containing(ViewId::new(2), 3, 2, container));
+        assert!(!tiled.move_overlay_containing(ViewId::new(99), 3, 2, container));
+        // A leaf in the base layer (not the float) cannot move the float.
+        let mut tree = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 10, 5)),
+            Rect::new(10, 5, 10, 5),
+        );
+        assert!(!tree.move_overlay_containing(ViewId::new(1), 3, 2, container));
+        let bounds = match &tree {
+            LayoutNode::Overlay { bounds, .. } => *bounds,
+            _ => panic!("must stay an overlay"),
+        };
+        assert_eq!(bounds, Rect::new(10, 5, 10, 5));
     }
 }

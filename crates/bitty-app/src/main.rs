@@ -2220,9 +2220,13 @@ fn starter_init_lua() -> &'static str {
      \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
      \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
      \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
-     \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
-     \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
-     \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
+      \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
+      \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
+      \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
+      \x20\x20-- Focus follows the mouse on hover (off by default:\n\
+      \x20\x20-- click-to-focus preserved). Uncomment to opt in; Alt+drag\n\
+      \x20\x20-- moves a floating pane where the layout model permits.\n\
+      \x20\x20-- mouse = { focus_follows_mouse = true },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
@@ -2463,6 +2467,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "scrollbar.width",
                         format!("{}", e.scrollbar.width),
                         &src("scrollbar.width")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
+                        "mouse.focus_follows_mouse",
+                        format!("{}", e.mouse.focus_follows_mouse),
+                        &src("mouse.focus_follows_mouse")
                     )
                 );
                 println!(
@@ -3601,9 +3613,9 @@ fn run_inspect_subcommand(args: &Args) -> i32 {
 /// (`font.line_height`/`font.letter_spacing` over the legacy `8x16` base via
 /// [`bitty_config::types::FontConfig::effective_cell`], defaults `10x22`);
 /// grid/queue geometry stays at compiled defaults; font family/size, scroll
-/// speed, selection auto-copy, and panel gaps come from the file/CLI/default
-/// chain (already validated by `bitty-config`, so construction is expected to
-/// succeed — failures stay fail-closed).
+/// speed, selection auto-copy, panel gaps, and hover-focus come from the
+/// file/CLI/default chain (already validated by `bitty-config`, so
+/// construction is expected to succeed — failures stay fail-closed).
 fn runtime_config_from_effective(
     effective: &bitty_config::EffectiveConfig,
 ) -> Result<bitty_runtime::RuntimeConfig, String> {
@@ -3666,6 +3678,12 @@ fn runtime_config_from_effective(
         scrollbar_mode,
         scrollbar_width,
     )
+    .map(|mut cfg| {
+        // CTX-0260: hover-focus flows file -> effective -> runtime the same
+        // way (booleans are total; default off preserves click-to-focus).
+        cfg.focus_follows_mouse = effective.mouse.focus_follows_mouse;
+        cfg
+    })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
 }
 
@@ -6305,6 +6323,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_inherits_file_focus_follows_mouse() {
+        // CTX-0260: `mouse.focus_follows_mouse` flows file -> effective ->
+        // runtime; crate defaults stay equal (bitty-runtime must not depend
+        // on bitty-config, so the pairing is by value, pinned here).
+        // Default off preserves click-to-focus (zero change for existing
+        // users).
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE,
+            bitty_config::types::DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE
+        );
+        const { assert!(!bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(r#"return { mouse = { focus_follows_mouse = true } }"#, &src)
+            .expect("opt-in parses");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert!(merged.effective.mouse.focus_follows_mouse);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert!(cfg.focus_follows_mouse);
+        assert_eq!(
+            merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Absent table rides the default-off end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no mouse table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert!(!merged2.effective.mouse.focus_follows_mouse);
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert!(!cfg2.focus_follows_mouse);
+        assert_eq!(
+            merged2
+                .source_of("mouse.focus_follows_mouse")
+                .unwrap()
+                .layer,
+            bitty_config::plan::LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
     fn runtime_config_inherits_file_layout_gaps() {
         // CTX-0177: `layout.gaps_in`/`gaps_out` flow file -> effective ->
         // runtime; crate defaults stay equal (bitty-runtime must not depend
@@ -6702,6 +6767,10 @@ mod tests {
         // only) so new installs ride hidden without a file override.
         assert!(plan.scrollbar.is_none());
         assert!(starter_init_lua().contains("scrollbar"));
+        // CTX-0260: starter leaves `mouse` unset (commented example only)
+        // so new installs ride click-to-focus without a file override.
+        assert!(plan.mouse.is_none());
+        assert!(starter_init_lua().contains("focus_follows_mouse"));
     }
 
     // -- `bitty init` wizard (CTX-0149, #243) --------------------------------

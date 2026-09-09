@@ -509,8 +509,29 @@ impl Runtime {
         // A left release always ends a thumb drag; the selection release
         // path below then runs harmlessly (`end_selection` early-returns
         // with no selection, and no selection was started while dragging).
+        // CTX-0260: a release also ends an Alt+drag move — but unlike the
+        // thumb drag it returns early, skipping the selection commit/copy
+        // (the grabbing press never started a selection, so there is
+        // nothing to commit and stale highlights must not auto-copy).
         if event.button == MouseButton::Left && event.state == PressState::Released {
             self.scrollbar_release();
+            if self.end_alt_drag() {
+                return;
+            }
+        }
+        // CTX-0260: Alt+Left-press on a floating overlay grabs it for an
+        // Alt+drag move and consumes the event (no selection starts). The
+        // grab fails soft on tiled layouts (no movable position) and under
+        // Shift (which forces the selection path per the CTX-0181
+        // precedent) — both fall through to selection below, so Alt+drag
+        // never breaks selection.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.alt_pressed
+            && self.begin_alt_drag()
+        {
+            return;
         }
 
         // Selection path (including shift override)
@@ -598,6 +619,15 @@ impl Runtime {
             self.update_selection(cell);
             return;
         }
+        // CTX-0260: an active Alt+drag consumes motion (it moves the
+        // grabbed float; selection/hover/capture-motion all stay out).
+        if self.update_alt_drag(pos) {
+            return;
+        }
+        // CTX-0260: opt-in focus-follows-mouse — hover moves keyboard focus
+        // (gated by the config flag, default off; Shift suppresses it so
+        // Shift+hover selection never steals focus).
+        self.hover_focus_at(pos);
         // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when capture active.
         let capture = !self.shift_pressed
             && self.state.modes().mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)

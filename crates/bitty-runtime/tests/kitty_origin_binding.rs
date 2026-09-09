@@ -157,3 +157,21 @@ fn close_pane_session_drops_its_placements() {
         "closed pane must not leave paintable placements behind"
     );
 }
+
+#[test]
+fn respawn_same_view_drops_stale_placements() {
+    // PX-1588: respawning a leaf on the same `ViewId` replaces the grid,
+    // so the dead session's placements must not carry over onto the fresh
+    // grid (the close path already clears; the respawn path must too).
+    let mut rt = two_pane_runtime();
+    assert!(rt.set_focus(ViewId::new(1)));
+    spawn_quiet_pane(&mut rt, ViewId::new(2));
+    rt.handle_pane_bytes(ViewId::new(2), &red_apc());
+    assert_eq!(rt.kitty_placement_count(), 1);
+    spawn_quiet_pane(&mut rt, ViewId::new(2));
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "respawned pane must not inherit the dead grid's placements"
+    );
+}

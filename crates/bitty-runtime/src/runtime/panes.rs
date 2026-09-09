@@ -160,6 +160,12 @@ impl Runtime {
                 writer,
             },
         );
+        // CTX-0254 (PX-1588): a respawned leaf starts with a fresh grid, so
+        // drop the previous session's placements with it. Without this, a
+        // replace on the same `ViewId` inherits the dead grid's placements
+        // onto the fresh grid (same stale-pixel class the close path fixes).
+        // Stored images survive inertly under the store caps.
+        self.kitty_images.clear_origin(Some(view.0));
         // If a waker is already installed (split after `set_pty_waker`),
         // promote immediately so the new pane wakes the loop too (CTX-0230).
         if self.pty_waker.is_some() {

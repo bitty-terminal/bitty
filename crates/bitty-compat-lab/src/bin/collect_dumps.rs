@@ -7,8 +7,8 @@
 //! `bitty-compat-lab::parse_bounded` and `actions_to_snapshot` headlessly,
 //! asserts determinism via byte-by-byte re-parse and `State::state_hash`,
 //! invariants via `State::check_invariants`, and writes a bounded
-//! deterministic JSON snapshot to `tmp/references/bitty/` (worktree) and to
-//! the umbrella `tmp/references/bitty/` mirror when present.
+//! deterministic JSON snapshot to `recording/references/bitty/` (canonical,
+//! worktree and umbrella) plus legacy `tmp/references/bitty/` mirrors.
 //!
 //! No `winit`, `wgpu`, `Window`, `Surface`, `HeadlessRasterizer`, or
 //! network. Only `bitty-vt` + `bitty-term-state` via the harness. The output

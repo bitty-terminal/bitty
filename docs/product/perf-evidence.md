@@ -185,7 +185,7 @@ All gates are headless; `BITTY_PERF_REAL_WINDOW=1` on a Tier 1 box adds the real
 
 ## Next
 
-- Pin reference hardware + OS (`performance-budget-rfc.md` Open items) and define the fixed synthetic corpus revision in `recordings/references/` before tightening PB-1..PB-7 to hard gates. Until then budgets remain arch constraints, not CI gates (cross-cutting rule).
+- Pin reference hardware + OS (`performance-budget-rfc.md` Open items) and define the fixed synthetic corpus revision in `recording/references/` before tightening PB-1..PB-7 to hard gates. Until then budgets remain arch constraints, not CI gates (cross-cutting rule).
 - Land 50-run `hyperfine` p50/p99 + variance on the Tier 1 ref machine and record them here (secondary comparison in `tools/perf/startup` retains `--help` history).
 - Replace the headless `ps %cpu` proxy with a 10 min compositor-traced idle sample on Wayland (`cage`/`sway` frame-presented timestamp) to gate PB-7.
 - Coordinate OQ-014 isolation so plugin VM creation cost is charged against plugin budgets, not PB-2/PB-3.

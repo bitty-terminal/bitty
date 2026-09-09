@@ -12,7 +12,7 @@ status: draft
 # CTX-0099 Dogfooding Evidence — 2026-08-31
 
 - Date: `2026-08-31` Host: `cachyos-hyprland` Bitty: `a8735d0+` (worktree `.worktrees/ctx-0099` branch `carryctx/ctx-0099`) Task: `CTX-0099` (P0, `feat,area:qa,P0`, `v0.1.0`, `OQ-001`).
-- Reference revisions: `ghostty 8867c37` MIT, `kitty 087b8c3` GPL-3.0, `wezterm f93d903` MIT, `alacritty ede2ac1` Apache-2.0/MIT, `xterm 9489b20` MIT/X11, `vttest 3.4.0` synthetic — from `recordings/references/README.md` (umbrella, plus `recordings/references/<emulator>/`).
+- Reference revisions: `ghostty 8867c37` MIT, `kitty 087b8c3` GPL-3.0, `wezterm f93d903` MIT, `alacritty ede2ac1` Apache-2.0/MIT, `xterm 9489b20` MIT/X11, `vttest 3.4.0` synthetic — from `recording/references/README.md` (umbrella, plus `recording/references/<emulator>/`).
 
 ## Corpora — 9 dogfooding traces (bounded `8 KiB`, `4096` actions, `forbid(unsafe)`)
 
@@ -30,9 +30,9 @@ status: draft
 
 All ≤310 bytes (<8 KiB), each replay deterministic byte-by-byte, `State::state_hash` identical across chunkings, `State::check_invariants` PASS (no orphan `spacer`, `width 80` `height 24`, `GRID_COLUMNS`/`GRID_ROWS`, `ZONE_RECORDS_MAX 1024`, `HYPERLINK_TABLE_MAX 1024`).
 
-## Snapshots — 39 dumps (`recordings/references/bitty/`)
+## Snapshots — 39 dumps (`recording/references/bitty/`)
 
-- `cargo run -p bitty-compat-lab --bin collect_dumps --locked` wrote 39 bounded snapshots (30 baseline + 9 dogfooding) to `recordings/references/bitty/` and `tmp/references/bitty/` (worktree) mirrored to umbrella `recordings/references/bitty/` — each `<16 KiB`, `80×24`, `generation` monotonic, `CANONICAL_HASH_VERSION 1`, `<MAX_TEXT_CHARS 1944`.
+- `cargo run -p bitty-compat-lab --bin collect_dumps --locked` wrote 39 bounded snapshots (30 baseline + 9 dogfooding) to `recording/references/bitty/` (canonical; worktree and umbrella) plus legacy `tmp/references/bitty/` mirrors — each `<16 KiB`, `80×24`, `generation` monotonic, `CANONICAL_HASH_VERSION 1`, `<MAX_TEXT_CHARS 1944`.
 - Examples: `vt-01-cursor-addressing` `3b45f2b4d8902bcf`, `shell-02-dogfooding` `6c19acfe43f6ed63`, `tui-03-dogfooding` `446def2b5a6f1875`, `unicode-09-dogfooding` `09c75f8905650c80`.
 - `cargo test -p bitty-compat-lab --test compare` `total 39 self_passed 39 self_failed 0` PASS (headless, no `winit`/`wgpu`).
 

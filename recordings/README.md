@@ -11,7 +11,7 @@ status: draft
 
 # Recordings — Persistent Workspace
 
-`recordings/` is the durable scratch area for bitty (project-local `recordings/` per CTX-0092, plus umbrella `recordings/`). It survives a reboot, unlike `/tmp`, and holds only untrusted research or generated evidence.
+`recordings/` is the durable scratch area for bitty (project-local `recordings/` per CTX-0092, plus umbrella `recording/`). It survives a reboot, unlike `/tmp`, and holds only untrusted research or generated evidence.
 
 ## Layout
 
@@ -20,7 +20,7 @@ recordings/
   README.md                         # this file
   references/
     bitty/*.snapshot.json            # headless bounded dumps (Parser -> State) via collect_dumps, 39 as of CTX-0114
-    ghostty/ kitty/ wezterm/ alacritty/ xterm/ # read-only reference clones, revision+license in recordings/references/README.md (umbrella) and tmp/references/ mirrors
+    ghostty/ kitty/ wezterm/ alacritty/ xterm/ # read-only reference clones, revision+license in recording/references/README.md (umbrella) and tmp/references/ mirrors
   compat-matrix-2026-09-01.json      # machine-readable 14×4 matrix (CTX-0114, bounded <16 KiB, 39 dumps)
   manual-smoke/<YYYY-MM-DD>/         # git-ignored windowed `grim`/`hyprctl` PNGs (human-run, not committed)
 ```
@@ -30,7 +30,7 @@ recordings/
 - Treat all `recordings/references/` material as untrusted, read-only. Never import as dependency, never edit in place.
 - `recordings/references/bitty/` is generated, deterministic, bounded (`80×24`, `<16 KiB` per file, `CANONICAL_HASH_VERSION 1`, `MAX_CORPUS_BYTES 8 KiB`, `MAX_ACTIONS 4096`), `forbid(unsafe)`, no `winit`/`wgpu`/`Window`/`Surface`.
 - `recordings/manual-smoke/` is git-ignored (`.gitignore` `recordings/manual-smoke/`). Commit only the filled `docs/product/manual-smoke.md` tables, not PNGs.
-- Refresh reference clones via `git clone --depth 1` and record new revision + license in `recordings/references/README.md` (umbrella).
+- Refresh reference clones via `git clone --depth 1` and record new revision + license in `recording/references/README.md` (umbrella).
 
 ## CTX-0099 snapshot
 

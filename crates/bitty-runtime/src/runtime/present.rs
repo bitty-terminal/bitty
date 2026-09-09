@@ -755,6 +755,23 @@ impl Runtime {
             }
         }
 
+        // Help popup panel (CTX-0265, 009 which-key): centered floating
+        // overlay listing the live registry rows. Presentation-only like
+        // the banners above (fills + glyphs, never grid truth); painted
+        // after the pills so the panel reads on top on the rare frames
+        // where both coincide. Visibility/readiness live in
+        // `runtime::help`; toggle/dismiss paths repaint via
+        // `pending_full_redraw`.
+        if self.paint_help_panel(
+            &allocations,
+            &view_map,
+            pad_px,
+            &mut combined_fills,
+            &mut combined_glyphs,
+        ) {
+            any_needs_draw = true;
+        }
+
         // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect        // on the focused leaf's right edge, painted above grid content like
         // the selection highlight. Never grid truth: no layout, container,
         // or cell mutation, and `hidden` (default) resolves to no fill.

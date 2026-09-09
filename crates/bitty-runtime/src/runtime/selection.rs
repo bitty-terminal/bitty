@@ -479,8 +479,10 @@ impl Runtime {
     /// not a press), leaving existing key routing untouched.
     ///
     /// CTX-0257: the same press also cancels a pending workspace-close arm
-    /// (kill-confirm gate). Either cancellation consumes the `Esc`; both are
-    /// dropped together when both pend (loud, no partial state).
+    /// (kill-confirm gate). CTX-0265: the same press also dismisses the
+    /// help popup (informational overlay, not a confirm gate). Any
+    /// cancellation consumes the `Esc`; all are dropped together when
+    /// several pend (loud, no partial state).
     pub(super) fn cancel_pending_on_escape(&mut self, event: &KeyEvent) -> bool {
         if event.state != PressState::Pressed {
             return false;
@@ -497,6 +499,13 @@ impl Runtime {
             // already snapped; idempotent).
             self.snap_focused_to_live();
             cancelled = self.cancel_pending_ws_close();
+        }
+        if self.help_visible {
+            // CTX-0265: Esc dismisses the help popup (overlay only; the
+            // `Esc` never reaches the PTY so a dismissal cannot drive
+            // shell/vim state).
+            self.snap_focused_to_live();
+            cancelled = self.dismiss_help() || cancelled;
         }
         if self.pending_paste.is_none() {
             return cancelled;

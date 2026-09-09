@@ -1135,6 +1135,77 @@ mod tests {
     }
 
     #[test]
+    fn fkey_special_keys_map_with_mod_mirror_and_bare_falls_through() {
+        // CTX-0264: F-keys plus INS/DEL/HM/END/PU/PD are first-class
+        // matchable chord segments. Platform events map to the config
+        // `KeyName` carrying the live modifier mirror (Alt and Super
+        // variants), while bare presses produce `KeyRef`s that match nothing
+        // in either default map — so `intercept_chrome_key` returns false
+        // and they route to `Runtime` terminal encoding unchanged.
+        use bitty_config::{EffectiveConfig, KeyName, ModKey, match_keymap, resolve_keymaps};
+        let plain = AppModifiers::default();
+        let with_alt = AppModifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let with_super = AppModifiers {
+            super_held: true,
+            ..Default::default()
+        };
+        let cases: &[(NamedKey, KeyName)] = &[
+            (NamedKey::F1, KeyName::F(1)),
+            (NamedKey::F5, KeyName::F(5)),
+            (NamedKey::F12, KeyName::F(12)),
+            (NamedKey::F35, KeyName::F(35)),
+            (NamedKey::Insert, KeyName::Insert),
+            (NamedKey::Delete, KeyName::Delete),
+            (NamedKey::Home, KeyName::Home),
+            (NamedKey::End, KeyName::End),
+            (NamedKey::PageUp, KeyName::PageUp),
+            (NamedKey::PageDown, KeyName::PageDown),
+        ];
+        for (named, want) in cases {
+            let event = test_key(LogicalKey::Named(*named));
+            let r = key_ref_from_event(&event, &with_alt).expect("alt matchable");
+            assert_eq!(r.key, *want, "alt+{named:?}");
+            assert!(r.alt && !r.super_held, "alt mirror for {named:?}");
+            let r = key_ref_from_event(&event, &with_super).expect("super matchable");
+            assert_eq!(r.key, *want, "super+{named:?}");
+            assert!(r.super_held && !r.alt, "super mirror for {named:?}");
+            // A Mod-held press is matchable (bindable); bare falls through.
+            let bare = key_ref_from_event(&event, &plain).expect("bare matchable");
+            assert_eq!(bare.key, *want);
+            assert!(!bare.ctrl && !bare.alt && !bare.shift && !bare.super_held);
+        }
+        // Bare presses match nothing under either default map (both mods),
+        // so the intercept never consumes them: shell/PTY path unchanged.
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = resolve_keymaps(&EffectiveConfig {
+                mod_key,
+                ..Default::default()
+            })
+            .expect("defaults");
+            for (named, _) in cases {
+                let bare = key_ref_from_event(&test_key(LogicalKey::Named(*named)), &plain)
+                    .expect("bare matchable");
+                assert_eq!(
+                    match_keymap(&maps, bare),
+                    None,
+                    "bare {named:?} is shell under mod {:?}",
+                    mod_key
+                );
+            }
+        }
+        // Non-chord platform keys still have no chord identity (route to
+        // the PTY): media leftovers collapse to `Other`, `Fn` is not a
+        // bindable segment.
+        assert!(
+            key_ref_from_event(&test_key(LogicalKey::Named(NamedKey::Other)), &plain).is_none()
+        );
+        assert!(key_ref_from_event(&test_key(LogicalKey::Named(NamedKey::Fn)), &plain).is_none());
+    }
+
+    #[test]
     fn single_owner_unbound_keys_reach_shell() {
         use bitty_config::{KeyName, KeyRef, match_keymap, resolve_keymaps};
         let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");

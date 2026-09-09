@@ -306,13 +306,23 @@ fn child_environment_inherits_session_with_overrides() {
     let mut writer = pty.take_writer().expect("writer half");
     let reader = pty.take_reader().expect("reader half");
 
-    writer.write_all(b"set\r\n").expect("write set to pty");
+    // `& echo` appends a sentinel AFTER `set` finishes (`&` runs it
+    // unconditionally), so waiting for the sentinel proves the whole
+    // environment listing arrived. `set` output sorts alphabetically:
+    // stopping at the first marker (`BITTY_PROBE=1`) returns mid-stream
+    // (win469e: 1290 bytes ending mid-CARGO) while `TERM=*` sorts later.
+    // The leading `\r\n` keeps the input echo (`...echo SENTINEL`) from
+    // matching early: only the command-output line is newline-delimited
+    // on both sides.
+    writer
+        .write_all(b"set & echo BITTY_SET_DONE\r\n")
+        .expect("write set to pty");
     writer.flush().expect("flush");
 
     // `set` separates with `\r\n`; byte-substring search is agnostic.
     // Bounded: on timeout the partial bytes below show what arrived.
     let deadline = Instant::now() + CMD_TIMEOUT;
-    let output = read_until(&reader, &mut writer, b"BITTY_PROBE=1", deadline);
+    let output = read_until(&reader, &mut writer, b"\r\nBITTY_SET_DONE\r\n", deadline);
     let text = String::from_utf8_lossy(&output);
     assert!(
         text.contains("BITTY_PROBE=1"),

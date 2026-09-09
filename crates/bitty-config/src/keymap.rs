@@ -60,12 +60,14 @@
 //! [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
 //! reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
 //! less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
-//! `shift+ctrl` resizes, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
-//! `ctrl+shift+c/v` copy/paste) plus the DEC-0034 workspace entry
-//! (CTX-0257): `alt+n` new workspace, `alt+1..=9` jump to workspace N,
-//! `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+w` close with
-//! kill-confirm. `alt+w` and `alt+1..=9` previously drove pane ops
-//! (`close_view`, `focus:<n>`); those actions stay parseable and
+//! `shift+ctrl` resizes plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
+//! Mod-aware resize variant (pure `shift+alt` stays creation: it cannot
+//! also resize under the single-owner rule), `ctrl+alt+arrows` navigate,
+//! `ctrl+tab` cycles, `ctrl+shift+c/v` copy/paste) plus the DEC-0034
+//! workspace entry (CTX-0257): `alt+n` new workspace, `alt+1..=9` jump to
+//! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used, `alt+w`
+//! close with kill-confirm. `alt+w` and `alt+1..=9` previously drove pane
+//! ops (`close_view`, `focus:<n>`); those actions stay parseable and
 //! user-bindable but are no longer bound by default — workspace numbers won
 //! the Alt slot per the owner spec, panes navigate spatially (`goto_split`,
 //! `focus_next`/`focus_prev`). Plain `Tab`, arrows, letters, and digits
@@ -115,9 +117,11 @@ pub const MAX_MOD_KEY_LEN: usize = 32;
 ///
 /// [`DEFAULT_KEYMAPS`] is the canonical Alt spelling; [`resolve_keymaps`]
 /// renders it through [`default_keymaps_with_mod`], so flipping one
-/// `mod_key` setting rebinds every `alt`-bearing default while chords
-/// without `alt` (`ctrl+tab` cycles, `shift+ctrl` resizes, `ctrl+shift`
-/// copy/paste) pass through as mod-independent fixed chords. Explicit user
+/// `mod_key` setting rebinds every `alt`-bearing default (including the
+/// CTX-0258 `ctrl+shift+alt+h/j/k/l` resize variant, which becomes
+/// `ctrl+shift+super+h/j/k/l`) while chords without `alt` (`ctrl+tab`
+/// cycles, `shift+ctrl` legacy resizes, `ctrl+shift` copy/paste) pass
+/// through as mod-independent fixed chords. Explicit user
 /// entries keep their exact spelling and overlay by the existing
 /// `context + chord` identity, so a mod flip never rewrites user intent.
 ///
@@ -873,7 +877,8 @@ impl ResolvedKeymap {
 /// [`DEFAULT_KEYMAPS`] ships the Alt-as-Mod map derived from the ghostty
 /// reference (`alt+h/j/k/l` navigate, `alt+u`/`alt+i` page up/down
 /// less-like, `alt+z`/`alt+m`/`alt+f` zoom, `shift+alt` creates,
-/// `shift+ctrl` resizes, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
+/// `shift+ctrl` resizes plus the CTX-0258 `ctrl+shift+alt+h/j/k/l`
+/// Mod-aware resize variant, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
 /// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
 /// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
 /// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
@@ -909,6 +914,14 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+ctrl+j", "resize_split:down"),
     ("shift+ctrl+k", "resize_split:up"),
     ("shift+ctrl+l", "resize_split:right"),
+    // CTX-0258 Mod-aware resize variant: `ctrl+shift+alt` carries the Mod
+    // slot so a Super flip rebinds it to `ctrl+shift+super` (pure
+    // `shift+alt` cannot be reused: it already creates via `new_split`
+    // under the single-owner rule).
+    ("ctrl+shift+alt+h", "resize_split:left"),
+    ("ctrl+shift+alt+j", "resize_split:down"),
+    ("ctrl+shift+alt+k", "resize_split:up"),
+    ("ctrl+shift+alt+l", "resize_split:right"),
     ("alt+w", "workspace_close"),
     ("alt+m", "toggle_zoom"),
     ("alt+f", "toggle_zoom"),
@@ -1523,20 +1536,30 @@ mod tests {
     #[test]
     fn defaults_have_unique_chord_identities() {
         // Collision audit as a test: every default chord identity is unique
-        // so no default shadows another (CTX-0178). CTX-0257 extends the
+        // so no default shadows another (CTX-0178, extended CTX-0258 to
+        // cover the Super-rebound map as well). CTX-0257 extends the
         // audit to the DEC-0034 entry set: 35 shipped + 4 new (alt+n/-/=/tab;
-        // alt+w and alt+1..=9 are rebinds, not new identities) = 39 total,
-        // and the full DEC set resolves.
-        let maps = default_keymaps().expect("defaults valid");
-        assert_eq!(
-            maps.len(),
-            39,
-            "35 shipped + 4 workspace-entry chords (alt+n/-/=/tab)"
-        );
-        let mut seen = std::collections::HashSet::new();
-        for m in &maps {
-            assert!(seen.insert(m.id()), "duplicate default id {}", m.id());
+        // alt+w and alt+1..=9 are rebinds, not new identities) = 39, plus
+        // CTX-0258's 4 Mod-aware resize chords = 43 total, and the full DEC
+        // set resolves.
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            assert_eq!(
+                maps.len(),
+                43,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords"
+            );
+            let mut seen = std::collections::HashSet::new();
+            for m in &maps {
+                assert!(
+                    seen.insert(m.id()),
+                    "duplicate default id {} under mod {:?}",
+                    m.id(),
+                    mod_key
+                );
+            }
         }
+        let maps = default_keymaps().expect("defaults valid");
         // The DEC-0034 entry set resolves through the shipped table.
         let dec: &[(&str, bool, bool, ChromeAction)] = &[
             ("n", false, false, ChromeAction::WorkspaceNew),
@@ -1620,6 +1643,156 @@ mod tests {
                 match_keymap(&maps, key_ref(key, false, true, false)),
                 None,
                 "alt+{key:?} unbound under super mod"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_keys_mod_m_and_hjkl_pinned_both_mods() {
+        // CTX-0258: `Mod+M` zoom and `Mod+HJKL` directional focus are
+        // pinned under BOTH Alt and Super (Super via CTX-0236 substitution).
+        let alt_maps = default_keymaps_with_mod(ModKey::Alt).expect("alt defaults valid");
+        for (key, dir) in [
+            ('h', SplitDir::Left),
+            ('j', SplitDir::Down),
+            ('k', SplitDir::Up),
+            ('l', SplitDir::Right),
+        ] {
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(KeyName::Char(key), false, true, false)),
+                Some(ChromeAction::GotoSplit(dir)),
+                "alt+{key} focuses"
+            );
+        }
+        assert_eq!(
+            match_keymap(&alt_maps, key_ref(KeyName::Char('m'), false, true, false)),
+            Some(ChromeAction::ToggleZoom),
+            "alt+m zooms"
+        );
+
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
+        for (key, dir) in [
+            ('h', SplitDir::Left),
+            ('j', SplitDir::Down),
+            ('k', SplitDir::Up),
+            ('l', SplitDir::Right),
+        ] {
+            assert_eq!(
+                match_keymap(&super_maps, key_ref_super(KeyName::Char(key), false, false)),
+                Some(ChromeAction::GotoSplit(dir)),
+                "super+{key} focuses"
+            );
+        }
+        assert_eq!(
+            match_keymap(&super_maps, key_ref_super(KeyName::Char('m'), false, false)),
+            Some(ChromeAction::ToggleZoom),
+            "super+m zooms"
+        );
+        // Old Alt chords are unbound under Super (back to the shell).
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::Char('m'), false, true, false)),
+            None,
+            "alt+m unbound under super mod"
+        );
+    }
+
+    #[test]
+    fn resize_has_legacy_and_mod_aware_variants_both_mods() {
+        // CTX-0258: `shift+ctrl+h/j/k/l` stays as the mod-independent
+        // legacy resize, and `ctrl+shift+alt+h/j/k/l` is the Mod-aware
+        // variant (rebound to `ctrl+shift+super` under a Super flip).
+        // Pure `shift+alt` stays `new_split` under both mods (single-owner).
+        let alt_maps = default_keymaps_with_mod(ModKey::Alt).expect("alt defaults valid");
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
+        for (key, dir) in [
+            ('h', SplitDir::Left),
+            ('j', SplitDir::Down),
+            ('k', SplitDir::Up),
+            ('l', SplitDir::Right),
+        ] {
+            // Legacy fixed chord works under both mods (no `alt` slot).
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(KeyName::Char(key), true, false, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "shift+ctrl+{key} resizes (alt map)"
+            );
+            assert_eq!(
+                match_keymap(&super_maps, key_ref(KeyName::Char(key), true, false, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "shift+ctrl+{key} resizes (super map)"
+            );
+            // Mod-aware variant: alt spelling under Alt ...
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(KeyName::Char(key), true, true, true)),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "ctrl+shift+alt+{key} resizes"
+            );
+            // ... rebound to super spelling under Super ...
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key: KeyName::Char(key),
+                        ctrl: true,
+                        alt: false,
+                        shift: true,
+                        super_held: true,
+                    }
+                ),
+                Some(ChromeAction::ResizeSplit(dir)),
+                "ctrl+shift+super+{key} resizes"
+            );
+            // ... and the old alt spelling is unbound under Super.
+            assert_eq!(
+                match_keymap(&super_maps, key_ref(KeyName::Char(key), true, true, true)),
+                None,
+                "ctrl+shift+alt+{key} unbound under super mod"
+            );
+            // `shift+alt` / `shift+super` still creates (no resize shadow).
+            assert_eq!(
+                match_keymap(&alt_maps, key_ref(KeyName::Char(key), false, true, true)),
+                Some(ChromeAction::NewSplit(dir)),
+                "shift+alt+{key} still splits"
+            );
+            assert_eq!(
+                match_keymap(
+                    &super_maps,
+                    KeyRef {
+                        key: KeyName::Char(key),
+                        ctrl: false,
+                        alt: false,
+                        shift: true,
+                        super_held: true,
+                    }
+                ),
+                Some(ChromeAction::NewSplit(dir)),
+                "shift+super+{key} still splits"
+            );
+        }
+        // Shell keys stay unbound under both maps (bare keys, Tab,
+        // arrows, and unshifted C0 bytes reach the shell; super+h/m are
+        // chrome-owned per the focus/zoom pin above and excluded here).
+        for k in [
+            key_ref(KeyName::Tab, false, false, false),
+            key_ref(KeyName::Char('h'), false, false, false),
+            key_ref(KeyName::Char('m'), false, false, false),
+        ] {
+            assert_eq!(
+                match_keymap(&alt_maps, k),
+                None,
+                "shell key {k:?} (alt map)"
+            );
+        }
+        for k in [
+            key_ref(KeyName::Tab, false, false, false),
+            key_ref(KeyName::Char('h'), false, false, false),
+            key_ref(KeyName::Char('m'), false, false, false),
+            key_ref_super(KeyName::Char('p'), false, false),
+        ] {
+            assert_eq!(
+                match_keymap(&super_maps, k),
+                None,
+                "shell key {k:?} (super map)"
             );
         }
     }

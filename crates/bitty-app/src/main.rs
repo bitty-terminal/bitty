@@ -4529,8 +4529,11 @@ impl AppHandler for TerminalApp {
         // visible to the state machine before the tick.
         self.poll_pty_pump();
 
-        // CTX-0153 single-owner intercept (see `intercept_chrome_key`): a
-        // consumed event never reaches `Runtime`.
+        // CTX-0153 single-owner intercept with CTX-0275 explicit dispatch
+        // priority (see `intercept_chrome_key` / `DispatchPriority`):
+        // emergency/reserved > active overlay-modal > user-defined keymap >
+        // plugin (inert, deny-by-default) > terminal encoding. A consumed
+        // event never reaches `Runtime`.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
             if self.intercept_chrome_key(kind) {
                 return;

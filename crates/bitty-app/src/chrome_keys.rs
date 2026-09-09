@@ -356,6 +356,120 @@ pub(crate) fn two_pane_layout() -> LayoutNode {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Explicit key-dispatch priority (CTX-0275; input-pointer RFC key dispatch
+// priority candidate).
+// ---------------------------------------------------------------------------
+
+/// Explicit dispatch layer for one keypress, highest first.
+///
+/// Priority order (emergency/reserved > active overlay-modal > user-defined
+/// > plugin > terminal encoding):
+///
+/// 1. [`DispatchPriority::Emergency`] — reserved Bitty bindings that must
+///    work even when a modal dialog or a user remap says otherwise. Today
+///    the only emergency gesture is `Esc` while a modal confirmation pends
+///    (paste gate / workspace kill-confirm): it cancels, is consumed here,
+///    and a user `escape` remap never steals it.
+/// 2. [`DispatchPriority::Modal`] — an active modal captures command
+///    dispatch: bound chrome chords that are NOT the modal's own confirm
+///    gesture are swallowed (consumed, no action, no PTY bytes) so no state
+///    mutates behind the dialog. Unbound keys still fall through to
+///    [`DispatchPriority::Terminal`] (fall-through unchanged).
+/// 3. [`DispatchPriority::User`] — the resolved keymap table (shipped
+///    defaults plus user overrides via [`bitty_config::match_keymap`]).
+///    The modal's own confirm gesture (repeat the arming chord) dispatches
+///    here so confirmation reuses the normal action path.
+/// 4. [`DispatchPriority::Plugin`] — plugin-suggested bindings (future).
+///    No plugin-binding facility exists, so this layer is inert and denies
+///    by default; see [`match_plugin_binding`].
+/// 5. [`DispatchPriority::Terminal`] — terminal encoding fall-through: the
+///    event is not consumed and routes to `Runtime` (PTY bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DispatchPriority {
+    /// Reserved emergency gesture (`Esc` cancels a pending confirmation).
+    Emergency,
+    /// Active modal captures a bound non-confirm chord (swallowed).
+    Modal,
+    /// Resolved keymap action runs (single owner, CTX-0153).
+    User,
+    /// Plugin-suggested binding (inert: deny-by-default, CTX-0275 slot).
+    Plugin,
+    /// No layer claimed the key: route to terminal encoding.
+    Terminal,
+}
+
+/// Plugin-suggested binding lookup (CTX-0275 future slot).
+///
+/// No plugin-binding facility exists today, so this always returns `None`
+/// (deny-by-default): an explicit user mapping can never lose to a plugin,
+/// and unbound keys keep falling through to terminal encoding. When a
+/// plugin-binding facility lands, its lookup must sit exactly here — after
+/// [`DispatchPriority::User`], before [`DispatchPriority::Terminal`] — and
+/// this stub is the single wiring point.
+fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::ChromeAction> {
+    None
+}
+
+/// Pure dispatch classifier over one matchable keypress (CTX-0275).
+///
+/// Inputs are plain data so the priority table is headless-testable without
+/// a display server or a live `Runtime`: `matched` is the
+/// [`bitty_config::match_keymap`] result for `keyref`, and the two pending
+/// flags are the app's modal surface (`Runtime::has_pending_paste` /
+/// `Runtime::has_pending_ws_close`). Returns the winning layer plus the
+/// action to run when the layer dispatches one (`User` only; `Modal`
+/// swallows, `Plugin` is inert, `Terminal` routes).
+///
+/// Table (first match wins):
+/// - `Esc` with any modal pending -> `(Emergency, None)`.
+/// - modal pending + bound chord that confirms THAT modal (repeat the
+///   arming chord: `paste_from_clipboard` while a paste pends,
+///   `workspace_close` while a close pends) -> `(User, action)`.
+/// - modal pending + any other bound chord -> `(Modal, None)` (captured).
+/// - bound chord, no modal -> `(User, action)`.
+/// - unbound key while a modal pends -> `(Terminal, None)` (fall-through
+///   unchanged: the dialog captures commands, not typing).
+/// - unbound key, no modal -> `(Terminal, None)` (existing fall-through).
+fn resolve_priority_for(
+    keyref: bitty_config::KeyRef,
+    matched: Option<bitty_config::ChromeAction>,
+    paste_pending: bool,
+    ws_close_pending: bool,
+) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
+    use bitty_config::{ChromeAction as A, KeyName};
+    let modal_active = paste_pending || ws_close_pending;
+    // Emergency/reserved first: Esc cancels any pending confirmation even
+    // when the user remapped `escape` (the remap only applies with no
+    // modal active, where this arm never fires).
+    if modal_active && keyref.key == KeyName::Escape {
+        return (DispatchPriority::Emergency, None);
+    }
+    match matched {
+        Some(action) if modal_active => {
+            let confirms_paste = paste_pending && matches!(action, A::PasteFromClipboard);
+            let confirms_close = ws_close_pending && matches!(action, A::WorkspaceClose);
+            if confirms_paste || confirms_close {
+                // The modal's own confirm gesture reuses the normal user
+                // action path (identical re-paste delivers, repeat Alt+W
+                // kills); every other bound chord is captured below.
+                (DispatchPriority::User, Some(action))
+            } else {
+                (DispatchPriority::Modal, None)
+            }
+        }
+        Some(action) => (DispatchPriority::User, Some(action)),
+        None => match match_plugin_binding(keyref) {
+            // Future wiring point: plugin suggestions sit after the user
+            // table (an explicit mapping always wins) and before terminal
+            // encoding. Inert today (`match_plugin_binding` denies by
+            // default), so this arm falls through to `Terminal`.
+            Some(action) => (DispatchPriority::Plugin, Some(action)),
+            None => (DispatchPriority::Terminal, None),
+        },
+    }
+}
+
 impl TerminalApp {
     /// Restore a zoomed layout before a tree-mutating action so the mutation
     /// applies to the real tree instead of the single-leaf zoom view.
@@ -688,12 +802,83 @@ impl TerminalApp {
 }
 
 impl TerminalApp {
-    /// Single-owner chrome intercept (CTX-0153): resolve bound chrome keys
-    /// BEFORE `Runtime` routing. Returns `true` when the event was consumed
-    /// (a bound chord ran, or a chrome-owned key repeat/duplicate was
-    /// swallowed) and must NOT reach `Runtime`; `false` means route normally
-    /// (unbound keys like Tab, arrows, plain letters fall through to shell
-    /// input). Modifier tracking stays in sync because modifier-only keys
+    /// True while a modal confirmation captures command dispatch (CTX-0275).
+    ///
+    /// Today's app-level modal surface is the two pending-confirm gates:
+    /// the suspicious-paste confirmation (`Runtime::has_pending_paste`) and
+    /// the workspace kill-confirm (`Runtime::has_pending_ws_close`). Panel
+    /// overlays already enforce creation-exclusivity
+    /// (`OverlayManager::modal_active`); when they gain key dispatch, their
+    /// active-modal bit must feed this same predicate so one capture rule
+    /// covers every modal kind.
+    pub(crate) fn modal_capture_active(&self) -> bool {
+        self.runtime.has_pending_paste() || self.runtime.has_pending_ws_close()
+    }
+
+    /// Classify one matchable keypress into its dispatch layer (CTX-0275).
+    ///
+    /// Thin wrapper over the pure [`resolve_priority_for`] table using live
+    /// modal state; see that function for the layer order and the
+    /// confirm-gesture rule.
+    pub(crate) fn resolve_dispatch(
+        &self,
+        keyref: bitty_config::KeyRef,
+        matched: Option<bitty_config::ChromeAction>,
+    ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
+        // Single capture predicate first (panel-modal bits feed
+        // `modal_capture_active` itself when overlay dispatch lands); the
+        // per-gate reads below only pick the confirm gesture.
+        let (paste_pending, ws_close_pending) = if self.modal_capture_active() {
+            (
+                self.runtime.has_pending_paste(),
+                self.runtime.has_pending_ws_close(),
+            )
+        } else {
+            (false, false)
+        };
+        resolve_priority_for(keyref, matched, paste_pending, ws_close_pending)
+    }
+
+    /// Run the emergency `Esc`-cancels-modal gesture (CTX-0275).
+    ///
+    /// Routes the press through `Runtime::handle_key_event` — the same
+    /// cancel path a routed `Esc` takes today
+    /// (`cancel_pending_on_escape`: drops the pending paste and/or the
+    /// workspace-close arm, consumes the key so it never reaches the PTY)
+    /// — then consumes it here so a user `escape` remap cannot steal the
+    /// cancel. Loud paste reporting mirrors `handle_event`'s CTX-0186 probe
+    /// byte-for-byte (a gated paste is never silent); workspace-close
+    /// cancellation stays silent exactly as today. Always returns `true`.
+    pub(crate) fn handle_emergency_escape(&mut self, key: &KeyEvent) -> bool {
+        let had_pending = self.runtime.has_pending_paste();
+        let before_len = self.runtime.pending_input_len();
+        self.runtime.handle_key_event(key.clone());
+        let has_pending = self.runtime.has_pending_paste();
+        let after_len = self.runtime.pending_input_len();
+        if has_pending {
+            if let Some(summary) = self.runtime.pending_paste_summary() {
+                eprintln!("bitty: paste -> {summary}");
+            }
+        } else if had_pending && after_len > before_len {
+            eprintln!("bitty: paste confirmed -> delivered");
+        } else if had_pending {
+            eprintln!("bitty: paste confirmation cancelled (Esc)");
+        }
+        if let Some(win) = self.window.as_ref() {
+            win.request_redraw();
+        }
+        true
+    }
+
+    /// Single-owner chrome intercept (CTX-0153) with explicit dispatch
+    /// priority (CTX-0275): emergency/reserved > active overlay-modal >
+    /// user-defined keymap > plugin (inert, deny-by-default) > terminal
+    /// encoding. Returns `true` when the event was consumed (emergency
+    /// cancel ran, a modal captured a bound chord, a bound chord ran, or a
+    /// chrome-owned key repeat/duplicate was swallowed) and must NOT reach
+    /// `Runtime`; `false` means route normally (unbound keys like Tab,
+    /// arrows, plain letters fall through to shell input, modal or not).
+    /// Modifier tracking stays in sync because modifier-only keys
     /// and `ModifiersChanged` update the mirror here AND are always routed
     /// (this method returns `false` for them), never consumed.
     ///
@@ -707,6 +892,10 @@ impl TerminalApp {
     /// the next press after the release re-matches against the live mirror.
     /// Focus transitions clear ownership alongside the CTX-0187 mirror clear
     /// (missed releases while unfocused must not swallow future typing).
+    ///
+    /// CTX-0187/0229 behavior is byte-identical with no modal active: the
+    /// emergency arm never fires, the modal arm never fires, and the
+    /// user/terminal arms run the exact pre-0275 match/own/fall-through.
     pub(crate) fn intercept_chrome_key(&mut self, kind: &WindowEventKind) -> bool {
         match kind {
             WindowEventKind::KeyboardInput(key) => {
@@ -727,24 +916,60 @@ impl TerminalApp {
                     // Still physically held from a consumed chord press: stay
                     // swallowed even when the mirror decayed (release cascade).
                     // No action re-runs; the PTY never sees the key.
+                    // (CTX-0229 ownership sits above the modal arm: ownership
+                    // is a physical invariant, and with no modal active the
+                    // arms below are unreachable — byte-identical.)
                     if self.chrome_held.contains(&keyref.key) {
                         if let Some(win) = self.window.as_ref() {
                             win.request_redraw();
                         }
                         return true;
                     }
-                    if let Some(action) = bitty_config::match_keymap(&self.keymaps, keyref) {
-                        // The press is chrome-owned from here until release.
-                        self.chrome_held.insert(keyref.key);
-                        // Repeats of a bound chord stay owned by chrome
-                        // (no action, no PTY bytes).
-                        if !key.repeat {
-                            self.apply_chrome_action(action);
+                    let matched = bitty_config::match_keymap(&self.keymaps, keyref);
+                    let (priority, action) = self.resolve_dispatch(keyref, matched);
+                    match priority {
+                        DispatchPriority::Emergency => {
+                            return self.handle_emergency_escape(key);
                         }
-                        if let Some(win) = self.window.as_ref() {
-                            win.request_redraw();
+                        DispatchPriority::Modal => {
+                            // Active modal captures the bound non-confirm
+                            // chord: consumed, no action runs, no PTY bytes.
+                            if let Some(win) = self.window.as_ref() {
+                                win.request_redraw();
+                            }
+                            return true;
                         }
-                        return true;
+                        DispatchPriority::User => {
+                            let Some(action) = action else {
+                                // Unreachable by construction (`User` always
+                                // carries the matched action); fail closed to
+                                // terminal routing rather than panicking.
+                                return false;
+                            };
+                            // The press is chrome-owned from here until release.
+                            self.chrome_held.insert(keyref.key);
+                            // Repeats of a bound chord stay owned by chrome
+                            // (no action, no PTY bytes).
+                            if !key.repeat {
+                                self.apply_chrome_action(action);
+                            }
+                            if let Some(win) = self.window.as_ref() {
+                                win.request_redraw();
+                            }
+                            return true;
+                        }
+                        DispatchPriority::Plugin => {
+                            // Inert today (`match_plugin_binding` denies by
+                            // default); fail closed to terminal routing.
+                            debug_assert!(
+                                match_plugin_binding(keyref).is_none(),
+                                "plugin layer must stay deny-by-default",
+                            );
+                            return false;
+                        }
+                        DispatchPriority::Terminal => {
+                            return false;
+                        }
                     }
                 }
                 false
@@ -1502,6 +1727,35 @@ mod tests {
         })
     }
 
+    fn esc_release() -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Named(NamedKey::Escape),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Released,
+            repeat: false,
+            is_synthetic: false,
+        })
+    }
+
+    fn alt_mods_event() -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: false,
+            alt: true,
+            super_pressed: false,
+        })
+    }
+
+    fn clear_mods_event() -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift: false,
+            control: false,
+            alt: false,
+            super_pressed: false,
+        })
+    }
+
     #[test]
     fn chrome_workspace_ops_move_active_and_tabline_follows() {
         use bitty_config::ChromeAction;
@@ -1556,9 +1810,10 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
         assert!(app.runtime.has_pending_ws_close());
         assert!(app.runtime.has_pane_session(&new_id));
-        // Esc through the real intercept cancels: unconsumed as chrome
-        // (routes to Runtime) and the arm drops with no kill.
-        assert!(!drive_chrome(&mut app, esc_press()));
+        // Esc through the real intercept cancels via the CTX-0275 emergency
+        // layer (consumed as chrome before any keymap match): the arm drops
+        // with no kill.
+        assert!(drive_chrome(&mut app, esc_press()));
         assert!(!app.runtime.has_pending_ws_close());
         assert!(app.runtime.has_pane_session(&new_id));
         // Re-arm, then repeat-to-confirm kills and closes.
@@ -1568,5 +1823,230 @@ mod tests {
         assert!(!app.runtime.has_pending_ws_close());
         assert!(!app.runtime.has_pane_session(&new_id));
         assert_eq!(app.runtime.workspace_count(), 1);
+    }
+
+    // CTX-0275 explicit DispatchPriority: headless regression suite.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_priority_table_orders_emergency_modal_user_terminal() {
+        // Pure classifier: emergency > modal > user > plugin (inert) >
+        // terminal, over plain data (no display server, no live Runtime).
+        use bitty_config::{ChromeAction as A, KeyName, KeyRef, SplitDir};
+        let esc = KeyRef {
+            key: KeyName::Escape,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: false,
+        };
+        let alt_h = KeyRef {
+            key: KeyName::Char('h'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let alt_w = KeyRef {
+            key: KeyName::Char('w'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let paste_chord = KeyRef {
+            key: KeyName::Char('v'),
+            ctrl: true,
+            alt: false,
+            shift: true,
+            super_held: false,
+        };
+        let bare_x = KeyRef {
+            key: KeyName::Char('x'),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: false,
+        };
+        // Emergency beats everything, even a user `escape` remap.
+        assert_eq!(
+            resolve_priority_for(esc, Some(A::CloseView), true, false),
+            (DispatchPriority::Emergency, None)
+        );
+        assert_eq!(
+            resolve_priority_for(esc, None, false, true),
+            (DispatchPriority::Emergency, None)
+        );
+        // No modal: bound -> User, unbound -> Terminal (pre-0275 behavior).
+        assert_eq!(
+            resolve_priority_for(esc, Some(A::CloseView), false, false),
+            (DispatchPriority::User, Some(A::CloseView))
+        );
+        assert_eq!(
+            resolve_priority_for(esc, None, false, false),
+            (DispatchPriority::Terminal, None)
+        );
+        // Unbound keys fall through even with a modal up (the dialog
+        // captures commands, not typing).
+        assert_eq!(
+            resolve_priority_for(bare_x, None, true, false),
+            (DispatchPriority::Terminal, None)
+        );
+        assert_eq!(
+            resolve_priority_for(bare_x, None, true, true),
+            (DispatchPriority::Terminal, None)
+        );
+        // Either gate captures a bound non-confirm chord...
+        assert_eq!(
+            resolve_priority_for(alt_h, Some(A::GotoSplit(SplitDir::Left)), true, false),
+            (DispatchPriority::Modal, None)
+        );
+        assert_eq!(
+            resolve_priority_for(alt_h, Some(A::GotoSplit(SplitDir::Left)), false, true),
+            (DispatchPriority::Modal, None)
+        );
+        // ...but each modal's own repeat-confirm still dispatches as User...
+        assert_eq!(
+            resolve_priority_for(paste_chord, Some(A::PasteFromClipboard), true, false),
+            (DispatchPriority::User, Some(A::PasteFromClipboard))
+        );
+        assert_eq!(
+            resolve_priority_for(alt_w, Some(A::WorkspaceClose), false, true),
+            (DispatchPriority::User, Some(A::WorkspaceClose))
+        );
+        // ...and crossed gestures stay captured (a close chord never
+        // confirms a paste, a paste chord never confirms a close).
+        assert_eq!(
+            resolve_priority_for(alt_w, Some(A::WorkspaceClose), true, false),
+            (DispatchPriority::Modal, None)
+        );
+        assert_eq!(
+            resolve_priority_for(paste_chord, Some(A::PasteFromClipboard), false, true),
+            (DispatchPriority::Modal, None)
+        );
+        // Plugin slot denies by default for every key shape.
+        for keyref in [esc, alt_h, alt_w, paste_chord, bare_x] {
+            assert!(
+                match_plugin_binding(keyref).is_none(),
+                "plugin layer must stay deny-by-default"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_priority_modal_captures_user_chords_but_not_typing() {
+        // Suspicious clipboard (embedded newline) arms the paste-confirm
+        // modal through the real chord; every later step drives the same
+        // `drive_chrome` dispatch `handle_event` performs.
+        let mut app = paste_test_app("line1\nline2");
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime.set_focus(ViewId::new(1));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.modal_capture_active());
+        // Bound focus chord behind the modal is captured: consumed, no
+        // focus move, no PTY bytes, no press-to-release ownership taken.
+        assert!(!drive_chrome(&mut app, alt_mods_event()));
+        assert!(drive_chrome(&mut app, char_press("l", "l", false)));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!app.chrome_held.contains(&bitty_config::KeyName::Char('l')));
+        assert!(!drive_chrome(&mut app, char_release("l")));
+        // Workspace close behind the modal is captured too: no arm, no kill.
+        assert!(drive_chrome(&mut app, char_press("w", "w", false)));
+        assert!(!app.runtime.has_pending_ws_close());
+        assert_eq!(app.runtime.workspace_count(), 1);
+        assert!(!drive_chrome(&mut app, char_release("w")));
+        // Unbound typing still falls through to the terminal: unconsumed
+        // with its byte delivered (fall-through unchanged). The alt latch
+        // is cleared first so this proves plain typing, not Alt+X ESC-x.
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        assert!(!drive_chrome(&mut app, char_press("x", "x", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"x");
+        assert!(!drive_chrome(&mut app, char_release("x")));
+        // The modal pends throughout: nothing above resolved it early.
+        assert!(app.runtime.has_pending_paste());
+        // Release hygiene for the owned paste key and the alt latch.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    fn dispatch_priority_emergency_esc_overrides_user_remap() {
+        // A user `escape` remap applies with no modal active but never
+        // steals the emergency cancel while a confirmation pends.
+        use bitty_config::{Chord, ChromeAction, ResolvedKeymap};
+        let mut maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        maps.push(ResolvedKeymap {
+            chord: Chord::parse("escape").expect("escape parses"),
+            action: ChromeAction::CloseView,
+            context: "global".to_string(),
+            from_default: false,
+        });
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.force_headless_clipboard();
+        rt.clipboard_mut()
+            .set_text("line1\nline2".to_string())
+            .expect("headless set");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        assert_eq!(app.runtime.leaf_count(), 2);
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        // Emergency: consumed here (not routed), pending dropped, layout
+        // untouched — the `close_view` remap does NOT run.
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_paste());
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(app.runtime.drain_pending_input().is_empty());
+        // With no modal active the remap applies again: Esc closes a pane.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!drive_chrome(&mut app, esc_release()));
+    }
+
+    #[test]
+    fn dispatch_priority_modal_confirm_gesture_still_dispatches() {
+        // The modal's own confirm gesture (identical repeat of the arming
+        // paste chord) dispatches as User and delivers exactly once.
+        let mut app = paste_test_app("line1\nline2");
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        // Release the key (ownership ends) while ctrl+shift stay latched,
+        // then repeat the identical chord: confirm, not capture.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(drive_chrome(&mut app, char_press("V", "V", false)));
+        assert!(!app.runtime.has_pending_paste());
+        assert_eq!(app.runtime.drain_pending_input(), b"line1\nline2");
+    }
+
+    #[test]
+    fn dispatch_priority_fallthrough_unchanged_without_modal() {
+        // No modal active: unbound keys route with their bytes (pre-0275
+        // fall-through byte-identical), bound chords still dispatch.
+        let mut app = paste_test_app("clean-paste");
+        assert!(!app.modal_capture_active());
+        assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"v");
+        assert!(!drive_chrome(&mut app, char_release("v")));
+        // Bound paste chord still dispatches as User and delivers clean
+        // text immediately (no modal arms for clean input).
+        press_paste_chord(&mut app);
+        assert!(!app.runtime.has_pending_paste());
+        assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
     }
 }

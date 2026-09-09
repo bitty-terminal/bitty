@@ -19,6 +19,11 @@ use crate::reader::READ_CHUNK_SIZE;
 use crate::reader::ReaderSource;
 use crate::writer::PtyWriter;
 
+/// Poll interval for [`Pty::wait_timeout`]: each poll is one non-blocking
+/// kernel status check (`try_wait`), so a 5 ms cadence bounds CPU while
+/// keeping reap latency negligible against second-scale timeouts.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// A child process running inside its own pseudo terminal.
 ///
 /// Created exclusively through [`crate::PtyBuilder::spawn`]. The handle owns
@@ -138,6 +143,88 @@ impl Pty {
         let status = self.session.wait()?;
         self.reaped = true;
         Ok(status)
+    }
+
+    /// Blocks until the child exits or `timeout` elapses, then reaps on success.
+    ///
+    /// Returns `Ok(Some(status))` when the child exited in time (reaped,
+    /// exactly like [`Pty::wait`]), or `Ok(None)` when the deadline passed
+    /// with the child still alive (nothing is reaped; follow with
+    /// [`Pty::kill`] or [`Pty::shutdown`]). Errors with
+    /// [`PtyError::ChildAlreadyReaped`] once a previous wait consumed the
+    /// status.
+    ///
+    /// This polls [`Pty::try_wait`] instead of blocking in the platform
+    /// primitive, so no code path waits past the deadline: an unbounded
+    /// [`Pty::wait`] hangs the caller when a child never signals exit (seen
+    /// with a `cmd /C exit` child under ConPTY on Windows CI, where it held
+    /// the whole test binary for ~23 minutes). Prefer this over [`Pty::wait`]
+    /// wherever the child is not known to exit on its own.
+    pub fn wait_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<ExitStatus>, PtyError> {
+        if self.reaped {
+            return Err(PtyError::ChildAlreadyReaped);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let status = self.session.try_wait()?;
+            if status.is_some() {
+                self.reaped = true;
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_timeout_returns_none_while_child_is_alive() {
+        bitty_test_support::require_pty!();
+        let mut pty = crate::PtyBuilder::new("/bin/cat")
+            .spawn()
+            .expect("spawn cat");
+        // `cat` blocks on stdin: it cannot exit within the timeout.
+        let outcome = pty
+            .wait_timeout(Duration::from_millis(200))
+            .expect("wait_timeout");
+        assert!(outcome.is_none(), "live child must time out");
+        // Nothing reaped: kill then reap through the same bounded path.
+        pty.kill().expect("kill");
+        let status = pty
+            .wait_timeout(Duration::from_secs(10))
+            .expect("reap after kill")
+            .expect("killed child must exit");
+        assert!(!status.is_success());
+        assert!(matches!(
+            pty.wait_timeout(Duration::from_secs(1)),
+            Err(PtyError::ChildAlreadyReaped)
+        ));
+    }
+
+    #[test]
+    fn wait_timeout_reaps_fast_exiting_child_like_wait() {
+        bitty_test_support::require_pty!();
+        let mut pty = crate::PtyBuilder::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("spawn sh");
+        let status = pty
+            .wait_timeout(Duration::from_secs(10))
+            .expect("wait_timeout")
+            .expect("fast child must exit in time");
+        assert!(!status.is_success());
+        assert_eq!(status.code(), 3);
     }
 }
 

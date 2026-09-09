@@ -160,6 +160,12 @@ impl Runtime {
                 writer,
             },
         );
+        // CTX-0254 (PX-1588): a respawned leaf starts with a fresh grid, so
+        // drop the previous session's placements with it. Without this, a
+        // replace on the same `ViewId` inherits the dead grid's placements
+        // onto the fresh grid (same stale-pixel class the close path fixes).
+        // Stored images survive inertly under the store caps.
+        self.kitty_images.clear_origin(Some(view.0));
         // If a waker is already installed (split after `set_pty_waker`),
         // promote immediately so the new pane wakes the loop too (CTX-0230).
         if self.pty_waker.is_some() {
@@ -270,6 +276,10 @@ impl Runtime {
     pub fn close_pane_session(&mut self, view: &ViewId) -> bool {
         let removed = self.pane_sessions.remove(view).is_some();
         if removed {
+            // CTX-0254: drop the closed pane's placements with its grid, so
+            // a later leaf reusing the numeric id can never inherit stale
+            // image pixels (origin tokens are `ViewId.0` values).
+            self.kitty_images.clear_origin(Some(view.0));
             self.pending_full_redraw = true;
         }
         removed
@@ -363,8 +373,16 @@ impl Runtime {
         if bytes.is_empty() || !self.pane_sessions.contains_key(&view) {
             return;
         }
+        // CTX-0254: tag Kitty placements emitted by this drain with the
+        // pane's origin token, so the present layer confines them to this
+        // pane's leaf (a background pane can never paint over the focused
+        // pane). Saved and restored around the shared pipeline like the
+        // parser/state swap pair below.
+        let prev_origin = self.kitty_origin;
+        self.kitty_origin = Some(view.0);
         {
             let Some(sess) = self.pane_sessions.get_mut(&view) else {
+                self.kitty_origin = prev_origin;
                 return;
             };
             std::mem::swap(&mut self.parser, &mut sess.parser);
@@ -375,12 +393,14 @@ impl Runtime {
         let Some(sess) = self.pane_sessions.get_mut(&view) else {
             // Unreachable single-threaded (see doc above); keep total rather
             // than debug-panicking on a corrupted swap pair.
+            self.kitty_origin = prev_origin;
             debug_assert!(false, "pane session vanished mid-pump");
             return;
         };
         std::mem::swap(&mut self.parser, &mut sess.parser);
         std::mem::swap(&mut self.state, &mut sess.state);
         std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
+        self.kitty_origin = prev_origin;
     }
 
     /// Flushes one pane's queued terminal replies (DA/DECRQM/XTGETTCAP,

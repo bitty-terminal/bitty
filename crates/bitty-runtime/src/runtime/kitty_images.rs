@@ -9,11 +9,13 @@
 //! cursor-anchored placement. Full `APC G` parser wiring is follow-up work;
 //! callers pass the already-parsed `f`/`s`/`v`/`a`/`c`/`r` values.
 //!
-//! Display anchors at the primary-state cursor cell with
-//! `State::scrollback_len()` as the scroll base (images scroll with
-//! content; see [`bitty_rich::kitty_place`]). While the alternate screen
-//! is active, transmissions decode and store but never place (fail
-//! closed, same shape as transmit-only).
+//! Display anchors at the drained stream's cursor cell (the primary grid,
+//! or the pane session swapped in by `handle_pane_bytes`) with that
+//! grid's `State::scrollback_len()` as the scroll base (images scroll with
+//! content; see [`bitty_rich::kitty_place`]). The placement keeps the
+//! stream's origin token so the present layer confines it to its own leaf
+//! (CTX-0254). While the alternate screen is active, transmissions decode
+//! and store but never place (fail closed, same shape as transmit-only).
 
 use super::*;
 
@@ -139,6 +141,14 @@ impl Runtime {
     /// are the explicit `c=`/`r=` cell spans (0 derives from pixels).
     /// `z` orders images ascending among themselves.
     ///
+    /// The placement is tagged with the currently-drained stream's origin
+    /// (`self.kitty_origin`: `None` primary, `Some` pane session swapped
+    /// in by `handle_pane_bytes`), and the cursor/scrollback base come
+    /// from that same swapped-in grid — so a pane's image anchors to the
+    /// pane's cursor and paints only on the pane's leaf (CTX-0254
+    /// cross-pane spoof prevention). Alternate-screen suppression likewise
+    /// reads the drained grid.
+    ///
     /// A successful display forces a full redraw so the next tick paints
     /// the new placement. Alternate-screen display stores without placing
     /// ([`KittyDisplayOutcome::SuppressedAlternateScreen`]).
@@ -181,7 +191,7 @@ impl Runtime {
         };
         let placement = self
             .kitty_images
-            .display(
+            .display_for_origin(
                 image,
                 cursor.col,
                 cursor.row,
@@ -190,6 +200,7 @@ impl Runtime {
                 rich_metrics,
                 self.state.scrollback_len(),
                 z,
+                self.kitty_origin,
             )
             .map_err(KittyImageError::Placement)?;
         self.pending_full_redraw = true;

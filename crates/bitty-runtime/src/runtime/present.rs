@@ -331,13 +331,42 @@ impl Runtime {
 
         let snapshot = self.state.snapshot();
         let mut pending_full = self.pending_full_redraw;
-        // CTX-0248: an alternate-screen transition forces a full present
-        // even when the grid generation is unchanged, so entering alt
-        // clears painted images (and leaving alt repaints the restored
-        // grid) instead of idling on a stale frame.
-        let alt_active = self.state.alt_screen_active();
-        if alt_active != self.kitty_alt_screen_latched {
-            self.kitty_alt_screen_latched = alt_active;
+        // Collect allocations deterministically BEFORE the idle check so
+        // geometry-only changes are visible (CTX-0228). `layout_with_gaps`
+        // is pure and bounded by the leaf count.
+        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
+        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
+        let focused = self.focus.focused();
+        // CTX-0254: Kitty origin binding. The image layer is keyed by the
+        // emitting PTY stream — `None` for the primary grid, `Some(id)`
+        // for the split-pane session owning the focused leaf — so a
+        // background pane can never paint over the focused pane
+        // (cross-pane spoof prevention). Alt-screen and scrollback resolve
+        // against the origin's own grid, never a global one; the latch
+        // below therefore tracks the focused origin's alt state.
+        let kitty_origin: Option<u64> = focused.and_then(|fid| {
+            if self.pane_sessions.contains_key(&fid) {
+                Some(fid.0)
+            } else {
+                None
+            }
+        });
+        let (kitty_origin_alt, kitty_origin_scrollback) = match kitty_origin {
+            Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                Some(sess) => (sess.state.alt_screen_active(), sess.state.scrollback_len()),
+                // Unreachable single-threaded (checked above); fail closed
+                // to "alt active" so nothing paints against a wrong grid.
+                None => (true, self.state.scrollback_len()),
+            },
+            None => (self.state.alt_screen_active(), self.state.scrollback_len()),
+        };
+        // CTX-0248: an alternate-screen transition on the focused origin
+        // forces a full present even when the grid generation is unchanged,
+        // so entering alt clears that origin's painted images (and leaving
+        // alt repaints the restored grid) instead of idling on a stale
+        // frame. Other origins are untouched (CTX-0254 `clear_origin`).
+        if kitty_origin_alt != self.kitty_alt_screen_latched {
+            self.kitty_alt_screen_latched = kitty_origin_alt;
             pending_full = true;
         }
         let last = self.last_presented_generation;
@@ -349,12 +378,6 @@ impl Runtime {
             current_gen = current_gen.max(sess.state.generation());
         }
 
-        // Collect allocations deterministically BEFORE the idle check so
-        // geometry-only changes are visible (CTX-0228). `layout_with_gaps`
-        // is pure and bounded by the leaf count.
-        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
-        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
-        let focused = self.focus.focused();
         // CTX-0228: a layout or focus change forces a full present even
         // when no PTY bytes advanced the generation. This covers tree edits
         // through `layout_mut`/`focus_mut` borrows and any future
@@ -864,17 +887,22 @@ impl Runtime {
         }
         self.scrollbar_visible = paints;
 
-        // Kitty images (CTX-0248, budget + cache CTX-0252 F2): topmost
-        // present-layer blits on the focused leaf, composited after fills
-        // and glyphs. Never grid truth: no cell, scrollback, or layout
-        // mutation. Each visible placement is scaled by the rich layer to
-        // its clamped cell-rect pixel extent and translated to the leaf
-        // origin (plus the window padding inset, like every other overlay).
-        // Skipped while the focused view inspects scrollback (live-grid
-        // anchors do not map to the history viewport) and cleared on
-        // alternate-screen entry. Multi-pane sessions are not fed yet:
-        // images anchor to the primary state only (parser `APC G` wiring
-        // is follow-up work).
+        // Kitty images (CTX-0248, budget + cache CTX-0252 F2, origin
+        // binding CTX-0254): topmost present-layer blits on the focused
+        // leaf, composited after fills and glyphs. Never grid truth: no
+        // cell, scrollback, or layout mutation. Each visible placement is
+        // scaled by the rich layer to its clamped cell-rect pixel extent
+        // and translated to the leaf origin (plus the window padding
+        // inset, like every other overlay).
+        //
+        // Only the focused leaf's origin paints here
+        // (`placements_in_paint_order_for`): placements emitted by any
+        // other pane stay retained but contribute zero pixels to this
+        // frame, so a background program cannot spoof content over the
+        // focused pane. Skipped while the focused view inspects scrollback
+        // (live-grid anchors do not map to the history viewport).
+        // Alternate-screen entry clears only the entering origin
+        // (`clear_origin`); other panes' images survive.
         //
         // Per-frame budget ([`bitty_rich::KittyFrameBudget`]): at most 32
         // blits / 64 MiB of scaled bytes per frame, checked before
@@ -885,10 +913,13 @@ impl Runtime {
         // source dims, scrollback sequence, and geometry, so static frames
         // reuse blits while scroll/geometry changes miss (never stale).
         let mut combined_images: Vec<bitty_render::grid::ImageBlit> = Vec::new();
-        if self.state.alt_screen_active() {
-            self.kitty_images.clear();
+        if kitty_origin_alt {
+            self.kitty_images.clear_origin(kitty_origin);
             self.kitty_raster_cache.clear();
-        } else if !self.kitty_images.placement_is_empty() {
+        } else if !self
+            .kitty_images
+            .placement_for_origin_is_empty(kitty_origin)
+        {
             let scrolled = self
                 .focused_view()
                 .and_then(|fid| view_map.get(&fid))
@@ -903,11 +934,17 @@ impl Runtime {
                                 width: live.width,
                                 height: live.height,
                             };
-                            let scrollback = self.state.scrollback_len();
+                            // CTX-0254: the origin's own scrollback sequence
+                            // (resolved above), so a pane's image tracks its
+                            // pane's content — never the primary grid's.
+                            let scrollback = kitty_origin_scrollback;
                             let origin_px_x = px_origin(rect.x, live.width, pad_px);
                             let origin_px_y = px_origin(rect.y, live.height, pad_px);
                             let mut budget = bitty_rich::KittyFrameBudget::new();
-                            for placement in self.kitty_images.placements_in_paint_order() {
+                            for placement in self
+                                .kitty_images
+                                .placements_in_paint_order_for(kitty_origin)
+                            {
                                 let Some(img) = self.kitty_images.get(placement.image) else {
                                     continue;
                                 };

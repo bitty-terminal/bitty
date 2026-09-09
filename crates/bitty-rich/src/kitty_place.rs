@@ -62,6 +62,32 @@
 //! while it is active (stored, not painted — same fail-closed shape as
 //! [`KittyAction::Transmit`]).
 //!
+//! # Origin binding + spoofing posture (CTX-0254)
+//!
+//! Every placement carries an [`KittyPlacement::origin`] token identifying
+//! the PTY stream that emitted it: `None` for the primary grid, `Some(id)`
+//! for a split-pane session (the runtime passes the leaf's `ViewId.0`; this
+//! crate stays `u64`-typed so it never depends on the UI crate). The
+//! present layer paints only the focused leaf's origin on that leaf, so a
+//! background pane's program can never paint pixels over the focused pane's
+//! grid (cross-pane spoof prevention). Scrollback and alternate-screen
+//! state are likewise resolved per origin at present time, never against a
+//! global grid.
+//!
+//! Residual posture (documented, not enforced here):
+//!
+//! - Within one origin, images stay topmost over that pane's own cursor and
+//!   selection fills (see "Placement semantics" above). Same-origin impact
+//!   is contained: the emitting program already controls every cell of its
+//!   own grid, so covering its own chrome adds no new spoof capability
+//!   beyond what PTY text already allows. Cursor-on-top remains follow-up
+//!   work.
+//! - The decoded-image *store* stays global and bounded (FIFO eviction on
+//!   the count/byte caps). A noisy origin can therefore evict another
+//!   origin's stored images (availability only — dangling placements fail
+//!   closed at lookup and paint nothing). Per-origin quotas are follow-up
+//!   work if this ever matters operationally.
+//!
 //! # Bounds (threat T-01/T-02)
 //!
 //! Placement reuses the decode caps ([`crate::kitty_decode`]) rather than
@@ -198,6 +224,12 @@ pub struct KittyPlacement {
     pub id: KittyPlacementId,
     /// Which image is placed.
     pub image: KittyImageId,
+    /// Origin token of the emitting PTY stream (CTX-0254): `None` for the
+    /// primary grid, `Some(token)` for a split-pane session (the runtime
+    /// passes the leaf's `ViewId.0`). The present layer paints a placement
+    /// only on its own origin's leaf, so background panes cannot spoof
+    /// pixels over the focused pane.
+    pub origin: Option<u64>,
     /// Cursor column at display time.
     pub anchor_col: u16,
     /// Cursor row at display time (before scroll adjustment).
@@ -488,7 +520,8 @@ impl KittyImageLayer {
     /// `cols`/`rows` are the explicit `c=`/`r=` spans (0 or absent derives
     /// from decoded pixels). `scrollback_base` is
     /// `State::scrollback_len()` now. Evicts the oldest placement at the
-    /// 128 cap (FIFO).
+    /// 128 cap (FIFO). The placement is bound to the primary origin
+    /// (`None`); pane sessions use [`KittyImageLayer::display_for_origin`].
     ///
     /// # Errors
     ///
@@ -506,6 +539,43 @@ impl KittyImageLayer {
         scrollback_base: usize,
         z: i32,
     ) -> Result<KittyPlacementId, KittyPlacementError> {
+        self.display_for_origin(
+            image,
+            anchor_col,
+            anchor_row,
+            cols,
+            rows,
+            metrics,
+            scrollback_base,
+            z,
+            None,
+        )
+    }
+
+    /// Places a stored image at the cursor cell for one origin (CTX-0254).
+    ///
+    /// Identical to [`KittyImageLayer::display`] except the placement is
+    /// tagged with `origin` (`None` primary, `Some(token)` pane session),
+    /// so the present layer can confine it to its own leaf. Same errors
+    /// and eviction behavior as [`KittyImageLayer::display`].
+    ///
+    /// # Errors
+    ///
+    /// [`KittyPlacementError::ImageNotFound`] when `image` is unknown.
+    /// Stores nothing new on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn display_for_origin(
+        &mut self,
+        image: KittyImageId,
+        anchor_col: u16,
+        anchor_row: u16,
+        cols: u16,
+        rows: u16,
+        metrics: CellMetrics,
+        scrollback_base: usize,
+        z: i32,
+        origin: Option<u64>,
+    ) -> Result<KittyPlacementId, KittyPlacementError> {
         let stored = self
             .get(image)
             .ok_or(KittyPlacementError::ImageNotFound(image))?;
@@ -519,6 +589,7 @@ impl KittyImageLayer {
         self.placements.push_back(KittyPlacement {
             id,
             image,
+            origin,
             anchor_col,
             anchor_row,
             cols,
@@ -552,6 +623,39 @@ impl KittyImageLayer {
         let mut ordered: Vec<&KittyPlacement> = self.placements.iter().collect();
         ordered.sort_by_key(|p| p.z);
         ordered
+    }
+
+    /// Placements of one origin in paint order (CTX-0254).
+    ///
+    /// The present layer paints only the focused leaf's origin, so a
+    /// background pane's placements never reach another leaf's frame.
+    /// Ascending `z`, stable for equal `z`, like
+    /// [`KittyImageLayer::placements_in_paint_order`].
+    pub fn placements_in_paint_order_for(&self, origin: Option<u64>) -> Vec<&KittyPlacement> {
+        let mut ordered: Vec<&KittyPlacement> = self
+            .placements
+            .iter()
+            .filter(|p| p.origin == origin)
+            .collect();
+        ordered.sort_by_key(|p| p.z);
+        ordered
+    }
+
+    /// Whether any placement of `origin` is retained.
+    #[must_use]
+    pub fn placement_for_origin_is_empty(&self, origin: Option<u64>) -> bool {
+        !self.placements.iter().any(|p| p.origin == origin)
+    }
+
+    /// Drops every placement of `origin`, keeping other origins and all
+    /// stored images (CTX-0254).
+    ///
+    /// Alternate-screen entry calls this for the entering origin only, so
+    /// one pane's fullscreen app never wipes another pane's images.
+    /// Images left without placements stay inert (never painted) and age
+    /// out under the store caps.
+    pub fn clear_origin(&mut self, origin: Option<u64>) {
+        self.placements.retain(|p| p.origin != origin);
     }
 
     /// Clears all images and placements (alternate-screen entry).
@@ -1215,6 +1319,64 @@ mod tests {
         let ordered = layer.placements_in_paint_order();
         let ids: Vec<KittyPlacementId> = ordered.iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![p2, p1, p3]);
+    }
+
+    #[test]
+    fn origin_binding_is_per_placement_and_filtered() {
+        // CTX-0254: placements carry their emitting stream's origin; the
+        // present layer paints only the focused leaf's origin.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        let primary = layer.display(img, 0, 0, 1, 1, METRICS, 0, 0).unwrap();
+        let pane = layer
+            .display_for_origin(img, 0, 0, 1, 1, METRICS, 0, 0, Some(7))
+            .unwrap();
+        assert_eq!(layer.get_placement(primary).unwrap().origin, None);
+        assert_eq!(
+            layer.get_placement(pane).unwrap().origin,
+            Some(7),
+            "pane placement must keep its origin token"
+        );
+        let for_primary: Vec<KittyPlacementId> = layer
+            .placements_in_paint_order_for(None)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(for_primary, vec![primary]);
+        let for_pane: Vec<KittyPlacementId> = layer
+            .placements_in_paint_order_for(Some(7))
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(for_pane, vec![pane]);
+        assert!(
+            layer.placements_in_paint_order_for(Some(9)).is_empty(),
+            "unrelated origins paint nothing"
+        );
+        assert!(!layer.placement_for_origin_is_empty(None));
+        assert!(!layer.placement_for_origin_is_empty(Some(7)));
+        assert!(layer.placement_for_origin_is_empty(Some(9)));
+    }
+
+    #[test]
+    fn clear_origin_keeps_other_origins_and_images() {
+        // CTX-0254: one pane entering the alternate screen must not wipe
+        // another pane's placements; stored images stay inert.
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        layer.display(img, 0, 0, 1, 1, METRICS, 0, 0).unwrap();
+        layer
+            .display_for_origin(img, 0, 0, 1, 1, METRICS, 0, 0, Some(7))
+            .unwrap();
+        assert_eq!(layer.placement_len(), 2);
+        layer.clear_origin(Some(7));
+        assert_eq!(layer.placement_len(), 1);
+        assert!(layer.placement_for_origin_is_empty(Some(7)));
+        assert!(!layer.placement_for_origin_is_empty(None));
+        assert_eq!(layer.len(), 1, "images survive origin clears, inert");
+        layer.clear_origin(None);
+        assert!(layer.placement_is_empty());
+        assert_eq!(layer.len(), 1);
     }
 
     #[test]

@@ -21,6 +21,9 @@ actionlint:
 pty-gate:
     ./scripts/check-pty-gated-tests.sh
 
+scratch-paths:
+    ./scripts/check-scratch-paths.sh
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
@@ -46,7 +49,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test pty-gate actionlint markdownlint
+check: fmt-check clippy test scratch-paths pty-gate actionlint markdownlint
 
 # Publish a ctxpack snapshot to the bitty-workflow mirror (commander merge
 # closeout only; never a git hook). Dry run exports + validates without push.

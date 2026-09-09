@@ -390,7 +390,7 @@ impl Runtime {
     /// Handles a mouse button event for selection or terminal mouse tracking.
     ///
     /// Single-window vertical slice semantics (candidate Input RFC, ghostty
-    /// reference `recordings/references/ghostty/src/Surface.zig`):
+    /// reference `recording/references/ghostty/src/Surface.zig`):
     /// - When mouse tracking is enabled (`1000`/`1002`/`1003`) + SGR `1006` and
     ///   not in shift-override, every button event encodes to bounded SGR bytes
     ///   (`ESC[<b;x;yM/m`, ≤32 bytes) and is written to the PTY. Right/middle

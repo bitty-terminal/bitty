@@ -55,6 +55,7 @@ main() {
 			cargo build --release -p bitty-app >/dev/null 2>&1 || true
 		fi
 		if [ -x "${bin}" ]; then
+			# scratch-paths-exempt: ephemeral hyperfine JSON, tail-displayed only, not durable evidence
 			hyperfine --warmup 1 --runs 5 --export-json "/tmp/bitty-perf-startup.json" "${bin} --help" 2>&1 | tail -n 20 || true
 			echo "hyperfine JSON: /tmp/bitty-perf-startup.json (headless --help proxy, not real first-frame)"
 		fi

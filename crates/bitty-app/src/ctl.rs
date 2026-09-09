@@ -25,6 +25,7 @@
 //! bitty ctl workspace new
 //! bitty ctl workspace close ws:2
 //! bitty ctl workspace focus ws:1
+//! bitty ctl workspace move ws:2
 //! bitty ctl config reload
 //! ```
 //!
@@ -45,7 +46,7 @@
 //! - `terminal send`: `terminal.input`
 //! - `terminal spawn|close`: `terminal.manage` (explicit elevation)
 //! - `view list`: `view.inspect`; `view split|focus`: `view.manage`
-//! - `workspace list`: `view.inspect`; `workspace new|focus`: `view.manage`
+//! - `workspace list`: `view.inspect`; `workspace new|focus|move`: `view.manage`
 //! - `workspace close`: `terminal.manage` (explicit elevation: kills live sessions)
 //! - `window list`: `view.inspect`
 //! - `config reload`: `config.modify` (explicit elevation)
@@ -164,6 +165,7 @@ pub enum CtlRequest {
     WorkspaceNew,
     WorkspaceClose { workspace_id: String },
     WorkspaceFocus { workspace_id: String },
+    WorkspaceMove { workspace_id: String },
     ConfigReload,
 }
 
@@ -186,6 +188,7 @@ impl CtlRequest {
             Self::WorkspaceNew => "core.workspace.new",
             Self::WorkspaceClose { .. } => "core.workspace.close",
             Self::WorkspaceFocus { .. } => "core.workspace.focus",
+            Self::WorkspaceMove { .. } => "core.workspace.move",
             Self::ConfigReload => "core.config.reload",
         }
     }
@@ -208,6 +211,7 @@ impl CtlRequest {
             Self::WorkspaceNew => Some(ipc_ctl::METHOD_NEW_WORKSPACE),
             Self::WorkspaceClose { .. } => Some(ipc_ctl::METHOD_CLOSE_WORKSPACE),
             Self::WorkspaceFocus { .. } => Some(ipc_ctl::METHOD_FOCUS_WORKSPACE),
+            Self::WorkspaceMove { .. } => Some(ipc_ctl::METHOD_MOVE_WORKSPACE),
             Self::ConfigReload => Some(ipc_ctl::METHOD_RELOAD_CONFIG),
         }
     }
@@ -231,9 +235,9 @@ impl CtlRequest {
             Self::TerminalText { terminal_id } => Some(ipc_ctl::params_terminal_id(terminal_id)),
             Self::ViewSplit { direction } => Some(ipc_ctl::params_split(*direction)),
             Self::ViewFocus { view_id } => Some(ipc_ctl::params_focus(view_id)),
-            Self::WorkspaceClose { workspace_id } | Self::WorkspaceFocus { workspace_id } => {
-                Some(ipc_ctl::params_workspace(workspace_id))
-            }
+            Self::WorkspaceClose { workspace_id }
+            | Self::WorkspaceFocus { workspace_id }
+            | Self::WorkspaceMove { workspace_id } => Some(ipc_ctl::params_workspace(workspace_id)),
         }
     }
 }
@@ -273,7 +277,7 @@ pub fn ctl_usage() -> String {
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
-         \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N\n\
+         \x20 workspace list | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
          \x20 config reload\n\
          examples:\n\
          \x20 bitty ctl instance list\n\
@@ -313,6 +317,7 @@ pub fn ctl_help_text() -> String {
             workspace new                 core.workspace.new (view.manage)\n  \
             workspace close ws:N          core.workspace.close (terminal.manage, elevation; kills live sessions)\n  \
             workspace focus ws:N          core.workspace.focus (view.manage)\n  \
+            workspace move ws:N           core.workspace.move (view.manage; moves focused window)\n  \
             config reload                 core.config.reload (config.modify, elevation)\n\
          \n\
          Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
@@ -321,7 +326,7 @@ pub fn ctl_help_text() -> String {
          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
          \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
          \x20 All other verbs — including view split / view focus (view.manage)\n\
-         \x20 and workspace list / new / focus, and every list, terminal send,\n\
+         \x20 and workspace list / new / focus / move, and every list, terminal send,\n\
          \x20 and terminal text verb — need no elevation.\n\
          \n\
          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
@@ -655,6 +660,19 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             })?;
             Ok((
                 CtlRequest::WorkspaceFocus {
+                    workspace_id: id.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("workspace"), Some("move")) => {
+            reject_ctl_options_for("workspace move", split_dir.is_some(), spawn_cwd.is_some())?;
+            let id = single_arg(rest, "workspace move", "ws:N (e.g. ws:2)")?;
+            ipc_ctl::parse_workspace_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid workspace id {id:?}: {err}"),
+            })?;
+            Ok((
+                CtlRequest::WorkspaceMove {
                     workspace_id: id.to_string(),
                 },
                 targeting,
@@ -1468,6 +1486,12 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         CtlRequest::WorkspaceFocus { workspace_id } => {
             out.push_str(&format!("focused {workspace_id} on {}\n", target.instance));
         }
+        CtlRequest::WorkspaceMove { workspace_id } => {
+            out.push_str(&format!(
+                "moved focused window to {workspace_id} on {}\n",
+                target.instance
+            ));
+        }
         CtlRequest::ConfigReload => {
             out.push_str(&format!(
                 "reloaded on {} — result: {result_json}\n",
@@ -1878,6 +1902,32 @@ pub fn apply_control(
             format!("no such workspace {workspace_id}"),
         ));
     }
+    if method == ipc_ctl::METHOD_MOVE_WORKSPACE {
+        // CTX-0259: non-interactive move of the focused window to `ws:N`.
+        // No kill, no elevation beyond view.manage (authorized upstream);
+        // unknown targets are NotFound with no partial state.
+        let workspace_id = ipc_ctl::parse_workspace_params(params)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        let num = ipc_ctl::parse_workspace_id(&workspace_id)
+            .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        match runtime.workspace_move_focused_to_one_based(u64::from(num)) {
+            Ok((moved, from, _to)) => {
+                return Ok(format!(
+                    "{{\"moved\":\"v:{}\",\"from\":\"ws:{from}\",\"to\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
+                    moved.0,
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
+            Err(message) => {
+                // `from==to` no-ops succeed inside the runtime; every Err
+                // here is an unknown target or missing focus (no partial).
+                if message.contains("no such workspace") {
+                    return Err(("usage", "NotFound", message));
+                }
+                return Err(("usage", "Conflict", message));
+            }
+        }
+    }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
         // Validate the config file (same probe the startup path uses) and
         // report its path; live hot-swap is a documented follow-up.
@@ -2153,15 +2203,38 @@ mod tests {
                 workspace_id: String::from("ws:1"),
             }
         );
+        let (req, _) =
+            parse_ctl_request(&words(&["workspace", "move", "ws:2"])).expect("must parse");
+        assert_eq!(
+            req,
+            CtlRequest::WorkspaceMove {
+                workspace_id: String::from("ws:2"),
+            }
+        );
+        assert_eq!(
+            req.registry_id(),
+            "core.workspace.move",
+            "registry id pinned"
+        );
+        assert_eq!(
+            req.wire_method(),
+            Some(ipc_ctl::METHOD_MOVE_WORKSPACE),
+            "wire method pinned"
+        );
         // Fail closed: missing/extra args, wrong id shapes, misplaced flags.
         assert!(parse_ctl_request(&words(&["workspace"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "close"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "focus"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "move"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "close", "ws:2", "extra"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "list", "extra"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "new", "extra"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "close", "v:2"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "focus", "t:1"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "move", "v:2"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "move", "ws:2", "extra"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "move", "ws:007"])).is_err());
+        assert!(parse_ctl_request(&words(&["workspace", "move", "ws:2", "--right"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "close", "ws:007"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "close", "ws:2", "--right"])).is_err());
         assert!(parse_ctl_request(&words(&["workspace", "dance"])).is_err());
@@ -2218,6 +2291,13 @@ mod tests {
             }
             .registry_id(),
             "core.workspace.focus"
+        );
+        assert_eq!(
+            CtlRequest::WorkspaceMove {
+                workspace_id: String::from("ws:2"),
+            }
+            .registry_id(),
+            "core.workspace.move"
         );
         assert_eq!(CtlRequest::ConfigReload.registry_id(), "core.config.reload");
     }
@@ -2669,7 +2749,7 @@ mod tests {
             "help must exempt view verbs, got {help:?}"
         );
         assert!(
-            help.contains("workspace list / new / focus"),
+            help.contains("workspace list / new / focus / move"),
             "help must exempt non-destructive workspace verbs, got {help:?}"
         );
         assert!(
@@ -2731,6 +2811,60 @@ mod tests {
             apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&bad), &all);
         assert!(!gone.ok);
         assert_eq!(gone.code, "NotFound");
+    }
+
+    #[test]
+    fn control_workspace_move_headless_no_elevation() {
+        // CTX-0259 parity: `workspace move ws:N` rides view.manage (no
+        // elevation), reparents the focused leaf, and fails closed on
+        // unknown targets with no partial state.
+        use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+        assert!(created.ok, "setup ws2: {created:?}");
+        let focus_ws1 = ipc_ctl::params_workspace("ws:1");
+        let back = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_FOCUS_WORKSPACE,
+            Some(&focus_ws1),
+            &cli,
+        );
+        assert!(back.ok, "setup focus ws1: {back:?}");
+        // Split ws1 so there is a second leaf to move.
+        let moved_id = ViewId::new(50);
+        let mut layout = rt.layout().clone();
+        let focused = rt.focused_view().expect("focus");
+        let old = layout.find_leaf(focused).cloned().expect("leaf");
+        let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(fresh_leaf),
+        );
+        rt.set_layout(layout);
+        assert!(rt.set_focus(moved_id));
+        let target = ipc_ctl::params_workspace("ws:2");
+        let done =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_MOVE_WORKSPACE, Some(&target), &cli);
+        assert!(
+            done.ok,
+            "workspace move must succeed without elevation: {done:?}"
+        );
+        assert!(done.result_json.contains("\"to\":\"ws:2\""));
+        assert!(done.result_json.contains("\"moved\":\"v:50\""));
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.layout().leaf_count(), 1);
+        // Unknown target is NotFound (no partial state).
+        let bad = ipc_ctl::params_workspace("ws:9");
+        let missing =
+            apply_control_envelope(&mut rt, ipc_ctl::METHOD_MOVE_WORKSPACE, Some(&bad), &cli);
+        assert!(!missing.ok);
+        assert_eq!(missing.code, "NotFound");
+        assert_eq!(rt.workspace_count(), 2);
+        assert_eq!(rt.layout().leaf_count(), 1);
     }
 
     #[test]

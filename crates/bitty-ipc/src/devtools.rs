@@ -1235,7 +1235,8 @@ impl Dispatcher {
     /// `listViews`, `listTerminals`, `spawnTerminal`, `closeTerminal`,
     /// `sendInput`, `getTerminalText`, `splitView`, `focusView`,
     /// `reloadConfig`) plus CTX-0257 workspace entry (`listWorkspaces`,
-    /// `createWorkspace`, `closeWorkspace`, `focusWorkspace`) plus CTX-0188
+    /// `createWorkspace`, `closeWorkspace`, `focusWorkspace`) plus CTX-0259
+    /// workspace move (`moveWorkspace`) plus CTX-0188
     /// test automation (`synthesizeInput`,
     /// `captureFrame`, bearer-scoped per Amendment A1) plus CTX-0189 live
     /// profiling (`getProcessStats`, `getFrameStats`, `streamProcessStats`,
@@ -1286,6 +1287,7 @@ impl Dispatcher {
             (crate::ctl::METHOD_NEW_WORKSPACE, handle_control),
             (crate::ctl::METHOD_CLOSE_WORKSPACE, handle_control),
             (crate::ctl::METHOD_FOCUS_WORKSPACE, handle_control),
+            (crate::ctl::METHOD_MOVE_WORKSPACE, handle_control),
             (crate::ctl::METHOD_RELOAD_CONFIG, handle_control),
         ];
         for (method, handler) in control {
@@ -5059,12 +5061,13 @@ mod tests {
         // control (listWindows, listViews, listTerminals, spawnTerminal,
         // closeTerminal, sendInput, getTerminalText, splitView, focusView,
         // reloadConfig) plus CTX-0257 workspace entry (listWorkspaces,
-        // createWorkspace, closeWorkspace, focusWorkspace) plus CTX-0188
+        // createWorkspace, closeWorkspace, focusWorkspace) plus CTX-0259 move
+        // (moveWorkspace) plus CTX-0188
         // automation (synthesizeInput,
         // captureFrame) plus CTX-0244 digest (frameHash) plus CTX-0189
         // profiling (getProcessStats, getFrameStats, streamProcessStats,
         // streamFrameStats).
-        assert_eq!(dispatcher.method_count(), 27);
+        assert_eq!(dispatcher.method_count(), 28);
         assert!(dispatcher.contains("bitty.debug/getGridText"));
         assert!(dispatcher.contains("bitty.debug/getInputRing"));
         assert!(dispatcher.contains("bitty.debug/getModifiers"));

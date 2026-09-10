@@ -1465,7 +1465,7 @@ pub fn run_list(request: &ListRequest) -> i32 {
 // `bitty list` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::Args;
+use crate::cli::Args;
 
 /// Runs `bitty list <kind>`; returns the process exit code.
 ///

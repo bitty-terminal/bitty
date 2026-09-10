@@ -2059,7 +2059,7 @@ fn append_json_escaped(out: &mut String, s: &str) {
 // `bitty ctl` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::Args;
+use crate::cli::Args;
 
 /// Runs `bitty ctl`; returns the process exit code.
 ///

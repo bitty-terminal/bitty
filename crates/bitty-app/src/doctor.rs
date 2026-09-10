@@ -1054,9 +1054,8 @@ fn truncate(raw: &str, max: usize) -> String {
 // `bitty doctor` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::Args;
+use crate::cli::{Args, version_text};
 use crate::config_cli::load_merged_config;
-use crate::version_text;
 
 /// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
 const DOCTOR_CLIPBOARD_CANDIDATES: &[&str] = &["wl-copy", "xclip", "xsel"];

@@ -1,6 +1,6 @@
 //! Stderr verbosity gating (`--verbose` / `--log-level` / `BITTY_LOG` / `RUST_LOG`).
 
-use crate::Args;
+use crate::cli::Args;
 
 /// Diagnostic verbosity for stderr logs (CTX-0190).
 ///

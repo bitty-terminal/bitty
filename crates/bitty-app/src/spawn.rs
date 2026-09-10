@@ -2,7 +2,7 @@
 
 use bitty_runtime::{Runtime, SplitAxis, ViewId};
 
-use crate::Args;
+use crate::cli::Args;
 
 // ---------------------------------------------------------------------------
 // Default shell resolution (CTX-0136)

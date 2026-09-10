@@ -1,6 +1,6 @@
 //! `bitty init` opt-in setup wizard (#243, CTX-0149).
 
-use crate::Args;
+use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
 /// Hamster mascot art, vendored byte-identical from the workspace asset

@@ -1658,7 +1658,7 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
 // `bitty dev` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::Args;
+use crate::cli::Args;
 
 /// Runs `bitty dev <verb>`; returns the process exit code.
 ///

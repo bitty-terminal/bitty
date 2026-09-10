@@ -1,6 +1,6 @@
 //! User config-file loading and `bitty config` handling (CTX-0148, DEC-0011).
 
-use crate::{Args, ConfigCommand, help_text};
+use crate::cli::{Args, ConfigCommand, help_text};
 
 // ---------------------------------------------------------------------------
 // User config-file loading (CTX-0148 Lua via bitty-lua sandbox, DEC-0011)

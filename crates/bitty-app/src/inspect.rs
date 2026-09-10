@@ -1272,7 +1272,7 @@ fn bundled_plugin_ids_hint() -> String {
 // `bitty inspect` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::Args;
+use crate::cli::Args;
 
 /// Runs `bitty inspect <target> <value>`; returns the process exit code.
 ///

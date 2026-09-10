@@ -115,8 +115,8 @@ use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN, MouseConfig,
-    ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN,
+    MouseConfig, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1038,6 +1038,62 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             Some(LayoutConfig { gaps_in, gaps_out })
         }
     };
+    // CTX-0292: `decoration` follows the same fully-optional pattern: absent
+    // table means "this layer says nothing" (plan.decoration None so merge
+    // keeps the lower-precedence value). When the table is present, omitted
+    // keys default to the accepted CTX-0118 decoration defaults (4/6/2/6) so
+    // `decoration = { gaps_in = 2 }` keeps working without forcing the other
+    // keys. Present values are range-checked here (fail-closed with the
+    // field path) and again by `DecorationConfig::validate` via
+    // `plan.validate()`.
+    let decoration = match data.decoration {
+        None => None,
+        Some(d) => {
+            let defaults = DecorationConfig::default();
+            let check = |field: &str, raw: Option<i64>, max: u32, fallback: u32| match raw {
+                None => Ok(fallback),
+                Some(v) => {
+                    if !(0..=max as i64).contains(&v) {
+                        return Err(ConfigError::validation(
+                            field,
+                            format!("must be within [0, {max}] (found {v})"),
+                        ));
+                    }
+                    Ok(v as u32)
+                }
+            };
+            let gaps_in = check(
+                "decoration.gaps_in",
+                d.gaps_in,
+                crate::types::MAX_DECORATION_GAP_PX,
+                defaults.gaps_in,
+            )?;
+            let gaps_out = check(
+                "decoration.gaps_out",
+                d.gaps_out,
+                crate::types::MAX_DECORATION_GAP_PX,
+                defaults.gaps_out,
+            )?;
+            let border = check(
+                "decoration.border",
+                d.border,
+                crate::types::MAX_DECORATION_BORDER_PX,
+                defaults.border,
+            )?;
+            let radius = check(
+                "decoration.radius",
+                d.radius,
+                crate::types::MAX_DECORATION_RADIUS_PX,
+                defaults.radius,
+            )?;
+            Some(DecorationConfig {
+                gaps_in,
+                gaps_out,
+                border,
+                radius,
+            })
+        }
+    };
     // CTX-0181: `scrollbar` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.scrollbar None so merge
     // keeps the lower-precedence value). When the table is present, omitted
@@ -1115,6 +1171,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         terminal,
         selection,
         layout,
+        decoration,
         scrollbar,
         mouse,
         appearance,
@@ -1459,6 +1516,60 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("layout"),
+                "must name the field: {bad} -> {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_decoration_parses_and_validates() {
+        // CTX-0292: explicit decoration parses; absent table means "says
+        // nothing" (plan.decoration None so merge keeps lower);
+        // present-but-partial defaults omitted keys to the accepted CTX-0118
+        // defaults (4/6/2/6); wrong types and out-of-range fail closed
+        // naming the field.
+        let plan = parse_lua_config(
+            r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0 } }"#,
+            &test_source(),
+        )
+        .expect("decoration parse");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(
+            (dec.gaps_in, dec.gaps_out, dec.border, dec.radius),
+            (0, 1, 1, 0)
+        );
+        let plan = parse_lua_config(r#"return { decoration = { border = 3 } }"#, &test_source())
+            .expect("partial decoration parses");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.border, 3);
+        assert_eq!(dec.gaps_in, crate::types::DEFAULT_DECORATION_GAPS_IN_PX);
+        assert_eq!(dec.gaps_out, crate::types::DEFAULT_DECORATION_GAPS_OUT_PX);
+        assert_eq!(dec.radius, crate::types::DEFAULT_DECORATION_RADIUS_PX);
+        let plan = parse_lua_config(r#"return { decoration = {} }"#, &test_source())
+            .expect("empty decoration defaults");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec, crate::types::DecorationConfig::default());
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no decoration table");
+        assert!(plan.decoration.is_none());
+        for bad in [
+            r#"return { decoration = { gaps_in = -1 } }"#,
+            r#"return { decoration = { gaps_in = 33 } }"#,
+            r#"return { decoration = { gaps_out = 100 } }"#,
+            r#"return { decoration = { border = 9 } }"#,
+            r#"return { decoration = { radius = 17 } }"#,
+            r#"return { decoration = { radius = "6" } }"#,
+            r#"return { decoration = { gaps_in = 1.5 } }"#,
+            r#"return { decoration = "bold" }"#,
+            r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("decoration"),
                 "must name the field: {bad} -> {msg}"
             );
         }

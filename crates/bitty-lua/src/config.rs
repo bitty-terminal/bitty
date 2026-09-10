@@ -35,6 +35,7 @@
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
+//!     decoration = { gaps_in = 4, gaps_out = 6, border = 2, radius = 6 }, -- Core-owned workspace decoration in logical px (CTX-0292)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
 //!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
@@ -156,6 +157,26 @@ pub struct LayoutData {
     pub gaps_out: Option<i64>,
 }
 
+/// Core-owned workspace decoration overrides, plain data (CTX-0292; see
+/// [`FontData`] for `Option` semantics).
+///
+/// Logical-pixel decoration per the accepted workspace-compositor contract
+/// (CTX-0118): `gaps_in`/`gaps_out` between/around views, `border` inside
+/// each View frame, `radius` for frame corners. Range-checked downstream in
+/// `bitty-config` (fail-closed).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DecorationData {
+    /// Inner gap in logical px (present only when the key is set).
+    pub gaps_in: Option<i64>,
+    /// Outer gap in logical px (present only when the key is set).
+    pub gaps_out: Option<i64>,
+    /// View frame border in logical px (present only when the key is set).
+    pub border: Option<i64>,
+    /// View frame corner radius in logical px (present only when the key is
+    /// set).
+    pub radius: Option<i64>,
+}
+
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
 /// semantics).
 ///
@@ -203,6 +224,8 @@ pub struct ConfigData {
     pub selection: Option<SelectionData>,
     /// `layout` table (CTX-0177 panel gaps).
     pub layout: Option<LayoutData>,
+    /// `decoration` table (CTX-0292 Core-owned workspace decoration).
+    pub decoration: Option<DecorationData>,
     /// `scrollbar` table (CTX-0181 overlay scrollbar).
     pub scrollbar: Option<ScrollbarData>,
     /// `mouse` table (CTX-0260 focus-follows-mouse).
@@ -234,6 +257,7 @@ impl ConfigData {
             && self.terminal.is_none()
             && self.selection.is_none()
             && self.layout.is_none()
+            && self.decoration.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.mod_key.is_none()
@@ -756,6 +780,38 @@ impl ConfigData {
                     };
                     out.layout = Some(LayoutData { gaps_in, gaps_out });
                 }
+                "decoration" => {
+                    // CTX-0292: `decoration = { gaps_in = 4, gaps_out = 6,
+                    // border = 2, radius = 6 }` sets the Core-owned
+                    // workspace decoration in logical px; absent
+                    // table/key means "says nothing". Integers only
+                    // (floats rejected like every other px/count key);
+                    // range-checked downstream in `bitty-config`.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["gaps_in", "gaps_out", "border", "radius"])?;
+                    let gaps_in = match get_field(nested, "gaps_in") {
+                        Some(v) => Some(expect_integer("decoration.gaps_in", v)?),
+                        None => None,
+                    };
+                    let gaps_out = match get_field(nested, "gaps_out") {
+                        Some(v) => Some(expect_integer("decoration.gaps_out", v)?),
+                        None => None,
+                    };
+                    let border = match get_field(nested, "border") {
+                        Some(v) => Some(expect_integer("decoration.border", v)?),
+                        None => None,
+                    };
+                    let radius = match get_field(nested, "radius") {
+                        Some(v) => Some(expect_integer("decoration.radius", v)?),
+                        None => None,
+                    };
+                    out.decoration = Some(DecorationData {
+                        gaps_in,
+                        gaps_out,
+                        border,
+                        radius,
+                    });
+                }
                 "scrollbar" => {
                     // CTX-0181: `scrollbar = { mode = "auto", width = 8 }`
                     // sets the overlay scrollback thumb; absent table/key
@@ -1124,6 +1180,58 @@ mod tests {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {
                     assert!(message.contains("layout"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decoration_extract_and_absent_means_no_override() {
+        // CTX-0292: explicit integers parse; absent table/key is `None` so
+        // merge keeps the lower-precedence value (the accepted CTX-0118
+        // defaults 4/6/2/6 when no layer sets them).
+        let data = eval_ok(
+            r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0 } }"#,
+        );
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.gaps_in, Some(0));
+        assert_eq!(dec.gaps_out, Some(1));
+        assert_eq!(dec.border, Some(1));
+        assert_eq!(dec.radius, Some(0));
+        let data = eval_ok(r#"return { decoration = { border = 3 } }"#);
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.gaps_in, None);
+        assert_eq!(dec.gaps_out, None);
+        assert_eq!(dec.border, Some(3));
+        assert_eq!(dec.radius, None);
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.decoration, None);
+        let data = eval_ok(r#"return { decoration = {} }"#);
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.gaps_in, None);
+        assert_eq!(dec.gaps_out, None);
+        assert_eq!(dec.border, None);
+        assert_eq!(dec.radius, None);
+    }
+
+    #[test]
+    fn decoration_wrong_type_is_shape_error_without_value() {
+        // CTX-0292: fail-closed on non-integers (floats/strings/tables never
+        // coerce, values never echoed).
+        let mut vm = LuaVm::new("test.decoration-type");
+        for code in [
+            r#"return { decoration = { gaps_in = 1.5 } }"#,
+            r#"return { decoration = { gaps_in = "4" } }"#,
+            r#"return { decoration = { gaps_out = true } }"#,
+            r#"return { decoration = { border = 1.5 } }"#,
+            r#"return { decoration = { radius = false } }"#,
+            r#"return { decoration = "bold" }"#,
+            r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("decoration"), "{code:?}: {message}");
                 }
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }

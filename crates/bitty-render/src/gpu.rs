@@ -396,12 +396,18 @@ impl PresentMode {
     }
 }
 
-/// Owned surface configuration (extent, format, present mode).
+/// Owned surface configuration (extent, format, present mode, opacity).
 ///
 /// This is the only configuration the embedder constructs. The `wgpu`
 /// `SurfaceConfiguration` is built internally from it plus adapter
 /// capabilities, so no `wgpu` type leaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `opacity` (CTX-0290) is the renderer's half of `window.opacity`: `1.0`
+/// keeps the opaque fast path, values below `1.0` request premultiplied
+/// output and a compositor-blendable swap-chain alpha mode (selected from
+/// the surface capabilities; see [`Surface::configure_with_opacity`]).
+/// Always sanitized (see [`bitty_platform::sanitize_opacity`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceConfig {
     /// Surface extent in physical pixels.
     pub extent: PhysicalSize,
@@ -409,11 +415,13 @@ pub struct SurfaceConfig {
     pub format: SurfaceFormat,
     /// Chosen present mode.
     pub present_mode: PresentMode,
+    /// Window opacity in `0.0..=1.0` (default `1.0` = fully opaque).
+    pub opacity: f32,
 }
 
 impl SurfaceConfig {
     /// Builds a configuration for `extent` with explicit format and present
-    /// mode choices.
+    /// mode choices and a fully opaque default opacity.
     ///
     /// # Errors
     ///
@@ -435,7 +443,25 @@ impl SurfaceConfig {
             extent,
             format,
             present_mode,
+            opacity: 1.0,
         })
+    }
+
+    /// Sets the window opacity, sanitized into `0.0..=1.0` (CTX-0290).
+    ///
+    /// Non-finite inputs degrade to `1.0` and finite inputs clamp, matching
+    /// [`bitty_platform::sanitize_opacity`] so the renderer can never be
+    /// poisoned by untrusted config values.
+    #[must_use]
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = bitty_platform::sanitize_opacity(opacity);
+        self
+    }
+
+    /// The configured (sanitized) window opacity.
+    #[must_use]
+    pub fn opacity(&self) -> f32 {
+        self.opacity
     }
 }
 
@@ -495,6 +521,14 @@ struct SurfaceState {
     config: Option<SurfaceConfig>,
     wgpu_config: Option<SurfaceConfiguration>,
     frame: u64,
+    // Requested window opacity (CTX-0290), sanitized. Kept separately from
+    // `config` so it survives reconfiguration (resize / swap-chain loss).
+    opacity: f32,
+    // Whether the platform accepted a premultiplied swap-chain alpha mode.
+    // `false` on a real surface without `PreMultiplied` support: the
+    // renderer then stays fully opaque instead of dimming RGB that the
+    // compositor would never blend (fail-closed, honest).
+    alpha_supported: bool,
     // Headless-only last RGBA buffer (premultiplied, `width*height*4` bytes).
     headless_rgba: Option<Vec<u8>>,
     headless_extent: Option<PhysicalSize>,
@@ -511,6 +545,8 @@ impl SurfaceState {
             config: None,
             wgpu_config: None,
             frame: 0,
+            opacity: 1.0,
+            alpha_supported: true,
             headless_rgba: None,
             headless_extent: None,
             resources: None,
@@ -608,6 +644,10 @@ impl Surface {
         let mut state = SurfaceState::new();
         state.config = Some(config);
         state.headless_extent = Some(config.extent);
+        // The headless compositor scales its CPU buffer, so renderer alpha is
+        // always honored here (CTX-0290).
+        state.opacity = config.opacity;
+        state.alpha_supported = true;
         // Pre-synthesize a `wgpu` config for inspection parity (not used for
         // real configuration on headless).
         state.wgpu_config = Some(synthesize_wgpu_config(&config));
@@ -639,13 +679,81 @@ impl Surface {
             .map(|c| c.extent)
     }
 
+    /// Current requested window opacity (`1.0` = opaque), sanitized.
+    ///
+    /// This is the value the renderer was configured with; query
+    /// [`Self::opacity_alpha_supported`] to learn whether the platform can
+    /// actually blend it.
+    #[must_use]
+    pub fn opacity(&self) -> f32 {
+        self.state.lock().expect("surface state poisoned").opacity
+    }
+
+    /// Whether the renderer can honor opacity on this surface (CTX-0290).
+    ///
+    /// `true` for headless fakes and for real surfaces whose capabilities
+    /// accepted a premultiplied alpha mode. `false` means the app requested
+    /// opacity below `1.0` but the platform offers no premultiplied
+    /// compositing: the renderer stays fully opaque rather than writing
+    /// dimmed RGB that the compositor would never blend.
+    #[must_use]
+    pub fn opacity_alpha_supported(&self) -> bool {
+        self.state
+            .lock()
+            .expect("surface state poisoned")
+            .alpha_supported
+    }
+
+    /// Renderer opacity actually applied when drawing frames (CTX-0290).
+    ///
+    /// Equals [`Self::opacity`] when the platform accepted premultiplied
+    /// compositing; otherwise `1.0` so an unsupported platform keeps the
+    /// opaque fast path instead of showing a dimmed window.
+    fn effective_opacity(&self) -> f32 {
+        let state = self.state.lock().expect("surface state poisoned");
+        if state.alpha_supported {
+            state.opacity
+        } else {
+            1.0
+        }
+    }
+
+    /// Configures (or reconfigures) the surface for `extent`, adopting
+    /// `opacity` as the requested window opacity (CTX-0290).
+    ///
+    /// Sanitizes `opacity` (via [`bitty_platform::sanitize_opacity`]), stores
+    /// it on the surface state, and delegates to [`Self::configure`]. The
+    /// stored opacity survives later reconfigurations (`resize`, swap-chain
+    /// recovery).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::configure`].
+    pub fn configure_with_opacity(
+        &self,
+        ctx: &GpuContext,
+        extent: PhysicalSize,
+        opacity: f32,
+    ) -> Result<(), RenderError> {
+        {
+            let mut state = self.state.lock().expect("surface state poisoned");
+            state.opacity = bitty_platform::sanitize_opacity(opacity);
+        }
+        self.configure(ctx, extent)
+    }
+
     /// Configures (or reconfigures) the surface for `extent`.
     ///
     /// For a real surface, this queries `get_capabilities`, picks a format
-    /// with `Srgb`→fallback and a present mode with `Mailbox`→`Fifo` fallback,
-    /// builds a `wgpu::SurfaceConfiguration`, and calls
-    /// `wgpu::Surface::configure`. For the headless fake it validates the
-    /// extent and stores the same fallback-chosen `SurfaceConfig`.
+    /// with `Srgb`→fallback, a present mode with `Mailbox`→`Fifo` fallback,
+    /// and an alpha mode from the surface's supported list (CTX-0290):
+    /// `Auto` for fully opaque windows, `PreMultiplied` when the configured
+    /// opacity is below `1.0` and the platform supports it. The
+    /// [`Self::opacity_alpha_supported`] flag records whether the requested
+    /// opacity can actually be blended. Then it builds a
+    /// `wgpu::SurfaceConfiguration` and calls `wgpu::Surface::configure`.
+    /// For the headless fake it validates the extent and stores the same
+    /// fallback-chosen `SurfaceConfig`.
     ///
     /// Zero-sized extents are rejected with [`RenderError::InvalidInput`];
     /// callers should use [`Self::resize`] when zero-sized resizes can arrive
@@ -668,22 +776,28 @@ impl Surface {
             SurfaceKind::Headless => {
                 let mut state = self.state.lock().expect("surface state poisoned");
                 let config =
-                    SurfaceConfig::new(extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?;
+                    SurfaceConfig::new(extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?
+                        .with_opacity(state.opacity);
                 state.config = Some(config);
                 state.headless_extent = Some(extent);
                 state.wgpu_config = Some(synthesize_wgpu_config(&config));
+                state.alpha_supported = true;
                 Ok(())
             }
             SurfaceKind::Gpu { surface, .. } => {
+                let opacity = self.state.lock().expect("surface state poisoned").opacity;
                 let caps = surface.get_capabilities(&ctx.adapter);
                 let format = pick_format(&caps);
                 let present_mode = pick_present_mode(&caps);
-                let config = SurfaceConfig::new(extent, format, present_mode)?;
-                let wgpu_config = build_wgpu_config(&config);
+                let (alpha_mode, alpha_supported) = pick_alpha_mode(&caps, opacity);
+                let config =
+                    SurfaceConfig::new(extent, format, present_mode)?.with_opacity(opacity);
+                let wgpu_config = build_wgpu_config(&config, alpha_mode);
                 surface.configure(&ctx.device, &wgpu_config);
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.config = Some(config);
                 state.wgpu_config = Some(wgpu_config);
+                state.alpha_supported = alpha_supported;
                 Ok(())
             }
         }
@@ -765,6 +879,8 @@ impl Surface {
                 }
                 drop(state);
 
+                let opacity = self.effective_opacity();
+
                 // Acquire with one retry on Outdated/Lost: reconfigure and try again.
                 // This matches wgpu's recommended recovery for swap-chain loss
                 // (see wgpu::SurfaceError::Outdated/Lost). Timeout/OutOfMemory
@@ -799,23 +915,13 @@ impl Surface {
                             ops: wgpu::Operations {
                                 // Bitty Dark clear color (single source of
                                 // truth: `bitty_config::theme::BITTY_DARK`
-                                // via `crate::grid::DEFAULT_BG`); the 0.06
-                                // hardcoded gray is gone. Channels are
-                                // sRGB-decoded to linear light for the
-                                // `Srgb` swap-chain target (CTX-0222), so
-                                // the store-encode presents byte-exact bg.
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: f64::from(crate::batch::srgb8_to_linear(
-                                        crate::grid::DEFAULT_BG[0],
-                                    )),
-                                    g: f64::from(crate::batch::srgb8_to_linear(
-                                        crate::grid::DEFAULT_BG[1],
-                                    )),
-                                    b: f64::from(crate::batch::srgb8_to_linear(
-                                        crate::grid::DEFAULT_BG[2],
-                                    )),
-                                    a: 1.0,
-                                }),
+                                // via `crate::grid::DEFAULT_BG`); channels
+                                // are sRGB-decoded to linear light for the
+                                // `Srgb` swap-chain target (CTX-0222) and
+                                // premultiplied by the requested opacity
+                                // (CTX-0290), so the store-encode presents
+                                // the byte-exact composited color.
+                                load: wgpu::LoadOp::Clear(premultiplied_clear(opacity)),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -888,6 +994,9 @@ impl Surface {
                 .config
                 .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))?
         };
+        // CTX-0290: effective opacity (1.0 when the platform cannot blend
+        // premultiplied alpha, so an unsupported surface stays opaque).
+        let opacity = self.effective_opacity();
 
         // Validate atlas requirement: any Atlas-sourced glyph needs atlas.
         let needs_atlas = draw_list
@@ -1009,6 +1118,10 @@ impl Surface {
                 for blit in &draw_list.images {
                     blend_rgba_blit_rgba(&mut rgba, width, height, blit);
                 }
+                // CTX-0290: apply the window opacity to the finished
+                // premultiplied buffer, the CPU equivalent of the GPU
+                // alpha-pinning blend below. No-op at opacity 1.0.
+                scale_premultiplied_rgba(&mut rgba, opacity);
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
                 state.headless_rgba = Some(rgba);
@@ -1095,14 +1208,9 @@ impl Surface {
                 );
                 // Theme clear color: Bitty Dark via `crate::grid::DEFAULT_BG`,
                 // sRGB-decoded to linear light for the `Srgb` swap-chain
-                // target (CTX-0222), matching the clear-only path above.
-                let bg = crate::grid::DEFAULT_BG;
-                let clear = wgpu::Color {
-                    r: f64::from(crate::batch::srgb8_to_linear(bg[0])),
-                    g: f64::from(crate::batch::srgb8_to_linear(bg[1])),
-                    b: f64::from(crate::batch::srgb8_to_linear(bg[2])),
-                    a: 1.0,
-                };
+                // target (CTX-0222) and premultiplied by the effective
+                // opacity (CTX-0290), matching the clear-only path above.
+                let clear = premultiplied_clear(opacity);
                 {
                     let mut state = self.state.lock().expect("surface state poisoned");
                     let resources = state.resources.as_mut().ok_or_else(|| {
@@ -1119,6 +1227,7 @@ impl Surface {
                             draw_list,
                             atlas,
                             clear,
+                            opacity,
                         )
                         .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
                 }
@@ -1306,6 +1415,11 @@ impl Surface {
         for blit in &draw_list.images {
             blend_rgba_blit_rgba(&mut rgba, width, height, blit);
         }
+        // CTX-0290: headless equivalent of the GPU alpha-pinning blend —
+        // scale the finished premultiplied buffer by the configured opacity
+        // so CI can prove the window-opacity effect without an adapter.
+        let opacity = self.effective_opacity();
+        scale_premultiplied_rgba(&mut rgba, opacity);
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
@@ -1341,6 +1455,7 @@ impl Surface {
         let config =
             SurfaceConfig::new(new_extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?;
         let mut state = self.state.lock().expect("surface state poisoned");
+        let config = config.with_opacity(state.opacity);
         state.config = Some(config);
         state.headless_extent = Some(new_extent);
         state.wgpu_config = Some(synthesize_wgpu_config(&config));
@@ -1382,7 +1497,42 @@ fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> PresentMode {
         .unwrap_or(PresentMode::Fifo)
 }
 
-fn build_wgpu_config(config: &SurfaceConfig) -> SurfaceConfiguration {
+/// Picks the swap-chain alpha mode for `opacity` (CTX-0290).
+///
+/// Returns the mode plus whether renderer alpha can actually be blended:
+///
+/// - `opacity >= 1.0` → [`wgpu::CompositeAlphaMode::Auto`] (the pre-CTX-0290
+///   opaque fast path); `true`.
+/// - `opacity < 1.0` and the caps offer
+///   [`wgpu::CompositeAlphaMode::PreMultiplied`] → that mode; `true`.
+/// - `opacity < 1.0` without premultiplied support → `Auto`; `false`
+///   (fail-closed: the renderer must stay fully opaque instead of writing
+///   scaled RGB that an opaque compositor would show as a dimmed window).
+///
+/// `wgpu` 26 rejects a non-`Auto` alpha mode outside
+/// `SurfaceCapabilities::alpha_modes`, so the selection is always taken
+/// from the caps list.
+fn pick_alpha_mode(
+    caps: &wgpu::SurfaceCapabilities,
+    opacity: f32,
+) -> (wgpu::CompositeAlphaMode, bool) {
+    if opacity >= 1.0 {
+        return (wgpu::CompositeAlphaMode::Auto, true);
+    }
+    if caps
+        .alpha_modes
+        .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+    {
+        (wgpu::CompositeAlphaMode::PreMultiplied, true)
+    } else {
+        (wgpu::CompositeAlphaMode::Auto, false)
+    }
+}
+
+fn build_wgpu_config(
+    config: &SurfaceConfig,
+    alpha_mode: wgpu::CompositeAlphaMode,
+) -> SurfaceConfiguration {
     SurfaceConfiguration {
         usage: TextureUsages::RENDER_ATTACHMENT,
         format: config.format.to_wgpu(),
@@ -1390,13 +1540,60 @@ fn build_wgpu_config(config: &SurfaceConfig) -> SurfaceConfiguration {
         height: config.extent.height(),
         desired_maximum_frame_latency: 2,
         present_mode: config.present_mode.to_wgpu(),
-        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        alpha_mode,
         view_formats: vec![],
     }
 }
 
 fn synthesize_wgpu_config(config: &SurfaceConfig) -> SurfaceConfiguration {
-    build_wgpu_config(config)
+    // Headless inspection parity: the CPU compositor always honors opacity,
+    // so synthesize the premultiplied mode exactly when the real path wants
+    // it (CTX-0290).
+    let alpha_mode = if config.opacity < 1.0 {
+        wgpu::CompositeAlphaMode::PreMultiplied
+    } else {
+        wgpu::CompositeAlphaMode::Auto
+    };
+    build_wgpu_config(config, alpha_mode)
+}
+
+/// Premultiplied clear color for `opacity` (CTX-0290).
+///
+/// The theme background is sRGB-decoded to linear light (matching the
+/// pre-CTX-0290 clear, CTX-0222) and scaled by `opacity`; alpha is
+/// `opacity`. With the alpha-pinning blend this leaves the swap-chain
+/// buffer at uniform alpha = `opacity` with premultiplied RGB, which the
+/// compositor blends at the requested window opacity.
+fn premultiplied_clear(opacity: f32) -> wgpu::Color {
+    let o = f64::from(opacity);
+    let bg = crate::grid::DEFAULT_BG;
+    wgpu::Color {
+        r: f64::from(crate::batch::srgb8_to_linear(bg[0])) * o,
+        g: f64::from(crate::batch::srgb8_to_linear(bg[1])) * o,
+        b: f64::from(crate::batch::srgb8_to_linear(bg[2])) * o,
+        a: o,
+    }
+}
+
+/// Scales a finished premultiplied RGBA buffer by `opacity` (CTX-0290).
+///
+/// This is the headless compositor's equivalent of the GPU opacity blit:
+/// scaling every premultiplied channel (including alpha) by `opacity`
+/// yields exactly the buffer the compositor would blend. `opacity >= 1.0`
+/// (including `NaN`) is a no-op so the opaque fast path stays byte-exact.
+fn scale_premultiplied_rgba(rgba: &mut [u8], opacity: f32) {
+    // No-op for fully opaque or non-finite values so the default path stays
+    // byte-exact (mirrors `sanitize_opacity` degrading NaN to 1.0).
+    if !opacity.is_finite() || opacity >= 1.0 {
+        return;
+    }
+    let factor = (opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = (u32::from(px[0]) * factor / 255) as u8;
+        px[1] = (u32::from(px[1]) * factor / 255) as u8;
+        px[2] = (u32::from(px[2]) * factor / 255) as u8;
+        px[3] = (u32::from(px[3]) * factor / 255) as u8;
+    }
 }
 
 const fn premultiply(color: u8, alpha: u8) -> u8 {
@@ -1846,6 +2043,146 @@ mod tests {
         assert!(rgba.chunks_exact(4).all(|px| px == &rgba[0..4]));
         // And the render-side default matches the same preset entry.
         assert_eq!(crate::grid::DEFAULT_BG[..3], theme_bg);
+    }
+
+    fn empty_draw_list(width: u32, height: u32) -> crate::grid::DrawList {
+        crate::grid::DrawList {
+            generation: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(width, height),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, width, height)],
+            },
+            fills: vec![],
+            glyphs: vec![],
+            images: vec![],
+        }
+    }
+
+    #[test]
+    fn surface_config_opacity_is_sanitized() {
+        let base = SurfaceConfig::new(
+            PhysicalSize::new(8, 8),
+            SurfaceFormat::Bgra8UnormSrgb,
+            PresentMode::Fifo,
+        )
+        .unwrap();
+        assert_eq!(base.opacity(), 1.0);
+        assert_eq!(base.with_opacity(f32::NAN).opacity(), 1.0);
+        assert_eq!(base.with_opacity(2.0).opacity(), 1.0);
+        assert_eq!(base.with_opacity(-1.0).opacity(), 0.0);
+        assert!((base.with_opacity(0.25).opacity() - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn alpha_mode_selection_requires_premultiplied_below_one() {
+        // CTX-0290: wgpu 26 rejects a non-`Auto` alpha mode outside the
+        // caps list, so the selection must come from the caps and fail
+        // closed to opaque when premultiplied compositing is unavailable.
+        let caps = wgpu::SurfaceCapabilities {
+            usages: TextureUsages::RENDER_ATTACHMENT,
+            formats: vec![TextureFormat::Bgra8UnormSrgb],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes: vec![
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ],
+        };
+        assert_eq!(
+            pick_alpha_mode(&caps, 1.0),
+            (wgpu::CompositeAlphaMode::Auto, true)
+        );
+        assert_eq!(
+            pick_alpha_mode(&caps, 0.5),
+            (wgpu::CompositeAlphaMode::PreMultiplied, true)
+        );
+
+        let opaque_only = wgpu::SurfaceCapabilities {
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+            ..caps
+        };
+        assert_eq!(
+            pick_alpha_mode(&opaque_only, 0.5),
+            (wgpu::CompositeAlphaMode::Auto, false),
+            "no premultiplied support must fail closed to the opaque path"
+        );
+    }
+
+    #[test]
+    fn headless_opacity_scales_premultiplied_buffer() {
+        // CTX-0290: the headless compositor is the CI-testable equivalent of
+        // the GPU alpha-pinning blend. An empty draw list at opacity 0.5 must
+        // present Bitty Dark scaled by round(0.5 * 255) = 128 on every
+        // channel, alpha included.
+        let cfg = SurfaceConfig::new(
+            PhysicalSize::new(32, 16),
+            SurfaceFormat::Bgra8UnormSrgb,
+            PresentMode::Fifo,
+        )
+        .unwrap()
+        .with_opacity(0.5);
+        let surface = Surface::headless_with_config(cfg).expect("valid extent");
+        assert!((surface.opacity() - 0.5).abs() < f32::EPSILON);
+        assert!(surface.opacity_alpha_supported());
+        assert_eq!(
+            surface.wgpu_config_snapshot().unwrap().alpha_mode,
+            wgpu::CompositeAlphaMode::PreMultiplied
+        );
+
+        surface
+            .headless_present(&empty_draw_list(32, 16), None)
+            .expect("clear-only present");
+        let rgba = surface.headless_rgba().expect("rgba after present");
+        let bg = crate::grid::DEFAULT_BG;
+        let scaled = [
+            (u32::from(bg[0]) * 128 / 255) as u8,
+            (u32::from(bg[1]) * 128 / 255) as u8,
+            (u32::from(bg[2]) * 128 / 255) as u8,
+            128,
+        ];
+        assert_eq!(&rgba[..4], &scaled);
+        assert!(rgba.chunks_exact(4).all(|px| px == &rgba[0..4]));
+        // The scaled buffer is premultiplied: RGB <= alpha for a gray-blue.
+        assert!(u32::from(rgba[0]) <= u32::from(rgba[3]));
+    }
+
+    #[test]
+    fn headless_opacity_one_stays_byte_identical() {
+        // The opaque fast path must not change: opacity 1.0 keeps Auto alpha
+        // mode and the pre-CTX-0290 bytes.
+        let cfg = SurfaceConfig::new(
+            PhysicalSize::new(32, 16),
+            SurfaceFormat::Bgra8UnormSrgb,
+            PresentMode::Fifo,
+        )
+        .unwrap()
+        .with_opacity(1.0);
+        let surface = Surface::headless_with_config(cfg).expect("valid extent");
+        assert_eq!(
+            surface.wgpu_config_snapshot().unwrap().alpha_mode,
+            wgpu::CompositeAlphaMode::Auto
+        );
+        surface
+            .headless_present(&empty_draw_list(32, 16), None)
+            .expect("clear-only present");
+        let rgba = surface.headless_rgba().expect("rgba after present");
+        let theme_bg = bitty_config::theme::BITTY_DARK.background;
+        assert_eq!(&rgba[..4], &[theme_bg[0], theme_bg[1], theme_bg[2], 0xFF]);
+    }
+
+    #[test]
+    fn scale_premultiplied_rgba_is_total_and_fail_closed() {
+        let mut px = [1u8, 2, 3, 4];
+        scale_premultiplied_rgba(&mut px, 1.0);
+        assert_eq!(px, [1, 2, 3, 4]);
+        scale_premultiplied_rgba(&mut px, f32::NAN);
+        assert_eq!(px, [1, 2, 3, 4]);
+        let mut px = [255u8; 4];
+        scale_premultiplied_rgba(&mut px, 0.0);
+        assert_eq!(px, [0, 0, 0, 0]);
+        let mut px = [255u8; 4];
+        scale_premultiplied_rgba(&mut px, -1.0);
+        assert_eq!(px, [0, 0, 0, 0]);
     }
 
     #[test]

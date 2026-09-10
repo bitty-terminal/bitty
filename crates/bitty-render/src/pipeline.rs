@@ -50,14 +50,15 @@
 //! the conversion without changing any batch layout.
 
 use wgpu::{
-    AddressMode, BindGroup, BindGroupLayout, BlendState, Buffer, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, Extent3d, FilterMode, FragmentState, IndexFormat, LoadOp,
-    MultisampleState, Operations, Origin3d, PipelineLayoutDescriptor, PrimitiveState,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    Sampler, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+    AddressMode, BindGroup, BindGroupLayout, BlendComponent, BlendFactor, BlendOperation,
+    BlendState, Buffer, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Extent3d,
+    FilterMode, FragmentState, IndexFormat, LoadOp, MultisampleState, Operations, Origin3d,
+    PipelineLayoutDescriptor, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
+    RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
+    ShaderModuleDescriptor, ShaderSource, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+    TextureAspect, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+    TextureUsages, TextureView, VertexAttribute, VertexBufferLayout, VertexFormat, VertexState,
+    VertexStepMode,
 };
 
 use crate::atlas::AtlasDims;
@@ -69,7 +70,19 @@ use crate::error::RenderError;
 use crate::grid::DrawList;
 
 /// Solid-fill WGSL: NDC position plus straight color passthrough.
+///
+/// CTX-0290: the fragment stage emits premultiplied color scaled by the
+/// window opacity uniform; the pipeline's alpha-pinning blend keeps the
+/// destination alpha (see [`OPACITY_BLEND`]). `out.a` stays the *unscaled*
+/// coverage factor because it is the blend's `OneMinusSrcAlpha` input, not
+/// stored alpha.
 const FILL_WGSL: &str = r#"
+struct Opacity {
+    value: f32,
+};
+
+@group(0) @binding(2) var<uniform> opacity: Opacity;
+
 struct FillOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -88,14 +101,26 @@ fn vs_main(
 
 @fragment
 fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
-    return color;
+    let alpha = color.a * opacity.value;
+    return vec4<f32>(color.rgb * alpha, color.a);
 }
 "#;
 
 /// Glyph WGSL: samples the R8 coverage atlas and modulates tint alpha.
+///
+/// CTX-0290: same premultiplied-by-opacity contract as [`FILL_WGSL`]; the
+/// returned alpha is the unmultiplied `color.a * coverage` (unscaled by
+/// opacity) so the `OneMinusSrcAlpha` blend factor stays proportional to the
+/// glyph's true coverage.
 const GLYPH_WGSL: &str = r#"
 @group(0) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(1) var atlas_sampler: sampler;
+
+struct Opacity {
+    value: f32,
+};
+
+@group(0) @binding(2) var<uniform> opacity: Opacity;
 
 struct GlyphOut {
     @builtin(position) pos: vec4<f32>,
@@ -125,9 +150,32 @@ fn fs_main(
     if (coverage < 0.004) {
         discard;
     }
-    return vec4<f32>(color.rgb, color.a * coverage);
+    let alpha = color.a * coverage * opacity.value;
+    return vec4<f32>(color.rgb * alpha, color.a * coverage);
 }
 "#;
+
+/// Blend state for the CTX-0290 opacity contract.
+///
+/// Color is premultiplied-over (`One`, `OneMinusSrcAlpha`) exactly like
+/// [`BlendState::ALPHA_BLENDING`], but the alpha channel is pinned to the
+/// destination (`Zero` src, `One` dst): the swap-chain clear set alpha to
+/// the window opacity, and every draw must leave it there while compositing
+/// its premultiplied RGB contribution. At opacity 1.0 this is byte-identical
+/// to the pre-CTX-0290 `ALPHA_BLENDING` output (destination alpha is 1.0 and
+/// stays 1.0 either way).
+const OPACITY_BLEND: BlendState = BlendState {
+    color: BlendComponent {
+        src_factor: BlendFactor::One,
+        dst_factor: BlendFactor::OneMinusSrcAlpha,
+        operation: BlendOperation::Add,
+    },
+    alpha: BlendComponent {
+        src_factor: BlendFactor::Zero,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    },
+};
 
 /// Long-lived GPU objects for one surface, reused across frames.
 pub(crate) struct GpuResources {
@@ -145,6 +193,10 @@ pub(crate) struct GpuResources {
     inline_bind: BindGroup,
     last_atlas_texels: Option<Vec<u8>>,
     last_atlas_dims: Option<AtlasDims>,
+    // CTX-0290 window-opacity uniform (one f32 in a 16-byte buffer) shared
+    // by both pipelines; `last_opacity` avoids redundant queue writes.
+    opacity_buf: Buffer,
+    last_opacity: f32,
 }
 
 impl std::fmt::Debug for GpuResources {
@@ -154,6 +206,7 @@ impl std::fmt::Debug for GpuResources {
             .field("atlas_dims", &self.atlas_dims)
             .field("index_capacity_quads", &self.index_capacity_quads)
             .field("has_last_atlas", &self.last_atlas_texels.is_some())
+            .field("last_opacity", &self.last_opacity)
             .finish_non_exhaustive()
     }
 }
@@ -208,6 +261,18 @@ fn make_bind_layout(device: &wgpu::Device) -> BindGroupLayout {
                 ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
+            // CTX-0290: window-opacity uniform shared by the fill and glyph
+            // fragment stages (fill declares only this binding).
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(4),
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -217,6 +282,7 @@ fn make_bind_group(
     layout: &BindGroupLayout,
     view: &TextureView,
     sampler: &Sampler,
+    opacity_buf: &Buffer,
     label: &'static str,
 ) -> BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -230,6 +296,10 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: opacity_buf.as_entire_binding(),
             },
         ],
     })
@@ -288,12 +358,14 @@ impl GpuResources {
             bind_group_layouts: &[&bind_layout],
             push_constant_ranges: &[],
         });
-        // The fill pipeline carries no texture bindings, but sharing the
-        // layout keeps bind-group switching free between passes.
-        let empty_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("bitty-fill-layout"),
-            bind_group_layouts: &[],
-            push_constant_ranges: &[],
+        // CTX-0290: the fill pipeline shares the glyph layout so both
+        // fragment stages can read the opacity uniform (binding 2); the
+        // fill shader simply declares no texture/sampler bindings.
+        let opacity_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("bitty-opacity-ub"),
+            size: 16,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let fill_attributes = [
@@ -315,7 +387,7 @@ impl GpuResources {
         };
         let fill_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some("bitty-fill-pipeline"),
-            layout: Some(&empty_pipeline_layout),
+            layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &fill_module,
                 entry_point: Some("vs_main"),
@@ -342,7 +414,7 @@ impl GpuResources {
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(OPACITY_BLEND),
                     write_mask: ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -402,7 +474,7 @@ impl GpuResources {
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState::ALPHA_BLENDING),
+                    blend: Some(OPACITY_BLEND),
                     write_mask: ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -449,6 +521,7 @@ impl GpuResources {
             &bind_layout,
             &atlas_view,
             &sampler,
+            &opacity_buf,
             "bitty-atlas-bind",
         );
 
@@ -460,6 +533,7 @@ impl GpuResources {
             &bind_layout,
             &inline_view,
             &sampler,
+            &opacity_buf,
             "bitty-inline-bind",
         );
 
@@ -478,6 +552,8 @@ impl GpuResources {
             inline_bind,
             last_atlas_texels: None,
             last_atlas_dims: None,
+            opacity_buf,
+            last_opacity: f32::NAN,
         })
     }
 
@@ -659,7 +735,10 @@ impl GpuResources {
 
     /// Draws one frame's batches inside a single render pass.
     ///
-    /// `clear` is the load-operation clear color (the surface background).
+    /// `clear` is the load-operation clear color (the surface background),
+    /// already premultiplied by `opacity` (CTX-0290). `opacity` is the
+    /// window opacity applied by both fragment stages; it is sanitized here
+    /// as a defensive boundary even though callers pass a sanitized value.
     /// All buffer writes are bounds-checked before submission; overruns
     /// return [`RenderError::InvalidInput`] without touching the GPU.
     #[allow(clippy::too_many_arguments)]
@@ -674,11 +753,20 @@ impl GpuResources {
         draw_list: &DrawList,
         atlas: Option<(&[u8], AtlasDims)>,
         clear: wgpu::Color,
+        opacity: f32,
     ) -> Result<(), RenderError> {
         if surface_w == 0 || surface_h == 0 {
             return Err(RenderError::InvalidInput {
                 reason: "surface extent must be non-zero",
             });
+        }
+        // CTX-0290: one uniform write shared by fill + glyph draws. NaN and
+        // out-of-range values degrade to 1.0/nearest, matching the platform
+        // sanitizer; `last_opacity` skips redundant writes.
+        let opacity = bitty_platform::sanitize_opacity(opacity);
+        if opacity != self.last_opacity {
+            queue.write_buffer(&self.opacity_buf, 0, &opacity.to_le_bytes());
+            self.last_opacity = opacity;
         }
         // Atlas upload first so sampling sees fresh texels.
         if let Some((texels, dims)) = atlas {
@@ -763,6 +851,10 @@ impl GpuResources {
                         occlusion_query_set: None,
                     });
                     pass.set_pipeline(&self.fill_pipeline);
+                    // CTX-0290: the fill pipeline shares the glyph bind
+                    // layout for the opacity uniform (binding 2); bindings
+                    // 0/1 are unused by the fill shader.
+                    pass.set_bind_group(0, &self.atlas_bind, &[]);
                     pass.set_vertex_buffer(0, self.fill_vb.slice(..chunk_bytes.len() as u64));
                     pass.set_index_buffer(
                         self.index_buf

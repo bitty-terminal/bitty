@@ -92,7 +92,7 @@ pub use modes::Modes;
 pub use replies::{REPLY_CAP_BYTES, Replies};
 pub use scrollback::{SCROLLBACK_MAX_LINES, ScrollbackLine};
 pub use state::{
-    GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, SNAPSHOT_VERSION, Snapshot,
-    State, TelemetryCounters, ZONE_RECORDS_MAX, ZoneRecord,
+    GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, MAX_GRID_DIM,
+    SNAPSHOT_VERSION, Snapshot, State, TelemetryCounters, ZONE_RECORDS_MAX, ZoneRecord,
 };
 pub use tabs::TabStops;

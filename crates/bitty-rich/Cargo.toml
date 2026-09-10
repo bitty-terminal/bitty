@@ -19,7 +19,7 @@ bitty-vt = { path = "../bitty-vt" }
 bitty-platform = { path = "../bitty-platform" }
 # 256-bit one-time clipboard-read tokens (CTX-0213). Pinned to the locked
 # 0.3.x line; no other RNG is used so token entropy is auditable in one place.
-getrandom = "0.3"
+getrandom = "0.4"
 # Bounded Kitty PNG decode (CTX-0247). std-only cannot do this: PNG needs
 # DEFLATE decompression plus unfiltering across five filter types, Adam7
 # deinterlacing, and palette/tRNS/16-bit normalization. Hand-rolling that is

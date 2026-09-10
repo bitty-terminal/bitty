@@ -60,10 +60,13 @@ fn tick_cursor_overlay_uses_theme_cursor_hue() {
     assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
     assert_eq!(pad, 8, "default padding inset is 8px at scale 1.0");
+    // CTX-0294: the accepted decoration outer gap (6px) plus border (2px)
+    // shifts the content origin another 8px at scale 1.0.
+    const DECORATION: usize = 8;
     let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
     assert_eq!(width, 736, "window width is grid 720 plus 8px per side");
-    let cx = pad + cfg.cell_width as usize + 4;
-    let cy = pad + 9;
+    let cx = pad + DECORATION + cfg.cell_width as usize + 4;
+    let cy = pad + DECORATION + 9;
     let idx = (cy * width + cx) * 4;
     // Theme cursor #f5e0dc at 0xA0 alpha, premultiplied by the headless
     // composite: (245*160/255, 224*160/255, 220*160/255, 160).

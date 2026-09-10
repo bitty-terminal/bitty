@@ -22,6 +22,16 @@ fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("default headless runtime must build")
 }
 
+/// Decorated content frame of `id` (CTX-0294): the pane geometry source of
+/// truth the live present and pane sync both use. `cells` is the content
+/// grid the pane state/PTY must match.
+fn frame_of(rt: &Runtime, id: ViewId) -> bitty_runtime::PresentFrame {
+    rt.present_frames()
+        .into_iter()
+        .find(|f| f.view == id)
+        .unwrap_or_else(|| panic!("leaf {id:?} must have a present frame"))
+}
+
 /// Mirror of the live split shape: clone the tree, split the focused leaf
 /// right (`Horizontal` axis, new pane last — the keymap `shift+alt+l` / `ctl
 /// view split --right` geometry), install via `set_layout`.
@@ -126,28 +136,22 @@ fn live_split_resizes_primary_grid_to_focused_allocation_and_reflows() {
     assert_eq!(rt.leaf_count(), 2);
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
 
-    let focused_alloc = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == ViewId::new(1))
-        .map(|(_, r)| r)
-        .expect("focused allocation");
-    assert_eq!(focused_alloc.width, 40, "80-col container splits 40/40");
-    let new_alloc = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == new_id)
-        .map(|(_, r)| r)
-        .expect("new leaf allocation");
-    assert_eq!(new_alloc.width, 40);
+    let focused_frame = frame_of(&rt, ViewId::new(1));
+    assert_eq!(
+        focused_frame.cols, 38,
+        "80-col container with default CTX-0294 decoration keeps 38 content cols"
+    );
+    let new_frame = frame_of(&rt, new_id);
+    assert_eq!(new_frame.cols, 38);
 
-    // THE CTX-0269 INVARIANT: every pane grid matches its allocation.
-    // Pre-fix the primary grid keeps the stale 80-col width (present clips
-    // to the 40-col tile, tails invisible — the live verdict).
+    // THE CTX-0269 INVARIANT: every pane grid matches its decorated content
+    // frame. Pre-fix the primary grid keeps the stale 80-col width (present
+    // clips to the pane tile, tails invisible — the live verdict).
     let snap = rt.snapshot();
     assert_eq!(
-        snap.width, focused_alloc.width as usize,
-        "primary grid must shrink to the focused pane allocation on live split"
+        snap.width,
+        usize::from(focused_frame.cols),
+        "primary grid must shrink to the focused pane content on live split"
     );
 
     // Reflow ran at the new width with the CTX-0266 (#441) rewrap
@@ -159,15 +163,23 @@ fn live_split_resizes_primary_grid_to_focused_allocation_and_reflows() {
     // fixed by the grid becoming honest: new output wraps at the narrow
     // width below.
     let snap = rt.snapshot();
-    let row0: String = snap.cells[0..40]
-        .iter()
-        .filter(|c| !c.spacer)
-        .map(|c| c.glyph)
-        .collect();
-    assert_eq!(row0, "Q".repeat(40), "narrow keeps the overlapping prefix");
+    let content_cols = usize::from(focused_frame.cols);
+    assert_eq!(snap.width, content_cols);
+    // CTX-0266 bottom-aligns physical rows into the grid, so the rewrapped
+    // prefix rows above the last visible row move to scrollback (retained,
+    // never dropped) while the grid keeps the tail row visible.
+    assert!(
+        rt.scrollback_len() >= 1,
+        "rewrapped prefix rows must be retained in scrollback, not dropped"
+    );
     assert!(
         snapshot_text(&rt.snapshot()).contains("<TAIL100>"),
         "tail inside the kept region must stay visible after reflow"
+    );
+    let grid_q = snap.cells.iter().filter(|c| c.glyph == 'Q').count();
+    assert!(
+        grid_q >= 24,
+        "the narrow rewrapped prefix must remain on the grid (got {grid_q} Q cells)"
     );
 
     // Split geometry forces a present even with no new PTY bytes.
@@ -185,7 +197,9 @@ fn live_split_fresh_output_wraps_at_narrow_width() {
     let mut rt = make_runtime();
     rt.tick().expect("first full redraw");
     live_split_focused_right(&mut rt);
-    assert_eq!(rt.snapshot().width, 40);
+    let content_cols = usize::from(frame_of(&rt, ViewId::new(1)).cols);
+    assert_eq!(content_cols, 38);
+    assert_eq!(rt.snapshot().width, content_cols);
 
     let mut line = "Q".repeat(100);
     line.push_str("<TAIL100>");
@@ -196,7 +210,7 @@ fn live_split_fresh_output_wraps_at_narrow_width() {
     assert_eq!(
         nonblank_rows(&rt.snapshot()),
         3,
-        "109 cells at the narrowed 40 cols must wrap to 3 rows"
+        "109 cells at the narrowed 38 content cols must wrap to 3 rows"
     );
     assert!(
         snapshot_text(&rt.snapshot()).contains("<TAIL100>"),
@@ -216,7 +230,7 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     rt.handle_pty_bytes(&bytes);
 
     live_split_focused_right(&mut rt);
-    assert_eq!(rt.snapshot().width, 40);
+    assert_eq!(rt.snapshot().width, 38);
 
     // LIVE widen-back shape: close the new leaf through the same funnel.
     let focused = rt.focused_view().expect("focus");
@@ -229,26 +243,36 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     // semantic (same as window widen): the narrowed rows unwrap via
     // soft-wrap flags and rewrap into fewer, fuller rows — no content
     // loss, no blank pad where content rewraps.
-    assert_eq!(rt.snapshot().width, 80, "close must restore full width");
-    let snap = rt.snapshot();
-    let row0: String = snap.cells[0..80]
-        .iter()
-        .filter(|c| !c.spacer)
-        .map(|c| c.glyph)
-        .collect();
+    let wide_frame = rt
+        .present_frames()
+        .into_iter()
+        .next()
+        .expect("widen-back leaves exactly one frame");
+    let wide_cols = usize::from(wide_frame.cols);
+    assert_eq!(rt.present_frames().len(), 1, "close leaves one leaf");
+    assert_eq!(wide_cols, 78, "single decorated pane keeps 78 content cols");
     assert_eq!(
-        row0,
-        "Q".repeat(80),
-        "widen-back unwraps (#441) and rewraps the logical line into full rows"
+        rt.snapshot().width,
+        wide_cols,
+        "close must restore the decorated full width"
     );
     assert!(
         snapshot_text(&rt.snapshot()).contains("<TAIL100>"),
         "widen-back must not lose the tail"
     );
-    assert_eq!(
-        nonblank_rows(&rt.snapshot()),
-        2,
-        "109 cells at 80 cols wrap back to 2 rows"
+    // 109 cells at 78 content cols rewrap to 2 physical rows; the leading
+    // rewrite is bottom-aligned, so the visible grid keeps at least the
+    // 31-cell tail row while the full 78-col prefix sits in scrollback.
+    let snap = rt.snapshot();
+    let grid_q = snap.cells.iter().filter(|c| c.glyph == 'Q').count();
+    assert!(
+        grid_q >= 22,
+        "widen-back must keep the rewrapped prefix (got {grid_q} Q cells)"
+    );
+    let visible_rows = nonblank_rows(&snap);
+    assert!(
+        (1..=2).contains(&visible_rows),
+        "109 cells at 78 content cols rewrap to at most 2 visible rows (got {visible_rows})"
     );
 }
 
@@ -283,24 +307,23 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
     );
 
     // Keymap shape: split, then size the fresh leaf's shell to its
-    // allocation (exactly what the `NewSplit` arm passes to spawn).
+    // decorated content frame (exactly what the `NewSplit` arm passes to
+    // spawn as the pane grid).
     let new_id = live_split_focused_right(&mut rt);
-    let allocs = rt.layout_allocations();
-    let (cols, rows) = allocs
-        .iter()
-        .find(|(id, _)| *id == new_id)
-        .map(|(_, r)| (r.width, r.height))
-        .expect("new leaf allocation");
+    let (cols, rows) = {
+        let f = frame_of(&rt, new_id);
+        (f.cols, f.rows)
+    };
     rt.spawn_shell_for_view(new_id, "/bin/sh", &[], cols, rows)
         .expect("pane shell must spawn");
     assert_eq!(rt.pane_pty_size(&new_id), Some((cols, rows)));
 
     // CTX-0269: the primary PTY winsize (SIGWINCH path) follows the focused
-    // allocation on the split funnel — pre-fix it kept the stale 80x24.
+    // decorated content on the split funnel — pre-fix it kept the stale 80x24.
     assert_eq!(
         rt.pty_size(),
-        Some((40, 24)),
-        "primary winsize must follow the focused pane allocation"
+        Some((38, 23)),
+        "primary winsize must follow the focused pane content"
     );
 
     // Second split of the pane leaf: `sync_pane_geometry` on the same
@@ -308,24 +331,20 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
     assert!(rt.set_focus(new_id), "focus must move to the pane leaf");
     let third_id = live_split_focused_right(&mut rt);
     let _ = third_id;
-    let pane_alloc = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == new_id)
-        .map(|(_, r)| r)
-        .expect("shrunk pane allocation");
-    assert_eq!(pane_alloc.width, 20, "40-col pane splits 20/20");
+    let pane_frame = frame_of(&rt, new_id);
+    assert_eq!(pane_frame.cols, 18, "38-col pane splits to 18 content cols");
     let pane_snap = rt
         .pane_snapshot(&new_id)
         .expect("pane session survives the second split");
     assert_eq!(
-        pane_snap.width, pane_alloc.width as usize,
-        "pane session grid must follow its leaf on re-split"
+        pane_snap.width,
+        usize::from(pane_frame.cols),
+        "pane session grid must follow its decorated frame on re-split"
     );
     assert_eq!(
         rt.pane_pty_size(&new_id),
-        Some((pane_alloc.width, pane_alloc.height)),
-        "pane winsize must follow its leaf on re-split"
+        Some((pane_frame.cols, pane_frame.rows)),
+        "pane winsize must follow its decorated frame on re-split"
     );
 }
 

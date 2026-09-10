@@ -267,15 +267,15 @@ pub struct Runtime {
     /// Tracking each origin's last presented generation makes the check exact.
     last_presented_pane_generations: std::collections::BTreeMap<ViewId, u64>,
     pending_full_redraw: bool,
-    /// Last presented leaf allocations (CTX-0228).
+    /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
     /// Geometry-only layout changes (tree edits via `layout_mut`,
-    /// `reflow_layout`, split/zoom) must force a full present even when
-    /// no PTY bytes advanced the generation. `tick` compares the current
-    /// allocations against this snapshot; any difference forces the full
-    /// per-leaf path. Updated on every present (and on empty-layout idle
-    /// so a frameless tree does not spin).
-    last_presented_allocations: Vec<(ViewId, UiRect)>,
+    /// `reflow_layout`, split/zoom, decoration config) must force a full
+    /// present even when no PTY bytes advanced the generation. `tick`
+    /// compares the current decorated physical frames against this snapshot;
+    /// any difference forces the full per-leaf path. Updated on every present
+    /// (and on empty-layout idle so a frameless tree does not spin).
+    last_presented_allocations: Vec<layout_focus::PresentFrame>,
     /// Focused view at the last present (CTX-0228).
     ///
     /// Cursor/focus moves change which pane paints the cursor even when

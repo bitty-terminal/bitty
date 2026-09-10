@@ -175,7 +175,7 @@ impl Runtime {
     /// rowless, or the view is too small (state kept for a later resize).
     pub(super) fn paint_help_panel(
         &mut self,
-        allocations: &[(ViewId, UiRect)],
+        frames: &[super::layout_focus::PresentFrame],
         view_map: &std::collections::HashMap<ViewId, View>,
         pad_px: i32,
         fills: &mut Vec<bitty_render::grid::FillRect>,
@@ -187,24 +187,24 @@ impl Runtime {
         let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) else {
             return false;
         };
-        let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) else {
+        let Some(frame) = frames.iter().find(|frame| frame.view == fid) else {
             return false;
         };
-        if rect.width == 0 || rect.height == 0 {
+        if frame.cols == 0 || frame.rows == 0 {
             return false;
         }
-        let Some(panel) = help_panel_layout(rect.width, rect.height, &self.help_rows) else {
+        let Some(panel) = help_panel_layout(frame.cols, frame.rows, &self.help_rows) else {
             return false;
         };
         let live = self.live_cell_metrics();
         // CTX-0253 F4: saturating origin/span math (see `super::present`
         // helpers) — hostile cell metrics must clip like compositors do,
         // never wrap the old `as i32` casts.
-        use super::present::{px_add, px_offset_cells, px_origin, px_side, px_span};
+        use super::present::{px_add, px_offset_cells, px_side, px_span};
         let cw = px_side(live.width);
         let ch = px_side(live.height);
-        let origin_px_x = px_origin(rect.x, live.width, pad_px);
-        let origin_px_y = px_origin(rect.y, live.height, pad_px);
+        let origin_px_x = px_add(pad_px, frame.content.x);
+        let origin_px_y = px_add(pad_px, frame.content.y);
         let panel_px_x = px_offset_cells(origin_px_x, panel.x, live.width);
         let panel_px_y = px_offset_cells(origin_px_y, panel.y, live.height);
         let panel_px_w = px_span(panel.w, live.width);

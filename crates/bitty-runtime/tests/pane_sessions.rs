@@ -179,7 +179,19 @@ fn pane_grid_tracks_leaf_allocation_across_layout_changes() {
         LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
     ));
     let after = rt.pane_snapshot(&ViewId::new(2)).expect("pane grid");
-    assert_eq!((after.width, after.height), (80, 12));
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|f| f.view == ViewId::new(2))
+        .expect("leaf 2 frame");
+    // CTX-0294: the pane follows the decorated content frame (78x11 for an
+    // 80x24 container with the accepted 4/6/2/6 decoration), not the raw
+    // cell allocation (80x12).
+    assert_eq!((frame.cols, frame.rows), (78, 11));
+    assert_eq!(
+        (after.width, after.height),
+        (usize::from(frame.cols), usize::from(frame.rows))
+    );
 }
 
 #[test]

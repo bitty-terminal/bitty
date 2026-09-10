@@ -176,9 +176,11 @@ fn select_all_covers_whole_grid() {
 #[test]
 fn cursor_to_cell_mapping_is_headless_and_clamped() {
     let rt = make_runtime();
-    // Default readable cell 9x19 (CTX-0157) plus the default 8px window
-    // padding inset (CTX-0223): cell (2, 2) starts at (8 + 18, 8 + 38).
-    let pos = CursorPosition { x: 26.0, y: 46.0 };
+    // Default readable cell 9x19 (CTX-0157), the default 8px window
+    // padding inset (CTX-0223), and the default CTX-0294 decoration
+    // outer gap + border (6 + 2 px): cell (2, 2) starts at
+    // (8 + 8 + 18, 8 + 8 + 38) = (34, 54).
+    let pos = CursorPosition { x: 35.0, y: 55.0 };
     let cell = rt.cursor_to_cell(pos);
     assert_eq!(cell, CellPos::new(2, 2));
     // Negative and far-outside clamp.
@@ -274,14 +276,16 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
 
 /// Physical position for a grid cell with the readable 9x19 cell metrics.
 ///
-/// CTX-0223: includes the default 8px window padding inset — the grid
-/// origin sits at (8, 8) physical pixels, so raw `col * 9` coordinates
-/// would land one cell off (or inside the padding band).
+/// CTX-0223 + CTX-0294: includes the default 8px window padding inset and
+/// the default Core-owned decoration outer gap + border (6 + 2 = 8px at
+/// scale 1.0), so the grid origin sits at (16, 16) physical pixels and raw
+/// `col * 9` coordinates would land inside the decoration bands.
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
     const PAD: f64 = 8.0;
+    const DECORATION: f64 = 8.0;
     CursorPosition {
-        x: PAD + f64::from(col) * 9.0,
-        y: PAD + f64::from(row) * 19.0,
+        x: PAD + DECORATION + f64::from(col) * 9.0,
+        y: PAD + DECORATION + f64::from(row) * 19.0,
     }
 }
 

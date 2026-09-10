@@ -558,6 +558,143 @@ pub struct FillRect {
     pub color: Rgba8,
 }
 
+/// Core-owned workspace decoration border color (CTX-0294).
+///
+/// Bitty Dark ANSI 8 (`#585b70`), the designed "dim decorations" role from
+/// the theme table: visible against [`DEFAULT_BG`] without competing with
+/// cell content. A focused-view accent variant belongs to the render-owner
+/// stage-2 lane (CTX-0238g follow-up); this constant keeps the first live
+/// wiring theme-token-controlled in one place.
+pub const DECORATION_BORDER: Rgba8 = [0x58, 0x5B, 0x70, 0xFF];
+
+/// Renders a rounded border ring inside `frame` as plain [`FillRect`]s
+/// (CTX-0294 minimal radius painting; no DrawList schema change).
+///
+/// The outer edge follows a quarter-circle of `radius` px at each corner
+/// (pixel-center sampling); the inner edge follows the same corner centers
+/// with radius `radius - border` and degenerates to a square corner when the
+/// border consumes the radius. `border == 0`, an empty frame, or a fully
+/// degenerate ring yields no fills.
+///
+/// Emitting existing fill primitives keeps the software compositor and the
+/// GPU path pixel-identical by construction: both composite the same rects
+/// in the same order. The caller supplies physical pixels (apply the DPI
+/// scale before calling), so HiDPI needs no shader work. Runs of identical
+/// rows merge into one rect, bounding the output to the four straight edges
+/// plus the corner rows (`<= 2 * min(radius, height/2)` per axis) rather than
+/// the full frame height.
+///
+/// Known limit (tracked by the render-owner stage-2 lane): glyphs were
+/// already emitted for the content rectangle, so sub-cell overhang at the
+/// four inner corner arcs is not clipped away; the outer frame silhouette,
+/// gap bands, and straight border edges are exact.
+#[must_use]
+pub fn rounded_border_fills(
+    frame: RectPx,
+    border: u16,
+    radius: u16,
+    color: Rgba8,
+) -> Vec<FillRect> {
+    let w = frame.width;
+    let h = frame.height;
+    if border == 0 || w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let b = u32::from(border).min(w).min(h);
+    if b == 0 {
+        return Vec::new();
+    }
+    // The outer quarter-circle cannot exceed half the shorter side, otherwise
+    // opposite corners overlap; the inner arc is the outer radius minus the
+    // border and is square once the border consumes it.
+    let r_out = u32::from(radius).min(w.min(h) / 2);
+    let r_in = r_out.saturating_sub(b);
+
+    // Number of pixels from the left/right edge of a rounded rectangle of
+    // radius `r`, height `span_h`, that lie outside its corner arc on local
+    // row `i` (pixel centers at i + 0.5).
+    let arc_inset = |r: u32, i: u32, span_h: u32| -> u32 {
+        if r == 0 || span_h == 0 {
+            return 0;
+        }
+        let d = i.min(span_h - 1 - i);
+        if d >= r {
+            return 0;
+        }
+        let dy = f64::from(r) - (f64::from(d) + 0.5);
+        let c = f64::from(r) - (f64::from(r) * f64::from(r) - dy * dy).max(0.0).sqrt();
+        let inset = (c - 0.5).ceil();
+        if inset <= 0.0 { 0 } else { inset as u32 }
+    };
+
+    let mut out: Vec<FillRect> = Vec::new();
+    // Runs per segment slot (band or left/right strips) merged across rows.
+    let mut runs: [Option<(u32, u32, i32, u32)>; 2] = [None, None];
+
+    fn flush_slot(
+        run: &mut Option<(u32, u32, i32, u32)>,
+        frame: RectPx,
+        w: u32,
+        color: Rgba8,
+        out: &mut Vec<FillRect>,
+    ) {
+        if let Some((left, right, y, rows)) = run.take() {
+            let width = (w as i64 - i64::from(left) - i64::from(right)).max(0) as u32;
+            if width > 0 && rows > 0 {
+                out.push(FillRect {
+                    rect: RectPx::new(frame.x.saturating_add(left as i32), y, width, rows),
+                    color,
+                });
+            }
+        }
+    }
+
+    for i in 0..h {
+        let o = arc_inset(r_out, i, h);
+        let y = frame.y.saturating_add(i as i32);
+        let mut segs: [(u32, u32); 2] = [(0, 0); 2];
+        let mut count = 0usize;
+        if i < b || i >= h - b {
+            // Top/bottom band: the whole rounded span is border.
+            segs[0] = (o, o);
+            count = 1;
+        } else {
+            // Inner rounded rect spans rows/cols [b, span-b); its arc inset
+            // is relative to that inset rectangle.
+            let n = b + arc_inset(r_in, i - b, h.saturating_sub(b.saturating_mul(2)));
+            if n > o {
+                // Left strip [o, n) and right strip [w-n, w-o).
+                segs[0] = (o, w.saturating_sub(n));
+                segs[1] = (w.saturating_sub(n), o);
+                count = 2;
+            }
+        }
+        for (slot, run) in runs.iter_mut().enumerate() {
+            if slot < count {
+                let seg = segs[slot];
+                let merge = matches!(
+                    *run,
+                    Some((l, r, ry, rows)) if l == seg.0 && r == seg.1 && ry + rows as i32 == y
+                );
+                if merge {
+                    if let Some(run) = run.as_mut() {
+                        run.3 += 1;
+                    }
+                } else {
+                    flush_slot(run, frame, w, color, &mut out);
+                    *run = Some((seg.0, seg.1, y, 1));
+                }
+            } else {
+                flush_slot(run, frame, w, color, &mut out);
+            }
+        }
+    }
+    for run in &mut runs {
+        flush_slot(run, frame, w, color, &mut out);
+    }
+    out
+}
+
 /// Where a glyph instance's texels live.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GlyphSource {

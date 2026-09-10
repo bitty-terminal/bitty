@@ -1646,14 +1646,20 @@ pub fn apply_control(
     }
     if method == ipc_ctl::METHOD_LIST_TERMINALS {
         // 1:1 terminal:view mapping until the registry lands: each leaf is
-        // one terminal `t:<view>`
+        // one terminal `t:<view>`. CTX-0284: tiles are layout-derived and may
+        // have no shell (ctl splits spawn none), so report live pane-session
+        // presence per entry instead of implying one shell per tile.
         let ids = runtime.layout().leaf_ids();
         let mut out = String::from("{\"terminals\":[");
         for (idx, id) in ids.iter().enumerate() {
             if idx > 0 {
                 out.push(',');
             }
-            out.push_str(&format!("{{\"id\":\"t:{}\"}}", id.0));
+            out.push_str(&format!(
+                "{{\"id\":\"t:{}\",\"has_pane_session\":{}}}",
+                id.0,
+                runtime.has_pane_session(id)
+            ));
         }
         out.push_str("]}");
         return Ok(out);
@@ -1703,13 +1709,20 @@ pub fn apply_control(
             ));
         }
         // Prefer the pane snapshot when present; fall back to the primary
-        // snapshot for leaves without a session (same grid source the
-        // headless seam presents).
+        // snapshot for a session-less leaf that IS the focused view
+        // (parity with the present.rs CTX-0234 focused-only branch, which
+        // paints the shared primary grid exactly there). Unfocused
+        // session-less leaves stay empty so one grid is never duplicated as
+        // text across tiles — deliberately NOT mirroring the CTX-0255
+        // co-paint arm (PX-1676), which is a separate present-layer concern.
+        // Single-leaf keeps the legacy fallback (the sole leaf owns focus).
         let text = runtime
             .pane_snapshot(&target_view)
             .map(|snap| snapshot_text(&snap))
             .or_else(|| {
-                if runtime.layout().leaf_ids().len() == 1 {
+                if runtime.focused_view() == Some(target_view)
+                    || runtime.layout().leaf_ids().len() == 1
+                {
                     Some(snapshot_text(&runtime.snapshot()))
                 } else {
                     None
@@ -2410,6 +2423,101 @@ mod tests {
         assert!(!conflict.ok);
         assert_eq!(conflict.code, "Conflict");
         assert!(conflict.message.contains("view focus"));
+    }
+
+    #[test]
+    fn control_terminal_text_sessionless_split_focused_parity() {
+        // CTX-0284: `ctl view split` is layout-only (no pane shell), so both
+        // leaves are session-less. The oracle must mirror present.rs CTX-0234
+        // focused-only fallback: the focused session-less leaf returns the
+        // primary text, unfocused session-less leaves stay empty (never
+        // duplicate one grid as text across tiles).
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
+        assert!(done.ok, "split must succeed: {done:?}");
+        assert_eq!(rt.focused_view().map(|v| v.0), Some(1));
+        let expected = snapshot_text(&rt.snapshot());
+        assert!(!expected.is_empty(), "primary debug text must be non-empty");
+        let t1_params = ipc_ctl::params_terminal_id("t:1");
+        let t1 = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&t1_params),
+            &cli,
+        );
+        assert!(t1.ok, "t:1 text must succeed: {t1:?}");
+        let t2_params = ipc_ctl::params_terminal_id("t:2");
+        let t2 = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&t2_params),
+            &cli,
+        );
+        assert!(t2.ok, "t:2 text must succeed: {t2:?}");
+        let t1_text = extract_string_from(&t1.result_json, "text").expect("t:1 text field");
+        let t2_text = extract_string_from(&t2.result_json, "text").expect("t:2 text field");
+        assert_eq!(
+            t1_text, expected,
+            "focused session-less leaf mirrors primary"
+        );
+        assert!(
+            t2_text.is_empty(),
+            "unfocused session-less leaf stays empty, got {t2_text:?}"
+        );
+        // Refocus mirrors: t:2 becomes primary, t:1 goes empty.
+        let focus = ipc_ctl::params_focus("v:2");
+        let moved = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&focus), &cli);
+        assert!(moved.ok, "focus v:2 must succeed: {moved:?}");
+        let expected2 = snapshot_text(&rt.snapshot());
+        let t1b = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&t1_params),
+            &cli,
+        );
+        let t2b = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&t2_params),
+            &cli,
+        );
+        assert!(t1b.ok && t2b.ok, "both texts must succeed: {t1b:?} {t2b:?}");
+        let t1b_text = extract_string_from(&t1b.result_json, "text").expect("t:1 text field");
+        let t2b_text = extract_string_from(&t2b.result_json, "text").expect("t:2 text field");
+        assert!(
+            t1b_text.is_empty(),
+            "v:1 unfocused after refocus stays empty, got {t1b_text:?}"
+        );
+        assert_eq!(
+            t2b_text, expected2,
+            "v:2 focused after refocus mirrors primary"
+        );
+    }
+
+    #[test]
+    fn control_terminal_list_reports_session_presence() {
+        // CTX-0284: layout-derived t:N entries must not imply shells that may
+        // not exist (ctl splits spawn no shell). Each entry reports whether a
+        // live pane session backs it.
+        let mut rt = headless_runtime();
+        let cli = bitty_ipc::ScopeSet::cli_default();
+        let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
+        assert!(done.ok, "split must succeed: {done:?}");
+        let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &cli);
+        assert!(terms.ok, "terminal list must succeed: {terms:?}");
+        assert!(
+            terms.result_json.contains("t:1") && terms.result_json.contains("t:2"),
+            "both leaves listed: {}",
+            terms.result_json
+        );
+        assert!(
+            terms.result_json.contains("\"has_pane_session\":false"),
+            "session-less leaves must report no session: {}",
+            terms.result_json
+        );
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "selection.auto_copy"
         | "layout.gaps_in"
         | "layout.gaps_out"
+        | "decoration.gaps_in"
+        | "decoration.gaps_out"
+        | "decoration.border"
+        | "decoration.radius"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
@@ -81,8 +85,8 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "selection" | "layout" | "scrollbar" | "mouse"
-        | "appearance" => Some(MergeClass::DeepMerge),
+        "font" | "window" | "terminal" | "selection" | "layout" | "decoration" | "scrollbar"
+        | "mouse" | "appearance" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -472,6 +476,67 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("layout".to_string(), src.clone());
         }
 
+        // CTX-0292: Core-owned workspace decoration (`decoration.gaps_in`,
+        // `decoration.gaps_out`, `decoration.border`, `decoration.radius`)
+        // is scalar-replace like `layout.gaps_in`; absent table means "says
+        // nothing".
+        if let Some(dec) = &plan.decoration {
+            for (field, value) in [
+                ("decoration.gaps_in", dec.gaps_in),
+                ("decoration.gaps_out", dec.gaps_out),
+                ("decoration.border", dec.border),
+                ("decoration.radius", dec.radius),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    match field {
+                        "decoration.gaps_in" => effective.decoration.gaps_in = value,
+                        "decoration.gaps_out" => effective.decoration.gaps_out = value,
+                        "decoration.border" => effective.decoration.border = value,
+                        _ => effective.decoration.radius = value,
+                    }
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    match field {
+                        "decoration.gaps_in" => effective.decoration.gaps_in = value,
+                        "decoration.gaps_out" => effective.decoration.gaps_out = value,
+                        "decoration.border" => effective.decoration.border = value,
+                        _ => effective.decoration.radius = value,
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("decoration".to_string(), src.clone());
+        }
+
         // CTX-0181: `scrollbar.mode`/`scrollbar.width` are scalar-replace
         // like `layout.gaps_in`; absent table means "says nothing".
         if let Some(bar) = &plan.scrollbar {
@@ -814,6 +879,11 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "layout.gaps_in",
         "layout.gaps_out",
         "layout",
+        "decoration.gaps_in",
+        "decoration.gaps_out",
+        "decoration.border",
+        "decoration.radius",
+        "decoration",
         "scrollbar.mode",
         "scrollbar.width",
         "scrollbar",
@@ -1103,6 +1173,65 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("layout".to_string(), src.clone());
         }
+        // CTX-0292: Core-owned workspace decoration is scalar-replace like
+        // `layout.gaps_in`; absent table means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(dec) = &plan.decoration {
+            for (field, value) in [
+                ("decoration.gaps_in", dec.gaps_in),
+                ("decoration.gaps_out", dec.gaps_out),
+                ("decoration.border", dec.border),
+                ("decoration.radius", dec.radius),
+            ] {
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                    match field {
+                        "decoration.gaps_in" => effective.decoration.gaps_in = value,
+                        "decoration.gaps_out" => effective.decoration.gaps_out = value,
+                        "decoration.border" => effective.decoration.border = value,
+                        _ => effective.decoration.radius = value,
+                    }
+                    let prev = attribution.get(field).cloned();
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                } else {
+                    let prev = attribution.get(field).cloned();
+                    match field {
+                        "decoration.gaps_in" => effective.decoration.gaps_in = value,
+                        "decoration.gaps_out" => effective.decoration.gaps_out = value,
+                        "decoration.border" => effective.decoration.border = value,
+                        _ => effective.decoration.radius = value,
+                    }
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                }
+            }
+            attribution.insert("decoration".to_string(), src.clone());
+        }
         // CTX-0260: `mouse.focus_follows_mouse` is scalar-replace like
         // `selection.auto_copy`; absent table means "says nothing".
         // (Second merge path: allow-policy-violations variant for diagnostics.)
@@ -1390,6 +1519,11 @@ fn merge_layers_allow_policy_violations(
         "layout.gaps_in",
         "layout.gaps_out",
         "layout",
+        "decoration.gaps_in",
+        "decoration.gaps_out",
+        "decoration.border",
+        "decoration.radius",
+        "decoration",
         "scrollbar.mode",
         "scrollbar.width",
         "scrollbar",
@@ -2041,6 +2175,84 @@ mod tests {
         assert_eq!(merged3.effective.layout.gaps_out, 0);
         assert_eq!(
             merged3.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn decoration_merges_scalar_replace_with_attribution() {
+        // CTX-0292: user decoration lands in effective with user
+        // attribution; CLI wins over file; absent layers keep the accepted
+        // CTX-0118 defaults (4/6/2/6) with core-defaults attribution.
+        use crate::types::DecorationConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    gaps_in: 0,
+                    gaps_out: 0,
+                    border: 1,
+                    radius: 0,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.decoration.gaps_in, 0);
+        assert_eq!(merged.effective.decoration.border, 1);
+        assert_eq!(
+            merged.source_of("decoration.gaps_in").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("decoration.border").unwrap().layer,
+            LayerKind::User
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    gaps_in: 8,
+                    gaps_out: 8,
+                    border: 4,
+                    radius: 12,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    gaps_in: 0,
+                    gaps_out: 0,
+                    border: 1,
+                    radius: 0,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(merged2.effective.decoration.gaps_in, 8);
+        assert_eq!(merged2.effective.decoration.radius, 12);
+        assert_eq!(
+            merged2.source_of("decoration.gaps_in").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "decoration.gaps_in")
+        );
+        // Empty stack keeps the accepted defaults with core attribution.
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert_eq!(merged3.effective.decoration, DecorationConfig::default());
+        assert_eq!(
+            merged3.source_of("decoration.gaps_in").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

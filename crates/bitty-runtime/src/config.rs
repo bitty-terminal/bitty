@@ -60,6 +60,49 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u16 = 0;
 /// Mirrors `bitty-config` `MAX_LAYOUT_GAP_CELLS` (see above).
 pub const MAX_LAYOUT_GAP_CELLS: u16 = 16;
 
+/// Alias of `bitty_ui`'s Core-owned decoration bounds (CTX-0292; accepted
+/// spec CTX-0118). `bitty-runtime` already depends on `bitty-ui`, so these
+/// cannot drift from the solver's own constants.
+pub const DEFAULT_DECORATION_GAPS_IN_PX: u16 = bitty_ui::DEFAULT_GAPS_IN_PX;
+
+/// Alias of `bitty_ui::DEFAULT_GAPS_OUT_PX` (CTX-0292).
+pub const DEFAULT_DECORATION_GAPS_OUT_PX: u16 = bitty_ui::DEFAULT_GAPS_OUT_PX;
+
+/// Alias of `bitty_ui::DEFAULT_BORDER_PX` (CTX-0292).
+pub const DEFAULT_DECORATION_BORDER_PX: u16 = bitty_ui::DEFAULT_BORDER_PX;
+
+/// Alias of `bitty_ui::DEFAULT_RADIUS_PX` (CTX-0292).
+pub const DEFAULT_DECORATION_RADIUS_PX: u16 = bitty_ui::DEFAULT_RADIUS_PX;
+
+/// Alias of `bitty_ui::MAX_GAP_PX` (CTX-0292: `0..=32` logical px).
+pub const MAX_DECORATION_GAP_PX: u16 = bitty_ui::MAX_GAP_PX;
+
+/// Alias of `bitty_ui::MAX_BORDER_PX` (CTX-0292: `0..=8` logical px).
+pub const MAX_DECORATION_BORDER_PX: u16 = bitty_ui::MAX_BORDER_PX;
+
+/// Alias of `bitty_ui::MAX_RADIUS_PX` (CTX-0292: `0..=16` logical px).
+pub const MAX_DECORATION_RADIUS_PX: u16 = bitty_ui::MAX_RADIUS_PX;
+
+/// Maps a Core decoration validation failure to the runtime config error
+/// (CTX-0292), naming the offending property without echoing user content.
+pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> RuntimeError {
+    let msg = match err {
+        bitty_ui::DecorationError::GapsIn(_) => {
+            "decoration.gaps_in must be within [0, 32] logical pixels"
+        }
+        bitty_ui::DecorationError::GapsOut(_) => {
+            "decoration.gaps_out must be within [0, 32] logical pixels"
+        }
+        bitty_ui::DecorationError::Border(_) => {
+            "decoration.border must be within [0, 8] logical pixels"
+        }
+        bitty_ui::DecorationError::Radius(_) => {
+            "decoration.radius must be within [0, 16] logical pixels"
+        }
+    };
+    RuntimeError::InvalidConfig(msg)
+}
+
 /// Default window padding in logical pixels (CTX-0223).
 /// Mirrors `bitty-config` `WindowConfig` default (`padding: 8`; kept as a
 /// local constant because `bitty-runtime` must not depend on `bitty-config`;
@@ -170,6 +213,13 @@ pub struct RuntimeConfig {
     /// Inset around the container edge in cells (CTX-0177
     /// `layout.gaps_out`). Same bounds and default as `gaps_in`.
     pub gaps_out: u16,
+    /// Core-owned workspace decoration in logical pixels (CTX-0292; accepted
+    /// spec CTX-0118 defaults `4/6/2/6`). Decoration is never part of a
+    /// `LayoutTree` or a plugin proposal; it is carried here from the
+    /// validated `EffectiveConfig` and applied by
+    /// [`crate::Runtime::decorated_allocations`] / the future live present
+    /// stage.
+    pub decoration: bitty_ui::Decoration,
     /// Window padding in logical pixels on every side (CTX-0223
     /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
     /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
@@ -222,6 +272,7 @@ impl Default for RuntimeConfig {
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
+            decoration: bitty_ui::Decoration::default(),
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
@@ -237,6 +288,11 @@ impl RuntimeConfig {
     /// CTX-0260: `focus_follows_mouse` is not a `new()` parameter (adding
     /// one would churn every call site); it defaults off here and the app
     /// layer sets it post-construction from the effective config.
+    ///
+    /// CTX-0292: `decoration` follows the same pattern: it defaults to the
+    /// accepted CTX-0118 values here and the app layer assigns the validated
+    /// effective decoration post-construction; [`Self::validate`] rejects
+    /// out-of-range decoration values fail-closed.
     ///
     /// # Errors
     ///
@@ -276,6 +332,7 @@ impl RuntimeConfig {
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in,
             gaps_out,
+            decoration: bitty_ui::Decoration::default(),
             window_padding,
             window_radius_px,
             scrollbar_mode,
@@ -329,6 +386,9 @@ impl RuntimeConfig {
             return Err(RuntimeError::InvalidConfig(
                 "layout gaps must be within [0, 16] cells",
             ));
+        }
+        if let Err(err) = self.decoration.validate() {
+            return Err(decoration_runtime_error(err));
         }
         if self.window_padding > MAX_WINDOW_PADDING {
             return Err(RuntimeError::InvalidConfig(
@@ -959,6 +1019,60 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn decoration_defaults_match_accepted_spec_and_validate() {
+        // CTX-0292 / accepted spec CTX-0118: defaults 4/6/2/6 logical px;
+        // runtime constants alias the bitty-ui solver bounds so they cannot
+        // drift; out-of-range values fail closed naming the property.
+        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 4) }
+        const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
+        const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
+        const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
+        const { assert!(MAX_DECORATION_GAP_PX == 32) }
+        const { assert!(MAX_DECORATION_BORDER_PX == 8) }
+        const { assert!(MAX_DECORATION_RADIUS_PX == 16) }
+        let cfg = RuntimeConfig::default();
+        assert_eq!((cfg.decoration.gaps_in, cfg.decoration.gaps_out), (4, 6));
+        assert_eq!((cfg.decoration.border, cfg.decoration.radius), (2, 6));
+        cfg.validate().expect("default decoration valid");
+        // `new()` leaves decoration at the accepted defaults.
+        let built = RuntimeConfig::new(
+            80,
+            24,
+            9,
+            19,
+            256,
+            "mono",
+            12.0,
+            3,
+            16,
+            true,
+            0,
+            0,
+            8,
+            DEFAULT_WINDOW_RADIUS_PX,
+            bitty_ui::ScrollbarMode::Hidden,
+            DEFAULT_SCROLLBAR_WIDTH,
+        )
+        .expect("build");
+        assert_eq!(built.decoration, bitty_ui::Decoration::default());
+        // Out-of-range decoration fails closed at validate().
+        for (field, bad) in [
+            ("gaps_in", bitty_ui::Decoration::new(33, 6, 2, 6)),
+            ("gaps_out", bitty_ui::Decoration::new(4, 33, 2, 6)),
+            ("border", bitty_ui::Decoration::new(4, 6, 9, 6)),
+            ("radius", bitty_ui::Decoration::new(4, 6, 2, 17)),
+        ] {
+            let cfg = RuntimeConfig {
+                decoration: bad,
+                ..RuntimeConfig::default()
+            };
+            let err = cfg.validate().expect_err("out-of-range must fail");
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field}: {msg}");
+        }
     }
 
     #[test]

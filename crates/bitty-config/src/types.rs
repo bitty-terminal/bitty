@@ -53,6 +53,40 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u32 = 0;
 /// values fail closed like every other config bound.
 pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
 
+/// Default Core-owned workspace decoration gaps (CTX-0292, accepted spec
+/// CTX-0118): `gaps_in` 4 logical px, `gaps_out` 6 logical px.
+pub const DEFAULT_DECORATION_GAPS_IN_PX: u32 = 4;
+
+/// Default outer workspace decoration gap (CTX-0292): 6 logical px.
+pub const DEFAULT_DECORATION_GAPS_OUT_PX: u32 = 6;
+
+/// Default View frame border thickness (CTX-0292): 2 logical px.
+pub const DEFAULT_DECORATION_BORDER_PX: u32 = 2;
+
+/// Default View frame corner radius (CTX-0292): 6 logical px.
+pub const DEFAULT_DECORATION_RADIUS_PX: u32 = 6;
+
+/// Maximum decoration gap in logical px (either axis), accepted CTX-0118.
+pub const MAX_DECORATION_GAP_PX: u32 = 32;
+
+/// Maximum View frame border thickness in logical px, accepted CTX-0118.
+pub const MAX_DECORATION_BORDER_PX: u32 = 8;
+
+/// Maximum View frame corner radius in logical px, accepted CTX-0118.
+pub const MAX_DECORATION_RADIUS_PX: u32 = 16;
+
+/// Safe-mode decoration gaps (CTX-0292 rule 5: `bitty --safe` = `0/0/1/0`).
+pub const SAFE_DECORATION_GAPS_IN_PX: u32 = 0;
+
+/// Safe-mode decoration outer gap; see [`SAFE_DECORATION_GAPS_IN_PX`].
+pub const SAFE_DECORATION_GAPS_OUT_PX: u32 = 0;
+
+/// Safe-mode View frame border thickness (`1`, not the `2` default).
+pub const SAFE_DECORATION_BORDER_PX: u32 = 1;
+
+/// Safe-mode View frame corner radius (`0`, not the `6` default).
+pub const SAFE_DECORATION_RADIUS_PX: u32 = 0;
+
 /// Default selection auto-copy behavior (CTX-0191).
 /// `true` preserves the ghostty-class copy-on-select: a committed mouse
 /// selection auto-copies to the clipboard (which best-effort syncs primary).
@@ -493,6 +527,99 @@ impl LayoutConfig {
     }
 }
 
+/// Core-owned workspace decoration in logical pixels (CTX-0292).
+///
+/// Implements the accepted workspace-compositor contract
+/// (`bitty-docs/docs/specifications/workspace-compositor.md`, section
+/// "Core-owned gaps, border, and radius", accepted via CTX-0118):
+///
+/// | Property   | Default | Range      |
+/// | ---------- | ------- | ---------- |
+/// | `gaps_in`  | 4 px    | 0..=32 px  |
+/// | `gaps_out` | 6 px    | 0..=32 px  |
+/// | `border`   | 2 px    | 0..=8 px   |
+/// | `radius`   | 6 px    | 0..=16 px  |
+///
+/// Values are integers in logical pixels, scaled by the `Window` DPI factor
+/// only at render time. Unknown keys or out-of-range values fail validation
+/// with a source-attributed diagnostic; Core never falls back to a silent
+/// default when validation fails. Decoration is Core-owned: it is never part
+/// of a `LayoutTree`, a `View`, or a `LayoutProvider` proposal.
+///
+/// This is distinct from the CTX-0177 `layout.gaps_in`/`gaps_out` panel gaps,
+/// which remain integer **cells** and keep their existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecorationConfig {
+    /// Gap between adjacent views inside one workspace, logical px.
+    pub gaps_in: u32,
+    /// Gap between the workspace tiling area and the window edge, logical px.
+    pub gaps_out: u32,
+    /// Border thickness drawn inside each View frame, logical px.
+    pub border: u32,
+    /// Corner radius for View frames, logical px.
+    pub radius: u32,
+}
+
+impl Default for DecorationConfig {
+    fn default() -> Self {
+        Self {
+            gaps_in: DEFAULT_DECORATION_GAPS_IN_PX,
+            gaps_out: DEFAULT_DECORATION_GAPS_OUT_PX,
+            border: DEFAULT_DECORATION_BORDER_PX,
+            radius: DEFAULT_DECORATION_RADIUS_PX,
+        }
+    }
+}
+
+impl DecorationConfig {
+    /// Safe-mode decoration (`bitty --safe`, spec rule 5): `0/0/1/0`
+    /// regardless of user configuration.
+    #[must_use]
+    pub const fn safe() -> Self {
+        Self {
+            gaps_in: SAFE_DECORATION_GAPS_IN_PX,
+            gaps_out: SAFE_DECORATION_GAPS_OUT_PX,
+            border: SAFE_DECORATION_BORDER_PX,
+            radius: SAFE_DECORATION_RADIUS_PX,
+        }
+    }
+
+    /// True when every decoration is zero (undecorated fast path).
+    #[must_use]
+    pub const fn is_zero(&self) -> bool {
+        self.gaps_in == 0 && self.gaps_out == 0 && self.border == 0 && self.radius == 0
+    }
+
+    /// Validate decoration config (fail-closed on out-of-range values).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.gaps_in > MAX_DECORATION_GAP_PX {
+            return Err(ConfigError::validation(
+                "decoration.gaps_in",
+                format!("must be within [0, {MAX_DECORATION_GAP_PX}]"),
+            ));
+        }
+        if self.gaps_out > MAX_DECORATION_GAP_PX {
+            return Err(ConfigError::validation(
+                "decoration.gaps_out",
+                format!("must be within [0, {MAX_DECORATION_GAP_PX}]"),
+            ));
+        }
+        if self.border > MAX_DECORATION_BORDER_PX {
+            return Err(ConfigError::validation(
+                "decoration.border",
+                format!("must be within [0, {MAX_DECORATION_BORDER_PX}]"),
+            ));
+        }
+        if self.radius > MAX_DECORATION_RADIUS_PX {
+            return Err(ConfigError::validation(
+                "decoration.radius",
+                format!("must be within [0, {MAX_DECORATION_RADIUS_PX}]"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Scrollbar display mode (CTX-0181).
 ///
 /// Mirrors `bitty-ui`'s mode by value (`bitty-config` owns no workspace
@@ -730,8 +857,11 @@ pub struct EffectiveConfig {
     pub terminal: TerminalConfig,
     /// Selection config (CTX-0191; default auto-copies on select).
     pub selection: SelectionConfig,
-    /// Layout config (CTX-0177 panel gaps; default edge-to-edge).
+    /// Layout config (CTX-0177 panel gaps in cells; default edge-to-edge).
     pub layout: LayoutConfig,
+    /// Core-owned workspace decoration in logical px (CTX-0292; accepted
+    /// spec CTX-0118 defaults 4/6/2/6).
+    pub decoration: DecorationConfig,
     /// Scrollbar config (CTX-0181 overlay scrollbar; default hidden).
     pub scrollbar: ScrollbarConfig,
     /// Mouse config (CTX-0260 focus-follows-mouse; default off).
@@ -759,6 +889,7 @@ impl Default for EffectiveConfig {
             terminal: TerminalConfig::default(),
             selection: SelectionConfig::default(),
             layout: LayoutConfig::default(),
+            decoration: DecorationConfig::default(),
             scrollbar: ScrollbarConfig::default(),
             mouse: MouseConfig::default(),
             appearance: AppearanceConfig::default(),
@@ -779,8 +910,8 @@ impl EffectiveConfig {
         self.terminal.validate()?;
         self.selection.validate()?;
         self.layout.validate()?;
+        self.decoration.validate()?;
         self.scrollbar.validate()?;
-        self.mouse.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -1164,6 +1295,68 @@ mod tests {
         eff.layout.gaps_in = MAX_LAYOUT_GAP_CELLS + 1;
         eff.validate()
             .expect_err("effective must reject oversized gaps");
+    }
+
+    #[test]
+    fn decoration_defaults_match_accepted_spec_and_validate() {
+        // CTX-0292 / accepted spec CTX-0118: defaults 4/6/2/6 logical px and
+        // ranges gaps 0..=32, border 0..=8, radius 0..=16, fail closed.
+        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 4) }
+        const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
+        const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
+        const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
+        const { assert!(MAX_DECORATION_GAP_PX == 32) }
+        const { assert!(MAX_DECORATION_BORDER_PX == 8) }
+        const { assert!(MAX_DECORATION_RADIUS_PX == 16) }
+        let d = DecorationConfig::default();
+        assert_eq!((d.gaps_in, d.gaps_out, d.border, d.radius), (4, 6, 2, 6));
+        d.validate().expect("default valid");
+        assert!(!d.is_zero());
+        // Safe-mode inversion: 0/0/1/0 regardless of the defaults.
+        let safe = DecorationConfig::safe();
+        assert_eq!(
+            (safe.gaps_in, safe.gaps_out, safe.border, safe.radius),
+            (0, 0, 1, 0)
+        );
+        safe.validate().expect("safe valid");
+        assert!(!safe.is_zero());
+        for good in [
+            DecorationConfig {
+                gaps_in: 0,
+                gaps_out: 0,
+                border: 0,
+                radius: 0,
+            },
+            DecorationConfig {
+                gaps_in: 32,
+                gaps_out: 32,
+                border: 8,
+                radius: 16,
+            },
+        ] {
+            good.validate().expect("boundary decoration must be valid");
+        }
+        for (field, bad) in [
+            ("decoration.gaps_in", 33),
+            ("decoration.gaps_out", 33),
+            ("decoration.border", 9),
+            ("decoration.radius", 17),
+        ] {
+            let mut c = DecorationConfig::default();
+            match field {
+                "decoration.gaps_in" => c.gaps_in = bad,
+                "decoration.gaps_out" => c.gaps_out = bad,
+                "decoration.border" => c.border = bad,
+                _ => c.radius = bad,
+            }
+            let err = c.validate().expect_err("out-of-range must fail closed");
+            assert_eq!(err.field(), Some(field), "wrong field for {field}");
+        }
+        // Effective-level validation covers decoration too.
+        let mut eff = EffectiveConfig::default();
+        eff.decoration.radius = MAX_DECORATION_RADIUS_PX + 1;
+        eff.validate()
+            .expect_err("effective must reject oversized decoration");
     }
 
     #[test]

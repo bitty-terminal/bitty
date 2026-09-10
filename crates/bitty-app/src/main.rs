@@ -2220,6 +2220,11 @@ fn starter_init_lua() -> &'static str {
      \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
      \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
      \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
+     \x20\x20-- Core-owned workspace decoration in logical px (accepted spec\n\
+     \x20\x20-- CTX-0118): gaps between/around views, border inside each\n\
+     \x20\x20-- View frame, corner radius. Defaults 4/6/2/6; safe mode\n\
+     \x20\x20-- forces 0/0/1/0.\n\
+     \x20\x20-- decoration = { gaps_in = 4, gaps_out = 6, border = 2, radius = 6 },\n\
       \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
       \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
       \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
@@ -2453,6 +2458,14 @@ fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         &src("layout.gaps_out")
                     )
                 );
+                for (field, value) in [
+                    ("decoration.gaps_in", e.decoration.gaps_in),
+                    ("decoration.gaps_out", e.decoration.gaps_out),
+                    ("decoration.border", e.decoration.border),
+                    ("decoration.radius", e.decoration.radius),
+                ] {
+                    println!("{}", check_row(field, format!("{value}"), &src(field)));
+                }
                 println!(
                     "{}",
                     check_row(
@@ -3660,6 +3673,28 @@ fn runtime_config_from_effective(
         .window
         .radius_px
         .min(bitty_runtime::config::MAX_WINDOW_RADIUS_PX);
+    // CTX-0292: Core-owned workspace decoration flows file -> effective ->
+    // runtime (`bitty-config` validates the accepted CTX-0118 ranges; the
+    // clamps below are defense-in-depth so a future bound drift can never
+    // wrap the u16 cast).
+    let decoration = bitty_runtime::Decoration::new(
+        effective
+            .decoration
+            .gaps_in
+            .min(u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX)) as u16,
+        effective
+            .decoration
+            .gaps_out
+            .min(u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX)) as u16,
+        effective
+            .decoration
+            .border
+            .min(u32::from(bitty_runtime::config::MAX_DECORATION_BORDER_PX)) as u16,
+        effective
+            .decoration
+            .radius
+            .min(u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX)) as u16,
+    );
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -3682,6 +3717,10 @@ fn runtime_config_from_effective(
         // CTX-0260: hover-focus flows file -> effective -> runtime the same
         // way (booleans are total; default off preserves click-to-focus).
         cfg.focus_follows_mouse = effective.mouse.focus_follows_mouse;
+        // CTX-0292: Core-owned workspace decoration is carried onto the
+        // validated runtime config (same post-construction pattern as
+        // `focus_follows_mouse`).
+        cfg.decoration = decoration;
         cfg
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
@@ -6446,6 +6485,100 @@ mod tests {
         // Oversized gaps fail closed at the file layer (never reach runtime).
         let src3 = ConfigSource::new(LayerKind::User, Some("init.lua"));
         parse_lua_config(r#"return { layout = { gaps_in = 17 } }"#, &src3).expect_err("must fail");
+    }
+
+    #[test]
+    fn runtime_config_inherits_file_decoration() {
+        // CTX-0292 / accepted spec CTX-0118: `decoration.gaps_in`,
+        // `decoration.gaps_out`, `decoration.border`, `decoration.radius`
+        // flow file -> effective -> runtime; the crate constants stay equal
+        // (bitty-runtime aliases bitty-ui, bitty-config owns its own copy;
+        // the pairing is pinned here). Default is the accepted 4/6/2/6.
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_DECORATION_GAPS_IN_PX,
+            bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX as u16
+        );
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_DECORATION_GAPS_OUT_PX,
+            bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX as u16
+        );
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_DECORATION_BORDER_PX,
+            bitty_config::types::DEFAULT_DECORATION_BORDER_PX as u16
+        );
+        assert_eq!(
+            bitty_runtime::config::DEFAULT_DECORATION_RADIUS_PX,
+            bitty_config::types::DEFAULT_DECORATION_RADIUS_PX as u16
+        );
+        assert_eq!(
+            u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX),
+            bitty_config::types::MAX_DECORATION_GAP_PX
+        );
+        assert_eq!(
+            u32::from(bitty_runtime::config::MAX_DECORATION_BORDER_PX),
+            bitty_config::types::MAX_DECORATION_BORDER_PX
+        );
+        assert_eq!(
+            u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX),
+            bitty_config::types::MAX_DECORATION_RADIUS_PX
+        );
+        use bitty_config::file::{parse_lua_config, resolve_effective};
+        use bitty_config::plan::{ConfigSource, LayerKind};
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan = parse_lua_config(
+            r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0 } }"#,
+            &src,
+        )
+        .expect("decoration parse");
+        let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+            .expect("merge");
+        assert_eq!(merged.effective.decoration.gaps_in, 0);
+        assert_eq!(merged.effective.decoration.gaps_out, 1);
+        let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+        assert_eq!(cfg.decoration, bitty_runtime::Decoration::new(0, 1, 1, 0));
+        assert_eq!(
+            merged.source_of("decoration.gaps_in").unwrap().layer,
+            bitty_config::plan::LayerKind::User
+        );
+        // Absent table rides the accepted CTX-0118 defaults end to end.
+        let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+            .expect("no decoration table parses");
+        let merged2 = resolve_effective(
+            Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(
+            merged2.effective.decoration,
+            bitty_config::types::DecorationConfig::default()
+        );
+        let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+        assert_eq!(cfg2.decoration, bitty_runtime::Decoration::default());
+        assert_eq!(cfg2.decoration, bitty_runtime::Decoration::new(4, 6, 2, 6));
+        assert_eq!(
+            merged2.source_of("decoration.gaps_in").unwrap().layer,
+            bitty_config::plan::LayerKind::CoreDefaults
+        );
+        // Safe mode inverts to 0/0/1/0 regardless of user configuration.
+        let safe = bitty_config::reload::fallback_builtin();
+        let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
+        assert_eq!(safe_cfg.decoration, bitty_runtime::Decoration::SAFE);
+        assert_eq!(
+            safe_cfg.decoration,
+            bitty_runtime::Decoration::new(0, 0, 1, 0)
+        );
+        // Out-of-range decoration fails closed at the file layer.
+        for bad in [
+            r#"return { decoration = { gaps_in = 33 } }"#,
+            r#"return { decoration = { gaps_out = 33 } }"#,
+            r#"return { decoration = { border = 9 } }"#,
+            r#"return { decoration = { radius = 17 } }"#,
+            r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
+        ] {
+            let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+            parse_lua_config(bad, &src).expect_err("must fail closed");
+        }
     }
 
     #[test]

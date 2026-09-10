@@ -56,6 +56,10 @@ impl std::fmt::Display for ReloadClass {
 /// | `window.opacity`          | Live               |
 /// | `window.padding`          | Live               |
 /// | `window.radius_px`        | Live               |
+/// | `decoration.gaps_in`      | Live               |
+/// | `decoration.gaps_out`     | Live               |
+/// | `decoration.border`       | Live               |
+/// | `decoration.radius`       | Live               |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -83,6 +87,11 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "window.padding"
         | "window.radius_px"
         | "window"
+        | "decoration.gaps_in"
+        | "decoration.gaps_out"
+        | "decoration.border"
+        | "decoration.radius"
+        | "decoration"
         | "appearance.theme"
         | "appearance"
         | "mod_key"
@@ -213,6 +222,29 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "window.radius_px",
         old.window.radius_px.to_string(),
         new.window.radius_px.to_string(),
+    );
+    // CTX-0292: Core-owned decoration is validated + stored live (the
+    // runtime `set_decoration` path adopts it without restart), so changes
+    // reconcile live like `window.radius_px`.
+    push_if_changed(
+        "decoration.gaps_in",
+        old.decoration.gaps_in.to_string(),
+        new.decoration.gaps_in.to_string(),
+    );
+    push_if_changed(
+        "decoration.gaps_out",
+        old.decoration.gaps_out.to_string(),
+        new.decoration.gaps_out.to_string(),
+    );
+    push_if_changed(
+        "decoration.border",
+        old.decoration.border.to_string(),
+        new.decoration.border.to_string(),
+    );
+    push_if_changed(
+        "decoration.radius",
+        old.decoration.radius.to_string(),
+        new.decoration.radius.to_string(),
     );
     push_if_changed(
         "terminal.scrollback",
@@ -349,10 +381,16 @@ pub fn reconcile_live(
 /// Safe-mode fallback: the minimal built-in configuration that always starts
 /// regardless of external configuration health (`bitty --safe`, R-009).
 ///
-/// This is exactly `EffectiveConfig::default()` — no external layers applied.
+/// This is `EffectiveConfig::default()` with the Core-owned workspace
+/// decoration forced to the safe-mode values `0/0/1/0` (CTX-0292; accepted
+/// spec CTX-0118 rule 5) regardless of user configuration. Every other field
+/// stays at its built-in default and no external layer is applied.
 #[must_use]
 pub fn fallback_builtin() -> EffectiveConfig {
-    EffectiveConfig::default()
+    EffectiveConfig {
+        decoration: crate::types::DecorationConfig::safe(),
+        ..EffectiveConfig::default()
+    }
 }
 
 /// Whether a report means the previous good plan should be retained (R-009).
@@ -469,8 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_default() {
-        assert_eq!(fallback_builtin(), EffectiveConfig::default());
+    fn fallback_forces_safe_decoration() {
+        // CTX-0292: safe mode inverts decoration to 0/0/1/0 regardless of
+        // the (non-zero) built-in defaults; every other field is default.
+        let fallback = fallback_builtin();
+        assert_eq!(fallback.decoration, crate::types::DecorationConfig::safe());
+        assert_eq!(fallback.decoration.gaps_in, 0);
+        assert_eq!(fallback.decoration.gaps_out, 0);
+        assert_eq!(fallback.decoration.border, 1);
+        assert_eq!(fallback.decoration.radius, 0);
+        assert_ne!(
+            fallback.decoration,
+            crate::types::DecorationConfig::default()
+        );
+        assert_eq!(fallback.font, EffectiveConfig::default().font);
+        assert_eq!(fallback.window, EffectiveConfig::default().window);
+        fallback.validate().expect("safe fallback is valid");
     }
 
     #[test]
@@ -518,6 +570,12 @@ mod tests {
         // without restart, zero render effect).
         assert_eq!(classify_field("window.radius_px"), ReloadClass::Live);
         assert_eq!(classify_field("window"), ReloadClass::Live);
+        // CTX-0292: Core-owned decoration is stored + validated live.
+        assert_eq!(classify_field("decoration.gaps_in"), ReloadClass::Live);
+        assert_eq!(classify_field("decoration.gaps_out"), ReloadClass::Live);
+        assert_eq!(classify_field("decoration.border"), ReloadClass::Live);
+        assert_eq!(classify_field("decoration.radius"), ReloadClass::Live);
+        assert_eq!(classify_field("decoration"), ReloadClass::Live);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
 
@@ -544,6 +602,36 @@ mod tests {
         assert_eq!(cur.window.padding, 4);
         assert!((cur.window.opacity - 0.9).abs() < f32::EPSILON);
         assert_eq!(cur.window.radius_px, 12);
+    }
+
+    #[test]
+    fn diff_decoration_is_live_and_reconcile() {
+        // CTX-0292: every decoration field surfaces as a Live diff and
+        // reconciles into the effective config without restart.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.decoration.gaps_in = 0;
+        new.decoration.gaps_out = 0;
+        new.decoration.border = 1;
+        new.decoration.radius = 0;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        for field in [
+            "decoration.gaps_in",
+            "decoration.gaps_out",
+            "decoration.border",
+            "decoration.radius",
+        ] {
+            assert!(
+                r.diffs.iter().any(|d| d.field == field),
+                "missing diff {field}"
+            );
+        }
+        let mut cur = old;
+        let applied = reconcile_live(&mut cur, &new).expect("live must reconcile");
+        assert_eq!(applied.overall, ReloadClass::Live);
+        assert_eq!(cur.decoration, crate::types::DecorationConfig::safe());
     }
 
     #[test]

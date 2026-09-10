@@ -15,8 +15,8 @@
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
-    AppearanceConfig, FontConfig, KeymapEntry, LayoutConfig, MouseConfig, PluginSpec,
-    ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig, MouseConfig,
+    PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -41,6 +41,9 @@ pub struct ConfigPlan {
     pub selection: Option<SelectionConfig>,
     /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`).
     pub layout: Option<LayoutConfig>,
+    /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
+    /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
+    pub decoration: Option<DecorationConfig>,
     /// Scrollbar configuration (CTX-0181 `scrollbar.mode`/`scrollbar.width`).
     pub scrollbar: Option<ScrollbarConfig>,
     /// Mouse configuration (CTX-0260 `mouse.focus_follows_mouse`).
@@ -112,6 +115,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set workspace decoration.
+    #[must_use]
+    pub fn with_decoration(mut self, decoration: DecorationConfig) -> Self {
+        self.decoration = Some(decoration);
+        self
+    }
+
     /// Convenience builder: set scrollbar.
     #[must_use]
     pub fn with_scrollbar(mut self, scrollbar: ScrollbarConfig) -> Self {
@@ -170,6 +180,9 @@ impl ConfigPlan {
         if let Some(l) = &self.layout {
             l.validate()?;
         }
+        if let Some(d) = &self.decoration {
+            d.validate()?;
+        }
         if let Some(s) = &self.scrollbar {
             s.validate()?;
         }
@@ -220,6 +233,7 @@ impl ConfigPlan {
             && self.terminal.is_none()
             && self.selection.is_none()
             && self.layout.is_none()
+            && self.decoration.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.appearance.is_none()

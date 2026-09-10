@@ -3,6 +3,7 @@
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
 use super::*;
+use crate::config::decoration_runtime_error;
 
 pub(super) fn default_layout(cols: usize, rows: usize) -> LayoutNode {
     let view = View::new(ViewId::new(1), cols, rows);
@@ -65,6 +66,66 @@ impl Runtime {
     #[must_use]
     pub fn gaps(&self) -> Gaps {
         Gaps::new(self.config.gaps_in, self.config.gaps_out)
+    }
+
+    /// Core-owned workspace decoration from the validated runtime config
+    /// (CTX-0292; accepted spec CTX-0118 defaults `4/6/2/6` logical px).
+    ///
+    /// Decoration is never part of the `LayoutTree`; it is applied by
+    /// [`Self::decorated_allocations`] (and, in a later render stage, the
+    /// present path).
+    #[must_use]
+    pub fn decoration(&self) -> bitty_ui::Decoration {
+        self.config.decoration
+    }
+
+    /// Live-adopts a new Core-owned decoration without restart (CTX-0292).
+    ///
+    /// Validates fail-closed (accepted ranges: gaps `0..=32`, border
+    /// `0..=8`, radius `0..=16` logical px) and stores the value. The
+    /// present path does not paint px decoration yet (fractional-cell View
+    /// frames are a later stage), so this forces one full redraw and
+    /// nothing else changes today; the setter keeps the contract lock.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::InvalidConfig`] naming the out-of-range property.
+    pub fn set_decoration(&mut self, decoration: bitty_ui::Decoration) -> Result<(), RuntimeError> {
+        if let Err(err) = decoration.validate() {
+            return Err(decoration_runtime_error(err));
+        }
+        if decoration != self.config.decoration {
+            self.config.decoration = decoration;
+            self.pending_full_redraw = true;
+        }
+        Ok(())
+    }
+
+    /// Decorated View frames in logical pixels for the current workspace
+    /// area (CTX-0292 Core-owned decoration application).
+    ///
+    /// The workspace area is the layout container converted to logical px
+    /// with the live cell metrics (window padding is Window chrome, not
+    /// workspace decoration). The result applies the accepted contract:
+    /// `gaps_out` insets the area, `gaps_in` reserves the band between
+    /// siblings, `border` insets each frame's content, and `radius` is
+    /// carried for clipping. Pure and deterministic for the same layout,
+    /// container, metrics, and decoration.
+    #[must_use]
+    pub fn decorated_allocations(&self) -> Vec<(ViewId, bitty_ui::DecoratedView)> {
+        let live = self.live_cell_metrics();
+        let area = UiRect::new(
+            (u32::from(self.container.x).saturating_mul(live.width)).min(u32::from(u16::MAX))
+                as u16,
+            (u32::from(self.container.y).saturating_mul(live.height)).min(u32::from(u16::MAX))
+                as u16,
+            (u32::from(self.container.width).saturating_mul(live.width)).min(u32::from(u16::MAX))
+                as u16,
+            (u32::from(self.container.height).saturating_mul(live.height)).min(u32::from(u16::MAX))
+                as u16,
+        );
+        self.layout
+            .layout_with_decoration(area, self.config.decoration)
     }
 
     /// Leaf whose gapped allocation contains container-cell `(col, row)`

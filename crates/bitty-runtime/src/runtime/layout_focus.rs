@@ -44,22 +44,14 @@ pub struct PresentFrame {
 impl Runtime {
     /// Resizes the primary terminal grid to `cols` x `rows` (CTX-0294).
     ///
-    /// `State::resize` rewraps width and height in one pass: every blank
-    /// row is a logical, so when the height shrinks by one with content at
-    /// the top, the bottom-align step keeps the blank tail and moves the
-    /// content row into scrollback (the grid then shows blanks). Resizing
-    /// width first at the current height (bottom-align is a no-op when the
-    /// row count is unchanged) and then applying height-only (truncate/pad,
-    /// top-preserving) keeps the visible content. Deterministic; two
-    /// damage generations. The underlying one-call behavior is tracked as a
-    /// term-state follow-up (CTX-0294 finding).
+    /// `State::resize` bottom-aligns real content on a combined width+height
+    /// shrink while trailing blank viewport rows absorb the height reduction
+    /// first (CTX-0312), so a single call preserves the visible content
+    /// without the former two-phase resize workaround. Deterministic; one
+    /// damage generation.
     fn resize_primary_grid(&mut self, cols: usize, rows: usize) {
         if cols == self.state.width() && rows == self.state.height() {
             return;
-        }
-        if cols != self.state.width() {
-            let keep_rows = self.state.height();
-            let _ = self.state.resize(cols, keep_rows);
         }
         let _ = self.state.resize(cols, rows);
     }

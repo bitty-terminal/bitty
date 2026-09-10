@@ -235,7 +235,9 @@ impl State {
     /// their base cell (`Cell::zerowidth`) and are never torn. Overflow
     /// past `rows` feeds scrollback oldest-first (capped by the scrollback
     /// buffer's configured capacity); underflow pads the grid bottom with
-    /// blanks.
+    /// blanks. When the height shrinks in the same call, trailing blank
+    /// viewport rows absorb up to the height reduction first, so real content
+    /// is not bottom-aligned behind them into scrollback (CTX-0312).
     /// Scrollback ids are reassigned fresh (still monotonic) because the
     /// physical row count changes; `total_written` advances with them.
     /// The cursor follows its logical line/offset when the primary screen
@@ -474,8 +476,10 @@ impl State {
     /// Unwraps via soft-wrap flags, rewraps with wide-pair atomicity (see
     /// `rewrap_one_logical`), pads underflow at the grid bottom, caps
     /// scrollback at the buffer's configured capacity oldest-first, and
-    /// reassigns fresh monotonic scrollback ids. Deterministic, headless,
-    /// bounded.
+    /// reassigns fresh monotonic scrollback ids. Trailing blank viewport rows
+    /// absorb up to the height reduction before the bottom-align split
+    /// (CTX-0312), so a width+height shrink keeps real content visible.
+    /// Deterministic, headless, bounded.
     fn reflow_primary(
         grid: &mut crate::grid::Grid,
         scrollback: &mut crate::scrollback::Scrollback,
@@ -521,6 +525,29 @@ impl State {
         let mut physical: Vec<(Vec<Cell>, bool)> = Vec::new();
         for ll in &logicals {
             physical.extend(rewrap_one_logical(ll, new_cols, erase));
+        }
+        // CTX-0312: when the height shrinks in the same call as a width
+        // change, trailing blank viewport rows absorb the reduction first.
+        // Without this the bottom-align split keeps the blank tail and moves
+        // real content rows above it into scrollback (80x24 "hello world" ->
+        // resize(38, 23) used to leave sb=1 and a blank grid). Only up to the
+        // height delta is trimmed, so a width-only reflow never consumes blank
+        // rows and never pulls existing history back into the grid.
+        let shrink = old_rows.saturating_sub(new_rows);
+        if shrink > 0 {
+            let mut trimmed = 0;
+            while trimmed < shrink
+                && physical.len() > trimmed
+                && physical[physical.len() - 1 - trimmed]
+                    .0
+                    .iter()
+                    .all(Cell::is_blank)
+            {
+                trimmed += 1;
+            }
+            if trimmed > 0 {
+                physical.truncate(physical.len() - trimmed);
+            }
         }
         // Split bottom-aligned: last `new_rows` to grid, rest to scrollback.
         if physical.len() < new_rows {

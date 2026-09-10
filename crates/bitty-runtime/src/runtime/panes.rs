@@ -306,14 +306,10 @@ impl Runtime {
             let rows = frame.rows.max(1);
             if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {
                 if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
-                    // CTX-0294: width first at the old height, then
-                    // height-only — keeps top content visible instead of
-                    // bottom-aligning it into scrollback on a one-call
-                    // shrink (see `Runtime::resize_primary_grid`).
-                    if sess.state.width() != cols as usize {
-                        let keep_rows = sess.state.height();
-                        let _ = sess.state.resize(cols as usize, keep_rows);
-                    }
+                    // CTX-0312: a single resize preserves visible content;
+                    // trailing blank viewport rows absorb the height shrink
+                    // before any bottom-align into scrollback, so the former
+                    // two-phase workaround is gone.
                     let _ = sess.state.resize(cols as usize, rows as usize);
                     let _ = sess.pty.resize(cols, rows);
                 }

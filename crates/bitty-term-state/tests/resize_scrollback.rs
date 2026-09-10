@@ -16,6 +16,15 @@ fn prints(state: &mut State, text: &str) {
     }
 }
 
+fn grid_row_text(s: &State, row: usize) -> String {
+    let snap = s.snapshot();
+    let start = row * snap.width;
+    snap.cells[start..start + snap.width]
+        .iter()
+        .map(|cell| if cell.spacer { ' ' } else { cell.glyph })
+        .collect()
+}
+
 #[test]
 fn state_resize_changes_geometry_and_generates_full_damage() {
     let mut s = State::new();
@@ -273,6 +282,115 @@ fn scrollback_lines_resize_to_new_width_and_stay_monotonic() {
         combined.contains("line00"),
         "history must stay coherent after reflow"
     );
+}
+
+/// CTX-0312: a one-call width+height shrink must let trailing blank viewport
+/// rows absorb the height reduction instead of bottom-aligning real content
+/// behind them into scrollback. Observed pre-fix: 80x24 "hello world" ->
+/// `resize(38, 23)` left `scrollback_len() == 1` and a blank grid.
+#[test]
+fn resize_one_call_shrink_both_dims_keeps_top_content_visible() {
+    let mut s = State::new();
+    prints(&mut s, "hello world");
+    assert_eq!(s.scrollback_len(), 0);
+
+    s.resize(38, 23);
+
+    assert_eq!((s.width(), s.height()), (38, 23));
+    assert_eq!(
+        s.scrollback_len(),
+        0,
+        "blank tail rows must absorb the height shrink, not push content out"
+    );
+    assert_eq!(
+        grid_row_text(&s, 0).trim_end(),
+        "hello world",
+        "top content must stay on the visible grid"
+    );
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (0, 11),
+        "cursor stays anchored on its logical line"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+/// CTX-0312: when real content exceeds the new height, the newest rows stay
+/// visible (bottom-aligned) and the overflow is retained in scrollback,
+/// bounded by the configured capacity.
+#[test]
+fn resize_one_call_shrink_both_dims_retains_overflow_scrollback() {
+    let cap = 4;
+    let mut s = State::with_scrollback_lines(cap);
+    for i in 0..40 {
+        prints(&mut s, &format!("L{i:02}"));
+        s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+    assert_eq!(s.scrollback_len(), cap, "baseline retention cap holds");
+
+    s.resize(12, 6);
+
+    assert_eq!((s.width(), s.height()), (12, 6));
+    assert!(
+        s.scrollback_len() <= cap,
+        "scrollback retention must stay within the configured bound"
+    );
+    assert!(
+        grid_row_text(&s, 5).contains("L39"),
+        "newest content must remain visible after bottom-aligned reflow"
+    );
+    for line in s.scrollback() {
+        assert_eq!(line.cells.len(), 12);
+    }
+    assert!(s.check_invariants().is_ok());
+}
+
+/// CTX-0312 decision lock: a width-only reflow never consumes trailing blank
+/// viewport rows, so existing history is not pulled back into the grid.
+#[test]
+fn resize_width_only_keeps_scrollback_boundary() {
+    let mut s = State::new();
+    for i in 0..30 {
+        prints(&mut s, &format!("L{i:02}"));
+        s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+    let sb_before = s.scrollback_len();
+    assert!(sb_before > 0, "need history for the boundary check");
+    // Blank viewport tail: clear the grid without touching scrollback.
+    s.apply(&TerminalAction::EraseInDisplay {
+        mode: bitty_vt::EraseDisplayMode::All,
+    });
+
+    s.resize(40, 24);
+
+    assert_eq!(
+        s.scrollback_len(),
+        sb_before,
+        "width-only resize must preserve the scrollback boundary"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+/// CTX-0312: a cursor parked on a blank row below the content stays in-bounds
+/// and the content remains visible after a combined shrink.
+#[test]
+fn resize_one_call_shrink_both_dims_clamps_blank_cursor_row() {
+    let mut s = State::new();
+    prints(&mut s, "hello world");
+    s.apply(&TerminalAction::CursorPosition {
+        row: bitty_vt::Row(11),
+        col: bitty_vt::Col(1),
+    });
+
+    s.resize(38, 5);
+
+    assert_eq!((s.width(), s.height()), (38, 5));
+    assert!(
+        s.cursor().position.row < 5,
+        "cursor must clamp inside the shrunk grid"
+    );
+    assert_eq!(grid_row_text(&s, 0).trim_end(), "hello world");
+    assert!(s.check_invariants().is_ok());
 }
 
 #[test]

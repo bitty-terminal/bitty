@@ -178,12 +178,13 @@ fn headless_present_draw_list_validates_atlas_requirement() {
 
 #[test]
 fn headless_image_parity_is_observable_not_silent() {
-    // CTX-0253 F3: CPU/GPU parity for Kitty image blits must be observable
+    // CTX-0291: CPU/GPU parity for Kitty image blits is observable
     // headlessly. The headless fake blends the blit (pixels prove it) and
-    // reports it drawn; the display gate (`gpu_image_skip`) proves the
-    // real-GPU branch would report the same blit skipped — an explicit,
-    // logged divergence, never a silent one.
-    use bitty_render::gpu::gpu_image_skip;
+    // reports it drawn; the GPU upload planner (the real-GPU branch's
+    // single validation point) admits the same blit — nothing skipped —
+    // and refuses malformed input fail-closed instead of painting it
+    // partially.
+    use bitty_render::batch::plan_image_uploads;
     let blit = bitty_render::grid::ImageBlit::try_new(
         bitty_render::geometry::RectPx::new(1, 1, 2, 2),
         [0xFF, 0, 0, 0xFF].repeat(4),
@@ -211,11 +212,21 @@ fn headless_image_parity_is_observable_not_silent() {
         let idx = (ry * 8 + rx) * 4;
         assert_eq!(&rgba[idx..idx + 4], &[0xFF, 0, 0, 0xFF], "{rx},{ry}");
     }
-    // Gate proof: the same frame on a real surface reports the blit
-    // skipped (fail-closed + loud warn at the call site), so the two paths
-    // disagree observably instead of silently.
-    assert_eq!(gpu_image_skip(true, list.images.len()), 0);
-    assert_eq!(gpu_image_skip(false, list.images.len()), 1);
+    // GPU parity proof: the planner admits the same blit for upload on a
+    // device whose 2D limit fits it (nothing skipped) ...
+    let plan = plan_image_uploads(&list.images, 4096);
+    assert_eq!(plan.admitted, vec![0]);
+    assert_eq!(plan.skipped, 0);
+    // ... and refuses malformed bytes fail-closed, counted (the headless
+    // compositor also skips them), so neither path can diverge silently.
+    let mut malformed = list.clone();
+    malformed.images.push(bitty_render::grid::ImageBlit {
+        dest: bitty_render::geometry::RectPx::new(0, 0, 2, 2),
+        rgba: vec![1; 7],
+    });
+    let plan = plan_image_uploads(&malformed.images, 4096);
+    assert_eq!(plan.admitted, vec![0]);
+    assert_eq!(plan.skipped, 1);
 }
 
 // ---------------------------------------------------------------------------

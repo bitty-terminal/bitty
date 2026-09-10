@@ -26,6 +26,13 @@
 //! without limit; callers draw chunk after chunk reusing the same bounded
 //! buffers (see [`chunk_fills`], [`chunk_atlas_glyphs`]).
 //!
+//! Kitty image blits (CTX-0291) are bounded by [`plan_image_uploads`]
+//! before any allocation: at most [`MAX_IMAGE_BLITS_PER_FRAME`] uploads and
+//! [`MAX_IMAGE_UPLOAD_BYTES_PER_FRAME`] padded staging bytes per frame
+//! (mirroring the rich layer's present budget), each blit additionally
+//! checked against the device's 2D texture limit. Refused blits are
+//! skipped fail-closed and counted — never partially uploaded.
+//!
 //! # Atlas uploads
 //!
 //! The CPU atlas (`GlyphAtlas` texels + [`AtlasDims`]) is the source of
@@ -42,7 +49,7 @@
 use crate::atlas::AtlasDims;
 use crate::error::RenderError;
 use crate::geometry::{ExtentPx, RectPx};
-use crate::grid::{FillRect, GlyphInstance, GlyphSource, Rgba8};
+use crate::grid::{FillRect, GlyphInstance, GlyphSource, ImageBlit, Rgba8};
 
 /// Maximum fill quads per vertex-buffer upload chunk.
 ///
@@ -86,6 +93,27 @@ pub const FILL_VERTEX_SIZE_BYTES: usize = 24;
 /// Bytes per glyph vertex: `pos: vec2<f32>` + `uv: vec2<f32>` +
 /// `color: vec4<f32>`.
 pub const GLYPH_VERTEX_SIZE_BYTES: usize = 32;
+
+/// Bytes per image vertex: `pos: vec2<f32>` + `uv: vec2<f32>`.
+pub const IMAGE_VERTEX_SIZE_BYTES: usize = 16;
+
+/// Maximum Kitty image blits the real-GPU path uploads per frame.
+///
+/// Mirrors the rich layer's `KITTY_PRESENT_MAX_BLITS_PER_FRAME` present
+/// budget (pinned by a cross-crate test in `bitty-runtime`): the GPU can
+/// never be asked to upload more blits than the runtime already admitted.
+/// Excess blits are skipped fail-closed and counted, never dropped silently.
+pub const MAX_IMAGE_BLITS_PER_FRAME: usize = 32;
+
+/// Maximum padded staging bytes the real-GPU path uploads per frame.
+///
+/// Mirrors the rich layer's `KITTY_PRESENT_MAX_BYTES_PER_FRAME` present
+/// budget (pinned by a cross-crate test in `bitty-runtime`). The check runs
+/// before any staging allocation and counts the padded row stride the
+/// `queue.write_texture` alignment requires, so a frame can never allocate
+/// more than this bound regardless of blit shapes. Excess blits are skipped
+/// fail-closed and counted.
+pub const MAX_IMAGE_UPLOAD_BYTES_PER_FRAME: usize = 64 * 1024 * 1024;
 
 /// Vertices per quad and indices per quad (two triangles).
 pub const VERTICES_PER_QUAD: usize = 4;
@@ -688,6 +716,147 @@ pub fn indices_to_le_bytes(indices: &[u16]) -> Vec<u8> {
     out
 }
 
+/// Padded `bytes_per_row` for a tightly packed RGBA8 row of `width` texels.
+///
+/// Returns `None` when `width * 4` overflows a `u32` (fail-closed; callers
+/// treat that as an unuploadable blit).
+#[must_use]
+pub fn padded_rgba_bytes_per_row(width: u32) -> Option<u32> {
+    width
+        .checked_mul(4)?
+        .checked_next_multiple_of(COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
+/// Builds a padded staging buffer holding one straight-alpha RGBA8 image.
+///
+/// `queue.write_texture` requires `bytes_per_row` to be a multiple of
+/// [`COPY_BYTES_PER_ROW_ALIGNMENT`], so rows are copied into a zero-padded
+/// buffer. Returns `None` when the extents are zero, the bytes do not match
+/// `width * height * 4`, or the padded size overflows (fail-closed; nothing
+/// is allocated for refused blits).
+#[must_use]
+pub fn build_padded_rgba(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let row = (width as usize).checked_mul(4)?;
+    if rgba.len() != row.checked_mul(height as usize)? {
+        return None;
+    }
+    let padded = padded_rgba_bytes_per_row(width)? as usize;
+    let mut out = vec![0u8; padded.checked_mul(height as usize)?];
+    for y in 0..height as usize {
+        out[y * padded..y * padded + row].copy_from_slice(&rgba[y * row..y * row + row]);
+    }
+    Some(out)
+}
+
+/// Serializes one image quad (4 vertices, 64 bytes: `pos + uv` each) or
+/// `None` when the rect or surface is empty. UV `(0,0)` is the texture's
+/// top-left texel, matching the top-down row-major upload. Off-surface
+/// quads are still emitted (the GPU clips them); only empty inputs are
+/// skipped.
+#[must_use]
+pub fn image_quad_bytes(
+    dest: RectPx,
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+) -> Option<[u8; 64]> {
+    if dest.width == 0 || dest.height == 0 || surface_w == 0 || surface_h == 0 {
+        return None;
+    }
+    let w = surface_w as f32;
+    let h = surface_h as f32;
+    let x0 = dest.x as f32 * scale;
+    let y0 = dest.y as f32 * scale;
+    let x1 = (dest.x as f32 + dest.width as f32) * scale;
+    let y1 = (dest.y as f32 + dest.height as f32) * scale;
+    let corners = [
+        (x0, y0, 0.0_f32, 0.0_f32),
+        (x1, y0, 1.0, 0.0),
+        (x1, y1, 1.0, 1.0),
+        (x0, y1, 0.0, 1.0),
+    ];
+    let mut out = [0u8; 64];
+    for (i, (px, py, u, v)) in corners.iter().enumerate() {
+        let ndc = pixel_to_ndc(*px, *py, w, h);
+        let base = i * IMAGE_VERTEX_SIZE_BYTES;
+        out[base..base + 4].copy_from_slice(&ndc[0].to_le_bytes());
+        out[base + 4..base + 8].copy_from_slice(&ndc[1].to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&u.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&v.to_le_bytes());
+    }
+    Some(out)
+}
+
+/// Bounded per-frame upload plan for Kitty image blits (CTX-0291).
+///
+/// The real-GPU path owns no image validation of its own: this plan decides
+/// exactly which `DrawList.images` entries are uploadable, in paint order,
+/// under the count and byte caps ([`MAX_IMAGE_BLITS_PER_FRAME`],
+/// [`MAX_IMAGE_UPLOAD_BYTES_PER_FRAME`]) plus a per-dimension device limit.
+/// Refused entries are counted in `skipped` so the caller can warn and
+/// report them in `PresentStats::images_skipped` — never a silent
+/// CPU/GPU divergence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageUploadPlan {
+    /// Indices into the source `images` admitted for upload, paint order.
+    pub admitted: Vec<usize>,
+    /// Entries refused: zero-sized, malformed bytes, over the dimension
+    /// limit, or over a per-frame cap.
+    pub skipped: usize,
+    /// Total padded staging bytes the admitted uploads will allocate.
+    pub upload_bytes: usize,
+}
+
+/// Plans the bounded GPU uploads for one frame's Kitty image blits.
+///
+/// `max_dimension` is the device's `max_texture_dimension_2d`; blits whose
+/// destination side exceeds it (or zero) cannot become a texture and are
+/// refused. Refusal is skip-and-continue in paint order, so a malformed or
+/// oversized entry never blocks the rest of the frame.
+#[must_use]
+pub fn plan_image_uploads(images: &[ImageBlit], max_dimension: u32) -> ImageUploadPlan {
+    let mut plan = ImageUploadPlan {
+        admitted: Vec::new(),
+        skipped: 0,
+        upload_bytes: 0,
+    };
+    for (index, blit) in images.iter().enumerate() {
+        let dest = blit.dest;
+        let expected = (u64::from(dest.width))
+            .checked_mul(u64::from(dest.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|&bytes| bytes <= usize::MAX as u64);
+        let valid = dest.width != 0
+            && dest.height != 0
+            && dest.width <= max_dimension
+            && dest.height <= max_dimension
+            && max_dimension != 0
+            && expected.is_some_and(|bytes| bytes as usize == blit.rgba.len());
+        if !valid {
+            plan.skipped += 1;
+            continue;
+        }
+        let padded = padded_rgba_bytes_per_row(dest.width)
+            .and_then(|row| (row as usize).checked_mul(dest.height as usize));
+        let Some(padded) = padded else {
+            plan.skipped += 1;
+            continue;
+        };
+        if plan.admitted.len() >= MAX_IMAGE_BLITS_PER_FRAME
+            || plan.upload_bytes.saturating_add(padded) > MAX_IMAGE_UPLOAD_BYTES_PER_FRAME
+        {
+            plan.skipped += 1;
+            continue;
+        }
+        plan.upload_bytes += padded;
+        plan.admitted.push(index);
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,5 +1207,112 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn image_quad_bytes_emits_ndc_and_uv_corners() {
+        let quad = image_quad_bytes(RectPx::new(1, 1, 2, 2), 8, 8, 1.0).expect("non-empty");
+        assert_eq!(quad.len(), 64);
+        let f = |o: usize| f32::from_le_bytes(quad[o..o + 4].try_into().unwrap());
+        // Vertex 0: pixel (1,1) -> NDC (-0.75, 0.75), uv (0,0).
+        assert!((f(0) - (-0.75)).abs() < 1e-6);
+        assert!((f(4) - 0.75).abs() < 1e-6);
+        assert_eq!(f(8), 0.0);
+        assert_eq!(f(12), 0.0);
+        // Vertex 2: pixel (3,3) -> NDC (-0.25, 0.25), uv (1,1).
+        assert!((f(32) - (-0.25)).abs() < 1e-6);
+        assert!((f(36) - 0.25).abs() < 1e-6);
+        assert_eq!(f(40), 1.0);
+        assert_eq!(f(44), 1.0);
+        // Scale multiplies pixel corners before the NDC map.
+        let scaled = image_quad_bytes(RectPx::new(1, 1, 2, 2), 16, 16, 2.0).expect("non-empty");
+        let g = |o: usize| f32::from_le_bytes(scaled[o..o + 4].try_into().unwrap());
+        assert!((g(0) - (-0.75)).abs() < 1e-6);
+        assert!((g(36) - 0.25).abs() < 1e-6);
+        // Degenerate inputs are refused.
+        assert!(image_quad_bytes(RectPx::new(0, 0, 0, 2), 8, 8, 1.0).is_none());
+        assert!(image_quad_bytes(RectPx::new(0, 0, 2, 2), 0, 8, 1.0).is_none());
+    }
+
+    #[test]
+    fn build_padded_rgba_keeps_bytes_and_row_alignment() {
+        // One 1x2 RGBA image: each 4-byte row pads to the 256-byte
+        // `COPY_BYTES_PER_ROW_ALIGNMENT`.
+        let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let padded = build_padded_rgba(&rgba, 1, 2).expect("valid");
+        assert_eq!(padded.len(), 512);
+        assert_eq!(&padded[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&padded[256..260], &[5, 6, 7, 8]);
+        assert!(padded[4..256].iter().all(|&b| b == 0));
+        assert_eq!(padded_rgba_bytes_per_row(1), Some(256));
+        assert_eq!(padded_rgba_bytes_per_row(64), Some(256));
+        assert_eq!(padded_rgba_bytes_per_row(65), Some(512));
+        assert!(build_padded_rgba(&rgba, 3, 1).is_none());
+        assert!(build_padded_rgba(&[], 0, 1).is_none());
+        assert!(build_padded_rgba(&rgba, 1, 0).is_none());
+    }
+
+    fn image_blit(width: u32, height: u32, value: u8) -> crate::grid::ImageBlit {
+        crate::grid::ImageBlit::try_new(
+            RectPx::new(0, 0, width, height),
+            vec![value; width as usize * height as usize * 4],
+        )
+        .expect("matching bytes")
+    }
+
+    #[test]
+    fn image_upload_plan_admits_valid_and_skips_malformed() {
+        let ok = image_blit(2, 2, 0x11);
+        let mut zero = ok.clone();
+        zero.dest = RectPx::new(0, 0, 0, 2);
+        let mut short = ok.clone();
+        short.rgba = vec![0u8; 7];
+        let oversize = image_blit(3, 1, 0x22);
+        let plan = plan_image_uploads(&[ok, zero, short, oversize], 2);
+        assert_eq!(plan.admitted, vec![0]);
+        assert_eq!(plan.skipped, 3);
+        assert_eq!(plan.upload_bytes, 256 * 2);
+    }
+
+    #[test]
+    fn image_upload_plan_enforces_blit_count_cap() {
+        let images: Vec<_> = (0..MAX_IMAGE_BLITS_PER_FRAME + 3)
+            .map(|i| image_blit(1, 1, i as u8))
+            .collect();
+        let plan = plan_image_uploads(&images, 4096);
+        assert_eq!(plan.admitted.len(), MAX_IMAGE_BLITS_PER_FRAME);
+        assert_eq!(plan.skipped, 3);
+        assert_eq!(plan.upload_bytes, MAX_IMAGE_BLITS_PER_FRAME * 256);
+    }
+
+    #[test]
+    fn image_upload_plan_enforces_byte_budget() {
+        // 4096 x 4096 RGBA is exactly the per-frame byte budget; a second
+        // copy must be refused (fail-closed, counted) while the first still
+        // uploads.
+        let side = 4096u32;
+        assert_eq!(
+            side as usize * side as usize * 4,
+            MAX_IMAGE_UPLOAD_BYTES_PER_FRAME
+        );
+        let big = image_blit(side, side, 0x33);
+        let plan = plan_image_uploads(&[big.clone(), big], side);
+        assert_eq!(plan.admitted, vec![0]);
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(plan.upload_bytes, MAX_IMAGE_UPLOAD_BYTES_PER_FRAME);
+    }
+
+    #[test]
+    fn image_upload_plan_refuses_oversize_beyond_device_limit() {
+        let wide = image_blit(65, 1, 0x44);
+        let plan = plan_image_uploads(&[wide], 64);
+        assert!(plan.admitted.is_empty());
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(plan.upload_bytes, 0);
+        // A zero device limit refuses everything rather than underflowing.
+        let tiny = image_blit(1, 1, 0x45);
+        let plan = plan_image_uploads(&[tiny], 0);
+        assert!(plan.admitted.is_empty());
+        assert_eq!(plan.skipped, 1);
     }
 }

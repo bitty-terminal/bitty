@@ -478,31 +478,15 @@ pub struct PresentStats {
     pub headless: bool,
     /// Number of Kitty image blits in the presented `DrawList`.
     pub images: usize,
-    /// Image blits skipped by the real-GPU path (CTX-0253 F3 display gate).
+    /// Image blits the presenting path did not paint.
     ///
     /// Always `0` on headless fakes (every blit is blended) and on
-    /// clear-only presents. Non-zero only on a real surface while the
-    /// texture-upload path is pending — the skip is fail-closed and loud
-    /// (see [`gpu_image_skip`]), never a silent CPU/GPU divergence.
+    /// clear-only presents. On a real surface the GPU pass uploads and
+    /// paints every blit (CTX-0291); a non-zero count means individual
+    /// blits were refused fail-closed (malformed bytes, over the device
+    /// texture limit, or over a per-frame bound) and the caller warned.
+    /// The refusal is counted and loud — never a silent CPU/GPU divergence.
     pub images_skipped: usize,
-}
-
-/// Fail-closed display gate for Kitty image blits on the real-GPU path
-/// (CTX-0253 F3).
-///
-/// The textured upload path has not landed, so the real GPU cannot paint
-/// `DrawList.images` while both CPU compositors (`headless_present` and the
-/// `sw-fallback` `draw_list_onto`) blend every entry. This helper makes the
-/// divergence explicit instead of silent: headless draws everything
-/// (`0` skipped), a real surface skips everything (`image_count` skipped)
-/// and the caller warns loudly plus reports the count in
-/// [`PresentStats::images_skipped`].
-///
-/// Headless-testable by design: no adapter or window is required to prove
-/// the two paths disagree observably (see the `gpu_image_gate_*` tests).
-#[must_use]
-pub const fn gpu_image_skip(is_headless: bool, image_count: usize) -> usize {
-    if is_headless { 0 } else { image_count }
 }
 
 #[derive(Debug)]
@@ -1113,8 +1097,7 @@ impl Surface {
                 // Kitty images (CTX-0248): topmost present-layer blits,
                 // above fills and glyphs, never grid truth. The headless
                 // CPU compositor blends every entry; the real-GPU branch
-                // below skips them fail-closed via the CTX-0253 F3 gate
-                // (`PresentStats::images_skipped` + loud warn).
+                // below uploads and paints them since CTX-0291.
                 for blit in &draw_list.images {
                     blend_rgba_blit_rgba(&mut rgba, width, height, blit);
                 }
@@ -1131,7 +1114,7 @@ impl Surface {
                     glyphs: draw_list.glyphs.len(),
                     headless: true,
                     images: draw_list.images.len(),
-                    images_skipped: gpu_image_skip(true, draw_list.images.len()),
+                    images_skipped: 0,
                 })
             }
             SurfaceKind::Gpu { surface, .. } => {
@@ -1211,7 +1194,7 @@ impl Surface {
                 // target (CTX-0222) and premultiplied by the effective
                 // opacity (CTX-0290), matching the clear-only path above.
                 let clear = premultiplied_clear(opacity);
-                {
+                let images_skipped = {
                     let mut state = self.state.lock().expect("surface state poisoned");
                     let resources = state.resources.as_mut().ok_or_else(|| {
                         RenderError::UpstreamGraphics("GPU resources missing after creation".into())
@@ -1229,18 +1212,17 @@ impl Surface {
                             clear,
                             opacity,
                         )
-                        .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
-                }
-                // CTX-0253 F3 display gate: the textured image-upload path
-                // has not landed, so this branch cannot paint
-                // `draw_list.images` (see `GpuResources::draw_frame`). The
-                // skip is fail-closed and loud — `images_skipped` carries
-                // the count and a warn names it — so CPU (headless) and GPU
-                // presents never diverge silently.
-                let images_skipped = gpu_image_skip(false, draw_list.images.len());
+                        .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?
+                };
+                // CTX-0291: the real-GPU pass uploads and paints kitty image
+                // blits (the CTX-0253 F3 skip gate is retired). A non-zero
+                // skip count means individual blits were refused fail-closed
+                // (malformed, over the device texture limit, or over a
+                // per-frame bound); warn and report so a divergence from the
+                // CPU compositors is never silent.
                 if images_skipped > 0 {
                     eprintln!(
-                        "bitty: real-GPU present skips {images_skipped} kitty image blit(s) (texture-upload pending; headless CPU blends them)"
+                        "bitty: real-GPU present skipped {images_skipped} kitty image blit(s) (fail-closed: malformed or over budget; headless CPU blends them)"
                     );
                 }
                 frame.present();
@@ -1410,8 +1392,8 @@ impl Surface {
         }
         // Kitty images (CTX-0248): topmost present-layer blits (see the
         // `present_draw_list` headless branch for the z-order contract).
-        // CTX-0253 F3: headless blends every entry (`images_skipped` stays
-        // 0); the real-GPU branch skips via `gpu_image_skip`.
+        // Headless blends every entry (`images_skipped` stays 0); the
+        // real-GPU branch uploads and paints them since CTX-0291.
         for blit in &draw_list.images {
             blend_rgba_blit_rgba(&mut rgba, width, height, blit);
         }
@@ -1429,7 +1411,7 @@ impl Surface {
             glyphs: draw_list.glyphs.len(),
             headless: true,
             images: draw_list.images.len(),
-            images_skipped: gpu_image_skip(true, draw_list.images.len()),
+            images_skipped: 0,
         })
     }
 
@@ -2384,17 +2366,41 @@ mod tests {
     }
 
     #[test]
-    fn gpu_image_gate_is_explicit_never_silent() {
-        // CTX-0253 F3: the CPU/GPU divergence decision is a pure,
-        // headless-testable function. Headless blends everything (nothing
-        // skipped); a real surface skips everything while the
-        // texture-upload path is pending. Both outcomes are observable via
-        // `PresentStats::images_skipped` — no silent branch exists.
-        assert_eq!(gpu_image_skip(true, 0), 0);
-        assert_eq!(gpu_image_skip(true, 3), 0);
-        assert_eq!(gpu_image_skip(false, 0), 0);
-        assert_eq!(gpu_image_skip(false, 1), 1);
-        assert_eq!(gpu_image_skip(false, 64), 64);
+    fn gpu_image_upload_plan_parity_with_headless_is_observable() {
+        // CTX-0291: the CTX-0253 F3 skip gate is retired. The same 2x2
+        // opaque red blit headless blends is admitted by the GPU upload
+        // planner (nothing skipped), and a malformed literal is refused
+        // fail-closed and counted on the GPU side. Both paths stay
+        // observable through `PresentStats`/`ImageUploadPlan`.
+        use crate::batch::plan_image_uploads;
+        use crate::geometry::RectPx;
+        use crate::grid::ImageBlit;
+        let blit = ImageBlit::try_new(RectPx::new(1, 1, 2, 2), [0xFF, 0, 0, 0xFF].repeat(4))
+            .expect("blit bytes match extent");
+        let list = image_test_list(vec![blit]);
+        let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("headless");
+        let stats = surface.headless_present(&list, None).expect("present");
+        assert_eq!(stats.images, 1);
+        assert_eq!(stats.images_skipped, 0);
+        // Pixel proof: the blit really blended headlessly.
+        let rgba = surface.headless_rgba().expect("rgba");
+        let idx = (8 + 1) * 4;
+        assert_eq!(&rgba[idx..idx + 4], &[0xFF, 0, 0, 0xFF]);
+        // GPU parity: the planner admits the same blit for texture upload
+        // (4096 is the smallest 2D texture limit across wgpu backends).
+        let plan = plan_image_uploads(&list.images, 4096);
+        assert_eq!(plan.admitted, vec![0]);
+        assert_eq!(plan.skipped, 0);
+        // A malformed literal is refused and counted; the valid blit still
+        // uploads (skip-and-continue, never a silent partial paint).
+        let mut malformed = list.clone();
+        malformed.images.push(ImageBlit {
+            dest: RectPx::new(0, 0, 2, 2),
+            rgba: vec![1; 7],
+        });
+        let plan = plan_image_uploads(&malformed.images, 4096);
+        assert_eq!(plan.admitted, vec![0]);
+        assert_eq!(plan.skipped, 1);
     }
 
     #[test]
@@ -2430,5 +2436,199 @@ mod tests {
         let stats = surface.headless_present(&empty, None).expect("present");
         assert_eq!(stats.images, 0);
         assert_eq!(stats.images_skipped, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Real GPU: env-gated offscreen render + readback (no window/display)
+    // -----------------------------------------------------------------------
+
+    fn gpu_tests_enabled() -> bool {
+        matches!(std::env::var("BITTY_RENDER_GPU_TESTS").as_deref(), Ok("1"))
+    }
+
+    /// Minimal blocking executor (no runtime dependency; mirrors the
+    /// integration-test helper in `tests/wgpu_surface.rs`).
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Notify(Arc<(Mutex<bool>, Condvar)>);
+        impl Wake for Notify {
+            fn wake(self: Arc<Self>) {
+                let (flag, cv) = &*self.0;
+                *flag.lock().unwrap() = true;
+                cv.notify_all();
+            }
+        }
+
+        let mut f = Box::pin(f);
+        let state = Arc::new((Mutex::new(false), Condvar::new()));
+        let waker = Waker::from(Arc::new(Notify(Arc::clone(&state))));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => {
+                    let (flag, cv) = &*state;
+                    let mut sig = flag.lock().unwrap();
+                    while !*sig {
+                        sig = cv.wait(sig).unwrap();
+                    }
+                    *sig = false;
+                }
+            }
+        }
+    }
+
+    /// CTX-0291 GPU-path integration: uploads Kitty blits into textures and
+    /// proves real painted pixels by offscreen render + readback. Gated by
+    /// `BITTY_RENDER_GPU_TESTS=1` (CI has no adapter, so it skips cleanly).
+    #[test]
+    fn real_gpu_offscreen_present_uploads_and_paints_images() {
+        if !gpu_tests_enabled() {
+            eprintln!("skipped: BITTY_RENDER_GPU_TESTS != 1");
+            return;
+        }
+        let ctx = match block_on(GpuContext::initialize()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!("adapter unavailable despite BITTY_RENDER_GPU_TESTS=1: {e}");
+                return;
+            }
+        };
+        let (width, height) = (32u32, 32u32);
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bitty-test-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut resources = crate::pipeline::GpuResources::create(
+            &ctx.device,
+            format,
+            crate::atlas::AtlasDims {
+                width: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+                height: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+            },
+        )
+        .expect("image/glyph resources");
+        // Opaque red at (4,4), opaque blue at (8,8), plus one malformed
+        // literal that must be refused fail-closed and counted.
+        let list = DrawList {
+            generation: 1,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(width, height),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, width, height)],
+            },
+            fills: vec![],
+            glyphs: vec![],
+            images: vec![
+                crate::grid::ImageBlit::try_new(
+                    crate::geometry::RectPx::new(4, 4, 2, 2),
+                    [0xFF, 0, 0, 0xFF].repeat(4),
+                )
+                .expect("red blit"),
+                crate::grid::ImageBlit::try_new(
+                    crate::geometry::RectPx::new(8, 8, 2, 2),
+                    [0, 0, 0xFF, 0xFF].repeat(4),
+                )
+                .expect("blue blit"),
+                crate::grid::ImageBlit {
+                    dest: crate::geometry::RectPx::new(0, 0, 2, 2),
+                    rgba: vec![1; 7],
+                },
+            ],
+        };
+        let skipped = resources
+            .draw_frame(
+                &ctx.device,
+                &ctx.queue,
+                &view,
+                width,
+                height,
+                1.0,
+                &list,
+                None,
+                wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                1.0,
+            )
+            .expect("offscreen draw");
+        assert_eq!(skipped, 1, "malformed blit refused fail-closed");
+        // Readback (`copy_texture_to_buffer` needs 256-byte row alignment).
+        let bytes_per_row = 256u32;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bitty-test-readback"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-test-readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        ctx.device.poll(wgpu::PollType::Wait).expect("device poll");
+        rx.recv().expect("map callback").expect("buffer map");
+        let data = slice.get_mapped_range();
+        let pixel = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+            let offset = (y * bytes_per_row + x * 4) as usize;
+            (
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            )
+        };
+        // BGRA target: opaque red stores as (B,G,R,A) = (0,0,255,255) and
+        // opaque blue as (255,0,0,255); outside the blits is clear black.
+        assert_eq!(pixel(4, 4), (0, 0, 255, 255), "red blit painted");
+        assert_eq!(pixel(5, 5), (0, 0, 255, 255), "red blit painted");
+        assert_eq!(pixel(8, 8), (255, 0, 0, 255), "blue blit painted");
+        assert_eq!(pixel(0, 0), (0, 0, 0, 255), "clear untouched");
+        drop(data);
+        readback.unmap();
     }
 }

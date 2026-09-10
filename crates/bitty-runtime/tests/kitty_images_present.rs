@@ -337,11 +337,11 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
 
 #[test]
 fn tick_stats_report_images_drawn_not_skipped() {
-    // CTX-0253 F3: CPU/GPU image parity is observable end to end. The
+    // CTX-0291: CPU/GPU image parity is observable end to end. The
     // headless seam blends the blit, so the tick stats must report it
-    // drawn (`images == 1`, `images_skipped == 0`); a real-GPU present of
-    // the same frame would report `images_skipped == 1` via the display
-    // gate instead of diverging silently.
+    // drawn (`images == 1`, `images_skipped == 0`); the real-GPU branch
+    // uploads and paints the same blit, reporting a skip only for
+    // malformed or over-budget blits instead of diverging silently.
     let mut rt = make_runtime();
     rt.kitty_display_image(32, Some(2), Some(2), None, 2, 2, &red_2x2(), 0)
         .expect("display must succeed");
@@ -355,4 +355,20 @@ fn tick_stats_report_images_drawn_not_skipped() {
     let stats = rt.tick().expect("text forces a present");
     assert_eq!(stats.images, 0);
     assert_eq!(stats.images_skipped, 0);
+}
+
+#[test]
+fn gpu_image_budget_mirrors_rich_present_budget() {
+    // CTX-0291: the real-GPU upload path re-derives the rich layer's
+    // per-frame present budget as compile-time caps (the render crate
+    // cannot depend on rich, so the mirror cannot be a `use`). Pin the
+    // pairs here so they can never drift silently.
+    assert_eq!(
+        bitty_render::batch::MAX_IMAGE_BLITS_PER_FRAME,
+        bitty_rich::KITTY_PRESENT_MAX_BLITS_PER_FRAME,
+    );
+    assert_eq!(
+        bitty_render::batch::MAX_IMAGE_UPLOAD_BYTES_PER_FRAME,
+        bitty_rich::KITTY_PRESENT_MAX_BYTES_PER_FRAME,
+    );
 }

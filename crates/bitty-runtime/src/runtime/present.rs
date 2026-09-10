@@ -119,10 +119,12 @@ pub struct PresentStats {
     pub generation: u64,
     /// Number of Kitty image blits in the presented draw list.
     pub images: usize,
-    /// Image blits skipped by the real-GPU path (CTX-0253 F3 display gate).
+    /// Image blits the presenting path did not paint.
     ///
-    /// Always `0` on the headless seam (every blit is blended); non-zero
-    /// only on a real surface while the texture-upload path is pending.
+    /// Always `0` on the headless seam (every blit is blended). On a real
+    /// surface the GPU pass uploads and paints every blit (CTX-0291);
+    /// non-zero means individual blits were refused fail-closed
+    /// (malformed, oversized, or over a per-frame bound).
     pub images_skipped: usize,
 }
 

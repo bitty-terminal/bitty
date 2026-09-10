@@ -64,6 +64,9 @@
 #   - The `#[cfg(test)]`-region rule uses the FIRST `#[cfg(test)]` line per
 #     file; prod code placed after a trailing test module would be wrongly
 #     exempt (no such layout exists today; keep test modules trailing).
+#     Extracted unit-test modules named `tests.rs` under `src/` are treated
+#     as test-only regions by name, because their `#[cfg(test)]` lives on the
+#     parent's `mod tests;` declaration (CTX-0304).
 #   - Rule 3 does not scan `docs/`, `crates/*/tests/`, or fixtures: docs
 #     record historical machine paths and `.bin` capture corpora embed
 #     whatever host produced them (sanitizing fixtures is a separate task).
@@ -114,8 +117,15 @@ for file in "${SRC_FILES[@]}"; do
 	[[ "$file" == "$SELF" ]] && continue
 	test_from=0
 	if [[ "$file" == *.rs ]]; then
-		test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
-		test_from="${test_from:-0}"
+		if [[ "$(basename "$file")" == "tests.rs" ]]; then
+			# Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
+			# attribute lives on the parent's `mod tests;` declaration, so
+			# the whole file is a test-only region.
+			test_from=1
+		else
+			test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
+			test_from="${test_from:-0}"
+		fi
 	fi
 	while IFS= read -r hit; do
 		lineno="${hit%%:*}"
@@ -149,8 +159,15 @@ for file in "${SRC_FILES[@]}"; do
 	[[ "$file" == "$SELF" ]] && continue
 	test_from=0
 	if [[ "$file" == *.rs ]]; then
-		test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
-		test_from="${test_from:-0}"
+		if [[ "$(basename "$file")" == "tests.rs" ]]; then
+			# Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
+			# attribute lives on the parent's `mod tests;` declaration, so
+			# the whole file is a test-only region.
+			test_from=1
+		else
+			test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
+			test_from="${test_from:-0}"
+		fi
 	fi
 	while IFS= read -r hit; do
 		lineno="${hit%%:*}"

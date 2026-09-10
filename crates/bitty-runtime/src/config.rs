@@ -197,6 +197,12 @@ pub struct RuntimeConfig {
     pub scrollbar_width: u32,
 }
 
+/// Default cell width in logical pixels (CTX-0157 breathing-room cell).
+pub const DEFAULT_CELL_WIDTH: u32 = 9;
+
+/// Default cell height in logical pixels (CTX-0157 breathing-room cell).
+pub const DEFAULT_CELL_HEIGHT: u32 = 19;
+
 /// Default font family (CTX-0157 acceptance probe).
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
 
@@ -211,8 +217,8 @@ impl Default for RuntimeConfig {
         Self {
             cols: bitty_term_state::GRID_COLUMNS,
             rows: bitty_term_state::GRID_ROWS,
-            cell_width: 9,
-            cell_height: 19,
+            cell_width: DEFAULT_CELL_WIDTH,
+            cell_height: DEFAULT_CELL_HEIGHT,
             cold_queue_capacity: 256,
             font_family: font_default_family(),
             font_size: 12.0,
@@ -320,7 +326,8 @@ impl RuntimeConfig {
                 "scroll_pixels_per_notch must be within [1, 256]",
             ));
         }
-        if self.cols > 1000 || self.rows > 1000 {
+        if self.cols > bitty_term_state::MAX_GRID_DIM || self.rows > bitty_term_state::MAX_GRID_DIM
+        {
             return Err(RuntimeError::InvalidConfig(
                 "grid dimensions must be <= 1000",
             ));
@@ -376,7 +383,10 @@ impl RuntimeConfig {
     pub fn grid_from_pixels(&self, size: bitty_platform::PhysicalSize) -> (usize, usize) {
         let cols = (size.width() / self.cell_width).max(1) as usize;
         let rows = (size.height() / self.cell_height).max(1) as usize;
-        (cols.min(1000), rows.min(1000))
+        (
+            cols.min(bitty_term_state::MAX_GRID_DIM),
+            rows.min(bitty_term_state::MAX_GRID_DIM),
+        )
     }
 
     /// Window (surface) extent: grid pixels plus the padding inset on every
@@ -447,6 +457,47 @@ mod tests {
         let (c, r) = cfg.grid_from_pixels(zero);
         assert_eq!(c, 1);
         assert_eq!(r, 1);
+        let huge = bitty_platform::PhysicalSize::new(u32::MAX, u32::MAX);
+        let (c, r) = cfg.grid_from_pixels(huge);
+        assert_eq!(
+            (c, r),
+            (
+                bitty_term_state::MAX_GRID_DIM,
+                bitty_term_state::MAX_GRID_DIM
+            )
+        );
+    }
+
+    #[test]
+    fn grid_dimension_bound_is_term_state_max_grid_dim() {
+        // One shared bound: runtime validation and the term-state resize
+        // clamp must both use `MAX_GRID_DIM` or state would silently clamp
+        // below an accepted config.
+        assert_eq!(bitty_term_state::MAX_GRID_DIM, 1000);
+        RuntimeConfig {
+            cols: bitty_term_state::MAX_GRID_DIM,
+            rows: bitty_term_state::MAX_GRID_DIM,
+            ..RuntimeConfig::default()
+        }
+        .validate()
+        .expect("bound itself is valid");
+        let over = bitty_term_state::MAX_GRID_DIM + 1;
+        assert!(
+            RuntimeConfig {
+                cols: over,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RuntimeConfig {
+                rows: over,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -845,7 +896,11 @@ mod tests {
     #[test]
     fn default_matches_readable_cell_and_nerd_font() {
         let cfg = RuntimeConfig::default();
-        assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
+        assert_eq!(
+            (cfg.cell_width, cfg.cell_height),
+            (DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT)
+        );
+        assert_eq!((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT), (9, 19));
         assert_eq!(cfg.font_family, "JetBrainsMono Nerd Font");
         assert!((cfg.font_size - 12.0).abs() < f32::EPSILON);
     }

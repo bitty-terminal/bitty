@@ -33,6 +33,13 @@ pub const GRID_COLUMNS: usize = 80;
 /// Initial grid height in rows; see [`GRID_COLUMNS`].
 pub const GRID_ROWS: usize = 24;
 
+/// Maximum grid dimension (columns or rows) accepted by [`State::resize`].
+///
+/// The single source of truth for the 1000x1000 grid bound: callers that
+/// cap a derived dimension (runtime config validation and pixel-to-grid
+/// derivation) reference this constant instead of restating the literal.
+pub const MAX_GRID_DIM: usize = 1000;
+
 /// Cap on distinct hyperlink identities retained (bounded memory per
 /// threat T-01). Beyond the cap, new distinct links degrade to no link.
 pub const HYPERLINK_TABLE_MAX: usize = 1024;
@@ -362,8 +369,8 @@ impl State {
     /// tagged with the new generation. Headless: pure in-memory, no I/O,
     /// deterministic.
     pub fn resize(&mut self, new_cols: usize, new_rows: usize) -> Damage {
-        let cols = new_cols.clamp(1, 1000);
-        let rows = new_rows.clamp(1, 1000);
+        let cols = new_cols.clamp(1, MAX_GRID_DIM);
+        let rows = new_rows.clamp(1, MAX_GRID_DIM);
         if cols == self.width && rows == self.height {
             return Damage {
                 generation: self.generation,

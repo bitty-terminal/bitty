@@ -423,9 +423,9 @@ impl Default for RegistryConfig {
             max_terminals: DEFAULT_MAX_TERMINALS,
             max_views_per_workspace: DEFAULT_MAX_VIEWS_PER_WORKSPACE,
             max_workspaces_per_window: DEFAULT_MAX_WORKSPACES_PER_WINDOW,
-            // CTX-0157 breathing-room cell (matches RuntimeConfig 9x19).
-            cell_width: 9,
-            cell_height: 19,
+            // CTX-0157 breathing-room cell (shared with `RuntimeConfig`).
+            cell_width: crate::config::DEFAULT_CELL_WIDTH,
+            cell_height: crate::config::DEFAULT_CELL_HEIGHT,
         }
     }
 }
@@ -649,8 +649,8 @@ impl TerminalRegistry {
         let rid = RuntimeId::new(self.next_runtime_raw);
         self.next_runtime_raw = self.next_runtime_raw.wrapping_add(1).max(1);
         let gen_val = self.registry_generation;
-        let cols: u16 = 80;
-        let rows: u16 = 24;
+        let cols: u16 = bitty_term_state::GRID_COLUMNS as u16;
+        let rows: u16 = bitty_term_state::GRID_ROWS as u16;
         let state = State::new();
         let rec = TerminalRecord {
             id: tid,
@@ -3283,6 +3283,30 @@ mod tests {
         assert_ne!(h1.runtime_id, h2.runtime_id);
         assert_eq!(reg.terminal_count(), 2);
         assert_eq!(reg.total_created(), 2);
+    }
+
+    #[test]
+    fn defaults_match_shared_grid_and_cell_constants() {
+        // CTX-0296: registry defaults must not restate literals; the grid
+        // comes from term-state and the cell from the runtime config.
+        let cfg = RegistryConfig::default();
+        let runtime = crate::config::RuntimeConfig::default();
+        assert_eq!(
+            (cfg.cell_width, cfg.cell_height),
+            (runtime.cell_width, runtime.cell_height)
+        );
+        assert_eq!(
+            (cfg.cell_width, cfg.cell_height),
+            (
+                crate::config::DEFAULT_CELL_WIDTH,
+                crate::config::DEFAULT_CELL_HEIGHT
+            )
+        );
+        let mut reg = default_registry();
+        let h = reg.create_terminal(None).expect("create");
+        let rec = reg.terminals.get(&h.id.0).expect("record present");
+        assert_eq!(rec.cols, bitty_term_state::GRID_COLUMNS as u16);
+        assert_eq!(rec.rows, bitty_term_state::GRID_ROWS as u16);
     }
 
     #[test]

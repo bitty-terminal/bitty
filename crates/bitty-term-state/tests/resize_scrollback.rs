@@ -56,6 +56,20 @@ fn state_resize_changes_geometry_and_generates_full_damage() {
 }
 
 #[test]
+fn resize_clamps_to_max_grid_dim_constant() {
+    // CTX-0296: the 1000x1000 bound is `MAX_GRID_DIM`, shared with
+    // bitty-runtime's config validation and pixel-to-grid derivation.
+    let mut s = State::new();
+    let over = bitty_term_state::MAX_GRID_DIM + 1;
+    s.resize(over, 1);
+    assert_eq!((s.width(), s.height()), (bitty_term_state::MAX_GRID_DIM, 1));
+    s.resize(1, over);
+    assert_eq!((s.width(), s.height()), (1, bitty_term_state::MAX_GRID_DIM));
+    s.resize(0, 0);
+    assert_eq!((s.width(), s.height()), (1, 1));
+}
+
+#[test]
 fn resize_preserves_overlapping_content_and_repairs_wide_pairs() {
     let mut s = State::new();
     // Fill first row with "AB" + wide CJK at col 2 (occupies 2 cells) + "X" at col 4

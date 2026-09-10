@@ -36,7 +36,18 @@
 #   `mktemp`, or `sock` (socket paths), or — for `.rs` files — the hit sits
 #   at/after the file's first `#[cfg(test)]` line (unit-test-only region).
 #   The `/tmp/` match requires the slash NOT to follow `[A-Za-z0-9_/-]`.
-#   This script exempts itself from both rules
+#
+# Rule 3 — no NEW host-absolute path literals in production code (CTX-0296):
+#   Same file scope and exemptions as Rule 2. Fails on `/mnt/`,
+#   `/home/<user>`, `/Users/<user>`, and Windows user paths (`C:\Users\...`
+#   in raw and escaped spellings), which are machine-specific and must come
+#   from config, parameters, or environment instead. System paths (`/usr`,
+#   `/bin`, `/proc`, `/dev`, `/run/user/<uid>`, `/sys`, `C:\Windows`,
+#   `C:\Program Files`) are deliberately out of scope: they are portable
+#   contract paths, not host leftovers. Comment-only lines and unit-test
+#   regions never count; `scratch-paths-exempt: <reason>` applies.
+#
+#   This script exempts itself from all rules
 #   (it must spell the forbidden patterns to define them).
 #
 # Escape hatch (auditable, grep-able, mirrors pty-gate):
@@ -53,6 +64,9 @@
 #   - The `#[cfg(test)]`-region rule uses the FIRST `#[cfg(test)]` line per
 #     file; prod code placed after a trailing test module would be wrongly
 #     exempt (no such layout exists today; keep test modules trailing).
+#   - Rule 3 does not scan `docs/`, `crates/*/tests/`, or fixtures: docs
+#     record historical machine paths and `.bin` capture corpora embed
+#     whatever host produced them (sanitizing fixtures is a separate task).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -127,6 +141,42 @@ for file in "${SRC_FILES[@]}"; do
 		FAIL=1
 	done < <(
 		rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])/tmp/' "$file" 2>/dev/null || true
+	)
+done
+
+# --- Rule 3: hardcoded host-absolute paths in production code (CTX-0296) ---
+for file in "${SRC_FILES[@]}"; do
+	[[ "$file" == "$SELF" ]] && continue
+	test_from=0
+	if [[ "$file" == *.rs ]]; then
+		test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
+		test_from="${test_from:-0}"
+	fi
+	while IFS= read -r hit; do
+		lineno="${hit%%:*}"
+		text="${hit#*:}"
+		if [[ "$text" =~ ^[[:space:]]*(//|#) ]]; then
+			continue
+		fi
+		case "$text" in
+		*scratch-paths-exempt:*)
+			continue
+			;;
+		esac
+		if [[ "$file" == *.rs ]] && ((test_from > 0)) && ((lineno >= test_from)); then
+			continue
+		fi
+		if ((lineno > 1)); then
+			from=$((lineno > 3 ? lineno - 3 : 1))
+			if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+				continue
+			fi
+		fi
+		echo "scratch-paths[abs-path]: $file:$hit"
+		FAIL=1
+	done < <(
+		rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
+			-e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
 	)
 done
 

@@ -80,7 +80,10 @@ impl Runtime {
             extent.height().saturating_sub(pad.saturating_mul(2)),
         );
         let (cols, rows) = grid_from_surface_extent(content, self.live_cell_metrics());
-        (cols.clamp(1, 1000), rows.clamp(1, 1000))
+        (
+            cols.clamp(1, bitty_term_state::MAX_GRID_DIM),
+            rows.clamp(1, bitty_term_state::MAX_GRID_DIM),
+        )
     }
 
     /// Configured window padding in logical pixels (CTX-0223

@@ -51,35 +51,100 @@ fn parse_help_and_version_flags() {
 }
 
 #[test]
-fn default_shell_prefers_shell_env() {
-    assert_eq!(resolve_default_shell(Some("/bin/fish")), "/bin/fish");
-    assert_eq!(resolve_default_shell(Some("/bin/bash")), "/bin/bash");
-    assert_eq!(resolve_default_shell(Some("/usr/bin/zsh")), "/usr/bin/zsh");
+fn default_shell_prefers_shell_env_when_no_configured_shell() {
+    assert_eq!(resolve_default_shell(None, None), "/bin/sh");
+    assert_eq!(resolve_default_shell(None, Some("/bin/fish")), "/bin/fish");
+    assert_eq!(resolve_default_shell(None, Some("/bin/bash")), "/bin/bash");
+    assert_eq!(
+        resolve_default_shell(None, Some("/usr/bin/zsh")),
+        "/usr/bin/zsh"
+    );
+}
+
+#[test]
+fn default_shell_prefers_configured_terminal_shell_over_env() {
+    // CTX-0298: the effective `terminal.shell` outranks $SHELL.
+    assert_eq!(
+        resolve_default_shell(Some("/bin/zsh"), Some("/bin/fish")),
+        "/bin/zsh"
+    );
+    assert_eq!(
+        resolve_default_shell(Some("  /bin/zsh  "), Some("/bin/fish")),
+        "/bin/zsh"
+    );
+    assert_eq!(resolve_default_shell(Some("/bin/zsh"), None), "/bin/zsh");
+}
+
+#[test]
+fn default_shell_fails_closed_on_unusable_configured_shell() {
+    // CTX-0298: blank/oversized/control-laden configured values never
+    // reach execve; they fall through to $SHELL, then /bin/sh.
+    for bad in ["", "   ", "\t\n ", "/bin/z\nsh", "/bin/zsh\u{7}"] {
+        assert_eq!(
+            resolve_default_shell(Some(bad), Some("/bin/fish")),
+            "/bin/fish",
+            "configured {bad:?} fails closed to $SHELL"
+        );
+        assert_eq!(resolve_default_shell(Some(bad), None), "/bin/sh");
+    }
+    // Edge whitespace is trimmed, not rejected: the normalized path runs.
+    assert_eq!(
+        resolve_default_shell(Some("/bin/zsh\n"), Some("/bin/fish")),
+        "/bin/zsh"
+    );
+    let overlong = "a".repeat(bitty_config::types::MAX_SHELL_LEN + 1);
+    assert_eq!(
+        resolve_default_shell(Some(&overlong), Some("/bin/fish")),
+        "/bin/fish"
+    );
 }
 
 #[test]
 fn default_shell_falls_back_when_env_missing_or_blank() {
-    assert_eq!(resolve_default_shell(None), "/bin/sh");
-    assert_eq!(resolve_default_shell(Some("")), "/bin/sh");
-    assert_eq!(resolve_default_shell(Some("   ")), "/bin/sh");
-    assert_eq!(resolve_default_shell(Some("\t\n ")), "/bin/sh");
+    assert_eq!(resolve_default_shell(None, Some("")), "/bin/sh");
+    assert_eq!(resolve_default_shell(None, Some("   ")), "/bin/sh");
+    assert_eq!(resolve_default_shell(None, Some("\t\n ")), "/bin/sh");
 }
 
 #[test]
 fn default_shell_trims_surrounding_whitespace() {
-    assert_eq!(resolve_default_shell(Some("  /bin/fish  ")), "/bin/fish");
+    assert_eq!(
+        resolve_default_shell(None, Some("  /bin/fish  ")),
+        "/bin/fish"
+    );
+    assert_eq!(
+        resolve_default_shell(Some("  /bin/fish  "), None),
+        "/bin/fish"
+    );
 }
 
 #[test]
-fn bare_args_resolve_to_default_shell() {
+fn configured_shell_argv0_rejects_unusable_values() {
+    assert_eq!(configured_shell_argv0(None), None);
+    assert_eq!(configured_shell_argv0(Some("")), None);
+    assert_eq!(configured_shell_argv0(Some(" \t ")), None);
+    assert_eq!(configured_shell_argv0(Some("/bin/zsh\u{7}")), None);
+    assert_eq!(configured_shell_argv0(Some("/bin/fish")), Some("/bin/fish"));
+    assert_eq!(
+        configured_shell_argv0(Some("  /bin/fish  ")),
+        Some("/bin/fish")
+    );
+}
+
+#[test]
+fn bare_args_resolve_to_default_shell_chain() {
     let parsed = parse_args(&args_of(&["bitty"]));
     assert_eq!(parsed.program, None);
     assert_eq!(
-        resolve_spawn_program(&parsed, Some("/bin/fish")),
+        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
+        "/bin/zsh"
+    );
+    assert_eq!(
+        resolve_spawn_program(&parsed, None, Some("/bin/fish")),
         "/bin/fish"
     );
-    assert_eq!(resolve_spawn_program(&parsed, None), "/bin/sh");
-    assert_eq!(resolve_spawn_program(&parsed, Some("")), "/bin/sh");
+    assert_eq!(resolve_spawn_program(&parsed, None, None), "/bin/sh");
+    assert_eq!(resolve_spawn_program(&parsed, None, Some("")), "/bin/sh");
 }
 
 #[test]
@@ -87,13 +152,16 @@ fn explicit_program_arg_stays_identical() {
     let parsed = parse_args(&args_of(&["bitty", "--", "fish", "-l"]));
     assert_eq!(parsed.program.as_deref(), Some("fish"));
     assert_eq!(parsed.program_args, vec!["-l"]);
-    // Explicit program wins over any injected $SHELL.
-    assert_eq!(resolve_spawn_program(&parsed, Some("/bin/bash")), "fish");
-    assert_eq!(resolve_spawn_program(&parsed, None), "fish");
+    // Explicit program wins over any injected configured shell + $SHELL.
+    assert_eq!(
+        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/bash")),
+        "fish"
+    );
+    assert_eq!(resolve_spawn_program(&parsed, None, None), "fish");
 
     let parsed = parse_args(&args_of(&["bitty", "/bin/bash"]));
     assert_eq!(
-        resolve_spawn_program(&parsed, Some("/bin/fish")),
+        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
         "/bin/bash"
     );
 }
@@ -2684,6 +2752,7 @@ fn spawn_spec_resolve_prefers_explicit_program() {
         program: Some("/bin/fish".to_string()),
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
+        config_shell: Some("/bin/zsh".to_string()),
     };
     assert_eq!(
         spec.resolve(),
@@ -2692,24 +2761,35 @@ fn spawn_spec_resolve_prefers_explicit_program() {
 }
 
 #[test]
-fn spawn_spec_resolve_defaults_to_shell_env_then_fallback() {
-    // CTX-0176: no explicit program resolves exactly like startup.
+fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
+    // CTX-0176/CTX-0298: no explicit program resolves exactly like
+    // startup — configured `terminal.shell`, then `$SHELL`, then /bin/sh.
     let spec = SpawnSpec {
         program: None,
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
+        config_shell: Some("/bin/zsh".to_string()),
+    };
+    assert_eq!(spec.resolve(), ("/bin/zsh".to_string(), Vec::new()));
+    let spec = SpawnSpec {
+        program: None,
+        program_args: vec!["-l".to_string()],
+        shell_env: Some("/bin/bash".to_string()),
+        config_shell: None,
     };
     assert_eq!(spec.resolve(), ("/bin/bash".to_string(), Vec::new()));
     let spec = SpawnSpec {
         program: None,
         program_args: Vec::new(),
         shell_env: None,
+        config_shell: None,
     };
     assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
     let spec = SpawnSpec {
         program: None,
         program_args: Vec::new(),
         shell_env: Some("   ".to_string()),
+        config_shell: Some(" \n ".to_string()),
     };
     assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
 }
@@ -2727,6 +2807,7 @@ fn new_split_without_spawnable_shell_keeps_pane_with_warning() {
         program: Some("/nonexistent-bitty-pane-shell-xyz".to_string()),
         program_args: Vec::new(),
         shell_env: None,
+        config_shell: None,
     };
     let mut app = TerminalApp::with_theme(
         rt,
@@ -2764,6 +2845,7 @@ fn new_split_spawns_private_shell_and_close_tears_it_down() {
         program: Some("/bin/sh".to_string()),
         program_args: Vec::new(),
         shell_env: None,
+        config_shell: None,
     };
     let mut app = TerminalApp::with_theme(
         rt,
@@ -2785,6 +2867,111 @@ fn new_split_spawns_private_shell_and_close_tears_it_down() {
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&ViewId::new(3)));
     assert_eq!(app.runtime.pane_count(), 0);
+}
+
+/// Writes an executable fake shell that records its own execution in
+/// `marker` and exits. Tiny and self-contained so the PTY child is
+/// short-lived; used by the CTX-0298 effect tests.
+#[cfg(unix)]
+fn write_marker_shell(
+    dir: &std::path::Path,
+    name: &str,
+    marker: &std::path::Path,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let body = format!(
+        "#!/bin/sh\nprintf 'configured-shell-ran' > '{}'\nexit 0\n",
+        marker.display()
+    );
+    std::fs::write(&path, body).expect("write fake shell");
+    let mut perms = std::fs::metadata(&path)
+        .expect("stat fake shell")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod fake shell");
+    path
+}
+
+/// Bounded wait for the fake shell to write its marker.
+#[cfg(unix)]
+fn wait_for_marker(marker: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    marker.exists()
+}
+
+#[test]
+#[cfg(unix)]
+fn spawn_default_shell_uses_configured_terminal_shell() {
+    // CTX-0298 effect test: `effective.terminal.shell` outranks `$SHELL`
+    // at startup, proven by actually spawning the configured argv[0] and
+    // observing its side effect. The injected `$SHELL` is /bin/sh, which
+    // would never write this marker.
+    require_pty!();
+    let base =
+        std::env::temp_dir().join(format!("bitty-ctx0298-configured-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("temp dir");
+    let marker = base.join("ran.marker");
+    let fake = write_marker_shell(&base, "configured-shell", &marker);
+
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let result = spawn_default_shell(
+        &mut rt,
+        Some(fake.to_str().expect("utf8 fake path")),
+        Some("/bin/sh"),
+    );
+    assert!(result.is_ok(), "configured shell spawns: {result:?}");
+    assert!(rt.has_pty(), "configured shell owns the primary PTY");
+    assert!(
+        wait_for_marker(&marker),
+        "configured shell was executed as argv[0]"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+#[cfg(unix)]
+fn spawn_default_shell_skips_blank_configured_shell_for_env() {
+    // CTX-0298 fail-closed effect test: a blank configured value never
+    // reaches execve; the marker proves the injected `$SHELL` ran instead.
+    require_pty!();
+    let base = std::env::temp_dir().join(format!("bitty-ctx0298-blank-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("temp dir");
+    let marker = base.join("ran.marker");
+    let env_shell = write_marker_shell(&base, "env-shell", &marker);
+
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let result = spawn_default_shell(
+        &mut rt,
+        Some("   "),
+        Some(env_shell.to_str().expect("utf8 fake path")),
+    );
+    assert!(result.is_ok(), "env shell spawns: {result:?}");
+    assert!(rt.has_pty(), "env shell owns the primary PTY");
+    assert!(
+        wait_for_marker(&marker),
+        "blank configured shell failed closed to the injected $SHELL"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+#[cfg(unix)]
+fn spawn_default_shell_falls_back_when_configured_shell_missing() {
+    // CTX-0298 safe-defaults effect test: a configured shell that cannot
+    // spawn retries FALLBACK_SHELL exactly like a failing `$SHELL`.
+    require_pty!();
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let result = spawn_default_shell(
+        &mut rt,
+        Some("/nonexistent-bitty-0298-configured-shell"),
+        Some("/bin/sh"),
+    );
+    assert!(result.is_ok(), "fallback /bin/sh spawns: {result:?}");
+    assert!(rt.has_pty(), "fallback shell owns the primary PTY");
 }
 
 // `close_last_leaf_helper_refuses` lives in `chrome_keys::tests` (CTX-0233).

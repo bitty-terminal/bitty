@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### `terminal.shell` honored at startup spawn (CTX-0298, issue #495)
+
+- The effective `terminal.shell` value is now used when no explicit CLI
+  program is given. Precedence: CLI program > configured `terminal.shell` >
+  `$SHELL` > `/bin/sh`. The frozen startup spawn recipe (split panes,
+  headless fallback) replays the same resolution.
+- Direct `argv[0]` throughout: no shell interpolation, no word splitting.
+  The project-layer trust gate that rejects `terminal.shell` is unchanged.
+- Fail-closed: config validation rejects control characters in
+  `terminal.shell`; the spawn resolver trims and skips blank, oversized, or
+  control-laden values, and a configured shell that fails to spawn retries
+  `/bin/sh` exactly like the existing `$SHELL` failure path.
+- Tests: pure precedence/fail-closed unit coverage plus bounded live-spawn
+  effect tests proving the configured shell executes as `argv[0]`.
+
 ### `bitty plugin` CLI-first management (CTX-0150, issue #244)
 
 - New `bitty plugin list|install|remove|enable|disable|info` subcommands over

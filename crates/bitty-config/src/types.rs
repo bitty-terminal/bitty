@@ -442,6 +442,15 @@ impl TerminalConfig {
                     format!("must be <= {MAX_SHELL_LEN} bytes"),
                 ));
             }
+            // CTX-0298: process authority must not carry control characters
+            // (`init_clean_shell` already rejects them before writing the
+            // wizard config; spawn re-checks defensively and fails closed).
+            if t.chars().any(char::is_control) {
+                return Err(ConfigError::validation(
+                    "terminal.shell",
+                    "must not contain control characters",
+                ));
+            }
         }
         Ok(())
     }
@@ -1153,6 +1162,30 @@ mod tests {
         }
         .validate()
         .unwrap_err();
+        // CTX-0298: process authority rejects control characters and
+        // overlong paths fail closed. Trimmed-away edge whitespace is
+        // normalized by the spawn resolver, so only embedded controls are
+        // rejected here.
+        for bad in ["/bin/zsh\u{7}", "/bin/z\nsh", "/bin/z\tsh"] {
+            TerminalConfig {
+                shell: Some(bad.into()),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+        }
+        TerminalConfig {
+            shell: Some(format!("/{}", "x".repeat(MAX_SHELL_LEN))),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        TerminalConfig {
+            shell: Some("/bin/fish".into()),
+            ..Default::default()
+        }
+        .validate()
+        .expect("clean absolute shell is valid");
         TerminalConfig::default().validate().expect("default valid");
     }
 

@@ -735,4 +735,47 @@ mod tests {
         assert_eq!(r2.overall, ReloadClass::RestartRequired);
         assert!(r2.diffs.iter().any(|d| d.field == "layout.gaps_out"));
     }
+
+    #[test]
+    fn diff_theme_and_keymaps_are_live_and_reconcile() {
+        // CTX-0295: `appearance.theme` and `keymaps` are declared Live but
+        // had no diff/reconcile test (only the class lookup in
+        // `classify_table`). A live reload must list both and apply them.
+        use crate::types::KeymapEntry;
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.appearance.theme = Some("dark".into());
+        new.keymaps = vec![KeymapEntry {
+            chord: "alt+h".into(),
+            action: "focus_next".into(),
+            context: "global".into(),
+        }];
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(!r.has_rejected);
+        assert!(r.diffs.iter().any(|d| d.field == "appearance.theme"));
+        assert!(r.diffs.iter().any(|d| d.field == "keymaps"));
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("theme + keymaps must reconcile live");
+        assert_eq!(cur.appearance.theme.as_deref(), Some("dark"));
+        assert_eq!(cur.keymaps.len(), 1);
+    }
+
+    #[test]
+    fn diff_terminal_shell_is_restart_required() {
+        // CTX-0295: `terminal.shell` is spawn-time state; a change must be
+        // reported restart-required (never silently live) and must be
+        // refused by `reconcile_live`.
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.terminal.shell = Some("/bin/fish".into());
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "terminal.shell"));
+        let mut cur = old;
+        assert!(reconcile_live(&mut cur, &new).is_err());
+        assert_eq!(cur.terminal.shell, None, "previous value stays active");
+    }
 }

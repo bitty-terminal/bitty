@@ -369,3 +369,67 @@ fn release_over_thumb_never_activates_hyperlinks() {
         "hidden-chrome click must still activate (test validity)"
     );
 }
+
+#[test]
+fn scrollbar_width_scales_track_and_thumb() {
+    // CTX-0295: `scrollbar.width` (default 8) is the paint width — a
+    // non-default logical width must move the track edge and shrink/grow the
+    // painted thumb footprint. Every earlier runtime test used the default 8,
+    // so the width knob had no effect evidence.
+    for width in [12_u32, 32] {
+        let mut rt = runtime_with_config(RuntimeConfig {
+            scrollbar_mode: ScrollbarMode::Always,
+            scrollbar_width: width,
+            ..RuntimeConfig::default()
+        });
+        let sb = feed_scrollback(&mut rt);
+        assert!(sb > 0, "need scrollback for the test");
+        assert_eq!(rt.scrollbar_width_physical(), width);
+        rt.tick().expect("always presents");
+        assert!(rt.scrollbar_is_visible());
+        let track = rt.scrollbar_track().expect("track");
+        assert_eq!(track.width, width, "track carries the configured width");
+        // Right edge stays inside the leaf at default padding:
+        // x = 0 cells * 9px + 8px pad + 80 cells * 9px - width.
+        assert_eq!(track.x, 728 - width as i32);
+        assert_eq!(track.y, 8);
+        assert_eq!(track.height, 456);
+
+        // The painted thumb is exactly `width` physical pixels wide: sample
+        // one row inside the thumb near the live (bottom) position and count
+        // non-background pixels across a window around the track. Filler
+        // text is left-aligned, so the right-edge window holds only the fill.
+        let rgba = rt.headless_rgba().expect("rgba after tick");
+        let surface = rt.surface_extent().expect("surface extent");
+        let stride = usize::try_from(surface.width()).expect("surface width fits");
+        let thumb = bitty_ui::scrollbar::thumb_geometry(track.height, 24, rt.scrollback_len(), 0)
+            .expect("thumb exists with scrollback");
+        let y = usize::try_from(track.y).expect("track y fits")
+            + usize::try_from(thumb.y + thumb.height / 2).expect("thumb y fits");
+        let x0 = usize::try_from(track.x - 8).expect("window x0 fits");
+        let x1 = usize::try_from(track.x + width as i32 + 8).expect("window x1 fits");
+        let painted = (x0..x1)
+            .filter(|&x| {
+                let i = (y * stride + x) * 4;
+                [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]] != bitty_render::grid::DEFAULT_BG
+            })
+            .count();
+        assert_eq!(
+            painted, width as usize,
+            "thumb fill must span exactly the configured width"
+        );
+    }
+
+    // DPI scaling rides the same path as padding: logical 12 at 2x is 24
+    // physical, and the resolved track doubles with the live cell metrics.
+    let mut rt = runtime_with_config(RuntimeConfig {
+        scrollbar_mode: ScrollbarMode::Always,
+        scrollbar_width: 12,
+        ..RuntimeConfig::default()
+    });
+    feed_scrollback(&mut rt);
+    rt.tick().expect("presents");
+    rt.apply_dpi_scale(2.0, None);
+    assert_eq!(rt.scrollbar_width_physical(), 24);
+    assert_eq!(rt.scrollbar_track().expect("track at 2x").width, 24);
+}

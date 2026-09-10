@@ -2377,4 +2377,449 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn lua_knob_bounds_matrix_fail_closed() {
+        // CTX-0295: one table over every bounded knob — min/max boundaries
+        // must parse, below/above must fail closed naming the field. Values
+        // are the Lua surface spellings (integers/floats as declared).
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            (
+                "font.size 0",
+                r#"return { font = { family = "Mono", size = 0 } }"#.to_string(),
+                Some("font.size"),
+            ),
+            (
+                "font.size min+",
+                r#"return { font = { family = "Mono", size = 0.5 } }"#.to_string(),
+                None,
+            ),
+            (
+                "font.size max",
+                r#"return { font = { family = "Mono", size = 128 } }"#.to_string(),
+                None,
+            ),
+            (
+                "font.size over",
+                r#"return { font = { family = "Mono", size = 129 } }"#.to_string(),
+                Some("font.size"),
+            ),
+            (
+                "font.line_height low",
+                r#"return { font = { family = "Mono", size = 12, line_height = 0.9 } }"#
+                    .to_string(),
+                Some("font.line_height"),
+            ),
+            (
+                "font.line_height min",
+                r#"return { font = { family = "Mono", size = 12, line_height = 1.0 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "font.line_height max",
+                r#"return { font = { family = "Mono", size = 12, line_height = 2.0 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "font.line_height high",
+                r#"return { font = { family = "Mono", size = 12, line_height = 2.1 } }"#
+                    .to_string(),
+                Some("font.line_height"),
+            ),
+            (
+                "font.letter_spacing low",
+                r#"return { font = { family = "Mono", size = 12, letter_spacing = -1 } }"#
+                    .to_string(),
+                Some("font.letter_spacing"),
+            ),
+            (
+                "font.letter_spacing min",
+                r#"return { font = { family = "Mono", size = 12, letter_spacing = 0 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "font.letter_spacing max",
+                r#"return { font = { family = "Mono", size = 12, letter_spacing = 8 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "font.letter_spacing high",
+                r#"return { font = { family = "Mono", size = 12, letter_spacing = 8.5 } }"#
+                    .to_string(),
+                Some("font.letter_spacing"),
+            ),
+            (
+                "window.opacity low",
+                r#"return { window = { opacity = -0.1, padding = 8 } }"#.to_string(),
+                Some("window.opacity"),
+            ),
+            (
+                "window.opacity min",
+                r#"return { window = { opacity = 0.0, padding = 8 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.opacity max",
+                r#"return { window = { opacity = 1.0, padding = 64 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.opacity high",
+                r#"return { window = { opacity = 1.5, padding = 8 } }"#.to_string(),
+                Some("window.opacity"),
+            ),
+            (
+                "window.padding low",
+                r#"return { window = { opacity = 1.0, padding = -1 } }"#.to_string(),
+                Some("window.padding"),
+            ),
+            (
+                "window.padding min",
+                r#"return { window = { opacity = 1.0, padding = 0 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.padding max",
+                r#"return { window = { opacity = 1.0, padding = 64 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.padding high",
+                r#"return { window = { opacity = 1.0, padding = 65 } }"#.to_string(),
+                Some("window.padding"),
+            ),
+            (
+                "window.radius_px low",
+                r#"return { window = { opacity = 1.0, padding = 8, radius_px = -1 } }"#.to_string(),
+                Some("window.radius_px"),
+            ),
+            (
+                "window.radius_px min",
+                r#"return { window = { opacity = 1.0, padding = 8, radius_px = 0 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.radius_px max",
+                r#"return { window = { opacity = 1.0, padding = 8, radius_px = 24 } }"#.to_string(),
+                None,
+            ),
+            (
+                "window.radius_px high",
+                r#"return { window = { opacity = 1.0, padding = 8, radius_px = 25 } }"#.to_string(),
+                Some("window.radius_px"),
+            ),
+            (
+                "terminal.scrollback low",
+                r#"return { terminal = { scrollback = -1 } }"#.to_string(),
+                Some("terminal.scrollback"),
+            ),
+            (
+                "terminal.scrollback min",
+                r#"return { terminal = { scrollback = 0 } }"#.to_string(),
+                None,
+            ),
+            (
+                "terminal.scrollback max",
+                r#"return { terminal = { scrollback = 100000 } }"#.to_string(),
+                None,
+            ),
+            (
+                "terminal.scrollback high",
+                r#"return { terminal = { scrollback = 100001 } }"#.to_string(),
+                Some("terminal.scrollback"),
+            ),
+            (
+                "scroll_lines low",
+                r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 0 } }"#
+                    .to_string(),
+                Some("terminal.scroll_lines_per_notch"),
+            ),
+            (
+                "scroll_lines min",
+                r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 1 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "scroll_lines max",
+                r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 32 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "scroll_lines high",
+                r#"return { terminal = { scrollback = 10000, scroll_lines_per_notch = 33 } }"#
+                    .to_string(),
+                Some("terminal.scroll_lines_per_notch"),
+            ),
+            (
+                "scroll_pixels low",
+                r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 0 } }"#
+                    .to_string(),
+                Some("terminal.scroll_pixels_per_notch"),
+            ),
+            (
+                "scroll_pixels min",
+                r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 1 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "scroll_pixels max",
+                r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 256 } }"#
+                    .to_string(),
+                None,
+            ),
+            (
+                "scroll_pixels high",
+                r#"return { terminal = { scrollback = 10000, scroll_pixels_per_notch = 257 } }"#
+                    .to_string(),
+                Some("terminal.scroll_pixels_per_notch"),
+            ),
+            (
+                "gaps_in low",
+                r#"return { layout = { gaps_in = -1 } }"#.to_string(),
+                Some("layout.gaps_in"),
+            ),
+            (
+                "gaps_in min",
+                r#"return { layout = { gaps_in = 0 } }"#.to_string(),
+                None,
+            ),
+            (
+                "gaps_in max",
+                r#"return { layout = { gaps_in = 16 } }"#.to_string(),
+                None,
+            ),
+            (
+                "gaps_in high",
+                r#"return { layout = { gaps_in = 17 } }"#.to_string(),
+                Some("layout.gaps_in"),
+            ),
+            (
+                "gaps_out high",
+                r#"return { layout = { gaps_out = 17 } }"#.to_string(),
+                Some("layout.gaps_out"),
+            ),
+            (
+                "scrollbar.width low",
+                r#"return { scrollbar = { width = 0 } }"#.to_string(),
+                Some("scrollbar.width"),
+            ),
+            (
+                "scrollbar.width min",
+                r#"return { scrollbar = { width = 1 } }"#.to_string(),
+                None,
+            ),
+            (
+                "scrollbar.width max",
+                r#"return { scrollbar = { width = 32 } }"#.to_string(),
+                None,
+            ),
+            (
+                "scrollbar.width high",
+                r#"return { scrollbar = { width = 33 } }"#.to_string(),
+                Some("scrollbar.width"),
+            ),
+            (
+                "scrollbar.mode bad",
+                r#"return { scrollbar = { mode = "overlay" } }"#.to_string(),
+                Some("scrollbar.mode"),
+            ),
+            (
+                "scrollbar.mode hidden",
+                r#"return { scrollbar = { mode = "hidden" } }"#.to_string(),
+                None,
+            ),
+            (
+                "scrollbar.mode always",
+                r#"return { scrollbar = { mode = "always" } }"#.to_string(),
+                None,
+            ),
+            (
+                "scrollbar.mode auto",
+                r#"return { scrollbar = { mode = "auto" } }"#.to_string(),
+                None,
+            ),
+            (
+                "mod_key bad",
+                r#"return { mod_key = "ctrl" }"#.to_string(),
+                Some("mod_key"),
+            ),
+            (
+                "mod_key alt",
+                r#"return { mod_key = "alt" }"#.to_string(),
+                None,
+            ),
+            (
+                "mod_key super",
+                r#"return { mod_key = "super" }"#.to_string(),
+                None,
+            ),
+            (
+                "mod_key case",
+                r#"return { mod_key = "SUPER" }"#.to_string(),
+                None,
+            ),
+            (
+                "theme overlong",
+                format!(r#"return {{ theme = "{}" }}"#, "x".repeat(65)),
+                Some("appearance.theme"),
+            ),
+            (
+                "decoration.gaps_in low",
+                r#"return { decoration = { gaps_in = -1 } }"#.to_string(),
+                Some("decoration.gaps_in"),
+            ),
+            (
+                "decoration.gaps_in min",
+                r#"return { decoration = { gaps_in = 0 } }"#.to_string(),
+                None,
+            ),
+            (
+                "decoration.gaps_in max",
+                r#"return { decoration = { gaps_in = 32 } }"#.to_string(),
+                None,
+            ),
+            (
+                "decoration.gaps_in high",
+                r#"return { decoration = { gaps_in = 33 } }"#.to_string(),
+                Some("decoration.gaps_in"),
+            ),
+            (
+                "decoration.gaps_out low",
+                r#"return { decoration = { gaps_out = -1 } }"#.to_string(),
+                Some("decoration.gaps_out"),
+            ),
+            (
+                "decoration.gaps_out max",
+                r#"return { decoration = { gaps_out = 32 } }"#.to_string(),
+                None,
+            ),
+            (
+                "decoration.gaps_out high",
+                r#"return { decoration = { gaps_out = 33 } }"#.to_string(),
+                Some("decoration.gaps_out"),
+            ),
+            (
+                "decoration.border low",
+                r#"return { decoration = { border = -1 } }"#.to_string(),
+                Some("decoration.border"),
+            ),
+            (
+                "decoration.border max",
+                r#"return { decoration = { border = 8 } }"#.to_string(),
+                None,
+            ),
+            (
+                "decoration.border high",
+                r#"return { decoration = { border = 9 } }"#.to_string(),
+                Some("decoration.border"),
+            ),
+            (
+                "decoration.radius low",
+                r#"return { decoration = { radius = -1 } }"#.to_string(),
+                Some("decoration.radius"),
+            ),
+            (
+                "decoration.radius max",
+                r#"return { decoration = { radius = 16 } }"#.to_string(),
+                None,
+            ),
+            (
+                "decoration.radius high",
+                r#"return { decoration = { radius = 17 } }"#.to_string(),
+                Some("decoration.radius"),
+            ),
+            (
+                "mouse.focus_follows_mouse bad",
+                r#"return { mouse = { focus_follows_mouse = 1 } }"#.to_string(),
+                Some("mouse.focus_follows_mouse"),
+            ),
+            (
+                "mouse.focus_follows_mouse true",
+                r#"return { mouse = { focus_follows_mouse = true } }"#.to_string(),
+                None,
+            ),
+            (
+                "mouse.focus_follows_mouse false",
+                r#"return { mouse = { focus_follows_mouse = false } }"#.to_string(),
+                None,
+            ),
+        ];
+        for (label, code, expected_field) in cases {
+            let result = parse_lua_config(&code, &test_source());
+            match expected_field {
+                None => {
+                    result.unwrap_or_else(|e| panic!("{label}: must parse, got {e}"));
+                }
+                Some(field) => {
+                    let err = result.expect_err(label);
+                    assert_eq!(err.field(), Some(field), "{label}: wrong field ({err})");
+                    assert_eq!(
+                        err.error_class(),
+                        crate::error::ErrorClass::Validation,
+                        "{label}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lua_nested_unknown_keys_fail_closed() {
+        // CTX-0295: unknown keys inside any table (and keymap entry) fail
+        // closed as UndeclaredField naming the dotted path — never merged.
+        let cases: &[(&str, &str)] = &[
+            (r#"return { bogus = 1 }"#, "bogus"),
+            (
+                r#"return { appearance = { theme = "dark", bogus = 1 } }"#,
+                "appearance.bogus",
+            ),
+            (
+                r#"return { font = { family = "Mono", size = 12, bogus = 1 } }"#,
+                "font.bogus",
+            ),
+            (
+                r#"return { window = { opacity = 1.0, padding = 8, bogus = 1 } }"#,
+                "window.bogus",
+            ),
+            (
+                r#"return { terminal = { scrollback = 10000, bogus = 1 } }"#,
+                "terminal.bogus",
+            ),
+            (
+                r#"return { selection = { auto_copy = true, bogus = 1 } }"#,
+                "selection.bogus",
+            ),
+            (
+                r#"return { layout = { gaps_in = 1, bogus = 1 } }"#,
+                "layout.bogus",
+            ),
+            (
+                r#"return { scrollbar = { mode = "auto", bogus = 1 } }"#,
+                "scrollbar.bogus",
+            ),
+            (
+                r#"return { decoration = { gaps_in = 1, bogus = 1 } }"#,
+                "decoration.bogus",
+            ),
+            (
+                r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
+                "mouse.bogus",
+            ),
+            (
+                r#"return { keymaps = { { chord = "ctrl+p", action = "focus_next", context = "global", bogus = 1 } } }"#,
+                "keymaps[1].bogus",
+            ),
+        ];
+        for (code, field) in cases {
+            let err = parse_lua_config(code, &test_source()).expect_err(code);
+            assert_eq!(err.field(), Some(*field), "{code}: {err}");
+        }
+    }
 }

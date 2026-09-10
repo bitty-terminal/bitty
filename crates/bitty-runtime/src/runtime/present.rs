@@ -296,6 +296,21 @@ impl Runtime {
         self.tick_at(std::time::Instant::now())
     }
 
+    /// Records the per-origin generations consumed by this frame so the next
+    /// `tick_at` can tell whether any primary or pane grid advanced
+    /// (CTX-0289). `primary_gen` is the primary state's generation; every
+    /// pane session contributes its own counter. Called on every present,
+    /// including the idle write-backs that consume a generation without
+    /// drawing pixels.
+    fn mark_frame_presented(&mut self, primary_gen: u64) {
+        self.last_presented_generation = primary_gen;
+        self.last_presented_pane_generations.clear();
+        for (id, sess) in &self.pane_sessions {
+            self.last_presented_pane_generations
+                .insert(*id, sess.state.generation());
+        }
+    }
+
     /// Tick with an explicit wall clock (CTX-0192 virtual-clock seam).
     ///
     /// `tick()` delegates with `Instant::now()`; tests pass virtual times to
@@ -370,12 +385,26 @@ impl Runtime {
             pending_full = true;
         }
         let last = self.last_presented_generation;
-        // CTX-0176: the presented generation tracks the newest grid across
-        // the primary state and every pane session, so frame-on-demand idles
-        // only when all shells are quiet.
+        // CTX-0176/CTX-0289: the primary state and every pane session own
+        // independent grid generation counters, so a single scalar `max`
+        // cannot detect that a lower-generation origin changed while a
+        // higher-generation origin stayed quiet. `current_gen` stays the max
+        // for present stats/damage, but frame-on-demand compares each origin
+        // against its own last presented generation.
         let mut current_gen = snapshot.generation;
-        for sess in self.pane_sessions.values() {
-            current_gen = current_gen.max(sess.state.generation());
+        let mut origins_changed = snapshot.generation != last;
+        for (id, sess) in &self.pane_sessions {
+            let pane_gen = sess.state.generation();
+            current_gen = current_gen.max(pane_gen);
+            if self.last_presented_pane_generations.get(id).copied() != Some(pane_gen) {
+                origins_changed = true;
+            }
+        }
+        // A pane added or removed since the last present is a change too
+        // (a closed pane's `pending_full_redraw` already covers its pixels;
+        // this keeps the origin bookkeeping exact).
+        if self.last_presented_pane_generations.len() != self.pane_sessions.len() {
+            origins_changed = true;
         }
 
         // CTX-0228: a layout or focus change forces a full present even
@@ -388,14 +417,15 @@ impl Runtime {
             pending_full = true;
         }
 
-        // Frame-on-demand: no new generation and no forced redraw -> idle.
-        if !pending_full && current_gen == last && last != u64::MAX {
+        // Frame-on-demand: no origin advanced and no forced redraw -> idle.
+        // `last == u64::MAX` marks the first frame (always present).
+        if !pending_full && !origins_changed && last != u64::MAX {
             return None;
         }
 
         // Empty layout -> idle (no leaf to present).
         if allocations.is_empty() {
-            self.last_presented_generation = current_gen;
+            self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             self.pending_full_redraw = false;
@@ -1015,7 +1045,7 @@ impl Runtime {
         {
             // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
             // But ensure generation advances for idle detection.
-            self.last_presented_generation = current_gen;
+            self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             return None;
@@ -1100,7 +1130,7 @@ impl Runtime {
         };
 
         if !combined_list.needs_draw() {
-            self.last_presented_generation = current_gen;
+            self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             return None;
@@ -1134,7 +1164,7 @@ impl Runtime {
                 Err(_) => return None,
             }
         };
-        self.last_presented_generation = current_gen;
+        self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
         self.kitty_last_frame_images = kitty_blits;

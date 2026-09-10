@@ -145,7 +145,9 @@ impl Runtime {
         let writer = pty.take_writer().map_err(RuntimeError::from)?;
         // All fallible steps done: publish the session. A replaced session's
         // old `Pty` drops here, killing + reaping its child (no zombie).
-        let mut state = State::new();
+        // CTX-0297: the pane terminal captures the configured scrollback
+        // capacity at creation (restart-required reload class).
+        let mut state = State::with_scrollback_lines(self.config.scrollback);
         state.resize(cols as usize, rows as usize);
         self.pane_sessions.insert(
             view,

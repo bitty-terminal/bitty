@@ -3785,6 +3785,20 @@ fn runtime_config_from_effective(
             .radius
             .min(u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX)) as u16,
     );
+    // CTX-0297: `terminal.scrollback` bounds retained history at terminal
+    // creation. Unlike the clamped geometry knobs above, an out-of-range
+    // value fails closed here (and in `RuntimeConfig::validate`) instead of
+    // silently clamping, so a future `bitty-config`/`bitty-runtime` bound
+    // drift cannot quietly change retention semantics.
+    let scrollback = usize::try_from(effective.terminal.scrollback)
+        .map_err(|_| "bitty: terminal.scrollback out of range".to_string())?;
+    if scrollback > bitty_runtime::config::MAX_SCROLLBACK_LINES {
+        return Err(format!(
+            "bitty: terminal.scrollback {} exceeds the supported maximum {}",
+            scrollback,
+            bitty_runtime::config::MAX_SCROLLBACK_LINES
+        ));
+    }
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -3811,6 +3825,9 @@ fn runtime_config_from_effective(
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).
         cfg.decoration = decoration;
+        // CTX-0297: effective `terminal.scrollback` is carried the same way;
+        // terminal creation captures it as the retention cap.
+        cfg.scrollback = scrollback;
         cfg
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))

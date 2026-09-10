@@ -156,6 +156,24 @@ fn plugin_full_lifecycle_live() {
     assert!(!state.contains(PLUGIN), "{state}");
     let backup = home.join("bitty").join("bitty-plugins.toml.bak");
     assert!(backup.exists(), "backup must be kept");
+
+    // CTX-0293: the capability-grant ledger, its backup, and the managed
+    // directory are owner-only on Unix regardless of the process umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&state_file(&home)), 0o600, "manifest must be 0600");
+        assert_eq!(mode(&backup), 0o600, "backup must be 0600");
+        assert_eq!(mode(&home.join("bitty")), 0o700, "managed dir must be 0700");
+    }
+
     let _ = std::fs::remove_dir_all(&home);
 }
 

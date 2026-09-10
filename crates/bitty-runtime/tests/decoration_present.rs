@@ -1,18 +1,23 @@
 #![forbid(unsafe_code)]
-//! Core-owned live present wiring for workspace decoration (CTX-0294).
+//! Core-owned live present wiring for workspace decoration (CTX-0294,
+//! stage-2 radius CTX-0311).
 //!
 //! The accepted workspace-compositor contract (spec CTX-0118) owns
 //! `decoration.gaps_in/gaps_out/border/radius` in logical pixels. CTX-0292
-//! landed the config + solver; these tests pin the live present wiring:
+//! landed the config + solver; CTX-0294 the live present wiring; CTX-0311
+//! replaced the minimal scanline ring with a rounded SDF primitive
+//! (`RoundedFill`) plus inner-arc glyph clipping. These tests pin the live
+//! present wiring:
 //!
 //! - `Runtime::present_frames` composes the decoration with the CTX-0177
 //!   cell gaps at the live DPI scale and derives the per-View content grid
 //!   (fractional-cell frames: the sub-cell remainder stays background);
 //! - `tick` paints `gaps_out`/`gaps_in` bands as clear background, the
-//!   `border` ring in `DECORATION_BORDER`, and the content inside the
-//!   border; `radius` clips the outer frame corners (minimal rounded ring);
-//! - `bitty --safe` decoration (`0/0/1/0`) paints no gaps, a 1px border,
-//!   and square corners;
+//!   `border` ring in `DECORATION_BORDER` as one rounded SDF primitive
+//!   (`PresentStats::rounded_fills`), and the content inside the border;
+//!   `radius` clips the frame corners and the inner arc clips glyphs;
+//! - `bitty --safe` decoration (`0/0/1/0`) paints no gaps, a 1px square
+//!   border, and square corners;
 //! - decorated hit testing uses the frame (`cursor_to_present_cell`) and
 //!   the global mapping subtracts the decoration outer inset.
 //!
@@ -93,6 +98,9 @@ fn live_present_paints_gap_bands_border_ring_and_fractional_remainder() {
     single_leaf(&mut rt);
     let stats = rt.tick().expect("first tick presents");
     assert!(stats.headless);
+    // CTX-0311: one rounded SDF ring primitive replaces the CTX-0294 scanline
+    // fills; gaps and content stay plain fills.
+    assert_eq!(stats.rounded_fills, 1, "one decoration ring primitive");
     let rgba = rt.headless_rgba().expect("rgba after tick");
     let width = surface_width(&rt);
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
@@ -146,7 +154,8 @@ fn radius_cuts_frame_corners_and_zero_radius_keeps_them_square() {
     // stays clear background.
     let mut rounded = runtime_with(Decoration::new(0, 6, 2, 6));
     single_leaf(&mut rounded);
-    rounded.tick().expect("tick presents");
+    let stats = rounded.tick().expect("tick presents");
+    assert_eq!(stats.rounded_fills, 1, "rounded frame uses the SDF ring");
     let rgba = rounded.headless_rgba().expect("rgba");
     let width = surface_width(&rounded);
     let bg = bitty_render::grid::DEFAULT_BG;
@@ -163,10 +172,15 @@ fn radius_cuts_frame_corners_and_zero_radius_keeps_them_square() {
     let extent = rounded.config().window_extent();
     dump_evidence("02-radius-6-corner", &rgba, extent.width(), extent.height());
 
-    // radius = 0: the same corner carries the border color.
+    // radius = 0: the same corner carries the border color (the SDF ring
+    // degenerates to a square ring, still one rounded primitive).
     let mut square = runtime_with(Decoration::new(0, 6, 2, 0));
     single_leaf(&mut square);
-    square.tick().expect("tick presents");
+    let stats = square.tick().expect("tick presents");
+    assert_eq!(
+        stats.rounded_fills, 1,
+        "square ring still uses the primitive"
+    );
     let rgba = square.headless_rgba().expect("rgba");
     assert_eq!(
         probe(&rgba, width, x_corner, y_corner),

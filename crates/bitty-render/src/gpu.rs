@@ -472,6 +472,9 @@ pub struct PresentStats {
     pub frame: u64,
     /// Number of fill rectangles in the presented `DrawList`.
     pub fills: usize,
+    /// Number of rounded fill/ring primitives in the presented `DrawList`
+    /// (CTX-0311).
+    pub rounded_fills: usize,
     /// Number of glyph instances in the presented `DrawList`.
     pub glyphs: usize,
     /// True when the surface is a headless fake (no swap-chain acquire).
@@ -837,6 +840,7 @@ impl Surface {
                 Ok(PresentStats {
                     frame,
                     fills: 0,
+                    rounded_fills: 0,
                     glyphs: 0,
                     headless: true,
                     images: 0,
@@ -921,6 +925,7 @@ impl Surface {
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: 0,
+                    rounded_fills: 0,
                     glyphs: 0,
                     headless: false,
                     images: 0,
@@ -1024,6 +1029,10 @@ impl Surface {
                 for fill in &draw_list.fills {
                     fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
                 }
+                // Rounded decoration fills/rings (CTX-0311).
+                for fill in &draw_list.rounded_fills {
+                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
+                }
                 // Glyphs.
                 if let Some((texels, dims)) = atlas {
                     for glyph in &draw_list.glyphs {
@@ -1051,6 +1060,7 @@ impl Surface {
                                     glyph.dest[0],
                                     glyph.dest[1],
                                     glyph.color,
+                                    glyph.clip,
                                 );
                             }
                             crate::grid::GlyphSource::Inline {
@@ -1068,6 +1078,7 @@ impl Surface {
                                     glyph.dest[0],
                                     glyph.dest[1],
                                     glyph.color,
+                                    glyph.clip,
                                 );
                             }
                         }
@@ -1090,6 +1101,7 @@ impl Surface {
                                 glyph.dest[0],
                                 glyph.dest[1],
                                 glyph.color,
+                                glyph.clip,
                             );
                         }
                     }
@@ -1111,6 +1123,7 @@ impl Surface {
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: draw_list.fills.len(),
+                    rounded_fills: draw_list.rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: true,
                     images: draw_list.images.len(),
@@ -1231,6 +1244,7 @@ impl Surface {
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: draw_list.fills.len(),
+                    rounded_fills: draw_list.rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: false,
                     images: draw_list.images.len(),
@@ -1322,6 +1336,10 @@ impl Surface {
         for fill in &draw_list.fills {
             fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
         }
+        // Rounded decoration fills/rings (CTX-0311).
+        for fill in &draw_list.rounded_fills {
+            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
+        }
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
                 match &glyph.source {
@@ -1347,6 +1365,7 @@ impl Surface {
                             glyph.dest[0],
                             glyph.dest[1],
                             glyph.color,
+                            glyph.clip,
                         );
                     }
                     crate::grid::GlyphSource::Inline {
@@ -1364,6 +1383,7 @@ impl Surface {
                             glyph.dest[0],
                             glyph.dest[1],
                             glyph.color,
+                            glyph.clip,
                         );
                     }
                 }
@@ -1386,6 +1406,7 @@ impl Surface {
                         glyph.dest[0],
                         glyph.dest[1],
                         glyph.color,
+                        glyph.clip,
                     );
                 }
             }
@@ -1408,6 +1429,7 @@ impl Surface {
         Ok(PresentStats {
             frame: state.frame,
             fills: draw_list.fills.len(),
+            rounded_fills: draw_list.rounded_fills.len(),
             glyphs: draw_list.glyphs.len(),
             headless: true,
             images: draw_list.images.len(),
@@ -1616,6 +1638,110 @@ fn fill_rect_rgba(
     }
 }
 
+/// Fills a rounded rectangle or border ring with analytic pixel-center
+/// coverage (CTX-0311) onto the premultiplied headless buffer — the CPU twin
+/// of the wgpu rounded-box SDF fill fragment stage, byte-for-byte the same
+/// math as [`crate::software::SurfaceRgba::fill_rounded_rect`].
+fn fill_rounded_rect_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    fill: &crate::grid::RoundedFill,
+) {
+    let left = i64::from(fill.frame.x).max(0);
+    let top = i64::from(fill.frame.y).max(0);
+    let right = (i64::from(fill.frame.x) + i64::from(fill.frame.width))
+        .max(0)
+        .min(i64::from(width));
+    let bottom = (i64::from(fill.frame.y) + i64::from(fill.frame.height))
+        .max(0)
+        .min(i64::from(height));
+    if right <= left || bottom <= top {
+        return;
+    }
+    if fill.border == 0 {
+        // Solid rounded fill: the whole frame carries coverage (not used by
+        // the decoration ring path).
+        for y in top..bottom {
+            for x in left..right {
+                blend_rounded_pixel_rgba(rgba, width, fill, x, y);
+            }
+        }
+        return;
+    }
+    // Ring hot path (CTX-0311): only the border band and the four corner
+    // squares can carry coverage. Iterate just those runs so interior
+    // rows/columns never touch `coverage_at` (the soak/latency budgets
+    // depend on this). Mirrors `software::SurfaceRgba::fill_rounded_rect`.
+    let fx0 = i64::from(fill.frame.x);
+    let fy0 = i64::from(fill.frame.y);
+    let fx1 = fx0 + i64::from(fill.frame.width);
+    let fy1 = fy0 + i64::from(fill.frame.height);
+    let band = i64::from(
+        u32::from(fill.border)
+            .min(fill.frame.width)
+            .min(fill.frame.height),
+    ) + 1;
+    let cs = (fill.resolved_radius().ceil() as i64) + 1;
+    let mid_left_end = (fx0 + band).min(right);
+    let mid_right_start = (fx1 - band).max(left).max(mid_left_end);
+    let cor_left_end = (fx0 + cs).min(right);
+    let cor_right_start = (fx1 - cs).max(left).max(cor_left_end);
+    for y in top..bottom {
+        if y < fy0 + band || y >= fy1 - band {
+            paint_rounded_run_rgba(rgba, width, fill, left, right, y);
+        } else if y < fy0 + cs || y >= fy1 - cs {
+            paint_rounded_run_rgba(rgba, width, fill, left, cor_left_end, y);
+            paint_rounded_run_rgba(rgba, width, fill, cor_right_start, right, y);
+        } else {
+            paint_rounded_run_rgba(rgba, width, fill, left, mid_left_end, y);
+            paint_rounded_run_rgba(rgba, width, fill, mid_right_start, right, y);
+        }
+    }
+}
+
+/// Blends one rounded-fill pixel onto the premultiplied headless buffer;
+/// zero-coverage pixels are skipped (CTX-0311).
+fn blend_rounded_pixel_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    fill: &crate::grid::RoundedFill,
+    x: i64,
+    y: i64,
+) {
+    let coverage = fill.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
+    if coverage <= 0.0 {
+        return;
+    }
+    let [cr, cg, cb, ca] = fill.color;
+    let coverage = (coverage * 255.0 + 0.5).min(255.0) as u32;
+    let sa = (coverage * u32::from(ca)) / 255;
+    let src_r = ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_g = ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_b = ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_a = sa.min(255) as u8;
+    let d = (y as usize * width as usize + x as usize) * 4;
+    let inv = 255 - u32::from(src_a);
+    rgba[d] = src_r.saturating_add((u32::from(rgba[d]) * inv / 255) as u8);
+    rgba[d + 1] = src_g.saturating_add((u32::from(rgba[d + 1]) * inv / 255) as u8);
+    rgba[d + 2] = src_b.saturating_add((u32::from(rgba[d + 2]) * inv / 255) as u8);
+    rgba[d + 3] = src_a.saturating_add((u32::from(rgba[d + 3]) * inv / 255) as u8);
+}
+
+/// Runs [`blend_rounded_pixel_rgba`] over `x0..x1` (empty when `x0 >= x1`).
+fn paint_rounded_run_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    fill: &crate::grid::RoundedFill,
+    x0: i64,
+    x1: i64,
+    y: i64,
+) {
+    for x in x0..x1 {
+        blend_rounded_pixel_rgba(rgba, width, fill, x, y);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn blend_coverage_mask_rgba(
     rgba: &mut [u8],
@@ -1627,6 +1753,7 @@ fn blend_coverage_mask_rgba(
     x: i32,
     y: i32,
     color: crate::grid::Rgba8,
+    clip: Option<crate::grid::RoundedClip>,
 ) {
     let Some(mask_w) = usize::try_from(mask_width).ok().filter(|w| *w > 0) else {
         return;
@@ -1646,17 +1773,29 @@ fn blend_coverage_mask_rgba(
     let [cr, cg, cb, ca] = color;
     for gy in dst_top..dst_bottom {
         for gx in dst_left..dst_right {
-            let coverage = u32::from(mask[gy as usize * mask_w + gx as usize]);
+            let sx = (i64::from(x) + gx) as usize;
+            let sy = (i64::from(y) + gy) as usize;
+            let mut coverage = u32::from(mask[gy as usize * mask_w + gx as usize]);
             if coverage == 0 {
                 continue;
+            }
+            if let Some(clip) = clip {
+                if clip.may_clip_pixel(sx as i64, sy as i64) {
+                    let clip_coverage = clip.coverage_at(sx as f32 + 0.5, sy as f32 + 0.5);
+                    if clip_coverage <= 0.0 {
+                        continue;
+                    }
+                    coverage = (coverage as f32 * clip_coverage + 0.5) as u32;
+                    if coverage == 0 {
+                        continue;
+                    }
+                }
             }
             let sa = (coverage * u32::from(ca)) / 255;
             let src_r = ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8;
             let src_g = ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8;
             let src_b = ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8;
             let src_a = sa.min(255) as u8;
-            let sx = (i64::from(x) + gx) as usize;
-            let sy = (i64::from(y) + gy) as usize;
             let d = (sy * width as usize + sx) * 4;
             let inv = 255 - u32::from(src_a);
             rgba[d] = src_r.saturating_add((u32::from(rgba[d]) * inv / 255) as u8);
@@ -1833,6 +1972,7 @@ mod tests {
                 dirty_rects: vec![],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2012,6 +2152,7 @@ mod tests {
                 dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 32, 16)],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2036,6 +2177,7 @@ mod tests {
                 dirty_rects: vec![crate::geometry::RectPx::new(0, 0, width, height)],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         }
@@ -2207,6 +2349,7 @@ mod tests {
                 dirty_rects: vec![],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2245,6 +2388,7 @@ mod tests {
                 dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images,
         }
@@ -2532,6 +2676,7 @@ mod tests {
                 dirty_rects: vec![crate::geometry::RectPx::new(0, 0, width, height)],
             },
             fills: vec![],
+            rounded_fills: vec![],
             glyphs: vec![],
             images: vec![
                 crate::grid::ImageBlit::try_new(
@@ -2628,6 +2773,226 @@ mod tests {
         assert_eq!(pixel(5, 5), (0, 0, 255, 255), "red blit painted");
         assert_eq!(pixel(8, 8), (255, 0, 0, 255), "blue blit painted");
         assert_eq!(pixel(0, 0), (0, 0, 0, 255), "clear untouched");
+        drop(data);
+        readback.unmap();
+    }
+
+    // -----------------------------------------------------------------------
+    // CTX-0311: rounded SDF fills + inner-arc glyph clipping.
+    // -----------------------------------------------------------------------
+
+    /// 32x32 frame, 4px border, radius 12; the content clip is the inner
+    /// rounded rect (4,4,24,24) with radius 8. The glyph is an 8x8 inline
+    /// full-coverage mask at (0,12): its left edge deliberately overhangs the
+    /// inner clip onto the left ring band.
+    fn rounded_clip_list() -> (DrawList, crate::grid::RoundedFill) {
+        use crate::geometry::RectPx;
+        use crate::grid::{GlyphInstance, GlyphSource, RoundedFill};
+        let ring = RoundedFill {
+            frame: RectPx::new(0, 0, 32, 32),
+            border: 4,
+            radius: 12,
+            color: [255, 0, 0, 255],
+        };
+        let clip = ring.inner_clip().expect("rounded ring has an inner clip");
+        let glyph = GlyphInstance {
+            dest: [0, 12],
+            size: [8, 8],
+            uv: [0.0; 4],
+            color: [255, 255, 255, 255],
+            clip: Some(clip),
+            source: GlyphSource::Inline {
+                mask: vec![255; 64],
+                width: 8,
+                height: 8,
+            },
+        };
+        let list = DrawList {
+            generation: 1,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(32, 32),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![RectPx::new(0, 0, 32, 32)],
+            },
+            fills: vec![],
+            rounded_fills: vec![ring.clone()],
+            glyphs: vec![glyph],
+            images: vec![],
+        };
+        (list, ring)
+    }
+
+    #[test]
+    fn headless_present_paints_rounded_ring_and_clips_glyphs() {
+        let (list, ring) = rounded_clip_list();
+        let surface = Surface::headless(PhysicalSize::new(32, 32)).expect("headless");
+        let stats = surface.headless_present(&list, None).expect("present");
+        assert_eq!(stats.rounded_fills, 1);
+        let rgba = surface.headless_rgba().expect("rgba");
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 32 + x) * 4;
+            [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
+        };
+        // Ring edge paints (opaque red); the outer corner is cut.
+        assert_eq!(px(0, 16), [255, 0, 0, 255], "left ring band");
+        assert_eq!(px(0, 0), [0x1E, 0x1E, 0x2E, 255], "outer corner cut");
+        // The glyph overhangs the inner clip at x=0: clipped, so the ring
+        // color survives instead of the white glyph texel.
+        assert_eq!(px(0, 16 - 4), [255, 0, 0, 255], "clipped glyph overhang");
+        assert_eq!(px(4, 16), [255, 255, 255, 255], "glyph inside the clip");
+        assert_eq!(px(16, 16), [0x1E, 0x1E, 0x2E, 255], "ring hole");
+        // The CPU coverage remains available for goldens.
+        assert!(ring.coverage_at(0.5, 16.5) >= 0.99);
+    }
+
+    /// Encodes linear light to an sRGB byte (test-local reference for the
+    /// GPU sRGB target).
+    fn srgb_encode_byte(linear: f32) -> u8 {
+        let encoded = if linear <= 0.003_130_8 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    }
+
+    /// CTX-0311 GPU path: renders the rounded ring plus the clipped glyph
+    /// offscreen on a real adapter and proves both the SDF partial coverage
+    /// and the glyph discard by readback. Gated by `BITTY_RENDER_GPU_TESTS=1`
+    /// (CI has no adapter, so it skips cleanly).
+    #[test]
+    fn real_gpu_offscreen_rounded_sdf_and_glyph_clip() {
+        if !gpu_tests_enabled() {
+            eprintln!("skipped: BITTY_RENDER_GPU_TESTS != 1");
+            return;
+        }
+        let ctx = match block_on(GpuContext::initialize()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!("adapter unavailable despite BITTY_RENDER_GPU_TESTS=1: {e}");
+                return;
+            }
+        };
+        let (list, ring) = rounded_clip_list();
+        let (width, height) = (32u32, 32u32);
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let target = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bitty-rounded-test-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut resources = crate::pipeline::GpuResources::create(
+            &ctx.device,
+            format,
+            crate::atlas::AtlasDims {
+                width: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+                height: crate::atlas::DEFAULT_ATLAS_DIMENSION,
+            },
+        )
+        .expect("present resources");
+        resources
+            .draw_frame(
+                &ctx.device,
+                &ctx.queue,
+                &view,
+                width,
+                height,
+                1.0,
+                &list,
+                None,
+                wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                1.0,
+            )
+            .expect("offscreen draw");
+        // Readback (`copy_texture_to_buffer` needs 256-byte row alignment).
+        let bytes_per_row = 256u32;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bitty-rounded-test-readback"),
+            size: u64::from(bytes_per_row) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-rounded-test-readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        ctx.device.poll(wgpu::PollType::Wait).expect("device poll");
+        rx.recv().expect("map callback").expect("buffer map");
+        let data = slice.get_mapped_range();
+        let pixel = |x: u32, y: u32| -> (u8, u8, u8, u8) {
+            let offset = (y * bytes_per_row + x * 4) as usize;
+            (
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            )
+        };
+        // BGRA target: opaque red is (0,0,255,255), white is (255,255,255,255).
+        assert_eq!(pixel(0, 16), (0, 0, 255, 255), "ring band paints");
+        assert_eq!(pixel(0, 0), (0, 0, 0, 255), "outer corner cut");
+        // Clipped glyph overhang: the white texel must not survive at x=0;
+        // the ring red does.
+        assert_eq!(pixel(0, 12), (0, 0, 255, 255), "clipped glyph stays ring");
+        assert_eq!(pixel(4, 16), (255, 255, 255, 255), "unclipped glyph paints");
+        assert_eq!(pixel(16, 16), (0, 0, 0, 255), "ring hole stays clear");
+        // Partial SDF coverage on the arc must match the shared analytic
+        // coverage encoded through the sRGB target (byte-tolerant).
+        let partial_x = 8u32;
+        let coverage = ring.coverage_at(partial_x as f32 + 0.5, 0.5);
+        assert!(
+            coverage > 0.05 && coverage < 0.95,
+            "expected partial arc coverage, got {coverage}"
+        );
+        let expected_r = srgb_encode_byte(coverage);
+        let gpu_r = pixel(partial_x, 0).2;
+        assert!(
+            gpu_r.abs_diff(expected_r) <= 4,
+            "SDF coverage mismatch at ({partial_x},0): gpu {gpu_r} vs analytic {expected_r}"
+        );
         drop(data);
         readback.unmap();
     }

@@ -198,6 +198,7 @@ fn headless_image_parity_is_observable_not_silent() {
             dirty_rects: vec![bitty_render::geometry::RectPx::new(0, 0, 8, 8)],
         },
         fills: vec![],
+        rounded_fills: vec![],
         glyphs: vec![],
         images: vec![blit],
     };
@@ -266,6 +267,7 @@ fn real_wgpu_surface_present_is_env_gated() {
                     dirty_rects: vec![],
                 },
                 fills: vec![],
+                rounded_fills: vec![],
                 glyphs: vec![],
                 images: vec![],
             };

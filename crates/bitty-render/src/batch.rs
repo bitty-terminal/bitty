@@ -53,14 +53,14 @@ use crate::grid::{FillRect, GlyphInstance, GlyphSource, ImageBlit, Rgba8};
 
 /// Maximum fill quads per vertex-buffer upload chunk.
 ///
-/// 4096 quads x 4 vertices x 24 bytes = 384 KiB per chunk, reused across
+/// 4096 quads x 4 vertices x 48 bytes = 768 KiB per chunk, reused across
 /// chunks within one frame so arbitrarily large `fills` lists (for example
 /// a fullscreen 29k-cell window) draw correctly without unbounded buffers.
 pub const MAX_FILL_QUADS_PER_BATCH: usize = 4096;
 
 /// Maximum glyph quads per vertex-buffer upload chunk.
 ///
-/// 4096 quads x 4 vertices x 32 bytes = 512 KiB per chunk, reused across
+/// 4096 quads x 4 vertices x 52 bytes = 832 KiB per chunk, reused across
 /// chunks the same way as fills.
 pub const MAX_GLYPH_QUADS_PER_BATCH: usize = 4096;
 
@@ -87,12 +87,16 @@ pub const INLINE_TEXTURE_SIZE: u32 = 1024;
 /// Required `bytes_per_row` alignment for texture uploads.
 pub const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 
-/// Bytes per fill vertex: `pos: vec2<f32>` + `color: vec4<f32>`.
-pub const FILL_VERTEX_SIZE_BYTES: usize = 24;
+/// Bytes per fill vertex: `pos: vec2<f32>` + `color: vec4<f32>` +
+/// `center: vec2<f32>` + `half: vec2<f32>` + `round: vec2<f32>`
+/// (`round.x < 0` marks a plain rect; otherwise `round = (radius, border)`,
+/// CTX-0311).
+pub const FILL_VERTEX_SIZE_BYTES: usize = 48;
 
 /// Bytes per glyph vertex: `pos: vec2<f32>` + `uv: vec2<f32>` +
-/// `color: vec4<f32>`.
-pub const GLYPH_VERTEX_SIZE_BYTES: usize = 32;
+/// `color: vec4<f32>` + `clip_center: vec2<f32>` + `clip_half: vec2<f32>` +
+/// `clip_radius: f32` (`< 0` marks no clip, CTX-0311).
+pub const GLYPH_VERTEX_SIZE_BYTES: usize = 52;
 
 /// Bytes per image vertex: `pos: vec2<f32>` + `uv: vec2<f32>`.
 pub const IMAGE_VERTEX_SIZE_BYTES: usize = 16;
@@ -224,28 +228,28 @@ pub struct GlyphChunk {
     pub bytes: Vec<u8>,
 }
 
-/// Serializes one fill quad (4 vertices, 96 bytes) or `None` when the rect
-/// is empty. Off-surface quads are still emitted (the GPU clips them); only
-/// empty rects are skipped.
-fn fill_quad_bytes(
-    rect: RectPx,
+/// Serializes one fill quad (4 vertices, 192 bytes).
+///
+/// `shape` is `(center_x, center_y, half_w, half_h, radius, border)` in
+/// scaled render pixels. `radius < 0` marks a plain rectangle: the fragment
+/// stage fills the whole quad, byte-identical to the pre-CTX-0311
+/// hard-edged fill.
+#[allow(clippy::too_many_arguments)]
+fn emit_fill_quad(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    shape: [f32; 6],
     color: Rgba8,
     surface_w: u32,
     surface_h: u32,
-    scale: f32,
-) -> Option<[u8; 96]> {
-    if rect.width == 0 || rect.height == 0 {
-        return None;
-    }
+) -> [u8; 192] {
     let w = surface_w as f32;
     let h = surface_h as f32;
     let c = rgba8_to_float4(color);
-    let x0 = rect.x as f32 * scale;
-    let y0 = rect.y as f32 * scale;
-    let x1 = (rect.x as f32 + rect.width as f32) * scale;
-    let y1 = (rect.y as f32 + rect.height as f32) * scale;
     let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-    let mut out = [0u8; 96];
+    let mut out = [0u8; 192];
     for (i, (px, py)) in corners.iter().enumerate() {
         let ndc = pixel_to_ndc(*px, *py, w, h);
         let base = i * FILL_VERTEX_SIZE_BYTES;
@@ -254,21 +258,94 @@ fn fill_quad_bytes(
         for (k, v) in c.iter().enumerate() {
             out[base + 8 + k * 4..base + 12 + k * 4].copy_from_slice(&v.to_le_bytes());
         }
+        for (k, v) in shape.iter().enumerate() {
+            out[base + 24 + k * 4..base + 28 + k * 4].copy_from_slice(&v.to_le_bytes());
+        }
     }
-    Some(out)
+    out
 }
 
-/// Serializes one glyph quad (4 vertices, 128 bytes) or `None` when the
+/// Serializes one plain fill quad (4 vertices, 192 bytes) or `None` when
+/// the rect is empty. Off-surface quads are still emitted (the GPU clips
+/// them); only empty rects are skipped.
+fn fill_quad_bytes(
+    rect: RectPx,
+    color: Rgba8,
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+) -> Option<[u8; 192]> {
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    let x0 = rect.x as f32 * scale;
+    let y0 = rect.y as f32 * scale;
+    let x1 = (rect.x as f32 + rect.width as f32) * scale;
+    let y1 = (rect.y as f32 + rect.height as f32) * scale;
+    let shape = [
+        (x0 + x1) * 0.5,
+        (y0 + y1) * 0.5,
+        (x1 - x0).abs() * 0.5,
+        (y1 - y0).abs() * 0.5,
+        -1.0,
+        0.0,
+    ];
+    Some(emit_fill_quad(
+        x0, y0, x1, y1, shape, color, surface_w, surface_h,
+    ))
+}
+
+/// Serializes one rounded fill/ring quad (4 vertices, 192 bytes) or `None`
+/// when the frame is empty. The SDF data (center, half extents, clamped
+/// radius/border) is scaled exactly like the vertex positions, so the
+/// fragment stage matches the software compositor's physical-pixel math.
+fn rounded_fill_quad_bytes(
+    fill: &crate::grid::RoundedFill,
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+) -> Option<[u8; 192]> {
+    if fill.frame.width == 0 || fill.frame.height == 0 {
+        return None;
+    }
+    let x0 = fill.frame.x as f32 * scale;
+    let y0 = fill.frame.y as f32 * scale;
+    let x1 = (fill.frame.x as f32 + fill.frame.width as f32) * scale;
+    let y1 = (fill.frame.y as f32 + fill.frame.height as f32) * scale;
+    let half_w = (x1 - x0).abs() * 0.5;
+    let half_h = (y1 - y0).abs() * 0.5;
+    let radius = fill.resolved_radius() * scale.abs();
+    let border = f32::from(fill.border) * scale.abs();
+    let shape = [
+        (x0 + x1) * 0.5,
+        (y0 + y1) * 0.5,
+        half_w,
+        half_h,
+        radius.min(half_w).min(half_h),
+        border.min(half_w).min(half_h),
+    ];
+    Some(emit_fill_quad(
+        x0, y0, x1, y1, shape, fill.color, surface_w, surface_h,
+    ))
+}
+
+/// Serializes one glyph quad (4 vertices, 208 bytes) or `None` when the
 /// glyph has a zero size.
+///
+/// The rounded clip (CTX-0311) is encoded as scaled center/half/radius;
+/// `clip_radius < 0` marks "no clip" so unclipped glyphs keep the exact
+/// pre-CTX-0311 shader path.
+#[allow(clippy::too_many_arguments)]
 fn glyph_quad_bytes(
     dest: [i32; 2],
     size: [u32; 2],
     uv: [f32; 4],
     color: Rgba8,
+    clip: Option<crate::grid::RoundedClip>,
     surface_w: u32,
     surface_h: u32,
     scale: f32,
-) -> Option<[u8; 128]> {
+) -> Option<[u8; 208]> {
     if size[0] == 0 || size[1] == 0 {
         return None;
     }
@@ -279,6 +356,19 @@ fn glyph_quad_bytes(
     let y0 = dest[1] as f32 * scale;
     let x1 = (dest[0] as f32 + size[0] as f32) * scale;
     let y1 = (dest[1] as f32 + size[1] as f32) * scale;
+    let (clip_center, clip_half, clip_radius) = match clip {
+        Some(clip) => {
+            let half_w = clip.rect.width as f32 * 0.5 * scale.abs();
+            let half_h = clip.rect.height as f32 * 0.5 * scale.abs();
+            let center = [
+                (clip.rect.x as f32 + clip.rect.width as f32 * 0.5) * scale,
+                (clip.rect.y as f32 + clip.rect.height as f32 * 0.5) * scale,
+            ];
+            let radius = f32::from(clip.radius) * scale.abs();
+            (center, [half_w, half_h], radius.min(half_w).min(half_h))
+        }
+        None => ([0.0, 0.0], [0.0, 0.0], -1.0),
+    };
     // uv is [u0, v0, u1, v1]; corners match the fill winding.
     let corners = [
         (x0, y0, uv[0], uv[1]),
@@ -286,7 +376,7 @@ fn glyph_quad_bytes(
         (x1, y1, uv[2], uv[3]),
         (x0, y1, uv[0], uv[3]),
     ];
-    let mut out = [0u8; 128];
+    let mut out = [0u8; 208];
     for (i, (px, py, u, v)) in corners.iter().enumerate() {
         let ndc = pixel_to_ndc(*px, *py, w, h);
         let base = i * GLYPH_VERTEX_SIZE_BYTES;
@@ -297,6 +387,11 @@ fn glyph_quad_bytes(
         for (k, ch) in c.iter().enumerate() {
             out[base + 16 + k * 4..base + 20 + k * 4].copy_from_slice(&ch.to_le_bytes());
         }
+        out[base + 32..base + 36].copy_from_slice(&clip_center[0].to_le_bytes());
+        out[base + 36..base + 40].copy_from_slice(&clip_center[1].to_le_bytes());
+        out[base + 40..base + 44].copy_from_slice(&clip_half[0].to_le_bytes());
+        out[base + 44..base + 48].copy_from_slice(&clip_half[1].to_le_bytes());
+        out[base + 48..base + 52].copy_from_slice(&clip_radius.to_le_bytes());
     }
     Some(out)
 }
@@ -321,6 +416,46 @@ pub fn chunk_fills(
     let mut count = 0usize;
     for fill in fills {
         let Some(quad) = fill_quad_bytes(fill.rect, fill.color, surface_w, surface_h, scale) else {
+            continue;
+        };
+        current.extend_from_slice(&quad);
+        count += 1;
+        if count >= MAX_FILL_QUADS_PER_BATCH {
+            chunks.push(FillChunk {
+                quad_count: count,
+                bytes: std::mem::take(&mut current),
+            });
+            count = 0;
+        }
+    }
+    if count > 0 {
+        chunks.push(FillChunk {
+            quad_count: count,
+            bytes: current,
+        });
+    }
+    chunks
+}
+
+/// Translates rounded fill/ring primitives into bounded serialized chunks
+/// (CTX-0311). Empty frames are skipped; chunk order preserves input order.
+/// The wgpu fill pipeline evaluates the rounded-box SDF per fragment, so one
+/// primitive is one quad regardless of the corner radius.
+#[must_use]
+pub fn chunk_rounded_fills(
+    fills: &[crate::grid::RoundedFill],
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+) -> Vec<FillChunk> {
+    if surface_w == 0 || surface_h == 0 || fills.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut count = 0usize;
+    for fill in fills {
+        let Some(quad) = rounded_fill_quad_bytes(fill, surface_w, surface_h, scale) else {
             continue;
         };
         current.extend_from_slice(&quad);
@@ -368,6 +503,7 @@ pub fn chunk_atlas_glyphs(
             glyph.size,
             glyph.uv,
             glyph.color,
+            glyph.clip,
             surface_w,
             surface_h,
             scale,
@@ -404,6 +540,9 @@ pub struct InlineGlyph {
     pub uv: [f32; 4],
     /// Tint color (straight alpha).
     pub color: Rgba8,
+    /// Optional rounded content clip, propagated from the source glyph
+    /// (CTX-0311); `None` keeps the unclipped behavior.
+    pub clip: Option<crate::grid::RoundedClip>,
 }
 
 /// Per-frame packing of inline glyph masks into a fixed transient texture.
@@ -515,6 +654,7 @@ pub fn pack_inline_glyphs(glyphs: &[GlyphInstance]) -> InlinePlan {
                 (slot_y + h) as f32 / dim,
             ],
             color: glyph.color,
+            clip: glyph.clip,
         });
     }
 
@@ -548,6 +688,7 @@ pub fn chunk_inline_glyphs(
             placement.size,
             placement.uv,
             placement.color,
+            placement.clip,
             surface_w,
             surface_h,
             scale,
@@ -875,6 +1016,7 @@ mod tests {
             size,
             uv: [0.0, 0.0, 0.5, 0.5],
             color: [0xE5, 0xE5, 0xE5, 0xFF],
+            clip: None,
             source: GlyphSource::Atlas {
                 slot: crate::atlas::AtlasSlot {
                     x: 0,
@@ -1020,6 +1162,7 @@ mod tests {
                 size: [8, 8],
                 uv: [0.0; 4],
                 color: [255, 255, 255, 255],
+                clip: None,
                 source: GlyphSource::Inline {
                     mask: vec![255; 64],
                     width: 8,
@@ -1087,6 +1230,7 @@ mod tests {
                 size: [4, 4],
                 uv: [0.0; 4],
                 color: [255, 255, 255, 255],
+                clip: None,
                 source: GlyphSource::Inline {
                     mask: vec![200; 16],
                     width: 4,
@@ -1098,6 +1242,7 @@ mod tests {
                 size: [0, 4],
                 uv: [0.0; 4],
                 color: [255, 255, 255, 255],
+                clip: None,
                 source: GlyphSource::Inline {
                     mask: vec![],
                     width: 0,

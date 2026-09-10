@@ -869,10 +869,13 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         None => None,
         Some(w) => match (w.opacity, w.padding) {
             (Some(opacity), Some(padding)) => {
-                if !(0..=64).contains(&padding) {
+                if !(0..=crate::types::MAX_WINDOW_PADDING as i64).contains(&padding) {
                     return Err(ConfigError::validation(
                         "window.padding",
-                        format!("must be within [0, 64] (found {padding})"),
+                        format!(
+                            "must be within [0, {}] (found {padding})",
+                            crate::types::MAX_WINDOW_PADDING
+                        ),
                     ));
                 }
                 // CTX-0241 S0: `radius_px` is optional (absent means "this

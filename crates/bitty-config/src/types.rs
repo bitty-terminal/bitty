@@ -135,6 +135,20 @@ pub const DEFAULT_WINDOW_RADIUS_PX: u32 = 0;
 /// 24px covers tasteful rounding at terminal window sizes while keeping
 /// untrusted input bounded (threat T-01). Larger values fail closed.
 pub const MAX_WINDOW_RADIUS_PX: u32 = 24;
+
+/// Default window padding in logical pixels (CTX-0223).
+///
+/// 8px keeps ghostty/alacritty-class breathing room between the grid and the
+/// window edge; the padding band keeps the theme background.
+pub const DEFAULT_WINDOW_PADDING: u32 = 8;
+
+/// Maximum window padding in logical pixels (`0..=64`).
+///
+/// Bounds untrusted input (threat T-01); larger values fail closed. Mirrored
+/// by value in `bitty-runtime::config::MAX_WINDOW_PADDING` (runtime cannot
+/// depend on `bitty-config`); the pairing is pinned by the app-level test.
+pub const MAX_WINDOW_PADDING: u32 = 64;
+
 /// Default font family: Nerd-Font-patched JetBrains Mono.
 ///
 /// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
@@ -353,7 +367,7 @@ impl Default for WindowConfig {
     fn default() -> Self {
         Self {
             opacity: 1.0,
-            padding: 8,
+            padding: DEFAULT_WINDOW_PADDING,
             radius_px: DEFAULT_WINDOW_RADIUS_PX,
         }
     }
@@ -368,8 +382,11 @@ impl WindowConfig {
                 "must be finite within [0.0, 1.0]",
             ));
         }
-        if self.padding > 64 {
-            return Err(ConfigError::validation("window.padding", "must be <= 64"));
+        if self.padding > MAX_WINDOW_PADDING {
+            return Err(ConfigError::validation(
+                "window.padding",
+                format!("must be <= {MAX_WINDOW_PADDING}"),
+            ));
         }
         if self.radius_px > MAX_WINDOW_RADIUS_PX {
             return Err(ConfigError::validation(
@@ -1114,6 +1131,39 @@ mod tests {
         .validate()
         .unwrap_err();
         WindowConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn window_padding_validation() {
+        // CTX-0301: padding literals are named; pin the default, the bound,
+        // and the fail-closed edge (`> MAX_WINDOW_PADDING`).
+        assert_eq!(WindowConfig::default().padding, DEFAULT_WINDOW_PADDING);
+        assert_eq!(DEFAULT_WINDOW_PADDING, 8);
+        assert_eq!(MAX_WINDOW_PADDING, 64);
+        WindowConfig {
+            padding: 0,
+            ..Default::default()
+        }
+        .validate()
+        .expect("zero valid");
+        WindowConfig {
+            padding: MAX_WINDOW_PADDING,
+            ..Default::default()
+        }
+        .validate()
+        .expect("max valid");
+        WindowConfig {
+            padding: MAX_WINDOW_PADDING + 1,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        WindowConfig {
+            padding: u32::MAX,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
     }
 
     #[test]

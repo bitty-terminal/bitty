@@ -1039,8 +1039,8 @@ pub struct CtlIpcOutcome {
 /// Connect, send one framed request, read one framed response.
 ///
 /// Unix-only (the servo is unix-only); non-unix returns unavailable.
-/// Time-bounded (5 s connect via blocking connect + 5 s read/write
-/// timeouts) so a dead peer cannot hang the CLI.
+/// Time-bounded (`ipc_ctl::CTL_TIMEOUT` read/write timeouts, shared with
+/// the server-side reply wait) so a dead peer cannot hang the CLI.
 #[cfg(unix)]
 pub fn ctl_roundtrip(
     socket_path: &str,
@@ -1049,15 +1049,14 @@ pub fn ctl_roundtrip(
 ) -> Result<CtlIpcOutcome, String> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::time::Duration;
 
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| format!("bitty ctl: cannot connect to {socket_path:?}: {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(ipc_ctl::CTL_TIMEOUT))
         .map_err(|err| format!("bitty ctl: cannot set read timeout: {err}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(ipc_ctl::CTL_TIMEOUT))
         .map_err(|err| format!("bitty ctl: cannot set write timeout: {err}"))?;
 
     let params_part = match params {

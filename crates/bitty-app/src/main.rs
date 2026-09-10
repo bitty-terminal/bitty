@@ -204,6 +204,7 @@ mod inspect;
 mod ipc_serve;
 
 mod list;
+mod plugin;
 mod run;
 
 use chrome_keys::AppModifiers;
@@ -507,6 +508,20 @@ struct Args {
     dev_socket_pre: Option<String>,
     /// Global `--instance` before the `dev` word (rejected at dispatch).
     dev_instance_pre: Option<String>,
+    /// `bitty plugin` CLI-first management (CTX-0150, DEC-0007). True once
+    /// the first positional `plugin` word is seen; a program literally named
+    /// `plugin` needs `bitty -- plugin ...` (or `bitty run -- plugin ...`).
+    /// Tokens after the word land verbatim in `plugin_raw` for
+    /// [`plugin::parse_plugin_request`].
+    plugin_word: bool,
+    /// Raw tokens after the `plugin` word (verb, id, flags) for
+    /// [`plugin::parse_plugin_request`]. Empty until `plugin_word` is set.
+    plugin_raw: Vec<String>,
+    /// Global `--format` before the `plugin` word (fallback merged at
+    /// dispatch; a post-word `--format` wins).
+    plugin_format: Option<String>,
+    /// `--no-color` for plugin table output (global or post-word).
+    plugin_no_color: bool,
     /// When true emit per-frame `bitty tick` stats (CTX-0190).
     /// `-v` / `--verbose` (also `BITTY_VERBOSE=1`); shorthand for
     /// `--log-level debug`. Default (unset) is quiet: no tick lines.
@@ -609,6 +624,10 @@ impl Args {
             dev_no_color: false,
             dev_socket_pre: None,
             dev_instance_pre: None,
+            plugin_word: false,
+            plugin_raw: Vec::new(),
+            plugin_format: None,
+            plugin_no_color: false,
             verbose: false,
             log_level: None,
         }
@@ -922,6 +941,7 @@ fn parse_args(raw: &[String]) -> Args {
             out.list_format = Some(val.to_string());
             out.inspect_format = Some(val.to_string());
             out.dev_format = Some(val.to_string());
+            out.plugin_format = Some(val.to_string());
             i += 1;
             continue;
         }
@@ -1162,12 +1182,14 @@ fn parse_args(raw: &[String]) -> Args {
                     out.list_format = Some(raw[i + 1].clone());
                     out.inspect_format = Some(raw[i + 1].clone());
                     out.dev_format = Some(raw[i + 1].clone());
+                    out.plugin_format = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
                     out.list_format = Some(String::new());
                     out.inspect_format = Some(String::new());
                     out.dev_format = Some(String::new());
+                    out.plugin_format = Some(String::new());
                     i += 1;
                 }
             }
@@ -1234,6 +1256,7 @@ fn parse_args(raw: &[String]) -> Args {
                 out.list_no_color = true;
                 out.inspect_no_color = true;
                 out.dev_no_color = true;
+                out.plugin_no_color = true;
                 i += 1;
             }
             "--split" => {
@@ -1650,6 +1673,28 @@ fn parse_args(raw: &[String]) -> Args {
                     out.dev_raw.extend_from_slice(&raw[i + 1..]);
                     break;
                 }
+                // `bitty plugin` CLI-first management (CTX-0150, DEC-0007).
+                // The word `plugin` is always this subcommand, never a
+                // program named `plugin`: use `bitty run -- plugin ...` (or
+                // legacy `bitty -- plugin ...`) for that program. Tokens
+                // after the word are kept verbatim for
+                // `plugin::parse_plugin_request`.
+                if !program_set
+                    && !out.config_word
+                    && !out.inspect_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.run_word
+                    && !out.ctl_word
+                    && !out.list_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && token == "plugin"
+                {
+                    out.plugin_word = true;
+                    out.plugin_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
                 if !program_set {
                     out.program = Some(token.clone());
                     program_set = true;
@@ -1714,10 +1759,11 @@ fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                 --format SHAPE  Doctor/ctl/list/inspect output shape: table|json|jsonl\n  \
-                               (default table; parsed globally, consumed by\n  \
-                               `bitty doctor`, `bitty ctl`, `bitty list`, and\n  \
-                               `bitty inspect`; ignored by startup).\n  \
+                 --format SHAPE  Doctor/ctl/list/inspect/plugin output shape:\n  \
+                              table|json|jsonl (default table; parsed globally,\n  \
+                              consumed by `bitty doctor`, `bitty ctl`,\n  \
+                              `bitty list`, `bitty inspect`, and\n  \
+                              `bitty plugin list|info`; ignored by startup).\n  \
                --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
                               or `bitty ctl --socket P ...`; bypasses discovery).\n  \
                --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
@@ -1763,6 +1809,11 @@ fn help_text() -> String {
             dev <verb>       Developer tracing, captures, dumps, overlays\n  \
                              (trace|capture|dump|overlay; local only, no\n  \
                              instance; `bitty dev --help` for detail)\n  \
+           plugin <verb>     CLI-first plugin management (local, no VM):\n  \
+                             list|install|remove|enable|disable|info over the\n  \
+                             managed manifest (bitty-plugins.toml); install\n  \
+                             requires capability consent; remove requires\n  \
+                             --force; `bitty plugin --help` for detail\n  \
          \n\
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
@@ -1820,8 +1871,10 @@ fn help_text() -> String {
             bitty --headless -- /bin/bash\n  \
             bitty /bin/bash\n  \
             bitty -- /bin/cat -A\n  \
-            bitty doctor\n  \
-            bitty doctor --format json\n",
+           bitty doctor\n  \
+           bitty doctor --format json\n  \
+           bitty plugin list\n  \
+           bitty plugin install bitty-terminal.tabs --yes\n",
         version_text()
     )
 }
@@ -4798,6 +4851,12 @@ fn main() {
         println!("{}", dev::dev_help_text());
         std::process::exit(0);
     }
+    // `bitty plugin --help` shows plugin help (never needs an instance, a
+    // config file, or a plugin VM).
+    if args.help && args.plugin_word {
+        println!("{}", plugin::plugin_help_text());
+        std::process::exit(0);
+    }
     if args.help {
         println!("{}", help_text());
         std::process::exit(0);
@@ -4897,6 +4956,34 @@ fn main() {
     // (exit 2); post-parse failures are generic errors (exit 1).
     if args.dev_word {
         std::process::exit(run_dev_subcommand(&args));
+    }
+
+    // `bitty plugin` CLI-first management (CTX-0150, DEC-0007). Local class:
+    // static bundled manifests plus the managed manifest only — no instance,
+    // no IPC, no plugin VM and no plugin code ever loaded. Capability
+    // consent prompts read stdin and fail closed on EOF.
+    if args.plugin_word {
+        let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+        let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+        let home = std::env::var("HOME").ok();
+        let context = plugin::PluginContext {
+            config_path: args.config_path.as_deref(),
+            bitty_config_env: bitty_config_env.as_deref(),
+            xdg_config_home: xdg_config_home.as_deref(),
+            home: home.as_deref(),
+            pre_format: args.plugin_format.as_deref(),
+            pre_no_color: args.plugin_no_color,
+        };
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        std::process::exit(plugin::run_plugin_subcommand(
+            &args.plugin_raw,
+            &context,
+            &mut input,
+            &mut output,
+        ));
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a
@@ -7142,6 +7229,56 @@ mod tests {
         let help = help_text();
         assert!(help.contains("dev <verb>"));
         assert!(help.contains("bitty dev --help"));
+    }
+
+    #[test]
+    fn parse_plugin_subcommand() {
+        let p = parse_args(&args_of(&["bitty", "plugin", "list"]));
+        assert!(p.plugin_word);
+        assert_eq!(p.plugin_raw, vec!["list".to_string()]);
+        assert_eq!(p.program, None);
+
+        // Tokens after the word stay verbatim for the plugin parser.
+        let p = parse_args(&args_of(&[
+            "bitty",
+            "plugin",
+            "install",
+            "bitty-terminal.tabs",
+            "--yes",
+        ]));
+        assert!(p.plugin_word);
+        assert_eq!(
+            p.plugin_raw,
+            vec![
+                "install".to_string(),
+                "bitty-terminal.tabs".to_string(),
+                "--yes".to_string()
+            ]
+        );
+
+        // Global --format before the word is stashed as the fallback.
+        let p = parse_args(&args_of(&["bitty", "--format", "json", "plugin", "list"]));
+        assert!(p.plugin_word);
+        assert_eq!(p.plugin_format.as_deref(), Some("json"));
+
+        let p = parse_args(&args_of(&["bitty", "--no-color", "plugin", "list"]));
+        assert!(p.plugin_word);
+        assert!(p.plugin_no_color);
+
+        // Escape hatch: a program literally named `plugin`.
+        let p = parse_args(&args_of(&["bitty", "--", "plugin", "list"]));
+        assert!(!p.plugin_word);
+        assert_eq!(p.program.as_deref(), Some("plugin"));
+
+        // `plugin` after another word belongs to that word's args.
+        let p = parse_args(&args_of(&["bitty", "list", "plugin"]));
+        assert!(p.list_word);
+        assert!(!p.plugin_word);
+
+        // Help mentions the new subcommand.
+        let help = help_text();
+        assert!(help.contains("plugin <verb>"));
+        assert!(help.contains("bitty plugin --help"));
     }
 
     #[test]

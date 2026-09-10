@@ -485,21 +485,7 @@ impl PluginHost {
     fn required_capabilities(
         manifest: &PluginManifest,
     ) -> Result<BTreeSet<CapabilityId>, PluginError> {
-        let mut required = manifest.capabilities.ids.clone();
-        for request in &manifest.capabilities.filesystem {
-            for path in &request.paths {
-                let capability = match request.access {
-                    FsAccess::Read => format!("fs.read:{path}"),
-                    FsAccess::Write => format!("fs.write:{path}"),
-                };
-                required.insert(CapabilityId::parse(&capability).map_err(|error| {
-                    PluginError::grant(format!(
-                        "invalid filesystem capability '{capability}': {error}"
-                    ))
-                })?);
-            }
-        }
-        Ok(required)
+        manifest.capabilities.all_ids()
     }
 
     /// Access the registry (read-only).

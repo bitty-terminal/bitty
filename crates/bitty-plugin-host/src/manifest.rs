@@ -503,6 +503,32 @@ impl CapabilityRequests {
         })
     }
 
+    /// The full requested capability set (flat ids plus filesystem requests
+    /// expanded to `fs.read:PARAM` / `fs.write:PARAM`).
+    ///
+    /// This is the exact set a grant must cover before activation; it is the
+    /// single expansion shared by [`crate::host::PluginHost::activate`] and
+    /// the `bitty plugin` CLI consent surface (CTX-0150). Sorted and
+    /// deduplicated (`BTreeSet`), deny-by-default: an empty set means no
+    /// authority requested.
+    pub fn all_ids(&self) -> Result<BTreeSet<CapabilityId>, PluginError> {
+        let mut required = self.ids.clone();
+        for request in &self.filesystem {
+            for path in &request.paths {
+                let capability = match request.access {
+                    FsAccess::Read => format!("fs.read:{path}"),
+                    FsAccess::Write => format!("fs.write:{path}"),
+                };
+                required.insert(CapabilityId::parse(&capability).map_err(|error| {
+                    PluginError::grant(format!(
+                        "invalid filesystem capability '{capability}': {error}"
+                    ))
+                })?);
+            }
+        }
+        Ok(required)
+    }
+
     /// Validate all capability requests.
     pub fn validate(&self) -> Result<(), PluginError> {
         // Already validated via CapabilityId::parse at insertion; re-validate invariants.

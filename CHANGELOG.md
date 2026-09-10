@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   patterns) shared by host activation and the CLI consent surface.
 - v1 installs bundled ids only (`bitty-terminal.*`); registry/Git/local-path
   sources remain deferred with the package manager and fail closed with a
-  clear error. Tests: 19 unit + 6 end-to-end binary cases, all headless.
+  clear error. Tests: 16 unit (`plugin`) + 1 dispatch-parse unit + 6
+  end-to-end binary cases, all headless.
 
 ### Kitty placement + rasterize + composite into present path (CTX-0248, issue #426)
 

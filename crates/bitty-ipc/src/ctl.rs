@@ -822,7 +822,10 @@ mod tests {
         // must never touch the control queue (no enqueue means no 5 s drain
         // wait, so a denial can never surface as a timeout). No timing
         // asserts: the queue-emptiness check is the proof.
-        while pop_pending_control().is_some() {}
+        // CTX-0287: hold the global-queue serial guard for the whole body;
+        // without it this test races enqueue_fires_control_waker (queue
+        // theft both directions, CI run 34455962423).
+        let _guard = ControlWakeGuard::take();
         let empty = ScopeSet::new();
         for method in all_control_methods() {
             let required = required_scope_for_ctl_method(method).expect("known method");
@@ -863,13 +866,39 @@ mod tests {
 
     /// RAII hermeticity for the process-global queue + waker slot: other
     /// tests share both, so restore unconditionally on drop.
-    struct ControlWakeGuard;
+    /// CTX-0287: also serializes the two global-queue tests. Rust runs tests
+    /// in parallel threads, so the denial test's drain/assert pair can steal
+    /// (or observe) the waker test's enqueued item and vice versa (CI run
+    /// 34455962423: complementary panics at :858 queue non-empty vs :919
+    /// queue empty; 3/60 local repro). Every test that touches the globals
+    /// holds `lock_control_queue_for_test` for its whole queue+waker
+    /// sequence via `ControlWakeGuard::take`; pure-parser tests need no
+    /// guard. Same `OnceLock<Mutex<()>>` idiom as devtools
+    /// `introspection_test_lock`. Test-only: production paths never take
+    /// this lock (lock order is always serial-guard then queue/waker locks,
+    /// never the reverse, so no deadlock). Poison-safe so a panicking holder
+    /// cannot cascade-fail the suite.
+    struct ControlWakeGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn control_queue_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn lock_control_queue_for_test() -> std::sync::MutexGuard<'static, ()> {
+        control_queue_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     impl ControlWakeGuard {
         fn take() -> Self {
+            let serial = lock_control_queue_for_test();
             while pop_pending_control().is_some() {}
             set_control_waker(None);
-            Self
+            Self { _serial: serial }
         }
     }
 
@@ -877,6 +906,7 @@ mod tests {
         fn drop(&mut self) {
             set_control_waker(None);
             while pop_pending_control().is_some() {}
+            // `_serial` drops here, releasing the serial guard last.
         }
     }
 

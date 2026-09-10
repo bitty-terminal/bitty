@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### `bitty plugin` CLI-first management (CTX-0150, issue #244)
+
+- New `bitty plugin list|install|remove|enable|disable|info` subcommands over
+  the existing draft `bitty-plugin-host` machinery (static bundled manifests,
+  closed capability grammar, hash binding). Local class: no instance, no IPC,
+  no plugin VM, and no plugin code is executed.
+- One machine-managed manifest at
+  `$XDG_CONFIG_HOME/bitty/bitty-plugins.toml` (or beside an explicit
+  `--config` path): a strict bounded format whose unknown keys, malformed
+  values, and over-limit files fail closed. `remove` requires `--force` and
+  keeps a `.bak` of the previous manifest; installs pin
+  `PluginManifest::manifest_hash()` and `enable` re-checks that pin.
+- Capability consent: the prompt lists every requested capability with its
+  plain-language effect and high-risk marker; `--yes` approves
+  non-interactively, the interactive `[y/N]` path fails closed on EOF or a
+  decline, and an update that adds capabilities blocks until re-approved
+  while narrowed/unchanged sets carry forward (P0-AC-030 pattern).
+- `bitty-plugin-host`: new `CapabilityRequests::all_ids()` exposes the exact
+  requested-capability expansion (flat ids plus `fs.read`/`fs.write`
+  patterns) shared by host activation and the CLI consent surface.
+- v1 installs bundled ids only (`bitty-terminal.*`); registry/Git/local-path
+  sources remain deferred with the package manager and fail closed with a
+  clear error. Tests: 16 unit (`plugin`) + 1 dispatch-parse unit + 6
+  end-to-end binary cases, all headless.
+
 ### Kitty placement + rasterize + composite into present path (CTX-0248, issue #426)
 
 - New `bitty-rich` `kitty_place` layer: `a=t`/`T`/unsupported action mapping, cursor-anchored cell rects, scroll-with-content, alt-screen clear, CTX-0247 decode caps reused, no allocation before validation.

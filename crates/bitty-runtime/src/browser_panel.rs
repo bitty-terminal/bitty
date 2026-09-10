@@ -18,7 +18,8 @@
 //! `Declared -> Created -> Navigating -> Focused -> Suspended -> Disposed`
 //! with validated transitions, navigation allowlist `https` default with
 //! `file://` requiring distinct `browser.file-url` gate per R-005
-//! `FileUrlActivation` (validated against `PROJECT_GLOB` `~/projects/**`),
+//! `FileUrlActivation` (validated against the shared project scope
+//! [`crate::project_scope::PROJECT_FS_PATTERN`]),
 //! `javascript:`/`data:`/`http://` denied, storage via distinct
 //! `browser.storage` gate, bounded queues `64`/`1024`/`256 KiB`/`8192`/`2 MiB`
 //! `DropOldest` with `8 KiB` payload and `32`/`8 KiB` batch (PR-1..PR-12,
@@ -342,42 +343,25 @@ impl BrowserIntegration {
         if path.is_empty() {
             return None;
         }
-        // For validation we expect either absolute `/...` or `~/projects/...`
-        // after file://. The pre-study PROJECT_GLOB is `~/projects/**`.
-        // Accept `file:///home/...` and `file://~/projects/...` both but scope
-        // check via `is_within_file_scope` will reject non-project absolute.
+        // Paths after `file://` are scope-checked by `is_within_file_scope`
+        // against the shared project scope root; non-project absolute paths
+        // are rejected there.
         Some(path.to_owned())
     }
 
-    /// Whether `file://` url is within the granted file scope `~/projects/**`.
+    /// Whether `file://` url is within the granted project file scope
+    /// [`crate::project_scope::PROJECT_FS_PATTERN`].
     ///
-    /// Pure, bounded check: path extracted from `file://` must be covered by
-    /// `~/projects/**` or be a valid absolute path that real-path would
-    /// resolve under `~/projects` — but pure helper conservatively requires
-    /// `~/projects/` prefix or exactly `~/projects`. Symlink/device checks are
-    /// deferred to host real-path resolution, mirroring `FileManagerIntegration`.
+    /// Pure, bounded check: the path extracted from `file://` must satisfy the
+    /// shared [`crate::project_scope::is_within_project_scope`] gate.
+    /// Non-project absolute paths stay denied; symlink/device checks are
+    /// deferred to host real-path resolution.
     #[must_use]
     pub fn is_within_file_scope(url: &str) -> bool {
         let Some(path) = Self::file_url_to_path(url) else {
             return false;
         };
-        // Reuse file-manager style scope: must start with ~/projects/
-        // For file:// we interpret the path after file:// as the filesystem path.
-        // The allowlist requires that path be within ~/projects/**.
-        // Accept both "~/projects/..." and "~/projects"
-        if path == "~/projects" || path == "~/projects/" {
-            return true;
-        }
-        if path.starts_with("~/projects/") {
-            if path.contains("..") {
-                return false;
-            }
-            return true;
-        }
-        // Also accept absolute `/home/user/projects` style? Conservative: reject
-        // unless it contains ~/projects segment; host real-path check would be needed.
-        // For bounded pure helper, only allow ~/projects prefix.
-        false
+        crate::project_scope::is_within_project_scope(&path)
     }
 
     /// Whether navigation to `url` is allowed under the allowlist.

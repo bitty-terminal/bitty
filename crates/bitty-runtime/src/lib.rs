@@ -190,6 +190,7 @@ pub mod palette;
 pub mod panels_async;
 pub mod paste;
 pub mod project;
+pub mod project_scope;
 pub mod queries;
 pub mod queue;
 pub mod registry;

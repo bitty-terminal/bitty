@@ -23,7 +23,8 @@
 use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
 
 /// Filesystem capability pattern for project plugin — constrained read-only.
-pub const PROJECT_FS_PATTERN: &str = "~/projects/**";
+/// Single source: [`crate::project_scope::PROJECT_FS_PATTERN`].
+pub use crate::project_scope::{PROJECT_FS_PATTERN, PROJECT_ROOT};
 
 /// Maximum project entries to list per discovery — bounded for presentation.
 pub const PROJECT_MAX_PROJECTS: usize = 64;
@@ -45,36 +46,15 @@ pub const PROJECT_MAX_PANELS_PER_WINDOW: usize = crate::registry::MAX_PANELS_PER
 pub struct ProjectIntegration;
 
 impl ProjectIntegration {
-    /// Whether `path` is within `~/projects/**` isolation boundary.
+    /// Whether `path` is within the [`PROJECT_ROOT`] isolation boundary.
     ///
-    /// Pure, bounded check: `path` must start with `~/projects/` or be exactly
-    /// `~/projects`, contain no `..` segment, no null byte, and length
-    /// `<= 4096` (parser bound for cwd). Symlink/device checks are deferred to
-    /// host real-path resolution; this gate rejects obvious escapes headlessly.
+    /// Delegates to [`crate::project_scope::is_within_project_scope`], the
+    /// shared pure, bounded, fail-closed gate. Symlink/device checks are
+    /// deferred to host real-path resolution; this gate rejects obvious
+    /// escapes headlessly.
     #[must_use]
     pub fn is_within_projects(path: &str) -> bool {
-        if path.is_empty() || path.len() > 4096 {
-            return false;
-        }
-        if path.contains('\0') {
-            return false;
-        }
-        // Normalize: must be ~/projects/** — allow ~/projects, ~/projects/, ~/projects/foo, ~/projects/foo/bar
-        if path == "~/projects" || path == "~/projects/" {
-            return true;
-        }
-        if !path.starts_with("~/projects/") {
-            return false;
-        }
-        // Reject parent traversal
-        if path.contains("..") {
-            return false;
-        }
-        // Reject control characters
-        if path.chars().any(|c| c.is_control()) {
-            return false;
-        }
-        true
+        crate::project_scope::is_within_project_scope(path)
     }
 
     /// Validates that `candidate` is allowed under the granted `PROJECT_FS_PATTERN`

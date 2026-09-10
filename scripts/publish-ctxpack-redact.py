@@ -5,7 +5,15 @@ Usage: publish-ctxpack-redact.py <snapshot-dir>
 
 Rewrites every ``*.jsonl`` file under <snapshot-dir> IN PLACE, replacing
 secret-shaped values with ``***REDACTED***`` while keeping field names (and,
-inside free text, variable names) intact for debuggability.
+inside free text, variable names) intact for debuggability. ``tombstones.jsonl``
+(added by ctxpack format v2) is treated like any other table file; unknown
+future table files are picked up by the same ``*.jsonl`` glob.
+
+After the JSONL pass, stamps ``manifest.json`` with ``"redacted": true``
+(publication-artifact marker per the ctxpack v2 contract) without touching any
+other manifest field -- in particular ``counts`` is never modified, so count
+consistency and the round-trip self-test still hold. Re-running is a no-op:
+an already-``true`` stamp is reported and the file is left byte-identical.
 
 What is redacted (fail-closed heuristics, JSONL-aware -- never blind sed):
   1. Key-name rule: any JSON object field whose name is secret-shaped (see
@@ -45,7 +53,10 @@ Scope and safety:
     the DB keeps the original values and the next export redacts them again.
   - Row counts and file sets are unchanged, so manifest counts and the
     round-trip self-test still hold on redacted output.
-  - Re-running is a no-op (``***REDACTED***`` carries no secret shape).
+  - ``manifest.json`` must exist and be a JSON object; its ``redacted`` stamp
+    is set to ``true`` (atomic replace) and no other manifest content changes.
+  - Re-running is a no-op (``***REDACTED***`` carries no secret shape and an
+    already-true stamp is left byte-identical).
   - Files are replaced atomically (tmp + rename); rows that do not parse
     as JSON are left byte-identical and reported (the self-test then fails
     closed on them as malformed rows, as before).
@@ -251,6 +262,35 @@ def redact_file(path):
     return rows, count, skipped
 
 
+def stamp_manifest(snap):
+    """Stamp ``manifest.json`` with ``redacted: true`` (publication marker).
+
+    Returns ``"stamped"`` when the flag was added, ``"already"`` when the
+    manifest already carried ``redacted: true`` (left byte-identical).
+    Raises ``ValueError`` on a missing/invalid manifest or a non-bool stamp;
+    callers fail closed.
+    """
+    path = os.path.join(snap, "manifest.json")
+    if not os.path.isfile(path):
+        raise ValueError("manifest.json is missing (not a ctxpack dir?)")
+    with open(path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest.json is not a JSON object")
+    current = manifest.get("redacted")
+    if current is True:
+        return "already"
+    if current not in (None, False):
+        raise ValueError("manifest.json 'redacted' is not a boolean: %r" % (current,))
+    manifest["redacted"] = True
+    tmp_path = path + ".redact-tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+    return "stamped"
+
+
 def main(argv):
     if len(argv) != 2 or argv[1] in ("-h", "--help"):
         sys.stderr.write("usage: publish-ctxpack-redact.py <snapshot-dir>\n")
@@ -281,6 +321,12 @@ def main(argv):
         total_skipped += skipped
         if count or skipped:
             print("  %-28s rows=%d redactions=%d nonjson_skipped=%d" % (name, rows, count, skipped))
+    try:
+        stamp = stamp_manifest(snap)
+    except ValueError as error:
+        sys.stderr.write("publish-ctxpack-redact: FAIL: %s\n" % error)
+        return 1
+    print("  manifest.json redacted=true (%s; counts untouched)" % stamp)
     print(
         "publish-ctxpack-redact: %d files, %d rows, %d replacements, %d non-JSON lines left untouched"
         % (len(files), total_rows, total_count, total_skipped)

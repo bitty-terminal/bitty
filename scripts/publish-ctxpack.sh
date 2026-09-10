@@ -15,11 +15,15 @@
 #      secret-named fields (*_KEY/*_TOKEN/*_SECRET/*_PASSWORD, GH_PAT,
 #      CLOUDFLARE_*, AWS_*) and 40+-char token-like runs become
 #      `***REDACTED***`. JSONL-aware (parse per line, redact, re-serialize),
-#      row counts unchanged, re-runnable no-op. The local carryctx DB is
+#      row counts unchanged, re-runnable no-op, covers every table file
+#      including format-v2 `tombstones.jsonl`; stamps `redacted: true` into
+#      manifest.json (counts untouched). The local carryctx DB is
 #      never modified -- it keeps the originals and the next export redacts
 #      them again.
-#   3. Validates (round-trip self-test, incl. a planted-fake-secret fixture
-#      proving staging is redacted while the source copy is untouched).
+#   3. Validates (round-trip self-test for format v1 and v2 snapshots, incl.
+#      a planted-fake-secret fixture proving staging is redacted while the
+#      source copy is untouched, and a validator accept/reject fixture
+#      matrix).
 #   4. Refreshes the mirror README.md pointer + LATEST file.
 #   5. Commits and pushes to the mirror repo main branch.
 #
@@ -206,12 +210,13 @@ not just the code.
 
 - Each `<UTC-timestamp>-<bitty-sha>/` directory is one
   `carryctx export --pack-format dir` snapshot (manifest.json + project.json
-  + per-table `*.jsonl`).
+  + per-table `*.jsonl`; format v2 snapshots also carry `tombstones.jsonl`).
 - `LATEST` names the newest snapshot directory.
 - Each snapshot carries a `source.json` with the bitty commit/branch it was
   taken from.
-- The mirror is publish-only: CarryCtx merge mode is unsupported (v1), so
-  snapshots are never merged back; re-import is a manual, replace-mode affair.
+- Every snapshot is a redacted publication artifact (`redacted: true` in
+  manifest.json); CarryCtx refuses redacted bundles as merge sources, so
+  snapshots are never merged back. Re-import is a manual, replace-mode affair.
 - Trigger: the commander's merge closeout runs `just workflow-publish` in
   the bitty repo. No git hook drives this (squash-merges never fire local
   hooks).
@@ -220,8 +225,9 @@ not just the code.
 
 Snapshots intentionally contain agent display names and absolute workspace
 paths. Secret-shaped values never reach the mirror: every export passes
-through an automatic JSONL-aware redaction step before validation and
-commit (secret-named fields such as `*_KEY` / `*_TOKEN` / `*_SECRET` /
+through an automatic JSONL-aware redaction step (all table files, including
+`tombstones.jsonl`) before validation and commit (secret-named fields such
+as `*_KEY` / `*_TOKEN` / `*_SECRET` /
 `*_PASSWORD`, `GH_PAT`, `CLOUDFLARE_*`, `AWS_*`, plus `NAME=value` pairs
 and 40+-char token-like runs in free text, become `***REDACTED***`;
 field/variable names are kept for debuggability; the local database is

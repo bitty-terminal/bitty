@@ -592,3 +592,34 @@ impl Runtime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Runtime;
+    use crate::config::RuntimeConfig;
+    use bitty_render::glyph::FontStyle;
+
+    #[test]
+    fn base_font_query_reflects_config() {
+        // CTX-0295: the configured family/size must reach the renderer
+        // `FontQuery` used for font loading and DPI rescale. The app-level
+        // mapping tests prove file -> RuntimeConfig; this closes the last
+        // link to the rasterizer input.
+        let cfg = RuntimeConfig {
+            font_family: "Mono".to_string(),
+            font_size: 17.5,
+            ..RuntimeConfig::default()
+        };
+        let rt = Runtime::new(cfg).expect("runtime builds with custom font config");
+        let query = rt.base_font_query();
+        assert_eq!(query.family, "Mono");
+        assert!((query.point_size - 17.5).abs() < f32::EPSILON);
+        assert_eq!(query.style, FontStyle::Normal);
+
+        // Defaults ride through unchanged too.
+        let rt = Runtime::with_defaults().expect("default runtime builds");
+        let query = rt.base_font_query();
+        assert_eq!(query.family, crate::config::font_default_family());
+        assert!((query.point_size - 12.0).abs() < f32::EPSILON);
+    }
+}

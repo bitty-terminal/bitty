@@ -30,7 +30,7 @@ pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
 // App handler
 // ---------------------------------------------------------------------------
 
-/// `AppModifiers` lives in [`chrome_keys`] (CTX-0233 pure move).
+/// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
 /// The Correct Terminal handler: owns `Runtime`, an optional window, and the
 /// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
 /// only when explicitly attached for debug/tests).
@@ -118,7 +118,7 @@ impl TerminalApp {
     /// Same as [`Self::with_theme`] plus a bounded `spawn_demo_pty_pump`
     /// burst naming `theme_name`/`source`. Tests that legitimately need
     /// synthetic bytes use this instead of `with_theme`; production uses
-    /// [`Self::attach_demo_pump`] behind [`demo_pump_enabled_from_env`].
+    /// [`Self::attach_demo_pump`] behind [`crate::layout_cmd::demo_pump_enabled_from_env`].
     #[cfg(test)]
     pub(crate) fn with_demo_pump(
         runtime: Runtime,
@@ -149,7 +149,7 @@ impl TerminalApp {
     /// Attaches the synthetic demo pump to an existing app (CTX-0167).
     ///
     /// Debug escape hatch for the real startup path: called only when
-    /// [`demo_pump_enabled_from_env`] is true (`BITTY_DEMO_PUMP=1`).
+    /// [`crate::layout_cmd::demo_pump_enabled_from_env`] is true (`BITTY_DEMO_PUMP=1`).
     /// No-op when a pump is already attached.
     pub(crate) fn attach_demo_pump(&mut self, theme_name: &str, source: &str) {
         if self.pty_rx.is_some() {
@@ -161,7 +161,7 @@ impl TerminalApp {
     }
 
     /// Sets the stderr verbosity gate (CTX-0190). Call once at startup from
-    /// [`effective_log_level`]; tests set it explicitly to prove gating.
+    /// [`crate::logging::effective_log_level`]; tests set it explicitly to prove gating.
     pub(crate) fn set_log_level(&mut self, level: LogLevel) {
         self.log_level = level;
     }
@@ -401,8 +401,8 @@ impl TerminalApp {
 // Chrome-key cluster lives in `chrome_keys` (CTX-0233 pure move:
 // `is_modifier_key`, `track_app_modifiers`, `clear_app_modifiers_on_focus`,
 // `key_ref_from_event`, split/layout-surgery helpers).
-/// Chrome actions live in [`chrome_keys`] (CTX-0233 pure move).
-/// Chrome intercept lives in [`chrome_keys`] (CTX-0233 pure move).
+/// Chrome actions live in [`crate::chrome_keys`] (CTX-0233 pure move).
+/// Chrome intercept lives in [`crate::chrome_keys`] (CTX-0233 pure move).
 impl AppHandler for TerminalApp {
     fn set_event_waker(&mut self, waker: EventWaker) {
         // Bridge the platform proxy into the runtime's bounded wakeup pump:

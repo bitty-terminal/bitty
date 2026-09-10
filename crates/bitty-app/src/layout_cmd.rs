@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
-use crate::Args;
+use crate::cli::Args;
 use crate::spawn::parse_split_axis;
 
 fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode> {
@@ -399,10 +399,10 @@ pub(crate) fn run_layout_proof(synthetic: &[u8]) -> i32 {
 /// consumer stalls the channel fills and the pump's `send` blocks — the same
 /// backpressure that would propagate to the kernel PTY buffer for a real child.
 ///
-/// Real sessions never attach this pump: [`TerminalApp::with_theme`] leaves
-/// `pty_rx` empty and [`TerminalApp::poll_pty_pump`] drains only the real
+/// Real sessions never attach this pump: [`crate::terminal_app::TerminalApp::with_theme`] leaves
+/// `pty_rx` empty and [`crate::terminal_app::TerminalApp::poll_pty_pump`] drains only the real
 /// runtime channel. Attach it explicitly via
-/// [`TerminalApp::with_demo_pump`] (tests) or `BITTY_DEMO_PUMP=1` (manual
+/// `TerminalApp::with_demo_pump` (tests, `#[cfg(test)]`) or `BITTY_DEMO_PUMP=1` (manual
 /// debug, see [`demo_pump_enabled_from_env`]). The live pump is wired —
 /// `Runtime::take_pty_reader` and `Runtime::poll_pty` exist and
 /// `TerminalApp::poll_pty_pump` drains the real runtime channel first.

@@ -31,23 +31,25 @@
 //! texture is capped by
 //! [`MAX_ATLAS_DIMENSION`](crate::batch::MAX_ATLAS_DIMENSION) and the
 //! transient inline texture is fixed at
-//! [`INLINE_TEXTURE_SIZE`](crate::batch::INLINE_TEXTURE_SIZE). Every
-//! `write_buffer`/`write_texture` call is bounds-checked first and maps
-//! overruns to [`RenderError::InvalidInput`] (fail-closed) instead of
-//! panicking.
+//! [`INLINE_TEXTURE_SIZE`](crate::batch::INLINE_TEXTURE_SIZE). Kitty image
+//! textures are positional slots bounded by
+//! [`MAX_IMAGE_BLITS_PER_FRAME`](crate::batch::MAX_IMAGE_BLITS_PER_FRAME)
+//! and [`plan_image_uploads`](crate::batch::plan_image_uploads); slots past
+//! the current frame's admitted set are dropped so stale image memory never
+//! outlives its frame. Every `write_buffer`/`write_texture` call is
+//! bounds-checked first and maps overruns to [`RenderError::InvalidInput`]
+//! (fail-closed) instead of panicking.
 //!
 //! # Shaders
 //!
-//! Two minimal WGSL programs: a solid-fill pass (`pos + color`) and an
+//! Three minimal WGSL programs: a solid-fill pass (`pos + color`), an
 //! atlas-textured glyph pass (`pos + uv + color`, coverage from the `R8`
-//! texture's red channel modulating the tint alpha). Both pipelines enable
-//! standard alpha blending so the cursor (semi-transparent white) and faint
-//! text composite over backgrounds. Gamma note: tint bytes are normalized
-//! `sRGB` values written to an `sRGB` target without an explicit
-//! linear-space round trip; output is slightly brighter than a fully
-//! color-managed pipeline. Text stays clearly legible (the P0 fix is
-//! visibility, not gamma exactness); a linear-workflow follow-up can add
-//! the conversion without changing any batch layout.
+//! texture's red channel modulating the tint alpha), and the Kitty image
+//! pass (`pos + uv`, straight-alpha `Rgba8UnormSrgb` sampling with
+//! premultiplied `One`/`OneMinusSrcAlpha` blending, CTX-0291). The image
+//! pass paints last, on top of fills and glyphs, matching both CPU
+//! compositors. All pipelines composite over backgrounds; per-frame resource
+//! use is bounded (see `batch::plan_image_uploads`).
 
 use wgpu::{
     AddressMode, BindGroup, BindGroupLayout, BlendComponent, BlendFactor, BlendOperation,
@@ -163,7 +165,9 @@ fn fs_main(
 /// the window opacity, and every draw must leave it there while compositing
 /// its premultiplied RGB contribution. At opacity 1.0 this is byte-identical
 /// to the pre-CTX-0290 `ALPHA_BLENDING` output (destination alpha is 1.0 and
-/// stays 1.0 either way).
+/// stays 1.0 either way), and computing the same equation makes the image
+/// pass byte-identical to CTX-0291's premultiplied src-over for opaque
+/// texels.
 const OPACITY_BLEND: BlendState = BlendState {
     color: BlendComponent {
         src_factor: BlendFactor::One,
@@ -177,20 +181,83 @@ const OPACITY_BLEND: BlendState = BlendState {
     },
 };
 
+/// Kitty image WGSL: samples a straight-alpha `Rgba8UnormSrgb` texture and
+/// premultiplies for `One`/`OneMinusSrcAlpha` blending. The sRGB texture
+/// decodes to linear light, so the destination `Srgb` target re-encodes an
+/// opaque texel byte-exactly (matching the CPU compositor's src-over in
+/// encoded space for opaque images).
+///
+/// CTX-0290 merge: the premultiplied RGB is additionally scaled by the
+/// window opacity uniform (binding 2, shared with the fill/glyph shaders)
+/// while the returned alpha stays the texel's unscaled coverage, so the
+/// [`OPACITY_BLEND`] alpha pin keeps the swap-chain alpha at the window
+/// opacity. At opacity 1.0 this is exactly the CTX-0291 image shader.
+const IMAGE_WGSL: &str = r#"
+@group(0) @binding(0) var image_tex: texture_2d<f32>;
+@group(0) @binding(1) var image_sampler: sampler;
+
+struct Opacity {
+    value: f32,
+};
+
+@group(0) @binding(2) var<uniform> opacity: Opacity;
+
+struct ImageOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+) -> ImageOut {
+    var out: ImageOut;
+    out.pos = vec4<f32>(position, 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let texel = textureSample(image_tex, image_sampler, uv);
+    let alpha = texel.a * opacity.value;
+    return vec4<f32>(texel.rgb * alpha, texel.a);
+}
+"#;
+
+/// One cached slot texture for the frame's topmost Kitty image pass.
+///
+/// Slots are positional (the n-th admitted blit owns slot `n`), so a static
+/// image set reuses its texture frame after frame while a changing one
+/// replaces the slot on extent mismatch. Slot lifetimes are bounded by
+/// [`crate::batch::MAX_IMAGE_BLITS_PER_FRAME`] and the per-frame byte budget.
+struct ImageTexture {
+    width: u32,
+    height: u32,
+    texture: Texture,
+    bind: BindGroup,
+}
 /// Long-lived GPU objects for one surface, reused across frames.
 pub(crate) struct GpuResources {
     format: TextureFormat,
     atlas_dims: AtlasDims,
     fill_pipeline: RenderPipeline,
     glyph_pipeline: RenderPipeline,
+    image_pipeline: RenderPipeline,
     fill_vb: Buffer,
     glyph_vb: Buffer,
+    image_vb: Buffer,
     index_buf: Buffer,
     index_capacity_quads: usize,
     atlas_tex: Texture,
     atlas_bind: BindGroup,
     inline_tex: Texture,
     inline_bind: BindGroup,
+    image_bind_layout: BindGroupLayout,
+    image_sampler: Sampler,
+    /// Positional per-frame Kitty image textures (CTX-0291).
+    image_textures: Vec<ImageTexture>,
     last_atlas_texels: Option<Vec<u8>>,
     last_atlas_dims: Option<AtlasDims>,
     // CTX-0290 window-opacity uniform (one f32 in a 16-byte buffer) shared
@@ -332,6 +399,38 @@ fn make_r8_texture(
     }))
 }
 
+/// Creates one straight-alpha sRGB RGBA8 image texture.
+///
+/// The sRGB format decodes sampled texels to linear light, matching the
+/// linear-light surface target; the fragment shader premultiplies before
+/// blending (see [`IMAGE_WGSL`]).
+fn make_rgba_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &'static str,
+) -> Result<Texture, RenderError> {
+    if width == 0 || height == 0 {
+        return Err(RenderError::InvalidInput {
+            reason: "image texture dimensions must be non-zero",
+        });
+    }
+    Ok(device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    }))
+}
+
 impl GpuResources {
     /// Creates all GPU objects for `format` + `atlas_dims`.
     pub(crate) fn create(
@@ -350,6 +449,10 @@ impl GpuResources {
         let glyph_module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("bitty-glyph-shader"),
             source: ShaderSource::Wgsl(GLYPH_WGSL.into()),
+        });
+        let image_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("bitty-image-shader"),
+            source: ShaderSource::Wgsl(IMAGE_WGSL.into()),
         });
 
         let bind_layout = make_bind_layout(device);
@@ -483,6 +586,64 @@ impl GpuResources {
             cache: None,
         });
 
+        // Image pipeline: pos + uv only; the shared bind layout matches the
+        // glyph pipeline's texture+sampler group, so image textures can use
+        // `make_bind_group` unchanged.
+        let image_attributes = [
+            VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: VertexFormat::Float32x2,
+            },
+            VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: VertexFormat::Float32x2,
+            },
+        ];
+        let image_layout = VertexBufferLayout {
+            array_stride: crate::batch::IMAGE_VERTEX_SIZE_BYTES as u64,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &image_attributes,
+        };
+        let image_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("bitty-image-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &image_module,
+                entry_point: Some("vs_main"),
+                buffers: &[image_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(FragmentState {
+                module: &image_module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(OPACITY_BLEND),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+
         let fill_vb = device.create_buffer(&BufferDescriptor {
             label: Some("bitty-fill-vb"),
             size: fill_buffer_size(),
@@ -492,6 +653,15 @@ impl GpuResources {
         let glyph_vb = device.create_buffer(&BufferDescriptor {
             label: Some("bitty-glyph-vb"),
             size: glyph_buffer_size(),
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // One image quad (4 vertices) is uploaded and drawn per admitted
+        // blit, each followed by its own submit (the same overwrite-safety
+        // pattern as fill/glyph chunks, CTX-0182).
+        let image_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("bitty-image-vb"),
+            size: (crate::batch::VERTICES_PER_QUAD * crate::batch::IMAGE_VERTEX_SIZE_BYTES) as u64,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -542,14 +712,19 @@ impl GpuResources {
             atlas_dims,
             fill_pipeline,
             glyph_pipeline,
+            image_pipeline,
             fill_vb,
             glyph_vb,
+            image_vb,
             index_buf,
             index_capacity_quads,
             atlas_tex,
             atlas_bind,
             inline_tex,
             inline_bind,
+            image_bind_layout: bind_layout,
+            image_sampler: sampler,
+            image_textures: Vec::new(),
             last_atlas_texels: None,
             last_atlas_dims: None,
             opacity_buf,
@@ -733,6 +908,79 @@ impl GpuResources {
         Ok(())
     }
 
+    /// Uploads one admitted Kitty image into positional slot `slot`.
+    ///
+    /// The slot texture is reused when its extent matches, so a static
+    /// image set uploads into the same texture every frame instead of
+    /// churning allocations. A mismatch replaces the slot in place (the old
+    /// texture is dropped after the new one exists). The caller has already
+    /// validated the bytes and budgets via [`batch::plan_image_uploads`];
+    /// this method still fails closed on any mismatch it observes.
+    fn upload_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<(), RenderError> {
+        let reuse = self
+            .image_textures
+            .get(slot)
+            .is_some_and(|entry| entry.width == width && entry.height == height);
+        if !reuse {
+            let texture = make_rgba_texture(device, width, height, "bitty-image")?;
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = make_bind_group(
+                device,
+                &self.image_bind_layout,
+                &view,
+                &self.image_sampler,
+                &self.opacity_buf,
+                "bitty-image-bind",
+            );
+            let entry = ImageTexture {
+                width,
+                height,
+                texture,
+                bind,
+            };
+            match self.image_textures.get_mut(slot) {
+                Some(existing) => *existing = entry,
+                None => self.image_textures.push(entry),
+            }
+        }
+        let padded =
+            batch::build_padded_rgba(rgba, width, height).ok_or(RenderError::InvalidInput {
+                reason: "image upload bytes do not match its extent",
+            })?;
+        let bytes_per_row =
+            batch::padded_rgba_bytes_per_row(width).ok_or(RenderError::InvalidInput {
+                reason: "image upload width overflows the padded row size",
+            })?;
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &self.image_textures[slot].texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &padded,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
     /// Draws one frame's batches inside a single render pass.
     ///
     /// `clear` is the load-operation clear color (the surface background),
@@ -741,6 +989,11 @@ impl GpuResources {
     /// as a defensive boundary even though callers pass a sanitized value.
     /// All buffer writes are bounds-checked before submission; overruns
     /// return [`RenderError::InvalidInput`] without touching the GPU.
+    /// Returns the number of Kitty image blits the GPU pass refused
+    /// (malformed, oversized, or over a per-frame bound): those are skipped
+    /// fail-closed and surfaced by the caller in
+    /// [`PresentStats::images_skipped`](crate::gpu::PresentStats), never
+    /// dropped silently.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_frame(
         &mut self,
@@ -754,7 +1007,7 @@ impl GpuResources {
         atlas: Option<(&[u8], AtlasDims)>,
         clear: wgpu::Color,
         opacity: f32,
-    ) -> Result<(), RenderError> {
+    ) -> Result<usize, RenderError> {
         if surface_w == 0 || surface_h == 0 {
             return Err(RenderError::InvalidInput {
                 reason: "surface extent must be non-zero",
@@ -786,13 +1039,9 @@ impl GpuResources {
                 reason: "atlas instance requires atlas texels",
             });
         }
-        // CTX-0253 F3 display gate: the textured image-upload path has not
-        // landed, so this pipeline draws fills + glyphs only and skips
-        // `draw_list.images` fail-closed. The skip is observable — the
-        // `Surface::present_draw_list` real-GPU branch reports it in
-        // `PresentStats::images_skipped` and warns loudly (single warn
-        // site per frame) — never a silent divergence from the CPU
-        // compositors that blend every blit.
+        // Paint order mirrors both CPU compositors: fills, then glyphs, then
+        // Kitty image blits on top (CTX-0291). The image pass is bounded by
+        // `batch::plan_image_uploads` before any allocation.
 
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
         let atlas_chunks =
@@ -801,14 +1050,17 @@ impl GpuResources {
         self.upload_inline(queue, &inline_plan)?;
         let inline_chunks = batch::chunk_inline_glyphs(&inline_plan, surface_w, surface_h, scale);
 
-        // Index buffer covers the largest single chunk this frame.
+        // Index buffer covers the largest single chunk this frame. Image
+        // blits are one quad per submit, so an image-only frame still needs
+        // the shared indices uploaded (quad 0).
         let max_quads = fill_chunks
             .iter()
             .map(|c| c.quad_count)
             .chain(atlas_chunks.iter().map(|c| c.quad_count))
             .chain(inline_chunks.iter().map(|c| c.quad_count))
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(usize::from(!draw_list.images.is_empty()));
         if max_quads > 0 {
             self.ensure_indices(queue, max_quads)?;
         }
@@ -927,6 +1179,70 @@ impl GpuResources {
             submit_glyph_chunk(&chunk.bytes, chunk.quad_count, &self.inline_bind)?;
         }
 
+        // Kitty images (CTX-0291): the topmost pass, one quad per admitted
+        // blit, painted after fills and glyphs to match both CPU compositors.
+        // `plan_image_uploads` is the single validation point: blit count,
+        // padded staging bytes, and texture dimensions are bounded before
+        // any allocation. Refused blits are skipped fail-closed and counted
+        // in the returned `skipped` so the caller can warn and report them.
+        let image_plan =
+            batch::plan_image_uploads(&draw_list.images, device.limits().max_texture_dimension_2d);
+        // Frames can shrink: drop cached slot textures beyond the admitted
+        // set so stale image memory never outlives its frame.
+        self.image_textures.truncate(image_plan.admitted.len());
+        let mut images_skipped = image_plan.skipped;
+        for (slot, &index) in image_plan.admitted.iter().enumerate() {
+            let blit = &draw_list.images[index];
+            self.upload_image(
+                device,
+                queue,
+                slot,
+                blit.dest.width,
+                blit.dest.height,
+                &blit.rgba,
+            )?;
+            let Some(quad) = batch::image_quad_bytes(blit.dest, surface_w, surface_h, scale) else {
+                images_skipped += 1;
+                continue;
+            };
+            queue.write_buffer(&self.image_vb, 0, &quad);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-present-draw-list"),
+            });
+            {
+                let load = if first_pass {
+                    LoadOp::Clear(clear)
+                } else {
+                    LoadOp::Load
+                };
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("bitty-draw-list"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.image_textures[slot].bind, &[]);
+                pass.set_vertex_buffer(0, self.image_vb.slice(..));
+                pass.set_index_buffer(
+                    self.index_buf.slice(..(INDICES_PER_QUAD * 2) as u64),
+                    IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..INDICES_PER_QUAD as u32, 0, 0..1);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            first_pass = false;
+        }
+
         // Empty frame (no chunks): single Clear so the surface never keeps
         // stale content from the previous frame.
         if first_pass {
@@ -952,6 +1268,6 @@ impl GpuResources {
             }
             queue.submit(std::iter::once(encoder.finish()));
         }
-        Ok(())
+        Ok(images_skipped)
     }
 }

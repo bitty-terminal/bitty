@@ -602,9 +602,10 @@ pub struct GlyphInstance {
 /// `dest.width * dest.height * 4` bytes. Paint order is after fills and
 /// glyphs: images are the topmost present-layer content (above cells,
 /// text, and fill overlays such as selection/cursor), and they never
-/// mutate grid truth. The GPU pipeline ignores this vector until a
-/// texture-upload path lands; both CPU compositors (`headless_present`
-/// and the `sw-fallback` `draw_list_onto`) blend every entry.
+/// mutate grid truth. Both CPU compositors (`headless_present` and the
+/// `sw-fallback` `draw_list_onto`) blend every entry, and the real-GPU
+/// pipeline uploads each entry into an RGBA texture and blits it last
+/// (CTX-0291), bounded by `batch::plan_image_uploads`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageBlit {
     /// Destination top-left in logical pixels plus span.

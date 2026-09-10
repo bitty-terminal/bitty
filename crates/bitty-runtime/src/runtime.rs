@@ -257,6 +257,15 @@ pub struct Runtime {
     cold_queue: ColdQueue,
     plugin_host: PluginHost,
     last_presented_generation: u64,
+    /// Per-origin generations observed at the last present (CTX-0289).
+    ///
+    /// The primary state and every split-pane session own independent grid
+    /// generation counters. A single scalar `max` across them cannot detect
+    /// that a lower-generation pane received output while a higher-generation
+    /// origin stayed quiet, so frame-on-demand wrongly idled and the pane's
+    /// output stayed invisible until an unrelated forced redraw (focus move).
+    /// Tracking each origin's last presented generation makes the check exact.
+    last_presented_pane_generations: std::collections::BTreeMap<ViewId, u64>,
     pending_full_redraw: bool,
     /// Last presented leaf allocations (CTX-0228).
     ///
@@ -642,6 +651,7 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
+            last_presented_pane_generations: std::collections::BTreeMap::new(),
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
@@ -762,6 +772,7 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
+            last_presented_pane_generations: std::collections::BTreeMap::new(),
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,

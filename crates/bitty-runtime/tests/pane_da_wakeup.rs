@@ -236,6 +236,50 @@ fn pane_forwarder_armed_when_waker_installed() {
     assert!(arrived, "forwarded pane output never arrived via poll_pty");
 }
 
+/// CTX-0289 regression: frame-on-demand must present a pane's output even
+/// when the primary grid's generation counter is numerically ahead.
+///
+/// Before the fix `tick_at` compared a single `max(primary, every pane)`
+/// generation against the last presented value, so a lower-generation pane
+/// that received output while the primary stayed quiet left the max
+/// unchanged. The frame was skipped and the pane's bytes stayed invisible
+/// until an unrelated forced redraw (e.g. a focus move) — exactly the live
+/// "keymap-split then focus the new pane" stall.
+#[test]
+fn pane_output_presents_when_primary_generation_is_ahead() {
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 30"])
+        .expect("spawn quiet primary shell");
+    let pane = ViewId::new(2);
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+        .expect("spawn quiet pane shell");
+
+    // Drive the primary generation well ahead of the fresh pane's (0) using
+    // synthetic bytes; the pane receives nothing.
+    for _ in 0..256 {
+        rt.handle_pty_bytes(b"PRIMARY-ADVANCE\r\n");
+    }
+    assert!(rt.tick().is_some(), "initial frame must present");
+    let primary_gen = rt.snapshot().generation;
+    let pane_gen = rt.pane_snapshot(&pane).expect("pane snapshot").generation;
+    assert!(
+        primary_gen > pane_gen,
+        "precondition: primary generation must be ahead (primary={primary_gen} pane={pane_gen})"
+    );
+
+    // Only the pane receives output now. The primary stays quiet, so a single
+    // max-based generation would not advance even though the pane changed.
+    rt.handle_pane_bytes(pane, b"PANE-AFTER-BASELINE\r\n");
+    assert!(
+        rt.pane_snapshot(&pane).expect("pane snapshot").generation > pane_gen,
+        "pane generation must advance after pane-only output"
+    );
+    assert!(
+        rt.tick().is_some(),
+        "pane-only output must present a frame when the primary generation is ahead"
+    );
+}
+
 /// Anti-garble at the grid level: while the primary streams output, split
 /// mid-stream and stream in the new pane concurrently. Neither grid may
 /// show the other's rows (no mirroring / mixed rows), and leaf allocations

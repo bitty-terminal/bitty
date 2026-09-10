@@ -105,23 +105,26 @@ impl Runtime {
     /// area (CTX-0292 Core-owned decoration application).
     ///
     /// The workspace area is the layout container converted to logical px
-    /// with the live cell metrics (window padding is Window chrome, not
-    /// workspace decoration). The result applies the accepted contract:
-    /// `gaps_out` insets the area, `gaps_in` reserves the band between
-    /// siblings, `border` insets each frame's content, and `radius` is
-    /// carried for clipping. Pure and deterministic for the same layout,
-    /// container, metrics, and decoration.
+    /// with the **base** (scale-1.0 design) cell metrics: accepted spec
+    /// CTX-0118 rule 1 puts decoration and layout math in logical pixels and
+    /// applies the Window DPI factor only at render time. Window padding is
+    /// Window chrome, not workspace decoration, so it is not part of the
+    /// area. The result applies the contract: `gaps_out` insets the area,
+    /// `gaps_in` reserves the band between siblings, `border` insets each
+    /// frame's content, and `radius` is carried for clipping. Pure and
+    /// deterministic for the same layout, container, metrics, and
+    /// decoration.
     #[must_use]
     pub fn decorated_allocations(&self) -> Vec<(ViewId, bitty_ui::DecoratedView)> {
-        let live = self.live_cell_metrics();
+        let base = self.base_cell_metrics();
         let area = UiRect::new(
-            (u32::from(self.container.x).saturating_mul(live.width)).min(u32::from(u16::MAX))
+            (u32::from(self.container.x).saturating_mul(base.width)).min(u32::from(u16::MAX))
                 as u16,
-            (u32::from(self.container.y).saturating_mul(live.height)).min(u32::from(u16::MAX))
+            (u32::from(self.container.y).saturating_mul(base.height)).min(u32::from(u16::MAX))
                 as u16,
-            (u32::from(self.container.width).saturating_mul(live.width)).min(u32::from(u16::MAX))
+            (u32::from(self.container.width).saturating_mul(base.width)).min(u32::from(u16::MAX))
                 as u16,
-            (u32::from(self.container.height).saturating_mul(live.height)).min(u32::from(u16::MAX))
+            (u32::from(self.container.height).saturating_mul(base.height)).min(u32::from(u16::MAX))
                 as u16,
         );
         self.layout

@@ -148,7 +148,8 @@ fn decorated_allocations_reserve_inner_gap_band() {
 #[test]
 fn zero_decoration_frames_match_plain_allocations_px() {
     // Decoration::ZERO is the undecorated fast path: frames are the plain
-    // cell allocations scaled by the live cell metrics, content == frame.
+    // cell allocations scaled by the base (logical, scale-1.0) cell
+    // metrics, content == frame.
     let mut rt = runtime_with_decoration(Decoration::ZERO);
     rt.set_layout(two_pane_split());
     rt.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));

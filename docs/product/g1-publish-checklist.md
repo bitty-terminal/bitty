@@ -182,7 +182,7 @@ No `TODO`/`FIXME` introduced; frontmatter `status: draft` retained.
 
 ## G1 leaf `cargo publish --dry-run` results
 
-Executed in worktree `/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0045-publish-g1`
+Executed in worktree `.worktrees/ctx-0045-publish-g1` (repository-relative)
 at `168493a`, toolchain `1.97.1` / `rust-toolchain.toml`, with `--allow-dirty`
 so the untracked draft checklist does not block verification. Mirrors the
 CTX-0043 dry-run pattern and is skipped forcredentialled `cargo publish`.

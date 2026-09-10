@@ -37,7 +37,7 @@ status: draft
 
 - **Capture**: `cargo run -p bitty-compat-lab --bin collect_dumps --locked` replays every `tests/compat/<category>/corpus/*.bin` headlessly and writes bounded deterministic JSON `recording/references/bitty/<category>-<stem>.snapshot.json` (80x24, `<16 KiB`, sorted keys, `state_hash` hex 16). Same bytes can be fed to each reference emulator via `script` replay + grid dump (`kitty --dump-commands`, Ghostty `dump`, `wezterm record`, Alacritty dump) normalized to `Snapshot` text.
 - **Compare**: `crates/bitty-compat-lab/src/compare.rs` `compare_all()` loads ≤64 bitty dumps (sorted) and for each: replays `corpus_rel` via `parse_bounded`, checks `bytes_len`, `actions_len`, `state_hash`, `Snapshot` text/cursor/title/generation, `State::check_invariants`, byte-by-byte determinism, then optionally diffs text vs any `recording/references/<backend>/*.snapshot.json` that share the same `corpus_rel` (`ghostty`/`kitty`/`wezterm`/`alacritty`). Graceful `reference_skipped` when absent (CI stays green); mismatches appear as `ref_fail`.
-- **Alacritty column**: added in CTX-0114. Previously `ghostty`/`kitty`/`wezterm`; now `alacritty` is fourth. Storage candidates: `tmp/references/<backend>/` (worktree) and `recording/references/<backend>/` (umbrella) and their mirrors.
+- **Alacritty column**: added in CTX-0114. Previously `ghostty`/`kitty`/`wezterm`; now `alacritty` is fourth. Storage candidates: `recording/references/<backend>/` (worktree) and the umbrella mirror (via `$BITTY_WORKSPACE`); no `tmp/` mirror is written.
 
 ## Matrix — 14 surfaces × 4 terminals
 
@@ -63,12 +63,12 @@ All rows `self PASS` via `cargo test -p bitty-compat-lab --test compat_matrix` (
 ## Special coverage — Ghostty / Kitty / WezTerm / Alacritty differential
 
 - Each surface row above exercises the same byte stream across the 4 reference dumps when available. Corpus choice mirrors the 7 manual-smoke surfaces plus IME/DPI per `docs/product/manual-smoke.md` §1–7 and dogfooding corpus `CTX-0099` (9 `*dogfooding*.bin`, each ≤310 B).
-- Reference clone provenance lives in `recording/references/README.md` (umbrella) — `ghostty 8867c37` MIT, `kitty 087b8c3` GPL-3.0, `wezterm f93d903` MIT, `alacritty ede2ac1` Apache-2.0/MIT, `xterm 9489b20` MIT/X11, `vttest 3.4.0` synthetic — plus `tmp/references/` mirrors. No clone is executed or imported.
+- Reference clone provenance lives in `recording/references/README.md` (umbrella) — `ghostty 8867c37` MIT, `kitty 087b8c3` GPL-3.0, `wezterm f93d903` MIT, `alacritty ede2ac1` Apache-2.0/MIT, `xterm 9489b20` MIT/X11, `vttest 3.4.0` synthetic. No clone is executed or imported.
 - Comparator backends probed in order `ghostty` → `kitty` → `wezterm` → `alacritty` (new in CTX-0114). Candidates are `workspace_root/recording/references/<backend>/` and umbrella mirrors; discovery is sorted, bounded to `MAX_SNAPSHOTS 64` and `MAX_SNAPSHOT_JSON_BYTES 16 KiB`.
 
 ## Recordings corpus and regression tests
 
-- **Corpus**: `tests/compat/*/corpus/*.bin` (30 baseline + 9 dogfooding = 39 as of `1d9eb6a`, plus placeholders). Each ≤8 KiB, each re-parse byte-by-byte deterministic, each `state_hash` canonical. New in CTX-0114: no new `.bin` required — existing 39 already cover all 14 surfaces via dogfooding corpus. `cargo run -p bitty-compat-lab --bin collect_dumps --locked` regenerates `recording/references/bitty/*.snapshot.json` (39, `<16 KiB` each, `80x24`, `CANONICAL_HASH_VERSION 1`) to `tmp/references/bitty/` and umbrella mirrors.
+- **Corpus**: `tests/compat/*/corpus/*.bin` (30 baseline + 9 dogfooding = 39 as of `1d9eb6a`, plus placeholders). Each ≤8 KiB, each re-parse byte-by-byte deterministic, each `state_hash` canonical. New in CTX-0114: no new `.bin` required — existing 39 already cover all 14 surfaces via dogfooding corpus. `cargo run -p bitty-compat-lab --bin collect_dumps --locked` regenerates `recording/references/bitty/*.snapshot.json` (39, `<16 KiB` each, `80x24`, `CANONICAL_HASH_VERSION 1`) in the worktree plus the umbrella mirror (via `$BITTY_WORKSPACE`).
 - **Machine-readable matrix**: `recordings/compat-matrix-2026-09-01.json` (generated headlessly via `crates/bitty-compat-lab/src/matrix.rs` `generate_matrix_json()` or `cargo test -p bitty-compat-lab --test compat_matrix -- --nocapture` artifact). Contains per-surface `corpus_rel`, `bytes_len`, `actions_len`, `state_hash`, `snapshot_width/height`, `generation`, `self PASS`, `reference SKIPPED/PASS` per backend. Bounded `<16 KiB`.
 - **Regression tests** (`crates/bitty-compat-lab/tests/`):
   - `harness.rs` — `compat_corpus_is_bounded_and_deterministic` (≥16 corpora), `vttest_corpora_present_and_bounded`, `no_window_gpu_leak_in_corpora`.

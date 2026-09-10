@@ -8,7 +8,8 @@
 //! asserts determinism via byte-by-byte re-parse and `State::state_hash`,
 //! invariants via `State::check_invariants`, and writes a bounded
 //! deterministic JSON snapshot to `recording/references/bitty/` (canonical,
-//! worktree and umbrella) plus legacy `tmp/references/bitty/` mirrors.
+//! worktree and umbrella). No `tmp/` mirror is written: `tmp/` is process
+//! scratch, never durable evidence (DEC-0038).
 //!
 //! No `winit`, `wgpu`, `Window`, `Surface`, `HeadlessRasterizer`, or
 //! network. Only `bitty-vt` + `bitty-term-state` via the harness. The output
@@ -27,6 +28,14 @@ const CATEGORIES: &[&str] = &[
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Umbrella workspace root, derived from the documented `$BITTY_WORKSPACE`
+/// convention — never a hardcoded absolute path (a hardcoded checkout path
+/// breaks on any other machine). `None` when the env var is absent, in
+/// which case only the worktree copy is written.
+fn umbrella_root() -> Option<PathBuf> {
+    std::env::var_os("BITTY_WORKSPACE").map(PathBuf::from)
 }
 
 fn corpus_dir(category: &str) -> PathBuf {
@@ -95,19 +104,16 @@ fn json_escape(input: &str) -> String {
 
 fn main() {
     let ws = workspace_root();
-    let out_worktree_tmp = ws.join("tmp/references/bitty");
     let out_worktree_rec = ws.join("recording/references/bitty");
-    let out_umbrella_tmp =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
-    let out_umbrella_rec =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
+    let out_umbrella_rec: Option<PathBuf> =
+        umbrella_root().map(|u| u.join("recording/references/bitty"));
 
-    for dir in [
-        &out_worktree_tmp,
-        &out_worktree_rec,
-        &out_umbrella_tmp,
-        &out_umbrella_rec,
-    ] {
+    let mut out_dirs: Vec<PathBuf> = vec![out_worktree_rec.clone()];
+    match &out_umbrella_rec {
+        Some(dir) => out_dirs.push(dir.clone()),
+        None => eprintln!("note: $BITTY_WORKSPACE is unset; writing the worktree copy only"),
+    }
+    for dir in &out_dirs {
         if let Err(e) = fs::create_dir_all(dir) {
             eprintln!("warn: cannot create {}: {e}", dir.display());
         }
@@ -204,12 +210,7 @@ fn main() {
                 "snapshot json unexpectedly large {} for {path:?}",
                 json.len()
             );
-            for dir in [
-                &out_worktree_tmp,
-                &out_worktree_rec,
-                &out_umbrella_tmp,
-                &out_umbrella_rec,
-            ] {
+            for dir in &out_dirs {
                 if dir.exists() {
                     let out_path = dir.join(&file_name);
                     fs::write(&out_path, &json)
@@ -235,11 +236,12 @@ fn main() {
         "expected at least 22 snapshots written, saw {written}"
     );
     println!(
-        "collect_dumps done: {written}/{total} snapshots written to {} , {} , {} and {}",
-        out_worktree_tmp.display(),
+        "collect_dumps done: {written}/{total} snapshots written to {} and {}",
         out_worktree_rec.display(),
-        out_umbrella_tmp.display(),
-        out_umbrella_rec.display()
+        out_umbrella_rec
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "(umbrella skipped: $BITTY_WORKSPACE unset)".to_string())
     );
     let _ = PathBuf::from(".");
 }

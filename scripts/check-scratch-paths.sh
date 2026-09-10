@@ -35,9 +35,8 @@
 #   `scratch-paths-exempt: <reason>`, or the line mentions `temp_dir`,
 #   `mktemp`, or `sock` (socket paths), or — for `.rs` files — the hit sits
 #   at/after the file's first `#[cfg(test)]` line (unit-test-only region).
-#   The `/tmp/` match requires the slash NOT to follow `[A-Za-z0-9_/-]`, so
-#   umbrella legacy mirrors (`.../bitty-terminal/tmp/references/...`) never
-#   count as OS-temp writes. This script exempts itself from both rules
+#   The `/tmp/` match requires the slash NOT to follow `[A-Za-z0-9_/-]`.
+#   This script exempts itself from both rules
 #   (it must spell the forbidden patterns to define them).
 #
 # Escape hatch (auditable, grep-able, mirrors pty-gate):

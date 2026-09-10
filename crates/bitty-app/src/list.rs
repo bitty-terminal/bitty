@@ -1461,6 +1461,47 @@ pub fn run_list(request: &ListRequest) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `bitty list` CLI entry point (relocated from `main.rs`, CTX-0305)
+// ---------------------------------------------------------------------------
+
+use crate::cli::Args;
+
+/// Runs `bitty list <kind>`; returns the process exit code.
+///
+/// - Extra positionals, unknown kinds, bad `--format`/`--socket`/`--instance`,
+///   and stray `--` fail closed (exit 2, stderr only, no stdout envelope).
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "list"|"ls"`) on stdout with diagnostics on stderr.
+/// - `instances` runtime/permission failures emit ok:false envelopes for
+///   json/jsonl (exit 6/7) and stderr-only for table.
+pub(crate) fn run_cli(args: &Args) -> i32 {
+    if !args.list_args.is_empty() {
+        eprintln!(
+            "bitty {}: unexpected argument '{}'\n{}",
+            args.list_spelling,
+            args.list_args[0],
+            list_usage()
+        );
+        return EXIT_USAGE;
+    }
+    let request = match ListRequest::validate(
+        args.list_kind.as_deref(),
+        args.list_format.as_deref(),
+        args.list_socket.as_deref(),
+        args.list_instance.as_deref(),
+        args.list_no_color,
+        &args.list_spelling,
+    ) {
+        Ok(req) => req,
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_USAGE;
+        }
+    };
+    run_list(&request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

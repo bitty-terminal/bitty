@@ -114,6 +114,84 @@ mod client;
 mod render;
 mod request;
 
+// ---------------------------------------------------------------------------
+// `bitty ctl` CLI entry point (relocated from `main.rs`, CTX-0305)
+// ---------------------------------------------------------------------------
+
+use crate::cli::Args;
+
+/// Runs `bitty ctl`; returns the process exit code.
+///
+/// - `--help` (anywhere in `ctl_raw`) prints help to stdout, exit 0, and
+///   never requires an instance.
+/// - Global `--socket`/`--instance`/`--format` before the `ctl` word merge
+///   with per-`ctl` flags (per-`ctl` wins when only one side sets a value;
+///   conflicting values are usage errors, exit 2).
+/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
+/// - Runtime verbs resolve targeting and speak IPC; exit codes follow the
+///   stable v1 mapping (0 ok, 6 unavailable, 7 permission, 8 conflict).
+pub(crate) fn run_cli(args: &Args) -> i32 {
+    match parse_ctl_request(&args.ctl_raw) {
+        Err(CtlParseError::Help) => {
+            print!("{}", ctl_help_text());
+            0
+        }
+        Err(err) => {
+            eprintln!("{}\n{}", err.message(), ctl_usage());
+            EXIT_USAGE
+        }
+        Ok((request, mut targeting)) => {
+            // Merge global pre-`ctl` targeting: per-`ctl` flags win when
+            // only one side sets a value; differing values are conflicts.
+            if let Some(pre) = args.ctl_socket_pre.as_deref() {
+                match targeting.socket.as_deref() {
+                    None => targeting.socket = Some(pre.to_string()),
+                    Some(post) if post == pre => {}
+                    Some(post) => {
+                        eprintln!(
+                            "bitty ctl: conflicting --socket {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
+                            ctl_usage()
+                        );
+                        return EXIT_USAGE;
+                    }
+                }
+            }
+            if let Some(pre) = args.ctl_instance_pre.as_deref() {
+                match targeting.instance.as_deref() {
+                    None => targeting.instance = Some(pre.to_string()),
+                    Some(post) if post == pre => {}
+                    Some(post) => {
+                        eprintln!(
+                            "bitty ctl: conflicting --instance {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
+                            ctl_usage()
+                        );
+                        return EXIT_USAGE;
+                    }
+                }
+            }
+            // Global --format before `ctl` applies when `ctl` set none.
+            // `parse_ctl_request` defaults to table, so detect an explicit
+            // post-`ctl` format by re-scanning `ctl_raw` for the flag.
+            let post_has_format = args
+                .ctl_raw
+                .iter()
+                .any(|t| t == "--format" || t.starts_with("--format="));
+            if !post_has_format {
+                if let Some(global) = args.doctor_format.as_deref() {
+                    match CtlFormat::parse(Some(global)) {
+                        Ok(fmt) => targeting.format = fmt,
+                        Err(message) => {
+                            eprintln!("{message}\n{}", ctl_usage());
+                            return EXIT_USAGE;
+                        }
+                    }
+                }
+            }
+            execute_ctl(&request, &targeting)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

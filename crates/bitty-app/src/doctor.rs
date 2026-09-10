@@ -1050,6 +1050,192 @@ fn truncate(raw: &str, max: usize) -> String {
 // Tests (each check unit-testable with fixtures; output shape tests)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// `bitty doctor` CLI entry point (relocated from `main.rs`, CTX-0305)
+// ---------------------------------------------------------------------------
+
+use crate::cli::{Args, version_text};
+use crate::config_cli::load_merged_config;
+
+/// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
+const DOCTOR_CLIPBOARD_CANDIDATES: &[&str] = &["wl-copy", "xclip", "xsel"];
+
+/// Returns true when `path` is executable (Unix exec bits; Windows: exists).
+fn doctor_shell_executable(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        path.exists()
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+}
+
+/// Collects live inputs for one doctor run.
+///
+/// Impure (environment, filesystem, bounded external probes) and total (every
+/// probe degrades to warn/inconclusive instead of panicking). Reuses the
+/// `config check` load path (`load_merged_config`) so an invalid config file
+/// becomes a failing `config` check (exit 3) rather than a startup abort. No
+/// plugin VM is ever loaded (safe-mode posture); all external commands run
+/// under `run_bounded` (no shell, no pipes, kill by PID on timeout).
+fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
+    let version = version_text();
+    let (exe_ok, exe_detail) = match std::env::current_exe() {
+        Ok(path) => (true, path.display().to_string()),
+        Err(_) => (false, String::new()),
+    };
+    let (config, keymaps, font_chain) = match load_merged_config(args) {
+        Ok(loaded) => {
+            let file_path = loaded
+                .probed
+                .as_ref()
+                .filter(|probe| probe.path.exists())
+                .map(|probe| probe.path.clone());
+            let config = if let Some(path) = file_path.as_ref() {
+                ConfigInput::Ok {
+                    source: format!("file: {}", path.display()),
+                }
+            } else if let Some(path) = loaded.profile_path.as_ref() {
+                ConfigInput::Ok {
+                    source: format!("profile: {}", path.display()),
+                }
+            } else {
+                ConfigInput::Missing
+            };
+            let keymaps = match bitty_config::keymap::resolve_keymaps(&loaded.merged.effective) {
+                Ok(maps) => KeymapInput::Ok(maps.len()),
+                Err(err) => KeymapInput::Err(err.to_string()),
+            };
+            let chain = loaded.merged.effective.font.fallback_chain();
+            (config, keymaps, chain)
+        }
+        Err(message) => {
+            let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect();
+            (ConfigInput::Invalid(message), KeymapInput::Skipped, chain)
+        }
+    };
+    let font_tool_available = find_on_path("fc-match").is_some();
+    let families: Vec<(String, bool)> = font_chain
+        .into_iter()
+        .map(|family| {
+            let present = probe_font(&family).unwrap_or(false);
+            (family, present)
+        })
+        .collect();
+    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let x11 = std::env::var("DISPLAY").ok();
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let dri_cards = dri_card_count();
+    let clipboard_backends: Vec<String> = DOCTOR_CLIPBOARD_CANDIDATES
+        .iter()
+        .filter_map(|name| find_on_path(name).map(|_| (*name).to_string()))
+        .collect();
+    #[cfg(windows)]
+    let (pty_available, pty_detail) = (true, "ConPTY available (Windows)".to_string());
+    #[cfg(not(windows))]
+    let (pty_available, pty_detail) = {
+        let path = std::path::Path::new("/dev/ptmx");
+        if path.exists() {
+            (true, "/dev/ptmx present".to_string())
+        } else {
+            (false, "/dev/ptmx missing".to_string())
+        }
+    };
+    let term = std::env::var("TERM")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let terminfo_found = match term.as_deref() {
+        None => None,
+        Some(name) => probe_terminfo(name),
+    };
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (shell_exists, shell_executable) = match shell.as_deref() {
+        None => (false, false),
+        Some(name) => {
+            let path = std::path::Path::new(name);
+            let exists = path.exists();
+            let executable = if exists {
+                doctor_shell_executable(path)
+            } else {
+                false
+            };
+            (exists, executable)
+        }
+    };
+    DoctorInputs {
+        version,
+        exe_ok,
+        exe_detail,
+        config,
+        keymaps,
+        font_tool_available,
+        families,
+        wayland,
+        x11,
+        session_type,
+        dri_cards,
+        clipboard_backends,
+        pty_available,
+        pty_detail,
+        term,
+        terminfo_found,
+        shell,
+        shell_exists,
+        shell_executable,
+    }
+}
+
+/// Runs `bitty doctor`; returns the process exit code.
+///
+/// - Extra positionals and unknown `--format` shapes fail closed (exit 2).
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "doctor"`) on stdout with diagnostics on stderr so
+///   machine output is never corrupted.
+/// - Exit `0` when every check passes (warns allowed), `1` on recoverable
+///   failure, else the strongest category code (3 config, 5 compat, 8
+///   conflict) per the accepted CLI contract.
+pub(crate) fn run_cli(args: &Args) -> i32 {
+    if !args.doctor_args.is_empty() {
+        eprintln!(
+            "bitty doctor: unexpected argument '{}'\n{}",
+            args.doctor_args[0],
+            doctor_usage()
+        );
+        return EXIT_USAGE;
+    }
+    let format = match DoctorFormat::parse(args.doctor_format.as_deref()) {
+        Ok(format) => format,
+        Err(message) => {
+            eprintln!("{message}\n{}", doctor_usage());
+            return EXIT_USAGE;
+        }
+    };
+    let inputs = collect_doctor_inputs(args);
+    let report = assemble_report(&inputs);
+    match format {
+        DoctorFormat::Table => {
+            let no_color = args.doctor_no_color || std::env::var("NO_COLOR").is_ok();
+            print!("{}", format_table(&report, no_color));
+        }
+        DoctorFormat::Json | DoctorFormat::Jsonl => {
+            println!("{}", format_json(&report));
+        }
+    }
+    report.exit_code()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

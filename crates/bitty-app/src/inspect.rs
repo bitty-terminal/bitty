@@ -1268,6 +1268,59 @@ fn bundled_plugin_ids_hint() -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// `bitty inspect` CLI entry point (relocated from `main.rs`, CTX-0305)
+// ---------------------------------------------------------------------------
+
+use crate::cli::Args;
+
+/// Runs `bitty inspect <target> <value>`; returns the process exit code.
+///
+/// - Extra positionals, unknown targets, missing values, bad `--format`,
+///   stray `--`, and `--socket`/`--instance` alongside `inspect` fail closed
+///   (exit 2, stderr only, no stdout envelope). `inspect` is local-only: no
+///   targeting flag ever applies.
+/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
+///   (`v: 1`, `command: "inspect"`) on stdout with diagnostics on stderr.
+/// - Well-formed but unknown values emit `ok: false` envelopes for json/jsonl
+///   (exit 1, class `NotFound`) and stderr-only diagnostics for table.
+pub(crate) fn run_cli(args: &Args) -> i32 {
+    if !args.inspect_args.is_empty() {
+        eprintln!(
+            "bitty inspect: unexpected argument '{}'\n{}",
+            args.inspect_args[0],
+            inspect_usage()
+        );
+        return EXIT_USAGE;
+    }
+    // Local-only: targeting flags never apply to `inspect` (no instance is
+    // contacted). Fail closed rather than silently ignoring them.
+    if args.ctl_socket_pre.is_some()
+        || args.ctl_instance_pre.is_some()
+        || args.list_socket.is_some()
+        || args.list_instance.is_some()
+    {
+        eprintln!(
+            "bitty inspect: --socket/--instance do not apply (inspect is local, no instance)\n{}",
+            inspect_usage()
+        );
+        return EXIT_USAGE;
+    }
+    let request = match InspectRequest::validate(
+        args.inspect_target.as_deref(),
+        args.inspect_value.as_deref(),
+        args.inspect_format.as_deref(),
+        args.inspect_no_color,
+    ) {
+        Ok(req) => req,
+        Err(message) => {
+            eprintln!("{message}");
+            return EXIT_USAGE;
+        }
+    };
+    run_inspect(&request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

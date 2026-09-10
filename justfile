@@ -58,3 +58,12 @@ workflow-publish *args:
 
 workflow-publish-dry *args:
     bash scripts/publish-ctxpack.sh --dry-run {{args}}
+
+# Restore the local CarryCtx DB from the bitty-workflow mirror LATEST
+# snapshot (fresh-clone recipe). Refuses to replace a non-empty local DB
+# without --force, e.g. `just workflow-import --force`.
+workflow-import *args:
+    bash scripts/fetch-ctxpack.sh {{args}}
+
+workflow-import-dry *args:
+    bash scripts/fetch-ctxpack.sh --dry-run {{args}}

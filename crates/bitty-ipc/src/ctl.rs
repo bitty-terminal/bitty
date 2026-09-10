@@ -56,10 +56,21 @@
 
 #![forbid(unsafe_code)]
 
+use std::time::Duration;
+
 use crate::error::IpcError;
 use crate::scope::{Scope, ScopeSet};
 
 // ── bounds ────────────────────────────────────────────────────────────────
+
+/// End-to-end budget for one `bitty ctl` round trip.
+///
+/// One value for both ends of the control channel: the client socket
+/// read/write timeouts in `bitty-app` `ctl_roundtrip` and the reply wait in
+/// [`enqueue_control_and_wait`]. Sharing it keeps the client from giving up
+/// before a live runtime can drain the queued action and answer with the
+/// structured timeout error.
+pub const CTL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum bytes for `terminal send` text (fail-closed, well under frame bound).
 pub const MAX_SEND_TEXT_BYTES: usize = 16 * 1024;
@@ -628,6 +639,14 @@ mod tests {
     use crate::scope::ScopeSet;
 
     #[test]
+    fn ctl_timeout_budget_is_pinned() {
+        // CTX-0301: one shared budget for both ends of the control channel;
+        // the client socket timeouts in `bitty-app` reuse this constant.
+        assert_eq!(CTL_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(CTL_TIMEOUT.as_secs(), 5);
+    }
+
+    #[test]
     fn control_methods_map_to_expected_scopes() {
         assert_eq!(
             required_scope_for_ctl_method(METHOD_SEND_INPUT),
@@ -1114,8 +1133,9 @@ fn wake_event_loop_for_control() {
 ///
 /// Called on IPC connection threads (via `devtools` handlers). Authorizes
 /// via `granted` before enqueue (fail-closed, no partial state); the main
-/// thread re-authorizes at apply (defense in depth). Waits up to 5 s for
-/// the reply; timeout or a full queue becomes `Unavailable`.
+/// thread re-authorizes at apply (defense in depth). Waits up to
+/// [`CTL_TIMEOUT`] for the reply; timeout or a full queue becomes
+/// `Unavailable`.
 pub fn enqueue_control_and_wait(
     method: &str,
     params: Option<&str>,
@@ -1181,7 +1201,7 @@ pub fn enqueue_control_and_wait(
     // Authorization already passed above and re-runs at drain; the wakeup
     // grants nothing and bypasses no check.
     wake_event_loop_for_control();
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    match rx.recv_timeout(CTL_TIMEOUT) {
         Ok(reply) => reply,
         Err(_) => ControlReply {
             ok: false,

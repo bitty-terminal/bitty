@@ -204,12 +204,38 @@ pub fn hyperlink_spans(snapshot: &Snapshot, state: &State) -> Vec<HyperlinkSpan>
     spans
 }
 
+/// Cell-height divisor that scales the underline bar thickness.
+///
+/// Mirrors `bitty-render`'s `UNDERLINE_THICKNESS_DIVISOR`: this crate
+/// deliberately avoids a `bitty-render` dependency, so the formula is
+/// duplicated by value and pinned across crates by
+/// `bitty-runtime/tests/underline_thickness_mirror.rs`.
+const UNDERLINE_THICKNESS_DIVISOR: u32 = 8;
+
+/// Minimum underline bar thickness in pixels.
+const MIN_UNDERLINE_THICKNESS_PX: u32 = 1;
+
+/// Maximum underline bar thickness in pixels.
+const MAX_UNDERLINE_THICKNESS_PX: u32 = 2;
+
+/// Underline bar thickness in pixels for a cell of `height`:
+/// `height / 8` clamped to `1..=2`.
+///
+/// Public so `bitty-runtime`, the one consumer that sees both this crate and
+/// `bitty-render`, can pin the duplicated formula against
+/// `bitty_render::grid::underline_thickness`.
+#[must_use]
+pub fn underline_thickness(height: u32) -> u32 {
+    (height / UNDERLINE_THICKNESS_DIVISOR)
+        .clamp(MIN_UNDERLINE_THICKNESS_PX, MAX_UNDERLINE_THICKNESS_PX)
+}
+
 /// Headless overlay geometry for hyperlink underlines.
 ///
 /// Each span maps to exactly one [`RectPx`] covering its columns at the
 /// row's baseline decoration area. The underline geometry is
 /// deliberately simple in this draft (one solid bar per span, height =
-/// `cell.height / 8` clamped to 1..2, y = `row*height + height - thickness*2`);
+/// [`underline_thickness`], y = `row*height + height - thickness*2`);
 /// a future rich-block RFC may replace this with per-cell style-aware
 /// underlines. Callers that already have a `GridRenderer` may prefer to
 /// let that layer emit decorations; this helper exists so headless tests
@@ -221,7 +247,7 @@ pub fn hyperlink_overlay_rects(
     metrics: CellMetrics,
 ) -> Vec<RectPx> {
     let spans = hyperlink_spans(snapshot, state);
-    let thickness = (metrics.height / 8).clamp(1, 2);
+    let thickness = underline_thickness(metrics.height);
     let mut rects = Vec::with_capacity(spans.len());
     for span in spans {
         let cols = (span.col_end - span.col_start + 1) as u64;
@@ -365,6 +391,24 @@ mod tests {
         assert_eq!(rects[0].x, 0);
         assert_eq!(rects[0].width, 16);
         assert_eq!(rects[0].height, 2);
+    }
+
+    #[test]
+    fn underline_thickness_is_named_and_clamped() {
+        // CTX-0301: mirrored `(height / 8).clamp(1, 2)` formula; the
+        // cross-crate pin lives in
+        // `bitty-runtime/tests/underline_thickness_mirror.rs`.
+        for (height, expected) in [
+            (0u32, 1),
+            (7, 1),
+            (8, 1),
+            (15, 1),
+            (16, 2),
+            (64, 2),
+            (u32::MAX, 2),
+        ] {
+            assert_eq!(underline_thickness(height), expected, "height {height}");
+        }
     }
 
     #[test]

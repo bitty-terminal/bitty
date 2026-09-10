@@ -216,7 +216,10 @@ not just the code.
   taken from.
 - Every snapshot is a redacted publication artifact (`redacted: true` in
   manifest.json); CarryCtx refuses redacted bundles as merge sources, so
-  snapshots are never merged back. Re-import is a manual, replace-mode affair.
+  snapshots are never merged back. To restore a fresh clone's local CarryCtx
+  DB from `LATEST`, run `just workflow-import` (`just workflow-import-dry`
+  validates only); restore always uses replace mode and refuses to replace a
+  non-empty local DB without `--force`.
 - Trigger: the commander's merge closeout runs `just workflow-publish` in
   the bitty repo. No git hook drives this (squash-merges never fire local
   hooks).

@@ -131,6 +131,26 @@
 - Do not execute reference scripts, hooks, binaries, or installers without an
   explicit reviewed need. Podman is optional when isolation is justified.
 
+### Shell quoting for CarryCtx notes (PX-1637 hardening)
+
+- Single-quote (or heredoc) all `carryctx progress` / `checkpoint` /
+  `decision` text args. Never wrap free prose in double quotes.
+- Never place backticks or `$()` inside a double-quoted note arg: bash
+  expands them before `carryctx` runs. PX-1637 fired this way — prose
+  backticks executed a shell builtin twice and dumped the full environment,
+  including secrets, into the note row.
+- Keep note args short; attach long evidence as files under `../recording/`
+  instead of inline text.
+- Pre-write guard (manual, hook-safe; run before a long note, abort the write
+  when it prints `REFUSE-TO-WRITE` (more than 50 consecutive `VAR=` lines)):
+
+  ```sh
+  printf '%s\n' "$NOTE" | awk '/^[A-Z_][A-Z0-9_]*=/{n++; if (n>50) bad=1; next}{n=0} END{exit bad}' || echo REFUSE-TO-WRITE
+  ```
+
+  This is a documented pattern only, not a blocking hook; hook scoping is a
+  separate open item.
+
 ## Handoff
 
 - Report changed files, exact verification evidence, unresolved risks, and

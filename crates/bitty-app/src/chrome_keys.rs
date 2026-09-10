@@ -15,7 +15,8 @@
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::{FocusDirection, LayoutNode, SplitAxis, View, ViewId, WsCloseRequest};
 
-use super::{TerminalApp, spawn_pane_shell};
+use crate::spawn::spawn_pane_shell;
+use crate::terminal_app::TerminalApp;
 
 /// App-side modifier mirror for keymap matching (CTX-0153).
 ///
@@ -1061,8 +1062,9 @@ impl TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{SpawnSpec, TerminalApp};
     use super::*;
+    use crate::spawn::SpawnSpec;
+    use crate::terminal_app::TerminalApp;
     use bitty_platform::{PlatformEvent, WindowId};
     use bitty_runtime::Runtime;
     // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);

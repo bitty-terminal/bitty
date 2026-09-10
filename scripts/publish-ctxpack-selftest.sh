@@ -14,6 +14,11 @@
 #      --mode replace`, then the imported table counts must match the
 #      manifest (worktrees rows may be pruned by re-anchoring, so
 #      worktrees <= manifest is accepted and reported).
+#   5. Redaction fixture: a synthetic two-file pack holding FAKE secret
+#      values (never real credentials) is copied to a staging dir and run
+#      through scripts/publish-ctxpack-redact.py; the staging copy must come
+#      out redacted (names kept, JSON valid, row counts unchanged) while the
+#      source copy still holds the fakes byte-identical (local DB untouched).
 #
 # Known carryctx v1 limitation (loud WARN, still exit 0): import loads
 # sessions while worktree rows missing at the import target are pruned, so
@@ -59,11 +64,17 @@ command -v timeout >/dev/null 2>&1 || fail "timeout not on PATH"
 [[ -d "$PACK" ]] || fail "export dir $PACK not found"
 
 SCRATCH=""
+FIXT_ROOT=""
 cleanup() {
 	if [[ "$KEEP_SCRATCH" == 0 && -n "$SCRATCH" && -d "$SCRATCH" ]]; then
 		rm -rf "$SCRATCH"
 	elif [[ -n "$SCRATCH" ]]; then
 		log "keeping scratch dir $SCRATCH (SELFTEST_KEEP_SCRATCH=1)"
+	fi
+	if [[ "$KEEP_SCRATCH" == 0 && -n "$FIXT_ROOT" && -d "$FIXT_ROOT" ]]; then
+		rm -rf "$FIXT_ROOT"
+	elif [[ -n "$FIXT_ROOT" ]]; then
+		log "keeping fixture dir $FIXT_ROOT (SELFTEST_KEEP_SCRATCH=1)"
 	fi
 }
 trap cleanup EXIT
@@ -112,6 +123,110 @@ for table, expected in sorted(counts.items()):
 
 print("manifest + counts + JSON: PASS (%d tables)" % len(counts))
 print("WORKTREE_BOUND_SESSIONS=%d" % worktree_bound_sessions)
+PYEOF
+
+# Check 5 — planted-fake-secret redaction fixture (CTX-0281). Synthetic pack
+# only; FAKE marker values, never real credentials. Models the pipeline
+# guarantee: the staging copy is redacted, the source ("local DB") copy is
+# byte-identical afterwards.
+REDACT_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/publish-ctxpack-redact.py"
+[[ -f "$REDACT_PY" ]] || fail "redactor $REDACT_PY not found"
+log "checking export-time redaction (planted-fake-secret fixture)"
+FIXT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ctxpack-redact-fixture.XXXXXX")"
+FIXT_LOCAL="$FIXT_ROOT/local"
+FIXT_STAGING="$FIXT_ROOT/staging"
+mkdir -p "$FIXT_LOCAL" "$FIXT_STAGING"
+FIXT_LOCAL="$FIXT_LOCAL" FIXT_STAGING="$FIXT_STAGING" timeout "$TIMEOUT_SECS" python3 - <<'PYEOF'
+import json, os
+
+local = os.environ["FIXT_LOCAL"]
+# Fake-but-shaped secret values: each carries a FAKE marker so a hit can
+# never be mistaken for a real credential, while still tripping every
+# redactor rule (secret field names, NAME=value env-dump lines, 40+ runs).
+fakes = [
+    "sk-FAKE-0123456789abcdef0123456789abcdef01",  # OPENAI_API_KEY value
+    "FAKECLOUDFLARETOKENFAKECLOUDFLARE01",  # CLOUDFLARE_API_TOKEN value
+    "ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE00",  # GH_PAT-shaped value
+]
+sha = "da39a3ee5e6b4b0d3255bfef95601890afd80709"  # must SURVIVE (SHA-1 exempt)
+manifest = {
+    "format": "carryctx-pack-dir",
+    "format_version": 1,
+    "project_id": "01FAKEFIXTURE00000000000000",
+    "counts": {"progress_items": 1, "events": 1},
+}
+progress_row = {
+    "id": "01FAKEFIXTURE00000000000001",
+    "task_id": "01FAKEFIXTURE00000000000002",
+    "type": "note",
+    "content": "shell env:\nOPENAI_API_KEY=%s\nCLOUDFLARE_API_TOKEN=%s\nplain prose stays" % (fakes[0], fakes[1]),
+}
+event_row = {
+    "id": "01FAKEFIXTURE00000000000003",
+    "type": "progress.created",
+    "payload_json": json.dumps(
+        {"gh_pat": fakes[2], "detail": "session done", "sha": sha},
+        separators=(",", ":"),
+    ),
+}
+with open(local + "/manifest.json", "w") as f:
+    json.dump(manifest, f)
+with open(local + "/project.json", "w") as f:
+    json.dump({"id": manifest["project_id"]}, f)
+with open(local + "/progress_items.jsonl", "w") as f:
+    f.write(json.dumps(progress_row) + "\n")
+with open(local + "/events.jsonl", "w") as f:
+    f.write(json.dumps(event_row) + "\n")
+with open(local + "/fakes.txt", "w") as f:
+    f.write("\n".join(fakes + [sha]) + "\n")
+print("fixture pack written (source copy)")
+PYEOF
+cp "$FIXT_LOCAL/progress_items.jsonl" "$FIXT_STAGING/progress_items.jsonl"
+cp "$FIXT_LOCAL/events.jsonl" "$FIXT_STAGING/events.jsonl"
+timeout "$TIMEOUT_SECS" python3 "$REDACT_PY" "$FIXT_STAGING" >/dev/null ||
+	fail "redactor failed on the planted-secret fixture"
+FIXT_LOCAL="$FIXT_LOCAL" FIXT_STAGING="$FIXT_STAGING" timeout "$TIMEOUT_SECS" python3 - <<'PYEOF'
+import json, os, sys
+
+local = os.environ["FIXT_LOCAL"]
+staging = os.environ["FIXT_STAGING"]
+with open(local + "/fakes.txt") as f:
+    fakes_and_sha = f.read().split()
+fakes, sha = fakes_and_sha[:3], fakes_and_sha[3]
+
+staged_text = ""
+for table in ("progress_items", "events"):
+    path = "%s/%s.jsonl" % (staging, table)
+    with open(path) as f:
+        lines = f.read().splitlines()
+    if len(lines) != 1:
+        sys.exit("staging %s.jsonl has %d rows, want 1" % (table, len(lines)))
+    for i, line in enumerate(lines, 1):
+        try:
+            json.loads(line)
+        except ValueError as e:
+            sys.exit("staging %s.jsonl line %d: invalid JSON (%s)" % (table, i, e))
+    staged_text += "\n".join(lines) + "\n"
+
+for fake in fakes:
+    if fake in staged_text:
+        sys.exit("staging copy still contains planted fake value %s..." % fake[:12])
+if "***REDACTED***" not in staged_text:
+    sys.exit("staging copy has no ***REDACTED*** markers")
+for name in ("OPENAI_API_KEY", "CLOUDFLARE_API_TOKEN", "gh_pat"):
+    if name not in staged_text:
+        sys.exit("staging copy lost field/variable name %s (names must survive)" % name)
+if sha not in staged_text:
+    sys.exit("staging copy lost the SHA-1 control string (over-redaction)")
+
+local_text = ""
+for table in ("progress_items", "events"):
+    with open("%s/%s.jsonl" % (local, table)) as f:
+        local_text += f.read()
+for fake in fakes:
+    if fake not in local_text:
+        sys.exit("source copy lost planted fake value (local DB must stay untouched)")
+print("redaction fixture: staging redacted, source untouched: PASS")
 PYEOF
 
 if [[ "$ROUND_TRIP" == 0 ]]; then

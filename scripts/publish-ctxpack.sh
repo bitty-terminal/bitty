@@ -10,15 +10,26 @@
 #   1. Exports `carryctx export --pack-format dir` from this repo into a
 #      staging clone of bitty-terminal/bitty-workflow as
 #      <UTC-date>-<bitty-main-sha>/.
-#   2. Refreshes the mirror README.md pointer + LATEST file.
-#   3. Commits and pushes to the mirror repo main branch.
+#   2. Redacts secret-shaped values inside the STAGING copy only (export-time
+#      redaction pass, scripts/publish-ctxpack-redact.py): values of
+#      secret-named fields (*_KEY/*_TOKEN/*_SECRET/*_PASSWORD, GH_PAT,
+#      CLOUDFLARE_*, AWS_*) and 40+-char token-like runs become
+#      `***REDACTED***`. JSONL-aware (parse per line, redact, re-serialize),
+#      row counts unchanged, re-runnable no-op. The local carryctx DB is
+#      never modified -- it keeps the originals and the next export redacts
+#      them again.
+#   3. Validates (round-trip self-test, incl. a planted-fake-secret fixture
+#      proving staging is redacted while the source copy is untouched).
+#   4. Refreshes the mirror README.md pointer + LATEST file.
+#   5. Commits and pushes to the mirror repo main branch.
 #
-# Privacy (accepted, commander-scanned before first publish): the pack
-# contains agent display names and absolute workspace paths, and no real
-# secrets (only ULID fragments + fake test-vector tokens in notes). This is
-# intentional — the mirror makes the whole engineering workflow transparent,
-# not just the code. Do NOT publish if a future scan finds real secrets;
-# fix/redact first, then publish.
+# Privacy: the pack intentionally contains agent display names and absolute
+# workspace paths, but secret-shaped values can NEVER reach the mirror: the
+# redaction pass (step 2) runs on every export, dry-run or publish, before
+# validation and commit, so even a live key accidentally pasted into a note
+# or session payload is replaced with `***REDACTED***` (names kept for
+# debuggability). A leaked-then-rotated secret still needs rotation at the
+# source -- redaction limits mirror exposure, it does not un-leak anything.
 #
 # Usage:
 #   scripts/publish-ctxpack.sh [--dry-run] [--mirror DIR] [--url URL]
@@ -49,6 +60,7 @@ MIRROR="${WORKFLOW_MIRROR_DIR:-$MIRROR_DEFAULT}"
 MIRROR_URL="${WORKFLOW_MIRROR_URL:-$MIRROR_URL_DEFAULT}"
 GIT_TIMEOUT="${GIT_TIMEOUT:-120}"
 KEEP_TMP=0
+REDACTIONS=0
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -109,6 +121,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 have git || fail "git not on PATH"
 have carryctx || fail "carryctx not on PATH"
 have timeout || fail "timeout not on PATH"
+have python3 || fail "python3 not on PATH (needed by the redaction pass)"
 
 # Read-only introspection of the bitty checkout. Never a write op here:
 # no checkout, reset, commit, stash, or index/worktree mutation.
@@ -206,9 +219,15 @@ not just the code.
 ## Privacy notice
 
 Snapshots intentionally contain agent display names and absolute workspace
-paths. The corpus was scanned for secrets before the first publish (only
-ULID fragments and fake test-vector tokens in notes; no real secrets). Do
-not publish a snapshot that introduces real secrets — redact first.
+paths. Secret-shaped values never reach the mirror: every export passes
+through an automatic JSONL-aware redaction step before validation and
+commit (secret-named fields such as `*_KEY` / `*_TOKEN` / `*_SECRET` /
+`*_PASSWORD`, `GH_PAT`, `CLOUDFLARE_*`, `AWS_*`, plus `NAME=value` pairs
+and 40+-char token-like runs in free text, become `***REDACTED***`;
+field/variable names are kept for debuggability; the local database is
+never modified). Redaction limits mirror exposure -- it does not un-leak a
+secret that was already pushed anywhere: rotate at the source and report
+suspected leaks to the repository owner immediately.
 EOF
 	if [[ -f "$readme" ]] && cmp -s "$tmp" "$readme"; then
 		rm -f "$tmp"
@@ -224,6 +243,21 @@ run_export() {
 		fail "carryctx export failed"
 	[[ -f "$dest/manifest.json" && -f "$dest/project.json" ]] ||
 		fail "export incomplete (manifest.json/project.json missing)"
+	redact_snapshot "$dest"
+}
+
+# Export-time redaction seam (post-export, pre-validate/commit). Operates
+# ONLY on the snapshot copy ($dest: the staging clone or a --dry-run tmp
+# dir); the local carryctx DB is strictly read-only throughout this script.
+# Row counts are unchanged, so manifest counts and the self-test still hold.
+redact_snapshot() {
+	local dest="$1" redact_out
+	log "redacting secret-shaped values in staging copy $dest (local DB untouched)"
+	redact_out="$(timeout "$GIT_TIMEOUT" python3 "$REPO_ROOT/scripts/publish-ctxpack-redact.py" "$dest")" ||
+		fail "secret redaction failed; mirror left untouched"
+	log "$redact_out"
+	REDACTIONS="$(printf '%s\n' "$redact_out" | sed -n 's/^REDACTIONS=//p')"
+	REDACTIONS="${REDACTIONS:-0}"
 }
 
 run_selftest() {
@@ -266,8 +300,8 @@ run_selftest "$SNAP_DIR"
 
 SOURCE_JSON="$SNAP_DIR/source.json"
 if ! [[ -f "$SOURCE_JSON" ]] || ! grep -q "\"bitty_commit\":\"$BITTY_SHA\"" "$SOURCE_JSON"; then
-	printf '{"snapshot":"%s","bitty_commit":"%s","bitty_branch":"%s","exported_at":"%s","tool":"scripts/publish-ctxpack.sh"}\n' \
-		"$(basename "$SNAP_DIR")" "$BITTY_SHA" "${BITTY_BRANCH:-detached}" "$STAMP" >"$SOURCE_JSON"
+	printf '{"snapshot":"%s","bitty_commit":"%s","bitty_branch":"%s","exported_at":"%s","redactions":%d,"tool":"scripts/publish-ctxpack.sh"}\n' \
+		"$(basename "$SNAP_DIR")" "$BITTY_SHA" "${BITTY_BRANCH:-detached}" "$STAMP" "$REDACTIONS" >"$SOURCE_JSON"
 fi
 
 write_mirror_readme

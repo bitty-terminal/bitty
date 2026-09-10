@@ -2,8 +2,8 @@
 //! Differential comparator: grid hash / snapshot / damage vs reference dumps.
 //!
 //! Headless, bounded, deterministic comparator that loads deterministic bitty
-//! `tmp/references/bitty/*.snapshot.json` dumps produced by `collect_dumps`
-//! (30 dumps as of CTX-0086) and replays the same corpus
+//! `recording/references/bitty/*.snapshot.json` dumps produced by
+//! `collect_dumps` (30 dumps as of CTX-0086) and replays the same corpus
 //! `tests/compat/<category>/corpus/*.bin` through
 //! `Parser -> TerminalAction -> State` to diff:
 //!
@@ -11,7 +11,7 @@
 //! - `Snapshot` grid (text + width/height + cursor + title + generation)
 //! - damage (`damage_since`) bookkeeping
 //! - vs reference dumps when available (ghostty/kitty/wezterm/alacritty headless
-//!   dumps under `tmp/references/<backend>/*.snapshot.json`). When no reference
+//!   dumps under `recording/references/<backend>/*.snapshot.json`). When no reference
 //!   backend dumps are present the comparator falls back to self-consistency:
 //!   regenerate + byte-by-byte determinism + invariant asserts.
 //!
@@ -55,51 +55,41 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Umbrella workspace root, derived from the documented `$BITTY_WORKSPACE`
+/// convention — never a hardcoded absolute path (a hardcoded checkout path
+/// breaks on any other machine). `None` when the env var is absent, in
+/// which case umbrella candidates are omitted.
+fn umbrella_root() -> Option<PathBuf> {
+    std::env::var_os("BITTY_WORKSPACE").map(PathBuf::from)
+}
+
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
-    let ws_tmp = workspace_root().join("tmp/references/bitty");
     // Canonical singular `recording/` (workspace rename); legacy plural
-    // `recordings/` retained as fallback only.
-    let ws_rec = workspace_root().join("recording/references/bitty");
-    let ws_rec_legacy = workspace_root().join("recordings/references/bitty");
-    let umbrella_tmp =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/bitty");
-    let umbrella_rec =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
-    let umbrella_rec_legacy =
-        PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/bitty");
-    vec![
-        ws_tmp,
-        ws_rec,
-        ws_rec_legacy,
-        umbrella_tmp,
-        umbrella_rec,
-        umbrella_rec_legacy,
-    ]
+    // `recordings/` retained as fallback only. No `tmp/` candidate: `tmp/`
+    // is process scratch, never durable evidence (DEC-0038).
+    let mut out = vec![
+        workspace_root().join("recording/references/bitty"),
+        workspace_root().join("recordings/references/bitty"),
+    ];
+    if let Some(u) = umbrella_root() {
+        out.push(u.join("recording/references/bitty"));
+        out.push(u.join("recordings/references/bitty"));
+    }
+    out
 }
 
 fn reference_dir(backend: &str) -> Vec<PathBuf> {
-    let ws_tmp = workspace_root().join(format!("tmp/references/{backend}"));
     // Canonical singular `recording/` (workspace rename); legacy plural
     // `recordings/` retained as fallback only.
-    let ws_rec = workspace_root().join(format!("recording/references/{backend}"));
-    let ws_rec_legacy = workspace_root().join(format!("recordings/references/{backend}"));
-    let umbrella_tmp = PathBuf::from(format!(
-        "/mnt/data/Workspace/Projects/bitty-terminal/tmp/references/{backend}"
-    ));
-    let umbrella_rec = PathBuf::from(format!(
-        "/mnt/data/Workspace/Projects/bitty-terminal/recording/references/{backend}"
-    ));
-    let umbrella_rec_legacy = PathBuf::from(format!(
-        "/mnt/data/Workspace/Projects/bitty-terminal/recordings/references/{backend}"
-    ));
-    vec![
-        ws_tmp,
-        ws_rec,
-        ws_rec_legacy,
-        umbrella_tmp,
-        umbrella_rec,
-        umbrella_rec_legacy,
-    ]
+    let mut out = vec![
+        workspace_root().join(format!("recording/references/{backend}")),
+        workspace_root().join(format!("recordings/references/{backend}")),
+    ];
+    if let Some(u) = umbrella_root() {
+        out.push(u.join(format!("recording/references/{backend}")));
+        out.push(u.join(format!("recordings/references/{backend}")));
+    }
+    out
 }
 
 /// One parsed bitty dump record.
@@ -413,7 +403,7 @@ fn corpus_path_for_rel(corpus_rel: &str) -> PathBuf {
     workspace_root().join("tests/compat").join(corpus_rel)
 }
 
-/// Load all bitty snapshots from `tmp/references/bitty/*.snapshot.json`.
+/// Load all bitty snapshots from `recording/references/bitty/*.snapshot.json`.
 ///
 /// Bounded to `MAX_SNAPSHOTS`, sorted, each file bounded to
 /// `MAX_SNAPSHOT_JSON_BYTES`.
@@ -449,7 +439,7 @@ pub fn load_bitty_dumps() -> Result<Vec<BittyDump>, String> {
         }
     }
     Err(
-        "no bitty dump directory found at tmp/references/bitty or recording/references/bitty (not found; run collect_dumps)"
+        "no bitty dump directory found at recording/references/bitty (not found; run collect_dumps)"
             .to_string(),
     )
 }
@@ -764,8 +754,8 @@ mod tests {
 
     #[test]
     fn example_snapshot_parses_and_is_bounded() {
-        let path =
-            workspace_root().join("tmp/references/bitty/vt-01-cursor-addressing.snapshot.json");
+        let path = workspace_root()
+            .join("recording/references/bitty/vt-01-cursor-addressing.snapshot.json");
         if !path.exists() {
             return;
         }
@@ -802,6 +792,13 @@ mod tests {
             ws_singular < ws_legacy,
             "singular recording/ ({ws_singular}) must precede legacy recordings/ ({ws_legacy})"
         );
+        // Umbrella entries exist only when `$BITTY_WORKSPACE` is set; skip
+        // that half of the contract otherwise (same pattern as the
+        // discovery test below).
+        if umbrella_root().is_none() {
+            eprintln!("SKIP: umbrella ordering asserts need $BITTY_WORKSPACE");
+            return;
+        }
         let umbrella_singular = pos_of(&candidates, "bitty-terminal/recording/references/bitty")
             .expect("singular umbrella recording/ candidate missing");
         let umbrella_legacy = pos_of(&candidates, "bitty-terminal/recordings/references/bitty")
@@ -836,8 +833,13 @@ mod tests {
         // End-to-end proof of the fix on hosts where the renamed umbrella
         // `recording/references/bitty/` baselines exist: discovery must
         // succeed even though no `recordings/` (plural) directory exists.
-        let singular_umbrella =
-            PathBuf::from("/mnt/data/Workspace/Projects/bitty-terminal/recording/references/bitty");
+        // The umbrella root comes from `$BITTY_WORKSPACE`, never a hardcoded
+        // checkout path.
+        let Some(ws) = umbrella_root() else {
+            eprintln!("SKIP: $BITTY_WORKSPACE is unset on this host");
+            return;
+        };
+        let singular_umbrella = ws.join("recording/references/bitty");
         if !singular_umbrella.is_dir() {
             eprintln!("SKIP: singular umbrella recording/ baselines absent on this host");
             return;

@@ -18,10 +18,10 @@
 //! `crates/bitty-compat-lab` to workspace root) so shard determinism does not
 //! depend on `cargo test` cwd. Every file is asserted `<= MAX_CORPUS_BYTES`.
 //!
-//! vttest pin: `tmp/references/vttest/` records upstream revision + license
+//! vttest pin: `recording/references/vttest/` records upstream revision + license
 //! and curation method; checked-in `tests/compat/vt/corpus/vttest-menu*.bin`
 //! and `tests/compat/vt/reference/*.txt` are bounded slices derived from
-//! `vttest` menus 1/11 shapes (see `tmp/references/vttest/README.md`).
+//! `vttest` menus 1/11 shapes (see `recording/references/vttest/README.md`).
 
 use std::path::PathBuf;
 

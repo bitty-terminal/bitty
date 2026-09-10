@@ -7,7 +7,7 @@
 //! stored `state_hash`, `Snapshot` grid/cursor/title/generation, `text`,
 //! `bytes_len`/`actions_len`, and `State` invariants plus `damage_since`
 //! sanity. Reference backends (ghostty/kitty/wezterm) are diffed opaquely
-//! when present under `tmp/references/<backend>/*.snapshot.json` — graceful
+//! when present under `recording/references/<backend>/*.snapshot.json` — graceful
 //! skip when absent (no network, no `winit`/`wgpu`/`Window`/`Surface`).
 
 use bitty_compat_lab::compare::{
@@ -33,7 +33,7 @@ fn load_bitty_dumps_is_bounded_and_sorted() {
         Ok(d) => d,
         Err(e) if e.contains("not found") || e.contains("no bitty") || e.contains("no dumps") => {
             eprintln!(
-                "SKIP: tmp/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
+                "SKIP: recording/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
             );
             return;
         }
@@ -41,7 +41,7 @@ fn load_bitty_dumps_is_bounded_and_sorted() {
     };
     if dumps.is_empty() {
         eprintln!(
-            "SKIP: tmp/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
+            "SKIP: recording/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
         );
         return;
     }
@@ -101,7 +101,7 @@ fn comparator_is_deterministic_and_self_consistent() {
         Ok(r) => r,
         Err(e) if e.contains("not found") || e.contains("no bitty") || e.contains("no dumps") => {
             eprintln!(
-                "SKIP: tmp/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
+                "SKIP: recording/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
             );
             return;
         }
@@ -159,7 +159,7 @@ fn comparator_no_unbounded_heap() {
         Ok(r) => r,
         Err(e) if e.contains("not found") || e.contains("no bitty") || e.contains("no dumps") => {
             eprintln!(
-                "SKIP: tmp/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
+                "SKIP: recording/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
             );
             return;
         }
@@ -205,7 +205,7 @@ fn comparator_reference_graceful_skip_when_absent() {
         Ok(r) => r,
         Err(e) if e.contains("not found") || e.contains("no bitty") || e.contains("no dumps") => {
             eprintln!(
-                "SKIP: tmp/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
+                "SKIP: recording/references/bitty dumps not present (run collect_dumps); skipping comparator assertions"
             );
             return;
         }

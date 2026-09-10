@@ -15,21 +15,27 @@
 //! - A release over the painted thumb never activates hyperlinks.
 //!
 //! Default headless geometry throughout: 80x24 grid, 9x19 cells, 8px
-//! window padding — so the no-gap track is `(720, 8, 8x456)` in physical
-//! pixels (right edge inside the leaf, grid columns untouched).
+//! window padding, and the accepted CTX-0118 decoration `4/6/2/6` — so the
+//! track is `(712, 16, 8x440)` in physical pixels, hugging the decorated
+//! content frame right edge (CTX-0294 present frame, not the raw cell
+//! allocation; grid columns untouched).
 
 #![forbid(unsafe_code)]
 
 use bitty_platform::{
     CursorPosition, MouseButton, MouseEvent, PlatformEvent, PressState, WindowEventKind, WindowId,
 };
-use bitty_runtime::{Runtime, RuntimeConfig, ScrollbarMode};
-use bitty_ui::scrollbar::{TrackRect, TrackSpec, track_rect};
+use bitty_runtime::{
+    Decoration, LayoutNode, Runtime, RuntimeConfig, ScrollbarMode, SplitAxis, View, ViewId,
+};
+use bitty_ui::scrollbar::TrackRect;
 
-/// Default no-gap track in physical pixels (80x24 cells of 9x19px + 8px pad).
-const TRACK_X: f64 = 720.0;
-const TRACK_Y: f64 = 8.0;
-const TRACK_H: f64 = 456.0;
+/// Default decorated track in physical pixels: 80x24 cells of 9x19px, 8px
+/// padding, decoration `4/6/2/6` (gaps_out 6 + border 2 inset the content
+/// frame to `(8, 8, 704, 440)`; right edge 8 + 8 + 704 = 720, thumb 8 wide).
+const TRACK_X: f64 = 712.0;
+const TRACK_Y: f64 = 16.0;
+const TRACK_H: f64 = 440.0;
 
 fn window() -> WindowId {
     WindowId::from_raw_public(1)
@@ -145,14 +151,14 @@ fn always_paints_exactly_one_thumb_fill_with_scrollback() {
     assert!(!hidden.scrollbar_is_visible());
     assert_eq!(stats.fills, base.fills + 1, "exactly one thumb fill");
     assert_eq!(stats.glyphs, base.glyphs, "thumb adds no glyphs");
-    // Track hugs the right edge inside the leaf at default geometry.
+    // Track hugs the decorated content frame right edge at default geometry.
     assert_eq!(
         shown.scrollbar_track(),
         Some(TrackRect {
-            x: 720,
-            y: 8,
+            x: 712,
+            y: 16,
             width: 8,
-            height: 456,
+            height: 440,
         })
     );
 }
@@ -266,23 +272,18 @@ fn gaps_and_padding_shift_hit_testing() {
         (TRACK_X as i32, TRACK_Y as i32),
         "outer gap must move the track"
     );
-    // The resolved track matches pure math on the gapped allocation.
-    let fid = rt.focused_view().expect("focused leaf");
-    let (_, rect) = rt
-        .layout_allocations()
-        .into_iter()
-        .find(|(id, _)| *id == fid)
-        .expect("focused allocation");
+    // The resolved track hugs the decorated content frame (outer cell gap
+    // plus decoration gaps_out 6 and border 2) translated by the 8px pad:
+    // content (17, 27, 686, 402) -> right edge 8 + 17 + 686 = 711.
     assert_eq!(
-        Some(track),
-        track_rect(TrackSpec {
-            leaf: rect,
-            cell_w_px: 9,
-            cell_h_px: 19,
-            pad_px: 8,
-            width_px: 8,
-        }),
-        "track must follow the gapped allocation plus padding"
+        track,
+        TrackRect {
+            x: 703,
+            y: 35,
+            width: 8,
+            height: 402,
+        },
+        "track must follow the decorated content frame plus padding"
     );
     // Stale no-gap press misses the scrollbar (selection keeps it).
     move_to(&mut rt, TRACK_X + 4.0, TRACK_Y + TRACK_H - 4.0);
@@ -304,7 +305,8 @@ fn gaps_and_padding_shift_hit_testing() {
     assert_eq!(scroll_offset(&rt), sb);
     release(&mut rt);
 
-    // CTX-0223: zero padding puts the track flush at the window edge.
+    // CTX-0223: zero padding puts the track flush at the decorated content
+    // edge (default decoration: content (8, 8, 704, 440) -> x 704, y 8).
     let mut bare = runtime_with_config(RuntimeConfig {
         scrollbar_mode: ScrollbarMode::Always,
         window_padding: 0,
@@ -315,17 +317,17 @@ fn gaps_and_padding_shift_hit_testing() {
     assert_eq!(
         bare.scrollbar_track(),
         Some(TrackRect {
-            x: 712,
-            y: 0,
+            x: 704,
+            y: 8,
             width: 8,
-            height: 456,
+            height: 440,
         })
     );
 }
 
 #[test]
 fn release_over_thumb_never_activates_hyperlinks() {
-    // A full-width hyperlink row sits on the live bottom row (col 79 maps
+    // A full-width hyperlink row sits on the live bottom row (col 77 maps
     // from the thumb strip); a thumb-gesture release must not open it,
     // while the same click with hidden chrome still does (test validity).
     fn feed_link_row(rt: &mut Runtime) {
@@ -342,7 +344,7 @@ fn release_over_thumb_never_activates_hyperlinks() {
     move_to(
         &mut rt,
         f64::from(track.x) + 2.0,
-        f64::from(track.y) + f64::from(track.height) - 4.0,
+        f64::from(track.y) + f64::from(track.height) - 2.0,
     );
     press(&mut rt);
     assert!(rt.is_scrollbar_dragging());
@@ -360,7 +362,7 @@ fn release_over_thumb_never_activates_hyperlinks() {
     move_to(
         &mut plain,
         f64::from(track.x) + 2.0,
-        f64::from(track.y) + f64::from(track.height) - 4.0,
+        f64::from(track.y) + f64::from(track.height) - 2.0,
     );
     press(&mut plain);
     release(&mut plain);
@@ -389,11 +391,11 @@ fn scrollbar_width_scales_track_and_thumb() {
         assert!(rt.scrollbar_is_visible());
         let track = rt.scrollbar_track().expect("track");
         assert_eq!(track.width, width, "track carries the configured width");
-        // Right edge stays inside the leaf at default padding:
-        // x = 0 cells * 9px + 8px pad + 80 cells * 9px - width.
-        assert_eq!(track.x, 728 - width as i32);
-        assert_eq!(track.y, 8);
-        assert_eq!(track.height, 456);
+        // Right edge hugs the decorated content frame at default padding:
+        // x = 8px pad + 8px content origin + 704px content - width.
+        assert_eq!(track.x, 720 - width as i32);
+        assert_eq!(track.y, 16);
+        assert_eq!(track.height, 440);
 
         // The painted thumb is exactly `width` physical pixels wide: sample
         // one row inside the thumb near the live (bottom) position and count
@@ -402,12 +404,21 @@ fn scrollbar_width_scales_track_and_thumb() {
         let rgba = rt.headless_rgba().expect("rgba after tick");
         let surface = rt.surface_extent().expect("surface extent");
         let stride = usize::try_from(surface.width()).expect("surface width fits");
-        let thumb = bitty_ui::scrollbar::thumb_geometry(track.height, 24, rt.scrollback_len(), 0)
+        let rows = usize::from(
+            rt.layout()
+                .find_leaf(rt.focused_view().expect("focused leaf"))
+                .expect("focused view")
+                .rows(),
+        );
+        let thumb = bitty_ui::scrollbar::thumb_geometry(track.height, rows, rt.scrollback_len(), 0)
             .expect("thumb exists with scrollback");
         let y = usize::try_from(track.y).expect("track y fits")
             + usize::try_from(thumb.y + thumb.height / 2).expect("thumb y fits");
+        // Window: 8px left of the track up to the content right edge
+        // (exclusive) so the adjacent decoration border ring, which is also
+        // non-background, is never counted.
         let x0 = usize::try_from(track.x - 8).expect("window x0 fits");
-        let x1 = usize::try_from(track.x + width as i32 + 8).expect("window x1 fits");
+        let x1 = usize::try_from(track.x + width as i32).expect("window x1 fits");
         let painted = (x0..x1)
             .filter(|&x| {
                 let i = (y * stride + x) * 4;
@@ -432,4 +443,134 @@ fn scrollbar_width_scales_track_and_thumb() {
     rt.apply_dpi_scale(2.0, None);
     assert_eq!(rt.scrollbar_width_physical(), 24);
     assert_eq!(rt.scrollbar_track().expect("track at 2x").width, 24);
+}
+
+#[test]
+fn track_follows_decorated_content_frame_defaults_and_zero() {
+    // CTX-0313: the track hugs the decorated content frame the live present
+    // paints (CTX-0294), not the raw cell allocation. Default decoration
+    // `4/6/2/6` insets the content frame to `(8, 8, 704, 440)` before the
+    // 8px padding: track top 16, right edge 8 + 8 + 704 = 720.
+    for (decoration, expected) in [
+        (
+            Decoration::default(),
+            TrackRect {
+                x: 712,
+                y: 16,
+                width: 8,
+                height: 440,
+            },
+        ),
+        (
+            Decoration::ZERO,
+            TrackRect {
+                x: 720,
+                y: 8,
+                width: 8,
+                height: 456,
+            },
+        ),
+    ] {
+        let mut rt = runtime_with_config(RuntimeConfig {
+            scrollbar_mode: ScrollbarMode::Always,
+            decoration,
+            ..RuntimeConfig::default()
+        });
+        let sb = feed_scrollback(&mut rt);
+        assert!(sb > 0, "need scrollback for {decoration:?}");
+        rt.tick().expect("presents");
+        let track = rt.scrollbar_track().expect("track");
+        assert_eq!(track, expected, "decoration {decoration:?}");
+        // Independent relation: the track is exactly the present-painted
+        // content frame plus the window padding inset.
+        let fid = rt.focused_view().expect("focused leaf");
+        let content = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == fid)
+            .expect("focused present frame")
+            .content;
+        assert_eq!(
+            track,
+            TrackRect {
+                x: 8 + content.x + content.width as i32 - 8,
+                y: 8 + content.y,
+                width: 8,
+                height: content.height,
+            },
+            "decoration {decoration:?}"
+        );
+    }
+}
+
+#[test]
+fn track_offsets_track_decoration_properties() {
+    // (decoration, expected (x, y, height)) for 80x24 9x19 cells, 8px pad,
+    // 8px thumb: accepted defaults, ZERO, and each property in isolation.
+    // `gaps_in` and `radius` leave a single leaf's frame rects unchanged;
+    // `gaps_out` and `border` inset the content frame the track hugs.
+    let cases = [
+        (Decoration::new(4, 6, 2, 6), (712, 16, 440)),
+        (Decoration::new(0, 0, 0, 0), (720, 8, 456)),
+        (Decoration::new(0, 0, 4, 0), (716, 12, 448)),
+        (Decoration::new(0, 10, 0, 0), (710, 18, 436)),
+        (Decoration::new(8, 0, 0, 0), (720, 8, 456)),
+        (Decoration::new(0, 0, 0, 16), (720, 8, 456)),
+    ];
+    for (decoration, (x, y, height)) in cases {
+        let mut rt = runtime_with_config(RuntimeConfig {
+            scrollbar_mode: ScrollbarMode::Always,
+            decoration,
+            ..RuntimeConfig::default()
+        });
+        let sb = feed_scrollback(&mut rt);
+        assert!(sb > 0, "need scrollback for {decoration:?}");
+        rt.tick().expect("presents");
+        let track = rt.scrollbar_track().expect("track");
+        assert_eq!(
+            (track.x, track.y, track.width, track.height),
+            (x, y, 8, height),
+            "decoration {decoration:?}"
+        );
+    }
+}
+
+#[test]
+fn split_inner_gap_moves_track_to_focused_content_frame() {
+    // `gaps_in` only enters through a split: each leaf's decorated content
+    // frame excludes the shared inner band, and the track follows focus.
+    let mut rt = runtime_with(ScrollbarMode::Always);
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    let sb = feed_scrollback(&mut rt);
+    assert!(sb > 0, "need scrollback for the test");
+    rt.tick().expect("presents");
+    // Outer 6 + border 2 -> content starts at 8; the 4px inner band splits
+    // the 708px area into two 352px frames: left content (8, 8, 348, 440),
+    // right content (364, 8, 348, 440); track right edge = content + 8px pad.
+    assert_eq!(
+        rt.scrollbar_track(),
+        Some(TrackRect {
+            x: 356,
+            y: 16,
+            width: 8,
+            height: 440,
+        }),
+        "focused first leaf"
+    );
+    assert!(rt.set_focus(ViewId::new(2)), "second leaf exists");
+    assert_eq!(
+        rt.scrollbar_track(),
+        Some(TrackRect {
+            x: 712,
+            y: 16,
+            width: 8,
+            height: 440,
+        }),
+        "focused second leaf"
+    );
 }

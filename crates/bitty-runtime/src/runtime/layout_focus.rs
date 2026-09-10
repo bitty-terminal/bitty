@@ -281,7 +281,7 @@ impl Runtime {
     /// size is the content-derived grid. The present path translates pixels
     /// directly from [`PresentFrame`], so this exists for the cell-path
     /// consumers — scroll bounds, selection clamping, scrollbar thumb
-    /// geometry — and for pane grid/PTY sizing.
+    /// sizing — and for pane grid/PTY sizing.
     pub(super) fn reflow_present_layout(&mut self, frames: &[PresentFrame]) {
         let live = self.live_cell_metrics();
         let cw = u32::from(u16::try_from(live.width).unwrap_or(u16::MAX)).max(1);

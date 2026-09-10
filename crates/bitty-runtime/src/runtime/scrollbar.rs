@@ -67,35 +67,32 @@ impl Runtime {
     /// physical pixels, or `None` when there is nothing to scroll or the
     /// geometry is degenerate.
     ///
-    /// The leaf allocation comes from the gap-aware layout
-    /// ([`Self::layout_allocations`], CTX-0177), so gap bands are excluded
-    /// by construction; the physical padding inset (CTX-0223) is added
-    /// exactly like the present layer's content translation. No mode gate
-    /// here — callers apply [`bitty_ui::scrollbar::is_visible`] with their
-    /// engagement signal.
+    /// CTX-0313: the track hugs the focused leaf's decorated content frame
+    /// ([`Self::present_frames`], the same rectangle the present layer
+    /// paints) instead of the raw CTX-0177 cell allocation, so the thumb
+    /// never covers the decoration gap/border bands; the physical padding
+    /// inset (CTX-0223) is added exactly like the present layer's content
+    /// translation. No mode gate here — callers apply
+    /// [`bitty_ui::scrollbar::is_visible`] with their engagement signal.
     pub(super) fn scrollbar_track_thumb(&self) -> Option<(ViewId, TrackRect, ThumbSpan)> {
         use bitty_ui::scrollbar::{TrackSpec, thumb_geometry, track_rect};
         let width = self.scrollbar_width_physical();
         if width == 0 {
             return None;
         }
-        let allocations = self.layout_allocations();
+        let frames = self.present_frames();
         let fid = self
             .focused_view()
-            .or_else(|| allocations.first().map(|(id, _)| *id))?;
-        let (_, rect) = allocations.iter().find(|(id, _)| *id == fid)?;
-        if rect.is_empty() {
-            return None;
-        }
+            .or_else(|| frames.first().map(|frame| frame.view))?;
+        let frame = frames.iter().find(|frame| frame.view == fid)?;
         let view = self.layout.find_leaf(fid)?;
         let sb_len = self.scrollback_len();
-        let live = self.live_cell_metrics();
-        let pad_px = self.window_padding_physical();
         let track = track_rect(TrackSpec {
-            leaf: *rect,
-            cell_w_px: live.width,
-            cell_h_px: live.height,
-            pad_px,
+            content_x: frame.content.x,
+            content_y: frame.content.y,
+            content_w: frame.content.width,
+            content_h: frame.content.height,
+            pad_px: self.window_padding_physical(),
             width_px: width,
         })?;
         let thumb = thumb_geometry(

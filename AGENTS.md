@@ -139,10 +139,10 @@
   expands them before `carryctx` runs. PX-1637 fired this way — prose
   backticks executed a shell builtin twice and dumped the full environment,
   including secrets, into the note row.
-- Keep note args short; attach long evidence as files under `../recordings/`
+- Keep note args short; attach long evidence as files under `../recording/`
   instead of inline text.
 - Pre-write guard (manual, hook-safe; run before a long note, abort the write
-  when it prints `REFUSE-TO-WRITE`):
+  when it prints `REFUSE-TO-WRITE` (more than 50 consecutive `VAR=` lines)):
 
   ```sh
   printf '%s\n' "$NOTE" | awk '/^[A-Z_][A-Z0-9_]*=/{n++; if (n>50) bad=1; next}{n=0} END{exit bad}' || echo REFUSE-TO-WRITE

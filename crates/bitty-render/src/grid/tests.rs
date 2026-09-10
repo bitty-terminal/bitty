@@ -13,6 +13,7 @@ use bitty_vt::GraphemeCell;
 
 use super::{
     CellMetrics, DEFAULT_BG, DEFAULT_FG, FAINT_ALPHA, palette_rgb, resolve_color, resolved_colors,
+    underline_thickness,
 };
 use crate::error::RenderError;
 use crate::frame::{DamageDescriptor, FrameMode, plan_frame};
@@ -521,6 +522,23 @@ fn underline_and_strikethrough_geometry_is_fixed() {
     assert_eq!(rects[2].rect.y, 7);
     assert_eq!(grid.counters().decorations_emitted, 3);
     assert_eq!(grid.counters().cells_drawn, 1);
+}
+
+#[test]
+fn underline_thickness_is_named_and_clamped() {
+    // CTX-0301: `(height / 8).clamp(1, 2)` is named; pin the representative
+    // heights including the clamps and the cell heights used by tests.
+    for (height, expected) in [
+        (0u32, 1),
+        (7, 1),
+        (8, 1),
+        (15, 1),
+        (16, 2),
+        (64, 2),
+        (u32::MAX, 2),
+    ] {
+        assert_eq!(underline_thickness(height), expected, "height {height}");
+    }
 }
 
 #[test]

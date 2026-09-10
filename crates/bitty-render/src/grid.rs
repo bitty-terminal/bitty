@@ -371,6 +371,32 @@ fn cursor_thickness(cell: CellMetrics) -> u32 {
     rounded.min(cell.width).min(cell.height)
 }
 
+/// Cell-height divisor that scales underline/strikethrough bar thickness.
+///
+/// Mirrored by `bitty-rich::hyperlink` for headless overlay geometry:
+/// `bitty-rich` deliberately avoids a `bitty-render` dependency, so the
+/// formula is duplicated by value and pinned across crates by
+/// `bitty-runtime/tests/underline_thickness_mirror.rs`.
+const UNDERLINE_THICKNESS_DIVISOR: u32 = 8;
+
+/// Minimum underline/strikethrough bar thickness in pixels.
+const MIN_UNDERLINE_THICKNESS_PX: u32 = 1;
+
+/// Maximum underline/strikethrough bar thickness in pixels.
+const MAX_UNDERLINE_THICKNESS_PX: u32 = 2;
+
+/// Underline/strikethrough bar thickness in pixels for a cell of
+/// `cell_height`: `cell_height / 8` clamped to `1..=2`.
+///
+/// Public so `bitty-runtime`, the one consumer that sees both this crate and
+/// `bitty-rich`, can pin the duplicated formula against
+/// `bitty_rich::hyperlink::underline_thickness`.
+#[must_use]
+pub fn underline_thickness(cell_height: u32) -> u32 {
+    (cell_height / UNDERLINE_THICKNESS_DIVISOR)
+        .clamp(MIN_UNDERLINE_THICKNESS_PX, MAX_UNDERLINE_THICKNESS_PX)
+}
+
 /// Selection background fill color: the theme selection ([`DEFAULT_SELECTION`]).
 ///
 /// Selection highlighting itself lives with the embedder (which owns the
@@ -1269,7 +1295,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     ) -> u64 {
         use bitty_term_state::UnderlineStyle;
 
-        let thickness = (self.cell.height / 8).clamp(1, 2);
+        let thickness = underline_thickness(self.cell.height);
         let left = u64::try_from(col)
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::from(self.cell.width));

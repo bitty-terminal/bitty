@@ -1594,6 +1594,10 @@ fn runtime_config_inherits_file_window_padding() {
         bitty_config::EffectiveConfig::default().window.padding
     );
     assert_eq!(
+        bitty_config::types::DEFAULT_WINDOW_PADDING,
+        bitty_runtime::config::DEFAULT_WINDOW_PADDING
+    );
+    assert_eq!(
         bitty_runtime::config::DEFAULT_WINDOW_RADIUS_PX,
         bitty_config::EffectiveConfig::default().window.radius_px
     );
@@ -1604,7 +1608,7 @@ fn runtime_config_inherits_file_window_padding() {
     );
     assert_eq!(
         bitty_runtime::config::MAX_WINDOW_PADDING,
-        64,
+        bitty_config::types::MAX_WINDOW_PADDING,
         "runtime bound must match config validation (`must be <= 64`)"
     );
     use bitty_config::file::{parse_lua_config, resolve_effective};

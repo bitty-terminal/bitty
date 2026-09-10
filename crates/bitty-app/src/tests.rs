@@ -270,6 +270,7 @@ fn default_run_emits_no_tick_lines() {
     let present = bitty_runtime::PresentStats {
         frame: 1,
         fills: 7,
+        rounded_fills: 0,
         glyphs: 3,
         headless: true,
         generation: 9,
@@ -294,6 +295,7 @@ fn verbose_run_emits_tick_lines() {
     let present = bitty_runtime::PresentStats {
         frame: 4,
         fills: 12,
+        rounded_fills: 0,
         glyphs: 5,
         headless: true,
         generation: 30,
@@ -321,6 +323,7 @@ fn tick_line_format_carries_frame_stats() {
     let present = bitty_runtime::PresentStats {
         frame: 2,
         fills: 1921,
+        rounded_fills: 0,
         glyphs: 21,
         headless: true,
         generation: 30,

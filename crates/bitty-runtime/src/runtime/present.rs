@@ -111,6 +111,9 @@ pub struct PresentStats {
     pub frame: u64,
     /// Number of fill rectangles in the presented draw list.
     pub fills: usize,
+    /// Number of rounded fill/ring primitives in the presented draw list
+    /// (CTX-0311).
+    pub rounded_fills: usize,
     /// Number of glyph instances in the presented draw list.
     pub glyphs: usize,
     /// Whether the surface was the headless software fake.
@@ -133,6 +136,7 @@ impl From<RenderPresentStats> for PresentStats {
         Self {
             frame: value.frame,
             fills: value.fills,
+            rounded_fills: value.rounded_fills,
             glyphs: value.glyphs,
             headless: value.headless,
             generation: 0,
@@ -432,6 +436,7 @@ impl Runtime {
 
         // Build the combined DrawList by rendering each leaf's viewport.
         let mut combined_fills = Vec::new();
+        let mut combined_rounded: Vec<bitty_render::grid::RoundedFill> = Vec::new();
         let mut combined_glyphs = Vec::new();
         let mut any_needs_draw = false;
 
@@ -655,28 +660,35 @@ impl Runtime {
                 }
             }
 
-            // CTX-0294: Core-owned decoration border ring, painted under the
-            // leaf content (the content sits inside the inner rounded rect by
-            // construction). Emitted as plain FillRects so the software and
-            // GPU compositors stay pixel-identical; gaps_out/gaps_in bands
-            // are the unallocated frame space and keep the surface clear
-            // color, exactly like the CTX-0177 gap bands.
-            if frame.border > 0 && frame.frame.width > 0 && frame.frame.height > 0 {
-                let ring = bitty_render::grid::rounded_border_fills(
-                    bitty_render::geometry::RectPx::new(
-                        px_add(pad_px, frame.frame.x),
-                        px_add(pad_px, frame.frame.y),
-                        frame.frame.width,
-                        frame.frame.height,
-                    ),
-                    frame.border,
-                    frame.radius,
-                    bitty_render::grid::DECORATION_BORDER,
+            // CTX-0311: Core-owned decoration ring as one rounded SDF
+            // primitive (border == 0 paints nothing; a solid rounded fill
+            // would cover the content). It paints after every plain fill —
+            // including the cell backgrounds above — and before glyphs, so
+            // the ring covers the corner cell backgrounds. `radius` clips
+            // content: the derived inner clip is attached to this leaf's
+            // glyphs below, so text never overdraws the inner corner curve.
+            // gaps_out/gaps_in bands are the unallocated frame space and
+            // keep the surface clear color, exactly like the CTX-0177 gap
+            // bands.
+            let mut frame_clip = None;
+            if frame.frame.width > 0 && frame.frame.height > 0 {
+                let ring_frame = bitty_render::geometry::RectPx::new(
+                    px_add(pad_px, frame.frame.x),
+                    px_add(pad_px, frame.frame.y),
+                    frame.frame.width,
+                    frame.frame.height,
                 );
-                if !ring.is_empty() {
-                    combined_fills.extend(ring);
+                if frame.border > 0 {
+                    combined_rounded.push(bitty_render::grid::RoundedFill {
+                        frame: ring_frame,
+                        border: frame.border,
+                        radius: frame.radius,
+                        color: bitty_render::grid::DECORATION_BORDER,
+                    });
                     any_needs_draw = true;
                 }
+                frame_clip =
+                    bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
             }
 
             if !list.needs_draw() {
@@ -694,6 +706,9 @@ impl Runtime {
             for mut glyph in list.glyphs {
                 glyph.dest[0] = px_add(glyph.dest[0], origin_px_x);
                 glyph.dest[1] = px_add(glyph.dest[1], origin_px_y);
+                // CTX-0311 inner-arc clip: only decorated rounded frames set
+                // it; square frames keep the documented overhang behavior.
+                glyph.clip = frame_clip;
                 combined_glyphs.push(glyph);
             }
         }
@@ -1068,6 +1083,7 @@ impl Runtime {
 
         if !any_needs_draw
             && combined_fills.is_empty()
+            && combined_rounded.is_empty()
             && combined_glyphs.is_empty()
             && combined_images.is_empty()
         {
@@ -1130,6 +1146,7 @@ impl Runtime {
                         mode: FrameMode::Clean,
                     },
                     fills: Vec::new(),
+                    rounded_fills: Vec::new(),
                     glyphs: Vec::new(),
                     images: Vec::new(),
                 });
@@ -1139,11 +1156,15 @@ impl Runtime {
             // cover the combined frame when content exists.
             tmp_list.generation = current_gen;
             tmp_list.fills = combined_fills;
+            tmp_list.rounded_fills = combined_rounded;
             tmp_list.glyphs = combined_glyphs;
             tmp_list.images = combined_images;
             let plan_extent = self.present_plan_extent();
             tmp_list.plan.extent = plan_extent;
-            if tmp_list.fills.is_empty() && tmp_list.glyphs.is_empty() {
+            if tmp_list.fills.is_empty()
+                && tmp_list.rounded_fills.is_empty()
+                && tmp_list.glyphs.is_empty()
+            {
                 tmp_list.plan.dirty_rects = Vec::new();
             } else {
                 tmp_list.plan.dirty_rects = vec![bitty_render::geometry::RectPx::new(
@@ -1219,6 +1240,7 @@ impl Runtime {
         Some(PresentStats {
             frame: stats.frame,
             fills: stats.fills,
+            rounded_fills: stats.rounded_fills,
             glyphs: stats.glyphs,
             headless: stats.headless,
             generation: current_gen,

@@ -584,6 +584,155 @@ pub struct FillRect {
     pub color: Rgba8,
 }
 
+/// Signed distance from `(px, py)` to a rounded box centered at the origin
+/// with half extents `(half_w, half_h)` and corner radius `r` (negative
+/// inside, positive outside). Shared by the software compositor and the
+/// WGSL present shader so both backends evaluate the identical f32 formula
+/// (CTX-0311).
+#[must_use]
+pub(crate) fn sd_rounded_box(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
+    let qx = px.abs() - (half_w - r);
+    let qy = py.abs() - (half_h - r);
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    qx.max(qy).min(0.0) + (ox * ox + oy * oy).sqrt() - r
+}
+
+/// A rounded-rectangle clip region in physical pixels (CTX-0311).
+///
+/// Applied per glyph instance as the inner-arc content clip of a decorated
+/// View frame: fragments whose pixel center falls outside the rounded
+/// rectangle lose their coverage, so text never overdraws the frame curve.
+/// `radius == 0` is a plain rectangular clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundedClip {
+    /// Clip rectangle (physical px).
+    pub rect: RectPx,
+    /// Corner radius (physical px), clamped to half the shorter side.
+    pub radius: u16,
+}
+
+impl RoundedClip {
+    /// Analytic coverage of this clip at pixel center `(px, py)` in the same
+    /// pixel space as [`Self::rect`]: 1 fully inside, 0 fully outside, with
+    /// a one-pixel linear transition at the boundary (identical f32 math to
+    /// the WGSL SDF fragment stage). At `radius == 0` this is the exact
+    /// rectangular hard edge used by the pre-CTX-0311 compositors.
+    #[must_use]
+    pub fn coverage_at(&self, px: f32, py: f32) -> f32 {
+        let half_w = self.rect.width as f32 * 0.5;
+        let half_h = self.rect.height as f32 * 0.5;
+        if half_w <= 0.0 || half_h <= 0.0 {
+            return 0.0;
+        }
+        let cx = self.rect.x as f32 + half_w;
+        let cy = self.rect.y as f32 + half_h;
+        let r = f32::from(self.radius).min(half_w).min(half_h);
+        let d = sd_rounded_box(px - cx, py - cy, half_w, half_h, r);
+        (0.5 - d).clamp(0.0, 1.0)
+    }
+}
+
+/// One rounded-rectangle fill or border ring to paint (CTX-0311).
+///
+/// `frame` is in physical pixels (the caller applies the DPI scale before
+/// constructing it), so HiDPI needs no backend-specific work. The corner
+/// radius is clamped to half the shorter side. `border == 0` paints the
+/// full solid rounded rectangle; `border > 0` paints only the ring between
+/// the outer rounded rectangle and the inner rounded rectangle inset by
+/// `border` — the CTX-0294 decoration shape, now evaluated as a fragment
+/// SDF instead of per-row scanlines. Rounded fills paint after all plain
+/// fills and before glyphs, so the ring covers cell backgrounds in the
+/// corner boxes while [`Self::inner_clip`] keeps glyphs out of the curve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundedFill {
+    /// Outer frame rectangle (physical px).
+    pub frame: RectPx,
+    /// Ring thickness in physical px; 0 paints the solid rounded rect.
+    pub border: u16,
+    /// Outer corner radius in physical px, clamped to half the shorter side.
+    pub radius: u16,
+    /// Straight-alpha fill color.
+    pub color: Rgba8,
+}
+
+impl RoundedFill {
+    /// Resolved outer radius: `radius` clamped to half the shorter side
+    /// (oversized radii saturate exactly like the CTX-0294 scanline ring).
+    #[must_use]
+    pub fn resolved_radius(&self) -> f32 {
+        let half = self.frame.width.min(self.frame.height) as f32 * 0.5;
+        f32::from(self.radius).min(half)
+    }
+
+    /// Analytic coverage of this shape at pixel center `(px, py)`: 1 inside
+    /// the painted region, 0 outside, with a one-pixel linear transition at
+    /// the outer boundary and, for a ring, at the inner boundary too.
+    #[must_use]
+    pub fn coverage_at(&self, px: f32, py: f32) -> f32 {
+        if self.frame.width == 0 || self.frame.height == 0 {
+            return 0.0;
+        }
+        let half_w = self.frame.width as f32 * 0.5;
+        let half_h = self.frame.height as f32 * 0.5;
+        let cx = self.frame.x as f32 + half_w;
+        let cy = self.frame.y as f32 + half_h;
+        let r_out = self.resolved_radius();
+        let outer = (0.5 - sd_rounded_box(px - cx, py - cy, half_w, half_h, r_out)).clamp(0.0, 1.0);
+        if self.border == 0 {
+            return outer;
+        }
+        let b = f32::from(self.border).min(half_w).min(half_h);
+        let r_in = (r_out - b).max(0.0);
+        let inner = sd_rounded_box(px - cx, py - cy, half_w - b, half_h - b, r_in);
+        outer * (0.5 + inner).clamp(0.0, 1.0)
+    }
+
+    /// The content clip implied by this frame (CTX-0311): the frame inset
+    /// by `border` with radius `max(clamped radius - border, 0)`.
+    ///
+    /// `None` when the radius resolves to zero (square frames keep the
+    /// documented glyph-overhang behavior — cells never clip glyphs), when
+    /// the border consumes the radius (`radius <= border`, square inner
+    /// corner), or when the frame or inner rectangle is degenerate.
+    #[must_use]
+    pub fn inner_clip(&self) -> Option<RoundedClip> {
+        rounded_frame_clip(self.frame, self.border, self.radius)
+    }
+}
+
+/// The content clip implied by a decorated frame (CTX-0311): the frame
+/// inset by `border`, corner radius `max(clamp(radius, min(w,h)/2) - border,
+/// 0)` (matching [`RoundedFill`]'s inner arc).
+///
+/// `None` when the radius resolves to zero (square frames keep the
+/// documented glyph-overhang behavior — cells never clip glyphs), when the
+/// border consumes the radius, or when the frame or inner rectangle is
+/// degenerate.
+#[must_use]
+pub fn rounded_frame_clip(frame: RectPx, border: u16, radius: u16) -> Option<RoundedClip> {
+    let span = frame.width.min(frame.height);
+    let r_out = u32::from(radius).min(span / 2);
+    let b = u32::from(border).min(span);
+    if r_out == 0 || r_out <= b {
+        return None;
+    }
+    let r_in = r_out - b;
+    let rect = RectPx::new(
+        frame.x.saturating_add(b as i32),
+        frame.y.saturating_add(b as i32),
+        frame.width.saturating_sub(b.saturating_mul(2)),
+        frame.height.saturating_sub(b.saturating_mul(2)),
+    );
+    if rect.width == 0 || rect.height == 0 {
+        return None;
+    }
+    Some(RoundedClip {
+        rect,
+        radius: u16::try_from(r_in).unwrap_or(u16::MAX),
+    })
+}
+
 /// Core-owned workspace decoration border color (CTX-0294).
 ///
 /// Bitty Dark ANSI 8 (`#585b70`), the designed "dim decorations" role from
@@ -592,134 +741,6 @@ pub struct FillRect {
 /// stage-2 lane (CTX-0238g follow-up); this constant keeps the first live
 /// wiring theme-token-controlled in one place.
 pub const DECORATION_BORDER: Rgba8 = [0x58, 0x5B, 0x70, 0xFF];
-
-/// Renders a rounded border ring inside `frame` as plain [`FillRect`]s
-/// (CTX-0294 minimal radius painting; no DrawList schema change).
-///
-/// The outer edge follows a quarter-circle of `radius` px at each corner
-/// (pixel-center sampling); the inner edge follows the same corner centers
-/// with radius `radius - border` and degenerates to a square corner when the
-/// border consumes the radius. `border == 0`, an empty frame, or a fully
-/// degenerate ring yields no fills.
-///
-/// Emitting existing fill primitives keeps the software compositor and the
-/// GPU path pixel-identical by construction: both composite the same rects
-/// in the same order. The caller supplies physical pixels (apply the DPI
-/// scale before calling), so HiDPI needs no shader work. Runs of identical
-/// rows merge into one rect, bounding the output to the four straight edges
-/// plus the corner rows (`<= 2 * min(radius, height/2)` per axis) rather than
-/// the full frame height.
-///
-/// Known limit (tracked by the render-owner stage-2 lane): glyphs were
-/// already emitted for the content rectangle, so sub-cell overhang at the
-/// four inner corner arcs is not clipped away; the outer frame silhouette,
-/// gap bands, and straight border edges are exact.
-#[must_use]
-pub fn rounded_border_fills(
-    frame: RectPx,
-    border: u16,
-    radius: u16,
-    color: Rgba8,
-) -> Vec<FillRect> {
-    let w = frame.width;
-    let h = frame.height;
-    if border == 0 || w == 0 || h == 0 {
-        return Vec::new();
-    }
-    let b = u32::from(border).min(w).min(h);
-    if b == 0 {
-        return Vec::new();
-    }
-    // The outer quarter-circle cannot exceed half the shorter side, otherwise
-    // opposite corners overlap; the inner arc is the outer radius minus the
-    // border and is square once the border consumes it.
-    let r_out = u32::from(radius).min(w.min(h) / 2);
-    let r_in = r_out.saturating_sub(b);
-
-    // Number of pixels from the left/right edge of a rounded rectangle of
-    // radius `r`, height `span_h`, that lie outside its corner arc on local
-    // row `i` (pixel centers at i + 0.5).
-    let arc_inset = |r: u32, i: u32, span_h: u32| -> u32 {
-        if r == 0 || span_h == 0 {
-            return 0;
-        }
-        let d = i.min(span_h - 1 - i);
-        if d >= r {
-            return 0;
-        }
-        let dy = f64::from(r) - (f64::from(d) + 0.5);
-        let c = f64::from(r) - (f64::from(r) * f64::from(r) - dy * dy).max(0.0).sqrt();
-        let inset = (c - 0.5).ceil();
-        if inset <= 0.0 { 0 } else { inset as u32 }
-    };
-
-    let mut out: Vec<FillRect> = Vec::new();
-    // Runs per segment slot (band or left/right strips) merged across rows.
-    let mut runs: [Option<(u32, u32, i32, u32)>; 2] = [None, None];
-
-    fn flush_slot(
-        run: &mut Option<(u32, u32, i32, u32)>,
-        frame: RectPx,
-        w: u32,
-        color: Rgba8,
-        out: &mut Vec<FillRect>,
-    ) {
-        if let Some((left, right, y, rows)) = run.take() {
-            let width = (w as i64 - i64::from(left) - i64::from(right)).max(0) as u32;
-            if width > 0 && rows > 0 {
-                out.push(FillRect {
-                    rect: RectPx::new(frame.x.saturating_add(left as i32), y, width, rows),
-                    color,
-                });
-            }
-        }
-    }
-
-    for i in 0..h {
-        let o = arc_inset(r_out, i, h);
-        let y = frame.y.saturating_add(i as i32);
-        let mut segs: [(u32, u32); 2] = [(0, 0); 2];
-        let mut count = 0usize;
-        if i < b || i >= h - b {
-            // Top/bottom band: the whole rounded span is border.
-            segs[0] = (o, o);
-            count = 1;
-        } else {
-            // Inner rounded rect spans rows/cols [b, span-b); its arc inset
-            // is relative to that inset rectangle.
-            let n = b + arc_inset(r_in, i - b, h.saturating_sub(b.saturating_mul(2)));
-            if n > o {
-                // Left strip [o, n) and right strip [w-n, w-o).
-                segs[0] = (o, w.saturating_sub(n));
-                segs[1] = (w.saturating_sub(n), o);
-                count = 2;
-            }
-        }
-        for (slot, run) in runs.iter_mut().enumerate() {
-            if slot < count {
-                let seg = segs[slot];
-                let merge = matches!(
-                    *run,
-                    Some((l, r, ry, rows)) if l == seg.0 && r == seg.1 && ry + rows as i32 == y
-                );
-                if merge {
-                    if let Some(run) = run.as_mut() {
-                        run.3 += 1;
-                    }
-                } else {
-                    flush_slot(run, frame, w, color, &mut out);
-                    *run = Some((seg.0, seg.1, y, 1));
-                }
-            } else {
-                flush_slot(run, frame, w, color, &mut out);
-            }
-        }
-    }
-    for run in &mut runs {
-        flush_slot(run, frame, w, color, &mut out);
-    }
-    out
-}
 
 /// Where a glyph instance's texels live.
 #[derive(Debug, Clone, PartialEq)]
@@ -753,6 +774,10 @@ pub struct GlyphInstance {
     pub uv: [f32; 4],
     /// Tint color (straight alpha).
     pub color: Rgba8,
+    /// Optional rounded content clip (CTX-0311). `None` preserves the
+    /// documented cell behavior that glyphs may overhang their cell (and,
+    /// for decorated frames, that square or undecorated frames never clip).
+    pub clip: Option<RoundedClip>,
     /// Texel source.
     pub source: GlyphSource,
 }
@@ -810,8 +835,8 @@ impl ImageBlit {
 /// Produced by [`GridRenderer::render`]; consumed by a GPU backend seam or,
 /// under the `sw-fallback` feature, by
 /// [`crate::software::draw_list_onto`]. Paint order is fills first, then
-/// glyphs, then images; each vector preserves cell scan order so identical
-/// inputs give byte-identical records.
+/// rounded fills, then glyphs, then images; each vector preserves cell scan
+/// order so identical inputs give byte-identical records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawList {
     /// Snapshot generation this list was built from.
@@ -820,6 +845,9 @@ pub struct DrawList {
     pub plan: FramePlan,
     /// Background and decoration rectangles.
     pub fills: Vec<FillRect>,
+    /// Rounded decoration fills/rings (CTX-0311), painted after [`Self::fills`]
+    /// and before glyphs so the frame ring covers corner cell backgrounds.
+    pub rounded_fills: Vec<RoundedFill>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
     /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
@@ -830,7 +858,10 @@ impl DrawList {
     /// True when the frame carries any drawing work.
     #[must_use]
     pub fn needs_draw(&self) -> bool {
-        !self.fills.is_empty() || !self.glyphs.is_empty() || !self.images.is_empty()
+        !self.fills.is_empty()
+            || !self.rounded_fills.is_empty()
+            || !self.glyphs.is_empty()
+            || !self.images.is_empty()
     }
 }
 
@@ -1320,6 +1351,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let mut list = DrawList {
             generation: snapshot.generation,
             fills: Vec::new(),
+            // Rounded decoration is composed by the runtime present path
+            // (CTX-0311); grid truth carries no rounded geometry.
+            rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             // Grid truth carries no images; the runtime present path pushes
             // placed Kitty blits onto the combined list (CTX-0248).
@@ -1536,6 +1570,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 ],
                 uv: slot.uv(self.atlas.dims()),
                 color,
+                // Cell glyphs overhang by construction; only the runtime's
+                // decorated frames set a rounded content clip (CTX-0311).
+                clip: None,
                 source: GlyphSource::Atlas { slot },
             },
             GlyphSource::Inline {
@@ -1547,6 +1584,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 size: [width, height],
                 uv: [0.0; 4],
                 color,
+                clip: None,
                 source: GlyphSource::Inline {
                     mask,
                     width,
@@ -1616,6 +1654,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     ],
                     uv: slot.uv(self.atlas.dims()),
                     color,
+                    clip: None,
                     source: GlyphSource::Atlas { slot },
                 },
                 GlyphSource::Inline {
@@ -1627,6 +1666,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     size: [width, height],
                     uv: [0.0; 4],
                     color,
+                    clip: None,
                     source: GlyphSource::Inline {
                         mask,
                         width,

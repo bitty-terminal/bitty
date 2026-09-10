@@ -237,6 +237,25 @@ impl SurfaceRgba {
         y: i32,
         color: Rgba8,
     ) {
+        self.blend_coverage_mask_clipped(mask, mask_width, mask_height, x, y, color, None);
+    }
+
+    /// [`Self::blend_coverage_mask`] with an optional rounded content clip
+    /// (CTX-0311): each texel's coverage is scaled by the clip's analytic
+    /// coverage at the destination pixel center, so glyph overhang never
+    /// paints outside a decorated frame's inner corner curve. `None` is
+    /// byte-identical to [`Self::blend_coverage_mask`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn blend_coverage_mask_clipped(
+        &mut self,
+        mask: &[u8],
+        mask_width: u32,
+        mask_height: u32,
+        x: i32,
+        y: i32,
+        color: Rgba8,
+        clip: Option<crate::grid::RoundedClip>,
+    ) {
         let Some(mask_width) = usize::try_from(mask_width).ok().filter(|w| *w > 0) else {
             return;
         };
@@ -254,9 +273,23 @@ impl SurfaceRgba {
         let [cr, cg, cb, ca] = color;
         for gy in dst_top..dst_bottom {
             for gx in dst_left..dst_right {
-                let coverage = u32::from(mask[gy as usize * mask_width + gx as usize]);
+                let sx = (i64::from(x) + gx) as usize;
+                let sy = (i64::from(y) + gy) as usize;
+                let mut coverage = u32::from(mask[gy as usize * mask_width + gx as usize]);
                 if coverage == 0 {
                     continue;
+                }
+                if let Some(clip) = clip {
+                    let clip_coverage = clip.coverage_at(sx as f32 + 0.5, sy as f32 + 0.5);
+                    if clip_coverage <= 0.0 {
+                        continue;
+                    }
+                    // Round to the nearest byte; `clip_coverage == 1.0`
+                    // keeps the exact pre-CTX-0311 integer value.
+                    coverage = (coverage as f32 * clip_coverage + 0.5) as u32;
+                    if coverage == 0 {
+                        continue;
+                    }
                 }
                 // Straight -> premultiplied: channel * alpha, then the mask
                 // coverage scales both: rgb * c * a / 65025 fits u32.
@@ -267,9 +300,53 @@ impl SurfaceRgba {
                     ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8,
                     sa.min(255) as u8,
                 ];
-                let sx = (i64::from(x) + gx) as usize;
-                let sy = (i64::from(y) + gy) as usize;
                 let d = (sy * self.width as usize + sx) * 4;
+                let inv = 255 - u32::from(src[3]);
+                self.data[d] =
+                    saturating_add_u8(src[0], (u32::from(self.data[d]) * inv / 255) as u8);
+                self.data[d + 1] =
+                    saturating_add_u8(src[1], (u32::from(self.data[d + 1]) * inv / 255) as u8);
+                self.data[d + 2] =
+                    saturating_add_u8(src[2], (u32::from(self.data[d + 2]) * inv / 255) as u8);
+                self.data[d + 3] =
+                    saturating_add_u8(src[3], (u32::from(self.data[d + 3]) * inv / 255) as u8);
+            }
+        }
+    }
+
+    /// Fills a rounded rectangle or border ring with analytic pixel-center
+    /// coverage (CTX-0311) — the CPU twin of the wgpu rounded-box SDF
+    /// fragment stage. Partial coverage blends premultiplied src-over like
+    /// [`Self::blend_coverage_mask`]; fully-covered opaque pixels are exact.
+    /// Empty or off-surface frames are no-ops.
+    pub fn fill_rounded_rect(&mut self, fill: &crate::grid::RoundedFill) {
+        let left = i64::from(fill.frame.x).max(0);
+        let top = i64::from(fill.frame.y).max(0);
+        let right = (i64::from(fill.frame.x) + i64::from(fill.frame.width))
+            .max(0)
+            .min(i64::from(self.width));
+        let bottom = (i64::from(fill.frame.y) + i64::from(fill.frame.height))
+            .max(0)
+            .min(i64::from(self.height));
+        if right <= left || bottom <= top {
+            return;
+        }
+        let [cr, cg, cb, ca] = fill.color;
+        for y in top..bottom {
+            for x in left..right {
+                let coverage = fill.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let coverage = (coverage * 255.0 + 0.5).min(255.0) as u32;
+                let sa = (coverage * u32::from(ca)) / 255;
+                let src = [
+                    ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8,
+                    ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8,
+                    ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8,
+                    sa.min(255) as u8,
+                ];
+                let d = (y as usize * self.width as usize + x as usize) * 4;
                 let inv = 255 - u32::from(src[3]);
                 self.data[d] =
                     saturating_add_u8(src[0], (u32::from(self.data[d]) * inv / 255) as u8);
@@ -334,9 +411,10 @@ impl SurfaceRgba {
     }
 }
 
-/// Composites a grid-pipeline [`DrawList`] onto a surface: fills first,
-/// then glyphs, then RGBA image blits (CTX-0248, topmost), preserving
-/// vector order. Atlas instances sample
+/// Composites a grid-pipeline [`DrawList`] onto a surface: fills, then
+/// rounded decoration fills/rings (CTX-0311), then glyphs (clipped when the
+/// instance carries a rounded clip), then RGBA image blits (CTX-0248,
+/// topmost), preserving vector order. Atlas instances sample
 /// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
 ///
 /// # Errors
@@ -350,6 +428,9 @@ pub fn draw_list_onto(
 ) -> Result<(), RenderError> {
     for fill in &list.fills {
         surface.fill_rect(fill.rect, fill.color);
+    }
+    for fill in &list.rounded_fills {
+        surface.fill_rounded_rect(fill);
     }
     for glyph in &list.glyphs {
         match &glyph.source {
@@ -366,13 +447,14 @@ pub fn draw_list_onto(
                     let start = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
                     mask.extend_from_slice(&texels[start..start + usize::from(slot.width)]);
                 }
-                surface.blend_coverage_mask(
+                surface.blend_coverage_mask_clipped(
                     &mask,
                     slot.width.into(),
                     slot.height.into(),
                     glyph.dest[0],
                     glyph.dest[1],
                     glyph.color,
+                    glyph.clip,
                 );
             }
             crate::grid::GlyphSource::Inline {
@@ -385,13 +467,14 @@ pub fn draw_list_onto(
                         reason: "inline mask length does not match its dimensions",
                     });
                 }
-                surface.blend_coverage_mask(
+                surface.blend_coverage_mask_clipped(
                     mask,
                     *width,
                     *height,
                     glyph.dest[0],
                     glyph.dest[1],
                     glyph.color,
+                    glyph.clip,
                 );
             }
         }
@@ -562,7 +645,7 @@ mod tests {
         assert_eq!(&surface.as_bytes()[0..4], &[0, 0, 0, 255]);
         // Fully off-surface is a safe no-op (painted pixels survive).
         surface.blend_rgba_image(&[9; 4], 1, 1, 9, 9);
-        let o = (1 * 3 + 2) * 4;
+        let o = 20;
         assert_eq!(&surface.as_bytes()[o..o + 4], &[0, 255, 0, 255]);
     }
 
@@ -578,5 +661,134 @@ mod tests {
             surface.blend_glyph(&bad, 0, 0),
             Err(RenderError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn rounded_fill_ring_paints_arc_interior_and_aa() {
+        let mut surface = SurfaceRgba::try_new(20, 10).unwrap();
+        surface.clear([0, 0, 0, 255]);
+        let fill = crate::grid::RoundedFill {
+            frame: crate::geometry::RectPx::new(0, 0, 20, 10),
+            border: 2,
+            radius: 4,
+            color: [0x58, 0x5B, 0x70, 0xFF],
+        };
+        surface.fill_rounded_rect(&fill);
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 20 + x) * 4;
+            [
+                surface.as_bytes()[o],
+                surface.as_bytes()[o + 1],
+                surface.as_bytes()[o + 2],
+                surface.as_bytes()[o + 3],
+            ]
+        };
+        // Straight border edge is the opaque ring color.
+        assert_eq!(px(0, 5), [0x58, 0x5B, 0x70, 0xFF]);
+        // Outer corner is cut; the content interior stays background.
+        assert_eq!(px(0, 0), [0, 0, 0, 255]);
+        assert_eq!(px(10, 5), [0, 0, 0, 255]);
+        // An arc pixel carries partial coverage, strictly between ring and
+        // background (anti-aliased, never a hard step).
+        let aa = px(1, 0);
+        assert!(aa[3] == 255 && aa[0] > 0 && aa[0] < 0x58, "aa={aa:?}");
+    }
+
+    #[test]
+    fn clipped_glyph_coverage_is_scaled_by_the_inner_arc() {
+        let mut surface = SurfaceRgba::try_new(8, 8).unwrap();
+        surface.clear([0, 0, 0, 0]);
+        let clip = crate::grid::RoundedClip {
+            rect: crate::geometry::RectPx::new(0, 0, 8, 8),
+            radius: 3,
+        };
+        surface.blend_coverage_mask_clipped(
+            &[255; 64],
+            8,
+            8,
+            0,
+            0,
+            [255, 255, 255, 255],
+            Some(clip),
+        );
+        // Fully outside the corner arc: untouched.
+        assert_eq!(&surface.as_bytes()[0..4], &[0, 0, 0, 0]);
+        // Fully inside: opaque white.
+        let inside = (4 * 8 + 4) * 4;
+        assert_eq!(&surface.as_bytes()[inside..inside + 4], &[255; 4]);
+        // On the arc: partial coverage strictly between.
+        let arc = 4;
+        let v = surface.as_bytes()[arc];
+        assert!(v > 0 && v < 255, "arc coverage must be partial: {v}");
+
+        // `None` is byte-identical to the unclipped path.
+        let mut plain = SurfaceRgba::try_new(8, 8).unwrap();
+        plain.clear([1, 2, 3, 4]);
+        let mut delegated = SurfaceRgba::try_new(8, 8).unwrap();
+        delegated.clear([1, 2, 3, 4]);
+        plain.blend_coverage_mask(&[128; 64], 8, 8, 0, 0, [200, 100, 50, 255]);
+        delegated.blend_coverage_mask_clipped(&[128; 64], 8, 8, 0, 0, [200, 100, 50, 255], None);
+        assert_eq!(plain.as_bytes(), delegated.as_bytes());
+    }
+
+    #[test]
+    fn draw_list_paints_rounded_fills_after_plain_fills() {
+        use crate::grid::{DrawList, FillRect, GlyphSource, RoundedFill};
+        let mut surface = SurfaceRgba::try_new(8, 8).unwrap();
+        surface.clear([0, 0, 0, 255]);
+        let list = DrawList {
+            generation: 1,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 8),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
+            },
+            // A plain fill covers the whole surface, then the ring paints on
+            // top: paint order is fills, rounded fills, glyphs, images.
+            fills: vec![FillRect {
+                rect: crate::geometry::RectPx::new(0, 0, 8, 8),
+                color: [0, 0, 255, 255],
+            }],
+            rounded_fills: vec![RoundedFill {
+                frame: crate::geometry::RectPx::new(0, 0, 8, 8),
+                border: 2,
+                radius: 3,
+                color: [0, 255, 0, 255],
+            }],
+            glyphs: vec![],
+            images: vec![],
+        };
+        draw_list_onto(&list, None, &mut surface).unwrap();
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 8 + x) * 4;
+            [
+                surface.as_bytes()[o],
+                surface.as_bytes()[o + 1],
+                surface.as_bytes()[o + 2],
+                surface.as_bytes()[o + 3],
+            ]
+        };
+        assert_eq!(px(4, 0), [0, 255, 0, 255], "ring over plain fill");
+        assert_eq!(px(4, 4), [0, 0, 255, 255], "interior keeps plain fill");
+        assert_eq!(px(0, 0), [0, 0, 255, 255], "corner cut shows plain fill");
+        // Inline glyphs without a clip still composite (regression guard).
+        let mut with_glyph = list;
+        with_glyph.glyphs.push(crate::grid::GlyphInstance {
+            dest: [2, 2],
+            size: [2, 2],
+            uv: [0.0; 4],
+            color: [255, 255, 255, 255],
+            clip: None,
+            source: GlyphSource::Inline {
+                mask: vec![255; 4],
+                width: 2,
+                height: 2,
+            },
+        });
+        let mut glyph_surface = SurfaceRgba::try_new(8, 8).unwrap();
+        glyph_surface.clear([0, 0, 0, 255]);
+        draw_list_onto(&with_glyph, None, &mut glyph_surface).unwrap();
+        let o = (2 * 8 + 2) * 4;
+        assert_eq!(&glyph_surface.as_bytes()[o..o + 4], &[255; 4]);
     }
 }

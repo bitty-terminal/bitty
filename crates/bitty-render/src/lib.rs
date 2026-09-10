@@ -175,7 +175,7 @@ pub use glyph::{
 };
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
-    ImageBlit, RenderCounters, SnapshotDamage,
+    ImageBlit, RenderCounters, RoundedClip, RoundedFill, SnapshotDamage,
 };
 pub use hidpi::{
     MAX_DPI_SCALE, MAX_SCALED_POINT_SIZE, MIN_DPI_SCALE, grid_from_surface_extent,

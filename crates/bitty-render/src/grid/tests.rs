@@ -1211,127 +1211,170 @@ fn dpi_rescale_re_resolves_the_baseline() {
 }
 
 // ---------------------------------------------------------------------------
-// CTX-0294: rounded decoration border ring (minimal radius painting).
+// CTX-0311: rounded SDF decoration primitive (solid fills + border rings).
 // ---------------------------------------------------------------------------
 
-/// Pixel coverage mask from emitted fills, deterministic and allocation-light.
-fn coverage(fills: &[super::FillRect], w: u32, h: u32) -> Vec<bool> {
-    let mut mask = vec![false; (w * h) as usize];
-    for fill in fills {
-        for y in fill.rect.y..(fill.rect.y + fill.rect.height as i32) {
-            for x in fill.rect.x..(fill.rect.x + fill.rect.width as i32) {
-                if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-                    mask[(y as u32 * w + x as u32) as usize] = true;
-                }
-            }
+/// Coverage mask from the rounded-fill SDF at pixel centers.
+fn rounded_mask(fill: &super::RoundedFill, w: u32, h: u32) -> Vec<f32> {
+    let mut mask = vec![0.0f32; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            mask[(y * w + x) as usize] = fill.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
         }
     }
     mask
 }
 
-#[test]
-fn rounded_border_zero_radius_paints_square_ring() {
-    let frame = crate::geometry::RectPx::new(0, 0, 20, 10);
-    let fills = super::rounded_border_fills(frame, 2, 0, super::DECORATION_BORDER);
-    let mask = coverage(&fills, 20, 10);
-    let at = |x: u32, y: u32| mask[(y * 20 + x) as usize];
-    // Ring edges are border, interior/surroundings are not.
-    assert!(at(0, 0) && at(19, 0) && at(0, 9) && at(19, 9));
-    assert!(at(0, 5) && at(19, 5) && at(10, 0) && at(10, 9));
-    assert!(!at(10, 5), "interior stays unpainted");
-    assert!(!at(2, 2), "straight corner stays square");
+/// Threshold helper: the pixel center is at least half-covered.
+fn covered(mask: &[f32], w: u32, x: u32, y: u32) -> bool {
+    mask[(y * w + x) as usize] >= 0.5
 }
 
 #[test]
-fn rounded_border_cuts_corners_without_inner_overlap() {
-    let frame = crate::geometry::RectPx::new(0, 0, 20, 10);
-    let fills = super::rounded_border_fills(frame, 2, 4, super::DECORATION_BORDER);
-    let mask = coverage(&fills, 20, 10);
-    let at = |x: u32, y: u32| mask[(y * 20 + x) as usize];
-    // The outer corner pixel is outside the quarter-circle and stays clear.
-    assert!(!at(0, 0) && !at(0, 1) && !at(1, 0));
-    assert!(!at(19, 0) && !at(19, 1) && !at(18, 0));
+fn rounded_fill_zero_radius_ring_is_square() {
+    let fill = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 20, 10),
+        border: 2,
+        radius: 0,
+        color: super::DECORATION_BORDER,
+    };
+    let mask = rounded_mask(&fill, 20, 10);
+    // Ring edges are border; the diagonal corner and interior stay clear.
+    assert!(covered(&mask, 20, 0, 0) && covered(&mask, 20, 19, 9));
+    assert!(covered(&mask, 20, 0, 5) && covered(&mask, 20, 10, 0));
+    assert!(!covered(&mask, 20, 10, 5), "interior stays unpainted");
+    assert!(!covered(&mask, 20, 2, 2), "straight corner stays square");
+}
+
+#[test]
+fn rounded_fill_cuts_corners_with_one_pixel_aa() {
+    let fill = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 20, 10),
+        border: 2,
+        radius: 4,
+        color: super::DECORATION_BORDER,
+    };
+    let mask = rounded_mask(&fill, 20, 10);
+    // The outer corner pixels are outside the quarter circle and stay clear.
+    assert!(!covered(&mask, 20, 0, 0) && !covered(&mask, 20, 1, 0));
+    assert!(!covered(&mask, 20, 0, 1));
+    assert!(!covered(&mask, 20, 19, 0) && !covered(&mask, 20, 18, 0));
     // Mid-edge and interior geometry are unchanged.
-    assert!(at(0, 5) && at(19, 5) && at(10, 0) && at(10, 9));
-    assert!(!at(10, 5), "content interior stays unpainted");
-    assert!(!at(5, 3), "content interior stays unpainted off-corner");
+    assert!(covered(&mask, 20, 0, 5) && covered(&mask, 20, 19, 5));
+    assert!(covered(&mask, 20, 10, 0) && covered(&mask, 20, 10, 9));
+    assert!(!covered(&mask, 20, 10, 5), "content interior stays clear");
+    assert!(!covered(&mask, 20, 5, 3), "off-corner interior stays clear");
+    // The SDF produces a one-pixel anti-aliasing ramp somewhere on the arc.
+    assert!(
+        mask.iter().any(|c| *c > 0.0 && *c < 1.0),
+        "arc must be anti-aliased"
+    );
 }
 
 #[test]
-fn rounded_border_radius_never_exceeds_half_span() {
+fn rounded_fill_radius_saturates_at_half_span() {
     // Oversized radius saturates at half the shorter side: both corners meet
-    // without inverted rects or overlap past the mid row.
-    let frame = crate::geometry::RectPx::new(3, 7, 12, 8);
-    let fills = super::rounded_border_fills(frame, 2, 40, super::DECORATION_BORDER);
-    let mask = coverage(&fills, 24, 24);
-    let at = |x: u32, y: u32| mask[(y * 24 + x) as usize];
-    // Top-center and bottom-center border rows exist; the frame's outer
-    // corner pixels are cut.
-    assert!(at(9, 7) && at(9, 14));
-    assert!(!at(3, 7) && !at(14, 7) && !at(3, 14) && !at(14, 14));
+    // without inverted or overlapping geometry.
+    let fill = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(3, 7, 12, 8),
+        border: 2,
+        radius: 40,
+        color: super::DECORATION_BORDER,
+    };
+    assert_eq!(fill.resolved_radius(), 4.0);
+    let mask = rounded_mask(&fill, 24, 24);
+    // Top-center and bottom-center border rows exist; the outer corners cut.
+    assert!(covered(&mask, 24, 9, 7) && covered(&mask, 24, 9, 14));
+    assert!(!covered(&mask, 24, 3, 7) && !covered(&mask, 24, 14, 7));
+    assert!(!covered(&mask, 24, 3, 14) && !covered(&mask, 24, 14, 14));
 }
 
 #[test]
-fn rounded_border_thick_border_covers_frame_and_noops_cleanly() {
-    let frame = crate::geometry::RectPx::new(0, 0, 20, 10);
-    // Border consumes the whole frame: everything is border.
-    let fills = super::rounded_border_fills(frame, 10, 0, super::DECORATION_BORDER);
-    let mask = coverage(&fills, 20, 10);
-    assert!(mask.iter().all(|p| *p), "full-frame border must cover all");
-    // Zero border and zero-size frames emit nothing.
-    assert!(super::rounded_border_fills(frame, 0, 6, super::DECORATION_BORDER).is_empty());
+fn rounded_fill_full_frame_border_paints_everything() {
+    let fill = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 20, 10),
+        border: 10,
+        radius: 0,
+        color: super::DECORATION_BORDER,
+    };
+    let mask = rounded_mask(&fill, 20, 10);
     assert!(
-        super::rounded_border_fills(
-            crate::geometry::RectPx::new(0, 0, 0, 10),
-            2,
-            6,
-            super::DECORATION_BORDER
-        )
-        .is_empty()
+        mask.iter().all(|c| *c >= 0.5),
+        "border consuming the frame must cover it"
     );
+    // Zero-size frames have zero coverage everywhere.
+    let empty = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 0, 10),
+        border: 2,
+        radius: 6,
+        color: super::DECORATION_BORDER,
+    };
+    assert_eq!(empty.coverage_at(0.5, 0.5), 0.0);
 }
 
 #[test]
-fn rounded_border_merges_straight_runs() {
-    // A tall frame must not emit one fill per row: the straight middle
-    // collapses into four long strips.
-    let frame = crate::geometry::RectPx::new(0, 0, 200, 600);
-    let fills = super::rounded_border_fills(frame, 2, 6, super::DECORATION_BORDER);
-    assert!(
-        fills.len() <= 32,
-        "expected merged runs, got {} fills",
-        fills.len()
-    );
-    // The largest strip spans most of the frame height.
-    let tallest = fills.iter().map(|f| f.rect.height).max().unwrap_or(0);
-    assert!(tallest >= 560, "middle strips must merge: {tallest}");
-    // Deterministic: identical inputs give identical rects.
-    assert_eq!(
-        fills,
-        super::rounded_border_fills(frame, 2, 6, super::DECORATION_BORDER)
-    );
+fn rounded_fill_solid_variant_has_no_inner_hole() {
+    // border == 0 is the solid rounded fill (not the decoration ring): the
+    // center is fully covered and only the outer corners are cut.
+    let fill = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 20, 10),
+        border: 0,
+        radius: 4,
+        color: super::DECORATION_BORDER,
+    };
+    let mask = rounded_mask(&fill, 20, 10);
+    assert!(covered(&mask, 20, 10, 5));
+    assert!(covered(&mask, 20, 2, 2));
+    assert!(!covered(&mask, 20, 0, 0));
 }
 
 #[test]
-fn rounded_border_hidpi_doubling_scales_geometry() {
-    // Physical-px inputs: doubling border/radius doubles the straight-edge
-    // thickness and the corner cut depth (within one sampled pixel), so the
-    // DPI step needs no shader work.
-    let one = super::rounded_border_fills(
-        crate::geometry::RectPx::new(0, 0, 40, 20),
-        2,
-        6,
-        super::DECORATION_BORDER,
-    );
-    let two = super::rounded_border_fills(
-        crate::geometry::RectPx::new(0, 0, 80, 40),
-        4,
-        12,
-        super::DECORATION_BORDER,
-    );
-    let cut_depth = |fills: &[super::FillRect], w: u32| -> u32 {
-        let mask = coverage(fills, w, w);
-        (0..w).take_while(|x| !mask[*x as usize]).count() as u32
+fn inner_clip_derivation_matches_the_ring() {
+    let frame = crate::geometry::RectPx::new(6, 6, 708, 444);
+    let clip = super::rounded_frame_clip(frame, 2, 6).expect("rounded inner clip");
+    assert_eq!(clip.rect, crate::geometry::RectPx::new(8, 8, 704, 440));
+    assert_eq!(clip.radius, 4);
+    // Fully inside far from the corner; cut at the inner arc; AA on it.
+    assert_eq!(clip.coverage_at(100.5, 100.5), 1.0);
+    assert_eq!(clip.coverage_at(8.5, 8.5), 0.0);
+    let arc = clip.coverage_at(9.5, 8.5);
+    assert!(arc > 0.0 && arc < 1.0, "inner arc must be AA: {arc}");
+    // Square frames, borders that consume the radius, and degenerate frames
+    // carry no clip (documented glyph-overhang behavior stays).
+    assert!(super::rounded_frame_clip(frame, 2, 0).is_none());
+    assert!(super::rounded_frame_clip(frame, 6, 6).is_none());
+    assert!(super::rounded_frame_clip(frame, 8, 6).is_none());
+    assert!(super::rounded_frame_clip(crate::geometry::RectPx::new(0, 0, 0, 10), 2, 6).is_none());
+    // The primitive delegates to the same derivation.
+    let fill = super::RoundedFill {
+        frame,
+        border: 2,
+        radius: 6,
+        color: super::DECORATION_BORDER,
+    };
+    assert_eq!(fill.inner_clip(), Some(clip));
+}
+
+#[test]
+fn rounded_fill_hidpi_doubling_scales_the_arc() {
+    // Physical-px inputs: doubling the frame, border, and radius doubles the
+    // corner cut depth (within the sampled pixel), so the DPI step needs no
+    // backend-specific work.
+    let one = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 40, 20),
+        border: 2,
+        radius: 6,
+        color: super::DECORATION_BORDER,
+    };
+    let two = super::RoundedFill {
+        frame: crate::geometry::RectPx::new(0, 0, 80, 40),
+        border: 4,
+        radius: 12,
+        color: super::DECORATION_BORDER,
+    };
+    let cut_depth = |fill: &super::RoundedFill, w: u32| -> u32 {
+        let mask = rounded_mask(fill, w, w);
+        (0..w).take_while(|x| !covered(&mask, w, *x, 0)).count() as u32
     };
     let one_cut = cut_depth(&one, 40);
     let two_cut = cut_depth(&two, 80);
@@ -1340,8 +1383,8 @@ fn rounded_border_hidpi_doubling_scales_geometry() {
         two_cut + 2 >= one_cut * 2 && two_cut <= one_cut * 2 + 2,
         "corner cut must scale with DPI: 1x {one_cut} -> 2x {two_cut}"
     );
-    let mask1 = coverage(&one, 40, 20);
-    let mask2 = coverage(&two, 80, 40);
-    assert!(!mask1[(5 * 40 + 20) as usize], "1x interior unpainted");
-    assert!(!mask2[(10 * 80 + 40) as usize], "2x interior unpainted");
+    let mask1 = rounded_mask(&one, 40, 20);
+    let mask2 = rounded_mask(&two, 80, 40);
+    assert!(!covered(&mask1, 40, 20, 5), "1x interior unpainted");
+    assert!(!covered(&mask2, 80, 40, 10), "2x interior unpainted");
 }

@@ -71,13 +71,20 @@ use crate::batch::{
 use crate::error::RenderError;
 use crate::grid::DrawList;
 
-/// Solid-fill WGSL: NDC position plus straight color passthrough.
+/// Solid-fill WGSL: NDC position, straight color, and rounded-box SDF data.
 ///
 /// CTX-0290: the fragment stage emits premultiplied color scaled by the
 /// window opacity uniform; the pipeline's alpha-pinning blend keeps the
 /// destination alpha (see [`OPACITY_BLEND`]). `out.a` stays the *unscaled*
 /// coverage factor because it is the blend's `OneMinusSrcAlpha` input, not
 /// stored alpha.
+///
+/// CTX-0311: `round.x < 0` marks a plain rectangle (coverage 1 inside the
+/// quad, byte-identical to the pre-CTX-0311 fill shader). Otherwise
+/// `round = (outer_radius, border)` and the fragment evaluates the same
+/// rounded-box SDF as [`crate::grid::RoundedFill::coverage_at`]: a solid
+/// rounded fill when `border == 0`, and a ring when `border > 0` (outer
+/// coverage times the complement of the inner rounded rectangle).
 const FILL_WGSL: &str = r#"
 struct Opacity {
     value: f32,
@@ -88,23 +95,57 @@ struct Opacity {
 struct FillOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) center: vec2<f32>,
+    @location(2) half: vec2<f32>,
+    @location(3) round: vec2<f32>,
 };
+
+fn sd_rounded_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - (half - vec2<f32>(r, r));
+    let outside = max(q, vec2<f32>(0.0, 0.0));
+    return min(max(q.x, q.y), 0.0) + length(outside) - r;
+}
 
 @vertex
 fn vs_main(
     @location(0) position: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) center: vec2<f32>,
+    @location(3) half: vec2<f32>,
+    @location(4) round: vec2<f32>,
 ) -> FillOut {
     var out: FillOut;
     out.pos = vec4<f32>(position, 0.0, 1.0);
     out.color = color;
+    out.center = center;
+    out.half = half;
+    out.round = round;
     return out;
 }
 
 @fragment
-fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
-    let alpha = color.a * opacity.value;
-    return vec4<f32>(color.rgb * alpha, color.a);
+fn fs_main(
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) center: vec2<f32>,
+    @location(2) half: vec2<f32>,
+    @location(3) round: vec2<f32>,
+) -> @location(0) vec4<f32> {
+    var coverage = 1.0;
+    if (round.x >= 0.0) {
+        coverage = clamp(0.5 - sd_rounded_box(pos.xy - center, half, round.x), 0.0, 1.0);
+        if (round.y > 0.0) {
+            let inner_half = half - vec2<f32>(round.y, round.y);
+            let inner_radius = max(round.x - round.y, 0.0);
+            coverage = coverage
+                * clamp(0.5 + sd_rounded_box(pos.xy - center, inner_half, inner_radius), 0.0, 1.0);
+        }
+        if (coverage <= 0.0) {
+            discard;
+        }
+    }
+    let alpha = color.a * coverage * opacity.value;
+    return vec4<f32>(color.rgb * alpha, color.a * coverage);
 }
 "#;
 
@@ -114,6 +155,12 @@ fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
 /// returned alpha is the unmultiplied `color.a * coverage` (unscaled by
 /// opacity) so the `OneMinusSrcAlpha` blend factor stays proportional to the
 /// glyph's true coverage.
+///
+/// CTX-0311: `clip_radius >= 0` applies the same rounded-box SDF as the
+/// fill stage at the fragment's framebuffer position and scales the glyph
+/// coverage by the inside factor, so text never overdraws a decorated
+/// frame's inner corner curve. `clip_radius < 0` is the no-clip sentinel:
+/// the shader path is then exactly the pre-CTX-0311 path.
 const GLYPH_WGSL: &str = r#"
 @group(0) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(0) @binding(1) var atlas_sampler: sampler;
@@ -128,32 +175,60 @@ struct GlyphOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) clip_center: vec2<f32>,
+    @location(3) clip_half: vec2<f32>,
+    @location(4) clip_radius: f32,
 };
+
+fn sd_rounded_box(p: vec2<f32>, half: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - (half - vec2<f32>(r, r));
+    let outside = max(q, vec2<f32>(0.0, 0.0));
+    return min(max(q.x, q.y), 0.0) + length(outside) - r;
+}
 
 @vertex
 fn vs_main(
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) clip_center: vec2<f32>,
+    @location(4) clip_half: vec2<f32>,
+    @location(5) clip_radius: f32,
 ) -> GlyphOut {
     var out: GlyphOut;
     out.pos = vec4<f32>(position, 0.0, 1.0);
     out.uv = uv;
     out.color = color;
+    out.clip_center = clip_center;
+    out.clip_half = clip_half;
+    out.clip_radius = clip_radius;
     return out;
 }
 
 @fragment
 fn fs_main(
+    @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) clip_center: vec2<f32>,
+    @location(3) clip_half: vec2<f32>,
+    @location(4) clip_radius: f32,
 ) -> @location(0) vec4<f32> {
     let coverage: f32 = textureSample(atlas_tex, atlas_sampler, uv).r;
     if (coverage < 0.004) {
         discard;
     }
-    let alpha = color.a * coverage * opacity.value;
-    return vec4<f32>(color.rgb * alpha, color.a * coverage);
+    var clip_coverage = 1.0;
+    if (clip_radius >= 0.0) {
+        let d = sd_rounded_box(pos.xy - clip_center, clip_half, clip_radius);
+        clip_coverage = clamp(0.5 - d, 0.0, 1.0);
+        if (clip_coverage <= 0.0) {
+            discard;
+        }
+    }
+    let scaled = coverage * clip_coverage;
+    let alpha = color.a * scaled * opacity.value;
+    return vec4<f32>(color.rgb * alpha, color.a * scaled);
 }
 "#;
 
@@ -482,6 +557,21 @@ impl GpuResources {
                 shader_location: 1,
                 format: VertexFormat::Float32x4,
             },
+            VertexAttribute {
+                offset: 24,
+                shader_location: 2,
+                format: VertexFormat::Float32x2,
+            },
+            VertexAttribute {
+                offset: 32,
+                shader_location: 3,
+                format: VertexFormat::Float32x2,
+            },
+            VertexAttribute {
+                offset: 40,
+                shader_location: 4,
+                format: VertexFormat::Float32x2,
+            },
         ];
         let fill_layout = VertexBufferLayout {
             array_stride: FILL_VERTEX_SIZE_BYTES as u64,
@@ -541,6 +631,21 @@ impl GpuResources {
                 offset: 16,
                 shader_location: 2,
                 format: VertexFormat::Float32x4,
+            },
+            VertexAttribute {
+                offset: 32,
+                shader_location: 3,
+                format: VertexFormat::Float32x2,
+            },
+            VertexAttribute {
+                offset: 40,
+                shader_location: 4,
+                format: VertexFormat::Float32x2,
+            },
+            VertexAttribute {
+                offset: 48,
+                shader_location: 5,
+                format: VertexFormat::Float32,
             },
         ];
         let glyph_layout = VertexBufferLayout {
@@ -1039,11 +1144,14 @@ impl GpuResources {
                 reason: "atlas instance requires atlas texels",
             });
         }
-        // Paint order mirrors both CPU compositors: fills, then glyphs, then
-        // Kitty image blits on top (CTX-0291). The image pass is bounded by
+        // Paint order mirrors both CPU compositors: fills, then rounded
+        // decoration fills (CTX-0311), then glyphs, then Kitty image blits on
+        // top (CTX-0291). The image pass is bounded by
         // `batch::plan_image_uploads` before any allocation.
 
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
+        let rounded_chunks =
+            batch::chunk_rounded_fills(&draw_list.rounded_fills, surface_w, surface_h, scale);
         let atlas_chunks =
             batch::chunk_atlas_glyphs(&draw_list.glyphs, surface_w, surface_h, scale);
         let inline_plan = batch::pack_inline_glyphs(&draw_list.glyphs);
@@ -1056,6 +1164,7 @@ impl GpuResources {
         let max_quads = fill_chunks
             .iter()
             .map(|c| c.quad_count)
+            .chain(rounded_chunks.iter().map(|c| c.quad_count))
             .chain(atlas_chunks.iter().map(|c| c.quad_count))
             .chain(inline_chunks.iter().map(|c| c.quad_count))
             .max()
@@ -1121,6 +1230,13 @@ impl GpuResources {
             };
 
         for chunk in &fill_chunks {
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count)?;
+        }
+
+        // CTX-0311: rounded decoration fills/rings ride the same fill
+        // pipeline and vertex buffer, submitted after every plain fill so
+        // the frame ring paints over corner cell backgrounds.
+        for chunk in &rounded_chunks {
             submit_fill_chunk(&chunk.bytes, chunk.quad_count)?;
         }
 

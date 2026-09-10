@@ -219,6 +219,7 @@ fn inline_glyphs_pack_into_the_fixed_transient_texture() {
             size: [8, 8],
             uv: [0.0; 4],
             color: [0xE5, 0xE5, 0xE5, 0xFF],
+            clip: None,
             source: GlyphSource::Inline {
                 mask: vec![128; 64],
                 width: 8,
@@ -246,6 +247,7 @@ fn inline_glyphs_pack_into_the_fixed_transient_texture() {
         size: [8, 8],
         uv: [0.0; 4],
         color: [255, 255, 255, 255],
+        clip: None,
         source: GlyphSource::Inline {
             mask: vec![1, 2, 3],
             width: 8,

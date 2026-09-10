@@ -198,6 +198,12 @@ impl WindowHandle {
     /// blending ignore the flag, so an unsupported platform keeps an opaque
     /// window instead of erroring.
     ///
+    /// This only declares the surface blendable; the pixels themselves must
+    /// carry the alpha. Renderer alpha scaling (CTX-0290) is configured on
+    /// the GPU surface at attach (`Surface::configure_with_opacity`); the
+    /// `Live` reload wiring that would re-apply both halves at runtime is not
+    /// implemented yet, so this method currently has no production caller.
+    ///
     /// Returns whether transparency was requested (for logging/diagnostics).
     pub fn set_opacity(&self, opacity: f32) -> bool {
         let transparent = opacity_requests_transparency(opacity);
@@ -272,6 +278,10 @@ pub fn sanitize_opacity(opacity: f32) -> f32 {
 /// through the `transparent` window flag (compositor-blended where the
 /// platform supports it, ignored where it does not). Fully opaque windows
 /// stay non-transparent so compositors keep the fast path.
+///
+/// On its own this flag only clears the Wayland opaque region; a visible
+/// effect needs renderer-side alpha as well (CTX-0290), which the app
+/// configures on the GPU surface with the same sanitized opacity.
 #[must_use]
 pub fn opacity_requests_transparency(opacity: f32) -> bool {
     sanitize_opacity(opacity) < 1.0
@@ -340,7 +350,8 @@ impl WindowConfig {
     /// inputs degrade to the nearest honored value instead of failing
     /// window creation. Values below `1.0` mark the window transparent at
     /// creation (see [`opacity_requests_transparency`]); `1.0` keeps the
-    /// opaque fast path.
+    /// opaque fast path. The renderer must be given the same opacity
+    /// (CTX-0290) for the value to have a visible effect.
     pub fn with_opacity(mut self, opacity: f32) -> Self {
         self.opacity = sanitize_opacity(opacity);
         self

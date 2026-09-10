@@ -4261,9 +4261,11 @@ struct TerminalApp {
     window_title: String,
     /// Window opacity from the effective config (CTX-0223
     /// `window.opacity`; default `1.0` = opaque). Applied to the platform
-    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation; values
-    /// below `1.0` request a transparent window where the platform supports
-    /// it and stay opaque (fail-soft) where it does not.
+    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation and to the
+    /// renderer at GPU attach (CTX-0290): the platform requests compositor
+    /// blending where supported, and the renderer scales its premultiplied
+    /// output so the value has a visible effect. Platforms without
+    /// premultiplied compositing stay opaque with a loud warning.
     window_opacity: f32,
     window: Option<WindowHandle>,
     window_id: Option<WindowId>,
@@ -4382,10 +4384,11 @@ impl TerminalApp {
         self.log_level = level;
     }
 
-    /// Sets the window opacity applied at creation (CTX-0223). Call once at
-    /// startup from the effective config; the value is sanitized by the
-    /// platform [`WindowConfig`](bitty_platform::WindowConfig), so
-    /// out-of-range inputs degrade instead of failing creation.
+    /// Sets the window opacity applied at creation and GPU attach
+    /// (CTX-0223/CTX-0290). Call once at startup from the effective config;
+    /// the value is sanitized by the platform
+    /// [`WindowConfig`](bitty_platform::WindowConfig) and the renderer
+    /// surface, so out-of-range inputs degrade instead of failing creation.
     fn with_window_opacity(mut self, opacity: f32) -> Self {
         self.window_opacity = opacity;
         self
@@ -4570,8 +4573,17 @@ impl TerminalApp {
                 Ok(surface) => {
                     let extent = PhysicalSize::new(inner.width(), inner.height());
                     // Configure surface with current extent (bounded, validated)
-                    match surface.configure(&gpu, extent) {
+                    // and the effective window opacity (CTX-0290): the
+                    // renderer scales its premultiplied output so the
+                    // compositor can blend the window at `window.opacity`.
+                    match surface.configure_with_opacity(&gpu, extent, self.window_opacity) {
                         Ok(()) => {
+                            if self.window_opacity < 1.0 && !surface.opacity_alpha_supported() {
+                                eprintln!(
+                                    "bitty: window.opacity={:.3} unsupported on this GPU surface (no premultiplied alpha mode) — staying opaque",
+                                    bitty_platform::sanitize_opacity(self.window_opacity)
+                                );
+                            }
                             self.runtime.attach_gpu(gpu, surface);
                             eprintln!(
                                 "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} crossfont={})",

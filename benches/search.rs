@@ -5,7 +5,7 @@
 //! `(State, pattern, SearchOptions)` with:
 //! - `SEARCH_MAX_PATTERN_LEN = 256` bytes (char-boundary truncated)
 //! - `SEARCH_MAX_RESULTS = 1000` (hard cap per call)
-//! - `SCROLLBACK_MAX_LINES = 10 000` (bounded heap)
+//! - `SCROLLBACK_DEFAULT_LINES = 10 000` (bounded heap, default retention)
 //!
 //! This bench builds scrollback up to bounded caps headlessly (no `winit`,
 //! no `wgpu`) and measures `State::search` latency and truncation
@@ -74,7 +74,7 @@ fn bench_search(state: &State, pat: &str, opts: SearchOptions, iters: usize) -> 
 fn main() {
     println!(
         "search — State::search headless, bounded (pattern {SEARCH_MAX_PATTERN_LEN} B, results {SEARCH_MAX_RESULTS}, scrollback {})",
-        bitty_term_state::scrollback::SCROLLBACK_MAX_LINES
+        bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES
     );
 
     let small = fill_scrollback(200, 80);

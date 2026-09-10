@@ -23,7 +23,7 @@ use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
 use crate::modes::{AltScreen, Modes};
 use crate::replies::Replies;
-use crate::scrollback::{ClearedRange, SCROLLBACK_MAX_LINES, Scrollback, ScrollbackLine};
+use crate::scrollback::{ClearedRange, SCROLLBACK_DEFAULT_LINES, Scrollback, ScrollbackLine};
 use crate::tabs::TabStops;
 
 /// Initial grid width in columns; width resizes reflow primary logical lines
@@ -289,9 +289,20 @@ impl Default for State {
 }
 
 impl State {
-    /// A freshly initialized terminal at [`GRID_ROWS`] x [`GRID_COLUMNS`].
+    /// A freshly initialized terminal at [`GRID_ROWS`] x [`GRID_COLUMNS`]
+    /// retaining at most [`SCROLLBACK_DEFAULT_LINES`] scrollback lines.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_scrollback_lines(SCROLLBACK_DEFAULT_LINES)
+    }
+
+    /// A freshly initialized terminal at [`GRID_ROWS`] x [`GRID_COLUMNS`]
+    /// retaining at most `max_lines` scrollback lines (the effective
+    /// `terminal.scrollback` value). The capacity is clamped to
+    /// [`SCROLLBACK_MAX_LINES`](crate::scrollback::SCROLLBACK_MAX_LINES);
+    /// `0` disables scrollback retention.
+    #[must_use]
+    pub fn with_scrollback_lines(max_lines: usize) -> Self {
         Self {
             width: GRID_COLUMNS,
             height: GRID_ROWS,
@@ -305,7 +316,7 @@ impl State {
             scroll_region_bottom: (GRID_ROWS - 1) as u16,
             tabs: TabStops::default_lattice(GRID_COLUMNS),
             charsets: Charsets::default(),
-            scrollback: Scrollback::new(),
+            scrollback: Scrollback::with_max_lines(max_lines),
             replies: Replies::new(),
             title: BoundedString::new(""),
             cwd_report: None,
@@ -349,8 +360,9 @@ impl State {
     /// plus its spacer never splits; a wide that would straddle the right
     /// margin wraps whole, leaving one blank). Combining marks ride on
     /// their base cell (`Cell::zerowidth`) and are never torn. Overflow
-    /// past `rows` feeds scrollback oldest-first (capped by
-    /// `SCROLLBACK_MAX_LINES`); underflow pads the grid bottom with blanks.
+    /// past `rows` feeds scrollback oldest-first (capped by the scrollback
+    /// buffer's configured capacity); underflow pads the grid bottom with
+    /// blanks.
     /// Scrollback ids are reassigned fresh (still monotonic) because the
     /// physical row count changes; `total_written` advances with them.
     /// The cursor follows its logical line/offset when the primary screen
@@ -588,8 +600,9 @@ impl State {
     ///
     /// Unwraps via soft-wrap flags, rewraps with wide-pair atomicity (see
     /// `rewrap_one_logical`), pads underflow at the grid bottom, caps
-    /// scrollback at `SCROLLBACK_MAX_LINES` oldest-first, and reassigns
-    /// fresh monotonic scrollback ids. Deterministic, headless, bounded.
+    /// scrollback at the buffer's configured capacity oldest-first, and
+    /// reassigns fresh monotonic scrollback ids. Deterministic, headless,
+    /// bounded.
     fn reflow_primary(
         grid: &mut crate::grid::Grid,
         scrollback: &mut crate::scrollback::Scrollback,
@@ -645,11 +658,11 @@ impl State {
         }
         let split = physical.len() - new_rows;
         let (sb_part, grid_part) = physical.split_at(split);
-        // Rebuild scrollback with fresh ids (monotonic), oldest-first, capped.
+        // Rebuild scrollback with fresh ids (monotonic), oldest-first, capped
+        // at this buffer's configured capacity.
+        let max_lines = scrollback.max_lines();
         scrollback.clear();
-        let start = sb_part
-            .len()
-            .saturating_sub(crate::scrollback::SCROLLBACK_MAX_LINES);
+        let start = sb_part.len().saturating_sub(max_lines);
         for (cells, wrapped) in &sb_part[start..] {
             scrollback.push_with_wrap(cells.clone(), *wrapped);
         }
@@ -931,10 +944,11 @@ impl State {
                 col: ccol,
             });
         }
-        if self.scrollback.len() > SCROLLBACK_MAX_LINES {
+        let scrollback_cap = self.scrollback.max_lines();
+        if self.scrollback.len() > scrollback_cap {
             return Err(InvariantViolation::ScrollbackOverCapacity {
                 len: self.scrollback.len(),
-                cap: SCROLLBACK_MAX_LINES,
+                cap: scrollback_cap,
             });
         }
         let mut previous_id: Option<u64> = None;
@@ -2399,7 +2413,7 @@ fn effective_count(n: Count) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scrollback::SCROLLBACK_MAX_LINES;
+    use crate::scrollback::SCROLLBACK_DEFAULT_LINES;
     use bitty_vt::{AttributeChange, AttributeDiff, Color, ControlChar, GraphemeCell};
 
     fn prints(state: &mut State, text: &str) {
@@ -2644,7 +2658,7 @@ mod tests {
             s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
         }
         assert!(
-            s.scrollback_len() > 0 && s.scrollback_len() <= SCROLLBACK_MAX_LINES,
+            s.scrollback_len() > 0 && s.scrollback_len() <= SCROLLBACK_DEFAULT_LINES,
             "indexing at the screen bottom must feed scrollback"
         );
         assert_eq!(
@@ -2660,6 +2674,35 @@ mod tests {
         });
         s.apply(&TerminalAction::ScrollUp { n: Count(3) });
         assert_eq!(s.scrollback_len(), before);
+    }
+
+    #[test]
+    fn configured_scrollback_capacity_bounds_retention() {
+        const CAP: usize = 3;
+        let mut s = State::with_scrollback_lines(CAP);
+        prints(&mut s, "line one");
+        for _ in 0..(GRID_ROWS + 10) {
+            s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        assert_eq!(
+            s.scrollback_len(),
+            CAP,
+            "retention must stop at the configured capacity"
+        );
+        assert!(s.check_invariants().is_ok());
+        // Oldest-first pruning: the retained tail is the newest content.
+        assert_eq!(s.scrollback().count(), CAP);
+    }
+
+    #[test]
+    fn zero_scrollback_capacity_retains_nothing() {
+        let mut s = State::with_scrollback_lines(0);
+        prints(&mut s, "line one");
+        for _ in 0..(GRID_ROWS + 10) {
+            s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        assert_eq!(s.scrollback_len(), 0);
+        assert!(s.check_invariants().is_ok());
     }
 
     #[test]

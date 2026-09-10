@@ -245,7 +245,7 @@ fn scrollback_lines_resize_to_new_width_and_stay_monotonic() {
         assert_eq!(line.cells.len(), 40);
     }
     assert!(s.check_invariants().is_ok());
-    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_MAX_LINES);
+    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_DEFAULT_LINES);
     let mut prev2: Option<u64> = None;
     for line in s.scrollback() {
         if let Some(p) = prev2 {
@@ -363,17 +363,20 @@ fn view_resize_and_reflow_headless_still_works() {
 #[test]
 fn scrollback_bounded_pruning_still_headless() {
     let mut s = State::new();
-    // Fill far beyond SCROLLBACK_MAX_LINES to force pruning. First height-1
+    // Fill far beyond SCROLLBACK_DEFAULT_LINES to force pruning. First height-1
     // linefeeds just move the cursor; each additional linefeed scrolls one
     // blank line into scrollback, so we need height extra.
-    let needed = bitty_term_state::SCROLLBACK_MAX_LINES + s.height() + 50;
+    let needed = bitty_term_state::SCROLLBACK_DEFAULT_LINES + s.height() + 50;
     for i in 0..needed {
         s.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
         if i % 500 == 0 {
             assert!(s.check_invariants().is_ok());
         }
     }
-    assert_eq!(s.scrollback_len(), bitty_term_state::SCROLLBACK_MAX_LINES);
+    assert_eq!(
+        s.scrollback_len(),
+        bitty_term_state::SCROLLBACK_DEFAULT_LINES
+    );
     assert!(s.check_invariants().is_ok());
 
     // Resize after pruned: reflow keeps total rows (scrollback+grid) coherent,
@@ -383,7 +386,7 @@ fn scrollback_bounded_pruning_still_headless() {
     let total_before = len_before + 24;
     s.resize(120, 40);
     assert_eq!(s.scrollback_len() + s.height(), total_before);
-    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_MAX_LINES);
+    assert!(s.scrollback_len() <= bitty_term_state::SCROLLBACK_DEFAULT_LINES);
     for line in s.scrollback() {
         assert_eq!(line.cells.len(), 120);
     }

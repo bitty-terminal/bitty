@@ -32,6 +32,22 @@ pub const DEFAULT_SCROLL_PIXELS_PER_NOTCH: u32 = 16;
 /// Maximum smooth-scroll pixels per wheel notch.
 pub const MAX_SCROLL_PIXELS_PER_NOTCH: u32 = 256;
 
+/// Default retained scrollback lines (CTX-0297 `terminal.scrollback`).
+///
+/// Mirrors `bitty_term_state::SCROLLBACK_DEFAULT_LINES` (kept as a re-export
+/// so runtime retention and terminal-state retention cannot drift) and the
+/// `bitty-config` `terminal.scrollback` default (`10 000`); the
+/// `bitty-app` mapping pins the pairing.
+pub const DEFAULT_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_DEFAULT_LINES;
+
+/// Hard maximum retained scrollback lines (CTX-0297).
+///
+/// Mirrors `bitty_term_state::SCROLLBACK_MAX_LINES` and the accepted
+/// `bitty-config` bound for `terminal.scrollback` (`0..=100_000`).
+/// [`RuntimeConfig::validate`] rejects values above it fail-closed so a
+/// future bound drift cannot grow terminal memory without limit.
+pub const MAX_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_MAX_LINES;
+
 /// Default selection auto-copy behavior (CTX-0191).
 /// Mirrors `bitty-config` `DEFAULT_SELECTION_AUTO_COPY` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
@@ -194,6 +210,13 @@ pub struct RuntimeConfig {
     pub scroll_lines_per_notch: u32,
     /// Smooth-scroll pixels per wheel notch, `1..=256` (CTX-0185; default 16).
     pub scroll_pixels_per_notch: u32,
+    /// Retained scrollback lines captured when terminal state is created
+    /// (CTX-0297 `terminal.scrollback`). `0..=MAX_SCROLLBACK_LINES`; default
+    /// `DEFAULT_SCROLLBACK_LINES` (`10 000`). `0` disables scrollback
+    /// retention. Consumed by `State::with_scrollback_lines`; the reload
+    /// class is `RestartRequired` because already-created terminals keep
+    /// their captured capacity.
+    pub scrollback: usize,
     /// Whether a committed mouse selection auto-copies to the clipboard
     /// (CTX-0191; default `true` = ghostty-class copy-on-select).
     /// `false` leaves the highlight in place; the explicit
@@ -274,6 +297,7 @@ impl Default for RuntimeConfig {
             font_size: 12.0,
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
+            scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
@@ -299,6 +323,12 @@ impl RuntimeConfig {
     /// accepted CTX-0118 values here and the app layer assigns the validated
     /// effective decoration post-construction; [`Self::validate`] rejects
     /// out-of-range decoration values fail-closed.
+    ///
+    /// CTX-0297: `scrollback` follows the same pattern: it defaults to
+    /// [`DEFAULT_SCROLLBACK_LINES`] here and the app layer assigns the
+    /// effective `terminal.scrollback` post-construction;
+    /// [`Self::validate`] rejects values above
+    /// [`MAX_SCROLLBACK_LINES`] fail-closed.
     ///
     /// # Errors
     ///
@@ -334,6 +364,7 @@ impl RuntimeConfig {
             font_size,
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
+            scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             gaps_in,
@@ -381,6 +412,11 @@ impl RuntimeConfig {
         if !(1..=MAX_SCROLL_PIXELS_PER_NOTCH).contains(&self.scroll_pixels_per_notch) {
             return Err(RuntimeError::InvalidConfig(
                 "scroll_pixels_per_notch must be within [1, 256]",
+            ));
+        }
+        if self.scrollback > MAX_SCROLLBACK_LINES {
+            return Err(RuntimeError::InvalidConfig(
+                "scrollback must be within [0, 100000] lines",
             ));
         }
         if self.cols > bitty_term_state::MAX_GRID_DIM || self.rows > bitty_term_state::MAX_GRID_DIM
@@ -833,6 +869,39 @@ mod tests {
             ..RuntimeConfig::default()
         };
         opt_out.validate().expect("opt-out valid");
+    }
+
+    #[test]
+    fn scrollback_default_and_bounds() {
+        // CTX-0297: retention defaults to the shared 10 000 and the hard
+        // 100 000 bound fails closed; `0` (retention disabled) stays valid.
+        const { assert!(DEFAULT_SCROLLBACK_LINES == 10_000) }
+        const { assert!(MAX_SCROLLBACK_LINES == 100_000) }
+        assert_eq!(
+            RuntimeConfig::default().scrollback,
+            DEFAULT_SCROLLBACK_LINES
+        );
+        RuntimeConfig {
+            scrollback: MAX_SCROLLBACK_LINES,
+            ..RuntimeConfig::default()
+        }
+        .validate()
+        .expect("hard max builds");
+        RuntimeConfig {
+            scrollback: 0,
+            ..RuntimeConfig::default()
+        }
+        .validate()
+        .expect("retention disabled builds");
+        assert!(
+            RuntimeConfig {
+                scrollback: MAX_SCROLLBACK_LINES + 1,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .is_err(),
+            "above hard max must fail closed"
+        );
     }
 
     #[test]

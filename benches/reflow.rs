@@ -75,7 +75,7 @@ fn main() {
         "  default GRID {}×{}, scrollback cap {}, bounded cols/rows 1..1000",
         bitty_term_state::GRID_COLUMNS,
         bitty_term_state::GRID_ROWS,
-        bitty_term_state::scrollback::SCROLLBACK_MAX_LINES
+        bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES
     );
 
     #[allow(clippy::type_complexity)]
@@ -107,13 +107,13 @@ fn main() {
             let _ = s.resize(80, 24);
         }
         assert!(
-            s.scrollback_len() <= bitty_term_state::scrollback::SCROLLBACK_MAX_LINES,
+            s.scrollback_len() <= bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES,
             "scrollback over cap after reflow churn"
         );
         println!(
             "  scrollback after 200 resizes: {} ≤ {}",
             s.scrollback_len(),
-            bitty_term_state::scrollback::SCROLLBACK_MAX_LINES
+            bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES
         );
     }
 

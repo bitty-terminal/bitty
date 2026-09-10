@@ -9,7 +9,7 @@
 //! render, measuring input-to-state latency (action → `State` commit +
 //! `Snapshot` + `Damage`). It is headless (no `winit::Window`,
 //! no `wgpu::Surface`), bounded (`GRID_COLUMNS` 80 × `GRID_ROWS` 24,
-//! `SCROLLBACK_MAX_LINES` 10 000, `REPLY_CAP_BYTES` 4096, `DAMAGE_MAX_REGIONS_PER_BATCH` 256),
+//! `SCROLLBACK_DEFAULT_LINES` 10 000, `REPLY_CAP_BYTES` 4096, `DAMAGE_MAX_REGIONS_PER_BATCH` 256),
 //! and `forbid(unsafe)`. Determinism follows `bitty-term-state` crate docs
 //! (pure function of `(initial state, action sequence)` + `State::state_hash`).
 //!
@@ -115,7 +115,7 @@ fn main() {
         "  8 KiB-equivalent apply throughput: {mb_s:.2} MB/s (PB-6 floor 40 MB/s; parser+apply together)"
     );
 
-    // Bounded check: scrollback never exceeds `SCROLLBACK_MAX_LINES` after
+    // Bounded check: scrollback never exceeds `SCROLLBACK_DEFAULT_LINES` after
     // bounded applies (invariant 4).
     {
         let mut s = State::new();
@@ -125,13 +125,13 @@ fn main() {
             }
         }
         assert!(
-            s.scrollback_len() <= bitty_term_state::scrollback::SCROLLBACK_MAX_LINES,
+            s.scrollback_len() <= bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES,
             "scrollback bound violated"
         );
         println!(
             "  scrollback bound OK: {} ≤ {}",
             s.scrollback_len(),
-            bitty_term_state::scrollback::SCROLLBACK_MAX_LINES
+            bitty_term_state::scrollback::SCROLLBACK_DEFAULT_LINES
         );
     }
 

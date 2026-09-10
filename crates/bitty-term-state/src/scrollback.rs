@@ -3,17 +3,25 @@
 //! Lines enter scrollback only via scroll-under-region operations; pruning
 //! removes oldest first; contents are immutable once written. The single
 //! exception is wholesale removal by `ED 3` / `FullReset`, which truncates
-//! the buffer without rewriting any line. Capacity is the config-free
-//! constant [`SCROLLBACK_MAX_LINES`]; see the crate documentation for the
-//! constant register and RFC references.
+//! the buffer without rewriting any line. Capacity is per-buffer: the
+//! default is [`SCROLLBACK_DEFAULT_LINES`] and every capacity is clamped to
+//! the hard cap [`SCROLLBACK_MAX_LINES`] (RFC invariant 4 bounded memory per
+//! threat T-01). See the crate documentation for the constant register and
+//! RFC references.
 
 use std::collections::VecDeque;
 
 use crate::cell::Cell;
 
+/// Default retained scrollback lines when no runtime configuration is
+/// supplied (mirrors the `bitty-config` `terminal.scrollback` default).
+pub const SCROLLBACK_DEFAULT_LINES: usize = 10_000;
+
 /// Hard cap on retained scrollback lines (RFC invariant 4 "pruning removes
-/// oldest first"; bounded memory per threat T-01).
-pub const SCROLLBACK_MAX_LINES: usize = 10_000;
+/// oldest first"; bounded memory per threat T-01). Mirrors the accepted
+/// `bitty-config` bound for `terminal.scrollback` (`0..=100_000`); every
+/// per-buffer capacity is clamped to this value.
+pub const SCROLLBACK_MAX_LINES: usize = 100_000;
 
 /// One immutable scrollback line with its monotonically assigned id.
 ///
@@ -39,6 +47,7 @@ pub struct Scrollback {
     lines: VecDeque<ScrollbackLine>,
     next_id: u64,
     total_written: u64,
+    max_lines: usize,
 }
 
 /// Result of a buffer-clearing operation: the removed id range
@@ -50,16 +59,33 @@ pub struct ClearedRange {
 }
 
 impl Scrollback {
-    /// An empty buffer.
+    /// An empty buffer retaining at most [`SCROLLBACK_DEFAULT_LINES`] lines.
     pub fn new() -> Self {
+        Self::with_max_lines(SCROLLBACK_DEFAULT_LINES)
+    }
+
+    /// An empty buffer retaining at most `max_lines` lines. Capacities above
+    /// the hard [`SCROLLBACK_MAX_LINES`] bound are clamped so a caller
+    /// mistake or a future bound drift can never grow memory without limit
+    /// (fail-closed at the core boundary).
+    #[must_use]
+    pub fn with_max_lines(max_lines: usize) -> Self {
         Self {
             lines: VecDeque::new(),
             next_id: 0,
             total_written: 0,
+            max_lines: max_lines.min(SCROLLBACK_MAX_LINES),
         }
     }
 
-    /// Number of retained lines (never above [`SCROLLBACK_MAX_LINES`]).
+    /// Retained-line capacity of this buffer (never above
+    /// [`SCROLLBACK_MAX_LINES`]).
+    #[must_use]
+    pub fn max_lines(&self) -> usize {
+        self.max_lines
+    }
+
+    /// Number of retained lines (never above [`Self::max_lines`]).
     #[must_use]
     pub fn len(&self) -> usize {
         self.lines.len()
@@ -117,8 +143,8 @@ impl Scrollback {
             cells: cells.into_boxed_slice(),
             wrapped,
         });
-        let evicted = if self.lines.len() > SCROLLBACK_MAX_LINES {
-            let overflow = self.lines.len() - SCROLLBACK_MAX_LINES;
+        let evicted = if self.lines.len() > self.max_lines {
+            let overflow = self.lines.len() - self.max_lines;
             let first_evicted = self.lines.front().map_or(0, |l| l.id);
             for _ in 0..overflow {
                 self.lines.pop_front();
@@ -177,16 +203,43 @@ mod tests {
 
     #[test]
     fn prune_removes_oldest_first_and_reports_range() {
-        let mut sb = Scrollback::new();
-        for _ in 0..SCROLLBACK_MAX_LINES {
+        let mut sb = Scrollback::with_max_lines(4);
+        for _ in 0..4 {
             sb.push(blank_row(1));
         }
-        assert_eq!(sb.len(), SCROLLBACK_MAX_LINES);
+        assert_eq!(sb.len(), 4);
         let (_, evicted) = sb.push(blank_row(1));
         assert_eq!(evicted.removed_count, 1);
         assert_eq!(evicted.first_line_id, 0);
-        assert_eq!(sb.len(), SCROLLBACK_MAX_LINES);
+        assert_eq!(sb.len(), 4);
         assert_eq!(sb.line(0).unwrap().id, 1);
+    }
+
+    #[test]
+    fn default_capacity_is_the_documented_default() {
+        const { assert!(SCROLLBACK_DEFAULT_LINES == 10_000) }
+        const { assert!(SCROLLBACK_MAX_LINES == 100_000) }
+        assert_eq!(Scrollback::new().max_lines(), SCROLLBACK_DEFAULT_LINES);
+    }
+
+    #[test]
+    fn configured_capacity_is_honored_and_clamped_to_hard_max() {
+        assert_eq!(Scrollback::with_max_lines(7).max_lines(), 7);
+        assert_eq!(
+            Scrollback::with_max_lines(usize::MAX).max_lines(),
+            SCROLLBACK_MAX_LINES
+        );
+    }
+
+    #[test]
+    fn zero_capacity_evicts_every_line() {
+        let mut sb = Scrollback::with_max_lines(0);
+        let (id, evicted) = sb.push(blank_row(1));
+        assert_eq!(id, 0);
+        assert_eq!(evicted.first_line_id, 0);
+        assert_eq!(evicted.removed_count, 1);
+        assert_eq!(sb.len(), 0);
+        assert_eq!(sb.total_written(), 1);
     }
 
     #[test]

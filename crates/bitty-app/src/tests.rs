@@ -1220,6 +1220,58 @@ fn runtime_config_inherits_file_scroll_speed() {
 }
 
 #[test]
+fn runtime_config_inherits_file_scrollback() {
+    // CTX-0297: `terminal.scrollback` flows file -> effective -> runtime
+    // and bounds retained history at terminal creation. The runtime
+    // default mirrors the terminal-state default (pairing pinned here;
+    // `bitty-runtime` must not depend on `bitty-config`).
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_SCROLLBACK_LINES,
+        bitty_term_state::SCROLLBACK_DEFAULT_LINES
+    );
+    assert_eq!(
+        bitty_runtime::config::MAX_SCROLLBACK_LINES,
+        bitty_term_state::SCROLLBACK_MAX_LINES
+    );
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(r#"return { terminal = { scrollback = 4242 } }"#, &src)
+        .expect("scrollback parses");
+    let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+    let merged = resolve_effective(Some(layer), None).expect("merge");
+    assert_eq!(merged.effective.terminal.scrollback, 4242);
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.scrollback, 4242);
+    // The default value rides through unchanged.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+        .expect("minimal terminal parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert_eq!(
+        cfg2.scrollback,
+        bitty_runtime::config::DEFAULT_SCROLLBACK_LINES
+    );
+}
+
+#[test]
+fn runtime_config_rejects_scrollback_bound_drift() {
+    // CTX-0297: a future `bitty-config` bound raised past the runtime /
+    // terminal-state hard cap must fail closed instead of silently
+    // clamping the retention semantics.
+    let mut effective = bitty_config::EffectiveConfig::default();
+    effective.terminal.scrollback = 200_000;
+    let err =
+        runtime_config_from_effective(&effective).expect_err("above hard cap must fail closed");
+    assert!(err.contains("terminal.scrollback"), "field named: {err}");
+}
+
+#[test]
 fn runtime_config_inherits_file_selection_auto_copy() {
     // CTX-0191: `selection.auto_copy` flows file -> effective -> runtime;
     // crate defaults stay equal (bitty-runtime must not depend on

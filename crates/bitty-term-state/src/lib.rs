@@ -17,17 +17,22 @@
 //! - ADR-0003 "Core Workspace Topology": dependency row for
 //!   `bitty-term-state` (workspace crates: `bitty-vt` only).
 //!
-//! # Config-free bounded constants
+//! # Bounded constants
 //!
 //! The M1 slice takes no runtime configuration; every bound below is a
-//! named constant so behavior stays deterministic and replayable. Each
-//! cites its RFC clause:
+//! named constant so behavior stays deterministic and replayable, except
+//! scrollback retention, whose per-buffer capacity is chosen at construction
+//! (`State::with_scrollback_lines`) within the hard
+//! [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) bound and
+//! defaulting to [`SCROLLBACK_DEFAULT_LINES`](scrollback::SCROLLBACK_DEFAULT_LINES).
+//! Each cites its RFC clause:
 //!
 //! | Constant | Value | Contract |
 //! |---|---|---|
 //! | [`GRID_COLUMNS`] / [`GRID_ROWS`] | 80 x 24 | Initial geometry; width resizes reflow primary logical lines via soft-wrap flags (CTX-0266), alt screen truncates (xterm) |
 //! | [`DEFAULT_TAB_INTERVAL`] | 8 | RFC invariant 6: default tab lattice; `FullReset` restores it |
-//! | [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) | 10 000 | RFC invariant 4: bounded pruning, oldest first |
+//! | [`SCROLLBACK_DEFAULT_LINES`](scrollback::SCROLLBACK_DEFAULT_LINES) | 10 000 | Default scrollback retention (`terminal.scrollback` default) |
+//! | [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) | 100 000 | Hard retention bound (RFC invariant 4: bounded pruning, oldest first; mirrors the accepted `terminal.scrollback` maximum) |
 //! | [`REPLY_CAP_BYTES`](replies::REPLY_CAP_BYTES) | 4096 | RFC invariant 7: reply bounds, drop-and-flag |
 //! | [`DAMAGE_HISTORY_BATCHES`](damage::DAMAGE_HISTORY_BATCHES) | 64 | Bounded `damage_since` window |
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
@@ -90,7 +95,7 @@ pub use image::{
 };
 pub use modes::Modes;
 pub use replies::{REPLY_CAP_BYTES, Replies};
-pub use scrollback::{SCROLLBACK_MAX_LINES, ScrollbackLine};
+pub use scrollback::{SCROLLBACK_DEFAULT_LINES, SCROLLBACK_MAX_LINES, ScrollbackLine};
 pub use state::{
     GRID_COLUMNS, GRID_ROWS, HYPERLINK_TABLE_MAX, InvariantViolation, MAX_GRID_DIM,
     SNAPSHOT_VERSION, Snapshot, State, TelemetryCounters, ZONE_RECORDS_MAX, ZoneRecord,

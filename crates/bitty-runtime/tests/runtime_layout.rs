@@ -151,24 +151,26 @@ fn gaps_allocations_exclude_gap_bands() {
 }
 
 #[test]
-fn cursor_to_cell_subtracts_outer_gap() {
+fn cursor_to_cell_subtracts_outer_gap_and_decoration() {
     // CTX-0177: with gaps_out = 2 cells at the default 9x19 live cell,
     // the grid origin shifts by (18px, 38px); the mapping must subtract
-    // it (0157 math) instead of drifting by the gap. CTX-0223: the
-    // default 8px window padding shifts it first, so the probe moves to
-    // pad + gap + 2 cells = (44, 84).
+    // it (0157 math) instead of drifting by the gap. CTX-0223 adds the
+    // default 8px window padding first; CTX-0294 adds the default
+    // decoration outer gap + border (6 + 2 = 8px at scale 1.0), so the
+    // probe moves to pad + gap + decoration + 2 cells = (52, 92).
     let rt = make_gapped_runtime(0, 2);
-    // Legacy probe (18, 38) -> (2, 2) now lands on the gap-shifted grid:
-    // col = (44 - 8 - 18) / 9 = 2, row = (84 - 8 - 38) / 19 = 2.
-    let pos = CursorPosition { x: 44.0, y: 84.0 };
+    // col = (52 - 8 - 18 - 8) / 9 = 2, row = (92 - 8 - 38 - 8) / 19 = 2.
+    let pos = CursorPosition { x: 52.0, y: 92.0 };
     assert_eq!(rt.cursor_to_cell(pos), CellPos::new(2, 2));
     // A click inside the outer gap clamps to the first cell (never
     // negative, never panics).
     let in_gap = CursorPosition { x: 9.0, y: 19.0 };
     assert_eq!(rt.cursor_to_cell(in_gap), CellPos::new(0, 0));
-    // Zero-gap, zero-padding runtime keeps the legacy mapping bit-identical.
+    // Zero-gap, zero-padding, undecorated runtime keeps the legacy
+    // mapping bit-identical (CTX-0177 cell algebra with no px decoration).
     let plain = Runtime::new(RuntimeConfig {
         window_padding: 0,
+        decoration: bitty_runtime::Decoration::ZERO,
         ..RuntimeConfig::default()
     })
     .expect("zero padding builds");

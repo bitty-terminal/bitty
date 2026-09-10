@@ -298,13 +298,22 @@ impl Runtime {
         if self.pane_sessions.is_empty() {
             return;
         }
-        // CTX-0177: gapped allocations so pane grids match the shrunk leaves.
-        let allocs = self.layout.layout_with_gaps(self.container, self.gaps());
-        for (id, rect) in &allocs {
-            let cols = rect.width.max(1);
-            let rows = rect.height.max(1);
-            if let Some(sess) = self.pane_sessions.get_mut(id) {
+        // CTX-0294: decorated content frames (Core px decoration + CTX-0177
+        // cell gaps) so pane grids/PTYs match the painted viewport.
+        let frames = self.present_frames();
+        for frame in &frames {
+            let cols = frame.cols.max(1);
+            let rows = frame.rows.max(1);
+            if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {
                 if sess.state.width() != cols as usize || sess.state.height() != rows as usize {
+                    // CTX-0294: width first at the old height, then
+                    // height-only — keeps top content visible instead of
+                    // bottom-aligning it into scrollback on a one-call
+                    // shrink (see `Runtime::resize_primary_grid`).
+                    if sess.state.width() != cols as usize {
+                        let keep_rows = sess.state.height();
+                        let _ = sess.state.resize(cols as usize, keep_rows);
+                    }
                     let _ = sess.state.resize(cols as usize, rows as usize);
                     let _ = sess.pty.resize(cols, rows);
                 }

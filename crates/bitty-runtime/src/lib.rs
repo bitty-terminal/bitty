@@ -205,6 +205,7 @@ pub use config::RuntimeConfig;
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
+pub use runtime::layout_focus::PresentFrame;
 pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
 pub use runtime::{
     ActivationGesture, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,

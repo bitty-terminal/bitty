@@ -202,6 +202,54 @@ pub struct DecoratedView {
     pub radius: u16,
 }
 
+/// Per-axis decoration bands in one integer unit (CTX-0294).
+///
+/// The accepted CTX-0118 decoration is symmetric (`gaps_in`, `gaps_out`,
+/// `border`, `radius` are scalars), but the render-time composition with the
+/// CTX-0177 cell gaps needs per-axis outer insets and sibling bands: a cell
+/// gap of `n` cells converts to `n * cell_width` physical px horizontally and
+/// `n * cell_height` vertically. [`LayoutNode::layout_with_decoration`]
+/// constructs this with equal axes so the accepted solver stays bit-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bands {
+    outer_x: u16,
+    outer_y: u16,
+    inner_x: u16,
+    inner_y: u16,
+    border: u16,
+    radius: u16,
+}
+
+/// Round-half-away-from-zero conversion of a logical-px decoration value to
+/// physical px at `scale`, saturating at `u16::MAX` (CTX-0294).
+///
+/// Zero stays zero (no 1px floor) so `Decoration::ZERO` is an exact
+/// undecorated fast path at every scale.
+fn scaled_px(value: u16, scale: f64) -> u16 {
+    if value == 0 {
+        return 0;
+    }
+    let scaled = f64::from(value) * scale;
+    if !scaled.is_finite() || scaled <= 0.0 {
+        return 0;
+    }
+    if scaled >= f64::from(u16::MAX) {
+        u16::MAX
+    } else {
+        scaled.round() as u16
+    }
+}
+
+/// Insets `rect` by independent horizontal/vertical amounts, saturating.
+fn inset_axes(rect: Rect, x: u16, y: u16) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(x),
+        rect.y.saturating_add(y),
+        rect.width.saturating_sub(x.saturating_mul(2)),
+        rect.height.saturating_sub(y.saturating_mul(2)),
+    )
+}
+
 impl LayoutNode {
     /// Decorated composition: the accepted Core-owned decoration application.
     ///
@@ -230,20 +278,69 @@ impl LayoutNode {
         bounds: Rect,
         decoration: Decoration,
     ) -> Vec<(ViewId, DecoratedView)> {
-        let area = if decoration.gaps_out == 0 {
-            bounds
-        } else {
-            decoration.gaps().inset_outer(bounds)
+        let bands = Bands {
+            outer_x: decoration.gaps_out,
+            outer_y: decoration.gaps_out,
+            inner_x: decoration.gaps_in,
+            inner_y: decoration.gaps_in,
+            border: decoration.border,
+            radius: decoration.radius,
         };
+        let area = inset_axes(bounds, bands.outer_x, bands.outer_y);
         let mut out = Vec::new();
-        self.layout_decorated_inner(area, decoration, &mut out);
+        self.layout_bands_inner(area, bands, &mut out);
         out
     }
 
-    fn layout_decorated_inner(
+    /// Decorated composition at render scale, composed with CTX-0177 cell
+    /// gaps (CTX-0294 live-present wiring).
+    ///
+    /// The accepted decoration stays in **logical pixels**; this solver is the
+    /// render-time step the spec rule 1 allows, converting each property to
+    /// **physical pixels** with the Window DPI `scale` (`round`, saturating,
+    /// zero stays zero). The CTX-0177 panel gaps are cell-unit and convert
+    /// with the live physical cell metrics:
+    ///
+    /// - outer inset axis: `scaled(gaps_out) + gaps.outer * cell_axis`;
+    /// - sibling band axis: `scaled(gaps_in) + gaps.inner * cell_axis`;
+    /// - border/content inset and radius: `scaled(...)`.
+    ///
+    /// With `gaps == Gaps::ZERO` and `scale == 1.0` this is bit-identical to
+    /// [`Self::layout_with_decoration`] (same integer unit); with
+    /// `decoration == Decoration::ZERO` it is the CTX-0177 cell-gap solver
+    /// expressed in physical pixels. `bounds` is the workspace area in
+    /// physical pixels (window padding is Window chrome, not decoration).
+    #[must_use]
+    pub fn layout_with_decoration_scaled(
         &self,
         bounds: Rect,
         decoration: Decoration,
+        scale: f64,
+        cell: (u16, u16),
+        gaps: Gaps,
+    ) -> Vec<(ViewId, DecoratedView)> {
+        let border = scaled_px(decoration.border, scale);
+        let radius = scaled_px(decoration.radius, scale);
+        let outer = scaled_px(decoration.gaps_out, scale);
+        let inner = scaled_px(decoration.gaps_in, scale);
+        let bands = Bands {
+            outer_x: outer.saturating_add(gaps.outer.saturating_mul(cell.0)),
+            outer_y: outer.saturating_add(gaps.outer.saturating_mul(cell.1)),
+            inner_x: inner.saturating_add(gaps.inner.saturating_mul(cell.0)),
+            inner_y: inner.saturating_add(gaps.inner.saturating_mul(cell.1)),
+            border,
+            radius,
+        };
+        let area = inset_axes(bounds, bands.outer_x, bands.outer_y);
+        let mut out = Vec::new();
+        self.layout_bands_inner(area, bands, &mut out);
+        out
+    }
+
+    fn layout_bands_inner(
+        &self,
+        bounds: Rect,
+        bands: Bands,
         out: &mut Vec<(ViewId, DecoratedView)>,
     ) {
         match self {
@@ -253,9 +350,9 @@ impl LayoutNode {
                     v.id(),
                     DecoratedView {
                         frame,
-                        content: inset_rect(frame, decoration.border),
-                        border: decoration.border,
-                        radius: decoration.radius,
+                        content: inset_rect(frame, bands.border),
+                        border: bands.border,
+                        radius: bands.radius,
                     },
                 ));
             }
@@ -265,14 +362,17 @@ impl LayoutNode {
                 first,
                 second,
             } => {
-                let (a, b) =
-                    crate::layout::split_rect_with_gap(bounds, *axis, *ratio, decoration.gaps_in);
-                first.layout_decorated_inner(a, decoration, out);
-                second.layout_decorated_inner(b, decoration, out);
+                let band = match axis {
+                    crate::geometry::SplitAxis::Horizontal => bands.inner_x,
+                    crate::geometry::SplitAxis::Vertical => bands.inner_y,
+                };
+                let (a, b) = crate::layout::split_rect_with_gap(bounds, *axis, *ratio, band);
+                first.layout_bands_inner(a, bands, out);
+                second.layout_bands_inner(b, bands, out);
             }
             Self::Stack(children) => {
                 for child in children {
-                    child.layout_decorated_inner(bounds, decoration, out);
+                    child.layout_bands_inner(bounds, bands, out);
                 }
             }
             Self::Overlay {
@@ -281,13 +381,13 @@ impl LayoutNode {
                 bounds: overlay_bounds,
                 ..
             } => {
-                base.layout_decorated_inner(bounds, decoration, out);
+                base.layout_bands_inner(bounds, bands, out);
                 let clipped = if let Some(inter) = overlay_bounds.clip_to(bounds) {
                     inter
                 } else {
                     Rect::zero()
                 };
-                overlay.layout_decorated_inner(clipped, decoration, out);
+                overlay.layout_bands_inner(clipped, bands, out);
             }
         }
     }
@@ -488,5 +588,117 @@ mod tests {
         );
         assert!(DecorationError::Border(9).to_string().contains("border"));
         assert!(DecorationError::Radius(17).to_string().contains("radius"));
+    }
+
+    #[test]
+    fn scaled_zero_decoration_matches_cell_gap_solver() {
+        // CTX-0294: with no px decoration the render-scale solver is the
+        // CTX-0177 cell-gap solver expressed in physical pixels.
+        let node = split(
+            0.5,
+            LayoutNode::leaf(view(1, 4, 2)),
+            LayoutNode::leaf(view(2, 4, 2)),
+        );
+        let cell = (9u16, 19u16);
+        let gaps = Gaps::new(2, 1);
+        let cell_bounds = Rect::new(0, 0, 80, 24);
+        let px_bounds = Rect::new(0, 0, 80 * 9, 24 * 19);
+        let px = node.layout_with_decoration_scaled(px_bounds, Decoration::ZERO, 1.75, cell, gaps);
+        let plain = node.layout_with_gaps(cell_bounds, gaps);
+        assert_eq!(px.len(), plain.len());
+        for ((pid, prect), (did, dview)) in plain.iter().zip(px.iter()) {
+            assert_eq!(pid, did);
+            assert_eq!(
+                dview.frame,
+                Rect::new(
+                    prect.x * 9,
+                    prect.y * 19,
+                    prect.width * 9,
+                    prect.height * 19
+                )
+            );
+            assert_eq!(dview.content, dview.frame);
+        }
+    }
+
+    #[test]
+    fn scaled_zero_scale_matches_logical_decoration() {
+        // CTX-0294: scale 1.0 with zero cell gaps is the accepted logical
+        // solver bit-for-bit.
+        let node = split(
+            0.37,
+            LayoutNode::leaf(view(1, 4, 2)),
+            LayoutNode::leaf(view(2, 4, 2)),
+        );
+        let bounds = Rect::new(1, 2, 101, 51);
+        let d = Decoration::new(3, 5, 2, 6);
+        assert_eq!(
+            node.layout_with_decoration(bounds, d),
+            node.layout_with_decoration_scaled(bounds, d, 1.0, (9, 19), Gaps::ZERO)
+        );
+    }
+
+    #[test]
+    fn scaled_decoration_scales_insets_hidpi() {
+        // CTX-0294: logical values double at 2x DPI while cell gaps stay
+        // per-axis physical.
+        let node = LayoutNode::leaf(view(1, 4, 2));
+        let bounds = Rect::new(0, 0, 200, 100);
+        let out = node.layout_with_decoration_scaled(
+            bounds,
+            Decoration::new(0, 6, 2, 6),
+            2.0,
+            (9, 19),
+            Gaps::new(0, 0),
+        );
+        assert_eq!(out[0].1.frame, Rect::new(12, 12, 176, 76));
+        assert_eq!(out[0].1.content, Rect::new(16, 16, 168, 68));
+        assert_eq!(out[0].1.border, 4);
+        assert_eq!(out[0].1.radius, 12);
+    }
+
+    #[test]
+    fn scaled_composes_cell_gaps_with_px_decoration() {
+        // CTX-0294: outer inset = 1 cell (9/19 px) + 6 px; the sibling band
+        // = 2 cells (18 px wide) + 4 px; border/radius scale too.
+        let node = split(
+            0.5,
+            LayoutNode::leaf(view(1, 4, 2)),
+            LayoutNode::leaf(view(2, 4, 2)),
+        );
+        let bounds = Rect::new(0, 0, 720, 456);
+        let out = node.layout_with_decoration_scaled(
+            bounds,
+            Decoration::new(4, 6, 2, 6),
+            1.0,
+            (9, 19),
+            Gaps::new(2, 1),
+        );
+        let (a, b) = (out[0].1.frame, out[1].1.frame);
+        assert_eq!(a.x, 15);
+        assert_eq!(a.y, 25);
+        assert_eq!(u32::from(b.x) - a.right(), 22);
+        assert_eq!(u32::from(a.width) + 22 + u32::from(b.width), 720 - 30);
+        assert_eq!(out[0].1.border, 2);
+        assert_eq!(out[0].1.radius, 6);
+    }
+
+    #[test]
+    fn scaled_hostile_scale_is_total() {
+        let node = LayoutNode::leaf(view(1, 4, 2));
+        let bounds = Rect::new(0, 0, 40, 20);
+        for scale in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e9] {
+            let out = node.layout_with_decoration_scaled(
+                bounds,
+                Decoration::new(32, 32, 8, 16),
+                scale,
+                (9, 19),
+                Gaps::new(16, 16),
+            );
+            assert_eq!(out.len(), 1);
+            let view = out[0].1;
+            assert!(view.content.width <= view.frame.width);
+            assert!(view.content.height <= view.frame.height);
+        }
     }
 }

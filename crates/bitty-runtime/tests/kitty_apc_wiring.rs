@@ -39,6 +39,9 @@ fn apc_g_single_shot_routes_to_display_and_paints() {
     let rgba = rt.headless_rgba().expect("rgba after tick");
     let width = window_width();
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    // CTX-0294: the default decoration outer gap + border (8px) shifts the
+    // content origin before cell (0,0).
+    let pad = pad + 8;
     assert_eq!(
         probe(&rgba, width, pad + 1, pad + 1),
         [0xFF, 0, 0, 0xFF],
@@ -62,6 +65,7 @@ fn apc_g_chunked_reassembly_routes_to_display() {
     let rgba = rt.headless_rgba().expect("rgba after tick");
     let width = window_width();
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    let pad = pad + 8;
     assert_eq!(probe(&rgba, width, pad + 1, pad + 1), [0xFF, 0, 0, 0xFF]);
 }
 
@@ -76,6 +80,7 @@ fn apc_g_transmit_only_stores_without_painting() {
     let rgba = rt.headless_rgba().expect("rgba after tick");
     let width = window_width();
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    let pad = pad + 8;
     assert_ne!(
         probe(&rgba, width, pad + 1, pad + 1),
         [0xFF, 0, 0, 0xFF],

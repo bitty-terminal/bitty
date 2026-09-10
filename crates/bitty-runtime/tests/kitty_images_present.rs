@@ -19,13 +19,15 @@ fn red_2x2() -> Vec<u8> {
 
 fn default_geometry() -> (usize, usize, usize) {
     // Mirrors `tick_cursor_overlay_uses_theme_cursor_hue`: 9x19 cells,
-    // 8px padding inset at scale 1.0, 80x24 grid.
+    // 8px padding inset at scale 1.0, 80x24 grid. The returned origin
+    // includes the CTX-0294 default decoration outer gap + border
+    // (6 + 2 = 8px), where cell (0,0) content actually starts.
     let cfg = RuntimeConfig::default();
     assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
     let rt = make_runtime();
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
     assert_eq!(pad, 8);
-    (9, 19, 8)
+    (9, 19, pad + 8)
 }
 
 fn probe(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
@@ -141,8 +143,9 @@ fn unknown_format_and_oversize_fail_closed() {
 fn scroll_moves_image_with_content() {
     let (cw, _, pad) = default_geometry();
     let mut rt = make_runtime();
-    // Anchor at the last row (24 rows: index 23).
-    rt.handle_pty_bytes(b"\x1b[24;1H");
+    // Anchor at the last *visible* row: decoration leaves 23 content rows
+    // (indexes 0..22), so row index 22 is the bottom painted row.
+    rt.handle_pty_bytes(b"\x1b[23;1H");
     rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
@@ -151,14 +154,14 @@ fn scroll_moves_image_with_content() {
     let ch = cfg.cell_height as usize;
     let before = rt.headless_rgba().expect("rgba");
     assert_eq!(
-        probe(&before, width, pad + 4, 23 * ch + pad + 9),
+        probe(&before, width, pad + 4, 22 * ch + pad + 9),
         [0xFF, 0, 0, 0xFF]
     );
-    // Three linefeeds at the bottom margin scroll three lines up.
+    // Two linefeeds reach the bottom state row (index 23); the third
+    // scrolls once more, so the anchor row-22 placement moves two up.
     rt.handle_pty_bytes(b"\n\n\n");
     rt.tick().expect("scroll damage must present");
     let after = rt.headless_rgba().expect("rgba");
-    // Placement is retained but now three rows higher.
     assert_eq!(rt.kitty_placement_count(), 1);
     assert_eq!(
         probe(&after, width, pad + 4, 20 * ch + pad + 9),
@@ -167,7 +170,7 @@ fn scroll_moves_image_with_content() {
     // The cursor now rests on the old anchor row, so that pixel carries
     // the cursor fill — the assertion that matters is "not image red".
     assert_ne!(
-        probe(&after, width, pad + 4, 23 * ch + pad + 9),
+        probe(&after, width, pad + 4, 22 * ch + pad + 9),
         [0xFF, 0, 0, 0xFF],
         "old anchor row must no longer carry the image"
     );
@@ -306,7 +309,8 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
     // stale at the old anchor).
     let (_, _, pad) = default_geometry();
     let mut rt = make_runtime();
-    rt.handle_pty_bytes(b"\x1b[24;1H");
+    // Bottom visible content row is 22 (decoration leaves 23 content rows).
+    rt.handle_pty_bytes(b"\x1b[23;1H");
     rt.kitty_display_image(32, Some(2), Some(2), None, 1, 1, &red_2x2(), 0)
         .expect("display must succeed");
     rt.tick().expect("display forces a present");
@@ -326,10 +330,10 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
     assert_eq!(
         probe(&rgba, width, pad + 4, 20 * ch + pad + 9),
         [0xFF, 0, 0, 0xFF],
-        "image must track content three rows up"
+        "image must track content two rows up"
     );
     assert_ne!(
-        probe(&rgba, width, pad + 4, 23 * ch + pad + 9),
+        probe(&rgba, width, pad + 4, 22 * ch + pad + 9),
         [0xFF, 0, 0, 0xFF],
         "old anchor row must not keep a stale blit"
     );

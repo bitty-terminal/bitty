@@ -152,14 +152,6 @@ impl From<RenderPresentStats> for PresentStats {
 // Every helper below is total: products accumulate in `u64`, sums in
 // `i64`, results clamp to the `i32`/`u32` ranges.
 
-/// Leaf pixel origin: `axis_cells * cell_px + pad_px`, saturated to `i32`.
-pub(super) fn px_origin(axis_cells: u16, cell_px: u32, pad_px: i32) -> i32 {
-    let v = u64::from(axis_cells)
-        .saturating_mul(u64::from(cell_px))
-        .saturating_add(u64::try_from(pad_px.max(0)).unwrap_or(0));
-    i32::try_from(v).unwrap_or(i32::MAX)
-}
-
 /// Saturating `i32` add for translated rect/glyph destinations.
 pub(super) fn px_add(a: i32, b: i32) -> i32 {
     a.saturating_add(b)
@@ -343,16 +335,20 @@ impl Runtime {
         // Reflow layout tree into container before rendering so leaf Views
         // carry deterministic origins/sizes for this frame. This is headless
         // and deterministic: same layout + container always yields same
-        // allocations. CTX-0177: gap-aware so leaves exclude gap bands.
-        self.layout.reflow_with_gaps(self.container, self.gaps());
+        // frames. CTX-0294: frames come from the Core-owned px decoration
+        // solver composed with the CTX-0177 cell gaps, so live present paints
+        // the accepted gaps/border/radius instead of cell-aligned tiling.
+        // The reflow mutates leaf Views to the decorated *content* grid so
+        // scroll/selection/PTY geometry matches the painted viewport.
+        let frames = self.present_frames();
+        self.reflow_present_layout(&frames);
 
         let snapshot = self.state.snapshot();
         let mut pending_full = self.pending_full_redraw;
         // Collect allocations deterministically BEFORE the idle check so
-        // geometry-only changes are visible (CTX-0228). `layout_with_gaps`
+        // geometry-only changes are visible (CTX-0228). `present_frames`
         // is pure and bounded by the leaf count.
-        // CTX-0177: gap-aware so per-leaf origins skip the gap bands.
-        let allocations = self.layout.layout_with_gaps(self.container, self.gaps());
+        let allocations = frames;
         let focused = self.focus.focused();
         // CTX-0254: Kitty origin binding. The image layer is keyed by the
         // emitting PTY stream — `None` for the primary grid, `Some(id)`
@@ -463,14 +459,21 @@ impl Runtime {
         // Build id->View map for scroll/IME lookups.
         let view_map: std::collections::HashMap<ViewId, View> = {
             let mut m = std::collections::HashMap::new();
-            for (vid, r) in &allocations {
-                if let Some(v) = self.layout.find_leaf(*vid) {
-                    m.insert(*vid, v.clone());
+            for frame in &allocations {
+                if let Some(v) = self.layout.find_leaf(frame.view) {
+                    m.insert(frame.view, v.clone());
                 } else {
-                    // Fallback: synthesized view sized to allocation
-                    let mut v = View::new(*vid, r.width as usize, r.height as usize);
-                    v.set_origin(bitty_ui::Point::new(r.x, r.y));
-                    m.insert(*vid, v);
+                    // Fallback: synthesized view sized to the decorated
+                    // content frame.
+                    let live = self.live_cell_metrics();
+                    let mut v = View::new(frame.view, frame.cols as usize, frame.rows as usize);
+                    v.set_origin(bitty_ui::Point::new(
+                        (frame.content.x.max(0) as u32 / live.width.max(1)).min(u32::from(u16::MAX))
+                            as u16,
+                        (frame.content.y.max(0) as u32 / live.height.max(1))
+                            .min(u32::from(u16::MAX)) as u16,
+                    ));
+                    m.insert(frame.view, v);
                 }
             }
             m
@@ -484,10 +487,11 @@ impl Runtime {
         // `u32` and must never wrap into a negative `i32` origin.
         let pad_px = i32::try_from(self.window_padding_physical()).unwrap_or(i32::MAX);
 
-        for (view_id, rect) in &allocations {
-            if rect.is_empty() {
+        for frame in &allocations {
+            if frame.content.width == 0 || frame.content.height == 0 {
                 continue;
             }
+            let view_id = &frame.view;
             // CTX-0176: a leaf with its own shell renders that session's
             // grid. CTX-0234: a leaf WITHOUT a session renders the shared
             // primary snapshot ONLY while focused — multipane input routing
@@ -544,10 +548,10 @@ impl Runtime {
                         title: base_snap.title.clone(),
                     }
                 } else {
-                    viewport_snapshot(base_snap, rect.width, rect.height)
+                    viewport_snapshot(base_snap, frame.cols, frame.rows)
                 }
             } else {
-                viewport_snapshot(base_snap, rect.width, rect.height)
+                viewport_snapshot(base_snap, frame.cols, frame.rows)
             };
 
             let damage = if use_full || pending_full || last == u64::MAX {
@@ -651,14 +655,37 @@ impl Runtime {
                 }
             }
 
+            // CTX-0294: Core-owned decoration border ring, painted under the
+            // leaf content (the content sits inside the inner rounded rect by
+            // construction). Emitted as plain FillRects so the software and
+            // GPU compositors stay pixel-identical; gaps_out/gaps_in bands
+            // are the unallocated frame space and keep the surface clear
+            // color, exactly like the CTX-0177 gap bands.
+            if frame.border > 0 && frame.frame.width > 0 && frame.frame.height > 0 {
+                let ring = bitty_render::grid::rounded_border_fills(
+                    bitty_render::geometry::RectPx::new(
+                        px_add(pad_px, frame.frame.x),
+                        px_add(pad_px, frame.frame.y),
+                        frame.frame.width,
+                        frame.frame.height,
+                    ),
+                    frame.border,
+                    frame.radius,
+                    bitty_render::grid::DECORATION_BORDER,
+                );
+                if !ring.is_empty() {
+                    combined_fills.extend(ring);
+                    any_needs_draw = true;
+                }
+            }
+
             if !list.needs_draw() {
                 continue;
             }
             any_needs_draw = true;
 
-            let live = self.live_cell_metrics();
-            let origin_px_x = px_origin(rect.x, live.width, pad_px);
-            let origin_px_y = px_origin(rect.y, live.height, pad_px);
+            let origin_px_x = px_add(pad_px, frame.content.x);
+            let origin_px_y = px_add(pad_px, frame.content.y);
             for mut fill in list.fills {
                 fill.rect.x = px_add(fill.rect.x, origin_px_x);
                 fill.rect.y = px_add(fill.rect.y, origin_px_y);
@@ -690,8 +717,8 @@ impl Runtime {
                     let live = self.live_cell_metrics();
                     let fid = self.focused_view().or(view_map.keys().next().copied());
                     if let Some(focused_id) = fid {
-                        if let Some((_, rect)) =
-                            allocations.iter().find(|(id, _)| *id == focused_id)
+                        if let Some(frame) =
+                            allocations.iter().find(|frame| frame.view == focused_id)
                         {
                             let rects = bitty_render::grid::selection_fill_rects(
                                 (norm.start.row, norm.start.col),
@@ -701,8 +728,8 @@ impl Runtime {
                                 live,
                             );
                             if !rects.is_empty() {
-                                let origin_px_x = px_origin(rect.x, live.width, pad_px);
-                                let origin_px_y = px_origin(rect.y, live.height, pad_px);
+                                let origin_px_x = px_add(pad_px, frame.content.x);
+                                let origin_px_y = px_add(pad_px, frame.content.y);
                                 for mut fill in rects {
                                     fill.rect.x = px_add(fill.rect.x, origin_px_x);
                                     fill.rect.y = px_add(fill.rect.y, origin_px_y);
@@ -721,7 +748,7 @@ impl Runtime {
             if !preedit.is_empty() && self.focused {
                 // Determine focused view allocation origin and cursor pixel position.
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some((vid, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
+                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
                         let live = self.live_cell_metrics();
                         // CTX-0176: the preedit overlay tracks the focused
                         // leaf's cursor, so IME lands on the pane receiving
@@ -731,8 +758,8 @@ impl Runtime {
                             .and_then(|focused| self.pane_sessions.get(&focused))
                             .map(|sess| sess.state.snapshot().cursor.position)
                             .unwrap_or(snapshot.cursor.position);
-                        let origin_px_x = px_origin(rect.x, live.width, pad_px);
-                        let origin_px_y = px_origin(rect.y, live.height, pad_px);
+                        let origin_px_x = px_add(pad_px, frame.content.x);
+                        let origin_px_y = px_add(pad_px, frame.content.y);
                         let base_x = px_offset_cells(origin_px_x, cur.col, live.width);
                         let base_y = px_offset_cells(origin_px_y, cur.row, live.height);
                         // Simple IME overlay: underline background rect plus glyphs for preedit chars.
@@ -768,7 +795,6 @@ impl Runtime {
                             color: [0x33, 0x33, 0x33, 0xCC],
                         });
                         any_needs_draw = true;
-                        let _ = vid; // keep
                     }
                 }
             }
@@ -787,10 +813,10 @@ impl Runtime {
         if self.has_pending_paste() {
             if let Some(banner) = self.paste_banner_text_at(now) {
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
-                        if rect.height > 0 && rect.width > 0 {
+                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
+                        if frame.rows > 0 && frame.cols > 0 {
                             let live = self.live_cell_metrics();
-                            let max_cells = rect.width as usize;
+                            let max_cells = usize::from(frame.cols);
                             // Compact pill: only as wide as the text (clipped
                             // to the view), right-aligned so most of the row
                             // stays visible.
@@ -800,15 +826,15 @@ impl Runtime {
                             // (see `px_span_usize`/`px_span`) so hostile cell
                             // metrics cannot wrap the products or the sums.
                             let pill_w = px_span_usize(text_cells, live.width);
-                            let full_w = px_span(rect.width, live.width);
+                            let full_w = px_span(frame.cols, live.width);
                             let origin_px_x = px_add(
-                                px_origin(rect.x, live.width, pad_px),
+                                px_add(pad_px, frame.content.x),
                                 px_side(full_w.saturating_sub(pill_w)),
                             );
                             let banner_y = px_add(
                                 px_offset_cells(
-                                    px_origin(rect.y, live.height, 0),
-                                    rect.height.saturating_sub(1),
+                                    frame.content.y,
+                                    frame.rows.saturating_sub(1),
                                     live.height,
                                 ),
                                 pad_px,
@@ -847,21 +873,21 @@ impl Runtime {
         if self.has_pending_ws_close() {
             if let Some(banner) = self.ws_close_banner_text() {
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
-                        if rect.height > 0 && rect.width > 0 {
+                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
+                        if frame.rows > 0 && frame.cols > 0 {
                             let live = self.live_cell_metrics();
-                            let max_cells = rect.width as usize;
+                            let max_cells = usize::from(frame.cols);
                             let text_cells = banner.chars().count().min(max_cells).max(1);
                             let pill_w = px_span_usize(text_cells, live.width);
-                            let full_w = px_span(rect.width, live.width);
+                            let full_w = px_span(frame.cols, live.width);
                             let origin_px_x = px_add(
-                                px_origin(rect.x, live.width, pad_px),
+                                px_add(pad_px, frame.content.x),
                                 px_side(full_w.saturating_sub(pill_w)),
                             );
                             let banner_y = px_add(
                                 px_offset_cells(
-                                    px_origin(rect.y, live.height, 0),
-                                    rect.height.saturating_sub(1),
+                                    frame.content.y,
+                                    frame.rows.saturating_sub(1),
                                     live.height,
                                 ),
                                 pad_px,
@@ -959,8 +985,8 @@ impl Runtime {
                 .unwrap_or(false);
             if !scrolled {
                 if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some((_, rect)) = allocations.iter().find(|(id, _)| *id == fid) {
-                        if rect.width > 0 && rect.height > 0 {
+                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
+                        if frame.cols > 0 && frame.rows > 0 {
                             let live = self.live_cell_metrics();
                             let rich_metrics = bitty_rich::CellMetrics {
                                 width: live.width,
@@ -970,8 +996,8 @@ impl Runtime {
                             // (resolved above), so a pane's image tracks its
                             // pane's content — never the primary grid's.
                             let scrollback = kitty_origin_scrollback;
-                            let origin_px_x = px_origin(rect.x, live.width, pad_px);
-                            let origin_px_y = px_origin(rect.y, live.height, pad_px);
+                            let origin_px_x = px_add(pad_px, frame.content.x);
+                            let origin_px_y = px_add(pad_px, frame.content.y);
                             let mut budget = bitty_rich::KittyFrameBudget::new();
                             for placement in self
                                 .kitty_images
@@ -983,8 +1009,8 @@ impl Runtime {
                                 let Some(rect_px) = bitty_rich::KittyImageLayer::placement_rect(
                                     placement,
                                     rich_metrics,
-                                    rect.width,
-                                    rect.height,
+                                    frame.cols,
+                                    frame.rows,
                                     scrollback,
                                 ) else {
                                     continue;
@@ -1008,8 +1034,8 @@ impl Runtime {
                                     src_h: img.height,
                                     scrollback,
                                     cell: rich_metrics,
-                                    viewport_cols: rect.width,
-                                    viewport_rows: rect.height,
+                                    viewport_cols: frame.cols,
+                                    viewport_rows: frame.rows,
                                 };
                                 let Some(scaled) = self
                                     .kitty_raster_cache
@@ -1204,15 +1230,12 @@ impl Runtime {
 
 #[cfg(test)]
 mod present_origin_tests {
-    use super::{px_add, px_offset_cells, px_origin, px_side, px_span, px_span_usize};
+    use super::{px_add, px_offset_cells, px_side, px_span, px_span_usize};
 
     #[test]
     fn origins_are_exact_on_normal_config() {
         // 9x19 cells (default geometry), 8px pad: the helpers must agree
         // with plain arithmetic where nothing overflows.
-        assert_eq!(px_origin(0, 9, 8), 8);
-        assert_eq!(px_origin(80, 9, 8), 728);
-        assert_eq!(px_origin(24, 19, 8), 464);
         assert_eq!(px_add(100, 728), 828);
         assert_eq!(px_offset_cells(8, 3, 9), 35);
         assert_eq!(px_span(80, 9), 720);
@@ -1225,9 +1248,6 @@ mod present_origin_tests {
         // CTX-0253 F4: extreme cell metrics from hostile local config must
         // clip like compositors do (saturate), never wrap the old `as i32`
         // casts or overflow `i32` multiply/add (debug panic / release wrap).
-        assert_eq!(px_origin(u16::MAX, u32::MAX, i32::MAX), i32::MAX);
-        assert_eq!(px_origin(1, u32::MAX, 0), i32::MAX);
-        assert_eq!(px_origin(u16::MAX, 1, 0), u16::MAX as i32);
         assert_eq!(px_add(i32::MAX, 1), i32::MAX);
         assert_eq!(px_add(i32::MAX, i32::MAX), i32::MAX);
         assert_eq!(px_offset_cells(i32::MAX, u16::MAX, u32::MAX), i32::MAX);
@@ -1235,7 +1255,5 @@ mod present_origin_tests {
         assert_eq!(px_span(u16::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_span_usize(usize::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_side(u32::MAX), i32::MAX);
-        // Zero stays zero (no 1px floor: a zero inset is meaningful).
-        assert_eq!(px_origin(0, 9, 0), 0);
     }
 }

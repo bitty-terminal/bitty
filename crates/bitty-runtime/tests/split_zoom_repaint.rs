@@ -24,23 +24,25 @@
 
 use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, View, ViewId};
 
-/// Pixel bounds of one leaf tile: cell allocation translated exactly like
-/// the present layer (live cell metrics at scale 1.0 + physical padding).
+/// Pixel bounds of one leaf tile: the decorated content frame translated
+/// exactly like the present layer (physical px + window padding inset).
+/// CTX-0294: decoration (gaps/border) shrinks and offsets the content, so
+/// the tile scan follows the present frames, not the raw cell allocation.
 fn tile_pixels(rt: &Runtime, id: ViewId) -> (usize, usize, usize, usize) {
-    let cfg = rt.config();
-    let cw = usize::try_from(cfg.cell_width).expect("cell width fits");
-    let ch = usize::try_from(cfg.cell_height).expect("cell height fits");
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
-    let (_, rect) = rt
-        .layout_allocations()
+    let frame = rt
+        .present_frames()
         .into_iter()
-        .find(|(vid, _)| *vid == id)
-        .unwrap_or_else(|| panic!("leaf {id:?} must have an allocation"));
-    let x = usize::from(rect.x) * cw + pad;
-    let y = usize::from(rect.y) * ch + pad;
-    let w = usize::from(rect.width) * cw;
-    let h = usize::from(rect.height) * ch;
-    (x, y, w, h)
+        .find(|frame| frame.view == id)
+        .unwrap_or_else(|| panic!("leaf {id:?} must have a present frame"));
+    let x = usize::try_from(frame.content.x.max(0)).expect("content x fits") + pad;
+    let y = usize::try_from(frame.content.y.max(0)).expect("content y fits") + pad;
+    (
+        x,
+        y,
+        frame.content.width as usize,
+        frame.content.height as usize,
+    )
 }
 
 /// Seam tolerance for cross-tile glyph overhang (CTX-0234 CI fix).

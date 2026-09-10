@@ -16,7 +16,54 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
     UiRect::new(0, 0, w, h)
 }
 
+/// One live-present View frame in physical pixels (CTX-0294).
+///
+/// Produced by [`Runtime::present_frames`]: the accepted Core-owned
+/// decoration converted to physical px at the live DPI factor and composed
+/// with the CTX-0177 cell gaps. `frame` is the hit-test rectangle and
+/// `content` is the painted rectangle (inside the border); both are relative
+/// to the container origin, before the window-padding inset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentFrame {
+    /// View this frame paints.
+    pub view: ViewId,
+    /// Decoration-inclusive hit-test rectangle, physical px.
+    pub frame: bitty_render::geometry::RectPx,
+    /// Painted content rectangle inside the border, physical px.
+    pub content: bitty_render::geometry::RectPx,
+    /// Content grid columns derived from `content` (floor, at least 1).
+    pub cols: u16,
+    /// Content grid rows derived from `content` (floor, at least 1).
+    pub rows: u16,
+    /// Border thickness in physical px.
+    pub border: u16,
+    /// Corner radius in physical px (carried; painted by the present ring).
+    pub radius: u16,
+}
+
 impl Runtime {
+    /// Resizes the primary terminal grid to `cols` x `rows` (CTX-0294).
+    ///
+    /// `State::resize` rewraps width and height in one pass: every blank
+    /// row is a logical, so when the height shrinks by one with content at
+    /// the top, the bottom-align step keeps the blank tail and moves the
+    /// content row into scrollback (the grid then shows blanks). Resizing
+    /// width first at the current height (bottom-align is a no-op when the
+    /// row count is unchanged) and then applying height-only (truncate/pad,
+    /// top-preserving) keeps the visible content. Deterministic; two
+    /// damage generations. The underlying one-call behavior is tracked as a
+    /// term-state follow-up (CTX-0294 finding).
+    fn resize_primary_grid(&mut self, cols: usize, rows: usize) {
+        if cols == self.state.width() && rows == self.state.height() {
+            return;
+        }
+        if cols != self.state.width() {
+            let keep_rows = self.state.height();
+            let _ = self.state.resize(cols, keep_rows);
+        }
+        let _ = self.state.resize(cols, rows);
+    }
+
     /// Converts a physical cursor position to a grid cell coordinate using
     /// the live (DPI-scaled) cell metrics. Clamped to the current snapshot bounds.
     ///
@@ -39,8 +86,16 @@ impl Runtime {
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
         let pad_px = f64::from(self.window_padding_physical());
-        let gap_px_x = f64::from(self.config.gaps_out) * cell_w;
-        let gap_px_y = f64::from(self.config.gaps_out) * cell_h;
+        // CTX-0294: the accepted Core-owned decoration insets the content
+        // inside each frame, so the primary grid origin moves by the outer
+        // gap plus the border at the live DPI scale (CTX-0177 cell gaps_out
+        // below stays in cells). Positions over the decoration bands still
+        // clamp like before (total mapping, no None).
+        let scale = self.dpi_scale();
+        let deco = self.config.decoration;
+        let deco_px = (f64::from(deco.gaps_out) + f64::from(deco.border)) * scale;
+        let gap_px_x = f64::from(self.config.gaps_out) * cell_w + deco_px;
+        let gap_px_y = f64::from(self.config.gaps_out) * cell_h + deco_px;
         let col = if cell_w <= 0.0 {
             0
         } else {
@@ -153,6 +208,151 @@ impl Runtime {
             .map(|(id, _)| id)
     }
 
+    /// Live-present View frames in physical pixels (CTX-0294).
+    ///
+    /// The accepted CTX-0118 decoration is logical px; this is the render-time
+    /// step (spec rule 1) that converts it with the live DPI factor and
+    /// composes it with the CTX-0177 cell gaps in one solver pass. Frames are
+    /// relative to the container origin, before the window-padding inset:
+    /// the present path adds [`Self::window_padding_physical`] exactly like
+    /// the grid content translation it already owns, so decoration sits
+    /// inside the Window and padding stays Window chrome.
+    ///
+    /// Per frame: `frame` is the hit-test rectangle (decoration-inclusive),
+    /// `content` is the painted rectangle inside the border, and `cols`/`rows`
+    /// are the content grid dimensions derived from `content` at the live cell
+    /// metrics (floor, at least 1). The sub-cell remainder stays background,
+    /// which is what makes the composition fractional-cell. Pure and
+    /// deterministic; total for hostile containers/decoration.
+    #[must_use]
+    pub fn present_frames(&self) -> Vec<PresentFrame> {
+        let live = self.live_cell_metrics();
+        let cw = live.width;
+        let ch = live.height;
+        if cw == 0 || ch == 0 {
+            return Vec::new();
+        }
+        let area = UiRect::new(
+            (u32::from(self.container.x).saturating_mul(cw)).min(u32::from(u16::MAX)) as u16,
+            (u32::from(self.container.y).saturating_mul(ch)).min(u32::from(u16::MAX)) as u16,
+            (u32::from(self.container.width).saturating_mul(cw)).min(u32::from(u16::MAX)) as u16,
+            (u32::from(self.container.height).saturating_mul(ch)).min(u32::from(u16::MAX)) as u16,
+        );
+        let cell = (
+            u16::try_from(cw).unwrap_or(u16::MAX),
+            u16::try_from(ch).unwrap_or(u16::MAX),
+        );
+        let max_dim = u32::try_from(bitty_term_state::MAX_GRID_DIM).unwrap_or(u32::MAX);
+        self.layout
+            .layout_with_decoration_scaled(
+                area,
+                self.config.decoration,
+                self.dpi_scale(),
+                cell,
+                self.gaps(),
+            )
+            .into_iter()
+            .map(|(view, dv)| PresentFrame {
+                view,
+                frame: bitty_render::geometry::RectPx::new(
+                    i32::from(dv.frame.x),
+                    i32::from(dv.frame.y),
+                    u32::from(dv.frame.width),
+                    u32::from(dv.frame.height),
+                ),
+                content: bitty_render::geometry::RectPx::new(
+                    i32::from(dv.content.x),
+                    i32::from(dv.content.y),
+                    u32::from(dv.content.width),
+                    u32::from(dv.content.height),
+                ),
+                cols: (u32::from(dv.content.width) / cw).clamp(1, max_dim) as u16,
+                rows: (u32::from(dv.content.height) / ch).clamp(1, max_dim) as u16,
+                border: dv.border,
+                radius: dv.radius,
+            })
+            .collect()
+    }
+
+    /// Reflows leaf `View`s to the decorated content frames (CTX-0294).
+    ///
+    /// Origin is the content rectangle floored to whole cells (the sub-cell
+    /// remainder is painted as background and never claimed by a cell) and
+    /// size is the content-derived grid. The present path translates pixels
+    /// directly from [`PresentFrame`], so this exists for the cell-path
+    /// consumers — scroll bounds, selection clamping, scrollbar thumb
+    /// geometry — and for pane grid/PTY sizing.
+    pub(super) fn reflow_present_layout(&mut self, frames: &[PresentFrame]) {
+        let live = self.live_cell_metrics();
+        let cw = u32::from(u16::try_from(live.width).unwrap_or(u16::MAX)).max(1);
+        let ch = u32::from(u16::try_from(live.height).unwrap_or(u16::MAX)).max(1);
+        for frame in frames {
+            let x = (frame.content.x.max(0) as u32) / cw;
+            let y = (frame.content.y.max(0) as u32) / ch;
+            if let Some(view) = self.layout.find_leaf_mut(frame.view) {
+                view.reflow_to_rect(UiRect::new(
+                    x.min(u32::from(u16::MAX)) as u16,
+                    y.min(u32::from(u16::MAX)) as u16,
+                    frame.cols,
+                    frame.rows,
+                ));
+            }
+        }
+    }
+
+    /// Decorated hit-testing: physical cursor position to `(view, local cell)`
+    /// over the present frames (frame for hit testing, content for painting).
+    ///
+    /// Positions over the window-padding band, outside every frame, or in an
+    /// empty frame yield `None`. A position over the border ring belongs to
+    /// the frame and clamps to the nearest content cell, matching the accepted
+    /// spec rule 4 (radius never affects hit testing beyond the frame). Total
+    /// and deterministic; the CTX-0177 panel-path mapping
+    /// ([`Self::cursor_to_leaf_cell`]) is unchanged.
+    #[must_use]
+    pub fn cursor_to_present_cell(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad;
+        let y = pos.y - pad;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let frames = self.present_frames();
+        let (frame, content) = frames.iter().find_map(|frame| {
+            let rect = frame.frame;
+            if rect.width == 0 || rect.height == 0 {
+                return None;
+            }
+            let right = rect.x as f64 + f64::from(rect.width);
+            let bottom = rect.y as f64 + f64::from(rect.height);
+            if x >= f64::from(rect.x) && x < right && y >= f64::from(rect.y) && y < bottom {
+                Some((frame, frame.content))
+            } else {
+                None
+            }
+        })?;
+        let local_col = ((x - f64::from(content.x)) / cell_w).floor().max(0.0);
+        let local_row = ((y - f64::from(content.y)) / cell_h).floor().max(0.0);
+        if local_col > f64::from(u16::MAX) || local_row > f64::from(u16::MAX) {
+            return None;
+        }
+        let max_col = u32::from(frame.cols).saturating_sub(1);
+        let max_row = u32::from(frame.rows).saturating_sub(1);
+        Some((
+            frame.view,
+            CellPos::new(
+                (local_row as u32).min(max_row) as u16,
+                (local_col as u32).min(max_col) as u16,
+            ),
+        ))
+    }
+
     /// Maps a physical cursor position to its leaf and leaf-local cell
     /// (CTX-0177).
     ///
@@ -263,21 +463,19 @@ impl Runtime {
         }
         // Leaf Views carry their allocation from here (not deferred to the
         // next tick) so per-leaf geometry is inspectable immediately.
-        self.layout.reflow_with_gaps(self.container, self.gaps());
+        // CTX-0294: decorated content frames (px decoration + cell gaps).
+        let frames = self.present_frames();
+        self.reflow_present_layout(&frames);
         // Primary grid + primary PTY winsize (SIGWINCH path) follow the
         // focused leaf — the tile that shows primary input/cursor.
         if let Some(focused) = self.focus.focused() {
-            if let Some((_, rect)) = self
-                .layout_allocations()
-                .into_iter()
-                .find(|(id, _)| *id == focused)
-            {
-                let cols = rect.width.max(1) as usize;
-                let rows = rect.height.max(1) as usize;
+            if let Some(frame) = frames.iter().find(|frame| frame.view == focused) {
+                let cols = usize::from(frame.cols.max(1));
+                let rows = usize::from(frame.rows.max(1));
                 if self.state.width() != cols || self.state.height() != rows {
-                    let _ = self.state.resize(cols, rows);
+                    self.resize_primary_grid(cols, rows);
                     if let Some(pty) = self.pty.as_mut() {
-                        let _ = pty.resize(rect.width.max(1), rect.height.max(1));
+                        let _ = pty.resize(frame.cols.max(1), frame.rows.max(1));
                     }
                 }
             }

@@ -912,6 +912,7 @@ impl EffectiveConfig {
         self.layout.validate()?;
         self.decoration.validate()?;
         self.scrollbar.validate()?;
+        self.mouse.validate()?;
         self.appearance.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
@@ -1256,6 +1257,34 @@ mod tests {
         EffectiveConfig::default()
             .validate()
             .expect("default valid");
+    }
+
+    #[test]
+    fn effective_validate_calls_every_section_validator() {
+        // CTX-0303: commit 117381b (CTX-0292) silently dropped
+        // `self.mouse.validate()?;` from EffectiveConfig::validate. The call is
+        // currently behavior-neutral (MouseConfig::validate is total and
+        // ConfigPlan::validate still validates mouse), so pin it structurally
+        // by scanning production source only. The `#[cfg(test)]` region is
+        // excluded so this test cannot satisfy itself.
+        let src = include_str!("types.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for call in [
+            "self.font.validate()?;",
+            "self.window.validate()?;",
+            "self.terminal.validate()?;",
+            "self.selection.validate()?;",
+            "self.layout.validate()?;",
+            "self.decoration.validate()?;",
+            "self.scrollbar.validate()?;",
+            "self.mouse.validate()?;",
+            "self.appearance.validate()?;",
+        ] {
+            assert!(
+                prod.contains(call),
+                "EffectiveConfig::validate must call {call}"
+            );
+        }
     }
 
     #[test]

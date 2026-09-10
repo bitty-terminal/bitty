@@ -13,20 +13,18 @@
 //! The scrollbar is presentation-only, like the selection highlight and the
 //! paste banner: the runtime paints a [`ThumbSpan`] as `FillRect`s in the
 //! present layer and never touches grid truth, scrollback, or layout. The
-//! track lives **inside** the focused leaf's pixel allocation (right edge),
-//! so enabling or hiding the scrollbar never changes grid geometry —
+//! track lives **inside** the focused leaf's decorated content frame (right
+//! edge), so enabling or hiding the scrollbar never changes grid geometry —
 //! `hidden` (the default) adds zero fills and zero layout delta.
 //!
 //! # Coordinate model
 //!
-//! All pixel values are physical pixels at the live DPI scale (the same
-//! space as [`crate::geometry`] consumers in `bitty-runtime`, which convert
-//! cell allocations via the live cell metrics). Gap bands (CTX-0177) and the
-//! window padding inset (CTX-0223) enter only through [`track_rect`]'s
-//! explicit origin/inset parameters, so hit-testing accounts for them by
-//! construction: the caller passes the gapped leaf allocation plus the
-//! physical padding, and positions over padding/gap bands never resolve
-//! into the track.
+//! All pixel values are physical pixels at the live DPI scale. The track is
+//! resolved from the **decorated content frame** — the CTX-0294 present
+//! rectangle inside the decoration border — plus the window padding inset
+//! (CTX-0223): the caller passes the painted content rectangle, and
+//! positions over the decoration gap/border bands or the padding band never
+//! resolve into the track.
 //!
 //! # Scroll direction
 //!
@@ -147,65 +145,57 @@ impl TrackRect {
     }
 }
 
-/// Inputs resolving an overlay track: the gapped leaf allocation in cells
-/// plus pixel metrics. One struct keeps the resolver total without arity
-/// lint pressure and keeps gaps/padding offsets explicit at call sites.
+/// Inputs resolving an overlay track: the decorated content frame in
+/// physical pixels plus the padding inset. One struct keeps the resolver
+/// total without arity lint pressure and keeps the frame/padding offsets
+/// explicit at call sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrackSpec {
-    /// Gapped leaf allocation in cells (gap-aware layout output, CTX-0177).
-    pub leaf: crate::geometry::Rect,
-    /// Live cell width in physical pixels.
-    pub cell_w_px: u32,
-    /// Live cell height in physical pixels.
-    pub cell_h_px: u32,
+    /// Decorated content frame origin x in window physical pixels (CTX-0294
+    /// present frame, before the window-padding inset).
+    pub content_x: i32,
+    /// Decorated content frame origin y in window physical pixels.
+    pub content_y: i32,
+    /// Decorated content frame width in physical pixels.
+    pub content_w: u32,
+    /// Decorated content frame height in physical pixels.
+    pub content_h: u32,
     /// Window padding inset in physical pixels (CTX-0223).
     pub pad_px: u32,
     /// Thumb width in physical pixels.
     pub width_px: u32,
 }
 
-/// Computes the overlay track rectangle for a leaf allocation.
+/// Computes the overlay track rectangle for a decorated content frame.
 ///
-/// The track hugs the leaf's right edge **inside** the allocation (overlay:
-/// grid columns keep their cells) and spans the full leaf height. Gaps
-/// (CTX-0177) and padding (CTX-0223) are accounted for by the caller passing
-/// the gapped leaf allocation plus the physical padding inset — positions
-/// over padding/gap bands fall outside the returned rect by construction.
+/// CTX-0313: the input is the *painted* content frame — the CTX-0294
+/// present rectangle inside the decoration border — so the track hugs the
+/// content edge instead of the raw cell allocation and never covers the
+/// decoration gap/border bands. The physical window padding (CTX-0223) is
+/// added by the resolver, exactly like the present layer's content
+/// translation. The track is `width_px` wide and spans the full content
+/// height.
 ///
-/// Returns `None` for degenerate inputs (zero cells, zero cell metrics,
-/// thumb wider than the leaf): the caller paints nothing.
+/// Returns `None` for degenerate inputs (zero-size frame, zero thumb width,
+/// thumb wider than the content): the caller paints nothing.
 #[must_use]
 pub fn track_rect(spec: TrackSpec) -> Option<TrackRect> {
     let TrackSpec {
-        leaf,
-        cell_w_px,
-        cell_h_px,
+        content_x,
+        content_y,
+        content_w,
+        content_h,
         pad_px,
         width_px,
     } = spec;
-    let (leaf_origin_x_cells, leaf_origin_y_cells) = (leaf.x, leaf.y);
-    let (leaf_width_cells, leaf_height_cells) = (leaf.width, leaf.height);
-    if leaf_width_cells == 0
-        || leaf_height_cells == 0
-        || cell_w_px == 0
-        || cell_h_px == 0
-        || width_px == 0
-    {
+    if content_w == 0 || content_h == 0 || width_px == 0 || content_w < width_px {
         return None;
     }
-    let leaf_w_px = u64::from(leaf_width_cells).saturating_mul(u64::from(cell_w_px));
-    let leaf_h_px = u64::from(leaf_height_cells).saturating_mul(u64::from(cell_h_px));
-    if leaf_w_px < u64::from(width_px) || leaf_h_px == 0 {
-        return None;
-    }
-    let x = i64::from(leaf_origin_x_cells)
-        .saturating_mul(i64::from(cell_w_px))
+    let x = i64::from(content_x)
         .saturating_add(i64::from(pad_px))
-        .saturating_add(leaf_w_px.min(i64::MAX as u64) as i64)
+        .saturating_add(i64::from(content_w))
         .saturating_sub(i64::from(width_px));
-    let y = i64::from(leaf_origin_y_cells)
-        .saturating_mul(i64::from(cell_h_px))
-        .saturating_add(i64::from(pad_px));
+    let y = i64::from(content_y).saturating_add(i64::from(pad_px));
     if x < 0 || y < 0 {
         return None;
     }
@@ -213,7 +203,7 @@ pub fn track_rect(spec: TrackSpec) -> Option<TrackRect> {
         x: x.min(i64::from(i32::MAX)) as i32,
         y: y.min(i64::from(i32::MAX)) as i32,
         width: width_px,
-        height: leaf_h_px.min(u64::from(u32::MAX)) as u32,
+        height: content_h,
     })
 }
 
@@ -427,39 +417,46 @@ mod tests {
     }
 
     #[test]
-    fn track_rect_accounts_for_gaps_and_padding() {
-        use crate::geometry::Rect;
-        let spec = |x, y, w, h, cw, ch, pad, width| TrackSpec {
-            leaf: Rect::new(x, y, w, h),
-            cell_w_px: cw,
-            cell_h_px: ch,
+    fn track_rect_hugs_decorated_content_frame() {
+        let spec = |x, y, w, h, pad, width| TrackSpec {
+            content_x: x,
+            content_y: y,
+            content_w: w,
+            content_h: h,
             pad_px: pad,
             width_px: width,
         };
-        // Leaf at container-cell origin (2, 1) — e.g. past gaps_out + a
-        // sibling — 80x24 cells of 9x19px with 8px padding, 8px thumb.
-        let track = track_rect(spec(2, 1, 80, 24, 9, 19, 8, 8)).expect("track");
+        // Decorated content frame at (16, 27), 704x440, with 8px padding and
+        // an 8px thumb: the track hugs the content right edge, offset by the
+        // padding, spanning the full content height.
+        let track = track_rect(spec(16, 27, 704, 440, 8, 8)).expect("track");
         assert_eq!(
             track,
             TrackRect {
-                // x = 2*9 + 8 + 80*9 - 8 = 738, y = 1*19 + 8 = 27.
-                x: 738,
-                y: 27,
+                // x = 16 + 8 + 704 - 8 = 720, y = 27 + 8 = 35.
+                x: 720,
+                y: 35,
                 width: 8,
-                height: 24 * 19,
+                height: 440,
             }
         );
-        // Zero origin (no gaps, edge-to-edge): track hugs the right edge
-        // inside the leaf, translated by padding only.
-        let plain = track_rect(spec(0, 0, 80, 24, 9, 19, 8, 8)).expect("track");
-        assert_eq!(plain.x, 80 * 9 + 8 - 8);
-        assert_eq!(plain.y, 8);
+        // Zero-origin content, no padding: flush at the content right edge.
+        let plain = track_rect(spec(0, 0, 704, 440, 0, 8)).expect("track");
+        assert_eq!(
+            plain,
+            TrackRect {
+                x: 696,
+                y: 0,
+                width: 8,
+                height: 440,
+            }
+        );
         // Degenerate inputs paint nothing.
-        assert_eq!(track_rect(spec(0, 0, 0, 24, 9, 19, 8, 8)), None);
-        assert_eq!(track_rect(spec(0, 0, 80, 24, 0, 19, 8, 8)), None);
-        assert_eq!(track_rect(spec(0, 0, 80, 24, 9, 19, 8, 0)), None);
-        // Thumb wider than the leaf: nothing (never underflow the x math).
-        assert_eq!(track_rect(spec(0, 0, 1, 24, 4, 19, 0, 8)), None);
+        assert_eq!(track_rect(spec(0, 0, 0, 440, 8, 8)), None);
+        assert_eq!(track_rect(spec(0, 0, 704, 0, 8, 8)), None);
+        assert_eq!(track_rect(spec(0, 0, 704, 440, 8, 0)), None);
+        // Thumb wider than the content: nothing (never underflow the x math).
+        assert_eq!(track_rect(spec(0, 0, 4, 440, 0, 8)), None);
     }
 
     #[test]

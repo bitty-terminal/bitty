@@ -215,8 +215,7 @@ mod spawn;
 
 use chrome_keys::AppModifiers;
 use config_cli::{
-    config_usage, load_app_config, load_merged_config, run_config_subcommand,
-    runtime_config_from_effective,
+    config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective,
 };
 use init::run_init_subcommand;
 use layout_cmd::{
@@ -1630,407 +1629,6 @@ fn version_text() -> String {
 // `bitty doctor` installation and compatibility diagnosis (CTX-0175)
 // ---------------------------------------------------------------------------
 
-/// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
-const DOCTOR_CLIPBOARD_CANDIDATES: &[&str] = &["wl-copy", "xclip", "xsel"];
-
-/// Returns true when `path` is executable (Unix exec bits; Windows: exists).
-fn doctor_shell_executable(path: &std::path::Path) -> bool {
-    #[cfg(windows)]
-    {
-        path.exists()
-    }
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path)
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-}
-
-/// Collects live inputs for one doctor run.
-///
-/// Impure (environment, filesystem, bounded external probes) and total (every
-/// probe degrades to warn/inconclusive instead of panicking). Reuses the
-/// `config check` load path (`load_merged_config`) so an invalid config file
-/// becomes a failing `config` check (exit 3) rather than a startup abort. No
-/// plugin VM is ever loaded (safe-mode posture); all external commands run
-/// under `doctor::run_bounded` (no shell, no pipes, kill by PID on timeout).
-fn collect_doctor_inputs(args: &Args) -> doctor::DoctorInputs {
-    let version = version_text();
-    let (exe_ok, exe_detail) = match std::env::current_exe() {
-        Ok(path) => (true, path.display().to_string()),
-        Err(_) => (false, String::new()),
-    };
-    let (config, keymaps, font_chain) = match load_merged_config(args) {
-        Ok(loaded) => {
-            let file_path = loaded
-                .probed
-                .as_ref()
-                .filter(|probe| probe.path.exists())
-                .map(|probe| probe.path.clone());
-            let config = if let Some(path) = file_path.as_ref() {
-                doctor::ConfigInput::Ok {
-                    source: format!("file: {}", path.display()),
-                }
-            } else if let Some(path) = loaded.profile_path.as_ref() {
-                doctor::ConfigInput::Ok {
-                    source: format!("profile: {}", path.display()),
-                }
-            } else {
-                doctor::ConfigInput::Missing
-            };
-            let keymaps = match bitty_config::keymap::resolve_keymaps(&loaded.merged.effective) {
-                Ok(maps) => doctor::KeymapInput::Ok(maps.len()),
-                Err(err) => doctor::KeymapInput::Err(err.to_string()),
-            };
-            let chain = loaded.merged.effective.font.fallback_chain();
-            (config, keymaps, chain)
-        }
-        Err(message) => {
-            let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect();
-            (
-                doctor::ConfigInput::Invalid(message),
-                doctor::KeymapInput::Skipped,
-                chain,
-            )
-        }
-    };
-    let font_tool_available = doctor::find_on_path("fc-match").is_some();
-    let families: Vec<(String, bool)> = font_chain
-        .into_iter()
-        .map(|family| {
-            let present = doctor::probe_font(&family).unwrap_or(false);
-            (family, present)
-        })
-        .collect();
-    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
-    let x11 = std::env::var("DISPLAY").ok();
-    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
-    let dri_cards = doctor::dri_card_count();
-    let clipboard_backends: Vec<String> = DOCTOR_CLIPBOARD_CANDIDATES
-        .iter()
-        .filter_map(|name| doctor::find_on_path(name).map(|_| (*name).to_string()))
-        .collect();
-    #[cfg(windows)]
-    let (pty_available, pty_detail) = (true, "ConPTY available (Windows)".to_string());
-    #[cfg(not(windows))]
-    let (pty_available, pty_detail) = {
-        let path = std::path::Path::new("/dev/ptmx");
-        if path.exists() {
-            (true, "/dev/ptmx present".to_string())
-        } else {
-            (false, "/dev/ptmx missing".to_string())
-        }
-    };
-    let term = std::env::var("TERM")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let terminfo_found = match term.as_deref() {
-        None => None,
-        Some(name) => doctor::probe_terminfo(name),
-    };
-    let shell = std::env::var("SHELL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let (shell_exists, shell_executable) = match shell.as_deref() {
-        None => (false, false),
-        Some(name) => {
-            let path = std::path::Path::new(name);
-            let exists = path.exists();
-            let executable = if exists {
-                doctor_shell_executable(path)
-            } else {
-                false
-            };
-            (exists, executable)
-        }
-    };
-    doctor::DoctorInputs {
-        version,
-        exe_ok,
-        exe_detail,
-        config,
-        keymaps,
-        font_tool_available,
-        families,
-        wayland,
-        x11,
-        session_type,
-        dri_cards,
-        clipboard_backends,
-        pty_available,
-        pty_detail,
-        term,
-        terminfo_found,
-        shell,
-        shell_exists,
-        shell_executable,
-    }
-}
-
-/// Runs `bitty doctor`; returns the process exit code.
-///
-/// - Extra positionals and unknown `--format` shapes fail closed (exit 2).
-/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
-///   (`v: 1`, `command: "doctor"`) on stdout with diagnostics on stderr so
-///   machine output is never corrupted.
-/// - Exit `0` when every check passes (warns allowed), `1` on recoverable
-///   failure, else the strongest category code (3 config, 5 compat, 8
-///   conflict) per the accepted CLI contract.
-fn run_doctor_subcommand(args: &Args) -> i32 {
-    if !args.doctor_args.is_empty() {
-        eprintln!(
-            "bitty doctor: unexpected argument '{}'\n{}",
-            args.doctor_args[0],
-            doctor::doctor_usage()
-        );
-        return doctor::EXIT_USAGE;
-    }
-    let format = match doctor::DoctorFormat::parse(args.doctor_format.as_deref()) {
-        Ok(format) => format,
-        Err(message) => {
-            eprintln!("{message}\n{}", doctor::doctor_usage());
-            return doctor::EXIT_USAGE;
-        }
-    };
-    let inputs = collect_doctor_inputs(args);
-    let report = doctor::assemble_report(&inputs);
-    match format {
-        doctor::DoctorFormat::Table => {
-            let no_color = args.doctor_no_color || std::env::var("NO_COLOR").is_ok();
-            print!("{}", doctor::format_table(&report, no_color));
-        }
-        doctor::DoctorFormat::Json | doctor::DoctorFormat::Jsonl => {
-            println!("{}", doctor::format_json(&report));
-        }
-    }
-    report.exit_code()
-}
-
-/// Runs `bitty ctl`; returns the process exit code.
-///
-/// - `--help` (anywhere in `ctl_raw`) prints help to stdout, exit 0, and
-///   never requires an instance.
-/// - Global `--socket`/`--instance`/`--format` before the `ctl` word merge
-///   with per-`ctl` flags (per-`ctl` wins when only one side sets a value;
-///   conflicting values are usage errors, exit 2).
-/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
-/// - Runtime verbs resolve targeting and speak IPC; exit codes follow the
-///   stable v1 mapping (0 ok, 6 unavailable, 7 permission, 8 conflict).
-fn run_ctl_subcommand(args: &Args) -> i32 {
-    match ctl::parse_ctl_request(&args.ctl_raw) {
-        Err(ctl::CtlParseError::Help) => {
-            print!("{}", ctl::ctl_help_text());
-            0
-        }
-        Err(err) => {
-            eprintln!("{}\n{}", err.message(), ctl::ctl_usage());
-            ctl::EXIT_USAGE
-        }
-        Ok((request, mut targeting)) => {
-            // Merge global pre-`ctl` targeting: per-`ctl` flags win when
-            // only one side sets a value; differing values are conflicts.
-            if let Some(pre) = args.ctl_socket_pre.as_deref() {
-                match targeting.socket.as_deref() {
-                    None => targeting.socket = Some(pre.to_string()),
-                    Some(post) if post == pre => {}
-                    Some(post) => {
-                        eprintln!(
-                            "bitty ctl: conflicting --socket {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
-                            ctl::ctl_usage()
-                        );
-                        return ctl::EXIT_USAGE;
-                    }
-                }
-            }
-            if let Some(pre) = args.ctl_instance_pre.as_deref() {
-                match targeting.instance.as_deref() {
-                    None => targeting.instance = Some(pre.to_string()),
-                    Some(post) if post == pre => {}
-                    Some(post) => {
-                        eprintln!(
-                            "bitty ctl: conflicting --instance {pre:?} vs {post:?} (pass once; see `bitty ctl --help`)\n{}",
-                            ctl::ctl_usage()
-                        );
-                        return ctl::EXIT_USAGE;
-                    }
-                }
-            }
-            // Global --format before `ctl` applies when `ctl` set none.
-            // `parse_ctl_request` defaults to table, so detect an explicit
-            // post-`ctl` format by re-scanning `ctl_raw` for the flag.
-            let post_has_format = args
-                .ctl_raw
-                .iter()
-                .any(|t| t == "--format" || t.starts_with("--format="));
-            if !post_has_format {
-                if let Some(global) = args.doctor_format.as_deref() {
-                    match ctl::CtlFormat::parse(Some(global)) {
-                        Ok(fmt) => targeting.format = fmt,
-                        Err(message) => {
-                            eprintln!("{message}\n{}", ctl::ctl_usage());
-                            return ctl::EXIT_USAGE;
-                        }
-                    }
-                }
-            }
-            ctl::execute_ctl(&request, &targeting)
-        }
-    }
-}
-
-/// Runs `bitty dev <verb>`; returns the process exit code.
-///
-/// - `--help` (anywhere in `dev_raw`, or `bitty --help dev`) prints help to
-///   stdout, exit 0, and never builds a runtime.
-/// - Global `--format`/`--no-color` before the `dev` word compose with
-///   post-`dev` flags (post-`dev` `--format` wins when both set it; both
-///   unset means table).
-/// - Global `--socket`/`--instance` before the `dev` word are usage errors
-///   (exit 2): dev is local-only and never touches IPC discovery.
-/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
-/// - Post-parse failures (headless runtime/renderer) are generic errors
-///   (exit 1) with ok:false envelopes for json/jsonl.
-fn run_dev_subcommand(args: &Args) -> i32 {
-    match dev::parse_dev_request(&args.dev_raw) {
-        Err(dev::DevParseError::Help) => {
-            print!("{}", dev::dev_help_text());
-            0
-        }
-        Err(err) => {
-            eprintln!("{}", err.message());
-            dev::EXIT_USAGE
-        }
-        Ok((request, mut options)) => {
-            // Global --format before `dev` applies when `dev` set none.
-            let post_has_format = args
-                .dev_raw
-                .iter()
-                .any(|t| t == "--format" || t.starts_with("--format="));
-            if !post_has_format {
-                if let Some(global) = args.dev_format.as_deref() {
-                    match dev::DevFormat::parse(Some(global)) {
-                        Ok(fmt) => options.format = fmt,
-                        Err(message) => {
-                            eprintln!("{message}\n{}", dev::dev_usage());
-                            return dev::EXIT_USAGE;
-                        }
-                    }
-                }
-            }
-            // Global --no-color composes (tables are plain; accepted for parity).
-            if args.dev_no_color {
-                options.no_color = true;
-            }
-            // Local-only: pre-word --socket/--instance are rejected (post-word
-            // spellings are already rejected by `parse_dev_request`).
-            if let Some(socket) = args.dev_socket_pre.as_deref() {
-                eprintln!(
-                    "bitty dev: --socket {socket:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
-                    dev::dev_usage()
-                );
-                return dev::EXIT_USAGE;
-            }
-            if let Some(instance) = args.dev_instance_pre.as_deref() {
-                eprintln!(
-                    "bitty dev: --instance {instance:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
-                    dev::dev_usage()
-                );
-                return dev::EXIT_USAGE;
-            }
-            dev::run_dev(&request, &options)
-        }
-    }
-}
-
-/// Runs `bitty list <kind>`; returns the process exit code.
-///
-/// - Extra positionals, unknown kinds, bad `--format`/`--socket`/`--instance`,
-///   and stray `--` fail closed (exit 2, stderr only, no stdout envelope).
-/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
-///   (`v: 1`, `command: "list"|"ls"`) on stdout with diagnostics on stderr.
-/// - `instances` runtime/permission failures emit ok:false envelopes for
-///   json/jsonl (exit 6/7) and stderr-only for table.
-fn run_list_subcommand(args: &Args) -> i32 {
-    if !args.list_args.is_empty() {
-        eprintln!(
-            "bitty {}: unexpected argument '{}'\n{}",
-            args.list_spelling,
-            args.list_args[0],
-            list::list_usage()
-        );
-        return list::EXIT_USAGE;
-    }
-    let request = match list::ListRequest::validate(
-        args.list_kind.as_deref(),
-        args.list_format.as_deref(),
-        args.list_socket.as_deref(),
-        args.list_instance.as_deref(),
-        args.list_no_color,
-        &args.list_spelling,
-    ) {
-        Ok(req) => req,
-        Err(message) => {
-            eprintln!("{message}");
-            return list::EXIT_USAGE;
-        }
-    };
-    list::run_list(&request)
-}
-
-/// Runs `bitty inspect <target> <value>`; returns the process exit code.
-///
-/// - Extra positionals, unknown targets, missing values, bad `--format`,
-///   stray `--`, and `--socket`/`--instance` alongside `inspect` fail closed
-///   (exit 2, stderr only, no stdout envelope). `inspect` is local-only: no
-///   targeting flag ever applies.
-/// - Table goes to stdout for humans; JSON/JSONL emit the versioned envelope
-///   (`v: 1`, `command: "inspect"`) on stdout with diagnostics on stderr.
-/// - Well-formed but unknown values emit `ok: false` envelopes for json/jsonl
-///   (exit 1, class `NotFound`) and stderr-only diagnostics for table.
-fn run_inspect_subcommand(args: &Args) -> i32 {
-    if !args.inspect_args.is_empty() {
-        eprintln!(
-            "bitty inspect: unexpected argument '{}'\n{}",
-            args.inspect_args[0],
-            inspect::inspect_usage()
-        );
-        return inspect::EXIT_USAGE;
-    }
-    // Local-only: targeting flags never apply to `inspect` (no instance is
-    // contacted). Fail closed rather than silently ignoring them.
-    if args.ctl_socket_pre.is_some()
-        || args.ctl_instance_pre.is_some()
-        || args.list_socket.is_some()
-        || args.list_instance.is_some()
-    {
-        eprintln!(
-            "bitty inspect: --socket/--instance do not apply (inspect is local, no instance)\n{}",
-            inspect::inspect_usage()
-        );
-        return inspect::EXIT_USAGE;
-    }
-    let request = match inspect::InspectRequest::validate(
-        args.inspect_target.as_deref(),
-        args.inspect_value.as_deref(),
-        args.inspect_format.as_deref(),
-        args.inspect_no_color,
-    ) {
-        Ok(req) => req,
-        Err(message) => {
-            eprintln!("{message}");
-            return inspect::EXIT_USAGE;
-        }
-    };
-    inspect::run_inspect(&request)
-}
-
 /// Window title carrying the resolved theme preset and its source layer.
 ///
 /// Visible via `hyprctl clients` and (where decorations show) the title bar,
@@ -2769,7 +2367,7 @@ fn main() {
     // before config load: an invalid config is a reported failing check
     // (exit 3), not a startup abort, and no plugin VM is ever loaded.
     if args.doctor_word {
-        std::process::exit(run_doctor_subcommand(&args));
+        std::process::exit(doctor::run_cli(&args));
     }
 
     // `bitty ctl` runtime control (CTX-0171, runtime class). Dispatched
@@ -2778,7 +2376,7 @@ fn main() {
     // targeting and speak the versioned IPC protocol. Parse failures are
     // usage errors (exit 2).
     if args.ctl_word {
-        std::process::exit(run_ctl_subcommand(&args));
+        std::process::exit(ctl::run_cli(&args));
     }
 
     // `bitty list <kind>` enumeration (CTX-0172). Local kinds never touch
@@ -2786,7 +2384,7 @@ fn main() {
     // before config loading so `list` works with a missing or invalid
     // config file (safe-mode clean, no plugin VM).
     if args.list_word {
-        std::process::exit(run_list_subcommand(&args));
+        std::process::exit(list::run_cli(&args));
     }
 
     // `bitty inspect <target> <value>` state and ownership (CTX-0173, local
@@ -2794,7 +2392,7 @@ fn main() {
     // a missing or invalid config file: every target resolves from built-in
     // defaults and static manifests (no file I/O, no instance, no VM).
     if args.inspect_word {
-        std::process::exit(run_inspect_subcommand(&args));
+        std::process::exit(inspect::run_cli(&args));
     }
 
     // `bitty dev <verb>` tracing, captures, dumps, overlays (CTX-0174,
@@ -2802,7 +2400,7 @@ fn main() {
     // instance, no IPC, no plugin VM. Parse failures are usage errors
     // (exit 2); post-parse failures are generic errors (exit 1).
     if args.dev_word {
-        std::process::exit(run_dev_subcommand(&args));
+        std::process::exit(dev::run_cli(&args));
     }
 
     // `bitty plugin` CLI-first management (CTX-0150, DEC-0007). Local class:

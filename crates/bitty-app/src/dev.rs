@@ -1654,6 +1654,76 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
 // `crates/bitty-app/tests/cli_dev.rs`)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// `bitty dev` CLI entry point (relocated from `main.rs`, CTX-0305)
+// ---------------------------------------------------------------------------
+
+use crate::Args;
+
+/// Runs `bitty dev <verb>`; returns the process exit code.
+///
+/// - `--help` (anywhere in `dev_raw`, or `bitty --help dev`) prints help to
+///   stdout, exit 0, and never builds a runtime.
+/// - Global `--format`/`--no-color` before the `dev` word compose with
+///   post-`dev` flags (post-`dev` `--format` wins when both set it; both
+///   unset means table).
+/// - Global `--socket`/`--instance` before the `dev` word are usage errors
+///   (exit 2): dev is local-only and never touches IPC discovery.
+/// - Other parse failures print the diagnostic plus usage to stderr (exit 2).
+/// - Post-parse failures (headless runtime/renderer) are generic errors
+///   (exit 1) with ok:false envelopes for json/jsonl.
+pub(crate) fn run_cli(args: &Args) -> i32 {
+    match parse_dev_request(&args.dev_raw) {
+        Err(DevParseError::Help) => {
+            print!("{}", dev_help_text());
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", err.message());
+            EXIT_USAGE
+        }
+        Ok((request, mut options)) => {
+            // Global --format before `dev` applies when `dev` set none.
+            let post_has_format = args
+                .dev_raw
+                .iter()
+                .any(|t| t == "--format" || t.starts_with("--format="));
+            if !post_has_format {
+                if let Some(global) = args.dev_format.as_deref() {
+                    match DevFormat::parse(Some(global)) {
+                        Ok(fmt) => options.format = fmt,
+                        Err(message) => {
+                            eprintln!("{message}\n{}", dev_usage());
+                            return EXIT_USAGE;
+                        }
+                    }
+                }
+            }
+            // Global --no-color composes (tables are plain; accepted for parity).
+            if args.dev_no_color {
+                options.no_color = true;
+            }
+            // Local-only: pre-word --socket/--instance are rejected (post-word
+            // spellings are already rejected by `parse_dev_request`).
+            if let Some(socket) = args.dev_socket_pre.as_deref() {
+                eprintln!(
+                    "bitty dev: --socket {socket:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
+                    dev_usage()
+                );
+                return EXIT_USAGE;
+            }
+            if let Some(instance) = args.dev_instance_pre.as_deref() {
+                eprintln!(
+                    "bitty dev: --instance {instance:?} is rejected (dev is local-only: no instance, no IPC)\n{}",
+                    dev_usage()
+                );
+                return EXIT_USAGE;
+            }
+            run_dev(&request, &options)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

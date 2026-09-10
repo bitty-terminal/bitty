@@ -1659,27 +1659,86 @@ fn fill_rounded_rect_rgba(
     if right <= left || bottom <= top {
         return;
     }
-    let [cr, cg, cb, ca] = fill.color;
-    for y in top..bottom {
-        let row = y as usize * width as usize;
-        for x in left..right {
-            let coverage = fill.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
-            if coverage <= 0.0 {
-                continue;
+    if fill.border == 0 {
+        // Solid rounded fill: the whole frame carries coverage (not used by
+        // the decoration ring path).
+        for y in top..bottom {
+            for x in left..right {
+                blend_rounded_pixel_rgba(rgba, width, fill, x, y);
             }
-            let coverage = (coverage * 255.0 + 0.5).min(255.0) as u32;
-            let sa = (coverage * u32::from(ca)) / 255;
-            let src_r = ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8;
-            let src_g = ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8;
-            let src_b = ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8;
-            let src_a = sa.min(255) as u8;
-            let d = (row + x as usize) * 4;
-            let inv = 255 - u32::from(src_a);
-            rgba[d] = src_r.saturating_add((u32::from(rgba[d]) * inv / 255) as u8);
-            rgba[d + 1] = src_g.saturating_add((u32::from(rgba[d + 1]) * inv / 255) as u8);
-            rgba[d + 2] = src_b.saturating_add((u32::from(rgba[d + 2]) * inv / 255) as u8);
-            rgba[d + 3] = src_a.saturating_add((u32::from(rgba[d + 3]) * inv / 255) as u8);
         }
+        return;
+    }
+    // Ring hot path (CTX-0311): only the border band and the four corner
+    // squares can carry coverage. Iterate just those runs so interior
+    // rows/columns never touch `coverage_at` (the soak/latency budgets
+    // depend on this). Mirrors `software::SurfaceRgba::fill_rounded_rect`.
+    let fx0 = i64::from(fill.frame.x);
+    let fy0 = i64::from(fill.frame.y);
+    let fx1 = fx0 + i64::from(fill.frame.width);
+    let fy1 = fy0 + i64::from(fill.frame.height);
+    let band = i64::from(
+        u32::from(fill.border)
+            .min(fill.frame.width)
+            .min(fill.frame.height),
+    ) + 1;
+    let cs = (fill.resolved_radius().ceil() as i64) + 1;
+    let mid_left_end = (fx0 + band).min(right);
+    let mid_right_start = (fx1 - band).max(left).max(mid_left_end);
+    let cor_left_end = (fx0 + cs).min(right);
+    let cor_right_start = (fx1 - cs).max(left).max(cor_left_end);
+    for y in top..bottom {
+        if y < fy0 + band || y >= fy1 - band {
+            paint_rounded_run_rgba(rgba, width, fill, left, right, y);
+        } else if y < fy0 + cs || y >= fy1 - cs {
+            paint_rounded_run_rgba(rgba, width, fill, left, cor_left_end, y);
+            paint_rounded_run_rgba(rgba, width, fill, cor_right_start, right, y);
+        } else {
+            paint_rounded_run_rgba(rgba, width, fill, left, mid_left_end, y);
+            paint_rounded_run_rgba(rgba, width, fill, mid_right_start, right, y);
+        }
+    }
+}
+
+/// Blends one rounded-fill pixel onto the premultiplied headless buffer;
+/// zero-coverage pixels are skipped (CTX-0311).
+fn blend_rounded_pixel_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    fill: &crate::grid::RoundedFill,
+    x: i64,
+    y: i64,
+) {
+    let coverage = fill.coverage_at(x as f32 + 0.5, y as f32 + 0.5);
+    if coverage <= 0.0 {
+        return;
+    }
+    let [cr, cg, cb, ca] = fill.color;
+    let coverage = (coverage * 255.0 + 0.5).min(255.0) as u32;
+    let sa = (coverage * u32::from(ca)) / 255;
+    let src_r = ((u32::from(cr) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_g = ((u32::from(cg) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_b = ((u32::from(cb) * coverage * u32::from(ca)) / 65025) as u8;
+    let src_a = sa.min(255) as u8;
+    let d = (y as usize * width as usize + x as usize) * 4;
+    let inv = 255 - u32::from(src_a);
+    rgba[d] = src_r.saturating_add((u32::from(rgba[d]) * inv / 255) as u8);
+    rgba[d + 1] = src_g.saturating_add((u32::from(rgba[d + 1]) * inv / 255) as u8);
+    rgba[d + 2] = src_b.saturating_add((u32::from(rgba[d + 2]) * inv / 255) as u8);
+    rgba[d + 3] = src_a.saturating_add((u32::from(rgba[d + 3]) * inv / 255) as u8);
+}
+
+/// Runs [`blend_rounded_pixel_rgba`] over `x0..x1` (empty when `x0 >= x1`).
+fn paint_rounded_run_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    fill: &crate::grid::RoundedFill,
+    x0: i64,
+    x1: i64,
+    y: i64,
+) {
+    for x in x0..x1 {
+        blend_rounded_pixel_rgba(rgba, width, fill, x, y);
     }
 }
 
@@ -1721,13 +1780,15 @@ fn blend_coverage_mask_rgba(
                 continue;
             }
             if let Some(clip) = clip {
-                let clip_coverage = clip.coverage_at(sx as f32 + 0.5, sy as f32 + 0.5);
-                if clip_coverage <= 0.0 {
-                    continue;
-                }
-                coverage = (coverage as f32 * clip_coverage + 0.5) as u32;
-                if coverage == 0 {
-                    continue;
+                if clip.may_clip_pixel(sx as i64, sy as i64) {
+                    let clip_coverage = clip.coverage_at(sx as f32 + 0.5, sy as f32 + 0.5);
+                    if clip_coverage <= 0.0 {
+                        continue;
+                    }
+                    coverage = (coverage as f32 * clip_coverage + 0.5) as u32;
+                    if coverage == 0 {
+                        continue;
+                    }
                 }
             }
             let sa = (coverage * u32::from(ca)) / 255;

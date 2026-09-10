@@ -631,6 +631,38 @@ impl RoundedClip {
         let d = sd_rounded_box(px - cx, py - cy, half_w, half_h, r);
         (0.5 - d).clamp(0.0, 1.0)
     }
+
+    /// Cheap integer test for the software rasterizers: true when the pixel
+    /// center at integer pixel `(px, py)` must be evaluated against the SDF.
+    /// Pixels outside the rectangle need the zero coverage, and inside
+    /// pixels only the four corner squares can be partly clipped; the deep
+    /// interior is guaranteed coverage 1 and skips the SDF (CTX-0311 hot
+    /// path). `radius == 0` is a plain rectangle: every inside pixel skips.
+    #[must_use]
+    pub fn may_clip_pixel(&self, px: i64, py: i64) -> bool {
+        if self.rect.width == 0 || self.rect.height == 0 {
+            return true;
+        }
+        let x0 = i64::from(self.rect.x);
+        let y0 = i64::from(self.rect.y);
+        let x1 = x0 + i64::from(self.rect.width);
+        let y1 = y0 + i64::from(self.rect.height);
+        if px < x0 || px >= x1 || py < y0 || py >= y1 {
+            return true;
+        }
+        let r = i64::from(self.radius)
+            .min(i64::from(self.rect.width) / 2)
+            .min(i64::from(self.rect.height) / 2)
+            + 1;
+        if r <= 1 {
+            return false;
+        }
+        let left = px < x0 + r;
+        let right = px >= x1 - r;
+        let top = py < y0 + r;
+        let bottom = py >= y1 - r;
+        (left || right) && (top || bottom)
+    }
 }
 
 /// One rounded-rectangle fill or border ring to paint (CTX-0311).

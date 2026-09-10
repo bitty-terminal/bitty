@@ -982,6 +982,62 @@ fn load_state(path: &Path) -> Result<PluginState, PluginFailure> {
     })
 }
 
+/// Owner-only mode for the managed manifest and its `.bak` (Unix, CTX-0293).
+#[cfg(unix)]
+const STATE_FILE_MODE: u32 = 0o600;
+
+/// Owner-only mode for the directory holding the managed manifest (CTX-0293).
+#[cfg(unix)]
+const STATE_DIR_MODE: u32 = 0o700;
+
+/// Force owner-only permissions on the managed manifest or its `.bak`.
+///
+/// The manifest is a capability-grant ledger; `std::fs::write` inherits the
+/// process umask, so the mode is set explicitly (P0-AC-026 defense in depth,
+/// CTX-0293). Non-Unix targets have no equivalent mode bits here and no-op.
+#[cfg(unix)]
+fn harden_managed_file(path: &Path) -> Result<(), PluginFailure> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STATE_FILE_MODE)).map_err(
+        |error| {
+            PluginFailure::generic(
+                "IoError",
+                format!(
+                    "bitty plugin: cannot set mode {STATE_FILE_MODE:03o} on '{}': {error}",
+                    path.display()
+                ),
+            )
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn harden_managed_file(_path: &Path) -> Result<(), PluginFailure> {
+    Ok(())
+}
+
+/// Force owner-only permissions on the directory holding the manifest.
+#[cfg(unix)]
+fn harden_managed_dir(path: &Path) -> Result<(), PluginFailure> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STATE_DIR_MODE)).map_err(
+        |error| {
+            PluginFailure::generic(
+                "IoError",
+                format!(
+                    "bitty plugin: cannot set mode {STATE_DIR_MODE:03o} on '{}': {error}",
+                    path.display()
+                ),
+            )
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn harden_managed_dir(_path: &Path) -> Result<(), PluginFailure> {
+    Ok(())
+}
+
 /// Write the state, keeping the previous bytes at `<file>.bak` first.
 fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, PluginFailure> {
     let rendered = state.render();
@@ -1003,6 +1059,7 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
                     ),
                 )
             })?;
+            harden_managed_dir(parent)?;
         }
     }
     let mut backup = None;
@@ -1025,6 +1082,7 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
                 ),
             )
         })?;
+        harden_managed_file(&backup_path)?;
         backup = Some(backup_path);
     }
     std::fs::write(path, rendered).map_err(|error| {
@@ -1033,6 +1091,7 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
             format!("bitty plugin: cannot write '{}': {error}", path.display()),
         )
     })?;
+    harden_managed_file(path)?;
     Ok(backup)
 }
 
@@ -2069,6 +2128,42 @@ mod tests {
             PluginState::parse(&empty).expect("empty parses"),
             PluginState::new()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_manifest_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("state-mode");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("seed permissive scratch dir");
+        let path = state_path(&dir);
+
+        let backup = save_state(&path, &sample_state()).expect("first save");
+        assert!(backup.is_none(), "first save has nothing to back up");
+        let manifest_mode = std::fs::metadata(&path)
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest_mode, 0o600, "managed manifest must be owner-only");
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "managed directory must be owner-only");
+
+        let backup = save_state(&path, &sample_state())
+            .expect("second save")
+            .expect("second save backs up the previous manifest");
+        let backup_mode = std::fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(backup_mode, 0o600, "backup must be owner-only");
     }
 
     #[test]

@@ -110,6 +110,17 @@ fn dogfooding_corpora_present_and_bounded() {
             !s.contains("wgpu"),
             "dogfooding corpus {p:?} must not embed wgpu"
         );
+        // CTX-0299: captures stay host-neutral; no absolute workspace paths
+        // and only the `/home/user` placeholder for home directories.
+        assert!(
+            !s.contains("/mnt/"),
+            "dogfooding corpus {p:?} must not embed absolute workspace paths"
+        );
+        assert_eq!(
+            s.matches("/home/").count(),
+            s.matches("/home/user").count(),
+            "dogfooding corpus {p:?} must use the neutral /home/user placeholder"
+        );
     }
 }
 

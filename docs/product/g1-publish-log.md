@@ -84,7 +84,7 @@ order` — PR #75 (`ff9715d`) — **merged** to `main` at `9eec31b`.
 
 ### Head and toolchain
 
-- Worktree: `/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0066-publish-g1`
+- Worktree: `.worktrees/ctx-0066-publish-g1` (repository-relative)
 - Branch: `ctx-0066/publish-g1` — `HEAD c465888` (`main` at `c465888` including
   soak CTX-0067 at `d4af44e` and AGENTS `c465888` `act -n` gate; historical `ctx-0062/publish-g1-final` at `ffd3eee`,
   `ctx-0052/publish-g1` at `bbbdc1c`, `ctx-0047/publish-g1-actual` at `9eec31b`
@@ -211,7 +211,7 @@ No `TODO`/`FIXME` introduced; frontmatter `status: draft` retained.
 ## G1 leaf `cargo publish --dry-run` results
 
 Executed in worktree
-`/mnt/data/Workspace/Projects/bitty-terminal/bitty/.worktrees/ctx-0066-publish-g1`
+`.worktrees/ctx-0066-publish-g1` (repository-relative)
 at `c465888` (prior `d4af44e` with soak, `ctx-0062/publish-g1-final` at `ffd3eee`, historical
 `ctx-0052/publish-g1` at `bbbdc1c`, `ctx-0047/publish-g1-actual` at `9eec31b`),
 toolchain `1.97.1`, with `--allow-dirty` so the draft log (`CTX-0066-DRYRUN-NOTE.md`)

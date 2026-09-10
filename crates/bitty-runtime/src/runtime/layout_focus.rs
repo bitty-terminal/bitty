@@ -62,8 +62,6 @@ impl Runtime {
             let _ = self.state.resize(cols, keep_rows);
         }
         let _ = self.state.resize(cols, rows);
-        self.cols = cols;
-        self.rows = rows;
     }
 
     /// Converts a physical cursor position to a grid cell coordinate using

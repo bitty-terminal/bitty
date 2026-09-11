@@ -357,6 +357,48 @@ fn control_terminal_send_and_text_headless() {
     assert_eq!(missing.code, "NotFound");
 }
 
+#[cfg(unix)]
+#[test]
+fn control_terminal_spawn_creates_observable_session() {
+    // CTX-0323 (D3): `terminal spawn` reported `{"spawned":true}` while the
+    // `view`/`terminal` lists stayed unchanged and `has_pane_session` stayed
+    // false. It must create an addressable pane session (new leaf + shell).
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    let all = bitty_ipc::ScopeSet::all();
+    assert_eq!(rt.pane_count(), 0, "fresh runtime owns no pane session");
+
+    let spawned = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPAWN_TERMINAL, Some("{}"), &all);
+    assert!(spawned.ok, "spawn must succeed: {spawned:?}");
+    assert!(spawned.result_json.contains("\"spawned\":true"));
+    assert!(
+        spawned.result_json.contains("\"terminal_id\":\"t:2\""),
+        "spawn must report the new terminal id: {spawned:?}"
+    );
+
+    // Observable: a new leaf/terminal exists and owns a live pane session.
+    let new_view = ViewId::new(2);
+    assert!(
+        rt.has_pane_session(&new_view),
+        "spawn must create a live pane session"
+    );
+    let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &all);
+    assert!(views.ok, "view list: {views:?}");
+    assert!(
+        views.result_json.contains("v:2"),
+        "view list must gain v:2: {views:?}"
+    );
+    let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
+    assert!(terms.ok, "terminal list: {terms:?}");
+    assert!(
+        terms
+            .result_json
+            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
+        "terminal list must show the live session: {terms:?}"
+    );
+}
+
 #[test]
 fn control_terminal_text_renders_grid_text_not_debug() {
     // CTX-0321 (D1): `terminal text` returned a `Debug` dump of the internal

@@ -245,15 +245,60 @@ pub fn apply_control(
                 ));
             }
             // Accepted + validated, but the spawn below does not chdir yet
-            // (Runtime::spawn_shell has no cwd seam); the client already
+            // (spawn_shell_for_view has no cwd seam); the client already
             // warned on stderr, and the result names the gap.
         }
+        // CTX-0323 (D3): a spawn must be representable in the ctl model. The
+        // old path replaced the primary shell, which `terminal list` (layout
+        // leaves + pane sessions) cannot observe, so it reported a no-op.
+        // Create a fresh leaf (default right split) and give it a private
+        // shell session: `view list` gains `v:N`, `terminal list` gains `t:N`
+        // with `has_pane_session:true`, and the caller can address it.
+        // Fail-closed: if the shell cannot start, the pre-spawn layout is
+        // restored, so success is never reported without a live session.
+        let Some(focused) = runtime.focused_view() else {
+            return Err((
+                "usage",
+                "Conflict",
+                String::from("no focused view to spawn into"),
+            ));
+        };
+        let next_id = runtime
+            .layout()
+            .leaf_ids()
+            .iter()
+            .map(|id| id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let new_id = ViewId::new(next_id.max(1));
+        let mut layout = runtime.layout().clone();
+        if !split_leaf(&mut layout, focused, SplitAxis::Horizontal, new_id, false) {
+            return Err((
+                "usage",
+                "Conflict",
+                String::from("focused view is not a splittable leaf"),
+            ));
+        }
+        let previous = runtime.layout().clone();
+        runtime.set_layout(layout);
+        let (cols, rows) = runtime
+            .layout_allocations()
+            .iter()
+            .find(|(id, _)| *id == new_id)
+            .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+            .unwrap_or((80, 24));
         let shell = std::env::var("SHELL").ok().filter(|s| !s.trim().is_empty());
         let program = shell.as_deref().unwrap_or("/bin/sh");
-        runtime
-            .spawn_shell(program)
-            .map_err(|err| ("transport", "Transport", format!("spawn failed: {err}")))?;
-        return Ok(String::from("{\"spawned\":true}"));
+        if let Err(err) = runtime.spawn_shell_for_view(new_id, program, &[], cols, rows) {
+            // Fail-closed: no observable terminal means no success.
+            runtime.set_layout(previous);
+            return Err(("transport", "Transport", format!("spawn failed: {err}")));
+        }
+        return Ok(format!(
+            "{{\"spawned\":true,\"terminal_id\":\"t:{}\",\"view_id\":\"v:{}\"}}",
+            new_id.0, new_id.0
+        ));
     }
     if method == ipc_ctl::METHOD_CLOSE_TERMINAL {
         let terminal_id = ipc_ctl::parse_terminal_id_params(params)

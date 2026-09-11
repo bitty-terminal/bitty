@@ -273,6 +273,9 @@ impl Runtime {
 
     /// Load slot `index` into the live layout + focus.
     fn load_slot(&mut self, index: usize) {
+        // CTX-0334: a workspace switch is an explicit focus change; abandon
+        // any pending hover dwell (the candidate is per-slot).
+        self.clear_hover_pending();
         if let Some(slot) = self.workspaces.get(index) {
             self.layout = slot.layout.clone();
             self.focus = slot.focus.clone();
@@ -297,6 +300,8 @@ impl Runtime {
                 self.workspaces.len()
             ));
         }
+        // CTX-0334: creating/switching workspace is an explicit focus change.
+        self.clear_hover_pending();
         self.stash_active_slot();
         let seq = self.next_workspace_seq;
         self.next_workspace_seq = seq.wrapping_add(1).max(1);
@@ -548,6 +553,9 @@ impl Runtime {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
         }
+        // CTX-0334: reparenting the focused pane restructures focus; abandon
+        // any pending hover dwell.
+        self.clear_hover_pending();
         if index == self.active_workspace {
             let focused = self
                 .focused_view()

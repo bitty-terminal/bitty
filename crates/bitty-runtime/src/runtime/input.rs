@@ -602,6 +602,12 @@ impl Runtime {
 
     /// Handles cursor movement for drag selection or mouse-tracking motion.
     pub fn handle_cursor_moved(&mut self, pos: CursorPosition) {
+        self.handle_cursor_moved_at(pos, std::time::Instant::now());
+    }
+
+    /// [`Self::handle_cursor_moved`] with an explicit wall clock
+    /// (CTX-0334 virtual-clock seam for the hover dwell delay).
+    pub fn handle_cursor_moved_at(&mut self, pos: CursorPosition, now: std::time::Instant) {
         self.last_cursor = Some(pos);
         // CTX-0181: an active thumb drag consumes motion (a selection drag
         // cannot coexist — the press routed exclusively). Otherwise an
@@ -609,12 +615,14 @@ impl Runtime {
         // hover costs no present.
         self.scrollbar_cursor_left = false;
         if self.scrollbar_drag_to(pos) {
+            self.clear_hover_pending();
             return;
         }
         if self.scrollbar_should_paint() != self.scrollbar_visible {
             self.pending_full_redraw = true;
         }
         if self.selection_dragging {
+            self.clear_hover_pending();
             let cell = self.cursor_to_cell(pos);
             self.update_selection(cell);
             return;
@@ -622,12 +630,14 @@ impl Runtime {
         // CTX-0260: an active Alt+drag consumes motion (it moves the
         // grabbed float; selection/hover/capture-motion all stay out).
         if self.update_alt_drag(pos) {
+            self.clear_hover_pending();
             return;
         }
-        // CTX-0260: opt-in focus-follows-mouse — hover moves keyboard focus
-        // (gated by the config flag, default off; Shift suppresses it so
-        // Shift+hover selection never steals focus).
-        self.hover_focus_at(pos);
+        // CTX-0260/CTX-0334: opt-in hover activation — hover moves keyboard
+        // focus (gated by the config flag, default off; Shift suppresses it
+        // so Shift+hover selection never steals focus). A positive dwell
+        // delay arms a timed pending candidate instead of focusing eagerly.
+        self.hover_focus_at_at(pos, now);
         // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when capture active.
         let capture = !self.shift_pressed
             && self.state.modes().mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)

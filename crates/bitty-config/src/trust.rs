@@ -378,12 +378,14 @@ mod tests {
 
     #[test]
     fn project_plan_allows_mouse_focus_follows_mouse() {
-        // CTX-0260: hover-focus is presentation-only chrome with no process
-        // authority (like auto-copy), so project layers may set it.
+        // CTX-0260/CTX-0334: hover-focus and its dwell delay are
+        // presentation-only chrome with no process authority (like
+        // auto-copy), so project layers may set them (within the bounds).
         use crate::types::MouseConfig;
         let plan = ConfigPlan {
             mouse: Some(MouseConfig {
                 focus_follows_mouse: true,
+                focus_follows_mouse_delay_ms: 120,
             }),
             ..Default::default()
         };

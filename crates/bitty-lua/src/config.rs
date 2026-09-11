@@ -196,16 +196,21 @@ pub struct ScrollbarData {
     pub width: Option<i64>,
 }
 
-/// Mouse overrides, plain data (CTX-0260; see [`FontData`] for `Option`
-/// semantics).
+/// Mouse overrides, plain data (CTX-0260/CTX-0334; see [`FontData`] for
+/// `Option` semantics).
 ///
 /// `focus_follows_mouse` opts into hover moving keyboard focus
-/// (default-off preserves click-to-focus). Wrong types fail closed as
-/// `ShapeError` downstream (never coerced).
+/// (default-off preserves click-to-focus). `focus_follows_mouse_delay_ms`
+/// optionally delays activation by that many milliseconds. Wrong types fail
+/// closed as `ShapeError` downstream (never coerced); the delay range is
+/// checked in `bitty-config` (fail-closed).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MouseData {
     /// Hover-focus opt-in (present only when the key is set).
     pub focus_follows_mouse: Option<bool>,
+    /// Dwell time in milliseconds before hover activation (present only
+    /// when the key is set).
+    pub focus_follows_mouse_delay_ms: Option<i64>,
 }
 
 /// Plain-data user configuration extracted from the Lua chunk.
@@ -846,19 +851,32 @@ impl ConfigData {
                     out.scrollbar = Some(ScrollbarData { mode, width });
                 }
                 "mouse" => {
-                    // CTX-0260: `mouse = { focus_follows_mouse = true }`
-                    // opts into hover moving keyboard focus; absent
-                    // table/key means "says nothing" (default-off
-                    // click-to-focus preserved). Booleans only (never
-                    // coerced); validated downstream in `bitty-config`.
+                    // CTX-0260/CTX-0334: `mouse = { focus_follows_mouse =
+                    // true, focus_follows_mouse_delay_ms = 0 }` opts into
+                    // hover activation; absent table/key means "says
+                    // nothing" (default-off click-to-focus preserved).
+                    // Booleans and integers only (never coerced); the
+                    // delay range is validated downstream in `bitty-config`.
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["focus_follows_mouse"])?;
+                    check_nested_keys(
+                        key,
+                        nested,
+                        &["focus_follows_mouse", "focus_follows_mouse_delay_ms"],
+                    )?;
                     let focus_follows_mouse = match get_field(nested, "focus_follows_mouse") {
                         Some(v) => Some(expect_bool("mouse.focus_follows_mouse", v)?),
                         None => None,
                     };
+                    let focus_follows_mouse_delay_ms =
+                        match get_field(nested, "focus_follows_mouse_delay_ms") {
+                            Some(v) => {
+                                Some(expect_integer("mouse.focus_follows_mouse_delay_ms", v)?)
+                            }
+                            None => None,
+                        };
                     out.mouse = Some(MouseData {
                         focus_follows_mouse,
+                        focus_follows_mouse_delay_ms,
                     });
                 }
                 "keymaps" => {
@@ -1302,29 +1320,37 @@ mod tests {
 
     #[test]
     fn mouse_focus_follows_mouse_extracts_and_absent_means_no_override() {
-        // CTX-0260: explicit opt-in parses; absent table/key is `None` so
-        // merge keeps the lower-precedence value (false when no layer sets
-        // it, preserving click-to-focus).
+        // CTX-0260/CTX-0334: explicit opt-in and dwell delay parse; absent
+        // table/key is `None` so merge keeps the lower-precedence value
+        // (false/0 when no layer sets it, preserving click-to-focus).
         let data = eval_ok(r#"return { mouse = { focus_follows_mouse = true } }"#);
         assert_eq!(data.mouse.unwrap().focus_follows_mouse, Some(true));
         let data = eval_ok(r#"return { mouse = { focus_follows_mouse = false } }"#);
         assert_eq!(data.mouse.unwrap().focus_follows_mouse, Some(false));
+        let data = eval_ok(
+            r#"return { mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 250 } }"#,
+        );
+        assert_eq!(data.mouse.unwrap().focus_follows_mouse_delay_ms, Some(250));
         let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
         assert_eq!(data.mouse, None);
         let data = eval_ok(r#"return { mouse = {} }"#);
-        assert_eq!(data.mouse.unwrap().focus_follows_mouse, None);
+        let mouse = data.mouse.unwrap();
+        assert_eq!(mouse.focus_follows_mouse, None);
+        assert_eq!(mouse.focus_follows_mouse_delay_ms, None);
     }
 
     #[test]
     fn mouse_focus_follows_mouse_wrong_type_is_shape_error_without_value() {
-        // CTX-0260: fail-closed on non-boolean values (never coerce, never
-        // echo the value).
+        // CTX-0260/CTX-0334: fail-closed on non-boolean/non-integer values
+        // (never coerce, never echo the value).
         let mut vm = LuaVm::new("test.mouse-type");
         for code in [
             r#"return { mouse = { focus_follows_mouse = 1 } }"#,
             r#"return { mouse = { focus_follows_mouse = "true" } }"#,
             r#"return { mouse = true }"#,
             r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
+            r#"return { mouse = { focus_follows_mouse_delay_ms = "250" } }"#,
+            r#"return { mouse = { focus_follows_mouse_delay_ms = 1.5 } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

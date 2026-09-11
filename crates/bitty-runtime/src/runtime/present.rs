@@ -316,6 +316,11 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // CTX-0334: commit a pending hover activation whose dwell deadline
+        // has elapsed before the frame's focus/highlight is resolved. The
+        // app arms a timed wake at `hover_activation_deadline`, so this
+        // fires even when the pointer stopped moving.
+        self.apply_hover_deadline(now);
         // CTX-0192 transient: collapse the full banner to the flash once its
         // duration expires. Force exactly one repaint for the transition so
         // the retained frame keeps a visible (smaller) signal while pending.

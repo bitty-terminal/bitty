@@ -114,6 +114,19 @@ pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 /// `true` opts into hover moving keyboard focus to the hovered pane.
 pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE: bool = false;
 
+/// Default hover-activation delay in milliseconds (CTX-0334).
+/// `0` activates immediately on pointer entry, matching the CTX-0260
+/// behavior; a positive value makes the pointer dwell in the hovered pane
+/// for that long before keyboard focus moves.
+pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
+
+/// Maximum accepted hover-activation delay in milliseconds (CTX-0334).
+///
+/// Bounds the dwell timer so a hostile or mistaken configuration cannot
+/// stall activation indefinitely (KDE-style focus delay); `validate()`
+/// rejects values above it fail-closed and `bitty-runtime` mirrors the bound.
+pub const MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 2_000;
+
 /// Default scrollbar mode (CTX-0181): `hidden`.
 ///
 /// Hidden-by-default keeps the grid geometry-neutral for existing users:
@@ -779,29 +792,53 @@ impl ScrollbarConfig {
 
 /// Mouse behavior configuration (CTX-0260).
 ///
-/// `focus_follows_mouse` controls Hyprland-like hover focus: `false`
+/// `focus_follows_mouse` controls Hyprland-like hover activation: `false`
 /// (default) preserves click-to-focus (hover never moves keyboard focus);
 /// `true` moves keyboard focus to the hovered pane. Set via `init.lua`
 /// `mouse = { focus_follows_mouse = true }` (key optional, defaulting to
 /// `false` when the table is present but omits it, so `mouse = {}` keeps
 /// click-to-focus).
+///
+/// `focus_follows_mouse_delay_ms` (CTX-0334) optionally makes activation
+/// wait for the pointer to dwell in the hovered pane: `0` (default)
+/// activates on pointer entry, a positive value delays focus by that many
+/// milliseconds so a transient pass-through never steals focus. Values are
+/// bounded by [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`] and validated
+/// fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseConfig {
     /// Whether hover moves keyboard focus to the hovered pane.
     pub focus_follows_mouse: bool,
+    /// Dwell time in milliseconds before hover activation moves focus.
+    pub focus_follows_mouse_delay_ms: u32,
 }
 
 impl Default for MouseConfig {
     fn default() -> Self {
         Self {
             focus_follows_mouse: DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE,
+            focus_follows_mouse_delay_ms: DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
         }
     }
 }
 
 impl MouseConfig {
-    /// Validate mouse config (booleans are total; always succeeds).
+    /// Validate mouse config.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::validation`] when
+    /// `focus_follows_mouse_delay_ms` exceeds
+    /// [`MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`] (fail-closed).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.focus_follows_mouse_delay_ms > MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS {
+            return Err(ConfigError::validation(
+                "mouse.focus_follows_mouse_delay_ms",
+                format!(
+                    "must be within [0, {MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS}] milliseconds"
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -1378,14 +1415,40 @@ mod tests {
     fn mouse_focus_follows_mouse_defaults_off_and_validates() {
         // CTX-0260: default-off preserves click-to-focus for existing users.
         const { assert!(!DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE) }
+        const { assert!(DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
         assert!(!MouseConfig::default().focus_follows_mouse);
+        assert_eq!(
+            MouseConfig::default().focus_follows_mouse_delay_ms,
+            DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
+        );
         assert!(!EffectiveConfig::default().mouse.focus_follows_mouse);
         MouseConfig::default().validate().expect("default valid");
         MouseConfig {
             focus_follows_mouse: true,
+            ..MouseConfig::default()
         }
         .validate()
         .expect("opt-in valid");
+        // CTX-0334: the dwell delay is bounded fail-closed.
+        for good in [
+            0,
+            1,
+            DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+            MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+        ] {
+            MouseConfig {
+                focus_follows_mouse: true,
+                focus_follows_mouse_delay_ms: good,
+            }
+            .validate()
+            .expect("boundary delay must be valid");
+        }
+        MouseConfig {
+            focus_follows_mouse: true,
+            focus_follows_mouse_delay_ms: MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS + 1,
+        }
+        .validate()
+        .expect_err("over-max delay must fail closed");
         EffectiveConfig::default()
             .validate()
             .expect("default valid");
@@ -1394,11 +1457,11 @@ mod tests {
     #[test]
     fn effective_validate_calls_every_section_validator() {
         // CTX-0303: commit 117381b (CTX-0292) silently dropped
-        // `self.mouse.validate()?;` from EffectiveConfig::validate. The call is
-        // currently behavior-neutral (MouseConfig::validate is total and
-        // ConfigPlan::validate still validates mouse), so pin it structurally
-        // by scanning production source only. The `#[cfg(test)]` region is
-        // excluded so this test cannot satisfy itself.
+        // `self.mouse.validate()?;` from EffectiveConfig::validate. The call
+        // became behavior-bearing again in CTX-0334 (MouseConfig::validate now
+        // rejects an over-max hover delay), so pin it structurally by scanning
+        // production source only. The `#[cfg(test)]` region is excluded so this
+        // test cannot satisfy itself.
         let src = include_str!("types.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         for call in [

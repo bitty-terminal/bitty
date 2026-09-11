@@ -537,6 +537,9 @@ impl Runtime {
                     self.scrollbar_cursor_left = true;
                     self.scrollbar_release();
                     self.end_alt_drag();
+                    // CTX-0334: leaving the window also drops a pending
+                    // hover dwell so a re-entry starts a fresh clock.
+                    self.clear_hover_pending();
                     if self.scrollbar_visible {
                         self.pending_full_redraw = true;
                     }

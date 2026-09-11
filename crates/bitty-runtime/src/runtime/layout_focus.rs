@@ -446,6 +446,9 @@ impl Runtime {
     /// invisible, reflow never firing). Best-effort like the pane sync:
     /// matching dims skip, PTY errors never fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
+        // CTX-0334: a structural layout change abandons any pending hover
+        // dwell; the candidate may no longer exist or may have moved.
+        self.clear_hover_pending();
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
         if leaf_ids.is_empty() {
@@ -513,6 +516,9 @@ impl Runtime {
     /// damage, so a successful change forces a full redraw on the next
     /// `tick`.
     pub fn set_focus(&mut self, id: ViewId) -> bool {
+        // CTX-0334: an explicit focus set abandons any pending hover dwell,
+        // so hover activation can never override a deliberate choice.
+        self.clear_hover_pending();
         if self.layout.leaf_ids().contains(&id) {
             // Only dirty when the focus actually moves; re-selecting the
             // focused pane is a no-op present-wise.
@@ -535,6 +541,8 @@ impl Runtime {
     /// CTX-0228: a focus move forces a full redraw (cursor/highlight moves
     /// with no PTY damage).
     pub fn move_focus(&mut self, dir: FocusDirection) -> Option<ViewId> {
+        // CTX-0334: a focus move abandons any pending hover dwell.
+        self.clear_hover_pending();
         let next = self
             .focus
             .advance_with_gaps(&self.layout, self.container, self.gaps(), dir);

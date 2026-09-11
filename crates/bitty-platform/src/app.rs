@@ -163,6 +163,17 @@ impl EventContext<'_> {
     pub fn set_wait(&self) {
         self.event_loop.set_control_flow(ControlFlow::Wait);
     }
+
+    /// Waits until `deadline` and then delivers
+    /// [`PlatformEvent::AboutToWait`] (CTX-0334 timed activation).
+    ///
+    /// Lets the application schedule a single future wake without
+    /// busy-polling — the hover dwell delay uses it so focus still applies
+    /// when the pointer stops moving and no further input events arrive.
+    pub fn set_wait_until(&self, deadline: std::time::Instant) {
+        self.event_loop
+            .set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
 }
 
 /// Owned handle to a live window.

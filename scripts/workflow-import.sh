@@ -9,6 +9,7 @@
 # Safety (thin, no Python):
 #   - refuses to replace a non-empty local DB (one project row with data rows)
 #     without --force, leaving the DB untouched;
+#   - initializes a fresh clone's CarryCtx state (no project row) before import;
 #   - --dry-run validates the snapshot and writes nothing;
 #   - restores the committed `.carryctx/config.toml` byte-identically, because
 #     `carryctx import` rewrites it with current config defaults;
@@ -184,6 +185,18 @@ CFG_BACKUP=""
 if [[ -f "$CFG" ]]; then
 	CFG_BACKUP="$TMP_ROOT/config.toml.before"
 	cp -p "$CFG" "$CFG_BACKUP" || fail "cannot back up $CFG"
+fi
+
+# Fresh clone / no project row: initialize CarryCtx state explicitly so the
+# documented fresh-clone path never depends on importer auto-init. The
+# committed `.carryctx/config.toml` (when present) is restored byte-identically
+# below, because `carryctx init` rewrites it with current config defaults.
+if [[ "$PROJECTS" -eq 0 ]]; then
+	log "no project row in local DB: initializing CarryCtx state (carryctx init --non-interactive)"
+	if ! timeout "$GIT_TIMEOUT" carryctx init --non-interactive --project "$PROJECT" >"$TMP_ROOT/init.log" 2>&1; then
+		cat "$TMP_ROOT/init.log" >&2 2>/dev/null || true
+		fail "carryctx init failed"
+	fi
 fi
 
 if [[ "$PROJECTS" -ge 1 && "$ROWS" -gt 0 ]]; then

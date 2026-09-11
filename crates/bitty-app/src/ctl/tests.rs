@@ -1009,6 +1009,96 @@ fn control_workspace_ids_roundtrip_after_close_and_new() {
     assert!(focused.ok, "focus ws:3 must succeed after gap: {focused:?}");
 }
 
+/// Extract a flat JSON string array by key (test-only: the control result is
+/// flat and workspace ids carry no escapes). Returns an empty vector when the
+/// key or array delimiters are missing so a bad shape fails the assertion
+/// rather than panicking inside the helper.
+fn json_string_array(result_json: &str, field: &str) -> Vec<String> {
+    let key = format!("\"{field}\":");
+    let Some(start) = result_json.find(&key) else {
+        return Vec::new();
+    };
+    let rest = &result_json[start + key.len()..];
+    let Some(open) = rest.find('[') else {
+        return Vec::new();
+    };
+    let Some(close_rel) = rest[open..].find(']') else {
+        return Vec::new();
+    };
+    let body = &rest[open + 1..open + close_rel];
+    body.split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+#[test]
+fn control_workspace_list_ids_roundtrip_across_sequence_gap() {
+    // CTX-0338 (D2 residual): `workspace list` must emit the canonical
+    // `ws:{seq}` identity that `focus`/`close`/`move` accept, so a client can
+    // feed list output straight back into the write verbs. Display labels
+    // stay available separately and the human `tabline` is unchanged.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let all = bitty_ipc::ScopeSet::all();
+
+    assert!(apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok);
+    assert!(apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok);
+    let close2 = ipc_ctl::params_workspace("ws:2");
+    let closed = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_CLOSE_WORKSPACE,
+        Some(&close2),
+        &all,
+    );
+    assert!(closed.ok, "close ws:2 must succeed: {closed:?}");
+    // Next creation takes ws:4, leaving a sequence gap at ws:2.
+    let third = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(third.result_json.contains("\"created\":\"ws:4\""));
+
+    let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
+    assert!(list.ok, "list must succeed: {list:?}");
+    let ids = json_string_array(&list.result_json, "workspaces");
+    assert_eq!(
+        ids,
+        vec!["ws:1", "ws:3", "ws:4"],
+        "list must emit canonical ids, got {list:?}"
+    );
+    let names = json_string_array(&list.result_json, "names");
+    assert_eq!(
+        names,
+        vec!["ws1", "ws3", "ws4"],
+        "display labels stay available separately, got {list:?}"
+    );
+    let active_id = extract_string_from(&list.result_json, "active_id").expect("active_id field");
+    assert_eq!(active_id, "ws:4", "active id must be canonical: {list:?}");
+
+    // Every id the list named must round-trip through focus then close.
+    for id in &ids {
+        let focus = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_FOCUS_WORKSPACE,
+            Some(&ipc_ctl::params_workspace(id)),
+            &cli,
+        );
+        assert!(focus.ok, "focus {id} from list must succeed: {focus:?}");
+    }
+    for id in &ids {
+        let close = apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_CLOSE_WORKSPACE,
+            Some(&ipc_ctl::params_workspace(id)),
+            &all,
+        );
+        assert!(close.ok, "close {id} from list must succeed: {close:?}");
+    }
+    // Closing every listed workspace never strands the window: the runtime
+    // respawns one fresh slot (count >= 1 by invariant).
+    let final_list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
+    assert!(final_list.ok);
+    assert!(final_list.result_json.contains("\"count\":1"));
+}
+
 #[test]
 fn control_workspace_move_headless_no_elevation() {
     // CTX-0259 parity: `workspace move ws:N` rides view.manage (no

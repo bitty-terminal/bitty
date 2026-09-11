@@ -191,6 +191,25 @@ impl Runtime {
         self.workspaces.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// Stable creation sequence (`ws{seq}` identity) of slot `index`.
+    ///
+    /// CTX-0322: the `ctl` surface addresses a workspace by this stable
+    /// sequence, never by the positional (1-based) display index, so an id
+    /// reported by `workspace new`/`list` stays valid through close+new.
+    #[must_use]
+    pub fn workspace_seq_at(&self, index: usize) -> Option<u64> {
+        self.workspaces.get(index).map(|s| s.seq)
+    }
+
+    /// Resolve a stable workspace sequence to its current slot index.
+    ///
+    /// CTX-0322: `None` when no slot carries `seq`; callers map that to
+    /// `NotFound` rather than addressing an unrelated workspace.
+    #[must_use]
+    pub fn workspace_index_by_seq(&self, seq: u64) -> Option<usize> {
+        self.workspaces.iter().position(|s| s.seq == seq)
+    }
+
     /// Minimal tabline render: names + indices + focused marker + count.
     ///
     /// Pure overlay string, never grid truth: `1:ws1* 2:ws2 (2)` — each
@@ -481,8 +500,18 @@ impl Runtime {
         WsCloseRequest::Pending { summary }
     }
 
-    /// Close workspace `one_based` (1-based, `ctl` path): immediate, no
-    /// confirm gate (elevation is the gate there). Returns sessions killed.
+    /// Close the workspace at slot `index` (0-based): immediate, no confirm
+    /// gate. Returns sessions killed. Unknown slots fail closed.
+    pub fn workspace_close_at(&mut self, index: usize) -> Result<usize, String> {
+        if index >= self.workspaces.len() {
+            return Err(String::from("no such workspace"));
+        }
+        let killed = self.kill_workspace_sessions(index);
+        self.remove_workspace(index);
+        Ok(killed)
+    }
+
+    /// Close workspace `one_based` by positional display index (key path).
     /// Unknown indices fail closed.
     pub fn workspace_close_index(&mut self, one_based: u64) -> Result<usize, String> {
         if one_based == 0 {
@@ -492,9 +521,7 @@ impl Runtime {
         if index >= self.workspaces.len() {
             return Err(format!("no such workspace ws:{one_based}"));
         }
-        let killed = self.kill_workspace_sessions(index);
-        self.remove_workspace(index);
-        Ok(killed)
+        self.workspace_close_at(index)
     }
 
     /// Move the focused window (leaf) into workspace `index` (0-based).

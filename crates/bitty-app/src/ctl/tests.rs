@@ -900,6 +900,74 @@ fn control_workspace_list_new_focus_close_headless() {
 }
 
 #[test]
+fn control_workspace_ids_roundtrip_after_close_and_new() {
+    // CTX-0322 (D2): `workspace new` must report the stable sequence id
+    // (`ws{seq}`) that `list` names and `focus`/`close` accept, even after a
+    // close opens a sequence gap. Before the fix, `new` reported the
+    // positional index (`ws:3`) while the slot's name was `ws4`, so the
+    // reported id could not be fed back to `close`/`focus`.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let all = bitty_ipc::ScopeSet::all();
+
+    let first = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(first.ok, "new ws2: {first:?}");
+    assert!(first.result_json.contains("\"created\":\"ws:2\""));
+    let second = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(second.ok, "new ws3: {second:?}");
+    assert!(second.result_json.contains("\"created\":\"ws:3\""));
+
+    let close2 = ipc_ctl::params_workspace("ws:2");
+    let done = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_CLOSE_WORKSPACE,
+        Some(&close2),
+        &all,
+    );
+    assert!(done.ok, "close ws:2 must succeed: {done:?}");
+    assert!(done.result_json.contains("\"closed\":\"ws:2\""));
+
+    // Next creation takes the next sequence id (ws4), not the freed index.
+    let third = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(third.ok, "new ws4: {third:?}");
+    assert!(
+        third.result_json.contains("\"created\":\"ws:4\""),
+        "created id must be the stable sequence, got {third:?}"
+    );
+
+    let list = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_WORKSPACES, None, &cli);
+    assert!(list.ok, "list must succeed: {list:?}");
+    assert!(
+        list.result_json.contains("ws4"),
+        "list must name the created workspace: {list:?}"
+    );
+
+    // The id `new` reported must round-trip through close (the D2 failure
+    // was NotFound for this exact id).
+    let close4 = ipc_ctl::params_workspace("ws:4");
+    let closed = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_CLOSE_WORKSPACE,
+        Some(&close4),
+        &all,
+    );
+    assert!(
+        closed.ok,
+        "close by the id reported from new must succeed: {closed:?}"
+    );
+
+    // focus by stable sequence id still resolves after the gap.
+    let focus3 = ipc_ctl::params_workspace("ws:3");
+    let focused = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_FOCUS_WORKSPACE,
+        Some(&focus3),
+        &cli,
+    );
+    assert!(focused.ok, "focus ws:3 must succeed after gap: {focused:?}");
+}
+
+#[test]
 fn control_workspace_move_headless_no_elevation() {
     // CTX-0259 parity: `workspace move ws:N` rides view.manage (no
     // elevation), reparents the focused leaf, and fails closed on

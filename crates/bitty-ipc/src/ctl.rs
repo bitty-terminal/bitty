@@ -47,7 +47,8 @@
 //! # Bounds (T-01 parity, fail closed)
 //!
 //! - Terminal ids: `t:<1..10 digits>` (e.g. `t:3`). View ids: `v:<1..10 digits>`.
-//! - Workspace ids: `ws:<1..10 digits>` (1-based display index, e.g. `ws:2`).
+//! - Workspace ids: `ws:<1..10 digits>` (stable creation sequence, e.g.
+//!   `ws:2`; never a positional display index — CTX-0322).
 //! - Send text: 1..=`MAX_SEND_TEXT_BYTES` bytes, no NUL, valid UTF-8 (checked by caller).
 //! - `--cwd`: 1..=`MAX_CTL_CWD_LEN` bytes, no NUL.
 //! - Split direction: `--left` | `--right` | `--up` | `--down` (exactly one; default `--right`).
@@ -251,10 +252,13 @@ pub fn parse_view_id(raw: &str) -> Result<u32, IpcError> {
     parse_id_digits(digits, "v")
 }
 
-/// Validate a workspace id (`ws:<digits>`, 1-based display index),
+/// Validate a workspace id (`ws:<digits>`, stable creation sequence),
 /// returning the numeric id.
 ///
-/// Shape-only: existence resolves server-side (`NotFound` when absent).
+/// CTX-0322: the id is the same stable sequence `workspace list` names
+/// (`ws{seq}`), so an id reported by `new`/`list` round-trips through
+/// `focus`/`close`/`move`. Shape-only: existence resolves server-side
+/// (`NotFound` when absent).
 pub fn parse_workspace_id(raw: &str) -> Result<u32, IpcError> {
     let digits = raw
         .strip_prefix("ws:")

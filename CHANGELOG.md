@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable panel content inset (CTX-0333):** `decoration.content_inset`
+  (logical px, default `6`, range `0..=32`, safe mode `0`) pads the painted
+  content inside each view frame, so text no longer sits flush against the
+  panel margin line. Exposed via `init.lua`, validated fail-closed, and
+  mirrored in `bitty check`/`bitty inspect`.
+
+### Changed
+
+- **Unified panel gaps (CTX-0333):** `decoration.gaps_in` now defaults to `6`
+  (was `4`), matching `decoration.gaps_out`, so the default sibling
+  (panel-to-panel / panel-to-terminal) and container gaps read as one spacing.
+  The coherent model is `effective gap = decoration.gap * DPI_scale +
+layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
+  both effective gaps are `6` logical px. Views now paint inside the
+  `border + content_inset` padding, which changes default tiled content grids.
+
 ### Help popup occludes grid text (CTX-0336, issue #559)
 
 - Fixed the `Mod+backtick` which-key help popup (`Mod+?`) painting the

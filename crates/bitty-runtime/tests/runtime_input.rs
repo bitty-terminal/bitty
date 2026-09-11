@@ -177,13 +177,14 @@ fn left_release_auto_copies_to_clipboard_and_primary() {
     assert_eq!(rt.clipboard().headless_contents(), "");
     assert_eq!(rt.primary_contents(), "");
     // Drag cells (0,0)..(0,4) = "hello" via the mouse path (CTX-0223 +
-    // CTX-0294: coords include the default 8px window padding inset and
-    // the default decoration outer gap + border = 8px, origin (16, 16)).
-    rt.handle_cursor_moved(CursorPosition { x: 16.0, y: 16.0 });
+    // CTX-0294/CTX-0333: coords include the default 8px window padding
+    // inset and the decoration outer gap + border + content inset = 14px,
+    // origin (22, 22)).
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 16.0 + 9.0 * 4.0,
-        y: 16.0,
+        x: 22.0 + 9.0 * 4.0,
+        y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert!(!rt.is_selection_dragging());
@@ -210,12 +211,12 @@ fn left_release_with_auto_copy_off_highlights_without_copying() {
     let mut rt = mouse_headless_runtime_no_auto_copy("hello world");
     assert!(!rt.config().selection_auto_copy);
     // CTX-0223 + CTX-0294: mouse coords include the 8px window padding
-    // inset and the 8px decoration origin shift.
-    rt.handle_cursor_moved(CursorPosition { x: 16.0, y: 16.0 });
+    // inset and the 14px decoration origin shift.
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 16.0 + 9.0 * 4.0,
-        y: 16.0,
+        x: 22.0 + 9.0 * 4.0,
+        y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     // Highlight present, drag finished, clipboards untouched.
@@ -248,13 +249,14 @@ fn left_release_auto_copy_overwrites_divergent_primary() {
     assert_eq!(rt.clipboard().headless_contents(), "zz");
     assert_eq!(rt.primary_contents(), "pq");
     // Drag cells (0,0)..(0,4) = "hello" via the mouse path (CTX-0223 +
-    // CTX-0294: coords include the default 8px window padding inset and
-    // the default decoration outer gap + border = 8px, origin (16, 16)).
-    rt.handle_cursor_moved(CursorPosition { x: 16.0, y: 16.0 });
+    // CTX-0294/CTX-0333: coords include the default 8px window padding
+    // inset and the decoration outer gap + border + content inset = 14px,
+    // origin (22, 22)).
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
     rt.handle_mouse_input(mouse_press(MouseButton::Left));
     rt.handle_cursor_moved(CursorPosition {
-        x: 16.0 + 9.0 * 4.0,
-        y: 16.0,
+        x: 22.0 + 9.0 * 4.0,
+        y: 22.0,
     });
     rt.handle_mouse_input(mouse_release(MouseButton::Left));
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));

@@ -138,11 +138,11 @@ fn live_split_resizes_primary_grid_to_focused_allocation_and_reflows() {
 
     let focused_frame = frame_of(&rt, ViewId::new(1));
     assert_eq!(
-        focused_frame.cols, 38,
-        "80-col container with default CTX-0294 decoration keeps 38 content cols"
+        focused_frame.cols, 37,
+        "80-col container with unified CTX-0333 decoration keeps 37 content cols"
     );
     let new_frame = frame_of(&rt, new_id);
-    assert_eq!(new_frame.cols, 38);
+    assert_eq!(new_frame.cols, 37);
 
     // THE CTX-0269 INVARIANT: every pane grid matches its decorated content
     // frame. Pre-fix the primary grid keeps the stale 80-col width (present
@@ -198,7 +198,7 @@ fn live_split_fresh_output_wraps_at_narrow_width() {
     rt.tick().expect("first full redraw");
     live_split_focused_right(&mut rt);
     let content_cols = usize::from(frame_of(&rt, ViewId::new(1)).cols);
-    assert_eq!(content_cols, 38);
+    assert_eq!(content_cols, 37);
     assert_eq!(rt.snapshot().width, content_cols);
 
     let mut line = "Q".repeat(100);
@@ -210,7 +210,7 @@ fn live_split_fresh_output_wraps_at_narrow_width() {
     assert_eq!(
         nonblank_rows(&rt.snapshot()),
         3,
-        "109 cells at the narrowed 38 content cols must wrap to 3 rows"
+        "109 cells at the narrowed 37 content cols must wrap to 3 rows"
     );
     assert!(
         snapshot_text(&rt.snapshot()).contains("<TAIL100>"),
@@ -230,7 +230,7 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     rt.handle_pty_bytes(&bytes);
 
     live_split_focused_right(&mut rt);
-    assert_eq!(rt.snapshot().width, 38);
+    assert_eq!(rt.snapshot().width, 37);
 
     // LIVE widen-back shape: close the new leaf through the same funnel.
     let focused = rt.focused_view().expect("focus");
@@ -250,7 +250,7 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
         .expect("widen-back leaves exactly one frame");
     let wide_cols = usize::from(wide_frame.cols);
     assert_eq!(rt.present_frames().len(), 1, "close leaves one leaf");
-    assert_eq!(wide_cols, 78, "single decorated pane keeps 78 content cols");
+    assert_eq!(wide_cols, 76, "single decorated pane keeps 76 content cols");
     assert_eq!(
         rt.snapshot().width,
         wide_cols,
@@ -260,9 +260,9 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
         snapshot_text(&rt.snapshot()).contains("<TAIL100>"),
         "widen-back must not lose the tail"
     );
-    // 109 cells at 78 content cols rewrap to 2 physical rows; the leading
+    // 109 cells at 76 content cols rewrap to 2 physical rows; the leading
     // rewrite is bottom-aligned, so the visible grid keeps at least the
-    // 31-cell tail row while the full 78-col prefix sits in scrollback.
+    // 33-cell tail row while the full 76-col prefix sits in scrollback.
     let snap = rt.snapshot();
     let grid_q = snap.cells.iter().filter(|c| c.glyph == 'Q').count();
     assert!(
@@ -272,7 +272,7 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     let visible_rows = nonblank_rows(&snap);
     assert!(
         (1..=2).contains(&visible_rows),
-        "109 cells at 78 content cols rewrap to at most 2 visible rows (got {visible_rows})"
+        "109 cells at 76 content cols rewrap to at most 2 visible rows (got {visible_rows})"
     );
 }
 
@@ -322,7 +322,7 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
     // decorated content on the split funnel — pre-fix it kept the stale 80x24.
     assert_eq!(
         rt.pty_size(),
-        Some((38, 23)),
+        Some((37, 22)),
         "primary winsize must follow the focused pane content"
     );
 
@@ -332,7 +332,7 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
     let third_id = live_split_focused_right(&mut rt);
     let _ = third_id;
     let pane_frame = frame_of(&rt, new_id);
-    assert_eq!(pane_frame.cols, 18, "38-col pane splits to 18 content cols");
+    assert_eq!(pane_frame.cols, 17, "37-col pane splits to 17 content cols");
     let pane_snap = rt
         .pane_snapshot(&new_id)
         .expect("pane session survives the second split");

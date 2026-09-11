@@ -155,12 +155,13 @@ fn cursor_to_cell_subtracts_outer_gap_and_decoration() {
     // CTX-0177: with gaps_out = 2 cells at the default 9x19 live cell,
     // the grid origin shifts by (18px, 38px); the mapping must subtract
     // it (0157 math) instead of drifting by the gap. CTX-0223 adds the
-    // default 8px window padding first; CTX-0294 adds the default
-    // decoration outer gap + border (6 + 2 = 8px at scale 1.0), so the
-    // probe moves to pad + gap + decoration + 2 cells = (52, 92).
+    // default 8px window padding first; CTX-0294/CTX-0333 adds the default
+    // decoration outer gap + border + content inset (6 + 2 + 6 = 14px at
+    // scale 1.0), so the probe moves to pad + gap + decoration + 2 cells =
+    // (58, 98).
     let rt = make_gapped_runtime(0, 2);
-    // col = (52 - 8 - 18 - 8) / 9 = 2, row = (92 - 8 - 38 - 8) / 19 = 2.
-    let pos = CursorPosition { x: 52.0, y: 92.0 };
+    // col = (58 - 8 - 18 - 14) / 9 = 2, row = (98 - 8 - 38 - 14) / 19 = 2.
+    let pos = CursorPosition { x: 58.0, y: 98.0 };
     assert_eq!(rt.cursor_to_cell(pos), CellPos::new(2, 2));
     // A click inside the outer gap clamps to the first cell (never
     // negative, never panics).

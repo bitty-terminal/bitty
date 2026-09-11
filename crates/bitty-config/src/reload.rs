@@ -60,6 +60,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.gaps_out`     | Live               |
 /// | `decoration.border`       | Live               |
 /// | `decoration.radius`       | Live               |
+/// | `decoration.content_inset`| Live               |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -92,6 +93,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.gaps_out"
         | "decoration.border"
         | "decoration.radius"
+        | "decoration.content_inset"
         | "decoration"
         | "appearance.theme"
         | "appearance"
@@ -247,6 +249,11 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "decoration.radius",
         old.decoration.radius.to_string(),
         new.decoration.radius.to_string(),
+    );
+    push_if_changed(
+        "decoration.content_inset",
+        old.decoration.content_inset.to_string(),
+        new.decoration.content_inset.to_string(),
     );
     push_if_changed(
         "terminal.scrollback",
@@ -510,14 +517,16 @@ mod tests {
 
     #[test]
     fn fallback_forces_safe_decoration() {
-        // CTX-0292: safe mode inverts decoration to 0/0/1/0 regardless of
-        // the (non-zero) built-in defaults; every other field is default.
+        // CTX-0292/CTX-0333: safe mode inverts decoration to 0/0/1/0/0
+        // regardless of the (non-zero) built-in defaults; every other field
+        // is default.
         let fallback = fallback_builtin();
         assert_eq!(fallback.decoration, crate::types::DecorationConfig::safe());
         assert_eq!(fallback.decoration.gaps_in, 0);
         assert_eq!(fallback.decoration.gaps_out, 0);
         assert_eq!(fallback.decoration.border, 1);
         assert_eq!(fallback.decoration.radius, 0);
+        assert_eq!(fallback.decoration.content_inset, 0);
         assert_ne!(
             fallback.decoration,
             crate::types::DecorationConfig::default()
@@ -577,6 +586,10 @@ mod tests {
         assert_eq!(classify_field("decoration.gaps_out"), ReloadClass::Live);
         assert_eq!(classify_field("decoration.border"), ReloadClass::Live);
         assert_eq!(classify_field("decoration.radius"), ReloadClass::Live);
+        assert_eq!(
+            classify_field("decoration.content_inset"),
+            ReloadClass::Live
+        );
         assert_eq!(classify_field("decoration"), ReloadClass::Live);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
@@ -616,6 +629,7 @@ mod tests {
         new.decoration.gaps_out = 0;
         new.decoration.border = 1;
         new.decoration.radius = 0;
+        new.decoration.content_inset = 0;
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
@@ -624,6 +638,7 @@ mod tests {
             "decoration.gaps_out",
             "decoration.border",
             "decoration.radius",
+            "decoration.content_inset",
         ] {
             assert!(
                 r.diffs.iter().any(|d| d.field == field),

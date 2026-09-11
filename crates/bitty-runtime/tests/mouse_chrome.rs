@@ -38,11 +38,12 @@ fn release(button: MouseButton) -> bitty_platform::MouseEvent {
 
 /// Cursor pixels landing on container cell (col, row) under the default
 /// headless geometry (8px padding inset, 9x19 cells, zero cell gaps, plus
-/// the CTX-0294 default decoration outer gap + border = 8px at scale 1.0).
+/// the unified CTX-0294/CTX-0333 default decoration outer gap + border +
+/// content inset = 14px at scale 1.0).
 fn cell_pixels(col: u16, row: u16) -> CursorPosition {
     CursorPosition {
-        x: 8.0 + 8.0 + f64::from(col) * 9.0 + 4.0,
-        y: 8.0 + 8.0 + f64::from(row) * 19.0 + 9.0,
+        x: 8.0 + 14.0 + f64::from(col) * 9.0 + 4.0,
+        y: 8.0 + 14.0 + f64::from(row) * 19.0 + 9.0,
     }
 }
 

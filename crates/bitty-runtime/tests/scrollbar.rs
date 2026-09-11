@@ -15,8 +15,8 @@
 //! - A release over the painted thumb never activates hyperlinks.
 //!
 //! Default headless geometry throughout: 80x24 grid, 9x19 cells, 8px
-//! window padding, and the accepted CTX-0118 decoration `4/6/2/6` — so the
-//! track is `(712, 16, 8x440)` in physical pixels, hugging the decorated
+//! window padding, and the unified CTX-0333 decoration `6/6/2/6/6` — so the
+//! track is `(706, 22, 8x428)` in physical pixels, hugging the decorated
 //! content frame right edge (CTX-0294 present frame, not the raw cell
 //! allocation; grid columns untouched).
 
@@ -31,11 +31,12 @@ use bitty_runtime::{
 use bitty_ui::scrollbar::TrackRect;
 
 /// Default decorated track in physical pixels: 80x24 cells of 9x19px, 8px
-/// padding, decoration `4/6/2/6` (gaps_out 6 + border 2 inset the content
-/// frame to `(8, 8, 704, 440)`; right edge 8 + 8 + 704 = 720, thumb 8 wide).
-const TRACK_X: f64 = 712.0;
-const TRACK_Y: f64 = 16.0;
-const TRACK_H: f64 = 440.0;
+/// padding, unified decoration `6/6/2/6/6` (gaps_out 6 + border 2 + content
+/// inset 6 inset the content frame to `(14, 14, 692, 428)`; right edge
+/// 14 + 692 = 706, thumb 8 wide).
+const TRACK_X: f64 = 706.0;
+const TRACK_Y: f64 = 22.0;
+const TRACK_H: f64 = 428.0;
 
 fn window() -> WindowId {
     WindowId::from_raw_public(1)
@@ -155,10 +156,10 @@ fn always_paints_exactly_one_thumb_fill_with_scrollback() {
     assert_eq!(
         shown.scrollbar_track(),
         Some(TrackRect {
-            x: 712,
-            y: 16,
+            x: 706,
+            y: 22,
             width: 8,
-            height: 440,
+            height: 428,
         })
     );
 }
@@ -273,15 +274,16 @@ fn gaps_and_padding_shift_hit_testing() {
         "outer gap must move the track"
     );
     // The resolved track hugs the decorated content frame (outer cell gap
-    // plus decoration gaps_out 6 and border 2) translated by the 8px pad:
-    // content (17, 27, 686, 402) -> right edge 8 + 17 + 686 = 711.
+    // plus decoration gaps_out 6, border 2, content inset 6) translated by
+    // the 8px pad: content (23, 33, 674, 390) -> right edge
+    // 8 + 23 + 674 - 8 = 697.
     assert_eq!(
         track,
         TrackRect {
-            x: 703,
-            y: 35,
+            x: 697,
+            y: 41,
             width: 8,
-            height: 402,
+            height: 390,
         },
         "track must follow the decorated content frame plus padding"
     );
@@ -306,7 +308,7 @@ fn gaps_and_padding_shift_hit_testing() {
     release(&mut rt);
 
     // CTX-0223: zero padding puts the track flush at the decorated content
-    // edge (default decoration: content (8, 8, 704, 440) -> x 704, y 8).
+    // edge (default decoration: content (14, 14, 692, 428) -> x 698, y 14).
     let mut bare = runtime_with_config(RuntimeConfig {
         scrollbar_mode: ScrollbarMode::Always,
         window_padding: 0,
@@ -317,35 +319,38 @@ fn gaps_and_padding_shift_hit_testing() {
     assert_eq!(
         bare.scrollbar_track(),
         Some(TrackRect {
-            x: 704,
-            y: 8,
+            x: 698,
+            y: 14,
             width: 8,
-            height: 440,
+            height: 428,
         })
     );
 }
 
 #[test]
 fn release_over_thumb_never_activates_hyperlinks() {
-    // A full-width hyperlink row sits on the live bottom row (col 77 maps
-    // from the thumb strip); a thumb-gesture release must not open it,
-    // while the same click with hidden chrome still does (test validity).
-    fn feed_link_row(rt: &mut Runtime) {
-        let row = "x".repeat(80);
-        rt.handle_pty_bytes(
-            format!("\x1b]8;;https://example.test\x07{row}\x1b]8;;\x07").as_bytes(),
-        );
-    }
+    // A hyperlink sits on exactly the cell under the thumb's bottom strip;
+    // a thumb-gesture release must not open it, while the same click with
+    // hidden chrome still does (test validity). Setting the link on the
+    // mapped cell keeps the test independent of the decorated content
+    // geometry.
     let mut rt = runtime_with(ScrollbarMode::Always);
     feed_scrollback(&mut rt);
-    feed_link_row(&mut rt);
     rt.tick().expect("presents");
     let track = rt.scrollbar_track().expect("track");
-    move_to(
-        &mut rt,
-        f64::from(track.x) + 2.0,
-        f64::from(track.y) + f64::from(track.height) - 2.0,
+    let click = CursorPosition {
+        x: f64::from(track.x) + 2.0,
+        y: f64::from(track.y) + f64::from(track.height) - 2.0,
+    };
+    let cell = rt.cursor_to_cell(click);
+    let link = format!(
+        "\x1b[{};{}H\x1b]8;;https://example.test\x07x\x1b]8;;\x07",
+        cell.row + 1,
+        cell.col + 1
     );
+    rt.handle_pty_bytes(link.as_bytes());
+    rt.tick().expect("link presents");
+    move_to(&mut rt, click.x, click.y);
     press(&mut rt);
     assert!(rt.is_scrollbar_dragging());
     release(&mut rt);
@@ -357,13 +362,9 @@ fn release_over_thumb_never_activates_hyperlinks() {
     // Validity: the same coordinates with hidden chrome DO activate.
     let mut plain = runtime_with(ScrollbarMode::Hidden);
     feed_scrollback(&mut plain);
-    feed_link_row(&mut plain);
+    plain.handle_pty_bytes(link.as_bytes());
     plain.tick().expect("presents");
-    move_to(
-        &mut plain,
-        f64::from(track.x) + 2.0,
-        f64::from(track.y) + f64::from(track.height) - 2.0,
-    );
+    move_to(&mut plain, click.x, click.y);
     press(&mut plain);
     release(&mut plain);
     assert!(
@@ -392,10 +393,10 @@ fn scrollbar_width_scales_track_and_thumb() {
         let track = rt.scrollbar_track().expect("track");
         assert_eq!(track.width, width, "track carries the configured width");
         // Right edge hugs the decorated content frame at default padding:
-        // x = 8px pad + 8px content origin + 704px content - width.
-        assert_eq!(track.x, 720 - width as i32);
-        assert_eq!(track.y, 16);
-        assert_eq!(track.height, 440);
+        // x = 8px pad + 14px content origin + 692px content - width.
+        assert_eq!(track.x, 714 - width as i32);
+        assert_eq!(track.y, 22);
+        assert_eq!(track.height, 428);
 
         // The painted thumb is exactly `width` physical pixels wide: sample
         // one row inside the thumb near the live (bottom) position and count
@@ -448,17 +449,17 @@ fn scrollbar_width_scales_track_and_thumb() {
 #[test]
 fn track_follows_decorated_content_frame_defaults_and_zero() {
     // CTX-0313: the track hugs the decorated content frame the live present
-    // paints (CTX-0294), not the raw cell allocation. Default decoration
-    // `4/6/2/6` insets the content frame to `(8, 8, 704, 440)` before the
-    // 8px padding: track top 16, right edge 8 + 8 + 704 = 720.
+    // paints (CTX-0294), not the raw cell allocation. Unified decoration
+    // `6/6/2/6/6` insets the content frame to `(14, 14, 692, 428)` before the
+    // 8px padding: track top 22, right edge 8 + 14 + 692 - 8 = 706.
     for (decoration, expected) in [
         (
             Decoration::default(),
             TrackRect {
-                x: 712,
-                y: 16,
+                x: 706,
+                y: 22,
                 width: 8,
-                height: 440,
+                height: 428,
             },
         ),
         (
@@ -506,16 +507,18 @@ fn track_follows_decorated_content_frame_defaults_and_zero() {
 #[test]
 fn track_offsets_track_decoration_properties() {
     // (decoration, expected (x, y, height)) for 80x24 9x19 cells, 8px pad,
-    // 8px thumb: accepted defaults, ZERO, and each property in isolation.
+    // 8px thumb: unified defaults, ZERO, and each property in isolation.
     // `gaps_in` and `radius` leave a single leaf's frame rects unchanged;
-    // `gaps_out` and `border` inset the content frame the track hugs.
+    // `gaps_out`, `border`, and `content_inset` inset the content frame the
+    // track hugs.
     let cases = [
-        (Decoration::new(4, 6, 2, 6), (712, 16, 440)),
-        (Decoration::new(0, 0, 0, 0), (720, 8, 456)),
-        (Decoration::new(0, 0, 4, 0), (716, 12, 448)),
-        (Decoration::new(0, 10, 0, 0), (710, 18, 436)),
-        (Decoration::new(8, 0, 0, 0), (720, 8, 456)),
-        (Decoration::new(0, 0, 0, 16), (720, 8, 456)),
+        (Decoration::new(6, 6, 2, 6, 6), (706, 22, 428)),
+        (Decoration::new(0, 0, 0, 0, 0), (720, 8, 456)),
+        (Decoration::new(0, 0, 4, 0, 0), (716, 12, 448)),
+        (Decoration::new(0, 10, 0, 0, 0), (710, 18, 436)),
+        (Decoration::new(8, 0, 0, 0, 0), (720, 8, 456)),
+        (Decoration::new(0, 0, 0, 16, 0), (720, 8, 456)),
+        (Decoration::new(0, 0, 0, 0, 4), (716, 12, 448)),
     ];
     for (decoration, (x, y, height)) in cases {
         let mut rt = runtime_with_config(RuntimeConfig {
@@ -549,16 +552,17 @@ fn split_inner_gap_moves_track_to_focused_content_frame() {
     let sb = feed_scrollback(&mut rt);
     assert!(sb > 0, "need scrollback for the test");
     rt.tick().expect("presents");
-    // Outer 6 + border 2 -> content starts at 8; the 4px inner band splits
-    // the 708px area into two 352px frames: left content (8, 8, 348, 440),
-    // right content (364, 8, 348, 440); track right edge = content + 8px pad.
+    // Outer gaps_out 6 splits the 720px area into frames inset 6, then the
+    // 6px inner band leaves two 351px frames; border 2 + content inset 6
+    // shrink each content to (14, 14, 335, 428) and (371, 14, 335, 428);
+    // track right edge = content + 8px pad.
     assert_eq!(
         rt.scrollbar_track(),
         Some(TrackRect {
-            x: 356,
-            y: 16,
+            x: 349,
+            y: 22,
             width: 8,
-            height: 440,
+            height: 428,
         }),
         "focused first leaf"
     );
@@ -566,10 +570,10 @@ fn split_inner_gap_moves_track_to_focused_content_frame() {
     assert_eq!(
         rt.scrollbar_track(),
         Some(TrackRect {
-            x: 712,
-            y: 16,
+            x: 706,
+            y: 22,
             width: 8,
-            height: 440,
+            height: 428,
         }),
         "focused second leaf"
     );

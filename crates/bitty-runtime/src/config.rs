@@ -100,6 +100,9 @@ pub const DEFAULT_DECORATION_BORDER_PX: u16 = bitty_ui::DEFAULT_BORDER_PX;
 /// Alias of `bitty_ui::DEFAULT_RADIUS_PX` (CTX-0292).
 pub const DEFAULT_DECORATION_RADIUS_PX: u16 = bitty_ui::DEFAULT_RADIUS_PX;
 
+/// Alias of `bitty_ui::DEFAULT_CONTENT_INSET_PX` (CTX-0333).
+pub const DEFAULT_DECORATION_CONTENT_INSET_PX: u16 = bitty_ui::DEFAULT_CONTENT_INSET_PX;
+
 /// Alias of `bitty_ui::MAX_GAP_PX` (CTX-0292: `0..=32` logical px).
 pub const MAX_DECORATION_GAP_PX: u16 = bitty_ui::MAX_GAP_PX;
 
@@ -108,6 +111,9 @@ pub const MAX_DECORATION_BORDER_PX: u16 = bitty_ui::MAX_BORDER_PX;
 
 /// Alias of `bitty_ui::MAX_RADIUS_PX` (CTX-0292: `0..=16` logical px).
 pub const MAX_DECORATION_RADIUS_PX: u16 = bitty_ui::MAX_RADIUS_PX;
+
+/// Alias of `bitty_ui::MAX_CONTENT_INSET_PX` (CTX-0333: `0..=32` logical px).
+pub const MAX_DECORATION_CONTENT_INSET_PX: u16 = bitty_ui::MAX_CONTENT_INSET_PX;
 
 /// Maps a Core decoration validation failure to the runtime config error
 /// (CTX-0292), naming the offending property without echoing user content.
@@ -124,6 +130,9 @@ pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> Runtim
         }
         bitty_ui::DecorationError::Radius(_) => {
             "decoration.radius must be within [0, 16] logical pixels"
+        }
+        bitty_ui::DecorationError::ContentInset(_) => {
+            "decoration.content_inset must be within [0, 32] logical pixels"
         }
     };
     RuntimeError::InvalidConfig(msg)
@@ -1201,20 +1210,25 @@ mod tests {
     }
 
     #[test]
-    fn decoration_defaults_match_accepted_spec_and_validate() {
-        // CTX-0292 / accepted spec CTX-0118: defaults 4/6/2/6 logical px;
-        // runtime constants alias the bitty-ui solver bounds so they cannot
-        // drift; out-of-range values fail closed naming the property.
-        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 4) }
+    fn decoration_defaults_match_unified_spec_and_validate() {
+        // CTX-0292/CTX-0333: unified defaults 6/6/2/6/6 logical px; runtime
+        // constants alias the bitty-ui solver bounds so they cannot drift;
+        // out-of-range values fail closed naming the property.
+        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 6) }
         const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
         const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
         const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
+        const { assert!(DEFAULT_DECORATION_CONTENT_INSET_PX == 6) }
         const { assert!(MAX_DECORATION_GAP_PX == 32) }
         const { assert!(MAX_DECORATION_BORDER_PX == 8) }
         const { assert!(MAX_DECORATION_RADIUS_PX == 16) }
+        const { assert!(MAX_DECORATION_CONTENT_INSET_PX == 32) }
         let cfg = RuntimeConfig::default();
-        assert_eq!((cfg.decoration.gaps_in, cfg.decoration.gaps_out), (4, 6));
+        assert_eq!((cfg.decoration.gaps_in, cfg.decoration.gaps_out), (6, 6));
         assert_eq!((cfg.decoration.border, cfg.decoration.radius), (2, 6));
+        assert_eq!(cfg.decoration.content_inset, 6);
+        // CTX-0333: sibling and container gaps match by default.
+        assert_eq!(cfg.decoration.gaps_in, cfg.decoration.gaps_out);
         cfg.validate().expect("default decoration valid");
         // `new()` leaves decoration at the accepted defaults.
         let built = RuntimeConfig::new(
@@ -1239,10 +1253,11 @@ mod tests {
         assert_eq!(built.decoration, bitty_ui::Decoration::default());
         // Out-of-range decoration fails closed at validate().
         for (field, bad) in [
-            ("gaps_in", bitty_ui::Decoration::new(33, 6, 2, 6)),
-            ("gaps_out", bitty_ui::Decoration::new(4, 33, 2, 6)),
-            ("border", bitty_ui::Decoration::new(4, 6, 9, 6)),
-            ("radius", bitty_ui::Decoration::new(4, 6, 2, 17)),
+            ("gaps_in", bitty_ui::Decoration::new(33, 6, 2, 6, 6)),
+            ("gaps_out", bitty_ui::Decoration::new(6, 33, 2, 6, 6)),
+            ("border", bitty_ui::Decoration::new(6, 6, 9, 6, 6)),
+            ("radius", bitty_ui::Decoration::new(6, 6, 2, 17, 6)),
+            ("content_inset", bitty_ui::Decoration::new(6, 6, 2, 6, 33)),
         ] {
             let cfg = RuntimeConfig {
                 decoration: bad,

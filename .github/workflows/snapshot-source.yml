@@ -8,18 +8,28 @@ name: Snapshot source
 # Triggers:
 #   - push to main: fails while a newer main HEAD is unpublished, so a red run
 #     is the closeout signal to publish.
-#   - push to carryctx-snapshots: re-checks and turns green once the closeout
-#     publishes the snapshot for the pending main HEAD.
-# Pull requests are unaffected: neither trigger is a pull_request event, so PR
-# builds and their required checks are untouched. Before the first publication
-# the branch does not exist yet; the check then passes with a notice so main is
-# not blocked while in-repo publication rolls out.
+#   - push to carryctx-snapshots: intended to re-check and turn green once the
+#     closeout publishes the snapshot for the pending main HEAD. The snapshot
+#     ref tree carries no workflow files, so GitHub never starts this workflow
+#     for that push; the schedule below is what actually re-checks. Kept for the
+#     eventual case where the ref carries workflow files.
+#   - schedule: daily staleness check so a missed closeout is caught even when
+#     main stays idle, and a delayed publish turns the check green.
+#   - workflow_dispatch: manual re-run during merge closeout.
+# Pull requests are unaffected: none of the triggers is a pull_request event, so
+# PR builds and their required checks are untouched. Before the first
+# publication the branch does not exist yet; the check then passes with a notice
+# so main is not blocked while in-repo publication rolls out.
 
 on:
   push:
     branches:
       - main
       - carryctx-snapshots
+  schedule:
+    # Daily at 06:17 UTC (off the hour to avoid top-of-hour scheduler load).
+    - cron: "17 6 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read

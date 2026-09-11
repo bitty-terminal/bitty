@@ -20,6 +20,7 @@ bitty-pty = { path = "../bitty-pty" }
 bitty-render = { path = "../bitty-render" }
 bitty-platform = { path = "../bitty-platform" }
 bitty-ui = { path = "../bitty-ui" }
+bitty-lua = { path = "../bitty-lua" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-agent = { path = "../bitty-agent" }
 bitty-ipc = { path = "../bitty-ipc" }

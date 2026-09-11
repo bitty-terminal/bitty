@@ -199,6 +199,7 @@ mod inspect;
 mod ipc_serve;
 mod layout_cmd;
 mod logging;
+mod plugin_runtime;
 
 mod list;
 mod plugin;
@@ -475,6 +476,17 @@ fn main() {
             apply_focus(&mut runtime, focus_spec);
         }
     }
+
+    // Gap A startup wiring (RFC plugin-host-runtime-rfc): discover bundled
+    // plugin packages and activate each in its own VM on this thread. The
+    // runtime is retained for the process lifetime so its registrations and
+    // host-service state outlive startup; command/event delivery from the
+    // event loop is a follow-up slice. `--safe` creates no third-party VM.
+    let _plugin_runtime = plugin_runtime::discover_and_activate(
+        args.safe,
+        runtime.config().cols,
+        runtime.config().rows,
+    );
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);

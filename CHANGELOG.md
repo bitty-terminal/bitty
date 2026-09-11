@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Plugin host runtime: per-plugin VM lifecycle and activation (CTX-0328)
+
+- Ratified `plugin-host-runtime-rfc` Gap A implemented across the policy,
+  mechanism, orchestration, and application layers. `bitty-plugin-host` stays
+  VM-free; `bitty-runtime` gains a `plugin_runtime` module owning one `!Send`
+  `piccolo` VM per `(PluginId, generation)` on a single executor thread with
+  the `Unloaded -> Loading -> Activating -> Active -> Suspended -> Disposing
+-> Disposed` lifecycle.
+- `bitty-lua` gains the VM seam: read-only `bitty` host-module injection,
+  rooted source-only `require`, bounded depth/node/byte marshalling,
+  generation-scoped registration capture, and budget-enforced callback
+  invocation. The retained stdlib piccolo omits is installed (`utf8`,
+  restricted `os.time/clock/date`, `string.byte/char/format`, `table.concat`,
+  `table.sort`).
+- Activation runs the fixed `init.lua`, validates the captured registrations
+  against the manifest, and commits atomically; any failure leaves no partial
+  activation. Minimal host services (`terminal.snapshot` sync bounded,
+  `notify.show` async hand-off, `store.*` sync atomic quota-bounded,
+  `settings.*` read-only) and typed `E_TIMEOUT`/`E_*` errors.
+- `bitty-app` discovers bundled packages at startup and activates them; a new
+  `--safe` flag creates no third-party VM. Bounds: 256 KiB manifest, 4096
+  module files, 16 MiB tree, 1024-byte path.
+- Follow-ups: Gap B source staging/integrity (CTX-0329) and Gap C hardening
+  (CTX-0330).
+
 ### `terminal.shell` honored at startup spawn (CTX-0298, issue #495)
 
 - The effective `terminal.shell` value is now used when no explicit CLI

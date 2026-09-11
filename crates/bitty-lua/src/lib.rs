@@ -53,13 +53,23 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
 
 pub mod config;
+pub mod host;
+mod stdlib;
 
 pub use config::{ConfigData, ConfigOutcome, FontData, KeymapData, TerminalData, WindowData};
+pub use host::{
+    API_VERSION, BoundedExecution, BridgeError, CommandRegistration, EventSubscription,
+    HostServices, LuaValue, MarshallingLimits, RegistrationCapture, SNAPSHOT_MAX_BYTES,
+    TimerRegistration,
+};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 
@@ -316,6 +326,19 @@ pub struct LuaVm {
     warning_count: u64,
     suspension_count: u64,
     total_executions: u64,
+    // ── Gap A host-bridge state (RFC plugin-host-runtime-rfc A.2) ──────────
+    /// Generation-scoped capture of `init.lua` registrations.
+    pub(crate) capture: Rc<RefCell<host::RegistrationCapture>>,
+    /// Re-entrancy guard shared by every bridge callback (A.3 rule 2).
+    pub(crate) in_bridge_call: Rc<Cell<bool>>,
+    /// Source-only module root used by the injected `require`.
+    pub(crate) module_root: Option<PathBuf>,
+    /// Whether the `bitty` host module has been installed.
+    pub(crate) host_installed: bool,
+    /// Bounded marshalling limits for this VM.
+    pub(crate) marshalling_limits: host::MarshallingLimits,
+    /// Bridge call deadline in milliseconds (reuses RC-1 by default).
+    pub(crate) host_deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,7 +385,10 @@ impl LuaVm {
         // Lua::core() loads base, coroutine, math, string, table — no I/O.
         // This matches the restricted stdlib baseline per lua-runtime-rfc:
         // pure computation base only, no `io`/`os.execute`/`debug` ambient authority.
-        let lua = Lua::core();
+        // The accepted baseline also retains `utf8`; piccolo omits it, so the
+        // bounded, I/O-free `utf8` functions are installed explicitly.
+        let mut lua = Lua::core();
+        stdlib::install_retained_stdlib(&mut lua);
         Self {
             id: id.into(),
             lua,
@@ -378,6 +404,12 @@ impl LuaVm {
             warning_count: 0,
             suspension_count: 0,
             total_executions: 0,
+            capture: Rc::new(RefCell::new(host::RegistrationCapture::new())),
+            in_bridge_call: Rc::new(Cell::new(false)),
+            module_root: None,
+            host_installed: false,
+            marshalling_limits: host::MarshallingLimits::default(),
+            host_deadline_ms: host::DEFAULT_HOST_DEADLINE_MS,
         }
     }
 
@@ -587,20 +619,6 @@ impl LuaVm {
             });
         }
 
-        self.total_executions = self.total_executions.wrapping_add(1);
-        self.warning_triggered = false;
-        self.instructions_used = 0;
-        self.wall_elapsed_ms = 0;
-        self.memory_used = self.lua.total_memory();
-
-        // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
-        // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
-        // instructions instead of once per whole budget. `total_used` tracks
-        // the true cumulative consumption across slices; fuel is only topped
-        // up between `step` calls (never during), per piccolo's contract.
-        let mut total_used: u64 = 0;
-        let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
-
         // Load closure — deterministic, no I/O beyond source bytes.
         let code_owned = code.to_string();
         let mut load_error: Option<String> = None;
@@ -627,6 +645,38 @@ impl LuaVm {
                 });
             }
         };
+
+        self.drive_stashed(stashed)
+    }
+
+    /// Shared budget-enforced stepping loop over an already-loaded executor.
+    ///
+    /// Used by [`LuaVm::drive_chunk`] and by host-bridge invocation
+    /// ([`LuaVm::call_function`](crate::LuaVm::call_function)); RC-1/RC-2
+    /// enforcement is identical in both paths.
+    pub(crate) fn drive_stashed(
+        &mut self,
+        stashed: StashedExecutor,
+    ) -> Result<DriveOutcome, VmError> {
+        if let VmStatus::Suspended(reason) = &self.status {
+            return Err(VmError::Suspended {
+                reason: reason.clone(),
+            });
+        }
+
+        self.total_executions = self.total_executions.wrapping_add(1);
+        self.warning_triggered = false;
+        self.instructions_used = 0;
+        self.wall_elapsed_ms = 0;
+        self.memory_used = self.lua.total_memory();
+
+        // Tighter slices (CR-LUA-01): each `Executor::step` gets at most
+        // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
+        // instructions instead of once per whole budget. `total_used` tracks
+        // the true cumulative consumption across slices; fuel is only topped
+        // up between `step` calls (never during), per piccolo's contract.
+        let mut total_used: u64 = 0;
+        let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
 
         // Execution wall-clock starts after chunk load: the RC-1 50 ms budget
         // bounds VM execution (what the fuel/instruction budget also bounds),
@@ -945,6 +995,20 @@ impl LuaVm {
 }
 
 #[cfg(test)]
+impl LuaVm {
+    /// Read a numeric/boolean global for unit tests (no marshalling surface).
+    pub(crate) fn test_global(&mut self, name: &str) -> Option<f64> {
+        self.lua
+            .enter(|ctx| match ctx.get_global(name.to_string()) {
+                piccolo::Value::Integer(i) => Some(i as f64),
+                piccolo::Value::Number(n) => Some(n),
+                piccolo::Value::Boolean(b) => Some(if b { 1.0 } else { 0.0 }),
+                _ => None,
+            })
+    }
+}
+
+#[cfg(test)]
 mod vm_unit_tests {
     use super::*;
 
@@ -994,9 +1058,14 @@ mod vm_unit_tests {
     #[test]
     fn restricted_stdlib_denies_ambient_io_and_dynamic_loading() {
         let mut vm = LuaVm::new("xuepoo.sandbox");
+        // The accepted Lua Runtime RFC retains `os.time`/`os.clock`/`os.date`
+        // but removes process/env/filesystem primitives; `io`, `package`,
+        // `debug`, and dynamic loading stay absent.
         let outcome = vm
             .execute(
-                "assert(io == nil and os == nil and package == nil and debug == nil and load == nil and loadfile == nil and dofile == nil)",
+                "assert(io == nil and package == nil and debug == nil and load == nil and loadfile == nil and dofile == nil \
+                 and type(os) == 'table' and type(os.time) == 'function' and type(os.clock) == 'function' \
+                 and os.execute == nil and os.getenv == nil and os.remove == nil and os.tmpname == nil)",
             )
             .unwrap();
         assert!(matches!(outcome, ExecuteOutcome::Completed { .. }));

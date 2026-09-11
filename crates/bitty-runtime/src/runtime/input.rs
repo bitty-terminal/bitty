@@ -538,6 +538,13 @@ impl Runtime {
         match (event.button, event.state) {
             (MouseButton::Left, PressState::Pressed) => {
                 if let Some(pos) = self.last_cursor {
+                    // CTX-0339: click-to-focus. A left press on a pane moves
+                    // keyboard focus to the hit-tested leaf even when
+                    // `focus_follows_mouse` is off (the default). Shift is
+                    // the accessibility escape (CTX-0181): `click_focus_at`
+                    // suppresses focus so Shift+click selects without
+                    // stealing focus, coherent with the hover path.
+                    self.click_focus_at(pos);
                     let cell = self.cursor_to_cell(pos);
                     self.start_selection(cell);
                 } else if self.selection.is_some() {

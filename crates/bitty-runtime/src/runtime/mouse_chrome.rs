@@ -15,6 +15,12 @@
 //! cancels the pending dwell so hover can never override a deliberate
 //! choice.
 //!
+//! CTX-0339 (click-to-focus): a left press routes through
+//! [`Runtime::click_focus_at`], which focuses the hit-tested leaf even when
+//! `focus_follows_mouse` is off (the default). It shares the hover
+//! hit-test ([`Runtime::cursor_to_leaf_cell`]) and Shift suppression, so a
+//! click and a hover agree on which pane owns the pointer.
+//!
 //! Lane note: pointer chrome only. Selection, capture encoding, scrollbar
 //! drags, and workspace switching belong to their owning paths; this module
 //! only grabs/moves/releases the Alt-drag and applies the gated hover step.
@@ -155,6 +161,33 @@ impl Runtime {
             return false;
         }
         self.alt_drag = None;
+        true
+    }
+
+    /// Click-to-focus (CTX-0339): a left press focuses the pane under the
+    /// pointer, independent of the opt-in hover flag (the default keeps
+    /// click-to-focus).
+    ///
+    /// Uses the same [`Self::cursor_to_leaf_cell`] hit-test as
+    /// [`Self::hover_focus_at_at`], so gap/padding bands (no leaf) keep the
+    /// current focus and a click and a hover agree on the target. Shift is
+    /// the accessibility escape (CTX-0181) and never steals focus, matching
+    /// the hover path. Mouse capture and scrollbar chrome never reach here:
+    /// the caller consumes those presses first, so a mouse-tracking app or
+    /// an active thumb drag keeps the pointer.
+    ///
+    /// Returns `true` when the pointer landed on a leaf (whether or not it
+    /// already held focus), `false` over a gap or under Shift.
+    pub(super) fn click_focus_at(&mut self, pos: CursorPosition) -> bool {
+        if self.shift_pressed {
+            return false;
+        }
+        let Some((id, _)) = self.cursor_to_leaf_cell(pos) else {
+            return false;
+        };
+        // A click is an explicit focus choice: `set_focus` also drops any
+        // pending hover dwell, so hover can never override it.
+        self.set_focus(id);
         true
     }
 

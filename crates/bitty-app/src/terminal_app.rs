@@ -629,6 +629,13 @@ impl AppHandler for TerminalApp {
                         win.request_redraw();
                     }
                 }
+                // CTX-0334: arm a single timed wake for a pending hover
+                // dwell so a stopped pointer still activates; otherwise
+                // return to energy-saving wait (frame-on-demand).
+                match self.runtime.hover_activation_deadline() {
+                    Some(deadline) => ctx.set_wait_until(deadline),
+                    None => ctx.set_wait(),
+                }
             }
             PlatformEvent::PtyReadable => {
                 // Evented PTY wakeup: the top-of-handler `poll_pty_pump`

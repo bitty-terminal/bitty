@@ -133,7 +133,7 @@ pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::PresentStats;
 
 use self::layout_focus::{default_container, default_layout};
-use self::mouse_chrome::AltDragState;
+use self::mouse_chrome::{AltDragState, HoverPending};
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, HeadlessRasterizer};
 use self::scrollbar::ScrollbarDrag;
@@ -344,6 +344,16 @@ pub struct Runtime {
     /// truth. Shift still forces the selection path (the grab never starts
     /// while Shift is held, per the CTX-0181 precedent).
     alt_drag: Option<AltDragState>,
+    /// Pending dwell before hover activation moves focus (CTX-0334).
+    ///
+    /// `Some` only while `mouse.focus_follows_mouse` is enabled with a
+    /// positive delay and the pointer has entered a non-focused pane; the
+    /// entry time is compared against the deadline on each `tick_at` (the
+    /// app schedules a wake at the deadline via `EventContext::set_wait_until`).
+    /// A pointer that leaves the pane or a matching focus clears it, so a
+    /// transient pass-through never steals focus. Presentation-only: never
+    /// grid truth.
+    hover_pending: Option<HoverPending>,
     /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
     ///
     /// Ghostty copies a committed left-drag selection to both the standard
@@ -665,6 +675,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            hover_pending: None,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
@@ -786,6 +797,7 @@ impl Runtime {
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
             alt_drag: None,
+            hover_pending: None,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),

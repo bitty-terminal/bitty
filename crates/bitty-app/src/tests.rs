@@ -1324,17 +1324,42 @@ fn runtime_config_inherits_file_focus_follows_mouse() {
         bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE,
         bitty_config::types::DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE
     );
+    // CTX-0334: the dwell-delay defaults and bound stay paired by value.
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+        bitty_config::types::DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
+    );
+    assert_eq!(
+        bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+        bitty_config::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
+    );
     const { assert!(!bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+    const { assert!(bitty_runtime::config::DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
-    let plan = parse_lua_config(r#"return { mouse = { focus_follows_mouse = true } }"#, &src)
-        .expect("opt-in parses");
+    let plan = parse_lua_config(
+        r#"return { mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 250 } }"#,
+        &src,
+    )
+    .expect("opt-in parses");
     let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
         .expect("merge");
     assert!(merged.effective.mouse.focus_follows_mouse);
+    assert_eq!(merged.effective.mouse.focus_follows_mouse_delay_ms, 250);
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
     assert!(cfg.focus_follows_mouse);
+    assert_eq!(
+        cfg.focus_follows_mouse_delay,
+        std::time::Duration::from_millis(250)
+    );
+    assert_eq!(
+        merged
+            .source_of("mouse.focus_follows_mouse_delay_ms")
+            .unwrap()
+            .layer,
+        bitty_config::plan::LayerKind::User
+    );
     assert_eq!(
         merged.source_of("mouse.focus_follows_mouse").unwrap().layer,
         bitty_config::plan::LayerKind::User
@@ -1860,6 +1885,7 @@ fn starter_init_lua_is_valid_config() {
     // so new installs ride click-to-focus without a file override.
     assert!(plan.mouse.is_none());
     assert!(starter_init_lua().contains("focus_follows_mouse"));
+    assert!(starter_init_lua().contains("focus_follows_mouse_delay_ms"));
 }
 
 // -- `bitty init` wizard (CTX-0149, #243) --------------------------------

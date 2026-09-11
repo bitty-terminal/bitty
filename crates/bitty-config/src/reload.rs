@@ -73,6 +73,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `scrollbar.mode`          | RestartRequired    |
 /// | `scrollbar.width`         | RestartRequired    |
 /// | `mouse.focus_follows_mouse` | RestartRequired  |
+/// | `mouse.focus_follows_mouse_delay_ms` | RestartRequired |
 /// | `plugins`                 | RestartRequired    |
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
@@ -110,6 +111,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "scrollbar.width"
         | "scrollbar"
         | "mouse.focus_follows_mouse"
+        | "mouse.focus_follows_mouse_delay_ms"
         | "mouse"
         | "plugins" => ReloadClass::RestartRequired,
         _ => ReloadClass::Rejected,

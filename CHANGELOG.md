@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Help popup occludes grid text (CTX-0336, issue #559)
+
+- Fixed the `Mod+backtick` which-key help popup (`Mod+?`) painting the
+  underlying terminal text through its opaque background and border: `DrawList`
+  composites every glyph after every fill, so base-grid glyphs repainted over
+  the panel. The panel now drops pre-existing glyphs whose pixel box intersects
+  its frame, keeping the popup fully opaque regardless of `window.opacity`.
+- Added a headless regression (`help_panel_occludes_grid_inside_its_frame`)
+  that brackets the panel from its border pixels and proves the underlay no
+  longer bleeds through.
+
 ## [0.0.20] - 2026-09-11
 
 ### Release highlights

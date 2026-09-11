@@ -359,9 +359,18 @@ pub fn apply_control(
         }
         match runtime.workspace_new() {
             Ok(index) => {
+                // CTX-0322: report the stable creation sequence (`ws{seq}`),
+                // the same identity `workspace list` names and `focus`/`close`
+                // accept — never the positional display index.
+                let Some(seq) = runtime.workspace_seq_at(index) else {
+                    return Err((
+                        "transport",
+                        "Transport",
+                        String::from("workspace slot vanished after create"),
+                    ));
+                };
                 return Ok(format!(
-                    "{{\"created\":\"ws:{}\",\"tabline\":\"{}\"}}",
-                    index + 1,
+                    "{{\"created\":\"ws:{seq}\",\"tabline\":\"{}\"}}",
                     json_escape(&runtime.workspaceline_text()),
                 ));
             }
@@ -379,10 +388,18 @@ pub fn apply_control(
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         let num = ipc_ctl::parse_workspace_id(&workspace_id)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
+        // CTX-0322: `ws:N` is the stable creation sequence, not a position.
+        let Some(index) = runtime.workspace_index_by_seq(u64::from(num)) else {
+            return Err((
+                "usage",
+                "NotFound",
+                format!("no such workspace {workspace_id}"),
+            ));
+        };
         // Non-interactive path: elevation (terminal.manage, authorized
         // upstream) is the gate, so close is immediate — the pending-confirm
         // gate is the interactive key-chord UX only.
-        match runtime.workspace_close_index(u64::from(num)) {
+        match runtime.workspace_close_at(index) {
             Ok(killed) => {
                 return Ok(format!(
                     "{{\"closed\":\"{workspace_id}\",\"killed\":{killed},\"tabline\":\"{}\"}}",
@@ -399,12 +416,14 @@ pub fn apply_control(
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         let num = ipc_ctl::parse_workspace_id(&workspace_id)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
-        let index = (u64::from(num) - 1) as usize;
-        if runtime.workspace_switch(index) {
-            return Ok(format!(
-                "{{\"focused\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
-                json_escape(&runtime.workspaceline_text()),
-            ));
+        // CTX-0322: resolve the stable sequence id `ws:N` to the current slot.
+        if let Some(index) = runtime.workspace_index_by_seq(u64::from(num)) {
+            if runtime.workspace_switch(index) {
+                return Ok(format!(
+                    "{{\"focused\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
+                    json_escape(&runtime.workspaceline_text()),
+                ));
+            }
         }
         return Err((
             "usage",
@@ -420,20 +439,29 @@ pub fn apply_control(
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         let num = ipc_ctl::parse_workspace_id(&workspace_id)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
-        match runtime.workspace_move_focused_to_one_based(u64::from(num)) {
-            Ok((moved, from, _to)) => {
+        // CTX-0322: resolve the stable sequence id `ws:N` to the current slot.
+        let Some(index) = runtime.workspace_index_by_seq(u64::from(num)) else {
+            return Err((
+                "usage",
+                "NotFound",
+                format!("no such workspace {workspace_id}"),
+            ));
+        };
+        let from_seq = runtime
+            .workspace_seq_at(runtime.active_workspace_index())
+            .unwrap_or(u64::from(num));
+        match runtime.workspace_move_focused_to(index) {
+            Ok(moved) => {
                 return Ok(format!(
-                    "{{\"moved\":\"v:{}\",\"from\":\"ws:{from}\",\"to\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
+                    "{{\"moved\":\"v:{}\",\"from\":\"ws:{from_seq}\",\"to\":\"{workspace_id}\",\"tabline\":\"{}\"}}",
                     moved.0,
                     json_escape(&runtime.workspaceline_text()),
                 ));
             }
             Err(message) => {
                 // `from==to` no-ops succeed inside the runtime; every Err
-                // here is an unknown target or missing focus (no partial).
-                if message.contains("no such workspace") {
-                    return Err(("usage", "NotFound", message));
-                }
+                // here is a missing focus or an unsplittable source (no
+                // partial state).
                 return Err(("usage", "Conflict", message));
             }
         }

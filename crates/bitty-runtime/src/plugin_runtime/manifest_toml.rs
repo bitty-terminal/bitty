@@ -1,9 +1,10 @@
 //! Bounded reader for the `bitty-plugin.toml` manifest subset.
 //!
-//! The full package-integrity pipeline (signatures, content digests, the
-//! complete TOML schema) is owned by the Gap B source-resolution task; this
-//! module is the minimal, fail-closed reader the runtime needs to discover a
-//! bundled package from its on-disk manifest. It performs no I/O: the caller
+//! The full package-integrity pipeline (signatures, artifact verification, the
+//! complete TOML schema) stays with the package manager; the runtime's Gap B
+//! resolution re-verifies the parsed manifest's `manifest_hash` and the module
+//! tree's `content_digest` against the stored record. This module is the
+//! minimal, fail-closed reader used for both, and performs no I/O: the caller
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`.

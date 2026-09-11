@@ -60,6 +60,7 @@ fn runtime(
     PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir: Some(data_dir),
+        store_root: None,
         bundled_roots,
         third_party_roots,
         settings: Rc::new(settings),

@@ -381,12 +381,24 @@ pub fn apply_control(
         return Err(("usage", "NotFound", format!("no such view {view_id}")));
     }
     if method == ipc_ctl::METHOD_LIST_WORKSPACES {
-        // Tabline truth: names + indices + focused marker + count, the same
-        // string the overlay renders (`workspaceline_text`).
-        let names = workspace_names_json(runtime);
-        let active = runtime.active_workspace_index() + 1;
+        // CTX-0338 (D2 residual): `workspaces` carries the canonical
+        // `ws:{seq}` identity the write verbs (`focus`/`close`/`move`) accept,
+        // so a client can feed list output straight back. Display labels stay
+        // available under `names`; `active` keeps the 1-based positional index
+        // for tabline parity and `active_id` names the focused workspace
+        // canonically. The human `tabline` string is unchanged.
+        let ids: Vec<String> = (0..runtime.workspace_count())
+            .filter_map(|idx| runtime.workspace_seq_at(idx).map(|seq| format!("ws:{seq}")))
+            .collect();
+        let active_id = runtime
+            .workspace_seq_at(runtime.active_workspace_index())
+            .map_or_else(String::new, |seq| format!("ws:{seq}"));
         return Ok(format!(
-            "{{\"workspaces\":{names},\"active\":{active},\"count\":{},\"tabline\":\"{}\"}}",
+            "{{\"workspaces\":{},\"names\":{},\"active\":{},\"active_id\":\"{}\",\"count\":{},\"tabline\":\"{}\"}}",
+            json_string_array(&ids),
+            json_string_array(&runtime.workspace_names()),
+            runtime.active_workspace_index() + 1,
+            json_escape(&active_id),
             runtime.workspace_count(),
             json_escape(&runtime.workspaceline_text()),
         ));
@@ -569,18 +581,19 @@ fn split_leaf(
     }
 }
 
-/// Workspace names as a JSON string array for `workspace list`.
+/// Serialize a slice of strings as a JSON string array for the control
+/// surface.
 ///
-/// Bounded: at most 16 names, each JSON-escaped. Names are runtime-issued
-/// (`ws{seq}`) until rename lands as a follow-up.
-fn workspace_names_json(runtime: &bitty_runtime::Runtime) -> String {
+/// Bounded by the caller (workspace slots are capped at 16); each item is
+/// JSON-escaped and order is preserved.
+fn json_string_array(items: &[String]) -> String {
     let mut out = String::from("[");
-    for (idx, name) in runtime.workspace_names().iter().enumerate() {
+    for (idx, item) in items.iter().enumerate() {
         if idx > 0 {
             out.push(',');
         }
         out.push('"');
-        out.push_str(&json_escape(name));
+        out.push_str(&json_escape(item));
         out.push('"');
     }
     out.push(']');

@@ -1,0 +1,22 @@
+[plugin]
+id = "bitty-featured.sample"
+name = "Sample Runtime Plugin"
+version = "0.1.0"
+description = "Runtime fixture exercising the Gap A bridge and Gap C host services."
+license = "MIT"
+
+[compat]
+bitty = ">=0.5,<1.0"
+plugin-api = "^1.0"
+
+[capabilities]
+terminal.semantic-read = true
+platform.notify = true
+
+[lazy]
+commands = [
+  "bitty-featured.sample:summary",
+]
+events = [
+  "terminal.opened",
+]

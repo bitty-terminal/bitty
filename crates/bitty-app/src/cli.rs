@@ -19,6 +19,9 @@ use crate::spawn::{looks_like_negative_number, parse_split_token};
 pub(crate) struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
     pub(crate) headless: bool,
+    /// When true (`--safe`) never create a third-party plugin VM and never
+    /// read the third-party store tree (recovery startup, RFC A.4 rule 6).
+    pub(crate) safe: bool,
     /// When true print help and exit 0.
     pub(crate) help: bool,
     /// When true print version and exit 0.
@@ -255,6 +258,7 @@ impl Args {
     pub(crate) fn new() -> Self {
         Self {
             headless: false,
+            safe: false,
             help: false,
             version: false,
             program: None,
@@ -629,6 +633,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--headless" => {
                 out.headless = true;
+                i += 1;
+            }
+            "--safe" => {
+                out.safe = true;
                 i += 1;
             }
             "--stack" => {
@@ -1217,6 +1225,7 @@ pub(crate) fn help_text() -> String {
                              (default warn; tick stats need debug|trace;\n  \
                              also BITTY_LOG/RUST_LOG)\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
+               --safe       Do not load third-party plugins (no plugin VM)\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
                --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \

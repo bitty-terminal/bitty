@@ -189,6 +189,7 @@ pub mod mail_panel;
 pub mod palette;
 pub mod panels_async;
 pub mod paste;
+pub mod plugin_runtime;
 pub mod project;
 pub mod project_scope;
 pub mod queries;

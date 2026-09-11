@@ -292,8 +292,22 @@ On this worktree at `c0aadd2` + this task delta:
 - **Queue budgets remain candidate values**: per-sub `64`, per-plugin `1024`
   / `256 KiB`, global `8192` / `2 MiB`, batch `32` / `8 KiB`, side queue
   `128` (runtime) are the accepted `v1` defaults enforced headlessly. Exact
-  timeout milliseconds and `RC-1`/`RC-2` instruction/memory enforcement remain
-  `OQ-014` candidates; the host's Lua VM (`piccolo`) seam is deferred.
+  timeout milliseconds remain `OQ-014` candidates; `RC-1`/`RC-2`
+  instruction/memory enforcement is live in `bitty-lua`.
+- **Host bridge (CTX-0328)**: the ratified `plugin-host-runtime-rfc` Gap A is
+  implemented in `bitty-runtime::plugin_runtime` over the `bitty-lua` host
+  seam: one `!Send` `piccolo` VM per `(PluginId, generation)`, read-only
+  `bitty` module injection, rooted source-only `require`, bounded callback
+  invocation, registration capture/manifest validation/atomic commit with
+  full host rollback on failure, and the minimal
+  `terminal.snapshot`/`notify.show`/`store.*`/`settings.*` services.
+  `bitty-app` discovers plugin packages at startup and activates them;
+  `--safe` creates no third-party VM, where provenance comes from the
+  discovery root (`SourceClass`) rather than a self-declared manifest id.
+  Gap B (XDG store/integrity/local-path, CTX-0329) and the Gap C hardening
+  slice (CTX-0330) remain follow-ups; in this slice the app's discoverable
+  roots are external (environment override or XDG), so they are third-party
+  and `--safe` loads nothing.
 
 - **Panel ecosystem**: the Panel Extensibility Vision (CTX-0094) remains
   candidate; this task does not add a Panel provider, WebView, or Event Bus.

@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.20] - 2026-09-11
+
+### Release highlights
+
+- **Plugin runtime Gap A (CTX-0328):** per-plugin `!Send` VM lifecycle and
+  atomic activation landed across `bitty-plugin-host`, `bitty-lua`,
+  `bitty-runtime`, and `bitty-app`; bundled plugins (including the activity
+  plugin) now load and activate, and `--safe` starts with no third-party VM.
+- **`ctl` D1/D2/D3 correctness (CTX-0321/0322/0323):** terminal text commands
+  render grid text instead of the Rust `Debug` snapshot; workspace ids are
+  stable `ws{seq}` values across `new`/`list`/`focus`/`close`/`move`;
+  `terminal spawn` creates an observable pane session.
+- **Kitty graphics:** APC `G` parser wiring with base64 unwrap (CTX-0255/0256),
+  bounded PNG/RGB decode (CTX-0247), placement/rasterize/composite into the
+  present path (CTX-0248), per-pane origin binding with a per-frame blit
+  budget and raster cache (CTX-0252/0254), GPU display gate and saturating
+  origin math (CTX-0253), and real-GPU texture upload + blit (CTX-0291).
+- **Workspace decoration and presentation (CTX-0292):** Core-owned gaps px,
+  border, and radius, plus SDF rounded decoration fills and inner-arc glyph
+  clipping (CTX-0311) and scrollbar overlay tracking the decorated content
+  frame (CTX-0313); `window.padding`/`opacity` wiring, premultiplied alpha,
+  theme cursor hue, tall-glyph clipping, and session-less split present fixes.
+- **Configuration matrix:** arrow-key default variants for HJKL actions
+  (CTX-0262), Mod+M/HJKL pinned to both mods with a Mod-aware resize variant
+  (CTX-0258), configurable leader/mod key, F-keys plus INS/DEL/HM/END/PU/PD as
+  bindable chrome chords, per-window font zoom, which-key help popup,
+  focus-follows-mouse, and knob-effect config tests (CTX-0295).
+- **Plugin CLI (CTX-0150):** `bitty plugin` subcommands with capability gates;
+  `required_services` manifest resolution (CTX-0277) and 0600 managed-manifest
+  permissions (CTX-0293).
+- **CarryCtx snapshot publication:** moved in-repo with the external mirror
+  retired (CTX-0319); publish pipeline unified with provenance and `ctxpack`
+  `format_version` 2 validation (CTX-0314/0317), export-time secret redaction,
+  scratch/host-path lint gates, and `just workflow-import` mirror restore
+  (CTX-0316).
+- **In-repo module splits:** `bitty-app` `main.rs`/`ctl.rs`, IPC
+  `devtools.rs`, runtime `registry.rs`, VT `parser.rs`, and term-state
+  `state.rs` decomposed into focused modules (CTX-0305/0306/0307/0308/0309/
+  0310); remaining hardcode-audit literals named and host identifiers
+  sanitized (CTX-0299/0300/0301).
+- **Platform and terminal correctness:** Windows ConPTY Tier-1 slice
+  (CTX-0268), `terminal.scrollback` capacity and `terminal.shell` honored
+  (CTX-0297/0298), dropped mouse validation restored (CTX-0303), narrow reflow
+  tail rewrap (CTX-0266), and live split resize updating primary grid plus PTY
+  winsize (CTX-0269).
+
+### Release engineering
+
+- Workspace version bumped `0.0.1 -> 0.0.20` (the first Cargo bump since the
+  `0.0.1` leaf release; tags `v0.0.2`-`v0.0.19` never moved the in-repo
+  version), applied to `Cargo.toml`, `Cargo.lock`, internal `path` dependency
+  pins, root and `packaging/PKGBUILD*` `pkgver`, `nfpm.yaml`, and the
+  `flake.nix` fallback. `scripts/check-release-version.sh` now keeps
+  `bitty --version`, packaging metadata, and the release tag in agreement.
+
 ### Plugin host runtime: per-plugin VM lifecycle and activation (CTX-0328)
 
 - Ratified `plugin-host-runtime-rfc` Gap A implemented across the policy,

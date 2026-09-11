@@ -33,13 +33,25 @@ fn legacy_decid_answers_primary_da() {
     assert_eq!(replies_text(&mut rt), vec![b"\x1b[?6c".to_vec()]);
 }
 
+/// Numeric firmware version bitty reports in its secondary-DA reply:
+/// `major*10000 + minor*100 + patch`, derived from the crate version so the
+/// expectation tracks a release bump instead of hardcoding it.
+fn firmware_version() -> usize {
+    let mut number = 0usize;
+    for (i, part) in env!("CARGO_PKG_VERSION").split('.').rev().enumerate() {
+        number += usize::pow(100, i as u32) * part.parse::<usize>().unwrap_or(0);
+    }
+    number
+}
+
 #[test]
 fn secondary_da_reports_versioned_identity() {
     let mut rt = Runtime::with_defaults().expect("build");
+    let expected = format!("\x1b[>0;{};1c", firmware_version()).into_bytes();
     rt.handle_pty_bytes(b"\x1b[>c");
-    assert_eq!(replies_text(&mut rt), vec![b"\x1b[>0;1;1c".to_vec()]);
+    assert_eq!(replies_text(&mut rt), vec![expected.clone()]);
     rt.handle_pty_bytes(b"\x1b[>0c");
-    assert_eq!(replies_text(&mut rt), vec![b"\x1b[>0;1;1c".to_vec()]);
+    assert_eq!(replies_text(&mut rt), vec![expected]);
 }
 
 #[test]
@@ -47,7 +59,8 @@ fn secondary_da_echo_does_not_retrigger() {
     // An echoing PTY (`cat`) reflects our own reply; its extra params must
     // not be mistaken for a fresh request (reply-echo loop guard).
     let mut rt = Runtime::with_defaults().expect("build");
-    rt.handle_pty_bytes(b"\x1b[>0;1;1c");
+    let own_reply = format!("\x1b[>0;{};1c", firmware_version());
+    rt.handle_pty_bytes(own_reply.as_bytes());
     assert!(replies_text(&mut rt).is_empty(), "echo must stay silent");
 }
 

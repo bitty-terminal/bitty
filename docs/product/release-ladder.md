@@ -99,6 +99,14 @@ accept the `v0.2` slice; it provides the reviewable layout for follow-up real
   `0.2.0` for VT/TUI, `0.3.0` for GPU, etc., with patch bumps for fixes.
   The `1.0` bump requires stabilization gates per
   [v1.0 criteria in proposed-delivery-sequence](../../../bitty-docs/docs/product/proposed-delivery-sequence.md#candidate-v10-criteria).
+- At the `0.0.20` release (CTX-0331) the workspace version moved
+  `0.0.1 -> 0.0.20`, the first post-`0.0.1` Cargo/packaging bump (tags
+  `v0.0.2`-`v0.0.19` were released without moving it). The change touched
+  `Cargo.toml`, `Cargo.lock`, internal `path` `version` pins, `PKGBUILD*`,
+  `nfpm.yaml`, and the `flake.nix` fallback; `scripts/check-release-version.sh`
+  now keeps the workspace version aligned with the release tag. No crates.io
+  publish is implied: `release.yml` builds and publishes GitHub Release
+  binaries/packages only.
 
 ## Crate inventory (as of CTX-0043 head `7b215a2` / `3bfe386` base)
 

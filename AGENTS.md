@@ -43,12 +43,12 @@
 - Independent review is required before completion. Self-reports are not
   acceptance evidence.
 - Fresh clones have no CarryCtx state DB. Restore the local DB from the
-  workflow mirror with `just workflow-import` (validate-only:
-  `just workflow-import-dry`). It validates the snapshot before any write,
-  refuses to replace a non-empty local DB without `--force`, preserves the
-  committed `.carryctx/config.toml`, and prints provenance and restored
-  counts. Mirror snapshots are redacted publication artifacts: never merge
-  them back, and rotate at the source any secret that leaked before rotation.
+  in-repo snapshot branch with `just workflow-import` (validate-only:
+  `just workflow-import-dry`). It fetches `refs/heads/carryctx-snapshots`,
+  refuses to replace a non-empty local DB without `--force`, and prints
+  provenance and restored counts. Snapshots are redacted publication artifacts
+  from `carryctx export --publication`: never merge them back, and rotate at
+  the source any secret that leaked before rotation.
 
 ## Delivery lifecycle
 

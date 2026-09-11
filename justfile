@@ -53,6 +53,11 @@ check: fmt-check clippy test scratch-paths pty-gate actionlint markdownlint
 
 # Publish a ctxpack snapshot to the bitty-workflow mirror (commander merge
 # closeout only; never a git hook). Dry run exports + validates without push.
+# Canonical closeout runs from the primary checkout on branch main
+# (`cd "$BITTY_WORKSPACE/bitty" && just workflow-publish`) so source.json
+# records repo_branch=main; detached worktrees publish but record `detached`.
+# Shared parametrized template: WORKFLOW_SOURCE_REPO / WORKFLOW_MIRROR_URL /
+# WORKFLOW_MIRROR_DIR override the defaults.
 workflow-publish *args:
     bash scripts/publish-ctxpack.sh {{args}}
 

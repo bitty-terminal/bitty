@@ -33,6 +33,8 @@
 ## CarryCtx workflow
 
 - CarryCtx is the durable execution record; it does not spawn agents.
+- Install the `carryctx` CLI globally for local development (recommended):
+  `cargo install carryctx` or `npm i -g carryctx`.
 - Bind a named agent and session to the task before work. Record progress,
   decisions, risks, blockers, handoffs, and checkpoints while work is active.
 - Map GitHub Issue intent to a CarryCtx task; repository ownership to a team;

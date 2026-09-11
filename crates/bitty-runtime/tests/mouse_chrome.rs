@@ -185,3 +185,136 @@ fn shift_alt_press_forces_selection_not_drag() {
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
+
+#[test]
+fn hover_delay_defers_focus_until_deadline() {
+    // CTX-0334: a positive dwell delay arms a pending candidate; focus
+    // moves only once `tick_at` observes the deadline.
+    let delay = std::time::Duration::from_millis(150);
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: true,
+        focus_follows_mouse_delay: delay,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    let t0 = std::time::Instant::now();
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0);
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "focus must stay until the dwell deadline"
+    );
+    assert_eq!(rt.hover_activation_deadline(), Some(t0 + delay));
+    let _ = rt.tick_at(t0 + delay - std::time::Duration::from_millis(1));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)), "before deadline");
+    let _ = rt.tick_at(t0 + delay);
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "deadline commits focus"
+    );
+    assert!(rt.hover_activation_deadline().is_none());
+}
+
+#[test]
+fn hover_delay_preserves_clock_within_pane_and_clears_on_gap() {
+    // Repeated motion inside the same pane keeps the original entry time;
+    // leaving to a gap/padding band drops the pending dwell.
+    let delay = std::time::Duration::from_millis(100);
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: true,
+        focus_follows_mouse_delay: delay,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    let t0 = std::time::Instant::now();
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0);
+    assert_eq!(rt.hover_activation_deadline(), Some(t0 + delay));
+    rt.handle_cursor_moved_at(cell_pixels(70, 12), t0 + delay / 2);
+    assert_eq!(
+        rt.hover_activation_deadline(),
+        Some(t0 + delay),
+        "same-pane motion must not reset the dwell clock"
+    );
+    rt.handle_cursor_moved_at(CursorPosition { x: 2.0, y: 2.0 }, t0 + delay / 2);
+    assert!(rt.hover_activation_deadline().is_none());
+    let _ = rt.tick_at(t0 + delay * 2);
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "a cleared dwell never commits"
+    );
+}
+
+#[test]
+fn hover_delay_zero_activates_immediately_and_disabled_with_delay_is_inert() {
+    // Delay `0` reproduces CTX-0260 immediate activation.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: true,
+        focus_follows_mouse_delay: std::time::Duration::ZERO,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
+    assert!(rt.hover_activation_deadline().is_none());
+    // Disabled: a configured delay never arms.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        focus_follows_mouse_delay: std::time::Duration::from_millis(100),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    let t0 = std::time::Instant::now();
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0);
+    assert!(rt.hover_activation_deadline().is_none());
+    let _ = rt.tick_at(t0 + std::time::Duration::from_secs(1));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+}
+
+#[test]
+fn hover_delay_shift_suppresses_and_clears_pending() {
+    let delay = std::time::Duration::from_millis(100);
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: true,
+        focus_follows_mouse_delay: delay,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    let t0 = std::time::Instant::now();
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0);
+    assert!(rt.hover_activation_deadline().is_none());
+    let _ = rt.tick_at(t0 + std::time::Duration::from_secs(1));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+}
+
+#[test]
+fn hover_delay_yields_to_explicit_focus_change() {
+    // If another path moves focus while a dwell pends, the pending hover
+    // activation must be abandoned rather than override the explicit choice.
+    let delay = std::time::Duration::from_millis(200);
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: true,
+        focus_follows_mouse_delay: delay,
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime builds");
+    rt.set_layout(two_pane());
+    let t0 = std::time::Instant::now();
+    // Dwell on pane 2 (still focused pane 1).
+    rt.handle_cursor_moved_at(cell_pixels(60, 12), t0);
+    // Explicit keyboard focus to pane 2, then back to pane 1.
+    rt.move_focus(bitty_runtime::FocusDirection::Right);
+    rt.move_focus(bitty_runtime::FocusDirection::Left);
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    // Deadline passes: the hover candidate must not steal focus.
+    let _ = rt.tick_at(t0 + delay);
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+}

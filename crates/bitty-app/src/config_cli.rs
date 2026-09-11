@@ -400,10 +400,12 @@ pub(crate) fn starter_init_lua() -> &'static str {
       \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
       \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
       \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
-      \x20\x20-- Focus follows the mouse on hover (off by default:\n\
-      \x20\x20-- click-to-focus preserved). Uncomment to opt in; Alt+drag\n\
-      \x20\x20-- moves a floating pane where the layout model permits.\n\
-      \x20\x20-- mouse = { focus_follows_mouse = true },\n\
+     \x20\x20-- Hover activation (off by default: click-to-focus preserved).\n\
+     \x20\x20-- Uncomment to opt in; the optional delay in milliseconds makes\n\
+     \x20\x20-- the pointer dwell in a pane before focus moves (0 = immediate,\n\
+     \x20\x20-- max 2000). Alt+drag moves a floating pane where the layout\n\
+     \x20\x20-- model permits.\n\
+     \x20\x20-- mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 },\n\
      \x20\x20-- keymaps = {\n\
      \x20\x20--     { chord = \"alt+h\", action = \"goto_split:left\", context = \"global\" },\n\
      \x20\x20--     { chord = \"alt+1\", action = \"focus:1\", context = \"global\" },\n\
@@ -665,6 +667,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "mouse.focus_follows_mouse_delay_ms",
+                        format!("{}", e.mouse.focus_follows_mouse_delay_ms),
+                        &src("mouse.focus_follows_mouse_delay_ms")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "mod_key",
                         format!("\"{}\"", e.mod_key.canonical()),
                         &src("mod_key")
@@ -874,6 +884,15 @@ pub(crate) fn runtime_config_from_effective(
         // CTX-0260: hover-focus flows file -> effective -> runtime the same
         // way (booleans are total; default off preserves click-to-focus).
         cfg.focus_follows_mouse = effective.mouse.focus_follows_mouse;
+        // CTX-0334: the dwell delay flows the same way. `bitty-config`
+        // already bounds it fail-closed; clamp here as defense-in-depth so
+        // a future bound drift can never exceed the runtime's timer bound.
+        cfg.focus_follows_mouse_delay = std::time::Duration::from_millis(u64::from(
+            effective
+                .mouse
+                .focus_follows_mouse_delay_ms
+                .min(bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS),
+        ));
         // CTX-0292: Core-owned workspace decoration is carried onto the
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).

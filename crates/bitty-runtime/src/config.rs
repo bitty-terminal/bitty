@@ -63,6 +63,16 @@ pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 /// `bitty-app`). `false` preserves click-to-focus.
 pub const DEFAULT_FOCUS_FOLLOWS_MOUSE: bool = false;
 
+/// Default hover-activation delay (CTX-0334).
+/// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`;
+/// `0` activates on pointer entry (CTX-0260 behavior).
+pub const DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
+
+/// Maximum accepted hover-activation delay in milliseconds (CTX-0334).
+/// Mirrors `bitty-config` `MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS`;
+/// [`RuntimeConfig::validate`] rejects larger values fail-closed.
+pub const MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 2_000;
+
 /// Default inner panel gap in cells (CTX-0177).
 /// Mirrors `bitty-config` `DEFAULT_LAYOUT_GAPS_IN` (kept local for the same
 /// no-dependency reason; paired by value and pinned by a `bitty-app` test).
@@ -228,6 +238,12 @@ pub struct RuntimeConfig {
     /// over another pane moves keyboard focus there (Shift still forces the
     /// selection path and suppresses hover-focus).
     pub focus_follows_mouse: bool,
+    /// Dwell time before hover activation moves focus (CTX-0334
+    /// `mouse.focus_follows_mouse_delay_ms`). `0` (default) activates on
+    /// pointer entry; a positive value requires the pointer to remain in the
+    /// hovered pane for at least this long, so a transient pass-through
+    /// never steals focus. Bounded by [`MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS`].
+    pub focus_follows_mouse_delay: std::time::Duration,
     /// Spacing between sibling panes in cells (CTX-0177 `layout.gaps_in`).
     /// `0..=MAX_LAYOUT_GAP_CELLS`; default `0` = edge-to-edge tiling.
     /// The gap band shows the window background; per-leaf rendering and
@@ -300,6 +316,9 @@ impl Default for RuntimeConfig {
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
+            focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
+                DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+            )),
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
@@ -367,6 +386,9 @@ impl RuntimeConfig {
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
+            focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
+                DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+            )),
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),
@@ -428,6 +450,13 @@ impl RuntimeConfig {
         if self.gaps_in > MAX_LAYOUT_GAP_CELLS || self.gaps_out > MAX_LAYOUT_GAP_CELLS {
             return Err(RuntimeError::InvalidConfig(
                 "layout gaps must be within [0, 16] cells",
+            ));
+        }
+        if self.focus_follows_mouse_delay
+            > std::time::Duration::from_millis(u64::from(MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS))
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "focus_follows_mouse_delay must be within [0, 2000] milliseconds",
             ));
         }
         if let Err(err) = self.decoration.validate() {
@@ -838,7 +867,12 @@ mod tests {
         // total (booleans always validate). `new()` defaults off; callers
         // opt in post-construction.
         const { assert!(!DEFAULT_FOCUS_FOLLOWS_MOUSE) }
+        const { assert!(DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS == 0) }
         assert!(!RuntimeConfig::default().focus_follows_mouse);
+        assert_eq!(
+            RuntimeConfig::default().focus_follows_mouse_delay,
+            std::time::Duration::ZERO
+        );
         let cfg = RuntimeConfig::new(
             80,
             24,
@@ -869,6 +903,27 @@ mod tests {
             ..RuntimeConfig::default()
         };
         opt_out.validate().expect("opt-out valid");
+        // CTX-0334: the dwell delay is bounded fail-closed.
+        for good in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(u64::from(MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS)),
+        ] {
+            RuntimeConfig {
+                focus_follows_mouse_delay: good,
+                ..RuntimeConfig::default()
+            }
+            .validate()
+            .expect("boundary delay must be valid");
+        }
+        RuntimeConfig {
+            focus_follows_mouse_delay: std::time::Duration::from_millis(
+                u64::from(MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS) + 1,
+            ),
+            ..RuntimeConfig::default()
+        }
+        .validate()
+        .expect_err("over-max delay must fail closed");
     }
 
     #[test]

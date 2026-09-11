@@ -80,6 +80,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
+        | "mouse.focus_follows_mouse_delay_ms"
         | "appearance.theme"
         | "mod_key"
         | "extends"
@@ -589,8 +590,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             attribution.insert("scrollbar".to_string(), src.clone());
         }
 
-        // CTX-0260: `mouse.focus_follows_mouse` is scalar-replace like
-        // `selection.auto_copy`; absent table means "says nothing".
+        // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
+        // delay are scalar-replace like `selection.auto_copy`; absent table
+        // means "says nothing".
         if let Some(mouse) = &plan.mouse {
             let field = "mouse.focus_follows_mouse";
             if is_policy {
@@ -620,6 +622,43 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             } else {
                 let prev = attribution.get(field).cloned();
                 effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            let field = "mouse.focus_follows_mouse_delay_ms";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
                 record_attribution(
                     &mut attribution,
                     &mut conflicts,
@@ -888,6 +927,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "scrollbar.width",
         "scrollbar",
         "mouse.focus_follows_mouse",
+        "mouse.focus_follows_mouse_delay_ms",
         "mouse",
         "appearance.theme",
         "appearance",
@@ -1232,8 +1272,9 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("decoration".to_string(), src.clone());
         }
-        // CTX-0260: `mouse.focus_follows_mouse` is scalar-replace like
-        // `selection.auto_copy`; absent table means "says nothing".
+        // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
+        // delay are scalar-replace like `selection.auto_copy`; absent table
+        // means "says nothing".
         // (Second merge path: allow-policy-violations variant for diagnostics.)
         if let Some(mouse) = &plan.mouse {
             let field = "mouse.focus_follows_mouse";
@@ -1264,6 +1305,43 @@ fn merge_layers_allow_policy_violations(
             } else {
                 let prev = attribution.get(field).cloned();
                 effective.mouse.focus_follows_mouse = mouse.focus_follows_mouse;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            let field = "mouse.focus_follows_mouse_delay_ms";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.mouse.focus_follows_mouse_delay_ms = mouse.focus_follows_mouse_delay_ms;
                 record_attribution(
                     &mut attribution,
                     &mut conflicts,
@@ -1528,6 +1606,7 @@ fn merge_layers_allow_policy_violations(
         "scrollbar.width",
         "scrollbar",
         "mouse.focus_follows_mouse",
+        "mouse.focus_follows_mouse_delay_ms",
         "mouse",
         "appearance.theme",
         "appearance",
@@ -1702,6 +1781,7 @@ mod tests {
             ConfigPlan {
                 mouse: Some(MouseConfig {
                     focus_follows_mouse: true,
+                    ..MouseConfig::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1729,6 +1809,7 @@ mod tests {
             ConfigPlan {
                 mouse: Some(MouseConfig {
                     focus_follows_mouse: false,
+                    ..MouseConfig::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1739,6 +1820,7 @@ mod tests {
             ConfigPlan {
                 mouse: Some(MouseConfig {
                     focus_follows_mouse: true,
+                    ..MouseConfig::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -1751,6 +1833,42 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|c| c.field == "mouse.focus_follows_mouse")
+        );
+    }
+
+    #[test]
+    fn mouse_focus_follows_mouse_delay_merges_scalar_replace_with_attribution() {
+        // CTX-0334: the dwell delay rides the same scalar-replace path as
+        // the enable bool, with its own attribution and core default.
+        use crate::types::MouseConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                mouse: Some(MouseConfig {
+                    focus_follows_mouse: true,
+                    focus_follows_mouse_delay_ms: 250,
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.mouse.focus_follows_mouse_delay_ms, 250);
+        assert_eq!(
+            merged
+                .source_of("mouse.focus_follows_mouse_delay_ms")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        let merged2 = merge_layers(vec![]).expect("merge");
+        assert_eq!(merged2.effective.mouse.focus_follows_mouse_delay_ms, 0);
+        assert_eq!(
+            merged2
+                .source_of("mouse.focus_follows_mouse_delay_ms")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
         );
     }
 
@@ -1963,9 +2081,14 @@ mod tests {
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("window"), Some(MergeClass::DeepMerge));
-        // CTX-0260: hover-focus is a scalar-replace leaf under `mouse`.
+        // CTX-0260/CTX-0334: hover-focus and its dwell delay are
+        // scalar-replace leaves under `mouse`.
         assert_eq!(
             merge_class_for("mouse.focus_follows_mouse"),
+            Some(MergeClass::ScalarReplace)
+        );
+        assert_eq!(
+            merge_class_for("mouse.focus_follows_mouse_delay_ms"),
             Some(MergeClass::ScalarReplace)
         );
         assert_eq!(merge_class_for("mouse"), Some(MergeClass::DeepMerge));

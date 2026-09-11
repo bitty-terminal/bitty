@@ -1,4 +1,4 @@
-//! `Runtime` — Focus-follows-mouse hover and Alt+drag floating-pane moves.
+//! `Runtime` — Hover-to-activate focus and Alt+drag floating-pane moves.
 //!
 //! CTX-0260 follow-through of DEC-0034: an opt-in hover moves keyboard
 //! focus (`RuntimeConfig::focus_follows_mouse`, default off to preserve
@@ -6,6 +6,14 @@
 //! where the layout model permits (floating [`LayoutNode::Overlay`] bounds
 //! move; tiled splits/stacks have no movable position, so the grab is a
 //! fail-soft no-op and the press falls through to selection).
+//!
+//! CTX-0334 (Hyprland-like mouse-enter activation): when
+//! `RuntimeConfig::focus_follows_mouse_delay` is non-zero, pointer entry on
+//! a non-focused pane arms a pending candidate ([`HoverPending`]) that
+//! [`Runtime::apply_hover_deadline`] commits once the dwell deadline
+//! elapses; `0` activates immediately on entry. Any explicit focus change
+//! cancels the pending dwell so hover can never override a deliberate
+//! choice.
 //!
 //! Lane note: pointer chrome only. Selection, capture encoding, scrollbar
 //! drags, and workspace switching belong to their owning paths; this module
@@ -16,6 +24,20 @@
 
 use super::*;
 use bitty_platform::CursorPosition;
+use std::time::Instant;
+
+/// Pending hover activation with a positive dwell delay (CTX-0334).
+///
+/// Recorded when the pointer enters a non-focused pane while
+/// `focus_follows_mouse` is enabled and the configured delay is non-zero;
+/// [`Runtime::apply_hover_deadline`] commits focus once the deadline passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HoverPending {
+    /// Candidate pane the pointer entered.
+    view: ViewId,
+    /// Time the pointer entered (or last re-targeted) the candidate.
+    since: Instant,
+}
 
 /// Active Alt+drag: which floating leaf is grabbed plus the press-time
 /// anchor in container cells (via [`Runtime::cursor_to_cell`], so deltas
@@ -136,20 +158,87 @@ impl Runtime {
         true
     }
 
-    /// Applies the gated hover-focus step for cursor motion at `pos`.
+    /// Dwell-delay-aware hover activation (CTX-0334 virtual-clock seam).
     ///
     /// No-op unless [`crate::config::RuntimeConfig::focus_follows_mouse`]
     /// is set (default off preserves click-to-focus) and Shift is released
     /// (Shift forces the selection path). Hover over gap/padding bands
-    /// (`cursor_to_leaf_cell` yields `None` there) keeps focus. Focus moves
-    /// through [`Self::set_focus`], which dirties only on change, so steady
-    /// hover costs no present.
-    pub(super) fn hover_focus_at(&mut self, pos: CursorPosition) {
+    /// (`cursor_to_leaf_cell` yields `None` there) keeps focus and clears
+    /// any pending dwell. With a zero delay focus moves immediately through
+    /// [`Self::set_focus`] (which dirties only on change, so steady hover
+    /// costs no present); with a positive delay the candidate is recorded
+    /// and [`Self::apply_hover_deadline`] commits it once `now` reaches the
+    /// deadline. Moving to a different candidate re-arms the dwell clock.
+    pub(super) fn hover_focus_at_at(&mut self, pos: CursorPosition, now: Instant) {
         if !self.config.focus_follows_mouse || self.shift_pressed {
+            self.hover_pending = None;
             return;
         }
-        if let Some((id, _)) = self.cursor_to_leaf_cell(pos) {
-            self.set_focus(id);
+        let Some((id, _)) = self.cursor_to_leaf_cell(pos) else {
+            // Gap/padding band: no candidate, keep focus, drop any dwell.
+            self.hover_pending = None;
+            return;
+        };
+        if self.focus.focused() == Some(id) {
+            self.hover_pending = None;
+            return;
         }
+        if self.config.focus_follows_mouse_delay.is_zero() {
+            self.hover_pending = None;
+            self.set_focus(id);
+            return;
+        }
+        // Re-arm only when the candidate actually changes; repeated motion
+        // inside the same pane must not reset the dwell clock.
+        match self.hover_pending {
+            Some(HoverPending { view, .. }) if view == id => {}
+            _ => {
+                self.hover_pending = Some(HoverPending {
+                    view: id,
+                    since: now,
+                });
+            }
+        }
+    }
+
+    /// Commits a pending hover activation whose dwell deadline has elapsed
+    /// (CTX-0334).
+    ///
+    /// Called from `Runtime::tick_at`; the app schedules a wake at
+    /// [`Self::hover_activation_deadline`] so focus still lands when the
+    /// pointer stops moving. Clearing the pending candidate keeps steady
+    /// hover present-neutral after the one focus present.
+    pub(super) fn apply_hover_deadline(&mut self, now: Instant) {
+        let Some(pending) = self.hover_pending else {
+            return;
+        };
+        if !self.config.focus_follows_mouse || self.shift_pressed {
+            self.hover_pending = None;
+            return;
+        }
+        if now.saturating_duration_since(pending.since) < self.config.focus_follows_mouse_delay {
+            return;
+        }
+        self.hover_pending = None;
+        self.set_focus(pending.view);
+    }
+
+    /// Deadline at which the pending hover activation commits, if any
+    /// (CTX-0334).
+    ///
+    /// The app loop arms a timed wake at this instant
+    /// (`EventContext::set_wait_until`) so a stopped pointer still activates
+    /// without busy-polling. `None` when no dwell is pending or the feature
+    /// is disabled.
+    #[must_use]
+    pub fn hover_activation_deadline(&self) -> Option<Instant> {
+        self.hover_pending
+            .map(|pending| pending.since + self.config.focus_follows_mouse_delay)
+    }
+
+    /// Drops any pending hover dwell (cursor left the window, a capture
+    /// path took over, or focus was applied elsewhere).
+    pub(super) fn clear_hover_pending(&mut self) {
+        self.hover_pending = None;
     }
 }

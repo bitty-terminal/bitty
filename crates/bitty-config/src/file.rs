@@ -34,7 +34,7 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
-//!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
+//!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
@@ -1150,11 +1150,39 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // `focus_follows_mouse` is omitted, default to `false` (click-to-focus
     // preserved) so `mouse = {}` keeps working unchanged. Wrong types
     // already failed closed as `ShapeError` in `bitty-lua` (never coerced).
-    let mouse = data.mouse.map(|m| MouseConfig {
-        focus_follows_mouse: m
-            .focus_follows_mouse
-            .unwrap_or(MouseConfig::default().focus_follows_mouse),
-    });
+    // CTX-0334: `focus_follows_mouse_delay_ms` follows the same optional
+    // scalar pattern; omitted defaults to `0` (immediate entry activation).
+    // The value is range-checked here and again by `MouseConfig::validate`
+    // via `plan.validate()` (fail-closed).
+    let mouse = match data.mouse {
+        None => None,
+        Some(m) => {
+            let defaults = MouseConfig::default();
+            let delay = match m.focus_follows_mouse_delay_ms {
+                None => defaults.focus_follows_mouse_delay_ms,
+                Some(v) => {
+                    if !(0..=crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS as i64)
+                        .contains(&v)
+                    {
+                        return Err(ConfigError::validation(
+                            "mouse.focus_follows_mouse_delay_ms",
+                            format!(
+                                "must be within [0, {}] (found {v})",
+                                crate::types::MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS
+                            ),
+                        ));
+                    }
+                    v as u32
+                }
+            };
+            Some(MouseConfig {
+                focus_follows_mouse: m
+                    .focus_follows_mouse
+                    .unwrap_or(defaults.focus_follows_mouse),
+                focus_follows_mouse_delay_ms: delay,
+            })
+        }
+    };
 
     // CTX-0236: `mod_key` is a fully-optional top-level scalar: absent
     // means "this layer says nothing" (plan.mod_key None so merge keeps the
@@ -1660,11 +1688,36 @@ mod tests {
         )
         .expect("no mouse table");
         assert!(plan.mouse.is_none());
+        // CTX-0334: the dwell delay parses as an optional integer and
+        // over-max values fail closed during validation.
+        let plan = parse_lua_config(
+            r#"return { mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 250 } }"#,
+            &test_source(),
+        )
+        .expect("delay parses");
+        assert_eq!(
+            plan.mouse
+                .expect("mouse present")
+                .focus_follows_mouse_delay_ms,
+            250
+        );
+        let err = parse_lua_config(
+            r#"return { mouse = { focus_follows_mouse_delay_ms = 5000 } }"#,
+            &test_source(),
+        )
+        .expect_err("over-max delay must fail closed at parse/validation");
+        assert!(
+            err.to_string().contains("focus_follows_mouse_delay_ms"),
+            "must name the field: {err}"
+        );
         for bad in [
             r#"return { mouse = { focus_follows_mouse = 1 } }"#,
             r#"return { mouse = { focus_follows_mouse = "true" } }"#,
             r#"return { mouse = true }"#,
             r#"return { mouse = { focus_follows_mouse = true, bogus = 1 } }"#,
+            r#"return { mouse = { focus_follows_mouse_delay_ms = "250" } }"#,
+            r#"return { mouse = { focus_follows_mouse_delay_ms = -1 } }"#,
+            r#"return { mouse = { focus_follows_mouse_delay_ms = 1.5 } }"#,
         ] {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();
             let msg = err.to_string();

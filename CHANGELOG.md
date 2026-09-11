@@ -36,6 +36,35 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   that brackets the panel from its border pixels and proves the underlay no
   longer bleeds through.
 
+### Plugin store: XDG source resolution, staging, and integrity (CTX-0329)
+
+- Ratified `plugin-host-runtime-rfc` Gap B implemented in `bitty-runtime`'s
+  `plugin_runtime`: the plugin store lives at
+  `$XDG_DATA_HOME/bitty/plugins/` with stored manifest bodies and module trees
+  under `packages/<id>/<version>/` and an atomic `current.json` active pointer
+  written by write-temp-then-rename.
+- Loading reads the pointer, loads the recorded manifest body, and re-verifies
+  `manifest_hash` and the module-tree `content_digest` fail-closed before any
+  VM is created. A missing body, hash/digest mismatch, identity/version
+  mismatch, or store-root escape is a typed `NotFound`/`Integrity` failure with
+  no silent fallback to another revision or to bundled content. Native
+  artifacts (`.so`, `.dll`, `.dylib`, `.node`) and the 4096-file / 16 MiB /
+  1024-byte tree bounds are re-checked during the same scan.
+- The runtime source record (`PluginRecord`) extends the shipped
+  `{source, manifest_hash, enabled, granted}` shape with `source_class`,
+  `plugin_id`, `version`, `root`, and `content_digest` (RFC B.4). The closed
+  source-class set is `bundled | registry | git | local-path`; only `bundled`
+  is first-party, and `--safe` creates no VM for any other class and never
+  reads the installed store tree (RFC A.4 rule 6). A `current.json` record may
+  not self-declare `bundled`: bundled provenance comes only from a configured
+  trusted root, and a `bundled` record in the store fails closed.
+- `local-path` development sources resolve from their canonical absolute path
+  read-only, are always re-digested, and are visibly unverified; drift keeps
+  the package unverified rather than hidden, and a changed/non-canonical root
+  is rejected. Startup discovery orders bundled, then installed XDG records,
+  then development roots, so provenance is deterministic and a bundled package
+  wins an id collision.
+
 ## [0.0.20] - 2026-09-11
 
 ### Release highlights

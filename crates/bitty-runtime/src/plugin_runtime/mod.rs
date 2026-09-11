@@ -13,12 +13,16 @@
 //! against the manifest, and commits atomically. `bitty --safe` never creates a
 //! third-party VM.
 //!
-//! Source resolution here is deliberately minimal (bundled roots only); the
-//! full XDG store, integrity re-verification, and local-path flow are owned by
-//! the Gap B source-resolution task, and the numeric bounds below are the
-//! RFC's proposed defaults.
+//! Source resolution implements the ratified Gap B store
+//! (`$XDG_DATA_HOME/bitty/plugins/`): the manifest body and Lua module tree are
+//! staged under `packages/`, the atomic `current.json` pointer names the active
+//! revision per plugin, and loading re-verifies `manifest_hash` and
+//! `content_digest` fail-closed before any VM is created. Local-path
+//! development packages are read-only, re-digested, and visibly unverified.
+//! The numeric bounds below are the RFC's ratified defaults.
 
 pub mod manifest_toml;
+pub mod resolution;
 pub mod services;
 pub mod store;
 
@@ -34,6 +38,10 @@ use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
 
+pub use resolution::{
+    CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
+    write_index,
+};
 pub use services::{
     EmptySettings, Notification, NotificationQueue, PluginServices, SettingsSource, SnapshotSource,
     UnavailableSnapshot,
@@ -57,13 +65,58 @@ pub const PLUGIN_INIT_MAX_BYTES: usize = 1024 * 1024;
 /// Notification queue capacity (`RC-8` rate governance candidate).
 pub const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
 
-/// How a discovered package was obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Closed source-class set (RFC B.1): `bundled`, `registry`, `git`, `local-path`.
+///
+/// Provenance is derived from the resolved record, never from the manifest id.
+/// Only [`SourceClass::Bundled`] is first-party; every other class is
+/// third-party and is skipped by `--safe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceClass {
-    /// Shipped alongside the application (read-only).
+    /// Shipped alongside the application (read-only, first-party).
     Bundled,
-    /// Any other discovered source; skipped under `--safe`.
-    ThirdParty,
+    /// Resolved from a package registry and staged in the XDG store.
+    Registry,
+    /// Resolved from a Git source and staged in the XDG store.
+    Git,
+    /// Local-path development source; never treated as verified.
+    LocalPath,
+}
+
+impl SourceClass {
+    /// Stable lower-case label used by the persisted index record.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::Registry => "registry",
+            Self::Git => "git",
+            Self::LocalPath => "local-path",
+        }
+    }
+
+    /// Parse the persisted label; unknown labels fail closed.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "bundled" => Some(Self::Bundled),
+            "registry" => Some(Self::Registry),
+            "git" => Some(Self::Git),
+            "local-path" => Some(Self::LocalPath),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the first-party `bundled` class.
+    #[must_use]
+    pub fn is_bundled(self) -> bool {
+        matches!(self, Self::Bundled)
+    }
+
+    /// Whether `--safe` must skip a VM for this class (RFC A.4 rule 6).
+    #[must_use]
+    pub fn is_third_party(self) -> bool {
+        !self.is_bundled()
+    }
 }
 
 /// Runtime lifecycle state for one `(PluginId, generation)`.
@@ -96,6 +149,10 @@ pub struct PluginPackage {
     pub module_root: PathBuf,
     /// Source provenance class.
     pub source_class: SourceClass,
+    /// Whether the package is visibly unverified (RFC B.5: always true for a
+    /// `local-path` development source, including when re-digestion detects
+    /// drift). Installed classes are verified or fail closed during discovery.
+    pub unverified: bool,
 }
 
 /// Configuration for a [`PluginRuntime`].
@@ -104,6 +161,13 @@ pub struct PluginRuntimeConfig {
     pub safe_mode: bool,
     /// Root for plugin persistent state (`$XDG_DATA_HOME/bitty/plugins-state`).
     pub data_dir: Option<PathBuf>,
+    /// Resolved plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
+    ///
+    /// When set, discovery reads the atomic `current.json` pointer and
+    /// re-verifies each enabled record's `manifest_hash` and `content_digest`
+    /// before the package joins activation (RFC B.2/B.3). A missing store root
+    /// resolves to no installed packages.
+    pub store_root: Option<PathBuf>,
     /// Trusted roots for application-shipped (`bundled`) packages.
     ///
     /// Provenance is derived from the root, never from the manifest id: a
@@ -111,9 +175,10 @@ pub struct PluginRuntimeConfig {
     /// roots. `--safe` still loads these (RFC A.4 rule 6 only forbids
     /// third-party VMs).
     pub bundled_roots: Vec<PathBuf>,
-    /// Untrusted roots (`local-path`, registry, git). Packages found here are
-    /// [`SourceClass::ThirdParty`] regardless of their self-declared id, and
-    /// `--safe` never creates a VM for them.
+    /// Untrusted development roots (for example the `BITTY_PLUGIN_DIR`
+    /// override). Packages found here are [`SourceClass::LocalPath`] regardless
+    /// of their self-declared id, are read-only, re-digested, and visibly
+    /// unverified, and `--safe` never creates a VM for them.
     pub third_party_roots: Vec<PathBuf>,
     /// Read-only settings source.
     pub settings: Rc<dyn SettingsSource>,
@@ -126,6 +191,7 @@ impl Default for PluginRuntimeConfig {
         Self {
             safe_mode: false,
             data_dir: None,
+            store_root: None,
             bundled_roots: Vec::new(),
             third_party_roots: Vec::new(),
             settings: Rc::new(EmptySettings),
@@ -147,6 +213,11 @@ pub struct ActivationReport {
     pub events: usize,
     /// Whether `--safe` skipped a third-party plugin (no VM created).
     pub skipped_safe_mode: bool,
+    /// Resolved source provenance class.
+    pub source_class: SourceClass,
+    /// Whether the package is visibly unverified (always true for a
+    /// `local-path` development source; RFC B.5).
+    pub unverified: bool,
 }
 
 /// Plugin runtime error, bounded and fail-closed.
@@ -168,6 +239,20 @@ pub enum PluginRuntimeError {
     },
     /// Filesystem failure.
     Io(String),
+    /// An installed source is missing (retained record with no package body).
+    NotFound {
+        /// Plugin id or path identifier.
+        plugin: String,
+        /// Bounded detail.
+        detail: String,
+    },
+    /// Fail-closed integrity failure (hash, digest, path escape, consent).
+    Integrity {
+        /// Plugin id or path identifier.
+        plugin: String,
+        /// Bounded detail.
+        detail: String,
+    },
     /// Lifecycle state violation.
     Lifecycle {
         /// Plugin id.
@@ -198,6 +283,12 @@ impl std::fmt::Display for PluginRuntimeError {
                 write!(f, "module tree error for '{plugin}': {detail}")
             }
             Self::Io(detail) => write!(f, "plugin runtime I/O: {detail}"),
+            Self::NotFound { plugin, detail } => {
+                write!(f, "plugin '{plugin}' source not found: {detail}")
+            }
+            Self::Integrity { plugin, detail } => {
+                write!(f, "plugin '{plugin}' integrity failure: {detail}")
+            }
             Self::Lifecycle { plugin, detail } => {
                 write!(f, "plugin '{plugin}' lifecycle error: {detail}")
             }
@@ -234,6 +325,7 @@ struct PluginEntry {
 pub struct PluginRuntime {
     safe_mode: bool,
     data_dir: Option<PathBuf>,
+    store_root: Option<PathBuf>,
     host: PluginHost,
     settings: Rc<dyn SettingsSource>,
     snapshot: Rc<dyn SnapshotSource>,
@@ -252,6 +344,7 @@ impl PluginRuntime {
         Self {
             safe_mode: config.safe_mode,
             data_dir: config.data_dir,
+            store_root: config.store_root,
             host: PluginHost::new(DropPolicy::DropOldest, crate::DEFAULT_PLUGIN_SIDE_CAPACITY),
             settings: config.settings,
             snapshot: config.snapshot,
@@ -311,57 +404,108 @@ impl PluginRuntime {
 
     /// Scan the configured roots and register every valid package.
     ///
-    /// Provenance (and therefore `--safe` eligibility) comes from the root the
-    /// package was found under, never from its self-declared id. Bundled roots
-    /// are scanned first so a bundled package wins an id collision over a
-    /// third-party one. Fail-closed: an invalid manifest is reported and
-    /// skipped, never loaded. Returns `(id, result)` pairs in discovery order.
+    /// Order is fixed so provenance is deterministic: first-party `bundled`
+    /// roots, then installed packages resolved through the XDG store's atomic
+    /// `current.json` pointer (RFC B.2/B.3), then untrusted development
+    /// (`local-path`) roots. Every source fails closed: an invalid manifest or
+    /// an integrity mismatch is reported and skipped, never loaded, and the
+    /// host never falls back to a different revision or to bundled content.
+    /// Returns `(id, result)` pairs in discovery order.
     pub fn discover(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
-        let mut roots: Vec<(SourceClass, PathBuf)> = self
-            .bundled_roots
-            .iter()
-            .cloned()
-            .map(|root| (SourceClass::Bundled, root))
-            .collect();
-        roots.extend(
-            self.third_party_roots
-                .iter()
-                .cloned()
-                .map(|root| (SourceClass::ThirdParty, root)),
-        );
         let mut results = Vec::new();
-        for (source_class, root) in roots {
-            let packages = match discover_root(&root, source_class) {
-                Ok(packages) => packages,
-                Err(error) => {
-                    results.push((
-                        PluginId::new("invalid.root").expect("static id is valid"),
-                        Err(error),
-                    ));
-                    continue;
+
+        for root in self.bundled_roots.clone() {
+            self.collect_dir_root(&root, SourceClass::Bundled, &mut results);
+        }
+
+        // RFC A.4 rule 6 / R-009: `--safe` never reads the third-party store
+        // tree, so installed records are not even enumerated; only the trusted
+        // bundled roots scanned above may load.
+        let store_root = if self.safe_mode {
+            None
+        } else {
+            self.store_root.clone()
+        };
+        if let Some(store_root) = store_root {
+            match resolution::load_index(&store_root) {
+                Ok(records) => {
+                    for record in records {
+                        if !record.enabled {
+                            continue;
+                        }
+                        let Ok(id) = PluginId::new(&record.plugin_id) else {
+                            results.push((
+                                invalid_plugin_id(),
+                                Err(PluginRuntimeError::Integrity {
+                                    plugin: record.plugin_id.clone(),
+                                    detail: "record plugin_id is not a valid plugin id".to_string(),
+                                }),
+                            ));
+                            continue;
+                        };
+                        if self.entries.contains_key(&id) {
+                            continue;
+                        }
+                        match resolution::resolve_record(&store_root, &record) {
+                            Ok(package) => {
+                                let id = package.manifest.id().clone();
+                                if self.entries.contains_key(&id) {
+                                    continue;
+                                }
+                                self.insert_package(id.clone(), package);
+                                results.push((id, Ok(())));
+                            }
+                            Err(error) => results.push((id, Err(error))),
+                        }
+                    }
                 }
-            };
-            for package in packages {
-                let id = package.manifest.id().clone();
-                if self.entries.contains_key(&id) {
-                    continue;
-                }
-                self.entries.insert(
-                    id.clone(),
-                    PluginEntry {
-                        package,
-                        generation: 0,
-                        state: LifecycleState::Unloaded,
-                        vm: None,
-                        services: None,
-                        registrations: RegistrationCapture::new(),
-                    },
-                );
-                self.order.push(id.clone());
-                results.push((id, Ok(())));
+                Err(error) => results.push((invalid_plugin_id(), Err(error))),
             }
         }
+
+        for root in self.third_party_roots.clone() {
+            self.collect_dir_root(&root, SourceClass::LocalPath, &mut results);
+        }
+
         results
+    }
+
+    fn collect_dir_root(
+        &mut self,
+        root: &Path,
+        source_class: SourceClass,
+        results: &mut Vec<(PluginId, Result<(), PluginRuntimeError>)>,
+    ) {
+        let packages = match discover_root(root, source_class) {
+            Ok(packages) => packages,
+            Err(error) => {
+                results.push((invalid_plugin_id(), Err(error)));
+                return;
+            }
+        };
+        for package in packages {
+            let id = package.manifest.id().clone();
+            if self.entries.contains_key(&id) {
+                continue;
+            }
+            self.insert_package(id.clone(), package);
+            results.push((id, Ok(())));
+        }
+    }
+
+    fn insert_package(&mut self, id: PluginId, package: PluginPackage) {
+        self.entries.insert(
+            id.clone(),
+            PluginEntry {
+                package,
+                generation: 0,
+                state: LifecycleState::Unloaded,
+                vm: None,
+                services: None,
+                registrations: RegistrationCapture::new(),
+            },
+        );
+        self.order.push(id);
     }
 
     /// Activate one discovered plugin.
@@ -393,13 +537,15 @@ impl PluginRuntime {
             // self-declared id: a third-party package cannot claim bundled
             // trust by naming itself `bitty.*` (RFC A.4 rule 6). This check
             // precedes any VM or host-reservation work.
-            if self.safe_mode && entry.package.source_class == SourceClass::ThirdParty {
+            if self.safe_mode && entry.package.source_class.is_third_party() {
                 return Ok(ActivationReport {
                     plugin: id.clone(),
                     state: LifecycleState::Unloaded,
                     commands: 0,
                     events: 0,
                     skipped_safe_mode: true,
+                    source_class: entry.package.source_class,
+                    unverified: entry.package.unverified,
                 });
             }
             verify_module_tree(id, &entry.package.module_root)?;
@@ -527,6 +673,8 @@ impl PluginRuntime {
 
         let (commands, events) = (capture.commands.len(), capture.events.len());
         let entry = self.entries.get_mut(id).expect("entry exists");
+        let source_class = entry.package.source_class;
+        let unverified = entry.package.unverified;
         entry.registrations = capture;
         entry.vm = Some(vm);
         entry.state = LifecycleState::Active;
@@ -536,6 +684,8 @@ impl PluginRuntime {
             commands,
             events,
             skipped_safe_mode: false,
+            source_class,
+            unverified,
         })
     }
 
@@ -759,6 +909,11 @@ fn lifecycle_error(id: &PluginId, detail: &str) -> PluginRuntimeError {
     }
 }
 
+/// Stable placeholder identity for a discovery failure that has no valid id.
+fn invalid_plugin_id() -> PluginId {
+    PluginId::new("invalid.root").expect("static id is valid")
+}
+
 /// Validate a registration capture against the manifest, fail closed.
 fn validate_capture(
     id: &PluginId,
@@ -810,80 +965,10 @@ fn validate_capture(
 }
 
 /// Verify a module tree against the RFC bounds, rejecting native artifacts and
-/// symlink escapes.
+/// symlink escapes. The walk is shared with [`resolution`] so the loaded tree
+/// and the digested tree are always the same bounded input.
 fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeError> {
-    let canonical =
-        std::fs::canonicalize(root).map_err(|error| PluginRuntimeError::ModuleTree {
-            plugin: id.to_string(),
-            detail: format!("module root unreadable: {error}"),
-        })?;
-    let mut files = 0usize;
-    let mut bytes = 0u64;
-    let mut stack = vec![canonical.clone()];
-    while let Some(directory) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&directory).map_err(|error| PluginRuntimeError::ModuleTree {
-                plugin: id.to_string(),
-                detail: format!("module directory unreadable: {error}"),
-            })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| PluginRuntimeError::ModuleTree {
-                plugin: id.to_string(),
-                detail: format!("module entry unreadable: {error}"),
-            })?;
-            let path = entry.path();
-            let metadata = entry
-                .metadata()
-                .map_err(|error| PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: format!("module metadata unreadable: {error}"),
-                })?;
-            if metadata.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            files += 1;
-            if files > PLUGIN_MODULE_MAX_FILES {
-                return Err(PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: "module tree exceeds the 4096-file ceiling".to_string(),
-                });
-            }
-            bytes = bytes.saturating_add(metadata.len());
-            if bytes > PLUGIN_MODULE_TREE_MAX_BYTES as u64 {
-                return Err(PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: "module tree exceeds the 16 MiB ceiling".to_string(),
-                });
-            }
-            if path.as_os_str().len() > PLUGIN_MODULE_PATH_MAX_BYTES {
-                return Err(PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: "module path exceeds the 1024-byte ceiling".to_string(),
-                });
-            }
-            if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
-                if matches!(extension, "so" | "dll" | "dylib" | "node") {
-                    return Err(PluginRuntimeError::ModuleTree {
-                        plugin: id.to_string(),
-                        detail: "native artifacts are not loadable modules".to_string(),
-                    });
-                }
-            }
-            let resolved =
-                std::fs::canonicalize(&path).map_err(|error| PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: format!("module path unresolved: {error}"),
-                })?;
-            if !resolved.starts_with(&canonical) {
-                return Err(PluginRuntimeError::ModuleTree {
-                    plugin: id.to_string(),
-                    detail: "module path escapes the plugin root".to_string(),
-                });
-            }
-        }
-    }
-    Ok(())
+    resolution::scan_module_tree(id.as_str(), root).map(|_| ())
 }
 
 /// Resolve the fixed `init.lua`: `<root>/init.lua` or `<root>/<module>/init.lua`.
@@ -972,6 +1057,7 @@ fn discover_root(
             manifest,
             module_root,
             source_class,
+            unverified: source_class == SourceClass::LocalPath,
         });
     }
     Ok(packages)
@@ -997,5 +1083,16 @@ impl PluginRuntime {
     #[must_use]
     pub fn third_party_roots_ref(&self) -> &[PathBuf] {
         &self.third_party_roots
+    }
+
+    /// Replace the resolved plugin store root after construction.
+    pub fn set_store_root(&mut self, store_root: Option<PathBuf>) {
+        self.store_root = store_root;
+    }
+
+    /// Resolved plugin store root, if any.
+    #[must_use]
+    pub fn store_root_ref(&self) -> Option<&Path> {
+        self.store_root.as_deref()
     }
 }

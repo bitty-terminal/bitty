@@ -69,8 +69,9 @@ fn dump_evidence(name: &str, rgba: &[u8], width: u32, height: u32) {
 
 #[test]
 fn present_frames_apply_logical_decoration_at_live_scale() {
-    // Default 4/6/2/6 at 9x19 cells, 80x24 container: frame inset 6px,
-    // content inset 2px more; content grid floors the remainder.
+    // Unified 6/6/2/6/6 at 9x19 cells, 80x24 container: frame inset 6px,
+    // content inset by border 2 + content inset 6 = 8px more; content grid
+    // floors the remainder.
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
     let frames = rt.present_frames();
@@ -81,13 +82,13 @@ fn present_frames_apply_logical_decoration_at_live_scale() {
     assert_eq!(frame.frame.y, 6);
     assert_eq!(frame.frame.width, 708);
     assert_eq!(frame.frame.height, 444);
-    assert_eq!(frame.content.x, 8);
-    assert_eq!(frame.content.y, 8);
-    assert_eq!(frame.content.width, 704);
-    assert_eq!(frame.content.height, 440);
-    // 704 = 78 * 9 + 2 remainder; 440 = 23 * 19 + 3.
-    assert_eq!(frame.cols, 78);
-    assert_eq!(frame.rows, 23);
+    assert_eq!(frame.content.x, 14);
+    assert_eq!(frame.content.y, 14);
+    assert_eq!(frame.content.width, 692);
+    assert_eq!(frame.content.height, 428);
+    // 692 = 76 * 9 + 8 remainder; 428 = 22 * 19 + 10.
+    assert_eq!(frame.cols, 76);
+    assert_eq!(frame.rows, 22);
     assert_eq!(frame.border, 2);
     assert_eq!(frame.radius, 6);
 }
@@ -128,11 +129,13 @@ fn live_present_paints_gap_bands_border_ring_and_fractional_remainder() {
         border,
         "border ring right"
     );
-    // Content starts after the border; first painted cell pixel is bg.
-    assert_eq!(probe(&rgba, width, pad + 8 + 2, y), bg, "content start");
-    // Sub-cell remainder (704 - 702 = 2px) stays background.
+    // The border+inset band is background: content starts at pad + 14
+    // (gaps_out 6 + border 2 + content_inset 6).
+    assert_eq!(probe(&rgba, width, pad + 14, y), bg, "content start");
+    // Sub-cell remainder: content width 692 = 76 * 9 + 8; the trailing 8px
+    // band stays background.
     assert_eq!(
-        probe(&rgba, width, pad + 8 + 702 + 1, y),
+        probe(&rgba, width, pad + 14 + 684 + 1, y),
         bg,
         "fractional-cell remainder stays bg"
     );
@@ -152,7 +155,7 @@ fn radius_cuts_frame_corners_and_zero_radius_keeps_them_square() {
     let x_corner = pad + 6;
     // radius = 6: the outer frame corner is outside the quarter circle and
     // stays clear background.
-    let mut rounded = runtime_with(Decoration::new(0, 6, 2, 6));
+    let mut rounded = runtime_with(Decoration::new(0, 6, 2, 6, 0));
     single_leaf(&mut rounded);
     let stats = rounded.tick().expect("tick presents");
     assert_eq!(stats.rounded_fills, 1, "rounded frame uses the SDF ring");
@@ -174,7 +177,7 @@ fn radius_cuts_frame_corners_and_zero_radius_keeps_them_square() {
 
     // radius = 0: the same corner carries the border color (the SDF ring
     // degenerates to a square ring, still one rounded primitive).
-    let mut square = runtime_with(Decoration::new(0, 6, 2, 0));
+    let mut square = runtime_with(Decoration::new(0, 6, 2, 0, 0));
     single_leaf(&mut square);
     let stats = square.tick().expect("tick presents");
     assert_eq!(
@@ -242,10 +245,10 @@ fn cell_gaps_compose_with_px_decoration() {
     assert_eq!(frames[0].frame.x, 15);
     // Outer inset y = 1 cell (19px) + 6px decoration.
     assert_eq!(frames[0].frame.y, 25);
-    // Sibling band = 2 cells (18px) + 4px decoration.
+    // Sibling band = 2 cells (18px) + 6px decoration (unified gaps_in).
     assert_eq!(
         (i64::from(frames[1].frame.x) - frames[0].frame.right_exclusive()) as u32,
-        22,
+        24,
         "cell gaps and px decoration compose additively"
     );
     rt.tick().expect("tick presents");
@@ -274,23 +277,24 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
     let pad = rt.window_padding_physical() as f64;
+    // Content starts at gaps_out 6 + border 2 + content_inset 6 = 14px.
     // A position inside the content maps to the content-local cell.
     let inside = CursorPosition {
-        x: pad + 8.0 + 9.0 * 2.0 + 1.0,
-        y: pad + 8.0 + 19.0 * 4.0 + 1.0,
+        x: pad + 14.0 + 9.0 * 2.0 + 1.0,
+        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(inside),
         Some((ViewId::new(1), CellPos::new(4, 2)))
     );
-    // The global mapping subtracts the outer gap plus border.
+    // The global mapping subtracts the outer gap plus border plus inset.
     assert_eq!(rt.cursor_to_cell(inside), CellPos::new(4, 2));
     // A position over the border ring still hits the frame and clamps to
     // the first content cell (spec rule 4: radius never widens hit testing
     // beyond the frame).
     let on_border = CursorPosition {
         x: pad + 7.0,
-        y: pad + 8.0 + 19.0 * 4.0 + 1.0,
+        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(on_border),
@@ -299,7 +303,7 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     // A position in the outer gap band belongs to no pane.
     let in_gap = CursorPosition {
         x: pad + 3.0,
-        y: pad + 8.0 + 19.0 * 4.0 + 1.0,
+        y: pad + 14.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(rt.cursor_to_present_cell(in_gap), None);
     // Over the window padding band: no pane.

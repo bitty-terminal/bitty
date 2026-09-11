@@ -1422,11 +1422,11 @@ fn runtime_config_inherits_file_layout_gaps() {
 
 #[test]
 fn runtime_config_inherits_file_decoration() {
-    // CTX-0292 / accepted spec CTX-0118: `decoration.gaps_in`,
-    // `decoration.gaps_out`, `decoration.border`, `decoration.radius`
+    // CTX-0292/CTX-0333: `decoration.gaps_in`, `decoration.gaps_out`,
+    // `decoration.border`, `decoration.radius`, `decoration.content_inset`
     // flow file -> effective -> runtime; the crate constants stay equal
     // (bitty-runtime aliases bitty-ui, bitty-config owns its own copy;
-    // the pairing is pinned here). Default is the accepted 4/6/2/6.
+    // the pairing is pinned here). Defaults are unified 6/6/2/6/6.
     assert_eq!(
         bitty_runtime::config::DEFAULT_DECORATION_GAPS_IN_PX,
         bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX as u16
@@ -1444,6 +1444,10 @@ fn runtime_config_inherits_file_decoration() {
         bitty_config::types::DEFAULT_DECORATION_RADIUS_PX as u16
     );
     assert_eq!(
+        bitty_runtime::config::DEFAULT_DECORATION_CONTENT_INSET_PX,
+        bitty_config::types::DEFAULT_DECORATION_CONTENT_INSET_PX as u16
+    );
+    assert_eq!(
         u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX),
         bitty_config::types::MAX_DECORATION_GAP_PX
     );
@@ -1455,11 +1459,15 @@ fn runtime_config_inherits_file_decoration() {
         u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX),
         bitty_config::types::MAX_DECORATION_RADIUS_PX
     );
+    assert_eq!(
+        u32::from(bitty_runtime::config::MAX_DECORATION_CONTENT_INSET_PX),
+        bitty_config::types::MAX_DECORATION_CONTENT_INSET_PX
+    );
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan = parse_lua_config(
-        r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0 } }"#,
+        r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0, content_inset = 2 } }"#,
         &src,
     )
     .expect("decoration parse");
@@ -1467,13 +1475,17 @@ fn runtime_config_inherits_file_decoration() {
         .expect("merge");
     assert_eq!(merged.effective.decoration.gaps_in, 0);
     assert_eq!(merged.effective.decoration.gaps_out, 1);
+    assert_eq!(merged.effective.decoration.content_inset, 2);
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
-    assert_eq!(cfg.decoration, bitty_runtime::Decoration::new(0, 1, 1, 0));
+    assert_eq!(
+        cfg.decoration,
+        bitty_runtime::Decoration::new(0, 1, 1, 0, 2)
+    );
     assert_eq!(
         merged.source_of("decoration.gaps_in").unwrap().layer,
         bitty_config::plan::LayerKind::User
     );
-    // Absent table rides the accepted CTX-0118 defaults end to end.
+    // Absent table rides the unified defaults end to end.
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
         .expect("no decoration table parses");
@@ -1488,18 +1500,21 @@ fn runtime_config_inherits_file_decoration() {
     );
     let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
     assert_eq!(cfg2.decoration, bitty_runtime::Decoration::default());
-    assert_eq!(cfg2.decoration, bitty_runtime::Decoration::new(4, 6, 2, 6));
+    assert_eq!(
+        cfg2.decoration,
+        bitty_runtime::Decoration::new(6, 6, 2, 6, 6)
+    );
     assert_eq!(
         merged2.source_of("decoration.gaps_in").unwrap().layer,
         bitty_config::plan::LayerKind::CoreDefaults
     );
-    // Safe mode inverts to 0/0/1/0 regardless of user configuration.
+    // Safe mode inverts to 0/0/1/0/0 regardless of user configuration.
     let safe = bitty_config::reload::fallback_builtin();
     let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
     assert_eq!(safe_cfg.decoration, bitty_runtime::Decoration::SAFE);
     assert_eq!(
         safe_cfg.decoration,
-        bitty_runtime::Decoration::new(0, 0, 1, 0)
+        bitty_runtime::Decoration::new(0, 0, 1, 0, 0)
     );
     // Out-of-range decoration fails closed at the file layer.
     for bad in [
@@ -1507,6 +1522,7 @@ fn runtime_config_inherits_file_decoration() {
         r#"return { decoration = { gaps_out = 33 } }"#,
         r#"return { decoration = { border = 9 } }"#,
         r#"return { decoration = { radius = 17 } }"#,
+        r#"return { decoration = { content_inset = 33 } }"#,
         r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
     ] {
         let src = ConfigSource::new(LayerKind::User, Some("init.lua"));

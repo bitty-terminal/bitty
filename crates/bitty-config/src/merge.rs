@@ -77,6 +77,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "decoration.gaps_out"
         | "decoration.border"
         | "decoration.radius"
+        | "decoration.content_inset"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
@@ -486,6 +487,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 ("decoration.gaps_out", dec.gaps_out),
                 ("decoration.border", dec.border),
                 ("decoration.radius", dec.radius),
+                ("decoration.content_inset", dec.content_inset),
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -493,7 +495,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         "decoration.gaps_in" => effective.decoration.gaps_in = value,
                         "decoration.gaps_out" => effective.decoration.gaps_out = value,
                         "decoration.border" => effective.decoration.border = value,
-                        _ => effective.decoration.radius = value,
+                        "decoration.radius" => effective.decoration.radius = value,
+                        _ => effective.decoration.content_inset = value,
                     }
                     let prev = attribution.get(field).cloned();
                     record_attribution(
@@ -522,7 +525,8 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         "decoration.gaps_in" => effective.decoration.gaps_in = value,
                         "decoration.gaps_out" => effective.decoration.gaps_out = value,
                         "decoration.border" => effective.decoration.border = value,
-                        _ => effective.decoration.radius = value,
+                        "decoration.radius" => effective.decoration.radius = value,
+                        _ => effective.decoration.content_inset = value,
                     }
                     record_attribution(
                         &mut attribution,
@@ -883,6 +887,7 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "decoration.gaps_out",
         "decoration.border",
         "decoration.radius",
+        "decoration.content_inset",
         "decoration",
         "scrollbar.mode",
         "scrollbar.width",
@@ -1182,6 +1187,7 @@ fn merge_layers_allow_policy_violations(
                 ("decoration.gaps_out", dec.gaps_out),
                 ("decoration.border", dec.border),
                 ("decoration.radius", dec.radius),
+                ("decoration.content_inset", dec.content_inset),
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -1189,7 +1195,8 @@ fn merge_layers_allow_policy_violations(
                         "decoration.gaps_in" => effective.decoration.gaps_in = value,
                         "decoration.gaps_out" => effective.decoration.gaps_out = value,
                         "decoration.border" => effective.decoration.border = value,
-                        _ => effective.decoration.radius = value,
+                        "decoration.radius" => effective.decoration.radius = value,
+                        _ => effective.decoration.content_inset = value,
                     }
                     let prev = attribution.get(field).cloned();
                     record_attribution(
@@ -1218,7 +1225,8 @@ fn merge_layers_allow_policy_violations(
                         "decoration.gaps_in" => effective.decoration.gaps_in = value,
                         "decoration.gaps_out" => effective.decoration.gaps_out = value,
                         "decoration.border" => effective.decoration.border = value,
-                        _ => effective.decoration.radius = value,
+                        "decoration.radius" => effective.decoration.radius = value,
+                        _ => effective.decoration.content_inset = value,
                     }
                     record_attribution(
                         &mut attribution,
@@ -1523,6 +1531,7 @@ fn merge_layers_allow_policy_violations(
         "decoration.gaps_out",
         "decoration.border",
         "decoration.radius",
+        "decoration.content_inset",
         "decoration",
         "scrollbar.mode",
         "scrollbar.width",
@@ -2181,9 +2190,10 @@ mod tests {
 
     #[test]
     fn decoration_merges_scalar_replace_with_attribution() {
-        // CTX-0292: user decoration lands in effective with user
-        // attribution; CLI wins over file; absent layers keep the accepted
-        // CTX-0118 defaults (4/6/2/6) with core-defaults attribution.
+        // CTX-0292/CTX-0333: user decoration lands in effective with user
+        // attribution; CLI wins over file; absent layers keep the unified
+        // defaults (gaps 6/6, border 2, radius 6, content inset 6) with
+        // core-defaults attribution.
         use crate::types::DecorationConfig;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
@@ -2193,6 +2203,7 @@ mod tests {
                     gaps_out: 0,
                     border: 1,
                     radius: 0,
+                    content_inset: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2201,12 +2212,17 @@ mod tests {
         let merged = merge_layers(vec![user]).expect("merge");
         assert_eq!(merged.effective.decoration.gaps_in, 0);
         assert_eq!(merged.effective.decoration.border, 1);
+        assert_eq!(merged.effective.decoration.content_inset, 0);
         assert_eq!(
             merged.source_of("decoration.gaps_in").unwrap().layer,
             LayerKind::User
         );
         assert_eq!(
             merged.source_of("decoration.border").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("decoration.content_inset").unwrap().layer,
             LayerKind::User
         );
         let cli = LayeredPlan::new(
@@ -2217,6 +2233,7 @@ mod tests {
                     gaps_out: 8,
                     border: 4,
                     radius: 12,
+                    content_inset: 3,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2230,6 +2247,7 @@ mod tests {
                     gaps_out: 0,
                     border: 1,
                     radius: 0,
+                    content_inset: 0,
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2238,6 +2256,7 @@ mod tests {
         let merged2 = merge_layers(vec![user2, cli]).expect("merge");
         assert_eq!(merged2.effective.decoration.gaps_in, 8);
         assert_eq!(merged2.effective.decoration.radius, 12);
+        assert_eq!(merged2.effective.decoration.content_inset, 3);
         assert_eq!(
             merged2.source_of("decoration.gaps_in").unwrap().layer,
             LayerKind::Cli

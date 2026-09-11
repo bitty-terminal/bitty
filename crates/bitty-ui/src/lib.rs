@@ -71,8 +71,9 @@ pub mod view;
 
 // Re-exports for ergonomic root access.
 pub use decoration::{
-    DEFAULT_BORDER_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX, DEFAULT_RADIUS_PX, DecoratedView,
-    Decoration, DecorationError, MAX_BORDER_PX, MAX_GAP_PX, MAX_RADIUS_PX,
+    DEFAULT_BORDER_PX, DEFAULT_CONTENT_INSET_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX,
+    DEFAULT_RADIUS_PX, DecoratedView, Decoration, DecorationError, MAX_BORDER_PX,
+    MAX_CONTENT_INSET_PX, MAX_GAP_PX, MAX_RADIUS_PX,
 };
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};

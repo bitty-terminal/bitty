@@ -719,6 +719,12 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "layout.gaps_in" => defaults.layout.gaps_in.to_string(),
         "layout.gaps_out" => defaults.layout.gaps_out.to_string(),
+        // CTX-0333: Core-owned decoration knobs, including the content inset.
+        "decoration.gaps_in" => defaults.decoration.gaps_in.to_string(),
+        "decoration.gaps_out" => defaults.decoration.gaps_out.to_string(),
+        "decoration.border" => defaults.decoration.border.to_string(),
+        "decoration.radius" => defaults.decoration.radius.to_string(),
+        "decoration.content_inset" => defaults.decoration.content_inset.to_string(),
         "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
         "scrollbar.width" => defaults.scrollbar.width.to_string(),
         // CTX-0260: hover-focus opt-in (default off = click-to-focus).
@@ -1188,7 +1194,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, scrollbar.mode, mouse.focus_follows_mouse, mod_key)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mod_key)",
                     request.value,
                 );
                 if emit_json {

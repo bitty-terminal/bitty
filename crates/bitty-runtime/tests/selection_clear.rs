@@ -64,13 +64,13 @@ fn mouse_release(button: MouseButton) -> MouseEvent {
 
 /// Physical position for a grid cell with the readable 9x19 cell metrics.
 ///
-/// CTX-0223 + CTX-0294: includes the default 8px window padding inset and
-/// the default decoration outer gap + border (6 + 2 = 8px), so the grid
-/// origin is at physical (16, 16); raw `col * 9` coordinates would select
-/// the wrong cell.
+/// CTX-0223 + CTX-0294/CTX-0333: includes the default 8px window padding
+/// inset and the default decoration outer gap + border + content inset
+/// (6 + 2 + 6 = 14px), so the grid origin is at physical (22, 22); raw
+/// `col * 9` coordinates would select the wrong cell.
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
     const PAD: f64 = 8.0;
-    const DECORATION: f64 = 8.0;
+    const DECORATION: f64 = 14.0;
     CursorPosition {
         x: PAD + DECORATION + f64::from(col) * 9.0,
         y: PAD + DECORATION + f64::from(row) * 19.0,

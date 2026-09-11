@@ -392,11 +392,12 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- gaps_in spaces sibling panes, gaps_out insets the outer edge;\n\
      \x20\x20-- both render as background-colored spacing (0..=16 cells).\n\
      \x20\x20-- layout = { gaps_in = 1, gaps_out = 2 },\n\
-     \x20\x20-- Core-owned workspace decoration in logical px (accepted spec\n\
-     \x20\x20-- CTX-0118): gaps between/around views, border inside each\n\
-     \x20\x20-- View frame, corner radius. Defaults 4/6/2/6; safe mode\n\
-     \x20\x20-- forces 0/0/1/0.\n\
-     \x20\x20-- decoration = { gaps_in = 4, gaps_out = 6, border = 2, radius = 6 },\n\
+     \x20\x20-- Core-owned workspace decoration in logical px: gaps between/\n\
+     \x20\x20-- around views (unified 6/6 so panel-panel matches panel-\n\
+     \x20\x20-- terminal), border inside each View frame, corner radius, and\n\
+     \x20\x20-- content_inset padding between the border and the text.\n\
+     \x20\x20-- Defaults 6/6/2/6/6; safe mode forces 0/0/1/0/0.\n\
+     \x20\x20-- decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 },\n\
       \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
       \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
       \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
@@ -635,6 +636,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     ("decoration.gaps_out", e.decoration.gaps_out),
                     ("decoration.border", e.decoration.border),
                     ("decoration.radius", e.decoration.radius),
+                    ("decoration.content_inset", e.decoration.content_inset),
                 ] {
                     println!("{}", check_row(field, format!("{value}"), &src(field)));
                 }
@@ -837,6 +839,9 @@ pub(crate) fn runtime_config_from_effective(
             .decoration
             .radius
             .min(u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX)) as u16,
+        effective.decoration.content_inset.min(u32::from(
+            bitty_runtime::config::MAX_DECORATION_CONTENT_INSET_PX,
+        )) as u16,
     );
     // CTX-0297: `terminal.scrollback` bounds retained history at terminal
     // creation. Unlike the clamped geometry knobs above, an out-of-range

@@ -33,6 +33,7 @@
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
+//!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
 //!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
@@ -1041,10 +1042,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             Some(LayoutConfig { gaps_in, gaps_out })
         }
     };
-    // CTX-0292: `decoration` follows the same fully-optional pattern: absent
-    // table means "this layer says nothing" (plan.decoration None so merge
-    // keeps the lower-precedence value). When the table is present, omitted
-    // keys default to the accepted CTX-0118 decoration defaults (4/6/2/6) so
+    // CTX-0292/CTX-0333: `decoration` follows the same fully-optional
+    // pattern: absent table means "this layer says nothing" (plan.decoration
+    // None so merge keeps the lower-precedence value). When the table is
+    // present, omitted keys default to the unified decoration defaults
+    // (gaps 6/6, border 2, radius 6, content inset 6) so
     // `decoration = { gaps_in = 2 }` keeps working without forcing the other
     // keys. Present values are range-checked here (fail-closed with the
     // field path) and again by `DecorationConfig::validate` via
@@ -1089,11 +1091,18 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 crate::types::MAX_DECORATION_RADIUS_PX,
                 defaults.radius,
             )?;
+            let content_inset = check(
+                "decoration.content_inset",
+                d.content_inset,
+                crate::types::MAX_DECORATION_CONTENT_INSET_PX,
+                defaults.content_inset,
+            )?;
             Some(DecorationConfig {
                 gaps_in,
                 gaps_out,
                 border,
                 radius,
+                content_inset,
             })
         }
     };
@@ -1526,20 +1535,26 @@ mod tests {
 
     #[test]
     fn lua_decoration_parses_and_validates() {
-        // CTX-0292: explicit decoration parses; absent table means "says
-        // nothing" (plan.decoration None so merge keeps lower);
-        // present-but-partial defaults omitted keys to the accepted CTX-0118
-        // defaults (4/6/2/6); wrong types and out-of-range fail closed
-        // naming the field.
+        // CTX-0292/CTX-0333: explicit decoration parses; absent table means
+        // "says nothing" (plan.decoration None so merge keeps lower);
+        // present-but-partial defaults omitted keys to the unified defaults
+        // (gaps 6/6, border 2, radius 6, content inset 6); wrong types and
+        // out-of-range fail closed naming the field.
         let plan = parse_lua_config(
-            r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0 } }"#,
+            r#"return { decoration = { gaps_in = 0, gaps_out = 1, border = 1, radius = 0, content_inset = 2 } }"#,
             &test_source(),
         )
         .expect("decoration parse");
         let dec = plan.decoration.expect("decoration present");
         assert_eq!(
-            (dec.gaps_in, dec.gaps_out, dec.border, dec.radius),
-            (0, 1, 1, 0)
+            (
+                dec.gaps_in,
+                dec.gaps_out,
+                dec.border,
+                dec.radius,
+                dec.content_inset
+            ),
+            (0, 1, 1, 0, 2)
         );
         let plan = parse_lua_config(r#"return { decoration = { border = 3 } }"#, &test_source())
             .expect("partial decoration parses");
@@ -1548,6 +1563,10 @@ mod tests {
         assert_eq!(dec.gaps_in, crate::types::DEFAULT_DECORATION_GAPS_IN_PX);
         assert_eq!(dec.gaps_out, crate::types::DEFAULT_DECORATION_GAPS_OUT_PX);
         assert_eq!(dec.radius, crate::types::DEFAULT_DECORATION_RADIUS_PX);
+        assert_eq!(
+            dec.content_inset,
+            crate::types::DEFAULT_DECORATION_CONTENT_INSET_PX
+        );
         let plan = parse_lua_config(r#"return { decoration = {} }"#, &test_source())
             .expect("empty decoration defaults");
         let dec = plan.decoration.expect("decoration present");
@@ -1564,6 +1583,9 @@ mod tests {
             r#"return { decoration = { gaps_out = 100 } }"#,
             r#"return { decoration = { border = 9 } }"#,
             r#"return { decoration = { radius = 17 } }"#,
+            r#"return { decoration = { content_inset = -1 } }"#,
+            r#"return { decoration = { content_inset = 33 } }"#,
+            r#"return { decoration = { content_inset = "6" } }"#,
             r#"return { decoration = { radius = "6" } }"#,
             r#"return { decoration = { gaps_in = 1.5 } }"#,
             r#"return { decoration = "bold" }"#,

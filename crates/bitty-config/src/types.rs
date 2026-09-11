@@ -53,9 +53,11 @@ pub const DEFAULT_LAYOUT_GAPS_OUT: u32 = 0;
 /// values fail closed like every other config bound.
 pub const MAX_LAYOUT_GAP_CELLS: u32 = 16;
 
-/// Default Core-owned workspace decoration gaps (CTX-0292, accepted spec
-/// CTX-0118): `gaps_in` 4 logical px, `gaps_out` 6 logical px.
-pub const DEFAULT_DECORATION_GAPS_IN_PX: u32 = 4;
+/// Default Core-owned workspace decoration sibling gap (CTX-0292; unified
+/// CTX-0333): 6 logical px. CTX-0333 raised this from the earlier `4` so the
+/// default sibling (panel-to-panel / panel-to-terminal) gap equals the
+/// container (`gaps_out`) gap and reads as one spacing.
+pub const DEFAULT_DECORATION_GAPS_IN_PX: u32 = 6;
 
 /// Default outer workspace decoration gap (CTX-0292): 6 logical px.
 pub const DEFAULT_DECORATION_GAPS_OUT_PX: u32 = 6;
@@ -66,8 +68,17 @@ pub const DEFAULT_DECORATION_BORDER_PX: u32 = 2;
 /// Default View frame corner radius (CTX-0292): 6 logical px.
 pub const DEFAULT_DECORATION_RADIUS_PX: u32 = 6;
 
+/// Default content inset in logical px (CTX-0333): 6.
+///
+/// Inner padding between the View frame's border and its painted content on
+/// every side, so text never sits flush against the panel margin line.
+pub const DEFAULT_DECORATION_CONTENT_INSET_PX: u32 = 6;
+
 /// Maximum decoration gap in logical px (either axis), accepted CTX-0118.
 pub const MAX_DECORATION_GAP_PX: u32 = 32;
+
+/// Maximum content inset in logical px (CTX-0333), same bound as the gaps.
+pub const MAX_DECORATION_CONTENT_INSET_PX: u32 = 32;
 
 /// Maximum View frame border thickness in logical px, accepted CTX-0118.
 pub const MAX_DECORATION_BORDER_PX: u32 = 8;
@@ -75,7 +86,7 @@ pub const MAX_DECORATION_BORDER_PX: u32 = 8;
 /// Maximum View frame corner radius in logical px, accepted CTX-0118.
 pub const MAX_DECORATION_RADIUS_PX: u32 = 16;
 
-/// Safe-mode decoration gaps (CTX-0292 rule 5: `bitty --safe` = `0/0/1/0`).
+/// Safe-mode decoration gaps (CTX-0292 rule 5: `bitty --safe` = `0/0/1/0/0`).
 pub const SAFE_DECORATION_GAPS_IN_PX: u32 = 0;
 
 /// Safe-mode decoration outer gap; see [`SAFE_DECORATION_GAPS_IN_PX`].
@@ -86,6 +97,10 @@ pub const SAFE_DECORATION_BORDER_PX: u32 = 1;
 
 /// Safe-mode View frame corner radius (`0`, not the `6` default).
 pub const SAFE_DECORATION_RADIUS_PX: u32 = 0;
+
+/// Safe-mode content inset (`0`, not the `6` default), so safe mode keeps
+/// the legacy border-only content geometry (CTX-0333).
+pub const SAFE_DECORATION_CONTENT_INSET_PX: u32 = 0;
 
 /// Default selection auto-copy behavior (CTX-0191).
 /// `true` preserves the ghostty-class copy-on-select: a committed mouse
@@ -517,6 +532,13 @@ impl SelectionConfig {
 /// optional, defaulting to `0` when the table is present but omits them, so
 /// `layout = {}` keeps edge-to-edge tiling). Both default to `0`, preserving
 /// edge-to-edge tiling for existing users.
+///
+/// One coherent model with [`DecorationConfig`]: the px decoration is scaled
+/// by the Window DPI factor and the cell gaps convert through the live cell
+/// metrics, so `effective gap = decoration.gap * DPI_scale +
+/// layout.gap_cells * cell_axis`. Because `layout` cell gaps default to `0`,
+/// the default effective sibling and container gaps are both the `6` logical
+/// px decoration default (CTX-0333).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutConfig {
     /// Spacing between sibling panes, in cells, `0..=MAX_LAYOUT_GAP_CELLS`.
@@ -555,16 +577,23 @@ impl LayoutConfig {
 
 /// Core-owned workspace decoration in logical pixels (CTX-0292).
 ///
-/// Implements the accepted workspace-compositor contract
+/// Implements the workspace-compositor contract
 /// (`bitty-docs/docs/specifications/workspace-compositor.md`, section
-/// "Core-owned gaps, border, and radius", accepted via CTX-0118):
+/// "Core-owned gaps, border, and radius", accepted via CTX-0118; unified and
+/// extended by CTX-0333):
 ///
-/// | Property   | Default | Range      |
-/// | ---------- | ------- | ---------- |
-/// | `gaps_in`  | 4 px    | 0..=32 px  |
-/// | `gaps_out` | 6 px    | 0..=32 px  |
-/// | `border`   | 2 px    | 0..=8 px   |
-/// | `radius`   | 6 px    | 0..=16 px  |
+/// | Property        | Default | Range      |
+/// | --------------- | ------- | ---------- |
+/// | `gaps_in`       | 6 px    | 0..=32 px  |
+/// | `gaps_out`      | 6 px    | 0..=32 px  |
+/// | `border`        | 2 px    | 0..=8 px   |
+/// | `radius`        | 6 px    | 0..=16 px  |
+/// | `content_inset` | 6 px    | 0..=32 px  |
+///
+/// CTX-0333 raised the sibling gap default from the earlier `4` so
+/// `gaps_in == gaps_out` out of the box (panel-to-panel matches
+/// panel-to-terminal/container spacing) and added `content_inset`, the inner
+/// padding between the frame border and the painted content.
 ///
 /// Values are integers in logical pixels, scaled by the `Window` DPI factor
 /// only at render time. Unknown keys or out-of-range values fail validation
@@ -573,7 +602,11 @@ impl LayoutConfig {
 /// of a `LayoutTree`, a `View`, or a `LayoutProvider` proposal.
 ///
 /// This is distinct from the CTX-0177 `layout.gaps_in`/`gaps_out` panel gaps,
-/// which remain integer **cells** and keep their existing behavior.
+/// which remain integer **cells** and keep their existing behavior. The one
+/// coherent model is: effective gap = `decoration.gap * DPI_scale +
+/// layout.gap_cells * cell_axis`, so with the default `layout` cell gaps of
+/// `0` the effective sibling and container gaps are both the `6` logical px
+/// decoration default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecorationConfig {
     /// Gap between adjacent views inside one workspace, logical px.
@@ -584,6 +617,9 @@ pub struct DecorationConfig {
     pub border: u32,
     /// Corner radius for View frames, logical px.
     pub radius: u32,
+    /// Inner padding between the frame border and the painted content,
+    /// logical px (CTX-0333; `0` reproduces the legacy border-only content).
+    pub content_inset: u32,
 }
 
 impl Default for DecorationConfig {
@@ -593,13 +629,15 @@ impl Default for DecorationConfig {
             gaps_out: DEFAULT_DECORATION_GAPS_OUT_PX,
             border: DEFAULT_DECORATION_BORDER_PX,
             radius: DEFAULT_DECORATION_RADIUS_PX,
+            content_inset: DEFAULT_DECORATION_CONTENT_INSET_PX,
         }
     }
 }
 
 impl DecorationConfig {
-    /// Safe-mode decoration (`bitty --safe`, spec rule 5): `0/0/1/0`
-    /// regardless of user configuration.
+    /// Safe-mode decoration (`bitty --safe`, spec rule 5): `0/0/1/0/0`
+    /// regardless of user configuration. Content inset stays zero so safe
+    /// mode reproduces the legacy border-only geometry.
     #[must_use]
     pub const fn safe() -> Self {
         Self {
@@ -607,13 +645,18 @@ impl DecorationConfig {
             gaps_out: SAFE_DECORATION_GAPS_OUT_PX,
             border: SAFE_DECORATION_BORDER_PX,
             radius: SAFE_DECORATION_RADIUS_PX,
+            content_inset: SAFE_DECORATION_CONTENT_INSET_PX,
         }
     }
 
     /// True when every decoration is zero (undecorated fast path).
     #[must_use]
     pub const fn is_zero(&self) -> bool {
-        self.gaps_in == 0 && self.gaps_out == 0 && self.border == 0 && self.radius == 0
+        self.gaps_in == 0
+            && self.gaps_out == 0
+            && self.border == 0
+            && self.radius == 0
+            && self.content_inset == 0
     }
 
     /// Validate decoration config (fail-closed on out-of-range values).
@@ -640,6 +683,12 @@ impl DecorationConfig {
             return Err(ConfigError::validation(
                 "decoration.radius",
                 format!("must be within [0, {MAX_DECORATION_RADIUS_PX}]"),
+            ));
+        }
+        if self.content_inset > MAX_DECORATION_CONTENT_INSET_PX {
+            return Err(ConfigError::validation(
+                "decoration.content_inset",
+                format!("must be within [0, {MAX_DECORATION_CONTENT_INSET_PX}]"),
             ));
         }
         Ok(())
@@ -1410,25 +1459,39 @@ mod tests {
     }
 
     #[test]
-    fn decoration_defaults_match_accepted_spec_and_validate() {
-        // CTX-0292 / accepted spec CTX-0118: defaults 4/6/2/6 logical px and
-        // ranges gaps 0..=32, border 0..=8, radius 0..=16, fail closed.
-        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 4) }
+    fn decoration_defaults_match_unified_spec_and_validate() {
+        // CTX-0333: unified 6/6 sibling/container gaps, 2px border, 6px
+        // radius, 6px content inset; ranges 0..=32 / 0..=32 / 0..=8 /
+        // 0..=16 / 0..=32, fail closed.
+        const { assert!(DEFAULT_DECORATION_GAPS_IN_PX == 6) }
         const { assert!(DEFAULT_DECORATION_GAPS_OUT_PX == 6) }
         const { assert!(DEFAULT_DECORATION_BORDER_PX == 2) }
         const { assert!(DEFAULT_DECORATION_RADIUS_PX == 6) }
+        const { assert!(DEFAULT_DECORATION_CONTENT_INSET_PX == 6) }
         const { assert!(MAX_DECORATION_GAP_PX == 32) }
         const { assert!(MAX_DECORATION_BORDER_PX == 8) }
         const { assert!(MAX_DECORATION_RADIUS_PX == 16) }
+        const { assert!(MAX_DECORATION_CONTENT_INSET_PX == 32) }
         let d = DecorationConfig::default();
-        assert_eq!((d.gaps_in, d.gaps_out, d.border, d.radius), (4, 6, 2, 6));
+        assert_eq!(
+            (d.gaps_in, d.gaps_out, d.border, d.radius, d.content_inset),
+            (6, 6, 2, 6, 6)
+        );
         d.validate().expect("default valid");
         assert!(!d.is_zero());
-        // Safe-mode inversion: 0/0/1/0 regardless of the defaults.
+        // CTX-0333: the sibling and container defaults match out of the box.
+        assert_eq!(d.gaps_in, d.gaps_out);
+        // Safe-mode inversion: 0/0/1/0/0 regardless of the defaults.
         let safe = DecorationConfig::safe();
         assert_eq!(
-            (safe.gaps_in, safe.gaps_out, safe.border, safe.radius),
-            (0, 0, 1, 0)
+            (
+                safe.gaps_in,
+                safe.gaps_out,
+                safe.border,
+                safe.radius,
+                safe.content_inset
+            ),
+            (0, 0, 1, 0, 0)
         );
         safe.validate().expect("safe valid");
         assert!(!safe.is_zero());
@@ -1438,12 +1501,14 @@ mod tests {
                 gaps_out: 0,
                 border: 0,
                 radius: 0,
+                content_inset: 0,
             },
             DecorationConfig {
                 gaps_in: 32,
                 gaps_out: 32,
                 border: 8,
                 radius: 16,
+                content_inset: 32,
             },
         ] {
             good.validate().expect("boundary decoration must be valid");
@@ -1453,13 +1518,15 @@ mod tests {
             ("decoration.gaps_out", 33),
             ("decoration.border", 9),
             ("decoration.radius", 17),
+            ("decoration.content_inset", 33),
         ] {
             let mut c = DecorationConfig::default();
             match field {
                 "decoration.gaps_in" => c.gaps_in = bad,
                 "decoration.gaps_out" => c.gaps_out = bad,
                 "decoration.border" => c.border = bad,
-                _ => c.radius = bad,
+                "decoration.radius" => c.radius = bad,
+                _ => c.content_inset = bad,
             }
             let err = c.validate().expect_err("out-of-range must fail closed");
             assert_eq!(err.field(), Some(field), "wrong field for {field}");
@@ -1469,6 +1536,10 @@ mod tests {
         eff.decoration.radius = MAX_DECORATION_RADIUS_PX + 1;
         eff.validate()
             .expect_err("effective must reject oversized decoration");
+        let mut eff = EffectiveConfig::default();
+        eff.decoration.content_inset = MAX_DECORATION_CONTENT_INSET_PX + 1;
+        eff.validate()
+            .expect_err("effective must reject oversized content inset");
     }
 
     #[test]

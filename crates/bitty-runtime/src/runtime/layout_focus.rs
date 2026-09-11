@@ -21,8 +21,9 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
 /// Produced by [`Runtime::present_frames`]: the accepted Core-owned
 /// decoration converted to physical px at the live DPI factor and composed
 /// with the CTX-0177 cell gaps. `frame` is the hit-test rectangle and
-/// `content` is the painted rectangle (inside the border); both are relative
-/// to the container origin, before the window-padding inset.
+/// `content` is the painted rectangle (inside the border and content inset);
+/// both are relative to the container origin, before the window-padding
+/// inset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentFrame {
     /// View this frame paints.
@@ -78,14 +79,16 @@ impl Runtime {
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
         let pad_px = f64::from(self.window_padding_physical());
-        // CTX-0294: the accepted Core-owned decoration insets the content
+        // CTX-0294/CTX-0333: the Core-owned decoration insets the content
         // inside each frame, so the primary grid origin moves by the outer
-        // gap plus the border at the live DPI scale (CTX-0177 cell gaps_out
-        // below stays in cells). Positions over the decoration bands still
-        // clamp like before (total mapping, no None).
+        // gap plus the border plus the content inset at the live DPI scale
+        // (CTX-0177 cell gaps_out below stays in cells). Positions over the
+        // decoration bands still clamp like before (total mapping, no None).
         let scale = self.dpi_scale();
         let deco = self.config.decoration;
-        let deco_px = (f64::from(deco.gaps_out) + f64::from(deco.border)) * scale;
+        let deco_px =
+            (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
+                * scale;
         let gap_px_x = f64::from(self.config.gaps_out) * cell_w + deco_px;
         let gap_px_y = f64::from(self.config.gaps_out) * cell_h + deco_px;
         let col = if cell_w <= 0.0 {
@@ -211,9 +214,10 @@ impl Runtime {
     /// inside the Window and padding stays Window chrome.
     ///
     /// Per frame: `frame` is the hit-test rectangle (decoration-inclusive),
-    /// `content` is the painted rectangle inside the border, and `cols`/`rows`
-    /// are the content grid dimensions derived from `content` at the live cell
-    /// metrics (floor, at least 1). The sub-cell remainder stays background,
+    /// `content` is the painted rectangle inside the border and content inset,
+    /// and `cols`/`rows` are the content grid dimensions derived from
+    /// `content` at the live cell metrics (floor, at least 1). The sub-cell
+    /// remainder stays background,
     /// which is what makes the composition fractional-cell. Pure and
     /// deterministic; total for hostile containers/decoration.
     #[must_use]

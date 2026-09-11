@@ -22,6 +22,13 @@ the [bitty-docs repository](https://github.com/bitty-terminal/bitty-docs).
 
 ## See the project workflow (CarryCtx)
 
+CarryCtx is the local-first tool that records this project's tasks, decisions,
+and checkpoints. Install it globally for local development (recommended):
+
+```sh
+cargo install carryctx      # Rust toolchain, or: npm i -g carryctx
+```
+
 CarryCtx engineering state (tasks, sessions, checkpoints) is not cloned. A
 fresh clone restores it from the in-repo `refs/heads/carryctx-snapshots`
 branch:

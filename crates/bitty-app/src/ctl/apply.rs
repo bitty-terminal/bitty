@@ -515,11 +515,21 @@ fn workspace_names_json(runtime: &bitty_runtime::Runtime) -> String {
 }
 
 /// Extract printable text from a terminal snapshot (rows joined, bounded).
-pub(super) fn snapshot_text(snapshot: &impl std::fmt::Debug) -> String {
-    // `Snapshot` exposes grid rows; fall back to debug rendering when the
-    // shape differs (bounded, never panics on unexpected grids).
-    let rendered = format!("{snapshot:?}");
-    bounded_text(&rendered)
+///
+/// CTX-0321: `terminal text` must return the rendered grid, not a `Debug` dump
+/// of the internal `Snapshot` struct. This reuses the canonical bounded
+/// row-wise extraction the devtools `grid-text` snapshot exposes
+/// ([`bitty_runtime::inspect::grid_text_from_snapshot`]): wide-char spacers are
+/// skipped, trailing blanks are trimmed per row, and the rows are newline
+/// joined. The joined result is bounded ([`bounded_text`]) and never panics on
+/// an unexpected grid.
+pub(super) fn snapshot_text(snapshot: &bitty_term_state::Snapshot) -> String {
+    let grid = bitty_runtime::inspect::grid_text_from_snapshot(
+        snapshot,
+        bitty_runtime::inspect::INSPECT_MAX_ROWS,
+        bitty_runtime::inspect::INSPECT_MAX_COLS,
+    );
+    bounded_text(&grid.lines.join("\n"))
 }
 
 /// Bound terminal text for the response (16 KiB, char-boundary safe).

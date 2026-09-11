@@ -109,6 +109,79 @@ fn hover_moves_focus_only_when_enabled() {
 }
 
 #[test]
+fn left_click_focuses_hit_pane_without_hover() {
+    // CTX-0339: the live-campaign regression. With the default
+    // `focus_follows_mouse = false`, hover must not move focus but a plain
+    // left press on the right pane must focus it.
+    assert!(!RuntimeConfig::default().focus_follows_mouse);
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "hover alone must not move focus when disabled"
+    );
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "left click must focus the hit pane"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+    // Clicking the left pane moves focus back.
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn left_click_on_already_focused_pane_keeps_focus() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(10, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn left_click_in_gap_band_keeps_focus() {
+    // A press over an outer gap/padding band hits no leaf, so focus stays.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(CursorPosition { x: 2.0, y: 2.0 });
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "a click over a gap must not steal focus"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn shift_left_click_selects_without_focus() {
+    // CTX-0181 accessibility escape: Shift forces the selection path and,
+    // consistent with `shift_suppresses_hover_focus`, never steals focus.
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane());
+    rt.handle_cursor_moved(cell_pixels(60, 12));
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "Shift+click must not focus the hit pane"
+    );
+    assert!(rt.is_selection_dragging(), "Shift+click still selects");
+    rt.handle_mouse_input(release(MouseButton::Left));
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
 fn shift_suppresses_hover_focus() {
     // CTX-0181 precedent: Shift forces the selection path, so Shift+hover
     // never steals focus even when the flag is on.

@@ -152,6 +152,17 @@ pub fn resolve_record(
     record: &PluginRecord,
 ) -> Result<PluginPackage, PluginRuntimeError> {
     let plugin = record.plugin_id.clone();
+    // A store record may never claim first-party provenance: `bundled`
+    // packages are shipped with the application and discovered from a
+    // configured trusted root, never from the user-writable store index.
+    // Trusting the record's `source_class` here would let a `bundled` label
+    // gain a first-party VM and bypass `--safe` (RFC B.1 / A.4 rule 6).
+    if record.source_class.is_bundled() {
+        return Err(integrity(
+            &plugin,
+            "bundled provenance is never accepted from a store record",
+        ));
+    }
     let (package_root, mut unverified) = match record.source_class {
         SourceClass::LocalPath => {
             let recorded = PathBuf::from(&record.root);
@@ -328,7 +339,7 @@ pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, Plug
                     detail: "module tree exceeds the 16 MiB ceiling".to_string(),
                 });
             }
-            if path.as_os_str().len() > PLUGIN_MODULE_PATH_MAX_BYTES {
+            if !path_within_bound(&path, PLUGIN_MODULE_PATH_MAX_BYTES) {
                 return Err(PluginRuntimeError::ModuleTree {
                     plugin: plugin.to_string(),
                     detail: "module path exceeds the 1024-byte ceiling".to_string(),
@@ -407,6 +418,16 @@ fn is_safe_relative(root: &str) -> bool {
 
 fn is_hex_digest(candidate: &str) -> bool {
     candidate.len() == HEX_DIGEST_LEN && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether a module entry path is within the byte ceiling.
+///
+/// This is a pure path-length comparison so the ratified
+/// [`PLUGIN_MODULE_PATH_MAX_BYTES`] bound can be exercised on every platform:
+/// macOS caps `PATH_MAX` at 1024, so an over-limit path cannot be materialized
+/// on disk there and must be validated against the path value itself.
+fn path_within_bound(path: &Path, max_bytes: usize) -> bool {
+    path.as_os_str().len() <= max_bytes
 }
 
 fn integrity(plugin: &str, detail: impl Into<String>) -> PluginRuntimeError {
@@ -667,5 +688,21 @@ mod tests {
         assert!(!is_safe_relative("packages/../../escape"));
         assert!(!is_safe_relative("/abs/path"));
         assert!(!is_safe_relative("./packages/bitty.a"));
+    }
+
+    #[test]
+    fn path_ceiling_is_enforced_at_ratified_bound() {
+        // The ratified ceiling is fixed by ADR-0010, not a new literal.
+        assert_eq!(PLUGIN_MODULE_PATH_MAX_BYTES, 1024);
+        // Validate the exact boundary on synthetic path values so the check is
+        // exercised on every platform without touching an over-limit on-disk
+        // path (macOS `PATH_MAX` is 1024 and cannot create one).
+        let at_bound = std::path::PathBuf::from("a".repeat(PLUGIN_MODULE_PATH_MAX_BYTES));
+        let over_bound = std::path::PathBuf::from("a".repeat(PLUGIN_MODULE_PATH_MAX_BYTES + 1));
+        assert!(path_within_bound(&at_bound, PLUGIN_MODULE_PATH_MAX_BYTES));
+        assert!(!path_within_bound(
+            &over_bound,
+            PLUGIN_MODULE_PATH_MAX_BYTES
+        ));
     }
 }

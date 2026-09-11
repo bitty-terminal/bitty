@@ -418,7 +418,15 @@ impl PluginRuntime {
             self.collect_dir_root(&root, SourceClass::Bundled, &mut results);
         }
 
-        if let Some(store_root) = self.store_root.clone() {
+        // RFC A.4 rule 6 / R-009: `--safe` never reads the third-party store
+        // tree, so installed records are not even enumerated; only the trusted
+        // bundled roots scanned above may load.
+        let store_root = if self.safe_mode {
+            None
+        } else {
+            self.store_root.clone()
+        };
+        if let Some(store_root) = store_root {
             match resolution::load_index(&store_root) {
                 Ok(records) => {
                     for record in records {

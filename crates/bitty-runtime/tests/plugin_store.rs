@@ -312,8 +312,11 @@ fn local_path_non_canonical_root_is_rejected() {
 }
 
 #[test]
-fn module_tree_bounds_are_enforced() {
-    // Byte ceiling: one file above 16 MiB.
+fn module_tree_byte_ceiling_is_enforced() {
+    // One file above the 16 MiB aggregate ceiling must fail closed. The
+    // 1024-byte path ceiling is covered portably by the `resolution` unit test
+    // (`path_ceiling_is_enforced_at_ratified_bound`): macOS caps `PATH_MAX` at
+    // 1024, so an over-limit path cannot be materialized on disk there.
     let store = temp_dir("bound-bytes");
     let package = store.join("packages/bitty-featured.store/0.1.0");
     write_package(&package, "bitty-featured.store", "0.1.0", "return {}");
@@ -322,23 +325,6 @@ fn module_tree_bounds_are_enforced() {
     assert!(
         content_digest(&package).is_err(),
         "tree over 16 MiB must be rejected"
-    );
-    let _ = std::fs::remove_dir_all(&store);
-
-    // Path ceiling: a nested file whose canonical path exceeds 1024 bytes.
-    let store = temp_dir("bound-path");
-    let package = store.join("packages/bitty-featured.store/0.1.0");
-    write_package(&package, "bitty-featured.store", "0.1.0", "return {}");
-    let mut deep = package.join("lua");
-    let segment = "d".repeat(80);
-    for _ in 0..20 {
-        deep = deep.join(&segment);
-    }
-    std::fs::create_dir_all(&deep).expect("deep dirs");
-    std::fs::write(deep.join("deep.lua"), "return {}").expect("deep file");
-    assert!(
-        content_digest(&package).is_err(),
-        "path over 1024 bytes must be rejected"
     );
     let _ = std::fs::remove_dir_all(&store);
 }
@@ -412,19 +398,93 @@ fn discovery_orders_bundled_then_installed_then_dev() {
 }
 
 #[test]
-fn safe_mode_skips_installed_but_loads_bundled() {
+fn safe_mode_skips_installed_store_but_loads_bundled() {
+    // Installed (third-party) records are not read under `--safe`.
     let store = temp_dir("safe-store");
     let package = store.join("packages/bitty-featured.store/0.1.0");
     write_package(&package, "bitty-featured.store", "0.1.0", INIT);
     let record = installed_record("packages/bitty-featured.store/0.1.0", &package);
     write_index(&store, std::slice::from_ref(&record)).expect("write index");
 
-    let mut rt = runtime(Some(store.clone()), true, "safe");
-    let id = PluginId::new("bitty-featured.store").expect("id");
+    // A trusted bundled root still loads under `--safe`.
+    let bundled = temp_dir("safe-bundled");
+    let bundled_id = "bitty-featured.bundled";
+    write_package(&bundled.join(bundled_id), bundled_id, "0.1.0", INIT);
+
+    let data = temp_dir("safe-state");
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: true,
+        data_dir: Some(data),
+        store_root: Some(store.clone()),
+        bundled_roots: vec![bundled.clone()],
+        third_party_roots: Vec::new(),
+        settings: Rc::new(MapSettings::default()),
+        snapshot: Rc::new(StaticSnapshot(LuaValue::Nil)),
+    });
     rt.discover();
-    let report = rt.activate(&id).expect("activate");
-    assert!(report.skipped_safe_mode);
-    assert_eq!(report.source_class, SourceClass::Registry);
-    assert!(!rt.host_has_plugin(&id));
+
+    let installed = PluginId::new("bitty-featured.store").expect("id");
+    assert!(
+        rt.state(&installed).is_none(),
+        "an installed record is not read or discovered under --safe"
+    );
+    let bundled_plugin = PluginId::new(bundled_id).expect("id");
+    let report = rt
+        .activate(&bundled_plugin)
+        .expect("bundled activates under --safe");
+    assert!(!report.skipped_safe_mode);
+    assert_eq!(report.source_class, SourceClass::Bundled);
+
+    let _ = std::fs::remove_dir_all(&store);
+    let _ = std::fs::remove_dir_all(&bundled);
+}
+
+#[test]
+fn safe_mode_does_not_read_store_tree() {
+    // A malformed index proves whether the store tree was read: `--safe` must
+    // not read it (RFC A.4 rule 6 / R-009), while the default path reports the
+    // integrity failure.
+    let store = temp_dir("safe-no-read");
+    std::fs::create_dir_all(&store).expect("store dir");
+    std::fs::write(store.join("current.json"), b"not a plugin index").expect("malformed index");
+
+    let mut safe = runtime(Some(store.clone()), true, "safe-no-read");
+    let safe_results = safe.discover();
+    assert!(
+        safe_results.is_empty(),
+        "--safe must not read the store tree: {safe_results:?}"
+    );
+    assert_eq!(safe.package_count(), 0);
+
+    let mut normal = runtime(Some(store.clone()), false, "normal-no-read");
+    let normal_results = normal.discover();
+    assert!(
+        normal_results.iter().any(|(_, result)| result.is_err()),
+        "the default path reports the malformed index: {normal_results:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+#[test]
+fn bundled_record_in_store_fails_closed() {
+    // A store record may not claim first-party provenance: bundled packages are
+    // shipped with the application from a configured trusted root, never the
+    // user-writable index.
+    let store = temp_dir("bundled-record");
+    let package = store.join("packages/bitty-featured.store/0.1.0");
+    write_package(&package, "bitty-featured.store", "0.1.0", INIT);
+    let mut record = installed_record("packages/bitty-featured.store/0.1.0", &package);
+    record.source_class = SourceClass::Bundled;
+    write_index(&store, std::slice::from_ref(&record)).expect("write index");
+
+    let mut rt = runtime(Some(store.clone()), false, "bundled-record");
+    let results = rt.discover();
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].1.is_err(),
+        "a self-declared bundled store record must fail closed"
+    );
+    assert_eq!(rt.package_count(), 0);
     let _ = std::fs::remove_dir_all(&store);
 }

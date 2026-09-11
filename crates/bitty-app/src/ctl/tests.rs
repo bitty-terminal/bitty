@@ -358,6 +358,33 @@ fn control_terminal_send_and_text_headless() {
 }
 
 #[test]
+fn control_terminal_text_renders_grid_text_not_debug() {
+    // CTX-0321 (D1): `terminal text` returned a `Debug` dump of the internal
+    // `Snapshot` struct. It must return the rendered grid (bounded, row-wise),
+    // never the struct shape.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    rt.handle_pty_bytes(b"hello grid");
+    let params = ipc_ctl::params_terminal_id("t:1");
+    let reply = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+        Some(&params),
+        &cli,
+    );
+    assert!(reply.ok, "terminal text must succeed: {reply:?}");
+    let text = extract_string_from(&reply.result_json, "text").expect("text field");
+    assert!(
+        text.contains("hello grid"),
+        "rendered grid text must contain the typed bytes, got {text:?}"
+    );
+    assert!(
+        !text.contains("Snapshot {") && !text.contains("Cell {") && !text.contains("Style {"),
+        "terminal text must not leak the Debug struct shape, got {text:?}"
+    );
+}
+
+#[test]
 fn control_send_to_unfocused_is_conflict() {
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
@@ -382,12 +409,18 @@ fn control_terminal_text_sessionless_split_focused_parity() {
     // duplicate one grid as text across tiles).
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
+    // Seed the primary grid so the mirrored text is observable (a fresh grid
+    // renders as blanks only).
+    rt.handle_pty_bytes(b"parity-probe");
     let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
     assert!(done.ok, "split must succeed: {done:?}");
     assert_eq!(rt.focused_view().map(|v| v.0), Some(1));
     let expected = snapshot_text(&rt.snapshot());
-    assert!(!expected.is_empty(), "primary debug text must be non-empty");
+    assert!(
+        expected.contains("parity-probe"),
+        "primary grid text must be rendered, got {expected:?}"
+    );
     let t1_params = ipc_ctl::params_terminal_id("t:1");
     let t1 = apply_control_envelope(
         &mut rt,

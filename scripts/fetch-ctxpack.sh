@@ -360,7 +360,7 @@ print("fetch-ctxpack: provenance: snapshot=%s export_id=%s format_version=v%s ca
     "true" if manifest.get("redacted") is True else "false",
 ))
 print("fetch-ctxpack: provenance: source_commit=%s exported_at=%s" % (
-    source.get("bitty_commit", "unknown"),
+    source.get("bitty_commit") or source.get("repo_commit", "unknown"),
     source.get("exported_at", "unknown"),
 ))
 PYEOF

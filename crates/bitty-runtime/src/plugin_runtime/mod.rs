@@ -104,8 +104,17 @@ pub struct PluginRuntimeConfig {
     pub safe_mode: bool,
     /// Root for plugin persistent state (`$XDG_DATA_HOME/bitty/plugins-state`).
     pub data_dir: Option<PathBuf>,
-    /// Directories scanned for `<name>/bitty-plugin.toml` packages.
+    /// Trusted roots for application-shipped (`bundled`) packages.
+    ///
+    /// Provenance is derived from the root, never from the manifest id: a
+    /// package can only be `bundled` when it is discovered under one of these
+    /// roots. `--safe` still loads these (RFC A.4 rule 6 only forbids
+    /// third-party VMs).
     pub bundled_roots: Vec<PathBuf>,
+    /// Untrusted roots (`local-path`, registry, git). Packages found here are
+    /// [`SourceClass::ThirdParty`] regardless of their self-declared id, and
+    /// `--safe` never creates a VM for them.
+    pub third_party_roots: Vec<PathBuf>,
     /// Read-only settings source.
     pub settings: Rc<dyn SettingsSource>,
     /// Bounded terminal snapshot source.
@@ -118,6 +127,7 @@ impl Default for PluginRuntimeConfig {
             safe_mode: false,
             data_dir: None,
             bundled_roots: Vec::new(),
+            third_party_roots: Vec::new(),
             settings: Rc::new(EmptySettings),
             snapshot: Rc::new(UnavailableSnapshot),
         }
@@ -228,7 +238,8 @@ pub struct PluginRuntime {
     settings: Rc<dyn SettingsSource>,
     snapshot: Rc<dyn SnapshotSource>,
     notifications: Rc<RefCell<NotificationQueue>>,
-    roots: Vec<PathBuf>,
+    bundled_roots: Vec<PathBuf>,
+    third_party_roots: Vec<PathBuf>,
     event_sequence: u64,
     entries: BTreeMap<PluginId, PluginEntry>,
     order: Vec<PluginId>,
@@ -247,7 +258,8 @@ impl PluginRuntime {
             notifications: Rc::new(RefCell::new(NotificationQueue::new(
                 NOTIFICATION_QUEUE_CAPACITY,
             ))),
-            roots: config.bundled_roots,
+            bundled_roots: config.bundled_roots,
+            third_party_roots: config.third_party_roots,
             event_sequence: 0,
             entries: BTreeMap::new(),
             order: Vec::new(),
@@ -299,12 +311,27 @@ impl PluginRuntime {
 
     /// Scan the configured roots and register every valid package.
     ///
-    /// Fail-closed: an invalid manifest is reported and skipped, never loaded.
-    /// Returns `(id, result)` pairs in discovery order.
+    /// Provenance (and therefore `--safe` eligibility) comes from the root the
+    /// package was found under, never from its self-declared id. Bundled roots
+    /// are scanned first so a bundled package wins an id collision over a
+    /// third-party one. Fail-closed: an invalid manifest is reported and
+    /// skipped, never loaded. Returns `(id, result)` pairs in discovery order.
     pub fn discover(&mut self) -> Vec<(PluginId, Result<(), PluginRuntimeError>)> {
+        let mut roots: Vec<(SourceClass, PathBuf)> = self
+            .bundled_roots
+            .iter()
+            .cloned()
+            .map(|root| (SourceClass::Bundled, root))
+            .collect();
+        roots.extend(
+            self.third_party_roots
+                .iter()
+                .cloned()
+                .map(|root| (SourceClass::ThirdParty, root)),
+        );
         let mut results = Vec::new();
-        for root in self.roots.clone() {
-            let packages = match discover_root(&root) {
+        for (source_class, root) in roots {
+            let packages = match discover_root(&root, source_class) {
                 Ok(packages) => packages,
                 Err(error) => {
                     results.push((
@@ -345,15 +372,6 @@ impl PluginRuntime {
     /// capture-validation, or VM failures. Failure leaves no partial
     /// activation.
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
-        if self.safe_mode && !id.as_str().starts_with("bitty.") {
-            return Ok(ActivationReport {
-                plugin: id.clone(),
-                state: LifecycleState::Unloaded,
-                commands: 0,
-                events: 0,
-                skipped_safe_mode: true,
-            });
-        }
         let (manifest, module_root, init_path) = {
             let entry = self
                 .entries
@@ -369,6 +387,19 @@ impl PluginRuntime {
                 return Err(PluginRuntimeError::Lifecycle {
                     plugin: id.to_string(),
                     detail: format!("cannot activate from state {:?}", entry.state),
+                });
+            }
+            // `--safe` is decided by discovery provenance, never by the
+            // self-declared id: a third-party package cannot claim bundled
+            // trust by naming itself `bitty.*` (RFC A.4 rule 6). This check
+            // precedes any VM or host-reservation work.
+            if self.safe_mode && entry.package.source_class == SourceClass::ThirdParty {
+                return Ok(ActivationReport {
+                    plugin: id.clone(),
+                    state: LifecycleState::Unloaded,
+                    commands: 0,
+                    events: 0,
+                    skipped_safe_mode: true,
                 });
             }
             verify_module_tree(id, &entry.package.module_root)?;
@@ -406,13 +437,22 @@ impl PluginRuntime {
             Ok(())
         })();
         if let Err(error) = policy {
-            self.rollback_host(id);
-            self.fail(id, error.to_string());
+            self.rollback(id, error.to_string());
             return Err(error);
         }
 
-        // Mechanism half: VM, bridge, and bounded activation.
-        let store = self.open_store(id)?;
+        // Mechanism half: VM, bridge, and bounded activation. Every failure
+        // below goes through `self.rollback`, which purges the policy-host
+        // generation (identity, command ownership, subscriptions) and records
+        // a terminal failure locally, so no partial activation survives and a
+        // retry starts from a clean host state (RFC A.4 rule 4).
+        let store = match self.open_store(id) {
+            Ok(store) => store,
+            Err(error) => {
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        };
         let terminal_read = required
             .iter()
             .any(|capability| capability.as_str() == "terminal.semantic-read");
@@ -437,41 +477,51 @@ impl PluginRuntime {
             entry.services = Some(plugin_services.clone());
         }
         let services: Rc<dyn HostServices> = plugin_services.clone();
-        vm.install_host_module(
+        if let Err(error) = vm.install_host_module(
             services,
             MarshallingLimits::default(),
             DEFAULT_HOST_DEADLINE_MS,
-        )
-        .map_err(|error| PluginRuntimeError::Vm(error.to_string()))?;
+        ) {
+            let error = PluginRuntimeError::Vm(error.to_string());
+            self.rollback(id, error.to_string());
+            return Err(error);
+        }
 
         {
             let entry = self.entries.get_mut(id).expect("entry exists");
             entry.state = LifecycleState::Activating;
         }
-        let outcome = vm
-            .execute_bounded(&source)
-            .map_err(|error| PluginRuntimeError::Vm(error.to_string()))?;
+        let outcome = match vm.execute_bounded(&source) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let error = PluginRuntimeError::Vm(error.to_string());
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        };
         match outcome {
             bitty_lua::BoundedExecution::Completed => {}
             bitty_lua::BoundedExecution::Suspended(reason) => {
                 let message = format!("init.lua suspended: {reason:?}");
-                self.fail(id, message.clone());
-                return Err(PluginRuntimeError::Capture {
+                let error = PluginRuntimeError::Capture {
                     plugin: id.to_string(),
-                    detail: message,
-                });
+                    detail: message.clone(),
+                };
+                self.rollback(id, error.to_string());
+                return Err(error);
             }
             bitty_lua::BoundedExecution::RuntimeError(message) => {
-                self.fail(id, message.clone());
-                return Err(PluginRuntimeError::Capture {
+                let error = PluginRuntimeError::Capture {
                     plugin: id.to_string(),
-                    detail: message,
-                });
+                    detail: message.clone(),
+                };
+                self.rollback(id, error.to_string());
+                return Err(error);
             }
         }
         let capture = vm.take_registrations();
         if let Err(error) = validate_capture(id, &manifest, &capture) {
-            self.fail(id, error.to_string());
+            self.rollback(id, error.to_string());
             return Err(error);
         }
 
@@ -544,7 +594,13 @@ impl PluginRuntime {
         Ok(())
     }
 
-    /// Dispose a plugin generation (`* -> Disposing -> Disposed`), dropping its VM.
+    /// Dispose a plugin generation (`* -> Disposing -> Disposed`), dropping its
+    /// VM and releasing host ownership.
+    ///
+    /// The host identity is purged (not merely marked `Disposed`) so a
+    /// subsequent [`PluginRuntime::activate`] starts from a clean registry
+    /// entry, matching the `Disposed -> activate` transition this module
+    /// permits.
     ///
     /// # Errors
     ///
@@ -558,7 +614,7 @@ impl PluginRuntime {
         entry.vm = None;
         entry.registrations = RegistrationCapture::new();
         entry.state = LifecycleState::Disposed;
-        let _ = self.host.dispose(id);
+        let _ = self.host.remove(id);
         Ok(())
     }
 
@@ -664,12 +720,35 @@ impl PluginRuntime {
         }
     }
 
-    fn fail(&mut self, id: &PluginId, message: String) {
+    /// Roll back a failed activation attempt atomically.
+    ///
+    /// Purges the policy-host generation (identity, command ownership, and
+    /// per-generation event queues) and records a terminal [`Failed`] state
+    /// locally, clearing the VM and services. Idempotent: safe whether or not
+    /// the policy half committed, and whether or not the host entry exists.
+    ///
+    /// [`Failed`]: LifecycleState::Failed
+    fn rollback(&mut self, id: &PluginId, message: String) {
+        let _ = self.host.remove(id);
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
             entry.services = None;
         }
+    }
+
+    /// Whether the policy host still holds a registry entry for `id`
+    /// (diagnostics; a rolled-back generation leaves none).
+    #[must_use]
+    pub fn host_has_plugin(&self, id: &PluginId) -> bool {
+        self.host.registry().get(id).is_some()
+    }
+
+    /// Whether the policy host still owns the qualified command (diagnostics;
+    /// a rolled-back generation releases ownership).
+    #[must_use]
+    pub fn host_owns_command(&self, qualified: &str) -> bool {
+        self.host.registry().is_command_owned(qualified)
     }
 }
 
@@ -677,13 +756,6 @@ fn lifecycle_error(id: &PluginId, detail: &str) -> PluginRuntimeError {
     PluginRuntimeError::Lifecycle {
         plugin: id.to_string(),
         detail: detail.to_string(),
-    }
-}
-
-impl PluginRuntime {
-    /// Best-effort rollback of policy state after a partial activation.
-    fn rollback_host(&mut self, id: &PluginId) {
-        let _ = self.host.dispose(id);
     }
 }
 
@@ -842,7 +914,13 @@ fn read_init(path: &Path) -> Result<String, PluginRuntimeError> {
 }
 
 /// Discover packages under one root (`<root>/<name>/bitty-plugin.toml`).
-fn discover_root(root: &Path) -> Result<Vec<PluginPackage>, PluginRuntimeError> {
+///
+/// Every package is stamped with `source_class`, the provenance of the root it
+/// was found under; the manifest id never influences its own trust class.
+fn discover_root(
+    root: &Path,
+    source_class: SourceClass,
+) -> Result<Vec<PluginPackage>, PluginRuntimeError> {
     if !root.is_dir() {
         return Ok(Vec::new());
     }
@@ -893,7 +971,7 @@ fn discover_root(root: &Path) -> Result<Vec<PluginPackage>, PluginRuntimeError> 
         packages.push(PluginPackage {
             manifest,
             module_root,
-            source_class: SourceClass::ThirdParty,
+            source_class,
         });
     }
     Ok(packages)
@@ -903,14 +981,21 @@ fn discover_root(root: &Path) -> Result<Vec<PluginPackage>, PluginRuntimeError> 
 pub use bitty_lua::BridgeError as HostBridgeError;
 
 impl PluginRuntime {
-    /// Attach discovery roots after construction.
-    pub fn set_bundled_roots(&mut self, roots: Vec<PathBuf>) {
-        self.roots = roots;
+    /// Replace the discovery roots after construction.
+    pub fn set_roots(&mut self, bundled_roots: Vec<PathBuf>, third_party_roots: Vec<PathBuf>) {
+        self.bundled_roots = bundled_roots;
+        self.third_party_roots = third_party_roots;
     }
 
-    /// Current discovery roots.
+    /// Trusted (`bundled`) discovery roots.
     #[must_use]
     pub fn bundled_roots_ref(&self) -> &[PathBuf] {
-        &self.roots
+        &self.bundled_roots
+    }
+
+    /// Untrusted discovery roots.
+    #[must_use]
+    pub fn third_party_roots_ref(&self) -> &[PathBuf] {
+        &self.third_party_roots
     }
 }

@@ -398,6 +398,33 @@ impl PluginHost {
         result
     }
 
+    /// Fully remove a plugin generation, releasing its identity and all owned
+    /// resources (command ownership and per-generation event queues).
+    ///
+    /// Unlike [`PluginHost::dispose`], the registry identity is purged so the
+    /// same plugin id can be declared again. This is the rollback primitive
+    /// that guarantees a failed activation leaves no partial activation and
+    /// allows a clean retry (RFC `plugin-host-runtime-rfc` A.4 rule 4).
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::NotFound`] when `id` has no registry entry. Queue
+    /// unsubscribe failures are ignored; the registry entry is still purged.
+    pub fn remove(&mut self, id: &PluginId) -> Result<(), PluginError> {
+        let events = self
+            .registry
+            .get(id)
+            .map(|entry| entry.subscribed_events.clone())
+            .unwrap_or_default();
+        self.registry.remove(id)?;
+        for event in events {
+            if let Ok(kind) = EventKind::parse(&event) {
+                let _ = self.pipeline.unsubscribe(id, &kind);
+            }
+        }
+        Ok(())
+    }
+
     /// Reload: dispose generation `N` resources before activating `N+1` atomically.
     pub fn reload(
         &mut self,
@@ -812,6 +839,30 @@ mod tests {
         assert!(host.declare(m).is_err());
         let builtin = minimal_manifest("bitty.core", vec![]);
         assert!(host.declare(builtin).is_ok());
+    }
+
+    #[test]
+    fn host_remove_purges_identity_allowing_redeclare() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let id = PluginId::new("xuepoo.test").unwrap();
+        host.declare(minimal_manifest("xuepoo.test", vec![]))
+            .unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        host.activate(&id).unwrap();
+
+        host.remove(&id).unwrap();
+
+        assert!(
+            host.registry().get(&id).is_none(),
+            "identity must be purged after remove"
+        );
+        // The same id can be declared and driven through the lifecycle again.
+        host.declare(minimal_manifest("xuepoo.test", vec![]))
+            .unwrap();
+        host.resolve(&id).unwrap();
+        host.register(&id).unwrap();
+        assert!(host.activate(&id).is_ok());
     }
 
     #[test]

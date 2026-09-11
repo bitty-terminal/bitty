@@ -553,6 +553,28 @@ impl Registry {
         Ok(())
     }
 
+    /// Fully remove a plugin identity and release its command ownership.
+    ///
+    /// Unlike [`Registry::dispose`], which retains the identity in the
+    /// `Disposed` state, `remove` deletes the entry so the same plugin id can
+    /// be declared again. It is the rollback primitive for a failed
+    /// activation: no partially activated generation survives (RFC
+    /// `plugin-host-runtime-rfc` A.4 rule 4).
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::NotFound`] when `id` has no entry.
+    pub fn remove(&mut self, id: &PluginId) -> Result<(), PluginError> {
+        let entry = self
+            .plugins
+            .remove(id.as_str())
+            .ok_or_else(|| PluginError::NotFound { id: id.to_string() })?;
+        for q in &entry.commands {
+            self.command_owners.remove(q.as_str());
+        }
+        Ok(())
+    }
+
     /// Reload: dispose generation `N` and activate generation `N+1` atomically.
     ///
     /// The caller supplies the new manifest for `N+1`; reservations made at
@@ -809,6 +831,38 @@ mod tests {
         reg.register(&PluginId::new("xuepoo.a").unwrap()).unwrap();
         reg.dispose(&PluginId::new("xuepoo.a").unwrap()).unwrap();
         assert!(!reg.is_command_owned("xuepoo.a:cmd"));
+    }
+
+    #[test]
+    fn remove_releases_identity_and_commands_allowing_redeclare() {
+        let mut reg = Registry::new();
+        let id = PluginId::new("xuepoo.a").unwrap();
+        reg.declare(minimal_manifest("xuepoo.a", vec!["xuepoo.a:cmd"]))
+            .unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        assert!(reg.is_command_owned("xuepoo.a:cmd"));
+
+        reg.remove(&id).unwrap();
+
+        assert!(reg.get(&id).is_none(), "identity must be purged");
+        assert!(
+            !reg.is_command_owned("xuepoo.a:cmd"),
+            "command ownership must be released"
+        );
+        // A fresh declaration of the same id succeeds after removal.
+        reg.declare(minimal_manifest("xuepoo.a", vec!["xuepoo.a:cmd"]))
+            .unwrap();
+        reg.resolve(&id).unwrap();
+        reg.register(&id).unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.a"), PluginState::Registered);
+    }
+
+    #[test]
+    fn remove_unknown_id_is_not_found() {
+        let mut reg = Registry::new();
+        let id = PluginId::new("xuepoo.missing").unwrap();
+        assert!(matches!(reg.remove(&id), Err(PluginError::NotFound { .. })));
     }
 
     fn manifest_with_services(

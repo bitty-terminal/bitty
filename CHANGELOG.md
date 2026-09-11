@@ -22,13 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restricted `os.time/clock/date`, `string.byte/char/format`, `table.concat`,
   `table.sort`).
 - Activation runs the fixed `init.lua`, validates the captured registrations
-  against the manifest, and commits atomically; any failure leaves no partial
-  activation. Minimal host services (`terminal.snapshot` sync bounded,
-  `notify.show` async hand-off, `store.*` sync atomic quota-bounded,
-  `settings.*` read-only) and typed `E_TIMEOUT`/`E_*` errors.
-- `bitty-app` discovers bundled packages at startup and activates them; a new
-  `--safe` flag creates no third-party VM. Bounds: 256 KiB manifest, 4096
-  module files, 16 MiB tree, 1024-byte path.
+  against the manifest, and commits atomically; any failure purges the policy
+  host generation (identity, command ownership, subscriptions) and records a
+  terminal failure, so no partial activation survives and a retry starts clean.
+  Minimal host services (`terminal.snapshot` sync bounded, `notify.show` async
+  hand-off, `store.*` sync atomic quota-bounded, `settings.*` read-only) and
+  typed `E_TIMEOUT`/`E_*` errors.
+- `bitty-app` discovers plugin packages at startup and activates them; a new
+  `--safe` flag creates no third-party VM. Safe-mode eligibility comes from the
+  discovery root's provenance (`SourceClass`), never a self-declared manifest
+  id, so a package cannot claim bundled trust by naming itself `bitty.*`.
+  Bounds: 256 KiB manifest, 4096 module files, 16 MiB tree, 1024-byte path.
 - Follow-ups: Gap B source staging/integrity (CTX-0329) and Gap C hardening
   (CTX-0330).
 

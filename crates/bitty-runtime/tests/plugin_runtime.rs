@@ -1,5 +1,5 @@
 //! Gap A + C-minimal runtime tests: discovery, activation, lifecycle, host
-//! services, capture validation, and safe mode.
+//! services, capture validation, atomic rollback, provenance-based safe mode.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,12 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf, safe_mode: bool) -> PluginRuntime {
+fn runtime(
+    bundled_roots: Vec<PathBuf>,
+    third_party_roots: Vec<PathBuf>,
+    data_dir: PathBuf,
+    safe_mode: bool,
+) -> PluginRuntime {
     let mut settings = MapSettings::default();
     settings
         .0
@@ -55,7 +60,8 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf, safe_mode: bool) -> PluginRun
     PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir: Some(data_dir),
-        bundled_roots: roots,
+        bundled_roots,
+        third_party_roots,
         settings: Rc::new(settings),
         snapshot: Rc::new(StaticSnapshot(LuaValue::table([
             ("version", LuaValue::Integer(1)),
@@ -71,6 +77,38 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf, safe_mode: bool) -> PluginRun
     })
 }
 
+/// Write a minimal plugin package under `root/<id>/`.
+fn write_plugin(root: &Path, id: &str, commands: &[&str], init_src: &str) -> PathBuf {
+    let plugin = root.join(id);
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    let commands_toml = commands
+        .iter()
+        .map(|command| format!("\"{command}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "Test"
+version = "0.1.0"
+description = "test"
+
+[compat]
+plugin-api = "^1.0"
+
+[lazy]
+commands = [{commands_toml}]
+events = []
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
+    plugin
+}
+
 fn sample_id() -> PluginId {
     PluginId::new("bitty-featured.sample").expect("id")
 }
@@ -78,7 +116,7 @@ fn sample_id() -> PluginId {
 #[test]
 fn discovers_activates_and_dispatches_bundled_plugin() {
     let data = temp_dir("activate");
-    let mut rt = runtime(vec![fixtures_root()], data.clone(), false);
+    let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), false);
     let discovered = rt.discover();
     assert_eq!(discovered.len(), 1, "{discovered:?}");
     assert_eq!(rt.package_count(), 1);
@@ -111,7 +149,7 @@ fn discovers_activates_and_dispatches_bundled_plugin() {
 #[test]
 fn event_delivery_invokes_subscribed_handler() {
     let data = temp_dir("events");
-    let mut rt = runtime(vec![fixtures_root()], data.clone(), false);
+    let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), false);
     rt.discover();
     rt.activate(&sample_id()).expect("activate");
 
@@ -129,7 +167,7 @@ fn event_delivery_invokes_subscribed_handler() {
 #[test]
 fn lifecycle_transitions_are_enforced() {
     let data = temp_dir("lifecycle");
-    let mut rt = runtime(vec![fixtures_root()], data.clone(), false);
+    let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), false);
     rt.discover();
     rt.activate(&sample_id()).expect("activate");
 
@@ -142,57 +180,224 @@ fn lifecycle_transitions_are_enforced() {
 
     rt.dispose(&sample_id()).expect("dispose");
     assert_eq!(rt.state(&sample_id()), Some(&LifecycleState::Disposed));
+    assert!(
+        !rt.host_has_plugin(&sample_id()),
+        "dispose purges host identity so Disposed -> activate is possible"
+    );
+
+    // A disposed generation can be activated again from clean host state.
+    let report = rt
+        .activate(&sample_id())
+        .expect("re-activate after dispose");
+    assert_eq!(report.state, LifecycleState::Active);
     let _ = std::fs::remove_dir_all(&data);
 }
 
 #[test]
 fn safe_mode_creates_no_third_party_vm() {
     let data = temp_dir("safe");
-    let mut rt = runtime(vec![fixtures_root()], data.clone(), true);
+    let mut rt = runtime(Vec::new(), vec![fixtures_root()], data.clone(), true);
     rt.discover();
     let report = rt.activate(&sample_id()).expect("activate");
     assert!(report.skipped_safe_mode);
     assert_eq!(report.commands, 0);
     assert_eq!(rt.state(&sample_id()), Some(&LifecycleState::Unloaded));
     assert!(rt.dispatch_command(&sample_id(), "summary", &[]).is_err());
+    assert!(
+        !rt.host_has_plugin(&sample_id()),
+        "no host entry under --safe"
+    );
     let _ = std::fs::remove_dir_all(&data);
 }
 
+/// A package whose id looks like the built-in namespace must not obtain a VM
+/// under `--safe` when its provenance is third-party (root-based trust).
 #[test]
-fn undeclared_registration_fails_capture_validation() {
+fn bundled_named_third_party_package_skipped_under_safe_mode() {
+    let root = temp_dir("provenance");
+    let id = PluginId::new("bitty.evil").expect("id");
+    write_plugin(&root, "bitty.evil", &[], "return {}");
+
+    let data_safe = temp_dir("provenance-safe");
+    let mut rt = runtime(Vec::new(), vec![root.clone()], data_safe.clone(), true);
+    rt.discover();
+    let report = rt.activate(&id).expect("activate");
+    assert!(
+        report.skipped_safe_mode,
+        "a self-declared built-in id must not confer bundled trust"
+    );
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Unloaded));
+    assert!(!rt.host_has_plugin(&id));
+    let _ = std::fs::remove_dir_all(&data_safe);
+
+    // The same third-party package loads without `--safe`.
+    let data = temp_dir("provenance-open");
+    let mut rt = runtime(Vec::new(), vec![root.clone()], data.clone(), false);
+    rt.discover();
+    let report = rt.activate(&id).expect("activate");
+    assert_eq!(report.state, LifecycleState::Active);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A package discovered under a trusted `bundled` root is provenance-bundled
+/// and is still activated under `--safe` (RFC A.4 rule 6 only forbids
+/// third-party VMs).
+#[test]
+fn bundled_root_package_loads_under_safe_mode() {
+    let root = temp_dir("bundled-root");
+    let id = PluginId::new("bitty.builtin").expect("id");
+    write_plugin(&root, "bitty.builtin", &[], "return {}");
+
+    let data = temp_dir("bundled-data");
+    let mut rt = runtime(vec![root.clone()], Vec::new(), data.clone(), true);
+    rt.discover();
+    let report = rt.activate(&id).expect("activate");
+    assert!(
+        !report.skipped_safe_mode,
+        "bundled provenance loads under --safe"
+    );
+    assert_eq!(report.state, LifecycleState::Active);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn undeclared_registration_fails_capture_validation_and_rolls_back() {
     let data = temp_dir("capture");
     let root = temp_dir("capture-root");
-    let plugin = root.join("bad");
-    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
-    std::fs::write(
-        plugin.join("bitty-plugin.toml"),
-        r#"[plugin]
-id = "bitty-featured.bad"
-name = "Bad"
-version = "0.1.0"
-description = "bad"
-
-[compat]
-plugin-api = "^1.0"
-
-[lazy]
-commands = []
-events = []
-"#,
-    )
-    .expect("manifest");
-    std::fs::write(
-        plugin.join("lua/init.lua"),
-        r#"bitty.commands.register({ id = "not-reserved", title = "x", run = function() end })"#,
-    )
-    .expect("init");
-
-    let mut rt = runtime(vec![root.clone()], data.clone(), false);
-    rt.discover();
     let id = PluginId::new("bitty-featured.bad").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.bad",
+        &["bitty-featured.bad:ok"],
+        r#"bitty.commands.register({ id = "not-reserved", title = "x", run = function() end })"#,
+    );
+
+    let mut rt = runtime(Vec::new(), vec![root.clone()], data.clone(), false);
+    rt.discover();
     let result = rt.activate(&id);
     assert!(result.is_err(), "undeclared command must fail closed");
     assert!(matches!(rt.state(&id), Some(LifecycleState::Failed(_))));
+    assert!(
+        !rt.host_has_plugin(&id),
+        "partial host activation must be purged"
+    );
+    assert!(
+        !rt.host_owns_command("bitty-featured.bad:not-reserved"),
+        "failed generation must not retain command ownership"
+    );
+    assert!(
+        !rt.host_owns_command("bitty-featured.bad:ok"),
+        "reserved command ownership must be released"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// After a failed activation purges host state, repairing the plugin and
+/// retrying must succeed (no `Duplicate` from a stale host generation).
+#[test]
+fn failed_activation_allows_clean_retry() {
+    let data = temp_dir("rollback-retry");
+    let root = temp_dir("rollback-retry-root");
+    let id = PluginId::new("bitty-featured.retry").expect("id");
+    let plugin = write_plugin(
+        &root,
+        "bitty-featured.retry",
+        &["bitty-featured.retry:ok"],
+        r#"bitty.commands.register({ id = "wrong", title = "x", run = function() end })"#,
+    );
+
+    let mut rt = runtime(Vec::new(), vec![root.clone()], data.clone(), false);
+    rt.discover();
+    assert!(rt.activate(&id).is_err(), "first attempt fails");
+    assert!(matches!(rt.state(&id), Some(LifecycleState::Failed(_))));
+    assert!(!rt.host_has_plugin(&id));
+
+    // Repair only the module (the manifest is unchanged) and retry.
+    std::fs::write(
+        plugin.join("lua/init.lua"),
+        r#"bitty.commands.register({ id = "ok", title = "ok", run = function() return "ok" end })"#,
+    )
+    .expect("rewrite init");
+    let report = rt
+        .activate(&id)
+        .expect("retry must succeed from clean host state");
+    assert_eq!(report.state, LifecycleState::Active);
+    assert_eq!(report.commands, 1);
+    assert!(rt.host_owns_command("bitty-featured.retry:ok"));
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every mechanism-stage failure must leave no partial activation: the host
+/// identity is purged, command ownership released, and the local generation is
+/// terminally failed.
+#[test]
+fn mechanism_failures_roll_back_host_state() {
+    for (tag, init_src) in [
+        ("runtime-error", r#"error("boom")"#),
+        ("suspended", "while true do end"),
+        ("invalid-syntax", "this is not lua"),
+    ] {
+        let data = temp_dir(&format!("rollback-{tag}"));
+        let root = temp_dir(&format!("rollback-{tag}-root"));
+        let id = PluginId::new("bitty-featured.stage").expect("id");
+        write_plugin(
+            &root,
+            "bitty-featured.stage",
+            &["bitty-featured.stage:ok"],
+            init_src,
+        );
+
+        let mut rt = runtime(Vec::new(), vec![root.clone()], data.clone(), false);
+        rt.discover();
+        assert!(rt.activate(&id).is_err(), "{tag}: activation must fail");
+        assert!(
+            matches!(rt.state(&id), Some(LifecycleState::Failed(_))),
+            "{tag}: generation must be Failed"
+        );
+        assert!(
+            !rt.host_has_plugin(&id),
+            "{tag}: host identity must be purged"
+        );
+        assert!(
+            !rt.host_owns_command("bitty-featured.stage:ok"),
+            "{tag}: command ownership must be released"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A store-open failure occurs before the VM is created but after the policy
+/// half committed, so it must still roll the host back.
+#[test]
+fn store_open_failure_rolls_back_host_state() {
+    let data = temp_dir("rollback-store");
+    let root = temp_dir("rollback-store-root");
+    let id = PluginId::new("bitty-featured.store").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.store",
+        &["bitty-featured.store:ok"],
+        "return {}",
+    );
+    // A store file over the file ceiling makes `open_store` fail closed.
+    let store_dir = data.join("bitty-featured.store");
+    std::fs::create_dir_all(&store_dir).expect("store dir");
+    std::fs::write(store_dir.join("store.json"), vec![b'a'; 200_000]).expect("oversized store");
+
+    let mut rt = runtime(Vec::new(), vec![root.clone()], data.clone(), false);
+    rt.discover();
+    assert!(
+        rt.activate(&id).is_err(),
+        "oversized store must fail closed"
+    );
+    assert!(matches!(rt.state(&id), Some(LifecycleState::Failed(_))));
+    assert!(!rt.host_has_plugin(&id));
+    assert!(!rt.host_owns_command("bitty-featured.store:ok"));
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -208,7 +413,7 @@ fn real_activity_plugin_activates() {
         return;
     };
     let data = temp_dir("activity");
-    let mut rt = runtime(vec![PathBuf::from(&dir)], data.clone(), false);
+    let mut rt = runtime(Vec::new(), vec![PathBuf::from(&dir)], data.clone(), false);
     rt.discover();
     let id = PluginId::new("bitty-featured.activity").expect("id");
     assert!(

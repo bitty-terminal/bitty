@@ -1,14 +1,16 @@
 //! Startup wiring for the plugin host runtime (RFC Gap A).
 //!
-//! Discovers bundled plugin packages from configuration-derived roots, then
-//! activates each in its own `!Send` VM on this thread. Policy and mechanism
-//! live in `bitty-runtime::plugin_runtime`; this module only resolves
-//! environment/XDG paths, supplies the committed-snapshot source, and reports
-//! the outcome. `--safe` skips every third-party VM.
+//! Discovers plugin packages from configuration-derived roots, then activates
+//! each in its own `!Send` VM on this thread. Policy and mechanism live in
+//! `bitty-runtime::plugin_runtime`; this module only resolves environment/XDG
+//! paths, supplies the committed-snapshot source, and reports the outcome.
 //!
-//! Source resolution here is the minimal bundled-root scan; the XDG package
-//! store, integrity re-verification, and local-path flow arrive with the Gap B
-//! task. Paths come from the environment (or `$HOME`), never literals.
+//! Provenance, not the manifest id, decides `--safe` eligibility. In this
+//! slice both discoverable roots are externally supplied (an environment
+//! override or the user-writable XDG data directory), so every package is
+//! classified third-party and `--safe` creates no VM. Genuine
+//! application-shipped `bundled` roots arrive with the Gap B task. Paths come
+//! from the environment (or `$HOME`), never literals.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -17,8 +19,11 @@ use bitty_runtime::plugin_runtime::{
     EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
 };
 
-/// Environment override for the bundled plugin package root.
-pub(crate) const BUNDLED_ROOT_ENV: &str = "BITTY_BUNDLED_PLUGIN_DIR";
+/// Environment override for the plugin package root (development/local-path).
+///
+/// The path is not application-shipped, so packages found here are third-party
+/// and are skipped by `--safe`.
+pub(crate) const PLUGIN_ROOT_ENV: &str = "BITTY_PLUGIN_DIR";
 
 /// Read-only snapshot of the committed core surface for `bitty.terminal.snapshot`.
 struct CommittedSnapshot {
@@ -71,9 +76,10 @@ impl SnapshotSource for CommittedSnapshot {
     }
 }
 
-/// Discover roots from `$BITTY_BUNDLED_PLUGIN_DIR` or the XDG data directory.
-fn bundled_roots() -> Vec<PathBuf> {
-    if let Ok(explicit) = std::env::var(BUNDLED_ROOT_ENV) {
+/// Discover external (third-party) roots from `$BITTY_PLUGIN_DIR` or the XDG
+/// data directory.
+fn plugin_roots() -> Vec<PathBuf> {
+    if let Ok(explicit) = std::env::var(PLUGIN_ROOT_ENV) {
         let path = PathBuf::from(explicit);
         return if path.is_dir() {
             vec![path]
@@ -101,15 +107,15 @@ fn data_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".local").join("share"))
 }
 
-/// Discover and activate bundled plugins, returning the live runtime.
+/// Discover and activate external plugins, returning the live runtime.
 ///
-/// Returns `None` when no bundled root exists (no plugin work is attempted).
+/// Returns `None` when no plugin root exists (no plugin work is attempted).
 pub(crate) fn discover_and_activate(
     safe_mode: bool,
     cols: usize,
     rows: usize,
 ) -> Option<PluginRuntime> {
-    let roots = bundled_roots();
+    let roots = plugin_roots();
     if roots.is_empty() {
         return None;
     }
@@ -117,7 +123,10 @@ pub(crate) fn discover_and_activate(
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir,
-        bundled_roots: roots,
+        // No application-shipped bundle root exists in this slice; the
+        // external roots are third-party provenance (see module docs).
+        bundled_roots: Vec::new(),
+        third_party_roots: roots,
         settings: Rc::new(EmptySettings),
         snapshot: Rc::new(CommittedSnapshot::new(cols, rows)),
     });

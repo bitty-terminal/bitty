@@ -210,7 +210,7 @@ impl Runtime {
         let panel_px_w = px_span(panel.w, live.width);
         let panel_px_h = px_span(panel.h, live.height);
         // Border: full-bleed fill, then the inset background leaves a
-        // 1-cell outline.
+        // 1-cell outline. Both fills are opaque (`0xFF` alpha).
         fills.push(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(
                 panel_px_x, panel_px_y, panel_px_w, panel_px_h,
@@ -226,6 +226,17 @@ impl Runtime {
             ),
             color: bitty_render::grid::HELP_PANEL_BG,
         });
+        // CTX-0336: `DrawList` composites every glyph after every fill, so
+        // the base grid's glyphs would otherwise draw on top of the opaque
+        // panel (the reported "transparent border overlapping content").
+        // Remember where the panel's own glyphs begin, then drop only the
+        // pre-existing (grid/other-overlay) glyphs whose pixel box crosses
+        // the panel frame: the panel stays fully opaque and reads back as
+        // its own background + border, with only its title/rows/footer on
+        // top. Bounded by the combined glyph count for one frame.
+        let occlude_start = glyphs.len();
+        let panel_rect =
+            bitty_render::geometry::RectPx::new(panel_px_x, panel_px_y, panel_px_w, panel_px_h);
         let inner_cells = usize::from(panel.w.saturating_sub(2));
         let text_x = px_add(panel_px_x, cw);
         let title = self.renderer.overlay_text_glyphs(
@@ -270,8 +281,37 @@ impl Runtime {
             bitty_render::grid::HELP_PANEL_FG,
         );
         glyphs.extend(footer);
+        // CTX-0336: keep the panel glyphs just pushed, drop any pre-existing
+        // glyph whose pixel box overlaps the opaque panel frame. `split_off`
+        // moves the (small) panel tail aside so `retain` only sees the
+        // underlay glyphs, then the tail is restored in paint order.
+        let panel_glyphs = glyphs.split_off(occlude_start);
+        glyphs.retain(|glyph| !glyph_overlaps_rect(glyph, panel_rect));
+        glyphs.extend(panel_glyphs);
         true
     }
+}
+
+/// True when `glyph`'s pixel bounding box intersects the axis-aligned `rect`
+/// (CTX-0336). Zero-area glyphs never intersect. `i64` throughout so extreme
+/// destinations cannot overflow (matching the present path's saturation
+/// discipline).
+fn glyph_overlaps_rect(
+    glyph: &bitty_render::grid::GlyphInstance,
+    rect: bitty_render::geometry::RectPx,
+) -> bool {
+    if glyph.size[0] == 0 || glyph.size[1] == 0 {
+        return false;
+    }
+    let gx0 = i64::from(glyph.dest[0]);
+    let gy0 = i64::from(glyph.dest[1]);
+    let gx1 = gx0.saturating_add(i64::from(glyph.size[0]));
+    let gy1 = gy0.saturating_add(i64::from(glyph.size[1]));
+    let rx0 = i64::from(rect.x);
+    let ry0 = i64::from(rect.y);
+    let rx1 = rx0.saturating_add(i64::from(rect.width));
+    let ry1 = ry0.saturating_add(i64::from(rect.height));
+    gx0 < rx1 && gx1 > rx0 && gy0 < ry1 && gy1 > ry0
 }
 
 #[cfg(test)]

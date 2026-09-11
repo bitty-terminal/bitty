@@ -128,6 +128,97 @@ fn help_rows_are_bounded() {
     assert_eq!(rt.help_rows().len(), bitty_runtime::HELP_MAX_ROWS);
 }
 
+/// CTX-0336 regression: the opaque help panel must fully occlude the grid
+/// text beneath it.
+///
+/// `DrawList` composites every glyph after every fill, so before the fix the
+/// base grid's glyphs drew on top of the panel's opaque background and
+/// border — the reported "oversized, transparent border overlapping
+/// content". This renders two headless frames that differ only in whether
+/// the grid carries ink, both with the panel shown, and brackets the panel
+/// frame from the border pixels of the ink-free frame:
+///
+/// * inside the panel frame the two frames must be byte-identical (nothing
+///   from the underlay survives the opaque panel), and
+/// * outside it they must differ (the grid is really painted, so the first
+///   assertion is not vacuous).
+#[test]
+fn help_panel_occludes_grid_inside_its_frame() {
+    fn render(grid_ink: bool) -> (u32, u32, Vec<u8>) {
+        let mut rt = make_runtime();
+        if grid_ink {
+            let (cols, rows) = (rt.config().cols, rt.config().rows);
+            let mut bytes = Vec::new();
+            for row in 0..rows {
+                if row > 0 {
+                    bytes.extend_from_slice(b"\r\n");
+                }
+                bytes.extend(std::iter::repeat_n(b'M', cols));
+            }
+            rt.handle_pty_bytes(&bytes);
+        }
+        let _ = rt.tick().expect("grid frame presents");
+        rt.set_help_rows(live_help_rows());
+        assert!(rt.toggle_help());
+        let _ = rt.tick().expect("overlay frame presents");
+        let extent = rt.config().window_extent();
+        (
+            extent.width(),
+            extent.height(),
+            rt.headless_rgba().expect("headless rgba"),
+        )
+    }
+
+    let (w, h, inked) = render(true);
+    let (w2, h2, empty) = render(false);
+    assert_eq!((w, h), (w2, h2), "same surface extent");
+    let stride = w as usize;
+
+    // Bracket the panel frame from the border pixels alone (no layout
+    // internals duplicated here). The border is opaque and unique to the
+    // panel, so its bounding box is exactly the panel rectangle.
+    let border = bitty_render::grid::HELP_PANEL_BORDER;
+    let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let i = (y as usize * stride + x as usize) * 4;
+            if empty[i..i + 4] == border {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    assert!(
+        x1 >= x0 && y1 >= y0 && x1 > x0 && y1 > y0,
+        "panel border must paint a non-degenerate ring"
+    );
+
+    let mut diff_inside = 0usize;
+    let mut diff_outside = 0usize;
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let i = (y as usize * stride + x as usize) * 4;
+            if inked[i..i + 4] != empty[i..i + 4] {
+                if (x0..=x1).contains(&x) && (y0..=y1).contains(&y) {
+                    diff_inside += 1;
+                } else {
+                    diff_outside += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        diff_inside, 0,
+        "grid ink bleeds through the opaque panel frame ({diff_inside} px)"
+    );
+    assert!(
+        diff_outside > 0,
+        "grid must be painted outside the panel (test would be vacuous)"
+    );
+}
+
 #[test]
 fn help_rows_come_from_the_live_registry() {
     // End-to-end registry proof at the runtime seam: an added chord is

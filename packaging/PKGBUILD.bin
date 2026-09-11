@@ -19,7 +19,7 @@
 # rename (verified against the 0164 worktree). If the dist name ever changes,
 # update `_bitty_asset` here and in `release.yml` together.
 pkgname=bitty-bin
-pkgver=0.0.1
+pkgver=0.0.20
 pkgrel=1
 pkgdesc="Bitty pre-alpha terminal workspace minimal correct terminal (prebuilt binary)"
 arch=('x86_64')

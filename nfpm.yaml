@@ -4,7 +4,7 @@
 name: bitty
 arch: amd64
 platform: linux
-version: 0.0.1
+version: 0.0.20
 section: utils
 priority: optional
 maintainer: Bitty Maintainers <maintainers@bitty-terminal.dev>

@@ -51,24 +51,27 @@ commit-check message:
 
 check: fmt-check clippy test scratch-paths pty-gate actionlint markdownlint
 
-# Publish a ctxpack snapshot to the bitty-workflow mirror (commander merge
-# closeout only; never a git hook). Dry run exports + validates without push.
-# Canonical closeout runs from the primary checkout on branch main
-# (`cd "$BITTY_WORKSPACE/bitty" && just workflow-publish`) so source.json
-# records repo_branch=main; detached worktrees publish but record `detached`.
-# Shared parametrized template: WORKFLOW_SOURCE_REPO / WORKFLOW_MIRROR_URL /
-# WORKFLOW_MIRROR_DIR override the defaults.
+# Publish a redacted CarryCtx snapshot inside this repo (commander merge
+# closeout only; never a git hook). `carryctx export --publication` redacts the
+# bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref
+# `refs/heads/carryctx-snapshots`; the target pushes that branch only when the
+# local ref advanced (native carryctx commits one snapshot per export, so a
+# re-run publishes again rather than no-opping). Canonical closeout runs from
+# the primary checkout on branch main
+# (`cd "$BITTY_WORKSPACE/bitty" && just workflow-publish`); a detached or
+# feature worktree records that branch as the snapshot source. Dry run
+# validates the export and writes neither the ref nor the remote.
 workflow-publish *args:
-    bash scripts/publish-ctxpack.sh {{args}}
+    bash scripts/workflow-publish.sh {{args}}
 
 workflow-publish-dry *args:
-    bash scripts/publish-ctxpack.sh --dry-run {{args}}
+    bash scripts/workflow-publish.sh --dry-run {{args}}
 
-# Restore the local CarryCtx DB from the bitty-workflow mirror LATEST
-# snapshot (fresh-clone recipe). Refuses to replace a non-empty local DB
-# without --force, e.g. `just workflow-import --force`.
+# Restore the local CarryCtx DB from the in-repo snapshot branch
+# `refs/heads/carryctx-snapshots` (fresh-clone recipe). Refuses to replace a
+# non-empty local DB without --force, e.g. `just workflow-import --force`.
 workflow-import *args:
-    bash scripts/fetch-ctxpack.sh {{args}}
+    bash scripts/workflow-import.sh {{args}}
 
 workflow-import-dry *args:
-    bash scripts/fetch-ctxpack.sh --dry-run {{args}}
+    bash scripts/workflow-import.sh --dry-run {{args}}

@@ -238,7 +238,11 @@ pub const PASTE_BANNER_FULL_DURATION: std::time::Duration = std::time::Duration:
 
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
-pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste… repeat=confirm Esc=cancel";
+///
+/// CTX-0369: wording names the confirm gesture in plain language. Repeating
+/// the paste (the chord or right-click gesture that armed the gate) is the
+/// confirm action; `Esc` cancels.
+pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (paste again to confirm, Esc cancels)";
 
 pub struct Runtime {
     config: RuntimeConfig,

@@ -1,9 +1,9 @@
-//! Suspicious-paste inspection and confirmation gate (P0-AC-008).
+//! Paste inspection and confirmation gate (P0-AC-008).
 //!
-//! Every paste entering the input pipeline is inspected for adversarial classes
-//! and requires explicit confirmation when any class is present. There is no
-//! silent delivery path: `request_paste` stores a pending paste when inspection
-//! flags are set and delivery happens only via explicit confirmation —
+//! Every paste entering the input pipeline is inspected, and text that is
+//! unsafe to deliver silently requires explicit confirmation. There is no
+//! silent delivery path: `request_paste` stores a pending paste when
+//! inspection triggers and delivery happens only via explicit confirmation —
 //! `confirm_pending_paste(true)`, repeating the identical paste while pending
 //! (CTX-0186: second chord/right-click press with unchanged clipboard), or the
 //! equivalent bracketed delivery after such confirmation. `Esc` while pending
@@ -13,34 +13,47 @@
 //! Bracketed paste (`?2004`) is defense-in-depth only — it wraps confirmed
 //! delivery but never bypasses confirmation.
 //!
-//! Adversarial classes (each triggers `needs_confirmation`):
-//! - C0 controls `0x00..0x1F` excluding safe subset (`\t` `0x09` is allowed; all
-//!   other C0 including `0x00..0x08`, `0x0B`, `0x0C`, `0x0E..0x1F`)
-//! - NUL `\0` (`0x00`)
-//! - ESC `\x1b` (`0x1B`)
-//! - CR `\r` (`0x0D`)
-//! - Embedded newline `\n` (`0x0A`) — any presence is suspicious (single-line
-//!   context is not known at the paste seam)
-//! - Unicode controls `U+0080..U+009F` (C1 controls)
-//! - BiDi / directional controls: `U+061C`, `U+200E`, `U+200F`, `U+202A..202E`,
-//!   `U+2066..2069`, plus zero-width `U+200B..200D`, `U+FEFF`, `U+2060`
+//! Two trigger groups require confirmation (`needs_confirmation`):
+//!
+//! 1. **Multi-line paste** — LF `\n` (`has_newline`). This is the kitty/ghostty
+//!    safety default, not an attack classification: a paste that spans several
+//!    lines can execute shell input in programs that do not handle bracketed
+//!    paste. LF is the expected multi-line trigger, so it is reported by its own
+//!    `newline` reason and is deliberately not folded into the generic `C0`
+//!    class (CTX-0369).
+//! 2. **Adversarial control classes** — each is reported by its own name:
+//!    - NUL `\0` (`0x00`) — `has_nul`
+//!    - ESC `\x1b` (`0x1B`) — `has_esc`
+//!    - CR `\r` (`0x0D`) — `has_cr` (a carriage return submits the line)
+//!    - Any other C0 control `0x00..0x1F` excluding tab and the
+//!      specifically-named NUL/ESC/CR/LF — `has_c0`
+//!    - Unicode controls `U+0080..U+009F` (C1 controls) — `has_unicode_control`
+//!    - BiDi / directional controls: `U+061C`, `U+200E`, `U+200F`,
+//!      `U+202A..202E`, `U+2066..2069`, plus zero-width `U+200B..200D`,
+//!      `U+FEFF`, `U+2060` — `has_bidi`
 
 #![forbid(unsafe_code)]
 
-/// Which suspicious classes were found in a paste.
+/// Which confirmation triggers were found in a paste: the multi-line LF
+/// trigger and/or the adversarial control classes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PasteInspection {
-    /// `true` when any `0x00..0x1F` C0 control (excluding `\t` allow-list)
-    /// is present. This overlaps with the more specific NUL/ESC/CR/newline
-    /// flags but is reported separately so every C0 byte is covered.
+    /// `true` when a C0 control `0x00..0x1F` other than the allow-listed
+    /// `\t` (`0x09`) and the specifically-classified NUL/ESC/CR/LF is present.
+    ///
+    /// Every C0 byte still triggers confirmation, but through exactly one
+    /// flag: NUL/ESC/CR/LF report their own names, and this flag covers only
+    /// the remaining C0 controls (for example BEL `0x07`, BS `0x08`, FS `0x1C`).
+    /// It therefore never duplicates a specific reason in [`Self::reasons`].
     pub has_c0: bool,
     /// `true` when NUL `0x00` is present.
     pub has_nul: bool,
     /// `true` when ESC `0x1B` is present.
     pub has_esc: bool,
-    /// `true` when CR `0x0D` is present.
+    /// `true` when CR `0x0D` is present (a carriage return submits the line).
     pub has_cr: bool,
-    /// `true` when LF `0x0A` (embedded newline) is present.
+    /// `true` when LF `0x0A` is present. LF is the expected multi-line paste
+    /// trigger (kitty/ghostty parity), reported as `newline`, not as `C0`.
     pub has_newline: bool,
     /// `true` when Unicode C1 `U+0080..U+009F` is present.
     pub has_unicode_control: bool,
@@ -111,24 +124,18 @@ pub(crate) fn inspect_paste(text: &str) -> PasteInspection {
     let mut insp = PasteInspection::default();
     for ch in text.chars() {
         let cp = ch as u32;
-        // C0 and specific controls
+        // C0: exactly one flag per byte. `\t` (0x09) is the only C0 allowed
+        // without a flag; NUL/ESC/CR/LF carry their own names so the generic
+        // `C0` reason never duplicates them (CTX-0369); every other C0 is
+        // reported as `C0`.
         if cp <= 0x1F {
-            // `\t` (0x09) is the only C0 allowed without C0 flag; every other
-            // C0 is suspicious. NUL/ESC/CR/LF still set their specific flags too.
-            if ch != '\t' {
-                insp.has_c0 = true;
-            }
-            if ch == '\0' {
-                insp.has_nul = true;
-            }
-            if ch == '\x1b' {
-                insp.has_esc = true;
-            }
-            if ch == '\r' {
-                insp.has_cr = true;
-            }
-            if ch == '\n' {
-                insp.has_newline = true;
+            match ch {
+                '\t' => {}
+                '\0' => insp.has_nul = true,
+                '\x1b' => insp.has_esc = true,
+                '\r' => insp.has_cr = true,
+                '\n' => insp.has_newline = true,
+                _ => insp.has_c0 = true,
             }
         }
         // C1 controls U+0080..U+009F
@@ -179,7 +186,7 @@ fn is_bidi_control(ch: char) -> bool {
 
 /// Pending paste that requires explicit confirmation before delivery.
 ///
-/// Stored when `inspect_paste` finds suspicious content. The text is already
+/// Stored when `inspect_paste` reports a confirmation trigger. The text is already
 /// truncated to `CLIPBOARD_MAX_BYTES` at a char boundary before this struct is
 /// created, so it is bounded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,36 +242,51 @@ mod tests {
     }
 
     #[test]
-    fn nul_triggers_c0_and_nul() {
+    fn nul_triggers_nul_only() {
         let insp = inspect_paste("a\0b");
         assert!(insp.has_nul);
-        assert!(insp.has_c0);
+        assert!(!insp.has_c0, "NUL must not also be reported as generic C0");
         assert!(insp.needs_confirmation());
-        assert!(insp.reasons().contains(&"NUL"));
+        assert_eq!(insp.reasons(), vec!["NUL"]);
     }
 
     #[test]
-    fn esc_triggers_c0_and_esc() {
+    fn esc_triggers_esc_only() {
         let insp = inspect_paste("a\x1bb");
         assert!(insp.has_esc);
-        assert!(insp.has_c0);
+        assert!(!insp.has_c0, "ESC must not also be reported as generic C0");
         assert!(insp.needs_confirmation());
+        assert_eq!(insp.reasons(), vec!["ESC"]);
     }
 
     #[test]
-    fn cr_triggers_c0_and_cr() {
+    fn cr_triggers_cr_only() {
         let insp = inspect_paste("a\rb");
         assert!(insp.has_cr);
-        assert!(insp.has_c0);
+        assert!(!insp.has_c0, "CR must not also be reported as generic C0");
         assert!(insp.needs_confirmation());
+        assert_eq!(insp.reasons(), vec!["CR"]);
     }
 
     #[test]
-    fn newline_triggers_c0_and_newline() {
-        let insp = inspect_paste("a\nb");
+    fn newline_triggers_multiline_only() {
+        // CTX-0369: LF is the expected multi-line trigger, not a control-char
+        // attack. It still gates, but is reported as `newline`, not `C0`.
+        let insp = inspect_paste("line1\nline2");
         assert!(insp.has_newline);
-        assert!(insp.has_c0);
+        assert!(!insp.has_c0, "LF must not be reported as generic C0");
         assert!(insp.needs_confirmation());
+        assert_eq!(insp.reasons(), vec!["newline"]);
+    }
+
+    #[test]
+    fn crlf_reports_cr_and_newline_not_c0() {
+        let insp = inspect_paste("a\r\nb");
+        assert!(insp.has_cr);
+        assert!(insp.has_newline);
+        assert!(!insp.has_c0);
+        assert!(insp.needs_confirmation());
+        assert_eq!(insp.reasons(), vec!["CR", "newline"]);
     }
 
     #[test]
@@ -316,10 +338,13 @@ mod tests {
         assert!(insp.has_newline);
         assert!(insp.has_unicode_control);
         assert!(insp.has_bidi);
-        assert!(insp.has_c0);
+        assert!(
+            !insp.has_c0,
+            "only NUL/LF present; neither may emit generic C0"
+        );
         assert_eq!(
             insp.reasons(),
-            vec!["NUL", "newline", "C0", "unicode-control", "bidi"]
+            vec!["NUL", "newline", "unicode-control", "bidi"]
         );
     }
 

@@ -36,9 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (e.g. `tokyonight`, `catppuccin`, `github`), and provenance (upstream
   source URL + license). `bitty list themes` enumerates the catalog with
   category and license, and `bitty init` accepts any catalog name or alias.
-  Fail-closed tests pin unique names/aliases, 16 ANSI entries, foreground
-  contrast >= 4.5:1 (`solarized-light` documented exemption), and focused
-  outline contrast >= 3:1.
+  Outline tokens are derived per palette so both CTX-0340 rules hold — AC-1
+  (focused >= 3:1 vs background) and AC-2 (focused >= 3:1 vs idle) — with no
+  preset exemption. Fail-closed tests pin unique names/aliases, 16 ANSI
+  entries, foreground contrast >= 4.5:1 (`solarized-light` documented
+  exemption), focused outline >= 3:1, focused/idle outline >= 3:1, and an
+  `EffectiveConfig::validate()` sweep over every catalog preset.
 - **Configurable focused/idle outline colors (CTX-0340):**
   `decoration.border_color` (base, unset), `decoration.border_color_focused`
   (default `#33CCFF`), and `decoration.border_color_idle` (default

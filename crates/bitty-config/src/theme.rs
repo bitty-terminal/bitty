@@ -26,11 +26,24 @@
 //! palette is included, and no value is invented to fill a gap.
 //!
 //! Outline tokens (`border_focused`/`border_idle`, CTX-0340) are Bitty-owned
-//! rather than upstream palette data: each preset's focused outline is the
-//! highest-contrast ANSI accent that clears the 3:1 non-text contrast floor
-//! against its background (preferring blue/cyan tints, falling back to the
-//! full ANSI set when none of those clears it), and the idle outline is ANSI
-//! 8 (bright black). [`BITTY_DARK`] keeps the originally ratified values.
+//! rather than upstream palette data, derived per preset so both accepted
+//! contrast rules hold (RFC-0001/OQ-039): **AC-1** focused >= 3:1 against the
+//! preset background, and **AC-2** focused >= 3:1 against idle. The rule:
+//!
+//! 1. Try ANSI accents as the focused outline, preferring the blue/cyan
+//!    family (ANSI 4/6/12/14, highest contrast first), then the remaining
+//!    ANSI 1–6/9–14 by descending contrast. The first accent that clears AC-1
+//!    and admits an idle that clears AC-2 wins.
+//! 2. If no accent qualifies, fall back to the preset foreground.
+//! 3. Take the idle outline from ANSI 8 (bright black), then the palette
+//!    selection color, then ANSI 0: the first surface that clears AC-2.
+//!    Prefer an idle that also clears the advisory AC-3 (>= 1.5:1 against the
+//!    background); only if none does is a lower-contrast idle used, which is
+//!    reported by `bitty config check` as an AC-3 advisory, never a failure.
+//!
+//! [`BITTY_DARK`] keeps the originally ratified `#33CCFF`/`#595959AA` pair.
+//! No preset needs an AC-2 exemption: every catalog pair satisfies both
+//! rules, and the catalog tests below pin that.
 //!
 //! # Bitty Dark palette — role table
 //!
@@ -255,7 +268,7 @@ pub static TOKYO_NIGHT_DAY: Theme = Theme {
     cursor: [0x37, 0x60, 0xBF],
     selection: [0xB7, 0xC1, 0xE3],
     border_focused: OutlineColor([0x00, 0x71, 0x97, 0xFF]),
-    border_idle: OutlineColor([0xA1, 0xA6, 0xC5, 0xFF]),
+    border_idle: OutlineColor([0xB7, 0xC1, 0xE3, 0xFF]),
     ansi: [
         [0xB4, 0xB5, 0xB9], // 0 black
         [0xF5, 0x2A, 0x65], // 1 red
@@ -290,7 +303,7 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     foreground: [0xCD, 0xD6, 0xF4],
     cursor: [0xF5, 0xE0, 0xDC],
     selection: [0xF5, 0xE0, 0xDC],
-    border_focused: OutlineColor([0xA6, 0xE3, 0xA1, 0xFF]),
+    border_focused: OutlineColor([0x94, 0xE2, 0xD5, 0xFF]),
     border_idle: OutlineColor([0x58, 0x5B, 0x70, 0xFF]),
     ansi: [
         [0x45, 0x47, 0x5A], // 0 black
@@ -326,7 +339,7 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     foreground: [0xCA, 0xD3, 0xF5],
     cursor: [0xF4, 0xDB, 0xD6],
     selection: [0xF4, 0xDB, 0xD6],
-    border_focused: OutlineColor([0xF5, 0xBD, 0xE6, 0xFF]),
+    border_focused: OutlineColor([0x8B, 0xD5, 0xCA, 0xFF]),
     border_idle: OutlineColor([0x5B, 0x60, 0x78, 0xFF]),
     ansi: [
         [0x49, 0x4D, 0x64], // 0 black
@@ -362,8 +375,8 @@ pub static CATPPUCCIN_FRAPPE: Theme = Theme {
     foreground: [0xC6, 0xD0, 0xF5],
     cursor: [0xF2, 0xD5, 0xCF],
     selection: [0xF2, 0xD5, 0xCF],
-    border_focused: OutlineColor([0xF4, 0xB8, 0xE4, 0xFF]),
-    border_idle: OutlineColor([0x62, 0x68, 0x80, 0xFF]),
+    border_focused: OutlineColor([0x81, 0xC8, 0xBE, 0xFF]),
+    border_idle: OutlineColor([0x51, 0x57, 0x6D, 0xFF]),
     ansi: [
         [0x51, 0x57, 0x6D], // 0 black
         [0xE7, 0x82, 0x84], // 1 red
@@ -398,7 +411,7 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     foreground: [0x4C, 0x4F, 0x69],
     cursor: [0xDC, 0x8A, 0x78],
     selection: [0xDC, 0x8A, 0x78],
-    border_focused: OutlineColor([0x1E, 0x66, 0xF5, 0xFF]),
+    border_focused: OutlineColor([0x4C, 0x4F, 0x69, 0xFF]),
     border_idle: OutlineColor([0xAC, 0xB0, 0xBE, 0xFF]),
     ansi: [
         [0xBC, 0xC0, 0xCC], // 0 black
@@ -506,8 +519,8 @@ pub static GRUVBOX_DARK: Theme = Theme {
     foreground: [0xEB, 0xDB, 0xB2],
     cursor: [0xEB, 0xDB, 0xB2],
     selection: [0x66, 0x5C, 0x54],
-    border_focused: OutlineColor([0xB8, 0xBB, 0x26, 0xFF]),
-    border_idle: OutlineColor([0x92, 0x83, 0x74, 0xFF]),
+    border_focused: OutlineColor([0x8E, 0xC0, 0x7C, 0xFF]),
+    border_idle: OutlineColor([0x66, 0x5C, 0x54, 0xFF]),
     ansi: [
         [0x28, 0x28, 0x28], // 0 black
         [0xCC, 0x24, 0x1D], // 1 red
@@ -542,8 +555,8 @@ pub static GRUVBOX_LIGHT: Theme = Theme {
     foreground: [0x3C, 0x38, 0x36],
     cursor: [0x3C, 0x38, 0x36],
     selection: [0x3C, 0x38, 0x36],
-    border_focused: OutlineColor([0x8F, 0x3F, 0x71, 0xFF]),
-    border_idle: OutlineColor([0x92, 0x83, 0x74, 0xFF]),
+    border_focused: OutlineColor([0xB5, 0x76, 0x14, 0xFF]),
+    border_idle: OutlineColor([0x3C, 0x38, 0x36, 0xFF]),
     ansi: [
         [0xFB, 0xF1, 0xC7], // 0 black
         [0xCC, 0x24, 0x1D], // 1 red
@@ -579,7 +592,7 @@ pub static SOLARIZED_DARK: Theme = Theme {
     cursor: [0x83, 0x94, 0x96],
     selection: [0x07, 0x36, 0x42],
     border_focused: OutlineColor([0x93, 0xA1, 0xA1, 0xFF]),
-    border_idle: OutlineColor([0x33, 0x5E, 0x69, 0xFF]),
+    border_idle: OutlineColor([0x07, 0x36, 0x42, 0xFF]),
     ansi: [
         [0x07, 0x36, 0x42], // 0 black
         [0xDC, 0x32, 0x2F], // 1 red
@@ -614,7 +627,7 @@ pub static SOLARIZED_LIGHT: Theme = Theme {
     foreground: [0x65, 0x7B, 0x83],
     cursor: [0x65, 0x7B, 0x83],
     selection: [0xEE, 0xE8, 0xD5],
-    border_focused: OutlineColor([0x58, 0x6E, 0x75, 0xFF]),
+    border_focused: OutlineColor([0x26, 0x8B, 0xD2, 0xFF]),
     border_idle: OutlineColor([0x00, 0x2B, 0x36, 0xFF]),
     ansi: [
         [0x07, 0x36, 0x42], // 0 black
@@ -650,8 +663,8 @@ pub static ONE_DARK: Theme = Theme {
     foreground: [0xAB, 0xB2, 0xBF],
     cursor: [0xAB, 0xB2, 0xBF],
     selection: [0x32, 0x38, 0x44],
-    border_focused: OutlineColor([0x98, 0xC3, 0x79, 0xFF]),
-    border_idle: OutlineColor([0x76, 0x76, 0x76, 0xFF]),
+    border_focused: OutlineColor([0x61, 0xAF, 0xEF, 0xFF]),
+    border_idle: OutlineColor([0x32, 0x38, 0x44, 0xFF]),
     ansi: [
         [0x21, 0x25, 0x2B], // 0 black
         [0xE0, 0x6C, 0x75], // 1 red
@@ -686,7 +699,7 @@ pub static ONE_LIGHT: Theme = Theme {
     foreground: [0x2A, 0x2C, 0x33],
     cursor: [0xBB, 0xBB, 0xBB],
     selection: [0xED, 0xED, 0xED],
-    border_focused: OutlineColor([0x95, 0x00, 0x95, 0xFF]),
+    border_focused: OutlineColor([0x2F, 0x5A, 0xF3, 0xFF]),
     border_idle: OutlineColor([0x00, 0x00, 0x00, 0xFF]),
     ansi: [
         [0x00, 0x00, 0x00], // 0 black
@@ -758,7 +771,7 @@ pub static AYU_MIRAGE: Theme = Theme {
     foreground: [0xCC, 0xCA, 0xC2],
     cursor: [0xFF, 0xCC, 0x66],
     selection: [0x40, 0x9F, 0xFF],
-    border_focused: OutlineColor([0xD5, 0xFF, 0x80, 0xFF]),
+    border_focused: OutlineColor([0x95, 0xE6, 0xCB, 0xFF]),
     border_idle: OutlineColor([0x68, 0x68, 0x68, 0xFF]),
     ansi: [
         [0x17, 0x1B, 0x24], // 0 black
@@ -795,7 +808,7 @@ pub static AYU_LIGHT: Theme = Theme {
     cursor: [0xFF, 0xAA, 0x33],
     selection: [0x03, 0x5B, 0xD6],
     border_focused: OutlineColor([0x9E, 0x75, 0xC7, 0xFF]),
-    border_idle: OutlineColor([0x68, 0x68, 0x68, 0xFF]),
+    border_idle: OutlineColor([0x00, 0x00, 0x00, 0xFF]),
     ansi: [
         [0x00, 0x00, 0x00], // 0 black
         [0xEA, 0x6C, 0x6D], // 1 red
@@ -830,8 +843,8 @@ pub static KANAGAWA_WAVE: Theme = Theme {
     foreground: [0xDC, 0xD7, 0xBA],
     cursor: [0xC8, 0xC0, 0x93],
     selection: [0x2D, 0x4F, 0x67],
-    border_focused: OutlineColor([0x98, 0xBB, 0x6C, 0xFF]),
-    border_idle: OutlineColor([0x72, 0x71, 0x69, 0xFF]),
+    border_focused: OutlineColor([0x7F, 0xB4, 0xCA, 0xFF]),
+    border_idle: OutlineColor([0x2D, 0x4F, 0x67, 0xFF]),
     ansi: [
         [0x16, 0x16, 0x1D], // 0 black
         [0xC3, 0x40, 0x43], // 1 red
@@ -866,8 +879,8 @@ pub static KANAGAWA_LOTUS: Theme = Theme {
     foreground: [0x54, 0x54, 0x64],
     cursor: [0x43, 0x43, 0x6C],
     selection: [0xC9, 0xCB, 0xD1],
-    border_focused: OutlineColor([0x62, 0x4C, 0x83, 0xFF]),
-    border_idle: OutlineColor([0x8A, 0x89, 0x80, 0xFF]),
+    border_focused: OutlineColor([0x59, 0x7B, 0x75, 0xFF]),
+    border_idle: OutlineColor([0x1F, 0x1F, 0x28, 0xFF]),
     ansi: [
         [0x1F, 0x1F, 0x28], // 0 black
         [0xC8, 0x40, 0x53], // 1 red
@@ -975,7 +988,7 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     cursor: [0xCE, 0xCA, 0xCD],
     selection: [0xDF, 0xDA, 0xD9],
     border_focused: OutlineColor([0x28, 0x69, 0x83, 0xFF]),
-    border_idle: OutlineColor([0x98, 0x93, 0xA5, 0xFF]),
+    border_idle: OutlineColor([0xDF, 0xDA, 0xD9, 0xFF]),
     ansi: [
         [0xF2, 0xE9, 0xE1], // 0 black
         [0xB4, 0x63, 0x7A], // 1 red
@@ -1010,8 +1023,8 @@ pub static EVERFOREST_DARK: Theme = Theme {
     foreground: [0xD3, 0xC6, 0xAA],
     cursor: [0xE6, 0x98, 0x75],
     selection: [0x54, 0x3A, 0x48],
-    border_focused: OutlineColor([0xA7, 0xC0, 0x80, 0xFF]),
-    border_idle: OutlineColor([0xA6, 0xB0, 0xA0, 0xFF]),
+    border_focused: OutlineColor([0x83, 0xC0, 0x92, 0xFF]),
+    border_idle: OutlineColor([0x54, 0x3A, 0x48, 0xFF]),
     ansi: [
         [0x7A, 0x84, 0x78], // 0 black
         [0xE6, 0x7E, 0x80], // 1 red
@@ -1046,8 +1059,8 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     foreground: [0x5C, 0x6A, 0x72],
     cursor: [0xF5, 0x7D, 0x26],
     selection: [0xEA, 0xED, 0xC8],
-    border_focused: OutlineColor([0x7A, 0x84, 0x78, 0xFF]),
-    border_idle: OutlineColor([0xA6, 0xB0, 0xA0, 0xFF]),
+    border_focused: OutlineColor([0x5C, 0x6A, 0x72, 0xFF]),
+    border_idle: OutlineColor([0xEA, 0xED, 0xC8, 0xFF]),
     ansi: [
         [0x7A, 0x84, 0x78], // 0 black
         [0xE6, 0x7E, 0x80], // 1 red
@@ -1082,7 +1095,7 @@ pub static MONOKAI: Theme = Theme {
     foreground: [0xFD, 0xFF, 0xF1],
     cursor: [0xC0, 0xC1, 0xB5],
     selection: [0x57, 0x58, 0x4F],
-    border_focused: OutlineColor([0xA6, 0xE2, 0x2E, 0xFF]),
+    border_focused: OutlineColor([0x66, 0xD9, 0xEF, 0xFF]),
     border_idle: OutlineColor([0x6E, 0x70, 0x66, 0xFF]),
     ansi: [
         [0x27, 0x28, 0x22], // 0 black
@@ -1155,7 +1168,7 @@ pub static GITHUB_DARK: Theme = Theme {
     cursor: [0x2F, 0x81, 0xF7],
     selection: [0xE6, 0xED, 0xF3],
     border_focused: OutlineColor([0x56, 0xD4, 0xDD, 0xFF]),
-    border_idle: OutlineColor([0x6E, 0x76, 0x81, 0xFF]),
+    border_idle: OutlineColor([0x48, 0x4F, 0x58, 0xFF]),
     ansi: [
         [0x48, 0x4F, 0x58], // 0 black
         [0xFF, 0x7B, 0x72], // 1 red
@@ -1190,8 +1203,8 @@ pub static GITHUB_LIGHT: Theme = Theme {
     foreground: [0x1F, 0x23, 0x28],
     cursor: [0x09, 0x69, 0xDA],
     selection: [0x1F, 0x23, 0x28],
-    border_focused: OutlineColor([0x11, 0x63, 0x29, 0xFF]),
-    border_idle: OutlineColor([0x57, 0x60, 0x6A, 0xFF]),
+    border_focused: OutlineColor([0x09, 0x69, 0xDA, 0xFF]),
+    border_idle: OutlineColor([0x1F, 0x23, 0x28, 0xFF]),
     ansi: [
         [0x24, 0x29, 0x2F], // 0 black
         [0xCF, 0x22, 0x2E], // 1 red
@@ -1557,6 +1570,80 @@ mod tests {
                 "preset {} focused outline contrast {ratio:.2}:1 is below 3:1",
                 theme.name
             );
+        }
+    }
+
+    #[test]
+    fn focused_idle_outline_meets_non_text_contrast_floor() {
+        // CTX-0340 AC-2: the focused outline must clear 3:1 against the idle
+        // outline. `EffectiveConfig::validate()` enforces this on the resolved
+        // pair, so a catalog preset below the floor makes every selection of
+        // that preset fail closed at startup. This is the catalog-level guard
+        // the `EffectiveConfig` sweep below backs (AC-2, no exemptions).
+        for theme in list_presets() {
+            let ratio = contrast(
+                [
+                    theme.border_focused.0[0],
+                    theme.border_focused.0[1],
+                    theme.border_focused.0[2],
+                ],
+                [
+                    theme.border_idle.0[0],
+                    theme.border_idle.0[1],
+                    theme.border_idle.0[2],
+                ],
+            );
+            assert!(
+                ratio >= 3.0,
+                "preset {} focused/idle outline contrast {ratio:.2}:1 is below 3:1 \
+                 (AC-2); re-derive the pair",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn idle_outline_clears_advisory_background_floor_or_is_visible() {
+        // CTX-0340 AC-3 is advisory, but every shipped preset must at least
+        // keep the idle outline visible against the background (not equal to
+        // it) so the `bitty config check` AC-3 warning stays a deliberate,
+        // reported advisory rather than a silently invisible outline.
+        for theme in list_presets() {
+            let idle = [
+                theme.border_idle.0[0],
+                theme.border_idle.0[1],
+                theme.border_idle.0[2],
+            ];
+            assert_ne!(
+                idle, theme.background,
+                "preset {} idle outline equals the background and would be invisible",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_preset_passes_effective_config_validation() {
+        // Integration-level guard: selecting a preset must not make the fully
+        // resolved effective config fail closed. `EffectiveConfig::validate`
+        // resolves the outline against `appearance.theme` and enforces the
+        // CTX-0340 AC-1/AC-2 contract, so this sweep is exactly what would
+        // have caught a catalog pair violating AC-2 at review time.
+        use crate::types::EffectiveConfig;
+        for theme in list_presets() {
+            let effective = EffectiveConfig {
+                appearance: crate::types::AppearanceConfig {
+                    theme: Some(theme.name.to_owned()),
+                    ..crate::types::AppearanceConfig::default()
+                },
+                ..EffectiveConfig::default()
+            };
+            if let Err(error) = effective.validate() {
+                panic!(
+                    "preset {} fails EffectiveConfig::validate(): {error}",
+                    theme.name
+                );
+            }
         }
     }
 

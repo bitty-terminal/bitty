@@ -26,6 +26,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frame-on-demand: a completed transition schedules no periodic wakeups
   (PB-7), and the terminal grid, cursor, and scrollback are never
   interpolated.
+- **Built-in theme preset catalog (CTX-0350):** the preset registry grows from
+  one to 30 curated themes — `bitty-dark` (default, alias `dark`) plus
+  tokyo-night (storm/day), catppuccin (mocha/macchiato/frappe/latte), github
+  (dark/light), gruvbox (dark/light), solarized (dark/light), one
+  (dark/light), ayu (dark/mirage/light), kanagawa (wave/lotus), rose-pine
+  (main/moon/dawn), everforest (dark/light), dracula, nord, monokai, and
+  night-owl. Each preset carries a `Dark`/`Light` `ThemeCategory`, aliases
+  (e.g. `tokyonight`, `catppuccin`, `github`), and provenance (upstream
+  source URL + license). `bitty list themes` enumerates the catalog with
+  category and license, and `bitty init` accepts any catalog name or alias.
+  Fail-closed tests pin unique names/aliases, 16 ANSI entries, foreground
+  contrast >= 4.5:1 (`solarized-light` documented exemption), and focused
+  outline contrast >= 3:1.
 - **Configurable focused/idle outline colors (CTX-0340):**
   `decoration.border_color` (base, unset), `decoration.border_color_focused`
   (default `#33CCFF`), and `decoration.border_color_idle` (default

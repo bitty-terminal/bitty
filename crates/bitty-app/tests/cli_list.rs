@@ -200,6 +200,27 @@ fn list_themes_jsonl_is_single_line_envelope() {
 }
 
 #[test]
+fn list_themes_catalog_exposes_30_and_categories() {
+    let output = run_bitty(&["list", "themes", "--format", "json"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(doc.contains("\"count\":30"), "count: {:?}", doc.text());
+    // Dark and light presets both ship; provenance and category are exposed.
+    assert!(doc.contains("\"category\":\"dark\""));
+    assert!(doc.contains("\"category\":\"light\""));
+    assert!(doc.contains("tokyo-night"));
+    assert!(doc.contains("github-light"));
+    assert!(doc.contains("catppuccin-mocha"));
+    assert!(doc.contains("https://github.com/folke/tokyonight.nvim"));
+    assert!(doc.contains("\"license\":\"MIT\""));
+}
+
+#[test]
 fn list_plugins_table_contains_bundled() {
     let output = run_bitty(&["list", "plugins"], &[]);
     assert_eq!(

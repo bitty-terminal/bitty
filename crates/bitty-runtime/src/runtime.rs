@@ -138,12 +138,12 @@ pub use self::animations::{
     PanelAnimator, ReducedMotionMode,
 };
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
-pub use self::present::PresentStats;
+pub use self::present::{ImeCursorArea, PresentStats};
 
 use self::layout_focus::{default_container, default_layout};
 use self::mouse_chrome::{AltDragState, HoverPending};
 use self::panes::PaneSession;
-use self::present::{AnyRasterizer, HeadlessRasterizer};
+use self::present::{AnyRasterizer, HeadlessRasterizer, ImeCaret};
 use self::scrollbar::ScrollbarDrag;
 use self::workspaces::{PendingWsClose, WorkspaceSlot};
 
@@ -452,6 +452,9 @@ pub struct Runtime {
     // IME composition overlay (presentation only, not Terminal Truth)
     ime_preedit: Option<String>,
     ime_cursor: usize,
+    /// Focused caret rect + preedit clip budget, refreshed each presented
+    /// frame (CTX-0367). `None` when no focused cursor was painted.
+    ime_caret: Option<ImeCaret>,
     // Wheel accumulator for pixel scroll (candidate: 4*cell bound)
     wheel_accum_y: f32,
     wheel_accum_x: f32,
@@ -744,6 +747,7 @@ impl Runtime {
             mouse_capture_enabled: false,
             ime_preedit: None,
             ime_cursor: 0,
+            ime_caret: None,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
             wheel_line_accum_y: 0.0,
@@ -875,6 +879,7 @@ impl Runtime {
             mouse_capture_enabled: false,
             ime_preedit: None,
             ime_cursor: 0,
+            ime_caret: None,
             wheel_accum_y: 0.0,
             wheel_accum_x: 0.0,
             wheel_line_accum_y: 0.0,

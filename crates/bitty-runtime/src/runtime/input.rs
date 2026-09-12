@@ -4,6 +4,37 @@
 //! byte-identical logic, only module wiring changed.
 use super::*;
 
+/// Maximum preedit scalars kept from one IME composition (CTX-0367).
+///
+/// Matches the `input-pointer-rfc.md` preedit overlay bound (128 chars) and
+/// the platform seam's own truncation; the overlay additionally clips to the
+/// pane width, so no composition can overdraw or grow the frame.
+pub const IME_PREEDIT_MAX_CHARS: usize = 128;
+
+/// Maximum characters committed from one IME commit (CTX-0367).
+///
+/// Matches `text-rendering-rfc.md` TXT-11 and the platform seam truncation
+/// (256 chars / 1024 UTF-8 bytes).
+pub const IME_COMMIT_MAX_CHARS: usize = 256;
+
+/// Maximum UTF-8 bytes committed from one IME commit (CTX-0367).
+pub const IME_COMMIT_MAX_BYTES: usize = 1024;
+
+/// Truncates `text` to at most `max` scalars at a char boundary.
+///
+/// Pure and allocation-minimal: returns the input unchanged when it already
+/// fits, otherwise copies only the kept prefix.
+fn truncate_chars(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut out = String::new();
+    for ch in text.chars().take(max) {
+        out.push(ch);
+    }
+    out
+}
+
 /// Bounded human-readable label for a [`KeyEvent`] (CTX-0159 input ring).
 ///
 /// Prefers the layout-dependent `text` when present (so `wtype` probes show
@@ -28,9 +59,25 @@ pub(super) fn key_inspect_label(event: &KeyEvent) -> String {
 
 impl Runtime {
     /// Current IME preedit overlay, if any (presentation only).
+    ///
+    /// Non-`None` exactly while a composition is active; the inline overlay
+    /// paints from this model and the key path suppresses raw input while it
+    /// is `Some` (CTX-0367).
     #[must_use]
     pub fn ime_preedit(&self) -> Option<&str> {
         self.ime_preedit.as_deref()
+    }
+
+    /// Physical-pixel caret rect for the platform IME candidate window.
+    ///
+    /// `Some` while the focused leaf painted a visible cursor in the last
+    /// presented frame; the embedder forwards it through
+    /// `bitty_platform::WindowHandle::set_ime_cursor_area` when it changes
+    /// (CTX-0367). `None` before the first present, while the cursor is
+    /// hidden, or while the window is unfocused.
+    #[must_use]
+    pub fn ime_cursor_area(&self) -> Option<ImeCursorArea> {
+        self.ime_caret.map(|caret| caret.area)
     }
 
     /// Encodes a [`KeyEvent`] into the terminal input bytes (legacy xterm).
@@ -127,6 +174,13 @@ impl Runtime {
     /// otherwise (release, synthetic, modifier-only, etc.). Headless
     /// callers may synthesize [`KeyEvent`]s without a window and drive this
     /// path deterministically.
+    ///
+    /// While an IME composition is active (`ime_preedit.is_some()`) raw key
+    /// presses are consumed here: winit already suppresses `KeyboardInput`
+    /// during the preedit phase on every backend, and this guard keeps the
+    /// single-commit invariant even if a platform quirk delivers both — the
+    /// raw Latin key must never insert alongside the eventual
+    /// `Ime::Commit` (CTX-0367).
     pub fn handle_key_event(&mut self, event: KeyEvent) -> Option<Vec<u8>> {
         let is_modifier = matches!(
             &event.logical_key,
@@ -140,6 +194,19 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0367 IME composition guard: consume raw presses while a
+        // preedit is active. winit suppresses `KeyboardInput` during the
+        // preedit phase on every backend; if a platform quirk ever delivers
+        // one anyway, inserting it would double-input the composition
+        // (preedit/commit already carries the text). Modifier tracking stays
+        // above so chord state never desyncs; releases produce no bytes.
+        if self.ime_preedit.is_some()
+            && event.state == PressState::Pressed
+            && !event.is_synthetic
+            && !is_modifier
+        {
+            return None;
+        }
         // CTX-0243: any non-modifier press snaps to live (covers Esc-cancel
         // with no bytes and unmapped keys with no encoding; normal typing
         // also snaps via `push_input_bytes` below — idempotent).
@@ -204,6 +271,15 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0367 IME composition guard (see the owned path): raw presses
+        // are consumed while a preedit is active.
+        if self.ime_preedit.is_some()
+            && event.state == PressState::Pressed
+            && !event.is_synthetic
+            && !is_modifier
+        {
+            return None;
+        }
         // CTX-0243: any non-modifier press snaps to live (see owned path).
         if event.state == PressState::Pressed && !is_modifier {
             self.snap_focused_to_live();
@@ -885,26 +961,31 @@ impl Runtime {
     }
 
     /// Handles IME preedit (presentation overlay, not Terminal Truth).
+    ///
+    /// `cursor` is winit's byte-wise preedit cursor offset (the start of its
+    /// `(begin, end)` range); the stored [`Self::ime_cursor`] is a
+    /// **character index** used to place the composition caret, so a hostile
+    /// offset inside a multi-byte scalar can never split a char. Text is
+    /// truncated to [`IME_PREEDIT_MAX_CHARS`]
+    /// scalars at a char boundary (TXT-10), and an empty preedit clears the
+    /// overlay (winit sends one right before [`Self::handle_ime_commit`], per
+    /// its `Ime::Commit` contract).
     pub fn handle_ime_preedit(&mut self, text: Option<String>, cursor: Option<usize>) {
         // CTX-0243: preedit is typing — snap to live so the overlay lands on
         // the visible window instead of a scrolled history viewport.
         self.snap_focused_to_live();
-        // Bounded: preedit ≤128 chars or 256 bytes per candidate TXT-10/11; truncate at char boundary.
         if let Some(t) = text {
-            const MAX: usize = 128;
-            let truncated = if t.chars().count() > MAX {
-                let mut s = String::new();
-                for (i, ch) in t.chars().enumerate() {
-                    if i >= MAX {
-                        break;
-                    }
-                    s.push(ch);
-                }
-                s
-            } else {
-                t
-            };
-            let cur = cursor.unwrap_or(truncated.len()).min(truncated.len());
+            let truncated = truncate_chars(t, IME_PREEDIT_MAX_CHARS);
+            let char_len = truncated.chars().count();
+            let cur = cursor
+                .map(|start| {
+                    truncated
+                        .char_indices()
+                        .take_while(|(byte, _)| *byte < start)
+                        .count()
+                })
+                .unwrap_or(char_len)
+                .min(char_len);
             self.ime_preedit = Some(truncated);
             self.ime_cursor = cur;
             self.pending_full_redraw = true;
@@ -916,18 +997,24 @@ impl Runtime {
     }
 
     /// Commits IME text: bounded ≤256 chars / ≤1024 bytes, then encoder path.
+    ///
+    /// The commit is UTF-8 `text.as_bytes()` pushed through the same bounded
+    /// PTY write queue as raw keyboard input (`push_input_bytes`); bracketed
+    /// paste framing is deliberately not applied (input-pointer RFC "IME
+    /// composition and commit"). The preedit overlay clears first so a cancel
+    /// of a stale composition can never paint after the commit.
     #[allow(clippy::explicit_counter_loop)]
     pub fn handle_ime_commit(&mut self, text: String) {
-        // Bounded before allocation (candidate TXT-11)
+        // Bounded before allocation (TXT-11)
         let bytes_len = text.len();
         let char_count = text.chars().count();
-        let bounded = if bytes_len > 1024 || char_count > 256 {
+        let bounded = if bytes_len > IME_COMMIT_MAX_BYTES || char_count > IME_COMMIT_MAX_CHARS {
             let mut out = String::new();
             let mut bytes = 0usize;
             let mut chars = 0usize;
             for ch in text.chars() {
                 let clen = ch.len_utf8();
-                if bytes + clen > 1024 || chars + 1 > 256 {
+                if bytes + clen > IME_COMMIT_MAX_BYTES || chars + 1 > IME_COMMIT_MAX_CHARS {
                     break;
                 }
                 out.push(ch);

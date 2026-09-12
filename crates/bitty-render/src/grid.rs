@@ -1077,8 +1077,14 @@ pub struct RenderCounters {
     pub cells_drawn: u64,
     /// Spacer (trailing wide-half) cells skipped.
     pub spacer_cells_skipped: u64,
-    /// Cells whose character produced no drawable bitmap.
+    /// Cells skipped without drawing (whitespace, overlay misses, rasterizer
+    /// failures). Missing glyphs no longer land here: they paint the tofu box
+    /// and count as [`RenderCounters::missing_glyphs`] (CTX-0368).
     pub blank_cells_skipped: u64,
+    /// Cells whose character had no covering face; the RFC tofu box was
+    /// painted instead (CTX-0368, text-rendering RFC "Missing-glyph
+    /// behavior").
+    pub missing_glyphs: u64,
     /// Cells whose glyph was suppressed by the invisible attribute.
     pub invisible_cells_skipped: u64,
     /// Background rectangles emitted (exactly one per visited cell).
@@ -1669,7 +1675,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         if term_cell.style.attributes.invisible {
             self.counters.invisible_cells_skipped += 1;
         } else if term_cell.glyph != ' ' {
-            self.emit_glyph(term_cell.glyph, row, col, fg, list);
+            self.emit_glyph(term_cell.glyph, row, col, span_cols, fg, list);
         } else if decorations == 0 {
             self.counters.blank_cells_skipped += 1;
             return;
@@ -1748,11 +1754,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     }
 
     /// Looks up, caches, atlas-uploads, and emits one glyph instance.
+    ///
+    /// When the rasterizer reports no drawable representation (no loaded face
+    /// covers the scalar), the cell paints the RFC missing-glyph tofu box
+    /// instead of staying blank (CTX-0368).
     fn emit_glyph(
         &mut self,
         character: char,
         row: usize,
         col: usize,
+        span_cols: usize,
         color: Rgba8,
         list: &mut DrawList,
     ) {
@@ -1765,9 +1776,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let bitmap = match self.cache.glyph(key) {
             Ok(CachedGlyph::Bitmap(bitmap)) => bitmap,
             Ok(CachedGlyph::Blank) => {
-                // Cached negative (whitespace/missing glyph): background
-                // and decorations already painted.
-                self.counters.blank_cells_skipped += 1;
+                // The rasterizer contract answers `Ok(None)` exactly when no
+                // loaded face covers the scalar; paint the visible RFC tofu
+                // box and count it so missing glyphs never read as blank.
+                self.emit_missing_glyph(row, col, span_cols, color, list);
                 return;
             }
             Err(_) => {
@@ -1818,6 +1830,50 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         };
         list.glyphs.push(instance);
         self.counters.glyphs_emitted += 1;
+    }
+
+    /// Paints the RFC "Missing-glyph behavior" tofu box (CTX-0368).
+    ///
+    /// A visible `1 px` outline at the cluster's cell extent in the cell
+    /// foreground: four fill rectangles (top, bottom, left, right) sized by
+    /// `span_cols` so a wide scalar's tofu spans both grid columns. Never
+    /// allocates an atlas slot and never mutates terminal truth — the cell
+    /// keeps its scalar, so selection/copy/search are unaffected. The
+    /// outline is the v1 missing indicator from the text-rendering RFC; the
+    /// `U+XXXX` hex fallback inside the box is explicitly not painted.
+    fn emit_missing_glyph(
+        &mut self,
+        row: usize,
+        col: usize,
+        span_cols: usize,
+        color: Rgba8,
+        list: &mut DrawList,
+    ) {
+        self.counters.missing_glyphs += 1;
+        let left = u64::try_from(col)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.width));
+        let top = u64::try_from(row)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::from(self.cell.height));
+        let width = saturating_u32(
+            u64::try_from(span_cols)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::from(self.cell.width)),
+        );
+        let height = self.cell.height;
+        let x = saturating_i32(left);
+        let y = saturating_i32(top);
+        let right = x.saturating_add(saturating_i32(u64::from(width)).saturating_sub(1));
+        let bottom = y.saturating_add(saturating_i32(u64::from(height)).saturating_sub(1));
+        for rect in [
+            RectPx::new(x, y, width, 1),
+            RectPx::new(x, bottom, width, 1),
+            RectPx::new(x, y, 1, height),
+            RectPx::new(right, y, 1, height),
+        ] {
+            list.fills.push(FillRect { rect, color });
+        }
     }
 
     /// Rasterizes one line of overlay text at an absolute pixel origin.

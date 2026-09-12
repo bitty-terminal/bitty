@@ -691,7 +691,91 @@ fn rasterizer_failure_skips_the_glyph_but_keeps_the_frame() {
     assert_eq!(list.fills.len(), 1);
     assert!(list.glyphs.is_empty());
     assert_eq!(grid.counters().blank_cells_skipped, 1);
+    assert_eq!(grid.counters().missing_glyphs, 0);
     assert_eq!(grid.cache_stats().1, 1); // counted as a miss, never cached
+}
+
+// ---------------------------------------------------------------------------
+// Missing-glyph tofu (CTX-0368)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uncovered_scalar_paints_tofu_box_and_counts_missing() {
+    // The rasterizer contract answers `Ok(None)` when no loaded face covers
+    // the scalar; the pipeline must paint the RFC 1 px outline at the cell
+    // extent and count it, never leave the cell blank.
+    let state = state_from(&[print('☑')]);
+    let damage = damage_all(&state);
+    let mut fake = FakeRasterizer::new();
+    fake.blank_chars.push('☑');
+    let mut grid = GridRenderer::new(fake, &font_query(), cell_metrics()).unwrap();
+
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    // One background fill plus the four tofu outline edges, no glyph.
+    assert_eq!(list.fills.len(), 5);
+    assert!(list.glyphs.is_empty());
+    let counters = grid.counters();
+    assert_eq!(counters.missing_glyphs, 1);
+    assert_eq!(counters.blank_cells_skipped, 0);
+    let edges: Vec<_> = list.fills[1..].iter().map(|fill| fill.rect).collect();
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (0, 0, 8, 1)),
+        "top edge at the cell origin"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (0, 15, 8, 1)),
+        "bottom edge on the last cell row"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (0, 0, 1, 16)),
+        "left edge"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (7, 0, 1, 16)),
+        "right edge inside the cell"
+    );
+}
+
+#[test]
+fn wide_uncovered_scalar_tofu_spans_both_columns() {
+    // U+1F600 is `char_cell_width == 2`; grid truth stores width 2 plus a
+    // spacer. The tofu outline must span both columns (16px) without
+    // changing grid-width semantics, and only the leading cell counts as
+    // missing.
+    let state = state_from(&[print('\u{1F600}')]);
+    let damage = damage_all(&state);
+    let mut fake = FakeRasterizer::new();
+    fake.blank_chars.push('\u{1F600}');
+    let mut grid = GridRenderer::new(fake, &font_query(), cell_metrics()).unwrap();
+
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+    // Leading background + spacer background + four outline edges.
+    assert_eq!(list.fills.len(), 6);
+    assert_eq!(grid.counters().missing_glyphs, 1);
+    assert_eq!(grid.counters().spacer_cells_skipped, 1);
+    // Fill order per visited cell: leading background, leading tofu edges,
+    // then the spacer background. The tofu edges are fills 1..=4.
+    let edges: Vec<_> = list.fills[1..5].iter().map(|fill| fill.rect).collect();
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (0, 0, 16, 1)),
+        "top edge spans both columns"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|r| (r.x, r.y, r.width, r.height) == (15, 0, 1, 16)),
+        "right edge at the second column's end"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -857,6 +857,19 @@ pub const BASE_CELL_WIDTH: u32 = 8;
 /// Legacy design cell height (see [`BASE_CELL_WIDTH`]).
 pub const BASE_CELL_HEIGHT: u32 = 16;
 
+/// Maximum number of platform fallback families appended after the primary.
+///
+/// Bound from the text-rendering RFC ("Fallback chain construction",
+/// `MAX_FALLBACK_FAMILIES = 8`): enumeration stays deterministic and the
+/// per-scalar walk stays cheap.
+pub const MAX_FALLBACK_FAMILIES: usize = 8;
+
+/// Maximum total chain depth (primary plus tails).
+///
+/// RFC `MAX_FALLBACK_DEPTH = 12`; the pinned chains stay well below it, and
+/// `bitty-render::fallback` never walks more faces than the chain holds.
+pub const MAX_FALLBACK_DEPTH: usize = 12;
+
 /// Braille/symbols fallback family (CTX-0163, issue #263).
 ///
 /// `fc-query` evidence on the reference host: `DejaVu Sans Mono` covers
@@ -867,16 +880,44 @@ pub const BASE_CELL_HEIGHT: u32 = 16;
 /// already an `optdepend` in `packaging/PKGBUILD` — no new dependency.
 pub const SYMBOLS_FALLBACK_FAMILY: &str = "Noto Sans Symbols 2";
 
-/// Documented monospace/Nerd fallback stack.
+/// Emoji-capable fallback family for the running platform (CTX-0368).
 ///
-/// Order: configured primary (Nerd-patched by default) -> unpatched
+/// The render path flattens any color bitmap to its alpha coverage in the
+/// atlas (monochrome tint by the cell foreground); the face is still the
+/// coverage authority for emoji-presentation scalars (`U+1F300+`, `U+2705`,
+/// `U+2699`-class) that the monospace and symbols tails miss. Color emoji
+/// *color* rendering remains an open follow-up in the text-rendering RFC.
+#[cfg(target_os = "linux")]
+pub const EMOJI_FALLBACK_FAMILY: &str = "Noto Color Emoji";
+/// Emoji fallback family on macOS (see [`EMOJI_FALLBACK_FAMILY`]).
+#[cfg(target_os = "macos")]
+pub const EMOJI_FALLBACK_FAMILY: &str = "Apple Color Emoji";
+/// Emoji fallback family on Windows (see [`EMOJI_FALLBACK_FAMILY`]).
+#[cfg(windows)]
+pub const EMOJI_FALLBACK_FAMILY: &str = "Segoe UI Emoji";
+/// Emoji fallback family on other targets (see [`EMOJI_FALLBACK_FAMILY`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub const EMOJI_FALLBACK_FAMILY: &str = "Noto Color Emoji";
+
+/// Documented monospace/Nerd fallback stack for the running platform.
+///
+/// Order on Linux: configured primary (Nerd-patched by default) -> unpatched
 /// `JetBrains Mono` -> system `monospace` (fontconfig/WC) ->
 /// `DejaVu Sans Mono` (widely available, covers box drawing + block
 /// elements `U+2580-U+259F`) -> [`SYMBOLS_FALLBACK_FAMILY`] (covers braille
-/// patterns `U+2800-U+28FF` for TUI graphs such as btop). Mirrors ghostty
-/// (embedded JetBrains Mono variable + symbols-only Nerd fallback, always
-/// present) and kitty (`font_family = "monospace"` + builtin Nerd font,
+/// patterns `U+2800-U+28FF` for TUI graphs such as btop) ->
+/// [`EMOJI_FALLBACK_FAMILY`] (emoji-presentation scalars the mono/symbols
+/// faces miss, for example `U+2699 GEAR`). Mirrors ghostty (embedded
+/// JetBrains Mono variable + symbols-only Nerd fallback, always present)
+/// and kitty (`font_family = "monospace"` + builtin Nerd font,
 /// `set_font_family(..., add_builtin_nerd_font=True)`).
+///
+/// macOS and Windows substitute their system equivalents (Menlo/Monaco,
+/// Apple Braille, Apple Symbols, Apple Color Emoji; Consolas/Cascadia Mono,
+/// Segoe UI Symbol, Segoe UI Emoji); every chain is a fixed, deterministic,
+/// bounded list (`<= MAX_FALLBACK_FAMILIES` tails, `<= MAX_FALLBACK_DEPTH`
+/// total), never a runtime enumeration. Platform fontconfig/CoreText/
+/// DirectWrite enumeration policy remains an open question under ADR-0004.
 ///
 /// Per-glyph coverage fallback is implemented by
 /// `bitty-render::fallback::FallbackRasterizer`, which walks this chain on
@@ -886,12 +927,46 @@ pub const SYMBOLS_FALLBACK_FAMILY: &str = "Noto Sans Symbols 2";
 /// chain is family-level attempt order for embedders: try each in order
 /// until `load_font` succeeds, ending in headless.
 /// [`FontConfig::fallback_chain`] builds the configured-first variant.
-pub const FONT_FALLBACK_CHAIN: [&str; 5] = [
+#[cfg(target_os = "linux")]
+pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
     "JetBrains Mono",
     "monospace",
     "DejaVu Sans Mono",
     SYMBOLS_FALLBACK_FAMILY,
+    EMOJI_FALLBACK_FAMILY,
+];
+
+/// Documented fallback stack on macOS (see [`FONT_FALLBACK_CHAIN`]).
+#[cfg(target_os = "macos")]
+pub const FONT_FALLBACK_CHAIN: &[&str] = &[
+    DEFAULT_FONT_FAMILY,
+    "Menlo",
+    "Monaco",
+    "Apple Braille",
+    "Apple Symbols",
+    EMOJI_FALLBACK_FAMILY,
+    "Arial Unicode MS",
+];
+
+/// Documented fallback stack on Windows (see [`FONT_FALLBACK_CHAIN`]).
+#[cfg(windows)]
+pub const FONT_FALLBACK_CHAIN: &[&str] = &[
+    DEFAULT_FONT_FAMILY,
+    "Consolas",
+    "Cascadia Mono",
+    "Segoe UI Symbol",
+    EMOJI_FALLBACK_FAMILY,
+    "Arial Unicode MS",
+];
+
+/// Documented fallback stack on other targets (see [`FONT_FALLBACK_CHAIN`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub const FONT_FALLBACK_CHAIN: &[&str] = &[
+    DEFAULT_FONT_FAMILY,
+    "DejaVu Sans Mono",
+    SYMBOLS_FALLBACK_FAMILY,
+    EMOJI_FALLBACK_FAMILY,
 ];
 
 /// Font configuration.
@@ -2008,16 +2083,14 @@ mod tests {
     fn font_fallback_chain_is_documented_order() {
         let d = FontConfig::default();
         let chain = d.fallback_chain();
-        assert_eq!(
-            chain,
-            vec![
-                "JetBrainsMono Nerd Font".to_string(),
-                "JetBrains Mono".to_string(),
-                "monospace".to_string(),
-                "DejaVu Sans Mono".to_string(),
-                "Noto Sans Symbols 2".to_string(),
-            ]
-        );
+        // Configured primary first, then the pinned platform tails in order.
+        assert_eq!(chain[0], DEFAULT_FONT_FAMILY);
+        let expected_tails: Vec<String> = FONT_FALLBACK_CHAIN
+            .iter()
+            .skip(1)
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(chain[1..], expected_tails[..]);
         // Custom primary stays first, chain dedups case-insensitively.
         let custom = FontConfig {
             family: "monospace".into(),
@@ -2025,39 +2098,68 @@ mod tests {
         };
         let chain = custom.fallback_chain();
         assert_eq!(chain[0], "monospace");
-        assert_eq!(chain.len(), 5);
-        // No duplicates when primary already in chain.
+        assert_eq!(chain.iter().filter(|f| *f == "monospace").count(), 1);
+        // No duplicates when the primary is already a tail (case-insensitive).
         let nerd = FontConfig {
             family: "  jetbrainsmono nerd font  ".into(),
             ..Default::default()
         };
         let chain = nerd.fallback_chain();
-        assert_eq!(chain.len(), 5);
+        assert_eq!(chain.len(), FONT_FALLBACK_CHAIN.len());
     }
 
     #[test]
     fn font_fallback_chain_covers_tui_graph_slices() {
-        // CTX-0163 (issue #263): btop CPU graphs draw braille patterns
-        // (`U+2800-U+28FF`); block graphs use `U+2580-U+259F`. The chain
-        // must end in a braille-capable symbols face and keep the
-        // block-capable `DejaVu Sans Mono` entry ahead of it, so a
-        // per-glyph fallback walk (see `bitty-render::fallback`) can
-        // resolve both slices on bare installs without the Nerd font.
-        assert_eq!(
-            FONT_FALLBACK_CHAIN[FONT_FALLBACK_CHAIN.len() - 1],
-            SYMBOLS_FALLBACK_FAMILY
+        // CTX-0163 (issue #263) + CTX-0368: btop CPU graphs draw braille
+        // patterns (`U+2800-U+28FF`); block graphs use `U+2580-U+259F`;
+        // symbols/emoji (`U+2714`, `U+2611`, `U+2699`) need a symbols and an
+        // emoji tail. The chain is a fixed, deterministic, bounded list that
+        // a per-glyph fallback walk (`bitty-render::fallback`) can traverse
+        // on bare installs without the Nerd font.
+        let tails = FONT_FALLBACK_CHAIN.len() - 1;
+        assert!(
+            tails <= MAX_FALLBACK_FAMILIES,
+            "tails {tails} exceed MAX_FALLBACK_FAMILIES"
         );
+        assert!(FONT_FALLBACK_CHAIN.len() <= MAX_FALLBACK_DEPTH);
         assert_eq!(SYMBOLS_FALLBACK_FAMILY, "Noto Sans Symbols 2");
-        assert!(FONT_FALLBACK_CHAIN.contains(&"DejaVu Sans Mono"));
-        // The symbols tail survives a custom primary (dedup only removes
-        // the primary itself, never the tail).
+        // No duplicate families in the pinned order.
+        for (i, a) in FONT_FALLBACK_CHAIN.iter().enumerate() {
+            for b in &FONT_FALLBACK_CHAIN[i + 1..] {
+                assert_ne!(a, b, "duplicate fallback family {a}");
+            }
+        }
+        // The symbols/emoji tails survive a custom primary (dedup only
+        // removes the primary itself, never a tail).
         let custom = FontConfig {
             family: "My Mono".into(),
             ..Default::default()
         };
         let chain = custom.fallback_chain();
-        assert_eq!(chain[chain.len() - 1], "Noto Sans Symbols 2");
-        assert!(chain.contains(&"DejaVu Sans Mono".to_string()));
+        assert_eq!(chain.len(), FONT_FALLBACK_CHAIN.len() + 1);
+        assert!(chain.contains(&EMOJI_FALLBACK_FAMILY.to_string()));
+        // The platform symbols/braille tail survives a custom primary.
+        #[cfg(target_os = "linux")]
+        assert!(chain.contains(&SYMBOLS_FALLBACK_FAMILY.to_string()));
+        #[cfg(target_os = "macos")]
+        assert!(chain.contains(&"Apple Braille".to_string()));
+        #[cfg(windows)]
+        assert!(chain.contains(&"Segoe UI Symbol".to_string()));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(FONT_FALLBACK_CHAIN.contains(&"DejaVu Sans Mono"));
+            assert_eq!(EMOJI_FALLBACK_FAMILY, "Noto Color Emoji");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(FONT_FALLBACK_CHAIN.contains(&"Apple Braille"));
+            assert_eq!(EMOJI_FALLBACK_FAMILY, "Apple Color Emoji");
+        }
+        #[cfg(windows)]
+        {
+            assert!(FONT_FALLBACK_CHAIN.contains(&"Segoe UI Symbol"));
+            assert_eq!(EMOJI_FALLBACK_FAMILY, "Segoe UI Emoji");
+        }
     }
 
     #[test]

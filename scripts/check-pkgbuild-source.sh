@@ -74,20 +74,36 @@ grep -Fq "./$INSTALL_SRC --version" "$ROOT_RECIPE" ||
 # Every packaged source referenced with install -Dm644 must exist in-tree
 # (terminfo is optional and guarded by `[ -f ... ]` in the recipe).
 missing=0
-while IFS= read -r rel; do
-	rel="${rel#./}"
+check_ref() {
+	local rel="${1#./}"
 	case "$rel" in
-	terminfo/bitty.terminfo) continue ;; # optional, guarded in package()
-	target/*) continue ;;                # built artifact, asserted above
-	*'$'*) continue ;;                   # variable-derived path, resolved at build time
+	target/*) return 0 ;; # built artifact, asserted above
+	*'$'*) return 0 ;;    # variable-derived path, resolved at build time
 	esac
 	if [[ ! -e "$REPO_ROOT/$rel" ]]; then
 		echo "check-pkgbuild-source: missing packaged source: $rel" >&2
 		missing=1
 	fi
+}
+
+# Expand the hicolor icon loop (`for size in ...`) across every declared size.
+ICON_TEMPLATE="$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
+	grep -oE 'install -Dm[0-9]+ "[^"]*\$\{size\}[^"]*"' |
+	sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)"
+read -r -a ICON_SIZES <<<"$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
+	grep -oE 'for size in [^;]+' | sed -E 's/^for size in //')"
+if [[ -n "$ICON_TEMPLATE" ]]; then
+	[[ "${#ICON_SIZES[@]}" -gt 0 ]] || fail "icon loop has no sizes"
+	for size in "${ICON_SIZES[@]}"; do
+		check_ref "${ICON_TEMPLATE//\$\{size\}/$size}"
+	done
+fi
+# Non-parameterized install sources.
+while IFS= read -r rel; do
+	check_ref "$rel"
 done < <(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
 	grep -oE 'install -Dm[0-9]+ "[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/' |
-	sed 's#\${size}#16#g')
+	grep -v '\${size}')
 [[ "$missing" -eq 0 ]] || fail "package() references files absent from the tree"
 
 if command -v makepkg >/dev/null 2>&1; then

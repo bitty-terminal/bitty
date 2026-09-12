@@ -862,9 +862,9 @@ mod tests {
         // restart-required diff (chrome is adopted at startup).
         use crate::types::ScrollbarMode;
         let old = EffectiveConfig::default();
-        assert_eq!(old.scrollbar.mode, ScrollbarMode::Hidden);
+        assert_eq!(old.scrollbar.mode, ScrollbarMode::Auto);
         let mut new = old.clone();
-        new.scrollbar.mode = ScrollbarMode::Auto;
+        new.scrollbar.mode = ScrollbarMode::Hidden;
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);

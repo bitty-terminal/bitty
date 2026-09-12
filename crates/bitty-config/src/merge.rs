@@ -2105,7 +2105,7 @@ mod tests {
     #[test]
     fn scrollbar_merges_scalar_replace_with_attribution() {
         // CTX-0181: user layer wins with per-field attribution; absent
-        // table keeps the lower-precedence value (hidden default).
+        // table keeps the lower-precedence value (auto default, CTX-0362).
         use crate::types::{ScrollbarConfig, ScrollbarMode};
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
@@ -2129,10 +2129,10 @@ mod tests {
             merged.source_of("scrollbar.width").unwrap().layer,
             LayerKind::User
         );
-        // Absent table rides the hidden default with core-defaults
+        // Absent table rides the auto default with core-defaults
         // attribution (like every other field).
         let merged2 = merge_layers(vec![]).expect("merge");
-        assert_eq!(merged2.effective.scrollbar.mode, ScrollbarMode::Hidden);
+        assert_eq!(merged2.effective.scrollbar.mode, ScrollbarMode::Auto);
         assert_eq!(
             merged2.source_of("scrollbar.mode").unwrap().layer,
             LayerKind::CoreDefaults

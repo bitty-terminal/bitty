@@ -34,7 +34,7 @@
 //!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
-//!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181, default hidden/8)
+//!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
 //!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
 //!     keymaps = {
@@ -72,7 +72,7 @@
 //!   edge-to-edge), and out-of-range values fail closed with the field path.
 //!   `scrollbar` follows it too: absent means "says nothing"; when present,
 //!   omitted keys default to [`ScrollbarConfig`](crate::types::ScrollbarConfig)
-//!   defaults (`hidden` mode, width `8`), unknown `mode` strings and
+//!   defaults (`auto` mode, width `8`), unknown `mode` strings and
 //!   out-of-range `width` fail closed with the field path.
 //!   `mouse` follows it as well: absent means "says nothing"; when present,
 //!   omitted `focus_follows_mouse` defaults to `false` (click-to-focus,
@@ -1254,8 +1254,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // CTX-0181: `scrollbar` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.scrollbar None so merge
     // keeps the lower-precedence value). When the table is present, omitted
-    // keys default to `ScrollbarConfig` defaults (hidden mode, width 8) so
-    // `scrollbar = { mode = "auto" }` keeps working without forcing `width`.
+    // keys default to `ScrollbarConfig` defaults (auto mode, width 8) so
+    // `scrollbar = { mode = "hidden" }` keeps working without forcing `width`.
     // `mode` is an exact lowercase string (unknown spellings fail closed
     // with the field path); `width` is range-checked here and again by
     // `ScrollbarConfig::validate` via `plan.validate()`.
@@ -2030,9 +2030,9 @@ mod tests {
     fn lua_scrollbar_parses_and_validates() {
         // CTX-0181: explicit mode/width parse; absent table means "says
         // nothing" (plan.scrollbar None so merge keeps lower);
-        // present-but-partial defaults omitted keys (hidden/8); unknown
-        // modes, wrong types, and out-of-range widths fail closed naming
-        // the field (never echoing the value).
+        // present-but-partial defaults omitted keys (auto/8, CTX-0362);
+        // unknown modes, wrong types, and out-of-range widths fail closed
+        // naming the field (never echoing the value).
         let plan = parse_lua_config(
             r#"return { scrollbar = { mode = "auto", width = 12 } }"#,
             &test_source(),
@@ -2052,7 +2052,7 @@ mod tests {
         let plan = parse_lua_config(r#"return { scrollbar = {} }"#, &test_source())
             .expect("empty scrollbar defaults");
         let bar = plan.scrollbar.expect("scrollbar present");
-        assert_eq!(bar.mode, ScrollbarMode::Hidden);
+        assert_eq!(bar.mode, ScrollbarMode::Auto);
         assert_eq!(bar.width, crate::types::DEFAULT_SCROLLBAR_WIDTH);
         let plan = parse_lua_config(
             r#"return { terminal = { scrollback = 10000 } }"#,

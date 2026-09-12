@@ -15,7 +15,8 @@
 //! present layer and never touches grid truth, scrollback, or layout. The
 //! track lives **inside** the focused leaf's decorated content frame (right
 //! edge), so enabling or hiding the scrollbar never changes grid geometry —
-//! `hidden` (the default) adds zero fills and zero layout delta.
+//! `auto` (the default since CTX-0362) adds zero fills and zero layout delta
+//! at rest and `hidden` never paints at all.
 //!
 //! # Coordinate model
 //!
@@ -35,21 +36,22 @@
 
 /// Scrollbar display mode (`scrollbar.mode`).
 ///
-/// - [`ScrollbarMode::Hidden`] (default): never painted, zero pixels, zero
-///   geometry delta. Existing users see no change.
+/// - [`ScrollbarMode::Auto`] (default since CTX-0362): painted only while
+///   engaged — the cursor hovers the track/thumb, sits within
+///   [`SCROLLBAR_PROXIMITY_PX`] of the track, or a thumb drag is active —
+///   modern-terminal auto-hide behavior, transparent at rest.
+/// - [`ScrollbarMode::Hidden`]: never painted, zero pixels, zero geometry
+///   delta. Explicit opt-out.
 /// - [`ScrollbarMode::Always`]: painted whenever there is scrollback to
 ///   scroll (`scrollback_len > 0`); hidden while history is empty.
-/// - [`ScrollbarMode::Auto`]: painted only while engaged — the cursor hovers
-///   the track/thumb, sits within [`SCROLLBAR_PROXIMITY_PX`] of the track,
-///   or a thumb drag is active — modern-terminal auto-hide behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollbarMode {
-    /// Never painted (default; geometry-neutral).
-    #[default]
+    /// Never painted (opt-out; geometry-neutral).
     Hidden,
     /// Painted whenever scrollback exists.
     Always,
-    /// Painted only while engaged (hover/proximity/drag).
+    /// Painted only while engaged (hover/proximity/drag). Default.
+    #[default]
     Auto,
 }
 
@@ -348,7 +350,7 @@ mod tests {
         assert_eq!(ScrollbarMode::Hidden.as_str(), "hidden");
         assert_eq!(ScrollbarMode::Always.as_str(), "always");
         assert_eq!(ScrollbarMode::Auto.as_str(), "auto");
-        assert_eq!(ScrollbarMode::default(), ScrollbarMode::Hidden);
+        assert_eq!(ScrollbarMode::default(), ScrollbarMode::Auto);
     }
 
     #[test]

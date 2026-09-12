@@ -752,13 +752,15 @@ pub const DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 0;
 /// rejects values above it fail-closed and `bitty-runtime` mirrors the bound.
 pub const MAX_MOUSE_FOCUS_FOLLOWS_MOUSE_DELAY_MS: u32 = 2_000;
 
-/// Default scrollbar mode (CTX-0181): `hidden`.
+/// Default scrollbar mode (CTX-0362): `auto`.
 ///
-/// Hidden-by-default keeps the grid geometry-neutral for existing users:
-/// no track, no thumb, zero fills, zero layout delta. `always` paints the
-/// overlay thumb whenever scrollback exists; `auto` reveals it on mouse
-/// proximity/hover/drag like modern terminals.
-pub const DEFAULT_SCROLLBAR_MODE: &str = "hidden";
+/// The overlay is transparent at rest and reveals on mouse proximity/hover
+/// or an active drag, so it stays geometry-neutral for existing users (no
+/// track, no thumb, zero fills, zero layout delta until engaged) while
+/// making the scrollback thumb discoverable without configuration.
+/// `always` pins it visible whenever scrollback exists; `hidden` disables
+/// it entirely.
+pub const DEFAULT_SCROLLBAR_MODE: &str = "auto";
 
 /// Default scrollbar thumb width in logical pixels (CTX-0181).
 ///
@@ -1547,17 +1549,17 @@ impl DecorationConfig {
 ///
 /// Mirrors `bitty-ui`'s mode by value (`bitty-config` owns no workspace
 /// dependencies, so the pairing is by string, pinned by a `bitty-app`
-/// cross-crate test): `hidden` (default, geometry-neutral), `always`
-/// (overlay thumb whenever scrollback exists), `auto` (revealed on mouse
-/// proximity/hover/drag).
+/// cross-crate test): `auto` (default since CTX-0362, revealed on mouse
+/// proximity/hover/drag), `hidden` (opt-out, geometry-neutral), `always`
+/// (overlay thumb whenever scrollback exists).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollbarMode {
-    /// Never painted (default; zero pixels, zero geometry delta).
-    #[default]
+    /// Never painted (opt-out; zero pixels, zero geometry delta).
     Hidden,
     /// Painted whenever scrollback exists.
     Always,
-    /// Painted only while engaged (hover/proximity/drag).
+    /// Painted only while engaged (hover/proximity/drag). Default.
+    #[default]
     Auto,
 }
 
@@ -1593,11 +1595,11 @@ impl ScrollbarMode {
 /// never grid truth, and the track lives inside the leaf allocation so grid
 /// geometry is untouched. Set via `init.lua`
 /// `scrollbar = { mode = "auto", width = 8 }` (both keys optional,
-/// defaulting to hidden/`8` when the table is present but omits them, so
-/// `scrollbar = {}` keeps the geometry-neutral default).
+/// defaulting to auto/`8` when the table is present but omits them, so
+/// `scrollbar = {}` keeps the geometry-neutral auto default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollbarConfig {
-    /// Display mode; default [`ScrollbarMode::Hidden`].
+    /// Display mode; default [`ScrollbarMode::Auto`].
     pub mode: ScrollbarMode,
     /// Thumb width in logical pixels, `1..=MAX_SCROLLBAR_WIDTH_PX`.
     pub width: u32,
@@ -1606,7 +1608,7 @@ pub struct ScrollbarConfig {
 impl Default for ScrollbarConfig {
     fn default() -> Self {
         Self {
-            mode: ScrollbarMode::Hidden,
+            mode: ScrollbarMode::Auto,
             width: DEFAULT_SCROLLBAR_WIDTH,
         }
     }
@@ -1816,7 +1818,7 @@ pub struct EffectiveConfig {
     /// Core-owned workspace decoration in logical px (CTX-0292; accepted
     /// spec CTX-0118 defaults 4/6/2/6).
     pub decoration: DecorationConfig,
-    /// Scrollbar config (CTX-0181 overlay scrollbar; default hidden).
+    /// Scrollbar config (CTX-0181 overlay scrollbar; default auto, CTX-0362).
     pub scrollbar: ScrollbarConfig,
     /// Mouse config (CTX-0260 focus-follows-mouse; default off).
     pub mouse: MouseConfig,
@@ -2247,17 +2249,19 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_defaults_hidden_and_validates_bounds() {
-        // CTX-0181: hidden-by-default keeps grid geometry-neutral; width
-        // bounds fail closed.
+    fn scrollbar_defaults_auto_and_validates_bounds() {
+        // CTX-0362: the default is the geometry-neutral `auto` overlay
+        // (transparent at rest, revealed on engagement); width bounds fail
+        // closed.
         const { assert!(DEFAULT_SCROLLBAR_WIDTH == 8) }
         const { assert!(MIN_SCROLLBAR_WIDTH_PX == 1) }
         const { assert!(MAX_SCROLLBAR_WIDTH_PX == 32) }
-        assert_eq!(DEFAULT_SCROLLBAR_MODE, "hidden");
+        assert_eq!(DEFAULT_SCROLLBAR_MODE, "auto");
         let d = ScrollbarConfig::default();
-        assert_eq!(d.mode, ScrollbarMode::Hidden);
+        assert_eq!(d.mode, ScrollbarMode::Auto);
         assert_eq!(d.width, DEFAULT_SCROLLBAR_WIDTH);
         d.validate().expect("default valid");
+        assert_eq!(ScrollbarMode::default(), ScrollbarMode::Auto);
         assert_eq!(ScrollbarMode::parse("hidden"), Some(ScrollbarMode::Hidden));
         assert_eq!(ScrollbarMode::parse("always"), Some(ScrollbarMode::Always));
         assert_eq!(ScrollbarMode::parse("auto"), Some(ScrollbarMode::Auto));

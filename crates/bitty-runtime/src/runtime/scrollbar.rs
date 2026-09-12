@@ -131,9 +131,10 @@ impl Runtime {
 
     /// Whether the scrollbar paints on the next present.
     ///
-    /// Hidden mode never paints (zero-pixel, geometry-neutral default);
-    /// `always` paints whenever scrollback exists; `auto` paints only while
-    /// engaged. Content presence is implied by a resolved thumb.
+    /// The shipped default `auto` paints only while engaged (transparent at
+    /// rest, so geometry-neutral); `hidden` never paints; `always` paints
+    /// whenever scrollback exists. Content presence is implied by a resolved
+    /// thumb.
     pub(super) fn scrollbar_should_paint(&self) -> bool {
         let Some(_) = self.scrollbar_track_thumb() else {
             return false;

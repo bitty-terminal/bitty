@@ -198,10 +198,10 @@ pub struct DecorationData {
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
 /// semantics).
 ///
-/// Overlay scrollback thumb: `mode` is `"hidden"` (default,
-/// geometry-neutral), `"always"`, or `"auto"` (revealed on mouse
-/// proximity/hover/drag); `width` is the thumb width in logical pixels.
-/// Range-checked downstream in `bitty-config` (fail-closed).
+/// Overlay scrollback thumb: `mode` is `"auto"` (default since CTX-0362,
+/// revealed on mouse proximity/hover/drag and geometry-neutral at rest),
+/// `"hidden"` (opt-out), or `"always"`; `width` is the thumb width in
+/// logical pixels. Range-checked downstream in `bitty-config` (fail-closed).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScrollbarData {
     /// Display mode string (present only when the key is set).
@@ -1582,8 +1582,8 @@ mod tests {
     #[test]
     fn scrollbar_extract_and_absent_means_no_override() {
         // CTX-0181: explicit mode/width parse; absent table/key is `None`
-        // so merge keeps the lower-precedence value (hidden/8 when no layer
-        // sets it).
+        // so merge keeps the lower-precedence value (auto/8 when no layer
+        // sets it; CTX-0362).
         let data = eval_ok(r#"return { scrollbar = { mode = "auto", width = 12 } }"#);
         let bar = data.scrollbar.unwrap();
         assert_eq!(bar.mode.as_deref(), Some("auto"));

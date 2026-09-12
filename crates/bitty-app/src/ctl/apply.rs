@@ -244,9 +244,11 @@ pub fn apply_control(
                     format!("spawn --cwd {dir:?} is not a directory"),
                 ));
             }
-            // Accepted + validated, but the spawn below does not chdir yet
-            // (spawn_shell_for_view has no cwd seam); the client already
-            // warned on stderr, and the result names the gap.
+            // Accepted + validated, but the explicit `dir` is still not
+            // applied to the spawn below: new panes inherit the focused
+            // pane's OSC 7 cwd only (CTX-0357), never an IPC-supplied
+            // path; the client already warned on stderr, and the result
+            // names the gap.
         }
         // CTX-0323 (D3): a spawn must be representable in the ctl model. The
         // old path replaced the primary shell, which `terminal list` (layout

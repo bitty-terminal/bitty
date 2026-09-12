@@ -2,6 +2,8 @@
 //!
 //! Split from `super` (`runtime.rs`) as a pure move under CTX-0232:
 //! byte-identical logic, only module wiring changed.
+use std::path::PathBuf;
+
 use super::*;
 
 /// One split pane's private shell session (CTX-0176).
@@ -89,6 +91,36 @@ impl Runtime {
         Ok(())
     }
 
+    /// Resolves the working directory a shell spawned as leaf `target` should
+    /// inherit from the previously focused (source) pane.
+    ///
+    /// Mirrors kitty `launch --cwd=current` and ghostty
+    /// `split-inherit-working-directory=true`: the new pane starts in the
+    /// directory most recently reported by the focused surface over `OSC 7`
+    /// (CTX-0357). The focused view is a source only while it is a different
+    /// view than the one being spawned — replacing a session never seeds the
+    /// fresh shell from the report of the session it replaces.
+    ///
+    /// Fail-open by construction: `None` when there is no focused source, no
+    /// report, the report is not a `file://` URL, the URL path is malformed
+    /// or relative, or the decoded path is no longer an existing directory.
+    /// The caller then keeps the PTY default (`$HOME`/`USERPROFILE`, else the
+    /// process cwd; ghostty `working-directory = home` parity).
+    fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
+        let source = self.focused_view()?;
+        if source == target {
+            return None;
+        }
+        let report = match self.pane_sessions.get(&source) {
+            Some(session) => session.state.cwd_report(),
+            // A session-less focused leaf (the primary grid owner) reports
+            // through the runtime-global state.
+            None => self.state.cwd_report(),
+        }?;
+        let path = osc7_cwd_path(report)?;
+        path.is_dir().then_some(path)
+    }
+
     /// Spawns `program` with `args` as the private shell of layout leaf
     /// `view`, sized to `cols` x `rows` cells.
     ///
@@ -137,6 +169,12 @@ impl Runtime {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut builder = PtyBuilder::new(program).size(cols, rows);
+        // CTX-0357: new panes inherit the focused pane's last `OSC 7` cwd
+        // when it still names an existing directory; otherwise the builder
+        // keeps the platform default (fail-open, never an error here).
+        if let Some(cwd) = self.inherited_cwd_for(view) {
+            builder = builder.cwd(cwd);
+        }
         for arg in args {
             builder = builder.arg(*arg);
         }
@@ -463,5 +501,96 @@ impl Runtime {
         };
         self.kitty_flags = kitty;
         self.mouse_capture_enabled = mouse;
+    }
+}
+
+/// Extracts the local path from an `OSC 7` cwd report (CTX-0357).
+///
+/// Only `file://` URLs are trusted — the sole scheme shell integration emits
+/// for a local cwd; any other scheme fails open to the platform default. The
+/// authority component is ignored (ghostty parity), the path is
+/// percent-decoded, and the result must be absolute. Returns `None` for a
+/// missing/relative path, malformed escapes, or non-UTF-8 decoded bytes.
+fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
+    let rest = report.strip_prefix("file://")?;
+    let slash = rest.find('/')?;
+    let decoded = String::from_utf8(percent_decode(&rest[slash..])?).ok()?;
+    let path = PathBuf::from(decoded);
+    path.is_absolute().then_some(path)
+}
+
+/// Decodes `%XX` escapes to bytes; `None` on a truncated escape or a
+/// non-hex digit. `+` stays literal (URI path semantics, not form data).
+fn percent_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_digit(*bytes.get(i + 1)?)?;
+            let lo = hex_digit(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Hex digit value for `%XX` decoding.
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc7_path_accepts_plain_and_authority_file_urls() {
+        assert_eq!(
+            osc7_cwd_path("file:///home/user"),
+            Some(PathBuf::from("/home/user"))
+        );
+        assert_eq!(
+            osc7_cwd_path("file://localhost/home/user"),
+            Some(PathBuf::from("/home/user"))
+        );
+        assert_eq!(
+            osc7_cwd_path("file://some-host/home/user"),
+            Some(PathBuf::from("/home/user"))
+        );
+    }
+
+    #[test]
+    fn osc7_path_percent_decodes() {
+        assert_eq!(
+            osc7_cwd_path("file:///home/user/my%20dir"),
+            Some(PathBuf::from("/home/user/my dir"))
+        );
+    }
+
+    #[test]
+    fn osc7_path_rejects_untrusted_or_malformed_forms() {
+        assert_eq!(osc7_cwd_path("kitty-shell-cwd://host/home/user"), None);
+        assert_eq!(osc7_cwd_path("https://example.com/home/user"), None);
+        assert_eq!(osc7_cwd_path("file:///home/user%2"), None);
+        assert_eq!(osc7_cwd_path("file:///home/user%zz"), None);
+        // No path component at all (authority-only URL): rejected.
+        assert_eq!(osc7_cwd_path("file://host"), None);
+        assert_eq!(osc7_cwd_path("file:///%FF%FE"), None);
+        assert_eq!(osc7_cwd_path(""), None);
+    }
+
+    #[test]
+    fn percent_decode_keeps_plus_literal() {
+        assert_eq!(percent_decode("/a+b").as_deref(), Some(&b"/a+b"[..]));
     }
 }

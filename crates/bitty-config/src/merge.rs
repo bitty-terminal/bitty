@@ -81,6 +81,9 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "decoration.border_color"
         | "decoration.border_color_focused"
         | "decoration.border_color_idle"
+        | "decoration.border_width"
+        | "decoration.border_width_focused"
+        | "decoration.border_width_idle"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
@@ -328,6 +331,9 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "decoration.border_color",
     "decoration.border_color_focused",
     "decoration.border_color_idle",
+    "decoration.border_width",
+    "decoration.border_width_focused",
+    "decoration.border_width_idle",
     "decoration",
     "scrollbar.mode",
     "scrollbar.width",
@@ -805,6 +811,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                         effective.decoration.border_color_focused = Some(color);
                     }
                     _ => effective.decoration.border_color_idle = Some(color),
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            // CTX-0344: outline widths follow the same "unset says nothing"
+            // scalar-replace rule as the colors.
+            for (field, width) in [
+                ("decoration.border_width", dec.border_width),
+                ("decoration.border_width_focused", dec.border_width_focused),
+                ("decoration.border_width_idle", dec.border_width_idle),
+            ] {
+                let Some(width) = width else {
+                    continue;
+                };
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "decoration.border_width" => effective.decoration.border_width = Some(width),
+                    "decoration.border_width_focused" => {
+                        effective.decoration.border_width_focused = Some(width);
+                    }
+                    _ => effective.decoration.border_width_idle = Some(width),
                 }
                 record_attribution(
                     &mut attribution,
@@ -1561,6 +1610,49 @@ fn merge_layers_allow_policy_violations(
                         effective.decoration.border_color_focused = Some(color);
                     }
                     _ => effective.decoration.border_color_idle = Some(color),
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            // CTX-0344: outline widths are scalar-replace; an unset width
+            // ("says nothing") never clobbers a lower layer.
+            for (field, width) in [
+                ("decoration.border_width", dec.border_width),
+                ("decoration.border_width_focused", dec.border_width_focused),
+                ("decoration.border_width_idle", dec.border_width_idle),
+            ] {
+                let Some(width) = width else {
+                    continue;
+                };
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "decoration.border_width" => effective.decoration.border_width = Some(width),
+                    "decoration.border_width_focused" => {
+                        effective.decoration.border_width_focused = Some(width);
+                    }
+                    _ => effective.decoration.border_width_idle = Some(width),
                 }
                 record_attribution(
                     &mut attribution,
@@ -2725,6 +2817,60 @@ mod tests {
         assert_eq!(empty.effective.decoration.border_color, None);
         assert_eq!(
             empty.source_of("decoration.border_color").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn decoration_widths_scalar_replace_and_unset_never_shadows() {
+        // CTX-0344: outline widths follow the same scalar-replace +
+        // "unset says nothing" rule as the colors.
+        use crate::types::DecorationConfig;
+        let profile = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Profile, Some("profile.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    border_width: Some(3),
+                    border_width_idle: Some(1),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        // User sets only the focused member; the base/idle must survive.
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    border_width_focused: Some(6),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, profile]).expect("merge");
+        assert_eq!(merged.effective.decoration.border_width, Some(3));
+        assert_eq!(merged.effective.decoration.border_width_focused, Some(6));
+        assert_eq!(merged.effective.decoration.border_width_idle, Some(1));
+        assert_eq!(
+            merged.source_of("decoration.border_width").unwrap().layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.border_width_focused")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        // No width set anywhere: the effective stays `None` (inherits
+        // `border`).
+        let empty = merge_layers(vec![]).expect("empty merge");
+        assert_eq!(empty.effective.decoration.border_width, None);
+        assert_eq!(
+            empty.source_of("decoration.border_width").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

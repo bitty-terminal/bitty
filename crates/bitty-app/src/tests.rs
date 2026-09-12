@@ -1561,11 +1561,78 @@ fn runtime_config_inherits_file_decoration() {
         r#"return { decoration = { border = 9 } }"#,
         r#"return { decoration = { radius = 17 } }"#,
         r#"return { decoration = { content_inset = 33 } }"#,
+        r#"return { decoration = { border_width = 17 } }"#,
+        r#"return { decoration = { border_width_focused = 17 } }"#,
+        r#"return { decoration = { border_width_idle = 17 } }"#,
         r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
     ] {
         let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
         parse_lua_config(bad, &src).expect_err("must fail closed");
     }
+}
+
+#[test]
+fn runtime_config_inherits_file_outline_width() {
+    // CTX-0344 (RFC-0001/OQ-045): `decoration.border_width` /
+    // `_focused` / `_idle` flow file -> effective -> runtime; the crate
+    // max stays equal; safe mode forces the `1`/`1` pair.
+    assert_eq!(
+        bitty_runtime::config::MAX_OUTLINE_WIDTH_PX,
+        bitty_config::types::MAX_DECORATION_BORDER_WIDTH_PX
+    );
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_OUTLINE_WIDTH_FOCUSED,
+        bitty_runtime::config::DEFAULT_OUTLINE_WIDTH_IDLE
+    );
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    // Base only -> both states inherit the base (4).
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(r#"return { decoration = { border_width = 4 } }"#, &src)
+        .expect("width parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(merged.effective.decoration.border_width, Some(4));
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.outline_width_focused, Some(4));
+    assert_eq!(cfg.outline_width_idle, Some(4));
+    // Explicit pair -> focused exceeds idle.
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { decoration = { border_width_focused = 6, border_width_idle = 2 } }"#,
+        &src,
+    )
+    .expect("width pair parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert!(
+        cfg.outline_width_focused > cfg.outline_width_idle,
+        "focused width must exceed idle where configured"
+    );
+    assert_eq!(
+        (cfg.outline_width_focused, cfg.outline_width_idle),
+        (Some(6), Some(2))
+    );
+    // No width config -> both inherit the runtime `decoration.border` (2).
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src)
+        .expect("no decoration parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("builds");
+    assert_eq!(
+        (cfg.outline_width_focused, cfg.outline_width_idle),
+        (Some(2), Some(2)),
+        "unset widths inherit decoration.border (2)"
+    );
+    // Safe mode forces 1/1 (equal, no width cue).
+    let safe = bitty_config::reload::fallback_builtin();
+    let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
+    assert_eq!(
+        (safe_cfg.outline_width_focused, safe_cfg.outline_width_idle),
+        (Some(1), Some(1))
+    );
 }
 
 #[test]

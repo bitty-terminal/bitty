@@ -125,6 +125,29 @@ impl Runtime {
         Ok(())
     }
 
+    /// Focused/idle outline ring width in physical pixels at the live DPI
+    /// scale (CTX-0344, RFC-0001/OQ-045).
+    ///
+    /// The resolved logical width scaled by the sanitized live factor,
+    /// rounded half away from zero — the same rule as
+    /// [`Self::window_padding_physical`]/[`Self::scrollbar_width_physical`]
+    /// so chrome agrees about the pixel grid. `0` logical stays `0` (no ring:
+    /// no 1px floor); the accepted `1` logical delta stays at least `1`
+    /// physical px at any DPI. Saturates at [`u16::MAX`] for a hostile scale.
+    #[must_use]
+    pub fn outline_width_physical(&self, logical_px: u32) -> u16 {
+        let scaled = f64::from(logical_px.min(crate::config::MAX_OUTLINE_WIDTH_PX))
+            * sanitize_dpi_scale(self.dpi_scale());
+        let rounded = scaled.round();
+        if rounded < 1.0 {
+            0
+        } else if rounded >= f64::from(u16::MAX) {
+            u16::MAX
+        } else {
+            rounded as u16
+        }
+    }
+
     /// Window padding in physical pixels at the live DPI scale (CTX-0223).
     ///
     /// The configured logical padding scaled by the sanitized live factor,

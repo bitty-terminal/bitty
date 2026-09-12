@@ -126,6 +126,20 @@ pub const DEFAULT_OUTLINE_FOCUSED: bitty_render::grid::Rgba8 = [0x33, 0xCC, 0xFF
 /// Ratified default idle outline (CTX-0340 `#595959AA`).
 pub const DEFAULT_OUTLINE_IDLE: bitty_render::grid::Rgba8 = [0x59, 0x59, 0x59, 0xAA];
 
+/// Default focused outline ring width in logical px (CTX-0344): `None`
+/// inherits the accepted `decoration.border` default.
+pub const DEFAULT_OUTLINE_WIDTH_FOCUSED: Option<u32> = None;
+
+/// Default idle outline ring width in logical px (CTX-0344): `None` inherits
+/// the accepted `decoration.border` default.
+pub const DEFAULT_OUTLINE_WIDTH_IDLE: Option<u32> = None;
+
+/// Maximum focused/idle outline ring width in logical px (CTX-0344,
+/// RFC-0001/OQ-045): `0..=16`. Mirrors
+/// `bitty-config` `MAX_DECORATION_BORDER_WIDTH_PX`; the runtime repeats the
+/// bound fail-closed so a direct construction cannot arm an oversized ring.
+pub const MAX_OUTLINE_WIDTH_PX: u32 = 16;
+
 /// Maps a Core decoration validation failure to the runtime config error
 /// (CTX-0292), naming the offending property without echoing user content.
 pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> RuntimeError {
@@ -286,6 +300,16 @@ pub struct RuntimeConfig {
     pub outline_focused: bitty_render::grid::Rgba8,
     /// Idle outline color; see [`Self::outline_focused`].
     pub outline_idle: bitty_render::grid::Rgba8,
+    /// Focused outline ring width in logical px (CTX-0344). Resolved by
+    /// `bitty-config` from `decoration.border` / `decoration.border_width` /
+    /// the explicit pair and carried here for the per-`View` paint decision.
+    /// `None` inherits the frame's geometry border (`decoration.border`).
+    /// Scaled by the live DPI factor at render time exactly like
+    /// `decoration.border`; the ring is painted inside the frame so the
+    /// content grid never moves. `Some(0)` paints no focused ring.
+    pub outline_width_focused: Option<u32>,
+    /// Idle outline ring width in logical px; see [`Self::outline_width_focused`].
+    pub outline_width_idle: Option<u32>,
     /// Window padding in logical pixels on every side (CTX-0223
     /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
     /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
@@ -358,6 +382,8 @@ impl Default for RuntimeConfig {
             decoration: bitty_ui::Decoration::default(),
             outline_focused: DEFAULT_OUTLINE_FOCUSED,
             outline_idle: DEFAULT_OUTLINE_IDLE,
+            outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
+            outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
@@ -431,6 +457,8 @@ impl RuntimeConfig {
             decoration: bitty_ui::Decoration::default(),
             outline_focused: DEFAULT_OUTLINE_FOCUSED,
             outline_idle: DEFAULT_OUTLINE_IDLE,
+            outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
+            outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             window_padding,
             window_radius_px,
             scrollbar_mode,
@@ -501,6 +529,16 @@ impl RuntimeConfig {
         }
         if let Err(err) = self.decoration.validate() {
             return Err(decoration_runtime_error(err));
+        }
+        // CTX-0344 (RFC-0001/OQ-045): the outline-width pair is fail-closed
+        // `0..=16` logical px, never clamped. `None` inherits the geometry
+        // border.
+        for value in [self.outline_width_focused, self.outline_width_idle] {
+            if value.is_some_and(|w| w > MAX_OUTLINE_WIDTH_PX) {
+                return Err(RuntimeError::InvalidConfig(
+                    "outline width must be within [0, 16] logical pixels",
+                ));
+            }
         }
         if self.window_padding > MAX_WINDOW_PADDING {
             return Err(RuntimeError::InvalidConfig(

@@ -18,8 +18,8 @@
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    AnimationKind, AnimationPolicy, LayoutNode, ReducedMotionMode, Runtime, RuntimeConfig,
-    SplitAxis, View, ViewId,
+    AnimationCurve, AnimationKind, AnimationPolicy, LayoutNode, ReducedMotionMode, Runtime,
+    RuntimeConfig, SplitAxis, View, ViewId,
 };
 
 fn runtime_with(policy: AnimationPolicy) -> Runtime {
@@ -156,6 +156,152 @@ fn zero_duration_reduced_and_safe_are_instant() {
     assert!(rt.tick_at(start).is_some());
     assert!(!rt.animations_active());
     assert!(rt.tick_at(start).is_none());
+}
+
+#[test]
+fn configured_open_duration_is_honored_not_the_default() {
+    // CTX-0356 regression: a positive custom duration must drive the tracker.
+    // On the buggy runtime the animator kept `AnimationPolicy::default()`
+    // (open = 150 ms), so a 500 ms configured open expired 350 ms early.
+    let policy = AnimationPolicy {
+        duration_ms: [500, 120, 100, 200],
+        ..AnimationPolicy::default()
+    };
+    let mut rt = runtime_with(policy);
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none(), "idle baseline");
+
+    rt.set_layout(two_pane_split());
+    rt.tick_at(start).expect("open presents");
+
+    // Still active well past the 150 ms default.
+    let past_default = start + Duration::from_millis(200);
+    assert!(
+        rt.animations_active(),
+        "configured 500 ms open must outlive the 150 ms default"
+    );
+    assert!(
+        rt.animation_progress(AnimationKind::Open, Some(ViewId::new(2)), past_default)
+            .is_some(),
+        "configured open must still report progress at 200 ms"
+    );
+
+    // Still active one frame before the configured end.
+    let near_end = start + Duration::from_millis(499);
+    assert!(
+        rt.animation_progress(AnimationKind::Open, Some(ViewId::new(2)), near_end)
+            .is_some(),
+        "configured open must still progress at 499 ms"
+    );
+
+    // Completed at the configured 500 ms.
+    let end = start + Duration::from_millis(500);
+    rt.tick_at(end);
+    assert!(
+        !rt.animations_active(),
+        "configured 500 ms open must complete by 500 ms"
+    );
+    assert!(rt.tick_at(end).is_none(), "idle after configured open");
+}
+
+#[test]
+fn configured_easing_drives_the_reported_progress() {
+    // CTX-0356 regression: a non-default easing must change the eased value.
+    // Linear at half the configured duration is exactly 0.5; the default
+    // EaseOut curve would report 0.75 for the same time.
+    let policy = AnimationPolicy {
+        duration_ms: [500, 120, 100, 200],
+        curves: [
+            AnimationCurve::Linear,
+            AnimationCurve::EaseIn,
+            AnimationCurve::EaseInOut,
+            AnimationCurve::EaseInOut,
+        ],
+        ..AnimationPolicy::default()
+    };
+    let mut rt = runtime_with(policy);
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    rt.set_layout(two_pane_split());
+    rt.tick_at(start).expect("open presents");
+
+    let half = start + Duration::from_millis(250);
+    let progress = rt
+        .animation_progress(AnimationKind::Open, Some(ViewId::new(2)), half)
+        .expect("mid progress");
+    assert!(
+        (progress - 0.5).abs() < 1e-4,
+        "configured Linear easing at half duration must be 0.5, got {progress}"
+    );
+}
+
+#[test]
+fn configured_durations_still_suppress_to_instant() {
+    // CTX-0356: the 0 ms suppression paths must keep winning over positive
+    // configured durations.
+    let positive = [500, 500, 500, 500];
+    for policy in [
+        AnimationPolicy {
+            duration_ms: positive,
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: positive,
+            reduced_motion: ReducedMotionMode::Always,
+            ..AnimationPolicy::default()
+        },
+        AnimationPolicy {
+            duration_ms: positive,
+            safe_mode: true,
+            ..AnimationPolicy::default()
+        },
+    ] {
+        let mut rt = runtime_with(policy);
+        let start = Instant::now();
+        let _ = rt.tick_at(start).expect("first frame");
+        rt.set_layout(two_pane_split());
+        assert!(rt.tick_at(start).is_some(), "split presents once");
+        assert!(
+            !rt.animations_active(),
+            "suppression must override configured durations: {policy:?}"
+        );
+        assert!(
+            rt.tick_at(start).is_none(),
+            "suppressed split idles immediately"
+        );
+        assert_eq!(rt.animation_deadline(), None);
+    }
+}
+
+#[test]
+fn set_animations_reloads_the_live_policy() {
+    // CTX-0356 acceptance: live reload adopts a new policy through
+    // `set_animations`, not only at construction.
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    let _ = rt.tick_at(start).expect("baseline presents");
+    assert!(rt.tick_at(start).is_none());
+
+    rt.set_animations(AnimationPolicy {
+        duration_ms: [500, 120, 100, 200],
+        ..AnimationPolicy::default()
+    });
+    rt.set_layout(two_pane_split());
+    rt.tick_at(start).expect("open presents");
+    let past_default = start + Duration::from_millis(200);
+    assert!(
+        rt.animation_progress(AnimationKind::Open, Some(ViewId::new(2)), past_default)
+            .is_some(),
+        "reloaded 500 ms open must outlive the 150 ms default"
+    );
+    let end = start + Duration::from_millis(500);
+    rt.tick_at(end);
+    assert!(
+        !rt.animations_active(),
+        "reloaded 500 ms open must complete by 500 ms"
+    );
 }
 
 #[test]

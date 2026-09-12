@@ -317,6 +317,21 @@ fn focus_mru_survives_detach_and_destroy() {
 }
 
 #[test]
+fn create_view_focuses_the_new_view() {
+    // CTX-0364: creating a window/view focuses it immediately
+    // (kitty/ghostty parity), including when another view already holds
+    // focus — never only on the empty-workspace first create.
+    let mut reg = default_registry();
+    let wid = reg.create_workspace().unwrap();
+    let vh1 = reg.create_view(wid).unwrap();
+    assert_eq!(reg.focused_view(wid), Some(vh1.id));
+    let vh2 = reg.create_view(wid).unwrap();
+    assert_eq!(reg.focused_view(wid), Some(vh2.id));
+    let vh3 = reg.create_view(wid).unwrap();
+    assert_eq!(reg.focused_view(wid), Some(vh3.id));
+}
+
+#[test]
 fn visibility_states_do_not_mutate_terminal() {
     let mut reg = default_registry();
     let wid = reg.create_workspace().unwrap();

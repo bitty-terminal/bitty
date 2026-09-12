@@ -336,7 +336,8 @@ pub fn list_help_text(invoked_as: &str) -> String {
          Usage: bitty {invoked_as} <themes|plugins|instances> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
-           themes     Built-in theme presets from bitty-config::theme (e.g. bitty-dark, alias dark).\n  \
+           themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
+                      tokyo-night, github-dark, catppuccin-mocha; aliases like dark).\n  \
                       Local class: no instance, no file I/O, safe-mode clean.\n  \
            plugins    Static bundled plugin catalog (bitty-terminal.*), staged disabled by default.\n  \
                       Local class: manifest metadata only, no plugin VM loaded, safe-mode clean.\n  \
@@ -387,10 +388,14 @@ pub fn list_help_text(invoked_as: &str) -> String {
 pub struct ThemeInfo {
     /// Registry name (e.g. `bitty-dark`).
     pub name: String,
+    /// Dark/light classification (`dark` or `light`).
+    pub category: String,
     /// Accepted aliases (e.g. `dark`).
     pub aliases: Vec<String>,
-    /// Source label (always `built-in` today).
+    /// Upstream project URL that owns the palette.
     pub source: String,
+    /// Upstream license identifier.
+    pub license: String,
     /// Background as `#rrggbb`.
     pub background: String,
     /// Foreground as `#rrggbb`.
@@ -407,23 +412,27 @@ pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
 }
 
-/// Enumerate built-in theme presets (today exactly one: Bitty Dark).
+/// Enumerate every built-in theme preset, default first.
 ///
-/// Pure, no I/O: the single source of truth stays
-/// `bitty-config::theme::BITTY_DARK`. Future presets extend this vector;
-/// callers must handle empty (defensive) as an empty table, not an error.
+/// Pure, no I/O: the single source of truth is
+/// `bitty-config::theme::ALL_PRESETS`. Callers must handle empty
+/// (defensive) as an empty table, not an error.
 #[must_use]
 pub fn list_themes() -> Vec<ThemeInfo> {
-    let theme = &bitty_config::theme::BITTY_DARK;
-    vec![ThemeInfo {
-        name: theme.name.to_string(),
-        aliases: vec![bitty_config::theme::DARK_THEME_ALIAS.to_string()],
-        source: "built-in".to_string(),
-        background: rgb_to_hex(theme.background),
-        foreground: rgb_to_hex(theme.foreground),
-        cursor: rgb_to_hex(theme.cursor),
-        selection: rgb_to_hex(theme.selection),
-    }]
+    bitty_config::theme::list_presets()
+        .iter()
+        .map(|theme| ThemeInfo {
+            name: theme.name.to_string(),
+            category: theme.category.as_str().to_string(),
+            aliases: theme.aliases.iter().map(|a| (*a).to_string()).collect(),
+            source: theme.source.to_string(),
+            license: theme.license.to_string(),
+            background: rgb_to_hex(theme.background),
+            foreground: rgb_to_hex(theme.foreground),
+            cursor: rgb_to_hex(theme.cursor),
+            selection: rgb_to_hex(theme.selection),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,8 +1200,10 @@ pub fn format_success_envelope(
                 }
                 let _ = write!(
                     out,
-                    "],\"source\":\"{}\",\"background\":\"{}\",\"foreground\":\"{}\",\"cursor\":\"{}\",\"selection\":\"{}\"}}",
+                    "],\"category\":\"{}\",\"source\":\"{}\",\"license\":\"{}\",\"background\":\"{}\",\"foreground\":\"{}\",\"cursor\":\"{}\",\"selection\":\"{}\"}}",
+                    json_escape(&t.category),
                     json_escape(&t.source),
+                    json_escape(&t.license),
                     json_escape(&t.background),
                     json_escape(&t.foreground),
                     json_escape(&t.cursor),
@@ -1298,7 +1309,7 @@ pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{}\n",
-        bold("NAME ALIASES SOURCE BACKGROUND FOREGROUND", color)
+        bold("NAME CATEGORY ALIASES SOURCE BACKGROUND FOREGROUND", color)
     ));
     if themes.is_empty() {
         out.push_str("(no themes)\n");
@@ -1306,9 +1317,14 @@ pub fn format_themes_table(themes: &[ThemeInfo], no_color: bool) -> String {
     }
     for t in themes {
         out.push_str(&format!(
-            "{} {} {} {} {}\n",
+            "{} {} {} {} {} {}\n",
             t.name,
-            t.aliases.join(","),
+            t.category,
+            if t.aliases.is_empty() {
+                "-".to_string()
+            } else {
+                t.aliases.join(",")
+            },
             t.source,
             t.background,
             t.foreground
@@ -1529,14 +1545,28 @@ mod tests {
     }
 
     #[test]
-    fn themes_lists_builtin_dark() {
+    fn themes_lists_full_catalog_default_first() {
         let themes = list_themes();
-        assert_eq!(themes.len(), 1);
+        assert_eq!(themes.len(), 30, "curated catalog size");
         assert_eq!(themes[0].name, "bitty-dark");
+        assert_eq!(themes[0].category, "dark");
         assert!(themes[0].aliases.contains(&"dark".to_string()));
-        assert_eq!(themes[0].source, "built-in");
+        assert_eq!(themes[0].source, "https://github.com/bitty-terminal/bitty");
         assert_eq!(themes[0].background, "#1e1e2e");
         assert_eq!(themes[0].foreground, "#cdd6f4");
+        // Both categories are represented.
+        assert!(themes.iter().any(|t| t.category == "dark"));
+        assert!(themes.iter().any(|t| t.category == "light"));
+        // Aliases and names are unique across the whole table.
+        let mut keys = std::collections::HashSet::new();
+        for t in &themes {
+            assert!(keys.insert(t.name.clone()), "duplicate name {}", t.name);
+            for a in &t.aliases {
+                assert!(keys.insert(a.clone()), "duplicate alias {a}");
+            }
+            assert!(t.source.starts_with("https://"));
+            assert!(!t.license.is_empty());
+        }
     }
 
     #[test]

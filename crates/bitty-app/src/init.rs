@@ -178,14 +178,18 @@ pub(crate) fn init_parse_shell_answer(
     init_clean_shell(trimmed).map(Some)
 }
 
-/// Parses one theme-step answer. Only the shipped preset exists today
-/// (`dark`, canonical config value; `bitty-dark` accepted as the registry
-/// name), so empty/`1`/either name resolves to `"dark"` and anything else
-/// reprompts instead of writing a value the resolver would only fall back.
+/// Parses one theme-step answer. Empty/`1` take the default (`dark`, the
+/// canonical convenience alias). Any built-in preset name or alias resolves
+/// to its canonical registry name; anything else reprompts instead of
+/// writing a value the resolver would only fall back.
 pub(crate) fn init_parse_theme_answer(raw: &str) -> Result<String, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
         "" | "1" | "dark" | "bitty-dark" => Ok(bitty_config::theme::DARK_THEME_ALIAS.to_string()),
-        _ => Err("unknown theme (only 'dark' is shipped today)".to_string()),
+        _ => match bitty_config::theme::resolve_theme_with_status(Some(&trimmed)) {
+            (theme, bitty_config::theme::ThemeResolution::Named) => Ok(theme.name.to_string()),
+            _ => Err("unknown theme; run 'bitty list themes' to see the catalog".to_string()),
+        },
     }
 }
 

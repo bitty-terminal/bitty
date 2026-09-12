@@ -2431,13 +2431,21 @@ fn init_step_parsers_accept_and_reject() {
     assert!(init_parse_shell_answer("9", &cands).is_err());
     assert!(init_parse_shell_answer("a\x07b", &cands).is_err());
 
-    // Theme: only the shipped preset resolves; typos reprompt.
+    // Theme: the default plus any catalog name/alias resolves; typos reprompt.
     assert_eq!(init_parse_theme_answer("").expect("default"), "dark");
     assert_eq!(
         init_parse_theme_answer("Bitty-Dark").expect("registry name"),
         "dark"
     );
-    assert!(init_parse_theme_answer("solarized").is_err());
+    assert_eq!(
+        init_parse_theme_answer("Tokyo-Night").expect("catalog name"),
+        "tokyo-night"
+    );
+    assert_eq!(
+        init_parse_theme_answer("catppuccin").expect("catalog alias"),
+        "catppuccin-mocha"
+    );
+    assert!(init_parse_theme_answer("not-a-theme").is_err());
 
     // Font size: default, valid, and the FontConfig bound.
     assert_eq!(

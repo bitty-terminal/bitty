@@ -107,8 +107,9 @@ pub use reload::{
     ReloadClass, ReloadReport, classify_field, diff, fallback_builtin, reconcile_live,
 };
 pub use theme::{
-    BITTY_DARK, DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeResolution, default_theme,
-    normalize_theme_name, resolve_theme, resolve_theme_with_status,
+    ALL_PRESETS, BITTY_DARK, DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeCategory,
+    ThemeResolution, default_theme, list_presets, normalize_theme_name, resolve_theme,
+    resolve_theme_with_status,
 };
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{

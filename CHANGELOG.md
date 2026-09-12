@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Panel animations (CTX-0341, RFC-0002):** `appearance.animations` adds
+  renderer-side, compositor-gated transitions for panel open and close, focus
+  change, and workspace switch. Accepted defaults: open `150` ms /
+  `ease_out`, close `120` ms / `ease_in`, focus `100` ms / `ease_in_out`,
+  workspace `200` ms / `ease_in_out`; every duration is an integer in
+  `0..=500` ms and the easing enum is closed
+  (`linear | ease_in | ease_out | ease_in_out | spring`). `spring` is a
+  reserved leaf whose parameters are deferred, so it resolves to
+  `ease_in_out`. `enabled = true` and `reduced_motion = "auto"` are the
+  defaults; `reduced_motion = "always"`, `enabled = false`, and `bitty --safe`
+  are all equivalent to `0` ms instant final-state application. Out-of-range
+  durations and unknown easings reject the reload with a source-attributed
+  diagnostic (never clamped); `appearance.animations` reconciles live.
+  Animations interpolate Core-owned chrome only (outline color/alpha) and are
+  frame-on-demand: a completed transition schedules no periodic wakeups
+  (PB-7), and the terminal grid, cursor, and scrollback are never
+  interpolated.
 - **Configurable focused/idle outline colors (CTX-0340):**
   `decoration.border_color` (base, unset), `decoration.border_color_focused`
   (default `#33CCFF`), and `decoration.border_color_idle` (default

@@ -112,9 +112,10 @@ pub use theme::{
 };
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{
+    AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
     AppearanceConfig, DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MouseConfig, OutlineColor, PluginSpec, ResolvedOutlineColors, ScrollbarConfig, ScrollbarMode,
-    SelectionConfig, TerminalConfig, WindowConfig,
+    MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors, ScrollbarConfig,
+    ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 
@@ -162,6 +163,7 @@ mod integration_tests {
                 }),
                 appearance: Some(AppearanceConfig {
                     theme: Some("dark".into()),
+                    animations: None,
                 }),
                 schema_version: Some(CURRENT_SCHEMA_VERSION),
                 ..Default::default()

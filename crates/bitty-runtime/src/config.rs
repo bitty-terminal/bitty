@@ -14,6 +14,11 @@
 //! grid memory itself — documented honestly in [`crate::Runtime`].
 
 use crate::error::RuntimeError;
+use crate::runtime::AnimationPolicy;
+
+/// Maximum animation duration in milliseconds (RFC-0002 hard bound;
+/// mirrors `bitty-config` `MAX_ANIMATION_DURATION_MS`).
+pub const MAX_ANIMATION_DURATION_MS: u32 = 500;
 
 /// Default lines scrolled per wheel notch (CTX-0185).
 /// Mirrors `bitty-config` `DEFAULT_SCROLL_LINES_PER_NOTCH` (kept as a local
@@ -306,6 +311,13 @@ pub struct RuntimeConfig {
     /// factor exactly like `window_padding`; the track lives inside the
     /// leaf allocation so the grid never absorbs it.
     pub scrollbar_width: u32,
+    /// Resolved renderer-side panel animation policy (RFC-0002, CTX-0341).
+    ///
+    /// Carries the accepted durations/easings, the `reduced_motion` mode, and
+    /// the `safe_mode` latch. The in-flight [`crate::runtime::PanelAnimator`]
+    /// tracker lives on [`crate::Runtime`] because it holds wall-clock state;
+    /// this is the immutable contract it is armed from.
+    pub animations: AnimationPolicy,
 }
 
 /// Default cell width in logical pixels (CTX-0157 breathing-room cell).
@@ -350,6 +362,7 @@ impl Default for RuntimeConfig {
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
             scrollbar_width: DEFAULT_SCROLLBAR_WIDTH,
+            animations: AnimationPolicy::default(),
         }
     }
 }
@@ -422,6 +435,7 @@ impl RuntimeConfig {
             window_radius_px,
             scrollbar_mode,
             scrollbar_width,
+            animations: AnimationPolicy::default(),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -502,6 +516,18 @@ impl RuntimeConfig {
             return Err(RuntimeError::InvalidConfig(
                 "scrollbar_width must be within [1, 32] logical pixels",
             ));
+        }
+        // RFC-0002 (CTX-0341): every resolved animation duration is
+        // fail-closed within the accepted `0..=500` ms hard bound. The
+        // config layer already enforces this; the runtime repeats it so a
+        // direct `RuntimeConfig` construction can never arm an unbounded
+        // animation.
+        for ms in self.animations.duration_ms {
+            if ms > MAX_ANIMATION_DURATION_MS {
+                return Err(RuntimeError::InvalidConfig(
+                    "animation durations must be within [0, 500] milliseconds",
+                ));
+            }
         }
         Ok(())
     }
@@ -586,6 +612,24 @@ mod tests {
         RuntimeConfig::default()
             .validate()
             .expect("default must be valid");
+    }
+
+    #[test]
+    fn animation_durations_are_bounded_fail_closed() {
+        // RFC-0002 (CTX-0341): every resolved duration is `0..=500`; the
+        // runtime repeats the bound so a direct construction cannot arm an
+        // unbounded animation.
+        let mut cfg = RuntimeConfig::default();
+        cfg.animations.duration_ms = [0, 0, 0, 0];
+        cfg.validate().expect("0 ms boundary valid");
+        cfg.animations.duration_ms = [500, 500, 500, 500];
+        cfg.validate().expect("500 ms boundary valid");
+        for idx in 0..4 {
+            let mut bad = RuntimeConfig::default();
+            bad.animations.duration_ms[idx] = MAX_ANIMATION_DURATION_MS + 1;
+            bad.validate()
+                .expect_err("out-of-range animation duration must fail closed");
+        }
     }
 
     #[test]

@@ -41,9 +41,21 @@
 
 use bitty_ipc::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
 use bitty_runtime::{
-    LayoutNode, PresentStats, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
-    tabs::TabsIntegration, workspace::WorkspaceIntegration,
+    AnimationPolicy, LayoutNode, PresentStats, Runtime, RuntimeConfig, SplitAxis, UiRect, View,
+    ViewId, tabs::TabsIntegration, workspace::WorkspaceIntegration,
 };
+
+/// RFC-0002 (CTX-0341): animations default ON and a layout change arms a
+/// bounded open transition that presents extra frames. These tests pin frame
+/// digest equality and the frame-on-demand idle contract, not the animation
+/// feature, so every runtime here disables animations and reproduces the
+/// pre-RFC instant idle exactly.
+fn instant() -> AnimationPolicy {
+    AnimationPolicy {
+        enabled: false,
+        ..AnimationPolicy::default()
+    }
+}
 
 /// Serial guard for the process-global automation + introspection stores
 /// (CTX-0179 pattern). EVERY test in this file takes it for its whole body:
@@ -132,6 +144,7 @@ fn v1_gap_digest_differs_from_no_gap_and_matches_rerun() {
     let mut gapped = Runtime::new(RuntimeConfig {
         gaps_in: 2,
         gaps_out: 1,
+        animations: instant(),
         ..RuntimeConfig::default()
     })
     .expect("gapped config must build");
@@ -161,7 +174,11 @@ fn v1_gap_digest_differs_from_no_gap_and_matches_rerun() {
     );
 
     // No-gap baseline: identical layout + content, ZERO gaps.
-    let mut plain = Runtime::new(RuntimeConfig::default()).expect("plain config must build");
+    let mut plain = Runtime::new(RuntimeConfig {
+        animations: instant(),
+        ..RuntimeConfig::default()
+    })
+    .expect("plain config must build");
     plain.set_layout(two_pane_split());
     plain.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut plain, 3, b'M');
@@ -192,6 +209,7 @@ fn v1_gap_digest_differs_from_no_gap_and_matches_rerun() {
     let mut rerun = Runtime::new(RuntimeConfig {
         gaps_in: 2,
         gaps_out: 1,
+        animations: instant(),
         ..RuntimeConfig::default()
     })
     .expect("rerun config must build");
@@ -220,7 +238,11 @@ fn v2_focus_switch_changes_digest_and_switchback_restores() {
     // (frames 1, 2, 3), so an interleaved tick would overwrite the socket
     // test's published frame mid-window.
     let _guard = hold_live_lock();
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = Runtime::new(RuntimeConfig {
+        animations: instant(),
+        ..RuntimeConfig::default()
+    })
+    .expect("build");
     rt.set_layout(two_pane_split());
     rt.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut rt, 3, b'M');
@@ -281,13 +303,21 @@ fn v3_workspace_alias_and_tabs_shim_digests_equal() {
         "alias and shim must allocate identically"
     );
 
-    let mut rt_new = Runtime::with_defaults().expect("new-path runtime must build");
+    let mut rt_new = Runtime::new(RuntimeConfig {
+        animations: instant(),
+        ..RuntimeConfig::default()
+    })
+    .expect("new-path runtime must build");
     rt_new.set_layout(via_workspace);
     rt_new.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut rt_new, 3, b'M');
     let (w, h, seq_new, rgba_new) = present_frame(&mut rt_new, "workspace path");
 
-    let mut rt_old = Runtime::with_defaults().expect("old-path runtime must build");
+    let mut rt_old = Runtime::new(RuntimeConfig {
+        animations: instant(),
+        ..RuntimeConfig::default()
+    })
+    .expect("old-path runtime must build");
     rt_old.set_layout(via_tabs);
     rt_old.set_container(UiRect::new(0, 0, 80, 24));
     write_marker(&mut rt_old, 3, b'M');
@@ -340,6 +370,7 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
     let mut rt = Runtime::new(RuntimeConfig {
         gaps_in: 2,
         gaps_out: 1,
+        animations: instant(),
         ..RuntimeConfig::default()
     })
     .expect("gapped config must build");

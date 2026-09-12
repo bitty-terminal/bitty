@@ -725,6 +725,33 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "decoration.border" => defaults.decoration.border.to_string(),
         "decoration.radius" => defaults.decoration.radius.to_string(),
         "decoration.content_inset" => defaults.decoration.content_inset.to_string(),
+        // CTX-0341 (RFC-0002): resolved panel animation contract defaults.
+        "appearance.animations.enabled" => defaults.animations.enabled.to_string(),
+        "appearance.animations.reduced_motion" => {
+            defaults.animations.reduced_motion.as_str().to_string()
+        }
+        "appearance.animations.duration_ms.open" => {
+            defaults.animations.duration_ms.open.to_string()
+        }
+        "appearance.animations.duration_ms.close" => {
+            defaults.animations.duration_ms.close.to_string()
+        }
+        "appearance.animations.duration_ms.focus" => {
+            defaults.animations.duration_ms.focus.to_string()
+        }
+        "appearance.animations.duration_ms.workspace" => {
+            defaults.animations.duration_ms.workspace.to_string()
+        }
+        "appearance.animations.easing.open" => defaults.animations.easing.open.as_str().to_string(),
+        "appearance.animations.easing.close" => {
+            defaults.animations.easing.close.as_str().to_string()
+        }
+        "appearance.animations.easing.focus" => {
+            defaults.animations.easing.focus.as_str().to_string()
+        }
+        "appearance.animations.easing.workspace" => {
+            defaults.animations.easing.workspace.as_str().to_string()
+        }
         "scrollbar.mode" => defaults.scrollbar.mode.as_str().to_string(),
         "scrollbar.width" => defaults.scrollbar.width.to_string(),
         // CTX-0260: hover-focus opt-in (default off = click-to-focus).
@@ -1198,7 +1225,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, mod_key)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key)",
                     request.value,
                 );
                 if emit_json {

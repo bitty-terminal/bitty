@@ -102,6 +102,17 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.border_color_idle"
         | "decoration"
         | "appearance.theme"
+        | "appearance.animations.enabled"
+        | "appearance.animations.reduced_motion"
+        | "appearance.animations.duration_ms.open"
+        | "appearance.animations.duration_ms.close"
+        | "appearance.animations.duration_ms.focus"
+        | "appearance.animations.duration_ms.workspace"
+        | "appearance.animations.easing.open"
+        | "appearance.animations.easing.close"
+        | "appearance.animations.easing.focus"
+        | "appearance.animations.easing.workspace"
+        | "appearance.animations"
         | "appearance"
         | "mod_key"
         | "keymaps" => ReloadClass::Live,
@@ -349,6 +360,71 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         format!("{:?}", old.appearance.theme),
         format!("{:?}", new.appearance.theme),
     );
+    // RFC-0002: presentation-only animation chrome is adopted live by the
+    // runtime (`set_animations`), so each leaf reconciles live like the
+    // outline pair.
+    push_if_changed(
+        "appearance.animations.enabled",
+        old.animations.enabled.to_string(),
+        new.animations.enabled.to_string(),
+    );
+    push_if_changed(
+        "appearance.animations.reduced_motion",
+        old.animations.reduced_motion.as_str().to_string(),
+        new.animations.reduced_motion.as_str().to_string(),
+    );
+    for (field, before, after) in [
+        (
+            "appearance.animations.duration_ms.open",
+            old.animations.duration_ms.open,
+            new.animations.duration_ms.open,
+        ),
+        (
+            "appearance.animations.duration_ms.close",
+            old.animations.duration_ms.close,
+            new.animations.duration_ms.close,
+        ),
+        (
+            "appearance.animations.duration_ms.focus",
+            old.animations.duration_ms.focus,
+            new.animations.duration_ms.focus,
+        ),
+        (
+            "appearance.animations.duration_ms.workspace",
+            old.animations.duration_ms.workspace,
+            new.animations.duration_ms.workspace,
+        ),
+    ] {
+        push_if_changed(field, before.to_string(), after.to_string());
+    }
+    for (field, before, after) in [
+        (
+            "appearance.animations.easing.open",
+            old.animations.easing.open,
+            new.animations.easing.open,
+        ),
+        (
+            "appearance.animations.easing.close",
+            old.animations.easing.close,
+            new.animations.easing.close,
+        ),
+        (
+            "appearance.animations.easing.focus",
+            old.animations.easing.focus,
+            new.animations.easing.focus,
+        ),
+        (
+            "appearance.animations.easing.workspace",
+            old.animations.easing.workspace,
+            new.animations.easing.workspace,
+        ),
+    ] {
+        push_if_changed(
+            field,
+            before.as_str().to_string(),
+            after.as_str().to_string(),
+        );
+    }
     // CTX-0236: the mod rebinds the resolved chrome map, exactly like an
     // explicit keymap edit, so it reconciles live with the keymaps.
     push_if_changed(
@@ -839,5 +915,38 @@ mod tests {
         let mut cur = old;
         assert!(reconcile_live(&mut cur, &new).is_err());
         assert_eq!(cur.terminal.shell, None, "previous value stays active");
+    }
+
+    #[test]
+    fn diff_animations_is_live_and_reconciles() {
+        // RFC-0002: animation chrome is presentation-only and adopted live.
+        use crate::types::{AnimationEasing, ReducedMotion};
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.animations.enabled = false;
+        new.animations.reduced_motion = ReducedMotion::Always;
+        new.animations.duration_ms.open = 300;
+        new.animations.easing.focus = AnimationEasing::Linear;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(!r.has_rejected);
+        for field in [
+            "appearance.animations.enabled",
+            "appearance.animations.reduced_motion",
+            "appearance.animations.duration_ms.open",
+            "appearance.animations.easing.focus",
+        ] {
+            assert!(r.diffs.iter().any(|d| d.field == field), "missing {field}");
+        }
+        assert_eq!(
+            classify_field("appearance.animations.easing.workspace"),
+            ReloadClass::Live
+        );
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("animations must reconcile live");
+        assert!(!cur.animations.enabled);
+        assert_eq!(cur.animations.duration_ms.open, 300);
+        assert_eq!(cur.animations.easing.focus, AnimationEasing::Linear);
     }
 }

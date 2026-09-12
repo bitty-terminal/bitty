@@ -220,6 +220,38 @@ pub struct MouseData {
     pub focus_follows_mouse_delay_ms: Option<i64>,
 }
 
+/// Panel-animation overrides, plain data (RFC-0002, CTX-0341; see [`FontData`]
+/// for `Option` semantics).
+///
+/// Every leaf is optional: absent means "this layer says nothing" so merge
+/// inherits the lower-precedence value. `enabled` and `reduced_motion` are
+/// concrete scalars in the accepted Lua schema; `duration_ms.*` are integers
+/// and `easing.*` are strings here, with range/grammar validation fail-closed
+/// in `bitty-config`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AnimationsData {
+    /// Master switch when the key is set.
+    pub enabled: Option<bool>,
+    /// Reduced-motion mode string when the key is set.
+    pub reduced_motion: Option<String>,
+    /// `duration_ms` table (present only when the table is set).
+    pub duration_open: Option<i64>,
+    /// Panel-close duration.
+    pub duration_close: Option<i64>,
+    /// Focus-change duration.
+    pub duration_focus: Option<i64>,
+    /// Workspace-switch duration.
+    pub duration_workspace: Option<i64>,
+    /// `easing` table (present only when the table is set).
+    pub easing_open: Option<String>,
+    /// Panel-close easing.
+    pub easing_close: Option<String>,
+    /// Focus-change easing.
+    pub easing_focus: Option<String>,
+    /// Workspace-switch easing.
+    pub easing_workspace: Option<String>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -230,6 +262,8 @@ pub struct ConfigData {
     pub theme: Option<String>,
     /// `appearance.theme` (wins over the alias when both are present).
     pub appearance_theme: Option<String>,
+    /// `appearance.animations` table (RFC-0002, CTX-0341).
+    pub animations: Option<AnimationsData>,
     /// `font` table.
     pub font: Option<FontData>,
     /// `window` table.
@@ -268,6 +302,7 @@ impl ConfigData {
     pub fn is_empty(&self) -> bool {
         self.theme.is_none()
             && self.appearance_theme.is_none()
+            && self.animations.is_none()
             && self.font.is_none()
             && self.window.is_none()
             && self.terminal.is_none()
@@ -478,8 +513,12 @@ impl ValueSnapshot {
         }
     }
 
-    /// Capture one table level; nested tables recurse at most once more
-    /// (`depth` 0 = top, 1 = nested, 2 = stop with empty children).
+    /// Capture one table level; nested tables recurse at most three times
+    /// (`depth` 0 = top, 1 = nested, 2 = deeper table such as
+    /// `appearance.animations`, 3 = `duration_ms`/`easing` leaves, 4 = stop
+    /// with `Nil` children). The RFC-0002 animations table is the deepest
+    /// known shape; deeper tables fail closed as `Nil` and are rejected by
+    /// the typed extractor.
     fn capture_table<'gc>(ctx: Context<'gc>, table: Table<'gc>, depth: u8) -> Self {
         let cap = if depth == 0 {
             MAX_CONFIG_TOP_KEYS + 1
@@ -504,7 +543,7 @@ impl ValueSnapshot {
             match key {
                 Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
                     Ok(name) => {
-                        let child = if depth >= 2 {
+                        let child = if depth >= 4 {
                             Self::Nil
                         } else {
                             match val {
@@ -675,9 +714,107 @@ impl ConfigData {
                 "theme" => out.theme = Some(expect_string(key, val)?),
                 "appearance" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["theme"])?;
+                    check_nested_keys(key, nested, &["theme", "animations"])?;
                     if let Some(t) = get_field(nested, "theme") {
                         out.appearance_theme = Some(expect_string("appearance.theme", t)?);
+                    }
+                    // RFC-0002: `appearance.animations` is a closed table of
+                    // typed leaves; strings/integers/bools only (never
+                    // coerced). Range/grammar validation is fail-closed in
+                    // `bitty-config`.
+                    if let Some(anim) = get_field(nested, "animations") {
+                        let anim_table = expect_table("appearance.animations", anim)?;
+                        check_nested_keys(
+                            "appearance.animations",
+                            anim_table,
+                            &["enabled", "reduced_motion", "duration_ms", "easing"],
+                        )?;
+                        let enabled = match get_field(anim_table, "enabled") {
+                            Some(v) => Some(expect_bool("appearance.animations.enabled", v)?),
+                            None => None,
+                        };
+                        let reduced_motion = match get_field(anim_table, "reduced_motion") {
+                            Some(v) => {
+                                Some(expect_string("appearance.animations.reduced_motion", v)?)
+                            }
+                            None => None,
+                        };
+                        let mut data = AnimationsData {
+                            enabled,
+                            reduced_motion,
+                            ..Default::default()
+                        };
+                        if let Some(dur) = get_field(anim_table, "duration_ms") {
+                            let dur_table = expect_table("appearance.animations.duration_ms", dur)?;
+                            check_nested_keys(
+                                "appearance.animations.duration_ms",
+                                dur_table,
+                                &["open", "close", "focus", "workspace"],
+                            )?;
+                            data.duration_open = match get_field(dur_table, "open") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.open",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                            data.duration_close = match get_field(dur_table, "close") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.close",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                            data.duration_focus = match get_field(dur_table, "focus") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.focus",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                            data.duration_workspace = match get_field(dur_table, "workspace") {
+                                Some(v) => Some(expect_integer(
+                                    "appearance.animations.duration_ms.workspace",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                        }
+                        if let Some(easing) = get_field(anim_table, "easing") {
+                            let easing_table =
+                                expect_table("appearance.animations.easing", easing)?;
+                            check_nested_keys(
+                                "appearance.animations.easing",
+                                easing_table,
+                                &["open", "close", "focus", "workspace"],
+                            )?;
+                            data.easing_open = match get_field(easing_table, "open") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.open", v)?)
+                                }
+                                None => None,
+                            };
+                            data.easing_close = match get_field(easing_table, "close") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.close", v)?)
+                                }
+                                None => None,
+                            };
+                            data.easing_focus = match get_field(easing_table, "focus") {
+                                Some(v) => {
+                                    Some(expect_string("appearance.animations.easing.focus", v)?)
+                                }
+                                None => None,
+                            };
+                            data.easing_workspace = match get_field(easing_table, "workspace") {
+                                Some(v) => Some(expect_string(
+                                    "appearance.animations.easing.workspace",
+                                    v,
+                                )?),
+                                None => None,
+                            };
+                        }
+                        out.animations = Some(data);
                     }
                 }
                 "font" => {
@@ -1304,6 +1441,70 @@ mod tests {
         assert_eq!(dec.border_color.as_deref(), Some("#112233"));
         assert_eq!(dec.border_color_focused, None);
         assert_eq!(dec.border_color_idle, None);
+    }
+
+    #[test]
+    fn animations_extract_and_absent_means_no_override() {
+        // RFC-0002: the full accepted table extracts; absent table/leaf is
+        // `None` so merge keeps the lower-precedence (accepted default).
+        let data = eval_ok(
+            r#"return { appearance = { animations = {
+                enabled = true,
+                reduced_motion = "auto",
+                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
+                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring" },
+            } } }"#,
+        );
+        let a = data.animations.expect("animations present");
+        assert_eq!(a.enabled, Some(true));
+        assert_eq!(a.reduced_motion.as_deref(), Some("auto"));
+        assert_eq!(a.duration_open, Some(150));
+        assert_eq!(a.duration_close, Some(120));
+        assert_eq!(a.duration_focus, Some(100));
+        assert_eq!(a.duration_workspace, Some(200));
+        assert_eq!(a.easing_open.as_deref(), Some("ease_out"));
+        assert_eq!(a.easing_close.as_deref(), Some("ease_in"));
+        assert_eq!(a.easing_focus.as_deref(), Some("ease_in_out"));
+        assert_eq!(a.easing_workspace.as_deref(), Some("spring"));
+        // A partial table leaves the other leaves absent.
+        let data =
+            eval_ok(r#"return { appearance = { animations = { duration_ms = { open = 0 } } } }"#);
+        let a = data.animations.expect("animations present");
+        assert_eq!(a.duration_open, Some(0));
+        assert_eq!(a.duration_close, None);
+        assert_eq!(a.easing_open, None);
+        assert_eq!(a.enabled, None);
+        // Absent table is `None` (this layer says nothing).
+        let data = eval_ok(r#"return { appearance = { theme = "dark" } }"#);
+        assert_eq!(data.animations, None);
+        let data = eval_ok(r#"return { appearance = {} }"#);
+        assert_eq!(data.animations, None);
+    }
+
+    #[test]
+    fn animations_wrong_types_fail_closed() {
+        let mut vm = LuaVm::new("test.animations-type");
+        for code in [
+            r#"return { appearance = { animations = { enabled = "yes" } } }"#,
+            r#"return { appearance = { animations = { reduced_motion = 1 } } }"#,
+            r#"return { appearance = { animations = { duration_ms = { open = "150" } } } }"#,
+            r#"return { appearance = { animations = { duration_ms = { open = 1.5 } } } }"#,
+            r#"return { appearance = { animations = { easing = { open = true } } } }"#,
+            r#"return { appearance = { animations = 5 } }"#,
+            r#"return { appearance = { animations = { bogus = 1 } } }"#,
+            r#"return { appearance = { animations = { duration_ms = { bogus = 1 } } } }"#,
+            r#"return { appearance = { animations = { easing = { bogus = "x" } } } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(
+                        message.contains("animations") || message.contains("appearance"),
+                        "{code:?}: {message}"
+                    );
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

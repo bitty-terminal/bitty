@@ -1,22 +1,32 @@
 //! Live font-stack coverage tests for the fallback chain (CTX-0368).
 //!
 //! These tests exercise the real `CrossFontRasterizer` + `FallbackRasterizer`
-//! pipeline against the host font stack. They are **skip-graceful**: when no
-//! platform font stack (or no loadable primary family) is available — for
-//! example a bare CI runner — the test returns early instead of failing, in
-//! the same style as the `crossfont_backend` live metrics test.
+//! pipeline against the host font stack. They are gated behind
+//! `BITTY_RENDER_FONT_TESTS=1` (mirroring the `BITTY_RENDER_GPU_TESTS` gate)
+//! and additionally skip when no platform font stack / loadable primary
+//! family is available, so default CI stays deterministic on bare runners
+//! that may resolve any family through fontconfig substitution.
+//!
+//! ```text
+//! BITTY_RENDER_FONT_TESTS=1 cargo test -p bitty-render --test glyph_fallback_live
+//! ```
 //!
 //! Deterministic coverage semantics (primary miss -> fallback hit, unknown ->
-//! tofu, bounded walk/cache) are unit-tested headlessly in
-//! `src/fallback.rs`; this file is the live-font evidence layer.
+//! tofu, bounded walk/cache) are unit-tested headlessly in `src/fallback.rs`
+//! and `src/grid/tests.rs`; this file is the live-font evidence layer.
 
 use bitty_render::{
     CellMetrics, CrossFontRasterizer, FallbackRasterizer, FontQuery, FontStyle, GlyphRasterizer,
     GridRenderer, RasterKey, ResolvedGlyph,
 };
 
+const ENABLE_ENV: &str = "BITTY_RENDER_FONT_TESTS";
 const PRIMARY: &str = "JetBrainsMono Nerd Font";
 const POINT_SIZE: f32 = 12.0;
+
+fn live_tests_enabled() -> bool {
+    matches!(std::env::var(ENABLE_ENV).as_deref(), Ok("1"))
+}
 
 fn query() -> FontQuery {
     FontQuery {
@@ -27,8 +37,12 @@ fn query() -> FontQuery {
 }
 
 /// Builds the production fallback chain over the host font stack, or `None`
-/// when the stack/primary face is unavailable (bare CI).
+/// when the env gate is off or the stack/primary face is unavailable.
 fn live_chain() -> Option<FallbackRasterizer<CrossFontRasterizer>> {
+    if !live_tests_enabled() {
+        eprintln!("skipped: set {ENABLE_ENV}=1 to run live font tests");
+        return None;
+    }
     let inner = CrossFontRasterizer::new().ok()?;
     let mut raster = FallbackRasterizer::with_default_chain(inner);
     raster.load_font(&query()).ok()?;

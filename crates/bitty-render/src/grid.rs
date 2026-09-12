@@ -143,6 +143,76 @@ pub const DEFAULT_CURSOR: Rgba8 = [0xF5, 0xE0, 0xDC, 0xFF];
 /// the background so selected cells read clearly while foreground-colored
 /// text stays legible on top.
 pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
+
+/// Resolved terminal palette carried by the renderer.
+///
+/// A preset is a fixed set of window background, foreground, cursor,
+/// selection, and the 16 ANSI colors (CTX-0355). The [`Default`] value is the
+/// designed Bitty Dark preset, so every existing construction keeps the
+/// previously hardcoded fallback; a selected preset is resolved once in the
+/// app layer and carried here so the clear color, default cell colors, and
+/// ANSI 0–15 all follow `appearance.theme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemePalette {
+    /// Window clear color and default cell background.
+    pub background: Rgba8,
+    /// Default glyph color.
+    pub foreground: Rgba8,
+    /// Block cursor fill (embedders may override alpha).
+    pub cursor: Rgba8,
+    /// Selection background fill.
+    pub selection: Rgba8,
+    /// The 16 ANSI colors, indices 0–15 (8 normal + 8 bright).
+    pub ansi: [[u8; 3]; 16],
+}
+
+impl ThemePalette {
+    /// Resolves a preset from the `bitty-config` theme registry.
+    ///
+    /// This is the single mapping from the config-side [`Theme`] to the
+    /// render-side palette; RGB channels are copied verbatim and alpha is
+    /// forced opaque for the four chrome colors (the preset has no alpha).
+    ///
+    /// [`Theme`]: bitty_config::theme::Theme
+    #[must_use]
+    pub fn from_theme(theme: &bitty_config::theme::Theme) -> Self {
+        Self {
+            background: [
+                theme.background[0],
+                theme.background[1],
+                theme.background[2],
+                0xFF,
+            ],
+            foreground: [
+                theme.foreground[0],
+                theme.foreground[1],
+                theme.foreground[2],
+                0xFF,
+            ],
+            cursor: [theme.cursor[0], theme.cursor[1], theme.cursor[2], 0xFF],
+            selection: [
+                theme.selection[0],
+                theme.selection[1],
+                theme.selection[2],
+                0xFF,
+            ],
+            ansi: theme.ansi,
+        }
+    }
+
+    /// The designed default preset (Bitty Dark), byte-identical to the
+    /// historical hardcoded [`DEFAULT_BG`]/[`DEFAULT_FG`] fallback.
+    #[must_use]
+    pub fn bitty_dark() -> Self {
+        Self::from_theme(&bitty_config::theme::BITTY_DARK)
+    }
+}
+
+impl Default for ThemePalette {
+    fn default() -> Self {
+        Self::bitty_dark()
+    }
+}
 /// Pending-paste banner background: opaque dark amber, distinct from the
 /// grid background, selection, and cursor so the confirmation prompt reads
 /// as a warning overlay (CTX-0186 presentation-only dialog).
@@ -259,12 +329,21 @@ const fn saturating_i32(value: u64) -> i32 {
 /// instead of a hardcoded green), while 16–231 (6x6x6 cube) and 232–255
 /// (grayscale ramp) stay xterm-compatible. Fully deterministic on every
 /// platform.
+///
+/// This is the default-preset wrapper over [`resolve_color_in`]; renderers
+/// carrying a resolved [`ThemePalette`] call that function instead.
 #[must_use]
 pub fn resolve_color(color: Option<&Color>, fallback: Rgba8) -> Rgba8 {
+    resolve_color_in(&ThemePalette::bitty_dark(), color, fallback)
+}
+
+/// Theme-aware [`resolve_color`]: ANSI 0–15 come from `palette`.
+#[must_use]
+pub fn resolve_color_in(palette: &ThemePalette, color: Option<&Color>, fallback: Rgba8) -> Rgba8 {
     let rgb = match color {
         None | Some(Color::Default) => [fallback[0], fallback[1], fallback[2]],
         Some(Color::Rgb(Rgb { r, g, b })) => [*r, *g, *b],
-        Some(Color::Indexed(i)) => palette_rgb(*i),
+        Some(Color::Indexed(i)) => palette_rgb_in(palette, *i),
     };
     [rgb[0], rgb[1], rgb[2], fallback[3]]
 }
@@ -275,10 +354,19 @@ pub fn resolve_color(color: Option<&Color>, fallback: Rgba8) -> Rgba8 {
 /// ([`bitty_config::theme::BITTY_DARK`]`ansi`, the single source of truth —
 /// read from the preset, never duplicated here); 16–231 are the
 /// xterm-compatible 6x6x6 cube and 232–255 the grayscale ramp.
+///
+/// This is the default-preset wrapper over [`palette_rgb_in`].
 #[must_use]
 pub fn palette_rgb(index: u8) -> [u8; 3] {
+    palette_rgb_in(&ThemePalette::bitty_dark(), index)
+}
+
+/// Theme-aware [`palette_rgb`]: indices 0–15 come from `palette.ansi`; the
+/// 6x6x6 cube and grayscale ramp stay xterm-compatible.
+#[must_use]
+pub fn palette_rgb_in(palette: &ThemePalette, index: u8) -> [u8; 3] {
     if index < 16 {
-        return bitty_config::theme::BITTY_DARK.ansi[index as usize];
+        return palette.ansi[index as usize];
     }
     const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
     if index <= 231 {
@@ -297,10 +385,19 @@ pub fn palette_rgb(index: u8) -> [u8; 3] {
 ///
 /// Inverse video swaps the pair; faint reduces foreground alpha. The pair
 /// is resolved eagerly so downstream code never sees symbolic colors.
+///
+/// This is the default-preset wrapper over [`resolved_colors_in`]; renderers
+/// carrying a resolved [`ThemePalette`] call that function instead.
 #[must_use]
 pub fn resolved_colors(style: &Style) -> (Rgba8, Rgba8) {
-    let fg = resolve_color(style.foreground.as_ref(), DEFAULT_FG);
-    let bg = resolve_color(style.background.as_ref(), DEFAULT_BG);
+    resolved_colors_in(&ThemePalette::bitty_dark(), style)
+}
+
+/// Theme-aware [`resolved_colors`]: default fg/bg come from `palette`.
+#[must_use]
+pub fn resolved_colors_in(palette: &ThemePalette, style: &Style) -> (Rgba8, Rgba8) {
+    let fg = resolve_color_in(palette, style.foreground.as_ref(), palette.foreground);
+    let bg = resolve_color_in(palette, style.background.as_ref(), palette.background);
     let (fg, bg) = if style.attributes.inverse {
         (bg, fg)
     } else {
@@ -351,6 +448,18 @@ pub fn cursor_fill(
     cols: usize,
     rows: usize,
 ) -> Option<FillRect> {
+    cursor_fill_in(&ThemePalette::bitty_dark(), cursor, cell, cols, rows)
+}
+
+/// Theme-aware [`cursor_fill`]: the emitted fill carries `palette.cursor`.
+#[must_use]
+pub fn cursor_fill_in(
+    palette: &ThemePalette,
+    cursor: &bitty_term_state::Cursor,
+    cell: CellMetrics,
+    cols: usize,
+    rows: usize,
+) -> Option<FillRect> {
     use bitty_term_state::CursorStyle;
 
     if !cursor.visible {
@@ -380,7 +489,7 @@ pub fn cursor_fill(
     };
     Some(FillRect {
         rect,
-        color: DEFAULT_CURSOR,
+        color: palette.cursor,
     })
 }
 
@@ -438,6 +547,12 @@ pub const fn selection_fill() -> Rgba8 {
     DEFAULT_SELECTION
 }
 
+/// Theme-aware selection color: `palette.selection` (CTX-0355).
+#[must_use]
+pub const fn selection_fill_in(palette: &ThemePalette) -> Rgba8 {
+    palette.selection
+}
+
 /// Selection highlight rectangles for a normalized inclusive cell range.
 ///
 /// Pure embedder overlay primitive (CTX-0158): the caller owns the selection
@@ -451,6 +566,27 @@ pub const fn selection_fill() -> Rgba8 {
 /// all inputs: no panics, no allocation beyond the bounded row count, no I/O.
 #[must_use]
 pub fn selection_fill_rects(
+    anchor: (u16, u16),
+    focus: (u16, u16),
+    grid_width: usize,
+    grid_height: usize,
+    cell: CellMetrics,
+) -> Vec<FillRect> {
+    selection_fill_rects_in(
+        &ThemePalette::bitty_dark(),
+        anchor,
+        focus,
+        grid_width,
+        grid_height,
+        cell,
+    )
+}
+
+/// Theme-aware [`selection_fill_rects`]: the emitted rects carry
+/// `palette.selection`.
+#[must_use]
+pub fn selection_fill_rects_in(
+    palette: &ThemePalette,
     anchor: (u16, u16),
     focus: (u16, u16),
     grid_width: usize,
@@ -505,7 +641,7 @@ pub fn selection_fill_rects(
             );
             rects.push(FillRect {
                 rect: RectPx::new(x, y, width, cell.height),
-                color: selection_fill(),
+                color: selection_fill_in(palette),
             });
         }
         if row == end_row {
@@ -1216,6 +1352,11 @@ pub struct GridRenderer<R: GlyphRasterizer> {
     font: FontId,
     point_size: f32,
     cell: CellMetrics,
+    /// Resolved terminal palette (CTX-0355) used for default cell colors,
+    /// ANSI 0–15, and the fill colors the planner emits. Defaults to the
+    /// designed Bitty Dark preset; embedders override it with
+    /// [`GridRenderer::set_theme_palette`].
+    palette: ThemePalette,
     /// Pen-baseline offset below the row top (see [`resolve_baseline_offset`]):
     /// metric-aware when the rasterizer measures the face, legacy 3/4 rule
     /// otherwise. Glyph instances keep their full bitmap size at
@@ -1266,9 +1407,26 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             font,
             point_size: query.point_size,
             cell,
+            palette: ThemePalette::default(),
             baseline_offset,
             counters: RenderCounters::default(),
         })
+    }
+
+    /// The resolved terminal palette used by [`Self::render`].
+    #[must_use]
+    pub const fn theme_palette(&self) -> ThemePalette {
+        self.palette
+    }
+
+    /// Replaces the resolved terminal palette (CTX-0355).
+    ///
+    /// This is the renderer-side seam for `appearance.theme`: the app layer
+    /// resolves the preset once and installs it, so default cell colors,
+    /// ANSI 0–15, and emitted fills follow the selected preset instead of
+    /// the built-in Bitty Dark default.
+    pub fn set_theme_palette(&mut self, palette: ThemePalette) {
+        self.palette = palette;
     }
 
     /// The configured cell metrics.
@@ -1464,7 +1622,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     ) {
         self.counters.cells_examined += 1;
 
-        let (fg, bg) = resolved_colors(&term_cell.style);
+        let (fg, bg) = resolved_colors_in(&self.palette, &term_cell.style);
         let left = u64::try_from(col)
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::from(self.cell.width));
@@ -1541,7 +1699,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 .unwrap_or(u64::MAX)
                 .saturating_mul(u64::from(self.cell.width)),
         );
-        let underline_color = resolve_color(term_cell.style.underline_color.as_ref(), fg);
+        let underline_color =
+            resolve_color_in(&self.palette, term_cell.style.underline_color.as_ref(), fg);
 
         // Curly/dotted/dashed shapes approximate to solid bars until the
         // text RFC defines decorated-glyph rendering; geometry stays

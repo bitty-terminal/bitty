@@ -154,7 +154,8 @@ impl Runtime {
             return None;
         }
         let (_, track, thumb) = self.scrollbar_track_thumb()?;
-        let mut color = crate::palette::theme_foreground_rgba();
+        // CTX-0355: the thumb follows the resolved theme foreground.
+        let mut color = self.config.theme.foreground;
         color[3] = 0x99;
         Some(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(

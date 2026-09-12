@@ -310,6 +310,18 @@ pub struct RuntimeConfig {
     pub outline_width_focused: Option<u32>,
     /// Idle outline ring width in logical px; see [`Self::outline_width_focused`].
     pub outline_width_idle: Option<u32>,
+    /// Resolved terminal palette for `appearance.theme` (CTX-0355): window
+    /// background (clear color), default foreground, cursor, selection, and
+    /// the 16 ANSI colors.
+    ///
+    /// `bitty-config` resolves the preset; `bitty-app` maps it onto this
+    /// field; the runtime installs it on both the [`GridRenderer`] and the
+    /// [`Surface`](bitty_render::gpu::Surface) so every default-path clear
+    /// and cell color follows the selected preset. Defaults to the designed
+    /// Bitty Dark preset, so existing constructions stay byte-identical.
+    ///
+    /// [`GridRenderer`]: bitty_render::grid::GridRenderer
+    pub theme: bitty_render::ThemePalette,
     /// Window padding in logical pixels on every side (CTX-0223
     /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
     /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
@@ -384,6 +396,7 @@ impl Default for RuntimeConfig {
             outline_idle: DEFAULT_OUTLINE_IDLE,
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
+            theme: bitty_render::ThemePalette::default(),
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
@@ -459,6 +472,7 @@ impl RuntimeConfig {
             outline_idle: DEFAULT_OUTLINE_IDLE,
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
+            theme: bitty_render::ThemePalette::default(),
             window_padding,
             window_radius_px,
             scrollbar_mode,

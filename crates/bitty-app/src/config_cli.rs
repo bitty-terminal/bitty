@@ -1095,6 +1095,11 @@ pub(crate) fn runtime_config_from_effective(
                 .min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX),
         );
         cfg.outline_width_idle = Some(widths.idle.min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX));
+        // CTX-0355: carry the same resolved preset's terminal palette
+        // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
+        // config so the default-path renderer and clear color follow
+        // `appearance.theme` instead of the hardcoded Bitty Dark fallback.
+        cfg.theme = bitty_runtime::ThemePalette::from_theme(theme);
         // RFC-0002 (CTX-0341): map the resolved effective animation contract
         // onto the runtime policy. Durations are already bounded by
         // `bitty-config` (fail-closed `0..=500`); `spring` was already mapped

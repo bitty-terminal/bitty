@@ -743,6 +743,10 @@ impl Runtime {
             help_rows: Vec::new(),
             next_workspace_seq: 2,
         };
+        // CTX-0355: install the resolved palette on both the renderer (cell
+        // defaults, ANSI, emitted fills) and the surface (clear color).
+        runtime.renderer.set_theme_palette(config.theme);
+        runtime.surface.set_theme_palette(config.theme);
         runtime.init_workspaces();
         Ok(runtime)
     }
@@ -868,6 +872,10 @@ impl Runtime {
             help_rows: Vec::new(),
             next_workspace_seq: 2,
         };
+        // CTX-0355: install the resolved palette on both the renderer (cell
+        // defaults, ANSI, emitted fills) and the surface (clear color).
+        runtime.renderer.set_theme_palette(config.theme);
+        runtime.surface.set_theme_palette(config.theme);
         runtime.init_workspaces();
         Ok(runtime)
     }
@@ -892,6 +900,9 @@ impl Runtime {
         // Keep renderer as is (AnyRasterizer may be crossfont already); surface
         // and gpu are swapped wholesale. Headless fallback remains if gpu later
         // fails present (caller may detach).
+        // CTX-0355: the app constructs the real-GPU surface; install the
+        // resolved palette so its clear color matches the renderer.
+        surface.set_theme_palette(self.config.theme);
         self.surface = surface;
         self.gpu = Some(gpu);
         self.pending_full_redraw = true;
@@ -901,6 +912,7 @@ impl Runtime {
     pub fn detach_gpu(&mut self) {
         if let Some(extent) = self.surface.extent() {
             if let Ok(s) = Surface::headless(extent) {
+                s.set_theme_palette(self.config.theme);
                 self.surface = s;
             }
         }

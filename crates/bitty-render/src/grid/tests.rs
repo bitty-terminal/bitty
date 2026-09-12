@@ -1388,3 +1388,118 @@ fn rounded_fill_hidpi_doubling_scales_the_arc() {
     assert!(!covered(&mask1, 40, 20, 5), "1x interior unpainted");
     assert!(!covered(&mask2, 80, 40, 10), "2x interior unpainted");
 }
+
+// ---------------------------------------------------------------------------
+// CTX-0355: resolved preset palette drives render (not hardcoded Bitty Dark)
+// ---------------------------------------------------------------------------
+
+/// `github-light` resolves a light palette distinct from `bitty-dark` on every
+/// chrome color and at least the ANSI entries the issue calls out.
+#[test]
+fn theme_palette_resolves_selected_preset_not_bitty_dark() {
+    use super::ThemePalette;
+
+    let dark = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("bitty-dark")));
+    let light = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+
+    // The issue's exact regression: github-light documents #FFFFFF bg but
+    // rendered #1E1E2E. The resolved palette must disagree with bitty-dark.
+    assert_eq!(light.background, [0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(dark.background, [0x1E, 0x1E, 0x2E, 0xFF]);
+    assert_ne!(light.background, dark.background);
+    assert_ne!(light.foreground, dark.foreground);
+    assert_ne!(light.cursor, dark.cursor);
+    assert_ne!(light.selection, dark.selection);
+    assert_ne!(light.ansi, dark.ansi);
+
+    // Default is the designed preset, byte-identical to the legacy constants.
+    assert_eq!(ThemePalette::default(), ThemePalette::bitty_dark());
+    assert_eq!(ThemePalette::bitty_dark().background[..3], DEFAULT_BG[..3]);
+    assert_eq!(ThemePalette::bitty_dark().foreground[..3], DEFAULT_FG[..3]);
+}
+
+/// The default-preset wrappers stay byte-identical to the explicit Bitty Dark
+/// palette, so every untouched call site keeps its behavior.
+#[test]
+fn default_wrappers_equal_bitty_dark_palette() {
+    use super::{
+        ThemePalette, cursor_fill, cursor_fill_in, palette_rgb, palette_rgb_in, resolve_color,
+        resolve_color_in, selection_fill, selection_fill_in,
+    };
+    use bitty_term_state::{Cursor, CursorPosition};
+
+    let dark = ThemePalette::bitty_dark();
+    for index in 0u8..=255 {
+        assert_eq!(
+            palette_rgb(index),
+            palette_rgb_in(&dark, index),
+            "idx {index}"
+        );
+    }
+    assert_eq!(
+        resolve_color(Some(&Color::Indexed(4)), DEFAULT_FG),
+        resolve_color_in(&dark, Some(&Color::Indexed(4)), DEFAULT_FG)
+    );
+    assert_eq!(selection_fill(), selection_fill_in(&dark));
+    let cursor = Cursor {
+        position: CursorPosition { row: 1, col: 1 },
+        visible: true,
+        ..Cursor::default()
+    };
+    assert_eq!(
+        cursor_fill(&cursor, cell_metrics(), 80, 24),
+        cursor_fill_in(&dark, &cursor, cell_metrics(), 80, 24)
+    );
+}
+
+/// A non-default preset threads through the renderer: default cell fg/bg and
+/// indexed ANSI 0..16 come from the selected palette, not Bitty Dark.
+#[test]
+fn renderer_resolves_cells_from_selected_palette() {
+    use super::ThemePalette;
+
+    let light = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+    let mut renderer = renderer();
+    renderer.set_theme_palette(light);
+    assert_eq!(renderer.theme_palette(), light);
+
+    // A plain unstyled cell: background fill must be the preset background,
+    // glyph the preset foreground (issue AC: "paints the preset
+    // background/foreground").
+    let state = state_from(&[print('A')]);
+    let list = renderer
+        .render(&state.snapshot(), &full_damage(&state))
+        .unwrap();
+    assert_eq!(list.fills[0].color, light.background);
+    assert_eq!(list.glyphs[0].color, light.foreground);
+    assert_ne!(list.fills[0].color, DEFAULT_BG);
+
+    // Indexed ANSI (SGR 32 -> Indexed 2 green) resolves from the preset.
+    let green_state = state_from(&[
+        sgr(&[AttributeChange::Foreground(Color::Indexed(2))]),
+        print('G'),
+    ]);
+    let green = renderer
+        .render(&green_state.snapshot(), &full_damage(&green_state))
+        .unwrap();
+    let green_rgb = light.ansi[2];
+    assert_eq!(
+        green.glyphs[0].color,
+        [green_rgb[0], green_rgb[1], green_rgb[2], 0xFF]
+    );
+    assert_ne!(green.glyphs[0].color, [0xA6, 0xE3, 0xA1, 0xFF]);
+}
+
+/// Inverse video and default-preset fallbacks still hold under a custom
+/// palette (regression guard for the swapped pair).
+#[test]
+fn custom_palette_inverse_swaps_preset_pair() {
+    use super::ThemePalette;
+
+    let light = ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+    let mut style = bitty_term_state::Style::default();
+    style.attributes.inverse = true;
+    let (fg, bg) = super::resolved_colors_in(&light, &style);
+    assert_eq!(fg, light.background);
+    assert_eq!(bg, light.foreground);
+}

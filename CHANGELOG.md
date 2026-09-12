@@ -118,6 +118,29 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   then development roots, so provenance is deterministic and a bundled package
   wins an id collision.
 
+### Missing-glyph fallback: coverage chain + tofu box (CTX-0368, issue #610)
+
+- The per-glyph fallback chain is now coverage-driven and platform-pinned:
+  Linux appends `Noto Color Emoji` after the existing mono/`DejaVu Sans Mono`/
+  `Noto Sans Symbols 2` tails; macOS uses `Menlo`/`Monaco`/`Apple Braille`/
+  `Apple Symbols`/`Apple Color Emoji`/`Arial Unicode MS`; Windows uses
+  `Consolas`/`Cascadia Mono`/`Segoe UI Symbol`/`Segoe UI Emoji`/`Arial Unicode
+MS`. Every chain stays deterministic and bounded (`<= 8` tails, `<= 12`
+  faces) and is loaded once at startup. Color emoji render monochrome via the
+  atlas coverage flatten; color-glyph rendering remains a follow-up open
+  question.
+- `FallbackRasterizer::resolve` reports the outcome explicitly (`covered`,
+  winning face, bitmap), so a scalar the primary lacks resolves through the
+  chain and is reported covered instead of silently blank.
+- When no loaded face covers a scalar, the grid now paints the text-rendering
+  RFC tofu box (1 px outline at the cluster's cell extent, spanning both
+  columns for wide scalars) and increments the new
+  `RenderCounters::missing_glyphs`, instead of leaving the cell blank. Grid
+  width semantics (`char_cell_width`) are unchanged.
+- Tests: headless coverage/tofu/determinism/bounded-cache units in
+  `bitty-render` plus a skip-graceful live host-font test; live screenshot
+  comparison against Ghostty in the task evidence.
+
 ## [0.0.20] - 2026-09-11
 
 ### Release highlights

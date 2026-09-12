@@ -11,6 +11,8 @@
 //!
 //! [`FONT_FALLBACK_CHAIN`]: bitty_config::types::FONT_FALLBACK_CHAIN
 
+#[cfg(test)]
+use bitty_config::types::{EMOJI_FALLBACK_FAMILY, SYMBOLS_FALLBACK_FAMILY};
 use bitty_config::types::{FONT_FALLBACK_CHAIN, FontConfig};
 
 use crate::error::RenderError;
@@ -58,6 +60,13 @@ pub const fn is_tui_graph_scalar(c: char) -> bool {
 /// produced only errors returns the last error so engine failures stay
 /// observable instead of silently blanking.
 ///
+/// [`resolve`](FallbackRasterizer::resolve) exposes the same walk with
+/// **coverage reporting** (CTX-0368, text-rendering RFC "Fallback chain
+/// construction"): `covered = true` means some loaded face produced a
+/// drawable bitmap for the scalar; `covered = false` means every face
+/// reported a missing glyph, which is the caller's cue to paint the RFC
+/// tofu box. `Ok(None)` from `rasterize` is exactly `covered = false`.
+///
 /// Bounded: at most `1 + chain.len()` faces; each rasterization performs at
 /// most that many upstream calls, and the [`GlyphCache`](crate::cache::GlyphCache)
 /// in front memoizes the outcome per key, so the walk runs once per distinct
@@ -68,6 +77,23 @@ pub struct FallbackRasterizer<R: GlyphRasterizer> {
     fallback_families: Vec<String>,
     fonts: Vec<FontId>,
     point_size: f32,
+}
+
+/// Outcome of one coverage-driven fallback resolution.
+///
+/// `covered == true` carries the winning face and its bitmap; `covered ==
+/// false` means no loaded face had a drawable glyph for the scalar (the
+/// caller paints tofu and counts it, per the text-rendering RFC
+/// "Missing-glyph behavior").
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedGlyph {
+    /// The face that produced `bitmap`, or the face the walk started from
+    /// when nothing covered.
+    pub font: FontId,
+    /// True when a drawable bitmap was produced.
+    pub covered: bool,
+    /// The drawable bitmap; `None` exactly when `covered == false`.
+    pub bitmap: Option<GlyphBitmap>,
 }
 
 impl<R: GlyphRasterizer> FallbackRasterizer<R> {
@@ -137,6 +163,67 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
     pub const fn point_size(&self) -> f32 {
         self.point_size
     }
+
+    /// Resolves `key` with coverage reporting (CTX-0368).
+    ///
+    /// Walks the requested face first (normally the primary) and then every
+    /// loaded chain face in load order, deduplicated. The first face that
+    /// yields a bitmap wins and is reported with `covered = true`. When every
+    /// face reports a missing glyph (`Ok(None)`), the result is
+    /// `covered = false` with no bitmap; the caller paints tofu. Engine
+    /// errors are skipped during the walk; a walk that produced only errors
+    /// returns the last one so failures stay observable.
+    ///
+    /// Deterministic: the order is fixed by `load_font` and the result is a
+    /// pure function of face coverage. Bounded: at most `1 + fonts().len()`
+    /// upstream calls per resolution.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::UnknownFontHandle`] before any face was loaded, and the
+    /// last upstream error when no face produced coverage and at least one
+    /// errored.
+    pub fn resolve(&mut self, key: RasterKey) -> Result<ResolvedGlyph, RenderError> {
+        if self.fonts.is_empty() {
+            return Err(RenderError::UnknownFontHandle);
+        }
+        // Attempt order: the requested face first (normally the primary the
+        // grid pipeline cached under), then the stored chain deduplicated.
+        let mut order: Vec<FontId> = Vec::with_capacity(self.fonts.len() + 1);
+        order.push(key.font);
+        for font in &self.fonts {
+            if !order.contains(font) {
+                order.push(*font);
+            }
+        }
+        let mut last_err: Option<RenderError> = None;
+        for font in order {
+            let attempt = RasterKey::new(key.character, font, key.point_size)
+                .map_err(|_| RenderError::UnknownFontHandle)?;
+            match self.inner.rasterize(attempt) {
+                Ok(Some(bitmap)) => {
+                    return Ok(ResolvedGlyph {
+                        font,
+                        covered: true,
+                        bitmap: Some(bitmap),
+                    });
+                }
+                Ok(None) => continue,
+                Err(err) => {
+                    last_err = Some(err);
+                    continue;
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Ok(ResolvedGlyph {
+            font: key.font,
+            covered: false,
+            bitmap: None,
+        })
+    }
 }
 
 impl<R: GlyphRasterizer> GlyphRasterizer for FallbackRasterizer<R> {
@@ -173,35 +260,7 @@ impl<R: GlyphRasterizer> GlyphRasterizer for FallbackRasterizer<R> {
     }
 
     fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
-        if self.fonts.is_empty() {
-            return Err(RenderError::UnknownFontHandle);
-        }
-        // Attempt order: the requested face first (normally the primary the
-        // grid pipeline cached under), then the stored chain deduplicated.
-        let mut order: Vec<FontId> = Vec::with_capacity(self.fonts.len() + 1);
-        order.push(key.font);
-        for font in &self.fonts {
-            if !order.contains(font) {
-                order.push(*font);
-            }
-        }
-        let mut last_err: Option<RenderError> = None;
-        for font in order {
-            let attempt = RasterKey::new(key.character, font, key.point_size)
-                .map_err(|_| RenderError::UnknownFontHandle)?;
-            match self.inner.rasterize(attempt) {
-                Ok(Some(bitmap)) => return Ok(Some(bitmap)),
-                Ok(None) => continue,
-                Err(err) => {
-                    last_err = Some(err);
-                    continue;
-                }
-            }
-        }
-        if let Some(err) = last_err {
-            return Err(err);
-        }
-        Ok(None)
+        self.resolve(key).map(|resolved| resolved.bitmap)
     }
 
     fn font_metrics(
@@ -332,7 +391,13 @@ mod tests {
         assert_eq!(wrapped.fallback_families(), expected.as_slice());
         assert_eq!(
             wrapped.fallback_families().last().map(String::as_str),
-            Some("Noto Sans Symbols 2")
+            Some(EMOJI_FALLBACK_FAMILY)
+        );
+        assert!(
+            wrapped
+                .fallback_families()
+                .iter()
+                .any(|f| f == SYMBOLS_FALLBACK_FAMILY)
         );
     }
 
@@ -342,8 +407,9 @@ mod tests {
         assert_eq!(chain[0], "My Mono");
         assert_eq!(
             chain.last().map(String::as_str),
-            Some("Noto Sans Symbols 2")
+            Some(EMOJI_FALLBACK_FAMILY)
         );
+        assert!(chain.iter().any(|f| f == SYMBOLS_FALLBACK_FAMILY));
         let chain = FallbackRasterizer::<Fake>::chain_for("monospace");
         assert_eq!(chain.iter().filter(|f| *f == "monospace").count(), 1);
     }
@@ -412,6 +478,141 @@ mod tests {
         let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
         let key = RasterKey::new('�', primary, 12.0).unwrap();
         assert!(wrapped.rasterize(key).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_reports_fallback_coverage() {
+        // CTX-0368: a symbol the primary lacks resolves through the chain and
+        // must report `covered = true`, naming the winning face.
+        let mut inner = Fake::default();
+        for family in [
+            "Primary Mono",
+            "JetBrains Mono",
+            "monospace",
+            "DejaVu Sans Mono",
+        ] {
+            inner.blank.push((family.to_string(), '✔'));
+        }
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let resolved = wrapped
+            .resolve(RasterKey::new('✔', primary, 12.0).unwrap())
+            .unwrap();
+        assert!(resolved.covered, "symbols tail covers U+2714");
+        assert_eq!(
+            resolved.font,
+            wrapped.fonts()[4],
+            "the Noto Sans Symbols 2 tail must win"
+        );
+        assert!(resolved.bitmap.is_some());
+        // Walk bounded by the loaded face count (primary + four tails).
+        assert_eq!(wrapped.inner.rasterize_calls.get(), 5);
+        // The legacy rasterize projection stays Some for the same key and
+        // performs exactly one more bounded walk.
+        assert!(
+            wrapped
+                .rasterize(RasterKey::new('✔', primary, 12.0).unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(wrapped.inner.rasterize_calls.get(), 10);
+    }
+
+    #[test]
+    fn resolve_reports_uncovered_scalar_as_not_covered() {
+        // CTX-0368: when no available face covers the scalar, resolution must
+        // report `covered = false` with no bitmap so the caller paints tofu.
+        let mut inner = Fake::default();
+        for family in [
+            "Primary Mono",
+            "JetBrains Mono",
+            "monospace",
+            "DejaVu Sans Mono",
+            "Noto Sans Symbols 2",
+        ] {
+            inner.blank.push((family.to_string(), '\u{10FFFF}'));
+        }
+        let mut wrapped = FallbackRasterizer::new(inner, tails());
+        let primary = wrapped.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let key = RasterKey::new('\u{10FFFF}', primary, 12.0).unwrap();
+        let resolved = wrapped.resolve(key).unwrap();
+        assert!(!resolved.covered);
+        assert_eq!(resolved.bitmap, None);
+        assert_eq!(resolved.font, primary, "uncovered reports the start face");
+        // The legacy contract still yields the cacheable negative.
+        assert!(wrapped.rasterize(key).unwrap().is_none());
+        // Two resolutions of the same uncovered scalar: 5 faces each.
+        assert_eq!(
+            wrapped.inner.rasterize_calls.get(),
+            u32::try_from(2 * wrapped.fonts().len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_is_deterministic_across_instances() {
+        // CTX-0368: selection is a pure function of coverage and pinned order.
+        let build = || {
+            let mut inner = Fake::default();
+            inner.blank.push(("Primary Mono".to_string(), '✔'));
+            inner.blank.push(("JetBrains Mono".to_string(), '☑'));
+            inner.blank.push(("monospace".to_string(), '⚙'));
+            FallbackRasterizer::new(inner, tails())
+        };
+        let mut a = build();
+        let mut b = build();
+        let primary_a = a.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let primary_b = b.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let scalars = ['✔', '☑', '⚙', '→', '⣿', 'A', '\u{10FFFF}'];
+        let mut sequence_a = Vec::new();
+        let mut sequence_b = Vec::new();
+        for c in scalars {
+            let ra = a
+                .resolve(RasterKey::new(c, primary_a, 12.0).unwrap())
+                .unwrap();
+            let rb = b
+                .resolve(RasterKey::new(c, primary_b, 12.0).unwrap())
+                .unwrap();
+            let face_a = a.fonts().iter().position(|f| *f == ra.font);
+            let face_b = b.fonts().iter().position(|f| *f == rb.font);
+            assert_eq!(ra.covered, rb.covered, "{c:?} coverage differs");
+            assert_eq!(ra.bitmap.is_some(), rb.bitmap.is_some());
+            sequence_a.push((ra.covered, face_a));
+            sequence_b.push((rb.covered, face_b));
+        }
+        assert_eq!(sequence_a, sequence_b);
+        assert!(
+            a.inner.rasterize_calls.get()
+                <= u32::try_from(scalars.len() * a.fonts().len()).unwrap(),
+            "walk stays bounded per resolution"
+        );
+    }
+
+    #[test]
+    fn fallback_walk_and_cache_stay_bounded() {
+        // CTX-0368: the fallback decorator sits behind the bounded GlyphCache;
+        // a tiny cache must evict wholesale instead of growing, and the
+        // per-scalar walk must never exceed the loaded face count.
+        use crate::cache::GlyphCache;
+        let capacity = 4;
+        let mut cache =
+            GlyphCache::new(FallbackRasterizer::new(Fake::default(), tails()), capacity).unwrap();
+        let font = cache.load_font(&query("Primary Mono", 12.0)).unwrap();
+        let scalars = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'];
+        for c in scalars {
+            assert!(
+                matches!(
+                    cache.glyph(RasterKey::new(c, font, 12.0).unwrap()).unwrap(),
+                    crate::cache::CachedGlyph::Bitmap(_)
+                ),
+                "{c:?} must rasterize through the fallback chain"
+            );
+        }
+        assert!(cache.len() <= capacity, "cache bound must hold");
+        let faces = cache.rasterizer().fonts().len();
+        assert!(
+            cache.rasterizer().inner.rasterize_calls.get()
+                <= u32::try_from(scalars.len() * faces).unwrap()
+        );
     }
 
     #[test]

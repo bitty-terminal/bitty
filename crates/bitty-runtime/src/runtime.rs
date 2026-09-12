@@ -662,9 +662,9 @@ impl Runtime {
         // Vertical slice: prefer crossfont when available, fallback to headless
         // for CI determinism. Both are bounded and headless-testable. The
         // crossfont backend is wrapped in the per-glyph fallback chain
-        // (CTX-0163: braille `U+2800-U+28FF` + blocks `U+2580-U+259F` for
-        // TUI graphs resolve through `Noto Sans Symbols 2` when the primary
-        // face lacks them). On
+        // (CTX-0163: braille `U+2800-U+28FF` + blocks `U+2580-U+259F`;
+        // CTX-0368: symbols/emoji through the pinned platform tail, with the
+        // RFC tofu box painted when no loaded face covers the scalar). On
         // Windows the monospace family may be absent, so a FontNotFound from
         // GridRenderer re-tries deterministically with HeadlessRasterizer
         // instead of failing with_defaults on headless CI.

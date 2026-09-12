@@ -166,8 +166,8 @@ pub use cache::GlyphCache;
 pub use crossfont_backend::CrossFontRasterizer;
 pub use error::RenderError;
 pub use fallback::{
-    BLOCK_FIRST, BLOCK_LAST, BRAILLE_FIRST, BRAILLE_LAST, FallbackRasterizer, is_block_element,
-    is_braille_pattern, is_tui_graph_scalar,
+    BLOCK_FIRST, BLOCK_LAST, BRAILLE_FIRST, BRAILLE_LAST, FallbackRasterizer, ResolvedGlyph,
+    is_block_element, is_braille_pattern, is_tui_graph_scalar,
 };
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{

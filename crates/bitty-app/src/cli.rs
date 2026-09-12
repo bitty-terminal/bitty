@@ -1283,7 +1283,6 @@ pub(crate) fn help_text() -> String {
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
           Subcommands (CLI-first management, DEC-0007):\n  \
-
             run [--cwd PATH] [--env K=V ...] [--title S] -- COMMAND...  Explicit child launch (local)\n  \
                              Runs COMMAND directly (no shell); `--` is required;\n  \
                              exit code is the child's. `bitty htop` never means\n  \

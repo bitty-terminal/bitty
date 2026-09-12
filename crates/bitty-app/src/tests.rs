@@ -1176,6 +1176,51 @@ fn runtime_config_applies_font_spacing() {
 }
 
 #[test]
+fn runtime_config_carries_selected_theme_palette() {
+    // CTX-0355: `appearance.theme` must reach `RuntimeConfig.theme`, not just
+    // the outline pair. The default path otherwise renders the hardcoded
+    // Bitty Dark palette for every preset.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+
+    // Default / unset theme -> the designed Bitty Dark palette.
+    let defaults = bitty_runtime::RuntimeConfig::default();
+    assert_eq!(
+        defaults.theme,
+        bitty_runtime::ThemePalette::bitty_dark(),
+        "no-theme default must stay Bitty Dark"
+    );
+
+    // A light preset selected in the file must thread through end to end and
+    // disagree with Bitty Dark on every chrome color and the ANSI table.
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { appearance = { theme = "github-light" } }"#,
+        &src,
+    )
+    .expect("theme parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(
+        merged.effective.appearance.theme.as_deref(),
+        Some("github-light")
+    );
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    let dark = bitty_runtime::ThemePalette::bitty_dark();
+    assert_eq!(cfg.theme.background, [0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_ne!(cfg.theme.background, dark.background);
+    assert_ne!(cfg.theme.foreground, dark.foreground);
+    assert_ne!(cfg.theme.cursor, dark.cursor);
+    assert_ne!(cfg.theme.selection, dark.selection);
+    assert_ne!(cfg.theme.ansi, dark.ansi);
+
+    // `--safe` / unknown fallback keeps the built-in default palette.
+    let safe = bitty_config::reload::fallback_builtin();
+    let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
+    assert_eq!(safe_cfg.theme, dark);
+}
+
+#[test]
 fn runtime_config_inherits_file_scroll_speed() {
     // CTX-0185: scroll keys flow file -> effective -> runtime; crate
     // defaults stay equal (bitty-runtime must not depend on bitty-config,

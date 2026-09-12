@@ -223,6 +223,11 @@ pub use bitty_ui::{
     DecoratedView, Decoration, DecorationError, Focus, FocusDirection, Gaps, LayoutNode,
     ScrollbarMode, SplitAxis, View, ViewId,
 };
+
+// CTX-0355: the resolved terminal palette crosses the app/runtime seam on
+// `RuntimeConfig`; re-export it so the composition root needs no direct
+// `bitty-render` dependency for the preset mapping.
+pub use bitty_render::ThemePalette;
 pub use bitty_ui::{Point as UiPoint, Rect as UiRect, Size as UiSize};
 
 pub use registry::{

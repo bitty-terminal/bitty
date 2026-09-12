@@ -106,7 +106,7 @@ use wgpu::{
 use crate::atlas::AtlasDims;
 use crate::batch;
 use crate::error::RenderError;
-use crate::grid::DrawList;
+use crate::grid::{DrawList, ThemePalette};
 use crate::pipeline::GpuResources;
 
 // ---------------------------------------------------------------------------
@@ -508,6 +508,11 @@ struct SurfaceState {
     config: Option<SurfaceConfig>,
     wgpu_config: Option<SurfaceConfiguration>,
     frame: u64,
+    // Resolved terminal palette (CTX-0355) driving the clear color on every
+    // present path. Defaults to the designed Bitty Dark preset; the embedder
+    // installs the selected `appearance.theme` palette via
+    // `Surface::set_theme_palette`.
+    theme: ThemePalette,
     // Requested window opacity (CTX-0290), sanitized. Kept separately from
     // `config` so it survives reconfiguration (resize / swap-chain loss).
     opacity: f32,
@@ -527,11 +532,12 @@ struct SurfaceState {
 }
 
 impl SurfaceState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             config: None,
             wgpu_config: None,
             frame: 0,
+            theme: ThemePalette::bitty_dark(),
             opacity: 1.0,
             alpha_supported: true,
             headless_rgba: None,
@@ -674,6 +680,23 @@ impl Surface {
     #[must_use]
     pub fn opacity(&self) -> f32 {
         self.state.lock().expect("surface state poisoned").opacity
+    }
+
+    /// Installs the resolved terminal palette (CTX-0355).
+    ///
+    /// Every clear path (clear-only present, `DrawList` present, and the
+    /// headless composites) paints `palette.background`, so the window clear
+    /// follows `appearance.theme`. Defaults to the designed Bitty Dark
+    /// preset, keeping the pre-CTX-0355 behavior byte-identical until the
+    /// embedder installs a selected preset.
+    pub fn set_theme_palette(&self, palette: ThemePalette) {
+        self.state.lock().expect("surface state poisoned").theme = palette;
+    }
+
+    /// The resolved terminal palette used by the clear paths.
+    #[must_use]
+    pub fn theme_palette(&self) -> ThemePalette {
+        self.state.lock().expect("surface state poisoned").theme
     }
 
     /// Whether the renderer can honor opacity on this surface (CTX-0290).
@@ -868,6 +891,8 @@ impl Surface {
                 drop(state);
 
                 let opacity = self.effective_opacity();
+                // CTX-0355: the clear color follows the resolved palette.
+                let theme = self.theme_palette();
 
                 // Acquire with one retry on Outdated/Lost: reconfigure and try again.
                 // This matches wgpu's recommended recovery for swap-chain loss
@@ -901,15 +926,13 @@ impl Surface {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                // Bitty Dark clear color (single source of
-                                // truth: `bitty_config::theme::BITTY_DARK`
-                                // via `crate::grid::DEFAULT_BG`); channels
-                                // are sRGB-decoded to linear light for the
-                                // `Srgb` swap-chain target (CTX-0222) and
-                                // premultiplied by the requested opacity
+                                // Resolved theme clear color (CTX-0355):
+                                // channels are sRGB-decoded to linear light
+                                // for the `Srgb` swap-chain target (CTX-0222)
+                                // and premultiplied by the requested opacity
                                 // (CTX-0290), so the store-encode presents
                                 // the byte-exact composited color.
-                                load: wgpu::LoadOp::Clear(premultiplied_clear(opacity)),
+                                load: wgpu::LoadOp::Clear(premultiplied_clear(&theme, opacity)),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -1009,11 +1032,10 @@ impl Surface {
                 // must not reach `vec!` unchecked.
                 let len = headless_buffer_len(width, height)?;
                 let mut rgba = vec![0u8; len];
-                // Clear to the theme background (premultiplied) — Bitty Dark
-                // via `crate::grid::DEFAULT_BG`; matches the GPU clear
-                // color above.
+                // Clear to the resolved theme background (premultiplied,
+                // CTX-0355); matches the GPU clear color above.
                 {
-                    let bg = crate::grid::DEFAULT_BG;
+                    let bg = self.theme_palette().background;
                     let pr = premultiply(bg[0], bg[3]);
                     let pg = premultiply(bg[1], bg[3]);
                     let pb = premultiply(bg[2], bg[3]);
@@ -1202,11 +1224,12 @@ impl Surface {
                     config.extent.height(),
                     draw_list.plan.extent,
                 );
-                // Theme clear color: Bitty Dark via `crate::grid::DEFAULT_BG`,
-                // sRGB-decoded to linear light for the `Srgb` swap-chain
-                // target (CTX-0222) and premultiplied by the effective
-                // opacity (CTX-0290), matching the clear-only path above.
-                let clear = premultiplied_clear(opacity);
+                // Theme clear color: the resolved palette background
+                // (CTX-0355), sRGB-decoded to linear light for the `Srgb`
+                // swap-chain target (CTX-0222) and premultiplied by the
+                // effective opacity (CTX-0290), matching the clear-only path
+                // above.
+                let clear = premultiplied_clear(&self.theme_palette(), opacity);
                 let images_skipped = {
                     let mut state = self.state.lock().expect("surface state poisoned");
                     let resources = state.resources.as_mut().ok_or_else(|| {
@@ -1321,7 +1344,8 @@ impl Surface {
         let len = headless_buffer_len(width, height)?;
         let mut rgba = vec![0u8; len];
         {
-            let bg = crate::grid::DEFAULT_BG;
+            // Clear to the resolved theme background (premultiplied, CTX-0355).
+            let bg = self.theme_palette().background;
             let pr = premultiply(bg[0], bg[3]);
             let pg = premultiply(bg[1], bg[3]);
             let pb = premultiply(bg[2], bg[3]);
@@ -1561,16 +1585,16 @@ fn synthesize_wgpu_config(config: &SurfaceConfig) -> SurfaceConfiguration {
     build_wgpu_config(config, alpha_mode)
 }
 
-/// Premultiplied clear color for `opacity` (CTX-0290).
+/// Premultiplied clear color for `opacity` from `palette` (CTX-0290/CTX-0355).
 ///
 /// The theme background is sRGB-decoded to linear light (matching the
 /// pre-CTX-0290 clear, CTX-0222) and scaled by `opacity`; alpha is
 /// `opacity`. With the alpha-pinning blend this leaves the swap-chain
 /// buffer at uniform alpha = `opacity` with premultiplied RGB, which the
 /// compositor blends at the requested window opacity.
-fn premultiplied_clear(opacity: f32) -> wgpu::Color {
+fn premultiplied_clear(palette: &ThemePalette, opacity: f32) -> wgpu::Color {
     let o = f64::from(opacity);
-    let bg = crate::grid::DEFAULT_BG;
+    let bg = palette.background;
     wgpu::Color {
         r: f64::from(crate::batch::srgb8_to_linear(bg[0])) * o,
         g: f64::from(crate::batch::srgb8_to_linear(bg[1])) * o,
@@ -1956,6 +1980,60 @@ mod tests {
         .unwrap();
         let surface = Surface::headless_with_config(cfg).unwrap();
         assert_eq!(surface.config().unwrap(), cfg);
+    }
+
+    #[test]
+    fn theme_palette_drives_clear_color_not_bitty_dark() {
+        // CTX-0355: the clear color must follow the resolved palette. The
+        // pre-fix code hardcoded `crate::grid::DEFAULT_BG` (Bitty Dark) in
+        // `premultiplied_clear` and the headless clear, so a light preset
+        // still cleared to #1E1E2E.
+        use crate::grid::{DrawList, ThemePalette};
+
+        let extent = PhysicalSize::new(4, 2);
+        let dark = ThemePalette::bitty_dark();
+        let light =
+            ThemePalette::from_theme(bitty_config::theme::resolve_theme(Some("github-light")));
+        assert_eq!(dark.background, [0x1E, 0x1E, 0x2E, 0xFF]);
+        assert_eq!(light.background, [0xFF, 0xFF, 0xFF, 0xFF]);
+
+        // The GPU clear argument (used by the real present path) follows the
+        // palette background, sRGB-decoded and premultiplied by opacity.
+        let dark_clear = premultiplied_clear(&dark, 1.0);
+        let light_clear = premultiplied_clear(&light, 1.0);
+        assert_eq!(light_clear.r, 1.0);
+        assert_eq!(light_clear.g, 1.0);
+        assert_eq!(light_clear.b, 1.0);
+        assert_eq!(light_clear.a, 1.0);
+        assert_ne!(light_clear.r, dark_clear.r);
+        assert_ne!(light_clear.g, dark_clear.g);
+        assert_ne!(light_clear.b, dark_clear.b);
+
+        // The headless composite path shares the same source of truth.
+        let surface = Surface::headless(extent).expect("valid extent");
+        surface.set_theme_palette(light);
+        assert_eq!(surface.theme_palette(), light);
+        let empty = DrawList {
+            generation: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(4, 2),
+                mode: crate::frame::FrameMode::Clean,
+                dirty_rects: vec![],
+            },
+            fills: vec![],
+            rounded_fills: vec![],
+            glyphs: vec![],
+            images: vec![],
+        };
+        surface
+            .headless_present(&empty, None)
+            .expect("headless clear-only present");
+        let rgba = surface.headless_rgba().expect("rgba after present");
+        assert_eq!(
+            &rgba[..4],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            "clear must be github-light bg"
+        );
     }
 
     #[test]

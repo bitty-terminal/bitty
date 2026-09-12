@@ -666,11 +666,11 @@ impl Runtime {
                             // (`bitty_render::grid::cursor_fill`: block = full cell,
                             // bar = left strip, underline = bottom strip, 15% thickness
                             // per DEC-0017 ghostty/alacritty refs). Geometry is shared;
-                            // the overlay hue is the designed theme cursor
-                            // (`crate::palette::theme_cursor_rgba`, Bitty Dark
-                            // rosewater) so the live cursor matches the palette
-                            // out of the box (CTX-0219: no hardcoded white).
-                            if let Some(fill) = bitty_render::grid::cursor_fill(
+                            // the overlay hue is the resolved theme cursor
+                            // (CTX-0355) so the live cursor matches the selected
+                            // preset (CTX-0219: no hardcoded white).
+                            if let Some(fill) = bitty_render::grid::cursor_fill_in(
+                                &self.config.theme,
                                 &view_snapshot.cursor,
                                 live,
                                 view_snapshot.width,
@@ -682,7 +682,7 @@ impl Runtime {
                                 // checked above).
                                 let cursor_color: bitty_render::grid::Rgba8 =
                                     if view_snapshot.cursor.visible {
-                                        let mut themed = crate::palette::theme_cursor_rgba();
+                                        let mut themed = self.config.theme.cursor;
                                         themed[3] = 0xA0;
                                         themed
                                     } else {
@@ -852,7 +852,8 @@ impl Runtime {
                         if let Some(frame) =
                             allocations.iter().find(|frame| frame.view == focused_id)
                         {
-                            let rects = bitty_render::grid::selection_fill_rects(
+                            let rects = bitty_render::grid::selection_fill_rects_in(
+                                &self.config.theme,
                                 (norm.start.row, norm.start.col),
                                 (norm.end.row, norm.end.col),
                                 snapshot.width,

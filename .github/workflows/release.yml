@@ -355,9 +355,10 @@ jobs:
           git -C "$AUR_DIR" checkout -B master
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
-          if [ ! -f "$AUR_DIR/PKGBUILD" ]; then
-            cp packaging/PKGBUILD "$AUR_DIR/PKGBUILD"
-          fi
+          # Always sync the source recipe from the tagged tree, matching the
+          # `aur-bin` job: a first-run-only copy would strand later PKGBUILD
+          # fixes (for example the bounded check() in CTX-0351) on AUR.
+          cp packaging/PKGBUILD "$AUR_DIR/PKGBUILD"
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" "$AUR_DIR/PKGBUILD"
           id builder >/dev/null 2>&1 || useradd --create-home builder
           # Keep the AUR checkout root-owned so root git stays trusted; run

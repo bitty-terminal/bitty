@@ -45,6 +45,14 @@ git push aur@aur.archlinux.org:bitty.git
 git push aur@aur.archlinux.org:bitty-bin.git  # first push registers the package
 ```
 
+Install from the AUR (prebuilt binary, no local compile):
+
+```sh
+paru -S bitty-bin   # or: yay -S bitty-bin
+```
+
+The source package (`bitty`) compiles the whole workspace locally and needs the Rust toolchain; prefer `bitty-bin` unless you specifically need a source build. `bitty` and `bitty-bin` conflict, so install one or the other.
+
 Validation: `bash -n PKGBUILD && makepkg --printsrcinfo`, plus `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
 
 ## Homebrew

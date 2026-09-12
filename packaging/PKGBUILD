@@ -26,7 +26,12 @@ build() {
 
 check() {
   cd "$pkgname-$pkgver"
-  cargo test --locked --workspace --all-targets || true
+  # Bounded smoke only: the freshly built binary must report the packaged
+  # version. The full `cargo test --workspace --all-targets` matrix is not
+  # run here: it compiles every test target of the 16-crate workspace, is
+  # disk-bound (rustc codegen ICE on a full disk), and `|| true` masked its
+  # exit status anyway. Project CI owns the full test matrix.
+  test "$(./target/release/bitty --version)" = "$pkgver"
 }
 
 package() {

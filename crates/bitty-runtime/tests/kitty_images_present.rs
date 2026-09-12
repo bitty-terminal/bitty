@@ -187,7 +187,10 @@ fn scroll_moves_image_with_content() {
         probe(&before, width, origin_x + 4, bottom * ch + origin_y + 9),
         [0xFF, 0, 0, 0xFF]
     );
-    // Three linefeeds scroll the anchor one content row up.
+    // Three linefeeds scroll the anchor one content row up, and the CTX-0361
+    // cursor-follow window slides two more rows (the cursor reached the grid
+    // bottom: 24-row screen, 22-row decorated frame), so the image tracks the
+    // text upward by three presented rows.
     rt.handle_pty_bytes(b"\n\n\n");
     rt.tick().expect("scroll damage must present");
     let after = rt.headless_rgba().expect("rgba");
@@ -195,8 +198,8 @@ fn scroll_moves_image_with_content() {
     assert_eq!(
         red_band(&after, width),
         Some((
-            (bottom - 1) * ch + origin_y,
-            (bottom - 1) * ch + origin_y + ch - 1
+            (bottom - 3) * ch + origin_y,
+            (bottom - 3) * ch + origin_y + ch - 1
         )),
         "image must track the scrolled content upward"
     );
@@ -358,11 +361,13 @@ fn scroll_invalidates_cached_raster_without_stale_pixels() {
     let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
     let ch = cfg.cell_height as usize;
     let rgba = rt.headless_rgba().expect("rgba");
+    // CTX-0361: one content scroll row plus the two-row cursor-follow window
+    // slide (cursor at the 24-row grid bottom, 22-row decorated frame).
     assert_eq!(
         red_band(&rgba, width),
         Some((
-            (bottom - 1) * ch + origin_y,
-            (bottom - 1) * ch + origin_y + ch - 1
+            (bottom - 3) * ch + origin_y,
+            (bottom - 3) * ch + origin_y + ch - 1
         )),
         "image must track the scrolled content upward"
     );

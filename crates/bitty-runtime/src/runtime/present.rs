@@ -198,25 +198,54 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
+/// First source row of a viewport window that keeps `cursor_row` visible.
+///
+/// The window is `window` rows tall inside `src_len` rows. It stays at the
+/// top while the cursor fits in the first window; once the cursor is below,
+/// the window scrolls the minimum amount and clamps to the screen bottom, so
+/// it ends bottom-anchored on the last rows (the live prompt case). CTX-0361.
+fn cursor_follow_window_start(cursor_row: usize, src_len: usize, window: usize) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    let max_start = src_len.saturating_sub(window);
+    if cursor_row < window {
+        0
+    } else {
+        (cursor_row + 1 - window).min(max_start)
+    }
+}
+
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
 ///
-/// The viewport is the top-left `cols x rows` window of the active screen,
-/// padded with erased cells when the requested size exceeds the snapshot
-/// dimensions (honest padding for the deferred grid-resize reflow). Cursor and
-/// modes are carried over; title/modes are snapshot-owned.
+/// When the requested size matches the snapshot the snapshot is returned
+/// unchanged. Otherwise the window is derived from the active screen, padded
+/// with erased cells when the requested size exceeds the snapshot dimensions
+/// (honest padding for the deferred grid-resize reflow). Rows follow the
+/// cursor: a screen taller than the viewport (the decorated content frame is
+/// smaller than the PTY grid until reflow) shows the rows around the live
+/// cursor instead of cropping the bottom, and the cursor is translated into
+/// window coordinates so the overlay paints the prompt row (CTX-0361). Cursor
+/// and modes are carried over; title/modes are snapshot-owned.
 pub(super) fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Snapshot {
     let req_w = cols as usize;
     let req_h = rows as usize;
     if snapshot.width == req_w && snapshot.height == req_h {
         return snapshot.clone();
     }
+    let start_row = cursor_follow_window_start(
+        snapshot.cursor.position.row as usize,
+        snapshot.height,
+        req_h,
+    );
     let mut cells = Vec::with_capacity(req_w * req_h);
     let src_w = snapshot.width;
     let src_h = snapshot.height;
     for r in 0..req_h {
         for c in 0..req_w {
-            if r < src_h && c < src_w {
-                let idx = r * src_w + c;
+            let src_r = start_row + r;
+            if src_r < src_h && c < src_w {
+                let idx = src_r * src_w + c;
                 let cell = snapshot.cells.get(idx).cloned().unwrap_or_else(|| {
                     bitty_term_state::Cell::erased(bitty_term_state::Style::default())
                 });
@@ -243,13 +272,16 @@ pub(super) fn viewport_snapshot(snapshot: &Snapshot, cols: u16, rows: u16) -> Sn
             }
         }
     }
+    let mut cursor = snapshot.cursor.clone();
+    cursor.position.row = (usize::from(cursor.position.row).saturating_sub(start_row))
+        .min(req_h.saturating_sub(1)) as u16;
     Snapshot {
         version: snapshot.version,
         generation: snapshot.generation,
         width: req_w,
         height: req_h,
         cells: cells.into_boxed_slice(),
-        cursor: snapshot.cursor.clone(),
+        cursor,
         modes: snapshot.modes.clone(),
         title: snapshot.title.clone(),
     }
@@ -1121,7 +1153,31 @@ impl Runtime {
                             // CTX-0254: the origin's own scrollback sequence
                             // (resolved above), so a pane's image tracks its
                             // pane's content — never the primary grid's.
-                            let scrollback = kitty_origin_scrollback;
+                            // CTX-0361: fold the live cursor-follow window
+                            // start into the sequence so placements track the
+                            // same rows the text viewport presents (the
+                            // decorated content frame is smaller than the PTY
+                            // grid until reflow).
+                            let (origin_cursor_row, origin_rows) = match kitty_origin {
+                                Some(token) => match self.pane_sessions.get(&ViewId::new(token)) {
+                                    Some(sess) => (
+                                        usize::from(sess.state.cursor().position.row),
+                                        sess.state.height(),
+                                    ),
+                                    None => {
+                                        (usize::from(snapshot.cursor.position.row), snapshot.height)
+                                    }
+                                },
+                                None => {
+                                    (usize::from(snapshot.cursor.position.row), snapshot.height)
+                                }
+                            };
+                            let scrollback = kitty_origin_scrollback
+                                + cursor_follow_window_start(
+                                    origin_cursor_row,
+                                    origin_rows,
+                                    usize::from(frame.rows),
+                                );
                             let origin_px_x = px_add(pad_px, frame.content.x);
                             let origin_px_y = px_add(pad_px, frame.content.y);
                             let mut budget = bitty_rich::KittyFrameBudget::new();
@@ -1388,5 +1444,75 @@ mod present_origin_tests {
         assert_eq!(px_span(u16::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_span_usize(usize::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_side(u32::MAX), i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod viewport_follow_tests {
+    use super::{cursor_follow_window_start, viewport_snapshot};
+    use bitty_term_state::{Snapshot, State, TerminalAction};
+    use bitty_vt::{Col, Row};
+
+    /// Snapshot with one sentinel glyph per row (`a`..) so the tests can see
+    /// which source rows the viewport window selected.
+    fn marked_snapshot(width: usize, height: usize, cursor_row: u16, cursor_col: u16) -> Snapshot {
+        let mut state = State::new();
+        state.resize(width, height);
+        let _ = state.apply(&TerminalAction::CursorPosition {
+            row: Row(cursor_row + 1),
+            col: Col(cursor_col + 1),
+        });
+        let mut snapshot = state.snapshot();
+        for row in 0..height {
+            snapshot.cells[row * width].glyph = char::from(b'a' + row as u8);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn window_start_follows_cursor_then_clamps_to_screen_bottom() {
+        // Cursor inside the first window -> window stays at the top.
+        assert_eq!(cursor_follow_window_start(0, 24, 22), 0);
+        assert_eq!(cursor_follow_window_start(21, 24, 22), 0);
+        // Cursor one/two rows below -> minimal scroll, bottom-anchored.
+        assert_eq!(cursor_follow_window_start(22, 24, 22), 1);
+        assert_eq!(cursor_follow_window_start(23, 24, 22), 2);
+        // Hostile cursor beyond the screen clamps to the last window.
+        assert_eq!(cursor_follow_window_start(9_999, 24, 22), 2);
+        // Window covers the whole screen or is degenerate -> top.
+        assert_eq!(cursor_follow_window_start(23, 24, 24), 0);
+        assert_eq!(cursor_follow_window_start(5, 24, 0), 0);
+    }
+
+    #[test]
+    fn viewport_snapshot_keeps_cursor_row_visible_and_translates_cursor() {
+        let snapshot = marked_snapshot(4, 4, 3, 1);
+
+        let window = viewport_snapshot(&snapshot, 4, 2);
+        assert_eq!(window.height, 2);
+        assert_eq!(
+            window.cursor.position.row, 1,
+            "cursor row must be translated into the window (bottom row)"
+        );
+        assert_eq!(window.cursor.position.col, 1);
+        assert_eq!(window.cells[0].glyph, 'c', "window shows source row 2");
+        assert_eq!(window.cells[4].glyph, 'd', "window shows source row 3");
+    }
+
+    #[test]
+    fn viewport_snapshot_keeps_top_window_while_cursor_fits() {
+        let snapshot = marked_snapshot(4, 4, 1, 0);
+
+        let window = viewport_snapshot(&snapshot, 4, 2);
+        assert_eq!(window.cursor.position.row, 1);
+        assert_eq!(window.cells[0].glyph, 'a', "window stays at the top");
+        assert_eq!(window.cells[4].glyph, 'b');
+    }
+
+    #[test]
+    fn viewport_snapshot_equal_dims_is_identity() {
+        let snapshot = marked_snapshot(4, 4, 2, 3);
+        let window = viewport_snapshot(&snapshot, 4, 4);
+        assert_eq!(window, snapshot);
     }
 }

@@ -4,31 +4,31 @@
   "carryctx_version": "0.11.3",
   "schema_version": 18,
   "project_id": "01M0WAMWPGZ2YDGM6M88AT3YGT",
-  "export_id": "01M2AV300XDJTFTK3180JN99B7",
-  "created_at": "2026-09-12T12:57:12.989782430+00:00",
+  "export_id": "01M2AVXBTMX5R7TBXTWXKG5TT0",
+  "created_at": "2026-09-12T13:11:37.044372390+00:00",
   "parents": [
-    "01M2AN9T8J7N9QDZT7ERPE9SYG"
+    "01M2AV300XDJTFTK3180JN99B7"
   ],
   "sequences": {
     "display_id_CTX": 360,
     "display_id_decision": 52,
     "display_id_handoff": 48,
-    "display_id_progress": 2066
+    "display_id_progress": 2067
   },
   "source": {
-    "git_commit": "0c4b6ae99c7c7bb0484fd0b079f08c9139097fba",
+    "git_commit": "053d62ac8242212cdae216c694e72231c412ee39",
     "hostname": "unknown"
   },
   "counts": {
     "agents": 478,
     "checkpoint_corrections": 0,
-    "checkpoints": 1116,
+    "checkpoints": 1117,
     "decisions": 51,
-    "events": 8729,
+    "events": 8745,
     "graph_edges": 652,
     "graph_nodes": 180,
     "handoffs": 47,
-    "progress_items": 2065,
+    "progress_items": 2066,
     "scopes": 748,
     "sequences": 4,
     "sessions": 475,

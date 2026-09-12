@@ -12,7 +12,9 @@
 //! [`FONT_FALLBACK_CHAIN`]: bitty_config::types::FONT_FALLBACK_CHAIN
 
 #[cfg(test)]
-use bitty_config::types::{EMOJI_FALLBACK_FAMILY, SYMBOLS_FALLBACK_FAMILY};
+use bitty_config::types::EMOJI_FALLBACK_FAMILY;
+#[cfg(all(test, target_os = "linux"))]
+use bitty_config::types::SYMBOLS_FALLBACK_FAMILY;
 use bitty_config::types::{FONT_FALLBACK_CHAIN, FontConfig};
 
 use crate::error::RenderError;
@@ -389,15 +391,35 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
         assert_eq!(wrapped.fallback_families(), expected.as_slice());
-        assert_eq!(
-            wrapped.fallback_families().last().map(String::as_str),
-            Some(EMOJI_FALLBACK_FAMILY)
+        assert!(
+            wrapped
+                .fallback_families()
+                .iter()
+                .any(|f| f == EMOJI_FALLBACK_FAMILY)
         );
+        // The braille/symbols face is platform-pinned: Linux resolves it to
+        // Noto Sans Symbols 2, macOS to Apple Braille, Windows to Segoe UI
+        // Symbol (asserted together in `bitty-config`).
+        #[cfg(target_os = "linux")]
         assert!(
             wrapped
                 .fallback_families()
                 .iter()
                 .any(|f| f == SYMBOLS_FALLBACK_FAMILY)
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            wrapped
+                .fallback_families()
+                .iter()
+                .any(|f| f == "Apple Braille")
+        );
+        #[cfg(windows)]
+        assert!(
+            wrapped
+                .fallback_families()
+                .iter()
+                .any(|f| f == "Segoe UI Symbol")
         );
     }
 
@@ -405,10 +427,8 @@ mod tests {
     fn chain_for_puts_primary_first_without_dupes() {
         let chain = FallbackRasterizer::<Fake>::chain_for("My Mono");
         assert_eq!(chain[0], "My Mono");
-        assert_eq!(
-            chain.last().map(String::as_str),
-            Some(EMOJI_FALLBACK_FAMILY)
-        );
+        assert!(chain.iter().any(|f| f == EMOJI_FALLBACK_FAMILY));
+        #[cfg(target_os = "linux")]
         assert!(chain.iter().any(|f| f == SYMBOLS_FALLBACK_FAMILY));
         let chain = FallbackRasterizer::<Fake>::chain_for("monospace");
         assert_eq!(chain.iter().filter(|f| *f == "monospace").count(), 1);

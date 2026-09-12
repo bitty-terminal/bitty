@@ -2137,8 +2137,14 @@ mod tests {
         };
         let chain = custom.fallback_chain();
         assert_eq!(chain.len(), FONT_FALLBACK_CHAIN.len() + 1);
-        assert!(chain.contains(&SYMBOLS_FALLBACK_FAMILY.to_string()));
         assert!(chain.contains(&EMOJI_FALLBACK_FAMILY.to_string()));
+        // The platform symbols/braille tail survives a custom primary.
+        #[cfg(target_os = "linux")]
+        assert!(chain.contains(&SYMBOLS_FALLBACK_FAMILY.to_string()));
+        #[cfg(target_os = "macos")]
+        assert!(chain.contains(&"Apple Braille".to_string()));
+        #[cfg(windows)]
+        assert!(chain.contains(&"Segoe UI Symbol".to_string()));
         #[cfg(target_os = "linux")]
         {
             assert!(FONT_FALLBACK_CHAIN.contains(&"DejaVu Sans Mono"));

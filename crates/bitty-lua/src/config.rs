@@ -186,6 +186,13 @@ pub struct DecorationData {
     pub border_color_focused: Option<String>,
     /// Explicit idle outline color (CTX-0340); raw canonical string.
     pub border_color_idle: Option<String>,
+    /// Base outline width in logical px (CTX-0344, RFC-0001/OQ-045); plain
+    /// integer, range-checked downstream in `bitty-config` (fail-closed).
+    pub border_width: Option<i64>,
+    /// Explicit focused outline width in logical px (CTX-0344).
+    pub border_width_focused: Option<i64>,
+    /// Explicit idle outline width in logical px (CTX-0344).
+    pub border_width_idle: Option<i64>,
 }
 
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
@@ -954,6 +961,9 @@ impl ConfigData {
                             "border_color",
                             "border_color_focused",
                             "border_color_idle",
+                            "border_width",
+                            "border_width_focused",
+                            "border_width_idle",
                         ],
                     )?;
                     let gaps_in = match get_field(nested, "gaps_in") {
@@ -992,6 +1002,21 @@ impl ConfigData {
                         Some(v) => Some(expect_string("decoration.border_color_idle", v)?),
                         None => None,
                     };
+                    // CTX-0344: outline widths are integers (floats rejected
+                    // like every other px key); the `0..=16` bound is
+                    // enforced fail-closed in `bitty-config`.
+                    let border_width = match get_field(nested, "border_width") {
+                        Some(v) => Some(expect_integer("decoration.border_width", v)?),
+                        None => None,
+                    };
+                    let border_width_focused = match get_field(nested, "border_width_focused") {
+                        Some(v) => Some(expect_integer("decoration.border_width_focused", v)?),
+                        None => None,
+                    };
+                    let border_width_idle = match get_field(nested, "border_width_idle") {
+                        Some(v) => Some(expect_integer("decoration.border_width_idle", v)?),
+                        None => None,
+                    };
                     out.decoration = Some(DecorationData {
                         gaps_in,
                         gaps_out,
@@ -1001,6 +1026,9 @@ impl ConfigData {
                         border_color,
                         border_color_focused,
                         border_color_idle,
+                        border_width,
+                        border_width_focused,
+                        border_width_idle,
                     });
                 }
                 "scrollbar" => {

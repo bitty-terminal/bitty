@@ -83,6 +83,21 @@ pub const MAX_DECORATION_CONTENT_INSET_PX: u32 = 32;
 /// Maximum View frame border thickness in logical px, accepted CTX-0118.
 pub const MAX_DECORATION_BORDER_PX: u32 = 8;
 
+/// Maximum focused/idle **outline width** in logical px (CTX-0344,
+/// RFC-0001/OQ-045): `0..=16`.
+///
+/// Deliberately wider than [`MAX_DECORATION_BORDER_PX`] (the content-inset
+/// geometry bound) because a focused outline may need to stand out from a
+/// thick idle one. This is the paint-only ring thickness; it never moves the
+/// content grid. Out-of-range values fail closed, never clamp.
+pub const MAX_DECORATION_BORDER_WIDTH_PX: u32 = 16;
+
+/// Safe-mode outline width (CTX-0344, RFC-0001/OQ-045): focused `1`, idle `1`.
+///
+/// Equal widths supply no non-color focus cue, so safe mode satisfies AC-2
+/// through the accepted safe color pair (`#FFFFFF` / `#808080`) instead.
+pub const SAFE_DECORATION_BORDER_WIDTH_PX: u32 = 1;
+
 /// Maximum View frame corner radius in logical px, accepted CTX-0118.
 pub const MAX_DECORATION_RADIUS_PX: u32 = 16;
 
@@ -694,6 +709,24 @@ pub struct ResolvedOutlineColors {
     pub idle: OutlineColor,
 }
 
+/// One resolved focused/idle outline-width pair in logical pixels (CTX-0344,
+/// RFC-0001/OQ-045).
+///
+/// Produced by [`DecorationConfig::resolve_outline_width`] after applying the
+/// accepted resolution order (`decoration.border` then
+/// `decoration.border_width` then the explicit `_focused` / `_idle` pair).
+/// The render path scales these at the live DPI factor exactly like
+/// `decoration.border`; a focused/idle delta of `1` logical px stays at
+/// least `1` physical px at any DPI. Values are paint-only: the content
+/// rectangle stays inset by `border + content_inset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedOutlineWidths {
+    /// Focused `View` ring thickness in logical px.
+    pub focused: u32,
+    /// Idle (unfocused) `View` ring thickness in logical px.
+    pub idle: u32,
+}
+
 /// Default selection auto-copy behavior (CTX-0191).
 /// `true` preserves the ghostty-class copy-on-select: a committed mouse
 /// selection auto-copies to the clipboard (which best-effort syncs primary).
@@ -1202,6 +1235,14 @@ impl LayoutConfig {
 /// base then explicit pair; see [`Self::resolve_outline`]. Values are
 /// canonical `#RRGGBB` / `#RRGGBBAA` ([`OutlineColor`]).
 ///
+/// CTX-0344 adds the accepted focus/idle **outline width** triple
+/// (RFC-0001 `OQ-045`): `border_width` is the base (inheriting
+/// `decoration.border` when unset), and `border_width_focused` /
+/// `border_width_idle` override it explicitly; see
+/// [`Self::resolve_outline_width`]. Bounds are `0..=16` logical px,
+/// fail-closed, live reload, and the ring is painted inside the frame so the
+/// content grid never moves.
+///
 /// CTX-0333 raised the sibling gap default from the earlier `4` so
 /// `gaps_in == gaps_out` out of the box (panel-to-panel matches
 /// panel-to-terminal/container spacing) and added `content_inset`, the inner
@@ -1243,6 +1284,19 @@ pub struct DecorationConfig {
     /// Explicit idle outline override (CTX-0340
     /// `decoration.border_color_idle`). `None` inherits the resolved base.
     pub border_color_idle: Option<OutlineColor>,
+    /// Base outline width for both focus states (CTX-0344
+    /// `decoration.border_width`), logical px. `None` inherits
+    /// [`Self::border`] (the accepted OQ-045 order: `border` then
+    /// `border_width` then the explicit pair).
+    pub border_width: Option<u32>,
+    /// Explicit focused outline-width override (CTX-0344
+    /// `decoration.border_width_focused`), logical px. `None` inherits the
+    /// resolved base and never silently shadows it.
+    pub border_width_focused: Option<u32>,
+    /// Explicit idle outline-width override (CTX-0344
+    /// `decoration.border_width_idle`), logical px. `None` inherits the
+    /// resolved base.
+    pub border_width_idle: Option<u32>,
 }
 
 impl Default for DecorationConfig {
@@ -1256,6 +1310,9 @@ impl Default for DecorationConfig {
             border_color: None,
             border_color_focused: None,
             border_color_idle: None,
+            border_width: None,
+            border_width_focused: None,
+            border_width_idle: None,
         }
     }
 }
@@ -1278,10 +1335,16 @@ impl DecorationConfig {
             border_color: None,
             border_color_focused: Some(SAFE_DECORATION_BORDER_FOCUSED),
             border_color_idle: Some(SAFE_DECORATION_BORDER_IDLE),
+            border_width: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
+            border_width_focused: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
+            border_width_idle: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
         }
     }
 
     /// True when every decoration is zero (undecorated fast path).
+    ///
+    /// The CTX-0344 outline-width knobs participate: an explicit non-zero
+    /// width paints a ring even when the geometry `border` is zero.
     #[must_use]
     pub const fn is_zero(&self) -> bool {
         self.gaps_in == 0
@@ -1289,6 +1352,9 @@ impl DecorationConfig {
             && self.border == 0
             && self.radius == 0
             && self.content_inset == 0
+            && matches!(self.border_width, None | Some(0))
+            && matches!(self.border_width_focused, None | Some(0))
+            && matches!(self.border_width_idle, None | Some(0))
     }
 
     /// Resolves the focused/idle outline pair from the theme tokens and the
@@ -1315,6 +1381,39 @@ impl DecorationConfig {
             .or(self.border_color)
             .unwrap_or(theme.border_idle);
         ResolvedOutlineColors { focused, idle }
+    }
+
+    /// Resolves the focused/idle outline-width pair in logical px from the
+    /// accepted CTX-0344 (RFC-0001 `OQ-045`) order.
+    ///
+    /// A width is available from, in increasing precedence:
+    /// 1. `decoration.border` (the base paint thickness, default `2`);
+    /// 2. `decoration.border_width` (base, both states);
+    /// 3. the explicit `decoration.border_width_focused` /
+    ///    `decoration.border_width_idle` pair.
+    ///
+    /// Only an explicit member overrides the resolved base; an unset member
+    /// inherits it and never shadows it. Safe mode ([`Self::safe`], which
+    /// stores the equal `1`/`1` pair) short-circuits to that pair, so safe
+    /// mode never relies on a width cue.
+    #[must_use]
+    pub fn resolve_outline_width(&self) -> ResolvedOutlineWidths {
+        let base = self.border_width.unwrap_or(self.border);
+        let focused = self.border_width_focused.unwrap_or(base);
+        let idle = self.border_width_idle.unwrap_or(base);
+        ResolvedOutlineWidths { focused, idle }
+    }
+
+    /// Whether the resolved width pair supplies the AC-2 non-color focus cue
+    /// (`border_width_focused >= border_width_idle + 1`, CTX-0344/RFC-0001).
+    ///
+    /// Integer logical px, so the delta survives DPI scaling. Used by the
+    /// contrast contract to allow a focused/idle color pair below the `3:1`
+    /// threshold when the thickness delta distinguishes focus instead.
+    #[must_use]
+    pub fn has_non_color_focus_cue(&self) -> bool {
+        let width = self.resolve_outline_width();
+        width.focused >= width.idle.saturating_add(1)
     }
 
     /// Validates the geometry ranges only (fail-closed on out-of-range
@@ -1356,6 +1455,20 @@ impl DecorationConfig {
                 format!("must be within [0, {MAX_DECORATION_CONTENT_INSET_PX}]"),
             ));
         }
+        // CTX-0344 (RFC-0001/OQ-045): the outline-width triple is bounded
+        // `0..=16` logical px fail-closed; never clamped.
+        for (field, value) in [
+            ("decoration.border_width", self.border_width),
+            ("decoration.border_width_focused", self.border_width_focused),
+            ("decoration.border_width_idle", self.border_width_idle),
+        ] {
+            if value.is_some_and(|v| v > MAX_DECORATION_BORDER_WIDTH_PX) {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("must be within [0, {MAX_DECORATION_BORDER_WIDTH_PX}]"),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1363,11 +1476,13 @@ impl DecorationConfig {
     /// over the theme background.
     ///
     /// - AC-1: focused outline >= 3:1 versus the background; fail-closed.
-    /// - AC-2: focused >= 3:1 versus idle. Reviewer clarification (a) of the
-    ///   RFC supports a base-only config where both states share one color;
-    ///   that case claims no color-only focus distinction, so AC-2 applies
-    ///   only when the two resolved colors differ (the non-color focus cue
-    ///   gap remains a tracked follow-up).
+    /// - AC-2: focused >= 3:1 versus idle, **or** the CTX-0344 non-color cue
+    ///   (`border_width_focused >= border_width_idle + 1`) is present, in
+    ///   which case the thickness delta supplies the focus distinction.
+    ///   Reviewer clarification (a) of the RFC supports a base-only config
+    ///   where both states share one color; that case claims no color-only
+    ///   focus distinction, so AC-2 applies only when the two resolved
+    ///   colors differ.
     /// - AC-3: idle >= 1.5:1 versus the background; advisory only, never a
     ///   failure (see [`Self::idle_contrast_warning`]).
     ///
@@ -1392,15 +1507,15 @@ impl DecorationConfig {
                 ),
             ));
         }
-        if resolved.focused != resolved.idle {
+        if resolved.focused != resolved.idle && !self.has_non_color_focus_cue() {
             let ac2 = resolved.focused.contrast_with(resolved.idle, bg);
             if ac2 < MIN_OUTLINE_FOCUSED_IDLE_CONTRAST {
                 return Err(ConfigError::validation(
                     "decoration.border_color_focused",
                     format!(
                         "focused outline {} has contrast {ac2:.2}:1 against idle {}; \
-                         AC-2 requires >= {MIN_OUTLINE_FOCUSED_IDLE_CONTRAST:.1}:1 until a \
-                         non-color focus cue ships",
+                         AC-2 requires >= {MIN_OUTLINE_FOCUSED_IDLE_CONTRAST:.1}:1 or a \
+                         focused outline width >= idle + 1 logical px",
                         resolved.focused, resolved.idle
                     ),
                 ));
@@ -2617,6 +2732,140 @@ mod tests {
         // No user color can survive safe mode: the resolver never reads a
         // theme token when an explicit pair is present.
         assert_ne!(r.focused, DEFAULT_DECORATION_BORDER_FOCUSED);
+    }
+
+    #[test]
+    fn outline_width_defaults_bounds_and_inheritance() {
+        // CTX-0344 (RFC-0001/OQ-045): `0..=16` logical px; the base inherits
+        // `decoration.border`; the pair inherits the resolved base; safe mode
+        // forces the equal `1`/`1` pair.
+        const { assert!(MAX_DECORATION_BORDER_WIDTH_PX == 16) }
+        const { assert!(SAFE_DECORATION_BORDER_WIDTH_PX == 1) }
+        // Default: everything unset -> both states inherit border 2.
+        let d = DecorationConfig::default();
+        let w = d.resolve_outline_width();
+        assert_eq!((w.focused, w.idle), (2, 2));
+        assert!(!d.has_non_color_focus_cue());
+        // Base set -> both states use the base.
+        let d = DecorationConfig {
+            border_width: Some(5),
+            ..Default::default()
+        };
+        let w = d.resolve_outline_width();
+        assert_eq!((w.focused, w.idle), (5, 5));
+        // Explicit members override the base; an unset member inherits it.
+        let d = DecorationConfig {
+            border_width: Some(4),
+            border_width_focused: Some(7),
+            border_width_idle: None,
+            ..Default::default()
+        };
+        let w = d.resolve_outline_width();
+        assert_eq!((w.focused, w.idle), (7, 4));
+        assert!(d.has_non_color_focus_cue());
+        // No base: an unset member falls through to `decoration.border`.
+        let d = DecorationConfig {
+            border: 3,
+            border_width_idle: Some(1),
+            border_width_focused: Some(2),
+            ..Default::default()
+        };
+        let w = d.resolve_outline_width();
+        assert_eq!((w.focused, w.idle), (2, 1));
+        assert!(d.has_non_color_focus_cue());
+        // Focused == idle supplies no non-color cue.
+        let d = DecorationConfig {
+            border_width: Some(6),
+            ..Default::default()
+        };
+        assert!(!d.has_non_color_focus_cue());
+        // Safe mode: equal 1/1 regardless of user values.
+        let safe = DecorationConfig::safe();
+        let w = safe.resolve_outline_width();
+        assert_eq!((w.focused, w.idle), (1, 1));
+        assert!(!safe.has_non_color_focus_cue());
+        assert_eq!(safe.border_width, Some(SAFE_DECORATION_BORDER_WIDTH_PX));
+        // Boundaries are accepted.
+        for raw in [0u32, MAX_DECORATION_BORDER_WIDTH_PX] {
+            DecorationConfig {
+                border_width: Some(raw),
+                border_width_focused: Some(raw),
+                border_width_idle: Some(raw),
+                ..Default::default()
+            }
+            .validate()
+            .expect("boundary width valid");
+        }
+        // Out-of-range fails closed naming the offending key, never clamps.
+        for (field, value) in [
+            (
+                "decoration.border_width",
+                DecorationConfig {
+                    border_width: Some(MAX_DECORATION_BORDER_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "decoration.border_width_focused",
+                DecorationConfig {
+                    border_width_focused: Some(MAX_DECORATION_BORDER_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "decoration.border_width_idle",
+                DecorationConfig {
+                    border_width_idle: Some(MAX_DECORATION_BORDER_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = value
+                .validate()
+                .expect_err("out-of-range width must fail closed");
+            assert_eq!(err.field(), Some(field), "wrong field for {field}");
+        }
+        // Effective-level validation covers the widths too.
+        let mut eff = EffectiveConfig::default();
+        eff.decoration.border_width_focused = Some(MAX_DECORATION_BORDER_WIDTH_PX + 1);
+        eff.validate()
+            .expect_err("effective must reject oversized width");
+        // is_zero accounts for a non-zero explicit width.
+        assert!(
+            !DecorationConfig {
+                border: 0,
+                gaps_in: 0,
+                gaps_out: 0,
+                radius: 0,
+                content_inset: 0,
+                border_width_focused: Some(3),
+                ..Default::default()
+            }
+            .is_zero()
+        );
+    }
+
+    #[test]
+    fn outline_width_non_color_cue_satisfies_ac2() {
+        // CTX-0344: a focused/idle color pair below the AC-2 3:1 threshold is
+        // accepted when the width cue (`focused >= idle + 1`) is present.
+        let theme = crate::theme::default_theme();
+        let no_cue = DecorationConfig {
+            border_color_focused: Some(OutlineColor([0xFF, 0xFF, 0xFF, 0xFF])),
+            border_color_idle: Some(OutlineColor([0xDD, 0xDD, 0xDD, 0xFF])),
+            ..Default::default()
+        };
+        no_cue
+            .validate_outline_contract(theme)
+            .expect_err("without a cue the pair must clear 3:1");
+        let with_cue = DecorationConfig {
+            border_width_focused: Some(3),
+            border_width_idle: Some(1),
+            ..no_cue
+        };
+        with_cue
+            .validate_outline_contract(theme)
+            .expect("the width cue satisfies AC-2");
     }
 
     #[test]

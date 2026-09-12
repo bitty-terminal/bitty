@@ -725,6 +725,10 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "decoration.border" => defaults.decoration.border.to_string(),
         "decoration.radius" => defaults.decoration.radius.to_string(),
         "decoration.content_inset" => defaults.decoration.content_inset.to_string(),
+        // CTX-0344: focus/idle outline widths inherit `decoration.border`.
+        "decoration.border_width" => defaults.decoration.border.to_string(),
+        "decoration.border_width_focused" => defaults.decoration.border.to_string(),
+        "decoration.border_width_idle" => defaults.decoration.border.to_string(),
         // CTX-0341 (RFC-0002): resolved panel animation contract defaults.
         "appearance.animations.enabled" => defaults.animations.enabled.to_string(),
         "appearance.animations.reduced_motion" => {

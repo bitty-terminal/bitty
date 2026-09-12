@@ -64,6 +64,9 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.border_color` | Live               |
 /// | `decoration.border_color_focused` | Live       |
 /// | `decoration.border_color_idle`    | Live       |
+/// | `decoration.border_width` | Live               |
+/// | `decoration.border_width_focused` | Live       |
+/// | `decoration.border_width_idle`    | Live       |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -100,6 +103,9 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.border_color"
         | "decoration.border_color_focused"
         | "decoration.border_color_idle"
+        | "decoration.border_width"
+        | "decoration.border_width_focused"
+        | "decoration.border_width_idle"
         | "decoration"
         | "appearance.theme"
         | "appearance.animations.enabled"
@@ -289,6 +295,27 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
             "decoration.border_color_idle",
             format!("{:?}", old.decoration.border_color_idle),
             format!("{:?}", new.decoration.border_color_idle),
+        ),
+    ] {
+        push_if_changed(field, before, after);
+    }
+    // CTX-0344: the outline-width triple is presentation-only and adopted
+    // live by the runtime, so width changes reconcile live like the colors.
+    for (field, before, after) in [
+        (
+            "decoration.border_width",
+            format!("{:?}", old.decoration.border_width),
+            format!("{:?}", new.decoration.border_width),
+        ),
+        (
+            "decoration.border_width_focused",
+            format!("{:?}", old.decoration.border_width_focused),
+            format!("{:?}", new.decoration.border_width_focused),
+        ),
+        (
+            "decoration.border_width_idle",
+            format!("{:?}", old.decoration.border_width_idle),
+            format!("{:?}", new.decoration.border_width_idle),
         ),
     ] {
         push_if_changed(field, before, after);
@@ -706,6 +733,16 @@ mod tests {
             classify_field("decoration.content_inset"),
             ReloadClass::Live
         );
+        // CTX-0344: outline widths are live.
+        assert_eq!(classify_field("decoration.border_width"), ReloadClass::Live);
+        assert_eq!(
+            classify_field("decoration.border_width_focused"),
+            ReloadClass::Live
+        );
+        assert_eq!(
+            classify_field("decoration.border_width_idle"),
+            ReloadClass::Live
+        );
         assert_eq!(classify_field("decoration"), ReloadClass::Live);
         assert_eq!(classify_field("bogus"), ReloadClass::Rejected);
     }
@@ -749,6 +786,10 @@ mod tests {
         // CTX-0340: outline colors are live too.
         new.decoration.border_color_focused = Some(crate::types::SAFE_DECORATION_BORDER_FOCUSED);
         new.decoration.border_color_idle = Some(crate::types::SAFE_DECORATION_BORDER_IDLE);
+        // CTX-0344: outline widths are live as well.
+        new.decoration.border_width = Some(1);
+        new.decoration.border_width_focused = Some(1);
+        new.decoration.border_width_idle = Some(1);
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
@@ -760,6 +801,9 @@ mod tests {
             "decoration.content_inset",
             "decoration.border_color_focused",
             "decoration.border_color_idle",
+            "decoration.border_width",
+            "decoration.border_width_focused",
+            "decoration.border_width_idle",
         ] {
             assert!(
                 r.diffs.iter().any(|d| d.field == field),

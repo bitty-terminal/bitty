@@ -449,8 +449,82 @@ fn safe_mode_outline_is_opaque_white_and_gray() {
 }
 
 #[test]
+fn focused_outline_width_exceeds_idle_and_is_dpi_scaled() {
+    // CTX-0344 (RFC-0001/OQ-045): the focused ring paints thicker than the
+    // idle ring when configured, and both scale with the live DPI factor.
+    let mut rt = Runtime::new(RuntimeConfig {
+        decoration: Decoration::default(),
+        outline_focused: [0xFF, 0x00, 0x00, 0xFF],
+        outline_idle: [0x00, 0xFF, 0x00, 0xFF],
+        outline_width_focused: Some(5),
+        outline_width_idle: Some(2),
+        ..RuntimeConfig::default()
+    })
+    .expect("width runtime builds");
+    // Left split focused, right idle: focused ring 5px, idle ring 2px.
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    rt.set_focus(ViewId::new(1));
+    let frames = rt.present_frames();
+    rt.tick().expect("tick presents");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    // Focused frame: left ring occupies x in [gap, gap+5); pixel 4 is the
+    // focused red ring, pixel 5 is background (ring ended).
+    let fy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
+    let fx0 = pad + usize::try_from(frames[0].frame.x).unwrap();
+    assert_eq!(
+        probe(&rgba, width, fx0 + 4, fy),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "focused ring must reach its configured 5px width"
+    );
+    assert_eq!(
+        probe(&rgba, width, fx0 + 5, fy),
+        bitty_render::grid::DEFAULT_BG,
+        "focused ring must stop at 5px"
+    );
+    // Idle frame: right ring occupies only 2px; pixel 2 is background.
+    let iy = pad + usize::try_from(frames[1].frame.y).unwrap() + 100;
+    let ix0 = pad + usize::try_from(frames[1].frame.x).unwrap();
+    assert_eq!(
+        probe(&rgba, width, ix0 + 1, iy),
+        [0x00, 0xFF, 0x00, 0xFF],
+        "idle ring keeps its 2px width"
+    );
+    assert_eq!(
+        probe(&rgba, width, ix0 + 2, iy),
+        bitty_render::grid::DEFAULT_BG,
+        "idle ring must stop at 2px"
+    );
+    // DPI: 2x doubles both rings in physical px.
+    rt.apply_dpi_scale(2.0, None);
+    let frames = rt.present_frames();
+    rt.tick().expect("tick after rescale");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    let fy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
+    let fx0 = pad + usize::try_from(frames[0].frame.x).unwrap();
+    assert_eq!(
+        probe(&rgba, width, fx0 + 9, fy),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "at 2x the focused 5px ring paints 10 physical px"
+    );
+    assert_eq!(
+        probe(&rgba, width, fx0 + 10, fy),
+        bitty_render::grid::DEFAULT_BG,
+        "at 2x the focused ring stops at 10 physical px"
+    );
+}
+
+#[test]
 fn set_outline_adopts_live_and_repaints_once() {
-    // CTX-0340: the runtime live-adopts a new pair and forces one repaint.
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
     let _ = rt.tick().expect("first tick presents");

@@ -1211,6 +1211,31 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 "decoration.border_color_idle",
                 d.border_color_idle.as_deref(),
             )?;
+            // CTX-0344 (RFC-0001/OQ-045): the outline-width triple is
+            // `0..=16` logical px, fail-closed. `None` means "says nothing"
+            // so the lower layer / `decoration.border` is inherited.
+            let check_width = |field: &str, raw: Option<i64>| -> Result<Option<u32>, ConfigError> {
+                match raw {
+                    None => Ok(None),
+                    Some(v) => {
+                        if !(0..=crate::types::MAX_DECORATION_BORDER_WIDTH_PX as i64).contains(&v) {
+                            return Err(ConfigError::validation(
+                                field,
+                                format!(
+                                    "must be within [0, {}] (found {v})",
+                                    crate::types::MAX_DECORATION_BORDER_WIDTH_PX
+                                ),
+                            ));
+                        }
+                        Ok(Some(v as u32))
+                    }
+                }
+            };
+            let border_width = check_width("decoration.border_width", d.border_width)?;
+            let border_width_focused =
+                check_width("decoration.border_width_focused", d.border_width_focused)?;
+            let border_width_idle =
+                check_width("decoration.border_width_idle", d.border_width_idle)?;
             Some(DecorationConfig {
                 gaps_in,
                 gaps_out,
@@ -1220,6 +1245,9 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 border_color,
                 border_color_focused,
                 border_color_idle,
+                border_width,
+                border_width_focused,
+                border_width_idle,
             })
         }
     };
@@ -1806,6 +1834,71 @@ mod tests {
             (
                 r##"return { decoration = { border_color = "#123456789" } }"##,
                 "decoration.border_color",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{bad} must name {field}: {msg}");
+        }
+    }
+
+    #[test]
+    fn lua_outline_widths_parse_and_fail_closed() {
+        // CTX-0344 (RFC-0001/OQ-045): the width triple parses as integers;
+        // absent keys stay `None` (inherit the lower layer / `border`); the
+        // `0..=16` bound and wrong types fail closed naming the key.
+        let plan = parse_lua_config(
+            r#"return { decoration = { border_width = 4, border_width_focused = 6, border_width_idle = 2 } }"#,
+            &test_source(),
+        )
+        .expect("outline widths parse");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.border_width, Some(4));
+        assert_eq!(dec.border_width_focused, Some(6));
+        assert_eq!(dec.border_width_idle, Some(2));
+        let plan = parse_lua_config(
+            r#"return { decoration = { border_width = 0 } }"#,
+            &test_source(),
+        )
+        .expect("zero width parses");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.border_width, Some(0));
+        assert_eq!(dec.border_width_focused, None);
+        assert_eq!(dec.border_width_idle, None);
+        let plan = parse_lua_config(r#"return { decoration = {} }"#, &test_source())
+            .expect("empty decoration defaults");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.border_width, None);
+        assert_eq!(dec.border_width_focused, None);
+        assert_eq!(dec.border_width_idle, None);
+        for (bad, field) in [
+            (
+                r#"return { decoration = { border_width = 17 } }"#,
+                "decoration.border_width",
+            ),
+            (
+                r#"return { decoration = { border_width_focused = 17 } }"#,
+                "decoration.border_width_focused",
+            ),
+            (
+                r#"return { decoration = { border_width_idle = 100 } }"#,
+                "decoration.border_width_idle",
+            ),
+            (
+                r#"return { decoration = { border_width = -1 } }"#,
+                "decoration.border_width",
+            ),
+            (
+                r#"return { decoration = { border_width_focused = 1.5 } }"#,
+                "decoration.border_width_focused",
+            ),
+            (
+                r#"return { decoration = { border_width = "2" } }"#,
+                "decoration.border_width",
+            ),
+            (
+                r#"return { decoration = { border_width_focused = true } }"#,
+                "decoration.border_width_focused",
             ),
         ] {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();

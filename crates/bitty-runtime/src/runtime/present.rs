@@ -716,11 +716,24 @@ impl Runtime {
                     frame.frame.width,
                     frame.frame.height,
                 );
-                if frame.border > 0 {
-                    // CTX-0340: the focused View paints the accent outline,
-                    // every idle View the subtle outline; both resolved by
-                    // `bitty-config` and carried on the runtime config.
-                    let is_focused_view = focused_id == Some(*view_id);
+                // CTX-0340: the focused View paints the accent outline, every
+                // idle View the subtle outline. CTX-0344: the ring *width* is
+                // resolved per focus state too (`decoration.border_width*`),
+                // scaled at the live DPI factor exactly like the geometry
+                // border. The ring paints inside the View rectangle; the
+                // content grid stays inset by `border + content_inset`, so a
+                // focused width change never moves content.
+                let is_focused_view = focused_id == Some(*view_id);
+                let ring_border = if is_focused_view {
+                    self.config
+                        .outline_width_focused
+                        .map_or(frame.border, |w| self.outline_width_physical(w))
+                } else {
+                    self.config
+                        .outline_width_idle
+                        .map_or(frame.border, |w| self.outline_width_physical(w))
+                };
+                if ring_border > 0 {
                     let outline_color = if is_focused_view {
                         self.config.outline_focused
                     } else {
@@ -751,12 +764,15 @@ impl Runtime {
                     );
                     combined_rounded.push(bitty_render::grid::RoundedFill {
                         frame: ring_frame,
-                        border: frame.border,
+                        border: ring_border,
                         radius: frame.radius,
                         color: ring_color,
                     });
                     any_needs_draw = true;
                 }
+                // The content clip is tied to the geometry border (not the
+                // outline width) so the content grid and glyph clipping are
+                // unchanged by a focused/idle width override.
                 frame_clip =
                     bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
             }

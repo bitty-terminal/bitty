@@ -420,6 +420,10 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- '#RRGGBBAA'. border_color sets both states; the focused/idle\n\
      \x20\x20-- keys override it per state. Defaults #33CCFF / #595959AA.\n\
      \x20\x20-- decoration = { border_color_focused = \"#33CCFF\", border_color_idle = \"#595959AA\" },\n\
+     \x20\x20-- Focused/idle outline width in logical px (0..=16). The base\n\
+     \x20\x20-- inherits decoration.border; focused/idle override it. A\n\
+     \x20\x20-- focused width >= idle + 1 supplies a non-color focus cue.\n\
+     \x20\x20-- decoration = { border_width = 2, border_width_focused = 3, border_width_idle = 1 },\n\
       \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
       \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
       \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
@@ -663,6 +667,50 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     ("decoration.content_inset", e.decoration.content_inset),
                 ] {
                     println!("{}", check_row(field, format!("{value}"), &src(field)));
+                }
+                // CTX-0344: report the resolved outline-width triple. The
+                // base inherits `decoration.border`; the focused/idle rows are
+                // the resolved values with their source.
+                let resolved_widths = e.decoration.resolve_outline_width();
+                let base_width = e.decoration.border_width.unwrap_or(e.decoration.border);
+                println!(
+                    "{}",
+                    check_row(
+                        "decoration.border_width",
+                        e.decoration
+                            .border_width
+                            .map_or_else(|| format!("{base_width} (inherited)"), |v| v.to_string()),
+                        &src("decoration.border_width"),
+                    )
+                );
+                let width_pair_source = |explicit: bool| -> String {
+                    if explicit {
+                        String::new()
+                    } else if e.decoration.border_width.is_some() {
+                        String::from("inherited decoration.border_width")
+                    } else {
+                        String::from("inherited decoration.border")
+                    }
+                };
+                for (field, value, explicit) in [
+                    (
+                        "decoration.border_width_focused",
+                        resolved_widths.focused,
+                        e.decoration.border_width_focused.is_some(),
+                    ),
+                    (
+                        "decoration.border_width_idle",
+                        resolved_widths.idle,
+                        e.decoration.border_width_idle.is_some(),
+                    ),
+                ] {
+                    let source = width_pair_source(explicit);
+                    let source = if source.is_empty() {
+                        src(field)
+                    } else {
+                        format!("resolved: {source}")
+                    };
+                    println!("{}", check_row(field, value.to_string(), &source));
                 }
                 // CTX-0340: report the resolved focused/idle outline pair
                 // (theme token / base / explicit pair) with its source, plus
@@ -1035,6 +1083,18 @@ pub(crate) fn runtime_config_from_effective(
         let outline = effective.decoration.resolve_outline(theme);
         cfg.outline_focused = outline.focused.0;
         cfg.outline_idle = outline.idle.0;
+        // CTX-0344 (RFC-0001/OQ-045): resolve the focus/idle outline-width
+        // pair (`decoration.border` -> `decoration.border_width` -> explicit
+        // pair). Bounds were already enforced fail-closed in `bitty-config`;
+        // clamp as defense-in-depth so a future bound drift cannot exceed the
+        // runtime's own bound.
+        let widths = effective.decoration.resolve_outline_width();
+        cfg.outline_width_focused = Some(
+            widths
+                .focused
+                .min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX),
+        );
+        cfg.outline_width_idle = Some(widths.idle.min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX));
         // RFC-0002 (CTX-0341): map the resolved effective animation contract
         // onto the runtime policy. Durations are already bounded by
         // `bitty-config` (fail-closed `0..=500`); `spring` was already mapped

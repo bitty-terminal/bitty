@@ -284,15 +284,25 @@ impl Runtime {
                     // excess rather than retaining unbounded frames.
                     break;
                 }
-                let color = if self.last_presented_focus == Some(old.view) {
+                let was_focused = self.last_presented_focus == Some(old.view);
+                let color = if was_focused {
                     self.config.outline_focused
                 } else {
                     self.config.outline_idle
                 };
+                // CTX-0344: retain the painted ring width (the focus-state
+                // outline width), not the content-geometry border, so the
+                // closing frame matches what was on screen. `None` inherits
+                // the already-physical geometry border.
+                let ring_width = if was_focused {
+                    self.config.outline_width_focused
+                } else {
+                    self.config.outline_width_idle
+                };
                 self.closing_frames.push(ClosingFrame {
                     view: old.view,
                     frame: old.frame,
-                    border: old.border,
+                    border: ring_width.map_or(old.border, |w| self.outline_width_physical(w)),
                     radius: old.radius,
                     color,
                 });

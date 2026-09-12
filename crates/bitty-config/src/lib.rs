@@ -115,8 +115,9 @@ pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_pr
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
     AppearanceConfig, DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors, ScrollbarConfig,
-    ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
+    MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors,
+    ResolvedOutlineWidths, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
+    WindowConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 

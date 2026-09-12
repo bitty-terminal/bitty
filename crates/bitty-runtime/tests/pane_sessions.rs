@@ -211,3 +211,65 @@ fn close_pane_session_tears_down_child() {
     let _ = rt.tick();
     assert!(!rt.close_pane_session(&ViewId::new(2)));
 }
+
+#[test]
+fn workspace_new_leaf_owns_its_shell_and_input_never_crosses() {
+    // CTX-0359 repro 3b (CTX-0358 findings): the fresh workspace leaf was
+    // session-less, so `push_input_bytes_multipane` fell back to the
+    // runtime-global writer and typing reached the previous workspace's
+    // shell (GOT-HELLO echoed there). The fresh leaf must own a shell
+    // (primary spawn recipe replay) and receive the typing itself.
+    let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless build");
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "while read x; do echo OLD:$x; done"])
+        .expect("spawn primary shell");
+    rt.workspace_new().expect("new workspace");
+    let new_id = rt.focused_view().expect("fresh workspace leaf is focused");
+    assert!(
+        rt.has_pane_session(&new_id),
+        "workspace_new leaf must own its own shell, not stay session-less"
+    );
+    assert!(
+        rt.pane_pid(&new_id).is_some(),
+        "fresh leaf shell must be live"
+    );
+    rt.push_input_bytes(b"hello\n");
+    assert!(
+        wait_for_pane_text(&mut rt, new_id, "OLD:hello"),
+        "typing must reach the fresh workspace's own shell"
+    );
+    let _ = rt.poll_pty();
+    rt.tick();
+    assert!(
+        !primary_text(&rt).contains("OLD:hello"),
+        "typing must never reach the previous workspace's shell"
+    );
+}
+
+#[test]
+fn keymap_split_pane_still_owns_its_grid_and_input() {
+    // CTX-0359 guard: primary-ownership scoping must not regress the
+    // everyday keymap `new_split` shape — the spawned pane renders and
+    // receives input on its own grid while the primary home keeps its
+    // content.
+    let mut rt = two_pane_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "echo HOME-OK; sleep 30"])
+        .expect("spawn primary shell");
+    rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &["-c", "cat"], 40, 12)
+        .expect("spawn pane shell");
+    assert!(
+        wait_for_primary_text(&mut rt, "HOME-OK"),
+        "primary home output never arrived"
+    );
+    assert!(rt.set_focus(ViewId::new(2)));
+    rt.push_input_bytes(b"typed-to-split\n");
+    assert!(
+        wait_for_pane_text(&mut rt, ViewId::new(2), "typed-to-split"),
+        "focused pane input never visibly landed"
+    );
+    let _ = rt.poll_pty();
+    rt.tick();
+    assert!(
+        !primary_text(&rt).contains("typed-to-split"),
+        "split input must not leak into the primary home"
+    );
+}

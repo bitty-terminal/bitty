@@ -11,16 +11,17 @@
 //! (`Some` with a non-empty draw list) without feeding PTY bytes and
 //! without wall-clock waits, then assert the frame returns to idle.
 //!
-//! CTX-0234 regression (same file: split-present mapping, live evidence
-//! `recording/live-verify-0220/` shots 10/12): leaves WITHOUT a pane shell
-//! session (ctl splits never spawn one; spawn failures) rendered the shared
-//! primary top-left viewport, so one shell duplicated across N tiles
-//! (three-column repeat + marker text in an unexpected tile after zoom-off).
-//! Rule pinned here: a session-less leaf shows the primary grid ONLY while
-//! focused (that is where multipane input routing sends typing with no
-//! session — what-you-see-is-what-you-type); every other session-less leaf
-//! presents erased. Pixel-asserted per tile through `headless_rgba`, no
-//! wall clock, no PTY spawn except where noted.
+//! CTX-0234/CTX-0359 regression (same file: split-present mapping, live
+//! evidence `recording/live-verify-0220/` shots 10/12): leaves WITHOUT a
+//! pane shell session (ctl splits never spawn one; spawn failures) used to
+//! render the shared primary top-left viewport, so one shell duplicated
+//! across N tiles (three-column repeat + marker text in an unexpected tile
+//! after zoom-off). Rule pinned here (CTX-0359): the runtime-global primary
+//! grid belongs to exactly one leaf — the primary owner (the leaf focused
+//! when the primary shell attached) — and is painted only there; every
+//! other session-less leaf presents erased, whatever its focus or whether
+//! any pane session exists. Pixel-asserted per tile through `headless_rgba`,
+//! no wall clock, no PTY spawn except where noted.
 
 use bitty_runtime::{
     AnimationPolicy, FocusDirection, LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId,
@@ -82,6 +83,13 @@ const SEAM_PX: usize = 8;
 /// overhang (see above) never counts as duplication; interior content —
 /// including the row-3 marker used below — is unaffected.
 fn tile_has_ink(rt: &Runtime, id: ViewId) -> bool {
+    tile_ink_pixels(rt, id) > 0
+}
+
+/// Ink pixel count inside the leaf tile (same seam-inset scan as
+/// [`tile_has_ink`]). Lets a test separate "a lone cursor cell" from "a full
+/// cloned marker row" without font introspection.
+fn tile_ink_pixels(rt: &Runtime, id: ViewId) -> usize {
     let rgba = rt.headless_rgba().expect("rgba after present");
     let extent = rt.config().window_extent();
     let sw = usize::try_from(extent.width()).expect("surface width fits");
@@ -107,15 +115,16 @@ fn tile_has_ink(rt: &Runtime, id: ViewId) -> bool {
         tw - 2 * SEAM_PX,
         th - 2 * SEAM_PX,
     );
+    let mut ink = 0usize;
     for y in y0..y0 + h {
         for x in x0..x0 + w {
             let i = (y * sw + x) * 4;
             if rgba[i..i + 4] != bg {
-                return true;
+                ink += 1;
             }
         }
     }
-    false
+    ink
 }
 
 /// Writes a full-width marker row into the primary grid (cursor parks on the
@@ -192,6 +201,57 @@ fn zoom_on_and_off_force_full_present() {
 }
 
 #[test]
+fn zoom_round_trip_preserves_primary_owner_and_content() {
+    // CTX-0359 review defect: `set_layout` inferred "owner closed" from any
+    // layout that excluded the owner, so zooming a NON-owner pane re-homed
+    // `primary_view` to the zoom target and zoom-off left the original pane
+    // session-less and blank. Ownership may only move on an explicit close.
+    let mut rt = instant_runtime();
+    write_primary_marker(&mut rt, 3, b'M');
+    assert!(rt.tick().is_some(), "first tick presents");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "startup owner is the initial leaf"
+    );
+    rt.set_layout(two_pane());
+    assert_full_present(rt.tick(), "split");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "split keeps the startup owner"
+    );
+    // Focus the non-owner pane and zoom onto it: the collapse tree excludes
+    // the owner, but a temporary layout must never steal ownership.
+    assert!(rt.set_focus(ViewId::new(2)));
+    assert_full_present(rt.tick(), "focus v2");
+    let backup = rt.layout().clone();
+    rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)));
+    assert_eq!(rt.leaf_count(), 1);
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "owner while zoomed onto a non-owner pane"
+    );
+    assert_full_present(rt.tick(), "zoom on");
+    // Zoom off: the owner is back in the live tree and still paints its
+    // marker row; no re-home happened in either direction.
+    rt.set_layout(backup);
+    assert_eq!(rt.leaf_count(), 2);
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "owner must survive the zoom round trip"
+    );
+    assert_full_present(rt.tick(), "zoom off");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "original primary pane content must survive zoom on/off"
+    );
+    assert_eq!(rt.tick(), None);
+}
+
+#[test]
 fn reflow_geometry_only_forces_full_present() {
     let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");
@@ -252,8 +312,8 @@ fn sessionless_unfocused_leaf_renders_blank_not_primary() {
     // CTX-0234 (live shots 10/12): with no pane session anywhere (the ctl
     // split shape — no shell is ever spawned), every leaf rendered the
     // shared primary viewport, duplicating one shell across all tiles.
-    // Only the focused session-less leaf may show primary (input routes
-    // there); the unfocused one must stay erased.
+    // CTX-0359: only the leaf that owns the primary shell may paint the
+    // primary grid; the other leaf stays erased.
     let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
@@ -263,34 +323,118 @@ fn sessionless_unfocused_leaf_renders_blank_not_primary() {
     assert_full_present(rt.tick(), "split");
     assert!(
         tile_has_ink(&rt, ViewId::new(1)),
-        "focused session-less leaf keeps the primary fallback"
+        "primary owner leaf keeps the primary grid"
     );
     assert!(
         !tile_has_ink(&rt, ViewId::new(2)),
-        "unfocused session-less leaf must not duplicate primary (live dup columns)"
+        "session-less non-owner leaf must not duplicate primary (live dup columns)"
     );
     assert_eq!(rt.tick(), None);
 }
 
 #[test]
-fn sessionless_primary_fallback_follows_focus() {
-    // The primary fallback is input-routing truth: typing reaches the
-    // primary shell only through the focused session-less leaf, so the
-    // visible primary content must move with focus — never duplicate.
+fn sessionless_primary_stays_with_owner_when_focus_moves() {
+    // CTX-0359 (replaces the CTX-0234 focus-follow pin): the primary grid
+    // belongs to the leaf that owns the primary shell, not to whatever leaf
+    // is focused. Pre-fix, focusing a session-less `ctl view split` tile
+    // cloned the primary grid into it and blanked the owner — while typing
+    // in the clone still drove the owner's shell.
     let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     rt.set_layout(two_pane());
     assert_full_present(rt.tick(), "split");
     assert!(rt.set_focus(ViewId::new(2)));
-    assert_full_present(rt.tick(), "focus moves primary fallback");
+    assert_full_present(rt.tick(), "focus moves off the primary owner");
     assert!(
-        tile_has_ink(&rt, ViewId::new(2)),
-        "newly focused session-less leaf shows primary"
+        tile_has_ink(&rt, ViewId::new(1)),
+        "primary owner keeps its grid while unfocused"
+    );
+    // The focused empty leaf may carry a lone cursor cell (present gates the
+    // cursor on focus), but never a cloned marker row: full-row cloning
+    // would put v:2's ink within a few percent of v:1's.
+    let owner_ink = tile_ink_pixels(&rt, ViewId::new(1));
+    let focused_ink = tile_ink_pixels(&rt, ViewId::new(2));
+    assert!(
+        focused_ink * 8 < owner_ink,
+        "focused session-less non-owner must stay erased apart from the cursor \
+         (owner={owner_ink}px, focused={focused_ink}px)"
+    );
+    assert_eq!(rt.tick(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn mixed_shape_never_clones_primary_into_sessionless_leaf() {
+    // CTX-0359 repro 2 (CTX-0358 findings): v:1 session-less primary owner,
+    // v:2 live pane, v:3 session-less. Pre-fix the CTX-0255 co-paint arm
+    // cloned the primary grid into v:3 (any session present), so two tiles
+    // painted the same shell. Only the primary owner may paint primary.
+    let mut rt = instant_runtime();
+    write_primary_marker(&mut rt, 2, b'M');
+    assert!(rt.tick().is_some(), "first tick presents");
+    let three = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+        ),
+    );
+    rt.set_layout(three);
+    assert!(
+        rt.set_focus(ViewId::new(1)),
+        "pin focus on the primary owner"
+    );
+    rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &["-c", "sleep 30"], 40, 24)
+        .expect("pane shell must spawn");
+    let mut seq = vec![0x1b, b'[', b'6', b';', b'1', b'H'];
+    seq.extend(std::iter::repeat_n(b'P', 40));
+    rt.handle_pane_bytes(ViewId::new(2), &seq);
+    assert_full_present(rt.tick(), "mixed three-way split");
+    assert!(rt.set_focus(ViewId::new(2)), "focus the live pane");
+    assert_full_present(rt.tick(), "focus the live pane");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "primary owner co-paints while unfocused (CTX-0255 preserved)"
     );
     assert!(
-        !tile_has_ink(&rt, ViewId::new(1)),
-        "defocused session-less leaf must go blank, not keep a primary copy"
+        tile_has_ink(&rt, ViewId::new(2)),
+        "live pane keeps its own grid"
+    );
+    assert!(
+        !tile_has_ink(&rt, ViewId::new(3)),
+        "session-less v:3 must not clone primary (repro: both session-less tiles inked)"
+    );
+    assert_eq!(rt.tick(), None);
+}
+
+#[test]
+fn workspace_new_leaf_renders_empty_not_previous_primary() {
+    // CTX-0359 repro 3a (CTX-0358 findings): the fresh workspace leaf is
+    // focused and session-less, so the present fallback painted the previous
+    // workspace's primary grid into it. A workspace with no shell yet must
+    // render empty; the old workspace's primary stays with its owner.
+    let mut rt = instant_runtime();
+    write_primary_marker(&mut rt, 2, b'W');
+    assert!(rt.tick().is_some(), "first tick presents");
+    rt.workspace_new().expect("new workspace");
+    let new_id = rt.focused_view().expect("fresh workspace leaf is focused");
+    assert_ne!(new_id, ViewId::new(1), "fresh leaf must be a new view");
+    assert_full_present(rt.tick(), "workspace switch");
+    assert!(
+        !tile_has_ink(&rt, new_id),
+        "new workspace leaf must not paint the previous workspace's primary grid"
+    );
+    // Switching back restores the primary owner's grid untouched.
+    assert!(rt.workspace_switch(0));
+    assert_full_present(rt.tick(), "switch back to the primary workspace");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "primary owner keeps its grid after the workspace round trip"
     );
     assert_eq!(rt.tick(), None);
 }
@@ -335,10 +479,11 @@ fn zoom_off_does_not_duplicate_primary_into_sessionless_leaves() {
 #[cfg(unix)]
 #[test]
 fn mixed_primary_plus_session_copaints_on_focus_v2() {
-    // CTX-0255 live repro (02-focus-v2 left blank, 03-refocus-v1 both paint):
-    // keymap-split shape is mixed — v:1 session-less shows the shared
-    // primary grid, v:2 owns a pane session. Focusing v:2 must NOT blank
-    // the primary home tile; both tiles co-paint. Refocus v:1 keeps both.
+    // CTX-0255 live repro (02-focus-v2 left blank, 03-refocus-v1 both paint),
+    // preserved by CTX-0359 ownership: keymap-split shape is mixed — v:1 is
+    // the primary owner (session-less, paints the primary grid), v:2 owns a
+    // pane session. Focusing v:2 must NOT blank the primary home tile; both
+    // tiles co-paint. Refocus v:1 keeps both.
     let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 2, b'M');
     assert!(rt.tick().is_some(), "first tick presents");

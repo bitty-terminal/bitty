@@ -80,6 +80,15 @@ impl Runtime {
         self.pty = Some(pty);
         self.pty_reader = Some(reader);
         self.pty_writer = Some(writer);
+        // CTX-0359: the primary shell is painted and typed into through the
+        // leaf focused at attach time (startup `--focus` included), so pin
+        // that leaf as the primary owner and remember the exact program
+        // recipe for `workspace_new` shell replay.
+        self.primary_view = self.focus.focused();
+        self.primary_spawn = Some((
+            program.to_string(),
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+        ));
         // If a waker is already installed (respawn after `set_pty_waker`),
         // promote immediately so the new child wakes the loop too.
         if self.pty_waker.is_some() {
@@ -302,7 +311,8 @@ impl Runtime {
 
     /// Read-only snapshot of the leaf's private grid, when it owns a
     /// session. Leaves without a session share the primary
-    /// [`snapshot`](Self::snapshot).
+    /// [`snapshot`](Self::snapshot) only while they are the primary owner
+    /// (CTX-0359).
     #[must_use]
     pub fn pane_snapshot(&self, view: &ViewId) -> Option<Snapshot> {
         self.pane_sessions

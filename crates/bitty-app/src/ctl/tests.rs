@@ -443,12 +443,12 @@ fn control_send_to_unfocused_is_conflict() {
 }
 
 #[test]
-fn control_terminal_text_sessionless_split_focused_parity() {
-    // CTX-0284: `ctl view split` is layout-only (no pane shell), so both
-    // leaves are session-less. The oracle must mirror present.rs CTX-0234
-    // focused-only fallback: the focused session-less leaf returns the
-    // primary text, unfocused session-less leaves stay empty (never
-    // duplicate one grid as text across tiles).
+fn control_terminal_text_sessionless_split_owner_parity() {
+    // CTX-0359 (replaces the CTX-0284 focused-follow oracle): `ctl view
+    // split` is layout-only (no pane shell), so v:1 is the primary owner and
+    // v:2 is session-less. The owner returns the primary text; v:2 stays
+    // empty and focus never moves the mirror between tiles (pre-fix the
+    // focused session-less leaf returned the v:1 shell's text).
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     // Seed the primary grid so the mirrored text is observable (a fresh grid
@@ -481,15 +481,12 @@ fn control_terminal_text_sessionless_split_focused_parity() {
     assert!(t2.ok, "t:2 text must succeed: {t2:?}");
     let t1_text = extract_string_from(&t1.result_json, "text").expect("t:1 text field");
     let t2_text = extract_string_from(&t2.result_json, "text").expect("t:2 text field");
-    assert_eq!(
-        t1_text, expected,
-        "focused session-less leaf mirrors primary"
-    );
+    assert_eq!(t1_text, expected, "primary owner mirrors the primary grid");
     assert!(
         t2_text.is_empty(),
-        "unfocused session-less leaf stays empty, got {t2_text:?}"
+        "session-less non-owner stays empty, got {t2_text:?}"
     );
-    // Refocus mirrors: t:2 becomes primary, t:1 goes empty.
+    // Refocus v:2: the owner keeps primary; the non-owner stays empty.
     let focus = ipc_ctl::params_focus("v:2");
     let moved = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&focus), &cli);
     assert!(moved.ok, "focus v:2 must succeed: {moved:?}");
@@ -509,13 +506,13 @@ fn control_terminal_text_sessionless_split_focused_parity() {
     assert!(t1b.ok && t2b.ok, "both texts must succeed: {t1b:?} {t2b:?}");
     let t1b_text = extract_string_from(&t1b.result_json, "text").expect("t:1 text field");
     let t2b_text = extract_string_from(&t2b.result_json, "text").expect("t:2 text field");
-    assert!(
-        t1b_text.is_empty(),
-        "v:1 unfocused after refocus stays empty, got {t1b_text:?}"
-    );
     assert_eq!(
-        t2b_text, expected2,
-        "v:2 focused after refocus mirrors primary"
+        t1b_text, expected2,
+        "v:1 primary owner keeps primary after refocus"
+    );
+    assert!(
+        t2b_text.is_empty(),
+        "v:2 non-owner stays empty after refocus, got {t2b_text:?}"
     );
 }
 

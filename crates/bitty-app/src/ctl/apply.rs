@@ -205,21 +205,18 @@ pub fn apply_control(
                 format!("no such terminal {terminal_id}"),
             ));
         }
-        // Prefer the pane snapshot when present; fall back to the primary
-        // snapshot for a session-less leaf that IS the focused view
-        // (parity with the present.rs CTX-0234 focused-only branch, which
-        // paints the shared primary grid exactly there). Unfocused
-        // session-less leaves stay empty so one grid is never duplicated as
-        // text across tiles — deliberately NOT mirroring the CTX-0255
-        // co-paint arm (PX-1676), which is a separate present-layer concern.
-        // Single-leaf keeps the legacy fallback (the sole leaf owns focus).
+        // Prefer the pane snapshot when present; the primary snapshot is
+        // returned only for the primary owner leaf (CTX-0359: the leaf
+        // focused when the primary shell attached). A session-less leaf that
+        // is not the owner has no shell of its own; its text is empty so one
+        // grid is never duplicated as text across tiles (pre-CTX-0359 the
+        // focused session-less leaf mirrored primary, which let a fresh
+        // workspace leaf read the previous workspace's terminal).
         let text = runtime
             .pane_snapshot(&target_view)
             .map(|snap| snapshot_text(&snap))
             .or_else(|| {
-                if runtime.focused_view() == Some(target_view)
-                    || runtime.layout().leaf_ids().len() == 1
-                {
+                if runtime.is_primary_view(&target_view) {
                     Some(snapshot_text(&runtime.snapshot()))
                 } else {
                     None

@@ -617,21 +617,52 @@ impl Runtime {
     /// immediately (tick repeats this every frame; idempotent), and every
     /// grid follows its leaf: pane sessions via
     /// [`Self::sync_pane_geometry`](super::Runtime::sync_pane_geometry), and
-    /// the shared primary grid (+ primary PTY winsize) via the focused
-    /// leaf's allocation. Focus is retained when the focused `ViewId` still
-    /// exists, otherwise it moves to the first leaf (if any) or clears.
+    /// the shared primary grid (+ primary PTY winsize) via the primary
+    /// owner leaf's allocation ([`Self::primary_view`]). Focus is retained
+    /// when the focused `ViewId` still exists, otherwise it moves to the
+    /// first leaf (if any) or clears.
     ///
-    /// CTX-0269: session-less leaves share the primary grid and the focused
-    /// one owns input/cursor, so the primary must shrink/grow with the
-    /// focused allocation — previously `set_layout` left the stale
-    /// pre-split grid and `tick` only clipped it via `viewport_snapshot`
-    /// (live split showed a ~155-col grid in a ~77-col pane, tails
-    /// invisible, reflow never firing). Best-effort like the pane sync:
-    /// matching dims skip, PTY errors never fail the layout change.
+    /// CTX-0269: session-less leaves clip the primary grid through
+    /// `viewport_snapshot`, so the primary must shrink/grow with the leaf
+    /// that paints it — previously `set_layout` left the stale pre-split
+    /// grid and `tick` only clipped it via `viewport_snapshot` (live split
+    /// showed a ~155-col grid in a ~77-col pane, tails invisible, reflow
+    /// never firing). CTX-0359: that leaf is the primary owner, not the
+    /// focused one (focus no longer moves the primary fallback); a layout
+    /// that never contained the owner (fresh workspace, zoom onto another
+    /// leaf) leaves the grid untouched for the owner's return, and only
+    /// [`Self::set_layout_closing`] re-homes on an explicit close.
+    /// Best-effort like the pane sync: matching dims skip, PTY errors never
+    /// fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
+        self.replace_layout(layout, None);
+    }
+
+    /// Replaces the owned layout because leaf `closed` was explicitly closed.
+    ///
+    /// CTX-0359: this is the only layout change that may re-home the primary
+    /// owner. When `closed` is [`Self::primary_view`] and is absent from the
+    /// new tree, the primary re-homes to the focused survivor so the live
+    /// shell still has a tile to paint and type into. A plain
+    /// [`Self::set_layout`] never changes ownership: temporary layouts that
+    /// merely exclude the owner (zoom onto a non-owner leaf, `restore_zoom`,
+    /// workspace installs) preserve the owner and its grid for the round
+    /// trip back.
+    pub fn set_layout_closing(&mut self, layout: LayoutNode, closed: ViewId) {
+        self.replace_layout(layout, Some(closed));
+    }
+
+    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
+        // CTX-0359: only an explicit close removes the owner; a layout that
+        // merely excludes it (zoom, restore) must never re-home.
+        let primary_closed = closed.is_some_and(|closed_view| {
+            self.primary_view == Some(closed_view)
+                && self.layout.leaf_ids().contains(&closed_view)
+                && !layout.leaf_ids().contains(&closed_view)
+        });
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
         if leaf_ids.is_empty() {
@@ -643,15 +674,25 @@ impl Runtime {
         } else {
             self.focus.set(leaf_ids[0]);
         }
+        // CTX-0359: the primary shell keeps exactly one view. When an
+        // explicit close removes its owner leaf (no primary-shell teardown
+        // yet), re-home the primary to the focused survivor so the live
+        // shell still has a tile to paint and type into; otherwise the
+        // owner never changes.
+        if primary_closed {
+            self.primary_view = self.focus.focused();
+        }
         // Leaf Views carry their allocation from here (not deferred to the
         // next tick) so per-leaf geometry is inspectable immediately.
         // CTX-0294: decorated content frames (px decoration + cell gaps).
         let frames = self.present_frames();
         self.reflow_present_layout(&frames);
-        // Primary grid + primary PTY winsize (SIGWINCH path) follow the
-        // focused leaf — the tile that shows primary input/cursor.
-        if let Some(focused) = self.focus.focused() {
-            if let Some(frame) = frames.iter().find(|frame| frame.view == focused) {
+        // CTX-0359: primary grid + primary PTY winsize (SIGWINCH path) follow
+        // the primary owner leaf — the tile that paints primary input/cursor
+        // — not the focused leaf. A layout without the owner (fresh
+        // workspace) leaves the grid untouched until the owner returns.
+        if let Some(primary) = self.primary_view {
+            if let Some(frame) = frames.iter().find(|frame| frame.view == primary) {
                 let cols = usize::from(frame.cols.max(1));
                 let rows = usize::from(frame.rows.max(1));
                 if self.state.width() != cols || self.state.height() != rows {

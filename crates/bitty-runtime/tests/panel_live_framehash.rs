@@ -13,13 +13,13 @@
 //!   identical content, and a fresh re-run reproduces the gapped digest
 //!   exactly. One gap-band pixel is also asserted == theme bg directly
 //!   (`panel_gaps.rs` parity: CTX-0151 stale-bg / CTX-0228 no-repaint class).
-//! - V2 focus-switch diff: moving focus moves the primary fallback between
-//!   tiles (CTX-0234 rule) so the digest changes; switching back restores
-//!   the exact digest. Headless `Runtime` renders no tabline strip, so the
-//!   stack-focus pixel delta lives in the workspaceline widget (plugin UI,
-//!   live-only); the split-focus analogue below pins the same mechanism
-//!   (focus change forces a full present per CTX-0228, primary follows
-//!   focus per CTX-0234). Live ws4 V2 covers the tabline region diff
+//! - V2 focus-switch diff: moving focus changes the focused tile's cursor
+//!   and ring pixels (CTX-0228 full present) so the digest changes;
+//!   switching back restores the exact digest. Headless `Runtime` renders no
+//!   tabline strip, so the stack-focus pixel delta lives in the
+//!   workspaceline widget (plugin UI, live-only); the split-focus analogue
+//!   below pins the same mechanism, and the primary grid stays with its
+//!   owner leaf (CTX-0359). Live ws4 V2 covers the tabline region diff
 //!   (see the ignored live-grant test at the bottom).
 //! - V3 rename parity: `WorkspaceIntegration::stack_for_workspace` and the
 //!   deprecated `TabsIntegration::stack_for_tabs` shim produce identical
@@ -251,8 +251,9 @@ fn v2_focus_switch_changes_digest_and_switchback_restores() {
     assert_eq!(rt.tick(), None, "must idle before focus switch");
     let digest_a = digest_pixels(w, h, &rgba_a);
 
-    // Focus switch: the primary fallback follows focus (CTX-0234), so the
-    // marker moves tiles and the digest must change (full present, CTX-0228).
+    // Focus switch: CTX-0359 keeps the primary grid with its owner leaf, so
+    // the pixel change comes from the cursor/focus ring moving tiles — still
+    // a full present (CTX-0228) and a distinct digest.
     assert!(rt.set_focus(ViewId::new(2)));
     let stats_b: PresentStats = rt.tick().expect("focus switch must present");
     assert!(stats_b.headless);
@@ -260,7 +261,7 @@ fn v2_focus_switch_changes_digest_and_switchback_restores() {
     let rgba_b = rt.headless_rgba().expect("rgba after focus switch");
     assert_ne!(
         rgba_b, rgba_a,
-        "focus switch must move pixels (primary follows focus)"
+        "focus switch must move pixels (cursor/focus ring)"
     );
     assert_ne!(
         digest_pixels(w, h, &rgba_b),

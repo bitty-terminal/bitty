@@ -277,13 +277,12 @@ impl Runtime {
     /// each leaf `View`'s `cols`/`rows`/`origin` are updated via
     /// `LayoutNode::reflow`. Then each leaf is rendered: a viewport snapshot
     /// sized to the leaf's dimensions is built from its own pane-session
-    /// grid when it owns a shell, from the shared `State` snapshot when it
-    /// is the focused session-less leaf (input routes there), and erased
-    /// otherwise (CTX-0234: never duplicate one grid across tiles),
-    /// rendered through the shared `GridRenderer` with a full-damage hint,
-    /// and its `DrawList` translated to the leaf's pixel origin. The
-    /// per-leaf `DrawList`s are combined and presented once via
-    /// `Surface::headless_present`.
+    /// grid when it owns a shell, from the shared `State` snapshot only for
+    /// the primary owner leaf (`primary_view`, CTX-0359), and erased
+    /// otherwise (never duplicate one grid across tiles), rendered through
+    /// the shared `GridRenderer` with a full-damage hint, and its `DrawList`
+    /// translated to the leaf's pixel origin. The per-leaf `DrawList`s are
+    /// combined and presented once via `Surface::headless_present`.
     ///
     /// The software seam composites `DrawList + Atlas` onto an owned RGBA
     /// buffer via `Surface::headless_present`; no display server or adapter
@@ -536,33 +535,27 @@ impl Runtime {
                 .map(|p| p.clamp(0.0, 1.0))
                 .unwrap_or(1.0);
             // CTX-0176: a leaf with its own shell renders that session's
-            // grid. CTX-0234: a leaf WITHOUT a session renders the shared
-            // primary snapshot ONLY while focused — multipane input routing
-            // (`push_input_bytes_multipane`) sends typing to the primary
-            // shell exactly through the focused session-less leaf, so the
-            // fallback is what-you-see-is-what-you-type there. Every other
-            // session-less leaf (ctl splits spawn no shell; spawn failures)
-            // presents erased: cloning primary into all of them duplicates
-            // one shell across N tiles (live three-column repeat + marker
-            // in an unexpected tile after zoom-off). The single-pane path
-            // is unchanged (the sole leaf is focused, so it keeps primary).
-            // CTX-0255: mixed shape (session-less primary home plus live
-            // pane sessions — the keymap-split live path) must co-paint:
-            // every session-less leaf keeps the shared primary grid even
-            // while unfocused, otherwise focusing the pane blanks the
-            // primary home tile (live 02-focus-v2 left blank, 03-refocus-v1
-            // both repaint). Pure session-less shape (no session anywhere)
-            // keeps the CTX-0234 focused-only fallback so one grid never
-            // duplicates across N tiles.
+            // grid. CTX-0359: a leaf WITHOUT a session renders the shared
+            // primary snapshot only when it IS the primary owner
+            // (`primary_view`: the leaf focused when the primary shell
+            // attached). The former CTX-0234 focused-only arm and CTX-0255
+            // mixed-shape co-paint arm cloned the primary grid into any
+            // session-less leaf that was focused (or into every one once any
+            // pane session existed); that duplicated one shell across tiles,
+            // painted the previous workspace's grid into a fresh workspace
+            // leaf, and blanked the primary owner whenever focus moved off
+            // it. Ownership — not focus and not session-presence — decides:
+            // every other session-less leaf (ctl splits spawn no shell,
+            // spawn failures, fresh workspace leaves) presents erased, so a
+            // session-less View never paints another View's grid.
             let focused_id = self.focus.focused();
             let pane_snap: Option<Snapshot> = match self.pane_sessions.get(view_id) {
                 Some(sess) => Some(sess.state.snapshot()),
-                None if Some(*view_id) == focused_id => Some(snapshot.clone()),
-                None if !self.pane_sessions.is_empty() => Some(snapshot.clone()),
+                None if Some(*view_id) == self.primary_view => Some(snapshot.clone()),
                 None => None,
             };
-            // Erased source for session-less, unfocused leaves;
-            // `viewport_snapshot` pads it to the allocation below.
+            // Erased source for session-less leaves that do not own the
+            // primary; `viewport_snapshot` pads it to the allocation below.
             let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
                 Some(erased_snapshot(&snapshot))
             } else {

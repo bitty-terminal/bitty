@@ -278,40 +278,44 @@ impl Runtime {
         // the echo lands in the visible window (typing while scrolled must
         // not stay stuck showing history with invisible input).
         self.snap_focused_to_live();
-        // CTX-0176: with per-pane sessions live, input routes to the focused
-        // leaf's shell only — never broadcast. Leaves without a session (the
-        // primary leaf) keep the original writer path below.
-        if !self.pane_sessions.is_empty() {
-            self.push_input_bytes_multipane(bytes);
-            return;
-        }
-        // Try live PTY write first (best effort, never panics).
-        if let Some(writer) = self.pty_writer.as_mut() {
-            use std::io::Write as _;
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
-            // Also keep a copy in pending for observability? For live PTY
-            // tests the child will echo, so pending is not needed. We do not
-            // double-buffer when writer exists to keep the bound honest.
-            // Headless tests without a writer will observe via pending.
-            return;
-        }
-        self.buffer_input_headless(bytes);
+        // CTX-0176: input routes to the focused leaf's own shell only —
+        // never broadcast. CTX-0359: this is the single routing path (the
+        // former `pane_sessions.is_empty()` shortcut wrote straight to the
+        // global writer), so a session-less leaf that does not own the
+        // primary can never reach another view's shell.
+        self.push_input_bytes_multipane(bytes);
     }
 
     /// Focused-leaf input routing for split layouts (CTX-0176): the focused
-    /// leaf's session writer wins; the shared writer serves leaves without a
-    /// session; with no writer live, bytes fall back to the bounded headless
-    /// buffer. Best-effort, never panics.
+    /// leaf's session writer wins; the shared writer serves only the primary
+    /// owner leaf (CTX-0359); with no writer live, bytes fall back to the
+    /// bounded headless buffer. Best-effort, never panics.
     pub(super) fn push_input_bytes_multipane(&mut self, bytes: &[u8]) {
         use std::io::Write as _;
         // CTX-0243: direct multipane sends must also snap (normally already
         // snapped by `push_input_bytes`; idempotent second snap is a no-op).
         self.snap_focused_to_live();
-        if let Some(focused) = self.focus.focused() {
-            if let Some(sess) = self.pane_sessions.get_mut(&focused) {
-                let _ = sess.writer.write_all(bytes);
-                let _ = sess.writer.flush();
+        match self.focus.focused() {
+            Some(focused) => {
+                if let Some(sess) = self.pane_sessions.get_mut(&focused) {
+                    let _ = sess.writer.write_all(bytes);
+                    let _ = sess.writer.flush();
+                    return;
+                }
+                // CTX-0359: only the primary owner leaf may fall back to
+                // the runtime-global writer. A session-less non-owner (fresh
+                // workspace leaf, ctl split tile, spawn failure) has no
+                // shell of its own; typing there must never reach another
+                // view's shell (previous workspace primary included), so it
+                // buffers headless instead.
+                if Some(focused) != self.primary_view {
+                    self.buffer_input_headless(bytes);
+                    return;
+                }
+            }
+            // No focused view: nothing owns input; never leak to a shell.
+            None => {
+                self.buffer_input_headless(bytes);
                 return;
             }
         }

@@ -236,7 +236,9 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     let focused = rt.focused_view().expect("focus");
     let mut layout = rt.layout().clone();
     close_leaf(&mut layout, focused);
-    rt.set_layout(layout);
+    // CTX-0359: re-homing is driven by the explicit close signal, not by a
+    // layout that merely excludes the owner (zoom must preserve it).
+    rt.set_layout_closing(layout, focused);
     assert_eq!(rt.leaf_count(), 1);
 
     // Grid widens back to the container. CTX-0266 (#441) unwrap/rewrap
@@ -350,17 +352,17 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
 
 // POSIX-only (`/bin/sh` for the mixed shape; same gate as above).
 //
-// CTX-0269 requirement 3: the unfocused-blank / v:2-blank reports are a
-// DIFFERENT root cause from the reflow bug — the deliberate CTX-0234
-// fallback (pure session-less splits present unfocused leaves erased so one
-// grid never duplicates across tiles) versus the CTX-0255 co-paint (any
-// live pane session keeps primary painted in every session-less leaf).
-// This test pins both arms behaviorally so the follow-up has a baseline.
+// CTX-0269 requirement 3 / CTX-0359: a pure session-less split (`ctl view
+// split`: no shell spawns) paints the primary grid in the primary owner
+// leaf only (v:1, the leaf focused when the primary attached) and erases
+// the session-less non-owner; the mixed shape (keymap split: the new leaf
+// owns a shell) paints primary in the owner PLUS the pane's own grid.
+// This test pins both arms behaviorally so a regression is visible.
 #[cfg(unix)]
 #[test]
 fn unfocused_blank_is_session_shape_not_reflow() {
-    // Pure session-less shape (`ctl view split`: no shell spawns): focus
-    // the new leaf; the old leaf is erased by design.
+    // Pure session-less shape: focus the new leaf; the non-owner is erased
+    // and the primary stays with its owner (never focus-follow, CTX-0359).
     let mut pure_rt = make_runtime();
     pure_rt.tick().expect("first full redraw");
     pure_rt.handle_pty_bytes(b"HELLO-0269");
@@ -370,7 +372,7 @@ fn unfocused_blank_is_session_shape_not_reflow() {
     let pure_stats = pure_rt.tick().expect("pure split must present");
 
     // Mixed shape (keymap split: new leaf owns a shell): focusing the pane
-    // keeps primary co-painted in the session-less home leaf.
+    // keeps primary co-painted in the session-less owner leaf.
     let mut mixed_rt = make_runtime();
     mixed_rt.tick().expect("first full redraw");
     mixed_rt.handle_pty_bytes(b"HELLO-0269");
@@ -382,9 +384,9 @@ fn unfocused_blank_is_session_shape_not_reflow() {
     assert!(mixed_rt.set_focus(mixed_new));
     let mixed_stats = mixed_rt.tick().expect("mixed split must present");
 
-    // Mixed paints primary (10 glyphs) in the home leaf PLUS the pane grid
-    // (4 glyphs); pure paints primary (10) in the focused leaf and erases
-    // the other (0). The gap pins the two different present arms.
+    // Mixed paints primary (10 glyphs) in the owner leaf PLUS the pane grid
+    // (4 glyphs); pure paints primary (10) in the owner leaf and erases the
+    // non-owner (0). The gap pins the two different present arms.
     assert!(
         mixed_stats.glyphs > pure_stats.glyphs,
         "mixed shape must paint more glyphs than pure erased shape (mixed={} pure={})",

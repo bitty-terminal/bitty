@@ -26,6 +26,16 @@ nfpm package --config nfpm.yaml --packager archlinux --target /tmp/bitty.pkg.tar
 
 Scripts under `packaging/scripts/` are bounded no-ops (exit 0) to keep package hooks honest.
 
+## Application icons
+
+`packaging/icons/hicolor/` holds the launcher icons installed by every package format: `apps/bitty.png` at 16, 32, 64, 128, 256, and 512 px plus the scalable `scalable/apps/bitty.svg`. They are generated from the approved Bitty mascot artwork (the mascot peeking over a dark terminal window on a cream rounded-square background) and share one square framing. The PNGs carry transparent corners, so the icon reads on both light and dark launchers. Regenerate every size together when the approved artwork changes.
+
+After installing or replacing icons, refresh the desktop icon cache so launchers stop showing a cached (possibly old) image:
+
+```sh
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor   # adjust the prefix if installing elsewhere
+```
+
 ## Nix Flake
 
 `flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.97.1`, filtered source bounded, no unsafe. Check:

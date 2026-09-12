@@ -61,6 +61,9 @@ jobs:
       - name: Validate bitty-bin template (render test)
         run: |
           bash scripts/check-pkgbuild-bin.sh
+      - name: Validate source PKGBUILD (artifact-install consistency)
+        run: |
+          bash scripts/check-pkgbuild-source.sh
       - name: Check release version alignment (Cargo <-> packaging <-> tag)
         run: |
           bash scripts/check-release-version.sh

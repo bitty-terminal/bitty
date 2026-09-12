@@ -44,6 +44,13 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      # Arch tooling is absent on ubuntu-latest, so this gate runs its
+      # in-tree assertions and skips the makepkg --printsrcinfo probe.
+      - name: Validate packaging recipes (artifact-install consistency)
+        run: |
+          bash scripts/check-pkgbuild-source.sh
+          bash scripts/check-pkgbuild-bin.sh
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

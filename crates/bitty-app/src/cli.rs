@@ -19,8 +19,13 @@ use crate::spawn::{looks_like_negative_number, parse_split_token};
 pub(crate) struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
     pub(crate) headless: bool,
-    /// When true (`--safe`) never create a third-party plugin VM and never
-    /// read the third-party store tree (recovery startup, RFC A.4 rule 6).
+    /// When true (`--safe`) never create a third-party plugin VM, never
+    /// read the third-party store tree (recovery startup, RFC A.4 rule 6),
+    /// and select the built-in safe effective config
+    /// ([`bitty_config::safe_merged`]): every external config layer
+    /// (`--config`/`BITTY_CONFIG`, profile, CLI appearance overrides) is
+    /// ignored and decoration is forced to the safe `0/0/1/0/0` geometry
+    /// with the opaque outline pair (CTX-0346, R-009/P0-AC-019).
     pub(crate) safe: bool,
     /// When true print help and exit 0.
     pub(crate) help: bool,
@@ -1225,7 +1230,10 @@ pub(crate) fn help_text() -> String {
                              (default warn; tick stats need debug|trace;\n  \
                              also BITTY_LOG/RUST_LOG)\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
-               --safe       Do not load third-party plugins (no plugin VM)\n  \
+               --safe       Safe mode: do not load third-party plugins (no\n  \
+                            plugin VM), and use the built-in safe config\n  \
+                            (decoration 0/0/1/0/0, opaque outline pair);\n  \
+                            ignores --config/BITTY_CONFIG/profiles/CLI overrides\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
                --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \

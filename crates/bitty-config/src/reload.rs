@@ -423,10 +423,7 @@ pub fn reconcile_live(
 /// stays at its built-in default and no external layer is applied.
 #[must_use]
 pub fn fallback_builtin() -> EffectiveConfig {
-    EffectiveConfig {
-        decoration: crate::types::DecorationConfig::safe(),
-        ..EffectiveConfig::default()
-    }
+    EffectiveConfig::default().with_safe_decoration()
 }
 
 /// Whether a report means the previous good plan should be retained (R-009).
@@ -561,6 +558,22 @@ mod tests {
         assert_eq!(fallback.font, EffectiveConfig::default().font);
         assert_eq!(fallback.window, EffectiveConfig::default().window);
         fallback.validate().expect("safe fallback is valid");
+    }
+
+    #[test]
+    fn with_safe_decoration_matches_fallback() {
+        // CTX-0346: the app-level `--safe` path builds the safe effective
+        // config from `EffectiveConfig::default().with_safe_decoration()`;
+        // it must equal `fallback_builtin()` so the two entry points can
+        // never drift.
+        let from_default = EffectiveConfig::default().with_safe_decoration();
+        assert_eq!(from_default, fallback_builtin());
+        assert_eq!(
+            from_default.decoration,
+            crate::types::DecorationConfig::safe()
+        );
+        assert_eq!(from_default.font, EffectiveConfig::default().font);
+        from_default.validate().expect("safe decoration is valid");
     }
 
     #[test]

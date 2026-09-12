@@ -24,6 +24,29 @@ use crate::writer::PtyWriter;
 /// keeping reap latency negligible against second-scale timeouts.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Maximum bytes of a process name reported in [`ForegroundJob::name`]
+/// (CTX-0370). The kernel interface (`/proc/<pid>/comm`) already caps names
+/// at 16 bytes; this is a defensive display bound.
+pub const MAX_JOB_NAME_BYTES: usize = 32;
+
+/// A foreground job observed on a PTY: the kernel's foreground process-group
+/// leader when it differs from the spawned child (the idle shell).
+///
+/// CTX-0370 busy definition: "the foreground process is not the shell
+/// itself". An interactive shell at its prompt is the foreground group
+/// leader == the spawned child pid, so it is *not* a job; a foreground
+/// pipeline's leader is a distinct pid, so it *is*. Read-only observation,
+/// bounded and cheap enough for a close-gesture path (never the input hot
+/// path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundJob {
+    /// Foreground process-group leader pid (`tcgetpgrp`).
+    pub pid: u32,
+    /// Bounded process name when the platform exposes one cheaply
+    /// (`/proc/<pid>/comm` on Linux); `None` elsewhere.
+    pub name: Option<String>,
+}
+
 /// A child process running inside its own pseudo terminal.
 ///
 /// Created exclusively through [`crate::PtyBuilder::spawn`]. The handle owns
@@ -78,6 +101,32 @@ impl Pty {
     /// Process id of the child, when applicable.
     pub fn pid(&self) -> Option<u32> {
         self.session.pid()
+    }
+
+    /// Kernel foreground process-group leader pid, when the platform exposes
+    /// one (Unix `tcgetpgrp` on the master fd; always `None` on Windows
+    /// ConPTY). Read-only, non-blocking, best-effort.
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        self.session.process_group_leader()
+    }
+
+    /// Foreground job running beyond the spawned shell, when detectable.
+    ///
+    /// CTX-0370 busy detection: the kernel foreground process group differs
+    /// from the spawned child pid. The child is the session leader and starts
+    /// as its own foreground group, so an idle shell reports `None`; a
+    /// foreground pipeline/program (job control moves each job into its own
+    /// process group) reports `Some` with a bounded name when the platform
+    /// exposes one. `None` also means "cannot determine" (Windows ConPTY, or
+    /// a dead PTY) — callers must treat it as *not busy*, never invent a
+    /// guess.
+    pub fn foreground_job(&self) -> Option<ForegroundJob> {
+        let child = self.pid()?;
+        let fg = foreground_job_pid(Some(child), self.foreground_pgid())?;
+        Some(ForegroundJob {
+            pid: fg,
+            name: process_name(fg),
+        })
     }
 
     /// Takes exclusive ownership of the output side.
@@ -182,10 +231,65 @@ impl Pty {
     }
 }
 
+/// Pure busy classifier shared by [`Pty::foreground_job`] and its tests:
+/// returns the foreground job pid only when the kernel reports a foreground
+/// process group that is not the spawned child (the idle shell).
+///
+/// `None` covers every "not busy / cannot determine" case: no child, no
+/// foreground group, the shell itself in front, or a non-positive group id.
+fn foreground_job_pid(child_pid: Option<u32>, fg_pgid: Option<u32>) -> Option<u32> {
+    let child = child_pid?;
+    let fg = fg_pgid?;
+    (fg != child).then_some(fg)
+}
+
+/// Bounded process name for a job pid, when the platform exposes one.
+///
+/// Linux reads `/proc/<pid>/comm` (a kernel interface; 16-byte name), trims
+/// the trailing newline, strips control characters, and truncates to
+/// [`MAX_JOB_NAME_BYTES`]. Any read failure, non-UTF-8 content, or empty
+/// result is `None` (fail-soft: the confirmation still names the pid).
+/// Other platforms return `None` (no new dependency, no `/proc`).
+fn process_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .take(MAX_JOB_NAME_BYTES)
+            .collect();
+        if cleaned.is_empty() {
+            return None;
+        }
+        Some(cleaned)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn busy_classifier_is_shell_identity_relative() {
+        // CTX-0370: only a foreground group distinct from the child pid is a
+        // job; every indeterminate case is "not busy" (never a false prompt).
+        assert_eq!(foreground_job_pid(None, Some(2)), None, "no child");
+        assert_eq!(foreground_job_pid(Some(1), None), None, "no fg group");
+        assert_eq!(foreground_job_pid(Some(1), Some(1)), None, "shell in front");
+        assert_eq!(
+            foreground_job_pid(Some(1), Some(2)),
+            Some(2),
+            "job in front"
+        );
+    }
 
     #[test]
     fn wait_timeout_returns_none_while_child_is_alive() {
@@ -225,6 +329,70 @@ mod tests {
             .expect("fast child must exit in time");
         assert!(!status.is_success());
         assert_eq!(status.code(), 3);
+    }
+
+    /// Polls `check` until it returns `Some`, or panics past `timeout`.
+    fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = check() {
+                return value;
+            }
+            assert!(std::time::Instant::now() < deadline, "poll timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn idle_shell_is_not_busy_and_running_job_is_detected() {
+        // CTX-0370 live busy detection: a shell at its prompt reports no
+        // foreground job; a foreground pipeline reports one; interrupting it
+        // returns to idle. Real `/bin/sh` + kernel pgid state, bounded polls.
+        bitty_test_support::require_pty!();
+        use std::io::Write as _;
+
+        let mut pty = crate::PtyBuilder::new("/bin/sh")
+            .size(80, 24)
+            .spawn()
+            .expect("spawn sh");
+        let mut writer = pty.take_writer().expect("writer half");
+        let reader = pty.take_reader().expect("reader half");
+        // Drain asynchronously? The bounded pump keeps startup output small;
+        // the shell's prompt fits far under the 128 KiB channel cap.
+        let _keep_reader = reader;
+
+        // The shell must own the foreground before "idle" is meaningful.
+        wait_until(Duration::from_secs(10), || {
+            pty.foreground_pgid().map(|_| ())
+        });
+        assert_eq!(
+            pty.foreground_job(),
+            None,
+            "idle shell is the foreground process, not a job"
+        );
+
+        writer.write_all(b"sleep 30\n").expect("write job");
+        writer.flush().expect("flush job");
+        let job = wait_until(Duration::from_secs(10), || pty.foreground_job());
+        assert_ne!(
+            job.pid,
+            pty.pid().expect("child pid"),
+            "job is not the shell"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(job.name.as_deref(), Some("sleep"), "bounded job name");
+
+        // Ctrl-C through the line discipline interrupts the foreground job;
+        // the shell takes the foreground back and busy clears.
+        writer.write_all(b"\x03").expect("write intr");
+        writer.flush().expect("flush intr");
+        wait_until(Duration::from_secs(10), || {
+            pty.foreground_job().is_none().then_some(())
+        });
+
+        // Clean teardown: shutdown kills + reaps the shell (SIGHUP reaches
+        // the foreground group as the session dies).
+        pty.shutdown().expect("shutdown");
     }
 }
 

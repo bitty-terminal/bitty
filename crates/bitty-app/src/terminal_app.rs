@@ -519,6 +519,21 @@ impl AppHandler for TerminalApp {
             ctx.exit();
             return;
         }
+        // CTX-0370: a window-close request that did not exit armed a bounded
+        // confirmation (or was superseded by one); report it loudly so the
+        // pending gate is never silent in the log. `AboutToWait` presents the
+        // overlay pill from `pending_full_redraw`.
+        if matches!(
+            &event,
+            PlatformEvent::Window {
+                window_id: _,
+                kind: WindowEventKind::CloseRequested,
+            }
+        ) {
+            if let Some(summary) = self.runtime.close_confirm_banner_text() {
+                eprintln!("bitty: window close PENDING -> {summary}");
+            }
+        }
         // CTX-0186 loud paste-dialog reporting: pending shows the bounded
         // summary with confirm/cancel instructions; a cleared pending with new
         // input bytes means the repeat gesture confirmed delivery; an Esc

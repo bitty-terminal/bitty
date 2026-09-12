@@ -39,6 +39,7 @@
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
 //!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
+//!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
@@ -290,6 +291,9 @@ pub struct ConfigData {
     /// Top-level `mod_key` scalar (CTX-0236 leader/mod for the shipped
     /// chrome map; raw string, parsed fail-closed downstream).
     pub mod_key: Option<String>,
+    /// Top-level `close_confirm` scalar (CTX-0370 view/window close
+    /// confirmation mode; raw string, parsed fail-closed downstream).
+    pub close_confirm: Option<String>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
     /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
@@ -319,6 +323,7 @@ impl ConfigData {
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.mod_key.is_none()
+            && self.close_confirm.is_none()
             && self.keymaps.is_none()
     }
 }
@@ -1086,6 +1091,10 @@ impl ConfigData {
                 // parsing and fail-closed validation live downstream in
                 // `bitty-config`, like the `theme` alias).
                 "mod_key" => out.mod_key = Some(expect_string(key, val)?),
+                // CTX-0370: top-level `close_confirm` scalar (raw string;
+                // typed parsing and fail-closed validation live downstream
+                // in `bitty-config`).
+                "close_confirm" => out.close_confirm = Some(expect_string(key, val)?),
                 _ => out.undeclared.push(key.clone()),
             }
         }
@@ -1372,6 +1381,29 @@ mod tests {
         {
             ConfigOutcome::ShapeError { message } => {
                 assert!(message.contains("mod_key"), "{message}");
+            }
+            other => panic!("expected shape error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_confirm_scalar_extracts_and_absent_means_no_override() {
+        // CTX-0370: top-level `close_confirm` extracts as a raw string
+        // (typed parsing lives downstream); absent means `None` so merge
+        // keeps the lower-precedence value (when_busy default).
+        let data = eval_ok(r#"return { close_confirm = "never" }"#);
+        assert_eq!(data.close_confirm.as_deref(), Some("never"));
+        assert!(!data.is_empty());
+        let data = eval_ok(r#"return { theme = "dark" }"#);
+        assert_eq!(data.close_confirm, None);
+        // Wrong type is a shape error naming the key, without echoing values.
+        let mut vm = LuaVm::new("test.close-confirm-type");
+        match vm
+            .eval_config(r#"return { close_confirm = 1 }"#)
+            .expect("no refuse")
+        {
+            ConfigOutcome::ShapeError { message } => {
+                assert!(message.contains("close_confirm"), "{message}");
             }
             other => panic!("expected shape error, got {other:?}"),
         }

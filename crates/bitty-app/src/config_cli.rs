@@ -858,6 +858,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "close_confirm",
+                        format!("\"{}\"", e.close_confirm.as_str()),
+                        &src("close_confirm")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "keymaps",
                         format!("{} entries", e.keymaps.len()),
                         &src("keymaps")
@@ -998,6 +1006,16 @@ pub(crate) fn runtime_config_from_effective(
         .scrollbar
         .width
         .min(bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX);
+    // CTX-0370: `close_confirm` flows file -> effective -> runtime by value
+    // (`bitty-runtime` owns no `bitty-config` dependency); the match is
+    // total with a fail-closed `when_busy` fallback so a future variant
+    // drift can never disable the gate (upstream only ever yields
+    // `always`/`when_busy`/`never`).
+    let close_confirm = match effective.close_confirm {
+        bitty_config::CloseConfirm::Always => bitty_runtime::CloseConfirmMode::Always,
+        bitty_config::CloseConfirm::Never => bitty_runtime::CloseConfirmMode::Never,
+        bitty_config::CloseConfirm::WhenBusy => bitty_runtime::CloseConfirmMode::WhenBusy,
+    };
     let window_radius_px = effective
         .window
         .radius_px
@@ -1072,6 +1090,9 @@ pub(crate) fn runtime_config_from_effective(
                 .focus_follows_mouse_delay_ms
                 .min(bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS),
         ));
+        // CTX-0370: the close-confirmation mode rides the validated runtime
+        // config (same post-construction pattern as hover-focus).
+        cfg.close_confirm = close_confirm;
         // CTX-0292: Core-owned workspace decoration is carried onto the
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).

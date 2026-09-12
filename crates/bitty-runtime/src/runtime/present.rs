@@ -1167,6 +1167,59 @@ impl Runtime {
             }
         }
 
+        // Pending view/window close confirmation banner (CTX-0370): the
+        // same presentation-only overlay pill as the paste and
+        // workspace-close banners (steady text while the arm holds).
+        // Gated on `has_pending_close_confirm()`; text is the bounded
+        // `close_confirm_banner_text()`. Overlay only, never grid truth;
+        // repeat-confirm and Esc-cancel paths repaint via
+        // `pending_full_redraw`. Painted after the workspace-close pill so
+        // a window arm reads on top when both are somehow armed.
+        if self.has_pending_close_confirm() {
+            if let Some(banner) = self.close_confirm_banner_text() {
+                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
+                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
+                        if frame.rows > 0 && frame.cols > 0 {
+                            let live = self.live_cell_metrics();
+                            let max_cells = usize::from(frame.cols);
+                            let text_cells = banner.chars().count().min(max_cells).max(1);
+                            let pill_w = px_span_usize(text_cells, live.width);
+                            let full_w = px_span(frame.cols, live.width);
+                            let origin_px_x = px_add(
+                                px_add(pad_px, frame.content.x),
+                                px_side(full_w.saturating_sub(pill_w)),
+                            );
+                            let banner_y = px_add(
+                                px_offset_cells(
+                                    frame.content.y,
+                                    frame.rows.saturating_sub(1),
+                                    live.height,
+                                ),
+                                pad_px,
+                            );
+                            combined_fills.push(bitty_render::grid::FillRect {
+                                rect: bitty_render::geometry::RectPx::new(
+                                    origin_px_x,
+                                    banner_y,
+                                    pill_w,
+                                    live.height,
+                                ),
+                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
+                            });
+                            let glyphs = self.renderer.overlay_text_glyphs(
+                                &banner,
+                                (origin_px_x, banner_y),
+                                max_cells,
+                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
+                            );
+                            combined_glyphs.extend(glyphs);
+                            any_needs_draw = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Help popup panel (CTX-0265, 009 which-key): centered floating
         // overlay listing the live registry rows. Presentation-only like
         // the banners above (fills + glyphs, never grid truth); painted

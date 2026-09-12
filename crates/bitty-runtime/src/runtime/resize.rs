@@ -491,7 +491,14 @@ impl Runtime {
                     self.apply_dpi_scale(factor.get(), None);
                     false
                 }
-                WindowEventKind::CloseRequested | WindowEventKind::Closed => true,
+                WindowEventKind::CloseRequested => {
+                    // CTX-0370: window close passes the `close_confirm` gate.
+                    // The first request may arm a bounded confirmation
+                    // (return `false`: keep running, paint the banner);
+                    // repeating the request confirms the quit, `Esc` cancels.
+                    self.window_close_request()
+                }
+                WindowEventKind::Closed => true,
                 WindowEventKind::RedrawRequested => {
                     // The embedder will call `tick` on `AboutToWait`; we do
                     // not present eagerly here so frame-on-demand stays

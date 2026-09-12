@@ -15,8 +15,8 @@
 use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
-    AppearanceConfig, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig, MouseConfig,
-    PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
+    MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -39,6 +39,9 @@ pub struct ConfigPlan {
     pub terminal: Option<TerminalConfig>,
     /// Selection configuration (CTX-0191 `selection.auto_copy`).
     pub selection: Option<SelectionConfig>,
+    /// Close-confirmation mode (CTX-0370 top-level `close_confirm`;
+    /// scalar-replace). `None` means "this layer says nothing".
+    pub close_confirm: Option<CloseConfirm>,
     /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`).
     pub layout: Option<LayoutConfig>,
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
@@ -232,6 +235,7 @@ impl ConfigPlan {
             && self.window.is_none()
             && self.terminal.is_none()
             && self.selection.is_none()
+            && self.close_confirm.is_none()
             && self.layout.is_none()
             && self.decoration.is_none()
             && self.scrollbar.is_none()

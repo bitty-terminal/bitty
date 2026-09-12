@@ -202,9 +202,10 @@ pub mod statusline;
 pub mod tabs;
 pub mod workspace;
 
-pub use config::RuntimeConfig;
+pub use config::{CloseConfirmMode, RuntimeConfig};
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
+pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::PresentFrame;
 pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};

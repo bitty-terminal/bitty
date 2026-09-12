@@ -129,6 +129,16 @@ pub(crate) fn tty_name(master: &Master) -> Option<PathBuf> {
     master.inner.tty_name()
 }
 
+pub(crate) fn process_group_leader(master: &Master) -> Option<u32> {
+    // CTX-0370: kernel foreground process-group leader (`tcgetpgrp` on the
+    // master fd, wrapped by portable-pty). Non-positive pids mean "no
+    // foreground group" and map to `None`.
+    master
+        .inner
+        .process_group_leader()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
 pub(crate) fn try_clone_reader(master: &Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
     master
         .inner

@@ -487,7 +487,8 @@ impl Runtime {
     ///
     /// CTX-0257: the same press also cancels a pending workspace-close arm
     /// (kill-confirm gate). CTX-0265: the same press also dismisses the
-    /// help popup (informational overlay, not a confirm gate). Any
+    /// help popup (informational overlay, not a confirm gate). CTX-0370: the
+    /// same press also cancels a pending view/window close confirmation. Any
     /// cancellation consumes the `Esc`; all are dropped together when
     /// several pend (loud, no partial state).
     pub(super) fn cancel_pending_on_escape(&mut self, event: &KeyEvent) -> bool {
@@ -501,11 +502,17 @@ impl Runtime {
             return false;
         }
         let mut cancelled = false;
+        // CTX-0370: Esc cancels a pending view/window close confirmation
+        // (the close itself is aborted; nothing is torn down).
+        if self.pending_close_confirm.is_some() {
+            self.snap_focused_to_live();
+            cancelled = self.cancel_pending_close_confirm();
+        }
         if self.pending_ws_close.is_some() {
             // CTX-0243: Esc-cancel is user intent — snap to live (key handler
             // already snapped; idempotent).
             self.snap_focused_to_live();
-            cancelled = self.cancel_pending_ws_close();
+            cancelled = self.cancel_pending_ws_close() || cancelled;
         }
         if self.help_visible {
             // CTX-0265: Esc dismisses the help popup (overlay only; the

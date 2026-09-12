@@ -324,6 +324,9 @@ impl Runtime {
     /// drops, killing and reaping the child without leaking a zombie.
     /// Returns true when a session was removed.
     pub fn close_pane_session(&mut self, view: &ViewId) -> bool {
+        // CTX-0370: a pending close confirmation for this pane dies with its
+        // session, so a later unrelated close can never "confirm" a stale arm.
+        self.clear_pending_close_for_view(*view);
         let removed = self.pane_sessions.remove(view).is_some();
         if removed {
             // CTX-0254: drop the closed pane's placements with its grid, so

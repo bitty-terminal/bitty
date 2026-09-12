@@ -100,6 +100,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "appearance.animations.easing.focus"
         | "appearance.animations.easing.workspace"
         | "mod_key"
+        | "close_confirm"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
@@ -320,6 +321,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "terminal",
     "selection.auto_copy",
     "selection",
+    "close_confirm",
     "layout.gaps_in",
     "layout.gaps_out",
     "layout",
@@ -1095,6 +1097,48 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             }
         }
 
+        // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
+        // means "says nothing" (lower-precedence value wins).
+        if let Some(close_confirm) = &plan.close_confirm {
+            let field = "close_confirm";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.close_confirm = *close_confirm;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.close_confirm = *close_confirm;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+
         if let Some(kms) = &plan.keymaps {
             let field = "keymaps";
             if is_policy {
@@ -1840,6 +1884,49 @@ fn merge_layers_allow_policy_violations(
                 );
             }
         }
+        // CTX-0370: `close_confirm` is scalar-replace like `mod_key`; absent
+        // means "says nothing" (lower-precedence value wins).
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(close_confirm) = &plan.close_confirm {
+            let field = "close_confirm";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.close_confirm = *close_confirm;
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.close_confirm = *close_confirm;
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+        }
+
         if let Some(kms) = &plan.keymaps {
             let field = "keymaps";
             if is_policy {
@@ -2100,6 +2187,53 @@ mod tests {
         let merged2 = try_merge_layers(vec![user2]).expect("try merge");
         assert_eq!(merged2.effective.mod_key, ModKey::Super);
         assert_eq!(merged2.source_of("mod_key").unwrap().layer, LayerKind::User);
+    }
+
+    #[test]
+    fn close_confirm_merges_scalar_replace_with_attribution() {
+        // CTX-0370: user layer wins with per-field attribution; absent
+        // keeps the lower-precedence value (when_busy default).
+        use crate::types::CloseConfirm;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                close_confirm: Some(CloseConfirm::Never),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(merged.effective.close_confirm, CloseConfirm::Never);
+        assert_eq!(
+            merged.source_of("close_confirm").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            crate::merge::merge_class_for("close_confirm"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // Absent rides the when_busy default attributed to core defaults.
+        let empty = merge_layers(vec![]).expect("empty merges");
+        assert_eq!(empty.effective.close_confirm, CloseConfirm::WhenBusy);
+        assert_eq!(
+            empty.source_of("close_confirm").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+        // try_merge_layers agrees (second merge path).
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                close_confirm: Some(CloseConfirm::Always),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = try_merge_layers(vec![user2]).expect("try merge");
+        assert_eq!(merged2.effective.close_confirm, CloseConfirm::Always);
+        assert_eq!(
+            merged2.source_of("close_confirm").unwrap().layer,
+            LayerKind::User
+        );
     }
 
     #[test]

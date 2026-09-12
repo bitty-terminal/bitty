@@ -509,14 +509,29 @@ impl Runtime {
 /// Only `file://` URLs are trusted — the sole scheme shell integration emits
 /// for a local cwd; any other scheme fails open to the platform default. The
 /// authority component is ignored (ghostty parity), the path is
-/// percent-decoded, and the result must be absolute. Returns `None` for a
-/// missing/relative path, malformed escapes, or non-UTF-8 decoded bytes.
+/// percent-decoded, and the result must be absolute for the target platform.
+/// Returns `None` for a missing/relative path, malformed escapes, or
+/// non-UTF-8 decoded bytes.
 fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
     let rest = report.strip_prefix("file://")?;
     let slash = rest.find('/')?;
     let decoded = String::from_utf8(percent_decode(&rest[slash..])?).ok()?;
+    #[cfg(windows)]
+    let decoded = strip_windows_drive_root(decoded);
     let path = PathBuf::from(decoded);
     path.is_absolute().then_some(path)
+}
+
+/// Windows `file://` URLs encode the drive root as `/C:/...`; drop the
+/// leading slash so `Path::is_absolute` sees the drive prefix.
+#[cfg(windows)]
+fn strip_windows_drive_root(path: String) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        path[1..].to_string()
+    } else {
+        path
+    }
 }
 
 /// Decodes `%XX` escapes to bytes; `None` on a truncated escape or a
@@ -553,6 +568,7 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn osc7_path_accepts_plain_and_authority_file_urls() {
         assert_eq!(
@@ -569,11 +585,34 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn osc7_path_accepts_windows_drive_file_urls() {
+        assert_eq!(
+            osc7_cwd_path("file:///C:/Users/me"),
+            Some(PathBuf::from("C:/Users/me"))
+        );
+        assert_eq!(
+            osc7_cwd_path("file://host/C:/Users/me"),
+            Some(PathBuf::from("C:/Users/me"))
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn osc7_path_percent_decodes() {
         assert_eq!(
             osc7_cwd_path("file:///home/user/my%20dir"),
             Some(PathBuf::from("/home/user/my dir"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn osc7_path_percent_decodes_windows() {
+        assert_eq!(
+            osc7_cwd_path("file:///C:/Users/my%20dir"),
+            Some(PathBuf::from("C:/Users/my dir"))
         );
     }
 

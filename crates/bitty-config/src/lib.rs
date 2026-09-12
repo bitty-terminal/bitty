@@ -99,7 +99,7 @@ pub use keymap::{
 };
 pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,
-    try_merge_layers,
+    safe_merged, try_merge_layers,
 };
 pub use migration::{CURRENT_SCHEMA_VERSION, migrate, needs_migration};
 pub use plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};

@@ -115,6 +115,24 @@ pub(crate) fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
 /// profile identity. impure (filesystem + env); total (all failures become
 /// `Err(String)`).
 pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
+    // CTX-0346 `--safe` (R-009/P0-AC-019, spec rule 5): select the built-in
+    // safe effective config and do not read any external layer. User files,
+    // `BITTY_CONFIG`, profiles, and CLI appearance overrides are ignored —
+    // decoration geometry is forced to `0/0/1/0/0` and the outline pair to
+    // the opaque `#FFFFFF`/`#808080` built-ins, consistent with the
+    // `--safe` plugin-VM guarantee. This also means a hostile or invalid
+    // user config can never abort safe startup or validation. Non-safe
+    // behavior is unchanged.
+    if args.safe {
+        let merged = bitty_config::safe_merged()
+            .map_err(|err| format!("bitty: invalid built-in safe config: {err}"))?;
+        return Ok(LoadedConfig {
+            merged,
+            probed: None,
+            profile_name: None,
+            profile_path: None,
+        });
+    }
     // Env overrides (12-factor, test-friendly): BITTY_CONFIG (path),
     // BITTY_PROFILE (name). CLI flags win over env (pure resolvers).
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();

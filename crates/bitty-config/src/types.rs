@@ -1315,6 +1315,18 @@ impl Default for EffectiveConfig {
 }
 
 impl EffectiveConfig {
+    /// Returns the built-in safe configuration: every field at its core
+    /// default except the Core-owned decoration forced to the safe-mode values
+    /// (`0/0/1/0/0` geometry and the opaque `#FFFFFF`/`#808080` outline pair)
+    /// regardless of external configuration (`bitty --safe`, spec rule 5,
+    /// R-009/P0-AC-019). The result is always valid; construction itself
+    /// performs no I/O.
+    #[must_use]
+    pub fn with_safe_decoration(mut self) -> Self {
+        self.decoration = DecorationConfig::safe();
+        self
+    }
+
     /// Validate all fields of the effective config.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.font.validate()?;

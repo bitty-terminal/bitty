@@ -151,6 +151,78 @@ fn record_attribution(
     attribution.insert(field.to_string(), new_src.clone());
 }
 
+/// Every dotted schema field the merge attributes, in canonical order.
+///
+/// Shared by [`merge_layers`] (which backfills any field no layer declared as
+/// [`LayerKind::CoreDefaults`]) and [`safe_merged`] (which attributes every
+/// field to the built-in safe configuration).
+const ATTRIBUTED_FIELDS: &[&str] = &[
+    "font.family",
+    "font.size",
+    "font.line_height",
+    "font.letter_spacing",
+    "font",
+    "window.opacity",
+    "window.padding",
+    "window.radius_px",
+    "window",
+    "terminal.scrollback",
+    "terminal.shell",
+    "terminal.scroll_lines_per_notch",
+    "terminal.scroll_pixels_per_notch",
+    "terminal",
+    "selection.auto_copy",
+    "selection",
+    "layout.gaps_in",
+    "layout.gaps_out",
+    "layout",
+    "decoration.gaps_in",
+    "decoration.gaps_out",
+    "decoration.border",
+    "decoration.radius",
+    "decoration.content_inset",
+    "decoration.border_color",
+    "decoration.border_color_focused",
+    "decoration.border_color_idle",
+    "decoration",
+    "scrollbar.mode",
+    "scrollbar.width",
+    "scrollbar",
+    "mouse.focus_follows_mouse",
+    "mouse.focus_follows_mouse_delay_ms",
+    "mouse",
+    "appearance.theme",
+    "appearance",
+    "keymaps",
+    "plugins",
+    "schema_version",
+];
+
+/// The built-in safe configuration (`bitty --safe`, R-009/P0-AC-019).
+///
+/// Returns [`crate::reload::fallback_builtin`] with every schema field
+/// attributed to [`LayerKind::CoreDefaults`]: no user file, profile, or CLI
+/// layer participates, so the safe values (`0/0/1/0/0` decoration geometry
+/// and the opaque `#FFFFFF`/`#808080` outline pair) always win. There are no
+/// conflicts or policy violations because nothing overrides the core layer.
+/// Pure; performs no I/O.
+pub fn safe_merged() -> Result<MergedConfig, ConfigError> {
+    let effective = crate::reload::fallback_builtin();
+    // Defense in depth: the built-in safe config is constructed to be valid.
+    effective.validate()?;
+    let core_src = ConfigSource::new(LayerKind::CoreDefaults, None::<String>);
+    let attribution = ATTRIBUTED_FIELDS
+        .iter()
+        .map(|field| ((*field).to_string(), core_src.clone()))
+        .collect();
+    Ok(MergedConfig {
+        effective,
+        attribution,
+        conflicts: Vec::new(),
+        policy_violations: Vec::new(),
+    })
+}
+
 /// Merge a stack of layered plans into an [`EffectiveConfig`] plus
 /// attribution and conflict diagnostics.
 ///
@@ -951,49 +1023,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
     }
 
     let core_src = ConfigSource::new(LayerKind::CoreDefaults, None::<String>);
-    for field in [
-        "font.family",
-        "font.size",
-        "font.line_height",
-        "font.letter_spacing",
-        "font",
-        "window.opacity",
-        "window.padding",
-        "window.radius_px",
-        "window",
-        "terminal.scrollback",
-        "terminal.shell",
-        "terminal.scroll_lines_per_notch",
-        "terminal.scroll_pixels_per_notch",
-        "terminal",
-        "selection.auto_copy",
-        "selection",
-        "layout.gaps_in",
-        "layout.gaps_out",
-        "layout",
-        "decoration.gaps_in",
-        "decoration.gaps_out",
-        "decoration.border",
-        "decoration.radius",
-        "decoration.content_inset",
-        "decoration.border_color",
-        "decoration.border_color_focused",
-        "decoration.border_color_idle",
-        "decoration",
-        "scrollbar.mode",
-        "scrollbar.width",
-        "scrollbar",
-        "mouse.focus_follows_mouse",
-        "mouse.focus_follows_mouse_delay_ms",
-        "mouse",
-        "appearance.theme",
-        "appearance",
-        "keymaps",
-        "plugins",
-        "schema_version",
-    ] {
+    for field in ATTRIBUTED_FIELDS {
         attribution
-            .entry(field.to_string())
+            .entry((*field).to_string())
             .or_insert_with(|| core_src.clone());
     }
 
@@ -1680,49 +1712,9 @@ fn merge_layers_allow_policy_violations(
     }
 
     let core_src = ConfigSource::new(LayerKind::CoreDefaults, None::<String>);
-    for field in [
-        "font.family",
-        "font.size",
-        "font.line_height",
-        "font.letter_spacing",
-        "font",
-        "window.opacity",
-        "window.padding",
-        "window.radius_px",
-        "window",
-        "terminal.scrollback",
-        "terminal.shell",
-        "terminal.scroll_lines_per_notch",
-        "terminal.scroll_pixels_per_notch",
-        "terminal",
-        "selection.auto_copy",
-        "selection",
-        "layout.gaps_in",
-        "layout.gaps_out",
-        "layout",
-        "decoration.gaps_in",
-        "decoration.gaps_out",
-        "decoration.border",
-        "decoration.radius",
-        "decoration.content_inset",
-        "decoration.border_color",
-        "decoration.border_color_focused",
-        "decoration.border_color_idle",
-        "decoration",
-        "scrollbar.mode",
-        "scrollbar.width",
-        "scrollbar",
-        "mouse.focus_follows_mouse",
-        "mouse.focus_follows_mouse_delay_ms",
-        "mouse",
-        "appearance.theme",
-        "appearance",
-        "keymaps",
-        "plugins",
-        "schema_version",
-    ] {
+    for field in ATTRIBUTED_FIELDS {
         attribution
-            .entry(field.to_string())
+            .entry((*field).to_string())
             .or_insert_with(|| core_src.clone());
     }
 
@@ -2558,6 +2550,37 @@ mod tests {
             empty.source_of("decoration.border_color").unwrap().layer,
             LayerKind::CoreDefaults
         );
+    }
+
+    #[test]
+    fn safe_merged_forces_safe_decoration_with_core_attribution() {
+        // CTX-0346: the safe merged config is the built-in safe effective
+        // config with every schema field attributed to core defaults; there
+        // are no conflicts because no user/profile/CLI layer participates.
+        use crate::types::DecorationConfig;
+        let merged = safe_merged().expect("safe merge");
+        assert_eq!(merged.effective, crate::reload::fallback_builtin());
+        assert_eq!(merged.effective.decoration, DecorationConfig::safe());
+        assert_eq!(merged.effective.decoration.gaps_in, 0);
+        assert_eq!(merged.effective.decoration.gaps_out, 0);
+        assert_eq!(merged.effective.decoration.border, 1);
+        assert_eq!(merged.effective.decoration.radius, 0);
+        assert_eq!(merged.effective.decoration.content_inset, 0);
+        assert!(merged.conflicts.is_empty());
+        assert!(merged.policy_violations.is_empty());
+        for field in [
+            "decoration.gaps_in",
+            "decoration.border_color_focused",
+            "decoration.border_color_idle",
+            "terminal.shell",
+            "appearance.theme",
+        ] {
+            assert_eq!(
+                merged.source_of(field).map(|s| s.layer),
+                Some(LayerKind::CoreDefaults),
+                "field {field} must be core-default attributed"
+            );
+        }
     }
 
     #[test]

@@ -276,6 +276,26 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
         return measure_latency(iterations);
     }
 
+    // Warmup: mirror `measure_latency` and run a few untimed iterations so
+    // allocator/cache/PTY-forwarder setup and the first `cat` echo are not
+    // charged to the first measured sample. The real-PTY branch was the only
+    // measured path without warmup, so its first sample was consistently the
+    // max (3–6 ms locally, 151.8 ms under CI parallelism — CTX-0342), while
+    // the warmed headless path stayed green in the same run. This removes the
+    // deterministic cold-start bias without relaxing any bound.
+    for _ in 0..3 {
+        let key = char_key_event('w', "w");
+        let bytes = Runtime::encode_key_event(&key).unwrap_or_else(|| vec![b'a']);
+        let encoded = rt.handle_key_event(key);
+        let effective = encoded.unwrap_or(bytes);
+        let _ = rt.write_replies();
+        let _ = rt.poll_pty();
+        rt.handle_pty_bytes(&effective);
+        let _ = rt.drain_cold_events();
+        let _ = rt.tick();
+        let _ = rt.tick();
+    }
+
     let iterations = iterations.clamp(1, MAX_SAMPLES);
     let keys: Vec<KeyEvent> = vec![
         char_key_event('a', "a"),
@@ -470,7 +490,19 @@ mod tests {
         // median and gate loosely; real PB-4 p50 8 ms / p99 15 ms is
         // bench-gated (benches/latency_real.rs) and Tier 1 evidence, not this
         // unit test.
-        let report = measure_latency_with_pty_echo(50);
+        //
+        // CTX-0342: use 200 samples (the same count as benches/latency_real.rs
+        // uses for this tracer), not 50. At n=50 `percentile(99)` returns rank
+        // `round(0.99*49)=49`, i.e. the single worst sample, so the "p99"
+        // assertion was really a max assertion and one CI scheduler stall
+        // (151.8 ms on run 34629980293) failed the gate while the rerun passed.
+        // At n=200 p99 excludes the two worst samples, which is what a p99
+        // statistic means; the 150 ms ceiling is unchanged, so the meaningful
+        // guard (real budget 8/15 ms, bench-gated) is not weakened. The
+        // real-PTY path is also warmed by `measure_latency_with_pty_echo`
+        // itself, removing the cold first-sample bias that made the max
+        // systematic rather than a random stall.
+        let report = measure_latency_with_pty_echo(200);
         assert!(!report.samples.is_empty());
         let p50_limit = if std::env::var("CI").is_ok() {
             80.0

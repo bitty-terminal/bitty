@@ -27,9 +27,10 @@
 //!
 //! Outline tokens (`border_focused`/`border_idle`, CTX-0340) are Bitty-owned
 //! rather than upstream palette data: each preset's focused outline is the
-//! highest-contrast blue/cyan ANSI accent that clears the 3:1 non-text
-//! contrast floor against its background, and the idle outline is ANSI 8
-//! (bright black). [`BITTY_DARK`] keeps the originally ratified values.
+//! highest-contrast ANSI accent that clears the 3:1 non-text contrast floor
+//! against its background (preferring blue/cyan tints, falling back to the
+//! full ANSI set when none of those clears it), and the idle outline is ANSI
+//! 8 (bright black). [`BITTY_DARK`] keeps the originally ratified values.
 //!
 //! # Bitty Dark palette — role table
 //!

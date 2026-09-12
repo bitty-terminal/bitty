@@ -91,7 +91,7 @@ ICON_TEMPLATE="$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
 	grep -oE 'install -Dm[0-9]+ "[^"]*\$\{size\}[^"]*"' |
 	sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)"
 read -r -a ICON_SIZES <<<"$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
-	grep -oE 'for size in [^;]+' | sed -E 's/^for size in //')"
+	grep -oE 'for size in [^;]+' | sed -E 's/^for size in //')" || true
 if [[ -n "$ICON_TEMPLATE" ]]; then
 	[[ "${#ICON_SIZES[@]}" -gt 0 ]] || fail "icon loop has no sizes"
 	for size in "${ICON_SIZES[@]}"; do

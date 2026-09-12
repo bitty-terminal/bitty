@@ -151,6 +151,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// Live-adopts a focused/idle outline pair without restart (CTX-0340).
+    ///
+    /// The pair is presentation-only chrome already validated by
+    /// `bitty-config` (grammar + contrast contract); this setter is the
+    /// boundary lock so an unvalidated caller cannot slip a pair in. A change
+    /// forces one full redraw so the new focus/idle split appears on the next
+    /// present.
+    pub fn set_outline(
+        &mut self,
+        focused: bitty_render::grid::Rgba8,
+        idle: bitty_render::grid::Rgba8,
+    ) {
+        if self.config.outline_focused != focused || self.config.outline_idle != idle {
+            self.config.outline_focused = focused;
+            self.config.outline_idle = idle;
+            self.pending_full_redraw = true;
+        }
+    }
+
     /// Decorated View frames in logical pixels for the current workspace
     /// area (CTX-0292 Core-owned decoration application).
     ///

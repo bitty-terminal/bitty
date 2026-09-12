@@ -78,6 +78,9 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "decoration.border"
         | "decoration.radius"
         | "decoration.content_inset"
+        | "decoration.border_color"
+        | "decoration.border_color_focused"
+        | "decoration.border_color_idle"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
@@ -539,6 +542,52 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     );
                 }
             }
+            // CTX-0340: outline colors are scalar-replace, but an unset
+            // (`None`) member means "this layer says nothing about color", so
+            // it must not clobber a lower layer's explicit value (the RFC's
+            // "an unset pair member inherits the resolved base and never
+            // silently shadows it").
+            for (field, color) in [
+                ("decoration.border_color", dec.border_color),
+                ("decoration.border_color_focused", dec.border_color_focused),
+                ("decoration.border_color_idle", dec.border_color_idle),
+            ] {
+                let Some(color) = color else {
+                    continue;
+                };
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "decoration.border_color" => effective.decoration.border_color = Some(color),
+                    "decoration.border_color_focused" => {
+                        effective.decoration.border_color_focused = Some(color);
+                    }
+                    _ => effective.decoration.border_color_idle = Some(color),
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
             attribution.insert("decoration".to_string(), src.clone());
         }
 
@@ -927,6 +976,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
         "decoration.border",
         "decoration.radius",
         "decoration.content_inset",
+        "decoration.border_color",
+        "decoration.border_color_focused",
+        "decoration.border_color_idle",
         "decoration",
         "scrollbar.mode",
         "scrollbar.width",
@@ -1278,6 +1330,49 @@ fn merge_layers_allow_policy_violations(
                     );
                 }
             }
+            // CTX-0340: outline colors are scalar-replace, and an unset color
+            // ("says nothing") never clobbers a lower layer.
+            for (field, color) in [
+                ("decoration.border_color", dec.border_color),
+                ("decoration.border_color_focused", dec.border_color_focused),
+                ("decoration.border_color_idle", dec.border_color_idle),
+            ] {
+                let Some(color) = color else {
+                    continue;
+                };
+                if is_policy {
+                    policy_fields.insert(field.to_string(), src.clone());
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    policy_violations.push(ConfigError::NonOverridable {
+                        field: field.to_string(),
+                        policy_source: policy_src.describe(),
+                        attempted_source: src.describe(),
+                    });
+                    conflicts.push(MergeConflict {
+                        field: field.to_string(),
+                        previous_source: policy_src.clone(),
+                        new_source: src.clone(),
+                        merge_class: MergeClass::ScalarReplace,
+                    });
+                    continue;
+                }
+                let prev = attribution.get(field).cloned();
+                match field {
+                    "decoration.border_color" => effective.decoration.border_color = Some(color),
+                    "decoration.border_color_focused" => {
+                        effective.decoration.border_color_focused = Some(color);
+                    }
+                    _ => effective.decoration.border_color_idle = Some(color),
+                }
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
             attribution.insert("decoration".to_string(), src.clone());
         }
         // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
@@ -1610,6 +1705,9 @@ fn merge_layers_allow_policy_violations(
         "decoration.border",
         "decoration.radius",
         "decoration.content_inset",
+        "decoration.border_color",
+        "decoration.border_color_focused",
+        "decoration.border_color_idle",
         "decoration",
         "scrollbar.mode",
         "scrollbar.width",
@@ -2327,6 +2425,7 @@ mod tests {
                     border: 1,
                     radius: 0,
                     content_inset: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2357,6 +2456,7 @@ mod tests {
                     border: 4,
                     radius: 12,
                     content_inset: 3,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2371,6 +2471,7 @@ mod tests {
                     border: 1,
                     radius: 0,
                     content_inset: 0,
+                    ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
                 ..Default::default()
@@ -2395,6 +2496,66 @@ mod tests {
         assert_eq!(merged3.effective.decoration, DecorationConfig::default());
         assert_eq!(
             merged3.source_of("decoration.gaps_in").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn decoration_colors_scalar_replace_and_unset_never_shadows() {
+        // CTX-0340: only an explicit color overrides the lower layer; an
+        // unset (`None`) member says nothing and never clobbers it. The base
+        // and the explicit pair are independent scalar-replace fields.
+        use crate::types::{DecorationConfig, OutlineColor};
+        // Base and focused differ and clear AC-2; the base is a neutral
+        // gray the user never overrides.
+        let base = OutlineColor([0x59, 0x59, 0x59, 0xFF]);
+        let focused = OutlineColor([0x33, 0xCC, 0xFF, 0xFF]);
+        let profile = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Profile, Some("profile.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    border_color: Some(base),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        // User sets only the focused member; the base must survive.
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    border_color_focused: Some(focused),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, profile]).expect("merge");
+        assert_eq!(merged.effective.decoration.border_color, Some(base));
+        assert_eq!(
+            merged.effective.decoration.border_color_focused,
+            Some(focused)
+        );
+        assert_eq!(merged.effective.decoration.border_color_idle, None);
+        assert_eq!(
+            merged.source_of("decoration.border_color").unwrap().layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.border_color_focused")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        // No color set anywhere: the effective stays `None` (theme token).
+        let empty = merge_layers(vec![]).expect("empty merge");
+        assert_eq!(empty.effective.decoration.border_color, None);
+        assert_eq!(
+            empty.source_of("decoration.border_color").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

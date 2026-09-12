@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable focused/idle outline colors (CTX-0340):**
+  `decoration.border_color` (base, unset), `decoration.border_color_focused`
+  (default `#33CCFF`), and `decoration.border_color_idle` (default
+  `#595959AA`) color each view outline by focus state, Hyprland-style.
+  Values are canonical `#RRGGBB` / `#RRGGBBAA` (alpha defaults `FF`),
+  reload live, and resolve theme token -> base -> explicit pair; an unset
+  pair member inherits the resolved base. `--safe` forces opaque `#FFFFFF`
+  focused / `#808080` idle. Validation enforces AC-1 (focused >= 3:1 vs
+  the workspace background) and AC-2 (focused >= 3:1 vs idle when the two
+  differ) fail-closed; AC-3 (idle >= 1.5:1) is a `bitty config check`
+  advisory.
 - **Configurable panel content inset (CTX-0333):** `decoration.content_inset`
   (logical px, default `6`, range `0..=32`, safe mode `0`) pads the painted
   content inside each view frame, so text no longer sits flush against the

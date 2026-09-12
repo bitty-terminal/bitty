@@ -684,11 +684,20 @@ impl Runtime {
                     frame.frame.height,
                 );
                 if frame.border > 0 {
+                    // CTX-0340: the focused View paints the accent outline,
+                    // every idle View the subtle outline; both resolved by
+                    // `bitty-config` and carried on the runtime config.
+                    let is_focused_view = focused_id == Some(*view_id);
+                    let outline_color = if is_focused_view {
+                        self.config.outline_focused
+                    } else {
+                        self.config.outline_idle
+                    };
                     combined_rounded.push(bitty_render::grid::RoundedFill {
                         frame: ring_frame,
                         border: frame.border,
                         radius: frame.radius,
-                        color: bitty_render::grid::DECORATION_BORDER,
+                        color: outline_color,
                     });
                     any_needs_draw = true;
                 }

@@ -61,6 +61,9 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.border`       | Live               |
 /// | `decoration.radius`       | Live               |
 /// | `decoration.content_inset`| Live               |
+/// | `decoration.border_color` | Live               |
+/// | `decoration.border_color_focused` | Live       |
+/// | `decoration.border_color_idle`    | Live       |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -94,6 +97,9 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.border"
         | "decoration.radius"
         | "decoration.content_inset"
+        | "decoration.border_color"
+        | "decoration.border_color_focused"
+        | "decoration.border_color_idle"
         | "decoration"
         | "appearance.theme"
         | "appearance"
@@ -255,6 +261,27 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         old.decoration.content_inset.to_string(),
         new.decoration.content_inset.to_string(),
     );
+    // CTX-0340: the outline pair is presentation-only and adopted live by
+    // the runtime, so color changes reconcile live like the geometry.
+    for (field, before, after) in [
+        (
+            "decoration.border_color",
+            format!("{:?}", old.decoration.border_color),
+            format!("{:?}", new.decoration.border_color),
+        ),
+        (
+            "decoration.border_color_focused",
+            format!("{:?}", old.decoration.border_color_focused),
+            format!("{:?}", new.decoration.border_color_focused),
+        ),
+        (
+            "decoration.border_color_idle",
+            format!("{:?}", old.decoration.border_color_idle),
+            format!("{:?}", new.decoration.border_color_idle),
+        ),
+    ] {
+        push_if_changed(field, before, after);
+    }
     push_if_changed(
         "terminal.scrollback",
         old.terminal.scrollback.to_string(),
@@ -630,6 +657,9 @@ mod tests {
         new.decoration.border = 1;
         new.decoration.radius = 0;
         new.decoration.content_inset = 0;
+        // CTX-0340: outline colors are live too.
+        new.decoration.border_color_focused = Some(crate::types::SAFE_DECORATION_BORDER_FOCUSED);
+        new.decoration.border_color_idle = Some(crate::types::SAFE_DECORATION_BORDER_IDLE);
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::Live);
         assert!(!r.needs_restart);
@@ -639,6 +669,8 @@ mod tests {
             "decoration.border",
             "decoration.radius",
             "decoration.content_inset",
+            "decoration.border_color_focused",
+            "decoration.border_color_idle",
         ] {
             assert!(
                 r.diffs.iter().any(|d| d.field == field),

@@ -398,6 +398,10 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- content_inset padding between the border and the text.\n\
      \x20\x20-- Defaults 6/6/2/6/6; safe mode forces 0/0/1/0/0.\n\
      \x20\x20-- decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 },\n\
+     \x20\x20-- Focused/idle outline colors (CTX-0340): '#RRGGBB' or\n\
+     \x20\x20-- '#RRGGBBAA'. border_color sets both states; the focused/idle\n\
+     \x20\x20-- keys override it per state. Defaults #33CCFF / #595959AA.\n\
+     \x20\x20-- decoration = { border_color_focused = \"#33CCFF\", border_color_idle = \"#595959AA\" },\n\
       \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
       \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
       \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
@@ -641,6 +645,62 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                     ("decoration.content_inset", e.decoration.content_inset),
                 ] {
                     println!("{}", check_row(field, format!("{value}"), &src(field)));
+                }
+                // CTX-0340: report the resolved focused/idle outline pair
+                // (theme token / base / explicit pair) with its source, plus
+                // the advisory AC-3 idle-contrast note when it is below the
+                // 1.5:1 floor. AC-3 never changes the exit code.
+                let theme = bitty_config::theme::resolve_theme(e.appearance.theme.as_deref());
+                let outline = e.decoration.resolve_outline(theme);
+                println!(
+                    "{}",
+                    check_row(
+                        "decoration.border_color",
+                        e.decoration
+                            .border_color
+                            .map_or_else(|| String::from("(unset)"), |c| c.to_hex()),
+                        &src("decoration.border_color"),
+                    )
+                );
+                // The focused/idle rows are the *resolved* values; their
+                // source is the explicit key when set, else the base, else the
+                // theme token.
+                let pair_source = |explicit: bool| -> String {
+                    if explicit {
+                        String::new()
+                    } else if e.decoration.border_color.is_some() {
+                        String::from("inherited decoration.border_color")
+                    } else {
+                        String::from("theme token")
+                    }
+                };
+                let focused_explicit = e.decoration.border_color_focused.is_some();
+                let idle_explicit = e.decoration.border_color_idle.is_some();
+                for (field, value, explicit) in [
+                    (
+                        "decoration.border_color_focused",
+                        outline.focused.to_hex(),
+                        focused_explicit,
+                    ),
+                    (
+                        "decoration.border_color_idle",
+                        outline.idle.to_hex(),
+                        idle_explicit,
+                    ),
+                ] {
+                    let source = pair_source(explicit);
+                    let source = if source.is_empty() {
+                        src(field)
+                    } else {
+                        format!("resolved: {source}")
+                    };
+                    println!("{}", check_row(field, value, &source));
+                }
+                if let Some(warning) = e.decoration.idle_contrast_warning(theme) {
+                    println!(
+                        "{}",
+                        check_row("decoration.border_color_idle.advisory", warning, "advisory")
+                    );
                 }
                 println!(
                     "{}",
@@ -902,6 +962,14 @@ pub(crate) fn runtime_config_from_effective(
         // validated runtime config (same post-construction pattern as
         // `focus_follows_mouse`).
         cfg.decoration = decoration;
+        // CTX-0340: resolve the focused/idle outline pair from the theme
+        // token / `decoration.border_color` / explicit pair and carry it onto
+        // the runtime config. The `bitty-config` validation already enforced
+        // AC-1/AC-2 fail-closed against the same theme background.
+        let theme = bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref());
+        let outline = effective.decoration.resolve_outline(theme);
+        cfg.outline_focused = outline.focused.0;
+        cfg.outline_idle = outline.idle.0;
         // CTX-0297: effective `terminal.scrollback` is carried the same way;
         // terminal creation captures it as the retention cap.
         cfg.scrollback = scrollback;

@@ -51,6 +51,11 @@ pub(crate) struct TerminalApp {
     pub(crate) window_opacity: f32,
     pub(crate) window: Option<WindowHandle>,
     pub(crate) window_id: Option<WindowId>,
+    /// Physical-pixel caret rect last pushed to the platform IME via
+    /// `WindowHandle::set_ime_cursor_area` (CTX-0367). Change detection
+    /// keeps the sync to one call per actual caret move instead of one per
+    /// frame.
+    pub(crate) ime_cursor_area: Option<bitty_runtime::ImeCursorArea>,
     /// Demo pump channel when explicitly attached for debug/tests
     /// (`None` in real sessions — CTX-0167).
     pub(crate) pty_rx: Option<Receiver<Vec<u8>>>,
@@ -101,6 +106,7 @@ impl TerminalApp {
             window_opacity: 1.0,
             window: None,
             window_id: None,
+            ime_cursor_area: None,
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
@@ -134,6 +140,7 @@ impl TerminalApp {
             window_opacity: 1.0,
             window: None,
             window_id: None,
+            ime_cursor_area: None,
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
@@ -279,6 +286,27 @@ impl TerminalApp {
     /// (warn level), and paste/startup/user-facing lines elsewhere bypass
     /// the gate entirely. `Runtime::tick` itself is untouched so devtools
     /// keeps full fidelity.
+    /// Pushes the runtime's focused caret rect to the platform IME
+    /// (CTX-0367).
+    ///
+    /// No-op without a window (headless CI) or when the rect is unchanged
+    /// since the last push. `None` (cursor hidden/unfocused) leaves the last
+    /// platform rect in place: winit exposes no clear call, and the OS
+    /// hides the candidate window on focus loss by itself.
+    pub(crate) fn sync_ime_cursor_area(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let area = self.runtime.ime_cursor_area();
+        if area == self.ime_cursor_area {
+            return;
+        }
+        self.ime_cursor_area = area;
+        if let Some(area) = area {
+            window.set_ime_cursor_area(area.x, area.y, area.width, area.height);
+        }
+    }
+
     pub(crate) fn drive_tick(&mut self) -> Option<bitty_runtime::PresentStats> {
         // CTX-0171: drain IPC runtime-control queue before present so
         // `bitty ctl` mutations (send/split/focus/close/spawn/reload) apply
@@ -289,6 +317,10 @@ impl TerminalApp {
         // Ensure replies that were queued before tick are flushed before present:
         // the runtime's tick consumes snapshot+damage and composites.
         let stats = self.runtime.tick();
+        // CTX-0367: the presented frame refreshed the focused caret; forward
+        // it to the platform so the OS IME preedit/candidate window tracks
+        // the terminal cursor (DPI-correct physical pixels, change-gated).
+        self.sync_ime_cursor_area();
         if let Some(present) = stats {
             self.presented_frames += 1;
             if let Some(line) = self.maybe_format_tick(&present) {
@@ -533,6 +565,12 @@ impl AppHandler for TerminalApp {
                         Ok(handle) => {
                             let id = handle.id();
                             self.window_id = Some(id);
+                            // CTX-0367: opt the window into platform IME
+                            // events (winit defaults to IME disabled, which
+                            // is exactly why fcitx5 could not compose).
+                            // Wayland text-input-v3 / X11 XIM / macOS /
+                            // Windows all route through this one call.
+                            handle.set_ime_allowed(true);
                             // Clone handle before moving into try_attach_gpu (which borrows self mutably)
                             let handle_for_gpu = handle.clone();
                             self.window = Some(handle);
@@ -542,7 +580,7 @@ impl AppHandler for TerminalApp {
                             // via winit's SurfaceTarget and present via tick.
                             self.try_attach_gpu(&handle_for_gpu);
                             eprintln!(
-                                "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={}",
+                                "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={} ime=allowed",
                                 id.get(),
                                 self.runtime.has_gpu(),
                                 self.runtime.is_crossfont(),

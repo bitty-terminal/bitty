@@ -146,6 +146,40 @@ impl From<RenderPresentStats> for PresentStats {
     }
 }
 
+/// Physical-pixel caret rectangle reported to the platform IME (CTX-0367).
+///
+/// The embedder forwards this to
+/// `bitty_platform::WindowHandle::set_ime_cursor_area` so the OS
+/// preedit/candidate window anchors at the terminal cursor cell. Coordinates
+/// are window-relative physical pixels, already DPI-scaled through the live
+/// cell metrics; the rect spans one cursor cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImeCursorArea {
+    /// Window-relative physical x of the caret cell's left edge.
+    pub x: i32,
+    /// Window-relative physical y of the caret cell's top edge.
+    pub y: i32,
+    /// Caret cell width in physical pixels (>= 1).
+    pub width: u32,
+    /// Caret cell height in physical pixels (>= 1).
+    pub height: u32,
+}
+
+/// Private caret bookkeeping for the inline preedit overlay (CTX-0367).
+///
+/// Exposed publicly only through [`Runtime::ime_cursor_area`]; the cell
+/// budget stays internal because it is a presentation clip, not part of the
+/// platform contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImeCaret {
+    /// Platform rect for the candidate window.
+    pub(super) area: ImeCursorArea,
+    /// Cell columns between the caret and the right edge of its pane content
+    /// (at least `1`), used to clip the inline preedit overlay so it never
+    /// paints outside the pane.
+    pub(super) cells_available: u16,
+}
+
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
 //
 // Compositors clip in `i64`; mirror that here. The old
@@ -493,6 +527,11 @@ impl Runtime {
         let mut combined_rounded: Vec<bitty_render::grid::RoundedFill> = Vec::new();
         let mut combined_glyphs = Vec::new();
         let mut any_needs_draw = false;
+        // CTX-0367: recompute the IME caret for this frame; the cursor paint
+        // below re-arms it for the focused leaf. A stale rect must never
+        // survive a frame where the focused cursor is hidden or the focused
+        // leaf has no damage.
+        self.ime_caret = None;
 
         // For damage, we treat any new generation or pending_full as full
         // per leaf (over-damage safe, deterministic). If generation gap is
@@ -678,6 +717,23 @@ impl Runtime {
                     if (cur.row as usize) < view_snapshot.height
                         && (cur.col as usize) < view_snapshot.width
                     {
+                        // CTX-0367: arm the platform-IME caret rect (window-
+                        // relative physical pixels) for the focused, visible
+                        // cursor. The inline preedit overlay and the OS
+                        // candidate window both anchor here; `cells_available`
+                        // clips the inline preedit to the pane's right edge.
+                        let live = self.live_cell_metrics();
+                        let origin_px_x = px_add(pad_px, frame.content.x);
+                        let origin_px_y = px_add(pad_px, frame.content.y);
+                        self.ime_caret = Some(ImeCaret {
+                            area: ImeCursorArea {
+                                x: px_offset_cells(origin_px_x, cur.col, live.width),
+                                y: px_offset_cells(origin_px_y, cur.row, live.height),
+                                width: live.width.max(1),
+                                height: live.height.max(1),
+                            },
+                            cells_available: frame.cols.saturating_sub(cur.col).max(1),
+                        });
                         // Check not on spacer
                         let idx = cur.row as usize * view_snapshot.width + cur.col as usize;
                         let is_spacer = view_snapshot
@@ -901,59 +957,97 @@ impl Runtime {
             }
         }
 
-        // IME preedit overlay: presentation-only, not state mutation. Paints atop cursor.
+        // IME preedit overlay (CTX-0367): presentation-only, never Terminal
+        // Truth. The preedit string, a single-pixel underline, and the
+        // composition caret paint at the focused caret armed inside the
+        // render loop above. `State`, `Snapshot`, scrollback, damage, and
+        // replies are untouched by composition: commit is the only path that
+        // reaches the PTY (`handle_ime_commit`), and cancel/disable clears
+        // the overlay without bytes. Bounded: the model preedit is capped at
+        // `IME_PREEDIT_MAX_CHARS` (128) by `handle_ime_preedit`, and the
+        // overlay additionally clips to the pane's remaining columns so a
+        // hostile composition can never overdraw another pane or grow the
+        // frame without limit.
         if let Some(preedit) = self.ime_preedit.clone() {
             if !preedit.is_empty() && self.focused {
-                // Determine focused view allocation origin and cursor pixel position.
-                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
-                        let live = self.live_cell_metrics();
-                        // CTX-0176: the preedit overlay tracks the focused
-                        // leaf's cursor, so IME lands on the pane receiving
-                        // input (primary grid when focus owns no session).
-                        let cur = self
-                            .focused_view()
-                            .and_then(|focused| self.pane_sessions.get(&focused))
-                            .map(|sess| sess.state.snapshot().cursor.position)
-                            .unwrap_or(snapshot.cursor.position);
-                        let origin_px_x = px_add(pad_px, frame.content.x);
-                        let origin_px_y = px_add(pad_px, frame.content.y);
-                        let base_x = px_offset_cells(origin_px_x, cur.col, live.width);
-                        let base_y = px_offset_cells(origin_px_y, cur.row, live.height);
-                        // Simple IME overlay: underline background rect plus glyphs for preedit chars.
-                        // For slice, render preedit as single underline fill plus per-char glyphs via renderer? Simplified: add a fill rect for underline.
-                        // CTX-0253 F4: the char count times the cell width
-                        // accumulates in `u64` before the 1024 clamp so a
-                        // hostile count can never wrap the `u32` product.
-                        let preedit_width = u32::try_from(
-                            (preedit.chars().count() as u64)
-                                .saturating_mul(u64::from(live.width))
-                                .min(1024),
-                        )
-                        .unwrap_or(1024);
-                        let underline_rect = bitty_render::geometry::RectPx::new(
-                            base_x,
-                            px_add(base_y, px_side(live.height).saturating_sub(2)),
-                            preedit_width,
-                            2,
-                        );
-                        combined_fills.push(bitty_render::grid::FillRect {
-                            rect: underline_rect,
-                            color: [0xFF, 0xFF, 0x00, 0xFF],
-                        });
-                        // Also push a background fill for preedit area (semi-transparent)
-                        let bg_rect = bitty_render::geometry::RectPx::new(
+                if let Some(caret) = self.ime_caret {
+                    let live = self.live_cell_metrics();
+                    // Cell-accurate layout: advance by the terminal cell
+                    // width so a wide CJK preedit glyph consumes two cells
+                    // (matching grid geometry) and zero-width marks compose
+                    // onto their base. The IME cursor is a character index
+                    // into the preedit; the caret bar snaps to its cell.
+                    let max_cells = usize::from(caret.cells_available);
+                    let mut clipped = String::new();
+                    let mut used_cells = 0usize;
+                    let mut caret_cells = 0usize;
+                    let mut caret_seen = false;
+                    for (char_idx, ch) in preedit.chars().enumerate() {
+                        if char_idx == self.ime_cursor && !caret_seen {
+                            caret_cells = used_cells;
+                            caret_seen = true;
+                        }
+                        let width = usize::from(bitty_term_state::char_cell_width(ch));
+                        if used_cells + width > max_cells {
+                            break;
+                        }
+                        clipped.push(ch);
+                        used_cells += width;
+                    }
+                    if !caret_seen {
+                        caret_cells = used_cells;
+                    }
+                    // CTX-0253 F4: cell count times the cell width
+                    // accumulates in `u64` before the `u32` clamp so hostile
+                    // metrics can never wrap the product.
+                    let drawn_cells = used_cells.clamp(1, max_cells.max(1));
+                    let preedit_width = px_span_usize(drawn_cells, live.width);
+                    let base_x = caret.area.x;
+                    let base_y = caret.area.y;
+                    let underline_y = px_add(base_y, px_side(live.height).saturating_sub(2));
+                    let glyphs = self.renderer.overlay_text_glyphs(
+                        &clipped,
+                        (base_x, base_y),
+                        max_cells,
+                        self.config.theme.foreground,
+                    );
+                    // Background, underline, then glyphs: fills paint before
+                    // glyphs in the `DrawList` order, so the text stays
+                    // legible on the tint.
+                    combined_fills.push(bitty_render::grid::FillRect {
+                        rect: bitty_render::geometry::RectPx::new(
                             base_x,
                             base_y,
                             preedit_width,
-                            live.height,
-                        );
-                        combined_fills.push(bitty_render::grid::FillRect {
-                            rect: bg_rect,
-                            color: [0x33, 0x33, 0x33, 0xCC],
-                        });
-                        any_needs_draw = true;
-                    }
+                            live.height.max(1),
+                        ),
+                        color: [0x33, 0x33, 0x33, 0xCC],
+                    });
+                    combined_fills.push(bitty_render::grid::FillRect {
+                        rect: bitty_render::geometry::RectPx::new(
+                            base_x,
+                            underline_y,
+                            preedit_width,
+                            2,
+                        ),
+                        color: [0xFF, 0xFF, 0x00, 0xFF],
+                    });
+                    combined_glyphs.extend(glyphs);
+                    // Composition caret: static bar at the IME cursor cell
+                    // (blink policy stays an embedder concern, matching the
+                    // Terminal cursor gate). Clamped into the drawn span.
+                    let caret_bar_cells = caret_cells.min(drawn_cells);
+                    let caret_bar_x = px_offset_cells(base_x, caret_bar_cells as u16, live.width);
+                    combined_fills.push(bitty_render::grid::FillRect {
+                        rect: bitty_render::geometry::RectPx::new(
+                            caret_bar_x,
+                            base_y,
+                            2,
+                            live.height.max(1),
+                        ),
+                        color: self.config.theme.cursor,
+                    });
+                    any_needs_draw = true;
                 }
             }
         }

@@ -200,6 +200,32 @@ impl WindowHandle {
         self.window.request_redraw();
     }
 
+    /// Enables or disables platform IME events for this window (CTX-0367).
+    ///
+    /// Wraps winit's `Window::set_ime_allowed`: `true` makes the window
+    /// receive [`WindowEventKind::Ime`](crate::event::WindowEventKind::Ime)
+    /// preedit/commit events (Wayland text-input-v3, X11 XIM, macOS
+    /// NSTextInputClient, Windows IMM) and makes the platform suppress raw
+    /// keyboard events during composition. IME is disabled by default in
+    /// winit, so a terminal must opt in for CJK input to work.
+    pub fn set_ime_allowed(&self, allowed: bool) {
+        self.window.set_ime_allowed(allowed);
+    }
+
+    /// Places the platform IME preedit/candidate window at a physical-pixel
+    /// rectangle (CTX-0367).
+    ///
+    /// Wraps winit's `Window::set_ime_cursor_area`; callers pass the live
+    /// cursor cell origin and cell size already scaled by the DPI factor.
+    /// Coordinates are window-relative physical pixels, matching winit's
+    /// `PhysicalPosition<i32>`/`PhysicalSize<u32>` contract.
+    pub fn set_ime_cursor_area(&self, x: i32, y: i32, width: u32, height: u32) {
+        self.window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(width, height),
+        );
+    }
+
     /// Live-applies a window opacity without restart (CTX-0223).
     ///
     /// This is the `window.opacity` side of the `Live` reload class: it

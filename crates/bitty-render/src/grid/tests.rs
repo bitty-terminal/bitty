@@ -1503,3 +1503,25 @@ fn custom_palette_inverse_swaps_preset_pair() {
     assert_eq!(fg, light.background);
     assert_eq!(bg, light.foreground);
 }
+
+/// CTX-0367: overlay text advances the pen by terminal cell width, so a wide
+/// CJK composition consumes two columns exactly like grid text (the previous
+/// one-column advance overlapped adjacent wide preedit glyphs). Clipping is
+/// expressed in cell columns, and a glyph that does not fit is dropped rather
+/// than overdrawing.
+#[test]
+fn overlay_text_advances_by_cell_width_and_clips_in_cells() {
+    let mut grid = renderer(); // 8x16 physical cells, glyph `left == 0`
+    let glyphs = grid.overlay_text_glyphs("a\u{4F60}b", (0, 0), 8, DEFAULT_FG);
+    assert_eq!(glyphs.len(), 3, "all three scalars fit in 4 columns");
+    assert_eq!(glyphs[0].dest[0], 0, "narrow 'a' at column 0");
+    assert_eq!(glyphs[1].dest[0], 8, "wide '\u{4F60}' at column 1");
+    assert_eq!(
+        glyphs[2].dest[0], 24,
+        "wide '\u{4F60}' consumes two columns: 'b' lands at column 3"
+    );
+
+    // Only three columns fit: the trailing 'b' must be clipped (4 > 3).
+    let clipped = grid.overlay_text_glyphs("a\u{4F60}b", (0, 0), 3, DEFAULT_FG);
+    assert_eq!(clipped.len(), 2, "cell-clipped overlay drops the overflow");
+}

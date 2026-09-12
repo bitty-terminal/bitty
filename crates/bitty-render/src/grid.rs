@@ -73,7 +73,9 @@
 
 use std::collections::HashMap;
 
-use bitty_term_state::{Color, Damage, DamageRect, DamagedRegion, Rgb, Snapshot, Style};
+use bitty_term_state::{
+    Color, Damage, DamageRect, DamagedRegion, Rgb, Snapshot, Style, char_cell_width,
+};
 
 use crate::atlas::{AtlasDims, AtlasLayout, AtlasSlot, DEFAULT_ATLAS_DIMENSION};
 use crate::cache::{CachedGlyph, GlyphCache};
@@ -1820,15 +1822,18 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
 
     /// Rasterizes one line of overlay text at an absolute pixel origin.
     ///
-    /// Presentation-only embedder primitive (CTX-0186 pending-paste banner):
-    /// each character advances one cell from `origin_px`, clipped to
-    /// `max_cells` characters. Glyph lookup, caching, and atlas placement
-    /// mirror [`Self::render`]'s cell path (same font, same baseline rule),
-    /// so headless and GPU composites sample identical texels. Whitespace,
-    /// missing glyphs, and rasterizer failures are skipped exactly like
-    /// cell glyphs (counted as `blank_cells_skipped`); the caller owns the
-    /// background fill. Returns the glyph instances to push (possibly
-    /// empty). Bounded: at most `max_cells` instances, no I/O, no panics.
+    /// Presentation-only embedder primitive (CTX-0186 pending-paste banner;
+    /// CTX-0367 inline IME preedit): the pen advances by each character's
+    /// terminal cell width ([`bitty_term_state::char_cell_width`]) — wide
+    /// CJK/emoji consume two columns like grid text, zero-width marks stay
+    /// at the current column — and stops at `max_cells` columns. Glyph
+    /// lookup, caching, and atlas placement mirror [`Self::render`]'s cell
+    /// path (same font, same baseline rule), so headless and GPU composites
+    /// sample identical texels. Whitespace, missing glyphs, and rasterizer
+    /// failures are skipped exactly like cell glyphs (counted as
+    /// `blank_cells_skipped`); the caller owns the background fill. Returns
+    /// the glyph instances to push (possibly empty). Bounded: at most
+    /// `max_cells` iterations and instances, no I/O, no panics.
     #[must_use]
     pub fn overlay_text_glyphs(
         &mut self,
@@ -1843,8 +1848,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let (origin_x, origin_y) = (i64::from(origin_px.0), i64::from(origin_px.1));
         let baseline = origin_y + self.baseline_offset;
         let mut out = Vec::new();
-        for (col, character) in text.chars().take(max_cells).enumerate() {
+        let mut col = 0usize;
+        for character in text.chars().take(max_cells) {
+            let advance = usize::from(char_cell_width(character));
+            if col + advance > max_cells {
+                break;
+            }
             if character == ' ' {
+                col += advance;
                 continue;
             }
             let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
@@ -1898,6 +1909,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             };
             out.push(instance);
             self.counters.glyphs_emitted += 1;
+            col += advance;
         }
         out
     }

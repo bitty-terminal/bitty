@@ -115,6 +115,12 @@ pub const MAX_DECORATION_RADIUS_PX: u16 = bitty_ui::MAX_RADIUS_PX;
 /// Alias of `bitty_ui::MAX_CONTENT_INSET_PX` (CTX-0333: `0..=32` logical px).
 pub const MAX_DECORATION_CONTENT_INSET_PX: u16 = bitty_ui::MAX_CONTENT_INSET_PX;
 
+/// Ratified default focused outline (CTX-0340 `#33CCFF`, opaque).
+pub const DEFAULT_OUTLINE_FOCUSED: bitty_render::grid::Rgba8 = [0x33, 0xCC, 0xFF, 0xFF];
+
+/// Ratified default idle outline (CTX-0340 `#595959AA`).
+pub const DEFAULT_OUTLINE_IDLE: bitty_render::grid::Rgba8 = [0x59, 0x59, 0x59, 0xAA];
+
 /// Maps a Core decoration validation failure to the runtime config error
 /// (CTX-0292), naming the offending property without echoing user content.
 pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> RuntimeError {
@@ -268,6 +274,13 @@ pub struct RuntimeConfig {
     /// [`crate::Runtime::decorated_allocations`] / the future live present
     /// stage.
     pub decoration: bitty_ui::Decoration,
+    /// Focused/idle outline colors (CTX-0340). Resolved by `bitty-config`
+    /// from the theme token / `decoration.border_color` / explicit pair and
+    /// carried here for the per-`View` paint decision. Defaults to the
+    /// ratified `#33CCFF` / `#595959AA` pair.
+    pub outline_focused: bitty_render::grid::Rgba8,
+    /// Idle outline color; see [`Self::outline_focused`].
+    pub outline_idle: bitty_render::grid::Rgba8,
     /// Window padding in logical pixels on every side (CTX-0223
     /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
     /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
@@ -331,6 +344,8 @@ impl Default for RuntimeConfig {
             gaps_in: DEFAULT_LAYOUT_GAPS_IN,
             gaps_out: DEFAULT_LAYOUT_GAPS_OUT,
             decoration: bitty_ui::Decoration::default(),
+            outline_focused: DEFAULT_OUTLINE_FOCUSED,
+            outline_idle: DEFAULT_OUTLINE_IDLE,
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
@@ -401,6 +416,8 @@ impl RuntimeConfig {
             gaps_in,
             gaps_out,
             decoration: bitty_ui::Decoration::default(),
+            outline_focused: DEFAULT_OUTLINE_FOCUSED,
+            outline_idle: DEFAULT_OUTLINE_IDLE,
             window_padding,
             window_radius_px,
             scrollbar_mode,

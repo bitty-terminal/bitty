@@ -16,6 +16,8 @@
 //! | Foreground | `#cdd6f4` | `[0xCD, 0xD6, 0xF4]` | Default glyph color and prompt text. Soft lavender-white: avoids pure-white glare against the dark background. |
 //! | Cursor | `#f5e0dc` | `[0xF5, 0xE0, 0xDC]` | Block cursor fill. Warm rosewater, distinct from both foreground and selection so the cursor stays findable on a busy line. |
 //! | Selection | `#313244` | `[0x31, 0x32, 0x44]` | Selection background fill. One step above the background: visible without shouting, and dark enough that foreground-colored text stays readable on top. |
+//! | Border focused | `#33CCFF` | `[0x33, 0xCC, 0xFF, 0xFF]` | Focused View outline (CTX-0340 `border.focused`). Saturated cyan accent, >= 3:1 against the background and the idle outline. |
+//! | Border idle | `#595959AA` | `[0x59, 0x59, 0x59, 0xAA]` | Idle View outline (CTX-0340 `border.idle`). Desaturated translucent gray: subtle by design while still clearing the advisory 1.5:1 floor. |
 //! | ANSI 0 (black) | `#45475a` | `[0x45, 0x47, 0x5A]` | Muted surface tone, not pure black, so "black" text and dim UI chrome remain visible on the dark background. |
 //! | ANSI 1 (red) | `#f38ba8` | `[0xF3, 0x8B, 0xA8]` | Errors, failures, `ls` archives/special flags. Soft red: urgent without vibrating. |
 //! | ANSI 2 (green) | `#a6e3a1` | `[0xA6, 0xE3, 0xA1]` | Success, `+` diffs, executable green in `ls --color`. This is the green the synthetic demo pump (`\x1b[32m`) resolves to — no hardcoded green remains in render. |
@@ -40,6 +42,8 @@
 //! file I/O and knows no config paths. It maps an already-parsed
 //! `appearance.theme` identifier to a preset.
 
+use crate::types::OutlineColor;
+
 /// Registry identifier of the designed default preset.
 pub const DEFAULT_THEME_NAME: &str = "bitty-dark";
 
@@ -60,6 +64,10 @@ pub struct Theme {
     pub cursor: [u8; 3],
     /// Selection background fill.
     pub selection: [u8; 3],
+    /// Focused View outline token (CTX-0340 RFC-0001 `border.focused`).
+    pub border_focused: OutlineColor,
+    /// Idle View outline token (CTX-0340 RFC-0001 `border.idle`).
+    pub border_idle: OutlineColor,
     /// The 16 ANSI colors, indices 0–15 (8 normal + 8 bright).
     pub ansi: [[u8; 3]; 16],
 }
@@ -81,6 +89,8 @@ pub static BITTY_DARK: Theme = Theme {
     foreground: [0xCD, 0xD6, 0xF4],
     cursor: [0xF5, 0xE0, 0xDC],
     selection: [0x31, 0x32, 0x44],
+    border_focused: crate::types::DEFAULT_DECORATION_BORDER_FOCUSED,
+    border_idle: crate::types::DEFAULT_DECORATION_BORDER_IDLE,
     ansi: [
         [0x45, 0x47, 0x5A], // 0 black
         [0xF3, 0x8B, 0xA8], // 1 red

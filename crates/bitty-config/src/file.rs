@@ -1097,12 +1097,40 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 crate::types::MAX_DECORATION_CONTENT_INSET_PX,
                 defaults.content_inset,
             )?;
+            // CTX-0340: canonical color grammar only; every other spelling
+            // fails closed naming the offending key, and an omitted color
+            // stays `None` so the lower layer / theme token is inherited.
+            let parse_color = |field: &str, raw: Option<&str>| match raw {
+                None => Ok(None),
+                Some(text) => match crate::types::OutlineColor::parse(text) {
+                    Some(color) => Ok(Some(color)),
+                    None => Err(ConfigError::validation(
+                        field,
+                        format!(
+                            "must be '#RRGGBB' or '#RRGGBBAA' (found \"{}\")",
+                            text.trim()
+                        ),
+                    )),
+                },
+            };
+            let border_color = parse_color("decoration.border_color", d.border_color.as_deref())?;
+            let border_color_focused = parse_color(
+                "decoration.border_color_focused",
+                d.border_color_focused.as_deref(),
+            )?;
+            let border_color_idle = parse_color(
+                "decoration.border_color_idle",
+                d.border_color_idle.as_deref(),
+            )?;
             Some(DecorationConfig {
                 gaps_in,
                 gaps_out,
                 border,
                 radius,
                 content_inset,
+                border_color,
+                border_color_focused,
+                border_color_idle,
             })
         }
     };
@@ -1625,6 +1653,75 @@ mod tests {
                 msg.contains("decoration"),
                 "must name the field: {bad} -> {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn lua_decoration_colors_parse_and_validate() {
+        // CTX-0340: canonical colors parse into `OutlineColor`; absent colors
+        // stay `None` (inherit the lower layer / theme token); a bad grammar
+        // fails closed naming the offending key.
+        let plan = parse_lua_config(
+            r##"return { decoration = { border_color = "#112233", border_color_focused = "#33CCFF", border_color_idle = "#595959AA" } }"##,
+            &test_source(),
+        )
+        .expect("decoration colors parse");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(
+            dec.border_color,
+            Some(crate::types::OutlineColor([0x11, 0x22, 0x33, 0xFF]))
+        );
+        assert_eq!(
+            dec.border_color_focused,
+            Some(crate::types::OutlineColor([0x33, 0xCC, 0xFF, 0xFF]))
+        );
+        assert_eq!(
+            dec.border_color_idle,
+            Some(crate::types::OutlineColor([0x59, 0x59, 0x59, 0xAA]))
+        );
+        let plan = parse_lua_config(
+            r##"return { decoration = { border_color = "#33CCFF" } }"##,
+            &test_source(),
+        )
+        .expect("base color parses");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(
+            dec.border_color,
+            Some(crate::types::OutlineColor([0x33, 0xCC, 0xFF, 0xFF]))
+        );
+        assert_eq!(dec.border_color_focused, None);
+        assert_eq!(dec.border_color_idle, None);
+        let plan = parse_lua_config(r#"return { decoration = {} }"#, &test_source())
+            .expect("empty decoration defaults");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.border_color, None);
+        assert_eq!(dec.border_color_focused, None);
+        assert_eq!(dec.border_color_idle, None);
+        for (bad, field) in [
+            (
+                r##"return { decoration = { border_color = "#FFF" } }"##,
+                "decoration.border_color",
+            ),
+            (
+                r#"return { decoration = { border_color = "red" } }"#,
+                "decoration.border_color",
+            ),
+            (
+                r##"return { decoration = { border_color_focused = "#GGGGGG" } }"##,
+                "decoration.border_color_focused",
+            ),
+            (
+                r##"return { decoration = { border_color_idle = "#12345" } }"##,
+                "decoration.border_color_idle",
+            ),
+            (
+                r##"return { decoration = { border_color = "#123456789" } }"##,
+                "decoration.border_color",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{bad} must name {field}: {msg}");
         }
     }
 

@@ -179,6 +179,13 @@ pub struct DecorationData {
     pub radius: Option<i64>,
     /// Content inset in logical px (present only when the key is set).
     pub content_inset: Option<i64>,
+    /// Base outline color (CTX-0340): raw `#RRGGBB` / `#RRGGBBAA` string,
+    /// validated downstream in `bitty-config` (fail-closed).
+    pub border_color: Option<String>,
+    /// Explicit focused outline color (CTX-0340); raw canonical string.
+    pub border_color_focused: Option<String>,
+    /// Explicit idle outline color (CTX-0340); raw canonical string.
+    pub border_color_idle: Option<String>,
 }
 
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
@@ -801,7 +808,16 @@ impl ConfigData {
                     check_nested_keys(
                         key,
                         nested,
-                        &["gaps_in", "gaps_out", "border", "radius", "content_inset"],
+                        &[
+                            "gaps_in",
+                            "gaps_out",
+                            "border",
+                            "radius",
+                            "content_inset",
+                            "border_color",
+                            "border_color_focused",
+                            "border_color_idle",
+                        ],
                     )?;
                     let gaps_in = match get_field(nested, "gaps_in") {
                         Some(v) => Some(expect_integer("decoration.gaps_in", v)?),
@@ -823,12 +839,31 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("decoration.content_inset", v)?),
                         None => None,
                     };
+                    // CTX-0340: color spellings are strings here; the
+                    // canonical `#RRGGBB`/`#RRGGBBAA` grammar and the
+                    // contrast contract are enforced fail-closed in
+                    // `bitty-config`.
+                    let border_color = match get_field(nested, "border_color") {
+                        Some(v) => Some(expect_string("decoration.border_color", v)?),
+                        None => None,
+                    };
+                    let border_color_focused = match get_field(nested, "border_color_focused") {
+                        Some(v) => Some(expect_string("decoration.border_color_focused", v)?),
+                        None => None,
+                    };
+                    let border_color_idle = match get_field(nested, "border_color_idle") {
+                        Some(v) => Some(expect_string("decoration.border_color_idle", v)?),
+                        None => None,
+                    };
                     out.decoration = Some(DecorationData {
                         gaps_in,
                         gaps_out,
                         border,
                         radius,
                         content_inset,
+                        border_color,
+                        border_color_focused,
+                        border_color_idle,
                     });
                 }
                 "scrollbar" => {
@@ -1248,6 +1283,45 @@ mod tests {
         assert_eq!(dec.border, None);
         assert_eq!(dec.radius, None);
         assert_eq!(dec.content_inset, None);
+        assert_eq!(dec.border_color, None);
+        assert_eq!(dec.border_color_focused, None);
+        assert_eq!(dec.border_color_idle, None);
+    }
+
+    #[test]
+    fn decoration_color_extract_and_absent_means_no_override() {
+        // CTX-0340: color spellings are extracted as raw strings; the
+        // canonical grammar is validated downstream (fail-closed).
+        let data = eval_ok(
+            r##"return { decoration = { border_color = "#112233", border_color_focused = "#33CCFF", border_color_idle = "#595959AA" } }"##,
+        );
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.border_color.as_deref(), Some("#112233"));
+        assert_eq!(dec.border_color_focused.as_deref(), Some("#33CCFF"));
+        assert_eq!(dec.border_color_idle.as_deref(), Some("#595959AA"));
+        let data = eval_ok(r##"return { decoration = { border_color = "#112233" } }"##);
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.border_color.as_deref(), Some("#112233"));
+        assert_eq!(dec.border_color_focused, None);
+        assert_eq!(dec.border_color_idle, None);
+    }
+
+    #[test]
+    fn decoration_color_wrong_type_is_shape_error() {
+        // CTX-0340: a non-string color fails closed without echoing a value.
+        let mut vm = LuaVm::new("test.decoration-color-type");
+        for code in [
+            r#"return { decoration = { border_color = 0x112233 } }"#,
+            r#"return { decoration = { border_color_focused = true } }"#,
+            r#"return { decoration = { border_color_idle = 123 } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("decoration"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1265,6 +1339,7 @@ mod tests {
             r#"return { decoration = { content_inset = "6" } }"#,
             r#"return { decoration = "bold" }"#,
             r#"return { decoration = { gaps_in = 1, bogus = 2 } }"#,
+            r#"return { decoration = { border_color = 1 } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

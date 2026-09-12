@@ -1529,6 +1529,16 @@ fn runtime_config_inherits_file_decoration() {
         cfg2.decoration,
         bitty_runtime::Decoration::new(6, 6, 2, 6, 6)
     );
+    // CTX-0340: with no color config the runtime carries the ratified
+    // theme-token pair.
+    assert_eq!(
+        cfg2.outline_focused,
+        bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED
+    );
+    assert_eq!(
+        cfg2.outline_idle,
+        bitty_runtime::config::DEFAULT_OUTLINE_IDLE
+    );
     assert_eq!(
         merged2.source_of("decoration.gaps_in").unwrap().layer,
         bitty_config::plan::LayerKind::CoreDefaults
@@ -1541,6 +1551,9 @@ fn runtime_config_inherits_file_decoration() {
         safe_cfg.decoration,
         bitty_runtime::Decoration::new(0, 0, 1, 0, 0)
     );
+    // CTX-0340: safe mode forces the opaque built-in outline pair.
+    assert_eq!(safe_cfg.outline_focused, [0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(safe_cfg.outline_idle, [0x80, 0x80, 0x80, 0xFF]);
     // Out-of-range decoration fails closed at the file layer.
     for bad in [
         r#"return { decoration = { gaps_in = 33 } }"#,

@@ -102,6 +102,178 @@ pub const SAFE_DECORATION_RADIUS_PX: u32 = 0;
 /// the legacy border-only content geometry (CTX-0333).
 pub const SAFE_DECORATION_CONTENT_INSET_PX: u32 = 0;
 
+/// Ratified default focused outline color (CTX-0340, RFC-0001/OQ-039):
+/// `#33CCFF` (alpha `FF`). This is also the Bitty Dark `border.focused`
+/// theme token.
+pub const DEFAULT_DECORATION_BORDER_FOCUSED: OutlineColor = OutlineColor([0x33, 0xCC, 0xFF, 0xFF]);
+
+/// Ratified default idle outline color (CTX-0340, RFC-0001/OQ-039):
+/// `#595959AA`. This is also the Bitty Dark `border.idle` theme token.
+pub const DEFAULT_DECORATION_BORDER_IDLE: OutlineColor = OutlineColor([0x59, 0x59, 0x59, 0xAA]);
+
+/// Safe-mode focused outline color (CTX-0340): opaque `#FFFFFF`, which
+/// satisfies AC-1/AC-2/AC-3 against the Bitty Dark workspace background.
+pub const SAFE_DECORATION_BORDER_FOCUSED: OutlineColor = OutlineColor([0xFF, 0xFF, 0xFF, 0xFF]);
+
+/// Safe-mode idle outline color (CTX-0340): opaque `#808080`, distinct from
+/// the focused color and passing the advisory AC-3 floor.
+pub const SAFE_DECORATION_BORDER_IDLE: OutlineColor = OutlineColor([0x80, 0x80, 0x80, 0xFF]);
+
+/// Minimum focused-outline contrast against the workspace background
+/// (CTX-0340 AC-1; WCAG 2.1 SC 1.4.11 non-text contrast).
+pub const MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST: f64 = 3.0;
+
+/// Minimum focused-outline contrast against the idle outline when no
+/// non-color focus cue is implemented (CTX-0340 AC-2).
+pub const MIN_OUTLINE_FOCUSED_IDLE_CONTRAST: f64 = 3.0;
+
+/// Advisory minimum idle-outline contrast against the workspace background
+/// (CTX-0340 AC-3); never enforced, reported by `bitty config check`.
+pub const MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST: f64 = 1.5;
+
+/// Maximum accepted outline color spelling length: `#RRGGBBAA` (9 bytes).
+pub const MAX_DECORATION_COLOR_LEN: usize = 9;
+
+/// Canonical Core-owned outline color (CTX-0340, RFC-0001/OQ-039).
+///
+/// Accepted spelling is exactly `#RRGGBB` or `#RRGGBBAA` (8-digit form is
+/// RGBA byte order); alpha defaults to `FF` when omitted. Named colors,
+/// `#RGB` shorthand, `rgb()`/`rgba()` syntax, gradients, and images are
+/// rejected fail-closed by [`Self::parse`]. All channels are unpremultiplied
+/// `sRGB` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutlineColor(pub [u8; 4]);
+
+impl OutlineColor {
+    /// Builds a color from RGBA bytes.
+    #[must_use]
+    pub const fn from_rgba(rgba: [u8; 4]) -> Self {
+        Self(rgba)
+    }
+
+    /// Parses a canonical `#RRGGBB` / `#RRGGBBAA` spelling.
+    ///
+    /// Returns `None` for any other grammar (including `#RGB`, missing `#`,
+    /// wrong digit count, or non-hex bytes). Fail-closed: the caller reports
+    /// the offending config key.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.len() > MAX_DECORATION_COLOR_LEN {
+            return None;
+        }
+        let body = trimmed.strip_prefix('#')?;
+        let (r, g, b, a) = match body.len() {
+            6 => (
+                hex_byte(body, 0)?,
+                hex_byte(body, 2)?,
+                hex_byte(body, 4)?,
+                0xFF,
+            ),
+            8 => (
+                hex_byte(body, 0)?,
+                hex_byte(body, 2)?,
+                hex_byte(body, 4)?,
+                hex_byte(body, 6)?,
+            ),
+            _ => return None,
+        };
+        Some(Self([r, g, b, a]))
+    }
+
+    /// Canonical spelling: `#RRGGBB` when opaque, `#RRGGBBAA` otherwise.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let [r, g, b, a] = self.0;
+        if a == 0xFF {
+            format!("#{r:02X}{g:02X}{b:02X}")
+        } else {
+            format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+        }
+    }
+
+    /// True when alpha is fully opaque.
+    #[must_use]
+    pub const fn is_opaque(self) -> bool {
+        self.0[3] == 0xFF
+    }
+
+    /// This color composited with straight-alpha src-over onto opaque `bg`.
+    #[must_use]
+    pub fn composited_over(self, bg: [u8; 3]) -> [u8; 3] {
+        let [r, g, b, a] = self.0;
+        let a16 = u16::from(a);
+        let mix = |src: u8, dst: u8| -> u8 {
+            let src = u16::from(src);
+            let dst = u16::from(dst);
+            (((src * a16) + (dst * (255 - a16)) + 127) / 255) as u8
+        };
+        [mix(r, bg[0]), mix(g, bg[1]), mix(b, bg[2])]
+    }
+
+    /// WCAG 2.1 contrast ratio of this color (composited over `bg`) against
+    /// `bg`. `bg` is assumed opaque.
+    #[must_use]
+    pub fn contrast_over(self, bg: [u8; 3]) -> f64 {
+        contrast_ratio(self.composited_over(bg), bg)
+    }
+
+    /// WCAG 2.1 contrast ratio between this color and `other`, both
+    /// composited over the same opaque `bg`.
+    #[must_use]
+    pub fn contrast_with(self, other: Self, bg: [u8; 3]) -> f64 {
+        contrast_ratio(self.composited_over(bg), other.composited_over(bg))
+    }
+}
+
+impl std::fmt::Display for OutlineColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+/// Parses one 2-hex-digit byte at `start` in `body`.
+fn hex_byte(body: &str, start: usize) -> Option<u8> {
+    let bytes = body.as_bytes().get(start..start + 2)?;
+    let hi = (bytes[0] as char).to_digit(16)?;
+    let lo = (bytes[1] as char).to_digit(16)?;
+    Some(((hi << 4) | lo) as u8)
+}
+
+/// WCAG 2.1 relative luminance of an opaque sRGB byte triple.
+fn relative_luminance(rgb: [u8; 3]) -> f64 {
+    let channel = |c: u8| -> f64 {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(rgb[0]) + 0.7152 * channel(rgb[1]) + 0.0722 * channel(rgb[2])
+}
+
+/// WCAG 2.1 contrast ratio between two opaque colors.
+fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f64 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// One resolved focused/idle outline pair (CTX-0340).
+///
+/// Produced by [`DecorationConfig::resolve_outline`] after applying the
+/// accepted resolution order; this is what the render path consumes per
+/// `View`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedOutlineColors {
+    /// Outline for the focused `View`.
+    pub focused: OutlineColor,
+    /// Outline for every idle (unfocused) `View`.
+    pub idle: OutlineColor,
+}
+
 /// Default selection auto-copy behavior (CTX-0191).
 /// `true` preserves the ghostty-class copy-on-select: a committed mouse
 /// selection auto-copies to the clipboard (which best-effort syncs primary).
@@ -603,6 +775,13 @@ impl LayoutConfig {
 /// | `radius`        | 6 px    | 0..=16 px  |
 /// | `content_inset` | 6 px    | 0..=32 px  |
 ///
+/// CTX-0340 extends this surface with the accepted focused/idle outline
+/// pair (RFC-0001 `OQ-039`): `border_color` is the base, and
+/// `border_color_focused` / `border_color_idle` override it explicitly when
+/// the user sets them. Resolution order (later wins) is theme token then
+/// base then explicit pair; see [`Self::resolve_outline`]. Values are
+/// canonical `#RRGGBB` / `#RRGGBBAA` ([`OutlineColor`]).
+///
 /// CTX-0333 raised the sibling gap default from the earlier `4` so
 /// `gaps_in == gaps_out` out of the box (panel-to-panel matches
 /// panel-to-terminal/container spacing) and added `content_inset`, the inner
@@ -633,6 +812,17 @@ pub struct DecorationConfig {
     /// Inner padding between the frame border and the painted content,
     /// logical px (CTX-0333; `0` reproduces the legacy border-only content).
     pub content_inset: u32,
+    /// Base outline color for both focus states (CTX-0340
+    /// `decoration.border_color`). `None` means "unset: use the theme token"
+    /// (and the ratified default pair lives on the theme).
+    pub border_color: Option<OutlineColor>,
+    /// Explicit focused outline override (CTX-0340
+    /// `decoration.border_color_focused`). `None` inherits the resolved
+    /// base and never silently shadows it.
+    pub border_color_focused: Option<OutlineColor>,
+    /// Explicit idle outline override (CTX-0340
+    /// `decoration.border_color_idle`). `None` inherits the resolved base.
+    pub border_color_idle: Option<OutlineColor>,
 }
 
 impl Default for DecorationConfig {
@@ -643,6 +833,9 @@ impl Default for DecorationConfig {
             border: DEFAULT_DECORATION_BORDER_PX,
             radius: DEFAULT_DECORATION_RADIUS_PX,
             content_inset: DEFAULT_DECORATION_CONTENT_INSET_PX,
+            border_color: None,
+            border_color_focused: None,
+            border_color_idle: None,
         }
     }
 }
@@ -650,7 +843,10 @@ impl Default for DecorationConfig {
 impl DecorationConfig {
     /// Safe-mode decoration (`bitty --safe`, spec rule 5): `0/0/1/0/0`
     /// regardless of user configuration. Content inset stays zero so safe
-    /// mode reproduces the legacy border-only geometry.
+    /// mode reproduces the legacy border-only geometry. CTX-0340: the
+    /// outline pair is forced to the opaque built-in pair and the explicit
+    /// color knobs are cleared, so user colors can never leak into safe
+    /// mode.
     #[must_use]
     pub const fn safe() -> Self {
         Self {
@@ -659,6 +855,9 @@ impl DecorationConfig {
             border: SAFE_DECORATION_BORDER_PX,
             radius: SAFE_DECORATION_RADIUS_PX,
             content_inset: SAFE_DECORATION_CONTENT_INSET_PX,
+            border_color: None,
+            border_color_focused: Some(SAFE_DECORATION_BORDER_FOCUSED),
+            border_color_idle: Some(SAFE_DECORATION_BORDER_IDLE),
         }
     }
 
@@ -672,7 +871,40 @@ impl DecorationConfig {
             && self.content_inset == 0
     }
 
-    /// Validate decoration config (fail-closed on out-of-range values).
+    /// Resolves the focused/idle outline pair from the theme tokens and the
+    /// explicit `decoration.border_color*` values (CTX-0340 accepted order).
+    ///
+    /// A color is available from, in increasing precedence:
+    /// 1. the theme tokens ([`crate::theme::Theme::border_focused`] /
+    ///    [`crate::theme::Theme::border_idle`]);
+    /// 2. `decoration.border_color` (base, both states);
+    /// 3. the explicit `decoration.border_color_focused` /
+    ///    `decoration.border_color_idle` pair.
+    ///
+    /// Only an explicit member overrides the resolved base; an unset member
+    /// inherits it and never shadows it. Safe mode ([`Self::safe`], which
+    /// stores an opaque built-in pair) short-circuits to those values.
+    #[must_use]
+    pub fn resolve_outline(&self, theme: &crate::theme::Theme) -> ResolvedOutlineColors {
+        let focused = self
+            .border_color_focused
+            .or(self.border_color)
+            .unwrap_or(theme.border_focused);
+        let idle = self
+            .border_color_idle
+            .or(self.border_color)
+            .unwrap_or(theme.border_idle);
+        ResolvedOutlineColors { focused, idle }
+    }
+
+    /// Validates the geometry ranges only (fail-closed on out-of-range
+    /// values).
+    ///
+    /// The CTX-0340 outline contrast contract is deliberately **not** checked
+    /// here: a single layer may legitimately set only the base color while a
+    /// higher-precedence layer sets the focused member, so the pair can only
+    /// be judged after merge. [`EffectiveConfig::validate`] runs
+    /// [`Self::validate_outline_contract`] on the resolved effective pair.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.gaps_in > MAX_DECORATION_GAP_PX {
             return Err(ConfigError::validation(
@@ -705,6 +937,74 @@ impl DecorationConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Enforces the CTX-0340 minimum-contrast contract on the resolved pair
+    /// over the theme background.
+    ///
+    /// - AC-1: focused outline >= 3:1 versus the background; fail-closed.
+    /// - AC-2: focused >= 3:1 versus idle. Reviewer clarification (a) of the
+    ///   RFC supports a base-only config where both states share one color;
+    ///   that case claims no color-only focus distinction, so AC-2 applies
+    ///   only when the two resolved colors differ (the non-color focus cue
+    ///   gap remains a tracked follow-up).
+    /// - AC-3: idle >= 1.5:1 versus the background; advisory only, never a
+    ///   failure (see [`Self::idle_contrast_warning`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] naming the focused key when a pair
+    /// violates AC-1 or AC-2.
+    pub fn validate_outline_contract(
+        &self,
+        theme: &crate::theme::Theme,
+    ) -> Result<(), ConfigError> {
+        let resolved = self.resolve_outline(theme);
+        let bg = theme.background;
+        let ac1 = resolved.focused.contrast_over(bg);
+        if ac1 < MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST {
+            return Err(ConfigError::validation(
+                "decoration.border_color_focused",
+                format!(
+                    "focused outline {} has contrast {ac1:.2}:1 against the background; \
+                     AC-1 requires >= {MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST:.1}:1",
+                    resolved.focused
+                ),
+            ));
+        }
+        if resolved.focused != resolved.idle {
+            let ac2 = resolved.focused.contrast_with(resolved.idle, bg);
+            if ac2 < MIN_OUTLINE_FOCUSED_IDLE_CONTRAST {
+                return Err(ConfigError::validation(
+                    "decoration.border_color_focused",
+                    format!(
+                        "focused outline {} has contrast {ac2:.2}:1 against idle {}; \
+                         AC-2 requires >= {MIN_OUTLINE_FOCUSED_IDLE_CONTRAST:.1}:1 until a \
+                         non-color focus cue ships",
+                        resolved.focused, resolved.idle
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Advisory idle-outline contrast (CTX-0340 AC-3), if it falls below the
+    /// 1.5:1 floor. Never a validation failure; surfaced by `config check`.
+    #[must_use]
+    pub fn idle_contrast_warning(&self, theme: &crate::theme::Theme) -> Option<String> {
+        let resolved = self.resolve_outline(theme);
+        let bg = theme.background;
+        let ac3 = resolved.idle.contrast_over(bg);
+        if ac3 < MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST {
+            Some(format!(
+                "idle outline {} has contrast {ac3:.2}:1 against the background \
+                 (advisory AC-3 floor {MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST:.1}:1)",
+                resolved.idle
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -1023,6 +1323,11 @@ impl EffectiveConfig {
         self.selection.validate()?;
         self.layout.validate()?;
         self.decoration.validate()?;
+        // CTX-0340: the outline pair is resolvable only after merge, so the
+        // AC-1/AC-2 contrast contract is enforced on the effective resolved
+        // pair against the selected theme's background (AC-3 stays advisory).
+        let theme = crate::theme::resolve_theme(self.appearance.theme.as_deref());
+        self.decoration.validate_outline_contract(theme)?;
         self.scrollbar.validate()?;
         self.mouse.validate()?;
         self.appearance.validate()?;
@@ -1565,6 +1870,7 @@ mod tests {
                 border: 0,
                 radius: 0,
                 content_inset: 0,
+                ..Default::default()
             },
             DecorationConfig {
                 gaps_in: 32,
@@ -1572,6 +1878,7 @@ mod tests {
                 border: 8,
                 radius: 16,
                 content_inset: 32,
+                ..Default::default()
             },
         ] {
             good.validate().expect("boundary decoration must be valid");
@@ -1648,5 +1955,214 @@ mod tests {
         EffectiveConfig::default()
             .validate()
             .expect("default valid");
+    }
+
+    #[test]
+    fn outline_color_parses_canonical_grammar_only() {
+        // CTX-0340: exactly `#RRGGBB` / `#RRGGBBAA`; alpha defaults to FF.
+        assert_eq!(
+            OutlineColor::parse("#33CCFF"),
+            Some(OutlineColor([0x33, 0xCC, 0xFF, 0xFF]))
+        );
+        assert_eq!(
+            OutlineColor::parse("#595959AA"),
+            Some(OutlineColor([0x59, 0x59, 0x59, 0xAA]))
+        );
+        assert_eq!(
+            OutlineColor::parse("  #000000FF  "),
+            Some(OutlineColor([0, 0, 0, 0xFF]))
+        );
+        // Fail-closed: #RGB shorthand, missing '#', wrong length, non-hex,
+        // named colors, function syntax, and overlong input are all rejected.
+        for bad in [
+            "#FFF",
+            "33CCFF",
+            "#33CCF",
+            "#33CCFFF",
+            "#GGGGGG",
+            "red",
+            "rgb(1,2,3)",
+            "rgba(1,2,3,0.5)",
+            "",
+            "   ",
+            "#1234567890",
+        ] {
+            assert!(
+                OutlineColor::parse(bad).is_none(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Alpha `00` is a valid 8-digit spelling (fully transparent).
+        assert_eq!(
+            OutlineColor::parse("#33CCFF00"),
+            Some(OutlineColor([0x33, 0xCC, 0xFF, 0x00]))
+        );
+    }
+
+    #[test]
+    fn outline_color_hex_round_trips() {
+        for raw in ["#33CCFF", "#595959AA", "#000000", "#12345678"] {
+            let parsed = OutlineColor::parse(raw).expect("canonical spelling parses");
+            assert_eq!(parsed.to_hex(), raw, "round trip for {raw}");
+        }
+        // Opaque 8-digit input canonicalizes to the 6-digit form.
+        assert_eq!(
+            OutlineColor::parse("#FFFFFFFF").unwrap().to_hex(),
+            "#FFFFFF"
+        );
+        assert!(OutlineColor::parse("#33CCFF").unwrap().is_opaque());
+        assert!(!OutlineColor::parse("#595959AA").unwrap().is_opaque());
+    }
+
+    #[test]
+    fn outline_contrast_matches_wcag_reference() {
+        // CTX-0340: the ratified pair clears AC-1/AC-2 and the advisory AC-3
+        // against the Bitty Dark workspace background.
+        let bg = crate::theme::BITTY_DARK.background;
+        let focused = DEFAULT_DECORATION_BORDER_FOCUSED;
+        let idle = DEFAULT_DECORATION_BORDER_IDLE;
+        assert!(focused.contrast_over(bg) >= MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST);
+        assert!(focused.contrast_with(idle, bg) >= MIN_OUTLINE_FOCUSED_IDLE_CONTRAST);
+        assert!(idle.contrast_over(bg) >= MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST);
+        // Translucent idle composites onto the background before comparison.
+        assert_eq!(idle.composited_over(bg), [0x45, 0x45, 0x4B]);
+        // A hard black focused color is below AC-1 and must fail closed.
+        let dark = OutlineColor([0x00, 0x00, 0x00, 0xFF]);
+        assert!(dark.contrast_over(bg) < MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST);
+    }
+
+    #[test]
+    fn outline_resolution_order_theme_base_then_pair() {
+        let theme = crate::theme::default_theme();
+        // Unset everything -> theme token pair.
+        let d = DecorationConfig::default();
+        let r = d.resolve_outline(theme);
+        assert_eq!(r.focused, DEFAULT_DECORATION_BORDER_FOCUSED);
+        assert_eq!(r.idle, DEFAULT_DECORATION_BORDER_IDLE);
+        // Base set -> both states use the base.
+        let d = DecorationConfig {
+            border_color: Some(OutlineColor([0x11, 0x22, 0x33, 0xFF])),
+            ..Default::default()
+        };
+        let r = d.resolve_outline(theme);
+        assert_eq!(r.focused, OutlineColor([0x11, 0x22, 0x33, 0xFF]));
+        assert_eq!(r.idle, OutlineColor([0x11, 0x22, 0x33, 0xFF]));
+        // Explicit pair members override the base; an unset member inherits
+        // it and never silently shadows it.
+        let base = OutlineColor([0x11, 0x22, 0x33, 0xFF]);
+        let focused = OutlineColor([0xAA, 0xBB, 0xCC, 0xFF]);
+        let d = DecorationConfig {
+            border_color: Some(base),
+            border_color_focused: Some(focused),
+            border_color_idle: None,
+            ..Default::default()
+        };
+        let r = d.resolve_outline(theme);
+        assert_eq!(r.focused, focused);
+        assert_eq!(r.idle, base);
+        // With no base, an unset member falls through to the theme token.
+        let d = DecorationConfig {
+            border_color_focused: Some(focused),
+            ..Default::default()
+        };
+        let r = d.resolve_outline(theme);
+        assert_eq!(r.focused, focused);
+        assert_eq!(r.idle, DEFAULT_DECORATION_BORDER_IDLE);
+    }
+
+    #[test]
+    fn outline_contrast_contract_is_fail_closed_for_ac1_and_ac2() {
+        let theme = crate::theme::default_theme();
+        // AC-1: focused black over the dark background fails closed naming
+        // the focused key.
+        let bad_ac1 = DecorationConfig {
+            border_color_focused: Some(OutlineColor([0x00, 0x00, 0x00, 0xFF])),
+            ..Default::default()
+        };
+        let err = bad_ac1
+            .validate_outline_contract(theme)
+            .expect_err("AC-1 violation must fail");
+        assert_eq!(err.field(), Some("decoration.border_color_focused"));
+        assert!(err.to_string().contains("AC-1"), "{err}");
+        // AC-2: two near-identical bright colors both pass AC-1 but fail the
+        // focused-vs-idle 3:1 floor.
+        let bad_ac2 = DecorationConfig {
+            border_color_focused: Some(OutlineColor([0xFF, 0xFF, 0xFF, 0xFF])),
+            border_color_idle: Some(OutlineColor([0xDD, 0xDD, 0xDD, 0xFF])),
+            ..Default::default()
+        };
+        let err = bad_ac2
+            .validate_outline_contract(theme)
+            .expect_err("AC-2 violation must fail");
+        assert!(err.to_string().contains("AC-2"), "{err}");
+        // A base-only config (both states share one color) is supported and
+        // does not claim a color-only focus distinction, so AC-2 is skipped.
+        let base_only = DecorationConfig {
+            border_color: Some(OutlineColor([0xFF, 0xFF, 0xFF, 0xFF])),
+            ..Default::default()
+        };
+        base_only
+            .validate_outline_contract(theme)
+            .expect("base-only config valid");
+        // The default (theme-token) pair passes.
+        DecorationConfig::default()
+            .validate_outline_contract(theme)
+            .expect("default valid");
+        // Safe pair passes AC-1/AC-2.
+        DecorationConfig::safe()
+            .validate_outline_contract(theme)
+            .expect("safe valid");
+        // A single layer may hold only the base; per-layer geometry
+        // validation must not run the merged-pair contract.
+        bad_ac1
+            .validate()
+            .expect("layer-level geometry validation is pair-agnostic");
+        let eff = EffectiveConfig {
+            decoration: bad_ac1,
+            ..Default::default()
+        };
+        eff.validate().expect_err("effective must enforce AC-1");
+    }
+
+    #[test]
+    fn outline_idle_contrast_is_advisory_only() {
+        // AC-3: a low-contrast idle is reported, never a validation failure.
+        let theme = crate::theme::default_theme();
+        let d = DecorationConfig {
+            border_color_idle: Some(OutlineColor([0x22, 0x22, 0x30, 0xFF])),
+            ..Default::default()
+        };
+        assert!(d.idle_contrast_warning(theme).is_some());
+        d.validate().expect("AC-3 is advisory, not a failure");
+        d.validate_outline_contract(theme)
+            .expect("AC-3 is advisory, not a failure");
+        // The ratified idle clears the advisory floor: no warning.
+        assert!(
+            DecorationConfig::default()
+                .idle_contrast_warning(theme)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn safe_decoration_forces_opaque_builtin_pair_regardless_of_user() {
+        // CTX-0340: `--safe` ignores user/preset colors and forces the
+        // opaque built-in pair; explicit user knobs are cleared.
+        let safe = DecorationConfig::safe();
+        assert_eq!(safe.border_color, None);
+        assert_eq!(
+            safe.border_color_focused,
+            Some(SAFE_DECORATION_BORDER_FOCUSED)
+        );
+        assert_eq!(safe.border_color_idle, Some(SAFE_DECORATION_BORDER_IDLE));
+        assert!(SAFE_DECORATION_BORDER_FOCUSED.is_opaque());
+        assert!(SAFE_DECORATION_BORDER_IDLE.is_opaque());
+        let theme = crate::theme::default_theme();
+        let r = safe.resolve_outline(theme);
+        assert_eq!(r.focused, SAFE_DECORATION_BORDER_FOCUSED);
+        assert_eq!(r.idle, SAFE_DECORATION_BORDER_IDLE);
+        // No user color can survive safe mode: the resolver never reads a
+        // theme token when an explicit pair is present.
+        assert_ne!(r.focused, DEFAULT_DECORATION_BORDER_FOCUSED);
     }
 }

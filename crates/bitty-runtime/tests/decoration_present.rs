@@ -107,7 +107,8 @@ fn live_present_paints_gap_bands_border_ring_and_fractional_remainder() {
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
     assert_eq!(pad, 8);
     let bg = bitty_render::grid::DEFAULT_BG;
-    let border = bitty_render::grid::DECORATION_BORDER;
+    // CTX-0340: a single focused leaf paints the focused outline color.
+    let border = bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED;
     let y = pad + 200;
     // gaps_out band: 6px of clear background inside the Window.
     for x in [pad + 1, pad + 3, pad + 5] {
@@ -187,8 +188,8 @@ fn radius_cuts_frame_corners_and_zero_radius_keeps_them_square() {
     let rgba = square.headless_rgba().expect("rgba");
     assert_eq!(
         probe(&rgba, width, x_corner, y_corner),
-        bitty_render::grid::DECORATION_BORDER,
-        "square corner must be border"
+        bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED,
+        "square corner must be the focused outline"
     );
     let extent = square.config().window_extent();
     dump_evidence("03-radius-0-corner", &rgba, extent.width(), extent.height());
@@ -214,7 +215,7 @@ fn safe_mode_decoration_paints_zero_gaps_one_pixel_border() {
     // No outer gap: padding then the 1px border immediately.
     assert_eq!(
         probe(&rgba, width, pad, pad + 100),
-        bitty_render::grid::DECORATION_BORDER
+        bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED
     );
     assert_eq!(probe(&rgba, width, pad + 1, pad + 100), bg);
     let extent = rt.config().window_extent();
@@ -332,6 +333,141 @@ fn zero_decoration_is_the_undecorated_fast_path() {
     assert_eq!(probe(&rgba, width, pad, pad + 100), bg);
     assert_ne!(
         probe(&rgba, width, pad, pad + 100),
-        bitty_render::grid::DECORATION_BORDER
+        bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED
     );
+}
+
+#[test]
+fn live_present_paints_focused_then_idle_outline_per_pane() {
+    // CTX-0340: the focused View ring paints the accent outline, the
+    // unfocused View the subtle idle outline; the default pair is the
+    // ratified `#33CCFF` / `#595959AA`.
+    let mut rt = Runtime::new(RuntimeConfig {
+        decoration: Decoration::default(),
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    rt.set_focus(ViewId::new(1));
+    let frames = rt.present_frames();
+    assert_eq!(frames.len(), 2);
+    let stats = rt.tick().expect("tick presents");
+    assert_eq!(stats.rounded_fills, 2, "one ring per pane");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    let focused = bitty_runtime::config::DEFAULT_OUTLINE_FOCUSED;
+    let idle = bitty_runtime::config::DEFAULT_OUTLINE_IDLE;
+    assert_eq!(focused, [0x33, 0xCC, 0xFF, 0xFF]);
+    assert_eq!(idle, [0x59, 0x59, 0x59, 0xAA]);
+    // Focused pane's left ring band (frame.x + 0..border).
+    let f = &frames[0];
+    let focus_x = pad + usize::try_from(f.frame.x).unwrap() + 1;
+    let y = pad + usize::try_from(f.frame.y).unwrap() + 100;
+    assert_eq!(
+        probe(&rgba, width, focus_x, y),
+        focused,
+        "focused pane paints the accent outline"
+    );
+    // Idle pane's left ring band composites the translucent idle over bg.
+    let idle_frame = &frames[1];
+    let idle_x = pad + usize::try_from(idle_frame.frame.x).unwrap() + 1;
+    let got = probe(&rgba, width, idle_x, y);
+    // The idle outline is translucent gray composited over the background;
+    // the software compositor rounds within one byte of the sRGB composite
+    // (idle `#595959AA` over `#1E1E2E` -> ~`[69, 69, 75]`).
+    let expected = [69u8, 69, 75];
+    for (i, channel) in expected.iter().enumerate() {
+        let delta = i32::from(got[i]) - i32::from(*channel);
+        assert!(
+            delta.abs() <= 1,
+            "idle pane channel {i}: got {} expected ~{channel}",
+            got[i]
+        );
+    }
+    assert_eq!(got[3], 0xFF, "composited surface is opaque");
+    assert_ne!(got, focused, "idle must differ from focused");
+    let extent = rt.config().window_extent();
+    dump_evidence(
+        "06-focus-idle-outline",
+        &rgba,
+        extent.width(),
+        extent.height(),
+    );
+}
+
+#[test]
+fn safe_mode_outline_is_opaque_white_and_gray() {
+    // CTX-0340: safe mode forces opaque `#FFFFFF` focused / `#808080` idle
+    // regardless of user configuration.
+    let mut rt = Runtime::new(RuntimeConfig {
+        decoration: Decoration::SAFE,
+        outline_focused: [0xFF, 0xFF, 0xFF, 0xFF],
+        outline_idle: [0x80, 0x80, 0x80, 0xFF],
+        ..RuntimeConfig::default()
+    })
+    .expect("safe runtime");
+    single_leaf(&mut rt);
+    rt.tick().expect("tick presents");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    // Safe-mode single leaf is focused: the 1px border is opaque white.
+    assert_eq!(
+        probe(&rgba, width, pad, pad + 100),
+        [0xFF, 0xFF, 0xFF, 0xFF]
+    );
+    // The idle color is carried for the unfocused state.
+    let mut split = Runtime::new(RuntimeConfig {
+        decoration: Decoration::SAFE,
+        outline_focused: [0xFF, 0xFF, 0xFF, 0xFF],
+        outline_idle: [0x80, 0x80, 0x80, 0xFF],
+        ..RuntimeConfig::default()
+    })
+    .expect("safe runtime");
+    split.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    split.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    split.set_focus(ViewId::new(1));
+    let frames = split.present_frames();
+    split.tick().expect("tick presents");
+    let rgba = split.headless_rgba().expect("rgba");
+    let idle_frame = &frames[1];
+    let idle_x = pad + usize::try_from(idle_frame.frame.x).unwrap();
+    let y = pad + usize::try_from(idle_frame.frame.y).unwrap() + 100;
+    assert_eq!(probe(&rgba, width, idle_x, y), [0x80, 0x80, 0x80, 0xFF]);
+}
+
+#[test]
+fn set_outline_adopts_live_and_repaints_once() {
+    // CTX-0340: the runtime live-adopts a new pair and forces one repaint.
+    let mut rt = runtime_with(Decoration::default());
+    single_leaf(&mut rt);
+    let _ = rt.tick().expect("first tick presents");
+    assert_eq!(rt.tick(), None, "idle on unchanged frame");
+    rt.set_outline([0xFF, 0x00, 0x00, 0xFF], [0x00, 0xFF, 0x00, 0xFF]);
+    let stats = rt.tick().expect("outline change must repaint");
+    assert!(stats.headless);
+    assert_eq!(rt.tick(), None, "must idle after one repaint");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    assert_eq!(
+        probe(&rgba, width, pad + 6, pad + 100),
+        [0xFF, 0x00, 0x00, 0xFF],
+        "single focused leaf uses the new focused color"
+    );
+    // A no-op set does not force another frame.
+    rt.set_outline([0xFF, 0x00, 0x00, 0xFF], [0x00, 0xFF, 0x00, 0xFF]);
+    assert_eq!(rt.tick(), None, "no-op set must not repaint");
 }

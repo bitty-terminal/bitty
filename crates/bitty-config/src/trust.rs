@@ -183,7 +183,8 @@ impl TrustStore {
 /// The allowed subset in this draft: `font`, `window`,
 /// `terminal.scrollback`, `terminal.scroll_lines_per_notch`,
 /// `terminal.scroll_pixels_per_notch`, `selection.auto_copy`, `layout`,
-/// `decoration`, `scrollbar`, `mouse`, `appearance`. Expanding this without
+/// `decoration` (geometry and the CTX-0340 outline colors), `scrollbar`,
+/// `mouse`, `appearance`. Expanding this without
 /// review would weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {

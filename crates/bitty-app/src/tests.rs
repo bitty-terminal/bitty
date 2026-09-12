@@ -1685,8 +1685,8 @@ fn runtime_config_inherits_file_scrollbar() {
     // CTX-0181: `scrollbar.mode`/`scrollbar.width` flow file ->
     // effective -> runtime; crate defaults stay equal (bitty-runtime
     // must not depend on bitty-config, so the pairing is by value,
-    // pinned here). Default preserves hidden (zero change for existing
-    // users).
+    // pinned here). CTX-0362: the default is the geometry-neutral `auto`
+    // overlay (transparent at rest).
     assert_eq!(
         bitty_runtime::config::DEFAULT_SCROLLBAR_WIDTH,
         bitty_config::types::DEFAULT_SCROLLBAR_WIDTH
@@ -1696,8 +1696,8 @@ fn runtime_config_inherits_file_scrollbar() {
         bitty_config::types::MAX_SCROLLBAR_WIDTH_PX
     );
     assert_eq!(
-        bitty_runtime::ScrollbarMode::Hidden.as_str(),
-        bitty_config::ScrollbarMode::Hidden.as_str()
+        bitty_runtime::ScrollbarMode::Auto.as_str(),
+        bitty_config::ScrollbarMode::Auto.as_str()
     );
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
@@ -1721,7 +1721,7 @@ fn runtime_config_inherits_file_scrollbar() {
         merged.source_of("scrollbar.mode").unwrap().layer,
         bitty_config::plan::LayerKind::User
     );
-    // Absent table rides hidden end to end.
+    // Absent table rides the auto default end to end.
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
         .expect("no scrollbar table parses");
@@ -1732,10 +1732,10 @@ fn runtime_config_inherits_file_scrollbar() {
     .expect("merge");
     assert_eq!(
         merged2.effective.scrollbar.mode,
-        bitty_config::ScrollbarMode::Hidden
+        bitty_config::ScrollbarMode::Auto
     );
     let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
-    assert_eq!(cfg2.scrollbar_mode, bitty_runtime::ScrollbarMode::Hidden);
+    assert_eq!(cfg2.scrollbar_mode, bitty_runtime::ScrollbarMode::Auto);
     assert_eq!(
         merged2.source_of("scrollbar.mode").unwrap().layer,
         bitty_config::plan::LayerKind::CoreDefaults
@@ -2077,8 +2077,9 @@ fn starter_init_lua_is_valid_config() {
     assert!(plan.layout.is_none());
     assert!(starter_init_lua().contains("gaps_in"));
     assert!(starter_init_lua().contains("gaps_out"));
-    // CTX-0181: starter leaves `scrollbar` unset (commented example
-    // only) so new installs ride hidden without a file override.
+    // CTX-0181/CTX-0362: starter leaves `scrollbar` unset (commented
+    // example only) so new installs ride the auto overlay without a file
+    // override.
     assert!(plan.scrollbar.is_none());
     assert!(starter_init_lua().contains("scrollbar"));
     // CTX-0260: starter leaves `mouse` unset (commented example only)

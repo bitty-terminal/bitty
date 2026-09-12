@@ -69,6 +69,15 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   both effective gaps are `6` logical px. Views now paint inside the
   `border + content_inset` padding, which changes default tiled content grids.
 
+- **Scrollbar overlays by default (CTX-0362):** `scrollbar.mode` now defaults
+  to `auto` (was `hidden`): the right-edge scrollback thumb is transparent at
+  rest and reveals on mouse proximity/hover, then hides again on leave. It
+  stays geometry-neutral (present-layer overlay, zero fills and zero layout
+  delta until engaged), and `hidden`/`always` remain selectable. Wheel
+  scroll-speed keys `terminal.scroll_lines_per_notch` (default `3`, range
+  `1..=32`) and `terminal.scroll_pixels_per_notch` (default `16`, range
+  `1..=256`) are unchanged and continue to scale the scroll amount.
+
 ### Help popup occludes grid text (CTX-0336, issue #559)
 
 - Fixed the `Mod+backtick` which-key help popup (`Mod+?`) painting the

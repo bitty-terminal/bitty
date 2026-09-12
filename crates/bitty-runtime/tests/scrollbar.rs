@@ -2,12 +2,14 @@
 //!
 //! Proves the CTX-0181 slice without a window server:
 //!
-//! - `hidden` (default) paints zero pixels and keeps grid geometry
-//!   untouched, even while hovering/pressing the track area.
+//! - `auto` (default, CTX-0362) paints nothing at rest — zero fills and
+//!   zero grid/layout delta — then reveals the thumb on mouse proximity,
+//!   reveals it on hover, and hides it again when the cursor leaves; with
+//!   exactly-once repaints, never per-motion presents.
+//! - `hidden` paints zero pixels and keeps grid geometry untouched, even
+//!   while hovering/pressing the track area (explicit opt-out).
 //! - `always` paints exactly one thumb fill whenever scrollback exists
 //!   (and none while history is empty).
-//! - `auto` hides until mouse proximity/hover/drag, then hides again on
-//!   leave — with exactly-once repaints, never per-motion presents.
 //! - Press+move on the thumb drags the viewport through the existing
 //!   scroll path (no selection starts, no scroll-semantics change).
 //! - Hit-testing accounts for panel gaps (CTX-0177) and padding (CTX-0223):
@@ -112,8 +114,8 @@ fn scroll_offset(rt: &Runtime) -> usize {
 }
 
 #[test]
-fn hidden_default_paints_nothing_and_keeps_geometry() {
-    // Hidden-by-default must NOT change grid geometry: hover and press
+fn hidden_mode_paints_nothing_and_keeps_geometry() {
+    // Explicit `hidden` must NOT change grid geometry: hover and press
     // over the track area add zero fills and zero layout delta.
     let mut rt = runtime_with(ScrollbarMode::Hidden);
     let sb = feed_scrollback(&mut rt);
@@ -137,6 +139,91 @@ fn hidden_default_paints_nothing_and_keeps_geometry() {
     assert_eq!(rt.snapshot().cells, cells_before);
     assert!(!rt.scrollbar_is_visible());
     let _ = stats;
+}
+
+#[test]
+fn default_mode_is_auto_overlay_and_reveals_on_hover() {
+    // CTX-0362: the shipped default is the overlay `auto` mode. At rest it
+    // is transparent and geometry-neutral (no fill, no layout delta); a
+    // cursor near/over the right-edge track reveals the thumb; leaving the
+    // proximity zone hides it again — each transition one repaint, steady
+    // state idle.
+    assert_eq!(
+        RuntimeConfig::default().scrollbar_mode,
+        ScrollbarMode::Auto,
+        "shipped default must be the auto overlay"
+    );
+    let mut rt = runtime_with_config(RuntimeConfig::default());
+    let sb = feed_scrollback(&mut rt);
+    assert!(sb > 0, "need scrollback for the test");
+    let cells_before = rt.snapshot().cells;
+    let allocs_before = rt.layout_allocations();
+    // At rest (no cursor entered the window): nothing paints.
+    rt.tick().expect("first frame presents");
+    assert!(!rt.scrollbar_is_visible(), "auto must start hidden");
+    // Hover the right edge: exactly one repaint reveals the thumb.
+    move_to(&mut rt, TRACK_X + 2.0, 200.0);
+    rt.tick().expect("hover transition presents");
+    assert!(rt.scrollbar_is_visible(), "hover must reveal the thumb");
+    assert!(rt.tick().is_none(), "steady hover must idle");
+    // The overlay never changes grid or layout geometry.
+    assert_eq!(rt.layout_allocations(), allocs_before);
+    assert_eq!(rt.snapshot().cells, cells_before);
+    // Moving away from the track hides it again with one repaint.
+    move_to(&mut rt, 100.0, 100.0);
+    rt.tick().expect("leave-proximity transition presents");
+    assert!(!rt.scrollbar_is_visible(), "leaving proximity must hide");
+    assert!(rt.tick().is_none(), "must idle once hidden again");
+}
+
+#[test]
+fn default_auto_hover_then_drag_scrolls_without_selection() {
+    // CTX-0362: under the shipped `auto` default the thumb is draggable
+    // once hover engages it; the press routes exclusively to the drag and
+    // never starts a selection. Leaving the window ends the drag and hides.
+    let mut rt = runtime_with_config(RuntimeConfig::default());
+    let sb = feed_scrollback(&mut rt);
+    assert!(sb > 0, "need scrollback for the test");
+    rt.tick().expect("first frame presents");
+    let track = rt.scrollbar_track().expect("track geometry resolves");
+    // Engage by hovering the live (bottom) thumb strip, then press.
+    move_to(
+        &mut rt,
+        f64::from(track.x) + 2.0,
+        f64::from(track.y) + f64::from(track.height) - 4.0,
+    );
+    rt.tick().expect("hover transition presents");
+    assert!(rt.scrollbar_is_visible());
+    press(&mut rt);
+    assert!(rt.is_scrollbar_dragging(), "hovered thumb press must drag");
+    assert!(rt.selection().is_none(), "chrome press must not select");
+    // Drag to the top: the viewport reaches oldest history.
+    move_to(&mut rt, f64::from(track.x) + 2.0, f64::from(track.y) + 2.0);
+    assert_eq!(scroll_offset(&rt), sb, "drag to top reaches oldest history");
+    release(&mut rt);
+    assert!(!rt.is_scrollbar_dragging());
+    // Leaving the window hides the revealed thumb again.
+    cursor_left(&mut rt);
+    assert!(rt.tick().is_some(), "leave must clear the painted thumb");
+    assert!(!rt.scrollbar_is_visible());
+}
+
+#[test]
+fn hidden_and_always_modes_remain_selectable() {
+    // CTX-0362: `auto` is only the default; explicit `hidden` opts out and
+    // `always` pins the overlay visible. Hovering never reveals `hidden`.
+    let mut hidden = runtime_with(ScrollbarMode::Hidden);
+    let sb = feed_scrollback(&mut hidden);
+    assert!(sb > 0, "need scrollback for the test");
+    hidden.tick().expect("first frame presents");
+    move_to(&mut hidden, TRACK_X + 2.0, 200.0);
+    assert!(hidden.tick().is_none(), "hidden hover must not present");
+    assert!(!hidden.scrollbar_is_visible());
+
+    let mut always = runtime_with(ScrollbarMode::Always);
+    feed_scrollback(&mut always);
+    always.tick().expect("first frame presents");
+    assert!(always.scrollbar_is_visible(), "always paints without hover");
 }
 
 #[test]

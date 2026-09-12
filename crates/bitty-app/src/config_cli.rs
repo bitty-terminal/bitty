@@ -424,9 +424,9 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- inherits decoration.border; focused/idle override it. A\n\
      \x20\x20-- focused width >= idle + 1 supplies a non-color focus cue.\n\
      \x20\x20-- decoration = { border_width = 2, border_width_focused = 3, border_width_idle = 1 },\n\
-      \x20\x20-- Overlay scrollback scrollbar (hidden by default: zero pixels,\n\
-      \x20\x20-- zero geometry change). Uncomment to reveal on mouse proximity:\n\
-      \x20\x20-- scrollbar = { mode = \"auto\", width = 8 },\n\
+      \x20\x20-- Overlay scrollback scrollbar (auto by default: transparent at rest,\n\
+      \x20\x20-- revealed on mouse proximity/hover). Uncomment to pin it visible,\n\
+      \x20\x20-- or set mode = \"hidden\" to disable: scrollbar = { mode = \"always\", width = 8 },\n\
      \x20\x20-- Hover activation (off by default: click-to-focus preserved).\n\
      \x20\x20-- Uncomment to opt in; the optional delay in milliseconds makes\n\
      \x20\x20-- the pointer dwell in a pane before focus moves (0 = immediate,\n\
@@ -986,8 +986,9 @@ pub(crate) fn runtime_config_from_effective(
     // config with zero render effect (default 0 = zero-cost everywhere).
     // CTX-0181: `scrollbar` flows the same way. The mode enum is paired by
     // value (`bitty-runtime` owns no `bitty-config` dependency); the match
-    // is total with a hidden-default fallback so a future variant drift can
-    // never misroute chrome into visibility.
+    // is total with a fail-closed `hidden` fallback so a future variant
+    // drift can never misroute chrome into visibility (upstream
+    // `bitty-config` only ever yields `hidden`/`always`/`auto`).
     let scrollbar_mode = match effective.scrollbar.mode.as_str() {
         "always" => bitty_runtime::ScrollbarMode::Always,
         "auto" => bitty_runtime::ScrollbarMode::Auto,

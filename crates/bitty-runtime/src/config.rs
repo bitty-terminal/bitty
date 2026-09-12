@@ -337,9 +337,10 @@ pub struct RuntimeConfig {
     /// this field). Default 0 keeps every path on the zero-cost fast path.
     pub window_radius_px: u32,
     /// Overlay scrollbar display mode (CTX-0181 `scrollbar.mode`).
-    /// Default `Hidden` = geometry-neutral (zero pixels, zero layout delta).
-    /// `Always` paints the thumb whenever scrollback exists; `Auto` reveals
-    /// it on mouse proximity/hover/drag.
+    /// Default `Auto` (CTX-0362) = revealed on mouse proximity/hover/drag,
+    /// geometry-neutral at rest (zero pixels, zero layout delta).
+    /// `Hidden` never paints; `Always` paints the thumb whenever scrollback
+    /// exists.
     pub scrollbar_mode: bitty_ui::ScrollbarMode,
     /// Overlay scrollbar thumb width in logical pixels (CTX-0181
     /// `scrollbar.width`). `MIN_SCROLLBAR_WIDTH_PX..=MAX_SCROLLBAR_WIDTH_PX`;
@@ -399,7 +400,7 @@ impl Default for RuntimeConfig {
             theme: bitty_render::ThemePalette::default(),
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
-            scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
+            scrollbar_mode: bitty_ui::ScrollbarMode::Auto,
             scrollbar_width: DEFAULT_SCROLLBAR_WIDTH,
             animations: AnimationPolicy::default(),
         }
@@ -1127,14 +1128,15 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_defaults_hidden_and_validates_bounds() {
-        // CTX-0181: hidden-by-default keeps geometry neutral; width bounds
-        // fail closed (mirrors `bitty-config` bounds, pinned in `bitty-app`).
+    fn scrollbar_defaults_auto_and_validates_bounds() {
+        // CTX-0362: the default is the geometry-neutral `auto` overlay
+        // (transparent at rest); width bounds fail closed (mirrors
+        // `bitty-config` bounds, pinned in `bitty-app`).
         const { assert!(DEFAULT_SCROLLBAR_WIDTH == 8) }
         const { assert!(MIN_SCROLLBAR_WIDTH_PX == 1) }
         const { assert!(MAX_SCROLLBAR_WIDTH_PX == 32) }
         let cfg = RuntimeConfig::default();
-        assert_eq!(cfg.scrollbar_mode, bitty_ui::ScrollbarMode::Hidden);
+        assert_eq!(cfg.scrollbar_mode, bitty_ui::ScrollbarMode::Auto);
         assert_eq!(cfg.scrollbar_width, DEFAULT_SCROLLBAR_WIDTH);
         RuntimeConfig::new(
             80,

@@ -628,21 +628,40 @@ impl Runtime {
     /// grid and `tick` only clipped it via `viewport_snapshot` (live split
     /// showed a ~155-col grid in a ~77-col pane, tails invisible, reflow
     /// never firing). CTX-0359: that leaf is the primary owner, not the
-    /// focused one (focus no longer moves the primary fallback); closing the
-    /// owner re-homes the primary to the focused survivor, while a layout
-    /// that never contained the owner (fresh workspace) leaves the grid
-    /// untouched. Best-effort like the pane sync: matching dims skip, PTY
-    /// errors never fail the layout change.
+    /// focused one (focus no longer moves the primary fallback); a layout
+    /// that never contained the owner (fresh workspace, zoom onto another
+    /// leaf) leaves the grid untouched for the owner's return, and only
+    /// [`Self::set_layout_closing`] re-homes on an explicit close.
+    /// Best-effort like the pane sync: matching dims skip, PTY errors never
+    /// fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
+        self.replace_layout(layout, None);
+    }
+
+    /// Replaces the owned layout because leaf `closed` was explicitly closed.
+    ///
+    /// CTX-0359: this is the only layout change that may re-home the primary
+    /// owner. When `closed` is [`Self::primary_view`] and is absent from the
+    /// new tree, the primary re-homes to the focused survivor so the live
+    /// shell still has a tile to paint and type into. A plain
+    /// [`Self::set_layout`] never changes ownership: temporary layouts that
+    /// merely exclude the owner (zoom onto a non-owner leaf, `restore_zoom`,
+    /// workspace installs) preserve the owner and its grid for the round
+    /// trip back.
+    pub fn set_layout_closing(&mut self, layout: LayoutNode, closed: ViewId) {
+        self.replace_layout(layout, Some(closed));
+    }
+
+    fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
-        // CTX-0359: capture whether this change removes the primary owner
-        // leaf (close) before the tree is replaced. Workspace switches and
-        // creations install layouts outside this funnel, so a fresh
-        // workspace leaf can never claim the primary through this path.
-        let primary_removed = self.primary_view.is_some_and(|p| {
-            self.layout.leaf_ids().contains(&p) && !layout.leaf_ids().contains(&p)
+        // CTX-0359: only an explicit close removes the owner; a layout that
+        // merely excludes it (zoom, restore) must never re-home.
+        let primary_closed = closed.is_some_and(|closed_view| {
+            self.primary_view == Some(closed_view)
+                && self.layout.leaf_ids().contains(&closed_view)
+                && !layout.leaf_ids().contains(&closed_view)
         });
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
@@ -655,11 +674,12 @@ impl Runtime {
         } else {
             self.focus.set(leaf_ids[0]);
         }
-        // CTX-0359: the primary shell keeps exactly one view. When its
-        // owner leaf is closed (no primary-shell teardown yet), re-home the
-        // primary to the focused survivor so the live shell still has a
-        // tile to paint and type into; otherwise the owner never changes.
-        if primary_removed {
+        // CTX-0359: the primary shell keeps exactly one view. When an
+        // explicit close removes its owner leaf (no primary-shell teardown
+        // yet), re-home the primary to the focused survivor so the live
+        // shell still has a tile to paint and type into; otherwise the
+        // owner never changes.
+        if primary_closed {
             self.primary_view = self.focus.focused();
         }
         // Leaf Views carry their allocation from here (not deferred to the

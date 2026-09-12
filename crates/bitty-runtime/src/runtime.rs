@@ -1050,10 +1050,14 @@ impl Runtime {
 
     /// Leaf that owns the runtime-global primary grid (CTX-0359).
     ///
-    /// `Some` while the primary owner is still present in the live layout
-    /// (rebound by [`Runtime::spawn_shell_with_args`]); the view paints the
-    /// primary snapshot and is the only session-less leaf whose input may
-    /// fall back to the primary writer.
+    /// Rebound when the primary shell attaches
+    /// ([`Runtime::spawn_shell_with_args`]) and when an explicit close
+    /// removes the owner ([`Runtime::set_layout_closing`]). Temporary
+    /// layouts that merely exclude the owner (zoom onto another leaf,
+    /// workspace installs) leave it untouched, so zoom round-trips restore
+    /// the same owner. The owner paints the primary snapshot and is the
+    /// only session-less leaf whose input may fall back to the primary
+    /// writer.
     #[must_use]
     pub fn primary_view(&self) -> Option<ViewId> {
         self.primary_view

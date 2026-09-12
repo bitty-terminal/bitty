@@ -236,7 +236,9 @@ fn live_split_then_close_restores_primary_grid_without_loss() {
     let focused = rt.focused_view().expect("focus");
     let mut layout = rt.layout().clone();
     close_leaf(&mut layout, focused);
-    rt.set_layout(layout);
+    // CTX-0359: re-homing is driven by the explicit close signal, not by a
+    // layout that merely excludes the owner (zoom must preserve it).
+    rt.set_layout_closing(layout, focused);
     assert_eq!(rt.leaf_count(), 1);
 
     // Grid widens back to the container. CTX-0266 (#441) unwrap/rewrap

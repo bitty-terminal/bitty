@@ -201,6 +201,57 @@ fn zoom_on_and_off_force_full_present() {
 }
 
 #[test]
+fn zoom_round_trip_preserves_primary_owner_and_content() {
+    // CTX-0359 review defect: `set_layout` inferred "owner closed" from any
+    // layout that excluded the owner, so zooming a NON-owner pane re-homed
+    // `primary_view` to the zoom target and zoom-off left the original pane
+    // session-less and blank. Ownership may only move on an explicit close.
+    let mut rt = instant_runtime();
+    write_primary_marker(&mut rt, 3, b'M');
+    assert!(rt.tick().is_some(), "first tick presents");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "startup owner is the initial leaf"
+    );
+    rt.set_layout(two_pane());
+    assert_full_present(rt.tick(), "split");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "split keeps the startup owner"
+    );
+    // Focus the non-owner pane and zoom onto it: the collapse tree excludes
+    // the owner, but a temporary layout must never steal ownership.
+    assert!(rt.set_focus(ViewId::new(2)));
+    assert_full_present(rt.tick(), "focus v2");
+    let backup = rt.layout().clone();
+    rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)));
+    assert_eq!(rt.leaf_count(), 1);
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "owner while zoomed onto a non-owner pane"
+    );
+    assert_full_present(rt.tick(), "zoom on");
+    // Zoom off: the owner is back in the live tree and still paints its
+    // marker row; no re-home happened in either direction.
+    rt.set_layout(backup);
+    assert_eq!(rt.leaf_count(), 2);
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(1)),
+        "owner must survive the zoom round trip"
+    );
+    assert_full_present(rt.tick(), "zoom off");
+    assert!(
+        tile_has_ink(&rt, ViewId::new(1)),
+        "original primary pane content must survive zoom on/off"
+    );
+    assert_eq!(rt.tick(), None);
+}
+
+#[test]
 fn reflow_geometry_only_forces_full_present() {
     let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");

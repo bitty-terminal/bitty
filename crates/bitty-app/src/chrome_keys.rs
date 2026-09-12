@@ -618,7 +618,10 @@ impl TerminalApp {
                 }
                 let mut layout = self.runtime.layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
-                    self.runtime.set_layout(layout);
+                    // CTX-0359: an explicit close is the only layout change
+                    // allowed to re-home the primary owner; a plain
+                    // `set_layout` (zoom, restore) must preserve it.
+                    self.runtime.set_layout_closing(layout, focused);
                     // CTX-0176: tear down the closed leaf's shell (drop kills
                     // + reaps the child; no-op when it never owned one).
                     if self.runtime.close_pane_session(&focused) {
@@ -1779,6 +1782,50 @@ mod tests {
         assert_eq!(app.runtime.leaf_count(), 1);
         app.apply_chrome_action(ChromeAction::CloseView);
         assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    #[test]
+    fn chrome_toggle_zoom_on_non_owner_preserves_primary_owner() {
+        // CTX-0359 review defect: `ToggleZoom` funnels through
+        // `Runtime::set_layout`; treating an owner-excluding layout as a
+        // close re-homed `primary_view` onto the zoomed non-owner pane and
+        // blanked the original home for good. Pin the action path: zoom
+        // round trips preserve the owner and only an explicit close
+        // re-homes it.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+        // Zoom onto the non-owner pane v:2 and back: ownership is untouched.
+        app.apply_chrome_action(ChromeAction::FocusId(2));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(
+            app.runtime.primary_view(),
+            Some(ViewId::new(1)),
+            "zoom on a non-owner must not re-home the primary"
+        );
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(
+            app.runtime.primary_view(),
+            Some(ViewId::new(1)),
+            "zoom round trip must preserve the primary owner"
+        );
+        // An explicit close of the owner is the one path that re-homes it.
+        app.apply_chrome_action(ChromeAction::FocusId(1));
+        app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
     }
 
     #[test]

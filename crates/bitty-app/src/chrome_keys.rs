@@ -585,8 +585,13 @@ impl TerminalApp {
                         .find(|(id, _)| *id == new_id)
                         .map(|(_, r)| (r.width.max(1), r.height.max(1)))
                         .unwrap_or((80, 24));
-                    match spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows)
-                    {
+                    let spawn_result =
+                        spawn_pane_shell(&mut self.runtime, &self.spawn_spec, new_id, cols, rows);
+                    // CTX-0364: focus follows the fresh pane (kitty/ghostty
+                    // parity). Set after the spawn so CTX-0357 cwd
+                    // inheritance still reads the source pane as focused.
+                    self.runtime.set_focus(new_id);
+                    match spawn_result {
                         Ok(()) => eprintln!(
                             "bitty: keymap new_split:{} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
                             dir.canonical(),
@@ -1761,10 +1766,11 @@ mod tests {
             SpawnSpec::default(),
         );
         app.runtime.set_layout(two_pane_layout());
-        // Split focused pane right: 2 -> 3 leaves, focus stays.
+        // Split focused pane right: 2 -> 3 leaves; focus follows the fresh
+        // pane (CTX-0364).
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
         assert_eq!(app.runtime.leaf_count(), 3);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
         // Resize nudges without changing leaf count.
         app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Right));
         assert_eq!(app.runtime.leaf_count(), 3);
@@ -1826,6 +1832,41 @@ mod tests {
         app.apply_chrome_action(ChromeAction::FocusId(1));
         app.apply_chrome_action(ChromeAction::CloseView);
         assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
+    }
+
+    #[test]
+    fn chrome_new_split_focuses_new_pane() {
+        // CTX-0364: the keymap `new_split` path (Shift+Alt+L) must focus the
+        // fresh pane immediately, matching the ctl path and kitty/ghostty.
+        use bitty_config::{ChromeAction, SplitDir};
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(1)),
+            "seed focus on v:1"
+        );
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(3)),
+            "new_split must focus the fresh pane v:3"
+        );
+    }
+
+    #[test]
+    fn chrome_workspace_new_focuses_fresh_view() {
+        // CTX-0364: new tab (workspace) focuses its fresh view immediately.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(2)),
+            "workspace_new must focus the fresh workspace view"
+        );
     }
 
     #[test]

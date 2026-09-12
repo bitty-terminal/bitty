@@ -399,6 +399,32 @@ fn control_terminal_spawn_creates_observable_session() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn control_terminal_spawn_focuses_new_view() {
+    // CTX-0364: `terminal spawn` creates a panel; focus must follow the
+    // newly created view immediately (kitty/ghostty parity).
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    let all = bitty_ipc::ScopeSet::all();
+    let spawned = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPAWN_TERMINAL, Some("{}"), &all);
+    assert!(spawned.ok, "spawn must succeed: {spawned:?}");
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(2)),
+        "spawn must focus the new view"
+    );
+    let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &all);
+    assert!(views.ok, "view list: {views:?}");
+    assert!(
+        views
+            .result_json
+            .contains("\"id\":\"v:2\",\"focused\":true"),
+        "new view must be the focused one: {views:?}"
+    );
+}
+
 #[test]
 fn control_terminal_text_renders_grid_text_not_debug() {
     // CTX-0321 (D1): `terminal text` returned a `Debug` dump of the internal
@@ -430,12 +456,13 @@ fn control_terminal_text_renders_grid_text_not_debug() {
 fn control_send_to_unfocused_is_conflict() {
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
-    // Split to create v:2, stay focused on v:1; sending to t:2 must name
-    // the focus verb rather than silently retargeting input.
+    // CTX-0364: the split now focuses the new v:2, so v:1 is the unfocused
+    // leaf; sending to t:1 must name the focus verb rather than silently
+    // retargeting input.
     let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
     assert!(done.ok, "split must succeed: {done:?}");
-    let params = ipc_ctl::params_send_input("t:2", "hi");
+    let params = ipc_ctl::params_send_input("t:1", "hi");
     let conflict = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&params), &cli);
     assert!(!conflict.ok);
     assert_eq!(conflict.code, "Conflict");
@@ -448,7 +475,8 @@ fn control_terminal_text_sessionless_split_owner_parity() {
     // split` is layout-only (no pane shell), so v:1 is the primary owner and
     // v:2 is session-less. The owner returns the primary text; v:2 stays
     // empty and focus never moves the mirror between tiles (pre-fix the
-    // focused session-less leaf returned the v:1 shell's text).
+    // focused session-less leaf returned the v:1 shell's text). CTX-0364:
+    // the split itself now focuses v:2, which must not change ownership.
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     // Seed the primary grid so the mirrored text is observable (a fresh grid
@@ -457,7 +485,7 @@ fn control_terminal_text_sessionless_split_owner_parity() {
     let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
     assert!(done.ok, "split must succeed: {done:?}");
-    assert_eq!(rt.focused_view().map(|v| v.0), Some(1));
+    assert_eq!(rt.focused_view().map(|v| v.0), Some(2));
     let expected = snapshot_text(&rt.snapshot());
     assert!(
         expected.contains("parity-probe"),
@@ -486,10 +514,11 @@ fn control_terminal_text_sessionless_split_owner_parity() {
         t2_text.is_empty(),
         "session-less non-owner stays empty, got {t2_text:?}"
     );
-    // Refocus v:2: the owner keeps primary; the non-owner stays empty.
-    let focus = ipc_ctl::params_focus("v:2");
+    // Refocus v:1: ownership is focus-independent, so the mirror is
+    // unchanged (the non-owner never paints the primary).
+    let focus = ipc_ctl::params_focus("v:1");
     let moved = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&focus), &cli);
-    assert!(moved.ok, "focus v:2 must succeed: {moved:?}");
+    assert!(moved.ok, "focus v:1 must succeed: {moved:?}");
     let expected2 = snapshot_text(&rt.snapshot());
     let t1b = apply_control_envelope(
         &mut rt,
@@ -571,6 +600,48 @@ fn control_view_split_and_focus_headless() {
     let missing = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&bad), &cli);
     assert!(!missing.ok);
     assert_eq!(missing.code, "NotFound");
+}
+
+#[test]
+fn control_view_split_focuses_new_view() {
+    // CTX-0364: kitty/ghostty move focus to the freshly created panel.
+    // `ctl view split` must focus the new view immediately, and `view list`
+    // must report exactly that view as `focused:true` (the live evidence
+    // symptom kept v:1 focused and the new view unfocused).
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
+    assert!(done.ok, "split must succeed: {done:?}");
+    assert_eq!(
+        rt.focused_view().map(|v| v.0),
+        Some(2),
+        "split right must focus the new view v:2"
+    );
+    let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &cli);
+    assert!(views.ok, "view list: {views:?}");
+    assert!(
+        views
+            .result_json
+            .contains("\"id\":\"v:2\",\"focused\":true"),
+        "new view must be focused: {views:?}"
+    );
+    assert!(
+        views
+            .result_json
+            .contains("\"id\":\"v:1\",\"focused\":false"),
+        "previous view must be unfocused: {views:?}"
+    );
+
+    // A second split from the now-focused v:2 must focus v:3.
+    let down = ipc_ctl::params_split(ipc_ctl::SplitDirection::Down);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&down), &cli);
+    assert!(done.ok, "second split must succeed: {done:?}");
+    assert_eq!(
+        rt.focused_view().map(|v| v.0),
+        Some(3),
+        "second split must focus the newest view v:3"
+    );
 }
 
 /// Allocation rect of leaf `id` in the runtime's live container.
@@ -936,6 +1007,29 @@ fn control_workspace_list_new_focus_close_headless() {
     let gone = apply_control_envelope(&mut rt, ipc_ctl::METHOD_CLOSE_WORKSPACE, Some(&bad), &all);
     assert!(!gone.ok);
     assert_eq!(gone.code, "NotFound");
+}
+
+#[test]
+fn control_workspace_new_focuses_fresh_view() {
+    // CTX-0364: a new tab (workspace) starts with its fresh leaf focused,
+    // not merely switched-to with stale focus.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(created.ok, "workspace new must succeed: {created:?}");
+    assert_eq!(
+        rt.focused_view().map(|v| v.0),
+        Some(2),
+        "new workspace must focus its fresh view"
+    );
+    let views = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_VIEWS, None, &cli);
+    assert!(views.ok, "view list: {views:?}");
+    assert!(
+        views
+            .result_json
+            .contains("\"id\":\"v:2\",\"focused\":true"),
+        "fresh workspace view must be focused: {views:?}"
+    );
 }
 
 #[test]
@@ -1645,7 +1739,8 @@ fn wm_split_routing_close_survivor_over_socket() {
         "one focused leaf: {body}"
     );
 
-    // Split right over IPC: new leaf appears, focus stays on v:1.
+    // Split right over IPC: new leaf appears and focus follows it
+    // (CTX-0364), so v:1 becomes the unfocused leaf.
     let params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
     let body = h.ctl(ipc_ctl::METHOD_SPLIT_VIEW, Some(&params));
     assert!(
@@ -1655,17 +1750,17 @@ fn wm_split_routing_close_survivor_over_socket() {
     assert_eq!(h.leaf_ids(), vec![1, 2]);
     let body = h.ctl(ipc_ctl::METHOD_LIST_VIEWS, None);
     assert!(
-        body.contains("\"id\":\"v:1\",\"focused\":true"),
-        "focus stays: {body}"
+        body.contains("\"id\":\"v:2\",\"focused\":true"),
+        "new leaf focused: {body}"
     );
     assert!(
-        body.contains("\"id\":\"v:2\",\"focused\":false"),
-        "new leaf unfocused: {body}"
+        body.contains("\"id\":\"v:1\",\"focused\":false"),
+        "prior leaf unfocused: {body}"
     );
 
     // Focused-only routing: sending to the unfocused leaf fails closed
     // and names the focus verb instead of retargeting input.
-    let params = ipc_ctl::params_send_input("t:2", "hi");
+    let params = ipc_ctl::params_send_input("t:1", "hi");
     let body = h.ctl(ipc_ctl::METHOD_SEND_INPUT, Some(&params));
     assert!(
         body.contains("\"error\""),
@@ -1681,10 +1776,14 @@ fn wm_split_routing_close_survivor_over_socket() {
         "denied bytes must not queue"
     );
 
-    // Focus the new leaf over IPC, then input routes.
+    // v:2 was focused by the split; the explicit verb is idempotent and
+    // input then routes to the new leaf.
     let params = ipc_ctl::params_focus("v:2");
     let body = h.ctl(ipc_ctl::METHOD_FOCUS_VIEW, Some(&params));
-    assert!(body.contains("\"focused\":\"v:2\""), "focus moves: {body}");
+    assert!(
+        body.contains("\"focused\":\"v:2\""),
+        "focus confirms: {body}"
+    );
     let params = ipc_ctl::params_send_input("t:2", "wm-proof");
     let body = h.ctl(ipc_ctl::METHOD_SEND_INPUT, Some(&params));
     assert!(body.contains("\"sent_to\":\"t:2\""), "send routes: {body}");

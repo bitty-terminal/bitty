@@ -294,6 +294,9 @@ pub fn apply_control(
             runtime.set_layout(previous);
             return Err(("transport", "Transport", format!("spawn failed: {err}")));
         }
+        // CTX-0364: focus follows the new panel. Set after the spawn so
+        // CTX-0357 cwd inheritance still reads the source pane as focused.
+        runtime.set_focus(new_id);
         return Ok(format!(
             "{{\"spawned\":true,\"terminal_id\":\"t:{}\",\"view_id\":\"v:{}\"}}",
             new_id.0, new_id.0
@@ -363,6 +366,9 @@ pub fn apply_control(
             ));
         }
         runtime.set_layout(layout);
+        // CTX-0364: focus follows the freshly created panel (kitty/ghostty
+        // parity): the new view becomes the input/cursor target immediately.
+        runtime.set_focus(new_id);
         return Ok(format!(
             "{{\"split\":\"{}\",\"new_view\":\"v:{}\"}}",
             direction.as_str(),

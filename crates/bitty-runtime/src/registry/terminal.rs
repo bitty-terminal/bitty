@@ -456,10 +456,11 @@ impl TerminalRegistry {
         ws.view_gens.insert(vid, vgen);
         ws.view_visibility.insert(vid, Visibility::Visible);
         ws.mru.push_front(vid);
-        // If focus is None, focus new view
-        if ws.focus.focused().is_none() {
-            ws.focus.set(vid);
-        }
+        // CTX-0364: creating a view/window focuses it immediately
+        // (kitty/ghostty parity). The old rule only focused on the first
+        // create in an empty workspace, so a second/third window left focus
+        // on the previous one.
+        ws.focus.set(vid);
         Ok(ViewHandle {
             id: vid,
             generation: vgen,

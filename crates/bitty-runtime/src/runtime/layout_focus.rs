@@ -617,21 +617,33 @@ impl Runtime {
     /// immediately (tick repeats this every frame; idempotent), and every
     /// grid follows its leaf: pane sessions via
     /// [`Self::sync_pane_geometry`](super::Runtime::sync_pane_geometry), and
-    /// the shared primary grid (+ primary PTY winsize) via the focused
-    /// leaf's allocation. Focus is retained when the focused `ViewId` still
-    /// exists, otherwise it moves to the first leaf (if any) or clears.
+    /// the shared primary grid (+ primary PTY winsize) via the primary
+    /// owner leaf's allocation ([`Self::primary_view`]). Focus is retained
+    /// when the focused `ViewId` still exists, otherwise it moves to the
+    /// first leaf (if any) or clears.
     ///
-    /// CTX-0269: session-less leaves share the primary grid and the focused
-    /// one owns input/cursor, so the primary must shrink/grow with the
-    /// focused allocation — previously `set_layout` left the stale
-    /// pre-split grid and `tick` only clipped it via `viewport_snapshot`
-    /// (live split showed a ~155-col grid in a ~77-col pane, tails
-    /// invisible, reflow never firing). Best-effort like the pane sync:
-    /// matching dims skip, PTY errors never fail the layout change.
+    /// CTX-0269: session-less leaves clip the primary grid through
+    /// `viewport_snapshot`, so the primary must shrink/grow with the leaf
+    /// that paints it — previously `set_layout` left the stale pre-split
+    /// grid and `tick` only clipped it via `viewport_snapshot` (live split
+    /// showed a ~155-col grid in a ~77-col pane, tails invisible, reflow
+    /// never firing). CTX-0359: that leaf is the primary owner, not the
+    /// focused one (focus no longer moves the primary fallback); closing the
+    /// owner re-homes the primary to the focused survivor, while a layout
+    /// that never contained the owner (fresh workspace) leaves the grid
+    /// untouched. Best-effort like the pane sync: matching dims skip, PTY
+    /// errors never fail the layout change.
     pub fn set_layout(&mut self, layout: LayoutNode) {
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
+        // CTX-0359: capture whether this change removes the primary owner
+        // leaf (close) before the tree is replaced. Workspace switches and
+        // creations install layouts outside this funnel, so a fresh
+        // workspace leaf can never claim the primary through this path.
+        let primary_removed = self.primary_view.is_some_and(|p| {
+            self.layout.leaf_ids().contains(&p) && !layout.leaf_ids().contains(&p)
+        });
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
         if leaf_ids.is_empty() {
@@ -643,15 +655,24 @@ impl Runtime {
         } else {
             self.focus.set(leaf_ids[0]);
         }
+        // CTX-0359: the primary shell keeps exactly one view. When its
+        // owner leaf is closed (no primary-shell teardown yet), re-home the
+        // primary to the focused survivor so the live shell still has a
+        // tile to paint and type into; otherwise the owner never changes.
+        if primary_removed {
+            self.primary_view = self.focus.focused();
+        }
         // Leaf Views carry their allocation from here (not deferred to the
         // next tick) so per-leaf geometry is inspectable immediately.
         // CTX-0294: decorated content frames (px decoration + cell gaps).
         let frames = self.present_frames();
         self.reflow_present_layout(&frames);
-        // Primary grid + primary PTY winsize (SIGWINCH path) follow the
-        // focused leaf — the tile that shows primary input/cursor.
-        if let Some(focused) = self.focus.focused() {
-            if let Some(frame) = frames.iter().find(|frame| frame.view == focused) {
+        // CTX-0359: primary grid + primary PTY winsize (SIGWINCH path) follow
+        // the primary owner leaf — the tile that paints primary input/cursor
+        // — not the focused leaf. A layout without the owner (fresh
+        // workspace) leaves the grid untouched until the owner returns.
+        if let Some(primary) = self.primary_view {
+            if let Some(frame) = frames.iter().find(|frame| frame.view == primary) {
                 let cols = usize::from(frame.cols.max(1));
                 let rows = usize::from(frame.rows.max(1));
                 if self.state.width() != cols || self.state.height() != rows {

@@ -576,8 +576,8 @@ impl TerminalApp {
                     self.runtime.set_layout(layout);
                     // CTX-0176: the fresh leaf gets its own shell/PTY sized
                     // to its allocation — best-effort (startup parity). On
-                    // failure the pane shares the primary grid with a loud
-                    // warning instead of silently mirroring.
+                    // failure the pane stays empty (CTX-0359: it never
+                    // paints or feeds the primary grid) with a loud warning.
                     let (cols, rows) = self
                         .runtime
                         .layout_allocations()
@@ -595,7 +595,7 @@ impl TerminalApp {
                             self.runtime.pane_pid(&new_id),
                         ),
                         Err(err) => eprintln!(
-                            "warning: keymap new_split:{} pane shell spawn failed ({err}) — pane {new_id:?} shares the primary grid",
+                            "warning: keymap new_split:{} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
                             dir.canonical(),
                         ),
                     }

@@ -34,11 +34,14 @@
 //! Per-pane shells (CTX-0176): every split leaf may own a private
 //! [`PaneSession`](Runtime::spawn_shell_for_view) — its own parser, grid
 //! state, and PTY triple — so panes stop mirroring the single primary
-//! session. Leaves without a session keep rendering the shared primary
-//! state (the unchanged single-pane path). Input routes to the focused
-//! leaf's writer only (see [`Runtime::push_input_bytes`]); [`Runtime::tick`]
-//! renders each leaf from its own grid; [`Runtime::poll_pty`] drains every
-//! session. [`Runtime::close_pane_session`] tears a leaf's child down.
+//! session. The runtime-global primary grid belongs to exactly one leaf, the
+//! `primary_view` (CTX-0359: the leaf focused when the primary shell
+//! attached); every other session-less leaf renders erased. Input routes to
+//! the focused leaf's own writer only, falling back to the primary writer
+//! exclusively on the primary owner (see [`Runtime::push_input_bytes`]);
+//! [`Runtime::tick`] renders each leaf from its own grid; [`Runtime::poll_pty`]
+//! drains every session. [`Runtime::close_pane_session`] tears a leaf's child
+//! down.
 //!
 //! # Plugin-host wiring (CTX-0027) — draft status, experimental review evidence
 //!
@@ -254,6 +257,24 @@ pub struct Runtime {
     /// Private shell sessions keyed by split-leaf id (CTX-0176). Empty in
     /// single-pane use, where the primary PTY/state path is unchanged.
     pane_sessions: BTreeMap<ViewId, PaneSession>,
+    /// Leaf that owns the runtime-global primary grid (CTX-0359).
+    ///
+    /// The primary PTY/state path is a runtime singleton, but its grid is
+    /// painted and typed into through exactly one leaf: the focused leaf at
+    /// the moment the primary shell attached (initialized to the default
+    /// layout's sole leaf, rebound by [`Runtime::spawn_shell_with_args`]).
+    /// A session-less leaf that is not this view never paints the primary
+    /// snapshot and never falls back to the primary writer.
+    primary_view: Option<ViewId>,
+    /// Program + args the primary shell last attached with (CTX-0359).
+    ///
+    /// [`Runtime::workspace_new`](Runtime::workspace_new) replays this recipe
+    /// for the fresh workspace leaf so a new workspace owns a real shell from
+    /// its first frame instead of staying session-less. `None` before any
+    /// successful [`Runtime::spawn_shell_with_args`] (headless runtimes,
+    /// startup spawn failure): the fresh leaf then stays empty and input is
+    /// buffered headless, never routed to another workspace's shell.
+    primary_spawn: Option<(String, Vec<String>)>,
     pending_input: Vec<u8>,
     pending_input_dropped: u64,
     renderer: GridRenderer<FallbackRasterizer<AnyRasterizer>>,
@@ -676,6 +697,8 @@ impl Runtime {
             pty_waker: None,
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
+            primary_view: Some(ViewId::new(1)),
+            primary_spawn: None,
             pending_input: Vec::new(),
             pending_input_dropped: 0,
             renderer,
@@ -805,6 +828,8 @@ impl Runtime {
             pty_waker: None,
             pty_writer: None,
             pane_sessions: BTreeMap::new(),
+            primary_view: Some(ViewId::new(1)),
+            primary_spawn: None,
             pending_input: Vec::new(),
             pending_input_dropped: 0,
             renderer,
@@ -1021,6 +1046,23 @@ impl Runtime {
     #[must_use]
     pub fn snapshot(&self) -> bitty_term_state::Snapshot {
         self.state.snapshot()
+    }
+
+    /// Leaf that owns the runtime-global primary grid (CTX-0359).
+    ///
+    /// `Some` while the primary owner is still present in the live layout
+    /// (rebound by [`Runtime::spawn_shell_with_args`]); the view paints the
+    /// primary snapshot and is the only session-less leaf whose input may
+    /// fall back to the primary writer.
+    #[must_use]
+    pub fn primary_view(&self) -> Option<ViewId> {
+        self.primary_view
+    }
+
+    /// Whether `view` owns the runtime-global primary grid (CTX-0359).
+    #[must_use]
+    pub fn is_primary_view(&self, view: &ViewId) -> bool {
+        self.primary_view == Some(*view)
     }
 
     /// Current terminal state (read-only) for assertions.

@@ -290,9 +290,12 @@ impl Runtime {
 
     /// Create a fresh workspace and switch to it.
     ///
-    /// The new workspace starts as a single idle leaf (no shell spawns;
-    /// lazy spawn is a follow-up). Fail-closed when at capacity
-    /// ([`MAX_WORKSPACES`]).
+    /// The new workspace starts as a single leaf. CTX-0359: when the primary
+    /// shell attached earlier, the fresh leaf replays that exact program
+    /// recipe and owns its own shell immediately (best-effort); without a
+    /// recipe it stays session-less, renders empty, and buffers input
+    /// headlessly — it never paints or feeds another workspace's shell.
+    /// Fail-closed when at capacity ([`MAX_WORKSPACES`]).
     pub fn workspace_new(&mut self) -> Result<usize, String> {
         if self.workspaces.len() >= MAX_WORKSPACES {
             return Err(format!(
@@ -320,6 +323,30 @@ impl Runtime {
         let index = self.workspaces.len() - 1;
         self.active_workspace = index;
         self.mru_front(index);
+        // CTX-0359: give the fresh workspace leaf a real shell of its own by
+        // replaying the primary attach recipe, so its first typed byte can
+        // never reach the previous workspace's shell. Best-effort, startup
+        // parity: on spawn failure the leaf stays empty and input buffers
+        // headless. Skipped when no primary ever attached (headless
+        // runtimes): there is no recipe to replay, and the session-less
+        // non-owner leaf never paints or feeds the primary.
+        if let Some((program, args)) = self.primary_spawn.clone() {
+            let (cols, rows) = self
+                .present_frames()
+                .iter()
+                .find(|frame| frame.view == fresh_id)
+                .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+                .unwrap_or((
+                    self.cols.min(u16::MAX as usize) as u16,
+                    self.rows.min(u16::MAX as usize) as u16,
+                ));
+            let tail: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = self.spawn_shell_for_view(fresh_id, &program, &tail, cols, rows) {
+                eprintln!(
+                    "warning: workspace_new pane {fresh_id:?} shell spawn failed ({err}) — workspace {seq} starts empty"
+                );
+            }
+        }
         self.pending_full_redraw = true;
         Ok(index)
     }

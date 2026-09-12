@@ -161,8 +161,8 @@ impl SpawnSpec {
 /// `cols` x `rows` cells (CTX-0176). Same sandbox as startup: direct argv,
 /// explicit program verbatim with no fallback, default shell with the
 /// [`FALLBACK_SHELL`] retry. Failures are logged by the fallback core and
-/// returned so the caller degrades loudly: the pane then shares the primary
-/// grid (never a silent mirror).
+/// returned so the caller degrades loudly: the pane then stays empty
+/// (CTX-0359: never a silent mirror of another pane's grid).
 pub(crate) fn spawn_pane_shell(
     runtime: &mut Runtime,
     spec: &SpawnSpec,
@@ -185,8 +185,8 @@ pub(crate) fn spawn_pane_shell(
 /// Spawns a private shell for every layout leaf except the focused one
 /// (CTX-0176), which keeps the already-spawned primary session. Each pane
 /// shell is sized to its leaf allocation. Best-effort: per-leaf failures
-/// warn loudly and leave that pane sharing the primary grid (never a
-/// silent mirror). Call only after a successful primary spawn.
+/// warn loudly and leave that pane empty (CTX-0359: never a silent mirror
+/// of the primary grid). Call only after a successful primary spawn.
 pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) {
     let primary = runtime.focused_view();
     let allocs = runtime.layout_allocations();
@@ -197,9 +197,7 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
         if let Err(err) =
             spawn_pane_shell(runtime, spec, *id, rect.width.max(1), rect.height.max(1))
         {
-            eprintln!(
-                "warning: startup pane {id:?} shell spawn failed ({err}) — pane shares the primary grid"
-            );
+            eprintln!("warning: startup pane {id:?} shell spawn failed ({err}) — pane stays empty");
         }
     }
 }

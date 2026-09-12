@@ -292,7 +292,12 @@ impl Runtime {
     ///
     /// A gated paste is never silent: while [`Self::has_pending_paste`] holds,
     /// this returns `Some` single line of the form
-    /// `Paste 2 lines, 11B [newline] "line1\nline2" (repeat=confirm Esc=cancel)`.
+    /// `Paste 2 lines, 11B [newline] "line1\nline2" (paste again to confirm, Esc cancels)`.
+    ///
+    /// Multi-line pastes report `newline` (`[newline]`), not the generic `C0`
+    /// control class, because LF is the expected multi-line trigger under the
+    /// kitty/ghostty safety default (CTX-0369). Only genuinely adversarial
+    /// classes name themselves as controls (`NUL`, `ESC`, `CR`, `C0`, ...).
     ///
     /// Bounded and deterministic: the input is already capped at
     /// `CLIPBOARD_MAX_BYTES` (8192), reasons are at most 7 static tokens, and
@@ -309,7 +314,7 @@ impl Runtime {
         let preview = preview.escape_debug().to_string();
         let preview = truncate_str_to_bytes(&preview, 48);
         Some(format!(
-            "Paste {lines} lines, {bytes}B [{reasons}] \"{preview}\" (repeat=confirm Esc=cancel)"
+            "Paste {lines} lines, {bytes}B [{reasons}] \"{preview}\" (paste again to confirm, Esc cancels)"
         ))
     }
 
@@ -353,16 +358,16 @@ impl Runtime {
     /// [`Self::last_clipboard_error`] instead of dropping it (PR #259
     /// review); direct callers match on the `Result` themselves.
     ///
-    /// Suspicious-paste inspection (P0-AC-008): every paste is inspected for
-    /// C0/NUL/ESC/CR/newline/Unicode BiDi controls. Clean text is delivered
-    /// immediately; suspicious text is stored as a pending paste that requires
-    /// explicit confirmation — `confirm_pending_paste(true)`, repeating the
-    /// identical paste while pending (CTX-0186 second chord/right-click press
-    /// with unchanged clipboard), or `Esc` to cancel. The pending paste stays
-    /// visible via [`Self::pending_paste_summary`]: there is no silent
-    /// delivery path and no silent drop. Bracketed paste (`?2004`) is
-    /// defense-in-depth only and wraps confirmed delivery when enabled in
-    /// terminal state.
+    /// Paste inspection (P0-AC-008): every paste is inspected. Multi-line
+    /// text (LF) and adversarial controls (NUL/ESC/CR/other C0/C1/Unicode
+    /// BiDi and zero-width) require confirmation; other text is delivered
+    /// immediately. Text needing confirmation is stored as a pending paste —
+    /// `confirm_pending_paste(true)`, repeating the identical paste while
+    /// pending (CTX-0186 second chord/right-click press with unchanged
+    /// clipboard), or `Esc` to cancel. The pending paste stays visible via
+    /// [`Self::pending_paste_summary`]: there is no silent delivery path and
+    /// no silent drop. Bracketed paste (`?2004`) is defense-in-depth only and
+    /// wraps confirmed delivery when enabled in terminal state.
     ///
     /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
     /// primitive before the scan, so untrusted clipboard content cannot grow
@@ -378,8 +383,9 @@ impl Runtime {
     /// Pastes from a given string via the inspection gate (headless helper).
     /// Returns `true` when the submitted paste requires confirmation and
     /// `false` when it is delivered immediately. Re-submitting the identical
-    /// pending text confirms and delivers (CTX-0186); different suspicious
-    /// content while pending preserves the first paste and returns `true`.
+    /// pending text confirms and delivers (CTX-0186); different
+    /// confirmation-requiring content while pending preserves the first paste
+    /// and returns `true`.
     pub fn paste_text_via_gate(&mut self, text: String) -> bool {
         self.request_paste(text)
     }
@@ -396,11 +402,12 @@ impl Runtime {
     }
 
     /// Core paste entry: bounds and inspects `text`, stores a pending paste
-    /// when suspicious, otherwise delivers immediately. Returns `true` when
-    /// confirmation is required and `false` when delivery is immediate. A
-    /// different suspicious request while another paste is pending is rejected,
-    /// which preserves the first pending paste for explicit confirmation or
-    /// cancel.
+    /// when confirmation is required (multi-line or adversarial controls),
+    /// otherwise delivers immediately. Returns `true` when confirmation is
+    /// required and `false` when delivery is immediate. A different
+    /// confirmation-requiring request while another paste is pending is
+    /// rejected, which preserves the first pending paste for explicit
+    /// confirmation or cancel.
     ///
     /// CTX-0186 explicit repeat-to-confirm: re-submitting the identical
     /// (post-truncation) text while it is pending is the user's confirmation

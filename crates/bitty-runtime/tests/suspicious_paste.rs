@@ -1,10 +1,12 @@
-//! Suspicious-paste inspection (P0-AC-008) — adversarial classes + confirmation gate.
+//! Paste inspection (P0-AC-008) — confirmation gate + adversarial classes.
 //!
-//! Every class (C0 controls, NUL, ESC, CR, embedded newline, Unicode controls
-//! U+0080..U+009F, BiDi/zero-width) must trigger inspection and require
-//! confirmation. There is no silent delivery path for suspicious pastes.
-//! Bracketed paste `?2004` is defense-in-depth only and wraps confirmed
-//! delivery when enabled in terminal state.
+//! Multi-line pastes (LF) require confirmation as the kitty/ghostty safety
+//! default and are reported as `newline`, not as a generic `C0` control
+//! (CTX-0369). Adversarial classes (other C0 controls, NUL, ESC, CR, Unicode
+//! controls U+0080..U+009F, BiDi/zero-width) each trigger inspection and
+//! require confirmation. There is no silent delivery path. Bracketed paste
+//! `?2004` is defense-in-depth only and wraps confirmed delivery when enabled
+//! in terminal state.
 //!
 //! Headless, bounded, deterministic; `cargo test` on CI without X11/Wayland;
 //! `#![forbid(unsafe_code)]`.
@@ -445,7 +447,19 @@ fn ctx0186_multiline_chord_paste_is_visible_and_repeat_confirms() {
     );
     assert!(
         summary.contains("newline"),
-        "summary must name reason: {summary:?}"
+        "summary must name the multi-line reason: {summary:?}"
+    );
+    assert!(
+        !summary.contains("C0"),
+        "CTX-0369: a normal multi-line paste must not be labelled a C0 control: {summary:?}"
+    );
+    assert!(
+        summary.contains("paste again to confirm"),
+        "summary must name the confirm gesture: {summary:?}"
+    );
+    assert!(
+        summary.contains("Esc cancels"),
+        "summary must name the cancel gesture: {summary:?}"
     );
     // Explicit repeat of the identical paste confirms and delivers.
     rt.drain_pending_input();
@@ -616,6 +630,18 @@ fn ctx0192_pending_summary_is_compact_single_line_bounded() {
     );
     assert!(summary.contains("2 lines"), "keep line count: {summary:?}");
     assert!(summary.contains("newline"), "keep reason: {summary:?}");
+    assert!(
+        !summary.contains("C0"),
+        "normal multi-line paste is not a C0 control: {summary:?}"
+    );
+    assert!(
+        summary.contains("paste again to confirm"),
+        "banner names the confirm gesture: {summary:?}"
+    );
+    assert!(
+        summary.contains("Esc cancels"),
+        "banner names the cancel gesture: {summary:?}"
+    );
     // Long hostile paste stays bounded too.
     let mut rt2 = make_runtime();
     rt2.paste_text(&"A".repeat(8192).replace("AAAA", "AAAA\n"));
@@ -697,4 +723,84 @@ fn ctx0192_banner_is_transient_full_then_flash_never_silent_overlay_only() {
     assert_eq!(cleared.fills, base.fills);
     assert_eq!(cleared.glyphs, base.glyphs);
     assert!(rt.tick_at(t1).is_none());
+}
+
+// ── CTX-0369: multi-line confirm UX acceptance ────────────────────────
+
+#[test]
+fn ctx0369_multiline_confirm_delivers_exact_text_and_cancel_drops() {
+    let text = "first line\nsecond line\n";
+    let mut rt = make_runtime();
+    rt.clipboard_mut().set_text(text.to_string()).unwrap();
+    rt.drain_pending_input();
+    // 2+ lines gate by default (kitty/ghostty safety default) and deliver
+    // nothing before confirmation.
+    assert!(
+        rt.paste_from_clipboard().unwrap().unwrap(),
+        "multi-line paste must require confirmation"
+    );
+    assert!(rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"", "no silent delivery while pending");
+    // Repeating the paste confirms and delivers exactly the clipboard bytes.
+    assert!(
+        !rt.paste_from_clipboard().unwrap().unwrap(),
+        "repeating the identical paste confirms"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), text.as_bytes(), "exact bytes delivered");
+
+    // Cancel path: gate again, then cancel drops without any delivery.
+    rt.drain_pending_input();
+    rt.clipboard_mut().set_text(text.to_string()).unwrap();
+    assert!(rt.paste_from_clipboard().unwrap().unwrap());
+    assert!(rt.has_pending_paste());
+    assert!(rt.cancel_pending_paste());
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"", "cancel must not deliver");
+}
+
+#[test]
+fn ctx0369_single_line_paste_delivers_without_confirmation() {
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .set_text("just one line".to_string())
+        .unwrap();
+    rt.drain_pending_input();
+    assert!(
+        !rt.paste_from_clipboard().unwrap().unwrap(),
+        "single-line paste is delivered immediately"
+    );
+    assert!(!rt.has_pending_paste());
+    assert_eq!(rt.pending_input(), b"just one line");
+}
+
+#[test]
+fn ctx0369_dangerous_controls_still_gate_and_name_their_class() {
+    // The honest relabelling must not weaken any adversarial class: each
+    // still gates, still names itself, and still delivers only on confirm.
+    for (text, token) in [
+        ("a\0b", "NUL"),
+        ("a\x1bb", "ESC"),
+        ("a\rb", "CR"),
+        ("a\x07b", "C0"),
+    ] {
+        let mut rt = make_runtime();
+        assert!(
+            rt.paste_text_via_gate(text.to_string()),
+            "{text:?} must require confirmation"
+        );
+        assert!(rt.has_pending_paste(), "{text:?} must leave pending");
+        assert_eq!(
+            rt.pending_input(),
+            b"",
+            "{text:?} must not deliver silently"
+        );
+        let summary = rt.pending_paste_summary().expect("must stay visible");
+        assert!(
+            summary.contains(token),
+            "{text:?} summary must name {token}: {summary:?}"
+        );
+        assert!(rt.confirm_pending_paste(true));
+        assert_eq!(rt.pending_input(), text.as_bytes());
+    }
 }

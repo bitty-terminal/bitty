@@ -87,6 +87,37 @@ use crate::glyph::{
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
 pub type Rgba8 = [u8; 4];
 
+/// Alpha-scales a straight-alpha color by `factor` (`0.0..=1.0`).
+///
+/// Used by the RFC-0002 (CTX-0341) renderer-side panel transitions to fade
+/// Core-owned chrome in/out without touching terminal truth. RGB is left
+/// untouched (straight alpha); `factor` is clamped so a hostile value can
+/// never invert or wrap the channel. At `factor >= 1.0` the color is
+/// returned byte-identical.
+#[must_use]
+pub fn scale_alpha(color: Rgba8, factor: f32) -> Rgba8 {
+    let a = (f32::from(color[3]) * factor.clamp(0.0, 1.0)).round();
+    [color[0], color[1], color[2], a.clamp(0.0, 255.0) as u8]
+}
+
+/// Linear interpolation from `from` to `to` at `t` (`0.0..=1.0`), per channel
+/// in straight alpha. `t` is clamped; endpoints are returned byte-exact.
+#[must_use]
+pub fn lerp_rgba(from: Rgba8, to: Rgba8, t: f32) -> Rgba8 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| -> u8 {
+        (f32::from(a) + (f32::from(b) - f32::from(a)) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [
+        mix(from[0], to[0]),
+        mix(from[1], to[1]),
+        mix(from[2], to[2]),
+        mix(from[3], to[3]),
+    ]
+}
+
 /// Default foreground: Bitty Dark `#cdd6f4`, fully opaque.
 ///
 /// Mirrors [`bitty_config::theme::BITTY_DARK`]`foreground`: a soft

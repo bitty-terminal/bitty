@@ -86,12 +86,30 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "mouse.focus_follows_mouse"
         | "mouse.focus_follows_mouse_delay_ms"
         | "appearance.theme"
+        | "appearance.animations.enabled"
+        | "appearance.animations.reduced_motion"
+        | "appearance.animations.duration_ms.open"
+        | "appearance.animations.duration_ms.close"
+        | "appearance.animations.duration_ms.focus"
+        | "appearance.animations.duration_ms.workspace"
+        | "appearance.animations.easing.open"
+        | "appearance.animations.easing.close"
+        | "appearance.animations.easing.focus"
+        | "appearance.animations.easing.workspace"
         | "mod_key"
         | "extends"
         | "profile"
         | "schema_version" => Some(MergeClass::ScalarReplace),
-        "font" | "window" | "terminal" | "selection" | "layout" | "decoration" | "scrollbar"
-        | "mouse" | "appearance" => Some(MergeClass::DeepMerge),
+        "font"
+        | "window"
+        | "terminal"
+        | "selection"
+        | "layout"
+        | "decoration"
+        | "scrollbar"
+        | "mouse"
+        | "appearance"
+        | "appearance.animations" => Some(MergeClass::DeepMerge),
         "keymaps" | "plugins" => Some(MergeClass::SetById),
         _ => None,
     }
@@ -151,6 +169,132 @@ fn record_attribution(
     attribution.insert(field.to_string(), new_src.clone());
 }
 
+/// Mutable merge accumulators shared with [`merge_animations_overrides`].
+///
+/// Bundles the four maps/vectors the merge walk threads through every field
+/// so the per-leaf helper stays under clippy's argument bound without
+/// duplicating the attribution/policy logic.
+struct MergeAccumulators<'a> {
+    policy_fields: &'a mut HashMap<String, ConfigSource>,
+    attribution: &'a mut HashMap<String, ConfigSource>,
+    conflicts: &'a mut Vec<MergeConflict>,
+    policy_violations: &'a mut Vec<ConfigError>,
+}
+
+/// Merges one layer's `appearance.animations` overrides (RFC-0002, CTX-0341).
+///
+/// Each present leaf is scalar-replace with its own source attribution; an
+/// absent leaf is "says nothing" and inherits the lower-precedence value.
+/// Mirrors the decoration color handling: policy layers own the leaf, later
+/// non-policy overrides are recorded as violations and skipped.
+fn merge_animations_overrides(
+    effective: &mut EffectiveConfig,
+    acc: &mut MergeAccumulators<'_>,
+    src: &ConfigSource,
+    is_policy: bool,
+    over: &crate::types::AnimationsOverride,
+) {
+    let MergeAccumulators {
+        policy_fields,
+        attribution,
+        conflicts,
+        policy_violations,
+    } = acc;
+    // Field name plus a setter for the concrete effective value. `None`
+    // leaves are skipped before any policy/attribution work.
+    let leaves: [(&str, bool); 10] = [
+        ("appearance.animations.enabled", over.enabled.is_some()),
+        (
+            "appearance.animations.reduced_motion",
+            over.reduced_motion.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.open",
+            over.duration_open.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.close",
+            over.duration_close.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.focus",
+            over.duration_focus.is_some(),
+        ),
+        (
+            "appearance.animations.duration_ms.workspace",
+            over.duration_workspace.is_some(),
+        ),
+        (
+            "appearance.animations.easing.open",
+            over.easing_open.is_some(),
+        ),
+        (
+            "appearance.animations.easing.close",
+            over.easing_close.is_some(),
+        ),
+        (
+            "appearance.animations.easing.focus",
+            over.easing_focus.is_some(),
+        ),
+        (
+            "appearance.animations.easing.workspace",
+            over.easing_workspace.is_some(),
+        ),
+    ];
+    for (field, present) in leaves {
+        if !present {
+            continue;
+        }
+        if is_policy {
+            policy_fields.insert(field.to_string(), src.clone());
+        } else if let Some(policy_src) = policy_fields.get(field) {
+            policy_violations.push(ConfigError::NonOverridable {
+                field: field.to_string(),
+                policy_source: policy_src.describe(),
+                attempted_source: src.describe(),
+            });
+            conflicts.push(MergeConflict {
+                field: field.to_string(),
+                previous_source: policy_src.clone(),
+                new_source: src.clone(),
+                merge_class: MergeClass::ScalarReplace,
+            });
+            continue;
+        }
+        // Apply only this leaf (all others inherit).
+        let mut one = crate::types::AnimationsOverride::default();
+        match field {
+            "appearance.animations.enabled" => one.enabled = over.enabled,
+            "appearance.animations.reduced_motion" => one.reduced_motion = over.reduced_motion,
+            "appearance.animations.duration_ms.open" => one.duration_open = over.duration_open,
+            "appearance.animations.duration_ms.close" => one.duration_close = over.duration_close,
+            "appearance.animations.duration_ms.focus" => one.duration_focus = over.duration_focus,
+            "appearance.animations.duration_ms.workspace" => {
+                one.duration_workspace = over.duration_workspace;
+            }
+            "appearance.animations.easing.open" => one.easing_open = over.easing_open,
+            "appearance.animations.easing.close" => one.easing_close = over.easing_close,
+            "appearance.animations.easing.focus" => one.easing_focus = over.easing_focus,
+            _ => one.easing_workspace = over.easing_workspace,
+        }
+        effective.animations.apply_overrides(&one);
+        let prev = attribution.get(field).cloned();
+        record_attribution(
+            attribution,
+            conflicts,
+            field,
+            prev,
+            src,
+            MergeClass::ScalarReplace,
+        );
+    }
+    // Attribute the container to this layer when it declared the table at
+    // all, matching the decoration/appearance container convention.
+    if leaves.iter().any(|(_, present)| *present) {
+        attribution.insert("appearance.animations".to_string(), src.clone());
+    }
+}
+
 /// Every dotted schema field the merge attributes, in canonical order.
 ///
 /// Shared by [`merge_layers`] (which backfills any field no layer declared as
@@ -192,6 +336,17 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "mouse.focus_follows_mouse_delay_ms",
     "mouse",
     "appearance.theme",
+    "appearance.animations.enabled",
+    "appearance.animations.reduced_motion",
+    "appearance.animations.duration_ms.open",
+    "appearance.animations.duration_ms.close",
+    "appearance.animations.duration_ms.focus",
+    "appearance.animations.duration_ms.workspace",
+    "appearance.animations.easing.open",
+    "appearance.animations.easing.close",
+    "appearance.animations.easing.focus",
+    "appearance.animations.easing.workspace",
+    "appearance.animations",
     "appearance",
     "keymaps",
     "plugins",
@@ -835,6 +990,17 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
                 attribution.insert("appearance".to_string(), src.clone());
+            }
+            // RFC-0002: the animations table deep-merges per leaf; every
+            // present leaf is scalar-replace with its own attribution.
+            if let Some(over) = &app.animations {
+                let mut acc = MergeAccumulators {
+                    policy_fields: &mut policy_fields,
+                    attribution: &mut attribution,
+                    conflicts: &mut conflicts,
+                    policy_violations: &mut policy_violations,
+                };
+                merge_animations_overrides(&mut effective, &mut acc, src, is_policy, over);
             }
         }
 
@@ -1527,6 +1693,17 @@ fn merge_layers_allow_policy_violations(
                     MergeClass::ScalarReplace,
                 );
                 attribution.insert("appearance".to_string(), src.clone());
+            }
+            // RFC-0002: the animations table deep-merges per leaf (second
+            // merge path: allow-policy-violations variant for diagnostics).
+            if let Some(over) = &app.animations {
+                let mut acc = MergeAccumulators {
+                    policy_fields: &mut policy_fields,
+                    attribution: &mut attribution,
+                    conflicts: &mut conflicts,
+                    policy_violations: &mut policy_violations,
+                };
+                merge_animations_overrides(&mut effective, &mut acc, src, is_policy, over);
             }
         }
         // CTX-0236: `mod_key` is scalar-replace like `appearance.theme`;
@@ -2646,6 +2823,125 @@ mod tests {
         assert_eq!(
             merged3.source_of("window.radius_px").unwrap().layer,
             LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn animations_merge_per_field_with_attribution() {
+        // RFC-0002 (CTX-0341): each present leaf is scalar-replace with its
+        // own attribution; absent leaves inherit the lower layer / defaults.
+        use crate::types::{AnimationEasing, AnimationsOverride, ReducedMotion};
+        let system = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemDefaults, Some("system.lua")),
+            ConfigPlan {
+                appearance: Some(crate::types::AppearanceConfig {
+                    theme: None,
+                    animations: Some(AnimationsOverride {
+                        duration_open: Some(250),
+                        easing_open: Some(AnimationEasing::Linear),
+                        ..Default::default()
+                    }),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                appearance: Some(crate::types::AppearanceConfig {
+                    theme: None,
+                    animations: Some(AnimationsOverride {
+                        duration_open: Some(500),
+                        enabled: Some(false),
+                        reduced_motion: Some(ReducedMotion::Always),
+                        ..Default::default()
+                    }),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![system.clone(), user.clone()]).expect("merge");
+        // User wins the leaves it declared.
+        assert_eq!(merged.effective.animations.duration_ms.open, 500);
+        assert!(!merged.effective.animations.enabled);
+        assert_eq!(
+            merged.effective.animations.reduced_motion,
+            ReducedMotion::Always
+        );
+        // System's easing survives because user said nothing about it.
+        assert_eq!(
+            merged.effective.animations.easing.open,
+            AnimationEasing::Linear
+        );
+        // Untouched leaves keep the accepted defaults.
+        assert_eq!(
+            merged.effective.animations.duration_ms.close,
+            crate::types::DEFAULT_ANIMATION_CLOSE_MS
+        );
+        assert_eq!(
+            merged.effective.animations.easing.focus,
+            AnimationEasing::EaseInOut
+        );
+        // Per-leaf attribution answers the declaring layer.
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.duration_ms.open")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.easing.open")
+                .unwrap()
+                .layer,
+            LayerKind::SystemDefaults
+        );
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.enabled")
+                .unwrap()
+                .layer,
+            LayerKind::User
+        );
+        // A leaf nobody declared rides core defaults.
+        assert_eq!(
+            merged
+                .source_of("appearance.animations.duration_ms.close")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+        assert!(
+            merged
+                .conflicts
+                .iter()
+                .any(|c| c.field == "appearance.animations.duration_ms.open")
+        );
+        // Empty stack keeps the accepted contract defaults.
+        let empty = merge_layers(vec![]).expect("empty merge");
+        assert!(empty.effective.animations.enabled);
+        assert_eq!(empty.effective.animations.duration_ms.open, 150);
+        assert_eq!(
+            empty.effective.animations.reduced_motion,
+            ReducedMotion::Auto
+        );
+        assert_eq!(
+            merge_class_for("appearance.animations"),
+            Some(MergeClass::DeepMerge)
+        );
+        assert_eq!(
+            merge_class_for("appearance.animations.duration_ms.open"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // try_merge_layers agrees (second merge path).
+        let merged2 = try_merge_layers(vec![system, user]).expect("try merge");
+        assert_eq!(merged2.effective.animations.duration_ms.open, 500);
+        assert_eq!(
+            merged2.effective.animations.easing.open,
+            AnimationEasing::Linear
         );
     }
 }

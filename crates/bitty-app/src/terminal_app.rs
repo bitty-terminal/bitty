@@ -632,7 +632,19 @@ impl AppHandler for TerminalApp {
                 // CTX-0334: arm a single timed wake for a pending hover
                 // dwell so a stopped pointer still activates; otherwise
                 // return to energy-saving wait (frame-on-demand).
-                match self.runtime.hover_activation_deadline() {
+                // RFC-0002 (CTX-0341): an active panel animation also arms a
+                // bounded wake at its next frame; when the last animation
+                // ends the deadline is `None` and the loop returns to wait
+                // (zero periodic wakeups, PB-7).
+                let hover = self.runtime.hover_activation_deadline();
+                let animation = self.runtime.animation_deadline();
+                let wake = match (hover, animation) {
+                    (Some(h), Some(a)) => Some(h.min(a)),
+                    (Some(h), None) => Some(h),
+                    (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),
                 }

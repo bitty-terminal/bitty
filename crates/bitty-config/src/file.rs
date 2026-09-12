@@ -428,6 +428,7 @@ impl CliOverrides {
         let plan = ConfigPlan {
             appearance: Some(AppearanceConfig {
                 theme: Some(trimmed.to_string()),
+                animations: None,
             }),
             schema_version: Some(CURRENT_SCHEMA_VERSION),
             ..Default::default()
@@ -498,6 +499,7 @@ impl CliOverrides {
         };
         let appearance = theme.as_deref().map(|t| AppearanceConfig {
             theme: Some(t.to_string()),
+            animations: None,
         });
         let plan = ConfigPlan {
             appearance,
@@ -837,7 +839,94 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     // Table-wins for the theme alias.
     let theme = data.appearance_theme.or(data.theme);
 
-    let appearance = theme.map(|t| AppearanceConfig { theme: Some(t) });
+    // RFC-0002 (`appearance.animations`, CTX-0341): the animations table is
+    // fully optional ("absent means this layer says nothing"). When present,
+    // each leaf is validated fail-closed with its field path — unknown easing
+    // and out-of-range durations reject the reload rather than clamping.
+    // Grammar/range checks live here and again in `AnimationsOverride::validate`
+    // via `plan.validate()`.
+    let animations = match data.animations {
+        None => None,
+        Some(a) => {
+            let mut over = crate::types::AnimationsOverride {
+                enabled: a.enabled,
+                ..Default::default()
+            };
+            over.reduced_motion = match a.reduced_motion.as_deref() {
+                None => None,
+                Some(raw) => match crate::types::ReducedMotion::parse(raw) {
+                    Some(m) => Some(m),
+                    None => {
+                        return Err(ConfigError::validation(
+                            "appearance.animations.reduced_motion",
+                            "must be one of \"auto\", \"always\", \"never\"",
+                        ));
+                    }
+                },
+            };
+            let parse_easing = |field: &str, raw: Option<&str>| match raw {
+                None => Ok(None),
+                Some(text) => match crate::types::AnimationEasing::parse(text) {
+                    Some(e) => Ok(Some(e)),
+                    None => Err(ConfigError::validation(
+                        field,
+                        "must be one of \"linear\", \"ease_in\", \"ease_out\", \
+                         \"ease_in_out\", \"spring\"",
+                    )),
+                },
+            };
+            let check_duration =
+                |field: &str, raw: Option<i64>| -> Result<Option<u32>, ConfigError> {
+                    match raw {
+                        None => Ok(None),
+                        Some(v) => {
+                            if !(0..=crate::types::MAX_ANIMATION_DURATION_MS as i64).contains(&v) {
+                                return Err(ConfigError::validation(
+                                    field,
+                                    format!(
+                                        "must be within [0, {}] (found {v})",
+                                        crate::types::MAX_ANIMATION_DURATION_MS
+                                    ),
+                                ));
+                            }
+                            Ok(Some(v as u32))
+                        }
+                    }
+                };
+            over.duration_open =
+                check_duration("appearance.animations.duration_ms.open", a.duration_open)?;
+            over.duration_close =
+                check_duration("appearance.animations.duration_ms.close", a.duration_close)?;
+            over.duration_focus =
+                check_duration("appearance.animations.duration_ms.focus", a.duration_focus)?;
+            over.duration_workspace = check_duration(
+                "appearance.animations.duration_ms.workspace",
+                a.duration_workspace,
+            )?;
+            over.easing_open = parse_easing(
+                "appearance.animations.easing.open",
+                a.easing_open.as_deref(),
+            )?;
+            over.easing_close = parse_easing(
+                "appearance.animations.easing.close",
+                a.easing_close.as_deref(),
+            )?;
+            over.easing_focus = parse_easing(
+                "appearance.animations.easing.focus",
+                a.easing_focus.as_deref(),
+            )?;
+            over.easing_workspace = parse_easing(
+                "appearance.animations.easing.workspace",
+                a.easing_workspace.as_deref(),
+            )?;
+            Some(over)
+        }
+    };
+
+    let appearance = match (theme, animations) {
+        (None, None) => None,
+        (theme, animations) => Some(AppearanceConfig { theme, animations }),
+    };
     let font = match data.font {
         None => None,
         Some(f) => match (f.family, f.size) {
@@ -1717,6 +1806,125 @@ mod tests {
             (
                 r##"return { decoration = { border_color = "#123456789" } }"##,
                 "decoration.border_color",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{bad} must name {field}: {msg}");
+        }
+    }
+
+    #[test]
+    fn lua_animations_parses_and_fails_closed() {
+        // RFC-0002 (CTX-0341): the accepted table parses; each leaf is
+        // optional ("says nothing"); unknown easing and out-of-range
+        // durations reject the reload naming the field; `spring` is accepted
+        // and kept for the resolver to map to ease_in_out.
+        let plan = parse_lua_config(
+            r#"return { appearance = { animations = {
+                enabled = true,
+                reduced_motion = "auto",
+                duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
+                easing = { open = "ease_out", close = "ease_in", focus = "ease_in_out", workspace = "spring" },
+            } } }"#,
+            &test_source(),
+        )
+        .expect("accepted animations parse");
+        let over = plan
+            .appearance
+            .expect("appearance present")
+            .animations
+            .expect("animations present");
+        assert_eq!(over.enabled, Some(true));
+        assert_eq!(over.reduced_motion, Some(crate::types::ReducedMotion::Auto));
+        assert_eq!(over.duration_open, Some(150));
+        assert_eq!(over.duration_close, Some(120));
+        assert_eq!(over.duration_focus, Some(100));
+        assert_eq!(over.duration_workspace, Some(200));
+        assert_eq!(
+            over.easing_open,
+            Some(crate::types::AnimationEasing::EaseOut)
+        );
+        assert_eq!(
+            over.easing_close,
+            Some(crate::types::AnimationEasing::EaseIn)
+        );
+        assert_eq!(
+            over.easing_focus,
+            Some(crate::types::AnimationEasing::EaseInOut)
+        );
+        assert_eq!(
+            over.easing_workspace,
+            Some(crate::types::AnimationEasing::Spring)
+        );
+        // Bounds `0` and `500` inclusive parse.
+        for raw in [0, 500] {
+            let code = format!(
+                r#"return {{ appearance = {{ animations = {{ duration_ms = {{ open = {raw} }} }} }} }}"#
+            );
+            let plan = parse_lua_config(&code, &test_source()).expect("boundary duration parses");
+            let over = plan.appearance.unwrap().animations.unwrap();
+            assert_eq!(over.duration_open, Some(raw as u32));
+        }
+        // Partial table: only the declared leaf is present.
+        let plan = parse_lua_config(
+            r#"return { appearance = { animations = { duration_ms = { open = 0 } } } }"#,
+            &test_source(),
+        )
+        .expect("partial animations parse");
+        let over = plan.appearance.unwrap().animations.unwrap();
+        assert_eq!(over.duration_open, Some(0));
+        assert_eq!(over.duration_close, None);
+        assert_eq!(over.easing_open, None);
+        assert_eq!(over.enabled, None);
+        // Absent table means "this layer says nothing".
+        let plan = parse_lua_config(
+            r#"return { appearance = { theme = "dark" } }"#,
+            &test_source(),
+        )
+        .expect("theme-only appearance parses");
+        assert!(plan.appearance.unwrap().animations.is_none());
+        // Fail-closed cases name the offending field.
+        for (bad, field) in [
+            (
+                r#"return { appearance = { animations = { duration_ms = { open = 501 } } } }"#,
+                "appearance.animations.duration_ms.open",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { close = -1 } } } }"#,
+                "appearance.animations.duration_ms.close",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { workspace = 999 } } } }"#,
+                "appearance.animations.duration_ms.workspace",
+            ),
+            (
+                r#"return { appearance = { animations = { easing = { open = "bounce" } } } }"#,
+                "appearance.animations.easing.open",
+            ),
+            (
+                r#"return { appearance = { animations = { easing = { workspace = "ease-in" } } } }"#,
+                "appearance.animations.easing.workspace",
+            ),
+            (
+                r#"return { appearance = { animations = { reduced_motion = "sometimes" } } }"#,
+                "appearance.animations.reduced_motion",
+            ),
+            (
+                r#"return { appearance = { animations = { duration_ms = { open = 1.5 } } } }"#,
+                "appearance.animations.duration_ms.open",
+            ),
+            (
+                r#"return { appearance = { animations = { enabled = "yes" } } }"#,
+                "appearance.animations.enabled",
+            ),
+            (
+                r#"return { appearance = { animations = "fast" } }"#,
+                "appearance.animations",
+            ),
+            (
+                r#"return { appearance = { animations = { bogus = 1 } } }"#,
+                "appearance.animations.bogus",
             ),
         ] {
             let err = parse_lua_config(bad, &test_source()).unwrap_err();

@@ -1638,6 +1638,65 @@ fn runtime_config_inherits_file_scrollbar() {
 }
 
 #[test]
+fn runtime_config_maps_animation_contract_end_to_end() {
+    // RFC-0002 (CTX-0341): the accepted `appearance.animations` table flows
+    // file -> effective -> runtime policy with `spring` resolved to
+    // `ease_in_out`; safe mode zeroes every duration.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    assert_eq!(
+        bitty_runtime::config::MAX_ANIMATION_DURATION_MS,
+        bitty_config::types::MAX_ANIMATION_DURATION_MS
+    );
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { appearance = { animations = {
+            enabled = true,
+            reduced_motion = "auto",
+            duration_ms = { open = 150, close = 120, focus = 100, workspace = 200 },
+            easing = { open = "spring", close = "linear", focus = "ease_in_out", workspace = "ease_in" },
+        } } }"#,
+        &src,
+    )
+    .expect("animations parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert!(cfg.animations.enabled);
+    assert_eq!(
+        cfg.animations.duration_ms,
+        [150, 120, 100, 200],
+        "accepted durations map verbatim"
+    );
+    // `spring` resolves to `ease_in_out` at the boundary.
+    assert_eq!(
+        cfg.animations.curves[0],
+        bitty_runtime::AnimationCurve::EaseInOut
+    );
+    assert_eq!(
+        cfg.animations.curves[1],
+        bitty_runtime::AnimationCurve::Linear
+    );
+    assert_eq!(
+        cfg.animations.reduced_motion,
+        bitty_runtime::ReducedMotionMode::Auto
+    );
+    // Safe mode zeroes every duration and keeps the final-state contract.
+    let safe = bitty_config::reload::fallback_builtin();
+    let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
+    assert_eq!(safe_cfg.animations.duration_ms, [0, 0, 0, 0]);
+    // Out-of-range/unknown values fail closed before runtime.
+    for bad in [
+        r#"return { appearance = { animations = { duration_ms = { open = 501 } } } }"#,
+        r#"return { appearance = { animations = { easing = { open = "bounce" } } } }"#,
+        r#"return { appearance = { animations = { reduced_motion = "sometimes" } } }"#,
+    ] {
+        let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        parse_lua_config(bad, &src).expect_err("must fail closed");
+    }
+}
+
+#[test]
 fn runtime_config_inherits_file_window_padding() {
     // CTX-0223: `window.padding` flows file -> effective -> runtime;
     // crate defaults stay equal (bitty-runtime must not depend on

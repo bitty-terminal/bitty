@@ -209,10 +209,11 @@ pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::PresentFrame;
 pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
 pub use runtime::{
-    ActivationGesture, DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY,
-    DEFAULT_PLUGIN_SIDE_CAPACITY, FileUrlActivation, KittyDisplayOutcome, KittyImageError,
-    PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION, PTY_FORWARD_CAPACITY_CHUNKS, PresentStats,
-    PtyWaker, Runtime, UrlActivation,
+    ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame,
+    DEFAULT_PLUGIN_DROP_POLICY, DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY,
+    FileUrlActivation, KittyDisplayOutcome, KittyImageError, MAX_CONCURRENT_ANIMATIONS,
+    PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION, PTY_FORWARD_CAPACITY_CHUNKS,
+    PanelAnimator, PresentStats, PtyWaker, ReducedMotionMode, Runtime, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

@@ -22,7 +22,24 @@
 //! presents erased. Pixel-asserted per tile through `headless_rgba`, no
 //! wall clock, no PTY spawn except where noted.
 
-use bitty_runtime::{FocusDirection, LayoutNode, Runtime, SplitAxis, View, ViewId};
+use bitty_runtime::{
+    AnimationPolicy, FocusDirection, LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId,
+};
+
+/// RFC-0002 (CTX-0341): animations default ON and a split/zoom/focus change
+/// arms a bounded transition that presents extra frames. These tests pin the
+/// CTX-0228 full-present-then-idle contract, not the animation feature, so
+/// they build every runtime with animations disabled (instant present).
+fn instant_runtime() -> Runtime {
+    Runtime::new(RuntimeConfig {
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("instant runtime must build")
+}
 
 /// Pixel bounds of one leaf tile: the decorated content frame translated
 /// exactly like the present layer (physical px + window padding inset).
@@ -140,7 +157,7 @@ fn assert_full_present(stats: Option<bitty_runtime::PresentStats>, what: &str) {
 
 #[test]
 fn split_geometry_only_forces_full_present() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");
     assert_eq!(rt.tick(), None, "must idle before split");
     rt.set_layout(two_pane());
@@ -156,7 +173,7 @@ fn split_geometry_only_forces_full_present() {
 
 #[test]
 fn zoom_on_and_off_force_full_present() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");
     assert_eq!(rt.tick(), None);
     rt.set_layout(two_pane());
@@ -176,7 +193,7 @@ fn zoom_on_and_off_force_full_present() {
 
 #[test]
 fn reflow_geometry_only_forces_full_present() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");
     assert_eq!(rt.tick(), None);
     let _ = rt.reflow_layout();
@@ -186,7 +203,7 @@ fn reflow_geometry_only_forces_full_present() {
 
 #[test]
 fn focus_moves_force_full_present() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     rt.set_layout(two_pane());
     assert_full_present(rt.tick(), "split before focus");
     assert_eq!(rt.tick(), None);
@@ -206,7 +223,7 @@ fn focus_moves_force_full_present() {
 
 #[test]
 fn layout_mut_borrow_without_explicit_dirty_still_presents() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     let _ = rt.tick().expect("first tick must present");
     assert_eq!(rt.tick(), None);
     // Mutate through the borrow without calling `mark_layout_dirty`:
@@ -219,7 +236,7 @@ fn layout_mut_borrow_without_explicit_dirty_still_presents() {
 
 #[test]
 fn set_focus_change_forces_full_present() {
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     rt.set_layout(two_pane());
     assert_full_present(rt.tick(), "split before set_focus");
     assert_eq!(rt.tick(), None);
@@ -237,7 +254,7 @@ fn sessionless_unfocused_leaf_renders_blank_not_primary() {
     // shared primary viewport, duplicating one shell across all tiles.
     // Only the focused session-less leaf may show primary (input routes
     // there); the unfocused one must stay erased.
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     assert_eq!(rt.tick(), None);
@@ -260,7 +277,7 @@ fn sessionless_primary_fallback_follows_focus() {
     // The primary fallback is input-routing truth: typing reaches the
     // primary shell only through the focused session-less leaf, so the
     // visible primary content must move with focus — never duplicate.
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     rt.set_layout(two_pane());
@@ -282,7 +299,7 @@ fn sessionless_primary_fallback_follows_focus() {
 fn zoom_off_does_not_duplicate_primary_into_sessionless_leaves() {
     // Live L8 shape: three session-less tiles side by side (ctl splits v4/v5
     // plus primary v1) rendered the same primary viewport three times.
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     let three = LayoutNode::split(
@@ -322,7 +339,7 @@ fn mixed_primary_plus_session_copaints_on_focus_v2() {
     // keymap-split shape is mixed — v:1 session-less shows the shared
     // primary grid, v:2 owns a pane session. Focusing v:2 must NOT blank
     // the primary home tile; both tiles co-paint. Refocus v:1 keeps both.
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 2, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     rt.set_layout(two_pane());
@@ -371,7 +388,7 @@ fn pane_session_tile_shows_only_its_own_grid() {
     // Guard for the sessioned path (live L1 keymap splits): each tile shows
     // exactly its own grid — primary marker in the primary tile only, pane
     // marker in the pane tile only, never crossed.
-    let mut rt = Runtime::with_defaults().expect("build");
+    let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 2, b'M');
     assert!(rt.tick().is_some(), "first tick presents");
     rt.set_layout(two_pane());

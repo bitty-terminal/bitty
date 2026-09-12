@@ -170,6 +170,160 @@ impl Runtime {
         }
     }
 
+    /// Live-adopts a resolved panel animation policy (RFC-0002, CTX-0341).
+    ///
+    /// Presentation-only; the tracker keeps any in-flight transition timing
+    /// and adopts the new policy for subsequent triggers. A change forces one
+    /// full redraw so the new durations/easings are observable immediately.
+    pub fn set_animations(&mut self, policy: AnimationPolicy) {
+        if self.config.animations != policy {
+            self.config.animations = policy;
+            self.animator.set_policy(policy);
+            self.pending_full_redraw = true;
+        }
+    }
+
+    /// Arms a transition for `surface` at `now`, returning whether it will
+    /// animate (RFC-0002). `false` means the caller applies the end state
+    /// immediately (instant, reduced motion, safe mode, or capacity).
+    pub fn trigger_animation(
+        &mut self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: std::time::Instant,
+    ) -> bool {
+        let armed = self.animator.trigger(kind, surface, now);
+        if armed {
+            // A new animation needs a frame even when no PTY bytes moved.
+            self.pending_full_redraw = true;
+        }
+        armed
+    }
+
+    /// Timer deadline for the next in-flight animation frame, if any
+    /// (RFC-0002 frame-on-demand: `None` when idle, so the app can sleep).
+    #[must_use]
+    pub fn animation_deadline(&self) -> Option<std::time::Instant> {
+        self.animator.next_deadline(std::time::Instant::now())
+    }
+
+    /// Whether any panel animation is currently active.
+    #[must_use]
+    pub fn animations_active(&self) -> bool {
+        self.animator.is_active(std::time::Instant::now())
+    }
+
+    /// Eased progress `0..=1` of an active transition, or `None` when that
+    /// transition is not animating (caller uses the final state directly).
+    #[must_use]
+    pub fn animation_progress(
+        &self,
+        kind: AnimationKind,
+        surface: Option<ViewId>,
+        now: std::time::Instant,
+    ) -> Option<f32> {
+        self.animator.progress(kind, surface, now)
+    }
+
+    /// Detects RFC-0002 transitions between the last presented frame and the
+    /// current one and arms the matching animations (CTX-0341).
+    ///
+    /// Called once per present before the idle short-circuit. Open/close are
+    /// derived from the View-set delta (a new View fades in, a removed one
+    /// fades out through a retained [`ClosingFrame`]); focus from the focused
+    /// View change; workspace from the active index change. The first frame
+    /// after startup arms nothing so a fresh window does not animate its
+    /// initial layout. Presentation-only: allocates no terminal state and is
+    /// bounded by the View count (itself bounded by the layout).
+    pub(super) fn detect_panel_animations(
+        &mut self,
+        allocations: &[PresentFrame],
+        focused: Option<ViewId>,
+        active_workspace: usize,
+        now: std::time::Instant,
+    ) {
+        let first_frame = self.last_presented_generation == u64::MAX;
+        if first_frame {
+            self.last_presented_workspace = active_workspace;
+            return;
+        }
+        let policy = self.config.animations;
+
+        if policy.animates(AnimationKind::Workspace)
+            && active_workspace != self.last_presented_workspace
+        {
+            self.trigger_animation(AnimationKind::Workspace, None, now);
+        }
+
+        let new_ids: std::collections::HashSet<ViewId> =
+            allocations.iter().map(|f| f.view).collect();
+        let old_ids: std::collections::HashSet<ViewId> = self
+            .last_presented_allocations
+            .iter()
+            .map(|f| f.view)
+            .collect();
+
+        if policy.animates(AnimationKind::Open) {
+            for frame in allocations {
+                if !old_ids.contains(&frame.view) {
+                    self.trigger_animation(AnimationKind::Open, Some(frame.view), now);
+                }
+            }
+        }
+        if policy.animates(AnimationKind::Close) {
+            let previous = self.last_presented_allocations.clone();
+            for old in &previous {
+                if new_ids.contains(&old.view) {
+                    continue;
+                }
+                if self.closing_frames.iter().any(|c| c.view == old.view) {
+                    continue;
+                }
+                if self.closing_frames.len() >= MAX_CONCURRENT_ANIMATIONS {
+                    // Bounded: a storm of closes commits the end state of the
+                    // excess rather than retaining unbounded frames.
+                    break;
+                }
+                let color = if self.last_presented_focus == Some(old.view) {
+                    self.config.outline_focused
+                } else {
+                    self.config.outline_idle
+                };
+                self.closing_frames.push(ClosingFrame {
+                    view: old.view,
+                    frame: old.frame,
+                    border: old.border,
+                    radius: old.radius,
+                    color,
+                });
+                self.trigger_animation(AnimationKind::Close, Some(old.view), now);
+            }
+        }
+        if focused != self.last_presented_focus {
+            if let Some(fid) = focused {
+                if policy.animates(AnimationKind::Focus) {
+                    self.trigger_animation(AnimationKind::Focus, Some(fid), now);
+                }
+            }
+        }
+        self.last_presented_workspace = active_workspace;
+    }
+
+    /// Advances the animation tracker and drops completed transitions
+    /// (RFC-0002). Returns `true` when any transition expired this frame, so
+    /// the caller presents exactly one final frame that commits the end state
+    /// (the next frame then idles).
+    pub(super) fn advance_animations(&mut self, now: std::time::Instant) -> bool {
+        let expired = self.animator.tick(now);
+        let before = self.closing_frames.len();
+        self.closing_frames.retain(|cf| {
+            self.animator
+                .progress(AnimationKind::Close, Some(cf.view), now)
+                .is_some()
+        });
+        expired || self.closing_frames.len() != before
+    }
+
     /// Decorated View frames in logical pixels for the current workspace
     /// area (CTX-0292 Core-owned decoration application).
     ///

@@ -134,6 +134,426 @@ pub const MIN_OUTLINE_IDLE_BACKGROUND_CONTRAST: f64 = 1.5;
 /// Maximum accepted outline color spelling length: `#RRGGBBAA` (9 bytes).
 pub const MAX_DECORATION_COLOR_LEN: usize = 9;
 
+// ── Panel animations (RFC-0002, CTX-0341) ────────────────────────────────
+//
+// Accepted contract: a closed transition set (panel open/close, focus change,
+// workspace switch) with per-transition integer durations in `0..=500` ms and
+// a closed easing enum (`linear | ease_in | ease_out | ease_in_out | spring`).
+// `spring` is a reserved leaf whose parameters are deferred, so it resolves to
+// `ease_in_out` until a follow-up RFC defines them. Durations and easings fail
+// closed; `enabled = false` and `reduced_motion = "always"` are equivalent to
+// `0` ms. Renderer-side by default; never interpolates terminal truth.
+
+/// Default panel-open duration in ms (RFC-0002).
+pub const DEFAULT_ANIMATION_OPEN_MS: u32 = 150;
+
+/// Default panel-close duration in ms (RFC-0002).
+pub const DEFAULT_ANIMATION_CLOSE_MS: u32 = 120;
+
+/// Default focus-change duration in ms (RFC-0002).
+pub const DEFAULT_ANIMATION_FOCUS_MS: u32 = 100;
+
+/// Default workspace-switch duration in ms (RFC-0002).
+pub const DEFAULT_ANIMATION_WORKSPACE_MS: u32 = 200;
+
+/// Hard upper bound for every animation duration in ms (RFC-0002: `0..=500`).
+pub const MAX_ANIMATION_DURATION_MS: u32 = 500;
+
+/// Default `appearance.animations.enabled` (RFC-0002).
+pub const DEFAULT_ANIMATIONS_ENABLED: bool = true;
+
+/// Default `appearance.animations.reduced_motion` (RFC-0002).
+pub const DEFAULT_REDUCED_MOTION: ReducedMotion = ReducedMotion::Auto;
+
+/// One animatable panel transition (RFC-0002 transition set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnimationTransition {
+    /// A `View` becomes occupied or a Panel is shown.
+    Open,
+    /// A `View` becomes empty/hidden or a Panel is hidden.
+    Close,
+    /// The focused `View` changes.
+    Focus,
+    /// The active `Workspace` changes.
+    Workspace,
+}
+
+impl AnimationTransition {
+    /// Canonical leaf name used in `appearance.animations.duration_ms` /
+    /// `easing`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Focus => "focus",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+/// Closed easing enum accepted by `appearance.animations.easing.*`.
+///
+/// `spring` is a reserved leaf: its parameters (stiffness, damping, rest
+/// threshold) are deferred, so [`Self::resolved`] maps it to
+/// [`Self::EaseInOut`] until a follow-up RFC defines them (RFC-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnimationEasing {
+    /// Constant velocity.
+    Linear,
+    /// Slow start, fast end.
+    EaseIn,
+    /// Fast start, slow end.
+    EaseOut,
+    /// Slow start and end (S-curve).
+    EaseInOut,
+    /// Reserved name; parameters deferred, resolved as `ease_in_out`.
+    Spring,
+}
+
+impl AnimationEasing {
+    /// Parses the exact lowercase spelling; unknown spellings return `None`
+    /// so callers fail closed with a source-attributed diagnostic.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "linear" => Some(Self::Linear),
+            "ease_in" => Some(Self::EaseIn),
+            "ease_out" => Some(Self::EaseOut),
+            "ease_in_out" => Some(Self::EaseInOut),
+            "spring" => Some(Self::Spring),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::EaseIn => "ease_in",
+            Self::EaseOut => "ease_out",
+            Self::EaseInOut => "ease_in_out",
+            Self::Spring => "spring",
+        }
+    }
+
+    /// The curve actually applied for this easing (RFC-0002 `spring` mapping).
+    #[must_use]
+    pub fn resolved(self) -> Self {
+        match self {
+            Self::Spring => Self::EaseInOut,
+            other => other,
+        }
+    }
+}
+
+/// Bounded `appearance.animations.reduced_motion` enum (RFC-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReducedMotion {
+    /// Follow the platform reduced-motion signal when one exists; otherwise
+    /// animate.
+    Auto,
+    /// Force `0` ms durations.
+    Always,
+    /// Ignore the platform signal but still respect the duration bounds.
+    Never,
+}
+
+impl ReducedMotion {
+    /// Parses the exact lowercase spelling; unknown spellings return `None`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "auto" => Some(Self::Auto),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// Per-transition durations in milliseconds, each `0..=500` (RFC-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationDurations {
+    /// Panel-open duration.
+    pub open: u32,
+    /// Panel-close duration.
+    pub close: u32,
+    /// Focus-change duration.
+    pub focus: u32,
+    /// Workspace-switch duration.
+    pub workspace: u32,
+}
+
+impl Default for AnimationDurations {
+    fn default() -> Self {
+        Self {
+            open: DEFAULT_ANIMATION_OPEN_MS,
+            close: DEFAULT_ANIMATION_CLOSE_MS,
+            focus: DEFAULT_ANIMATION_FOCUS_MS,
+            workspace: DEFAULT_ANIMATION_WORKSPACE_MS,
+        }
+    }
+}
+
+impl AnimationDurations {
+    /// Reads the duration for one transition.
+    #[must_use]
+    pub fn get(self, transition: AnimationTransition) -> u32 {
+        match transition {
+            AnimationTransition::Open => self.open,
+            AnimationTransition::Close => self.close,
+            AnimationTransition::Focus => self.focus,
+            AnimationTransition::Workspace => self.workspace,
+        }
+    }
+}
+
+/// Per-transition easings (RFC-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationEasings {
+    /// Panel-open easing.
+    pub open: AnimationEasing,
+    /// Panel-close easing.
+    pub close: AnimationEasing,
+    /// Focus-change easing.
+    pub focus: AnimationEasing,
+    /// Workspace-switch easing.
+    pub workspace: AnimationEasing,
+}
+
+impl Default for AnimationEasings {
+    fn default() -> Self {
+        Self {
+            open: AnimationEasing::EaseOut,
+            close: AnimationEasing::EaseIn,
+            focus: AnimationEasing::EaseInOut,
+            workspace: AnimationEasing::EaseInOut,
+        }
+    }
+}
+
+impl AnimationEasings {
+    /// Reads the easing for one transition.
+    #[must_use]
+    pub fn get(self, transition: AnimationTransition) -> AnimationEasing {
+        match transition {
+            AnimationTransition::Open => self.open,
+            AnimationTransition::Close => self.close,
+            AnimationTransition::Focus => self.focus,
+            AnimationTransition::Workspace => self.workspace,
+        }
+    }
+}
+
+/// `appearance.animations` — the accepted RFC-0002 panel animation contract.
+///
+/// This table is owned by the animation contract and does not migrate any
+/// existing key. It is renderer-side by default and compositor-gated: no
+/// platform surface is required, and an unsupported platform simply renders
+/// the final committed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimationsConfig {
+    /// Master switch; `false` is equivalent to `0` ms durations while the
+    /// final-state contract is kept.
+    pub enabled: bool,
+    /// Per-transition durations.
+    pub duration_ms: AnimationDurations,
+    /// Per-transition easings.
+    pub easing: AnimationEasings,
+    /// Reduced-motion mode.
+    pub reduced_motion: ReducedMotion,
+}
+
+impl Default for AnimationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_ANIMATIONS_ENABLED,
+            duration_ms: AnimationDurations::default(),
+            easing: AnimationEasings::default(),
+            reduced_motion: DEFAULT_REDUCED_MOTION,
+        }
+    }
+}
+
+impl AnimationsConfig {
+    /// Resolves the duration actually applied for `transition`.
+    ///
+    /// Fail-closed at the value level: any disabled path yields `0` (instant)
+    /// rather than an unbounded or degraded state. `safe_mode` forces `0`
+    /// regardless of configuration and the platform signal (RFC-0002);
+    /// `platform_reduced` is the platform reduced-motion signal consulted
+    /// only by [`ReducedMotion::Auto`].
+    #[must_use]
+    pub fn effective_duration_ms(
+        &self,
+        transition: AnimationTransition,
+        platform_reduced: bool,
+        safe_mode: bool,
+    ) -> u32 {
+        if safe_mode || !self.enabled {
+            return 0;
+        }
+        let reduced = match self.reduced_motion {
+            ReducedMotion::Always => true,
+            ReducedMotion::Never => false,
+            ReducedMotion::Auto => platform_reduced,
+        };
+        if reduced {
+            return 0;
+        }
+        self.duration_ms.get(transition)
+    }
+
+    /// The applied easing for `transition` with `spring` resolved.
+    #[must_use]
+    pub fn effective_easing(&self, transition: AnimationTransition) -> AnimationEasing {
+        self.easing.get(transition).resolved()
+    }
+
+    /// Applies one layer's per-field overrides onto this value (RFC-0002
+    /// "deep-merges as a table while each field is scalar-replace").
+    ///
+    /// Every `Some` leaf replaces the corresponding field; `None` inherits
+    /// the receiver's value, so a layer that sets only one duration or easing
+    /// never resets the others.
+    pub fn apply_overrides(&mut self, over: &AnimationsOverride) {
+        if let Some(v) = over.enabled {
+            self.enabled = v;
+        }
+        if let Some(v) = over.reduced_motion {
+            self.reduced_motion = v;
+        }
+        if let Some(v) = over.duration_open {
+            self.duration_ms.open = v;
+        }
+        if let Some(v) = over.duration_close {
+            self.duration_ms.close = v;
+        }
+        if let Some(v) = over.duration_focus {
+            self.duration_ms.focus = v;
+        }
+        if let Some(v) = over.duration_workspace {
+            self.duration_ms.workspace = v;
+        }
+        if let Some(v) = over.easing_open {
+            self.easing.open = v;
+        }
+        if let Some(v) = over.easing_close {
+            self.easing.close = v;
+        }
+        if let Some(v) = over.easing_focus {
+            self.easing.focus = v;
+        }
+        if let Some(v) = over.easing_workspace {
+            self.easing.workspace = v;
+        }
+    }
+
+    /// Validates the duration bounds fail-closed (each field `0..=500`).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            (
+                "appearance.animations.duration_ms.open",
+                self.duration_ms.open,
+            ),
+            (
+                "appearance.animations.duration_ms.close",
+                self.duration_ms.close,
+            ),
+            (
+                "appearance.animations.duration_ms.focus",
+                self.duration_ms.focus,
+            ),
+            (
+                "appearance.animations.duration_ms.workspace",
+                self.duration_ms.workspace,
+            ),
+        ] {
+            if value > MAX_ANIMATION_DURATION_MS {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("must be within [0, {MAX_ANIMATION_DURATION_MS}]"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One layer's optional `appearance.animations` leaves (RFC-0002, CTX-0341).
+///
+/// Every leaf is `Option` so "this layer says nothing" is distinguishable
+/// from an explicit value; merge applies each `Some` leaf by scalar replace
+/// and inherits the rest. Exactly one of the four duration leaves (and one of
+/// the four easing leaves) is expected per declared table; omitted leaves
+/// inherit the lower-precedence value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnimationsOverride {
+    /// `appearance.animations.enabled`.
+    pub enabled: Option<bool>,
+    /// `appearance.animations.reduced_motion`.
+    pub reduced_motion: Option<ReducedMotion>,
+    /// `appearance.animations.duration_ms.open`.
+    pub duration_open: Option<u32>,
+    /// `appearance.animations.duration_ms.close`.
+    pub duration_close: Option<u32>,
+    /// `appearance.animations.duration_ms.focus`.
+    pub duration_focus: Option<u32>,
+    /// `appearance.animations.duration_ms.workspace`.
+    pub duration_workspace: Option<u32>,
+    /// `appearance.animations.easing.open`.
+    pub easing_open: Option<AnimationEasing>,
+    /// `appearance.animations.easing.close`.
+    pub easing_close: Option<AnimationEasing>,
+    /// `appearance.animations.easing.focus`.
+    pub easing_focus: Option<AnimationEasing>,
+    /// `appearance.animations.easing.workspace`.
+    pub easing_workspace: Option<AnimationEasing>,
+}
+
+impl AnimationsOverride {
+    /// Validates present duration leaves fail-closed (each `0..=500`).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("appearance.animations.duration_ms.open", self.duration_open),
+            (
+                "appearance.animations.duration_ms.close",
+                self.duration_close,
+            ),
+            (
+                "appearance.animations.duration_ms.focus",
+                self.duration_focus,
+            ),
+            (
+                "appearance.animations.duration_ms.workspace",
+                self.duration_workspace,
+            ),
+        ] {
+            if let Some(v) = value {
+                if v > MAX_ANIMATION_DURATION_MS {
+                    return Err(ConfigError::validation(
+                        field,
+                        format!("must be within [0, {MAX_ANIMATION_DURATION_MS}]"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Canonical Core-owned outline color (CTX-0340, RFC-0001/OQ-039).
 ///
 /// Accepted spelling is exactly `#RRGGBB` or `#RRGGBBAA` (8-digit form is
@@ -1154,6 +1574,10 @@ impl MouseConfig {
 pub struct AppearanceConfig {
     /// Optional theme identifier.
     pub theme: Option<String>,
+    /// Panel animation overrides (RFC-0002, CTX-0341). `None` means "this
+    /// layer says nothing"; a present value deep-merges per leaf, and the
+    /// effective concrete [`AnimationsConfig`] lives on [`EffectiveConfig`].
+    pub animations: Option<AnimationsOverride>,
 }
 
 impl AppearanceConfig {
@@ -1173,6 +1597,9 @@ impl AppearanceConfig {
                     format!("must be <= {MAX_THEME_LEN} bytes"),
                 ));
             }
+        }
+        if let Some(a) = &self.animations {
+            a.validate()?;
         }
         Ok(())
     }
@@ -1280,6 +1707,11 @@ pub struct EffectiveConfig {
     pub mouse: MouseConfig,
     /// Appearance config (theme defaults to `None` if unset).
     pub appearance: AppearanceConfig,
+    /// Resolved panel animation contract (RFC-0002, CTX-0341). Always a
+    /// concrete value: the accepted defaults plus every declared layer's
+    /// per-field overrides. Lives beside `appearance` because it is the
+    /// effective form of `appearance.animations`.
+    pub animations: AnimationsConfig,
     /// Leader/Mod key the shipped chrome map is expressed against (CTX-0236;
     /// default Alt). Honored by [`crate::keymap::resolve_keymaps`].
     pub mod_key: ModKey,
@@ -1305,6 +1737,7 @@ impl Default for EffectiveConfig {
             scrollbar: ScrollbarConfig::default(),
             mouse: MouseConfig::default(),
             appearance: AppearanceConfig::default(),
+            animations: AnimationsConfig::default(),
             mod_key: ModKey::default(),
             keymaps: Vec::new(),
             plugins: Vec::new(),
@@ -1318,12 +1751,19 @@ impl EffectiveConfig {
     /// Returns the built-in safe configuration: every field at its core
     /// default except the Core-owned decoration forced to the safe-mode values
     /// (`0/0/1/0/0` geometry and the opaque `#FFFFFF`/`#808080` outline pair)
-    /// regardless of external configuration (`bitty --safe`, spec rule 5,
-    /// R-009/P0-AC-019). The result is always valid; construction itself
-    /// performs no I/O.
+    /// and every panel-animation duration forced to `0` ms (RFC-0002: `--safe`
+    /// forces instant final-state application) regardless of external
+    /// configuration (`bitty --safe`, spec rule 5, R-009/P0-AC-019). The
+    /// result is always valid; construction itself performs no I/O.
     #[must_use]
     pub fn with_safe_decoration(mut self) -> Self {
         self.decoration = DecorationConfig::safe();
+        self.animations.duration_ms = AnimationDurations {
+            open: 0,
+            close: 0,
+            focus: 0,
+            workspace: 0,
+        };
         self
     }
 
@@ -1343,6 +1783,7 @@ impl EffectiveConfig {
         self.scrollbar.validate()?;
         self.mouse.validate()?;
         self.appearance.validate()?;
+        self.animations.validate()?;
         if self.keymaps.len() > MAX_KEYMAPS {
             return Err(ConfigError::validation(
                 "keymaps",
@@ -2176,5 +2617,255 @@ mod tests {
         // No user color can survive safe mode: the resolver never reads a
         // theme token when an explicit pair is present.
         assert_ne!(r.focused, DEFAULT_DECORATION_BORDER_FOCUSED);
+    }
+
+    #[test]
+    fn animations_defaults_match_rfc0002_and_validate() {
+        // RFC-0002: open 150 / close 120 / focus 100 / workspace 200 ms;
+        // enabled = true; reduced_motion = "auto"; ratified easings.
+        const { assert!(DEFAULT_ANIMATION_OPEN_MS == 150) }
+        const { assert!(DEFAULT_ANIMATION_CLOSE_MS == 120) }
+        const { assert!(DEFAULT_ANIMATION_FOCUS_MS == 100) }
+        const { assert!(DEFAULT_ANIMATION_WORKSPACE_MS == 200) }
+        const { assert!(MAX_ANIMATION_DURATION_MS == 500) }
+        let a = AnimationsConfig::default();
+        assert!(a.enabled);
+        assert_eq!(a.reduced_motion, ReducedMotion::Auto);
+        assert_eq!(
+            a.duration_ms,
+            AnimationDurations {
+                open: 150,
+                close: 120,
+                focus: 100,
+                workspace: 200,
+            }
+        );
+        assert_eq!(
+            a.easing,
+            AnimationEasings {
+                open: AnimationEasing::EaseOut,
+                close: AnimationEasing::EaseIn,
+                focus: AnimationEasing::EaseInOut,
+                workspace: AnimationEasing::EaseInOut,
+            }
+        );
+        a.validate().expect("accepted defaults valid");
+        // Effective duration follows the contract defaults when nothing
+        // reduces motion.
+        assert_eq!(
+            a.effective_duration_ms(AnimationTransition::Open, false, false),
+            150
+        );
+        assert_eq!(
+            a.effective_duration_ms(AnimationTransition::Workspace, false, false),
+            200
+        );
+        // Bound boundaries are accepted: 0 and 500 inclusive.
+        for raw in [0u32, 500] {
+            let b = AnimationsConfig {
+                duration_ms: AnimationDurations {
+                    open: raw,
+                    close: raw,
+                    focus: raw,
+                    workspace: raw,
+                },
+                ..Default::default()
+            };
+            b.validate().expect("0 and 500 are inside the hard bound");
+        }
+        // Out-of-range durations fail closed naming the field, never clamp.
+        for (field, bad) in [
+            ("appearance.animations.duration_ms.open", 501u32),
+            ("appearance.animations.duration_ms.close", 999),
+            ("appearance.animations.duration_ms.focus", 501),
+            ("appearance.animations.duration_ms.workspace", 501),
+        ] {
+            let mut b = AnimationsConfig::default();
+            match field {
+                "appearance.animations.duration_ms.open" => b.duration_ms.open = bad,
+                "appearance.animations.duration_ms.close" => b.duration_ms.close = bad,
+                "appearance.animations.duration_ms.focus" => b.duration_ms.focus = bad,
+                _ => b.duration_ms.workspace = bad,
+            }
+            let err = b.validate().expect_err("out-of-range must fail closed");
+            assert_eq!(err.field(), Some(field), "wrong field for {field}");
+        }
+        // Layer-level override validation shares the same bound and paths.
+        for (field, over) in [
+            (
+                "appearance.animations.duration_ms.open",
+                AnimationsOverride {
+                    duration_open: Some(501),
+                    ..Default::default()
+                },
+            ),
+            (
+                "appearance.animations.duration_ms.close",
+                AnimationsOverride {
+                    duration_close: Some(u32::MAX),
+                    ..Default::default()
+                },
+            ),
+            (
+                "appearance.animations.duration_ms.focus",
+                AnimationsOverride {
+                    duration_focus: Some(501),
+                    ..Default::default()
+                },
+            ),
+            (
+                "appearance.animations.duration_ms.workspace",
+                AnimationsOverride {
+                    duration_workspace: Some(501),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = over.validate().expect_err("override must fail closed");
+            assert_eq!(err.field(), Some(field), "wrong field for {field}");
+        }
+        // Effective-level validation covers appearance.animations too.
+        let mut eff = EffectiveConfig::default();
+        eff.animations.duration_ms.open = MAX_ANIMATION_DURATION_MS + 1;
+        eff.validate()
+            .expect_err("effective must reject oversized animation duration");
+    }
+
+    #[test]
+    fn animation_overrides_apply_per_field_and_inherit_the_rest() {
+        // RFC-0002: the table deep-merges while each field is scalar-replace;
+        // a layer that sets one duration/easing leaves the others intact.
+        let mut a = AnimationsConfig::default();
+        a.apply_overrides(&AnimationsOverride {
+            duration_open: Some(500),
+            easing_open: Some(AnimationEasing::Linear),
+            ..Default::default()
+        });
+        assert_eq!(a.duration_ms.open, 500);
+        assert_eq!(a.easing.open, AnimationEasing::Linear);
+        // Untouched leaves inherit the accepted defaults.
+        assert_eq!(a.duration_ms.close, DEFAULT_ANIMATION_CLOSE_MS);
+        assert_eq!(a.duration_ms.focus, DEFAULT_ANIMATION_FOCUS_MS);
+        assert_eq!(a.duration_ms.workspace, DEFAULT_ANIMATION_WORKSPACE_MS);
+        assert_eq!(a.easing.close, AnimationEasing::EaseIn);
+        // A second layer overrides a disjoint leaf and keeps the first.
+        a.apply_overrides(&AnimationsOverride {
+            enabled: Some(false),
+            reduced_motion: Some(ReducedMotion::Always),
+            ..Default::default()
+        });
+        assert!(!a.enabled);
+        assert_eq!(a.reduced_motion, ReducedMotion::Always);
+        assert_eq!(a.duration_ms.open, 500, "earlier override survives");
+        assert_eq!(a.easing.open, AnimationEasing::Linear);
+        // Empty override is a pure no-op (this layer said nothing).
+        let before = a;
+        a.apply_overrides(&AnimationsOverride::default());
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn animation_easing_enum_round_trips_and_spring_maps_to_ease_in_out() {
+        for (raw, value) in [
+            ("linear", AnimationEasing::Linear),
+            ("ease_in", AnimationEasing::EaseIn),
+            ("ease_out", AnimationEasing::EaseOut),
+            ("ease_in_out", AnimationEasing::EaseInOut),
+            ("spring", AnimationEasing::Spring),
+        ] {
+            assert_eq!(AnimationEasing::parse(raw), Some(value));
+            assert_eq!(value.as_str(), raw);
+        }
+        // Unknown spellings fail closed (the caller names the field).
+        for bad in ["ease", "ease-in", "Spring", "cubic_bezier", ""] {
+            assert_eq!(AnimationEasing::parse(bad), None, "{bad} must be unknown");
+        }
+        // RFC-0002: spring parameters are deferred, so `spring` resolves to
+        // the `ease_in_out` curve.
+        assert_eq!(
+            AnimationEasing::Spring.resolved(),
+            AnimationEasing::EaseInOut
+        );
+        assert_eq!(AnimationEasing::Linear.resolved(), AnimationEasing::Linear);
+        let a = AnimationsConfig {
+            easing: AnimationEasings {
+                open: AnimationEasing::Spring,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            a.effective_easing(AnimationTransition::Open),
+            AnimationEasing::EaseInOut
+        );
+    }
+
+    #[test]
+    fn reduced_motion_enum_parses_exactly() {
+        for (raw, value) in [
+            ("auto", ReducedMotion::Auto),
+            ("always", ReducedMotion::Always),
+            ("never", ReducedMotion::Never),
+        ] {
+            assert_eq!(ReducedMotion::parse(raw), Some(value));
+            assert_eq!(value.as_str(), raw);
+        }
+        for bad in ["Auto", "system", "on", ""] {
+            assert_eq!(ReducedMotion::parse(bad), None, "{bad} must be unknown");
+        }
+    }
+
+    #[test]
+    fn animation_effective_duration_honors_disabled_reduced_and_safe() {
+        let base = AnimationsConfig::default();
+        // Disabled is equivalent to 0 ms durations but keeps the contract.
+        let disabled = AnimationsConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        for t in [
+            AnimationTransition::Open,
+            AnimationTransition::Close,
+            AnimationTransition::Focus,
+            AnimationTransition::Workspace,
+        ] {
+            assert_eq!(disabled.effective_duration_ms(t, false, false), 0);
+        }
+        // `reduced_motion = "always"` forces 0 even when enabled.
+        let always = AnimationsConfig {
+            reduced_motion: ReducedMotion::Always,
+            ..Default::default()
+        };
+        assert_eq!(
+            always.effective_duration_ms(AnimationTransition::Open, false, false),
+            0
+        );
+        // `reduced_motion = "never"` ignores the platform signal.
+        let never = AnimationsConfig {
+            reduced_motion: ReducedMotion::Never,
+            ..Default::default()
+        };
+        assert_eq!(
+            never.effective_duration_ms(AnimationTransition::Open, true, false),
+            150
+        );
+        // `auto` follows the platform signal.
+        assert_eq!(
+            base.effective_duration_ms(AnimationTransition::Open, true, false),
+            0
+        );
+        assert_eq!(
+            base.effective_duration_ms(AnimationTransition::Focus, false, false),
+            100
+        );
+        // `--safe` forces 0 regardless of config and the platform signal.
+        assert_eq!(
+            base.effective_duration_ms(AnimationTransition::Open, false, true),
+            0
+        );
+        assert_eq!(
+            never.effective_duration_ms(AnimationTransition::Workspace, false, true),
+            0
+        );
     }
 }

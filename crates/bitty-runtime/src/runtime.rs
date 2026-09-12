@@ -114,6 +114,7 @@ use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
+pub mod animations;
 pub mod help;
 pub mod input;
 pub mod kitty_images;
@@ -129,6 +130,10 @@ pub mod search;
 pub mod selection;
 pub mod workspaces;
 
+pub use self::animations::{
+    AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame, MAX_CONCURRENT_ANIMATIONS,
+    PanelAnimator, ReducedMotionMode,
+};
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::PresentStats;
 
@@ -354,6 +359,24 @@ pub struct Runtime {
     /// transient pass-through never steals focus. Presentation-only: never
     /// grid truth.
     hover_pending: Option<HoverPending>,
+    /// Renderer-side panel animation tracker (RFC-0002, CTX-0341).
+    ///
+    /// Presentation-only chrome transitions (open/close/focus/workspace) with
+    /// bounded durations and easings. Never grid truth; frame-on-demand is
+    /// preserved because `is_active`/`next_deadline` gate the present path and
+    /// a completed animation schedules no further wakeups. See
+    /// [`crate::runtime::animations`].
+    animator: PanelAnimator,
+    /// Frames retained for an in-flight close transition (RFC-0002).
+    ///
+    /// A removed `View` has no allocation to paint from, so its last presented
+    /// frame is retained and painted as a fading ring/background until the
+    /// close duration elapses. Bounded by [`MAX_CONCURRENT_ANIMATIONS`] and
+    /// dropped as soon as its close animation completes.
+    closing_frames: Vec<ClosingFrame>,
+    /// Active workspace at the last present (RFC-0002 workspace transition
+    /// detection). Mirrors `last_presented_focus` for the workspace kind.
+    last_presented_workspace: usize,
     /// Last clipboard failure observed on the mouse-paste path (CTX-0158).
     ///
     /// Ghostty copies a committed left-drag selection to both the standard
@@ -676,6 +699,9 @@ impl Runtime {
             scrollbar_visible: false,
             alt_drag: None,
             hover_pending: None,
+            animator: PanelAnimator::default(),
+            closing_frames: Vec::new(),
+            last_presented_workspace: 0,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),
@@ -798,6 +824,9 @@ impl Runtime {
             scrollbar_visible: false,
             alt_drag: None,
             hover_pending: None,
+            animator: PanelAnimator::default(),
+            closing_frames: Vec::new(),
+            last_presented_workspace: 0,
             last_clipboard_error: None,
             last_cursor: None,
             search_state: SearchState::new(),

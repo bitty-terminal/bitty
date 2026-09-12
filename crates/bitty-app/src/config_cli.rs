@@ -720,6 +720,53 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         check_row("decoration.border_color_idle.advisory", warning, "advisory")
                     );
                 }
+                // CTX-0341 (RFC-0002): report the resolved animation contract
+                // (durations/easings are already `spring`-resolved and
+                // bounded; the reload diff is live).
+                for (field, value) in [
+                    (
+                        "appearance.animations.enabled",
+                        e.animations.enabled.to_string(),
+                    ),
+                    (
+                        "appearance.animations.reduced_motion",
+                        e.animations.reduced_motion.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.open",
+                        e.animations.duration_ms.open.to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.close",
+                        e.animations.duration_ms.close.to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.focus",
+                        e.animations.duration_ms.focus.to_string(),
+                    ),
+                    (
+                        "appearance.animations.duration_ms.workspace",
+                        e.animations.duration_ms.workspace.to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.open",
+                        e.animations.easing.open.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.close",
+                        e.animations.easing.close.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.focus",
+                        e.animations.easing.focus.as_str().to_string(),
+                    ),
+                    (
+                        "appearance.animations.easing.workspace",
+                        e.animations.easing.workspace.as_str().to_string(),
+                    ),
+                ] {
+                    println!("{}", check_row(field, value, &src(field)));
+                }
                 println!(
                     "{}",
                     check_row(
@@ -988,10 +1035,63 @@ pub(crate) fn runtime_config_from_effective(
         let outline = effective.decoration.resolve_outline(theme);
         cfg.outline_focused = outline.focused.0;
         cfg.outline_idle = outline.idle.0;
+        // RFC-0002 (CTX-0341): map the resolved effective animation contract
+        // onto the runtime policy. Durations are already bounded by
+        // `bitty-config` (fail-closed `0..=500`); `spring` was already mapped
+        // to `ease_in_out` by the resolver. `safe_mode` is encoded into the
+        // effective durations (`with_safe_decoration` zeroes them), so the
+        // runtime policy needs no separate flag here.
+        cfg.animations = animation_policy_from_effective(effective);
         // CTX-0297: effective `terminal.scrollback` is carried the same way;
         // terminal creation captures it as the retention cap.
         cfg.scrollback = scrollback;
         cfg
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
+}
+
+/// Maps the resolved `bitty-config` animation contract onto the runtime
+/// policy (RFC-0002, CTX-0341).
+///
+/// Durations are clamped defensively to the accepted `0..=500` ms hard bound
+/// (already enforced fail-closed by `bitty-config`), and `spring` easings are
+/// resolved to `ease_in_out` at the boundary so the runtime engine has no
+/// deferred curve. `safe_mode` and `platform_reduced` are left false here:
+/// safe mode is already encoded as zero effective durations, and the platform
+/// reduced-motion signal is owned by the app/embedder (no platform query
+/// exists in this slice, documented as an honest gap in RFC-0002 verification).
+fn animation_policy_from_effective(
+    effective: &bitty_config::EffectiveConfig,
+) -> bitty_runtime::AnimationPolicy {
+    use bitty_config::types::AnimationEasing as CEasing;
+    let map_curve = |e: CEasing| match e.resolved() {
+        CEasing::Linear => bitty_runtime::AnimationCurve::Linear,
+        CEasing::EaseIn => bitty_runtime::AnimationCurve::EaseIn,
+        CEasing::EaseOut => bitty_runtime::AnimationCurve::EaseOut,
+        CEasing::EaseInOut | CEasing::Spring => bitty_runtime::AnimationCurve::EaseInOut,
+    };
+    let reduced = match effective.animations.reduced_motion {
+        bitty_config::types::ReducedMotion::Always => bitty_runtime::ReducedMotionMode::Always,
+        bitty_config::types::ReducedMotion::Never => bitty_runtime::ReducedMotionMode::Never,
+        bitty_config::types::ReducedMotion::Auto => bitty_runtime::ReducedMotionMode::Auto,
+    };
+    let clamped = |ms: u32| ms.min(bitty_runtime::config::MAX_ANIMATION_DURATION_MS);
+    bitty_runtime::AnimationPolicy {
+        enabled: effective.animations.enabled,
+        duration_ms: [
+            clamped(effective.animations.duration_ms.open),
+            clamped(effective.animations.duration_ms.close),
+            clamped(effective.animations.duration_ms.focus),
+            clamped(effective.animations.duration_ms.workspace),
+        ],
+        curves: [
+            map_curve(effective.animations.easing.open),
+            map_curve(effective.animations.easing.close),
+            map_curve(effective.animations.easing.focus),
+            map_curve(effective.animations.easing.workspace),
+        ],
+        reduced_motion: reduced,
+        safe_mode: false,
+        platform_reduced: false,
+    }
 }

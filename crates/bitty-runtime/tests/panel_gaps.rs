@@ -10,12 +10,22 @@
 //! - Gap bands stay bg after split + after resize (CTX-0151 stale-bg /
 //!   CTX-0228 no-repaint classes). All headless, deterministic, RGBA-asserted.
 
-use bitty_runtime::{Gaps, LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
+use bitty_runtime::{
+    AnimationPolicy, Gaps, LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId,
+};
 
 fn gapped_runtime(gaps_in: u16, gaps_out: u16) -> Runtime {
     Runtime::new(RuntimeConfig {
         gaps_in,
         gaps_out,
+        // RFC-0002 (CTX-0341): animations default ON and a new split View
+        // triggers an open transition, which would present extra frames. These
+        // tests pin gap geometry and the frame-on-demand idle contract, not
+        // the animation feature, so they disable it explicitly.
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
         ..RuntimeConfig::default()
     })
     .expect("gapped config must build")

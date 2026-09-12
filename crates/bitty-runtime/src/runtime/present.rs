@@ -424,6 +424,24 @@ impl Runtime {
             pending_full = true;
         }
 
+        // RFC-0002 (CTX-0341): derive open/close/focus/workspace transitions
+        // from the last presented frame and arm the bounded animations. This
+        // runs before the idle short-circuit so an armed transition forces the
+        // frame even when no PTY bytes advanced the generation. It mutates
+        // presentation-only animation state, never terminal truth.
+        // `advance_animations` first drops transitions that expired since the
+        // last frame and reports it, so this frame is the one that commits the
+        // final end state (the next frame then idles).
+        let expired_animations = self.advance_animations(now);
+        let active_workspace = self.active_workspace_index();
+        self.detect_panel_animations(&allocations, focused, active_workspace, now);
+        let animations_active = self.animator.is_active(now);
+        if animations_active || expired_animations {
+            // A live (or just-completed) animation is a presentation-only
+            // change: force the full per-leaf path for this frame.
+            pending_full = true;
+        }
+
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).
         if !pending_full && !origins_changed && last != u64::MAX {
@@ -497,11 +515,26 @@ impl Runtime {
         // `u32` and must never wrap into a negative `i32` origin.
         let pad_px = i32::try_from(self.window_padding_physical()).unwrap_or(i32::MAX);
 
+        // RFC-0002 (CTX-0341): per-surface animation factors for this frame.
+        // `open_factor` scales the core-owned ring alpha during a panel open;
+        // the workspace factor cross-fades Core-owned chrome on a workspace
+        // switch; the focus factor (applied inside the loop) cross-fades the
+        // outline color. All default to the final value when the transition is
+        // instant or already complete. Purely presentation: no grid, cursor,
+        // scrollback, or Terminal Truth is interpolated.
+        let workspace_factor = self
+            .animation_progress(AnimationKind::Workspace, None, now)
+            .map(|p| p.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
         for frame in &allocations {
             if frame.content.width == 0 || frame.content.height == 0 {
                 continue;
             }
             let view_id = &frame.view;
+            let open_factor = self
+                .animation_progress(AnimationKind::Open, Some(*view_id), now)
+                .map(|p| p.clamp(0.0, 1.0))
+                .unwrap_or(1.0);
             // CTX-0176: a leaf with its own shell renders that session's
             // grid. CTX-0234: a leaf WITHOUT a session renders the shared
             // primary snapshot ONLY while focused — multipane input routing
@@ -693,11 +726,34 @@ impl Runtime {
                     } else {
                         self.config.outline_idle
                     };
+                    // RFC-0002 (CTX-0341): the focus transition cross-fades
+                    // the ring color from idle toward the focused accent over
+                    // the accepted duration. Geometry never moves; only the
+                    // Core-owned color interpolates. When not animating (or
+                    // instant), the final color is used unchanged.
+                    let animated_color = if is_focused_view {
+                        match self.animation_progress(AnimationKind::Focus, Some(*view_id), now) {
+                            Some(p) => bitty_render::grid::lerp_rgba(
+                                self.config.outline_idle,
+                                self.config.outline_focused,
+                                p,
+                            ),
+                            None => outline_color,
+                        }
+                    } else {
+                        outline_color
+                    };
+                    // Panel-open fades the ring in from transparent; the final
+                    // committed color is applied at animation end.
+                    let ring_color = bitty_render::grid::scale_alpha(
+                        animated_color,
+                        open_factor * workspace_factor,
+                    );
                     combined_rounded.push(bitty_render::grid::RoundedFill {
                         frame: ring_frame,
                         border: frame.border,
                         radius: frame.radius,
-                        color: outline_color,
+                        color: ring_color,
                     });
                     any_needs_draw = true;
                 }
@@ -725,6 +781,37 @@ impl Runtime {
                 glyph.clip = frame_clip;
                 combined_glyphs.push(glyph);
             }
+        }
+
+        // RFC-0002 (CTX-0341): paint the retained frames of Views closed
+        // during the current close transition. A closed View has no live
+        // allocation, so its last presented ring fades out over the accepted
+        // close duration; the final removed state is committed at animation
+        // end (the closing frame is dropped once the tracker reports no
+        // progress). Terminal content is never retained or interpolated —
+        // only the Core-owned ring. Bounded by MAX_CONCURRENT_ANIMATIONS.
+        for closing in &self.closing_frames {
+            if closing.frame.width == 0 || closing.frame.height == 0 {
+                continue;
+            }
+            let remaining = self.animation_progress(AnimationKind::Close, Some(closing.view), now);
+            let factor = remaining.map(|p| 1.0 - p.clamp(0.0, 1.0)).unwrap_or(0.0);
+            if factor <= 0.0 {
+                continue;
+            }
+            let ring_frame = bitty_render::geometry::RectPx::new(
+                px_add(pad_px, closing.frame.x),
+                px_add(pad_px, closing.frame.y),
+                closing.frame.width,
+                closing.frame.height,
+            );
+            combined_rounded.push(bitty_render::grid::RoundedFill {
+                frame: ring_frame,
+                border: closing.border,
+                radius: closing.radius,
+                color: bitty_render::grid::scale_alpha(closing.color, factor),
+            });
+            any_needs_draw = true;
         }
 
         // Selection highlight overlay (CTX-0158, ghostty selection rendering):

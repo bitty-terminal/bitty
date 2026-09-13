@@ -80,7 +80,38 @@ impl SnapshotSource for CommittedSnapshot {
 
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
 fn store_root() -> Option<PathBuf> {
-    data_home().map(|base| base.join("bitty").join("plugins"))
+    store_root_for(
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Resolved XDG plugin store root from explicit environment values.
+///
+/// Shared by startup discovery and the `bitty plugin` package-manager CLI so
+/// both resolve the exact same store without reading process environment
+/// inside the CLI (hermetic tests pass the values in).
+pub(crate) fn store_root_for(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    data_home_for(xdg_data_home, home).map(|base| base.join("bitty").join("plugins"))
+}
+
+/// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment values.
+pub(crate) fn data_home_for(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_data_home {
+        if !xdg.trim().is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    home.filter(|home| !home.trim().is_empty())
+        .map(|home| PathBuf::from(home).join(".local").join("share"))
+}
+
+/// `$XDG_DATA_HOME` or `$HOME/.local/share`.
+fn data_home() -> Option<PathBuf> {
+    data_home_for(
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
 }
 
 /// Untrusted local-path development roots from `$BITTY_PLUGIN_DIR`.
@@ -94,19 +125,6 @@ fn dev_roots() -> Vec<PathBuf> {
     } else {
         Vec::new()
     }
-}
-
-/// `$XDG_DATA_HOME` or `$HOME/.local/share`.
-fn data_home() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.trim().is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|home| !home.trim().is_empty())
-        .map(|home| PathBuf::from(home).join(".local").join("share"))
 }
 
 /// Discover and activate installed and development plugins, returning the live

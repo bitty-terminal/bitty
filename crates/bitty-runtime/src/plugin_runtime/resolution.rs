@@ -166,51 +166,33 @@ pub fn resolve_record(
     let (package_root, mut unverified) = match record.source_class {
         SourceClass::LocalPath => {
             let recorded = PathBuf::from(&record.root);
-            if !recorded.is_absolute() {
-                return Err(integrity(
-                    &plugin,
-                    "local-path root must be an absolute path",
-                ));
-            }
-            let canonical =
-                std::fs::canonicalize(&recorded).map_err(|error| PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("local-path root unreadable: {error}"),
+            if recorded.is_absolute() {
+                // Development flow (RFC B.5): read-only live tree, re-digested
+                // on every load; drift is reported by staying unverified.
+                let canonical = std::fs::canonicalize(&recorded).map_err(|error| {
+                    PluginRuntimeError::NotFound {
+                        plugin: plugin.clone(),
+                        detail: format!("local-path root unreadable: {error}"),
+                    }
                 })?;
-            // Never follow a changed path or a new symlink target silently: the
-            // recorded root must already be the canonical development path.
-            if canonical != recorded {
-                return Err(integrity(
-                    &plugin,
-                    "local-path root is not the canonical recorded path",
-                ));
-            }
-            (canonical, true)
-        }
-        _ => {
-            if !is_safe_relative(&record.root) {
-                return Err(integrity(
-                    &plugin,
-                    "installed root must be a safe store-relative path",
-                ));
-            }
-            let store_canonical = std::fs::canonicalize(store_root).map_err(|error| {
-                PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("store root unreadable: {error}"),
+                // Never follow a changed path or a new symlink target silently: the
+                // recorded root must already be the canonical development path.
+                if canonical != recorded {
+                    return Err(integrity(
+                        &plugin,
+                        "local-path root is not the canonical recorded path",
+                    ));
                 }
-            })?;
-            let joined = store_root.join(&record.root);
-            let canonical =
-                std::fs::canonicalize(&joined).map_err(|error| PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("package root missing: {error}"),
-                })?;
-            if !canonical.starts_with(&store_canonical) {
-                return Err(integrity(&plugin, "package root escapes the plugin store"));
+                (canonical, true)
+            } else {
+                // Staged local install: the package-manager copy under
+                // `packages/` is immutable, so a digest mismatch is store
+                // tampering (fail closed) while the provenance class stays
+                // visibly unverified.
+                (store_relative_root(store_root, record)?, true)
             }
-            (canonical, false)
         }
+        _ => (store_relative_root(store_root, record)?, false),
     };
 
     let module_root = module_root_for(&package_root);
@@ -254,7 +236,9 @@ pub fn resolve_record(
     let id = manifest.id().clone();
     let digest = scan_module_tree(id.as_str(), &module_root)?;
     if !digest.eq_ignore_ascii_case(&record.content_digest) {
-        if record.source_class == SourceClass::LocalPath {
+        let live_dev_tree =
+            record.source_class == SourceClass::LocalPath && Path::new(&record.root).is_absolute();
+        if live_dev_tree {
             // Drift is reported, not hidden: the package stays unverified until
             // it is re-resolved (RFC B.5 rule 3).
             unverified = true;
@@ -268,7 +252,40 @@ pub fn resolve_record(
         module_root,
         source_class: record.source_class,
         unverified,
+        granted: Some(record.granted.clone()),
     })
+}
+
+/// Canonicalize a store-relative recorded root, fail closed on escapes.
+///
+/// Shared by installed (`registry`/`git`) records and staged `local-path`
+/// records; the caller owns the provenance and trust flags.
+fn store_relative_root(
+    store_root: &Path,
+    record: &PluginRecord,
+) -> Result<PathBuf, PluginRuntimeError> {
+    let plugin = &record.plugin_id;
+    if !is_safe_relative(&record.root) {
+        return Err(integrity(
+            plugin,
+            "installed root must be a safe store-relative path",
+        ));
+    }
+    let store_canonical =
+        std::fs::canonicalize(store_root).map_err(|error| PluginRuntimeError::NotFound {
+            plugin: plugin.clone(),
+            detail: format!("store root unreadable: {error}"),
+        })?;
+    let joined = store_root.join(&record.root);
+    let canonical =
+        std::fs::canonicalize(&joined).map_err(|error| PluginRuntimeError::NotFound {
+            plugin: plugin.clone(),
+            detail: format!("package root missing: {error}"),
+        })?;
+    if !canonical.starts_with(&store_canonical) {
+        return Err(integrity(plugin, "package root escapes the plugin store"));
+    }
+    Ok(canonical)
 }
 
 /// Compute the canonical content digest of a package's module tree.
@@ -384,7 +401,7 @@ pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, Plug
 
 /// The module root a package is loaded from: `<root>/lua` when present, else
 /// the package root itself.
-fn module_root_for(package_root: &Path) -> PathBuf {
+pub(crate) fn module_root_for(package_root: &Path) -> PathBuf {
     let lua = package_root.join("lua");
     if lua.is_dir() {
         lua

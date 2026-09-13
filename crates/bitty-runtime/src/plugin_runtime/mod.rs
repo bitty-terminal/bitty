@@ -22,6 +22,7 @@
 //! The numeric bounds below are the RFC's ratified defaults.
 
 pub mod manifest_toml;
+pub mod package;
 pub mod resolution;
 pub mod services;
 pub mod store;
@@ -34,6 +35,7 @@ use std::rc::Rc;
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
+use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
@@ -153,6 +155,11 @@ pub struct PluginPackage {
     /// `local-path` development source, including when re-digestion detects
     /// drift). Installed classes are verified or fail closed during discovery.
     pub unverified: bool,
+    /// Capabilities consented for this exact manifest hash, when the package
+    /// came from a resolved store record. `None` means the package's declared
+    /// set is granted in full (bundled and development sources have no
+    /// persisted grant record of their own).
+    pub granted: Option<Vec<String>>,
 }
 
 /// Configuration for a [`PluginRuntime`].
@@ -516,7 +523,7 @@ impl PluginRuntime {
     /// capture-validation, or VM failures. Failure leaves no partial
     /// activation.
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
-        let (manifest, module_root, init_path) = {
+        let (manifest, module_root, init_path, recorded_grant) = {
             let entry = self
                 .entries
                 .get(id)
@@ -559,13 +566,17 @@ impl PluginRuntime {
                 entry.package.manifest.clone(),
                 entry.package.module_root.clone(),
                 init_path,
+                entry.package.granted.clone(),
             )
         };
         let source = read_init(&init_path)?;
 
-        // Policy half: declare, resolve, register, grant, activate.
+        // Policy half: declare, resolve, register, grant, activate. The grant
+        // is the intersection of the manifest's declared capabilities with the
+        // consented record (RFC B.4: grants are bound to the manifest hash);
+        // development and bundled packages without a record grant in full.
         let hash = manifest.manifest_hash();
-        let required =
+        let declared =
             manifest
                 .capabilities
                 .all_ids()
@@ -573,12 +584,13 @@ impl PluginRuntime {
                     plugin: id.to_string(),
                     detail: error.to_string(),
                 })?;
+        let granted = effective_granted(id, &declared, recorded_grant.as_deref())?;
         let policy = (|| -> Result<(), PluginRuntimeError> {
             self.host.declare(manifest.clone())?;
             self.host.resolve(id)?;
             self.host.register(id)?;
             self.host
-                .insert_grant(GrantRecord::granted(id.clone(), hash, required.clone(), 0));
+                .insert_grant(GrantRecord::granted(id.clone(), hash, granted.clone(), 0));
             self.host.activate(id)?;
             Ok(())
         })();
@@ -599,10 +611,10 @@ impl PluginRuntime {
                 return Err(error);
             }
         };
-        let terminal_read = required
+        let terminal_read = granted
             .iter()
             .any(|capability| capability.as_str() == "terminal.semantic-read");
-        let platform_notify = required
+        let platform_notify = granted
             .iter()
             .any(|capability| capability.as_str() == "platform.notify");
         let plugin_services = Rc::new(PluginServices::new(
@@ -766,6 +778,63 @@ impl PluginRuntime {
         entry.state = LifecycleState::Disposed;
         let _ = self.host.remove(id);
         Ok(())
+    }
+
+    /// Reload one plugin generation (teardown-and-rebuild).
+    ///
+    /// Generation N is disposed (VM, registrations, and host ownership
+    /// released) before generation N+1 is resolved and activated: the accepted
+    /// model, with no mixed-generation authority and no in-memory state
+    /// handoff (persisted `bitty.store` data survives). Store-backed packages
+    /// are re-resolved from the atomic `current.json` pointer and re-verified
+    /// fail-closed; a development package is re-validated against the ratified
+    /// module-tree bounds. Bundled sources are application-shipped and are not
+    /// hot-swapped.
+    ///
+    /// A failed re-resolve or activation leaves the plugin cleanly disposed or
+    /// `Failed` (FS-6); the host never falls back silently to another revision
+    /// or to bundled content.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginRuntimeError`] when the plugin is unknown, bundled, or fails
+    /// re-resolution/activation.
+    pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        let (source_class, module_root) = {
+            let entry = self
+                .entries
+                .get(id)
+                .ok_or_else(|| lifecycle_error(id, "not found"))?;
+            (
+                entry.package.source_class,
+                entry.package.module_root.clone(),
+            )
+        };
+        if source_class.is_bundled() {
+            return Err(PluginRuntimeError::Lifecycle {
+                plugin: id.to_string(),
+                detail: "bundled sources are not hot-swapped".to_string(),
+            });
+        }
+        self.dispose(id)?;
+
+        if let Some(store_root) = self.store_root.clone() {
+            let records = resolution::load_index(&store_root)?;
+            if let Some(record) = records
+                .iter()
+                .find(|record| record.plugin_id == id.as_str())
+            {
+                let package = resolution::resolve_record(&store_root, record)?;
+                let entry = self.entries.get_mut(id).expect("entry exists");
+                entry.package = package;
+            } else if source_class == SourceClass::LocalPath {
+                verify_module_tree(id, &module_root)?;
+            }
+        } else if source_class == SourceClass::LocalPath {
+            verify_module_tree(id, &module_root)?;
+        }
+
+        self.activate(id)
     }
 
     /// Dispatch one captured command, invoking its `run` function under budget.
@@ -971,8 +1040,44 @@ fn verify_module_tree(id: &PluginId, root: &Path) -> Result<(), PluginRuntimeErr
     resolution::scan_module_tree(id.as_str(), root).map(|_| ())
 }
 
+/// The capabilities a generation may exercise: the declared set intersected
+/// with the consented store record, or the full declared set when the package
+/// has no record (bundled and development sources).
+///
+/// A record grant that names an undeclared capability is store tampering and
+/// fails closed; grants are bound to the manifest hash that resolution already
+/// re-verified, so a replacement manifest cannot silently widen authority.
+fn effective_granted(
+    id: &PluginId,
+    declared: &BTreeSet<CapabilityId>,
+    recorded: Option<&[String]>,
+) -> Result<BTreeSet<CapabilityId>, PluginRuntimeError> {
+    let Some(recorded) = recorded else {
+        return Ok(declared.clone());
+    };
+    let mut effective = BTreeSet::new();
+    for raw in recorded {
+        let capability =
+            CapabilityId::parse(raw).map_err(|error| PluginRuntimeError::Integrity {
+                plugin: id.to_string(),
+                detail: format!("recorded grant is not a capability identifier: {error}"),
+            })?;
+        if !declared.contains(&capability) {
+            return Err(PluginRuntimeError::Integrity {
+                plugin: id.to_string(),
+                detail: format!(
+                    "recorded grant '{}' is not declared by the manifest",
+                    capability.as_str()
+                ),
+            });
+        }
+        effective.insert(capability);
+    }
+    Ok(effective)
+}
+
 /// Resolve the fixed `init.lua`: `<root>/init.lua` or `<root>/<module>/init.lua`.
-fn entry_point(module_root: &Path, id: &PluginId) -> Option<PathBuf> {
+pub(crate) fn entry_point(module_root: &Path, id: &PluginId) -> Option<PathBuf> {
     let direct = module_root.join("init.lua");
     if direct.is_file() {
         return Some(direct);
@@ -1058,6 +1163,7 @@ fn discover_root(
             module_root,
             source_class,
             unverified: source_class == SourceClass::LocalPath,
+            granted: None,
         });
     }
     Ok(packages)

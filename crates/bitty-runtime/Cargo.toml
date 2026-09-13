@@ -24,6 +24,9 @@ bitty-lua = { path = "../bitty-lua" }
 bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-agent = { path = "../bitty-agent" }
 bitty-ipc = { path = "../bitty-ipc" }
+# CTX-0406: the package-manager staging path evaluates the closed compat
+# requirement grammar with the same pure implementation the plugin host uses.
+bitty-package = { path = "../bitty-package" }
 # CTX-0248: the tick overlay path stores Kitty images and computes
 # placement rects through the rich layer (moved from dev-dependencies;
 # same workspace crate, no new supply-chain surface).
@@ -32,6 +35,5 @@ bitty-rich = { path = "../bitty-rich" }
 
 [dev-dependencies]
 bitty-agent = { path = "../bitty-agent" }
-bitty-package = { path = "../bitty-package" }
 bitty-config = { path = "../bitty-config" }
 bitty-test-support = { path = "../bitty-test-support" }

@@ -118,6 +118,7 @@ use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
+pub mod background_images;
 pub mod close_confirm;
 pub mod help;
 pub mod input;
@@ -563,6 +564,21 @@ pub struct Runtime {
     /// unchanged, so entering alt clears painted images (and leaving alt
     /// repaints the restored grid) instead of idling on a stale frame.
     kitty_alt_screen_latched: bool,
+    /// Decoded per-`View` background images (CTX-0347, RFC-0001/OQ-042).
+    ///
+    /// Loaded eagerly at construction from the validated config (global
+    /// `decoration.background_image` plus every `views.*.background_image`),
+    /// keyed by canonical path plus content identity. A load failure rejects
+    /// the whole config; `--safe` leaves the store empty and never opens a
+    /// file. The store owns the BG-4/BG-5 pool and the approved-root policy.
+    backgrounds: bitty_rich::BackgroundStore,
+    /// Configured path spelling -> resolved cache key (CTX-0347). The
+    /// present path looks up by the same spelling the config carries, so no
+    /// filesystem work happens per frame.
+    background_keys: std::collections::HashMap<String, bitty_rich::BackgroundKey>,
+    /// Scaled-background-blit cache across present frames (CTX-0347),
+    /// keyed by source identity + fit + destination rect + DPI.
+    background_rasters: bitty_rich::BackgroundRasterCache,
 }
 
 /// Opaque, runtime-issued proof of a platform input gesture.
@@ -815,6 +831,9 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,
+            backgrounds: bitty_rich::BackgroundStore::deny_all(),
+            background_keys: std::collections::HashMap::new(),
+            background_rasters: bitty_rich::BackgroundRasterCache::new(),
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
@@ -828,6 +847,7 @@ impl Runtime {
         runtime.renderer.set_theme_palette(config.theme);
         runtime.surface.set_theme_palette(config.theme);
         runtime.init_workspaces();
+        runtime.reload_backgrounds()?;
         Ok(runtime)
     }
 
@@ -952,6 +972,9 @@ impl Runtime {
             kitty_raster_cache: bitty_rich::KittyRasterCache::new(),
             kitty_last_frame_images: 0,
             kitty_alt_screen_latched: false,
+            backgrounds: bitty_rich::BackgroundStore::deny_all(),
+            background_keys: std::collections::HashMap::new(),
+            background_rasters: bitty_rich::BackgroundRasterCache::new(),
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
@@ -965,6 +988,7 @@ impl Runtime {
         runtime.renderer.set_theme_palette(config.theme);
         runtime.surface.set_theme_palette(config.theme);
         runtime.init_workspaces();
+        runtime.reload_backgrounds()?;
         Ok(runtime)
     }
 

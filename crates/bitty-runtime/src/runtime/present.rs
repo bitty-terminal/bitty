@@ -136,6 +136,9 @@ pub struct PresentStats {
     pub generation: u64,
     /// Number of Kitty image blits in the presented draw list.
     pub images: usize,
+    /// Number of per-`View` background-image blits in the presented draw
+    /// list (CTX-0347). Bound by the accepted BG-7 (32 blits / 64 MiB).
+    pub backgrounds: usize,
     /// Image blits the presenting path did not paint.
     ///
     /// Always `0` on the headless seam (every blit is blended). On a real
@@ -157,6 +160,7 @@ impl From<RenderPresentStats> for PresentStats {
             headless: value.headless,
             generation: 0,
             images: value.images,
+            backgrounds: 0,
             images_skipped: value.images_skipped,
         }
     }
@@ -254,6 +258,12 @@ struct CursorPaint {
 struct CombinedLeaves {
     fills: Vec<bitty_render::grid::FillRect>,
     rounded: Vec<bitty_render::grid::RoundedFill>,
+    /// CTX-0347 per-`View` background blits, emitted for every visible leaf
+    /// (reused or re-rendered) because this retryable pass rebuilds the
+    /// combined list from scratch on an atlas reset.
+    backgrounds: Vec<bitty_render::grid::ImageBlit>,
+    /// Bytes admitted by the CTX-0347 per-frame background budget so far.
+    background_bytes: usize,
     glyphs: Vec<bitty_render::grid::GlyphInstance>,
     needs_draw: bool,
     cursor: Option<CursorPaint>,
@@ -602,13 +612,15 @@ impl Runtime {
     }
 
     /// Paints the deferred focused-cursor overlay (CTX-0386) and arms the
-    /// platform-IME caret rect (CTX-0367). A no-op when the window lost
-    /// focus; the cursor never leaves a stale fill because it is not part of
-    /// any retained leaf list. Returns whether a fill was pushed.
+    /// platform-IME caret rect (CTX-0367). The fill lands in the CTX-0347
+    /// overlay layer so it stays visible above a per-`View` background image.
+    /// A no-op when the window lost focus; the cursor never leaves a stale
+    /// fill because it is not part of any retained leaf list. Returns whether
+    /// a fill was pushed.
     fn paint_cursor(
         &mut self,
         paint: &CursorPaint,
-        combined_fills: &mut Vec<bitty_render::grid::FillRect>,
+        combined_overlay: &mut Vec<bitty_render::grid::FillRect>,
     ) -> bool {
         if !self.focused {
             return false;
@@ -655,7 +667,7 @@ impl Runtime {
                 fill.rect.width,
                 fill.rect.height,
             );
-            combined_fills.push(bitty_render::grid::FillRect {
+            combined_overlay.push(bitty_render::grid::FillRect {
                 rect,
                 color: themed,
             });
@@ -971,6 +983,75 @@ impl Runtime {
                     self.push_leaf_ring(frame, view_id, open_factor, &ring_ctx, &mut built.rounded);
                 built.needs_draw |= ring_painted;
 
+                // CTX-0347 (RFC-0001/OQ-042): the resolved per-`View` background
+                // image paints inside the content rect, above cell backgrounds
+                // and the decoration ring, below overlay fills and glyphs. It
+                // is emitted for reused and freshly rendered leaves alike — the
+                // combined list is rebuilt every frame, and a reused leaf only
+                // retains fills/glyphs. The decode already happened at config
+                // reconcile; this path is a pure cache lookup plus a bounded
+                // nearest-neighbor scale. The per-frame budget mirrors BG-7
+                // (32 blits / 64 MiB staging) so a hostile layout can never
+                // allocate beyond the accepted present bound; refused entries
+                // skip fail-closed. Resolution is skipped entirely when no
+                // image can match (`has_background_images`), keeping the common
+                // no-image frame free of the per-View resolve and its fit
+                // allocation.
+                if frame.content.width > 0
+                    && frame.content.height > 0
+                    && self.config.has_background_images()
+                {
+                    let resolved = self.view_background_for(view_id);
+                    if let Some(path) = resolved.image.as_deref() {
+                        if let Some(key) = self.background_keys.get(path).cloned() {
+                            if let Some(image) = self.backgrounds.get(&key) {
+                                let dest = bitty_rich::RectPx::new(
+                                    origin_px_x,
+                                    origin_px_y,
+                                    frame.content.width,
+                                    frame.content.height,
+                                );
+                                let fit = bitty_rich::BackgroundFit::parse(&resolved.fit)
+                                    .unwrap_or_default();
+                                let raster_key = bitty_rich::BackgroundRasterKey {
+                                    source: bitty_rich::BackgroundRasterKeySource::from(&key),
+                                    fit,
+                                    dest,
+                                    dpi_bits: self.scale_factor.get().to_bits(),
+                                };
+                                if let Some(blit) =
+                                    self.background_rasters.get_or_rasterize(raster_key, &image)
+                                {
+                                    let bytes = u64::from(blit.dest.width)
+                                        .saturating_mul(u64::from(blit.dest.height))
+                                        .saturating_mul(4)
+                                        as usize;
+                                    if built.backgrounds.len()
+                                        < bitty_rich::BG_PRESENT_MAX_BLITS_PER_FRAME
+                                        && built.background_bytes.saturating_add(bytes)
+                                            <= bitty_rich::BG_PRESENT_MAX_BYTES_PER_FRAME
+                                    {
+                                        if let Ok(entry) = bitty_render::grid::ImageBlit::try_new(
+                                            bitty_render::geometry::RectPx::new(
+                                                blit.dest.x,
+                                                blit.dest.y,
+                                                blit.dest.width,
+                                                blit.dest.height,
+                                            ),
+                                            blit.rgba.clone(),
+                                        ) {
+                                            built.background_bytes =
+                                                built.background_bytes.saturating_add(bytes);
+                                            built.backgrounds.push(entry);
+                                            built.needs_draw = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if reuse {
                     let leaf = self
                         .presented_leaf_frames
@@ -1124,12 +1205,16 @@ impl Runtime {
         self.presented_leaf_frames
             .retain(|id, _| allocations.iter().any(|frame| frame.view == *id));
 
-        let mut combined_fills = built.fills;
+        let combined_fills = built.fills;
         let mut combined_rounded = built.rounded;
+        // CTX-0347: background blits ride the retryable leaf pass; the overlay
+        // layer (cursor, selection, chrome) is recomposed per frame above them.
+        let combined_backgrounds = built.backgrounds;
         let mut combined_glyphs = built.glyphs;
         let mut any_needs_draw = built.needs_draw;
+        let mut combined_overlay: Vec<bitty_render::grid::FillRect> = Vec::new();
         if let Some(paint) = built.cursor {
-            any_needs_draw |= self.paint_cursor(&paint, &mut combined_fills);
+            any_needs_draw |= self.paint_cursor(&paint, &mut combined_overlay);
         }
 
         // RFC-0002 (CTX-0341): paint the retained frames of Views closed
@@ -1199,7 +1284,7 @@ impl Runtime {
                                 for mut fill in rects {
                                     fill.rect.x = px_add(fill.rect.x, origin_px_x);
                                     fill.rect.y = px_add(fill.rect.y, origin_px_y);
-                                    combined_fills.push(fill);
+                                    combined_overlay.push(fill);
                                 }
                                 any_needs_draw = true;
                             }
@@ -1266,7 +1351,7 @@ impl Runtime {
                     // Background, underline, then glyphs: fills paint before
                     // glyphs in the `DrawList` order, so the text stays
                     // legible on the tint.
-                    combined_fills.push(bitty_render::grid::FillRect {
+                    combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             base_x,
                             base_y,
@@ -1275,7 +1360,7 @@ impl Runtime {
                         ),
                         color: [0x33, 0x33, 0x33, 0xCC],
                     });
-                    combined_fills.push(bitty_render::grid::FillRect {
+                    combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             base_x,
                             underline_y,
@@ -1290,7 +1375,7 @@ impl Runtime {
                     // Terminal cursor gate). Clamped into the drawn span.
                     let caret_bar_cells = caret_cells.min(drawn_cells);
                     let caret_bar_x = px_offset_cells(base_x, caret_bar_cells as u16, live.width);
-                    combined_fills.push(bitty_render::grid::FillRect {
+                    combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             caret_bar_x,
                             base_y,
@@ -1343,7 +1428,7 @@ impl Runtime {
                                 ),
                                 pad_px,
                             );
-                            combined_fills.push(bitty_render::grid::FillRect {
+                            combined_overlay.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
                                     banner_y,
@@ -1396,7 +1481,7 @@ impl Runtime {
                                 ),
                                 pad_px,
                             );
-                            combined_fills.push(bitty_render::grid::FillRect {
+                            combined_overlay.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
                                     banner_y,
@@ -1449,7 +1534,7 @@ impl Runtime {
                                 ),
                                 pad_px,
                             );
-                            combined_fills.push(bitty_render::grid::FillRect {
+                            combined_overlay.push(bitty_render::grid::FillRect {
                                 rect: bitty_render::geometry::RectPx::new(
                                     origin_px_x,
                                     banner_y,
@@ -1483,7 +1568,7 @@ impl Runtime {
             &allocations,
             &view_map,
             pad_px,
-            &mut combined_fills,
+            &mut combined_overlay,
             &mut combined_glyphs,
         ) {
             any_needs_draw = true;
@@ -1497,7 +1582,7 @@ impl Runtime {
         let scrollbar_now = self.scrollbar_thumb_fill();
         let paints = scrollbar_now.is_some();
         if let Some(fill) = scrollbar_now {
-            combined_fills.push(fill);
+            combined_overlay.push(fill);
             any_needs_draw = true;
         }
         self.scrollbar_visible = paints;
@@ -1650,6 +1735,8 @@ impl Runtime {
         if !any_needs_draw
             && combined_fills.is_empty()
             && combined_rounded.is_empty()
+            && combined_backgrounds.is_empty()
+            && combined_overlay.is_empty()
             && combined_glyphs.is_empty()
             && combined_images.is_empty()
         {
@@ -1666,6 +1753,8 @@ impl Runtime {
         // plan that reports needs_draw == true when we have content.
         // CTX-0252 F2: latch the presented blit count before the move below.
         let kitty_blits = combined_images.len();
+        // CTX-0347: latch the presented background-blit count too.
+        let background_blits = combined_backgrounds.len();
         // CTX-0386: the 1x1 plan probe below is the frame's last renderer
         // call; an atlas exhaustion reset inside it would invalidate every
         // retained slot, so drop the stores afterwards and let the next frame
@@ -1719,6 +1808,8 @@ impl Runtime {
                     },
                     fills: Vec::new(),
                     rounded_fills: Vec::new(),
+                    backgrounds: Vec::new(),
+                    overlay_fills: Vec::new(),
                     glyphs: Vec::new(),
                     images: Vec::new(),
                 });
@@ -1729,6 +1820,8 @@ impl Runtime {
             tmp_list.generation = current_gen;
             tmp_list.fills = combined_fills;
             tmp_list.rounded_fills = combined_rounded;
+            tmp_list.backgrounds = combined_backgrounds;
+            tmp_list.overlay_fills = combined_overlay;
             tmp_list.glyphs = combined_glyphs;
             tmp_list.images = combined_images;
             let plan_extent = self.present_plan_extent();
@@ -1832,6 +1925,7 @@ impl Runtime {
             headless: stats.headless,
             generation: current_gen,
             images: stats.images,
+            backgrounds: background_blits,
             images_skipped: stats.images_skipped,
         })
     }

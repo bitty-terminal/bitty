@@ -179,6 +179,22 @@ pub const DEFAULT_OUTLINE_WIDTH_IDLE: Option<u32> = None;
 /// bound fail-closed so a direct construction cannot arm an oversized ring.
 pub const MAX_OUTLINE_WIDTH_PX: u32 = 16;
 
+/// Maximum `background_image` path length in bytes (CTX-0347,
+/// RFC-0001/OQ-042: `<= 4096`). Mirrors `bitty-config`
+/// `MAX_BACKGROUND_IMAGE_PATH_BYTES`.
+pub const MAX_BACKGROUND_IMAGE_PATH_BYTES: usize = 4096;
+
+/// Maximum `background_image_roots` entries (CTX-0347, RFC-0001/OQ-042:
+/// `at most 32`). Mirrors `bitty-config` `MAX_BACKGROUND_IMAGE_ROOTS`.
+pub const MAX_BACKGROUND_IMAGE_ROOTS: usize = 32;
+
+/// Accepted background fit spellings (CTX-0347, RFC-0001/OQ-042).
+pub const BACKGROUND_FITS: [&str; 5] = ["fill", "fit", "center", "tile", "stretch"];
+
+/// Default background fit spelling (RFC-0001/OQ-042: `decoration.background_fit`
+/// defaults to `fill`).
+pub const DEFAULT_BACKGROUND_FIT: &str = "fill";
+
 /// Minimum resolved focused-outline contrast against the background
 /// (RFC-0001 AC-1, `3:1`). Mirrors
 /// `bitty-config` `MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST`; `bitty-runtime`
@@ -285,6 +301,21 @@ pub struct RuntimeViewOutline {
     pub width_idle: Option<u32>,
 }
 
+/// One `View`'s resolved background image and fit after per-`View` overrides
+/// (CTX-0347, RFC-0001/OQ-042).
+///
+/// The global `decoration.background_image`/`background_fit` pair is the base
+/// tier; a matching `views` rule overrides either field independently. The
+/// approved-root policy is deliberately absent: `background_image_roots` is
+/// global-only and cannot be widened per `View`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeViewBackground {
+    /// Resolved background-image path (`None` = no image contributes).
+    pub image: Option<String>,
+    /// Resolved fit spelling (always one of [`BACKGROUND_FITS`]).
+    pub fit: String,
+}
+
 /// The `views` rule (selector plus leaf) that last supplied one resolved
 /// runtime field, used for source-attributed contract diagnostics (CTX-0343).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,10 +396,48 @@ pub struct ViewAppearanceRule {
     pub border_width_focused: Option<u32>,
     /// Explicit idle outline width, logical px.
     pub border_width_idle: Option<u32>,
-    /// Background-image path (resolution only; decode/render is CTX-0347).
+    /// Background-image path (per-`View` tier; resolution is consumed by
+    /// the CTX-0347 present path via [`RuntimeConfig::resolve_view_background`]).
     pub background_image: Option<String>,
     /// Background fit mode spelled as the accepted enum.
     pub background_fit: Option<String>,
+}
+
+/// Validates one background-image/root path spelling fail-closed
+/// (CTX-0347, RFC-0001/OQ-042): non-empty, `<= 4096` bytes, no NUL, and
+/// absolute or `~`-anchored.
+fn validate_background_path(path: &str) -> Result<(), RuntimeError> {
+    if path.is_empty() {
+        return Err(RuntimeError::InvalidConfig(
+            "background image path must be non-empty",
+        ));
+    }
+    if path.len() > MAX_BACKGROUND_IMAGE_PATH_BYTES {
+        return Err(RuntimeError::InvalidConfig(
+            "background image path must be <= 4096 bytes",
+        ));
+    }
+    if path.contains('\0') {
+        return Err(RuntimeError::InvalidConfig(
+            "background image path must not contain NUL",
+        ));
+    }
+    if !(std::path::Path::new(path).is_absolute() || path.starts_with('~')) {
+        return Err(RuntimeError::InvalidConfig(
+            "background image path must be absolute or '~'-anchored",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one background fit spelling against the accepted closed set.
+fn validate_background_fit(fit: &str) -> Result<(), RuntimeError> {
+    if bitty_rich::BackgroundFit::parse(fit).is_none() {
+        return Err(RuntimeError::InvalidConfig(
+            "background fit must be one of fill, fit, center, tile, stretch",
+        ));
+    }
+    Ok(())
 }
 
 /// Maps a Core decoration validation failure to the runtime config error
@@ -551,6 +620,19 @@ pub struct RuntimeConfig {
     /// resolved outline values above. Matching is by canonical selector and
     /// the focused leaf's id; the runtime never reads terminal truth here.
     pub view_appearance: Vec<ViewAppearanceRule>,
+    /// Global default background-image path (CTX-0347, RFC-0001/OQ-042
+    /// `decoration.background_image`). `None` means no image contributes
+    /// unless a `views` rule sets one. The path is syntax-validated here and
+    /// resolved against [`Self::background_image_roots`] by the
+    /// `bitty-rich` loader.
+    pub background_image: Option<String>,
+    /// Global background fit spelling; always one of [`BACKGROUND_FITS`]
+    /// (default [`DEFAULT_BACKGROUND_FIT`]).
+    pub background_fit: String,
+    /// Approved background-image roots (CTX-0347
+    /// `decoration.background_image_roots`), deny-by-default. Global-only:
+    /// no `views` rule can widen it.
+    pub background_image_roots: Vec<String>,
     /// Resolved terminal palette for `appearance.theme` (CTX-0355): window
     /// background (clear color), default foreground, cursor, selection, and
     /// the 16 ANSI colors.
@@ -649,6 +731,9 @@ impl Default for RuntimeConfig {
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             view_appearance: Vec::new(),
+            background_image: None,
+            background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
+            background_image_roots: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
             theme_resolved: false,
             window_padding: DEFAULT_WINDOW_PADDING,
@@ -728,6 +813,9 @@ impl RuntimeConfig {
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             view_appearance: Vec::new(),
+            background_image: None,
+            background_fit: DEFAULT_BACKGROUND_FIT.to_string(),
+            background_image_roots: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
             theme_resolved: false,
             window_padding,
@@ -861,6 +949,28 @@ impl RuntimeConfig {
                     ));
                 }
             }
+            if let Some(path) = &rule.background_image {
+                validate_background_path(path)?;
+            }
+            if let Some(fit) = &rule.background_fit {
+                validate_background_fit(fit)?;
+            }
+        }
+        // CTX-0347 (RFC-0001/OQ-042): the global background image/fit and the
+        // deny-by-default root list repeat the accepted bounds fail-closed;
+        // neither is clamped. Root membership and decode are the
+        // `bitty-rich` loader's job.
+        if let Some(path) = &self.background_image {
+            validate_background_path(path)?;
+        }
+        validate_background_fit(&self.background_fit)?;
+        if self.background_image_roots.len() > MAX_BACKGROUND_IMAGE_ROOTS {
+            return Err(RuntimeError::InvalidConfig(
+                "background_image_roots must contain at most 32 entries",
+            ));
+        }
+        for root in &self.background_image_roots {
+            validate_background_path(root)?;
         }
         Ok(())
     }
@@ -873,11 +983,54 @@ impl RuntimeConfig {
     /// independent of rule order; an unset field inherits the next-less-
     /// specific value. `target` is the `(content, workspace, view)` tuple the
     /// caller derives from its public layout state. Background-image
-    /// resolution is config-layer only (decode/render is CTX-0347) and is
-    /// therefore not consumed here yet.
+    /// resolution is separate ([`Self::resolve_view_background`]) because the
+    /// image path is not part of the outline draw decision.
     #[must_use]
     pub fn resolve_view_outline(&self, target: &RuntimeViewTarget) -> RuntimeViewOutline {
         self.resolve_view_outline_traced(target).0
+    }
+
+    /// True when any background image could contribute (the global
+    /// `decoration.background_image` or any `views` rule). The present path
+    /// uses this to skip background resolution and its per-frame allocation
+    /// entirely on the common no-image configuration (CTX-0347).
+    #[must_use]
+    pub fn has_background_images(&self) -> bool {
+        self.background_image.is_some()
+            || self
+                .view_appearance
+                .iter()
+                .any(|rule| rule.background_image.is_some())
+    }
+
+    /// Resolves one `View`'s background image and fit (CTX-0347,    /// RFC-0001/OQ-042) from the global pair plus every matching per-`View`
+    /// rule.
+    ///
+    /// Resolution is per field per tier (`*` < content < `ws:` < `view:`),
+    /// independent of rule order; a rule that sets only the fit leaves the
+    /// inherited image in place and vice versa. The global
+    /// `background_image_roots` policy is not part of this resolution: no
+    /// `views` entry can widen it.
+    #[must_use]
+    pub fn resolve_view_background(&self, target: &RuntimeViewTarget) -> RuntimeViewBackground {
+        let mut image = self.background_image.clone();
+        let mut fit = self.background_fit.clone();
+        for tier in 0..=3u8 {
+            for rule in &self.view_appearance {
+                if runtime_selector_tier(&rule.selector) != Some(tier)
+                    || !runtime_selector_matches(&rule.selector, target)
+                {
+                    continue;
+                }
+                if let Some(value) = &rule.background_image {
+                    image = Some(value.clone());
+                }
+                if let Some(value) = &rule.background_fit {
+                    fit.clone_from(value);
+                }
+            }
+        }
+        RuntimeViewBackground { image, fit }
     }
 
     /// [`Self::resolve_view_outline`] plus the winning rule per resolved

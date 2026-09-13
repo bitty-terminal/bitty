@@ -481,6 +481,21 @@ pub fn draw_list_onto(
     for fill in &list.rounded_fills {
         surface.fill_rounded_rect(fill);
     }
+    // CTX-0347: per-`View` background images paint behind content, above cell
+    // backgrounds and the decoration ring.
+    for blit in &list.backgrounds {
+        surface.blend_rgba_image(
+            &blit.rgba,
+            blit.dest.width,
+            blit.dest.height,
+            blit.dest.x,
+            blit.dest.y,
+        );
+    }
+    // CTX-0347: selection/cursor overlays stay visible above the image.
+    for fill in &list.overlay_fills {
+        surface.fill_rect(fill.rect, fill.color);
+    }
     for glyph in &list.glyphs {
         match &glyph.source {
             crate::grid::GlyphSource::Atlas { slot } => {
@@ -793,7 +808,8 @@ mod tests {
                 dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
             },
             // A plain fill covers the whole surface, then the ring paints on
-            // top: paint order is fills, rounded fills, glyphs, images.
+            // top: paint order is fills, rounded fills, backgrounds, overlay
+            // fills, glyphs, images.
             fills: vec![FillRect {
                 rect: crate::geometry::RectPx::new(0, 0, 8, 8),
                 color: [0, 0, 255, 255],
@@ -804,6 +820,8 @@ mod tests {
                 radius: 3,
                 color: [0, 255, 0, 255],
             }],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -839,5 +857,53 @@ mod tests {
         draw_list_onto(&with_glyph, None, &mut glyph_surface).unwrap();
         let o = (2 * 8 + 2) * 4;
         assert_eq!(&glyph_surface.as_bytes()[o..o + 4], &[255; 4]);
+    }
+
+    #[test]
+    fn draw_list_paints_background_image_between_fills_and_overlay() {
+        // CTX-0347: the per-View background image covers cell backgrounds
+        // but stays below the selection/cursor overlay and glyphs.
+        use crate::grid::{DrawList, FillRect, ImageBlit};
+        let mut surface = SurfaceRgba::try_new(8, 8).unwrap();
+        surface.clear([0, 0, 0, 255]);
+        let list = DrawList {
+            generation: 1,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 8),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 8)],
+            },
+            fills: vec![FillRect {
+                rect: crate::geometry::RectPx::new(0, 0, 8, 8),
+                color: [255, 0, 0, 255],
+            }],
+            rounded_fills: vec![],
+            backgrounds: vec![
+                ImageBlit::try_new(
+                    crate::geometry::RectPx::new(0, 0, 8, 8),
+                    [0, 255, 0, 255].repeat(64),
+                )
+                .expect("background bytes match extent"),
+            ],
+            overlay_fills: vec![FillRect {
+                rect: crate::geometry::RectPx::new(0, 0, 4, 4),
+                color: [0, 0, 255, 255],
+            }],
+            glyphs: vec![],
+            images: vec![],
+        };
+        draw_list_onto(&list, None, &mut surface).unwrap();
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * 8 + x) * 4;
+            [
+                surface.as_bytes()[o],
+                surface.as_bytes()[o + 1],
+                surface.as_bytes()[o + 2],
+                surface.as_bytes()[o + 3],
+            ]
+        };
+        assert_eq!(px(7, 7), [0, 255, 0, 255], "image above the cell fill");
+        assert_eq!(px(1, 1), [0, 0, 255, 255], "overlay above the image");
+        assert_eq!(px(5, 5), [0, 255, 0, 255], "image outside the overlay");
     }
 }

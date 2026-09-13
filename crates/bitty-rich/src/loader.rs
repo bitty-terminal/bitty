@@ -123,10 +123,20 @@ impl ResourcePolicy {
     ///
     /// An empty `roots` vec is allowed and denies all (see `deny_all`).
     pub fn new(roots: Vec<PathBuf>) -> Result<Self, ResourceError> {
-        if roots.len() > MAX_ROOTS {
+        Self::with_max_roots(roots, MAX_ROOTS)
+    }
+
+    /// [`Self::new`] with an explicit root-count cap.
+    ///
+    /// The deny-by-default `decoration.background_image_roots` policy
+    /// (CTX-0347, RFC-0001/OQ-042) accepts up to 32 entries, so the
+    /// background loader passes that accepted cap while every existing
+    /// caller keeps [`MAX_ROOTS`].
+    pub fn with_max_roots(roots: Vec<PathBuf>, max_roots: usize) -> Result<Self, ResourceError> {
+        if roots.len() > max_roots {
             return Err(ResourceError::TooLong {
                 len: roots.len(),
-                cap: MAX_ROOTS,
+                cap: max_roots,
             });
         }
         let mut canon_roots = Vec::with_capacity(roots.len());

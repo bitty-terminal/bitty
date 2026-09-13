@@ -1036,8 +1036,9 @@ impl ImageBlit {
 /// Produced by [`GridRenderer::render`]; consumed by a GPU backend seam or,
 /// under the `sw-fallback` feature, by
 /// [`crate::software::draw_list_onto`]. Paint order is fills first, then
-/// rounded fills, then glyphs, then images; each vector preserves cell scan
-/// order so identical inputs give byte-identical records.
+/// rounded fills, then background images, then overlay fills, then glyphs,
+/// then Kitty images; each vector preserves cell scan order so identical
+/// inputs give byte-identical records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawList {
     /// Snapshot generation this list was built from.
@@ -1049,6 +1050,14 @@ pub struct DrawList {
     /// Rounded decoration fills/rings (CTX-0311), painted after [`Self::fills`]
     /// and before glyphs so the frame ring covers corner cell backgrounds.
     pub rounded_fills: Vec<RoundedFill>,
+    /// Background-image blits (CTX-0347): the per-`View` content rectangle
+    /// painted after cell backgrounds and the decoration ring, and before
+    /// overlay fills and glyphs, so the image sits behind content and the
+    /// selection/cursor overlays stay visible on top of it.
+    pub backgrounds: Vec<ImageBlit>,
+    /// Overlay fills painted above the background image and below glyphs
+    /// (CTX-0347: the selection highlight and cursor fill).
+    pub overlay_fills: Vec<FillRect>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
     /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
@@ -1061,6 +1070,8 @@ impl DrawList {
     pub fn needs_draw(&self) -> bool {
         !self.fills.is_empty()
             || !self.rounded_fills.is_empty()
+            || !self.backgrounds.is_empty()
+            || !self.overlay_fills.is_empty()
             || !self.glyphs.is_empty()
             || !self.images.is_empty()
     }
@@ -1585,6 +1596,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // Rounded decoration is composed by the runtime present path
             // (CTX-0311); grid truth carries no rounded geometry.
             rounded_fills: Vec::new(),
+            // Background images and overlay fills are composed by the runtime
+            // present path (CTX-0347); grid truth carries neither.
+            backgrounds: Vec::new(),
+            overlay_fills: Vec::new(),
             glyphs: Vec::new(),
             // Grid truth carries no images; the runtime present path pushes
             // placed Kitty blits onto the combined list (CTX-0248).

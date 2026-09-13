@@ -376,6 +376,41 @@ fn resolve_editor() -> String {
     resolve_editor_with_env(visual.as_deref(), editor.as_deref())
 }
 
+/// Expands one `~`-anchored background-image path against `$HOME`
+/// (CTX-0347, RFC-0001/OQ-042).
+///
+/// `bitty-config` validates the accepted syntax (`absolute | ~`); the app is
+/// the environment boundary, so it resolves the home anchor once at config
+/// mapping and the runtime/loader only ever see absolute paths. A `~` path
+/// with `$HOME` unset fails closed; absolute paths pass through unchanged.
+pub(crate) fn expand_home_path(raw: &str) -> Result<String, String> {
+    expand_home_path_with(
+        raw,
+        std::env::var_os("HOME")
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+}
+
+/// [`expand_home_path`] with the home directory injected, so tests are
+/// hermetic across platforms (Windows CI has no `$HOME`).
+pub(crate) fn expand_home_path_with(
+    raw: &str,
+    home: Option<&std::path::Path>,
+) -> Result<String, String> {
+    if raw != "~" && !raw.starts_with("~/") {
+        return Ok(raw.to_string());
+    }
+    let home =
+        home.ok_or_else(|| format!("bitty: '{raw}' is '~'-anchored but $HOME is not set"))?;
+    let joined = if raw == "~" {
+        home.to_path_buf()
+    } else {
+        home.join(&raw[2..])
+    };
+    Ok(joined.to_string_lossy().into_owned())
+}
+
 /// Starter `init.lua` written by `config edit` only when the file is missing.
 /// Never used to overwrite existing content.
 pub(crate) fn starter_init_lua() -> &'static str {
@@ -983,6 +1018,25 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         return 2;
                     }
                 }
+                // CTX-0347 (RFC-0001/OQ-042): the background-image pipeline is
+                // a validation step, not a paint step. `config check` runs the
+                // exact startup gate — approved-root policy, canonicalize,
+                // regular file, BG-1..BG-3, format/animation sniff, decode,
+                // BG-4/BG-5 admission — so a missing file, an unapproved
+                // root, an animated container, or an over-limit image fails
+                // here with a source-attributed key before anything paints.
+                match runtime_config_from_effective(e) {
+                    Ok(cfg) => {
+                        if let Err(err) = bitty_runtime::validate_background_images(&cfg) {
+                            eprintln!("bitty config check: {err}");
+                            return 2;
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return 2;
+                    }
+                }
                 0
             }
             Err(msg) => {
@@ -1137,6 +1191,48 @@ pub(crate) fn runtime_config_from_effective(
             bitty_runtime::config::MAX_SCROLLBACK_LINES
         ));
     }
+    // CTX-0347 (RFC-0001/OQ-042): `~`-anchored background paths are expanded
+    // here, at the environment boundary, so `bitty-runtime` stays free of
+    // environment reads and the loader only ever sees absolute paths. A
+    // `~` path with `$HOME` unset fails closed. Per-`View` rules expand the
+    // same way below.
+    let background_image = match effective.decoration.background_image.as_deref() {
+        Some(path) => Some(expand_home_path(path)?),
+        None => None,
+    };
+    let background_fit = effective.decoration.resolve_background_fit();
+    let background_image_roots = effective
+        .decoration
+        .background_image_roots
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|root| expand_home_path(root))
+        .collect::<Result<Vec<_>, String>>()?;
+    let view_appearance = effective
+        .views
+        .iter()
+        .map(|entry| {
+            let background_image = match entry.overrides.background_image.as_deref() {
+                Some(path) => Some(expand_home_path(path)?),
+                None => None,
+            };
+            Ok(bitty_runtime::ViewAppearanceRule {
+                selector: entry.selector.canonical(),
+                border_color: entry.overrides.border_color.map(|c| c.0),
+                border_color_focused: entry.overrides.border_color_focused.map(|c| c.0),
+                border_color_idle: entry.overrides.border_color_idle.map(|c| c.0),
+                border_width: entry.overrides.border_width,
+                border_width_focused: entry.overrides.border_width_focused,
+                border_width_idle: entry.overrides.border_width_idle,
+                background_image,
+                background_fit: entry
+                    .overrides
+                    .background_fit
+                    .map(|f| f.as_str().to_string()),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     bitty_runtime::RuntimeConfig::new(
         defaults.cols,
         defaults.rows,
@@ -1203,25 +1299,17 @@ pub(crate) fn runtime_config_from_effective(
         // check on first match (View creation/bind/move) so a previously
         // inert `ws:`/`view:` entry also fails closed. `bitty-config` cannot
         // be named here, so the rule is rebuilt from the public `ViewOverride`
-        // accessors by value.
-        cfg.view_appearance = effective
-            .views
-            .iter()
-            .map(|entry| bitty_runtime::ViewAppearanceRule {
-                selector: entry.selector.canonical(),
-                border_color: entry.overrides.border_color.map(|c| c.0),
-                border_color_focused: entry.overrides.border_color_focused.map(|c| c.0),
-                border_color_idle: entry.overrides.border_color_idle.map(|c| c.0),
-                border_width: entry.overrides.border_width,
-                border_width_focused: entry.overrides.border_width_focused,
-                border_width_idle: entry.overrides.border_width_idle,
-                background_image: entry.overrides.background_image.clone(),
-                background_fit: entry
-                    .overrides
-                    .background_fit
-                    .map(|f| f.as_str().to_string()),
-            })
-            .collect();
+        // accessors by value. CTX-0347: the same map carries the expanded
+        // background-image leaf and the accepted fit spelling.
+        cfg.view_appearance = view_appearance;
+        // CTX-0347 (RFC-0001/OQ-042): carry the global background image/fit
+        // and the deny-by-default approved-root list. `Runtime::new` loads
+        // every configured image fail-closed (and `bitty config check` runs
+        // the same pipeline via `validate_background_images`), so a bad
+        // path/format/bound never reaches the present path.
+        cfg.background_image = background_image;
+        cfg.background_fit = background_fit.as_str().to_string();
+        cfg.background_image_roots = background_image_roots;
         // CTX-0355: carry the same resolved preset's terminal palette
         // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
         // config so the default-path renderer and clear color follow

@@ -86,6 +86,9 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "decoration.border_width"
         | "decoration.border_width_focused"
         | "decoration.border_width_idle"
+        | "decoration.background_image"
+        | "decoration.background_fit"
+        | "decoration.background_image_roots"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "mouse.focus_follows_mouse"
@@ -434,8 +437,9 @@ fn merge_views(
 /// Maps one `views.<selector>.<leaf>` field to the global `decoration.*`
 /// field it overrides (RFC-0001/OQ-041), so a `SystemPolicy` pin on a global
 /// outline leaf also protects that leaf through every selector tier
-/// (CTX-0343). `background_image`/`background_fit` have no global owner yet
-/// (CTX-0347), so no policy pin exists for them.
+/// (CTX-0343). CTX-0347 gives `background_image`/`background_fit` their
+/// global owners; `decoration.background_image_roots` stays global-only and
+/// deliberately has no `views` leaf to map.
 fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
     Some(match leaf {
         "border_color" => "decoration.border_color",
@@ -444,6 +448,8 @@ fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
         "border_width" => "decoration.border_width",
         "border_width_focused" => "decoration.border_width_focused",
         "border_width_idle" => "decoration.border_width_idle",
+        "background_image" => "decoration.background_image",
+        "background_fit" => "decoration.background_fit",
         _ => return None,
     })
 }
@@ -547,6 +553,9 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "decoration.border_width",
     "decoration.border_width_focused",
     "decoration.border_width_idle",
+    "decoration.background_image",
+    "decoration.background_fit",
+    "decoration.background_image_roots",
     "decoration",
     "views",
     "scrollbar.mode",
@@ -1078,6 +1087,45 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-0347 (RFC-0001/OQ-042): the global background image and fit
+            // follow the same "unset says nothing" scalar-replace rule as the
+            // outline colors/widths; the approved-root list is global path
+            // policy and can be pinned like any other scalar field. The
+            // `background_image_roots` leaf is global-only: it is absent from
+            // the `views` field set, so nothing can widen it per `View`.
+            let mut decoration_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                dec.background_image.as_ref(),
+                &mut effective.decoration.background_image,
+                "decoration",
+                "background_image",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_fit.as_ref(),
+                &mut effective.decoration.background_fit,
+                "decoration",
+                "background_fit",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_image_roots.as_ref(),
+                &mut effective.decoration.background_image_roots,
+                "decoration",
+                "background_image_roots",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
             attribution.insert("decoration".to_string(), src.clone());
         }
 
@@ -1932,6 +1980,44 @@ fn merge_layers_allow_policy_violations(
                     MergeClass::ScalarReplace,
                 );
             }
+            // CTX-0347 (RFC-0001/OQ-042): the global background image and fit
+            // follow the same "unset says nothing" scalar-replace rule as the
+            // outline colors/widths; the approved-root list is global path
+            // policy and can be pinned like any other scalar field.
+            // (Second merge path: allow-policy-violations variant.)
+            let mut decoration_acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_view_leaf(
+                dec.background_image.as_ref(),
+                &mut effective.decoration.background_image,
+                "decoration",
+                "background_image",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_fit.as_ref(),
+                &mut effective.decoration.background_fit,
+                "decoration",
+                "background_fit",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
+            merge_view_leaf(
+                dec.background_image_roots.as_ref(),
+                &mut effective.decoration.background_image_roots,
+                "decoration",
+                "background_image_roots",
+                src,
+                is_policy,
+                &mut decoration_acc,
+            );
             attribution.insert("decoration".to_string(), src.clone());
         }
         // CTX-0343: `views` entries deep-merge per selector per field (see
@@ -3309,6 +3395,130 @@ mod tests {
     }
 
     #[test]
+    fn decoration_background_scalar_replace_and_unset_never_shadows() {
+        // CTX-0347 (RFC-0001/OQ-042): the global image/fit/roots are
+        // scalar-replace with "unset says nothing"; a later layer that sets
+        // only the fit keeps the lower layer's image and root list.
+        use crate::types::{BackgroundFit, DecorationConfig};
+        let profile = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Profile, Some("profile.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    background_image: Some("~/wall/one.png".to_string()),
+                    background_image_roots: Some(vec!["~/wall".to_string()]),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    background_fit: Some(BackgroundFit::Tile),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user, profile]).expect("merge");
+        assert_eq!(
+            merged.effective.decoration.background_image.as_deref(),
+            Some("~/wall/one.png")
+        );
+        assert_eq!(
+            merged.effective.decoration.background_fit,
+            Some(BackgroundFit::Tile)
+        );
+        assert_eq!(
+            merged
+                .effective
+                .decoration
+                .background_image_roots
+                .as_deref(),
+            Some(&["~/wall".to_string()][..])
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.background_image")
+                .unwrap()
+                .layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged.source_of("decoration.background_fit").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.background_image_roots")
+                .unwrap()
+                .layer,
+            LayerKind::Profile
+        );
+        // No layer sets the image: effective stays absent (deny-by-default
+        // roots and no image) with core-defaults attribution.
+        let empty = merge_layers(vec![]).expect("empty merge");
+        assert_eq!(empty.effective.decoration.background_image, None);
+        assert_eq!(empty.effective.decoration.background_image_roots, None);
+        assert_eq!(
+            empty
+                .source_of("decoration.background_image")
+                .unwrap()
+                .layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn view_background_leaf_inherits_global_and_policy_pin_protects_it() {
+        // CTX-0347: `views[].background_image`/`background_fit` map to the
+        // global `decoration.*` owners, so a `SystemPolicy` pin on the global
+        // leaf also protects every selector tier.
+        use crate::types::{BackgroundFit, DecorationConfig, ViewAppearanceOverride, ViewSelector};
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    background_image: Some("~/policy-wall.png".to_string()),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                views: Some(vec![crate::types::ViewOverride {
+                    selector: ViewSelector::Wildcard,
+                    overrides: ViewAppearanceOverride {
+                        background_image: Some("~/user-wall.png".to_string()),
+                        background_fit: Some(BackgroundFit::Fit),
+                        ..Default::default()
+                    },
+                }]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = try_merge_layers(vec![user, policy]).expect("merge");
+        assert!(
+            !merged.policy_violations.is_empty(),
+            "the pinned image leaf must reject the user override"
+        );
+        assert_eq!(
+            merged.effective.decoration.background_image.as_deref(),
+            Some("~/policy-wall.png")
+        );
+        // The unpinned fit leaf still accepts the user value.
+        let view = &merged.effective.views[0];
+        assert_eq!(view.overrides.background_fit, Some(BackgroundFit::Fit));
+    }
+
+    #[test]
     fn safe_merged_forces_safe_decoration_with_core_attribution() {
         // CTX-0346: the safe merged config is the built-in safe effective
         // config with every schema field attributed to core defaults; there
@@ -3322,6 +3532,12 @@ mod tests {
         assert_eq!(merged.effective.decoration.border, 1);
         assert_eq!(merged.effective.decoration.radius, 0);
         assert_eq!(merged.effective.decoration.content_inset, 0);
+        // CTX-0347: safe mode opens and decodes no image and keeps the
+        // roots deny-by-default, so no `views.*` image can leak in.
+        assert_eq!(merged.effective.decoration.background_image, None);
+        assert_eq!(merged.effective.decoration.background_fit, None);
+        assert_eq!(merged.effective.decoration.background_image_roots, None);
+        assert!(merged.effective.views.is_empty());
         assert!(merged.conflicts.is_empty());
         assert!(merged.policy_violations.is_empty());
         for field in [

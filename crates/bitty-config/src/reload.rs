@@ -101,6 +101,9 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.border_width` | Live               |
 /// | `decoration.border_width_focused` | Live       |
 /// | `decoration.border_width_idle`    | Live       |
+/// | `decoration.background_image`     | Live       |
+/// | `decoration.background_fit`       | Live       |
+/// | `decoration.background_image_roots` | Live     |
 /// | `appearance.theme`        | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
@@ -147,6 +150,9 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.border_width"
         | "decoration.border_width_focused"
         | "decoration.border_width_idle"
+        | "decoration.background_image"
+        | "decoration.background_fit"
+        | "decoration.background_image_roots"
         | "decoration"
         | "appearance.theme"
         | "appearance.animations.enabled"

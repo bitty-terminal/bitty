@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable per-panel background image (CTX-0347, RFC-0001/OQ-042):**
+  `decoration.background_image` / `background_fit` set a global background
+  image and `views.<selector>.background_image` / `background_fit` override it
+  per panel (per field, tier order). `decoration.background_image_roots` is a
+  deny-by-default, global-only approved-root list that no `views.*` entry can
+  widen. Accepted formats are PNG, JPEG (baseline/progressive), and static
+  WebP; animated and malformed containers are rejected by header sniff before
+  decode. Accepted bounds: BG-1 `4 MiB` encoded, BG-2 `4096x4096`, BG-3
+  `64 MiB` decoded per image, BG-4 `256 MiB` aggregate, BG-5 `256` resident
+  images, BG-6 one image per `View`, BG-7 `32` blits / `64 MiB` per frame.
+  Fit modes are `fill`/`fit`/`center`/`tile`/`stretch`; the image paints inside
+  the `View` content rect (DPI-correct, behind content) and never changes cell
+  geometry or Terminal Truth. Decode and cache are bounded and off the hot
+  path, keyed by canonical path plus content identity. `bitty config check`
+  and startup run the same fail-closed load pipeline, so a missing file, an
+  unapproved root, an unsupported/animated format, or an over-limit image
+  rejects the whole config with a source-attributed key. `bitty --safe` ignores
+  every background key and opens no image file.
 - **Per-View appearance overrides (CTX-0343, RFC-0001/OQ-041):** a `views`
   table overrides appearance per panel with a closed selector grammar —
   `"*"` (every View) < a content type (`empty`/`terminal`/`rich`/`browser`)

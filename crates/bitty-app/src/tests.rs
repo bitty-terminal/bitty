@@ -277,6 +277,7 @@ fn default_run_emits_no_tick_lines() {
         headless: true,
         generation: 9,
         images: 0,
+        backgrounds: 0,
         images_skipped: 0,
     };
     assert!(app.maybe_format_tick(&present).is_none());
@@ -304,6 +305,7 @@ fn verbose_run_emits_tick_lines() {
         headless: true,
         generation: 30,
         images: 1,
+        backgrounds: 0,
         images_skipped: 0,
     };
     let line = app
@@ -334,6 +336,7 @@ fn tick_line_format_carries_frame_stats() {
         headless: true,
         generation: 30,
         images: 0,
+        backgrounds: 0,
         images_skipped: 0,
     };
     let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false);
@@ -1805,6 +1808,19 @@ fn runtime_config_inherits_file_outline_width() {
     );
 }
 
+/// Synthetic platform-absolute path for config-mapping tests: a drive path
+/// on Windows, a `/`-rooted path elsewhere. `bitty-config` validates
+/// "absolute" with `Path::is_absolute()`, which is platform-specific.
+/// Windows paths use forward slashes so the value is also a valid Lua
+/// string literal (backslashes would be escape sequences).
+fn synthetic_abs(rel: &str) -> String {
+    if cfg!(windows) {
+        format!("C:/{rel}")
+    } else {
+        format!("/{rel}")
+    }
+}
+
 #[test]
 fn runtime_config_carries_per_view_overrides() {
     // CTX-0343: `views.*` rules flow file -> effective -> runtime in
@@ -1813,15 +1829,14 @@ fn runtime_config_carries_per_view_overrides() {
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
-    let plan = parse_lua_config(
-        r##"return { views = {
+    let one = synthetic_abs("srv/wall/one.png");
+    let source = r##"return { views = {
             ["*"] = { border_color_focused = "#33CCFF" },
             ["ws:2"] = { border_width_idle = 1 },
-            ["view:7"] = { background_image = "~/wall/one.png", background_fit = "fit" },
-        } }"##,
-        &src,
-    )
-    .expect("views parse");
+            ["view:7"] = { background_image = "__IMG__", background_fit = "fit" },
+        } }"##
+        .replace("__IMG__", &one);
+    let plan = parse_lua_config(&source, &src).expect("views parse");
     let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
         .expect("merge");
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
@@ -1837,15 +1852,77 @@ fn runtime_config_carries_per_view_overrides() {
         Some([0x33, 0xCC, 0xFF, 0xFF])
     );
     assert_eq!(by_selector("ws:2").border_width_idle, Some(1));
+    // CTX-0347: the absolute path flows to the runtime unchanged.
     assert_eq!(
         by_selector("view:7").background_image.as_deref(),
-        Some("~/wall/one.png")
+        Some(one.as_str())
     );
     assert_eq!(by_selector("view:7").background_fit.as_deref(), Some("fit"));
     // Safe mode carries no per-View rules at all.
     let safe = bitty_config::reload::fallback_builtin();
     let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
     assert!(safe_cfg.view_appearance.is_empty());
+}
+
+#[test]
+fn runtime_config_carries_global_background_image_fit_and_roots() {
+    // CTX-0347: the global pair and the deny-by-default root list flow
+    // file -> effective -> runtime. Absolute paths are carried verbatim so
+    // the test is hermetic on every platform (Windows has no `$HOME`).
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let image = synthetic_abs("srv/wall/global.png");
+    let root_a = synthetic_abs("srv/wall");
+    let root_b = synthetic_abs("srv/pictures");
+    let source = r##"return { decoration = {
+            background_image = "__IMG__",
+            background_fit = "tile",
+            background_image_roots = { "__ROOT_A__", "__ROOT_B__" },
+        } }"##
+        .replace("__IMG__", &image)
+        .replace("__ROOT_A__", &root_a)
+        .replace("__ROOT_B__", &root_b);
+    let plan = parse_lua_config(&source, &src).expect("background decoration parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.background_image.as_deref(), Some(image.as_str()));
+    assert_eq!(cfg.background_fit, "tile");
+    assert_eq!(cfg.background_image_roots, vec![root_a, root_b]);
+    // Safe mode clears the image and the roots (no file may be opened).
+    let safe_cfg = runtime_config_from_effective(&bitty_config::reload::fallback_builtin())
+        .expect("safe builds");
+    assert_eq!(safe_cfg.background_image, None);
+    assert!(safe_cfg.background_image_roots.is_empty());
+}
+
+#[test]
+fn expand_home_path_is_injected_and_fails_closed_without_home() {
+    // CTX-0347: expansion is hermetic over an injected home, so Windows CI
+    // (which has no `$HOME`) never depends on the ambient environment.
+    let home = std::path::Path::new("/home/test");
+    // Build the expectation with the platform separator (`\` on Windows)
+    // instead of hardcoding a path spelling.
+    assert_eq!(
+        crate::config_cli::expand_home_path_with("~/wall/one.png", Some(home)).expect("expand"),
+        home.join("wall/one.png").to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        crate::config_cli::expand_home_path_with("~", Some(home)).expect("bare tilde"),
+        home.to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        crate::config_cli::expand_home_path_with("/srv/wall.png", Some(home)).expect("absolute"),
+        "/srv/wall.png"
+    );
+    assert!(crate::config_cli::expand_home_path_with("~/wall.png", None).is_err());
+    // The live wrapper only resolves against the process home; an absolute
+    // path never needs it.
+    assert_eq!(
+        crate::config_cli::expand_home_path("/srv/wall.png").expect("absolute passthrough"),
+        "/srv/wall.png"
+    );
 }
 
 #[test]

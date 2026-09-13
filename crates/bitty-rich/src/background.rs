@@ -613,6 +613,15 @@ fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
 /// (measured 10.50-10.76 B/px), so that shape is charged 11. Every other
 /// `VP8X` shape keeps the previous conservative 8.
 ///
+/// The walk scans the whole physical buffer, not just the declared container:
+/// `image-webp` reads chunk headers up to
+/// `position + riff_size.saturating_sub(12)` (ten bytes past `riff_end` for a
+/// minimum-size `VP8X` chunk), so a declared size shorter than the chunk
+/// sequence would let the decoder find a trailing `VP8 ` that a
+/// `riff_end`-bounded walk never sees. A chunk that crosses `riff_end` is
+/// therefore rejected as malformed instead of treated as absent. The only
+/// remaining gap is a sub-8-byte tail, which cannot hold a chunk header.
+///
 /// # Errors
 ///
 /// [`BackgroundError::Animated`] for an `ANIM`/`ANMF` chunk and
@@ -626,10 +635,16 @@ fn vp8x_peak_bytes_per_pixel(
     chunk_len: usize,
 ) -> Result<u32, BackgroundError> {
     let riff_end = declared + 8;
-    let mut position = chunk_end + (chunk_len & 1);
+    let position_after_vp8x = chunk_end + (chunk_len & 1);
+    if position_after_vp8x > riff_end {
+        return Err(BackgroundError::Malformed {
+            detail: "WebP VP8X chunk overruns the declared RIFF container".to_string(),
+        });
+    }
+    let mut position = position_after_vp8x;
     let mut has_alpha = false;
     let mut has_lossy = false;
-    while position + 8 <= bytes.len() && position + 8 <= riff_end {
+    while position + 8 <= bytes.len() {
         let tag = &bytes[position..position + 4];
         let len = le32(&bytes[position + 4..position + 8]) as usize;
         let data_end = position
@@ -638,9 +653,14 @@ fn vp8x_peak_bytes_per_pixel(
             .ok_or_else(|| BackgroundError::Malformed {
                 detail: "WebP chunk length overflow".to_string(),
             })?;
-        if data_end > bytes.len() || data_end > riff_end {
+        if data_end > bytes.len() {
             return Err(BackgroundError::Malformed {
                 detail: "truncated WebP chunk in VP8X container".to_string(),
+            });
+        }
+        if data_end > riff_end {
+            return Err(BackgroundError::Malformed {
+                detail: "WebP chunk overruns the declared RIFF container".to_string(),
             });
         }
         match tag {
@@ -1985,6 +2005,50 @@ mod tests {
             sniff_image(&anim),
             Err(BackgroundError::Animated { format: "WebP" })
         ));
+
+        // A declared RIFF size that ends before the trailing `VP8 ` chunk used
+        // to stop the walk early (charge 8) while `image-webp`'s ten-byte
+        // wider `max_position` still decoded it as lossy-alpha. The declared
+        // size must cover the chunk sequence: ALPH data ends at 39, its pad
+        // ends the next position, and `VP8 ` spans 40..58, so every declared
+        // size in 31..=39 hides the chunk from a bounded walk and must fail
+        // closed instead.
+        let lossy_alpha = webp_with_vp8x(0x10, &[(b"ALPH", &[0x01u8]), (b"VP8 ", &[0u8; 10])]);
+        assert_eq!(lossy_alpha.len(), 58);
+        for declared in [31u32, 32, 39] {
+            let mut patched = lossy_alpha.clone();
+            patched[4..8].copy_from_slice(&declared.to_le_bytes());
+            assert!(
+                matches!(
+                    sniff_image(&patched),
+                    Err(BackgroundError::Malformed { .. })
+                ),
+                "declared {declared}: chunk crossing the declared end must fail closed"
+            );
+        }
+        // A declared size shorter than the VP8X header chunk itself is
+        // rejected instead of being trusted.
+        let mut shrunken = webp_with_vp8x(0x00, &[]);
+        shrunken[4..8].copy_from_slice(&10u32.to_le_bytes());
+        assert!(matches!(
+            sniff_image(&shrunken),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // Trailing bytes past the declared container that parse as a chunk
+        // are rejected too, not silently ignored.
+        let mut trailing = lossy_alpha.clone();
+        trailing.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            sniff_image(&trailing),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // The unmodified container still charges the lossy-alpha profile.
+        assert_eq!(
+            sniff_image(&lossy_alpha)
+                .expect("lossy alpha")
+                .peak_bytes_per_pixel,
+            11
+        );
     }
 
     #[test]

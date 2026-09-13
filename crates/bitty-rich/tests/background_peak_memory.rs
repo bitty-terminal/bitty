@@ -522,3 +522,39 @@ fn over_budget_webp_rejected_before_allocation() {
         "rejection allocated {peak} bytes; expected no decode buffer"
     );
 }
+
+#[test]
+fn vp8x_declared_riff_size_mismatch_rejected_before_decode() {
+    // `image-webp` walks the VP8X chunk sequence up to
+    // `position + riff_size.saturating_sub(12)`, i.e. ten bytes past
+    // `riff_end` for a minimum-size container, and reads chunk data by
+    // absolute range. A declared RIFF size that stops the sniff walk before
+    // the trailing `VP8 ` chunk therefore used to charge 8 B/px while the
+    // decoder still decoded lossy-alpha at ~10.5 B/px (re-review of #656,
+    // comment 5653530254). `lossy_alpha_2469.webp` lays out ALPH@30 with
+    // data ending at 311 and `VP8 `@312, so declared sizes 303..=311 hid the
+    // chunk; every one must now fail closed before any allocation.
+    assert_eq!(
+        u32::from_le_bytes(LOSSY_ALPHA_2469[4..8].try_into().expect("4-byte size")),
+        11298,
+        "fixture layout changed: declared-size window moves"
+    );
+    for declared in 303u32..=311 {
+        let mut bytes = LOSSY_ALPHA_2469.to_vec();
+        bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+        let (result, peak) = peak_alloc::measure(|| decode_background(&bytes));
+        assert!(
+            matches!(result, Err(BackgroundError::Malformed { .. })),
+            "declared {declared}: expected Malformed, got {result:?}"
+        );
+        assert!(
+            peak <= 4 * 1024 * 1024,
+            "declared {declared}: rejection allocated {peak} bytes; expected no decode buffer"
+        );
+    }
+    // The genuine container still sniffs as lossy-alpha, and its documented
+    // largest accepted side keeps the measured peak inside BG-3.
+    let header = sniff_image(LOSSY_ALPHA_2469).expect("genuine lossy-alpha fixture");
+    assert_eq!(header.peak_bytes_per_pixel, 11);
+    assert_eq!(largest_side(11), 2469);
+}

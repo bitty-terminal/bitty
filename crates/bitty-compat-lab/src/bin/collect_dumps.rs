@@ -26,7 +26,16 @@ use bitty_compat_lab::{
 };
 
 const CATEGORIES: &[&str] = &[
-    "vt", "osc", "keyboard", "mouse", "resize", "unicode", "shell", "tui",
+    "vt",
+    "osc",
+    "keyboard",
+    "mouse",
+    "resize",
+    "unicode",
+    "shell",
+    "tui",
+    "scrollback",
+    "graphics",
 ];
 
 fn corpus_dir(category: &str) -> PathBuf {

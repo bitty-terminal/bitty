@@ -66,9 +66,19 @@ fn list_corpus_manifest(category: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Canonical categories from the Phase C scaffold.
+/// Canonical categories from the Phase C scaffold plus the CTX-0404
+/// M1/M2 additions (`scrollback`, `graphics`).
 const CATEGORIES: &[&str] = &[
-    "vt", "osc", "keyboard", "mouse", "resize", "unicode", "shell", "tui",
+    "vt",
+    "osc",
+    "keyboard",
+    "mouse",
+    "resize",
+    "unicode",
+    "shell",
+    "tui",
+    "scrollback",
+    "graphics",
 ];
 
 #[test]

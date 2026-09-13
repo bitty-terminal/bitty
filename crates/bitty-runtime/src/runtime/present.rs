@@ -116,6 +116,20 @@ pub struct PresentStats {
     pub rounded_fills: usize,
     /// Number of glyph instances in the presented draw list.
     pub glyphs: usize,
+    /// Cells examined by the grid renderer while producing this frame
+    /// (per-frame delta, CTX-0386).
+    ///
+    /// The presented `glyphs` count includes primitives reused from a
+    /// retained leaf list, so it does not measure work; this counter does.
+    /// A frame that only re-renders one damaged pane examines roughly that
+    /// pane's cell count, while a full frame examines every visible leaf.
+    pub cells_examined: u64,
+    /// Glyph instances emitted by the grid renderer while producing this
+    /// frame (per-frame delta, CTX-0386).
+    ///
+    /// The work-side companion to `cells_examined`: a reused leaf emits no
+    /// glyphs, while the presented `glyphs` count still carries them all.
+    pub glyphs_emitted: u64,
     /// Whether the surface was the headless software fake.
     pub headless: bool,
     /// Snapshot generation that was presented.
@@ -138,6 +152,8 @@ impl From<RenderPresentStats> for PresentStats {
             fills: value.fills,
             rounded_fills: value.rounded_fills,
             glyphs: value.glyphs,
+            cells_examined: 0,
+            glyphs_emitted: 0,
             headless: value.headless,
             generation: 0,
             images: value.images,
@@ -178,6 +194,78 @@ pub(super) struct ImeCaret {
     /// (at least `1`), used to clip the inline preedit overlay so it never
     /// paints outside the pane.
     pub(super) cells_available: u16,
+}
+
+/// Bounded retries when a glyph-atlas exhaustion reset invalidates the
+/// retained leaf lists mid-frame (CTX-0386). A reset clears every slot,
+/// including slots emitted earlier in the same pass, so the whole leaf set is
+/// rebuilt; one retry is enough for every realistic pass and the bound keeps
+/// a pathological atlas from spinning the frame loop.
+const ATLAS_REBUILD_LIMIT: u8 = 2;
+
+/// One leaf's retained present primitives (CTX-0386).
+///
+/// The software and GPU present paths clear the surface every frame and
+/// composite a single complete draw list, so a leaf that produced no damage
+/// must still contribute its previous primitives. Retaining them per leaf is
+/// what lets a split stop re-examining (and re-emitting glyphs for) every
+/// pane when only one pane is busy. Coordinates are already translated into
+/// window space and glyph clips are already attached, so the retained list is
+/// presented verbatim.
+pub(super) struct PresentedLeaf {
+    /// Painted content origin (physical px, before window padding) the list
+    /// was translated against. A mismatch forces a fresh leaf render.
+    pub(super) origin: (i32, i32),
+    /// Scroll offset the list was rendered at. A mismatch forces a fresh
+    /// leaf render (scrollback composites a different cell window).
+    pub(super) scroll_offset: usize,
+    /// Complete translated cell fills.
+    pub(super) fills: Vec<bitty_render::grid::FillRect>,
+    /// Complete translated glyph instances (inner-arc clip attached).
+    pub(super) glyphs: Vec<bitty_render::grid::GlyphInstance>,
+}
+
+/// Deferred per-frame cursor overlay (CTX-0386).
+///
+/// Captured while walking the focused leaf and painted after all leaves so a
+/// reused (retained) leaf never carries a stale cursor fill: cursor-only
+/// batches (`DECTCEM` visibility, `CUP` moves) advance the generation without
+/// grid damage, and the overlay must track the current snapshot even when the
+/// leaf's retained list is reused.
+struct CursorPaint {
+    /// Content origin in physical px, window padding already added.
+    origin_x: i32,
+    /// Content origin in physical px, window padding already added.
+    origin_y: i32,
+    /// Cursor with its row translated into viewport coordinates.
+    cursor: bitty_term_state::Cursor,
+    /// Viewport dimensions the cursor was translated against.
+    cols: usize,
+    /// Viewport dimensions the cursor was translated against.
+    rows: usize,
+    /// Cell columns between the caret and the pane's right edge (>= 1).
+    cells_available: u16,
+    /// Whether the cursor cell is the trailing half of a wide char.
+    on_spacer: bool,
+}
+
+/// One frame's combined leaf primitives, built in a retryable pass.
+#[derive(Default)]
+struct CombinedLeaves {
+    fills: Vec<bitty_render::grid::FillRect>,
+    rounded: Vec<bitty_render::grid::RoundedFill>,
+    glyphs: Vec<bitty_render::grid::GlyphInstance>,
+    needs_draw: bool,
+    cursor: Option<CursorPaint>,
+}
+
+/// Loop-invariant inputs for the per-leaf decoration ring (CTX-0386).
+#[derive(Clone, Copy)]
+struct RingFrameContext {
+    focused_id: Option<ViewId>,
+    workspace_factor: f32,
+    now: std::time::Instant,
+    pad_px: i32,
 }
 
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
@@ -341,14 +429,20 @@ impl Runtime {
     ///
     /// Multi-pane: the layout tree is reflowed into the current container;
     /// each leaf `View`'s `cols`/`rows`/`origin` are updated via
-    /// `LayoutNode::reflow`. Then each leaf is rendered: a viewport snapshot
-    /// sized to the leaf's dimensions is built from its own pane-session
-    /// grid when it owns a shell, from the shared `State` snapshot only for
-    /// the primary owner leaf (`primary_view`, CTX-0359), and erased
-    /// otherwise (never duplicate one grid across tiles), rendered through
-    /// the shared `GridRenderer` with a full-damage hint, and its `DrawList`
-    /// translated to the leaf's pixel origin. The per-leaf `DrawList`s are
-    /// combined and presented once via `Surface::headless_present`.
+    /// `LayoutNode::reflow`. Then each leaf contributes its complete draw
+    /// primitives: a leaf whose own origin produced damage is re-rendered
+    /// from a viewport snapshot sized to its dimensions — built from its own
+    /// pane-session grid when it owns a shell, from the shared `State`
+    /// snapshot only for the primary owner leaf (`primary_view`, CTX-0359),
+    /// and erased otherwise (never duplicate one grid across tiles) — through
+    /// the shared `GridRenderer` with a full leaf damage hint and translated
+    /// to the leaf's pixel origin. CTX-0386: a clean leaf instead reuses the
+    /// primitive list retained from its last render, so one busy pane no
+    /// longer re-examines every other pane. The per-leaf lists are combined
+    /// and presented once via `Surface::headless_present`.
+    ///
+    /// Full invalidation (first frame, resize, DPI/font, layout/focus edit,
+    /// appearance/animation transition) still re-renders every leaf.
     ///
     /// The software seam composites `DrawList + Atlas` onto an owned RGBA
     /// buffer via `Surface::headless_present`; no display server or adapter
@@ -362,16 +456,212 @@ impl Runtime {
     /// Records the per-origin generations consumed by this frame so the next
     /// `tick_at` can tell whether any primary or pane grid advanced
     /// (CTX-0289). `primary_gen` is the primary state's generation; every
-    /// pane session contributes its own counter. Called on every present,
+    /// pane session carries its own consumed counter (CTX-0386), updated
+    /// whether or not that pane was visible this frame — a pane that returns
+    /// to the visible layout is covered by the full-frame invalidation that
+    /// the visibility change already forces. Called on every present,
     /// including the idle write-backs that consume a generation without
     /// drawing pixels.
     fn mark_frame_presented(&mut self, primary_gen: u64) {
         self.last_presented_generation = primary_gen;
-        self.last_presented_pane_generations.clear();
-        for (id, sess) in &self.pane_sessions {
-            self.last_presented_pane_generations
-                .insert(*id, sess.state.generation());
+        for sess in self.pane_sessions.values_mut() {
+            sess.last_presented_generation = sess.state.generation();
         }
+    }
+
+    /// Pushes the Core-owned decoration ring for one leaf and returns the
+    /// inner content clip for its glyphs (CTX-0311, moved verbatim from the
+    /// leaf loop under CTX-0386 so a reused retained leaf still owns a live
+    /// ring). `border == 0` paints nothing; the returned clip is `None` for
+    /// square or zero-size frames.
+    fn push_leaf_ring(
+        &self,
+        frame: &layout_focus::PresentFrame,
+        view_id: ViewId,
+        open_factor: f32,
+        ctx: &RingFrameContext,
+        combined_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+    ) -> (Option<bitty_render::grid::RoundedClip>, bool) {
+        let mut frame_clip = None;
+        let mut painted = false;
+        if frame.frame.width > 0 && frame.frame.height > 0 {
+            let ring_frame = bitty_render::geometry::RectPx::new(
+                px_add(ctx.pad_px, frame.frame.x),
+                px_add(ctx.pad_px, frame.frame.y),
+                frame.frame.width,
+                frame.frame.height,
+            );
+            // CTX-0340/CTX-0343: the focused View paints the accent
+            // outline, every idle View the subtle outline. The pair and
+            // the ring *width* now resolve per `View` (RFC-0001/OQ-041)
+            // from the global values plus any matching `views` rule, so a
+            // per-panel override paints only its own panel. Widths scale
+            // at the live DPI factor exactly like the geometry border; the
+            // ring paints inside the View rectangle and the content grid
+            // stays inset by `border + content_inset`, so an override never
+            // moves content.
+            let is_focused_view = ctx.focused_id == Some(view_id);
+            let view_outline = self.view_outline_for(view_id);
+            let ring_border = if is_focused_view {
+                view_outline
+                    .width_focused
+                    .map_or(frame.border, |w| self.outline_width_physical(w))
+            } else {
+                view_outline
+                    .width_idle
+                    .map_or(frame.border, |w| self.outline_width_physical(w))
+            };
+            if ring_border > 0 {
+                let outline_color = if is_focused_view {
+                    view_outline.focused
+                } else {
+                    view_outline.idle
+                };
+                // RFC-0002 (CTX-0341): the focus transition cross-fades
+                // the ring color from idle toward the focused accent over
+                // the accepted duration. Geometry never moves; only the
+                // Core-owned color interpolates. When not animating (or
+                // instant), the final color is used unchanged.
+                let animated_color = if is_focused_view {
+                    match self.animation_progress(AnimationKind::Focus, Some(view_id), ctx.now) {
+                        Some(p) => bitty_render::grid::lerp_rgba(
+                            view_outline.idle,
+                            view_outline.focused,
+                            p,
+                        ),
+                        None => outline_color,
+                    }
+                } else {
+                    outline_color
+                };
+                // Panel-open fades the ring in from transparent; the final
+                // committed color is applied at animation end.
+                let ring_color = bitty_render::grid::scale_alpha(
+                    animated_color,
+                    open_factor * ctx.workspace_factor,
+                );
+                combined_rounded.push(bitty_render::grid::RoundedFill {
+                    frame: ring_frame,
+                    border: ring_border,
+                    radius: frame.radius,
+                    color: ring_color,
+                });
+                painted = true;
+            }
+            // The content clip is tied to the geometry border (not the
+            // outline width) so the content grid and glyph clipping are
+            // unchanged by a focused/idle width override.
+            frame_clip =
+                bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
+        }
+        (frame_clip, painted)
+    }
+
+    /// Repaints the focused cursor from live state without building a
+    /// viewport snapshot (CTX-0386). Used when a leaf's retained list is
+    /// reused: the grid content is unchanged, but a cursor-only batch
+    /// (`DECTCEM`, `CUP`) may have moved the overlay, so it is recomputed
+    /// from the origin's current cursor with the same cursor-follow row
+    /// translation [`viewport_snapshot`] applies.
+    fn reused_cursor_paint(
+        &self,
+        frame: &layout_focus::PresentFrame,
+        view_id: ViewId,
+        snapshot: &Snapshot,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> Option<CursorPaint> {
+        let (mut cursor, base_height) = match self.pane_sessions.get(&view_id) {
+            Some(sess) => (sess.state.cursor().clone(), sess.state.height()),
+            None => (snapshot.cursor.clone(), snapshot.height),
+        };
+        if !cursor.visible {
+            return None;
+        }
+        let rows = usize::from(frame.rows);
+        let cols = usize::from(frame.cols);
+        let start = cursor_follow_window_start(usize::from(cursor.position.row), base_height, rows);
+        cursor.position.row = (usize::from(cursor.position.row).saturating_sub(start))
+            .min(rows.saturating_sub(1)) as u16;
+        if usize::from(cursor.position.row) >= rows || usize::from(cursor.position.col) >= cols {
+            return None;
+        }
+        let cells_available = frame.cols.saturating_sub(cursor.position.col).max(1);
+        // `State` steps the cursor off any spacer half after every action
+        // batch and resize (`enforce_cursor_invariants`), so a reused leaf
+        // needs no cell probe to resolve the spacer flag.
+        Some(CursorPaint {
+            origin_x,
+            origin_y,
+            cursor,
+            cols,
+            rows,
+            cells_available,
+            on_spacer: false,
+        })
+    }
+
+    /// Paints the deferred focused-cursor overlay (CTX-0386) and arms the
+    /// platform-IME caret rect (CTX-0367). A no-op when the window lost
+    /// focus; the cursor never leaves a stale fill because it is not part of
+    /// any retained leaf list. Returns whether a fill was pushed.
+    fn paint_cursor(
+        &mut self,
+        paint: &CursorPaint,
+        combined_fills: &mut Vec<bitty_render::grid::FillRect>,
+    ) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let live = self.live_cell_metrics();
+        // CTX-0367: arm the platform-IME caret rect (window-relative
+        // physical pixels) for the focused, visible cursor. The inline
+        // preedit overlay and the OS candidate window both anchor here;
+        // `cells_available` clips the inline preedit to the pane's right
+        // edge.
+        self.ime_caret = Some(ImeCaret {
+            area: ImeCursorArea {
+                x: px_offset_cells(paint.origin_x, paint.cursor.position.col, live.width),
+                y: px_offset_cells(paint.origin_y, paint.cursor.position.row, live.height),
+                width: live.width.max(1),
+                height: live.height.max(1),
+            },
+            cells_available: paint.cells_available,
+        });
+        if paint.on_spacer {
+            return false;
+        }
+        // DECSCUSR shape comes from the shared render primitive
+        // (`bitty_render::grid::cursor_fill`: block = full cell, bar = left
+        // strip, underline = bottom strip, 15% thickness per DEC-0017
+        // ghostty/alacritty refs). Geometry is shared; the overlay hue is
+        // the resolved theme cursor (CTX-0355) so the live cursor matches
+        // the selected preset (CTX-0219: no hardcoded white).
+        if let Some(fill) = bitty_render::grid::cursor_fill_in(
+            &self.config.theme,
+            &paint.cursor,
+            live,
+            paint.cols,
+            paint.rows,
+        ) {
+            // Cursor color: the theme cursor hue at the existing translucent
+            // alpha (blinks stay with the embedder's visibility/focus gate,
+            // already checked above).
+            let mut themed = self.config.theme.cursor;
+            themed[3] = 0xA0;
+            let rect = bitty_render::geometry::RectPx::new(
+                px_add(fill.rect.x, paint.origin_x),
+                px_add(fill.rect.y, paint.origin_y),
+                fill.rect.width,
+                fill.rect.height,
+            );
+            combined_fills.push(bitty_render::grid::FillRect {
+                rect,
+                color: themed,
+            });
+            return true;
+        }
+        false
     }
 
     /// Tick with an explicit wall clock (CTX-0192 virtual-clock seam).
@@ -462,21 +752,18 @@ impl Runtime {
         // cannot detect that a lower-generation origin changed while a
         // higher-generation origin stayed quiet. `current_gen` stays the max
         // for present stats/damage, but frame-on-demand compares each origin
-        // against its own last presented generation.
+        // against its own last presented generation (CTX-0386: held on the
+        // session itself, so an added session starts at the `u64::MAX`
+        // sentinel and always reads as changed even before `mark_frame_`
+        // `presented` consumes it).
         let mut current_gen = snapshot.generation;
         let mut origins_changed = snapshot.generation != last;
-        for (id, sess) in &self.pane_sessions {
+        for sess in self.pane_sessions.values() {
             let pane_gen = sess.state.generation();
             current_gen = current_gen.max(pane_gen);
-            if self.last_presented_pane_generations.get(id).copied() != Some(pane_gen) {
+            if sess.last_presented_generation != pane_gen {
                 origins_changed = true;
             }
-        }
-        // A pane added or removed since the last present is a change too
-        // (a closed pane's `pending_full_redraw` already covers its pixels;
-        // this keeps the origin bookkeeping exact).
-        if self.last_presented_pane_generations.len() != self.pane_sessions.len() {
-            origins_changed = true;
         }
 
         // CTX-0228: a layout or focus change forces a full present even
@@ -522,36 +809,13 @@ impl Runtime {
             return None;
         }
 
-        // Build the combined DrawList by rendering each leaf's viewport.
-        let mut combined_fills = Vec::new();
-        let mut combined_rounded: Vec<bitty_render::grid::RoundedFill> = Vec::new();
-        let mut combined_glyphs = Vec::new();
-        let mut any_needs_draw = false;
-        // CTX-0367: recompute the IME caret for this frame; the cursor paint
-        // below re-arms it for the focused leaf. A stale rect must never
-        // survive a frame where the focused cursor is hidden or the focused
-        // leaf has no damage.
-        self.ime_caret = None;
-
-        // For damage, we treat any new generation or pending_full as full
-        // per leaf (over-damage safe, deterministic). If generation gap is
-        // large and regions empty, also full. Otherwise still full for
-        // correctness with viewport slicing.
-        // CTX-0176: per-pane grids carry independent generations that the
-        // shared damage ring cannot see, so any live pane session forces the
-        // full per-leaf path (over-damage safe, deterministic).
-        let use_full = !self.pane_sessions.is_empty()
-            || pending_full
-            || last == u64::MAX
-            || {
-                let gap = current_gen.saturating_sub(last);
-                let regions = self.state.damage_since(last);
-                gap > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64 && regions.is_empty()
-            }
-            || {
-                let regions = self.state.damage_since(last);
-                !regions.is_empty() || pending_full
-            };
+        // CTX-0386: genuine full invalidation only. `pending_full` already
+        // funnels every window resize, DPI/font change, layout or focus edit,
+        // appearance/animation transition, alt-screen latch, and explicit
+        // `pending_full_redraw`; `last == u64::MAX` marks the first frame.
+        // Everything else re-renders per origin from its own damage ring, so a
+        // split no longer repaints every pane just because sessions exist.
+        let mut full_frame = pending_full || last == u64::MAX;
 
         // For single-window slice we need per-view scrollback viewport and cursor.
         // Build id->View map for scroll/IME lookups.
@@ -596,291 +860,256 @@ impl Runtime {
             .animation_progress(AnimationKind::Workspace, None, now)
             .map(|p| p.clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        for frame in &allocations {
-            if frame.content.width == 0 || frame.content.height == 0 {
-                continue;
-            }
-            let view_id = &frame.view;
-            let open_factor = self
-                .animation_progress(AnimationKind::Open, Some(*view_id), now)
-                .map(|p| p.clamp(0.0, 1.0))
-                .unwrap_or(1.0);
-            // CTX-0176: a leaf with its own shell renders that session's
-            // grid. CTX-0359: a leaf WITHOUT a session renders the shared
-            // primary snapshot only when it IS the primary owner
-            // (`primary_view`: the leaf focused when the primary shell
-            // attached). The former CTX-0234 focused-only arm and CTX-0255
-            // mixed-shape co-paint arm cloned the primary grid into any
-            // session-less leaf that was focused (or into every one once any
-            // pane session existed); that duplicated one shell across tiles,
-            // painted the previous workspace's grid into a fresh workspace
-            // leaf, and blanked the primary owner whenever focus moved off
-            // it. Ownership — not focus and not session-presence — decides:
-            // every other session-less leaf (ctl splits spawn no shell,
-            // spawn failures, fresh workspace leaves) presents erased, so a
-            // session-less View never paints another View's grid.
-            let focused_id = self.focus.focused();
-            let pane_snap: Option<Snapshot> = match self.pane_sessions.get(view_id) {
-                Some(sess) => Some(sess.state.snapshot()),
-                None if Some(*view_id) == self.primary_view => Some(snapshot.clone()),
-                None => None,
-            };
-            // Erased source for session-less leaves that do not own the
-            // primary; `viewport_snapshot` pads it to the allocation below.
-            let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
-                Some(erased_snapshot(&snapshot))
-            } else {
-                None
-            };
-            let base_snap: &Snapshot = pane_snap
-                .as_ref()
-                .or(erased_snap.as_ref())
-                .unwrap_or(&snapshot);
-            // Determine viewport snapshot: when view scroll_offset !=0, visible_cells composites scrollback.
-            let view = view_map.get(view_id);
-            let view_snapshot = if let Some(v) = view {
-                if v.scroll_offset() != 0 && pane_snap.is_some() {
-                    let cells = match self.pane_sessions.get(view_id) {
-                        Some(sess) => v.visible_cells(&sess.state),
-                        None => v.visible_cells(&self.state),
-                    };
-                    Snapshot {
-                        version: base_snap.version,
-                        generation: base_snap.generation,
-                        width: v.cols() as usize,
-                        height: v.rows() as usize,
-                        cells,
-                        cursor: base_snap.cursor.clone(),
-                        modes: base_snap.modes.clone(),
-                        title: base_snap.title.clone(),
+        let ring_ctx = RingFrameContext {
+            focused_id: self.focus.focused(),
+            workspace_factor,
+            now,
+            pad_px,
+        };
+
+        // CTX-0367: recompute the IME caret for this frame; `paint_cursor`
+        // re-arms it for the focused leaf. A stale rect must never survive a
+        // frame where the focused cursor is hidden or the focused leaf has no
+        // damage.
+        self.ime_caret = None;
+        // CTX-0386: renderer work baseline for the per-frame deltas reported in
+        // `PresentStats::cells_examined`/`glyphs_emitted`.
+        let cells_before = self.renderer.counters().cells_examined;
+        let glyphs_before = self.renderer.counters().glyphs_emitted;
+
+        // CTX-0386: build the combined leaf primitives. Both present paths
+        // clear the surface and composite one complete list per frame, so a
+        // clean leaf contributes its retained primitives verbatim instead of a
+        // fresh (partial, hence blanking) list; a leaf re-renders only when
+        // its own origin's damage ring advanced. An atlas exhaustion reset
+        // invalidates every retained slot (including slots emitted earlier in
+        // the same pass), so the whole leaf set is rebuilt when a reset is
+        // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
+        let mut attempt = 0u8;
+        let built = loop {
+            attempt += 1;
+            let mut built = CombinedLeaves::default();
+            let evictions_before = self.renderer.atlas_stats().2;
+
+            for frame in &allocations {
+                if frame.content.width == 0 || frame.content.height == 0 {
+                    continue;
+                }
+                let view_id = frame.view;
+                let view = view_map.get(&view_id);
+                let scrolled = view.map(|v| v.scroll_offset() != 0).unwrap_or(false);
+                let open_factor = self
+                    .animation_progress(AnimationKind::Open, Some(view_id), now)
+                    .map(|p| p.clamp(0.0, 1.0))
+                    .unwrap_or(1.0);
+                let origin_px_x = px_add(pad_px, frame.content.x);
+                let origin_px_y = px_add(pad_px, frame.content.y);
+                // The ring arm uses the strict focus match; the cursor arm
+                // keeps the `unwrap_or(true)` default for a layout with no
+                // resolvable focus. Both preserve their pre-CTX-0386 shape.
+                let is_focused_view = ring_ctx
+                    .focused_id
+                    .map(|fid| fid == view_id)
+                    .unwrap_or(true);
+
+                // Each origin's damage comes from its own ring (CTX-0386).
+                // `last_presented_generation` is consumed per present: the
+                // session field for panes, the runtime scalar for the primary
+                // owner. A gap past the retained history window is treated as
+                // damage so an evicted ring can never under-damage.
+                let (origin_gen, origin_last, leaf_damage) = match self.pane_sessions.get(&view_id)
+                {
+                    Some(sess) => (
+                        sess.state.generation(),
+                        sess.last_presented_generation,
+                        sess.state.damage_since(sess.last_presented_generation),
+                    ),
+                    None if Some(view_id) == self.primary_view => (
+                        snapshot.generation,
+                        self.last_presented_generation,
+                        self.state.damage_since(self.last_presented_generation),
+                    ),
+                    None => (snapshot.generation, snapshot.generation, Vec::new()),
+                };
+                let damage_evicted = origin_gen.saturating_sub(origin_last)
+                    > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
+                let leaf_damaged = !leaf_damage.is_empty() || damage_evicted;
+                let reuse = !full_frame
+                    && !leaf_damaged
+                    && self
+                        .presented_leaf_frames
+                        .get(&view_id)
+                        .is_some_and(|leaf| {
+                            leaf.origin == (frame.content.x, frame.content.y)
+                                && leaf.scroll_offset
+                                    == view.map(|v| v.scroll_offset()).unwrap_or(0)
+                        });
+
+                // CTX-0311 ring: shared by the reuse and re-render paths so a
+                // retained leaf still paints its live focus/open outline.
+                let (frame_clip, ring_painted) =
+                    self.push_leaf_ring(frame, view_id, open_factor, &ring_ctx, &mut built.rounded);
+                built.needs_draw |= ring_painted;
+
+                if reuse {
+                    let leaf = self
+                        .presented_leaf_frames
+                        .get(&view_id)
+                        .expect("reuse requires a retained leaf");
+                    built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
+                    built.fills.extend(leaf.fills.iter().cloned());
+                    built.glyphs.extend(leaf.glyphs.iter().cloned());
+                    if is_focused_view && !scrolled {
+                        built.cursor = self.reused_cursor_paint(
+                            frame,
+                            view_id,
+                            &snapshot,
+                            origin_px_x,
+                            origin_px_y,
+                        );
+                    }
+                    continue;
+                }
+
+                // CTX-0176: a leaf with its own shell renders that session's
+                // grid. CTX-0359: a leaf WITHOUT a session renders the shared
+                // primary snapshot only when it IS the primary owner
+                // (`primary_view`: the leaf focused when the primary shell
+                // attached). Ownership — not focus and not session-presence —
+                // decides: every other session-less leaf (ctl splits spawn no
+                // shell, spawn failures, fresh workspace leaves) presents
+                // erased, so a session-less View never paints another View's
+                // grid.
+                let pane_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
+                    Some(sess) => Some(sess.state.snapshot()),
+                    None if Some(view_id) == self.primary_view => Some(snapshot.clone()),
+                    None => None,
+                };
+                // Erased source for session-less leaves that do not own the
+                // primary; `viewport_snapshot` pads it to the allocation below.
+                let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
+                    Some(erased_snapshot(&snapshot))
+                } else {
+                    None
+                };
+                let base_snap: &Snapshot = pane_snap
+                    .as_ref()
+                    .or(erased_snap.as_ref())
+                    .unwrap_or(&snapshot);
+                // Determine viewport snapshot: when view scroll_offset !=0,
+                // visible_cells composites scrollback.
+                let view_snapshot = if let Some(v) = view {
+                    if v.scroll_offset() != 0 && pane_snap.is_some() {
+                        let cells = match self.pane_sessions.get(&view_id) {
+                            Some(sess) => v.visible_cells(&sess.state),
+                            None => v.visible_cells(&self.state),
+                        };
+                        Snapshot {
+                            version: base_snap.version,
+                            generation: base_snap.generation,
+                            width: v.cols() as usize,
+                            height: v.rows() as usize,
+                            cells,
+                            cursor: base_snap.cursor.clone(),
+                            modes: base_snap.modes.clone(),
+                            title: base_snap.title.clone(),
+                        }
+                    } else {
+                        viewport_snapshot(base_snap, frame.cols, frame.rows)
                     }
                 } else {
                     viewport_snapshot(base_snap, frame.cols, frame.rows)
-                }
-            } else {
-                viewport_snapshot(base_snap, frame.cols, frame.rows)
-            };
+                };
 
-            let damage = if use_full || pending_full || last == u64::MAX {
-                Damage {
+                // A re-rendered leaf is redrawn in full. Sub-pane partial
+                // merges are deliberately not attempted: retained glyphs can
+                // paint outside their cell (metric overhang), so intersecting
+                // them with sub-cell damage would under-damage neighbouring
+                // cells. Pane granularity is the containment unit and
+                // over-damage stays the only failure direction.
+                let damage = Damage {
                     generation: current_gen,
                     regions: vec![DamagedRegion::Grid(DamageRect::full(
                         view_snapshot.height as u16,
                         view_snapshot.width as u16,
                     ))]
                     .into_boxed_slice(),
-                }
-            } else {
-                // Incremental path: clip damage_since to viewport bounds.
-                // For this slice we still produce a full per-leaf damage when
-                // any damage exists (over-damage safe), keeping determinism.
-                let regions = self.state.damage_since(last);
-                if regions.is_empty() {
-                    Damage {
-                        generation: current_gen,
-                        regions: Box::new([]),
-                    }
-                } else {
-                    Damage {
-                        generation: current_gen,
-                        regions: vec![DamagedRegion::Grid(DamageRect::full(
-                            view_snapshot.height as u16,
-                            view_snapshot.width as u16,
-                        ))]
-                        .into_boxed_slice(),
-                    }
-                }
-            };
-
-            if damage.regions.is_empty() {
-                continue;
-            }
-
-            let list = match self.renderer.render(&view_snapshot, &damage) {
-                Ok(list) => list,
-                Err(_) => continue,
-            };
-            // Cursor rendering: add a cursor fill when visible, focused, and live.
-            // Single-window slice: cursor is presentation overlay, not terminal truth mutation.
-            let mut list = list;
-            if view_snapshot.cursor.visible
-                && self.focused
-                && view.map(|v| v.scroll_offset() == 0).unwrap_or(true)
-            {
-                // Only draw cursor when this view is the focused view (or single leaf default)
-                let is_focused_view = self
-                    .focused_view()
-                    .map(|fid| fid == *view_id)
-                    .unwrap_or(true);
-                if is_focused_view {
+                };
+                let list = match self.renderer.render(&view_snapshot, &damage) {
+                    Ok(list) => list,
+                    Err(_) => continue,
+                };
+                if is_focused_view && view_snapshot.cursor.visible && !scrolled {
                     let cur = &view_snapshot.cursor.position;
                     if (cur.row as usize) < view_snapshot.height
                         && (cur.col as usize) < view_snapshot.width
                     {
-                        // CTX-0367: arm the platform-IME caret rect (window-
-                        // relative physical pixels) for the focused, visible
-                        // cursor. The inline preedit overlay and the OS
-                        // candidate window both anchor here; `cells_available`
-                        // clips the inline preedit to the pane's right edge.
-                        let live = self.live_cell_metrics();
-                        let origin_px_x = px_add(pad_px, frame.content.x);
-                        let origin_px_y = px_add(pad_px, frame.content.y);
-                        self.ime_caret = Some(ImeCaret {
-                            area: ImeCursorArea {
-                                x: px_offset_cells(origin_px_x, cur.col, live.width),
-                                y: px_offset_cells(origin_px_y, cur.row, live.height),
-                                width: live.width.max(1),
-                                height: live.height.max(1),
-                            },
-                            cells_available: frame.cols.saturating_sub(cur.col).max(1),
-                        });
-                        // Check not on spacer
                         let idx = cur.row as usize * view_snapshot.width + cur.col as usize;
-                        let is_spacer = view_snapshot
+                        let on_spacer = view_snapshot
                             .cells
                             .get(idx)
                             .map(|c| c.spacer)
                             .unwrap_or(false);
-                        if !is_spacer {
-                            let live = self.live_cell_metrics();
-                            // DECSCUSR shape comes from the shared render primitive
-                            // (`bitty_render::grid::cursor_fill`: block = full cell,
-                            // bar = left strip, underline = bottom strip, 15% thickness
-                            // per DEC-0017 ghostty/alacritty refs). Geometry is shared;
-                            // the overlay hue is the resolved theme cursor
-                            // (CTX-0355) so the live cursor matches the selected
-                            // preset (CTX-0219: no hardcoded white).
-                            if let Some(fill) = bitty_render::grid::cursor_fill_in(
-                                &self.config.theme,
-                                &view_snapshot.cursor,
-                                live,
-                                view_snapshot.width,
-                                view_snapshot.height,
-                            ) {
-                                // Cursor color: the theme cursor hue at the existing
-                                // translucent alpha (blinks stay with the
-                                // embedder's visibility/focus gate, already
-                                // checked above).
-                                let cursor_color: bitty_render::grid::Rgba8 =
-                                    if view_snapshot.cursor.visible {
-                                        let mut themed = self.config.theme.cursor;
-                                        themed[3] = 0xA0;
-                                        themed
-                                    } else {
-                                        [0, 0, 0, 0]
-                                    };
-                                list.fills.push(bitty_render::grid::FillRect {
-                                    rect: fill.rect,
-                                    color: cursor_color,
-                                });
-                            }
-                        }
+                        built.cursor = Some(CursorPaint {
+                            origin_x: origin_px_x,
+                            origin_y: origin_px_y,
+                            cursor: view_snapshot.cursor.clone(),
+                            cols: view_snapshot.width,
+                            rows: view_snapshot.height,
+                            cells_available: frame.cols.saturating_sub(cur.col).max(1),
+                            on_spacer,
+                        });
                     }
                 }
-            }
 
-            // CTX-0311: Core-owned decoration ring as one rounded SDF
-            // primitive (border == 0 paints nothing; a solid rounded fill
-            // would cover the content). It paints after every plain fill —
-            // including the cell backgrounds above — and before glyphs, so
-            // the ring covers the corner cell backgrounds. `radius` clips
-            // content: the derived inner clip is attached to this leaf's
-            // glyphs below, so text never overdraws the inner corner curve.
-            // gaps_out/gaps_in bands are the unallocated frame space and
-            // keep the surface clear color, exactly like the CTX-0177 gap
-            // bands.
-            let mut frame_clip = None;
-            if frame.frame.width > 0 && frame.frame.height > 0 {
-                let ring_frame = bitty_render::geometry::RectPx::new(
-                    px_add(pad_px, frame.frame.x),
-                    px_add(pad_px, frame.frame.y),
-                    frame.frame.width,
-                    frame.frame.height,
-                );
-                // CTX-0340/CTX-0343: the focused View paints the accent
-                // outline, every idle View the subtle outline. The pair and
-                // the ring *width* now resolve per `View` (RFC-0001/OQ-041)
-                // from the global values plus any matching `views` rule, so a
-                // per-panel override paints only its own panel. Widths scale
-                // at the live DPI factor exactly like the geometry border; the
-                // ring paints inside the View rectangle and the content grid
-                // stays inset by `border + content_inset`, so an override never
-                // moves content.
-                let is_focused_view = focused_id == Some(*view_id);
-                let view_outline = self.view_outline_for(*view_id);
-                let ring_border = if is_focused_view {
-                    view_outline
-                        .width_focused
-                        .map_or(frame.border, |w| self.outline_width_physical(w))
-                } else {
-                    view_outline
-                        .width_idle
-                        .map_or(frame.border, |w| self.outline_width_physical(w))
-                };
-                if ring_border > 0 {
-                    let outline_color = if is_focused_view {
-                        view_outline.focused
-                    } else {
-                        view_outline.idle
-                    };
-                    // RFC-0002 (CTX-0341): the focus transition cross-fades
-                    // the ring color from idle toward the focused accent over
-                    // the accepted duration. Geometry never moves; only the
-                    // Core-owned color interpolates. When not animating (or
-                    // instant), the final color is used unchanged.
-                    let animated_color = if is_focused_view {
-                        match self.animation_progress(AnimationKind::Focus, Some(*view_id), now) {
-                            Some(p) => bitty_render::grid::lerp_rgba(
-                                view_outline.idle,
-                                view_outline.focused,
-                                p,
-                            ),
-                            None => outline_color,
-                        }
-                    } else {
-                        outline_color
-                    };
-                    // Panel-open fades the ring in from transparent; the final
-                    // committed color is applied at animation end.
-                    let ring_color = bitty_render::grid::scale_alpha(
-                        animated_color,
-                        open_factor * workspace_factor,
-                    );
-                    combined_rounded.push(bitty_render::grid::RoundedFill {
-                        frame: ring_frame,
-                        border: ring_border,
-                        radius: frame.radius,
-                        color: ring_color,
-                    });
-                    any_needs_draw = true;
+                let leaf_painted = list.needs_draw();
+                let mut fills = list.fills;
+                for fill in &mut fills {
+                    fill.rect.x = px_add(fill.rect.x, origin_px_x);
+                    fill.rect.y = px_add(fill.rect.y, origin_px_y);
                 }
-                // The content clip is tied to the geometry border (not the
-                // outline width) so the content grid and glyph clipping are
-                // unchanged by a focused/idle width override.
-                frame_clip =
-                    bitty_render::grid::rounded_frame_clip(ring_frame, frame.border, frame.radius);
+                let mut glyphs = list.glyphs;
+                for glyph in &mut glyphs {
+                    glyph.dest[0] = px_add(glyph.dest[0], origin_px_x);
+                    glyph.dest[1] = px_add(glyph.dest[1], origin_px_y);
+                    // CTX-0311 inner-arc clip: only decorated rounded frames
+                    // set it; square frames keep the documented overhang.
+                    glyph.clip = frame_clip;
+                }
+                built.needs_draw |= leaf_painted || !fills.is_empty() || !glyphs.is_empty();
+                self.presented_leaf_frames.insert(
+                    view_id,
+                    PresentedLeaf {
+                        origin: (frame.content.x, frame.content.y),
+                        scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
+                        fills: fills.clone(),
+                        glyphs: glyphs.clone(),
+                    },
+                );
+                built.fills.extend(fills);
+                built.glyphs.extend(glyphs);
             }
 
-            if !list.needs_draw() {
-                continue;
+            if self.renderer.atlas_stats().2 == evictions_before || attempt >= ATLAS_REBUILD_LIMIT {
+                break built;
             }
-            any_needs_draw = true;
+            // Atlas exhaustion reset: every retained slot is dead, so drop the
+            // stores and rebuild every leaf against the fresh atlas.
+            self.presented_leaf_frames.clear();
+            full_frame = true;
+        };
 
-            let origin_px_x = px_add(pad_px, frame.content.x);
-            let origin_px_y = px_add(pad_px, frame.content.y);
-            for mut fill in list.fills {
-                fill.rect.x = px_add(fill.rect.x, origin_px_x);
-                fill.rect.y = px_add(fill.rect.y, origin_px_y);
-                combined_fills.push(fill);
-            }
-            for mut glyph in list.glyphs {
-                glyph.dest[0] = px_add(glyph.dest[0], origin_px_x);
-                glyph.dest[1] = px_add(glyph.dest[1], origin_px_y);
-                // CTX-0311 inner-arc clip: only decorated rounded frames set
-                // it; square frames keep the documented overhang behavior.
-                glyph.clip = frame_clip;
-                combined_glyphs.push(glyph);
-            }
+        // CTX-0386: a retained list is only valid for a leaf visible this
+        // frame; a hidden or closed leaf re-renders when it returns.
+        self.presented_leaf_frames
+            .retain(|id, _| allocations.iter().any(|frame| frame.view == *id));
+
+        let mut combined_fills = built.fills;
+        let mut combined_rounded = built.rounded;
+        let mut combined_glyphs = built.glyphs;
+        let mut any_needs_draw = built.needs_draw;
+        if let Some(paint) = built.cursor {
+            any_needs_draw |= self.paint_cursor(&paint, &mut combined_fills);
         }
 
         // RFC-0002 (CTX-0341): paint the retained frames of Views closed
@@ -1417,6 +1646,12 @@ impl Runtime {
         // plan that reports needs_draw == true when we have content.
         // CTX-0252 F2: latch the presented blit count before the move below.
         let kitty_blits = combined_images.len();
+        // CTX-0386: the 1x1 plan probe below is the frame's last renderer
+        // call; an atlas exhaustion reset inside it would invalidate every
+        // retained slot, so drop the stores afterwards and let the next frame
+        // rebuild. This frame stays best-effort, the same class the
+        // full-render path already had.
+        let evictions_before_probe = self.renderer.atlas_stats().2;
         let combined_list = {
             // We need a FramePlan; construct via a dummy damage descriptor that
             // indicates full. Simplest: reuse empty plan but set dirty_rects
@@ -1495,6 +1730,11 @@ impl Runtime {
             tmp_list
         };
 
+        // Drop retained lists if the plan probe reset the atlas above.
+        if self.renderer.atlas_stats().2 != evictions_before_probe {
+            self.presented_leaf_frames.clear();
+        }
+
         if !combined_list.needs_draw() {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
@@ -1559,6 +1799,16 @@ impl Runtime {
             fills: stats.fills,
             rounded_fills: stats.rounded_fills,
             glyphs: stats.glyphs,
+            cells_examined: self
+                .renderer
+                .counters()
+                .cells_examined
+                .saturating_sub(cells_before),
+            glyphs_emitted: self
+                .renderer
+                .counters()
+                .glyphs_emitted
+                .saturating_sub(glyphs_before),
             headless: stats.headless,
             generation: current_gen,
             images: stats.images,

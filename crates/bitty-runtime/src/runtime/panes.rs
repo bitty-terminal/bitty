@@ -24,6 +24,15 @@ pub(super) struct PaneSession {
     pub(super) forward_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     pub(super) forward_handle: Option<std::thread::JoinHandle<()>>,
     pub(super) writer: PtyWriter,
+    /// Generation of `state` consumed by the last presented frame (CTX-0386).
+    ///
+    /// Per-pane damage is computed from this session's own ring
+    /// (`state.damage_since(last_presented_generation)`), so a split pane
+    /// that produced no output is reused from its retained leaf list instead
+    /// of re-rendering. Initialized to `u64::MAX` ("never presented") so a
+    /// freshly spawned session always reads as changed to frame-on-demand,
+    /// matching the runtime-global primary sentinel.
+    pub(super) last_presented_generation: u64,
 }
 
 impl Runtime {
@@ -220,6 +229,7 @@ impl Runtime {
                 forward_rx: None,
                 forward_handle: None,
                 writer,
+                last_presented_generation: u64::MAX,
             },
         );
         // CTX-0254 (PX-1588): a respawned leaf starts with a fresh grid, so

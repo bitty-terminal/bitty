@@ -139,6 +139,21 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   `1..=32`) and `terminal.scroll_pixels_per_notch` (default `16`, range
   `1..=256`) are unchanged and continue to scale the scroll amount.
 
+### Per-pane damage tracking: splits stop forcing full repaint (CTX-0386, issue #642)
+
+- Each split pane now derives its damage from its own grid generation ring
+  (`State::damage_since` against a per-`PaneSession` `last_presented_generation`)
+  instead of any live pane session forcing a full per-leaf redraw. A pane that
+  produced no output contributes its retained complete draw list, so a frame
+  driven by one pane re-examines only that pane while the composited frame
+  still carries every pane. Headless two-pane measurement: a one-pane update
+  frame drops from 1629 to 815 cells examined and 85 to 5 glyphs emitted
+  (`PresentStats::cells_examined`/`glyphs_emitted`, new per-frame work
+  counters). Layout/focus edits, window resize, DPI/font, appearance
+  transitions, and the first frame still force a full invalidation; the cursor
+  overlay is recomputed per frame so a reused leaf never carries a stale
+  cursor.
+
 ### Idle-outline visibility across preset themes (CTX-0354, issue #630)
 
 - Cleared the advisory CTX-0340 AC-3 idle-outline warning (`idle >= 1.5:1`

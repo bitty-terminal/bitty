@@ -179,12 +179,6 @@ pub(crate) fn split_dir_to_axis(dir: bitty_config::SplitDir) -> SplitAxis {
     }
 }
 
-/// Fresh view id: one past the current maximum (total; empty layouts yield 1).
-pub(crate) fn next_view_id(layout: &LayoutNode) -> ViewId {
-    let max = layout.leaf_ids().iter().map(|id| id.0).max().unwrap_or(0);
-    ViewId::new(max.saturating_add(1).max(1))
-}
-
 /// Split the focused leaf along `axis`, keeping the focused view and adding a
 /// fresh sibling. The new pane goes first for `Left`/`Up`, second otherwise.
 /// Returns false when the focused id is not in the tree.
@@ -574,7 +568,12 @@ impl TerminalApp {
                     }
                 };
                 let mut layout = self.runtime.layout().clone();
-                let new_id = next_view_id(&layout);
+                // CTX-0378: the id comes from the runtime-wide allocator
+                // (every slot + the live layout), never this layout's max + 1:
+                // `pane_sessions` is keyed globally by `ViewId`, so a local
+                // scan would alias another workspace's shell and the spawn
+                // below would replace its session.
+                let new_id = self.runtime.next_view_id_global();
                 let place_new_first = matches!(
                     dir,
                     bitty_config::SplitDir::Left | bitty_config::SplitDir::Up
@@ -2016,6 +2015,71 @@ mod tests {
             Some(ViewId::new(3)),
             "new_split must focus the fresh pane v:3"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chrome_new_split_after_workspace_new_does_not_clobber_other_shell() {
+        // CTX-0378 / Issue #627: the keymap `new_split` path allocated from
+        // the active layout's `max + 1`, then spawned a shell for that id.
+        // After `WorkspaceNew` gives ws2 its own leaf + replayed shell, a
+        // split in ws1 must allocate globally (v:4) and must never re-spawn
+        // over ws2's live session (which would kill its shell).
+        use bitty_config::{ChromeAction, SplitDir};
+        bitty_test_support::require_pty!();
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.spawn_shell_with_args("/bin/sh", &[])
+            .expect("primary shell must attach headless");
+        let spec = SpawnSpec {
+            program: Some("/bin/sh".to_string()),
+            program_args: Vec::new(),
+            shell_env: None,
+            config_shell: None,
+        };
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            spec,
+        );
+        // ws1: split -> v:2 with a shell of its own.
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        let ws1_pid = app
+            .runtime
+            .pane_pid(&ViewId::new(2))
+            .expect("ws1 split shell must spawn");
+        // ws2: fresh workspace owns v:3 and the replayed shell.
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        let ws2_view = app.runtime.focused_view().expect("ws2 focus");
+        assert_eq!(ws2_view, ViewId::new(3));
+        let ws2_pid = app.runtime.pane_pid(&ws2_view).expect("ws2 shell");
+        // Back to ws1 and split: the global allocator must give v:4.
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(ViewId::new(4)),
+            "keymap split must allocate the global next id, not ws1's v:3"
+        );
+        assert_eq!(
+            app.runtime.pane_pid(&ws2_view),
+            Some(ws2_pid),
+            "ws2's shell must survive the ws1 split (no session replacement)"
+        );
+        assert_eq!(
+            app.runtime.pane_pid(&ViewId::new(2)),
+            Some(ws1_pid),
+            "ws1's earlier split shell must stay live"
+        );
+        let new_pid = app
+            .runtime
+            .pane_pid(&ViewId::new(4))
+            .expect("new split shell must spawn");
+        assert_ne!(new_pid, ws2_pid, "distinct shells for distinct views");
+        assert_ne!(new_pid, ws1_pid, "distinct shells for distinct views");
     }
 
     #[test]

@@ -103,6 +103,14 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
     None
 }
 
+/// Build the startup layout from CLI flags (precedence: `--layout` >
+/// `--stack` > `--overlay` > `--split` > single leaf).
+///
+/// Startup-only: this seeds the first workspace before any split exists, so
+/// its small ids are unique within that one layout. Every live creation path
+/// after startup (split, spawn, new workspace) must allocate through
+/// [`Runtime::next_view_id_global`], the single globally unique allocator
+/// (CTX-0378); never derive an id from one layout's max.
 pub(crate) fn build_layout(args: &Args, cols: usize, rows: usize) -> LayoutNode {
     // Precedence: --layout > --stack > --overlay > --split > single
     if let Some(spec) = args.layout.as_deref() {

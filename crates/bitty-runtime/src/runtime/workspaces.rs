@@ -247,20 +247,48 @@ impl Runtime {
     }
 
     /// Fresh [`ViewId`] unique across every slot and the live layout.
-    fn next_view_id_global(&self) -> ViewId {
-        let mut max = self
-            .layout
-            .leaf_ids()
-            .iter()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0);
-        for slot in &self.workspaces {
-            if let Some(m) = slot.layout.leaf_ids().iter().map(|id| id.0).max() {
-                max = max.max(m);
+    ///
+    /// This is the single live-allocation point for leaf ids (CTX-0378):
+    /// `pane_sessions` is keyed globally by [`ViewId`], so a split inside one
+    /// workspace must never reuse an id another slot owns. Every creation
+    /// path (`workspace_new`, the last-slot reset, the ctl split/spawn verbs,
+    /// and the keymap `new_split` action) takes its id here; a per-layout
+    /// `max + 1` scan is forbidden because it aliases another workspace's
+    /// shell.
+    ///
+    /// Bounded and alias-free: the scan covers the live layout plus at most
+    /// [`MAX_WORKSPACES`] stashed slots. While an owner is live its id is
+    /// never re-handed (`max + 1`). If the `u64` space were exhausted so that
+    /// `max + 1` is impossible, the lowest free id is scanned instead — the
+    /// allocator never wraps, saturates, or returns an id a live leaf owns.
+    #[must_use]
+    pub fn next_view_id_global(&self) -> ViewId {
+        let live = self.live_view_raws();
+        let max = live.iter().copied().max().unwrap_or(0);
+        let id = match max.checked_add(1) {
+            Some(next) => ViewId::new(next),
+            None => {
+                let mut raw = 1u64;
+                while live.contains(&raw) {
+                    raw += 1;
+                }
+                ViewId::new(raw)
             }
+        };
+        debug_assert!(
+            !live.contains(&id.0),
+            "view id allocator must never hand out a live id"
+        );
+        id
+    }
+
+    /// Raw ids of every live leaf: the live layout plus all stashed slots.
+    fn live_view_raws(&self) -> Vec<u64> {
+        let mut raws: Vec<u64> = self.layout.leaf_ids().iter().map(|id| id.0).collect();
+        for slot in &self.workspaces {
+            raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
         }
-        ViewId::new(max.saturating_add(1).max(1))
+        raws
     }
 
     /// Stash the live layout + focus into the active slot (fresh copy).
@@ -807,6 +835,32 @@ mod tests {
         assert!(rt.workspace_switch(0));
         assert_eq!(rt.layout().leaf_count(), 2, "stashed ws1 layout restored");
         assert_eq!(rt.workspaceline_text(), "1:ws1* 2:ws2 (2)");
+    }
+
+    #[test]
+    fn next_view_id_global_accounts_for_inactive_slots() {
+        // CTX-0378: a split in ws1 must never reuse an id an inactive ws2
+        // owns. The live ws1 layout is [v:1]; a per-layout max + 1 would
+        // return v:2 (ws2's leaf). The global allocator must skip it.
+        let mut rt = fresh();
+        assert_eq!(rt.next_view_id_global(), ViewId::new(2));
+        rt.workspace_new().expect("ws2");
+        assert!(rt.layout().leaf_ids().contains(&ViewId::new(2)));
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
+        assert_eq!(rt.next_view_id_global(), ViewId::new(3));
+        assert!(!rt.layout().leaf_ids().contains(&ViewId::new(3)));
+    }
+
+    #[test]
+    fn next_view_id_global_is_pure_until_a_leaf_commits() {
+        // Allocation itself never mutates state: repeating it before the id
+        // is installed in a layout returns the same fresh id (idempotent),
+        // so a refused split cannot burn ids or alias later.
+        let rt = fresh();
+        assert_eq!(rt.next_view_id_global(), ViewId::new(2));
+        assert_eq!(rt.next_view_id_global(), ViewId::new(2));
+        assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
     }
 
     #[test]

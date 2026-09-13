@@ -57,6 +57,33 @@ impl Runtime {
         let _ = self.state.resize(cols, rows);
     }
 
+    /// Resizes the primary grid and PTY winsize to the primary owner leaf's
+    /// decorated content frame (CTX-0359/CTX-0405).
+    ///
+    /// No-op when there is no owner, the owner is absent from the current
+    /// layout (a fresh workspace leaves the grid untouched until the owner
+    /// returns), or the sizes already match. `replace_layout` calls this on
+    /// every tree install and `remove_workspace` calls it when a workspace
+    /// close re-homes the owner, so a presented primary frame always matches
+    /// its owner leaf's content frame.
+    pub(super) fn sync_primary_geometry(&mut self) {
+        let Some(primary) = self.primary_view else {
+            return;
+        };
+        let frames = self.present_frames();
+        let Some(frame) = frames.iter().find(|frame| frame.view == primary) else {
+            return;
+        };
+        let cols = usize::from(frame.cols.max(1));
+        let rows = usize::from(frame.rows.max(1));
+        if self.state.width() != cols || self.state.height() != rows {
+            self.resize_primary_grid(cols, rows);
+            if let Some(pty) = self.pty.as_mut() {
+                let _ = pty.resize(frame.cols.max(1), frame.rows.max(1));
+            }
+        }
+    }
+
     /// Converts a physical cursor position to a grid cell coordinate using
     /// the live (DPI-scaled) cell metrics. Clamped to the current snapshot bounds.
     ///
@@ -793,21 +820,10 @@ impl Runtime {
         // the primary owner leaf — the tile that paints primary input/cursor
         // — not the focused leaf. A layout without the owner (fresh
         // workspace) leaves the grid untouched until the owner returns.
-        if let Some(primary) = self.primary_view {
-            if let Some(frame) = frames.iter().find(|frame| frame.view == primary) {
-                let cols = usize::from(frame.cols.max(1));
-                let rows = usize::from(frame.rows.max(1));
-                if self.state.width() != cols || self.state.height() != rows {
-                    self.resize_primary_grid(cols, rows);
-                    if let Some(pty) = self.pty.as_mut() {
-                        let _ = pty.resize(frame.cols.max(1), frame.rows.max(1));
-                    }
-                }
-            }
-        }
+        self.sync_primary_geometry();
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.
-        self.sync_pane_geometry();
+        self.sync_pane_geometry_to(&frames);
         self.pending_full_redraw = true;
     }
 

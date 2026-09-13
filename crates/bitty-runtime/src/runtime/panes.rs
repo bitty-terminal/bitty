@@ -4,6 +4,7 @@
 //! byte-identical logic, only module wiring changed.
 use std::path::PathBuf;
 
+use super::layout_focus::PresentFrame;
 use super::*;
 
 /// One split pane's private shell session (CTX-0176).
@@ -385,13 +386,23 @@ impl Runtime {
     /// already match are skipped (keeps generations stable for
     /// frame-on-demand); a PTY resize error never fails the reflow.
     pub(super) fn sync_pane_geometry(&mut self) {
+        let frames = self.present_frames();
+        self.sync_pane_geometry_to(&frames);
+    }
+
+    /// Frame-taking core of [`Self::sync_pane_geometry`] (CTX-0405).
+    ///
+    /// The present path already holds this frame's decorated content frames;
+    /// passing them in keeps the per-frame sync from recomputing them. The
+    /// resize rule is identical: only sessions whose grid or PTY winsize
+    /// differs from their leaf frame are touched.
+    pub(super) fn sync_pane_geometry_to(&mut self, frames: &[PresentFrame]) {
         if self.pane_sessions.is_empty() {
             return;
         }
         // CTX-0294: decorated content frames (Core px decoration + CTX-0177
         // cell gaps) so pane grids/PTYs match the painted viewport.
-        let frames = self.present_frames();
-        for frame in &frames {
+        for frame in frames {
             let cols = frame.cols.max(1);
             let rows = frame.rows.max(1);
             if let Some(sess) = self.pane_sessions.get_mut(&frame.view) {

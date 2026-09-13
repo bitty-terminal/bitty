@@ -308,6 +308,13 @@ impl Runtime {
             self.layout = slot.layout.clone();
             self.focus = slot.focus.clone();
         }
+        // CTX-0405: a slot swap is a layout install that bypasses
+        // `replace_layout`; the loaded slot's leaf boundaries may have been
+        // stashed before a window resize or reflow, so re-sync the primary
+        // grid and every visible pane session to the loaded frames. Hidden
+        // sessions in other slots are untouched.
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
     }
 
     /// Front an index in the MRU (each live index exactly once).
@@ -524,6 +531,16 @@ impl Runtime {
         self.active_workspace = active;
         self.load_slot(active);
         self.mru_front(active);
+        // CTX-0405: removing a slot destroys every leaf it owns, including a
+        // primary owner moved into it earlier. Re-home the primary grid to
+        // the loaded slot's focused leaf so ownership never dangles on a
+        // dead id; an owner still live in another slot is preserved.
+        if let Some(owner) = self.primary_view {
+            if !self.live_view_raws().contains(&owner.0) {
+                self.primary_view = self.focus.focused();
+                self.sync_primary_geometry();
+            }
+        }
         self.pending_full_redraw = true;
     }
 
@@ -687,6 +704,11 @@ impl Runtime {
             slot.layout = wrapped;
             slot.focus = Focus::with_focus(focused);
         }
+        // CTX-0405: the source promotion changed surviving leaf boundaries in
+        // place (the moved leaf's own session re-syncs when its target slot
+        // is loaded), so re-sync the active source before presenting again.
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
         self.pending_full_redraw = true;
         Ok(focused)
     }

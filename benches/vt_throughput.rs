@@ -41,7 +41,7 @@ const PB6_THROUGHPUT_MB_S: f64 = 40.0;
 
 /// Synthetic corpus: mix of printable, CSI SGR, DECSET, OSC, and malformed
 /// bytes derived from `crates/bitty-vt/seeds/*.bin` families (cursor,
-/// SGR, erase, DCS, param stress) without embedding real `tmp/references`.
+/// SGR, erase, DCS, param stress) without embedding real `recording/references`.
 fn synthetic_corpus(len: usize) -> Vec<u8> {
     // Deterministic pattern: printable run + SGR + cursor addressing + DCS probe.
     let chunk: &[u8] = b"\x1b[31;1mHello \x1b[0m\x1b[2J\x1b[H\x1b[?25h world \x1b[38;2;255;128;0m!\n\x1b]0;Bitty\x07\x1bP0;fake|DCS\x1b\\";

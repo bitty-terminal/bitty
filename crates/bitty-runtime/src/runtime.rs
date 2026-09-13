@@ -289,15 +289,18 @@ pub struct Runtime {
     cold_queue: ColdQueue,
     plugin_host: PluginHost,
     last_presented_generation: u64,
-    /// Per-origin generations observed at the last present (CTX-0289).
+    /// Per-leaf retained present primitives, keyed by visible [`ViewId`]
+    /// (CTX-0386).
     ///
-    /// The primary state and every split-pane session own independent grid
-    /// generation counters. A single scalar `max` across them cannot detect
-    /// that a lower-generation pane received output while a higher-generation
-    /// origin stayed quiet, so frame-on-demand wrongly idled and the pane's
-    /// output stayed invisible until an unrelated forced redraw (focus move).
-    /// Tracking each origin's last presented generation makes the check exact.
-    last_presented_pane_generations: std::collections::BTreeMap<ViewId, u64>,
+    /// The present compositor clears the surface every frame, so a leaf that
+    /// produced no damage still contributes its retained complete draw list.
+    /// A leaf re-renders only when its own origin's damage ring advanced;
+    /// per-origin generation consumption lives on the primary scalar above
+    /// and on `PaneSession::last_presented_generation`. Invalidated
+    /// wholesale by any full-frame invalidation and by a glyph-atlas
+    /// exhaustion reset. Entries are pruned to the visible allocation set
+    /// after every presented frame. See `runtime::present`.
+    presented_leaf_frames: std::collections::BTreeMap<ViewId, self::present::PresentedLeaf>,
     pending_full_redraw: bool,
     /// Last presented View frames (CTX-0228, decoration-aware CTX-0294).
     ///
@@ -725,7 +728,7 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
-            last_presented_pane_generations: std::collections::BTreeMap::new(),
+            presented_leaf_frames: std::collections::BTreeMap::new(),
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,
@@ -858,7 +861,7 @@ impl Runtime {
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             plugin_host,
             last_presented_generation: u64::MAX,
-            last_presented_pane_generations: std::collections::BTreeMap::new(),
+            presented_leaf_frames: std::collections::BTreeMap::new(),
             pending_full_redraw: true,
             last_presented_allocations: Vec::new(),
             last_presented_focus: None,

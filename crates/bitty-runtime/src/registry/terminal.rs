@@ -13,6 +13,15 @@ pub struct TerminalRegistry {
     registry_generation: Generation,
     next_terminal_raw: u64,
     next_runtime_raw: u64,
+    /// Registry-local monotone view id allocator.
+    ///
+    /// `TerminalRegistry` is a self-contained subsystem: no current path
+    /// composes it with a live [`Runtime`](crate::Runtime), so it owns its
+    /// ids and guarantees they are unique across every workspace it tracks.
+    /// If the two systems are ever composed in one process, this counter
+    /// must be driven by [`Runtime::next_view_id_global`](crate::Runtime)
+    /// (CTX-0378) so a `ViewId` stays globally unique across both — never
+    /// per workspace.
     next_view_raw: u64,
     next_workspace_raw: u64,
     config: RegistryConfig,
@@ -411,6 +420,10 @@ impl TerminalRegistry {
     }
 
     /// Creates a view in `workspace`. Validates `max_views_per_workspace`.
+    ///
+    /// The new `ViewId` comes from this registry's internal monotone
+    /// counter, so it is unique across every workspace the registry tracks —
+    /// never a per-workspace `max + 1`.
     ///
     /// # Errors
     /// `TooManyViews`, `NotFound`, `GenerationExhausted`.

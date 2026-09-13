@@ -262,15 +262,11 @@ pub fn apply_control(
                 String::from("no focused view to spawn into"),
             ));
         };
-        let next_id = runtime
-            .layout()
-            .leaf_ids()
-            .iter()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let new_id = ViewId::new(next_id.max(1));
+        // CTX-0378: the id must be globally unique across every workspace
+        // slot, not one past the active layout's max — `pane_sessions` is
+        // keyed globally by `ViewId`, so a local scan aliases another
+        // workspace's shell.
+        let new_id = runtime.next_view_id_global();
         let mut layout = runtime.layout().clone();
         if !split_leaf(&mut layout, focused, SplitAxis::Horizontal, new_id, false) {
             return Err((
@@ -355,15 +351,10 @@ pub fn apply_control(
             ipc_ctl::SplitDirection::Up => (SplitAxis::Vertical, true),
             ipc_ctl::SplitDirection::Down => (SplitAxis::Vertical, false),
         };
-        let next_id = runtime
-            .layout()
-            .leaf_ids()
-            .iter()
-            .map(|id| id.0)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let new_id = ViewId::new(next_id.max(1));
+        // CTX-0378: globally unique across every workspace slot (see
+        // `Runtime::next_view_id_global`); a local max + 1 would alias
+        // another workspace's `ViewId` and its pane session.
+        let new_id = runtime.next_view_id_global();
         let mut layout = runtime.layout().clone();
         if !split_leaf(&mut layout, focused, axis, new_id, place_new_first) {
             return Err((

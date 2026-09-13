@@ -644,6 +644,81 @@ fn control_view_split_focuses_new_view() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn control_view_split_after_workspace_new_keeps_shells_isolated() {
+    // CTX-0378 / Issue #627: `workspace new` creates ws2 (v:2) with a
+    // replayed shell of its own. A split back in ws1 used to allocate v:2
+    // from ws1's `max + 1`; `pane_sessions` is keyed globally by `ViewId`,
+    // so the split pane aliased ws2's shell (content mirror + input bleed).
+    // The id must come from the global allocator: v:3, leaving ws2's session
+    // untouched and the new leaf session-less (ctl splits spawn no shell).
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    // Attach the primary so `workspace new` replays a real recipe (CTX-0359)
+    // and ws2 owns a live shell, matching the live repro.
+    rt.spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell must attach headless");
+    let all = bitty_ipc::ScopeSet::all();
+
+    let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &all);
+    assert!(created.ok, "workspace new: {created:?}");
+    let ws2_view = rt.focused_view().expect("ws2 focus");
+    assert_eq!(ws2_view, ViewId::new(2), "ws2 owns the globally next id");
+    let ws2_pid = rt
+        .pane_pid(&ws2_view)
+        .expect("ws2 must own a replayed shell");
+
+    // Back to ws1 and split: the new id must skip ws2's live v:2.
+    let focus = ipc_ctl::params_workspace("ws:1");
+    let back = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_WORKSPACE, Some(&focus), &all);
+    assert!(back.ok, "focus ws1: {back:?}");
+    let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &all);
+    assert!(done.ok, "split: {done:?}");
+    assert!(
+        done.result_json.contains("\"new_view\":\"v:3\""),
+        "split must allocate the global next id v:3, not ws1's v:2: {}",
+        done.result_json
+    );
+    assert_eq!(rt.focused_view(), Some(ViewId::new(3)));
+
+    // ws2's shell survives untouched and the fresh leaf owns no session, so
+    // it can neither paint nor feed ws2's shell.
+    assert_eq!(
+        rt.pane_pid(&ws2_view),
+        Some(ws2_pid),
+        "ws2 shell must not be replaced by the ws1 split"
+    );
+    assert!(rt.has_pane_session(&ws2_view), "ws2 session stays live");
+    assert!(
+        !rt.has_pane_session(&ViewId::new(3)),
+        "the ctl split leaf must not alias any pane session"
+    );
+    // The active-workspace terminal list only shows ws1's leaves; the split
+    // leaf must be session-less (before the fix it aliased ws2's t:2).
+    let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
+    assert!(terms.ok, "terminal list: {terms:?}");
+    assert!(
+        terms
+            .result_json
+            .contains("{\"id\":\"t:3\",\"has_pane_session\":false}"),
+        "the split leaf t:3 must be session-less: {}",
+        terms.result_json
+    );
+    assert!(
+        !terms.result_json.contains("t:2"),
+        "ws2's t:2 must not appear in ws1's list: {}",
+        terms.result_json
+    );
+
+    // The stashed ws2 slot still owns exactly v:2 with the same shell.
+    assert!(rt.workspace_switch(1));
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(2)]);
+    assert_eq!(rt.pane_pid(&ViewId::new(2)), Some(ws2_pid));
+}
+
 /// Allocation rect of leaf `id` in the runtime's live container.
 fn leaf_rect(rt: &bitty_runtime::Runtime, id: u64) -> bitty_runtime::UiRect {
     rt.layout_allocations()

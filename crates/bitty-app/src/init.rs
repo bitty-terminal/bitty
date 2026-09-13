@@ -1,5 +1,7 @@
 //! `bitty init` opt-in setup wizard (#243, CTX-0149).
 
+use std::io::IsTerminal as _;
+
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
@@ -85,10 +87,52 @@ pub(crate) struct InitAnswers {
     pub(crate) shell: Option<String>,
     /// `appearance.theme` value (always a known preset name).
     pub(crate) theme: String,
+    /// `font.family` (trimmed, non-empty).
+    pub(crate) font_family: String,
     /// `font.size` in points, within `(0, 128]`.
     pub(crate) font_size: f32,
+    /// `decoration.gaps_in` in logical px, within `0..=32`.
+    pub(crate) gaps_in: u32,
+    /// `decoration.gaps_out` in logical px, within `0..=32`.
+    pub(crate) gaps_out: u32,
+    /// `decoration.border` in logical px, within `0..=8`.
+    pub(crate) border: u32,
+    /// `decoration.radius` in logical px, within `0..=16`.
+    pub(crate) radius: u32,
+    /// `terminal.scrollback` lines, within `0..=100000`.
+    pub(crate) scrollback: u32,
+    /// Top-level `close_confirm` mode.
+    pub(crate) close_confirm: bitty_config::CloseConfirm,
     /// Keybinding preset choice.
     pub(crate) key_preset: InitKeyPreset,
+}
+
+/// Explicit value-flag answers (`bitty init --theme … --scrollback …`).
+///
+/// Parsed and validated ONCE by [`init_overrides_from_args`] with the same
+/// fail-closed step parsers the interactive wizard uses, so an explicit flag
+/// and an interactive answer can never disagree on validity. `None` means
+/// "the flag was absent; ask (interactive) or take the default (`--yes`)".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct InitOverrides {
+    /// `--theme NAME` answer.
+    pub(crate) theme: Option<String>,
+    /// `--font-family NAME` answer.
+    pub(crate) font_family: Option<String>,
+    /// `--font-size PTS` answer.
+    pub(crate) font_size: Option<f32>,
+    /// `--scrollback LINES` answer.
+    pub(crate) scrollback: Option<u32>,
+    /// `--close-confirm MODE` answer.
+    pub(crate) close_confirm: Option<bitty_config::CloseConfirm>,
+    /// `--gaps-in PX` answer.
+    pub(crate) gaps_in: Option<u32>,
+    /// `--gaps-out PX` answer.
+    pub(crate) gaps_out: Option<u32>,
+    /// `--border PX` answer.
+    pub(crate) border: Option<u32>,
+    /// `--radius PX` answer.
+    pub(crate) radius: Option<u32>,
 }
 
 /// Validates and normalizes one shell path: trims, rejects empty,
@@ -112,8 +156,9 @@ pub(crate) fn init_clean_shell(raw: &str) -> Result<String, String> {
 }
 
 /// Sane non-interactive defaults for `--yes`: `$SHELL` when it is a clean
-/// path (else unset so startup falls back), the dark preset, the default
-/// point size, and the implicit shipped keymap defaults.
+/// path (else unset so startup falls back), the dark preset, the shipped font
+/// default, the shipped decoration geometry, the shipped scrollback, the
+/// default close-confirm mode, and the implicit shipped keymap defaults.
 pub(crate) fn init_yes_defaults(shell_env: Option<&str>) -> InitAnswers {
     let shell = shell_env
         .map(str::trim)
@@ -122,8 +167,122 @@ pub(crate) fn init_yes_defaults(shell_env: Option<&str>) -> InitAnswers {
     InitAnswers {
         shell,
         theme: bitty_config::theme::DARK_THEME_ALIAS.to_string(),
+        font_family: bitty_config::types::DEFAULT_FONT_FAMILY.to_string(),
         font_size: bitty_config::types::DEFAULT_FONT_SIZE,
+        gaps_in: bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
+        gaps_out: bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
+        border: bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
+        radius: bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
+        scrollback: bitty_config::types::TerminalConfig::default().scrollback,
+        close_confirm: bitty_config::types::DEFAULT_CLOSE_CONFIRM,
         key_preset: InitKeyPreset::Default,
+    }
+}
+
+/// Parses and validates the explicit value flags into [`InitOverrides`].
+///
+/// Every value goes through the same fail-closed step parser the interactive
+/// wizard uses; the first invalid value aborts the whole run with a message
+/// naming the flag. Init-only flags present without a value fail closed
+/// (their empty raw is an error, never a silent default).
+pub(crate) fn init_overrides_from_args(args: &Args) -> Result<InitOverrides, String> {
+    let mut out = InitOverrides::default();
+    if let Some(raw) = args.theme.as_deref().filter(|v| !v.trim().is_empty()) {
+        out.theme = Some(init_parse_theme_answer(raw)?);
+    }
+    if let Some(raw) = args.font_family.as_deref().filter(|v| !v.trim().is_empty()) {
+        out.font_family = Some(init_parse_font_family_answer(raw)?);
+    }
+    if let Some(raw) = args.font_size.as_deref().filter(|v| !v.trim().is_empty()) {
+        out.font_size = Some(init_parse_font_size_answer(raw)?);
+    }
+    if let Some(raw) = args.init_scrollback.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--scrollback needs a line count".to_string());
+        }
+        out.scrollback = Some(init_parse_scrollback_answer(raw)?);
+    }
+    if let Some(raw) = args.init_close_confirm.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--close-confirm needs a mode".to_string());
+        }
+        out.close_confirm = Some(init_parse_close_confirm_answer(raw)?);
+    }
+    if let Some(raw) = args.init_gaps_in.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--gaps-in needs a value".to_string());
+        }
+        out.gaps_in = Some(init_parse_decoration_answer(
+            raw,
+            "gaps_in",
+            bitty_config::types::MAX_DECORATION_GAP_PX,
+            bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
+        )?);
+    }
+    if let Some(raw) = args.init_gaps_out.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--gaps-out needs a value".to_string());
+        }
+        out.gaps_out = Some(init_parse_decoration_answer(
+            raw,
+            "gaps_out",
+            bitty_config::types::MAX_DECORATION_GAP_PX,
+            bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
+        )?);
+    }
+    if let Some(raw) = args.init_border.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--border needs a value".to_string());
+        }
+        out.border = Some(init_parse_decoration_answer(
+            raw,
+            "border",
+            bitty_config::types::MAX_DECORATION_BORDER_PX,
+            bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
+        )?);
+    }
+    if let Some(raw) = args.init_radius.as_deref() {
+        if raw.trim().is_empty() {
+            return Err("--radius needs a value".to_string());
+        }
+        out.radius = Some(init_parse_decoration_answer(
+            raw,
+            "radius",
+            bitty_config::types::MAX_DECORATION_RADIUS_PX,
+            bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Applies validated value-flag overrides to `answers` (CLI wins).
+pub(crate) fn init_apply_overrides(answers: &mut InitAnswers, overrides: &InitOverrides) {
+    if let Some(v) = &overrides.theme {
+        answers.theme.clone_from(v);
+    }
+    if let Some(v) = &overrides.font_family {
+        answers.font_family.clone_from(v);
+    }
+    if let Some(v) = overrides.font_size {
+        answers.font_size = v;
+    }
+    if let Some(v) = overrides.scrollback {
+        answers.scrollback = v;
+    }
+    if let Some(v) = overrides.close_confirm {
+        answers.close_confirm = v;
+    }
+    if let Some(v) = overrides.gaps_in {
+        answers.gaps_in = v;
+    }
+    if let Some(v) = overrides.gaps_out {
+        answers.gaps_out = v;
+    }
+    if let Some(v) = overrides.border {
+        answers.border = v;
+    }
+    if let Some(v) = overrides.radius {
+        answers.radius = v;
     }
 }
 
@@ -176,6 +335,78 @@ pub(crate) fn init_parse_shell_answer(
         ));
     }
     init_clean_shell(trimmed).map(Some)
+}
+
+/// Parses one font-family-step answer: empty takes the shipped default;
+/// otherwise trims, rejects empty, overlong, and control-character input
+/// fail-closed (mirrors [`bitty_config::types::FontConfig::validate`]'s
+/// family bound so the wizard can never emit a family startup would reject).
+pub(crate) fn init_parse_font_family_answer(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(bitty_config::types::DEFAULT_FONT_FAMILY.to_string());
+    }
+    if trimmed.len() > bitty_config::types::MAX_FONT_FAMILY_LEN {
+        return Err(format!(
+            "font family must be <= {} bytes",
+            bitty_config::types::MAX_FONT_FAMILY_LEN
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("font family must not contain control characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parses one scrollback-step answer: empty takes the shipped default,
+/// otherwise a `u32` within `0..=100000` (the
+/// [`bitty_config::types::TerminalConfig::validate`] bound, so the wizard can
+/// never emit a line count startup would reject).
+pub(crate) fn init_parse_scrollback_answer(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(bitty_config::types::TerminalConfig::default().scrollback);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(lines) if lines <= bitty_config::types::MAX_TERMINAL_SCROLLBACK => Ok(lines),
+        _ => Err(format!(
+            "scrollback must be an integer within [0, {}]",
+            bitty_config::types::MAX_TERMINAL_SCROLLBACK
+        )),
+    }
+}
+
+/// Parses one close-confirm-step answer: empty/`1` take the default
+/// (`when_busy`), `2`/`always` and `3`/`never` select their modes. Anything
+/// else reprompts instead of writing a mode startup would only fall back.
+pub(crate) fn init_parse_close_confirm_answer(
+    raw: &str,
+) -> Result<bitty_config::CloseConfirm, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "1" => Ok(bitty_config::types::DEFAULT_CLOSE_CONFIRM),
+        "2" | "always" => Ok(bitty_config::CloseConfirm::Always),
+        "3" | "never" => Ok(bitty_config::CloseConfirm::Never),
+        _ => Err("pick 1 (when_busy), 2 (always), or 3 (never)".to_string()),
+    }
+}
+
+/// Parses one decoration-scalar-step answer: empty takes `default`,
+/// otherwise a `u32` within `0..=max` (the field's shipped bound, so the
+/// wizard can never emit a value `DecorationConfig::validate` would reject).
+pub(crate) fn init_parse_decoration_answer(
+    raw: &str,
+    field: &str,
+    max: u32,
+    default: u32,
+) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(value) if value <= max => Ok(value),
+        _ => Err(format!("{field} must be an integer within [0, {max}]")),
+    }
 }
 
 /// Parses one theme-step answer. Empty/`1` take the default (`dark`, the
@@ -251,10 +482,9 @@ pub(crate) fn init_render_vim_keymaps() -> String {
 
 /// Renders wizard answers as an `init.lua` return table. The output always
 /// parses via `bitty-config::file::parse_lua_config` (pinned by
-/// `init_rendered_config_parses`): `theme` + both `font` keys are always
-/// present (the `font`/`window` tables require complete pairs), the
-/// `terminal` table always carries `scrollback` alongside `shell` (the
-/// parser requires `terminal.scrollback`), and the `keymaps` section appears
+/// `init_rendered_config_parses_and_merges_to_effective`): `theme`, the
+/// `font` pair, and the `decoration`/`terminal`/`close_confirm` basics are
+/// always present with shipped keys only, and the `keymaps` section appears
 /// only for the vim preset.
 pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     let mut out = String::from(
@@ -269,16 +499,28 @@ pub(crate) fn render_init_lua(answers: &InitAnswers) -> String {
     ));
     out.push_str(&format!(
         "    font = {{ family = \"{}\", size = {} }},\n",
-        init_lua_escape(bitty_config::types::DEFAULT_FONT_FAMILY),
+        init_lua_escape(&answers.font_family),
         answers.font_size,
     ));
-    if let Some(shell) = &answers.shell {
-        out.push_str(&format!(
+    out.push_str(&format!(
+        "    decoration = {{ gaps_in = {}, gaps_out = {}, border = {}, radius = {} }},\n",
+        answers.gaps_in, answers.gaps_out, answers.border, answers.radius,
+    ));
+    match &answers.shell {
+        Some(shell) => out.push_str(&format!(
             "    terminal = {{ scrollback = {}, shell = \"{}\" }},\n",
-            bitty_config::TerminalConfig::default().scrollback,
+            answers.scrollback,
             init_lua_escape(shell),
-        ));
+        )),
+        None => out.push_str(&format!(
+            "    terminal = {{ scrollback = {} }},\n",
+            answers.scrollback,
+        )),
     }
+    out.push_str(&format!(
+        "    close_confirm = \"{}\",\n",
+        answers.close_confirm.as_str()
+    ));
     match answers.key_preset {
         InitKeyPreset::Default => {
             out.push_str(
@@ -352,16 +594,22 @@ pub(crate) fn init_ask<T>(
     ))
 }
 
-/// Runs the interactive wizard: mascot greeting, then shell / theme /
-/// font-size / keybinding-preset picks. Pure over injected `input`,
-/// `output`, `shell_env`, `columns`, and `shell_exists`, so the whole flow
-/// is headless-testable with piped stdin.
+/// Runs the interactive wizard: mascot greeting, then shell / theme / font
+/// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
+/// scrollback / close-confirm / keybinding-preset picks. Pure over injected
+/// `input`, `output`, `shell_env`, `columns`, `shell_exists`, and
+/// `overrides`, so the whole flow is headless-testable with piped stdin.
+///
+/// A step answered by a value flag ([`InitOverrides`]) is skipped entirely
+/// (no prompt, no stdin read); the remaining steps prompt with their shipped
+/// default and reprompt fail-closed on invalid input.
 pub(crate) fn run_init_interactive(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     shell_env: Option<&str>,
     columns: Option<u16>,
     shell_exists: &dyn Fn(&str) -> bool,
+    overrides: &InitOverrides,
 ) -> Result<InitAnswers, String> {
     let _ = write!(output, "{}", init_greeting_art(columns));
     let _ = writeln!(
@@ -380,16 +628,139 @@ pub(crate) fn run_init_interactive(
         "Shell [Enter for default, number, or custom path]:",
         |line| init_parse_shell_answer(line, &candidates),
     )?;
-    let theme = init_ask(input, output, "Theme [dark]:", init_parse_theme_answer)?;
-    let font_size = init_ask(
-        input,
+    let theme = match &overrides.theme {
+        Some(theme) => theme.clone(),
+        None => init_ask(input, output, "Theme [dark]:", init_parse_theme_answer)?,
+    };
+    let font_family = match &overrides.font_family {
+        Some(family) => family.clone(),
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "Font family [{}]:",
+                bitty_config::types::DEFAULT_FONT_FAMILY
+            ),
+            init_parse_font_family_answer,
+        )?,
+    };
+    let font_size = match overrides.font_size {
+        Some(size) => size,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "Font size in points [{}]:",
+                bitty_config::types::DEFAULT_FONT_SIZE
+            ),
+            init_parse_font_size_answer,
+        )?,
+    };
+    let _ = writeln!(
         output,
-        &format!(
-            "Font size in points [{}]:",
-            bitty_config::types::DEFAULT_FONT_SIZE
-        ),
-        init_parse_font_size_answer,
-    )?;
+        "\nDecoration (logical pixels; 0 disables; see RFC-0001):"
+    );
+    let gaps_in = match overrides.gaps_in {
+        Some(value) => value,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "gaps_in (space between panes) [{}]:",
+                bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX
+            ),
+            |line| {
+                init_parse_decoration_answer(
+                    line,
+                    "gaps_in",
+                    bitty_config::types::MAX_DECORATION_GAP_PX,
+                    bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX,
+                )
+            },
+        )?,
+    };
+    let gaps_out = match overrides.gaps_out {
+        Some(value) => value,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "gaps_out (space around the window edge) [{}]:",
+                bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX
+            ),
+            |line| {
+                init_parse_decoration_answer(
+                    line,
+                    "gaps_out",
+                    bitty_config::types::MAX_DECORATION_GAP_PX,
+                    bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX,
+                )
+            },
+        )?,
+    };
+    let border = match overrides.border {
+        Some(value) => value,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "border (frame thickness) [{}]:",
+                bitty_config::types::DEFAULT_DECORATION_BORDER_PX
+            ),
+            |line| {
+                init_parse_decoration_answer(
+                    line,
+                    "border",
+                    bitty_config::types::MAX_DECORATION_BORDER_PX,
+                    bitty_config::types::DEFAULT_DECORATION_BORDER_PX,
+                )
+            },
+        )?,
+    };
+    let radius = match overrides.radius {
+        Some(value) => value,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "radius (corner rounding) [{}]:",
+                bitty_config::types::DEFAULT_DECORATION_RADIUS_PX
+            ),
+            |line| {
+                init_parse_decoration_answer(
+                    line,
+                    "radius",
+                    bitty_config::types::MAX_DECORATION_RADIUS_PX,
+                    bitty_config::types::DEFAULT_DECORATION_RADIUS_PX,
+                )
+            },
+        )?,
+    };
+    let _ = writeln!(output, "\nBehavior:");
+    let scrollback = match overrides.scrollback {
+        Some(value) => value,
+        None => init_ask(
+            input,
+            output,
+            &format!(
+                "Scrollback lines [{}]:",
+                bitty_config::types::TerminalConfig::default().scrollback
+            ),
+            init_parse_scrollback_answer,
+        )?,
+    };
+    let close_confirm = match overrides.close_confirm {
+        Some(mode) => mode,
+        None => init_ask(
+            input,
+            output,
+            "Close confirm [1 when_busy]:\n  \
+             1) when_busy — confirm only while a foreground job runs (default)\n  \
+             2) always — confirm every view/window close\n  \
+             3) never — never confirm:",
+            init_parse_close_confirm_answer,
+        )?,
+    };
     let key_preset = init_ask(
         input,
         output,
@@ -399,7 +770,14 @@ pub(crate) fn run_init_interactive(
     Ok(InitAnswers {
         shell,
         theme,
+        font_family,
         font_size,
+        gaps_in,
+        gaps_out,
+        border,
+        radius,
+        scrollback,
+        close_confirm,
         key_preset,
     })
 }
@@ -503,29 +881,62 @@ pub(crate) fn write_init_config(
 /// Short usage for `bitty init` (stdout on `--help`-style flows, stderr on
 /// fail-closed exit 2).
 pub(crate) fn init_usage() -> String {
-    "usage: bitty init [--yes] [--force] [--config PATH]\n\
+    "usage: bitty init [--yes] [--force] [VALUE FLAGS] [--config PATH]\n\
      \n\
-     Opt-in setup wizard (never auto-runs): mascot greeting, shell / theme /\n\
-     font-size / keybinding-preset picks, then writes the config file.\n\
+     Opt-in setup wizard (never auto-runs): mascot greeting, then shell /\n\
+     theme / font family+size / decoration (gaps_in, gaps_out, border,\n\
+     radius) / scrollback / close_confirm / keybinding-preset picks, then\n\
+     writes the config file with shipped keys only (no secrets, no network).\n\
      \n\
      flags:\n\
-     \x20 --yes     skip prompts; write sane defaults ($SHELL when clean,\n\
-     \x20           dark theme, 12pt, shipped keymap defaults)\n\
+     \x20 --yes     skip prompts; write sane defaults ($SHELL when clean, dark\n\
+     \x20           theme, shipped font/decoration/scrollback/close_confirm,\n\
+     \x20           shipped keymap defaults)\n\
      \x20 --force   overwrite an existing file (backs it up to init.lua.bak)\n\
+     \n\
+     value flags (answer one step, skip its prompt; validated fail-closed):\n\
+     \x20 --theme NAME         preset name or alias (e.g. dark, tokyo-night)\n\
+     \x20 --font-family NAME   font family (<= 128 bytes)\n\
+     \x20 --font-size PTS      point size within (0, 128]\n\
+     \x20 --scrollback LINES   scrollback lines within [0, 100000]\n\
+     \x20 --close-confirm MODE always | when_busy | never\n\
+     \x20 --gaps-in PX         pane gap within [0, 32] (decoration.gaps_in)\n\
+     \x20 --gaps-out PX        edge gap within [0, 32] (decoration.gaps_out)\n\
+     \x20 --border PX          frame thickness within [0, 8]\n\
+     \x20 --radius PX          corner radius within [0, 16]\n\
      \n\
      target: --config PATH wins, else BITTY_CONFIG, else\n\
      $XDG_CONFIG_HOME/bitty/init.lua (fallback ~/.config/bitty/init.lua).\n\
      Without --force an existing file is never overwritten (exit 2).\n\
-     Re-runs are idempotent: same answers write the same file.\n\
-     Validate any file any time with `bitty config check`."
+     Without a TTY on stdin, prompts are skipped only with --yes (exit 2\n\
+     otherwise, never a hang). Re-runs are idempotent: same answers write\n\
+     the same file. Validate any file any time with `bitty config check`."
         .to_string()
+}
+
+/// Hermetic environment for [`run_init_subcommand_with_io`]: every value the
+/// dispatch reads is injected so tests touch neither process env, the real
+/// TTY, nor the host filesystem root policy.
+pub(crate) struct InitEnv<'a> {
+    /// Stands in for `BITTY_CONFIG`.
+    pub(crate) bitty_config: Option<&'a str>,
+    /// Stands in for `SHELL`.
+    pub(crate) shell: Option<&'a str>,
+    /// Stands in for `XDG_CONFIG_HOME`.
+    pub(crate) xdg_config_home: Option<&'a str>,
+    /// Stands in for `HOME` (XDG fallback root).
+    pub(crate) home: Option<&'a str>,
+    /// Stands in for `COLUMNS` (greeting width).
+    pub(crate) columns: Option<u16>,
+    /// Whether stdin is a TTY; `false` without `--yes` fails closed.
+    pub(crate) stdin_is_tty: bool,
 }
 
 /// Runs `bitty init`; returns the process exit code.
 ///
 /// - `0`: wrote the file (prints the target plus what changed).
-/// - `2`: usage-level refusal (unexpected args, existing file without
-///   `--force`, invalid `$SHELL` handling aside) — nothing was overwritten.
+/// - `2`: usage-level refusal (unexpected args, invalid value flag, non-TTY
+///   without `--yes`, existing file without `--force`) — nothing was written.
 /// - `1`: aborted prompts (EOF / too many retries) or filesystem failure.
 pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
@@ -533,13 +944,38 @@ pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
     run_init_subcommand_with_env(args, bitty_config_env.as_deref(), shell_env.as_deref())
 }
 
-/// [`run_init_subcommand`] with injected environment values so tests stay
-/// hermetic (no process-env mutation): `bitty_config_env` stands in for
-/// `BITTY_CONFIG`, `shell_env` for `SHELL`.
+/// [`run_init_subcommand`] with injected `BITTY_CONFIG`/`SHELL` values; the
+/// remaining environment (XDG root, COLUMNS, TTY-ness) is read live. Tests
+/// use [`run_init_subcommand_with_io`] for full hermeticity.
 pub(crate) fn run_init_subcommand_with_env(
     args: &Args,
     bitty_config_env: Option<&str>,
     shell_env: Option<&str>,
+) -> i32 {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
+    let env = InitEnv {
+        bitty_config: bitty_config_env,
+        shell: shell_env,
+        xdg_config_home: xdg.as_deref(),
+        home: home.as_deref(),
+        columns,
+        stdin_is_tty: std::io::stdin().is_terminal(),
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_init_subcommand_with_io(args, &env, &mut stdin.lock(), &mut stdout.lock())
+}
+
+/// [`run_init_subcommand`] over injected IO and environment. `input` is read
+/// only by the interactive wizard; `output` receives prompts only. Writes go
+/// to the resolved config path and diagnostics to stderr.
+pub(crate) fn run_init_subcommand_with_io(
+    args: &Args,
+    env: &InitEnv<'_>,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
 ) -> i32 {
     if !args.init_args.is_empty() {
         eprintln!(
@@ -549,11 +985,25 @@ pub(crate) fn run_init_subcommand_with_env(
         );
         return 2;
     }
+    // Validate every explicit value flag before touching the filesystem or
+    // prompting: an invalid flag is a usage error, never a silent default.
+    let overrides = match init_overrides_from_args(args) {
+        Ok(overrides) => overrides,
+        Err(message) => {
+            eprintln!("bitty init: {message}\n{}", init_usage());
+            return 2;
+        }
+    };
     // BITTY_CONFIG env participates exactly like --config (CLI wins), same
     // as the `config` subcommand and startup.
     let explicit =
-        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), bitty_config_env);
-    let target = match bitty_config::file::probe_config_path(explicit.as_deref()) {
+        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.bitty_config);
+    let target = match bitty_config::file::probe_config_path_with_env(
+        explicit.as_deref(),
+        env.xdg_config_home,
+        env.home,
+        &|path| path.exists(),
+    ) {
         Some(probed) => probed.path,
         None => {
             eprintln!("bitty init: no config root ($XDG_CONFIG_HOME or $HOME unset)");
@@ -561,27 +1011,32 @@ pub(crate) fn run_init_subcommand_with_env(
         }
     };
     let answers = if args.init_yes {
-        let answers = init_yes_defaults(shell_env);
+        let mut answers = init_yes_defaults(env.shell);
+        init_apply_overrides(&mut answers, &overrides);
         // Warn when $SHELL existed but was unusable, so the omission is
         // never silent (the written file simply leaves `shell` unset and
         // startup falls back to /bin/sh).
-        let raw = shell_env.map(str::trim).unwrap_or_default();
+        let raw = env.shell.map(str::trim).unwrap_or_default();
         if !raw.is_empty() && answers.shell.is_none() {
             eprintln!("bitty init: ignoring unusable $SHELL {raw:?}; leaving shell unset");
         }
         answers
     } else {
-        let columns = init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
-        let stdin = std::io::stdin();
-        let mut stdin_lock = stdin.lock();
-        let stdout = std::io::stdout();
-        let mut stdout_lock = stdout.lock();
+        // Fail closed instead of blocking on a pipe that will never answer.
+        if !env.stdin_is_tty {
+            eprintln!(
+                "bitty init: stdin is not a terminal; re-run with --yes (and value flags) for non-interactive defaults\n{}",
+                init_usage()
+            );
+            return 2;
+        }
         match run_init_interactive(
-            &mut stdin_lock,
-            &mut stdout_lock,
-            shell_env,
-            columns,
+            input,
+            output,
+            env.shell,
+            env.columns,
             &|path| std::path::Path::new(path).exists(),
+            &overrides,
         ) {
             Ok(answers) => answers,
             Err(message) => {
@@ -614,10 +1069,14 @@ pub(crate) fn run_init_subcommand_with_env(
                 ),
             };
             println!(
-                "bitty init: wrote '{}' (theme=\"{}\", shell={shell}, font.size={}, keymaps={keymaps})",
+                "bitty init: wrote '{}' (theme=\"{}\", shell={shell}, font={} {}pt, \
+                 scrollback={}, close_confirm={}, keymaps={keymaps})",
                 outcome.path.display(),
                 answers.theme,
+                answers.font_family,
                 answers.font_size,
+                answers.scrollback,
+                answers.close_confirm.as_str(),
             );
             println!("bitty init: validate any time with `bitty config check`");
             0

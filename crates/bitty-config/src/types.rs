@@ -1131,10 +1131,15 @@ impl WindowConfig {
     }
 }
 
+/// Maximum `terminal.scrollback` lines (bounded memory; CTX-0345: the
+/// `bitty init` wizard validates against this single source so a written
+/// config can never exceed the startup bound).
+pub const MAX_TERMINAL_SCROLLBACK: u32 = 100_000;
+
 /// Terminal behavior configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
-    /// Scrollback lines, `0..=100000` (bounded memory).
+    /// Scrollback lines, `0..=MAX_TERMINAL_SCROLLBACK` (bounded memory).
     pub scrollback: u32,
     /// Preferred shell argv[0], if overridden; trimmed non-empty when present.
     pub shell: Option<String>,
@@ -1160,10 +1165,10 @@ impl Default for TerminalConfig {
 impl TerminalConfig {
     /// Validate terminal config.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.scrollback > 100_000 {
+        if self.scrollback > MAX_TERMINAL_SCROLLBACK {
             return Err(ConfigError::validation(
                 "terminal.scrollback",
-                "must be <= 100000",
+                format!("must be <= {MAX_TERMINAL_SCROLLBACK}"),
             ));
         }
         if !(1..=MAX_SCROLL_LINES_PER_NOTCH).contains(&self.scroll_lines_per_notch) {

@@ -1150,6 +1150,61 @@ impl std::fmt::Display for ViewAppearanceTarget {
     }
 }
 
+/// Every `views` target resolvable without live runtime state (CTX-0343):
+/// the wildcard tier (matched by any target) and each accepted content-type
+/// tier. `ws:`/`view:` selectors never match these synthetic targets
+/// (`workspace_label`/`view_id` are `0`, outside both accepted ranges), so
+/// they stay inert here; the runtime validates them fail-closed on first
+/// match at `View` creation, bind, or workspace move.
+const RESOLVABLE_VIEW_TARGETS: [ViewAppearanceTarget; 4] = [
+    ViewAppearanceTarget::new(ViewContent::Empty, 0, 0),
+    ViewAppearanceTarget::new(ViewContent::Terminal, 0, 0),
+    ViewAppearanceTarget::new(ViewContent::Rich, 0, 0),
+    ViewAppearanceTarget::new(ViewContent::Browser, 0, 0),
+];
+
+/// Which RFC-0001 "Per-View contrast" acceptance check a resolved pair
+/// failed (CTX-0343).
+///
+/// Returned by [`ResolvedViewAppearance::contract_violation`] so callers can
+/// attribute the failure to the selector leaf that supplied the value while
+/// [`ResolvedViewAppearance::validate_contract`] keeps the stable
+/// human-readable diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewContractViolation {
+    /// AC-1: the resolved focused outline is below the `3:1` floor against
+    /// the workspace background.
+    FocusedBackground,
+    /// AC-2: the resolved focused outline is below the `3:1` floor against
+    /// the resolved idle outline and the OQ-045 width cue does not hold.
+    FocusedIdle,
+}
+
+/// The `views` entry (selector plus leaf) that last supplied one resolved
+/// field, in precedence-tier order (CTX-0343).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewLeafSource {
+    selector: ViewSelector,
+    leaf: &'static str,
+}
+
+impl ViewLeafSource {
+    /// Dotted source-attributed diagnostic path (`views[ws:2].border_color`).
+    fn field_path(&self) -> String {
+        format!("views[{}].{}", self.selector.canonical(), self.leaf)
+    }
+}
+
+/// Per-field provenance for one resolved `View` appearance, used to build
+/// source-attributed contract diagnostics (CTX-0343).
+#[derive(Debug, Clone, Default)]
+struct ViewAppearanceSources {
+    focused_color: Option<ViewLeafSource>,
+    idle_color: Option<ViewLeafSource>,
+    focused_width: Option<ViewLeafSource>,
+    idle_width: Option<ViewLeafSource>,
+}
+
 /// One fully resolved per-`View` appearance (RFC-0001/OQ-041).
 ///
 /// Produced by [`EffectiveConfig::resolve_view_appearance`] after applying
@@ -1182,8 +1237,8 @@ impl ResolvedViewAppearance {
         self.outline_width_focused >= self.outline_width_idle.saturating_add(1)
     }
 
-    /// Enforces the CTX-0340/CTX-0343 contrast contract on this fully
-    /// resolved pair (RFC-0001 "Per-View contrast").
+    /// Classifies the CTX-0340/CTX-0343 contrast contract failure of this
+    /// resolved pair, if any (RFC-0001 "Per-View contrast").
     ///
     /// - AC-1: resolved focused outline `>= 3:1` against the workspace
     ///   background; fail-closed.
@@ -1193,27 +1248,52 @@ impl ResolvedViewAppearance {
     ///   distinction).
     /// - AC-3 stays advisory ([`Self::idle_contrast_warning`]).
     ///
-    /// # Errors
-    ///
-    /// [`ConfigError::Validation`] naming `views` with a message that
-    /// includes the resolved pair; callers add the `View` target attribution.
-    pub fn validate_contract(&self, theme: &crate::theme::Theme) -> Result<(), ConfigError> {
+    /// `None` means the pair passes. Callers that need only the pass/fail
+    /// boundary use this; [`Self::validate_contract`] maps it to the
+    /// human-readable [`ConfigError::Validation`].
+    #[must_use]
+    pub fn contract_violation(&self, theme: &crate::theme::Theme) -> Option<ViewContractViolation> {
         let bg = theme.background;
         let ac1 = self.outline_focused.contrast_over(bg);
         if ac1 < MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST {
-            return Err(ConfigError::validation(
-                "views",
-                format!(
-                    "resolved focused outline {} has contrast {ac1:.2}:1 against the background; \
-                     AC-1 requires >= {MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST:.1}:1",
-                    self.outline_focused
-                ),
-            ));
+            return Some(ViewContractViolation::FocusedBackground);
         }
         if self.outline_focused != self.outline_idle && !self.has_non_color_focus_cue() {
             let ac2 = self.outline_focused.contrast_with(self.outline_idle, bg);
             if ac2 < MIN_OUTLINE_FOCUSED_IDLE_CONTRAST {
-                return Err(ConfigError::validation(
+                return Some(ViewContractViolation::FocusedIdle);
+            }
+        }
+        None
+    }
+
+    /// Enforces the CTX-0340/CTX-0343 contrast contract on this fully
+    /// resolved pair (RFC-0001 "Per-View contrast").
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] naming `views` with a message that
+    /// includes the resolved pair and the failed AC; callers add the `View`
+    /// target and, where known, the source-attributed selector leaf.
+    pub fn validate_contract(&self, theme: &crate::theme::Theme) -> Result<(), ConfigError> {
+        let bg = theme.background;
+        match self.contract_violation(theme) {
+            None => Ok(()),
+            Some(ViewContractViolation::FocusedBackground) => {
+                let ac1 = self.outline_focused.contrast_over(bg);
+                Err(ConfigError::validation(
+                    "views",
+                    format!(
+                        "resolved focused outline {} has contrast {ac1:.2}:1 against the \
+                         background; AC-1 requires >= \
+                         {MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST:.1}:1",
+                        self.outline_focused
+                    ),
+                ))
+            }
+            Some(ViewContractViolation::FocusedIdle) => {
+                let ac2 = self.outline_focused.contrast_with(self.outline_idle, bg);
+                Err(ConfigError::validation(
                     "views",
                     format!(
                         "resolved focused outline {} has contrast {ac2:.2}:1 against idle {}; \
@@ -1221,10 +1301,9 @@ impl ResolvedViewAppearance {
                          outline width >= idle + 1 logical px",
                         self.outline_focused, self.outline_idle
                     ),
-                ));
+                ))
             }
         }
-        Ok(())
     }
 
     /// Advisory AC-3 idle-contrast warning for this resolved pair, if it
@@ -2568,9 +2647,8 @@ impl EffectiveConfig {
         self.layout.validate()?;
         self.decoration.validate()?;
         // CTX-0343: every merged `views` entry must stay structurally valid
-        // (grammar/bounds); the per-View AC-1/AC-2 contrast check runs on the
-        // fully resolved pair at reconcile/first-match, not here, because it
-        // depends on the live `View` target.
+        // (grammar/bounds); the per-View AC-1/AC-2 contrast check then runs
+        // on every target resolvable without live runtime state.
         for entry in &self.views {
             entry.validate()?;
         }
@@ -2579,6 +2657,13 @@ impl EffectiveConfig {
         // pair against the selected theme's background (AC-3 stays advisory).
         let theme = crate::theme::resolve_theme(self.appearance.theme.as_deref());
         self.decoration.validate_outline_contract(theme)?;
+        // CTX-0343: a violating `views.*` override that is resolvable now
+        // (`*` or a content-type selector) rejects the WHOLE reload with a
+        // source-attributed `views[<selector>].<field>` diagnostic. The
+        // `ws:`/`view:` tiers are still inert at merge time; the runtime
+        // first-match path (View creation/bind/move) validates those pairs
+        // fail-closed before they are committed.
+        self.validate_view_targets(theme, &RESOLVABLE_VIEW_TARGETS)?;
         self.scrollbar.validate()?;
         self.mouse.validate()?;
         self.appearance.validate()?;
@@ -2642,6 +2727,17 @@ impl EffectiveConfig {
         theme: &crate::theme::Theme,
         target: &ViewAppearanceTarget,
     ) -> ResolvedViewAppearance {
+        self.resolve_view_appearance_traced(theme, target).0
+    }
+
+    /// [`Self::resolve_view_appearance`] plus the winning selector leaf per
+    /// resolved field (CTX-0343): the provenance used to build
+    /// source-attributed contract diagnostics.
+    fn resolve_view_appearance_traced(
+        &self,
+        theme: &crate::theme::Theme,
+        target: &ViewAppearanceTarget,
+    ) -> (ResolvedViewAppearance, ViewAppearanceSources) {
         let decoration = &self.decoration;
         let mut color_base = decoration.border_color;
         let mut color_focused = decoration.border_color_focused;
@@ -2651,6 +2747,12 @@ impl EffectiveConfig {
         let mut width_idle = decoration.border_width_idle;
         let mut background_image: Option<String> = None;
         let mut background_fit = BackgroundFit::Fill;
+        let mut base_src: Option<ViewLeafSource> = None;
+        let mut focused_src: Option<ViewLeafSource> = None;
+        let mut idle_src: Option<ViewLeafSource> = None;
+        let mut width_base_src: Option<ViewLeafSource> = None;
+        let mut width_focused_src: Option<ViewLeafSource> = None;
+        let mut width_idle_src: Option<ViewLeafSource> = None;
         for tier in 0..=3u8 {
             for entry in &self.views {
                 if entry.selector.tier() != tier || !entry.selector.matches(target) {
@@ -2659,21 +2761,45 @@ impl EffectiveConfig {
                 let overrides = &entry.overrides;
                 if let Some(value) = overrides.border_color {
                     color_base = Some(value);
+                    base_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_color",
+                    });
                 }
                 if let Some(value) = overrides.border_color_focused {
                     color_focused = Some(value);
+                    focused_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_color_focused",
+                    });
                 }
                 if let Some(value) = overrides.border_color_idle {
                     color_idle = Some(value);
+                    idle_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_color_idle",
+                    });
                 }
                 if let Some(value) = overrides.border_width {
                     width_base = Some(value);
+                    width_base_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_width",
+                    });
                 }
                 if let Some(value) = overrides.border_width_focused {
                     width_focused = Some(value);
+                    width_focused_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_width_focused",
+                    });
                 }
                 if let Some(value) = overrides.border_width_idle {
                     width_idle = Some(value);
+                    width_idle_src = Some(ViewLeafSource {
+                        selector: entry.selector,
+                        leaf: "border_width_idle",
+                    });
                 }
                 if let Some(value) = &overrides.background_image {
                     background_image = Some(value.clone());
@@ -2683,44 +2809,72 @@ impl EffectiveConfig {
                 }
             }
         }
-        ResolvedViewAppearance {
-            outline_focused: color_focused.or(color_base).unwrap_or(theme.border_focused),
-            outline_idle: color_idle.or(color_base).unwrap_or(theme.border_idle),
-            outline_width_focused: width_focused.or(width_base).unwrap_or(decoration.border),
-            outline_width_idle: width_idle.or(width_base).unwrap_or(decoration.border),
-            background_image,
-            background_fit,
-        }
+        let sources = ViewAppearanceSources {
+            focused_color: focused_src.or_else(|| base_src.clone()),
+            idle_color: idle_src.or_else(|| base_src.clone()),
+            focused_width: width_focused_src.or_else(|| width_base_src.clone()),
+            idle_width: width_idle_src.or_else(|| width_base_src.clone()),
+        };
+        (
+            ResolvedViewAppearance {
+                outline_focused: color_focused.or(color_base).unwrap_or(theme.border_focused),
+                outline_idle: color_idle.or(color_base).unwrap_or(theme.border_idle),
+                outline_width_focused: width_focused.or(width_base).unwrap_or(decoration.border),
+                outline_width_idle: width_idle.or(width_base).unwrap_or(decoration.border),
+                background_image,
+                background_fit,
+            },
+            sources,
+        )
     }
 
     /// Enforces the AC-1/AC-2 contrast contract on one fully resolved `View`
-    /// pair (RFC-0001 "Per-View contrast") and names the target in the
-    /// diagnostic.
+    /// pair (RFC-0001 "Per-View contrast") and names the target plus the
+    /// source-attributed `views[<selector>].<field>` leaf in the diagnostic.
     ///
     /// # Errors
     ///
-    /// [`ConfigError::Validation`] naming `views` when the resolved pair
-    /// violates AC-1 or AC-2.
+    /// [`ConfigError::Validation`] naming the offending selector leaf when a
+    /// `views` entry supplied the failing value (field `views` only when the
+    /// failure comes from the inherited global pair) and the target.
     pub fn validate_view_contract(
         &self,
         theme: &crate::theme::Theme,
         target: &ViewAppearanceTarget,
     ) -> Result<(), ConfigError> {
-        self.resolve_view_appearance(theme, target)
-            .validate_contract(theme)
-            .map_err(|err| match err {
-                ConfigError::Validation { field, message } => {
-                    ConfigError::validation(field, format!("[{target}] {message}"))
-                }
-                other => other,
-            })
+        let (resolved, sources) = self.resolve_view_appearance_traced(theme, target);
+        let Some(violation) = resolved.contract_violation(theme) else {
+            return Ok(());
+        };
+        // AC-1 is a focused-vs-background failure; AC-2 is focused-vs-idle
+        // (plus the width cue). Prefer the focused leaf, then idle, then the
+        // width leaves so the diagnostic names the most specific `views`
+        // entry that supplied the failing pair.
+        let source = match violation {
+            ViewContractViolation::FocusedBackground => sources.focused_color,
+            ViewContractViolation::FocusedIdle => sources
+                .focused_color
+                .or(sources.idle_color)
+                .or(sources.focused_width)
+                .or(sources.idle_width),
+        };
+        let field = source
+            .as_ref()
+            .map_or_else(|| "views".to_string(), ViewLeafSource::field_path);
+        resolved.validate_contract(theme).map_err(|err| match err {
+            ConfigError::Validation { message, .. } => {
+                ConfigError::validation(field, format!("[{target}] {message}"))
+            }
+            other => other,
+        })
     }
 
     /// Validates every supplied live `View` target.
     ///
-    /// Used by `ConfigPlan` reconcile for currently resolvable targets
-    /// (`*`, content-type, and any matching `ws:`/`view:`) and on first match
-    /// when a `View` is created, bound, or moved under a previously inert
+    /// [`Self::validate`] calls this with the resolvable target set (`*` and
+    /// every content type) so a violating override rejects the whole reload;
+    /// the runtime repeats the check on first match when a `View` is
+    /// created, bound, or moved under a previously inert `ws:`/`view:`
     /// selector. The first violating target rejects the whole check
     /// fail-closed.
     ///
@@ -4366,6 +4520,8 @@ mod tests {
             .validate_view_contract(theme, &terminal_target())
             .expect_err("AC-1 must fail closed");
         assert!(err.to_string().contains("AC-1"), "{err}");
+        // The diagnostic is source-attributed to the selector leaf.
+        assert_eq!(err.field(), Some("views[*].border_color_focused"));
 
         // AC-2: focused/idle differ but their contrast is below 3:1 and no
         // width cue is present.
@@ -4381,6 +4537,7 @@ mod tests {
             .validate_view_contract(theme, &terminal_target())
             .expect_err("AC-2 must fail closed without a width cue");
         assert!(err.to_string().contains("AC-2"), "{err}");
+        assert_eq!(err.field(), Some("views[*].border_color_focused"));
 
         // The OQ-045 width cue satisfies AC-2.
         let config = with_views(vec![entry(
@@ -4409,6 +4566,64 @@ mod tests {
         config
             .validate_view_contract(theme, &terminal_target())
             .expect("equal resolved pair skips AC-2");
+    }
+
+    #[test]
+    fn effective_validate_rejects_resolvable_view_contract_violation() {
+        // CTX-0343 production path: `EffectiveConfig::validate` (called by
+        // the merge/reconcile path) rejects a resolvable violating override
+        // with a source-attributed diagnostic, not only the helper.
+        let theme = crate::theme::resolve_theme(None);
+        let bg = theme.background;
+        let config = EffectiveConfig {
+            views: vec![entry(
+                ViewSelector::Wildcard,
+                ViewAppearanceOverride {
+                    border_color_focused: Some(OutlineColor([bg[0], bg[1], bg[2], 0xFF])),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("AC-1 violation must reject the whole reload");
+        assert_eq!(err.field(), Some("views[*].border_color_focused"));
+        assert!(err.to_string().contains("AC-1"), "{err}");
+
+        // The content-type tier is resolvable without live state too.
+        let config = EffectiveConfig {
+            views: vec![entry(
+                ViewSelector::Content(ViewContent::Terminal),
+                ViewAppearanceOverride {
+                    border_color_focused: Some(color("#FFFFFF")),
+                    border_color_idle: Some(color("#AAAAAA")),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("AC-2 violation must reject the whole reload");
+        assert_eq!(err.field(), Some("views[terminal].border_color_focused"));
+        assert!(err.to_string().contains("AC-2"), "{err}");
+
+        // A `ws:`-tier violation stays inert at merge time: the reload is
+        // accepted here and the runtime validates it on first match.
+        let config = EffectiveConfig {
+            views: vec![entry(
+                ViewSelector::Workspace(2),
+                ViewAppearanceOverride {
+                    border_color_focused: Some(OutlineColor([bg[0], bg[1], bg[2], 0xFF])),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("ws: tier is inert until its View first matches");
     }
 
     #[test]

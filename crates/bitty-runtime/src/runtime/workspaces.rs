@@ -303,12 +303,21 @@ impl Runtime {
                 self.workspaces.len()
             ));
         }
+        // CTX-0343 first match: the fresh `View` lands in the new workspace
+        // label as `empty` content. Resolve and check before any state
+        // mutation; a violating pair fails the `View` creation closed.
+        let fresh_id = self.next_view_id_global();
+        let new_label = u8::try_from(self.workspaces.len() + 1)
+            .unwrap_or(u8::MAX)
+            .clamp(1, MAX_WORKSPACES as u8);
+        if let Err(err) = self.validate_view_target_at("empty", new_label, fresh_id) {
+            return Err(err.to_string());
+        }
         // CTX-0334: creating/switching workspace is an explicit focus change.
         self.clear_hover_pending();
         self.stash_active_slot();
         let seq = self.next_workspace_seq;
         self.next_workspace_seq = seq.wrapping_add(1).max(1);
-        let fresh_id = self.next_view_id_global();
         let leaf = View::new(fresh_id, self.cols, self.rows);
         let layout = LayoutNode::leaf(leaf);
         let focus = Focus::with_focus(fresh_id);
@@ -600,6 +609,15 @@ impl Runtime {
             .find_leaf(focused)
             .cloned()
             .ok_or_else(|| String::from("focused pane not in layout"))?;
+        // CTX-0343 first match: the move brings the `View` under the target
+        // workspace label; resolve and check before any state mutation.
+        let content = self.view_content_kind(focused);
+        let target_label = u8::try_from(index + 1)
+            .unwrap_or(u8::MAX)
+            .clamp(1, MAX_WORKSPACES as u8);
+        if let Err(err) = self.validate_view_target_at(content, target_label, focused) {
+            return Err(err.to_string());
+        }
         // Remove from the live (source) layout. Single-leaf sources leave a
         // fresh idle leaf behind; multi-leaf sources promote the sibling.
         if self.layout.leaf_count() <= 1 {

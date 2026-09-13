@@ -20,6 +20,10 @@ pub enum RuntimeError {
     InvalidSize(&'static str),
     /// A bounded queue was constructed with zero capacity.
     InvalidQueueCapacity,
+    /// A per-`View` appearance contract violation (RFC-0001/CTX-0343 AC-1 or
+    /// AC-2 on a resolved pair). The owned message names the source-attributed
+    /// `views[<selector>].<field>` leaf and the failed acceptance check.
+    ViewAppearance(String),
     /// Plugin host rejected the request.
     Plugin(String),
 }
@@ -33,6 +37,7 @@ impl fmt::Display for RuntimeError {
             Self::Render(msg) => write!(f, "render error: {msg}"),
             Self::InvalidSize(msg) => write!(f, "invalid size: {msg}"),
             Self::InvalidQueueCapacity => write!(f, "cold queue capacity must be > 0"),
+            Self::ViewAppearance(msg) => write!(f, "view appearance contract: {msg}"),
             Self::Plugin(msg) => write!(f, "plugin error: {msg}"),
         }
     }

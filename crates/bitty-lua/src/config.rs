@@ -81,17 +81,6 @@ pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 /// host never iterates unbounded sequences outside fuel accounting).
 pub const MAX_CONFIG_KEYMAPS: usize = 1024;
 
-/// Maximum `views.*` selectors read (CTX-0343).
-///
-/// Extraction memory guard only: RFC-0001/OQ-041 states the `views` table
-/// adds no semantic whole-table cap (the aggregate parse is bounded by the
-/// Config VM budgets), and the closed selector grammar means at most one
-/// wildcard, one content type, one workspace, and one `ViewId` per live
-/// `View` can match. This cap sits far above the live-match ceiling so a
-/// legitimate `ws:`/`view:` set is never truncated, while one capture stays
-/// bounded. Overflow is rejected fail-closed, never partially applied.
-pub const MAX_CONFIG_VIEW_SELECTORS: usize = 512;
-
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
@@ -664,24 +653,18 @@ impl ValueSnapshot {
         }
     }
 
-    /// Capture the `views` selector map with its own extraction cap
-    /// (CTX-0343): the map is bounded by [`MAX_CONFIG_VIEW_SELECTORS`] rather
-    /// than the small nested-table cap, and overflow marks `truncated` so the
-    /// typed extractor rejects the whole table fail-closed. Entry tables are
+    /// Capture the `views` selector map.
+    ///
+    /// RFC-0001/OQ-041 states the `views` table adds no whole-table cap: the
+    /// closed selector grammar bounds the live-match set, and the aggregate
+    /// parse is bounded by the Config VM RC-1/RC-2 budgets. Entry tables are
     /// captured one level deep (their leaves are scalars).
     fn capture_views_table<'gc>(ctx: Context<'gc>, table: Table<'gc>) -> Self {
         let mut pairs = Vec::new();
         let mut has_non_string_keys = false;
-        let mut truncated = false;
-        let mut count = 0usize;
         for (key, val) in table.iter() {
             if matches!(key, Value::Integer(_)) {
                 continue;
-            }
-            count += 1;
-            if count > MAX_CONFIG_VIEW_SELECTORS {
-                truncated = true;
-                break;
             }
             match key {
                 Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
@@ -700,7 +683,7 @@ impl ValueSnapshot {
         Self::Table {
             pairs,
             seq: Vec::new(),
-            truncated,
+            truncated: false,
             has_non_string_keys,
         }
     }
@@ -1148,22 +1131,16 @@ impl ConfigData {
                     // unknown fields rejected by path), leaf types are never
                     // coerced, and the selector grammar plus every field bound
                     // is validated fail-closed downstream in `bitty-config`.
-                    let (pairs, truncated, has_non_string_keys) = match val.as_ref() {
+                    let (pairs, has_non_string_keys) = match val.as_ref() {
                         ValueSnapshot::Table {
                             pairs,
-                            truncated,
                             has_non_string_keys,
                             ..
-                        } => (pairs.as_slice(), *truncated, *has_non_string_keys),
+                        } => (pairs.as_slice(), *has_non_string_keys),
                         other => {
                             return Err(format!("views: expected table (found {})", other.kind()));
                         }
                     };
-                    if truncated {
-                        return Err(format!(
-                            "views: exceeds {MAX_CONFIG_VIEW_SELECTORS} selectors"
-                        ));
-                    }
                     if has_non_string_keys {
                         return Err("views: selector keys must be strings".to_string());
                     }

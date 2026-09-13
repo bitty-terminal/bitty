@@ -63,6 +63,13 @@ impl Runtime {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
         }
+        // CTX-0343: binding the primary shell turns the focused leaf into a
+        // `terminal`-content `View`; a `ws:`/`view:` entry that first matches
+        // here must not compose a violating pair. Fail closed before spawn.
+        if let Some(primary) = self.focus.focused() {
+            let label = self.active_workspace_label();
+            self.validate_view_target_at("terminal", label, primary)?;
+        }
         let cols = self.cols.min(u16::MAX as usize) as u16;
         let rows = self.rows.min(u16::MAX as usize) as u16;
         let mut builder = PtyBuilder::new(program).size(cols, rows);
@@ -175,6 +182,12 @@ impl Runtime {
                 "view is not a leaf of the current layout",
             ));
         }
+        // CTX-0343: a pane bind turns (or keeps) the leaf at `terminal`
+        // content; a previously inert `ws:`/`view:` selector that first
+        // matches now is checked before the session is committed. Fail closed
+        // before any spawn.
+        let label = self.active_workspace_label();
+        self.validate_view_target_at("terminal", label, view)?;
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut builder = PtyBuilder::new(program).size(cols, rows);

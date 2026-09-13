@@ -1196,12 +1196,14 @@ pub(crate) fn runtime_config_from_effective(
         );
         cfg.outline_width_idle = Some(widths.idle.min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX));
         // CTX-0343 (RFC-0001/OQ-041): carry the per-`View` override rules
-        // onto the runtime config in canonical selector form. The grammar,
-        // field bounds, and per-`View` AC-1/AC-2 contract were already
-        // enforced fail-closed by `bitty-config`; the runtime repeats the
-        // selector/width validation so a direct construction stays bounded.
-        // `bitty-config` cannot be named here, so the rule is rebuilt from
-        // the public `ViewOverride` accessors by value.
+        // onto the runtime config in canonical selector form. `bitty-config`
+        // enforces the grammar, field bounds, and the per-`View` AC-1/AC-2
+        // contract for every resolvable target during merge/reconcile; the
+        // runtime mirrors the selector/width bounds and repeats the AC-1/AC-2
+        // check on first match (View creation/bind/move) so a previously
+        // inert `ws:`/`view:` entry also fails closed. `bitty-config` cannot
+        // be named here, so the rule is rebuilt from the public `ViewOverride`
+        // accessors by value.
         cfg.view_appearance = effective
             .views
             .iter()

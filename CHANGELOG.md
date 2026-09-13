@@ -21,9 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected; `decoration.background_image_roots` stays global-only. Unknown
   selectors/fields/types, malformed labels, out-of-range widths, invalid
   colors, and bad fit values reject the whole reload fail-closed with a
-  source-attributed diagnostic. AC-1/AC-2 are enforced on each fully resolved
-  pair (the OQ-045 width cue satisfies AC-2), AC-3 stays advisory. The layer is
-  Live; `bitty --safe` ignores every `views.*` entry. `background_image`/
+  source-attributed diagnostic. AC-1/AC-2 are enforced fail-closed at two
+  production points: during merge/reconcile every resolvable target (`*` and
+  each content type) is checked and a violation rejects the whole reload with
+  a `views[<selector>].<field>` diagnostic; a `ws:`/`view:` entry that is
+  inert until it first matches is checked before the View creation, bind, or
+  workspace move commits it (and fails that operation closed). The OQ-045
+  width cue satisfies AC-2, AC-3 stays advisory. The `views` table adds no
+  whole-table entry cap (RFC-0001: no new numeric ceiling; the closed
+  selector set and Config VM parse budgets bound it). The layer is Live;
+  `bitty --safe` ignores every `views.*` entry. `background_image`/
   `background_fit` land as resolution + validation only — image decode/render
   and root trust stay with CTX-0347.
 - **Guided `bitty init` configuration wizard (CTX-0345):** the opt-in setup

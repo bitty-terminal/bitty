@@ -184,8 +184,9 @@ impl TrustStore {
 /// `terminal.scrollback`, `terminal.scroll_lines_per_notch`,
 /// `terminal.scroll_pixels_per_notch`, `selection.auto_copy`, `layout`,
 /// `decoration` (geometry and the CTX-0340 outline colors), `scrollbar`,
-/// `mouse`, `appearance`. Expanding this without
-/// review would weaken T-08 mitigation.
+/// `mouse`, `appearance`, `views` (CTX-0343 per-View appearance; like
+/// `decoration`, presentation-only chrome, still grammar/bounds checked).
+/// Expanding this without review would weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {
         return Err(ConfigError::TrustViolation {
@@ -278,6 +279,17 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
         a.validate().map_err(|e| ConfigError::TrustViolation {
             message: e.to_string(),
         })?;
+    }
+    if let Some(v) = &plan.views {
+        // CTX-0343: per-`View` appearance is presentation-only chrome (like
+        // `decoration`), so a project layer may set it — but only through
+        // this declared allowlist entry, and every entry still fails closed
+        // on grammar, selector, and field bounds.
+        for entry in v {
+            entry.validate().map_err(|e| ConfigError::TrustViolation {
+                message: e.to_string(),
+            })?;
+        }
     }
     Ok(())
 }
@@ -413,6 +425,42 @@ mod tests {
             ..Default::default()
         };
         validate_project_plan(&plan).expect("font allowed in project");
+    }
+
+    #[test]
+    fn project_plan_allows_views() {
+        // CTX-0343: `views` joins the declared project allowlist as
+        // presentation-only chrome (like `decoration`); entries still fail
+        // closed on bounds.
+        use crate::types::{ViewAppearanceOverride, ViewOverride, ViewSelector};
+        let plan = ConfigPlan {
+            views: Some(vec![ViewOverride {
+                selector: ViewSelector::Wildcard,
+                overrides: ViewAppearanceOverride {
+                    border_width_focused: Some(2),
+                    ..Default::default()
+                },
+            }]),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("views allowed in project");
+    }
+
+    #[test]
+    fn project_plan_rejects_out_of_range_view_width() {
+        use crate::types::{ViewAppearanceOverride, ViewOverride, ViewSelector};
+        let plan = ConfigPlan {
+            views: Some(vec![ViewOverride {
+                selector: ViewSelector::Wildcard,
+                overrides: ViewAppearanceOverride {
+                    border_width: Some(crate::types::MAX_DECORATION_BORDER_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            }]),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(matches!(err, ConfigError::TrustViolation { .. }), "{err:?}");
     }
 
     #[test]

@@ -11,7 +11,10 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_perf::latency::{measure_latency, measure_latency_with_pty_echo};
+use bitty_perf::latency::{
+    HEADLESS_BUDGET_SAMPLES, HEADLESS_WALL_CLOCK_CEILING_MS, measure_latency,
+    measure_latency_with_pty_echo,
+};
 
 fn main() {
     println!(
@@ -55,17 +58,21 @@ fn main() {
         report2.headless
     );
 
-    // Small fast-path sanity: single key must stay well under headroom even on slow CI.
-    // Hardened from <50 ms to <120 ms: 10-sample p99 is the max (rank = max) and
-    // flakes at 51–52 ms on macOS ARM64 and Windows under parallelism (runs
-    // 33502295193, 33495753158). Use 50 samples and a relaxed 120 ms bound;
-    // real PB-4 budget (8/15 ms) is gated by the 1_000-sample report above
-    // and Tier 1 evidence, not this 10-sample sanity.
-    let fast = measure_latency(50);
+    // Small fast-path sanity: the tracer must stay well under headroom even on
+    // a slow shared runner. Use the shared HEADLESS_BUDGET_SAMPLES=200 so
+    // `percentile(99)` is a true p99 rather than the maximum: at n=50
+    // `round(0.99*49)=49` returned the single worst sample and one scheduler
+    // stall failed this sanity (CTX-0410 / #659). The 120 ms ceiling is
+    // unchanged; the real PB-4 budget (8/15 ms) is gated by the 1_000-sample
+    // report above and Tier 1 evidence, not this fast-path sanity.
+    let fast = measure_latency(HEADLESS_BUDGET_SAMPLES);
     assert!(
-        fast.p99_ms < 120.0,
-        "sanity: p99 should stay << 120 ms even on CI (got {:.3} ms)",
+        fast.p99_ms < HEADLESS_WALL_CLOCK_CEILING_MS,
+        "sanity: p99 should stay << {HEADLESS_WALL_CLOCK_CEILING_MS:.0} ms even on CI (got {:.3} ms)",
         fast.p99_ms
     );
-    println!("sanity 50-sample p99 {:.3} ms within headroom", fast.p99_ms);
+    println!(
+        "sanity {HEADLESS_BUDGET_SAMPLES}-sample p99 {:.3} ms within headroom",
+        fast.p99_ms
+    );
 }

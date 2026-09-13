@@ -384,14 +384,27 @@ fn resolve_editor() -> String {
 /// mapping and the runtime/loader only ever see absolute paths. A `~` path
 /// with `$HOME` unset fails closed; absolute paths pass through unchanged.
 pub(crate) fn expand_home_path(raw: &str) -> Result<String, String> {
+    expand_home_path_with(
+        raw,
+        std::env::var_os("HOME")
+            .as_deref()
+            .map(std::path::Path::new),
+    )
+}
+
+/// [`expand_home_path`] with the home directory injected, so tests are
+/// hermetic across platforms (Windows CI has no `$HOME`).
+pub(crate) fn expand_home_path_with(
+    raw: &str,
+    home: Option<&std::path::Path>,
+) -> Result<String, String> {
     if raw != "~" && !raw.starts_with("~/") {
         return Ok(raw.to_string());
     }
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| format!("bitty: '{raw}' is '~'-anchored but $HOME is not set"))?;
+    let home =
+        home.ok_or_else(|| format!("bitty: '{raw}' is '~'-anchored but $HOME is not set"))?;
     let joined = if raw == "~" {
-        home
+        home.to_path_buf()
     } else {
         home.join(&raw[2..])
     };

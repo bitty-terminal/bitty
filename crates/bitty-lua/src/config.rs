@@ -1265,7 +1265,11 @@ impl ConfigData {
                                     data.border_width_idle = Some(expect_integer(&path, value)?);
                                 }
                                 "background_image" => {
-                                    data.background_image = Some(expect_string(&path, value)?);
+                                    data.background_image = Some(expect_bounded_string(
+                                        &path,
+                                        value,
+                                        MAX_CONFIG_BACKGROUND_PATH_BYTES,
+                                    )?);
                                 }
                                 "background_fit" => {
                                     data.background_fit = Some(expect_string(&path, value)?);
@@ -1997,6 +2001,28 @@ mod tests {
         assert_eq!(data.views, None);
         let data = eval_ok(r#"return { views = {} }"#);
         assert_eq!(data.views.expect("present table").len(), 0);
+    }
+
+    #[test]
+    fn views_background_image_uses_the_background_path_bound() {
+        // CTX-0347 review: per-View paths use the accepted 4096-byte
+        // background bound, not the generic 2048-byte string cap.
+        let path = format!("/{}", "a".repeat(MAX_CONFIG_BACKGROUND_PATH_BYTES - 1));
+        let code =
+            format!("return {{ views = {{ [\"*\"] = {{ background_image = \"{path}\" }} }} }}");
+        let data = eval_ok(&code);
+        let views = data.views.expect("views table");
+        assert_eq!(
+            views[0].background_image.as_deref().map(str::len),
+            Some(MAX_CONFIG_BACKGROUND_PATH_BYTES)
+        );
+        let over = format!(
+            "return {{ views = {{ [\"*\"] = {{ background_image = \"/{}\" }} }} }}",
+            "a".repeat(MAX_CONFIG_BACKGROUND_PATH_BYTES)
+        );
+        let err = eval_err(&over);
+        assert!(err.contains("background_image"), "{err}");
+        assert!(err.contains("views[*]"), "{err}");
     }
 
     #[test]

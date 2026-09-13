@@ -303,6 +303,14 @@ fn sniff_png(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
                 if width == 0 || height == 0 {
                     return Err(BackgroundError::Dimensions { width, height });
                 }
+                let bit_depth = bytes[offset + 16];
+                if bit_depth != 8 {
+                    return Err(BackgroundError::UnsupportedFormat {
+                        detail: format!(
+                            "PNG bit depth {bit_depth} is unsupported; only 8-bit samples are accepted"
+                        ),
+                    });
+                }
                 header = Some((width, height));
             }
             b"acTL" => {
@@ -1277,6 +1285,26 @@ mod tests {
         out
     }
 
+    fn encode_png_16(width: u32, height: u32, color: [u16; 4]) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 4 * 2) as usize);
+        for _ in 0..(width * height) {
+            for channel in color {
+                pixels.extend_from_slice(&channel.to_ne_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        image::ImageEncoder::write_image(
+            encoder,
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgba16,
+        )
+        .expect("png16 encode");
+        out
+    }
+
     fn encode_jpeg(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
         let mut pixels = Vec::with_capacity((width * height * 3) as usize);
         for _ in 0..(width * height) {
@@ -1344,6 +1372,21 @@ mod tests {
         assert_eq!(header.format, BackgroundFormat::WebP);
         assert_eq!((header.width, header.height), (6, 7));
         assert!(decode_background(&webp).is_ok());
+    }
+
+    #[test]
+    fn sixteen_bit_png_rejected_before_decode() {
+        // BG-3 budgets 4 bytes per pixel (RGBA8); a 16-bit PNG decodes at
+        // 12 bytes per pixel, so it must fail closed from the header.
+        let png = encode_png_16(256, 256, [0x10, 0x20, 0x30, 0xFFFF]);
+        assert!(matches!(
+            sniff_image(&png),
+            Err(BackgroundError::UnsupportedFormat { detail }) if detail.contains("bit depth")
+        ));
+        assert!(matches!(
+            decode_background(&png),
+            Err(BackgroundError::UnsupportedFormat { .. })
+        ));
     }
 
     #[test]

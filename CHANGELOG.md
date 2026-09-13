@@ -101,6 +101,18 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   `1..=32`) and `terminal.scroll_pixels_per_notch` (default `16`, range
   `1..=256`) are unchanged and continue to scale the scroll amount.
 
+### Test determinism: cwd_inherit one-shot pwd race on macOS (CTX-0376, issue #623)
+
+- `new_pane_inherits_focused_pane_osc7_cwd` and `focused_pane_selects_the_inherited_cwd`
+  no longer spawn a one-shot `/bin/pwd -P` as the pane shell: on macOS the
+  kernel discards unread PTY slave output when the child exits before the
+  reader drains it (XNU `S_CTTYREF`; Apple Developer Forums thread 663632,
+  pexpect#662, Ruby bug #20682), so the grid could stay blank forever and no
+  wait window could recover it. The pane shell now runs
+  `pwd -P; exec sleep 30` under `/bin/sh`, printing the same physical cwd while
+  keeping the slave open; the assertion still proves the inherited cwd from the
+  spawned child's own output.
+
 ### Help popup occludes grid text (CTX-0336, issue #559)
 
 - Fixed the `Mod+backtick` which-key help popup (`Mod+?`) painting the

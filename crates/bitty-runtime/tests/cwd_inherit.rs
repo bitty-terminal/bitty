@@ -8,8 +8,7 @@
 //! path that is no longer an existing directory leaves the child at the
 //! default (process) cwd and never errors.
 //!
-//! Unix-only: spawning needs a POSIX shell/PTY plus `/bin/pwd`
-//! (mirrors `pane_sessions.rs`).
+//! Unix-only: spawning needs a POSIX shell/PTY (mirrors `pane_sessions.rs`).
 
 #![cfg(unix)]
 
@@ -19,7 +18,6 @@ use std::time::Duration;
 use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const PWD: &str = "/bin/pwd";
 const SHELL: &str = "/bin/sh";
 
 fn runtime() -> Runtime {
@@ -121,11 +119,21 @@ fn osc7(dir: &Path) -> Vec<u8> {
     format!("\x1b]7;file://{url}\x07").into_bytes()
 }
 
-/// Spawns `/bin/pwd -P` as leaf `view`'s private shell and returns the grid
-/// text once it contains `needle`.
+/// Spawns a shell as leaf `view`'s private shell that prints its physical
+/// cwd and then stays alive, and returns the grid text once it contains
+/// `needle`.
+///
+/// The child must outlive the drain. On macOS the kernel discards unread PTY
+/// slave output when the child exits before the parent reads it (XNU
+/// `S_CTTYREF`; Apple Developer Forums thread 663632, pexpect#662, Ruby bug
+/// #20682), so a one-shot `/bin/pwd -P` can race the pump and leave the grid
+/// blank forever — no wait window fixes that. Holding the slave open with a
+/// trailing sleep makes the wait deterministic without weakening the
+/// assertion: the inherited cwd is still proven by the spawned child's own
+/// `pwd -P` output.
 fn spawn_pwd_and_wait(rt: &mut Runtime, view: ViewId, needle: &str) -> String {
-    rt.spawn_shell_for_view(view, PWD, &["-P"], 120, 24)
-        .expect("spawn /bin/pwd for pane");
+    rt.spawn_shell_for_view(view, SHELL, &["-c", "pwd -P; exec sleep 30"], 120, 24)
+        .expect("spawn pwd shell for pane");
     assert!(
         wait_for_pane_text(rt, view, needle),
         "pane {view:?} never showed {needle:?}; grid={:?}",

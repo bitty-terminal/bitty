@@ -1077,13 +1077,15 @@ pub struct RenderCounters {
     pub cells_drawn: u64,
     /// Spacer (trailing wide-half) cells skipped.
     pub spacer_cells_skipped: u64,
-    /// Cells skipped without drawing (whitespace, overlay misses, rasterizer
-    /// failures). Missing glyphs no longer land here: they paint the tofu box
-    /// and count as [`RenderCounters::missing_glyphs`] (CTX-0368).
+    /// Cells skipped without drawing (whitespace, rasterizer failures, and
+    /// overlay text whose scalar is uncovered). Grid cells with a missing
+    /// glyph no longer land here: they paint the tofu box and count as
+    /// [`RenderCounters::missing_glyphs`] (CTX-0368).
     pub blank_cells_skipped: u64,
     /// Cells whose character had no covering face; the RFC tofu box was
     /// painted instead (CTX-0368, text-rendering RFC "Missing-glyph
-    /// behavior").
+    /// behavior"). Grid cell path only: overlay text skips uncovered
+    /// scalars as `blank_cells_skipped` instead.
     pub missing_glyphs: u64,
     /// Cells whose glyph was suppressed by the invisible attribute.
     pub invisible_cells_skipped: u64,
@@ -1885,11 +1887,13 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// at the current column — and stops at `max_cells` columns. Glyph
     /// lookup, caching, and atlas placement mirror [`Self::render`]'s cell
     /// path (same font, same baseline rule), so headless and GPU composites
-    /// sample identical texels. Whitespace, missing glyphs, and rasterizer
-    /// failures are skipped exactly like cell glyphs (counted as
-    /// `blank_cells_skipped`); the caller owns the background fill. Returns
-    /// the glyph instances to push (possibly empty). Bounded: at most
-    /// `max_cells` iterations and instances, no I/O, no panics.
+    /// sample identical texels. Whitespace, rasterizer failures, and
+    /// uncovered scalars are skipped as `blank_cells_skipped`; unlike the
+    /// cell path, which paints the CTX-0368 tofu box for a missing glyph,
+    /// the overlay keeps the skip behavior and never paints tofu. The
+    /// caller owns the background fill. Returns the glyph instances to push
+    /// (possibly empty). Bounded: at most `max_cells` iterations and
+    /// instances, no I/O, no panics.
     #[must_use]
     pub fn overlay_text_glyphs(
         &mut self,

@@ -16,4 +16,4 @@ Intended draft capabilities (pending acceptance in `compatibility-milestone-rfc`
 - `Ss` / `Se` cursor styling (`DECSCUSR`, `CursorStyle`).
 - Existing `xterm-256color` baseline otherwise; `bitty` diff from `xterm-256color` stays minimal and is recorded in the diff header of `bitty.ti` when landed.
 
-Contract: `DEFAULT_TERM` remains `xterm-256color` until a `tic`-compiled `bitty` entry is published and the `TERM` contract in `docs/specifications/compatibility-milestone-rfc.md` plus the compatibility matrix are updated to move the default at a minor-version bump. Callers may override via `PtyBuilder::env("TERM", "...")`.
+Contract: `DEFAULT_TERM` remains `xterm-256color` until a `tic`-compiled `bitty` entry is published and the `TERM` contract in `docs/specifications/text-compatibility.md` (§ Terminfo) plus the release compatibility matrix (`docs/product/compat-matrix.md`) are updated to move the default at a minor-version bump. Callers may override via `PtyBuilder::env("TERM", "...")`.

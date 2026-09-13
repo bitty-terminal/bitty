@@ -1,7 +1,7 @@
 //! v0.1 minimal terminal slice evidence: headless shell echo, resize, backpressure, deterministic replay.
 //!
 //! This suite directly implements the v0.1 gate sketch from
-//! `docs/product/release-ladder.md` row `v0.1`:
+//! `docs/development/release-mechanics.md` row `v0.1`:
 //! "`shell echo + resize + backpressure headless tests; cargo check; cargo publish --dry-run`".
 //!
 //! Crates exercised: `vt` + `pty` + `term-state` + `platform` + `config` + `render` + `ui` + `runtime` + `app`.

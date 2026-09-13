@@ -21,8 +21,7 @@
 //! invariant (`tick == None` → no polling loop → ≤1 % CPU).
 //!
 //! Budget reference: `docs/specifications/performance-budget-rfc.md#budgets`.
-//! Evidence: CTX-0100 real-window measurements from `c0aadd2+` (the archived
-//! research document remains available in this repository's git history).
+//! Evidence: `docs/product/perf-evidence.md` (CTX-0100, real measurements from `c0aadd2+`).
 
 #![forbid(unsafe_code)]
 

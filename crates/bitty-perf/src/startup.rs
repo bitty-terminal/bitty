@@ -439,7 +439,7 @@ impl StartupReport {
     }
 
     /// Formats the timeline as a human-readable table for bench output and
-    /// perf-evidence captures.
+    /// `docs/product/perf-evidence.md`.
     #[must_use]
     pub fn format_timeline(&self) -> String {
         let mut out = String::new();

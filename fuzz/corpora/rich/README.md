@@ -15,8 +15,8 @@ evidence matrix row `R-002 Evidence: P0-AC-003/004 / fuzz/corpora/rich/`.
   committed alongside the corpora so any drift is diff-visible.
 - Corporate scope: `fuzz/corpora/**` belongs to CTX-0089
   `ctx-0089/feat-rich-r002-verification` (disjoint from Subagent B's
-  security corpus work in `bitty-docs`). Do not move corpora into the
-  `docs/` submodule.
+  `docs/security/**` audits in the docs submodule). Do not move corpora into
+  `docs/security/**`.
 - Earlier vt corpus `fuzz/corpora/vt/` (30 files, R-001) is retained
   unchanged; this directory is additive for R-002.
 

@@ -63,7 +63,7 @@ main() {
 		echo "hyperfine not present — primary instrumentation is startup_real bench above"
 	fi
 
-	echo "PB-1 real-window tracing done (primary: startup_real Instant per-phase; headless CI shows unavailable with duration, Tier 1 real shows success; see docs/specifications/performance-budget-rfc.md#pb-1 and crates/bitty-perf/src/startup.rs)"
+	echo "PB-1 real-window tracing done (primary: startup_real Instant per-phase; headless CI shows unavailable with duration, Tier 1 real shows success; see docs/product/perf-evidence.md and crates/bitty-perf/src/startup.rs)"
 }
 
 main "$@"

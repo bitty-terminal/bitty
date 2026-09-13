@@ -57,7 +57,7 @@ main() {
 		echo "PB-7 proxy PASS: ${mid_cpu}% ≤ ${PB7_PCT}% (sleep child; product idle gated on Tier 1)"
 	fi
 
-	echo "PB-7 real-window invariant done (zero wakeups == every idle tick None → Wait; clean Damage→Clean→no draws; see docs/specifications/performance-budget-rfc.md#pb-7 and crates/bitty-perf/src/idle.rs)"
+	echo "PB-7 real-window invariant done (zero wakeups == every idle tick None → Wait; clean Damage→Clean→no draws; see docs/product/perf-evidence.md and crates/bitty-perf/src/idle.rs)"
 }
 
 main "$@"

@@ -15,8 +15,8 @@ matrix row `R-001 Evidence: P0-AC-001/002 / fuzz/corpora/vt/`.
   committed alongside the corpora so any drift is diff-visible.
 - Corporate scope: `fuzz/corpora/**` belongs to CTX-0088
   `ctx-0088/feat-vt-r001-verification` (disjoint from Subagent B's
-  security corpus work in `bitty-docs`). Do not move corpora into the
-  `docs/` submodule.
+  `docs/security/**` audits in the docs submodule). Do not move corpora into
+  `docs/security/**`.
 
 ## Coverage (adversarial dimensions per P0-AC-002)
 

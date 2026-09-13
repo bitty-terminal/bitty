@@ -221,7 +221,7 @@ impl Runtime {
         Some(text)
     }
 
-    /// Ghostty `setSelectionAndCopy` equivalent (CTX-0158): copies the
+    /// Copy-on-select path (CTX-0158): copies the
     /// current selection to the standard clipboard, which the platform layer
     /// best-effort syncs to the primary selection on Linux (CTX-0160).
     /// Returns the copied text, or `None` when no selection exists.
@@ -230,7 +230,8 @@ impl Runtime {
     /// update, and headless tests never touch the real clipboard.
     ///
     /// Called automatically on left-release only when
-    /// `RuntimeConfig::selection_auto_copy` is `true` (CTX-0191); the explicit
+    /// `RuntimeConfig::selection_auto_copy` is `true` (CTX-0191); that opt-in
+    /// defaults to `false` (CTX-0371, matching kitty/ghostty). The explicit
     /// `copy_to_clipboard` chord calls the same path regardless of the toggle.
     pub fn auto_copy_selection(&mut self) -> Option<String> {
         let text = self.selection_text()?;

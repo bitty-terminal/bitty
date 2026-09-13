@@ -31,7 +31,7 @@
 //!     --          line_height = 1.375, letter_spacing = 2.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
-//!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191, default true)
+//!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified sibling/container gap + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
@@ -70,8 +70,9 @@
 //!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent).
 //!   `selection` is fully optional (absent table/key means "this layer says
 //!   nothing"); when present, `auto_copy` defaults to
-//!   [`SelectionConfig`](crate::types::SelectionConfig) default `true` when
-//!   omitted, so existing configs without `selection` keep working unchanged.
+//!   [`SelectionConfig`](crate::types::SelectionConfig) default `false`
+//!   (CTX-0371) when omitted, so configs without `selection` keep working and
+//!   selecting text never writes the system clipboard implicitly.
 //!   `layout` follows the same fully-optional pattern: absent table/key means
 //!   "this layer says nothing"; when the table is present, omitted keys
 //!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
@@ -1085,11 +1086,11 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     };
     // CTX-0191: `selection` is fully optional (absent table means "this layer
     // says nothing" so merge keeps the lower-precedence value). When the
-    // table is present but `auto_copy` is omitted, default to `true` (like
-    // the CTX-0185 scroll extras inside `terminal`): existing configs without
-    // `selection` keep working unchanged, and `selection = { auto_copy =
-    // false }` is the explicit opt-out. Wrong types already failed closed as
-    // `ShapeError` in `bitty-lua` (never coerced, never echoed).
+    // table is present but `auto_copy` is omitted, default to `false`
+    // (CTX-0371, matching kitty/ghostty): selecting text never writes the
+    // system clipboard implicitly, and `selection = { auto_copy = true }` is
+    // the explicit opt-in. Wrong types already failed closed as `ShapeError`
+    // in `bitty-lua` (never coerced, never echoed).
     let selection = data.selection.map(|s| SelectionConfig {
         auto_copy: s.auto_copy.unwrap_or(SelectionConfig::default().auto_copy),
     });
@@ -1640,9 +1641,9 @@ mod tests {
 
     #[test]
     fn lua_selection_auto_copy_parses_and_validates() {
-        // CTX-0191: explicit bool parses; absent table means "says nothing"
-        // (plan.selection None so merge keeps lower); present-but-empty
-        // defaults to true; wrong types fail closed naming the field.
+        // CTX-0191/CTX-0371: explicit bool parses; absent table means "says
+        // nothing" (plan.selection None so merge keeps lower); present-but-
+        // empty defaults to false; wrong types fail closed naming the field.
         let plan = parse_lua_config(
             r#"return { selection = { auto_copy = false } }"#,
             &test_source(),
@@ -1663,7 +1664,7 @@ mod tests {
         assert!(plan.selection.is_none());
         let plan = parse_lua_config(r#"return { selection = {} }"#, &test_source())
             .expect("empty selection defaults");
-        assert!(plan.selection.unwrap().auto_copy);
+        assert!(!plan.selection.unwrap().auto_copy);
         for bad in [
             r#"return { selection = { auto_copy = 1 } }"#,
             r#"return { selection = { auto_copy = "false" } }"#,

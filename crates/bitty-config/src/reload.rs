@@ -854,12 +854,12 @@ mod tests {
 
     #[test]
     fn diff_selection_auto_copy_is_restart_required() {
-        // CTX-0191: flipping auto-copy must surface as a restart-required
-        // diff (no silent no-op on reload).
+        // CTX-0191/CTX-0371: flipping auto-copy must surface as a
+        // restart-required diff (no silent no-op on reload).
         let old = EffectiveConfig::default();
-        assert!(old.selection.auto_copy);
+        assert!(!old.selection.auto_copy);
         let mut new = old.clone();
-        new.selection.auto_copy = false;
+        new.selection.auto_copy = true;
         let r = diff(&old, &new);
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);

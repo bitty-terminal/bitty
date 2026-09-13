@@ -43,12 +43,24 @@ fn mouse_headless_runtime(text: &str) -> Runtime {
 }
 
 fn mouse_headless_runtime_no_auto_copy(text: &str) -> Runtime {
-    // CTX-0191: runtime with the opt-out toggle off.
+    // CTX-0191: runtime with the copy-on-select toggle explicitly off.
     let mut rt = Runtime::new(RuntimeConfig {
         selection_auto_copy: false,
         ..RuntimeConfig::default()
     })
     .expect("opt-out runtime must build");
+    rt.force_headless_clipboard();
+    rt.handle_pty_bytes(text.as_bytes());
+    rt
+}
+
+fn mouse_headless_runtime_auto_copy(text: &str) -> Runtime {
+    // CTX-0191: runtime with the copy-on-select opt-in enabled.
+    let mut rt = Runtime::new(RuntimeConfig {
+        selection_auto_copy: true,
+        ..RuntimeConfig::default()
+    })
+    .expect("auto-copy runtime must build");
     rt.force_headless_clipboard();
     rt.handle_pty_bytes(text.as_bytes());
     rt
@@ -173,7 +185,7 @@ fn scroll_focused_page_moves_viewport_by_page() {
 
 #[test]
 fn left_release_auto_copies_to_clipboard_and_primary() {
-    let mut rt = mouse_headless_runtime("hello world");
+    let mut rt = mouse_headless_runtime_auto_copy("hello world");
     assert_eq!(rt.clipboard().headless_contents(), "");
     assert_eq!(rt.primary_contents(), "");
     // Drag cells (0,0)..(0,4) = "hello" via the mouse path (CTX-0223 +
@@ -198,7 +210,7 @@ fn left_release_auto_copies_to_clipboard_and_primary() {
 
 #[test]
 fn left_release_with_auto_copy_off_highlights_without_copying() {
-    // CTX-0191: opt-out leaves the highlight in place but touches
+    // CTX-0191: explicit opt-out leaves the highlight in place but touches
     // neither clipboard; the explicit chord path still copies.
     assert!(
         !RuntimeConfig {
@@ -234,6 +246,38 @@ fn left_release_with_auto_copy_off_highlights_without_copying() {
 }
 
 #[test]
+fn default_selection_does_not_clobber_clipboard() {
+    // CTX-0371: the shipped default must not write the system clipboard (or
+    // primary) when text is selected — kitty/ghostty semantics. Selecting
+    // still highlights, and the explicit copy chord still works.
+    let mut rt = mouse_headless_runtime("hello world");
+    assert!(!rt.config().selection_auto_copy, "default is off");
+    rt.clipboard_mut()
+        .set_text("keep-me".to_string())
+        .expect("headless set");
+    rt.set_primary_text("keep-primary".to_string());
+    // Drag cells (0,0)..(0,4) = "hello".
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
+    rt.handle_mouse_input(mouse_press(MouseButton::Left));
+    rt.handle_cursor_moved(CursorPosition {
+        x: 22.0 + 9.0 * 4.0,
+        y: 22.0,
+    });
+    rt.handle_mouse_input(mouse_release(MouseButton::Left));
+    // Highlight present, both clipboards untouched.
+    assert!(rt.has_selection());
+    assert_eq!(rt.selection_text().as_deref(), Some("hello"));
+    assert_eq!(rt.clipboard().headless_contents(), "keep-me");
+    assert_eq!(rt.primary_contents(), "keep-primary");
+    // Explicit chord still copies on demand.
+    let copied = rt
+        .copy_selection_to_clipboard()
+        .expect("explicit copy must not error");
+    assert_eq!(copied.as_deref(), Some("hello"));
+    assert_eq!(rt.clipboard().headless_contents(), "hello");
+}
+
+#[test]
 fn left_release_auto_copy_overwrites_divergent_primary() {
     // Regression pin for the live Wayland gap (select-in-bitty never
     // reached `wl-paste --primary`): `auto_copy_selection` must replace
@@ -241,7 +285,7 @@ fn left_release_auto_copy_overwrites_divergent_primary() {
     // the regular clipboard. The write itself is delivered by the
     // platform layer's wl-copy-first primary sync (CTX-0160 as fixed
     // here); the headless seam proves the contract deterministically.
-    let mut rt = mouse_headless_runtime("hello world");
+    let mut rt = mouse_headless_runtime_auto_copy("hello world");
     rt.clipboard_mut()
         .set_text("zz".to_string())
         .expect("headless set");

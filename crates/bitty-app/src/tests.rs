@@ -1321,26 +1321,26 @@ fn runtime_config_rejects_scrollback_bound_drift() {
 
 #[test]
 fn runtime_config_inherits_file_selection_auto_copy() {
-    // CTX-0191: `selection.auto_copy` flows file -> effective -> runtime;
-    // crate defaults stay equal (bitty-runtime must not depend on
-    // bitty-config, so the pairing is by value, pinned here). Default
-    // preserves copy-on-select (zero change for existing users).
+    // CTX-0191/CTX-0371: `selection.auto_copy` flows file -> effective ->
+    // runtime; crate defaults stay equal (bitty-runtime must not depend on
+    // bitty-config, so the pairing is by value, pinned here). Default is
+    // off: selecting text never writes the system clipboard implicitly.
     assert_eq!(
         bitty_runtime::config::DEFAULT_SELECTION_AUTO_COPY,
         bitty_config::types::DEFAULT_SELECTION_AUTO_COPY
     );
-    const { assert!(bitty_runtime::config::DEFAULT_SELECTION_AUTO_COPY) }
+    const { assert!(!bitty_runtime::config::DEFAULT_SELECTION_AUTO_COPY) }
     use bitty_config::file::{parse_lua_config, resolve_effective};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
-    let plan = parse_lua_config(r#"return { selection = { auto_copy = false } }"#, &src)
-        .expect("opt-out parses");
+    let plan = parse_lua_config(r#"return { selection = { auto_copy = true } }"#, &src)
+        .expect("opt-in parses");
     let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
         .expect("merge");
-    assert!(!merged.effective.selection.auto_copy);
+    assert!(merged.effective.selection.auto_copy);
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
-    assert!(!cfg.selection_auto_copy);
-    // Absent table rides the default-on end to end.
+    assert!(cfg.selection_auto_copy);
+    // Absent table rides the default-off end to end.
     let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
         .expect("no selection table parses");
@@ -1349,9 +1349,9 @@ fn runtime_config_inherits_file_selection_auto_copy() {
         None,
     )
     .expect("merge");
-    assert!(merged2.effective.selection.auto_copy);
+    assert!(!merged2.effective.selection.auto_copy);
     let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
-    assert!(cfg2.selection_auto_copy);
+    assert!(!cfg2.selection_auto_copy);
     assert_eq!(
         merged2.source_of("selection.auto_copy").unwrap().layer,
         bitty_config::plan::LayerKind::CoreDefaults

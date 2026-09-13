@@ -20,11 +20,25 @@ use bitty_platform::{
     CursorPosition, MouseButton, MouseEvent, PhysicalSize, PlatformEvent, PressState,
     WindowEventKind, WindowId,
 };
-use bitty_runtime::Runtime;
+use bitty_runtime::{Runtime, RuntimeConfig};
 use bitty_ui::{CellPos, Selection};
 
 fn make_runtime() -> Runtime {
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    rt.force_headless_clipboard();
+    rt
+}
+
+/// Runtime with the CTX-0191 copy-on-select opt-in enabled.
+///
+/// CTX-0371 changed the shipped default to off (kitty/ghostty semantics), so
+/// tests that assert release-to-clipboard behavior must opt in explicitly.
+fn make_auto_copy_runtime() -> Runtime {
+    let mut rt = Runtime::new(RuntimeConfig {
+        selection_auto_copy: true,
+        ..RuntimeConfig::default()
+    })
+    .expect("headless runtime must build");
     rt.force_headless_clipboard();
     rt
 }
@@ -292,7 +306,7 @@ fn cell_pos(col: u16, row: u16) -> CursorPosition {
 
 #[test]
 fn multiline_mouse_drag_selects_row_range_with_newlines() {
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "line1\r\nline2\r\nline3");
     // Drag from row 0 col 0 down to row 2 col 4.
     mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(2, 1), cell_pos(4, 2)]);
@@ -313,7 +327,7 @@ fn multiline_mouse_drag_selects_row_range_with_newlines() {
 
 #[test]
 fn multiline_mouse_drag_respects_partial_columns() {
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "abcdef\r\nghijkl");
     // Drag from row 0 col 2 to row 1 col 3: first row runs to the edge
     // (padding trimmed), last row ends exactly at col 3.
@@ -364,7 +378,7 @@ fn multiline_mouse_drag_with_wide_chars_keeps_columns() {
 
 #[test]
 fn multiline_selection_pastes_through_repeat_confirm_gate() {
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "line1\r\nline2\r\nline3");
     mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(4, 2)]);
     assert_eq!(rt.clipboard().headless_contents(), "line1\nline2\nline3");
@@ -392,7 +406,7 @@ fn multiline_selection_pastes_through_repeat_confirm_gate() {
 
 #[test]
 fn multiline_primary_pastes_through_repeat_confirm_gate() {
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "alpha\r\nbeta");
     mouse_drag(&mut rt, cell_pos(0, 0), &[cell_pos(3, 1)]);
     // Auto-copy synced the primary selection (ghostty copy-on-select).

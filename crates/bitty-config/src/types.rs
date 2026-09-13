@@ -727,12 +727,15 @@ pub struct ResolvedOutlineWidths {
     pub idle: u32,
 }
 
-/// Default selection auto-copy behavior (CTX-0191).
-/// `true` preserves the ghostty-class copy-on-select: a committed mouse
-/// selection auto-copies to the clipboard (which best-effort syncs primary).
-/// `false` leaves the highlight in place and copies only via the explicit
-/// `copy_to_clipboard` chord (Ctrl+Shift+C).
-pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
+/// Default selection auto-copy behavior (CTX-0191, CTX-0371).
+/// `false` matches kitty (`copy_on_select no`) and ghostty
+/// (`copy-on-select none`; `primary` on Linux since 1.4): a committed mouse
+/// selection keeps its highlight and copies nothing to the system clipboard.
+/// `true` opts into ghostty-class copy-on-select: the selection auto-copies
+/// to the clipboard (which best-effort syncs the primary selection on Linux).
+/// In both cases the explicit `copy_to_clipboard` chord (Ctrl+Shift+C) copies
+/// on demand.
+pub const DEFAULT_SELECTION_AUTO_COPY: bool = false;
 
 /// Default focus-follows-mouse behavior (CTX-0260).
 /// `false` preserves click-to-focus: hovering never moves keyboard focus.
@@ -1203,13 +1206,14 @@ impl TerminalConfig {
     }
 }
 
-/// Selection behavior configuration (CTX-0191).
+/// Selection behavior configuration (CTX-0191, CTX-0371).
 ///
-/// `auto_copy` controls ghostty-class copy-on-select. `true` (default)
-/// preserves current behavior: a committed mouse selection auto-copies to
-/// the clipboard (which best-effort syncs the primary selection on Linux).
-/// `false` leaves the highlight in place and copies only via the explicit
-/// `copy_to_clipboard` chord (Ctrl+Shift+C).
+/// `auto_copy` controls copy-on-select. `false` (default) matches kitty
+/// (`copy_on_select no`) and ghostty (`copy-on-select none`): a committed
+/// mouse selection keeps its highlight and copies only via the explicit
+/// `copy_to_clipboard` chord (Ctrl+Shift+C). `true` opts into ghostty-class
+/// copy-on-select: the selection auto-copies to the clipboard (which
+/// best-effort syncs the primary selection on Linux).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionConfig {
     /// Whether a committed mouse selection auto-copies to the clipboard.
@@ -2397,17 +2401,18 @@ mod tests {
     }
 
     #[test]
-    fn selection_auto_copy_defaults_on_and_validates() {
-        // CTX-0191: default-on preserves copy-on-select for existing users.
-        const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
-        assert!(SelectionConfig::default().auto_copy);
-        assert!(EffectiveConfig::default().selection.auto_copy);
+    fn selection_auto_copy_defaults_off_and_validates() {
+        // CTX-0371: default-off matches kitty/ghostty (no implicit clipboard
+        // write); copy-on-select remains available as an explicit opt-in.
+        const { assert!(!DEFAULT_SELECTION_AUTO_COPY) }
+        assert!(!SelectionConfig::default().auto_copy);
+        assert!(!EffectiveConfig::default().selection.auto_copy);
         SelectionConfig::default()
             .validate()
             .expect("default valid");
-        SelectionConfig { auto_copy: false }
+        SelectionConfig { auto_copy: true }
             .validate()
-            .expect("opt-out valid");
+            .expect("opt-in valid");
         EffectiveConfig::default()
             .validate()
             .expect("default valid");

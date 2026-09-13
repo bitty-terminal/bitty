@@ -2645,26 +2645,26 @@ mod tests {
 
     #[test]
     fn later_layer_wins_selection_auto_copy() {
-        // CTX-0191: user opt-out overrides the default-on; CLI wins over file.
-        // Absent table means "says nothing" so defaults survive.
+        // CTX-0191/CTX-0371: user opt-in overrides the default-off; CLI wins
+        // over file. Absent table means "says nothing" so defaults survive.
         use crate::types::SelectionConfig;
         let user = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
-                selection: Some(SelectionConfig { auto_copy: false }),
+                selection: Some(SelectionConfig { auto_copy: true }),
                 ..Default::default()
             },
         );
         let merged = merge_layers(vec![user]).expect("merge");
-        assert!(!merged.effective.selection.auto_copy);
+        assert!(merged.effective.selection.auto_copy);
         assert_eq!(
             merged.source_of("selection.auto_copy").unwrap().layer,
             LayerKind::User
         );
-        // No layers at all -> default-on survives with core-defaults source.
+        // No layers at all -> default-off survives with core-defaults source.
         let merged_default = merge_layers(vec![]).expect("merge");
-        assert!(merged_default.effective.selection.auto_copy);
-        // CLI opt-out wins over a user opt-in.
+        assert!(!merged_default.effective.selection.auto_copy);
+        // User opt-in overridden by a later CLI opt-out still wins by layer.
         let user_in = LayeredPlan::new(
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {

@@ -1728,6 +1728,85 @@ fn runtime_config_inherits_file_outline_width() {
 }
 
 #[test]
+fn runtime_config_carries_per_view_overrides() {
+    // CTX-0343: `views.*` rules flow file -> effective -> runtime in
+    // canonical selector form; the app maps the resolved per-View colors
+    // onto the runtime rule leaves by value.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r##"return { views = {
+            ["*"] = { border_color_focused = "#33CCFF" },
+            ["ws:2"] = { border_width_idle = 1 },
+            ["view:7"] = { background_image = "~/wall/one.png", background_fit = "fit" },
+        } }"##,
+        &src,
+    )
+    .expect("views parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.view_appearance.len(), 3);
+    let by_selector = |name: &str| {
+        cfg.view_appearance
+            .iter()
+            .find(|rule| rule.selector == name)
+            .unwrap_or_else(|| panic!("missing rule {name}"))
+    };
+    assert_eq!(
+        by_selector("*").border_color_focused,
+        Some([0x33, 0xCC, 0xFF, 0xFF])
+    );
+    assert_eq!(by_selector("ws:2").border_width_idle, Some(1));
+    assert_eq!(
+        by_selector("view:7").background_image.as_deref(),
+        Some("~/wall/one.png")
+    );
+    assert_eq!(by_selector("view:7").background_fit.as_deref(), Some("fit"));
+    // Safe mode carries no per-View rules at all.
+    let safe = bitty_config::reload::fallback_builtin();
+    let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
+    assert!(safe_cfg.view_appearance.is_empty());
+}
+
+#[test]
+fn runtime_view_contract_floors_match_config() {
+    // CTX-0343: the runtime mirrors the config AC-1/AC-2 floors and the WCAG
+    // math without a crate dependency; pin the floors equal here so a drift
+    // on either side fails the workspace tests.
+    assert_eq!(
+        bitty_runtime::config::MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST,
+        bitty_config::types::MIN_OUTLINE_FOCUSED_BACKGROUND_CONTRAST
+    );
+    assert_eq!(
+        bitty_runtime::config::MIN_OUTLINE_FOCUSED_IDLE_CONTRAST,
+        bitty_config::types::MIN_OUTLINE_FOCUSED_IDLE_CONTRAST
+    );
+}
+
+#[test]
+fn merge_rejects_resolvable_view_contract_violation() {
+    // CTX-0343 production path: a resolvable violating `views.*` override
+    // rejects the whole merge/reload with a source-attributed diagnostic
+    // (the config-layer half of the two-point enforcement; the runtime half
+    // is covered by the first-match tests in `bitty-runtime`).
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let bg = bitty_config::theme::resolve_theme(None).background;
+    let lua = format!(
+        "return {{ views = {{ [\"*\"] = {{ border_color_focused = \"#{:02X}{:02X}{:02X}\" }} }} }}",
+        bg[0], bg[1], bg[2]
+    );
+    let plan = parse_lua_config(&lua, &src).expect("plan parses");
+    let err = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect_err("resolvable violation must reject the whole merge");
+    assert_eq!(err.field(), Some("views[*].border_color_focused"));
+    assert!(err.to_string().contains("AC-1"), "{err}");
+}
+
+#[test]
 fn runtime_config_inherits_file_scrollbar() {
     // CTX-0181: `scrollbar.mode`/`scrollbar.width` flow file ->
     // effective -> runtime; crate defaults stay equal (bitty-runtime

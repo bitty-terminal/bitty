@@ -170,8 +170,89 @@ impl Runtime {
         }
     }
 
-    /// Live-adopts a resolved panel animation policy (RFC-0002, CTX-0341).
+    /// Resolves one `View`'s focused/idle outline after per-`View` overrides
+    /// (RFC-0001/OQ-041, CTX-0343).
     ///
+    /// Consumes only public runtime layout state: the `ViewId` is the stable
+    /// leaf handle, the workspace label is the active slot's 1-based index,
+    /// and the content kind is `terminal` for a leaf that owns a pane session
+    /// or the primary grid and `empty` for a session-less leaf (the only
+    /// content kinds currently composed; `rich`/`browser` join when their
+    /// surfaces land). Presentation-only: no terminal truth is read or
+    /// mutated.
+    #[must_use]
+    pub(crate) fn view_outline_for(&self, view_id: ViewId) -> crate::config::RuntimeViewOutline {
+        let content = self.view_content_kind(view_id);
+        let workspace_label = self.active_workspace_label();
+        let target = crate::config::RuntimeViewTarget {
+            content,
+            workspace_label,
+            view_id: view_id.0,
+        };
+        self.config.resolve_view_outline(&target)
+    }
+
+    /// Content kind of a leaf for `views` selector matching: `terminal` for a
+    /// leaf that owns a pane session or the primary grid, `empty` otherwise
+    /// (see [`Self::view_outline_for`]).
+    pub(crate) fn view_content_kind(&self, view_id: ViewId) -> &'static str {
+        if self.pane_sessions.contains_key(&view_id) || Some(view_id) == self.primary_view {
+            "terminal"
+        } else {
+            "empty"
+        }
+    }
+
+    /// The active workspace's stable 1-based label, clamped to the accepted
+    /// `1..=16` selector range.
+    pub(crate) fn active_workspace_label(&self) -> u8 {
+        u8::try_from(self.active_workspace_index() + 1)
+            .unwrap_or(u8::MAX)
+            .clamp(1, crate::runtime::workspaces::MAX_WORKSPACES as u8)
+    }
+
+    /// Fail-closed RFC-0001 first-match check for one concrete `View` target
+    /// (CTX-0343 first-match enforcement).
+    ///
+    /// `content` is the content kind the `View` will have when the caller
+    /// commits the operation (`"terminal"` for a bind, `"empty"` for a fresh
+    /// leaf). A previously inert `ws:`/`view:` entry that first matches is
+    /// resolved and checked here before it can compose a violating pair.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::ViewAppearance`] naming the offending
+    /// `views[<selector>].<field>` leaf and the failed AC.
+    pub(crate) fn validate_view_target_at(
+        &self,
+        content: &'static str,
+        workspace_label: u8,
+        view_id: ViewId,
+    ) -> Result<(), RuntimeError> {
+        let target = crate::config::RuntimeViewTarget {
+            content,
+            workspace_label,
+            view_id: view_id.0,
+        };
+        self.config
+            .validate_view_outline(&target)
+            .map_err(RuntimeError::ViewAppearance)
+    }
+
+    /// Fail-closed first-match check before a fresh `View` is committed to the
+    /// active workspace (CTX-0343): resolves the `empty`-content pair for the
+    /// active workspace label. The caller must not create the `View` when this
+    /// returns an error.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::ViewAppearance`] naming the offending
+    /// `views[<selector>].<field>` leaf.
+    pub fn validate_new_view_appearance(&self, view_id: ViewId) -> Result<(), RuntimeError> {
+        self.validate_view_target_at("empty", self.active_workspace_label(), view_id)
+    }
+
+    /// Live-adopts a resolved panel animation policy (RFC-0002, CTX-0341).
     /// Presentation-only; the tracker keeps any in-flight transition timing
     /// and adopts the new policy for subsequent triggers. A change forces one
     /// full redraw so the new durations/easings are observable immediately.

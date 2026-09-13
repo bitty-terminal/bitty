@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-View appearance overrides (CTX-0343, RFC-0001/OQ-041):** a `views`
+  table overrides appearance per panel with a closed selector grammar —
+  `"*"` (every View) < a content type (`empty`/`terminal`/`rich`/`browser`)
+  < `"ws:<1..=16>"` (one Workspace) < `"view:<ViewId>"` (one View). Accepted
+  fields: `border_color`/`_focused`/`_idle`, `border_width`/`_focused`/`_idle`,
+  `background_image`, and `background_fit`. Resolution is per field per View in
+  tier order, independent of `init.lua` declaration order, so an unset field
+  inherits the next-less-specific value and is never silently shadowed.
+  `opacity`, `blur` (OQ-038), and `animations` (OQ-043) are reserved and
+  rejected; `decoration.background_image_roots` stays global-only. Unknown
+  selectors/fields/types, malformed labels, out-of-range widths, invalid
+  colors, and bad fit values reject the whole reload fail-closed with a
+  source-attributed diagnostic. AC-1/AC-2 are enforced fail-closed at two
+  production points: during merge/reconcile every resolvable target (`*` and
+  each content type) is checked and a violation rejects the whole reload with
+  a `views[<selector>].<field>` diagnostic; a `ws:`/`view:` entry that is
+  inert until it first matches is checked before the View creation, bind, or
+  workspace move commits it (and fails that operation closed). The OQ-045
+  width cue satisfies AC-2, AC-3 stays advisory. The `views` table adds no
+  whole-table entry cap (RFC-0001: no new numeric ceiling; the closed
+  selector set and Config VM parse budgets bound it). The layer is Live;
+  `bitty --safe` ignores every `views.*` entry. `background_image`/
+  `background_fit` land as resolution + validation only — image decode/render
+  and root trust stay with CTX-0347.
 - **Guided `bitty init` configuration wizard (CTX-0345):** the opt-in setup
   wizard now walks through the most useful shipped appearance and behavior
   keys in addition to shell/theme/font-size/keymaps: font family,

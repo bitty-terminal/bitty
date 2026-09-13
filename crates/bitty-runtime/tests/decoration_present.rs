@@ -545,3 +545,169 @@ fn set_outline_adopts_live_and_repaints_once() {
     rt.set_outline([0xFF, 0x00, 0x00, 0xFF], [0x00, 0xFF, 0x00, 0xFF]);
     assert_eq!(rt.tick(), None, "no-op set must not repaint");
 }
+
+#[test]
+fn per_view_outline_overrides_paint_only_their_panel() {
+    // CTX-0343 (RFC-0001/OQ-041): a `views["view:2"]` rule overrides the
+    // outline for ViewId(2) only; ViewId(1) keeps the global pair.
+    let mut rt = Runtime::new(RuntimeConfig {
+        decoration: Decoration::default(),
+        outline_focused: [0xFF, 0x00, 0x00, 0xFF],
+        outline_idle: [0x00, 0xFF, 0x00, 0xFF],
+        view_appearance: vec![bitty_runtime::ViewAppearanceRule {
+            selector: "view:2".to_string(),
+            border_color_focused: Some([0x00, 0x00, 0xFF, 0xFF]),
+            border_color_idle: Some([0xFF, 0xFF, 0x00, 0xFF]),
+            ..Default::default()
+        }],
+        ..RuntimeConfig::default()
+    })
+    .expect("per-view runtime builds");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    rt.set_focus(ViewId::new(1));
+    let frames = rt.present_frames();
+    rt.tick().expect("tick presents");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    // Focused View 1 uses the global focused color (no rule matches it).
+    let fy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
+    let fx0 = pad + usize::try_from(frames[0].frame.x).unwrap();
+    assert_eq!(probe(&rgba, width, fx0 + 1, fy), [0xFF, 0x00, 0x00, 0xFF]);
+    // Idle View 2 uses its own idle override, not the global idle color.
+    let iy = pad + usize::try_from(frames[1].frame.y).unwrap() + 100;
+    let ix0 = pad + usize::try_from(frames[1].frame.x).unwrap();
+    assert_eq!(probe(&rgba, width, ix0 + 1, iy), [0xFF, 0xFF, 0x00, 0xFF]);
+}
+
+#[test]
+fn per_view_rule_follows_the_selector_across_focus() {
+    // The same `view:2` rule applies to the focused state too, so moving
+    // focus onto View 2 shows its focused override while View 1 falls back
+    // to the global idle color.
+    let mut rt = Runtime::new(RuntimeConfig {
+        decoration: Decoration::default(),
+        outline_focused: [0xFF, 0x00, 0x00, 0xFF],
+        outline_idle: [0x00, 0xFF, 0x00, 0xFF],
+        view_appearance: vec![bitty_runtime::ViewAppearanceRule {
+            selector: "view:2".to_string(),
+            border_color_focused: Some([0x00, 0x00, 0xFF, 0xFF]),
+            border_color_idle: Some([0xFF, 0xFF, 0x00, 0xFF]),
+            ..Default::default()
+        }],
+        ..RuntimeConfig::default()
+    })
+    .expect("per-view runtime builds");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    rt.set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    rt.set_focus(ViewId::new(2));
+    let frames = rt.present_frames();
+    rt.tick().expect("tick presents");
+    let rgba = rt.headless_rgba().expect("rgba");
+    let width = surface_width(&rt);
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
+    let fy = pad + usize::try_from(frames[1].frame.y).unwrap() + 100;
+    let fx0 = pad + usize::try_from(frames[1].frame.x).unwrap();
+    assert_eq!(probe(&rgba, width, fx0 + 1, fy), [0x00, 0x00, 0xFF, 0xFF]);
+    let iy = pad + usize::try_from(frames[0].frame.y).unwrap() + 100;
+    let ix0 = pad + usize::try_from(frames[0].frame.x).unwrap();
+    assert_eq!(probe(&rgba, width, ix0 + 1, iy), [0x00, 0xFF, 0x00, 0xFF]);
+}
+
+#[test]
+fn runtime_rejects_out_of_range_view_rule_width() {
+    // The runtime repeats the fail-closed width bound so a direct
+    // construction can never arm an oversized per-View ring.
+    let err = Runtime::new(RuntimeConfig {
+        view_appearance: vec![bitty_runtime::ViewAppearanceRule {
+            selector: "ws:2".to_string(),
+            border_width_focused: Some(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX + 1),
+            ..Default::default()
+        }],
+        ..RuntimeConfig::default()
+    })
+    .expect_err("out-of-range view width must fail closed");
+    assert!(format!("{err}").contains("view_appearance"), "{err}");
+
+    let err = Runtime::new(RuntimeConfig {
+        view_appearance: vec![bitty_runtime::ViewAppearanceRule {
+            selector: "ws:0".to_string(),
+            ..Default::default()
+        }],
+        ..RuntimeConfig::default()
+    })
+    .expect_err("malformed selector must fail closed");
+    assert!(format!("{err}").contains("view_appearance"), "{err}");
+}
+
+#[test]
+fn runtime_rejects_inert_ws_rule_on_first_match() {
+    // CTX-0343 first match: a `ws:2` rule is inert at construction; creating
+    // workspace 2 brings its fresh empty View under the selector, and the
+    // resolved AC-1 violation must fail the creation closed with a
+    // source-attributed diagnostic and no state mutation.
+    let bg = RuntimeConfig::default().theme.background;
+    let rule = bitty_runtime::ViewAppearanceRule {
+        selector: "ws:2".to_string(),
+        border_color_focused: Some([bg[0], bg[1], bg[2], 0xFF]),
+        ..Default::default()
+    };
+    let mut rt = Runtime::new(RuntimeConfig {
+        view_appearance: vec![rule],
+        ..RuntimeConfig::default()
+    })
+    .expect("inert ws:2 rule builds");
+    assert_eq!(rt.workspace_count(), 1);
+    let err = rt
+        .workspace_new()
+        .expect_err("first match must fail the View creation closed");
+    assert!(err.contains("views[ws:2].border_color_focused"), "{err}");
+    assert_eq!(
+        rt.workspace_count(),
+        1,
+        "failed creation leaves state untouched"
+    );
+}
+
+#[test]
+fn runtime_rejects_inert_ws_rule_on_pane_bind() {
+    // CTX-0343 first match on bind: a `ws:1` rule is inert at construction
+    // (no bind has committed yet); binding the primary shell turns the
+    // focused leaf into `terminal` content, and `spawn_shell_with_args` must
+    // refuse before spawning.
+    let bg = RuntimeConfig::default().theme.background;
+    let rule = bitty_runtime::ViewAppearanceRule {
+        selector: "ws:1".to_string(),
+        border_color_focused: Some([bg[0], bg[1], bg[2], 0xFF]),
+        ..Default::default()
+    };
+    let mut rt = Runtime::new(RuntimeConfig {
+        view_appearance: vec![rule],
+        ..RuntimeConfig::default()
+    })
+    .expect("inert ws:1 rule builds");
+    // pty-gate-exempt: rejection-only — the contract check fails before any
+    // PTY is created (asserted by the is_err below and no session bound).
+    let err = rt
+        .spawn_shell_with_args("/bin/sh", &[])
+        .expect_err("bind under a violating ws:1 rule fails closed");
+    assert!(
+        format!("{err}").contains("views[ws:1].border_color_focused"),
+        "{err}"
+    );
+    assert!(
+        !rt.has_pane_session(&ViewId::new(1)),
+        "no session may be bound"
+    );
+}

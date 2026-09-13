@@ -579,6 +579,13 @@ impl TerminalApp {
                     dir,
                     bitty_config::SplitDir::Left | bitty_config::SplitDir::Up
                 );
+                // CTX-0343 first match: a previously inert `ws:`/`view:`
+                // selector can match the fresh `View`; fail the creation
+                // closed before the layout commits it.
+                if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+                    eprintln!("warning: keymap new_split refused: {err}");
+                    return;
+                }
                 if split_focused_leaf(
                     &mut layout,
                     focused,

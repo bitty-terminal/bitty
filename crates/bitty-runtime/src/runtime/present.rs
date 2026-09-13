@@ -797,28 +797,31 @@ impl Runtime {
                     frame.frame.width,
                     frame.frame.height,
                 );
-                // CTX-0340: the focused View paints the accent outline, every
-                // idle View the subtle outline. CTX-0344: the ring *width* is
-                // resolved per focus state too (`decoration.border_width*`),
-                // scaled at the live DPI factor exactly like the geometry
-                // border. The ring paints inside the View rectangle; the
-                // content grid stays inset by `border + content_inset`, so a
-                // focused width change never moves content.
+                // CTX-0340/CTX-0343: the focused View paints the accent
+                // outline, every idle View the subtle outline. The pair and
+                // the ring *width* now resolve per `View` (RFC-0001/OQ-041)
+                // from the global values plus any matching `views` rule, so a
+                // per-panel override paints only its own panel. Widths scale
+                // at the live DPI factor exactly like the geometry border; the
+                // ring paints inside the View rectangle and the content grid
+                // stays inset by `border + content_inset`, so an override never
+                // moves content.
                 let is_focused_view = focused_id == Some(*view_id);
+                let view_outline = self.view_outline_for(*view_id);
                 let ring_border = if is_focused_view {
-                    self.config
-                        .outline_width_focused
+                    view_outline
+                        .width_focused
                         .map_or(frame.border, |w| self.outline_width_physical(w))
                 } else {
-                    self.config
-                        .outline_width_idle
+                    view_outline
+                        .width_idle
                         .map_or(frame.border, |w| self.outline_width_physical(w))
                 };
                 if ring_border > 0 {
                     let outline_color = if is_focused_view {
-                        self.config.outline_focused
+                        view_outline.focused
                     } else {
-                        self.config.outline_idle
+                        view_outline.idle
                     };
                     // RFC-0002 (CTX-0341): the focus transition cross-fades
                     // the ring color from idle toward the focused accent over
@@ -828,8 +831,8 @@ impl Runtime {
                     let animated_color = if is_focused_view {
                         match self.animation_progress(AnimationKind::Focus, Some(*view_id), now) {
                             Some(p) => bitty_render::grid::lerp_rgba(
-                                self.config.outline_idle,
-                                self.config.outline_focused,
+                                view_outline.idle,
+                                view_outline.focused,
                                 p,
                             ),
                             None => outline_color,

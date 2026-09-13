@@ -27,7 +27,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::ConfigError;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
-use crate::types::{EffectiveConfig, KeymapEntry, PluginSpec};
+use crate::types::{
+    EffectiveConfig, KeymapEntry, PluginSpec, ViewAppearanceOverride, ViewOverride,
+};
 
 /// Declared merge class for a single schema field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,6 +112,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "selection"
         | "layout"
         | "decoration"
+        | "views"
         | "scrollbar"
         | "mouse"
         | "appearance"
@@ -299,6 +302,214 @@ fn merge_animations_overrides(
     }
 }
 
+/// Merges one layer's `views` entries (RFC-0001/OQ-041, CTX-0343).
+///
+/// Deep-merge per selector per field: a merged entry is created on first
+/// sight and each present leaf is scalar-replace with its own source
+/// attribution; an absent leaf means "this layer says nothing" and inherits
+/// the lower-precedence value. Merged entries stay sorted by
+/// `(tier, canonical selector)` so resolution, attribution, and reload diffs
+/// are independent of `init.lua` declaration order.
+fn merge_views(
+    effective: &mut EffectiveConfig,
+    acc: &mut MergeAccumulators<'_>,
+    src: &ConfigSource,
+    is_policy: bool,
+    views: &[ViewOverride],
+) {
+    for entry in views {
+        let canonical = entry.selector.canonical();
+        let index = match effective
+            .views
+            .iter()
+            .position(|existing| existing.selector == entry.selector)
+        {
+            Some(index) => index,
+            None => {
+                effective.views.push(ViewOverride {
+                    selector: entry.selector,
+                    overrides: ViewAppearanceOverride::default(),
+                });
+                effective.views.len() - 1
+            }
+        };
+        let slot = &mut effective.views[index].overrides;
+        let base = format!("views[{canonical}]");
+        let mut touched = false;
+        touched |= merge_view_leaf(
+            entry.overrides.border_color.as_ref(),
+            &mut slot.border_color,
+            &base,
+            "border_color",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.border_color_focused.as_ref(),
+            &mut slot.border_color_focused,
+            &base,
+            "border_color_focused",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.border_color_idle.as_ref(),
+            &mut slot.border_color_idle,
+            &base,
+            "border_color_idle",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.border_width.as_ref(),
+            &mut slot.border_width,
+            &base,
+            "border_width",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.border_width_focused.as_ref(),
+            &mut slot.border_width_focused,
+            &base,
+            "border_width_focused",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.border_width_idle.as_ref(),
+            &mut slot.border_width_idle,
+            &base,
+            "border_width_idle",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.background_image.as_ref(),
+            &mut slot.background_image,
+            &base,
+            "background_image",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= merge_view_leaf(
+            entry.overrides.background_fit.as_ref(),
+            &mut slot.background_fit,
+            &base,
+            "background_fit",
+            src,
+            is_policy,
+            acc,
+        );
+        if touched {
+            acc.attribution.insert(base, src.clone());
+        }
+    }
+    if !views.is_empty() {
+        let prev = acc.attribution.get("views").cloned();
+        record_attribution(
+            acc.attribution,
+            acc.conflicts,
+            "views",
+            prev,
+            src,
+            MergeClass::DeepMerge,
+        );
+        effective.views.sort_by(|a, b| {
+            a.selector
+                .tier()
+                .cmp(&b.selector.tier())
+                .then_with(|| a.selector.canonical().cmp(&b.selector.canonical()))
+        });
+    }
+}
+
+/// Maps one `views.<selector>.<leaf>` field to the global `decoration.*`
+/// field it overrides (RFC-0001/OQ-041), so a `SystemPolicy` pin on a global
+/// outline leaf also protects that leaf through every selector tier
+/// (CTX-0343). `background_image`/`background_fit` have no global owner yet
+/// (CTX-0347), so no policy pin exists for them.
+fn view_leaf_global_field(leaf: &str) -> Option<&'static str> {
+    Some(match leaf {
+        "border_color" => "decoration.border_color",
+        "border_color_focused" => "decoration.border_color_focused",
+        "border_color_idle" => "decoration.border_color_idle",
+        "border_width" => "decoration.border_width",
+        "border_width_focused" => "decoration.border_width_focused",
+        "border_width_idle" => "decoration.border_width_idle",
+        _ => return None,
+    })
+}
+
+/// Applies one present `views` leaf into the merged slot, honoring the
+/// policy-ownership rules exactly like every other scalar-replace field.
+///
+/// A `SystemPolicy` pin on the matching global `decoration.*` leaf also
+/// protects the `views` leaf: a pinned field stays pinned through all
+/// selector tiers, so a later user `views[<selector>].border_color_*` cannot
+/// re-color it per-`View` (CTX-0343).
+///
+/// Returns `true` when the leaf was applied (so the caller can attribute the
+/// selector container); `false` when absent or rejected as a policy
+/// violation.
+fn merge_view_leaf<T: Clone>(
+    value: Option<&T>,
+    target: &mut Option<T>,
+    base: &str,
+    leaf: &str,
+    src: &ConfigSource,
+    is_policy: bool,
+    acc: &mut MergeAccumulators<'_>,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let field = format!("{base}.{leaf}");
+    if is_policy {
+        acc.policy_fields.insert(field.clone(), src.clone());
+    } else {
+        let policy_src = acc
+            .policy_fields
+            .get(&field)
+            .or_else(|| {
+                view_leaf_global_field(leaf).and_then(|global| acc.policy_fields.get(global))
+            })
+            .cloned();
+        if let Some(policy_src) = policy_src {
+            acc.policy_violations.push(ConfigError::NonOverridable {
+                field: field.clone(),
+                policy_source: policy_src.describe(),
+                attempted_source: src.describe(),
+            });
+            acc.conflicts.push(MergeConflict {
+                field,
+                previous_source: policy_src,
+                new_source: src.clone(),
+                merge_class: MergeClass::ScalarReplace,
+            });
+            return false;
+        }
+    }
+    *target = Some(value.clone());
+    let prev = acc.attribution.get(&field).cloned();
+    record_attribution(
+        acc.attribution,
+        acc.conflicts,
+        &field,
+        prev,
+        src,
+        MergeClass::ScalarReplace,
+    );
+    true
+}
+
 /// Every dotted schema field the merge attributes, in canonical order.
 ///
 /// Shared by [`merge_layers`] (which backfills any field no layer declared as
@@ -337,6 +548,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "decoration.border_width_focused",
     "decoration.border_width_idle",
     "decoration",
+    "views",
     "scrollbar.mode",
     "scrollbar.width",
     "scrollbar",
@@ -867,6 +1079,19 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 );
             }
             attribution.insert("decoration".to_string(), src.clone());
+        }
+
+        // CTX-0343: `views` entries deep-merge per selector per field (see
+        // `merge_views`); absent fields inherit, so a lower layer's explicit
+        // member is never reset by a higher layer's unrelated leaf.
+        if let Some(views) = &plan.views {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_views(&mut effective, &mut acc, src, is_policy, views);
         }
 
         // CTX-0181: `scrollbar.mode`/`scrollbar.width` are scalar-replace
@@ -1709,6 +1934,19 @@ fn merge_layers_allow_policy_violations(
             }
             attribution.insert("decoration".to_string(), src.clone());
         }
+        // CTX-0343: `views` entries deep-merge per selector per field (see
+        // `merge_views`); absent fields inherit, so a lower layer's explicit
+        // member is never reset by a higher layer's unrelated leaf.
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(views) = &plan.views {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_views(&mut effective, &mut acc, src, is_policy, views);
+        }
         // CTX-0260/CTX-0334: `mouse.focus_follows_mouse` and its dwell
         // delay are scalar-replace like `selection.auto_copy`; absent table
         // means "says nothing".
@@ -2447,6 +2685,67 @@ mod tests {
         let merged = try_merge_layers(vec![policy, user]).expect("try_merge keeps value");
         assert!(!merged.policy_violations.is_empty());
         assert_eq!(merged.effective.window.opacity, 0.9);
+    }
+
+    #[test]
+    fn policy_pin_protects_view_selector_tiers() {
+        // CTX-0343: a `SystemPolicy` pin on a global decoration outline leaf
+        // stays pinned through every `views` selector tier. A user
+        // `views[*].border_color_focused` cannot re-color it per-View.
+        use crate::types::{
+            DecorationConfig, OutlineColor, ViewAppearanceOverride, ViewOverride, ViewSelector,
+        };
+        let pinned = OutlineColor::parse("#33CCFF").expect("color");
+        let attempt = OutlineColor::parse("#FF0000").expect("color");
+        let policy = LayeredPlan::new(
+            ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
+            ConfigPlan {
+                decoration: Some(DecorationConfig {
+                    border_color_focused: Some(pinned),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                views: Some(vec![ViewOverride {
+                    selector: ViewSelector::Wildcard,
+                    overrides: ViewAppearanceOverride {
+                        border_color_focused: Some(attempt),
+                        ..Default::default()
+                    },
+                }]),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = try_merge_layers(vec![policy, user]).expect("merge keeps the pin");
+        assert!(
+            merged.policy_violations.iter().any(|violation| matches!(
+                violation,
+                ConfigError::NonOverridable { field, .. }
+                    if field == "views[*].border_color_focused"
+            )),
+            "expected a NonOverridable violation: {:?}",
+            merged.policy_violations
+        );
+        // The pinned global value is retained and the rejected leaf never
+        // enters the merged `views` table.
+        assert_eq!(
+            merged.effective.decoration.border_color_focused,
+            Some(pinned)
+        );
+        assert!(
+            merged
+                .effective
+                .views
+                .iter()
+                .all(|entry| entry.overrides.border_color_focused.is_none()),
+            "rejected leaf must not reach the merged table"
+        );
     }
 
     #[test]

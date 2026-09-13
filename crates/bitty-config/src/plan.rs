@@ -16,7 +16,8 @@ use crate::error::ConfigError;
 use crate::keymap::ModKey;
 use crate::types::{
     AppearanceConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, WindowConfig,
+    MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, ViewOverride,
+    WindowConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -47,6 +48,11 @@ pub struct ConfigPlan {
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
     /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
     pub decoration: Option<DecorationConfig>,
+    /// Per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343
+    /// `views.<selector>.*`). A present entry carries its parsed selector and
+    /// the closed override field set; absent means "this layer says
+    /// nothing". Cross-layer merge is per selector per field.
+    pub views: Option<Vec<ViewOverride>>,
     /// Scrollbar configuration (CTX-0181 `scrollbar.mode`/`scrollbar.width`).
     pub scrollbar: Option<ScrollbarConfig>,
     /// Mouse configuration (CTX-0260 `mouse.focus_follows_mouse`).
@@ -125,6 +131,13 @@ impl ConfigPlan {
         self
     }
 
+    /// Convenience builder: set per-`View` appearance overrides (CTX-0343).
+    #[must_use]
+    pub fn with_views(mut self, views: Vec<ViewOverride>) -> Self {
+        self.views = Some(views);
+        self
+    }
+
     /// Convenience builder: set scrollbar.
     #[must_use]
     pub fn with_scrollbar(mut self, scrollbar: ScrollbarConfig) -> Self {
@@ -186,6 +199,11 @@ impl ConfigPlan {
         if let Some(d) = &self.decoration {
             d.validate()?;
         }
+        if let Some(views) = &self.views {
+            for entry in views {
+                entry.validate()?;
+            }
+        }
         if let Some(s) = &self.scrollbar {
             s.validate()?;
         }
@@ -238,6 +256,7 @@ impl ConfigPlan {
             && self.close_confirm.is_none()
             && self.layout.is_none()
             && self.decoration.is_none()
+            && self.views.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.appearance.is_none()

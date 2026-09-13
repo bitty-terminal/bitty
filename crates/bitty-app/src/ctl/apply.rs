@@ -280,6 +280,13 @@ pub fn apply_control(
             ));
         }
         let previous = runtime.layout().clone();
+        // CTX-0343 first match: a previously inert `ws:`/`view:` selector can
+        // match the fresh `View` as `empty` content; fail the creation closed
+        // before the layout commits it. The `terminal` bind is checked again
+        // inside `spawn_shell_for_view`.
+        if let Err(err) = runtime.validate_new_view_appearance(new_id) {
+            return Err(("usage", "Conflict", format!("spawn refused: {err}")));
+        }
         runtime.set_layout(layout);
         let (cols, rows) = runtime
             .layout_allocations()

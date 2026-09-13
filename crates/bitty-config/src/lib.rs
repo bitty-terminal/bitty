@@ -114,10 +114,12 @@ pub use theme::{
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
-    AppearanceConfig, CloseConfirm, DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry,
-    LayoutConfig, MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors,
-    ResolvedOutlineWidths, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
-    WindowConfig,
+    AppearanceConfig, BackgroundFit, CloseConfirm, DecorationConfig, EffectiveConfig, FontConfig,
+    KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_VIEW_SELECTOR_BYTES,
+    MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec, ReducedMotion,
+    ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance, ScrollbarConfig,
+    ScrollbarMode, SelectionConfig, TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget,
+    ViewContent, ViewOverride, ViewSelector, WindowConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 

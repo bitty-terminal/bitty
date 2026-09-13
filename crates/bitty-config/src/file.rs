@@ -3573,7 +3573,7 @@ mod tests {
             r##"return { decoration = {
                 background_image = "~/wall/one.png",
                 background_fit = "tile",
-                background_image_roots = { "/srv/wallpapers", "~/Pictures" },
+                background_image_roots = { "~/wallpapers", "~/Pictures" },
             } }"##,
             &test_source(),
         )
@@ -3583,7 +3583,7 @@ mod tests {
         assert_eq!(dec.background_fit, Some(BackgroundFit::Tile));
         assert_eq!(
             dec.background_image_roots.as_deref(),
-            Some(&["/srv/wallpapers".to_string(), "~/Pictures".to_string()][..])
+            Some(&["~/wallpapers".to_string(), "~/Pictures".to_string()][..])
         );
         plan.validate().expect("valid background decoration");
 

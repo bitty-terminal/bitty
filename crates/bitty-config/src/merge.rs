@@ -3405,7 +3405,7 @@ mod tests {
             ConfigPlan {
                 decoration: Some(DecorationConfig {
                     background_image: Some("~/wall/one.png".to_string()),
-                    background_image_roots: Some(vec!["/srv/wall".to_string()]),
+                    background_image_roots: Some(vec!["~/wall".to_string()]),
                     ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
@@ -3438,7 +3438,7 @@ mod tests {
                 .decoration
                 .background_image_roots
                 .as_deref(),
-            Some(&["/srv/wall".to_string()][..])
+            Some(&["~/wall".to_string()][..])
         );
         assert_eq!(
             merged
@@ -3482,7 +3482,7 @@ mod tests {
             ConfigSource::new(LayerKind::SystemPolicy, Some("policy.lua")),
             ConfigPlan {
                 decoration: Some(DecorationConfig {
-                    background_image: Some("/policy/wall.png".to_string()),
+                    background_image: Some("~/policy-wall.png".to_string()),
                     ..Default::default()
                 }),
                 schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
@@ -3495,7 +3495,7 @@ mod tests {
                 views: Some(vec![crate::types::ViewOverride {
                     selector: ViewSelector::Wildcard,
                     overrides: ViewAppearanceOverride {
-                        background_image: Some("/user/wall.png".to_string()),
+                        background_image: Some("~/user-wall.png".to_string()),
                         background_fit: Some(BackgroundFit::Fit),
                         ..Default::default()
                     },
@@ -3511,7 +3511,7 @@ mod tests {
         );
         assert_eq!(
             merged.effective.decoration.background_image.as_deref(),
-            Some("/policy/wall.png")
+            Some("~/policy-wall.png")
         );
         // The unpinned fit leaf still accepts the user value.
         let view = &merged.effective.views[0];

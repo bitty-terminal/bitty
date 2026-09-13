@@ -304,10 +304,10 @@ fn sniff_png(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
                     return Err(BackgroundError::Dimensions { width, height });
                 }
                 let bit_depth = bytes[offset + 16];
-                if bit_depth != 8 {
+                if bit_depth > 8 {
                     return Err(BackgroundError::UnsupportedFormat {
                         detail: format!(
-                            "PNG bit depth {bit_depth} is unsupported; only 8-bit samples are accepted"
+                            "PNG bit depth {bit_depth} is unsupported; samples wider than 8 bits are rejected"
                         ),
                     });
                 }
@@ -1387,6 +1387,36 @@ mod tests {
             decode_background(&png),
             Err(BackgroundError::UnsupportedFormat { .. })
         ));
+    }
+
+    fn png_header_with_bit_depth(bit_depth: u8) -> Vec<u8> {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.push(bit_depth);
+        ihdr.push(3); // palette color type
+        ihdr.extend_from_slice(&[0, 0, 0]); // compression, filter, interlace
+        png.extend_from_slice(&(ihdr.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&[0, 0, 0, 0]); // CRC, not verified while sniffing
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png
+    }
+
+    #[test]
+    fn sub_eight_bit_png_still_sniffs() {
+        // Only sample widths above 8 bits exceed the RGBA8 budget; 1/2/4-bit
+        // palette and grayscale PNGs stay accepted from the header.
+        for depth in [1u8, 2, 4] {
+            let png = png_header_with_bit_depth(depth);
+            let header = sniff_image(&png).expect("sub-8-bit sniff");
+            assert_eq!(header.format, BackgroundFormat::Png);
+            assert_eq!((header.width, header.height), (2, 1));
+        }
     }
 
     #[test]

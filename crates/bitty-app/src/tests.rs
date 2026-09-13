@@ -1893,13 +1893,15 @@ fn expand_home_path_is_injected_and_fails_closed_without_home() {
     // CTX-0347: expansion is hermetic over an injected home, so Windows CI
     // (which has no `$HOME`) never depends on the ambient environment.
     let home = std::path::Path::new("/home/test");
+    // Build the expectation with the platform separator (`\` on Windows)
+    // instead of hardcoding a path spelling.
     assert_eq!(
         crate::config_cli::expand_home_path_with("~/wall/one.png", Some(home)).expect("expand"),
-        "/home/test/wall/one.png"
+        home.join("wall/one.png").to_string_lossy().into_owned()
     );
     assert_eq!(
         crate::config_cli::expand_home_path_with("~", Some(home)).expect("bare tilde"),
-        "/home/test"
+        home.to_string_lossy().into_owned()
     );
     assert_eq!(
         crate::config_cli::expand_home_path_with("/srv/wall.png", Some(home)).expect("absolute"),

@@ -22,6 +22,7 @@
 //! `Window`, `Surface`, or `HeadlessRasterizer`.
 //! Deterministic: sorted file discovery, canonical JSON, FNV-1a, sorted report.
 
+use crate::{umbrella_root, workspace_root};
 use std::fs;
 use std::path::PathBuf;
 
@@ -51,22 +52,12 @@ pub const EXPECTED_HEIGHT: usize = 24;
 /// bumps and rejected regenerated baselines).
 pub const EXPECTED_HASH_VERSION: u32 = bitty_term_state::canonical_public::CANONICAL_HASH_VERSION;
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Umbrella workspace root, derived from the documented `$BITTY_WORKSPACE`
-/// convention — never a hardcoded absolute path (a hardcoded checkout path
-/// breaks on any other machine). `None` when the env var is absent, in
-/// which case umbrella candidates are omitted.
-fn umbrella_root() -> Option<PathBuf> {
-    std::env::var_os("BITTY_WORKSPACE").map(PathBuf::from)
-}
-
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
     // Canonical singular `recording/` (workspace rename); legacy plural
-    // `recordings/` retained as fallback only. No `tmp/` candidate: `tmp/`
-    // is process scratch, never durable evidence (DEC-0038).
+    // `recordings/` retained as fallback only, always after the singular
+    // candidate (CR-COMPAT-01). No `tmp/` candidate: `tmp/` is process
+    // scratch, never durable evidence (DEC-0038). Roots come from
+    // `workspace_root()` / `umbrella_root()`, never from path literals.
     let mut out = vec![
         workspace_root().join("recording/references/bitty"),
         workspace_root().join("recordings/references/bitty"),
@@ -770,61 +761,43 @@ mod tests {
         assert!(dump.actions_len <= MAX_ACTIONS);
     }
 
-    fn pos_of(candidates: &[PathBuf], needle: &str) -> Option<usize> {
-        candidates
-            .iter()
-            .position(|p| p.to_string_lossy().contains(needle))
+    fn derived_roots() -> (PathBuf, PathBuf) {
+        let ws = workspace_root();
+        let umbrella =
+            umbrella_root().expect("umbrella root derives from the crate or $BITTY_WORKSPACE");
+        (ws, umbrella)
     }
 
     #[test]
-    fn bitty_candidates_prefer_singular_recording_over_legacy_plural() {
+    fn bitty_candidates_are_singular_then_legacy_plural_per_root() {
         // CR-COMPAT-01: after the workspace `recordings/` -> `recording/`
-        // rename, singular candidates must exist and precede the legacy
-        // plural fallback (workspace-relative and umbrella mirrors).
-        let candidates = bitty_snapshot_dir_candidates();
-        let ws_singular = pos_of(&candidates, "recording/references/bitty")
-            .expect("singular workspace recording/ candidate missing");
-        let ws_legacy = candidates
-            .iter()
-            .position(|p| p.to_string_lossy().contains("recordings/references/bitty"))
-            .expect("legacy plural fallback candidate missing");
-        assert!(
-            ws_singular < ws_legacy,
-            "singular recording/ ({ws_singular}) must precede legacy recordings/ ({ws_legacy})"
-        );
-        // Umbrella entries exist only when `$BITTY_WORKSPACE` is set; skip
-        // that half of the contract otherwise (same pattern as the
-        // discovery test below).
-        if umbrella_root().is_none() {
-            eprintln!("SKIP: umbrella ordering asserts need $BITTY_WORKSPACE");
-            return;
-        }
-        let umbrella_singular = pos_of(&candidates, "bitty-terminal/recording/references/bitty")
-            .expect("singular umbrella recording/ candidate missing");
-        let umbrella_legacy = pos_of(&candidates, "bitty-terminal/recordings/references/bitty")
-            .expect("legacy umbrella plural fallback candidate missing");
-        assert!(
-            umbrella_singular < umbrella_legacy,
-            "singular umbrella recording/ ({umbrella_singular}) must precede legacy recordings/ ({umbrella_legacy})"
+        // rename, every root probes the singular candidate before the legacy
+        // plural fallback. Expectations are built from the same derivation
+        // helpers as the candidate list, so the test holds on any host.
+        let (ws, umbrella) = derived_roots();
+        assert_eq!(
+            bitty_snapshot_dir_candidates(),
+            vec![
+                ws.join("recording/references/bitty"),
+                ws.join("recordings/references/bitty"),
+                umbrella.join("recording/references/bitty"),
+                umbrella.join("recordings/references/bitty"),
+            ]
         );
     }
 
     #[test]
-    fn reference_dir_prefers_singular_recording_over_legacy_plural() {
+    fn reference_dir_candidates_are_singular_then_legacy_plural_per_root() {
         // Same ordering contract for per-backend reference discovery.
-        let candidates = reference_dir("ghostty");
-        let singular = pos_of(&candidates, "recording/references/ghostty")
-            .expect("singular workspace recording/ reference candidate missing");
-        let legacy = candidates
-            .iter()
-            .position(|p| {
-                p.to_string_lossy()
-                    .contains("recordings/references/ghostty")
-            })
-            .expect("legacy plural reference fallback candidate missing");
-        assert!(
-            singular < legacy,
-            "singular recording/ ({singular}) must precede legacy recordings/ ({legacy})"
+        let (ws, umbrella) = derived_roots();
+        assert_eq!(
+            reference_dir("ghostty"),
+            vec![
+                ws.join("recording/references/ghostty"),
+                ws.join("recordings/references/ghostty"),
+                umbrella.join("recording/references/ghostty"),
+                umbrella.join("recordings/references/ghostty"),
+            ]
         );
     }
 
@@ -833,10 +806,10 @@ mod tests {
         // End-to-end proof of the fix on hosts where the renamed umbrella
         // `recording/references/bitty/` baselines exist: discovery must
         // succeed even though no `recordings/` (plural) directory exists.
-        // The umbrella root comes from `$BITTY_WORKSPACE`, never a hardcoded
-        // checkout path.
+        // The umbrella root is derived from the crate parent (or
+        // `$BITTY_WORKSPACE`), never a hardcoded checkout path.
         let Some(ws) = umbrella_root() else {
-            eprintln!("SKIP: $BITTY_WORKSPACE is unset on this host");
+            eprintln!("SKIP: umbrella root unavailable on this host");
             return;
         };
         let singular_umbrella = ws.join("recording/references/bitty");

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# check-scratch-paths.sh — CTX-0280 repo lint.
+# check-scratch-paths.sh — CTX-0280 repo lint (CTX-0379: docs/metadata coverage).
+#
+# Usage: scripts/check-scratch-paths.sh [--root <dir>]
+#   --root scans <dir> instead of the repository root. Used by the fixture
+#   test `scripts/tests/check-scratch-paths.test.sh`.
 #
 # Fails on *new* stale scratch-path references. The workspace convention is
 # the singular `recording/` directory for durable evidence (umbrella
@@ -8,22 +12,14 @@
 #
 # Rule 1 — no NEW `recordings/` (plural) refs (whole tree, text files):
 #   Every `recordings/` line must match the explicit allowlist below.
-#   Allowed today (each reviewed per-hit in CTX-0280, none may grow silently):
+#   Allowed today (each reviewed per-hit, none may grow silently):
 #     - `crates/bitty-compat-lab/src/compare.rs`: intentional legacy-plural
 #       fallback candidates (CTX-0206 design; singular is probed first and
 #       ordering tests pin singular-before-legacy).
-#     - `.gitignore`: functional ignores of real project-local paths
-#       (`recordings/manual-smoke/`, `recordings/references/bitty/`).
-#     - `recordings/README.md`: self-description of the project-local dir,
-#       which is really named `recordings/` (kept per CTX-0280 exception b).
-#     - lines containing `recordings/compat-matrix-2026-09-01.json`: the kept
-#       v1 artifact itself plus its v1 follow-up references (separate task
-#       owns the rename, if any).
-#     - lines containing `recordings/manual-smoke/`: project-local
-#       git-ignored windowed-capture scratch (functional `mkdir`/`grim`
-#       paths, never committed).
-#     - lines containing `recordings/README.md`: pointer at the real local
-#       file (e.g. compat-matrix CTX-0114 note).
+#     - lines containing `recordings/compat-matrix-2026-09-01.json`:
+#       historical revision-history/CHANGELOG entries that name the v1
+#       artifact as it existed then (the artifact itself is generated into
+#       the git-ignored workspace `recording/` since CTX-0379).
 #
 # Rule 2 — no NEW hardcoded `/tmp/` evidence writes (code + scripts only):
 #   Scope is `crates/*/src/**.rs`, `scripts/*`, `tools/**`. Integration
@@ -47,8 +43,17 @@
 #   contract paths, not host leftovers. Comment-only lines and unit-test
 #   regions never count; `scratch-paths-exempt: <reason>` applies.
 #
-#   This script exempts itself from all rules
-#   (it must spell the forbidden patterns to define them).
+# Rule 4 — no NEW host-absolute paths in tracked docs/metadata (CTX-0379):
+#   Scans every non-code, non-test file (`docs/**`, root `*.md`, `.github/**`,
+#   `justfile`, dotfiles, packaging metadata) for the same `/mnt/`,
+#   `/home/<user>`, `/Users/<user>`, and `C:\Users` patterns. Docs are
+#   user-follow instructions, so a host path there is drift even when the
+#   file is prose; `scratch-paths-exempt: <reason>` on the hit line (or one of
+#   the 3 lines above) is the auditable escape hatch.
+#
+#   This script and its fixture tree `scripts/tests/fixtures/scratch-paths/`
+#   are exempt from all rules (they must spell the forbidden patterns to
+#   define and test them).
 #
 # Escape hatch (auditable, grep-able, mirrors pty-gate):
 #   - `// scratch-paths-exempt: <reason>` (or `# ...` in shell) on the hit
@@ -58,26 +63,45 @@
 #   - Rule 1 scans file contents, not paths: a brand-new `recordings/`
 #     directory with no `recordings/` string inside passes (reviewers must
 #     still route new durable evidence to `recording/`).
-#   - Rule 2 does not scan `docs/` or `crates/*/tests/`: a new doc telling
-#     humans to dump evidence to `/tmp/` passes (docs are instructions, and
-#     current manual commands such as `grim /tmp/*.png` stay legit).
+#   - Rules 2/3/4 do not scan `crates/*/tests/**` or `tests/**` fixtures:
+#     integration tests and `.bin` capture corpora embed neutral placeholders
+#     (`/home/user`) or host bytes by design.
 #   - The `#[cfg(test)]`-region rule uses the FIRST `#[cfg(test)]` line per
 #     file; prod code placed after a trailing test module would be wrongly
 #     exempt (no such layout exists today; keep test modules trailing).
 #     Extracted unit-test modules named `tests.rs` under `src/` are treated
 #     as test-only regions by name, because their `#[cfg(test)]` lives on the
 #     parent's `mod tests;` declaration (CTX-0304).
-#   - Rule 3 does not scan `docs/`, `crates/*/tests/`, or fixtures: docs
-#     record historical machine paths and `.bin` capture corpora embed
-#     whatever host produced them (sanitizing fixtures is a separate task).
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+ROOT=""
+while (($# > 0)); do
+	case "$1" in
+	--root)
+		ROOT="${2:?--root requires a directory}"
+		shift 2
+		;;
+	-h | --help)
+		echo "usage: $0 [--root <dir>]"
+		exit 0
+		;;
+	*)
+		echo "usage: $0 [--root <dir>]" >&2
+		exit 2
+		;;
+	esac
+done
+
+if [[ -n "$ROOT" ]]; then
+	cd "$ROOT"
+else
+	cd "$(dirname "$0")/.."
+fi
 
 FAIL=0
+SELF=scripts/check-scratch-paths.sh
 
 # --- Rule 1: recordings/ (plural) allowlist ---
-SELF=scripts/check-scratch-paths.sh
 while IFS= read -r hit; do
 	file="${hit%%:*}"
 	file="${file#./}"
@@ -85,12 +109,12 @@ while IFS= read -r hit; do
 	line="${rest%%:*}"
 	text="${rest#*:}"
 	case "$file" in
-	crates/bitty-compat-lab/src/compare.rs | .gitignore | recordings/README.md)
+	crates/bitty-compat-lab/src/compare.rs)
 		continue
 		;;
 	esac
 	case "$text" in
-	*recordings/compat-matrix-2026-09-01.json* | *recordings/manual-smoke/* | *recordings/README.md* | *scratch-paths-exempt:*)
+	*recordings/compat-matrix-2026-09-01.json* | *scratch-paths-exempt:*)
 		continue
 		;;
 	esac
@@ -103,14 +127,16 @@ while IFS= read -r hit; do
 	echo "scratch-paths[recordings]: $hit"
 	FAIL=1
 done < <(
-	rg -n --no-heading -g '!target/**' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' -g '!scripts/check-scratch-paths.sh' 'recordings/' . 2>/dev/null || true
+	rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
+		-g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
 )
 
 # --- Rule 2: hardcoded /tmp/ writes in code + scripts ---
 mapfile -d '' SRC_FILES < <(
 	find crates scripts tools -type f \
 		\( -path 'crates/*/src/*.rs' -o -path 'crates/*/src/**/*.rs' \
-		-o -path 'scripts/*' -o -path 'tools/*' \) -print0 2>/dev/null | sort -z
+		-o -path 'scripts/*' -o -path 'tools/*' \) \
+		! -path 'scripts/tests/fixtures/*' -print0 2>/dev/null | sort -z
 )
 
 for file in "${SRC_FILES[@]}"; do
@@ -190,6 +216,38 @@ for file in "${SRC_FILES[@]}"; do
 			fi
 		fi
 		echo "scratch-paths[abs-path]: $file:$hit"
+		FAIL=1
+	done < <(
+		rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
+			-e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
+	)
+done
+
+# --- Rule 4: hardcoded host-absolute paths in tracked docs/metadata (CTX-0379) ---
+mapfile -d '' DOC_FILES < <(
+	rg --files -0 --hidden \
+		-g '!crates/**' -g '!tests/**' -g '!scripts/**' -g '!tools/**' \
+		-g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
+		. 2>/dev/null || true
+)
+
+for file in "${DOC_FILES[@]}"; do
+	file="${file#./}"
+	while IFS= read -r hit; do
+		lineno="${hit%%:*}"
+		text="${hit#*:}"
+		case "$text" in
+		*scratch-paths-exempt:*)
+			continue
+			;;
+		esac
+		if ((lineno > 1)); then
+			from=$((lineno > 3 ? lineno - 3 : 1))
+			if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+				continue
+			fi
+		fi
+		echo "scratch-paths[doc-abs-path]: $file:$hit"
 		FAIL=1
 	done < <(
 		rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \

@@ -20,23 +20,14 @@
 use std::fs;
 use std::path::PathBuf;
 
-use bitty_compat_lab::{MAX_ACTIONS, MAX_CORPUS_BYTES, actions_to_snapshot, parse_bounded};
+use bitty_compat_lab::{
+    MAX_ACTIONS, MAX_CORPUS_BYTES, actions_to_snapshot, parse_bounded, umbrella_root,
+    workspace_root,
+};
 
 const CATEGORIES: &[&str] = &[
     "vt", "osc", "keyboard", "mouse", "resize", "unicode", "shell", "tui",
 ];
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Umbrella workspace root, derived from the documented `$BITTY_WORKSPACE`
-/// convention — never a hardcoded absolute path (a hardcoded checkout path
-/// breaks on any other machine). `None` when the env var is absent, in
-/// which case only the worktree copy is written.
-fn umbrella_root() -> Option<PathBuf> {
-    std::env::var_os("BITTY_WORKSPACE").map(PathBuf::from)
-}
 
 fn corpus_dir(category: &str) -> PathBuf {
     workspace_root()
@@ -105,13 +96,22 @@ fn json_escape(input: &str) -> String {
 fn main() {
     let ws = workspace_root();
     let out_worktree_rec = ws.join("recording/references/bitty");
+    // `$BITTY_WORKSPACE` is the explicit umbrella opt-in. The derived parent
+    // fallback is read-only (compare.rs discovery); writes only go to an
+    // umbrella evidence dir that already exists, so a standalone clone cannot
+    // create stray dirs next to the repository.
+    let umbrella_explicit = std::env::var_os("BITTY_WORKSPACE").is_some_and(|v| !v.is_empty());
     let out_umbrella_rec: Option<PathBuf> =
         umbrella_root().map(|u| u.join("recording/references/bitty"));
 
     let mut out_dirs: Vec<PathBuf> = vec![out_worktree_rec.clone()];
     match &out_umbrella_rec {
-        Some(dir) => out_dirs.push(dir.clone()),
-        None => eprintln!("note: $BITTY_WORKSPACE is unset; writing the worktree copy only"),
+        Some(dir) if umbrella_explicit || dir.is_dir() => out_dirs.push(dir.clone()),
+        Some(dir) => eprintln!(
+            "note: umbrella evidence dir {} absent and $BITTY_WORKSPACE unset; writing the worktree copy only",
+            dir.display()
+        ),
+        None => eprintln!("note: umbrella root unavailable; writing the worktree copy only"),
     }
     for dir in &out_dirs {
         if let Err(e) = fs::create_dir_all(dir) {
@@ -236,12 +236,12 @@ fn main() {
         "expected at least 22 snapshots written, saw {written}"
     );
     println!(
-        "collect_dumps done: {written}/{total} snapshots written to {} and {}",
-        out_worktree_rec.display(),
-        out_umbrella_rec
-            .as_ref()
+        "collect_dumps done: {written}/{total} snapshots written to {}",
+        out_dirs
+            .iter()
             .map(|d| d.display().to_string())
-            .unwrap_or_else(|| "(umbrella skipped: $BITTY_WORKSPACE unset)".to_string())
+            .collect::<Vec<_>>()
+            .join(" and ")
     );
     let _ = PathBuf::from(".");
 }

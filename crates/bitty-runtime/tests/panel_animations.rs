@@ -331,11 +331,23 @@ fn focus_change_arms_bounded_cross_fade() {
     assert!(rt.tick_at(start).is_none());
     assert!(rt.set_focus(ViewId::new(2)));
     let _ = rt.tick_at(start).expect("focus change presents");
-    assert!(rt.animations_active(), "focus cross-fade must be active");
+    // Query the arming on the same virtual clock `tick_at` uses. The
+    // wall-clock `animations_active()` reads the cross-fade as already
+    // expired when a loaded CI scheduler stalls this thread for more than
+    // the 100 ms focus duration between arming and the assertion (CTX-0408).
+    assert!(
+        rt.animation_progress(AnimationKind::Focus, Some(ViewId::new(2)), start)
+            .is_some(),
+        "focus cross-fade must be active"
+    );
     // Focus is 100 ms in the accepted contract.
     let end = start + Duration::from_millis(100);
     rt.tick_at(end);
-    assert!(!rt.animations_active(), "focus must expire by 100 ms");
+    assert!(
+        rt.animation_progress(AnimationKind::Focus, Some(ViewId::new(2)), end)
+            .is_none(),
+        "focus must expire by 100 ms"
+    );
     assert!(rt.tick_at(end).is_none());
 }
 

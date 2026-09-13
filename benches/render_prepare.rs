@@ -1,7 +1,7 @@
 //! Render prepare baseline — PB-4 / PB-7 frame-on-demand.
 //!
 //! Headless, bounded, `#![forbid(unsafe_code)]` harness for
-//! `bitty-docs/docs/specifications/performance-budget-rfc.md`:
+//! `docs/specifications/performance-budget-rfc.md`:
 //! - PB-4 input latency: snapshot→frame plan→draw list must stay well
 //!   under 8 ms p50 (this bench isolates `GridRenderer::render` with a
 //!   fake `GlyphRasterizer`, no GPU, no `SurfaceTarget`).
@@ -14,7 +14,7 @@
 //! Bounded via `State` invariants, `Damage::regions` ≤ 256 (coalesced), and
 //! atlas `MAX_FRAME_REGIONS` 256.
 //!
-//! Budget reference: `bitty-docs/docs/specifications/performance-budget-rfc.md#pb-4-input-latency`
+//! Budget reference: `docs/specifications/performance-budget-rfc.md#pb-4-input-latency`
 //! and `#pb-7-idle-resource-usage` plus `crates/bitty-render/src/grid.rs` docs.
 //!
 //! Run headlessly:

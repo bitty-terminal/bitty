@@ -1,6 +1,6 @@
 //! `bitty run -- COMMAND...`: explicit child launch (CTX-0170).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`run` section) as refined by
+//! Canonical: `docs/interfaces/cli.md` (`run` section) as refined by
 //! `docs/specifications/cli-contract-rfc.md` (`bitty run` local class).
 //!
 //! # Contract (implemented)

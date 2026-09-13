@@ -1,6 +1,6 @@
 //! `bitty list`: enumerate resources (CTX-0172).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`list` introspection
+//! Canonical: `docs/interfaces/cli.md` (`list` introspection
 //! section) as refined by `docs/specifications/cli-contract-rfc.md`
 //! (`bitty list` mixed class, output envelope v1, exit codes 0-8, `ls` alias).
 //!

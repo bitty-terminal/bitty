@@ -6,8 +6,12 @@
 - The umbrella directory is not a Git repository and sibling repositories own
   their own Git, CarryCtx, CI, releases, and agent guidance.
 - All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
-- `bitty-docs` is the canonical source for product, architecture, security,
-  configuration, interface, and project decisions.
+- `bitty-terminal-docs` is the canonical source for terminal-platform product,
+  architecture, configuration, interface, and specification documents. It is
+  mounted at `docs/` as a Git submodule pinned to a commit; initialize it with
+  `git submodule update --init`.
+- `bitty-docs` is the canonical source for shared governance: decisions, the
+  security corpus, reviews, findings, and project state.
 
 ## Current phase
 
@@ -27,7 +31,9 @@
 1. Read this guide and the applicable files in `.carryctx/rules/`.
 2. Adopt the assigned persona in `.carryctx/personas/`.
 3. Read the task, team context, exact scopes, dependencies, and relevant
-   canonical contracts in `bitty-docs`.
+   canonical contracts in the `docs/` submodule (bitty-terminal-docs) and
+   shared governance in `bitty-docs`; run `git submodule update --init` first
+   when `docs/` is empty.
 4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
 
 ## CarryCtx workflow
@@ -96,9 +102,19 @@
 ## Documentation contract
 
 - Repository-owned documentation is English-only.
-- Synchronize affected canonical material in `bitty-docs` when architecture,
-  security, public behavior, configuration, compatibility, or developer
-  workflows change.
+- Canonical platform docs live in `bitty-terminal-docs`, mounted at `docs/` as
+  a Git submodule pinned to a merged `main` commit. Shared governance
+  (decisions, security corpus, reviews, project state) stays in `bitty-docs`;
+  AI-core and plugin-ecosystem corpora live in `bitty-ai-docs` and
+  `bitty-plugins-docs` and are linked by absolute URL.
+- Initialize/refresh the submodule with `git submodule update --init`; bump the
+  pin with `git submodule update --remote docs` followed by `git add docs` and
+  a `docs:` commit. `docs/` is external content: `just check` excludes it from
+  markdownlint and the scratch-path gate, so gates behave identically with and
+  without the submodule initialized.
+- Synchronize affected canonical material in `bitty-terminal-docs` (platform)
+  or `bitty-docs` (governance) when architecture, security, public behavior,
+  configuration, compatibility, or developer workflows change.
 - Distinguish normative requirements, accepted decisions, candidates, open
   questions, and implemented behavior. Implementation claims require code,
   test, or release evidence from this repository.

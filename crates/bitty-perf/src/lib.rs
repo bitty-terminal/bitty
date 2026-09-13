@@ -7,7 +7,7 @@
 //! and new real-window benches
 //! `benches/{startup_real,latency_real,idle_real}.rs` (CTX-0100).
 //! All are headless, bounded, `forbid(unsafe)` — see
-//! `bitty-docs/docs/specifications/performance-budget-rfc.md` PB-1..PB-7.
+//! `docs/specifications/performance-budget-rfc.md` PB-1..PB-7.
 //!
 //! CTX-0100 upgrade: the former `--help` proxy is replaced by
 //! instrumentation that covers the full `bitty-app` cold path:
@@ -20,7 +20,7 @@
 //! stage breakdown and p50/p99, and idle is gated by the frame-on-demand
 //! invariant (`tick == None` → no polling loop → ≤1 % CPU).
 //!
-//! Budget reference: `bitty-docs/docs/specifications/performance-budget-rfc.md#budgets`.
+//! Budget reference: `docs/specifications/performance-budget-rfc.md#budgets`.
 //! Evidence: `docs/product/perf-evidence.md` (CTX-0100, real measurements from `c0aadd2+`).
 
 #![forbid(unsafe_code)]

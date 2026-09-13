@@ -886,8 +886,8 @@ impl State {
                 // Semantically inert here by contract (RFC replay guarantee
                 // 6): clipboard effects enter state only through recorded
                 // policy outcomes delivered as environment inputs once the
-                // policy channel exists; the P0 consent gates in
-                // bitty-docs/docs/security/ remain authoritative.
+                // policy channel exists; the P0 consent gates in the
+                // bitty-docs security corpus remain authoritative.
             }
             TerminalAction::OscCwd { url } => self.cwd_report = Some(url.clone()),
             TerminalAction::OscHyperlink { link } => self.osc_hyperlink(link.as_ref()),

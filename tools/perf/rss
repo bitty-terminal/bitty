@@ -2,7 +2,7 @@
 # PB-2/PB-3 RSS harness — headless, bounded.
 # Budget: PB-2 idle ≤80 MB RSS p50 (one window 60 s idle, bundled plugins only)
 #         PB-3 typical ≤250 MB 8-tab 4 h + reclaim within 15 % after close+GC
-#         (bitty-docs/docs/specifications/performance-budget-rfc.md#pb-2, #pb-3)
+#         (docs/specifications/performance-budget-rfc.md#pb-2, #pb-3)
 # Scope: Phase F baseline harness (CTX-0076). Headless bounded check: samples
 # the current process RSS and the `cargo run -p bitty-app --help` child RSS
 # via `ps -o rss=` (KiB) and `/proc/<pid>/status` when available, without
@@ -64,7 +64,7 @@ check_budget() {
 main() {
 	goto_root
 	echo "perf/rss — PB-2 idle ≤${PB2_MB} MB p50 / PB-3 typical ≤${PB3_MB} MB + reclaim ${PB3_RECLAIM_PCT}% (headless bounded)"
-	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-2 and #pb-3"
+	echo "budget: docs/specifications/performance-budget-rfc.md#pb-2 and #pb-3"
 	echo "headless: ps/proc rss only, transient child, timeout ${TIMEOUT_SECS}s"
 
 	# Self RSS — baseline for the shell running this script (sanity, not the product).

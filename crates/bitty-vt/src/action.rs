@@ -1,7 +1,7 @@
 //! The typed action interface between the VT parser and terminal state.
 //!
 //! This module implements the "Typed Action interface" section of the
-//! Terminal State RFC (`bitty-docs/docs/specifications/terminal-state-rfc.md`).
+//! Terminal State RFC (`docs/specifications/terminal-state-rfc.md`).
 //! The RFC's illustrative `Action` enum shape is the accepted contract; names
 //! are adapted only where Rust idioms require (the parser-facing enum is
 //! named [`TerminalAction`] so the crate can also expose a plain-language

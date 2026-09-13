@@ -1,6 +1,6 @@
 //! `bitty dev`: developer tracing, captures, dumps, and overlays (CTX-0174).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`dev` diagnostics section)
+//! Canonical: `docs/interfaces/cli.md` (`dev` diagnostics section)
 //! as refined by `docs/specifications/cli-contract-rfc.md` (`bitty dev` mixed
 //! class, output envelope v1, exit codes 0-8) and the instrumentation scopes
 //! owned by `docs/specifications/devtools-rfc.md`.

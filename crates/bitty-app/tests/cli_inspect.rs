@@ -1,6 +1,6 @@
 //! `bitty inspect` end-to-end dispatch proofs (CTX-0173).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`inspect` introspection) as
+//! Canonical: `docs/interfaces/cli.md` (`inspect` introspection) as
 //! refined by `cli-contract-rfc.md` (mixed class, envelope v1, exit codes).
 //!
 //! These tests drive the built `bitty` binary via `CARGO_BIN_EXE_bitty`.

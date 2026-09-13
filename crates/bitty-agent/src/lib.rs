@@ -6,7 +6,7 @@
 //! build-order spine (`PTY -> VT -> Grid -> Font -> GPU -> Correct Terminal`
 //! `-> Config -> Command/Event -> Plugin Runtime -> Plugin Manager ->`
 //! `DevTools -> Rich Presentation -> IPC -> Agent`) recorded in
-//! `bitty-docs/docs/product/proposed-delivery-sequence.md`. That spine is
+//! `docs/product/proposed-delivery-sequence.md`. That spine is
 //! itself **draft research**, not accepted direction; this crate is
 //! intentionally `draft` / `proposed` and its contract **may change** without
 //! a semver major bump until a normative Agent spec is accepted. Do not
@@ -27,8 +27,9 @@
 //! **deferred and documented honestly** below.
 //!
 //! The security invariants that govern the future RFC are already normative
-//! in `bitty-docs/docs/security/overview.md`, `threat-model.md`, and
-//! `p0-acceptance-criteria.md` (invariants 5/6, trust boundary table,
+//! in the [bitty-docs security corpus](https://github.com/bitty-terminal/bitty-docs/tree/main/docs/security)
+//! (`overview.md`, `threat-model.md`, and `p0-acceptance-criteria.md`;
+//! invariants 5/6, trust boundary table,
 //! `T-10`, `R-013`, `P0-AC-024`). This crate only proposes mechanisms beneath
 //! them — it never weakens *read-only by default*, *least-privilege scopes*,
 //! *untrusted-observation labeling*, or *per-client consent*. See the
@@ -188,9 +189,9 @@
 //!
 //! # Drift and honesty statement
 //!
-//! `bitty-docs` has no accepted Agent RFC at the time of this draft. The
-//! only canonical Agent-adjacent sources are the draft spine in
-//! `proposed-delivery-sequence.md`, the candidate boundaries in
+//! No dedicated accepted Agent-core RFC exists in the docs corpus at the
+//! time of this draft. The only canonical Agent-adjacent sources are the
+//! draft spine in `proposed-delivery-sequence.md`, the candidate boundaries in
 //! `architecture/overview.md` and `core-boundaries.md`, and the open
 //! questions `OQ-018`/`OQ-019` plus the security corpus. This crate does not
 //! copy unstated fields as normative API; it interprets already-accepted

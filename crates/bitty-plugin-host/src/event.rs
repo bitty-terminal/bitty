@@ -31,7 +31,7 @@
 //! accepted v1 default used by [`crate::event::DEFAULT_QUEUE_CAPACITY`] /
 //! `DEFAULT_PLUGIN_DROP_POLICY` and `bitty-runtime::Runtime::new` (experimental
 //! review evidence; RFC remains `Proposed` until acceptance). See
-//! `bitty-docs/docs/specifications/plugin-platform-rfc.md` § “Delivery, ordering,
+//! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-platform-rfc.md` § “Delivery, ordering,
 //! batching, and coalescing” (point 3) and `OQ-013` for the authoritative
 //! trade-off statement.
 //! Numeric queue depths and timeout milliseconds are OQ-014; this crate uses
@@ -39,7 +39,7 @@
 //!
 //! # Three-level queue budgets (budgets candidate, OQ-014; DropPolicy DropOldest accepted for v1, OQ-013 closed)
 //!
-//! The isolation/resource RFC (`bitty-docs`) proposes three related dimensions
+//! The isolation/resource RFC (`bitty-plugins-docs`) proposes three related dimensions
 //! (per-queue vs aggregate dimension drift noted in Wave-C review). This crate
 //! documents and enforces the following budgets — queue **depth/byte limits
 //! remain candidate** (not normative until `OQ-014` is accepted; values are
@@ -128,8 +128,9 @@
 //!   `budget_snapshot`. Host also tracks `publish_count`.
 //!
 //! RFC lifecycle: `Draft -> experimental review evidence -> Accepted ->
-//! normative` per `bitty-docs` workflow. Queue depths and `DropOldest` are
-//! accepted for v1 (`OQ-013` closed, `OQ-014` P0-reviewed per CTX-0040);
+//! normative` per the `bitty-plugins-docs` documentation workflow. Queue
+//! depths and `DropOldest` are accepted for v1 (`OQ-013` closed, `OQ-014`
+//! P0-reviewed per CTX-0040);
 //! RC-1/RC-2 are enforced via `bitty-lua` (see crate docs) and host
 //! `invariant_global_bounds` is strict.
 

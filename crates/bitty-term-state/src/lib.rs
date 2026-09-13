@@ -7,11 +7,11 @@
 //! are queued and returned to the caller. Reads occur through versioned
 //! [`Snapshot`] values plus damage, never through mutable interior access,
 //! preserving the presentation boundary of
-//! `bitty-docs/docs/architecture/core-boundaries.md`.
+//! `docs/architecture/core-boundaries.md`.
 //!
 //! Contracts implemented here (accepted 2026-08-26):
 //!
-//! - `bitty-docs/docs/specifications/terminal-state-rfc.md`, sections
+//! - `docs/specifications/terminal-state-rfc.md`, sections
 //!   "Grid and state invariants", "Damage tracking model", and
 //!   "Deterministic replay guarantees".
 //! - ADR-0003 "Core Workspace Topology": dependency row for

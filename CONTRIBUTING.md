@@ -2,9 +2,12 @@
 
 Thank you for your interest in contributing to Bitty. This repository is in a
 pre-implementation bootstrap phase: it contains a dependency-free Rust
-workspace scaffold and quality gates, not product behavior. Canonical product,
-architecture, security, and project documentation lives in the
-[bitty-docs](https://github.com/bitty-terminal/bitty-docs) repository.
+workspace scaffold and quality gates, not product behavior. Canonical platform
+documentation lives in
+[bitty-terminal-docs](https://github.com/bitty-terminal/bitty-terminal-docs),
+mounted at `docs/` as a Git submodule; shared governance, decisions, and the
+security corpus live in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs).
 
 Start by reading [AGENTS.md](AGENTS.md). It defines the governance model,
 CarryCtx workflow, delivery lifecycle, and constraints that every contributor
@@ -23,10 +26,18 @@ and agent must follow.
 
 ## Setup
 
-Clone the repository and run:
+Clone with the canonical docs submodule and run:
 
 ```bash
+git clone --recurse-submodules https://github.com/bitty-terminal/bitty.git
+cd bitty
 just setup
+```
+
+Existing checkouts initialize the submodule separately:
+
+```bash
+git submodule update --init
 ```
 
 This fetches Cargo dependencies, installs the Lefthook Git hooks
@@ -39,7 +50,7 @@ check, pre-push build check), and provisions the pinned JS dev tools under
 All checks run through the justfile:
 
 ```bash
-just check              # fmt-check + clippy + test + actionlint + markdownlint
+just check              # fmt-check + clippy + test + scratch-path/PTY gates + actionlint + markdownlint
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
 just test               # cargo test --workspace --all-targets --locked
@@ -88,7 +99,8 @@ gates as `just check`.
 
 - Do not add product code, dependencies, or configuration unless an explicitly
   scoped task authorizes it.
-- Documentation synchronization in `bitty-docs` is part of definition of done.
+- Documentation synchronization in `bitty-terminal-docs` (platform) and
+  `bitty-docs` (governance) is part of definition of done.
 - Never describe scaffolding or plans as implemented behavior.
 
 ## Reporting issues

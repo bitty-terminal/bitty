@@ -1,7 +1,7 @@
 //! `bitty plugin` end-to-end dispatch proofs (CTX-0150, issue #244).
 //!
-//! Canonical: `bitty-docs/docs/product/plugin-roadmap.md` owner direction
-//! 2026-09-03 (DEC-0007), `docs/extensibility/package-management.md`
+//! Canonical: `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/product/plugin-roadmap.md` owner direction
+//! 2026-09-03 (DEC-0007), `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/extensibility/package-management.md`
 //! ("Managed manifest"), and `docs/specifications/cli-contract-rfc.md`.
 //!
 //! These tests drive the built `bitty` binary via `CARGO_BIN_EXE_bitty`

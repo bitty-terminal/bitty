@@ -7,9 +7,9 @@
 //! that downstream crates (render, rich presentation, plugin host) can
 //! compile against without requiring actual raster decode.
 //!
-//! # Drift from `bitty-docs/docs/interfaces/rich-content.md` and OQ-008
+//! # Drift from `docs/interfaces/rich-content.md` and OQ-008
 //!
-//! - `bitty-docs/docs/interfaces/rich-content.md` remains a **draft** (not
+//! - `docs/interfaces/rich-content.md` remains a **draft** (not
 //!   accepted). It sketches `RichBlock`/`Image`/`SceneNode` candidates that
 //!   are **not** implemented here.
 //! - OQ-008 decision remains **open**. No image bytes are decoded, no pixel

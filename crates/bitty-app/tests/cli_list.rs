@@ -1,6 +1,6 @@
 //! `bitty list` end-to-end dispatch proofs (CTX-0172).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`list` introspection) as
+//! Canonical: `docs/interfaces/cli.md` (`list` introspection) as
 //! refined by `docs/specifications/cli-contract-rfc.md` (mixed class, envelope
 //! v1, exit codes, `ls` alias).
 //!

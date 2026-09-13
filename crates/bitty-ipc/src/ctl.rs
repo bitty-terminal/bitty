@@ -1,8 +1,8 @@
 //! `bitty ctl` control plane: pure validation + scope mapping (CTX-0171).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`ctl` section) as refined by
+//! Canonical: `docs/interfaces/cli.md` (`ctl` section) as refined by
 //! `docs/specifications/cli-contract-rfc.md` (`bitty ctl`, runtime class) and
-//! `docs/specifications/ipc-agent-rfc.md` (scopes, instance selection).
+//! `https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md` (scopes, instance selection).
 //!
 //! This module is pure data, bounded, headless, and `forbid(unsafe)`:
 //! it owns no socket, spawns no thread, and performs no I/O. It defines the

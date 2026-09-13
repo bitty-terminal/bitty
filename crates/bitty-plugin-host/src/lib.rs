@@ -3,7 +3,7 @@
 //! # Draft status — not normative
 //!
 //! This crate implements the **proposed** contracts from
-//! `bitty-docs/docs/specifications/plugin-platform-rfc.md`.
+//! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-platform-rfc.md`.
 //! That RFC is still `Proposed` (frontmatter `draft`) and closes
 //! `OQ-011`, `OQ-012`, and `OQ-013` only if it is adopted after independent
 //! review by the category owner, a docs curator, and a security reviewer.

@@ -23,8 +23,9 @@
 //! `CTX-0038` / `OQ-014`.
 //!
 //! RFC lifecycle: `Draft -> experimental review evidence -> Accepted -> normative`
-//! per `bitty-docs` workflow. Queue budgets are `candidate` (`OQ-014`);
-//! `DropOldest` is `accepted` for v1 (`OQ-013` closed). This harness targets
+//! per the `bitty-plugins-docs` documentation workflow. Queue budgets are
+//! `candidate` (`OQ-014`); `DropOldest` is `accepted` for v1 (`OQ-013`
+//! closed). This harness targets
 //! `OQ-014` measurement and is the experimental evidence for that review.
 //!
 //! All tests are deterministic: fixed sequences, fixed payload sizes, fixed

@@ -1065,7 +1065,7 @@ fn validate_background_image_path(field: &str, path: &str) -> Result<(), ConfigE
     if path.contains('\0') {
         return Err(ConfigError::validation(field, "must not contain NUL bytes"));
     }
-    if !(path.starts_with('/') || path.starts_with('~')) {
+    if !(std::path::Path::new(path).is_absolute() || path.starts_with('~')) {
         return Err(ConfigError::validation(
             field,
             "must be an absolute or '~'-anchored path",
@@ -1106,7 +1106,7 @@ fn validate_background_image_roots(field: &str, roots: &[String]) -> Result<(), 
                 format!("entry {index} must not contain NUL bytes"),
             ));
         }
-        if !(root.starts_with('/') || root.starts_with('~')) {
+        if !(std::path::Path::new(root).is_absolute() || root.starts_with('~')) {
             return Err(ConfigError::validation(
                 field,
                 format!("entry {index} must be an absolute or '~'-anchored path"),

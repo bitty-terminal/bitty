@@ -422,7 +422,7 @@ fn validate_background_path(path: &str) -> Result<(), RuntimeError> {
             "background image path must not contain NUL",
         ));
     }
-    if !(path.starts_with('/') || path.starts_with('~')) {
+    if !(std::path::Path::new(path).is_absolute() || path.starts_with('~')) {
         return Err(RuntimeError::InvalidConfig(
             "background image path must be absolute or '~'-anchored",
         ));

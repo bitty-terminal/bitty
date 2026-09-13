@@ -141,6 +141,20 @@ MS`. Every chain stays deterministic and bounded (`<= 8` tails, `<= 12`
   `bitty-render` plus a skip-graceful live host-font test; live screenshot
   comparison against Ghostty in the task evidence.
 
+### Nested tmux blank window: primary grid follows the decorated content frame (CTX-0375, issue #615)
+
+- Fixed a nested `tmux` (and any full-screen TUI drawing on the last row)
+  rendering a blank/bottom-cropped window: `reflow_to_grid` sized the primary
+  terminal grid and PTY to the window grid while `present_frames` derives each
+  leaf's decorated content grid (`gaps_out + border + content_inset`), so the
+  present viewport cropped the right/bottom rows and never painted tmux's
+  status bar. The primary grid now follows the primary owner leaf's decorated
+  content frame on window resize and DPI adoption, mirroring the existing
+  split path (CTX-0359).
+- Added a headless regression (`nested_tmux_present`) that pins the
+  grid-equals-content-frame invariant and proves a tmux-style status bar on
+  the last grid row paints.
+
 ## [0.0.20] - 2026-09-11
 
 ### Release highlights

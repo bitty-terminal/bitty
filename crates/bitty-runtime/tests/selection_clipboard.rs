@@ -162,10 +162,11 @@ fn select_all_covers_whole_grid() {
     assert!(!rt.has_selection());
     rt.select_all();
     assert!(rt.has_selection());
-    // Resize to smaller grid clamps selection (CTX-0223: the window
-    // carries the default 8px padding inset, so 4 cols x 2 rows needs a
-    // 4*9+16 x 2*19+16 window).
-    rt.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
+    // Resize to smaller grid clamps selection (CTX-0223/CTX-0375: the window
+    // carries the default 8px padding inset and the 14px per-side decoration
+    // inset, so a window-sized 8x4 container cell area insets to a 4x2 content
+    // grid, which is what a 4*9+16 x 2*19+16 window used to be pre-decoration).
+    rt.handle_resize(PhysicalSize::new(9 * 8 + 16, 19 * 4 + 16))
         .expect("resize small");
     assert!(rt.has_selection());
     // New selection should be within new bounds (4 cols x 2 rows).

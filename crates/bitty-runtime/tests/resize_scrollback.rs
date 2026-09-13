@@ -16,11 +16,13 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     let gen_before = rt.snapshot().generation;
 
     // Resize physics: 800x600 at 9x19 readable cell minus the default 8px
-    // window padding inset (CTX-0223) => 87x30.
+    // window padding inset (CTX-0223) and the 14px per-side decoration
+    // inset (CTX-0375) => 83x28. The layout container keeps the window cell
+    // count (87x30) so the decoration lands inside the Window.
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize");
-    assert_eq!(rt.snapshot().width, 87);
-    assert_eq!(rt.snapshot().height, 30);
+    assert_eq!(rt.snapshot().width, 83);
+    assert_eq!(rt.snapshot().height, 28);
     assert_eq!(rt.container(), bitty_ui::Rect::new(0, 0, 87, 30));
     assert!(
         rt.snapshot().generation > gen_before,
@@ -43,7 +45,7 @@ fn runtime_handle_resize_actually_resizes_state_and_is_headless() {
     rt.handle_resize(PhysicalSize::new(0, 0))
         .expect("zero no-op");
     assert_eq!(rt.surface_extent(), extent_before);
-    assert_eq!(rt.snapshot().width, 87);
+    assert_eq!(rt.snapshot().width, 83);
 }
 
 #[test]
@@ -57,22 +59,22 @@ fn runtime_resize_updates_scrollback_width_and_views() {
     let sb_before = rt.state().scrollback_len();
     assert!(sb_before > 0);
 
-    // Resize wider: scrollback lines must be padded (CTX-0223: 800x600
-    // minus the 8px padding inset => 87 cols).
+    // Resize wider: scrollback lines must be padded (CTX-0223/CTX-0375:
+    // 800x600 minus the 8px padding and 14px decoration insets => 83 cols).
     rt.handle_resize(PhysicalSize::new(800, 600))
         .expect("resize wide");
-    assert_eq!(rt.snapshot().width, 87);
+    assert_eq!(rt.snapshot().width, 83);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 87);
+        assert_eq!(line.cells.len(), 83);
     }
     // Narrower: truncate with repair.
     rt.handle_resize(PhysicalSize::new(320, 240))
         .expect("resize narrow");
-    // (320-16)/9=33 cols, (240-16)/19=11 rows (padding inset removed first).
-    assert_eq!(rt.snapshot().width, 33);
-    assert_eq!(rt.snapshot().height, 11);
+    // (320-16-28)/9=29 cols, (240-16-28)/19=9 rows.
+    assert_eq!(rt.snapshot().width, 29);
+    assert_eq!(rt.snapshot().height, 9);
     for line in rt.state().scrollback() {
-        assert_eq!(line.cells.len(), 33);
+        assert_eq!(line.cells.len(), 29);
     }
     assert!(rt.state().check_invariants().is_ok());
     // Headless tick still works after multiple resizes.
@@ -135,8 +137,16 @@ fn headless_still_works_after_multiple_resizes_and_prints() {
         rt.handle_resize(size).expect("resize");
         rt.handle_pty_bytes(b"hello after resize\r\n");
         let snap = rt.snapshot();
-        assert_eq!(snap.width, rt.container().width as usize);
-        assert_eq!(snap.height, rt.container().height as usize);
+        // CTX-0375: the grid follows the primary owner leaf's decorated
+        // content frame, not the window cell container.
+        let frame = rt.present_frames();
+        let primary = frame
+            .iter()
+            .find(|f| Some(f.view) == rt.primary_view())
+            .or_else(|| frame.first())
+            .expect("single-leaf primary frame");
+        assert_eq!(snap.width, usize::from(primary.cols));
+        assert_eq!(snap.height, usize::from(primary.rows));
         assert!(rt.state().check_invariants().is_ok());
         let _ = rt.tick();
         assert!(

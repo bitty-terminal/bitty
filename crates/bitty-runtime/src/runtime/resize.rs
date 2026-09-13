@@ -406,13 +406,34 @@ impl Runtime {
         rows: usize,
         surface_extent: PhysicalSize,
     ) -> Result<(), RuntimeError> {
-        // Resize terminal state first so snapshot dimensions reflect the new
-        // geometry before layout and surface work; resize also emits full
-        // damage (grid + scrollback reflow) with a new generation.
+        // CTX-0375: the primary grid follows the primary owner leaf's
+        // *decorated content* frame, not the window grid. The Core-owned
+        // decoration (`gaps_out + border + content_inset`, CTX-0294/CTX-0333)
+        // insets every leaf's content rectangle by px, so a window-sized grid
+        // is cropped to the content frame by `viewport_snapshot`; the top
+        // cursor keeps the window top-anchored and the bottom rows (for
+        // example a nested tmux status bar on the last row) never painted.
+        // This mirrors the CTX-0359 owner-follow reflow in `set_layout`; the
+        // container keeps the window cell count so the decoration still lands
+        // inside the Window. The container is set first so `present_frames`
+        // can derive the decorated content frame; resizing state to it emits
+        // full damage (grid + scrollback reflow) with a new generation.
+        self.container = default_container(cols, rows);
+        let (cols, rows) = {
+            let frames = self.present_frames();
+            self.primary_view
+                .and_then(|primary| frames.iter().find(|frame| frame.view == primary))
+                .map(|frame| {
+                    (
+                        usize::from(frame.cols.max(1)),
+                        usize::from(frame.rows.max(1)),
+                    )
+                })
+                .unwrap_or((cols.max(1), rows.max(1)))
+        };
         let _damage = self.state.resize(cols, rows);
         self.cols = cols;
         self.rows = rows;
-        self.container = default_container(cols, rows);
         // Clamp any leaf View scroll offsets to the new scrollback limit
         // (scrollback may have been truncated on shrink, though we preserve
         // ids; clamp keeps offset in-bounds deterministically).

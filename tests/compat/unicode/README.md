@@ -43,4 +43,4 @@ Each `corpus/*.bin` is consumed headlessly via `tests/compat/harness.rs::parse_b
 
 - `char_cell_width`: `if cp < 0x0300 { 1 } else if is_zero_width(cp) { 0 } else if is_wide(cp) { 2 } else { 1 }`. Pure `matches!` tables, no allocation, no `unsafe`, no I/O.
 - `State::apply(Print(GraphemeCell))` maps `0` → drop scalar (combining), `1` → one cell, `2` → lead + `wide_spacer`; `State::check_invariants` enforces `cell.width ∈ {1,2}` and no orphan spacers. All headless and bounded by `GRID_COLUMNS`/`GRID_ROWS`.
-- See `docs/product/unicode-ime.md` (§ Width) and `docs/product/text-compatibility.md` (draft) for the normative width table reference and text-domain open items.
+- See `docs/specifications/terminal-state-rfc.md` (§ Cell model and width invariants) and `docs/specifications/compatibility-milestone-rfc.md` (accepted) for the width-table contract, protocol scope, and text-domain open items.

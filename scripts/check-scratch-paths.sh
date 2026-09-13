@@ -43,13 +43,20 @@
 #   contract paths, not host leftovers. Comment-only lines and unit-test
 #   regions never count; `scratch-paths-exempt: <reason>` applies.
 #
-# Rule 4 — no NEW host-absolute paths in tracked docs/metadata (CTX-0379):
-#   Scans every non-code, non-test file (`docs/**`, root `*.md`, `.github/**`,
+# Rule 4 — no NEW host-absolute paths in tracked repo-owned docs/metadata
+# (CTX-0379; docs submodule scope CTX-0412):
+#   Scans every repo-owned non-code, non-test file (root `*.md`, `.github/**`,
 #   `justfile`, dotfiles, packaging metadata) for the same `/mnt/`,
 #   `/home/<user>`, `/Users/<user>`, and `C:\Users` patterns. Docs are
 #   user-follow instructions, so a host path there is drift even when the
 #   file is prose; `scratch-paths-exempt: <reason>` on the hit line (or one of
 #   the 3 lines above) is the auditable escape hatch.
+#
+#   The `docs/` Git submodule (bitty-terminal-docs) is external content owned
+#   and linted by its own repository, so Rules 1 and 4 skip it. Scanning a
+#   checked-out submodule here would fail on upstream examples the parent repo
+#   cannot fix and would make the gate depend on whether `git submodule
+#   update --init` ran.
 #
 #   This script and its fixture tree `scripts/tests/fixtures/scratch-paths/`
 #   are exempt from all rules (they must spell the forbidden patterns to
@@ -127,7 +134,7 @@ while IFS= read -r hit; do
 	echo "scratch-paths[recordings]: $hit"
 	FAIL=1
 done < <(
-	rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
+	rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' -g '!docs/**' \
 		-g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
 )
 
@@ -226,7 +233,7 @@ done
 # --- Rule 4: hardcoded host-absolute paths in tracked docs/metadata (CTX-0379) ---
 mapfile -d '' DOC_FILES < <(
 	rg --files -0 --hidden \
-		-g '!crates/**' -g '!tests/**' -g '!scripts/**' -g '!tools/**' \
+		-g '!crates/**' -g '!tests/**' -g '!scripts/**' -g '!tools/**' -g '!docs/**' \
 		-g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
 		. 2>/dev/null || true
 )

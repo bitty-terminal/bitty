@@ -15,9 +15,7 @@ use bitty_perf::startup::{measure_headless_startup, measure_real_window_startup}
 
 fn main() {
     println!("startup_real — PB-1 cold startup (CTX-0100 real-window, Instant tracing, bounded)");
-    println!(
-        "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-1 (p50 100 ms p99 200 ms)"
-    );
+    println!("budget: docs/specifications/performance-budget-rfc.md#pb-1 (p50 100 ms p99 200 ms)");
     println!(
         "pipeline: process_start → args → config → runtime(font+surface) → layout → pty → winit_probe → wgpu_probe → font_probe → first_bytes → first_frame"
     );

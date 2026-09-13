@@ -1,7 +1,7 @@
 //! `bitty-ipc`: IPC and MCP boundary for Bitty (accepted IPC-Agent RFC, OQ-018).
 //!
 //! This crate implements the **accepted** `IPC and Agent RFC`
-//! (`bitty-docs/docs/specifications/ipc-agent-rfc.md`, frontmatter
+//! (`https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md`, frontmatter
 //! `accepted` on 2026-08-29, closes `OQ-018`). The RFC's instance
 //! selection, transport and framing, wire and auth, scope families,
 //! rate limits `RC-9`/`RC-10`, Agent bounded messages, consent and
@@ -11,7 +11,7 @@
 //!
 //! Acceptance was per independent category-owner, docs-curator, and
 //! security-auditor review (CTX-0076) with P0 sign-off on 2026-08-29;
-//! see the RFC's `P0 Review Sign-off` and `bitty-docs/docs/reviews/p0-review-checklist.md`.
+//! see the RFC's `P0 Review Sign-off` and `https://github.com/bitty-terminal/bitty-docs/blob/main/docs/reviews/p0-review-checklist.md`.
 //! The lifecycle is `Draft -> experimental review evidence -> Accepted (2026-08-29) -> normative`.
 //!
 //! # What this crate owns
@@ -58,13 +58,15 @@
 //! from an **untrusted client** per ADR-0003 and the normative security
 //! corpus:
 //!
-//! - `bitty-docs/docs/security/overview.md` invariant 5: "IPC is local-
-//!   user-only by default and every operation has an explicit scope."
-//! - `bitty-docs/docs/security/threat-model.md` boundary map
-//!   `PTY bytes | Lua plugin | IPC / MCP -> Bitty core` and sections
-//!   "IPC, CLI, and child processes" (`T-09`, `R-011`, `R-012`) and "MCP, Agents, and
-//!   DevTools" (`T-10`, `R-013`).
-//! - `bitty-docs/docs/security/risk-register.md` `R-011` / `R-012` / `R-013` / `R-014`.
+//! - [`overview.md`](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/overview.md)
+//!   invariant 5: "IPC is local-user-only by default and every operation has
+//!   an explicit scope."
+//! - [`threat-model.md`](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/threat-model.md)
+//!   boundary map `PTY bytes | Lua plugin | IPC / MCP -> Bitty core` and
+//!   sections "IPC, CLI, and child processes" (`T-09`, `R-011`, `R-012`) and
+//!   "MCP, Agents, and DevTools" (`T-10`, `R-013`).
+//! - [`risk-register.md`](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/security/risk-register.md)
+//!   `R-011` / `R-012` / `R-013` / `R-014`.
 //!
 //! The crate therefore enforces at the data boundary:
 //!

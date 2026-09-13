@@ -1,7 +1,7 @@
 //! Typed configuration structs for the draft `ConfigPlan` pipeline.
 //!
 //! These types are **candidate** shapes derived from
-//! `bitty-docs/docs/configuration/lua-and-xdg.md` and the proposed
+//! `docs/configuration/lua-and-xdg.md` and the proposed
 //! configuration-model RFC. They are pure data, cloneable, comparable, and
 //! validated without I/O.
 //!
@@ -1998,7 +1998,7 @@ impl LayoutConfig {
 /// Core-owned workspace decoration in logical pixels (CTX-0292).
 ///
 /// Implements the workspace-compositor contract
-/// (`bitty-docs/docs/specifications/workspace-compositor.md`, section
+/// (`docs/specifications/workspace-compositor.md`, section
 /// "Core-owned gaps, border, and radius", accepted via CTX-0118; unified and
 /// extended by CTX-0333):
 ///

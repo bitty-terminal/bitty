@@ -3,7 +3,7 @@
 //! # Draft status — not normative
 //!
 //! This crate implements the **proposed** contracts from
-//! `bitty-docs/docs/specifications/package-lifecycle-rfc.md`.
+//! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/package-lifecycle-rfc.md`.
 //! That RFC is still `Proposed` (frontmatter `draft`) and closes `OQ-021`
 //! and `OQ-022` only if it is adopted after independent review by the
 //! category owner, a docs curator, and a security reviewer (including a
@@ -15,9 +15,10 @@
 //! Do not describe its behavior as shipped until an ADR records acceptance
 //! and a release ships it.
 //!
-//! The RFC depends on normative security requirements in
-//! `bitty-docs/docs/security/overview.md`, `threat-model.md`, and
-//! `p0-acceptance-criteria.md`. This crate only proposes mechanisms beneath
+//! The RFC depends on normative security requirements in the
+//! [bitty-docs security corpus](https://github.com/bitty-terminal/bitty-docs/tree/main/docs/security)
+//! (`overview.md`, `threat-model.md`, and `p0-acceptance-criteria.md`). This
+//! crate only proposes mechanisms beneath
 //! them — it never weakens `Invariant 7` (bounded inputs), `Invariant 8`
 //! (no package code execution on install), or `P0-AC-027..030`.
 //!
@@ -102,7 +103,7 @@
 //! - **Depends on:** nothing (pure `std`). No workspace-crate dependencies.
 //! - **No third-party dependencies** (pure `std` plus vendored SHA-256).
 //!   The RFC's crypto is stubbed deterministically; real signatures will
-//!   land with the `bitty-docs` key-management design.
+//!   land with the `bitty-plugins-docs` key-management design.
 //! - **Never holds** GPU objects, window handles, PTY file descriptors, or
 //!   internal Rust hot-path objects. It is pure data + validation.
 //! - **`#![forbid(unsafe_code)]`** at crate and workspace level; `MSRV 1.85`,

@@ -1,7 +1,7 @@
 //! Terminal state transition baseline — PB-4 latency / PB-6 throughput split.
 //!
 //! Headless, bounded, `#![forbid(unsafe_code)]` harness for
-//! `bitty-docs/docs/specifications/performance-budget-rfc.md`:
+//! `docs/specifications/performance-budget-rfc.md`:
 //! - PB-4 input latency ≤ 8 ms p50 / ≤ 15 ms p99 (key-to-screen, Wayland 60 Hz)
 //! - PB-6 contributes here as parse-and-apply together ≥ 40 MB/s
 //!
@@ -13,7 +13,7 @@
 //! and `forbid(unsafe)`. Determinism follows `bitty-term-state` crate docs
 //! (pure function of `(initial state, action sequence)` + `State::state_hash`).
 //!
-//! Budget reference: `bitty-docs/docs/specifications/performance-budget-rfc.md#pb-4-input-latency`.
+//! Budget reference: `docs/specifications/performance-budget-rfc.md#pb-4-input-latency`.
 //!
 //! Run headlessly:
 //! ```text

@@ -1,8 +1,8 @@
 //! `bitty ctl` runtime control over `BITTY_SOCKET` (CTX-0171).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`ctl` section) as refined by
+//! Canonical: `docs/interfaces/cli.md` (`ctl` section) as refined by
 //! `docs/specifications/cli-contract-rfc.md` (`bitty ctl`, runtime class) and
-//! `docs/specifications/ipc-agent-rfc.md` (instance selection, scopes).
+//! `https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md` (instance selection, scopes).
 //!
 //! # Contract (implemented)
 //!

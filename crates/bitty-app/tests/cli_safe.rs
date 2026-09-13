@@ -6,7 +6,7 @@
 //! decoration geometry and outline pair. `--safe` must instead select the
 //! built-in safe effective config (`0/0/1/0/0`, opaque `#FFFFFF`/`#808080`)
 //! regardless of any external layer, per spec rule 5
-//! (`bitty-docs/docs/specifications/workspace-compositor.md`) and
+//! (`docs/specifications/workspace-compositor.md`) and
 //! RFC-0001/OQ-039, and must never abort on a hostile/invalid user config
 //! (R-009 / P0-AC-019).
 //!

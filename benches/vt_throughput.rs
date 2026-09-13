@@ -1,7 +1,7 @@
 //! VT parser throughput baseline — PB-6 throughput floor.
 //!
 //! Headless, bounded, `#![forbid(unsafe_code)]` harness for
-//! `bitty-docs/docs/specifications/performance-budget-rfc.md` PB-6:
+//! `docs/specifications/performance-budget-rfc.md` PB-6:
 //! ≥ 40 MB/s sustained VT parse-and-render on single core of slowest
 //! Tier 1 reference machine, fixed synthetic corpus.
 //!
@@ -12,7 +12,7 @@
 //! the synthetic corpus is a repeatable byte pattern, chunking invariance
 //! is asserted once per corpus.
 //!
-//! Budget reference: `bitty-docs/docs/specifications/performance-budget-rfc.md#pb-6-throughput-floor`.
+//! Budget reference: `docs/specifications/performance-budget-rfc.md#pb-6-throughput-floor`.
 //! Tooling entry: `tools/perf/latency` for PB-4 and `tools/perf/startup` for PB-1
 //! are separate; this bench covers PB-6 only.
 //!

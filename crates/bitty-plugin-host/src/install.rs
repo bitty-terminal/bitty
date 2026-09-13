@@ -3,7 +3,7 @@
 //! # Draft status — not normative
 //!
 //! This module implements the **proposed** contracts from
-//! `bitty-docs/docs/specifications/package-lifecycle-rfc.md` (frontmatter `draft`).
+//! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/package-lifecycle-rfc.md` (frontmatter `draft`).
 //! That RFC is still `Proposed` and closes `OQ-021`/`OQ-022` only after independent
 //! review by the category owner, a docs curator, and a security reviewer (including
 //! a separate security-auditor persona per the documentation workflow). Nothing

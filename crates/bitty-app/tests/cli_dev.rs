@@ -1,6 +1,6 @@
 //! `bitty dev` end-to-end dispatch proofs (CTX-0174).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`dev` diagnostics) as
+//! Canonical: `docs/interfaces/cli.md` (`dev` diagnostics) as
 //! refined by `docs/specifications/cli-contract-rfc.md` (`bitty dev` mixed
 //! class, local-only slice, envelope v1, exit codes) with instrumentation
 //! scopes owned by `docs/specifications/devtools-rfc.md`.

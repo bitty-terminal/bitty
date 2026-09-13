@@ -3,13 +3,14 @@
 //! # Draft status — experimental implementation as review evidence
 //!
 //! This crate implements the **proposed** contracts from
-//! `bitty-docs/docs/specifications/configuration-model-rfc.md`
+//! `docs/specifications/configuration-model-rfc.md`
 //! (`Proposed` / `draft`, `OQ-010`). That RFC remains `Proposed` (not
 //! `Accepted`/`normative`) until independent review (category owner + docs
 //! curator + security reviewer) accepts it and an ADR records acceptance.
 //! Per the new RFC lifecycle (`Draft -> experimental review evidence ->
-//! Accepted -> normative` per `bitty-docs/docs/specifications/README.md` and
-//! `docs/development/documentation-workflow.md`), this crate's **experimental
+//! Accepted -> normative` per `docs/specifications/README.md` and the
+//! [documentation workflow](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/docs/development/documentation-workflow.md)),
+//! this crate's **experimental
 //! implementation of Candidate A** serves as review evidence and carries no
 //! compatibility promise; do not describe its behavior as shipped/stable until
 //! the RFC is `Accepted` and a release ships it.

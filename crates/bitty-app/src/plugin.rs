@@ -1,10 +1,10 @@
 //! `bitty plugin`: CLI-first plugin management (CTX-0150, issue #244).
 //!
-//! Canonical direction: `bitty-docs/docs/product/plugin-roadmap.md` owner
+//! Canonical direction: `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/product/plugin-roadmap.md` owner
 //! direction 2026-09-03 (DEC-0007): management UX is subcommand-first and the
 //! durable state is a managed manifest, never hand-edited Lua. Candidate
 //! layout and semantics from
-//! `bitty-docs/docs/extensibility/package-management.md` and
+//! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/extensibility/package-management.md` and
 //! `default-distribution-rfc.md` § "Managed manifest".
 //!
 //! # Contract (implemented)

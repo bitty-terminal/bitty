@@ -3,7 +3,7 @@
 //!
 //! The crate implements the parser side of the Terminal State RFC's typed
 //! action interface (see
-//! `bitty-docs/docs/specifications/terminal-state-rfc.md`, section "Typed
+//! `docs/specifications/terminal-state-rfc.md`, section "Typed
 //! Action interface" and "Parser obligations") under the topology rules of
 //! ADR-0003 and the upstream-dependency decision of ADR-0004:
 //!

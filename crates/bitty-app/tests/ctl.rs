@@ -1,6 +1,6 @@
 //! `bitty ctl` end-to-end dispatch proofs (CTX-0171).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`ctl` section) as refined by
+//! Canonical: `docs/interfaces/cli.md` (`ctl` section) as refined by
 //! `docs/specifications/cli-contract-rfc.md` (`bitty ctl`, runtime class).
 //!
 //! These tests drive the built `bitty` binary via `CARGO_BIN_EXE_bitty`.

@@ -1,7 +1,7 @@
 //! `bitty-rich`: rich presentation (OQ-008 image store, OQ-015 scene).
 //!
 //! Implements the accepted contracts from
-//! `bitty-docs/docs/specifications/rich-presentation-rfc.md` (accepted
+//! `docs/specifications/rich-presentation-rfc.md` (accepted
 //! 2026-08-28, closes OQ-008, OQ-015, OQ-016 at design level) at the
 //! headless, bounded layer. No GPU, no window system, no filesystem, no
 //! unsafe.

@@ -29,7 +29,7 @@ have_cargo() {
 main() {
 	goto_root
 	echo "perf/startup — PB-1 cold startup ≤${PB1_P50_MS} ms p50 / ≤${PB1_P99_MS} ms p99 (CTX-0100 real-window tracing, bounded)"
-	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-1 (default config, warm file cache, local shell)"
+	echo "budget: docs/specifications/performance-budget-rfc.md#pb-1 (default config, warm file cache, local shell)"
 	echo "pipeline: process_start → args_parse → config_load → runtime_create(font+surface) → layout → pty_spawn → winit_probe → wgpu_probe → font_probe → first_bytes → first_frame"
 	echo "instrumentation: crates/bitty-perf/src/startup.rs Instant per-phase, benches/startup_real.rs (headless baseline, BITTY_PERF_REAL_WINDOW=1 for real)"
 
@@ -63,7 +63,7 @@ main() {
 		echo "hyperfine not present — primary instrumentation is startup_real bench above"
 	fi
 
-	echo "PB-1 real-window tracing done (primary: startup_real Instant per-phase; headless CI shows unavailable with duration, Tier 1 real shows success; see docs/product/perf-evidence.md and crates/bitty-perf/src/startup.rs)"
+	echo "PB-1 real-window tracing done (primary: startup_real Instant per-phase; headless CI shows unavailable with duration, Tier 1 real shows success; see docs/specifications/performance-budget-rfc.md#pb-1 and crates/bitty-perf/src/startup.rs)"
 }
 
 main "$@"

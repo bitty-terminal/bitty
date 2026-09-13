@@ -21,7 +21,7 @@ fn main() {
         "latency_real — PB-4 input latency (CTX-0100 keydown→PTY→parser→state→render→present, bounded tracing)"
     );
     println!(
-        "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-4 (p50 8 ms p99 15 ms, 60 Hz minimum, Wayland/frame-presented)"
+        "budget: docs/specifications/performance-budget-rfc.md#pb-4 (p50 8 ms p99 15 ms, 60 Hz minimum, Wayland/frame-presented)"
     );
     println!(
         "pipeline: encode_key_event(≤64 B) → handle_key_event → handle_pty_bytes → parser→State → Damage → GridRenderer(fake) → Surface::headless_present"

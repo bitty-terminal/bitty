@@ -1,6 +1,6 @@
 //! `bitty inspect`: user-facing state and ownership (CTX-0173).
 //!
-//! Canonical: `bitty-docs/docs/interfaces/cli.md` (`inspect` introspection
+//! Canonical: `docs/interfaces/cli.md` (`inspect` introspection
 //! section) as refined by `cli-contract-rfc.md`
 //! (`bitty inspect`, mixed class, output envelope v1, exit codes 0-8).
 //!

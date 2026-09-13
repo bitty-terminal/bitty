@@ -15,7 +15,7 @@ use bitty_perf::idle::check_idle;
 fn main() {
     println!("idle_real — PB-7 idle resource (CTX-0100 frame-on-demand invariant, bounded)");
     println!(
-        "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-7 (≤1% avg CPU over 10 min, zero wakeups when idle)"
+        "budget: docs/specifications/performance-budget-rfc.md#pb-7 (≤1% avg CPU over 10 min, zero wakeups when idle)"
     );
     println!(
         "invariant: tick returns None when no new generation and no pending_full_redraw → ControlFlow::Wait → zero periodic wakeups"

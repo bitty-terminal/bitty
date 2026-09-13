@@ -22,9 +22,9 @@
 //! GPU legs are `#[cfg(unix)]` / env-gated and skip gracefully when the
 //! resource is absent, so CI stays green.
 //!
-//! The hyprctl+grim capture leg is documented in
-//! `docs/product/soak-0.0.1.md` and is **not** automated here (it requires a
-//! live Hyprland session). This file proves the same bytes->snapshot->present
+//! The hyprctl+grim capture leg is release evidence tracked in the
+//! `docs/product/release-ladder.md` and is **not** automated here (it
+//! requires a live Hyprland session). This file proves the same bytes->snapshot->present
 //! plumbing that hyprctl+grim would screenshot, via `headless_rgba`.
 
 #![allow(unsafe_code)] // soak probe needs RawWaker unsafe, workspace still denies unsafe_code

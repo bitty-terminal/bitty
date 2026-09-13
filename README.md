@@ -8,8 +8,10 @@ panel animations — configured with Lua.
 
 Bitty is pre-1.0 and pre-alpha. The current release line is `v0.0.20`; there is
 no stable public API, and behavior, configuration keys, and package names can
-change between releases. Canonical product, architecture, security, and
-configuration documentation lives in
+change between releases. Canonical platform documentation lives in
+[bitty-terminal-docs](https://github.com/bitty-terminal/bitty-terminal-docs),
+mounted at `docs/` as a Git submodule; shared governance, decisions, reviews,
+and the security corpus live in
 [bitty-docs](https://github.com/bitty-terminal/bitty-docs).
 
 ## Status
@@ -42,8 +44,11 @@ repository. Anything not marked shipped is not a compatibility promise.
 
 "Early" means the mechanism exists and is tested, but its external contract is
 still changing; do not depend on it yet. The design corpus for text/Unicode and
-IME, plugins, packages, IPC, and agent access remains under review in
-`bitty-docs`.
+IME, plugins, packages, IPC, and agent access remains under review across
+[bitty-terminal-docs](https://github.com/bitty-terminal/bitty-terminal-docs),
+[bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs), and
+[bitty-plugins-docs](https://github.com/bitty-terminal/bitty-plugins-docs),
+with shared governance in `bitty-docs`.
 
 ## Install
 
@@ -71,8 +76,12 @@ automatically by `rustup`, and the MSRV is `1.85` — plus the fontconfig and
 freetype development packages. A GPU and display are used when available;
 without them Bitty falls back to a headless path.
 
+The `docs/` submodule carries the canonical platform documents and is not
+needed to build; clone with `--recurse-submodules` to get it in one step (an
+existing checkout runs `git submodule update --init`):
+
 ```sh
-git clone https://github.com/bitty-terminal/bitty.git
+git clone --recurse-submodules https://github.com/bitty-terminal/bitty.git
 cd bitty
 cargo build --release --locked -p bitty-app
 ./target/release/bitty
@@ -163,10 +172,10 @@ bitty config edit    # open it in $VISUAL/$EDITOR
 ```
 
 The configuration schema, XDG layout, profiles, plugins, and security model are
-documented in bitty-docs:
-[Lua configuration and filesystem layout](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/configuration/lua-and-xdg.md),
-the [Configuration Model RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/configuration-model-rfc.md),
-and the [CLI reference](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/interfaces/cli.md).
+documented in the canonical docs:
+[Lua configuration and filesystem layout](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/configuration/lua-and-xdg.md),
+the [Configuration Model RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/configuration-model-rfc.md),
+and the [CLI reference](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/interfaces/cli.md).
 Those documents are draft design contracts; where they differ from the shipped
 `init.lua` schema above, the shipped code and `bitty config check` are
 authoritative.
@@ -206,7 +215,22 @@ Released under the `MIT OR Apache-2.0` license. See [LICENSE](LICENSE).
 
 ## Documentation
 
-- [bitty-docs](https://github.com/bitty-terminal/bitty-docs) — canonical
-  product, architecture, security, configuration, and interface documents.
+Canonical platform documentation lives in
+[bitty-terminal-docs](https://github.com/bitty-terminal/bitty-terminal-docs)
+and is mounted at `docs/` as a Git submodule pinned by commit:
+
+- New clone: `git clone --recurse-submodules …` (or
+  `git submodule update --init` in an existing checkout).
+- Bump the pin: `git submodule update --remote docs`, then `git add docs` and
+  commit the pointer change.
+- Read: [`docs/README.md`](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/docs/README.md)
+  is the documentation map.
+
+Shared governance, decisions, reviews, and the security corpus live in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs). The AI-core and
+plugin-ecosystem corpora live in
+[bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs) and
+[bitty-plugins-docs](https://github.com/bitty-terminal/bitty-plugins-docs).
+
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [`packaging/README.md`](packaging/README.md) — distribution and packaging.

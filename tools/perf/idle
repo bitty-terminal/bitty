@@ -27,7 +27,7 @@ have_cargo() {
 main() {
 	goto_root
 	echo "perf/idle — PB-7 ≤${PB7_PCT}% CPU avg over 10 min, zero wakeups when idle (CTX-0100 frame-on-demand, bounded)"
-	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-7 (no PTY output/animation/plugin timer → Wait loop)"
+	echo "budget: docs/specifications/performance-budget-rfc.md#pb-7 (no PTY output/animation/plugin timer → Wait loop)"
 	echo "invariant: tick == None when no damage and no pending_full_redraw → Wait → zero periodic wakeups"
 	echo "instrumentation: crates/bitty-perf/src/idle.rs 9 checks + idle_tick_mean + clean_render_mean, benches/idle_real.rs"
 
@@ -57,7 +57,7 @@ main() {
 		echo "PB-7 proxy PASS: ${mid_cpu}% ≤ ${PB7_PCT}% (sleep child; product idle gated on Tier 1)"
 	fi
 
-	echo "PB-7 real-window invariant done (zero wakeups == every idle tick None → Wait; clean Damage→Clean→no draws; see docs/product/perf-evidence.md and crates/bitty-perf/src/idle.rs)"
+	echo "PB-7 real-window invariant done (zero wakeups == every idle tick None → Wait; clean Damage→Clean→no draws; see docs/specifications/performance-budget-rfc.md#pb-7 and crates/bitty-perf/src/idle.rs)"
 }
 
 main "$@"

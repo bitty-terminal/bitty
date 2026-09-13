@@ -27,7 +27,7 @@ have_cargo() {
 main() {
 	goto_root
 	echo "perf/latency — PB-4 ≤${PB4_P50_MS} ms p50 / ≤${PB4_P99_MS} ms p99 key-to-screen (CTX-0100 real-window tracing, bounded)"
-	echo "budget: bitty-docs/docs/specifications/performance-budget-rfc.md#pb-4 (60 Hz minimum, Wayland/frame-presented, plugins off hot path)"
+	echo "budget: docs/specifications/performance-budget-rfc.md#pb-4 (60 Hz minimum, Wayland/frame-presented, plugins off hot path)"
 	echo "pipeline: keydown → encode(≤64 B) → handle_key → PTY→parser→State → Damage → GridRenderer → Surface::present"
 	echo "instrumentation: crates/bitty-perf/src/latency.rs Instant per-stage, p50/p99 over presented samples, benches/latency_real.rs"
 
@@ -54,7 +54,7 @@ main() {
 		done
 	fi
 
-	echo "PB-4 tracing done (primary: latency_real per-stage Instant + p50/p99; headless CI via headless_present, real via wgpu when attached; see docs/product/perf-evidence.md and crates/bitty-perf/src/latency.rs)"
+	echo "PB-4 tracing done (primary: latency_real per-stage Instant + p50/p99; headless CI via headless_present, real via wgpu when attached; see docs/specifications/performance-budget-rfc.md#pb-4 and crates/bitty-perf/src/latency.rs)"
 }
 
 main "$@"

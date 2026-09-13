@@ -10,7 +10,7 @@
 //! builds bounded in-VM strings/tables, and `string.format` refuses unknown
 //! conversions and caps its output.
 //!
-//! [Lua Runtime RFC]: ../../../../bitty-docs/docs/specifications/lua-runtime-rfc.md
+//! [Lua Runtime RFC]: https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/lua-runtime-rfc.md
 
 use piccolo::{
     Callback, CallbackReturn, Closure, Context, Error, Executor, IntoValue, Lua, Table, Value,

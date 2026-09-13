@@ -35,7 +35,7 @@ status: draft
 | Leg       | Where                                                                                              | What                                                                                                                                                   | Bound                                                                             | CI-blocking                                            | Evidence                                                     |
 | --------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ |
 | Automated | `crates/bitty-runtime/tests/dogfooding.rs` + `tests/compat/harness.rs` + `crates/bitty-compat-lab` | `Parser -> TerminalAction -> State -> Snapshot` on `<=8 KiB` corpora, `<=4096` actions, `ZONE_RECORDS_MAX 1024`, deterministic re-parse + `state_hash` | `READ_CHUNK_SIZE 8 KiB`, `MAX_CORPUS_BYTES 8192`, `MAX_ACTIONS 4096`, wall `90 s` | yes — `just check` + `cargo test --workspace --locked` | `eprintln!` findings table, `cargo test -p bitty-compat-lab` |
-| Manual    | this doc                                                                                           | Windowed bitty vs ghostty/kitty/wezterm/alacritty on the same bytes/key/mouse sequence                                                                 | human bounded (~15 s per row, `grim` file `<2 MiB`)                               | **no** — human-run, not wired to `just check`          | `recordings/manual-smoke/<date>/` + table below                     |
+| Manual    | this doc                                                                                           | Windowed bitty vs ghostty/kitty/wezterm/alacritty on the same bytes/key/mouse sequence                                                                 | human bounded (~15 s per row, `grim` file `<2 MiB`)                               | **no** — human-run, not wired to `just check`          | `recording/manual-smoke/<date>/` + table below                     |
 
 No window/GPU leak in automated checks — `rg -n winit|wgpu|Window|Surface tests/compat crat
 es/bitty-compat-lab crates/bitty-runtime/tests/dogfooding.rs` must be `0` except forbid comments (same rule as `dogfooding.md`). Manual screenshots via `grim` are human-run and live outside the repo.
@@ -61,7 +61,7 @@ nvim: <nvim --version | head -1>  tmux: <tmux -V>  fzf: <fzf --version>  htop: <
 2. Open bitty and one reference terminal side-by-side on workspace 9 (Hyprland dwindle split).
 3. Feed the same bytes/interactions to both; capture windowed evidence only via `grim` (see Screenshot guidance).
 4. Fill the row's `Actual (bitty)` and `Status` in place; keep `Expected (reference)` verbatim from the reference emulator's observed grid/title/zones.
-5. Store artefacts under `recordings/manual-smoke/<YYYY-MM-DD>/` (ignored, not committed) — commit only the **filled table** to the checkpoint note, not the PNGs.
+5. Store artefacts under `recording/manual-smoke/<YYYY-MM-DD>/` (ignored, not committed) — commit only the **filled table** to the checkpoint note, not the PNGs.
 
 ## 1 — Prompt marks — `OSC 133` zones + `OSC 7` cwd
 
@@ -143,7 +143,7 @@ Shell integration ownership stays host-shell side (`zsh`/`fish` `OSC 133/7` plug
 
 One matrix row per manual scenario; **Expected** is what the reference panel showed, **Actual** is bitty on the same bytes/keys/mouse. Fill `Verdict` as `PASS` / `DIFF:<reason>` / `SKIP:<tool missing>` and file a follow-up when `DIFF`.
 
-| Area       | #   | Scenario                | References exercised | Expected (panel consensus = ghostty/kitty/wezterm/alacritty) | Actual (bitty) | Verdict | Artefact (`recordings/manual-smoke/<date>/…`) |
+| Area       | #   | Scenario                | References exercised | Expected (panel consensus = ghostty/kitty/wezterm/alacritty) | Actual (bitty) | Verdict | Artefact (`recording/manual-smoke/<date>/…`) |
 | ---------- | --- | ----------------------- | -------------------- | ------------------------------------------------------------ | -------------- | ------- | -------------------------------------- |
 | prompt     | 1.1 | `133;A/B`               | g/k/w/a              | zones `A`+`B` visible in reference dumps                     | zones A/B 2 records bounded headless PASS | PASS | `01-prompt-AB.png` (headless-verified `recording/references/bitty/shell-02*.json`) |
 | prompt     | 1.2 | `133;C/D`               | g/k/w                | `C`/`D` with exit code in ghostty JSON, marks in kitty       | C/D with exit code deterministic headless PASS | PASS | `02-prompt-CD.png` (headless-verified `shell-02*.json`) |
@@ -184,27 +184,27 @@ Headless companion rows are green when `cargo test -p bitty-compat-lab` + `cargo
 - **Window capture (preferred — avoids slurp in CI logs):**
 
   ```bash
-  mkdir -p recordings/manual-smoke/$(date +%F)
+  mkdir -p recording/manual-smoke/$(date +%F)
   # list windows on workspace 9, then capture one by address
   hyprctl clients -j | jq -r '.[] | select(.workspace.id==9) | "\(.address) \(.class) \(.title)"'
-  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="bitty") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recordings/manual-smoke/$(date +%F)/01-bitty.png
-  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="kitty")  | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recordings/manual-smoke/$(date +%F)/01-kitty.png
+  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="bitty") | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recording/manual-smoke/$(date +%F)/01-bitty.png
+  grim -g "$(hyprctl clients -j | jq -r '.[] | select(.class=="kitty")  | "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])"')" recording/manual-smoke/$(date +%F)/01-kitty.png
   # or interactive (human only)
-  grim -g "$(slurp)" recordings/manual-smoke/$(date +%F)/manual-$(date +%H%M%S).png
+  grim -g "$(slurp)" recording/manual-smoke/$(date +%F)/manual-$(date +%H%M%S).png
   ```
 
-- **Full-workspace fallback (when addresses drift):** `grim recordings/manual-smoke/$(date +%F)/workspace-9-$(date +%H%M%S).png`.
+- **Full-workspace fallback (when addresses drift):** `grim recording/manual-smoke/$(date +%F)/workspace-9-$(date +%H%M%S).png`.
 - **Grid dump (text) alongside PNGs** — prefer text diffs for the comparator (CTX-0085) and keep PNGs as visual sanity:
 
   ```bash
   # kitty / ghostty / wezterm dumps of the same PTY bytes
-  kitty --dump-commands > recordings/manual-smoke/$(date +%F)/kitty-dump.json
-  wezterm record --cwd . > recordings/manual-smoke/$(date +%F)/wezterm-record.json
+  kitty --dump-commands > recording/manual-smoke/$(date +%F)/kitty-dump.json
+  wezterm record --cwd . > recording/manual-smoke/$(date +%F)/wezterm-record.json
   # bitty headless snapshot for the same bytes
-  cargo test -p bitty-compat-lab -- --nocapture > recordings/manual-smoke/$(date +%F)/bitty-snapshot.txt
+  cargo test -p bitty-compat-lab -- --nocapture > recording/manual-smoke/$(date +%F)/bitty-snapshot.txt
   ```
 
-- **Storage:** `recordings/manual-smoke/<YYYY-MM-DD>/` is git-ignored and stays out of the PR — it is not `recording/references/` (which is revision-pinned). Commit only the filled comparison matrix, not the PNGs.
+- **Storage:** `recording/manual-smoke/<YYYY-MM-DD>/` is git-ignored and stays out of the PR — it is not `recording/references/` (which is revision-pinned). Commit only the filled comparison matrix, not the PNGs.
 - **Bounded artefacts:** `grim` PNGs are target `<2 MiB`; failed captures are re-taken, not accumulated. Do not wrap `grim` in a loop that spams screenshots.
 - **No GPU leak in repo:** `rg -n "grim|hyprctl|winit|wgpu|Window|Surface" crates/ tests/ scripts/` must still be `0` except in this doc and `docs/product/soak-0.0.1.md`/`dogfooding.md` where those strings appear only as documentation/forbid lists. Automated harness never invokes them; see `crates/bitty-compat-lab/tests/harness.rs:11` and `crates/bitty-runtime/tests/dogfooding.rs:1`.
 
@@ -261,7 +261,7 @@ Headless dogfooding evidence at `a8735d0+` on CachyOS/Hyprland host (no window/G
 - Harness: `cargo test -p bitty-compat-lab -- --nocapture` PASS — `compat_corpus_is_bounded_and_deterministic` (39 corpora), `vttest_corpora_present_and_bounded`, `comparator_is_deterministic_and_self_consistent` `total 39 self_passed 39 self_failed 0` (headless `forbid(unsafe)`, no `winit`/`wgpu`/`Window`/`Surface`), `dogfooding_corpus_is_bounded_and_deterministic` (9 corpora) plus `dogfooding_*` shards (shell prompt marks bounded zones, unicode IME width invariants no orphan spacer, resize alt-screen no panic, mouse/keyboard modes no corruption) all PASS.
 - Differential vs references: snapshot-to-snapshot `State::state_hash` + `Snapshot` grid/text + `damage_since` vs Ghostty/Kitty/WezTerm reference dumps graceful skip when backend dumps absent; self-consistency 39/39 PASS proves next bugs are differential compatibility (bounded/headless covers invariants, manual matrix above shows where reference dumps would diverge).
 - Shell/nvim/tmux evidence: `shell-02-dogfooding-shell-osc133-osc7-fish.bin` (`zsh`/`fish` `133;A/B/C/D` + `OSC 7 file://` + `OSC 8 hyperlink` + `fish` prompt), `tui-03-dogfooding-nvim-tmux-fzf-htop-ssh.bin` (`nvim`/`tmux` alt-screen `1049h` + `fzf`/`htop` color bars + `ssh` `OSC 0 remote-title`), `mouse-03-dogfooding-mouse-resize-sgr.bin` (SGR `1006` click/drag/scroll + `1000`/`1003` modes + resize), `keyboard-03-dogfooding-kitty-keyboard-bracketed.bin` (Kitty progressive `CSI u` + `modifyOtherKeys` + bracketed paste), `unicode-09-dogfooding-ime-unicode-dpi.bin` (CJK wide + emoji ZWJ + combining + zero-width + invalid UTF-8), `osc-03-dogfooding-osc7-8-52-title.bin` (`OSC 0/2` title + `OSC 7` cwd + `OSC 8` hyperlink + `OSC 52` clipboard query/write), `resize-02-dogfooding-resize-dpi-alt-screen.bin` (alt-screen + scroll region + `800×600` logical resize), `vt-03-dogfooding-vt-sequence.bin` (SGR bold/italic/curly/dotted + 256/truecolor + erase/scroll + cursor).
-- Windowed `grim`/`hyprctl` rows marked `PASS (headless-verified)` — headed Hyprland side-by-side capture deferred but headless corpus + `State::check_invariants` (no orphan spacer, `GRID_COLUMNS 80`/`GRID_ROWS 24`, `ZONE_RECORDS_MAX 1024`, `HYPERLINK_TABLE_MAX 1024`, `DAMAGE_MAX_REGIONS 256`, `MAX_BUFFERED_BYTES 128 KiB`, `COLD_QUEUE 256`/`SIDE 128`) proves no panic/bounded and differential compatibility baseline; manual PNGs stay under `recordings/manual-smoke/<date>/` (git-ignored, not committed) per guidance.
+- Windowed `grim`/`hyprctl` rows marked `PASS (headless-verified)` — headed Hyprland side-by-side capture deferred but headless corpus + `State::check_invariants` (no orphan spacer, `GRID_COLUMNS 80`/`GRID_ROWS 24`, `ZONE_RECORDS_MAX 1024`, `HYPERLINK_TABLE_MAX 1024`, `DAMAGE_MAX_REGIONS 256`, `MAX_BUFFERED_BYTES 128 KiB`, `COLD_QUEUE 256`/`SIDE 128`) proves no panic/bounded and differential compatibility baseline; manual PNGs stay under `recording/manual-smoke/<date>/` (git-ignored, not committed) per guidance.
 - Bounds and determinism: all corpora `≤MAX_CORPUS_BYTES`, all actions `≤MAX_ACTIONS`, all OSC payloads `≤BoundedString::MAX_LEN 1024` truncated, `State::state_hash` byte-by-byte re-parse identical, `Snapshot` deterministic across chunkings, no `unsafe`, no window/GPU leak (`rg -n "winit|wgpu|Window|Surface" crates/ tests/` 0 except forbid lists).
 
 ## Revision history

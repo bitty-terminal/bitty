@@ -38,7 +38,7 @@ gtk-update-icon-cache -f -t /usr/share/icons/hicolor   # adjust the prefix if in
 
 ## Nix Flake
 
-`flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.97.1`, filtered source bounded, no unsafe. Check:
+`flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.98.1`, filtered source bounded, no unsafe. Check:
 
 ```sh
 nix flake check

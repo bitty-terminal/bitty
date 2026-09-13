@@ -22,7 +22,7 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        rustToolchain = pkgs.rust-bin.stable."1.97.1".minimal.override {
+        rustToolchain = pkgs.rust-bin.stable."1.98.1".minimal.override {
           targets = [ "x86_64-unknown-linux-gnu" ];
         };
 

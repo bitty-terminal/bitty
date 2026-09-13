@@ -60,7 +60,7 @@ cargo fmt --all -- --check          # exit 0
 just fmt-check                      # same, via justfile:6
 ```
 
-No diff. `rust-toolchain.toml:2` pins `channel = "1.97.1"` with `rustfmt` + `clippy`; edition 2024 enforces via that channel.
+No diff. `rust-toolchain.toml:2` pins `channel = "1.98.1"` with `rustfmt` + `clippy`; edition 2024 enforces via that channel.
 
 ### 2. Lint (Clippy `-D warnings`)
 
@@ -148,7 +148,7 @@ No tracked `TODO`/`FIXME` introduced; `cargo clippy -D warnings` would fail it.
 
 | Pin                 | Value                                   | Source                                                                |
 | ------------------- | --------------------------------------- | --------------------------------------------------------------------- |
-| Rust channel        | `1.97.1` minimal + `rustfmt` + `clippy` | `rust-toolchain.toml:2-4` + `.github/workflows/ci.yml:35-38`          |
+| Rust channel        | `1.98.1` minimal + `rustfmt` + `clippy` | `rust-toolchain.toml:2-4` + `.github/workflows/ci.yml:35-38`          |
 | MSRV                | `1.85`                                  | `Cargo.toml:25` `rust-version` + `clippy.toml:3` `msrv`               |
 | Edition/Resolver    | `2024` / `3`                            | `Cargo.toml:24,20`                                                    |
 | `wgpu`              | `26.0.1`                                | `crates/bitty-render/Cargo.toml`, `docs/product/release-ladder.md:55` |

@@ -111,9 +111,7 @@ impl Grid {
         for slot in &mut self.cells {
             *slot = Cell::erased(erase_style.clone());
         }
-        for w in &mut self.wraps {
-            *w = false;
-        }
+        self.wraps.fill(false);
     }
 
     /// Fills the inclusive rectangle with `fill`. Bounds are caller-clamped.

@@ -26,9 +26,11 @@
 //! palette is included, and no value is invented to fill a gap.
 //!
 //! Outline tokens (`border_focused`/`border_idle`, CTX-0340) are Bitty-owned
-//! rather than upstream palette data, derived per preset so both accepted
+//! rather than upstream palette data, derived per preset so the accepted
 //! contrast rules hold (RFC-0001/OQ-039): **AC-1** focused >= 3:1 against the
-//! preset background, and **AC-2** focused >= 3:1 against idle. The rule:
+//! preset background (enforced), **AC-2** focused >= 3:1 against idle
+//! (enforced), and **AC-3** idle >= 1.5:1 against the background (advisory,
+//! reported by `bitty config check`). The rule:
 //!
 //! 1. Try ANSI accents as the focused outline, preferring the blue/cyan
 //!    family (ANSI 4/6/12/14, highest contrast first), then the remaining
@@ -36,14 +38,26 @@
 //!    and admits an idle that clears AC-2 wins.
 //! 2. If no accent qualifies, fall back to the preset foreground.
 //! 3. Take the idle outline from ANSI 8 (bright black), then the palette
-//!    selection color, then ANSI 0: the first surface that clears AC-2.
-//!    Prefer an idle that also clears the advisory AC-3 (>= 1.5:1 against the
-//!    background); only if none does is a lower-contrast idle used, which is
-//!    reported by `bitty config check` as an AC-3 advisory, never a failure.
+//!    selection color, then ANSI 0: the first surface that clears AC-2 and
+//!    the advisory AC-3.
+//! 4. If no surface clears both, mix the palette selection color toward the
+//!    focused outline to the midpoint of the window where AC-2 and AC-3 both
+//!    hold (CTX-0354). The idle stays a Bitty-owned blend of two preset
+//!    tokens rather than an invented hue.
+//!
+//! Five presets use the step-4 blend — solarized-dark `#274F58`, one-dark
+//! `#3B4E64`, rose-pine-dawn `#B7C1C6`, everforest-dark `#5B4E53`, and
+//! everforest-light `#BCC2AC` (was `#EAEDC8`, 1.00:1). `tokyo-night-day` is
+//! the one documented AC-3 exemption: against its focused `#007197` every
+//! palette surface that clears AC-2 (the selection `#B7C1E3`, 3.09:1) sits at
+//! only 1.38:1 against the background, and no selection->focused blend clears
+//! both floors; retaining that visible 1.38:1 idle is preferred to a
+//! near-black token outside the light palette's tone, and `bitty config
+//! check` keeps reporting the advisory.
 //!
 //! [`BITTY_DARK`] keeps the originally ratified `#33CCFF`/`#595959AA` pair.
-//! No preset needs an AC-2 exemption: every catalog pair satisfies both
-//! rules, and the catalog tests below pin that.
+//! No preset needs an AC-1/AC-2 exemption: every catalog pair satisfies both
+//! enforced rules, and the catalog tests below pin that.
 //!
 //! # Bitty Dark palette — role table
 //!
@@ -592,7 +606,7 @@ pub static SOLARIZED_DARK: Theme = Theme {
     cursor: [0x83, 0x94, 0x96],
     selection: [0x07, 0x36, 0x42],
     border_focused: OutlineColor([0x93, 0xA1, 0xA1, 0xFF]),
-    border_idle: OutlineColor([0x07, 0x36, 0x42, 0xFF]),
+    border_idle: OutlineColor([0x27, 0x4F, 0x58, 0xFF]),
     ansi: [
         [0x07, 0x36, 0x42], // 0 black
         [0xDC, 0x32, 0x2F], // 1 red
@@ -664,7 +678,7 @@ pub static ONE_DARK: Theme = Theme {
     cursor: [0xAB, 0xB2, 0xBF],
     selection: [0x32, 0x38, 0x44],
     border_focused: OutlineColor([0x61, 0xAF, 0xEF, 0xFF]),
-    border_idle: OutlineColor([0x32, 0x38, 0x44, 0xFF]),
+    border_idle: OutlineColor([0x3B, 0x4E, 0x64, 0xFF]),
     ansi: [
         [0x21, 0x25, 0x2B], // 0 black
         [0xE0, 0x6C, 0x75], // 1 red
@@ -988,7 +1002,7 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     cursor: [0xCE, 0xCA, 0xCD],
     selection: [0xDF, 0xDA, 0xD9],
     border_focused: OutlineColor([0x28, 0x69, 0x83, 0xFF]),
-    border_idle: OutlineColor([0xDF, 0xDA, 0xD9, 0xFF]),
+    border_idle: OutlineColor([0xB7, 0xC1, 0xC6, 0xFF]),
     ansi: [
         [0xF2, 0xE9, 0xE1], // 0 black
         [0xB4, 0x63, 0x7A], // 1 red
@@ -1024,7 +1038,7 @@ pub static EVERFOREST_DARK: Theme = Theme {
     cursor: [0xE6, 0x98, 0x75],
     selection: [0x54, 0x3A, 0x48],
     border_focused: OutlineColor([0x83, 0xC0, 0x92, 0xFF]),
-    border_idle: OutlineColor([0x54, 0x3A, 0x48, 0xFF]),
+    border_idle: OutlineColor([0x5B, 0x4E, 0x53, 0xFF]),
     ansi: [
         [0x7A, 0x84, 0x78], // 0 black
         [0xE6, 0x7E, 0x80], // 1 red
@@ -1060,7 +1074,7 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     cursor: [0xF5, 0x7D, 0x26],
     selection: [0xEA, 0xED, 0xC8],
     border_focused: OutlineColor([0x5C, 0x6A, 0x72, 0xFF]),
-    border_idle: OutlineColor([0xEA, 0xED, 0xC8, 0xFF]),
+    border_idle: OutlineColor([0xBC, 0xC2, 0xAC, 0xFF]),
     ansi: [
         [0x7A, 0x84, 0x78], // 0 black
         [0xE6, 0x7E, 0x80], // 1 red
@@ -1390,6 +1404,26 @@ mod tests {
             .map(|(_, reason)| *reason)
     }
 
+    /// Presets whose palette cannot clear the advisory AC-3 floor
+    /// (idle >= 1.5:1 against the background) while keeping the enforced
+    /// AC-1/AC-2 invariants, with the reason. The exemption is explicit and
+    /// measured: `bitty config check` still reports the advisory, so it can
+    /// never become a silent runtime pass.
+    const AC3_EXEMPTIONS: &[(&str, &str)] = &[(
+        "tokyo-night-day",
+        "no palette surface or selection->focused blend clears AC-3 while \
+         holding AC-2 against focused #007197; the compliant near-black idle \
+         would sit outside this light palette's tone, so the visible \
+         selection idle #B7C1E3 (1.38:1) is retained",
+    )];
+
+    fn ac3_exemption(theme: &Theme) -> Option<&'static str> {
+        AC3_EXEMPTIONS
+            .iter()
+            .find(|(name, _)| *name == theme.name)
+            .map(|(_, reason)| *reason)
+    }
+
     #[test]
     fn none_resolves_to_default() {
         let (theme, status) = resolve_theme_with_status(None);
@@ -1557,14 +1591,11 @@ mod tests {
         // CTX-0340 AC-1: the focused outline must clear 3:1 against the
         // workspace background. The derivation above guarantees it for every
         // preset; this test pins the guarantee so a future edit cannot
-        // silently regress it.
+        // silently regress it. Contrast uses the runtime `OutlineColor`
+        // compositing path, so the measured value is the one startup and
+        // `bitty config check` see.
         for theme in list_presets() {
-            let focused = [
-                theme.border_focused.0[0],
-                theme.border_focused.0[1],
-                theme.border_focused.0[2],
-            ];
-            let ratio = contrast(focused, theme.background);
+            let ratio = theme.border_focused.contrast_over(theme.background);
             assert!(
                 ratio >= 3.0,
                 "preset {} focused outline contrast {ratio:.2}:1 is below 3:1",
@@ -1580,19 +1611,12 @@ mod tests {
         // pair, so a catalog preset below the floor makes every selection of
         // that preset fail closed at startup. This is the catalog-level guard
         // the `EffectiveConfig` sweep below backs (AC-2, no exemptions).
+        // Contrast uses the runtime `OutlineColor` compositing path so both
+        // sides are measured exactly as they render over the background.
         for theme in list_presets() {
-            let ratio = contrast(
-                [
-                    theme.border_focused.0[0],
-                    theme.border_focused.0[1],
-                    theme.border_focused.0[2],
-                ],
-                [
-                    theme.border_idle.0[0],
-                    theme.border_idle.0[1],
-                    theme.border_idle.0[2],
-                ],
-            );
+            let ratio = theme
+                .border_focused
+                .contrast_with(theme.border_idle, theme.background);
             assert!(
                 ratio >= 3.0,
                 "preset {} focused/idle outline contrast {ratio:.2}:1 is below 3:1 \
@@ -1603,22 +1627,40 @@ mod tests {
     }
 
     #[test]
-    fn idle_outline_clears_advisory_background_floor_or_is_visible() {
-        // CTX-0340 AC-3 is advisory, but every shipped preset must at least
-        // keep the idle outline visible against the background (not equal to
-        // it) so the `bitty config check` AC-3 warning stays a deliberate,
-        // reported advisory rather than a silently invisible outline.
+    fn idle_outline_clears_advisory_background_floor_or_is_documented() {
+        // CTX-0340 AC-3 (idle >= 1.5:1 against the background) is advisory,
+        // but after CTX-0354 every shipped preset must clear it unless it is
+        // listed in `AC3_EXEMPTIONS`. An exempt preset must measure below the
+        // floor (no stale exemption) and stay visible (never equal to the
+        // background), and a fixed preset must clear the floor. Contrast is
+        // computed exactly as the runtime does (`OutlineColor` composited
+        // over the background), so an alpha idle cannot pass this test and
+        // then fail at `bitty config check`.
         for theme in list_presets() {
-            let idle = [
-                theme.border_idle.0[0],
-                theme.border_idle.0[1],
-                theme.border_idle.0[2],
-            ];
+            let ratio = theme.border_idle.contrast_over(theme.background);
             assert_ne!(
-                idle, theme.background,
-                "preset {} idle outline equals the background and would be invisible",
+                theme.border_idle.composited_over(theme.background),
+                theme.background,
+                "preset {} idle outline is invisible against the background",
                 theme.name
             );
+            if let Some(reason) = ac3_exemption(theme) {
+                assert!(
+                    ratio < 1.5,
+                    "preset {} is listed as an AC-3 exemption but measures \
+                     {ratio:.2}:1; remove the exemption",
+                    theme.name
+                );
+                assert!(!reason.is_empty());
+            } else {
+                assert!(
+                    ratio >= 1.5,
+                    "preset {} idle outline contrast {ratio:.2}:1 is below the \
+                     advisory AC-3 floor 1.5:1; re-derive the idle or add a \
+                     documented AC3_EXEMPTIONS entry",
+                    theme.name
+                );
+            }
         }
     }
 

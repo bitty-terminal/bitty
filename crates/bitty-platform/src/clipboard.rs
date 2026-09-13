@@ -18,9 +18,13 @@
 //!   is unsound from bitty's multithreaded runtime — live proof showed the
 //!   primary `set` returning `Ok` while `wl-paste --primary` stayed empty,
 //!   so middle-click found nothing. `wl-copy` is single-threaded at fork
-//!   time and serves reliably. When `wl-copy` is missing or fails, the write
-//!   falls back to the `arboard` primary path, so behavior never regresses
-//!   below the CTX-0160 contract.
+//!   time and serves reliably. The payload is written to the child's stdin
+//!   pipe — never argv, which any same-UID process can read through
+//!   `/proc/<pid>/cmdline` — and the child is reaped by a background thread
+//!   with a bounded wait, so a wedged compositor cannot stall the caller
+//!   (CTX-0388). When `wl-copy` cannot be started or fed, the write falls
+//!   back to the `arboard` primary path, so behavior never regresses below
+//!   the CTX-0160 contract.
 //! - Reads are authoritative per selection: `get_text` reads the regular
 //!   clipboard and surfaces `PlatformError::ClipboardOperation` on failure;
 //!   `get_primary` reads the primary selection the same way. There is no
@@ -56,6 +60,8 @@
 //! the platform primitive. This file itself never grants ambient access.
 
 #![forbid(unsafe_code)]
+
+use std::time::Duration;
 
 use crate::error::PlatformError;
 
@@ -275,9 +281,9 @@ impl Clipboard {
     /// Truncated to [`CLIPBOARD_MAX_BYTES`] before the system call. On
     /// Wayland the write prefers the `wl-copy --primary` CLI (fork-safe from
     /// multithreaded processes) and falls back to the `arboard` primary path
-    /// when the CLI is missing or fails. On non-Linux platforms there is no
-    /// primary selection: the primary buffer is updated headlessly and `Ok`
-    /// is returned without touching the OS.
+    /// when the CLI is missing or cannot be started. On non-Linux platforms
+    /// there is no primary selection: the primary buffer is updated headlessly
+    /// and `Ok` is returned without touching the OS.
     ///
     /// # Errors
     ///
@@ -490,10 +496,11 @@ fn set_primary_text(_inner: &mut arboard::Clipboard, _text: String) -> Result<()
 /// Primary-selection write with a fork-safe Wayland fast path (CTX-0158).
 ///
 /// When a Wayland session is advertised, the write first tries the
-/// `wl-copy --primary` CLI and only falls back to the `arboard` primary
-/// path when the CLI is missing or fails, so behavior never regresses below
-/// the CTX-0160 contract. Everywhere else (X11, headless-adjacent) this is
-/// exactly the `arboard` primary write.
+/// `wl-copy --primary` CLI and falls back to the `arboard` primary path when
+/// the CLI is missing or cannot be handed the payload (spawn or stdin-pipe
+/// failure), so behavior never regresses below the CTX-0160 contract.
+/// Everywhere else (X11, headless-adjacent) this is exactly the `arboard`
+/// primary write.
 fn set_primary_selection(inner: &mut arboard::Clipboard, text: &str) -> Result<(), String> {
     if is_wayland_session() && wl_copy_primary(text).is_ok() {
         return Ok(());
@@ -501,40 +508,120 @@ fn set_primary_selection(inner: &mut arboard::Clipboard, text: &str) -> Result<(
     set_primary_text(inner, text.to_owned())
 }
 
+/// How long the background reaper waits for the `wl-copy` child before it
+/// kills and reaps it. Enforced off the caller (CTX-0388), never on the
+/// frame loop.
+const WL_COPY_WAIT: Duration = Duration::from_secs(2);
+/// Reaper poll cadence: one non-blocking `try_wait` per interval on the
+/// background thread. Kept off the calling thread so the main path never
+/// sleeps.
+const WL_COPY_POLL: Duration = Duration::from_millis(10);
+
 /// Writes `text` to the Wayland primary selection via the `wl-copy` CLI.
 ///
-/// Fixed argv (`wl-copy --primary -- <text>`), no shell, stdio nulled, and
-/// the wait is bounded (2 s) so a wedged compositor cannot hang the caller;
-/// on timeout the child is killed and reaped. Any failure (missing binary,
-/// non-zero exit, timeout) is an `Err` string and the caller falls back to
-/// `arboard`. `text` must already be truncated to [`CLIPBOARD_MAX_BYTES`].
+/// Fixed argv (`wl-copy --primary`, no shell) with the payload fed over the
+/// child's **stdin pipe** — argv is world-readable through
+/// `/proc/<pid>/cmdline`, so clipboard text must never travel as an argument
+/// (CTX-0388). The child is handed to a background reaper with a bounded
+/// wait ([`WL_COPY_WAIT`]); the caller never sleeps or polls, so a wedged
+/// compositor cannot stall the frame loop. Spawn and stdin-write failures
+/// return synchronously and the caller falls back to `arboard`; a late
+/// non-zero exit or timeout is logged by the reaper (the caller has already
+/// returned by then). `text` must already be truncated to
+/// [`CLIPBOARD_MAX_BYTES`].
 fn wl_copy_primary(text: &str) -> Result<(), String> {
+    wl_copy_spawn("wl-copy", text, WL_COPY_WAIT, WL_COPY_POLL)
+}
+
+/// Spawns `program` with the fixed `--primary` argv, feeds `text` on the
+/// child's stdin pipe, and reaps it off the caller's thread with a bounded
+/// wait.
+///
+/// The `program`/`wait`/`poll` parameters exist so the argv/stdin and
+/// bounded-reap contracts are testable against a fake script without
+/// resolving from `PATH` (edition 2024 makes `set_var` unsafe and this crate
+/// forbids unsafe code).
+fn wl_copy_spawn(program: &str, text: &str, wait: Duration, poll: Duration) -> Result<(), String> {
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
 
-    const WL_COPY_WAIT: Duration = Duration::from_secs(2);
-    const WL_COPY_POLL: Duration = Duration::from_millis(10);
-
-    let mut child = Command::new("wl-copy")
+    let mut child = Command::new(program)
         .arg("--primary")
-        .arg("--")
-        .arg(text)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| err.to_string())?;
-    let deadline = Instant::now() + WL_COPY_WAIT;
+    // Feed the payload on the child's stdin pipe, then drop the handle so the
+    // child reads EOF. A failed write (child exited early) fails closed; the
+    // child is killed and reaped before returning so no zombie remains.
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(String::from("wl-copy stdin pipe was not created"));
+    };
+    if let Err(err) = stdin.write_all(text.as_bytes()) {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err.to_string());
+    }
+    drop(stdin);
+    // Hand the child off; the caller returns immediately (never waits).
+    spawn_wl_copy_reaper(program, child, wait, poll)
+}
+
+/// Moves `child` to a named background reaper thread and returns without
+/// waiting. Thread creation is the only fallible step; a failed handoff kills
+/// and reaps the child so it is never leaked.
+fn spawn_wl_copy_reaper(
+    program: &str,
+    child: std::process::Child,
+    wait: Duration,
+    poll: Duration,
+) -> Result<(), String> {
+    let (child_tx, child_rx) = std::sync::mpsc::channel::<std::process::Child>();
+    let program = program.to_owned();
+    std::thread::Builder::new()
+        .name(String::from("bitty-wl-copy-reap"))
+        .spawn(move || {
+            let Ok(mut child) = child_rx.recv() else {
+                return;
+            };
+            if let Err(err) = reap_wl_copy(&mut child, wait, poll) {
+                eprintln!("warning: {program}: {err}");
+            }
+        })
+        .map_err(|err| err.to_string())?;
+    match child_tx.send(child) {
+        Ok(()) => Ok(()),
+        Err(std::sync::mpsc::SendError(mut child)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(String::from("wl-copy reaper exited before handoff"))
+        }
+    }
+}
+
+/// Waits up to `wait` for `child` to exit, polling with `poll` pauses; kills
+/// and reaps it on timeout. Runs on the background reaper thread only (the
+/// caller must never invoke this on a frame path).
+fn reap_wl_copy(
+    child: &mut std::process::Child,
+    wait: Duration,
+    poll: Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match child.try_wait().map_err(|err| err.to_string())? {
             Some(status) if status.success() => return Ok(()),
             Some(status) => return Err(format!("wl-copy --primary exited with {status}")),
-            None if Instant::now() >= deadline => {
+            None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("wl-copy --primary timed out".to_string());
+                return Err(String::from("wl-copy --primary timed out"));
             }
-            None => std::thread::sleep(WL_COPY_POLL),
+            None => std::thread::sleep(poll),
         }
     }
 }
@@ -617,6 +704,8 @@ fn clear_primary_text(_inner: &mut arboard::Clipboard) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     #[test]
     fn headless_clipboard_roundtrip_is_deterministic() {
@@ -715,5 +804,222 @@ mod tests {
         cb.set_text_lossy("lossy".to_string());
         assert_eq!(cb.get_text_lossy(), "lossy");
         assert_eq!(cb.get_primary_lossy(), "lossy");
+    }
+
+    // -- CTX-0388 / Issue #644: wl-copy stdin + off-thread reap ------------
+    //
+    // A fake `wl-copy` script stands in for the CLI so the argv/stdin and
+    // bounded-reap contracts are deterministic and display-free. The script
+    // path is injected, never resolved from PATH (setting env vars is
+    // `unsafe` under edition 2024 and forbidden in this crate).
+
+    /// Per-test scratch directory holding a fake `wl-copy` script; removed
+    /// on drop. Derived from `temp_dir()` (no host path baked into source).
+    #[cfg(unix)]
+    struct ScratchDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("bitty-wlcopy-test-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+
+        fn script(&self, name: &str, body: &str) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = self.path(name);
+            std::fs::write(&path, body).expect("write fake script");
+            let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod");
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Polls until `path` contains exactly `expected` (bounded).
+    #[cfg(unix)]
+    fn wait_for_content(path: &std::path::Path, expected: &str, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(path).is_ok_and(|text| text == expected) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Linux `ETXTBSY` ("Text file busy"), the errno for execing a script
+    /// another forked child still holds open for writing.
+    #[cfg(unix)]
+    const ETXTBSY: i32 = 26;
+
+    /// Spawns a test-authored script, retrying the Linux `ETXTBSY` race: a
+    /// concurrently forking test thread can briefly inherit our just-written
+    /// script's write fd, so `exec` fails with "Text file busy". Production
+    /// runs a long-installed `wl-copy`, so this race is test-only.
+    #[cfg(unix)]
+    fn spawn_script(program: &std::path::Path) -> std::process::Child {
+        for _ in 0..100 {
+            match std::process::Command::new(program)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => return child,
+                Err(err) if err.raw_os_error() == Some(ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("spawn {program:?}: {err}"),
+            }
+        }
+        panic!("spawn {program:?} kept failing with ETXTBSY");
+    }
+
+    /// [`wl_copy_spawn`] with the same test-only `ETXTBSY` retry (the spawn
+    /// happens inside the production helper, so the retry wraps the call).
+    #[cfg(unix)]
+    fn wl_copy_spawn_retry(
+        program: &str,
+        text: &str,
+        wait: Duration,
+        poll: Duration,
+    ) -> Result<(), String> {
+        for _ in 0..100 {
+            match wl_copy_spawn(program, text, wait, poll) {
+                Err(err) if err.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                other => return other,
+            }
+        }
+        Err(String::from("fake wl-copy kept failing with ETXTBSY"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_copy_feeds_text_on_stdin_and_keeps_argv_clean() {
+        // The payload must travel over the child's stdin pipe, never argv:
+        // argv is readable by any same-UID process via /proc/<pid>/cmdline.
+        let scratch = ScratchDir::new("stdin-argv");
+        let argv_dump = scratch.path("argv.txt");
+        let stdin_dump = scratch.path("stdin.txt");
+        let script = scratch.script(
+            "fake-wl-copy",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n",
+                argv_dump.display(),
+                stdin_dump.display()
+            ),
+        );
+        let secret = String::from("argv-leak-secret-42");
+        wl_copy_spawn_retry(
+            &script.to_string_lossy(),
+            &secret,
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+        )
+        .expect("spawn must succeed");
+        assert!(
+            wait_for_content(&stdin_dump, &secret, 5),
+            "fake wl-copy must receive the payload on stdin"
+        );
+        let argv = std::fs::read_to_string(&argv_dump).expect("argv dump");
+        assert_eq!(argv, "--primary\n", "argv must carry no payload");
+        assert!(
+            !argv.contains(&secret),
+            "payload must never appear in argv: {argv:?}"
+        );
+        let stdin = std::fs::read_to_string(&stdin_dump).expect("stdin dump");
+        assert_eq!(stdin, secret, "payload must arrive over stdin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_copy_spawn_does_not_wait_for_the_child_on_the_caller() {
+        // The old path polled `try_wait` with a 10 ms sleep on the caller
+        // (main) thread for up to 2 s; the fixed path hands the child to a
+        // reaper thread and returns immediately.
+        let scratch = ScratchDir::new("nonblocking");
+        let script = scratch.script("slow-wl-copy", "#!/bin/sh\nsleep 10\n");
+        let started = std::time::Instant::now();
+        wl_copy_spawn_retry(
+            &script.to_string_lossy(),
+            "payload",
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .expect("spawn must succeed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "spawn path must not block on the child (took {elapsed:?})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_copy_reaper_bounds_and_kills_a_wedged_child() {
+        // Reaping is bounded and off the caller; a wedged child is killed
+        // and reaped instead of hanging the write path.
+        let scratch = ScratchDir::new("reaper-timeout");
+        let script = scratch.script("wedged-wl-copy", "#!/bin/sh\nsleep 30\n");
+        let mut child = spawn_script(&script);
+        let started = std::time::Instant::now();
+        let result = reap_wl_copy(
+            &mut child,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        );
+        let elapsed = started.elapsed();
+        let err = result.expect_err("a wedged child must time out");
+        assert!(err.contains("timed out"), "timeout must be named: {err}");
+        assert!(elapsed >= Duration::from_millis(100), "waits the bound");
+        assert!(elapsed < Duration::from_secs(2), "never hangs: {elapsed:?}");
+        // Killed and reaped: no live child and no success status left behind.
+        let status = child
+            .try_wait()
+            .expect("try_wait must not error")
+            .expect("child must be reaped");
+        assert!(!status.success(), "killed child is not a success");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_copy_reaper_surfaces_nonzero_exit() {
+        let scratch = ScratchDir::new("reaper-nonzero");
+        let script = scratch.script("failing-wl-copy", "#!/bin/sh\nexit 3\n");
+        let mut child = spawn_script(&script);
+        let err = reap_wl_copy(&mut child, Duration::from_secs(5), Duration::from_millis(5))
+            .expect_err("non-zero exit must surface");
+        assert!(err.contains("exited with"), "names the exit status: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wl_copy_missing_program_fails_closed_without_panic() {
+        // A missing binary makes the caller fall back to `arboard`.
+        let err = wl_copy_spawn(
+            "/definitely/not/a/real/wl-copy-binary",
+            "x",
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .expect_err("missing binary must fail closed");
+        assert!(!err.is_empty(), "failure must carry a reason");
     }
 }

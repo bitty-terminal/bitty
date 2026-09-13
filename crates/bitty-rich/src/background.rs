@@ -13,8 +13,11 @@
 //!   Animated or multi-frame containers (APNG, animated WebP, GIF) and
 //!   unsupported formats are rejected by header sniff *before* any decode.
 //! - **Limits**: BG-1..BG-7 alias the accepted image-store ceilings and the
-//!   OQ-042 design/present bounds; every byte estimate is overflow-checked
-//!   and the decode/cache path never allocates beyond a checked bound.
+//!   OQ-042 design/present bounds. BG-3 is enforced before decode as the
+//!   overflow-checked charge `width * height * peak_bytes_per_pixel`, where
+//!   the per-pixel charge covers the RGBA8 output plus any full-size codec
+//!   scratch; bounded fixed overhead (encoded input, row/upsampler scratch)
+//!   sits outside the formula.
 //! - **Fit modes**: [`BackgroundFit`] `fill`/`fit`/`center`/`tile`/`stretch`
 //!   geometry is pure and pixel-exact ([`fit_plan`], [`rasterize_background`]).
 //! - **Caching**: [`BackgroundStore`] keys decoded images by canonical path
@@ -38,7 +41,9 @@ pub const BG_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 /// BG-2: max decoded dimension per axis (aliases IMG-2).
 pub const BG_MAX_DIMENSION: u32 = 4096;
 
-/// BG-3: max decoded bytes per image, `width * height * 4` (aliases IMG-3).
+/// BG-3: max charged decoded peak per image (aliases IMG-3). The charge is the
+/// overflow-checked formula `width * height * peak_bytes_per_pixel`; see
+/// [`ImageHeader`] for the per-format value.
 pub const BG_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
 
 /// BG-4: max aggregate decoded background bytes (aliases IMG-4).
@@ -86,6 +91,20 @@ pub struct ImageHeader {
     pub width: u32,
     /// Header height in pixels (`> 0`).
     pub height: u32,
+    /// Peak decoder bytes per pixel charged against BG-3: the single RGBA8
+    /// output plus any full-size decoder-internal buffer the bitstream forces.
+    ///
+    /// `4` is the RGBA8 output alone (PNG, baseline JPEG, and WebP lossless
+    /// with alpha, whose decoder writes straight into the output). `8` is
+    /// charged when the decoder materializes a full-size scratch buffer on top
+    /// of the output (lossy `VP8`, lossless `VP8L` without the alpha bit, and
+    /// the conservative `VP8X` container). Progressive JPEG is charged its
+    /// full-image coefficient store (at least `8`, higher for 4:4:4-style
+    /// sampling), and a lossy `VP8 ` with an `ALPH` chunk is charged `11` for
+    /// the alpha scratch. Bounded fixed overhead (the encoded input, row and
+    /// upsampler scratch) sits outside this charge, so BG-3 is enforced as a
+    /// formula, not as a measured literal.
+    pub peak_bytes_per_pixel: u32,
 }
 
 /// Typed background-image rejection. Every variant names the failed bound or
@@ -118,9 +137,10 @@ pub enum BackgroundError {
         /// Header height.
         height: u32,
     },
-    /// Overflow-checked decoded estimate over BG-3.
+    /// Overflow-checked decode peak estimate over BG-3.
     DecodedTooLarge {
-        /// Checked `width * height * 4` estimate (or `u64::MAX` on overflow).
+        /// Checked `width * height * peak_bytes_per_pixel` estimate (or
+        /// `u64::MAX` on overflow).
         bytes: u64,
         /// Accepted cap ([`BG_MAX_DECODED_BYTES`]).
         cap: u64,
@@ -304,10 +324,10 @@ fn sniff_png(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
                     return Err(BackgroundError::Dimensions { width, height });
                 }
                 let bit_depth = bytes[offset + 16];
-                if bit_depth > 8 {
+                if !matches!(bit_depth, 1 | 2 | 4 | 8) {
                     return Err(BackgroundError::UnsupportedFormat {
                         detail: format!(
-                            "PNG bit depth {bit_depth} is unsupported; samples wider than 8 bits are rejected"
+                            "PNG bit depth {bit_depth} is unsupported; only 1, 2, 4, or 8 bits per sample are accepted"
                         ),
                     });
                 }
@@ -331,6 +351,7 @@ fn sniff_png(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
         format: BackgroundFormat::Png,
         width,
         height,
+        peak_bytes_per_pixel: 4,
     })
 }
 
@@ -411,10 +432,16 @@ fn sniff_jpeg(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
             if width == 0 || height == 0 {
                 return Err(BackgroundError::Dimensions { width, height });
             }
+            let peak_bytes_per_pixel = if marker == 0xC2 {
+                progressive_jpeg_charge(bytes, offset, seg_len)?
+            } else {
+                4
+            };
             return Ok(ImageHeader {
                 format: BackgroundFormat::Jpeg,
                 width,
                 height,
+                peak_bytes_per_pixel,
             });
         }
         if marker == 0xDA {
@@ -429,6 +456,46 @@ fn sniff_jpeg(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
         }
         offset = seg_end;
     }
+}
+
+/// BG-3 charge for one progressive JPEG (SOF2) frame.
+///
+/// zune-jpeg, the decoder behind `image`'s JPEG path, keeps a full-image
+/// `i16` coefficient buffer for every component of a progressive frame until
+/// the final scans run (`mcu_prog.rs`, `block[i] = vec![0; ...]`). Its size is
+/// `2 * sum(h_i * v_i) / (h_max * v_max)` bytes per pixel, charged on top of
+/// the `4`-byte RGBA8 output. A floor of 8 covers the measured 4:2:0 profile
+/// (7.04 B/px including row/upsampler scratch) and the grayscale profile
+/// (6.01 B/px); 4:4:4 profiles are charged their full 10.
+fn progressive_jpeg_charge(
+    bytes: &[u8],
+    offset: usize,
+    seg_len: usize,
+) -> Result<u32, BackgroundError> {
+    let components = usize::from(bytes[offset + 9]);
+    if components == 0 || components > 4 || seg_len < 8 + 3 * components {
+        return Err(BackgroundError::Malformed {
+            detail: "progressive JPEG frame header has an invalid component table".to_string(),
+        });
+    }
+    let mut sampling_area = 0u32;
+    let mut max_horizontal = 0u32;
+    let mut max_vertical = 0u32;
+    for index in 0..components {
+        let sampling = bytes[offset + 10 + 3 * index + 1];
+        let horizontal = u32::from(sampling >> 4);
+        let vertical = u32::from(sampling & 0x0F);
+        if !(1..=4).contains(&horizontal) || !(1..=4).contains(&vertical) {
+            return Err(BackgroundError::Malformed {
+                detail: "progressive JPEG component sampling factor out of range".to_string(),
+            });
+        }
+        sampling_area += horizontal * vertical;
+        max_horizontal = max_horizontal.max(horizontal);
+        max_vertical = max_vertical.max(vertical);
+    }
+    let coefficient_bytes = 2 * sampling_area.div_ceil(max_horizontal * max_vertical);
+    Ok((4 + coefficient_bytes).max(8))
 }
 
 fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
@@ -474,10 +541,13 @@ fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
             if width == 0 || height == 0 {
                 return Err(BackgroundError::Dimensions { width, height });
             }
+            let peak_bytes_per_pixel =
+                vp8x_peak_bytes_per_pixel(bytes, declared, chunk_end, chunk_len)?;
             Ok(ImageHeader {
                 format: BackgroundFormat::WebP,
                 width,
                 height,
+                peak_bytes_per_pixel,
             })
         }
         b"VP8 " => {
@@ -500,6 +570,7 @@ fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
                 format: BackgroundFormat::WebP,
                 width,
                 height,
+                peak_bytes_per_pixel: 8,
             })
         }
         b"VP8L" => {
@@ -514,10 +585,15 @@ fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
             if width == 0 || height == 0 {
                 return Err(BackgroundError::Dimensions { width, height });
             }
+            // The VP8L alpha bit (bit 28) means the decoder writes RGBA8
+            // straight into our bounded buffer; without it `image-webp`
+            // decodes through an internal full-size RGBA scratch buffer.
+            let has_alpha = (bits >> 28) & 1 != 0;
             Ok(ImageHeader {
                 format: BackgroundFormat::WebP,
                 width,
                 height,
+                peak_bytes_per_pixel: if has_alpha { 4 } else { 8 },
             })
         }
         b"ANIM" => Err(BackgroundError::Animated { format: "WebP" }),
@@ -527,14 +603,89 @@ fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
     }
 }
 
-/// Enforces BG-2 and the checked BG-3 estimate for one parsed header.
+/// BG-3 charge for a static `VP8X` extended WebP.
+///
+/// `VP8X` is a container: its payload is a RIFF chunk sequence (`ICCP`,
+/// `ALPH`, `VP8 `/`VP8L`, metadata). The measured worst case is a lossy
+/// `VP8 ` image with an `ALPH` chunk: `image-webp`'s `read_alpha_chunk`
+/// allocates a full-size `w * h * 4` RGBA scratch plus a `w * h` green buffer
+/// for the alpha plane on top of the VP8 YUV frame and our RGBA8 output
+/// (measured 10.50-10.76 B/px), so that shape is charged 11. Every other
+/// `VP8X` shape keeps the previous conservative 8.
+///
+/// The walk scans the whole physical buffer, not just the declared container:
+/// `image-webp` reads chunk headers up to
+/// `position + riff_size.saturating_sub(12)` (ten bytes past `riff_end` for a
+/// minimum-size `VP8X` chunk), so a declared size shorter than the chunk
+/// sequence would let the decoder find a trailing `VP8 ` that a
+/// `riff_end`-bounded walk never sees. A chunk that crosses `riff_end` is
+/// therefore rejected as malformed instead of treated as absent. The only
+/// remaining gap is a sub-8-byte tail, which cannot hold a chunk header.
+///
+/// # Errors
+///
+/// [`BackgroundError::Animated`] for an `ANIM`/`ANMF` chunk and
+/// [`BackgroundError::Malformed`] for a chunk that overruns the declared
+/// RIFF container, so an unparseable container never silently falls back to
+/// the cheaper charge.
+fn vp8x_peak_bytes_per_pixel(
+    bytes: &[u8],
+    declared: usize,
+    chunk_end: usize,
+    chunk_len: usize,
+) -> Result<u32, BackgroundError> {
+    let riff_end = declared + 8;
+    let position_after_vp8x = chunk_end + (chunk_len & 1);
+    if position_after_vp8x > riff_end {
+        return Err(BackgroundError::Malformed {
+            detail: "WebP VP8X chunk overruns the declared RIFF container".to_string(),
+        });
+    }
+    let mut position = position_after_vp8x;
+    let mut has_alpha = false;
+    let mut has_lossy = false;
+    while position + 8 <= bytes.len() {
+        let tag = &bytes[position..position + 4];
+        let len = le32(&bytes[position + 4..position + 8]) as usize;
+        let data_end = position
+            .checked_add(8)
+            .and_then(|start| start.checked_add(len))
+            .ok_or_else(|| BackgroundError::Malformed {
+                detail: "WebP chunk length overflow".to_string(),
+            })?;
+        if data_end > bytes.len() {
+            return Err(BackgroundError::Malformed {
+                detail: "truncated WebP chunk in VP8X container".to_string(),
+            });
+        }
+        if data_end > riff_end {
+            return Err(BackgroundError::Malformed {
+                detail: "WebP chunk overruns the declared RIFF container".to_string(),
+            });
+        }
+        match tag {
+            b"ALPH" => has_alpha = true,
+            b"VP8 " => has_lossy = true,
+            b"ANIM" | b"ANMF" => return Err(BackgroundError::Animated { format: "WebP" }),
+            _ => {}
+        }
+        position = data_end + (len & 1);
+    }
+    Ok(if has_alpha && has_lossy { 11 } else { 8 })
+}
+
+/// Enforces BG-2 and the checked BG-3 peak estimate for one parsed header.
 ///
 /// # Errors
 ///
 /// [`BackgroundError::Dimensions`] when an axis is zero or over
 /// [`BG_MAX_DIMENSION`], [`BackgroundError::DecodedTooLarge`] when the
-/// overflow-checked `width * height * 4` estimate exceeds
-/// [`BG_MAX_DECODED_BYTES`].
+/// overflow-checked `width * height * peak_bytes_per_pixel` charge exceeds
+/// [`BG_MAX_DECODED_BYTES`]. The charge follows
+/// [`ImageHeader::peak_bytes_per_pixel`]: `4` bytes per pixel for a direct
+/// RGBA8 write, more where the format forces a full-size decoder-internal
+/// scratch buffer. It bounds image-sized allocations; bounded fixed overhead
+/// (encoded input, row and upsampler scratch) sits outside the formula.
 pub fn check_header_bounds(header: &ImageHeader) -> Result<(), BackgroundError> {
     if header.width == 0
         || header.height == 0
@@ -548,7 +699,7 @@ pub fn check_header_bounds(header: &ImageHeader) -> Result<(), BackgroundError> 
     }
     let bytes = u64::from(header.width)
         .checked_mul(u64::from(header.height))
-        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|pixels| pixels.checked_mul(u64::from(header.peak_bytes_per_pixel)))
         .unwrap_or(u64::MAX);
     if bytes > BG_MAX_DECODED_BYTES as u64 {
         return Err(BackgroundError::DecodedTooLarge {
@@ -859,8 +1010,19 @@ impl BackgroundStore {
 /// Decodes a fully read and previously sniffed buffer into RGBA8.
 ///
 /// The header sniff runs first, so this function never sees an animated or
-/// unsupported container. Dimensions are re-checked after decode so a
-/// decoder that disagrees with its header fails closed.
+/// unsupported container. The resident decode is a single `width * height * 4`
+/// allocation: the per-format [`image::ImageDecoder`] writes its native 8-bit
+/// channels into that buffer's prefix and [`expand_in_place`] grows them to
+/// straight-alpha RGBA8. Full-size codec scratch (progressive JPEG
+/// coefficients, WebP alpha planes) is charged separately by
+/// [`ImageHeader::peak_bytes_per_pixel`] and bounded by [`check_header_bounds`]
+/// before this runs, so no image-sized allocation is uncharged. The previous
+/// `DynamicImage::to_rgba8` path cloned even an already-RGBA8 image, peaking
+/// at twice the resident buffer.
+///
+/// Dimensions and the decoder's native color type are re-checked before any
+/// allocation so a decoder that disagrees with its header fails closed, and
+/// every native type other than 8-bit `L8`/`La8`/`Rgb8`/`Rgba8` is refused.
 ///
 /// # Errors
 ///
@@ -869,22 +1031,123 @@ impl BackgroundStore {
 pub fn decode_background(bytes: &[u8]) -> Result<BackgroundImage, BackgroundError> {
     let header = sniff_image(bytes)?;
     check_header_bounds(&header)?;
-    let format = match header.format {
-        BackgroundFormat::Png => image::ImageFormat::Png,
-        BackgroundFormat::Jpeg => image::ImageFormat::Jpeg,
-        BackgroundFormat::WebP => image::ImageFormat::WebP,
+    let rgba = decode_rgba8_bounded(bytes, &header)?;
+    BackgroundImage::try_new(header.width, header.height, rgba)
+}
+
+/// Native channel width for the accepted 8-bit decoder color types.
+fn native_bytes_per_pixel(color: image::ColorType) -> Option<usize> {
+    match color {
+        image::ColorType::L8 => Some(1),
+        image::ColorType::La8 => Some(2),
+        image::ColorType::Rgb8 => Some(3),
+        image::ColorType::Rgba8 => Some(4),
+        _ => None,
+    }
+}
+
+/// Decodes one sniffed buffer into a single bounded RGBA8 allocation.
+///
+/// The caller has already validated BG-2 dimensions and the BG-3 estimate, so
+/// `width * height * 4` is at most [`BG_MAX_DECODED_BYTES`]. The output buffer
+/// is allocated once at that size; the decoder writes its native channels into
+/// the prefix and the conversion runs in place.
+fn decode_rgba8_bounded(bytes: &[u8], header: &ImageHeader) -> Result<Vec<u8>, BackgroundError> {
+    use image::ImageDecoder;
+
+    let malformed = |err: image::ImageError| BackgroundError::Malformed {
+        detail: format!("decode refused: {err}"),
     };
-    let decoded = image::load_from_memory_with_format(bytes, format).map_err(|err| {
-        BackgroundError::Malformed {
-            detail: format!("decode refused: {err}"),
+    let reader = std::io::Cursor::new(bytes);
+    let decoder: Box<dyn ImageDecoder> = match header.format {
+        BackgroundFormat::Png => {
+            Box::new(image::codecs::png::PngDecoder::new(reader).map_err(malformed)?)
         }
-    })?;
-    if decoded.width() != header.width || decoded.height() != header.height {
+        BackgroundFormat::Jpeg => {
+            Box::new(image::codecs::jpeg::JpegDecoder::new(reader).map_err(malformed)?)
+        }
+        BackgroundFormat::WebP => {
+            Box::new(image::codecs::webp::WebPDecoder::new(reader).map_err(malformed)?)
+        }
+    };
+
+    let (width, height) = decoder.dimensions();
+    if width != header.width || height != header.height {
         return Err(BackgroundError::Malformed {
             detail: "decoded dimensions disagree with the header".to_string(),
         });
     }
-    BackgroundImage::try_new(header.width, header.height, decoded.to_rgba8().into_raw())
+    let color = decoder.color_type();
+    let Some(native_bpp) = native_bytes_per_pixel(color) else {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: format!("decoder produced unsupported color type {color:?}"),
+        });
+    };
+    let pixels =
+        (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(BackgroundError::DecodedTooLarge {
+                bytes: u64::MAX,
+                cap: BG_MAX_DECODED_BYTES as u64,
+            })?;
+    let rgba_len = pixels
+        .checked_mul(4)
+        .ok_or(BackgroundError::DecodedTooLarge {
+            bytes: u64::MAX,
+            cap: BG_MAX_DECODED_BYTES as u64,
+        })?;
+    let native_len = pixels * native_bpp;
+    if decoder.total_bytes() != native_len as u64 {
+        return Err(BackgroundError::Malformed {
+            detail: "decoder reported an inconsistent decoded size".to_string(),
+        });
+    }
+
+    let mut buf = vec![0u8; rgba_len];
+    decoder
+        .read_image(&mut buf[..native_len])
+        .map_err(malformed)?;
+    expand_in_place(&mut buf, pixels, native_bpp);
+    Ok(buf)
+}
+
+/// Expands interleaved 8-bit native channels to straight-alpha RGBA8 in place.
+///
+/// Iterating back to front keeps every write at or after the source byte it
+/// replaces, so no second buffer is needed. `rgba` must hold `pixels * 4` bytes
+/// with the `pixels * native_bpp` source bytes at the front.
+fn expand_in_place(rgba: &mut [u8], pixels: usize, native_bpp: usize) {
+    match native_bpp {
+        4 => {}
+        3 => {
+            for i in (0..pixels).rev() {
+                let (r, g, b) = (rgba[i * 3], rgba[i * 3 + 1], rgba[i * 3 + 2]);
+                rgba[i * 4] = r;
+                rgba[i * 4 + 1] = g;
+                rgba[i * 4 + 2] = b;
+                rgba[i * 4 + 3] = 0xFF;
+            }
+        }
+        2 => {
+            for i in (0..pixels).rev() {
+                let (l, a) = (rgba[i * 2], rgba[i * 2 + 1]);
+                rgba[i * 4] = l;
+                rgba[i * 4 + 1] = l;
+                rgba[i * 4 + 2] = l;
+                rgba[i * 4 + 3] = a;
+            }
+        }
+        1 => {
+            for i in (0..pixels).rev() {
+                let l = rgba[i];
+                rgba[i * 4] = l;
+                rgba[i * 4 + 1] = l;
+                rgba[i * 4 + 2] = l;
+                rgba[i * 4 + 3] = 0xFF;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Accepted fit mode (RFC-0001/OQ-042).
@@ -1323,15 +1586,61 @@ mod tests {
         out
     }
 
-    fn encode_webp_lossless(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for _ in 0..(width * height) {
-            pixels.extend_from_slice(&color);
+    fn solid(width: u32, height: u32, bpp: usize, color: &[u8]) -> Vec<u8> {
+        let mut pixels = vec![0u8; (width as usize) * (height as usize) * bpp];
+        for chunk in pixels.chunks_exact_mut(bpp) {
+            chunk.copy_from_slice(color);
         }
+        pixels
+    }
+
+    fn encode_png_rgb(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
+        let pixels = solid(width, height, 3, &color);
         let mut out = Vec::new();
-        let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
         image::ImageEncoder::write_image(
-            encoder,
+            image::codecs::png::PngEncoder::new(&mut out),
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("png rgb encode");
+        out
+    }
+
+    fn encode_png_gray(width: u32, height: u32, luma: u8) -> Vec<u8> {
+        let pixels = solid(width, height, 1, &[luma]);
+        let mut out = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut out),
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::L8,
+        )
+        .expect("png gray encode");
+        out
+    }
+
+    fn encode_png_gray_alpha(width: u32, height: u32, color: [u8; 2]) -> Vec<u8> {
+        let pixels = solid(width, height, 2, &color);
+        let mut out = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut out),
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::La8,
+        )
+        .expect("png gray-alpha encode");
+        out
+    }
+
+    fn encode_webp_lossless(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let pixels = solid(width, height, 4, &color);
+        let mut out = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::webp::WebPEncoder::new_lossless(&mut out),
             &pixels,
             width,
             height,
@@ -1372,6 +1681,33 @@ mod tests {
         assert_eq!(header.format, BackgroundFormat::WebP);
         assert_eq!((header.width, header.height), (6, 7));
         assert!(decode_background(&webp).is_ok());
+    }
+
+    #[test]
+    fn native_channel_expansion_matches_rgba8() {
+        // Every accepted 8-bit native decoder layout must expand to
+        // straight-alpha RGBA8: L8, La8, Rgb8, and Rgba8.
+        let gray = encode_png_gray(2, 1, 0x40);
+        let image = decode_background(&gray).expect("gray decode");
+        assert_eq!(
+            image.rgba(),
+            &[0x40, 0x40, 0x40, 0xFF, 0x40, 0x40, 0x40, 0xFF]
+        );
+
+        let gray_alpha = encode_png_gray_alpha(1, 1, [0x20, 0x80]);
+        let image = decode_background(&gray_alpha).expect("gray+alpha decode");
+        assert_eq!(image.rgba(), &[0x20, 0x20, 0x20, 0x80]);
+
+        let rgb = encode_png_rgb(2, 1, [0x11, 0x22, 0x33]);
+        let image = decode_background(&rgb).expect("rgb decode");
+        assert_eq!(
+            image.rgba(),
+            &[0x11, 0x22, 0x33, 0xFF, 0x11, 0x22, 0x33, 0xFF]
+        );
+
+        let rgba = encode_png(1, 1, [0x01, 0x02, 0x03, 0x04]);
+        let image = decode_background(&rgba).expect("rgba decode");
+        assert_eq!(image.rgba(), &[0x01, 0x02, 0x03, 0x04]);
     }
 
     #[test]
@@ -1416,6 +1752,23 @@ mod tests {
             let header = sniff_image(&png).expect("sub-8-bit sniff");
             assert_eq!(header.format, BackgroundFormat::Png);
             assert_eq!((header.width, header.height), (2, 1));
+        }
+    }
+
+    #[test]
+    fn invalid_png_bit_depth_rejected_at_sniff() {
+        // PNG permits only sample depths 1, 2, 4, 8, and 16; 16 is already
+        // rejected as unsupported, and an out-of-set depth such as 3 must fail
+        // closed at sniff instead of reaching the decoder.
+        for depth in [3u8, 5, 6, 7, 9, 0] {
+            let png = png_header_with_bit_depth(depth);
+            assert!(
+                matches!(
+                    sniff_image(&png),
+                    Err(BackgroundError::UnsupportedFormat { detail }) if detail.contains("bit depth")
+                ),
+                "depth {depth} must be rejected at sniff"
+            );
         }
     }
 
@@ -1485,6 +1838,217 @@ mod tests {
             sniff_image(&animated),
             Err(BackgroundError::Animated { format: "WebP" })
         ));
+    }
+
+    /// Builds a JPEG marker stream with one SOF segment and the given
+    /// `(horizontal, vertical)` sampling factors.
+    fn jpeg_with_sof(marker: u8, components: &[(u8, u8)]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, marker];
+        let seg_len = 2 + 6 + 3 * components.len();
+        bytes.extend_from_slice(&(seg_len as u16).to_be_bytes());
+        bytes.push(8);
+        bytes.extend_from_slice(&2u16.to_be_bytes());
+        bytes.extend_from_slice(&3u16.to_be_bytes());
+        bytes.push(components.len() as u8);
+        for (index, (horizontal, vertical)) in components.iter().enumerate() {
+            bytes.push(index as u8 + 1);
+            bytes.push((horizontal << 4) | vertical);
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn progressive_jpeg_charge_follows_coefficient_store() {
+        // 4:2:0: sum(h*v)=6 over a 2x2 MCU -> 2*ceil(6/4)=4 extra -> 8.
+        let h420 = jpeg_with_sof(0xC2, &[(2, 2), (1, 1), (1, 1)]);
+        assert_eq!(sniff_image(&h420).expect("420").peak_bytes_per_pixel, 8);
+        // 4:4:4: sum=3 -> 2*3=6 extra -> 10.
+        let h444 = jpeg_with_sof(0xC2, &[(1, 1), (1, 1), (1, 1)]);
+        assert_eq!(sniff_image(&h444).expect("444").peak_bytes_per_pixel, 10);
+        // 4:2:2: sum=4 over a 2x1 MCU -> 4 extra -> 8.
+        let h422 = jpeg_with_sof(0xC2, &[(2, 1), (1, 1), (1, 1)]);
+        assert_eq!(sniff_image(&h422).expect("422").peak_bytes_per_pixel, 8);
+        // Grayscale: sum=1 -> 2 extra -> 6, floored to 8 for the unchanged
+        // 4:2:0/4:4:4-and-below acceptance rule.
+        let gray = jpeg_with_sof(0xC2, &[(1, 1)]);
+        assert_eq!(sniff_image(&gray).expect("gray").peak_bytes_per_pixel, 8);
+        // Four full-resolution components -> 8 extra -> 12.
+        let cmyk = jpeg_with_sof(0xC2, &[(1, 1), (1, 1), (1, 1), (1, 1)]);
+        assert_eq!(sniff_image(&cmyk).expect("cmyk").peak_bytes_per_pixel, 12);
+        // Baseline and extended sequential keep the single-buffer charge.
+        for marker in [0xC0u8, 0xC1] {
+            let sequential = jpeg_with_sof(marker, &[(2, 2), (1, 1), (1, 1)]);
+            assert_eq!(
+                sniff_image(&sequential)
+                    .expect("sequential")
+                    .peak_bytes_per_pixel,
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_jpeg_rejects_malformed_component_table() {
+        // No components at all.
+        let zero = jpeg_with_sof(0xC2, &[]);
+        assert!(matches!(
+            sniff_image(&zero),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // More components than the decoder can hold.
+        let five = jpeg_with_sof(0xC2, &[(1, 1); 5]);
+        assert!(matches!(
+            sniff_image(&five),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // Zero sampling factor.
+        let zero_sampling = jpeg_with_sof(0xC2, &[(0, 1), (1, 1), (1, 1)]);
+        assert!(matches!(
+            sniff_image(&zero_sampling),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // Sampling factor above the JPEG maximum of four.
+        let over_sampling = jpeg_with_sof(0xC2, &[(1, 5), (1, 1), (1, 1)]);
+        assert!(matches!(
+            sniff_image(&over_sampling),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // A declared component count that does not fit the segment length.
+        let mut truncated = jpeg_with_sof(0xC2, &[(1, 1), (1, 1), (1, 1)]);
+        truncated[4..6].copy_from_slice(&8u16.to_be_bytes());
+        assert!(matches!(
+            sniff_image(&truncated),
+            Err(BackgroundError::Malformed { .. })
+        ));
+    }
+
+    /// Builds a static `VP8X` container with the given flags and payload
+    /// chunks.
+    fn webp_with_vp8x(flags: u8, chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WEBP");
+
+        let mut vp8x = vec![flags];
+        vp8x.extend_from_slice(&[0; 3]);
+        vp8x.extend_from_slice(&15u32.to_le_bytes()[..3]);
+        vp8x.extend_from_slice(&15u32.to_le_bytes()[..3]);
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&(vp8x.len() as u32).to_le_bytes());
+        body.extend_from_slice(&vp8x);
+
+        for (tag, payload) in chunks {
+            body.extend_from_slice(*tag);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn vp8x_lossy_alpha_charges_alpha_scratch() {
+        let alpha = [0x01u8];
+        let vp8 = [0x00u8; 10];
+        let vp8l = [0x2Fu8; 5];
+        // Lossy VP8 plus an ALPH chunk: image-webp allocates a full-size RGBA
+        // scratch and a green buffer for the alpha plane.
+        let lossy_alpha = webp_with_vp8x(0x10, &[(b"ALPH", &alpha), (b"VP8 ", &vp8)]);
+        assert_eq!(
+            sniff_image(&lossy_alpha)
+                .expect("lossy alpha")
+                .peak_bytes_per_pixel,
+            11
+        );
+        // Lossy VP8 without alpha keeps the conservative 8.
+        let lossy = webp_with_vp8x(0x00, &[(b"VP8 ", &vp8)]);
+        assert_eq!(sniff_image(&lossy).expect("lossy").peak_bytes_per_pixel, 8);
+        // Lossless VP8L keeps the conservative 8 even with an ALPH chunk.
+        let lossless_alpha = webp_with_vp8x(0x10, &[(b"ALPH", &alpha), (b"VP8L", &vp8l)]);
+        assert_eq!(
+            sniff_image(&lossless_alpha)
+                .expect("lossless alpha")
+                .peak_bytes_per_pixel,
+            8
+        );
+        // Metadata chunks before the image data do not disturb the walk.
+        let with_iccp =
+            webp_with_vp8x(0x10, &[(b"ICCP", &vp8), (b"ALPH", &alpha), (b"VP8 ", &vp8)]);
+        assert_eq!(
+            sniff_image(&with_iccp)
+                .expect("iccp lossy alpha")
+                .peak_bytes_per_pixel,
+            11
+        );
+    }
+
+    #[test]
+    fn vp8x_malformed_chunk_walk_fails_closed() {
+        let mut overrun = webp_with_vp8x(0x00, &[(b"ALPH", &[0x01u8])]);
+        // The ALPH chunk starts at 30; an impossible length must be refused
+        // instead of silently charging the cheaper profile.
+        overrun[34..38].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            sniff_image(&overrun),
+            Err(BackgroundError::Malformed { .. })
+        ));
+
+        let anim = webp_with_vp8x(0x00, &[(b"ANIM", &[0; 6])]);
+        assert!(matches!(
+            sniff_image(&anim),
+            Err(BackgroundError::Animated { format: "WebP" })
+        ));
+
+        // A declared RIFF size that ends before the trailing `VP8 ` chunk used
+        // to stop the walk early (charge 8) while `image-webp`'s ten-byte
+        // wider `max_position` still decoded it as lossy-alpha. The declared
+        // size must cover the chunk sequence: ALPH data ends at 39, its pad
+        // ends the next position, and `VP8 ` spans 40..58, so every declared
+        // size in 31..=39 hides the chunk from a bounded walk and must fail
+        // closed instead.
+        let lossy_alpha = webp_with_vp8x(0x10, &[(b"ALPH", &[0x01u8]), (b"VP8 ", &[0u8; 10])]);
+        assert_eq!(lossy_alpha.len(), 58);
+        for declared in [31u32, 32, 39] {
+            let mut patched = lossy_alpha.clone();
+            patched[4..8].copy_from_slice(&declared.to_le_bytes());
+            assert!(
+                matches!(
+                    sniff_image(&patched),
+                    Err(BackgroundError::Malformed { .. })
+                ),
+                "declared {declared}: chunk crossing the declared end must fail closed"
+            );
+        }
+        // A declared size shorter than the VP8X header chunk itself is
+        // rejected instead of being trusted.
+        let mut shrunken = webp_with_vp8x(0x00, &[]);
+        shrunken[4..8].copy_from_slice(&10u32.to_le_bytes());
+        assert!(matches!(
+            sniff_image(&shrunken),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // Trailing bytes past the declared container that parse as a chunk
+        // are rejected too, not silently ignored.
+        let mut trailing = lossy_alpha.clone();
+        trailing.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            sniff_image(&trailing),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        // The unmodified container still charges the lossy-alpha profile.
+        assert_eq!(
+            sniff_image(&lossy_alpha)
+                .expect("lossy alpha")
+                .peak_bytes_per_pixel,
+            11
+        );
     }
 
     #[test]

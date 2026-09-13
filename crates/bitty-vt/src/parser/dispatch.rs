@@ -8,9 +8,9 @@ use super::sgr::parse_sgr;
 use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, Mode, MouseCoordinateEncoding,
-    MouseTrackingMode, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
-    UnrecognizedSequence, ZoneKind,
+    DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
+    Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, Row, SequenceKind, StatusKind,
+    TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -79,6 +79,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
                 MouseCoordinateEncoding::Urxvt,
             )),
             2004 => Some(Mode::BracketedPaste),
+            2026 => Some(Mode::SynchronizedUpdate),
             7727 => {
                 let flags = if enabled {
                     Self::kitty_flags_from_sub(sub)
@@ -163,6 +164,79 @@ fn join_segments(params: &[&[u8]]) -> Vec<u8> {
         joined.extend_from_slice(segment);
     }
     joined
+}
+
+/// Parses an `OSC 10`/`OSC 11` payload segment list (CTX-0381).
+///
+/// Accepted shapes (exactly one payload segment): `?` (query), `#RGB`,
+/// `#RRGGBB`, and `rgb:R/G/B` with 1-4 hex digits per component. Everything
+/// else (empty payload, extra segments, wrong component count, non-hex
+/// digits, unknown prefixes) returns `None` so the caller records it as
+/// inert. The input is already length-bounded by the parser's OSC collector.
+fn parse_dynamic_color(rest: &[&[u8]]) -> Option<DynamicColorOp> {
+    let [payload] = rest else {
+        return None;
+    };
+    if *payload == b"?" {
+        return Some(DynamicColorOp::Query);
+    }
+    parse_dynamic_color_spec(payload).map(DynamicColorOp::Set)
+}
+
+/// Parses a color spec into 8-bit RGB; see [`parse_dynamic_color`].
+fn parse_dynamic_color_spec(payload: &[u8]) -> Option<Rgb> {
+    if let Some(hex) = payload.strip_prefix(b"#") {
+        return match hex.len() {
+            3 => Some(Rgb {
+                r: scale_hex_component(&hex[0..1])?,
+                g: scale_hex_component(&hex[1..2])?,
+                b: scale_hex_component(&hex[2..3])?,
+            }),
+            6 => Some(Rgb {
+                r: scale_hex_component(&hex[0..2])?,
+                g: scale_hex_component(&hex[2..4])?,
+                b: scale_hex_component(&hex[4..6])?,
+            }),
+            _ => None,
+        };
+    }
+    let rgb = payload.strip_prefix(b"rgb:")?;
+    let mut parts = rgb.split(|&byte| byte == b'/');
+    let r = scale_hex_component(parts.next()?)?;
+    let g = scale_hex_component(parts.next()?)?;
+    let b = scale_hex_component(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Rgb { r, g, b })
+}
+
+/// Scales 1-4 hex digits to a full 8-bit channel: narrow values are
+/// left-aligned, so `f` -> 0xFF, `0f` -> 0x0F, and `ffff` -> 0xFF.
+fn scale_hex_component(digits: &[u8]) -> Option<u8> {
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let mut value: u16 = 0;
+    for &digit in digits {
+        value = (value << 4) | u16::from(hex_digit(digit)?);
+    }
+    let scaled = match digits.len() {
+        1 => value * 0x11,
+        2 => value,
+        3 => value >> 4,
+        _ => value >> 8,
+    };
+    Some(scaled as u8)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
@@ -525,6 +599,25 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                 self.emit(TerminalAction::OscTitle {
                     text: BoundedString::new(text),
                 });
+            }
+            10 | 11 => {
+                let target = if id == 10 {
+                    DynamicColorTarget::Foreground
+                } else {
+                    DynamicColorTarget::Background
+                };
+                match parse_dynamic_color(rest) {
+                    Some(op) => self.emit(TerminalAction::OscDynamicColor { target, op }),
+                    // Malformed payloads fail closed: no query, no set; the
+                    // sequence is recorded as inert telemetry only.
+                    None => {
+                        let data = join_segments(rest);
+                        self.emit(TerminalAction::OscUnknown {
+                            id,
+                            data: BoundedBytes::new(data),
+                        });
+                    }
+                }
             }
             7 => {
                 let joined = join_segments(rest);

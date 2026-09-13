@@ -192,6 +192,15 @@ impl WindowHandle {
         self.id
     }
 
+    /// Sets the OS window title (CTX-0382).
+    ///
+    /// Wraps winit's `Window::set_title`. Callers pass an already-sanitized,
+    /// bounded string (see the app-side title sanitizer) so untrusted PTY
+    /// output cannot inject control sequences into the titlebar.
+    pub fn set_title(&self, title: &str) {
+        self.window.set_title(title);
+    }
+
     /// Schedules a redraw request delivery for this window.
     ///
     /// The application observes it as

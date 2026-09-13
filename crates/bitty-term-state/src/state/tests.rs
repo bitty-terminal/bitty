@@ -359,6 +359,25 @@ fn full_reset_restores_initial_truth() {
 }
 
 #[test]
+fn synchronized_update_mode_is_tracked_and_nested_begins_end_once() {
+    let mut s = State::new();
+    assert!(!s.modes().synchronized_update, "off at power-on");
+    // Nested begins are idempotent mode sets; one reset ends the batch.
+    for enabled in [true, true, false] {
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::SynchronizedUpdate,
+            enabled,
+        });
+    }
+    assert!(!s.modes().synchronized_update);
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::SynchronizedUpdate,
+        enabled: true,
+    });
+    assert!(s.modes().synchronized_update);
+}
+
+#[test]
 fn sgr_reset_clears_pen_colors_for_bce_blanks() {
     let mut s = State::new();
     s.apply(&TerminalAction::SetAttributes {

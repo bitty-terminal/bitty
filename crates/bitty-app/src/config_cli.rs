@@ -1227,6 +1227,10 @@ pub(crate) fn runtime_config_from_effective(
         // config so the default-path renderer and clear color follow
         // `appearance.theme` instead of the hardcoded Bitty Dark fallback.
         cfg.theme = bitty_runtime::ThemePalette::from_theme(theme);
+        // CTX-0381: mark the palette as user-resolved so OSC 10/11 queries
+        // are answered from it; headless/unit configs keep the false default
+        // and stay silent (no reply before theme resolution).
+        cfg.theme_resolved = true;
         // RFC-0002 (CTX-0341): map the resolved effective animation contract
         // onto the runtime policy. Durations are already bounded by
         // `bitty-config` (fail-closed `0..=500`); `spring` was already mapped

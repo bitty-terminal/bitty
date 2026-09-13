@@ -505,6 +505,32 @@ impl Runtime {
                     }
                 }
             }
+            // OSC 10/11 dynamic default colors (CTX-0381): the parser already
+            // classified and bounded the payload (malformed forms never reach
+            // this arm). Queries are answered from the resolved palette only
+            // — no reply before theme resolution — and sets are
+            // capability-gated (default deny) like OSC 52 writes.
+            if let TerminalAction::OscDynamicColor { target, op } = &action {
+                match op {
+                    DynamicColorOp::Query => {
+                        if self.config.theme_resolved {
+                            let color = match target {
+                                DynamicColorTarget::Foreground => self.active_foreground(),
+                                DynamicColorTarget::Background => self.active_background(),
+                            };
+                            let reply = crate::queries::osc_color_reply(*target, color);
+                            self.state.apply(&TerminalAction::Reply {
+                                bytes: reply.into_boxed_slice(),
+                            });
+                        }
+                    }
+                    DynamicColorOp::Set(rgb) => {
+                        if self.osc_color_set_allowed {
+                            self.apply_osc_color(*target, [rgb.r, rgb.g, rgb.b]);
+                        }
+                    }
+                }
+            }
             // Kitty graphics (CTX-0256): the parser already base64-unwrapped
             // and reassembled `m=` chunks under the ledger cap, so `payload`
             // is decoded bytes ready for the existing intake seam. Route to

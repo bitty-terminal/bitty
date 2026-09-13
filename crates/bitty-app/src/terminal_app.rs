@@ -26,6 +26,28 @@ pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
     format!("bitty \u{2014} Correct Terminal \u{2014} {theme_name} ({source})")
 }
 
+/// Maximum number of characters kept from a terminal-reported window title
+/// (CTX-0382).
+///
+/// The parser already bounds the OSC payload at 4 KiB; a titlebar needs far
+/// less, so the app clips here before the OS ever sees the string.
+pub(crate) const WINDOW_TITLE_MAX_CHARS: usize = 256;
+
+/// Strips control characters from a terminal-reported title (CTX-0382) and
+/// bounds it to [`WINDOW_TITLE_MAX_CHARS`].
+///
+/// Untrusted PTY output must never inject escape sequences or control
+/// characters into the OS titlebar: every control scalar (C0, DEL, C1 —
+/// including ESC and the C1 CSI/ST bytes) is dropped. The remaining text is
+/// truncated on a character boundary, so the result is always a safe,
+/// printable prefix.
+pub(crate) fn sanitize_window_title(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .take(WINDOW_TITLE_MAX_CHARS)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // App handler
 // ---------------------------------------------------------------------------
@@ -62,6 +84,13 @@ pub(crate) struct TerminalApp {
     pub(crate) _pty_thread: Option<JoinHandle<()>>,
     /// Count of `tick` calls that presented a frame.
     pub(crate) presented_frames: u64,
+    /// Last OS window title applied from `ColdEvent::TitleChanged`
+    /// (CTX-0382). `None` until the first OSC 0/2 arrives; the change gate
+    /// keeps identical titles from churning the titlebar.
+    pub(crate) last_applied_title: Option<String>,
+    /// Count of sanitized title applications (CTX-0382 diagnostics): stays
+    /// at one per distinct title, proving no per-frame churn.
+    pub(crate) title_applies: u64,
     /// Resolved keymap table (shipped defaults + user overrides).
     pub(crate) keymaps: Vec<bitty_config::ResolvedKeymap>,
     /// App-side modifier mirror for chord matching.
@@ -110,6 +139,8 @@ impl TerminalApp {
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
+            last_applied_title: None,
+            title_applies: 0,
             keymaps,
             app_mods: AppModifiers::default(),
             chrome_held: HashSet::new(),
@@ -144,6 +175,8 @@ impl TerminalApp {
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
+            last_applied_title: None,
+            title_applies: 0,
             keymaps,
             app_mods: AppModifiers::default(),
             chrome_held: HashSet::new(),
@@ -314,6 +347,12 @@ impl TerminalApp {
         // scope enforcement (never ambient authority).
         let _ =
             ctl::drain_global_control_queue(&mut self.runtime, &ctl::granted_scopes_for_servo());
+        // CTX-0382: drain cold-path events on every tick — including
+        // deferred (synchronized update) and idle ticks — because a title
+        // change produces no grid damage and would otherwise sit in the
+        // bounded queue until unrelated output arrived. Title application
+        // is sanitized and change-gated; the other events stay telemetry.
+        self.apply_cold_events();
         // Ensure replies that were queued before tick are flushed before present:
         // the runtime's tick consumes snapshot+damage and composites.
         let stats = self.runtime.tick();
@@ -347,21 +386,52 @@ impl TerminalApp {
                     "bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)"
                 );
             }
-            let pending = self.runtime.cold_queue_len();
-            if pending > 0 && self.tick_logging_enabled() {
-                let events = self.runtime.drain_cold_events();
-                eprintln!(
-                    "bitty cold-queue: drained {} events, {} remain",
-                    events.len(),
-                    pending
-                );
-            } else if pending > 0 {
-                // Quiet default still drains to keep the queue bounded, but
-                // stays silent: no per-tick stderr noise.
-                let _ = self.runtime.drain_cold_events();
-            }
         }
         stats
+    }
+
+    /// Drains cold-path events and applies the ones the app owns (CTX-0382).
+    ///
+    /// Bounded: one pass over at most the runtime's cold-queue capacity.
+    /// Only `TitleChanged` has an app-side effect; the rest stays plugin
+    /// telemetry (already bridged by the runtime).
+    pub(crate) fn apply_cold_events(&mut self) {
+        let events = self.runtime.drain_cold_events();
+        if events.is_empty() {
+            return;
+        }
+        if self.tick_logging_enabled() {
+            eprintln!("bitty cold-queue: drained {} events", events.len());
+        }
+        for event in events {
+            if let bitty_runtime::ColdEvent::TitleChanged(raw) = event {
+                self.apply_window_title(&raw);
+            }
+        }
+    }
+
+    /// Applies a sanitized, change-gated title to the OS window (CTX-0382).
+    ///
+    /// An empty sanitized title resets to the static theme title (matching
+    /// xterm's reset-to-default behavior). Identical titles are dropped so
+    /// the titlebar never churns per frame; `title_applies` counts real
+    /// applications. No-op without a window (headless CI), but the applied
+    /// title is still recorded so tests can observe the path end to end.
+    pub(crate) fn apply_window_title(&mut self, raw: &str) {
+        let sanitized = sanitize_window_title(raw);
+        let title = if sanitized.is_empty() {
+            self.window_title.clone()
+        } else {
+            sanitized
+        };
+        if self.last_applied_title.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        self.last_applied_title = Some(title.clone());
+        self.title_applies += 1;
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(&title);
+        }
     }
 
     /// Attempts to attach a real GPU surface after window creation (single-window slice).

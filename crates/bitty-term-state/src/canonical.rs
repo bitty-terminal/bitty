@@ -26,7 +26,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v4 adds soft-wrap continuation flags (`CTX-0266` reflow): grid `wraps`
 /// plus scrollback `wrapped`. Prior versions omitted them, so states
 /// differing only in wrap continuation collided and reflow was not replayable.
-pub const CANONICAL_HASH_VERSION: u32 = 4;
+/// v5 adds the synchronized-update mode (`CTX-0380` `DECSET 2026`): prior
+/// versions omitted it, so states differing only in the presentation
+/// deferral flag collided.
+pub const CANONICAL_HASH_VERSION: u32 = 5;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -190,6 +193,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 4);
+        assert_eq!(CANONICAL_HASH_VERSION, 5);
     }
 }

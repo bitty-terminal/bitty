@@ -5,7 +5,10 @@
 //! `super::*` became explicit imports and the private `layout` field
 //! reads became the public `layout()` getter (identical semantics).
 use bitty_platform::PlatformEvent;
-use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    LayoutNode, Runtime, RuntimeConfig, SYNC_UPDATE_DEFER_TIMEOUT, SplitAxis, UiRect, View, ViewId,
+};
+use std::time::{Duration, Instant};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -287,4 +290,75 @@ fn windows_build_still_compiles_with_queue_and_tick() {
     rt.handle_pty_bytes(b"hi");
     let _ = rt.tick();
     assert!(rt.is_headless());
+}
+
+// ---------------------------------------------------------------------------
+// CTX-0380: DECSET 2026 synchronized updates defer presentation, bounded.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn synchronized_update_defers_frames_and_commits_on_exit() {
+    let mut rt = make_runtime();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    let t0 = Instant::now();
+    rt.handle_pty_bytes(b"\x1b[?2026hfirst");
+    assert!(rt.synchronized_update_active());
+    assert!(
+        rt.tick_at(t0).is_none(),
+        "frame must defer while synchronized updates are active"
+    );
+    rt.handle_pty_bytes(b"second\x1b[?2026l");
+    assert!(!rt.synchronized_update_active());
+    let stats = rt
+        .tick_at(t0 + Duration::from_millis(5))
+        .expect("mode exit commits the batched frame");
+    assert!(stats.glyphs > 0);
+    assert!(
+        rt.tick_at(t0 + Duration::from_millis(10)).is_none(),
+        "after the commit the path returns to idle"
+    );
+}
+
+#[test]
+fn synchronized_update_timeout_commits_without_exit() {
+    let mut rt = make_runtime();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    let t0 = Instant::now();
+    rt.handle_pty_bytes(b"\x1b[?2026hhung");
+    assert!(rt.tick_at(t0).is_none(), "deferred inside the bound");
+    assert!(
+        rt.tick_at(t0 + SYNC_UPDATE_DEFER_TIMEOUT / 2).is_none(),
+        "still deferred before the bound"
+    );
+    let stats = rt
+        .tick_at(t0 + SYNC_UPDATE_DEFER_TIMEOUT + Duration::from_millis(1))
+        .expect("hung process must not stall presentation past the bound");
+    assert!(stats.glyphs > 0);
+    // The mode stays exactly as the application set it (no silent reset),
+    // and fresh damage inside the next window defers again.
+    assert!(rt.synchronized_update_active());
+    rt.handle_pty_bytes(b"more");
+    assert!(
+        rt.tick_at(t0 + SYNC_UPDATE_DEFER_TIMEOUT + Duration::from_millis(2))
+            .is_none(),
+        "a still-active mode opens a fresh bounded window"
+    );
+}
+
+#[test]
+fn synchronized_update_nested_begins_end_with_one_reset() {
+    let mut rt = make_runtime();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    let t0 = Instant::now();
+    rt.handle_pty_bytes(b"\x1b[?2026h\x1b[?2026ha");
+    assert!(rt.tick_at(t0).is_none(), "nested begin still defers");
+    rt.handle_pty_bytes(b"\x1b[?2026l");
+    assert!(
+        !rt.synchronized_update_active(),
+        "one reset ends nested begins"
+    );
+    assert!(
+        rt.tick_at(t0 + Duration::from_millis(1)).is_some(),
+        "the reset commits the batch"
+    );
 }

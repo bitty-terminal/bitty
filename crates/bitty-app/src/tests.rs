@@ -1811,9 +1811,11 @@ fn runtime_config_inherits_file_outline_width() {
 /// Synthetic platform-absolute path for config-mapping tests: a drive path
 /// on Windows, a `/`-rooted path elsewhere. `bitty-config` validates
 /// "absolute" with `Path::is_absolute()`, which is platform-specific.
+/// Windows paths use forward slashes so the value is also a valid Lua
+/// string literal (backslashes would be escape sequences).
 fn synthetic_abs(rel: &str) -> String {
     if cfg!(windows) {
-        format!("C:\\{}", rel.replace('/', "\\"))
+        format!("C:/{rel}")
     } else {
         format!("/{rel}")
     }

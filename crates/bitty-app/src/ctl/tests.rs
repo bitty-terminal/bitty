@@ -470,13 +470,13 @@ fn control_send_to_unfocused_is_conflict() {
 }
 
 #[test]
-fn control_terminal_text_sessionless_split_owner_parity() {
-    // CTX-0359 (replaces the CTX-0284 focused-follow oracle): `ctl view
-    // split` is layout-only (no pane shell), so v:1 is the primary owner and
-    // v:2 is session-less. The owner returns the primary text; v:2 stays
-    // empty and focus never moves the mirror between tiles (pre-fix the
-    // focused session-less leaf returned the v:1 shell's text). CTX-0364:
-    // the split itself now focuses v:2, which must not change ownership.
+fn control_terminal_text_split_owns_its_grid_not_primary() {
+    // CTX-0359 ownership rule, CTX-0387 updated shape: the primary grid is
+    // painted only through its owner leaf (v:1). A ctl split now gives v:2
+    // its own shell (Issue #643), so v:2 owns an independent, initially
+    // empty grid — it must never mirror the primary, and focus never moves
+    // the mirror between tiles. The session-less non-owner shape stays
+    // covered by the bitty-runtime present/input tests.
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     // Seed the primary grid so the mirrored text is observable (a fresh grid
@@ -511,8 +511,12 @@ fn control_terminal_text_sessionless_split_owner_parity() {
     let t2_text = extract_string_from(&t2.result_json, "text").expect("t:2 text field");
     assert_eq!(t1_text, expected, "primary owner mirrors the primary grid");
     assert!(
-        t2_text.is_empty(),
-        "session-less non-owner stays empty, got {t2_text:?}"
+        t2_text.trim().is_empty(),
+        "split pane renders its own blank grid, not the primary: {t2_text:?}"
+    );
+    assert!(
+        !t2_text.contains("parity-probe"),
+        "split pane must never mirror the primary text: {t2_text:?}"
     );
     // Refocus v:1: ownership is focus-independent, so the mirror is
     // unchanged (the non-owner never paints the primary).
@@ -540,16 +544,19 @@ fn control_terminal_text_sessionless_split_owner_parity() {
         "v:1 primary owner keeps primary after refocus"
     );
     assert!(
-        t2b_text.is_empty(),
-        "v:2 non-owner stays empty after refocus, got {t2b_text:?}"
+        t2b_text.trim().is_empty(),
+        "v:2 never mirrors the primary after refocus: {t2b_text:?}"
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn control_terminal_list_reports_session_presence() {
-    // CTX-0284: layout-derived t:N entries must not imply shells that may
-    // not exist (ctl splits spawn no shell). Each entry reports whether a
-    // live pane session backs it.
+    // CTX-0284 + CTX-0387: layout-derived t:N entries must not imply shells
+    // that may not exist, so each entry reports whether a live pane session
+    // backs it. The primary leaf has no pane session (its grid is the
+    // runtime-global primary); the ctl split leaf now owns one (Issue #643).
+    bitty_test_support::require_pty!();
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
@@ -558,13 +565,17 @@ fn control_terminal_list_reports_session_presence() {
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &cli);
     assert!(terms.ok, "terminal list must succeed: {terms:?}");
     assert!(
-        terms.result_json.contains("t:1") && terms.result_json.contains("t:2"),
-        "both leaves listed: {}",
+        terms
+            .result_json
+            .contains("{\"id\":\"t:1\",\"has_pane_session\":false}"),
+        "primary leaf stays session-less: {}",
         terms.result_json
     );
     assert!(
-        terms.result_json.contains("\"has_pane_session\":false"),
-        "session-less leaves must report no session: {}",
+        terms
+            .result_json
+            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
+        "split leaf must report its live session: {}",
         terms.result_json
     );
 }
@@ -646,13 +657,119 @@ fn control_view_split_focuses_new_view() {
 
 #[cfg(unix)]
 #[test]
+fn control_view_split_spawns_own_shell_and_accepts_input() {
+    // CTX-0387 / Issue #643: `ctl view split` used to commit a session-less
+    // leaf that swallowed input. It must create a pane with a shell of its
+    // own (PID) and route focused input to it, like the keymap new_split.
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let mut rt = headless_runtime();
+    // The primary attaches `cat` so the recorded recipe replays a pane that
+    // echoes focused input deterministically.
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "cat"])
+        .expect("primary shell must attach headless");
+    let all = bitty_ipc::ScopeSet::all();
+    let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &all);
+    assert!(done.ok, "split must succeed: {done:?}");
+    let new_view = ViewId::new(2);
+    assert!(
+        rt.has_pane_session(&new_view),
+        "ctl split leaf must own a live pane session"
+    );
+    let new_pid = rt
+        .pane_pid(&new_view)
+        .expect("ctl split leaf must report its own shell pid");
+    assert!(new_pid > 0, "shell pid must be live");
+    assert_eq!(
+        rt.focused_view(),
+        Some(new_view),
+        "ctl split must focus the fresh pane"
+    );
+    // Focused input reaches v:2's own shell (cat echoes it onto v:2's grid).
+    let send = ipc_ctl::params_send_input("t:2", "ctl-split-input\n");
+    let sent = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&send), &all);
+    assert!(sent.ok, "send to focused t:2 must succeed: {sent:?}");
+    assert!(
+        wait_for_pane_text(&mut rt, new_view, "ctl-split-input"),
+        "typed bytes must land on the split pane's own grid"
+    );
+    // `terminal list` agrees: t:2 is backed by a live session.
+    let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
+    assert!(terms.ok, "terminal list: {terms:?}");
+    assert!(
+        terms
+            .result_json
+            .contains("{\"id\":\"t:2\",\"has_pane_session\":true}"),
+        "t:2 must report a live session: {}",
+        terms.result_json
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn control_view_split_matches_keymap_new_split() {
+    // CTX-0387 parity: the ctl split verb routes through the same
+    // `spawn_pane_shell` creation path as the keymap `NewSplit` action. Each
+    // path's fresh pane owns a distinct child and takes focus.
+    use crate::spawn::SpawnSpec;
+    use crate::terminal_app::TerminalApp;
+    use bitty_config::{ChromeAction, SplitDir};
+    use bitty_runtime::ViewId;
+    bitty_test_support::require_pty!();
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let mut rt = headless_runtime();
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "cat"])
+        .expect("primary shell must attach headless");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    // Keymap path: v:2 owns a shell and is focused.
+    app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+    let key_view = ViewId::new(2);
+    assert!(
+        app.runtime.has_pane_session(&key_view),
+        "keymap split must own a shell"
+    );
+    assert_eq!(app.runtime.focused_view(), Some(key_view));
+    let key_pid = app.runtime.pane_pid(&key_view).expect("keymap pane pid");
+    // Ctl path on the same runtime: v:3 owns its own child and is focused.
+    let all = bitty_ipc::ScopeSet::all();
+    let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+    let done = apply_control_envelope(
+        &mut app.runtime,
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        Some(&split),
+        &all,
+    );
+    assert!(done.ok, "ctl split must succeed: {done:?}");
+    let ctl_view = ViewId::new(3);
+    assert!(
+        app.runtime.has_pane_session(&ctl_view),
+        "ctl split must own a shell"
+    );
+    assert_eq!(app.runtime.focused_view(), Some(ctl_view));
+    let ctl_pid = app.runtime.pane_pid(&ctl_view).expect("ctl split pane pid");
+    assert_ne!(key_pid, ctl_pid, "each split owns its own child");
+    // Both creation paths keep the canonical side-by-side axis.
+    assert_side_by_side(&app.runtime, 1, 2, "keymap split Right");
+    assert_side_by_side(&app.runtime, 2, 3, "ctl split Right");
+}
+
+#[cfg(unix)]
+#[test]
 fn control_view_split_after_workspace_new_keeps_shells_isolated() {
     // CTX-0378 / Issue #627: `workspace new` creates ws2 (v:2) with a
     // replayed shell of its own. A split back in ws1 used to allocate v:2
     // from ws1's `max + 1`; `pane_sessions` is keyed globally by `ViewId`,
     // so the split pane aliased ws2's shell (content mirror + input bleed).
-    // The id must come from the global allocator: v:3, leaving ws2's session
-    // untouched and the new leaf session-less (ctl splits spawn no shell).
+    // The id must come from the global allocator: v:3, with its own replayed
+    // shell (CTX-0387), leaving ws2's session untouched.
     use bitty_runtime::ViewId;
     bitty_test_support::require_pty!();
     let mut rt = headless_runtime();
@@ -684,27 +801,35 @@ fn control_view_split_after_workspace_new_keeps_shells_isolated() {
     );
     assert_eq!(rt.focused_view(), Some(ViewId::new(3)));
 
-    // ws2's shell survives untouched and the fresh leaf owns no session, so
-    // it can neither paint nor feed ws2's shell.
+    // ws2's shell survives untouched and the fresh leaf owns its own
+    // distinct shell, so it can neither paint nor feed ws2's shell.
     assert_eq!(
         rt.pane_pid(&ws2_view),
         Some(ws2_pid),
         "ws2 shell must not be replaced by the ws1 split"
     );
     assert!(rt.has_pane_session(&ws2_view), "ws2 session stays live");
+    let split_view = ViewId::new(3);
     assert!(
-        !rt.has_pane_session(&ViewId::new(3)),
-        "the ctl split leaf must not alias any pane session"
+        rt.has_pane_session(&split_view),
+        "the ctl split leaf must own its own pane session"
+    );
+    let split_pid = rt
+        .pane_pid(&split_view)
+        .expect("the ctl split leaf must report its own pid");
+    assert_ne!(
+        split_pid, ws2_pid,
+        "the split shell must be a distinct child, never ws2's"
     );
     // The active-workspace terminal list only shows ws1's leaves; the split
-    // leaf must be session-less (before the fix it aliased ws2's t:2).
+    // leaf reports its own live session (before the fix it aliased ws2's t:2).
     let terms = apply_control_envelope(&mut rt, ipc_ctl::METHOD_LIST_TERMINALS, None, &all);
     assert!(terms.ok, "terminal list: {terms:?}");
     assert!(
         terms
             .result_json
-            .contains("{\"id\":\"t:3\",\"has_pane_session\":false}"),
-        "the split leaf t:3 must be session-less: {}",
+            .contains("{\"id\":\"t:3\",\"has_pane_session\":true}"),
+        "the split leaf t:3 must report its own session: {}",
         terms.result_json
     );
     assert!(
@@ -746,6 +871,30 @@ fn assert_stacked(rt: &bitty_runtime::Runtime, first: u64, second: u64, ctx: &st
     assert_eq!((a.x, a.width), (b.x, b.width), "{ctx}: shared column band");
     assert!(a.y + a.height <= b.y, "{ctx}: y-ordered, no overlap");
     assert!(a.height > 0 && b.height > 0, "{ctx}: both panes visible");
+}
+
+/// Polls the primary + pane PTY pumps and ticks until `view`'s private grid
+/// shows `needle`, bounded at 10 s (CTX-0387 live-input proof).
+#[cfg(unix)]
+fn wait_for_pane_text(
+    rt: &mut bitty_runtime::Runtime,
+    view: bitty_runtime::ViewId,
+    needle: &str,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        let text: String = rt
+            .pane_snapshot(&view)
+            .map(|snap| snap.cells.iter().map(|cell| cell.glyph).collect())
+            .unwrap_or_default();
+        if text.contains(needle) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
 }
 
 #[test]
@@ -1798,11 +1947,12 @@ fn wm_prune_split_leaf(
 #[cfg(unix)]
 fn wm_split_routing_close_survivor_over_socket() {
     let _guard = hold_wm_lock();
+    bitty_test_support::require_pty!();
     let granted = bitty_ipc::ScopeSet::all();
     let socket_path = wm_socket_path("sr");
     bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
     // 8 control verbs below: list, split, list, send-denied, focus,
-    // send-ok, text, close-denied = 8 requests.
+    // send-ok, text, close-ok = 8 requests.
     let server = spawn_wm_server(socket_path.clone(), granted.clone(), "wm-flow", 8);
     let mut h = WmHarness::new(wm_connect(&socket_path), granted);
 
@@ -1859,11 +2009,25 @@ fn wm_split_routing_close_survivor_over_socket() {
         body.contains("\"focused\":\"v:2\""),
         "focus confirms: {body}"
     );
-    let params = ipc_ctl::params_send_input("t:2", "wm-proof");
+    let params = ipc_ctl::params_send_input("t:2", "wm-proof\n");
     let body = h.ctl(ipc_ctl::METHOD_SEND_INPUT, Some(&params));
     assert!(body.contains("\"sent_to\":\"t:2\""), "send routes: {body}");
-    assert!(body.contains("\"bytes\":8"), "byte count: {body}");
-    assert!(!h.rt.drain_pending_input().is_empty(), "bytes must queue");
+    assert!(body.contains("\"bytes\":9"), "byte count: {body}");
+    // CTX-0387: the split leaf owns a live shell, so focused input lands on
+    // its own PTY (echoed onto its grid), never the headless fallback buffer.
+    use bitty_runtime::ViewId;
+    assert!(
+        h.rt.has_pane_session(&ViewId::new(2)),
+        "split must own a live pane session"
+    );
+    assert!(
+        h.rt.drain_pending_input().is_empty(),
+        "routed input must not fall back to the headless buffer"
+    );
+    assert!(
+        wait_for_pane_text(&mut h.rt, ViewId::new(2), "wm-proof"),
+        "typed bytes must land on the split pane's own grid"
+    );
     let params = ipc_ctl::params_terminal_id("t:2");
     let body = h.ctl(ipc_ctl::METHOD_GET_TERMINAL_TEXT, Some(&params));
     assert!(
@@ -1871,21 +2035,20 @@ fn wm_split_routing_close_survivor_over_socket() {
         "text serves: {body}"
     );
 
-    // Close over IPC tears down the pane *session*, not the leaf: with
-    // no live PTY session headlessly this fails closed (Conflict) and
-    // the layout is untouched — never a half-removed leaf.
+    // Close over IPC tears down the pane session; the layout leaf survives
+    // (never a half-removed leaf, never a stale session).
     let params = ipc_ctl::params_terminal_id("t:2");
     let body = h.ctl(ipc_ctl::METHOD_CLOSE_TERMINAL, Some(&params));
     assert!(
-        body.contains("\"error\""),
-        "session-less close must fail: {body}"
+        body.contains("\"closed\":\"t:2\""),
+        "live session close must succeed: {body}"
     );
-    assert!(body.contains("Conflict"), "must be Conflict: {body}");
-    assert!(
-        body.contains("no live session"),
-        "must name the gap: {body}"
+    assert!(!h.rt.has_pane_session(&ViewId::new(2)), "session torn down");
+    assert_eq!(
+        h.leaf_ids(),
+        vec![1, 2],
+        "layout leaf survives session close"
     );
-    assert_eq!(h.leaf_ids(), vec![1, 2], "layout untouched by failed close");
 
     drop(h);
     server.join().unwrap();

@@ -996,10 +996,9 @@ impl Runtime {
                 // primary snapshot only when it IS the primary owner
                 // (`primary_view`: the leaf focused when the primary shell
                 // attached). Ownership — not focus and not session-presence —
-                // decides: every other session-less leaf (ctl splits spawn no
-                // shell, spawn failures, fresh workspace leaves) presents
-                // erased, so a session-less View never paints another View's
-                // grid.
+                // decides: every other session-less leaf (spawn failures,
+                // recipe-less leaves) presents erased, so a session-less View
+                // never paints another View's grid.
                 let pane_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
                     Some(sess) => Some(sess.state.snapshot()),
                     None if Some(view_id) == self.primary_view => Some(snapshot.clone()),

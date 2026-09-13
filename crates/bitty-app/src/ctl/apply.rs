@@ -143,9 +143,10 @@ pub fn apply_control(
     }
     if method == ipc_ctl::METHOD_LIST_TERMINALS {
         // 1:1 terminal:view mapping until the registry lands: each leaf is
-        // one terminal `t:<view>`. CTX-0284: tiles are layout-derived and may
-        // have no shell (ctl splits spawn none), so report live pane-session
-        // presence per entry instead of implying one shell per tile.
+        // one terminal `t:<view>`. CTX-0284/CTX-0387: tiles are layout-derived
+        // and a leaf may still have no shell (spawn failure), so report live
+        // pane-session presence per entry instead of implying one shell per
+        // tile.
         let ids = runtime.layout().leaf_ids();
         let mut out = String::from("{\"terminals\":[");
         for (idx, id) in ids.iter().enumerate() {
@@ -251,8 +252,9 @@ pub fn apply_control(
         // old path replaced the primary shell, which `terminal list` (layout
         // leaves + pane sessions) cannot observe, so it reported a no-op.
         // Create a fresh leaf (default right split) and give it a private
-        // shell session: `view list` gains `v:N`, `terminal list` gains `t:N`
-        // with `has_pane_session:true`, and the caller can address it.
+        // shell session through the shared CTX-0387 creation path:
+        // `view list` gains `v:N`, `terminal list` gains `t:N` with
+        // `has_pane_session:true`, and the caller can address it.
         // Fail-closed: if the shell cannot start, the pre-spawn layout is
         // restored, so success is never reported without a live session.
         let Some(focused) = runtime.focused_view() else {
@@ -262,37 +264,10 @@ pub fn apply_control(
                 String::from("no focused view to spawn into"),
             ));
         };
-        // CTX-0378: the id must be globally unique across every workspace
-        // slot, not one past the active layout's max — `pane_sessions` is
-        // keyed globally by `ViewId`, so a local scan aliases another
-        // workspace's shell.
-        let new_id = runtime.next_view_id_global();
-        let mut layout = runtime.layout().clone();
-        if !split_leaf(&mut layout, focused, SplitAxis::Horizontal, new_id, false) {
-            return Err((
-                "usage",
-                "Conflict",
-                String::from("focused view is not a splittable leaf"),
-            ));
-        }
         let previous = runtime.layout().clone();
-        // CTX-0343 first match: a previously inert `ws:`/`view:` selector can
-        // match the fresh `View` as `empty` content; fail the creation closed
-        // before the layout commits it. The `terminal` bind is checked again
-        // inside `spawn_shell_for_view`.
-        if let Err(err) = runtime.validate_new_view_appearance(new_id) {
-            return Err(("usage", "Conflict", format!("spawn refused: {err}")));
-        }
-        runtime.set_layout(layout);
-        let (cols, rows) = runtime
-            .layout_allocations()
-            .iter()
-            .find(|(id, _)| *id == new_id)
-            .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
-            .unwrap_or((80, 24));
-        let shell = std::env::var("SHELL").ok().filter(|s| !s.trim().is_empty());
-        let program = shell.as_deref().unwrap_or("/bin/sh");
-        if let Err(err) = runtime.spawn_shell_for_view(new_id, program, &[], cols, rows) {
+        let (new_id, cols, rows) =
+            create_split_leaf(runtime, focused, SplitAxis::Horizontal, false)?;
+        if let Err(err) = spawn_leaf_shell(runtime, new_id, cols, rows) {
             // Fail-closed: no observable terminal means no success.
             runtime.set_layout(previous);
             return Err(("transport", "Transport", format!("spawn failed: {err}")));
@@ -351,19 +326,17 @@ pub fn apply_control(
             ipc_ctl::SplitDirection::Up => (SplitAxis::Vertical, true),
             ipc_ctl::SplitDirection::Down => (SplitAxis::Vertical, false),
         };
-        // CTX-0378: globally unique across every workspace slot (see
-        // `Runtime::next_view_id_global`); a local max + 1 would alias
-        // another workspace's `ViewId` and its pane session.
-        let new_id = runtime.next_view_id_global();
-        let mut layout = runtime.layout().clone();
-        if !split_leaf(&mut layout, focused, axis, new_id, place_new_first) {
-            return Err((
-                "usage",
-                "Conflict",
-                String::from("focused view is not a splittable leaf"),
-            ));
+        // CTX-0387: the fresh pane gets its own shell through the same
+        // creation path as the keymap `new_split` action (`spawn_pane_shell`,
+        // replaying the recorded primary recipe). Best-effort, matching the
+        // keymap and `workspace_new`: a failed spawn leaves the pane empty
+        // with a loud warning instead of failing the layout verb.
+        let (new_id, cols, rows) = create_split_leaf(runtime, focused, axis, place_new_first)?;
+        if let Err(err) = spawn_leaf_shell(runtime, new_id, cols, rows) {
+            eprintln!(
+                "warning: ctl view split pane {new_id:?} shell spawn failed ({err}) — pane stays empty"
+            );
         }
-        runtime.set_layout(layout);
         // CTX-0364: focus follows the freshly created panel (kitty/ghostty
         // parity): the new view becomes the input/cursor target immediately.
         runtime.set_focus(new_id);
@@ -544,6 +517,74 @@ pub fn apply_control(
         "UnknownMethod",
         format!("unknown control method {method}"),
     ))
+}
+
+/// Shared ctl creation core (CTX-0387): allocate a globally unique leaf id,
+/// split `focused` along `axis`, validate the fresh view's appearance, and
+/// commit the layout. Fail-closed: a refused split or appearance conflict
+/// leaves the layout untouched. Returns the new leaf id plus its allocation
+/// size in cells.
+fn create_split_leaf(
+    runtime: &mut bitty_runtime::Runtime,
+    focused: bitty_runtime::ViewId,
+    axis: bitty_runtime::SplitAxis,
+    place_new_first: bool,
+) -> Result<(bitty_runtime::ViewId, u16, u16), (&'static str, &'static str, String)> {
+    // CTX-0378: the id must be globally unique across every workspace slot,
+    // not one past the active layout's max — `pane_sessions` is keyed
+    // globally by `ViewId`, so a local scan aliases another workspace's shell.
+    let new_id = runtime.next_view_id_global();
+    let mut layout = runtime.layout().clone();
+    if !split_leaf(&mut layout, focused, axis, new_id, place_new_first) {
+        return Err((
+            "usage",
+            "Conflict",
+            String::from("focused view is not a splittable leaf"),
+        ));
+    }
+    // CTX-0343 first match: a previously inert `ws:`/`view:` selector can
+    // match the fresh `View` as `empty` content; fail the creation closed
+    // before the layout commits it (the spawn helper re-checks the
+    // `terminal` bind).
+    if let Err(err) = runtime.validate_new_view_appearance(new_id) {
+        return Err(("usage", "Conflict", format!("spawn refused: {err}")));
+    }
+    runtime.set_layout(layout);
+    let (cols, rows) = runtime
+        .layout_allocations()
+        .iter()
+        .find(|(id, _)| *id == new_id)
+        .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+        .unwrap_or((80, 24));
+    Ok((new_id, cols, rows))
+}
+
+/// Spawns the private shell of ctl-created leaf `view` through the same
+/// app-level path as the keymap `new_split` action (CTX-0387).
+///
+/// Replays the runtime's recorded primary attach recipe when a primary shell
+/// attached (CTX-0359; keymap/`workspace_new` parity, explicit `--program`
+/// tail included), otherwise resolves `$SHELL` > `/bin/sh` exactly like the
+/// prior ctl spawn arm. The call itself is fail-closed; each verb chooses its
+/// own failure policy (`terminal spawn` rolls the layout back, `view split`
+/// keeps the empty pane best-effort like the keymap).
+fn spawn_leaf_shell(
+    runtime: &mut bitty_runtime::Runtime,
+    view: bitty_runtime::ViewId,
+    cols: u16,
+    rows: u16,
+) -> Result<(), bitty_runtime::RuntimeError> {
+    let (program, program_args) = match runtime.primary_spawn_recipe() {
+        Some((program, args)) => (Some(program.to_owned()), args.to_vec()),
+        None => (None, Vec::new()),
+    };
+    let spec = crate::spawn::SpawnSpec {
+        program,
+        program_args,
+        shell_env: std::env::var("SHELL").ok(),
+        config_shell: None,
+    };
+    crate::spawn::spawn_pane_shell(runtime, &spec, view, cols, rows)
 }
 
 /// Split the focused leaf (mirrors the composition-root helper).

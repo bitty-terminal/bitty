@@ -116,6 +116,22 @@ impl Runtime {
         Ok(())
     }
 
+    /// Program + args the primary shell last attached with, when it succeeded
+    /// (CTX-0359).
+    ///
+    /// Creation paths that give a fresh leaf its own shell replay this recipe
+    /// so a new pane starts exactly the program the primary attached with
+    /// (`workspace_new`, the ctl split/spawn verbs; keymap parity).
+    /// `None` before any successful primary attach (headless runtimes,
+    /// startup spawn failure), where callers supply their own default
+    /// resolution.
+    #[must_use]
+    pub fn primary_spawn_recipe(&self) -> Option<(&str, &[String])> {
+        self.primary_spawn
+            .as_ref()
+            .map(|(program, args)| (program.as_str(), args.as_slice()))
+    }
+
     /// Resolves the working directory a shell spawned as leaf `target` should
     /// inherit from the previously focused (source) pane.
     ///

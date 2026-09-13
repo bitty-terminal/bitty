@@ -13,8 +13,9 @@
 //!
 //! CTX-0234/CTX-0359 regression (same file: split-present mapping, live
 //! evidence `recording/live-verify-0220/` shots 10/12): leaves WITHOUT a
-//! pane shell session (ctl splits never spawn one; spawn failures) used to
-//! render the shared primary top-left viewport, so one shell duplicated
+//! pane shell session (built directly here; spawn failures or recipe-less
+//! runtimes in production) used to render the shared primary top-left
+//! viewport, so one shell duplicated
 //! across N tiles (three-column repeat + marker text in an unexpected tile
 //! after zoom-off). Rule pinned here (CTX-0359): the runtime-global primary
 //! grid belongs to exactly one leaf — the primary owner (the leaf focused
@@ -441,8 +442,9 @@ fn workspace_new_leaf_renders_empty_not_previous_primary() {
 
 #[test]
 fn zoom_off_does_not_duplicate_primary_into_sessionless_leaves() {
-    // Live L8 shape: three session-less tiles side by side (ctl splits v4/v5
-    // plus primary v1) rendered the same primary viewport three times.
+    // Live L8 shape: three session-less tiles side by side (the shape a
+    // pre-CTX-0387 `ctl view split` produced; built directly here) rendered
+    // the same primary viewport three times.
     let mut rt = instant_runtime();
     write_primary_marker(&mut rt, 3, b'M');
     assert!(rt.tick().is_some(), "first tick presents");

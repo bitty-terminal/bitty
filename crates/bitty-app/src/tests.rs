@@ -2163,6 +2163,33 @@ fn parse_init_subcommand() {
     assert!(p.init_yes);
     assert!(p.init_force);
 
+    // Value flags accept both `--flag VALUE` and `--flag=VALUE`.
+    let p = parse_args(&args_of(&[
+        "bitty",
+        "init",
+        "--yes",
+        "--scrollback",
+        "20000",
+        "--close-confirm=never",
+        "--gaps-in",
+        "2",
+        "--gaps-out=4",
+        "--border",
+        "1",
+        "--radius=0",
+    ]));
+    assert!(p.init_word);
+    assert_eq!(p.init_scrollback.as_deref(), Some("20000"));
+    assert_eq!(p.init_close_confirm.as_deref(), Some("never"));
+    assert_eq!(p.init_gaps_in.as_deref(), Some("2"));
+    assert_eq!(p.init_gaps_out.as_deref(), Some("4"));
+    assert_eq!(p.init_border.as_deref(), Some("1"));
+    assert_eq!(p.init_radius.as_deref(), Some("0"));
+
+    // A missing value is recorded empty so the init dispatch fails closed.
+    let p = parse_args(&args_of(&["bitty", "init", "--yes", "--scrollback"]));
+    assert_eq!(p.init_scrollback.as_deref(), Some(""));
+
     let p = parse_args(&args_of(&[
         "bitty",
         "--config",
@@ -2542,8 +2569,24 @@ fn init_yes_defaults_are_sane() {
     let d = init_yes_defaults(Some("/bin/bash"));
     assert_eq!(d.shell.as_deref(), Some("/bin/bash"));
     assert_eq!(d.theme, "dark");
+    assert_eq!(d.font_family, bitty_config::types::DEFAULT_FONT_FAMILY);
     assert_eq!(d.font_size, bitty_config::types::DEFAULT_FONT_SIZE);
     assert_eq!(d.key_preset, InitKeyPreset::Default);
+    assert_eq!(
+        d.scrollback,
+        bitty_config::types::TerminalConfig::default().scrollback
+    );
+    assert_eq!(d.close_confirm, bitty_config::CloseConfirm::WhenBusy);
+    assert_eq!(
+        d.gaps_in,
+        bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX
+    );
+    assert_eq!(
+        d.gaps_out,
+        bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX
+    );
+    assert_eq!(d.border, bitty_config::types::DEFAULT_DECORATION_BORDER_PX);
+    assert_eq!(d.radius, bitty_config::types::DEFAULT_DECORATION_RADIUS_PX);
 
     // Blank $SHELL means "leave unset" (startup falls back to /bin/sh).
     let d = init_yes_defaults(Some("   "));
@@ -2554,6 +2597,90 @@ fn init_yes_defaults_are_sane() {
     // Unusable $SHELL never becomes a default (warned + omitted at dispatch).
     let d = init_yes_defaults(Some("/bin/ba\x07sh"));
     assert_eq!(d.shell, None);
+}
+
+#[test]
+fn init_answer_parsers_cover_new_steps_fail_closed() {
+    // Font family: empty takes the default; trim; bound + controls rejected.
+    assert_eq!(
+        init_parse_font_family_answer("").expect("default"),
+        bitty_config::types::DEFAULT_FONT_FAMILY
+    );
+    assert_eq!(
+        init_parse_font_family_answer("  Fira Code  ").expect("trim"),
+        "Fira Code"
+    );
+    assert!(init_parse_font_family_answer("a\x07b").is_err());
+    assert!(init_parse_font_family_answer(&"x".repeat(200)).is_err());
+
+    // Scrollback: empty default, exact bounds accepted, everything else fails.
+    assert_eq!(
+        init_parse_scrollback_answer("").expect("default"),
+        bitty_config::types::TerminalConfig::default().scrollback
+    );
+    assert_eq!(init_parse_scrollback_answer("0").expect("zero"), 0);
+    assert_eq!(
+        init_parse_scrollback_answer("100000").expect("max"),
+        100_000
+    );
+    for bad in ["100001", "-1", "1.5", "many", " 12x"] {
+        assert!(
+            init_parse_scrollback_answer(bad).is_err(),
+            "scrollback {bad:?} fails closed"
+        );
+    }
+
+    // Close confirm: empty/1 default, exact names and menu numbers
+    // (case-insensitive names).
+    assert_eq!(
+        init_parse_close_confirm_answer("").expect("default"),
+        bitty_config::CloseConfirm::WhenBusy
+    );
+    assert_eq!(
+        init_parse_close_confirm_answer("1").expect("menu default"),
+        bitty_config::CloseConfirm::WhenBusy
+    );
+    assert_eq!(
+        init_parse_close_confirm_answer("always").expect("always"),
+        bitty_config::CloseConfirm::Always
+    );
+    assert_eq!(
+        init_parse_close_confirm_answer("2").expect("menu always"),
+        bitty_config::CloseConfirm::Always
+    );
+    assert_eq!(
+        init_parse_close_confirm_answer("NEVER").expect("never"),
+        bitty_config::CloseConfirm::Never
+    );
+    assert_eq!(
+        init_parse_close_confirm_answer("3").expect("menu never"),
+        bitty_config::CloseConfirm::Never
+    );
+    for bad in ["sometimes", "true", "0", "4"] {
+        assert!(
+            init_parse_close_confirm_answer(bad).is_err(),
+            "close_confirm {bad:?} fails closed"
+        );
+    }
+
+    // Decoration scalars: empty default, per-field bounds, fail-closed.
+    let gaps_default = bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX;
+    assert_eq!(
+        init_parse_decoration_answer("", "gaps_in", 32, gaps_default).expect("default"),
+        gaps_default
+    );
+    assert_eq!(
+        init_parse_decoration_answer("0", "border", 8, 2).expect("zero"),
+        0
+    );
+    assert_eq!(
+        init_parse_decoration_answer("32", "gaps_in", 32, gaps_default).expect("max gap"),
+        32
+    );
+    assert!(init_parse_decoration_answer("33", "gaps_in", 32, gaps_default).is_err());
+    assert!(init_parse_decoration_answer("9", "border", 8, 2).is_err());
+    assert!(init_parse_decoration_answer("17", "radius", 16, 6).is_err());
+    assert!(init_parse_decoration_answer("2.5", "border", 8, 2).is_err());
 }
 
 #[test]
@@ -2680,23 +2807,64 @@ fn drive_init_wizard(
     shell_env: Option<&str>,
     columns: Option<u16>,
 ) -> (Result<InitAnswers, String>, String) {
+    drive_init_wizard_with_overrides(stdin_lines, shell_env, columns, &InitOverrides::default())
+}
+
+/// [`drive_init_wizard`] with explicit value-flag overrides (skipped steps).
+fn drive_init_wizard_with_overrides(
+    stdin_lines: &str,
+    shell_env: Option<&str>,
+    columns: Option<u16>,
+    overrides: &InitOverrides,
+) -> (Result<InitAnswers, String>, String) {
     let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
     let mut output = Vec::new();
-    let result = run_init_interactive(&mut input, &mut output, shell_env, columns, &|p| {
-        p == "/bin/bash" || p == "/bin/sh"
-    });
+    let result = run_init_interactive(
+        &mut input,
+        &mut output,
+        shell_env,
+        columns,
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        overrides,
+    );
     let printed = String::from_utf8(output).expect("wizard output is UTF-8");
     (result, printed)
 }
 
 #[test]
 fn init_interactive_all_defaults() {
-    // Four Enters: default shell, dark theme, default size, default keys.
-    let (result, printed) = drive_init_wizard("\n\n\n\n", Some("/bin/bash"), None);
+    // Eleven Enters: default shell, theme, family, size, gaps_in, gaps_out,
+    // border, radius, scrollback, close_confirm, keys.
+    let (result, printed) = drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
     let answers = result.expect("defaults accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/bash"));
     assert_eq!(answers.theme, "dark");
+    assert_eq!(
+        answers.font_family,
+        bitty_config::types::DEFAULT_FONT_FAMILY
+    );
     assert_eq!(answers.font_size, bitty_config::types::DEFAULT_FONT_SIZE);
+    assert_eq!(
+        answers.gaps_in,
+        bitty_config::types::DEFAULT_DECORATION_GAPS_IN_PX
+    );
+    assert_eq!(
+        answers.gaps_out,
+        bitty_config::types::DEFAULT_DECORATION_GAPS_OUT_PX
+    );
+    assert_eq!(
+        answers.border,
+        bitty_config::types::DEFAULT_DECORATION_BORDER_PX
+    );
+    assert_eq!(
+        answers.radius,
+        bitty_config::types::DEFAULT_DECORATION_RADIUS_PX
+    );
+    assert_eq!(
+        answers.scrollback,
+        bitty_config::types::TerminalConfig::default().scrollback
+    );
+    assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::WhenBusy);
     assert_eq!(answers.key_preset, InitKeyPreset::Default);
 
     // Greeting shows the mascot plus every step prompt.
@@ -2704,30 +2872,61 @@ fn init_interactive_all_defaults() {
     assert!(printed.contains("MMMMM"));
     assert!(printed.contains("Shell"));
     assert!(printed.contains("Theme"));
+    assert!(printed.contains("Font family"));
     assert!(printed.contains("Font size"));
+    assert!(printed.contains("gaps_in"));
+    assert!(printed.contains("gaps_out"));
+    assert!(printed.contains("border"));
+    assert!(printed.contains("radius"));
+    assert!(printed.contains("Scrollback"));
+    assert!(printed.contains("Close confirm"));
     assert!(printed.contains("Keybindings"));
 }
 
 #[test]
 fn init_interactive_custom_picks() {
-    // Pick /bin/sh (#2), bitty-dark, 14pt, vim preset (#2).
-    let (result, _) = drive_init_wizard("2\nbitty-dark\n14\n2\n", Some("/bin/bash"), None);
+    // Pick /bin/sh (#2), bitty-dark, Fira Code, 14pt, 10/12/3/8 decoration,
+    // 50000 scrollback, always confirm, vim preset (#2).
+    let (result, _) = drive_init_wizard(
+        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        Some("/bin/bash"),
+        None,
+    );
     let answers = result.expect("custom picks accepted");
     assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
     assert_eq!(answers.theme, "dark");
+    assert_eq!(answers.font_family, "Fira Code");
     assert_eq!(answers.font_size, 14.0);
+    assert_eq!(answers.gaps_in, 10);
+    assert_eq!(answers.gaps_out, 12);
+    assert_eq!(answers.border, 3);
+    assert_eq!(answers.radius, 8);
+    assert_eq!(answers.scrollback, 50_000);
+    assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::Always);
     assert_eq!(answers.key_preset, InitKeyPreset::Vim);
 }
 
 #[test]
 fn init_interactive_retries_then_aborts() {
-    // Bad font size reprompts and then accepts the correction.
-    let (result, printed) = drive_init_wizard("\n\nbanana\n14\n\n", Some("/bin/bash"), None);
+    // Bad font size reprompts and then accepts the correction (then the
+    // remaining seven steps take defaults).
+    let (result, printed) =
+        drive_init_wizard("\n\n\nbanana\n14\n\n\n\n\n\n\n\n", Some("/bin/bash"), None);
+    assert!(result.is_ok());
+    assert!(printed.contains("try again"));
+
+    // A bad decoration value also reprompts instead of aborting.
+    let (result, printed) =
+        drive_init_wizard("\n\n\n\n99\n4\n\n\n\n\n\n\n", Some("/bin/bash"), None);
     assert!(result.is_ok());
     assert!(printed.contains("try again"));
 
     // Three bad preset answers exhaust the bound and abort.
-    let (result, _) = drive_init_wizard("\n\n\nnope\nnah\nnever\n", Some("/bin/bash"), None);
+    let (result, _) = drive_init_wizard(
+        "\n\n\n\n\n\n\n\n\n\nnope\nnah\nnever\n",
+        Some("/bin/bash"),
+        None,
+    );
     assert!(result.is_err());
 
     // EOF up front aborts without guessing.
@@ -2735,34 +2934,74 @@ fn init_interactive_retries_then_aborts() {
     assert!(result.is_err());
 
     // A narrow window still wizards, with the text fallback greeting.
-    let (result, printed) = drive_init_wizard("\n\n\n\n", Some("/bin/bash"), Some(20));
+    let (result, printed) =
+        drive_init_wizard("\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"), Some(20));
     assert!(result.is_ok());
     assert!(printed.contains("too narrow"));
     assert!(!printed.contains("MMMMM"));
 }
 
 #[test]
-fn init_render_default_and_vim() {
-    let base = InitAnswers {
-        shell: Some("/bin/bash".to_string()),
-        theme: "dark".to_string(),
-        font_size: 12.0,
-        key_preset: InitKeyPreset::Default,
+fn init_interactive_overrides_skip_prompts() {
+    // Nine of eleven steps answered by value flags: only shell and the key
+    // preset still prompt, and no overridden step prompt is printed.
+    let overrides = InitOverrides {
+        theme: Some("dark".to_string()),
+        font_family: Some("Fira Code".to_string()),
+        font_size: Some(15.0),
+        scrollback: Some(50_000),
+        close_confirm: Some(bitty_config::CloseConfirm::Never),
+        gaps_in: Some(0),
+        gaps_out: Some(0),
+        border: Some(1),
+        radius: Some(0),
     };
+    let (result, printed) =
+        drive_init_wizard_with_overrides("\n\n", Some("/bin/bash"), None, &overrides);
+    let answers = result.expect("overrides answer every overridden step");
+    assert_eq!(answers.theme, "dark");
+    assert_eq!(answers.font_family, "Fira Code");
+    assert_eq!(answers.font_size, 15.0);
+    assert_eq!(answers.scrollback, 50_000);
+    assert_eq!(answers.close_confirm, bitty_config::CloseConfirm::Never);
+    assert_eq!(answers.gaps_in, 0);
+    assert_eq!(answers.border, 1);
+    assert_eq!(answers.shell.as_deref(), Some("/bin/bash"));
+    assert_eq!(answers.key_preset, InitKeyPreset::Default);
+    assert!(!printed.contains("Theme ["));
+    assert!(!printed.contains("gaps_in ["));
+    assert!(!printed.contains("Scrollback ["));
+    assert!(!printed.contains("Close confirm ["));
+    // Unanswered steps still prompt.
+    assert!(printed.contains("Shell"));
+    assert!(printed.contains("Keybindings"));
+}
+
+#[test]
+fn init_render_default_and_vim() {
+    let base = init_yes_defaults(Some("/bin/bash"));
     let lua = render_init_lua(&base);
     assert!(lua.contains("theme = \"dark\""));
     assert!(lua.contains("JetBrainsMono Nerd Font"));
     assert!(lua.contains("shell = \"/bin/bash\""));
-    assert!(lua.contains("scrollback"));
+    assert!(lua.contains("scrollback = 10000"));
+    assert!(lua.contains("close_confirm = \"when_busy\""));
+    assert!(lua.contains("decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6 }"));
     assert!(!lua.contains("keymaps = {"));
 
-    // No shell: no terminal table at all (startup default applies).
-    let noshell = InitAnswers {
-        shell: None,
-        ..base.clone()
-    };
+    // No shell: the terminal table still carries scrollback.
+    let noshell = init_yes_defaults(None);
     let lua = render_init_lua(&noshell);
-    assert!(!lua.contains("terminal ="));
+    assert!(lua.contains("terminal = { scrollback = 10000 }"));
+    assert!(!lua.contains("shell ="));
+
+    // A custom font family flows through verbatim.
+    let family = InitAnswers {
+        font_family: "Fira Code".to_string(),
+        ..init_yes_defaults(None)
+    };
+    let lua = render_init_lua(&family);
+    assert!(lua.contains("family = \"Fira Code\""));
 
     // Vim preset writes every shipped binding explicitly.
     let vim = InitAnswers {
@@ -2784,36 +3023,79 @@ fn init_render_default_and_vim() {
 }
 
 #[test]
-fn init_rendered_config_parses() {
-    use bitty_config::file::parse_lua_config;
+fn init_rendered_config_parses_and_merges_to_effective() {
+    use bitty_config::CloseConfirm;
+    use bitty_config::file::{CliOverrides, parse_lua_config, resolve_effective_full};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
-    // Every preset x shell combination must parse with values intact.
+    // Every preset x shell combination must parse with values intact and
+    // merge into a valid `EffectiveConfig` (the startup load path).
     for preset in [InitKeyPreset::Default, InitKeyPreset::Vim] {
         for shell in [Some("/bin/zsh"), None] {
             let answers = InitAnswers {
                 shell: shell.map(str::to_string),
-                theme: "dark".to_string(),
+                font_family: "Fira Code".to_string(),
                 font_size: 14.0,
+                scrollback: 50_000,
+                close_confirm: CloseConfirm::Always,
+                gaps_in: 1,
+                gaps_out: 2,
+                border: 3,
+                radius: 4,
                 key_preset: preset,
+                ..init_yes_defaults(None)
             };
             let lua = render_init_lua(&answers);
             let plan = parse_lua_config(&lua, &src).expect("wizard output parses");
-            assert_eq!(plan.appearance.unwrap().theme.as_deref(), Some("dark"));
-            let font = plan.font.expect("font table");
-            assert_eq!(font.size, 14.0);
             assert_eq!(
-                plan.terminal.as_ref().and_then(|t| t.shell.as_deref()),
-                shell,
-                "shell round-trips"
+                plan.appearance.as_ref().unwrap().theme.as_deref(),
+                Some("dark")
             );
+            let font = plan.font.as_ref().expect("font table");
+            assert_eq!(font.family, "Fira Code");
+            assert_eq!(font.size, 14.0);
+            let dec = plan.decoration.as_ref().expect("decoration table");
+            assert_eq!(dec.gaps_in, 1);
+            assert_eq!(dec.gaps_out, 2);
+            assert_eq!(dec.border, 3);
+            assert_eq!(dec.radius, 4);
+            let term = plan.terminal.as_ref().expect("terminal table");
+            assert_eq!(term.scrollback, 50_000);
+            assert_eq!(term.shell.as_deref(), shell, "shell round-trips");
+            assert_eq!(plan.close_confirm, Some(CloseConfirm::Always));
             match preset {
                 InitKeyPreset::Vim => assert_eq!(
-                    plan.keymaps.expect("vim preset writes keymaps").len(),
+                    plan.keymaps
+                        .as_ref()
+                        .expect("vim preset writes keymaps")
+                        .len(),
                     bitty_config::keymap::DEFAULT_KEYMAPS.len()
                 ),
                 InitKeyPreset::Default => assert!(plan.keymaps.is_none()),
             }
+
+            // EffectiveConfig load path: merge + validate, values intact.
+            let merged = resolve_effective_full(
+                Some(bitty_config::LayeredPlan::new(src.clone(), plan)),
+                None,
+                &CliOverrides::default(),
+            )
+            .expect("wizard output merges");
+            let effective = merged.effective;
+            effective.validate().expect("effective config valid");
+            assert_eq!(effective.font.family, "Fira Code");
+            assert_eq!(effective.font.size, 14.0);
+            assert_eq!(effective.terminal.scrollback, 50_000);
+            assert_eq!(
+                effective.terminal.shell.as_deref(),
+                shell,
+                "effective shell round-trips"
+            );
+            assert_eq!(effective.close_confirm, CloseConfirm::Always);
+            assert_eq!(effective.decoration.gaps_in, 1);
+            assert_eq!(effective.decoration.gaps_out, 2);
+            assert_eq!(effective.decoration.border, 3);
+            assert_eq!(effective.decoration.radius, 4);
         }
     }
 }
@@ -2869,9 +3151,9 @@ fn init_vim_preset_agrees_with_shipped_defaults() {
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let lua = render_init_lua(&InitAnswers {
         shell: None,
-        theme: "dark".to_string(),
         font_size: 12.0,
         key_preset: InitKeyPreset::Vim,
+        ..init_yes_defaults(None)
     });
     let plan = parse_lua_config(&lua, &src).expect("vim config parses");
     let effective = bitty_config::EffectiveConfig {
@@ -2914,9 +3196,9 @@ fn init_write_new_refuse_force_backup_idempotent() {
     // --force backs up the previous bytes, then writes the new content.
     let updated_content = render_init_lua(&InitAnswers {
         shell: Some("/bin/zsh".to_string()),
-        theme: "dark".to_string(),
         font_size: 14.0,
         key_preset: InitKeyPreset::Vim,
+        ..init_yes_defaults(None)
     });
     let outcome = write_init_config(&target, &updated_content, true).expect("forced write");
     assert!(outcome.updated);
@@ -2934,9 +3216,9 @@ fn init_write_new_refuse_force_backup_idempotent() {
     // Idempotent: writing the same answers again produces byte-identical output.
     let again = render_init_lua(&InitAnswers {
         shell: Some("/bin/zsh".to_string()),
-        theme: "dark".to_string(),
         font_size: 14.0,
         key_preset: InitKeyPreset::Vim,
+        ..init_yes_defaults(None)
     });
     assert_eq!(again, updated_content);
 
@@ -2961,34 +3243,60 @@ fn init_write_rejects_invalid_content_without_touching_fs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Hermetic `bitty init` environment for dispatch tests: no live process env,
+/// real TTY, or filesystem probing leaks in.
+fn init_env<'a>(
+    bitty_config: Option<&'a str>,
+    shell: Option<&'a str>,
+    xdg_config_home: Option<&'a str>,
+    home: Option<&'a str>,
+    stdin_is_tty: bool,
+) -> InitEnv<'a> {
+    InitEnv {
+        bitty_config,
+        shell,
+        xdg_config_home,
+        home,
+        columns: None,
+        stdin_is_tty,
+    }
+}
+
 #[test]
 fn init_dispatch_yes_force_idempotent() {
     let dir = init_test_dir("dispatch");
     let target = dir.join("init.lua");
+    let home = dir.display().to_string();
 
-    // --yes writes sane defaults to the explicit target, exit 0.
     let mut args = Args::new();
     args.init_word = true;
     args.init_yes = true;
     args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+
+    // --yes writes sane defaults to the explicit target, exit 0.
     assert_eq!(
-        run_init_subcommand_with_env(&args, None, Some("/bin/bash")),
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
     let written = std::fs::read_to_string(&target).expect("written");
     assert!(written.contains("shell = \"/bin/bash\""));
     assert!(written.contains("theme = \"dark\""));
+    assert!(written.contains("close_confirm = \"when_busy\""));
 
     // Second --yes run refuses without --force (idempotent, exit 2).
     assert_eq!(
-        run_init_subcommand_with_env(&args, None, Some("/bin/bash")),
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         2
     );
 
     // --force overwrites with a backup, exit 0.
     args.init_force = true;
+    let sh_env = init_env(None, Some("/bin/sh"), None, Some(&home), false);
     assert_eq!(
-        run_init_subcommand_with_env(&args, None, Some("/bin/sh")),
+        run_init_subcommand_with_io(&args, &sh_env, &mut input, &mut output),
         0
     );
     let backup = target.with_extension("lua.bak");
@@ -3002,9 +3310,198 @@ fn init_dispatch_yes_force_idempotent() {
     // Unexpected positionals fail closed, exit 2.
     args.init_force = false;
     args.init_args = vec!["bogus".to_string()];
-    assert_eq!(run_init_subcommand_with_env(&args, None, None), 2);
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        2
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_non_tty_without_yes_fails_closed_and_writes_nothing() {
+    let dir = init_test_dir("notty");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true; // no --yes: prompting would be required
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"\n\n\n\n\n\n\n\n\n\n\n";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        2,
+        "non-TTY without --yes is a usage error, never a hang"
+    );
+    assert!(
+        !dir.join(".config").join("bitty").exists(),
+        "refusal writes nothing"
+    );
+    assert!(output.is_empty(), "no prompts are printed without a TTY");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_xdg_and_bitty_config_paths() {
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+
+    // XDG_CONFIG_HOME wins: <xdg>/bitty/init.lua.
+    let xdg = init_test_dir("xdg");
+    let xdg_s = xdg.display().to_string();
+    let env = init_env(None, Some("/bin/bash"), Some(&xdg_s), None, false);
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let xdg_target = xdg.join("bitty").join("init.lua");
+    assert!(xdg_target.exists(), "XDG path honored");
+    let content = std::fs::read_to_string(&xdg_target).expect("xdg file");
+    assert!(content.contains("scrollback"), "always writes scrollback");
+
+    // HOME fallback: <home>/.config/bitty/init.lua.
+    let home = init_test_dir("home");
+    let home_s = home.display().to_string();
+    let env = init_env(None, None, None, Some(&home_s), false);
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    assert!(home.join(".config").join("bitty").join("init.lua").exists());
+
+    // BITTY_CONFIG wins over XDG; --config would win over both.
+    let env_dir = init_test_dir("bittycfg");
+    let explicit = env_dir.join("custom.lua");
+    let explicit_s = explicit.display().to_string();
+    let env = init_env(
+        Some(&explicit_s),
+        Some("/bin/bash"),
+        Some(&xdg_s),
+        Some(&home_s),
+        false,
+    );
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    assert!(explicit.exists(), "BITTY_CONFIG honored");
+    assert!(!xdg.join("bitty").join("custom.lua").exists());
+
+    // No XDG and no HOME: fail closed before any write.
+    let env = init_env(None, None, None, None, false);
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(&xdg);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&env_dir);
+}
+
+#[test]
+fn init_dispatch_yes_value_flags_apply_and_fail_closed() {
+    let dir = init_test_dir("flags");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+
+    let base_args = || {
+        let mut args = Args::new();
+        args.init_word = true;
+        args.init_yes = true;
+        args.config_path = Some(target.display().to_string());
+        args
+    };
+
+    // A fully explicit non-interactive run applies every flag value.
+    let mut args = base_args();
+    args.theme = Some("tokyo-night".to_string());
+    args.font_family = Some("Fira Code".to_string());
+    args.font_size = Some("14".to_string());
+    args.init_scrollback = Some("50000".to_string());
+    args.init_close_confirm = Some("always".to_string());
+    args.init_gaps_in = Some("2".to_string());
+    args.init_gaps_out = Some("4".to_string());
+    args.init_border = Some("1".to_string());
+    args.init_radius = Some("0".to_string());
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let written = std::fs::read_to_string(&target).expect("written");
+    assert!(written.contains("theme = \"tokyo-night\""));
+    assert!(written.contains("family = \"Fira Code\", size = 14"));
+    assert!(written.contains("decoration = { gaps_in = 2, gaps_out = 4, border = 1, radius = 0 }"));
+    assert!(written.contains("close_confirm = \"always\""));
+    assert!(written.contains("scrollback = 50000"));
+
+    // Every invalid value fails closed before touching the filesystem:
+    // remove the target first so overwrite refusal cannot mask the reason.
+    std::fs::remove_file(&target).expect("remove for invalid cases");
+    type FlagSetter = fn(&mut Args);
+    let invalid: [(&str, FlagSetter); 8] = [
+        ("bad theme", |a| a.theme = Some("not-a-theme".to_string())),
+        ("bad family", |a| a.font_family = Some("a\x07b".to_string())),
+        ("bad size", |a| a.font_size = Some("banana".to_string())),
+        ("bad scrollback", |a| {
+            a.init_scrollback = Some("100001".to_string());
+        }),
+        ("bad close-confirm", |a| {
+            a.init_close_confirm = Some("sometimes".to_string());
+        }),
+        ("bad gaps-in", |a| a.init_gaps_in = Some("33".to_string())),
+        ("bad border", |a| a.init_border = Some("9".to_string())),
+        ("bad radius", |a| a.init_radius = Some("17".to_string())),
+    ];
+    for (label, set) in invalid {
+        let mut args = base_args();
+        set(&mut args);
+        assert_eq!(
+            run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+            2,
+            "{label} is a usage error"
+        );
+        assert!(!target.exists(), "{label} writes nothing");
+    }
+
+    // A valid forced run still writes after the refusals (no stuck state).
+    let mut args = base_args();
+    args.init_force = true;
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    assert!(target.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_interactive_tty_prompts_and_writes_answers() {
+    let xdg = init_test_dir("tty-interactive");
+    let xdg_s = xdg.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true; // interactive: TTY + no --yes
+    let env = init_env(None, Some("/bin/bash"), Some(&xdg_s), None, true);
+    // Eleven Enters take every default.
+    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\n";
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let target = xdg.join("bitty").join("init.lua");
+    assert!(target.exists(), "interactive TTY run writes the XDG file");
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(printed.contains("Welcome to bitty"));
+    assert!(printed.contains("Close confirm"));
+    let _ = std::fs::remove_dir_all(&xdg);
 }
 
 #[test]
@@ -3020,9 +3517,7 @@ fn init_lua_escape_keeps_strings_valid() {
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let lua = render_init_lua(&InitAnswers {
         shell: Some("C:\\Tools\\sh\"x".to_string()),
-        theme: "dark".to_string(),
-        font_size: 12.0,
-        key_preset: InitKeyPreset::Default,
+        ..init_yes_defaults(None)
     });
     let plan = parse_lua_config(&lua, &src).expect("escaped shell parses");
     assert_eq!(
@@ -3039,6 +3534,16 @@ fn init_usage_names_flags_and_target() {
     assert!(usage.contains("--config"));
     assert!(usage.contains("BITTY_CONFIG"));
     assert!(usage.contains("init.lua"));
+    assert!(usage.contains("--theme"));
+    assert!(usage.contains("--font-family"));
+    assert!(usage.contains("--font-size"));
+    assert!(usage.contains("--scrollback"));
+    assert!(usage.contains("--close-confirm"));
+    assert!(usage.contains("--gaps-in"));
+    assert!(usage.contains("--gaps-out"));
+    assert!(usage.contains("--border"));
+    assert!(usage.contains("--radius"));
+    assert!(usage.contains("stdin"));
 }
 
 #[test]

@@ -107,6 +107,20 @@ pub(crate) struct Args {
     pub(crate) init_yes: bool,
     /// `--force`: wizard overwrites an existing config (with `.bak` backup).
     pub(crate) init_force: bool,
+    /// `--scrollback LINES`: init-only explicit answer (raw text, validated
+    /// fail-closed by the init dispatch; missing value fails closed there).
+    pub(crate) init_scrollback: Option<String>,
+    /// `--close-confirm MODE`: init-only explicit answer
+    /// (always|when_busy|never; raw, validated fail-closed at dispatch).
+    pub(crate) init_close_confirm: Option<String>,
+    /// `--gaps-in PX`: init-only explicit answer (raw, validated at dispatch).
+    pub(crate) init_gaps_in: Option<String>,
+    /// `--gaps-out PX`: init-only explicit answer (raw, validated at dispatch).
+    pub(crate) init_gaps_out: Option<String>,
+    /// `--border PX`: init-only explicit answer (raw, validated at dispatch).
+    pub(crate) init_border: Option<String>,
+    /// `--radius PX`: init-only explicit answer (raw, validated at dispatch).
+    pub(crate) init_radius: Option<String>,
     /// Unexpected extra positionals in init mode (dispatch errors).
     pub(crate) init_args: Vec<String>,
     /// `bitty doctor` installation and compatibility diagnosis (CTX-0175).
@@ -288,6 +302,12 @@ impl Args {
             init_word: false,
             init_yes: false,
             init_force: false,
+            init_scrollback: None,
+            init_close_confirm: None,
+            init_gaps_in: None,
+            init_gaps_out: None,
+            init_border: None,
+            init_radius: None,
             init_args: Vec::new(),
             doctor_word: false,
             doctor_format: None,
@@ -370,14 +390,22 @@ impl Args {
 /// - `--yes` → init-only: skip prompts, write sane defaults (CTX-0149).
 /// - `--force` → init-only: overwrite an existing config file, backing it
 ///   up to `<file>.bak` first (CTX-0149).
+/// - init-only value flags (parsed globally, validated fail-closed by the
+///   init dispatch; CTX-0345): `--scrollback LINES`,
+///   `--close-confirm always|when_busy|never`, `--gaps-in PX`,
+///   `--gaps-out PX`, `--border PX`, `--radius PX`; the existing
+///   `--theme`/`--font-family`/`--font-size` flags also answer their init
+///   step. A flag answered step is skipped in the interactive wizard and
+///   wins over the `--yes` defaults.
 /// - `run [OPTIONS] -- COMMAND...` → explicit child launch (CTX-0170);
 ///   a program literally named `run` needs `bitty run -- run ...` or
 ///   `bitty -- run ...`. Tokens after `run` are kept verbatim for
 ///   `run::parse_run_request`, which requires `--` before COMMAND.
 /// - `config <path|check|edit>` → config subcommand (DEC-0007); a program
 ///   literally named `config` needs `bitty -- config ...`
-/// - `init [--yes] [--force]` → opt-in setup wizard (#243, CTX-0149);
-///   a program literally named `init` needs `bitty -- init ...`
+/// - `init [--yes] [--force] [value flags]` → opt-in setup wizard (#243,
+///   CTX-0149; guided config surface CTX-0345); a program literally named
+///   `init` needs `bitty -- init ...`
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
@@ -390,8 +418,8 @@ impl Args {
 ///   globally, consumed by each subcommand dispatch; ignored by startup)
 /// - `--no-color` → disable ANSI coloring in doctor/list table output
 ///   (accepted by inspect for parity; its tables are plain text)
-/// - `--yes` / `--force` are init-only flags (parsed globally, consumed by
-///   the init dispatch; ignored by normal startup)
+/// - `--yes` / `--force` / init value flags are init-only (parsed globally,
+///   consumed by the init dispatch; ignored by normal startup)
 /// - `--` → treat the rest as program argv verbatim
 ///
 /// The first non-flag token becomes `program`; additional non-flag tokens
@@ -490,6 +518,28 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             i += 1;
             continue;
+        }
+        // CTX-0345: `bitty init` value flags accept both `--flag VALUE` and
+        // `--flag=VALUE`; raw text is validated fail-closed by the init
+        // dispatch (an empty `=` value fails closed there, never a default).
+        if let Some((flag, value)) = token
+            .strip_prefix("--")
+            .and_then(|rest| rest.split_once('='))
+        {
+            let slot = match flag {
+                "scrollback" => Some(&mut out.init_scrollback),
+                "close-confirm" => Some(&mut out.init_close_confirm),
+                "gaps-in" => Some(&mut out.init_gaps_in),
+                "gaps-out" => Some(&mut out.init_gaps_out),
+                "border" => Some(&mut out.init_border),
+                "radius" => Some(&mut out.init_radius),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                *slot = Some(value.to_string());
+                i += 1;
+                continue;
+            }
         }
         if token.starts_with("--split-ratio=") {
             let val = token.trim_start_matches("--split-ratio=");
@@ -663,6 +713,72 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // (with a `.bak` backup). Ignored elsewhere.
                 out.init_force = true;
                 i += 1;
+            }
+            "--scrollback" => {
+                // `bitty init --scrollback LINES`: init-only explicit answer
+                // (raw; validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_scrollback = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_scrollback = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--close-confirm" => {
+                // `bitty init --close-confirm MODE`: init-only explicit answer
+                // (raw; validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_close_confirm = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_close_confirm = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--gaps-in" => {
+                // `bitty init --gaps-in PX`: init-only explicit answer (raw;
+                // validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_gaps_in = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_gaps_in = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--gaps-out" => {
+                // `bitty init --gaps-out PX`: init-only explicit answer (raw;
+                // validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_gaps_out = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_gaps_out = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--border" => {
+                // `bitty init --border PX`: init-only explicit answer (raw;
+                // validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_border = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_border = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--radius" => {
+                // `bitty init --radius PX`: init-only explicit answer (raw;
+                // validated fail-closed at the init dispatch).
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.init_radius = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.init_radius = Some(String::new());
+                    i += 1;
+                }
             }
             "--format" => {
                 // `bitty doctor/ctl/list/inspect/dev --format SHAPE`: raw on
@@ -1296,13 +1412,22 @@ pub(crate) fn help_text() -> String {
             config edit      Open the file in $VISUAL/$EDITOR (vi fallback);\n  \
                              creates parents + starter when missing, never\n  \
                              overwrites existing content\n  \
-             init [--yes] [--force]  Opt-in interactive setup wizard (never\n  \
-                              auto-runs): mascot greeting, shell/theme/font-size\n  \
-                              picks, vim keybinding preset, writes init.lua.\n  \
+             init [--yes] [--force] [VALUE FLAGS]  Opt-in guided setup wizard\n  \
+                              (never auto-runs): mascot greeting, shell/theme/\n  \
+                              font family+size/decoration gaps+border+radius/\n  \
+                              scrollback/close_confirm picks, vim keybinding\n  \
+                              preset, writes init.lua with shipped keys only.\n  \
                               --yes skips prompts (sane defaults); without\n  \
                               --force an existing file is never overwritten\n  \
                               (--force backs it up to init.lua.bak first).\n  \
+                              Without a TTY on stdin, --yes is required\n  \
+                              (otherwise exit 2; never a hang).\n  \
                               Honors --config PATH / BITTY_CONFIG as the target.\n  \
+                              Value flags answer one step and skip its prompt:\n  \
+                              --theme NAME, --font-family NAME, --font-size PTS,\n  \
+                              --scrollback LINES, --close-confirm MODE,\n  \
+                              --gaps-in PX, --gaps-out PX, --border PX,\n  \
+                              --radius PX (each validated fail-closed).\n  \
             doctor [--format SHAPE] [--no-color]  Diagnose installation and\n  \
                               compatibility (local class, safe mode): binary,\n  \
                               config, keymaps, fonts, display, GPU, clipboard,\n  \

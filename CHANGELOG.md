@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guided `bitty init` configuration wizard (CTX-0345):** the opt-in setup
+  wizard now walks through the most useful shipped appearance and behavior
+  keys in addition to shell/theme/font-size/keymaps: font family,
+  decoration basics (`decoration.gaps_in`, `decoration.gaps_out`,
+  `decoration.border`, `decoration.radius`), `terminal.scrollback`, and
+  top-level `close_confirm`. The rendered `init.lua` always carries those
+  keys and is validated through the effective config path before any write
+  (shipped keys only; no secrets, no network). Non-interactive runs use
+  `--yes` plus explicit value flags (`--theme`, `--font-family`,
+  `--font-size`, `--scrollback`, `--close-confirm`, `--gaps-in`,
+  `--gaps-out`, `--border`, `--radius`); each flag answers its step, skips
+  that prompt, and is validated fail-closed. Without a TTY on stdin,
+  `bitty init` exits 2 with usage instead of blocking, and an existing file
+  is still only replaced with `--force` (keeping a `.bak` backup).
 - **Close confirmation for running jobs (CTX-0370):** closing a pane or the
   window while a PTY still has a foreground job now prompts before discarding
   the work. Busy detection reads the kernel foreground process group

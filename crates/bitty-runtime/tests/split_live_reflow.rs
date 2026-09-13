@@ -352,11 +352,13 @@ fn live_split_resizes_primary_and_pane_pty_winsize() {
 
 // POSIX-only (`/bin/sh` for the mixed shape; same gate as above).
 //
-// CTX-0269 requirement 3 / CTX-0359: a pure session-less split (`ctl view
-// split`: no shell spawns) paints the primary grid in the primary owner
-// leaf only (v:1, the leaf focused when the primary attached) and erases
-// the session-less non-owner; the mixed shape (keymap split: the new leaf
-// owns a shell) paints primary in the owner PLUS the pane's own grid.
+// CTX-0269 requirement 3 / CTX-0359: a pure session-less split (built
+// directly here; no shell spawns — the shape a pre-CTX-0387 `ctl view
+// split` or a spawn failure leaves behind) paints the primary grid in the
+// primary owner leaf only (v:1, the leaf focused when the primary attached)
+// and erases the session-less non-owner; the mixed shape (keymap split: the
+// new leaf owns a shell) paints primary in the owner PLUS the pane's own
+// grid.
 // This test pins both arms behaviorally so a regression is visible.
 #[cfg(unix)]
 #[test]

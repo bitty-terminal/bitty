@@ -379,11 +379,11 @@ impl Runtime {
                     return;
                 }
                 // CTX-0359: only the primary owner leaf may fall back to
-                // the runtime-global writer. A session-less non-owner (fresh
-                // workspace leaf, ctl split tile, spawn failure) has no
-                // shell of its own; typing there must never reach another
-                // view's shell (previous workspace primary included), so it
-                // buffers headless instead.
+                // the runtime-global writer. A session-less non-owner
+                // (spawn failure, or a recipe-less leaf created before the
+                // primary attached) has no shell of its own; typing there
+                // must never reach another view's shell (previous workspace
+                // primary included), so it buffers headless instead.
                 if Some(focused) != self.primary_view {
                     self.buffer_input_headless(bytes);
                     return;

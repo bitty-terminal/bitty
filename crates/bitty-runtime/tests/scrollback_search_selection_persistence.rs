@@ -185,9 +185,10 @@ fn persistent_selection_survives_resize_clamping_headless() {
     assert_eq!(rt.selection_text().as_deref(), Some("hello"));
     let pers = rt.persistent_selection().unwrap();
     // Resize to smaller grid: 4 cols x 2 rows -> selection col 4 clamped to 3.
-    // CTX-0223: the window carries the default 8px padding inset on every
-    // side, so the window is grid pixels + 16: 4*9+16 x 2*19+16.
-    rt.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
+    // CTX-0223/CTX-0375: the window carries the default 8px padding inset on
+    // every side plus the 14px per-side decoration inset. A window-sized
+    // 8x4 container cell area insets to a 4x2 content grid.
+    rt.handle_resize(PhysicalSize::new(9 * 8 + 16, 19 * 4 + 16))
         .expect("resize small must succeed");
     // Persistent selection columns should be clamped to new width (3)
     let clamped = pers.clamped(rt.state());
@@ -200,7 +201,7 @@ fn persistent_selection_survives_resize_clamping_headless() {
     rt2.start_selection(CellPos::new(0, 0));
     rt2.end_selection(CellPos::new(0, 4));
     let _pers2 = rt2.persistent_selection().unwrap();
-    rt2.handle_resize(PhysicalSize::new(9 * 4 + 16, 19 * 2 + 16))
+    rt2.handle_resize(PhysicalSize::new(9 * 8 + 16, 19 * 4 + 16))
         .unwrap();
     // Runtime's automatic clamping after resize should keep selection valid and non-empty
     assert!(rt2.has_selection());
@@ -311,7 +312,9 @@ fn selection_persistence_headless_still_works_via_state_resize_and_search() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].matched_text, "persist");
     // Resize larger so total buffer grows and persistent stays in bounds.
-    rt.handle_resize(PhysicalSize::new(8 * 120, 16 * 30))
+    // CTX-0375: the content grid excludes the decoration inset, so pick a
+    // window that still yields a grid at least as large as the 80x24 default.
+    rt.handle_resize(PhysicalSize::new(8 * 120, 16 * 40))
         .expect("resize must succeed");
     // After resize, selection clamped but still exists
     assert!(rt.has_selection());
@@ -322,7 +325,7 @@ fn selection_persistence_headless_still_works_via_state_resize_and_search() {
     let mut rt2 = make_runtime();
     feed_runtime(&mut rt2, "persist search test");
     rt2.select_all();
-    rt2.handle_resize(PhysicalSize::new(8 * 120, 16 * 30))
+    rt2.handle_resize(PhysicalSize::new(8 * 120, 16 * 40))
         .unwrap();
     assert_eq!(
         rt.search("persist", SearchOptions::default()),

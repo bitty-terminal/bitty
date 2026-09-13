@@ -60,12 +60,16 @@ fn dpi_adoption_derives_grid_from_physical_over_scaled_cells() {
     assert_eq!(rt.dpi_scale(), 1.0);
     // Hyprland scale 1.6, tiled physical extent 2506x1496: scaled cells
     // are 14x30 (CTX-0157 readable 9x19 base) and the physical padding
-    // is round(8 * 1.6) = 13px per side (CTX-0223), so the grid is
-    // (2506-26)/14 x (1496-26)/30 = 177x49 (not 278x78 unscaled).
+    // is round(8 * 1.6) = 13px per side (CTX-0223). CTX-0375: the primary
+    // grid follows the decorated content frame, so the Core-owned
+    // decoration (gaps_out 6 + border 2 + content_inset 6 = 14 logical px
+    // per side, round(14 * 1.6) = 23 physical px) is removed too:
+    // (2506-26-46)/14 x (1496-26-46)/30 = 173x47 (a window-sized 177x49
+    // grid would be cropped to the content frame).
     rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
     assert_eq!(rt.dpi_scale(), 1.6);
     let snap = rt.snapshot();
-    assert_eq!((snap.width, snap.height), (177, 49));
+    assert_eq!((snap.width, snap.height), (173, 47));
     assert_eq!(
         rt.surface_extent(),
         Some(PhysicalSize::new(2506, 1496)),
@@ -91,7 +95,7 @@ fn dpi_rescale_without_extent_keeps_grid_for_following_resized() {
     rt.handle_resize(PhysicalSize::new(2506, 1496))
         .expect("valid resize");
     let snap = rt.snapshot();
-    assert_eq!((snap.width, snap.height), (177, 49));
+    assert_eq!((snap.width, snap.height), (173, 47));
 }
 
 #[test]
@@ -108,8 +112,9 @@ fn invalid_dpi_scales_are_sanitized_fail_safe() {
         let snap = rt.snapshot();
         assert_eq!(
             (snap.width, snap.height),
-            (87, 30),
-            "unscaled 9x19 cells over 800x600 minus the 8px padding inset"
+            (83, 28),
+            "unscaled 9x19 cells over 800x600 minus the 8px padding inset \
+             and the 14px per-side decoration inset (CTX-0375)"
         );
         assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
         assert!(rt.tick().is_some(), "window stays drawable");
@@ -180,8 +185,8 @@ fn logical_recompute_matches_physical_resize() {
     via_physical.handle_resize(physical).expect("valid resize");
     let a = via_logical.snapshot();
     let b = via_physical.snapshot();
-    assert_eq!((a.width, a.height), (177, 49));
-    assert_eq!((b.width, b.height), (177, 49));
+    assert_eq!((a.width, a.height), (173, 47));
+    assert_eq!((b.width, b.height), (173, 47));
 }
 
 #[test]
@@ -190,13 +195,15 @@ fn repeated_rescales_start_from_design_base_without_drift() {
     rt.apply_dpi_scale(2.0, Some(PhysicalSize::new(1600, 1200)));
     let scaled = rt.snapshot();
     // 9x19 base at 2x -> 18x38 cells, physical padding round(8 * 2) =
-    // 16px per side (CTX-0223): (1600-32)/18=87, (1200-32)/38=30.
-    assert_eq!((scaled.width, scaled.height), (87, 30));
+    // 16px per side (CTX-0223) and decoration round(14 * 2) = 28px per
+    // side (CTX-0375): (1600-32-56)/18=83, (1200-32-56)/38=28.
+    assert_eq!((scaled.width, scaled.height), (83, 28));
     // Back to 1.0 must restore the exact base grid, not a rounded echo.
-    // Padding is 8px per side again: (1600-16)/9=176, (1200-16)/19=62.
+    // Padding is 8px per side and decoration 14px per side again:
+    // (1600-16-28)/9=172, (1200-16-28)/19=60.
     rt.apply_dpi_scale(1.0, Some(PhysicalSize::new(1600, 1200)));
     let restored = rt.snapshot();
-    assert_eq!((restored.width, restored.height), (176, 62));
+    assert_eq!((restored.width, restored.height), (172, 60));
     assert_eq!(rt.dpi_scale(), 1.0);
 }
 
@@ -208,9 +215,9 @@ fn resized_after_scale_uses_scaled_cells() {
         .expect("valid resize");
     let snap = rt.snapshot();
     // 18x38 scaled cells minus the 16px physical padding per side
-    // (CTX-0223): (800-32)/18=42, (600-32)/38=14 (unscaled w/o padding
-    // would be 88x31).
-    assert_eq!((snap.width, snap.height), (42, 14));
+    // (CTX-0223) and the 28px decoration inset per side (CTX-0375):
+    // (800-32-56)/18=38, (600-32-56)/38=12.
+    assert_eq!((snap.width, snap.height), (38, 12));
 }
 
 #[test]

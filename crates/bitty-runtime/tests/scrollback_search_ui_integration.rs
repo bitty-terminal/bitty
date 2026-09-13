@@ -330,9 +330,10 @@ fn search_ui_refresh_preserves_current_clamped_and_auto_refresh_headless() {
     let cnt = rt.search_match_count();
     // Height-only resize keeps column width, so no rewrap happens and the
     // per-row match count is preserved exactly (refresh only clamps).
-    // 736x586 maps to 80x30 under the default 9x19 cells and 8px padding:
-    // same 80 columns, 24 -> 30 rows.
-    rt.handle_resize(PhysicalSize::new(736, 586))
+    // CTX-0375: the content grid excludes the 14px per-side decoration inset,
+    // so 772x624 maps to an 80x30 content grid (window 84x32 cells) under the
+    // default 9x19 cells and 8px padding: same 80 columns, 24 -> 30 rows.
+    rt.handle_resize(PhysicalSize::new(772, 624))
         .expect("resize must succeed");
     assert_eq!(rt.state().width(), 80);
     assert_eq!(rt.state().height(), 30);

@@ -990,8 +990,20 @@ impl RuntimeConfig {
         self.resolve_view_outline_traced(target).0
     }
 
-    /// Resolves one `View`'s background image and fit (CTX-0347,
-    /// RFC-0001/OQ-042) from the global pair plus every matching per-`View`
+    /// True when any background image could contribute (the global
+    /// `decoration.background_image` or any `views` rule). The present path
+    /// uses this to skip background resolution and its per-frame allocation
+    /// entirely on the common no-image configuration (CTX-0347).
+    #[must_use]
+    pub fn has_background_images(&self) -> bool {
+        self.background_image.is_some()
+            || self
+                .view_appearance
+                .iter()
+                .any(|rule| rule.background_image.is_some())
+    }
+
+    /// Resolves one `View`'s background image and fit (CTX-0347,    /// RFC-0001/OQ-042) from the global pair plus every matching per-`View`
     /// rule.
     ///
     /// Resolution is per field per tier (`*` < content < `ws:` < `view:`),

@@ -993,8 +993,14 @@ impl Runtime {
                 // nearest-neighbor scale. The per-frame budget mirrors BG-7
                 // (32 blits / 64 MiB staging) so a hostile layout can never
                 // allocate beyond the accepted present bound; refused entries
-                // skip fail-closed.
-                if frame.content.width > 0 && frame.content.height > 0 {
+                // skip fail-closed. Resolution is skipped entirely when no
+                // image can match (`has_background_images`), keeping the common
+                // no-image frame free of the per-View resolve and its fit
+                // allocation.
+                if frame.content.width > 0
+                    && frame.content.height > 0
+                    && self.config.has_background_images()
+                {
                     let resolved = self.view_background_for(view_id);
                     if let Some(path) = resolved.image.as_deref() {
                         if let Some(key) = self.background_keys.get(path).cloned() {

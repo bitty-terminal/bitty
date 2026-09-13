@@ -382,6 +382,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         old.mouse.focus_follows_mouse.to_string(),
         new.mouse.focus_follows_mouse.to_string(),
     );
+    // CTX-0334: the hover dwell delay is adopted at startup like the
+    // hover switch itself, so changes are restart-required.
+    push_if_changed(
+        "mouse.focus_follows_mouse_delay_ms",
+        old.mouse.focus_follows_mouse_delay_ms.to_string(),
+        new.mouse.focus_follows_mouse_delay_ms.to_string(),
+    );
     push_if_changed(
         "appearance.theme",
         format!("{:?}", old.appearance.theme),
@@ -459,13 +466,34 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         old.mod_key.canonical().to_string(),
         new.mod_key.canonical().to_string(),
     );
-    // Keymaps and plugins: compare sorted ids, not raw order (merge already
-    // sorts them).
-    let old_kms: Vec<String> = old.keymaps.iter().map(|k| k.id()).collect();
-    let new_kms: Vec<String> = new.keymaps.iter().map(|k| k.id()).collect();
+    // Keymaps and plugins are set-by-identifier stores: compare the sorted
+    // `id -> value` pairs (never raw order; merge already sorts them) so a
+    // rebind of an existing chord or an enabled-flag flip is detected.
+    let mut old_kms: Vec<(String, &str)> = old
+        .keymaps
+        .iter()
+        .map(|k| (k.id(), k.action.as_str()))
+        .collect();
+    let mut new_kms: Vec<(String, &str)> = new
+        .keymaps
+        .iter()
+        .map(|k| (k.id(), k.action.as_str()))
+        .collect();
+    old_kms.sort();
+    new_kms.sort();
     push_if_changed("keymaps", format!("{old_kms:?}"), format!("{new_kms:?}"));
-    let old_pls: Vec<String> = old.plugins.iter().map(|p| p.id.clone()).collect();
-    let new_pls: Vec<String> = new.plugins.iter().map(|p| p.id.clone()).collect();
+    let mut old_pls: Vec<(String, bool)> = old
+        .plugins
+        .iter()
+        .map(|p| (p.id.clone(), p.enabled))
+        .collect();
+    let mut new_pls: Vec<(String, bool)> = new
+        .plugins
+        .iter()
+        .map(|p| (p.id.clone(), p.enabled))
+        .collect();
+    old_pls.sort();
+    new_pls.sort();
     push_if_changed("plugins", format!("{old_pls:?}"), format!("{new_pls:?}"));
 
     let needs_restart = diffs
@@ -897,6 +925,82 @@ mod tests {
                 .iter()
                 .any(|d| d.field == "mouse.focus_follows_mouse")
         );
+    }
+
+    #[test]
+    fn diff_mouse_focus_follows_mouse_delay_is_restart_required() {
+        // CTX-0373: the hover dwell delay (CTX-0334) is adopted at startup
+        // like the hover switch itself. The classify table already declared
+        // it restart-required; the diff must report it so a reload cannot
+        // silently claim success.
+        let old = EffectiveConfig::default();
+        assert_eq!(old.mouse.focus_follows_mouse_delay_ms, 0);
+        assert_eq!(
+            classify_field("mouse.focus_follows_mouse_delay_ms"),
+            ReloadClass::RestartRequired
+        );
+        let mut new = old.clone();
+        new.mouse.focus_follows_mouse_delay_ms = 250;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(
+            r.diffs
+                .iter()
+                .any(|d| d.field == "mouse.focus_follows_mouse_delay_ms")
+        );
+        let mut cur = old;
+        assert!(reconcile_live(&mut cur, &new).is_err());
+        assert_eq!(cur.mouse.focus_follows_mouse_delay_ms, 0);
+    }
+
+    #[test]
+    fn diff_plugin_enabled_flip_is_restart_required() {
+        // CTX-0373: plugins are set-by-identifier; the diff must compare the
+        // enabled flag, not only the id set, or an enable/disable flip would
+        // report a live no-op.
+        use crate::types::PluginSpec;
+        let old = EffectiveConfig {
+            plugins: vec![PluginSpec {
+                id: "xuepoo.markdown".into(),
+                enabled: false,
+            }],
+            ..EffectiveConfig::default()
+        };
+        let mut new = old.clone();
+        new.plugins[0].enabled = true;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "plugins"));
+        let mut cur = old;
+        assert!(reconcile_live(&mut cur, &new).is_err());
+        assert!(!cur.plugins[0].enabled, "previous value stays active");
+    }
+
+    #[test]
+    fn diff_keymap_action_change_is_live_and_reconciles() {
+        // CTX-0373: keymaps are set-by-identifier; a rebind of an existing
+        // chord changes the action, so the diff must compare the bound
+        // action, not only the context+chord id set.
+        use crate::types::KeymapEntry;
+        let old = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "ctrl+tab".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..EffectiveConfig::default()
+        };
+        let mut new = old.clone();
+        new.keymaps[0].action = "focus_prev".into();
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(!r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "keymaps"));
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("keymap rebind must reconcile live");
+        assert_eq!(cur.keymaps[0].action, "focus_prev");
     }
 
     #[test]

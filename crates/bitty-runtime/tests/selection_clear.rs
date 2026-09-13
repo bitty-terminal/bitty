@@ -13,11 +13,25 @@
 use bitty_platform::{
     CursorPosition, KeyLocation, LogicalKey, MouseButton, MouseEvent, NamedKey, PressState,
 };
-use bitty_runtime::Runtime;
+use bitty_runtime::{Runtime, RuntimeConfig};
 use bitty_ui::CellPos;
 
 fn make_runtime() -> Runtime {
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    rt.force_headless_clipboard();
+    rt
+}
+
+/// Runtime with the CTX-0191 copy-on-select opt-in enabled.
+///
+/// CTX-0371 changed the shipped default to off (kitty/ghostty semantics), so
+/// the auto-copy assertions below must opt in explicitly.
+fn make_auto_copy_runtime() -> Runtime {
+    let mut rt = Runtime::new(RuntimeConfig {
+        selection_auto_copy: true,
+        ..RuntimeConfig::default()
+    })
+    .expect("headless runtime must build");
     rt.force_headless_clipboard();
     rt
 }
@@ -152,7 +166,7 @@ fn typing_clears_selection_and_delivers_bytes() {
 
 #[test]
 fn new_drag_replaces_old_selection() {
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     select_hello(&mut rt);
     // New drag via the mouse path replaces the old range.
     rt.handle_cursor_moved(cell_pos(6, 0));
@@ -218,7 +232,7 @@ fn drag_auto_copy_proves_capture_for_wl_paste() {
     // Issue #268 Q3: verify capture independently of rendering. Headless
     // proof that after a drag, both clipboards hold exactly the dragged text
     // (live `wl-paste` / `wl-paste --primary` observe the same via CTX-0160).
-    let mut rt = make_runtime();
+    let mut rt = make_auto_copy_runtime();
     feed_text(&mut rt, "hello world");
     rt.handle_cursor_moved(cell_pos(0, 0));
     rt.handle_mouse_input(mouse_press(MouseButton::Left));

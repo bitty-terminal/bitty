@@ -33,7 +33,7 @@
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
 //!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16 },
-//!     selection = { auto_copy = true }, -- false opts out of copy-on-select (CTX-0191)
+//!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
 //!     decoration = { gaps_in = 6, gaps_out = 6, border = 2, radius = 6, content_inset = 6 }, -- Core-owned workspace decoration in logical px; unified gaps + content padding (CTX-0292/CTX-0333)
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
@@ -912,8 +912,9 @@ impl ConfigData {
                     });
                 }
                 "selection" => {
-                    // CTX-0191: `selection = { auto_copy = false }` opts out
-                    // of copy-on-select; absent table/key means "says nothing".
+                    // CTX-0191/CTX-0371: `selection = { auto_copy = true }`
+                    // opts in to copy-on-select; absent table/key means
+                    // "says nothing" (default false, matching kitty/ghostty).
                     let nested = expect_table(key, val)?;
                     check_nested_keys(key, nested, &["auto_copy"])?;
                     let auto_copy = match get_field(nested, "auto_copy") {

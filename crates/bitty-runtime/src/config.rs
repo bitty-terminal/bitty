@@ -53,12 +53,13 @@ pub const DEFAULT_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_DEFAULT
 /// future bound drift cannot grow terminal memory without limit.
 pub const MAX_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_MAX_LINES;
 
-/// Default selection auto-copy behavior (CTX-0191).
+/// Default selection auto-copy behavior (CTX-0191, CTX-0371).
 /// Mirrors `bitty-config` `DEFAULT_SELECTION_AUTO_COPY` (kept as a local
 /// constant because `bitty-runtime` must not depend on `bitty-config`;
 /// `bitty-app` maps the effective value across at startup and the two
 /// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
-pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
+/// `false` matches kitty/ghostty: no implicit clipboard write on select.
+pub const DEFAULT_SELECTION_AUTO_COPY: bool = false;
 
 /// Default focus-follows-mouse behavior (CTX-0260).
 /// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE` (kept as a
@@ -262,9 +263,10 @@ pub struct RuntimeConfig {
     /// their captured capacity.
     pub scrollback: usize,
     /// Whether a committed mouse selection auto-copies to the clipboard
-    /// (CTX-0191; default `true` = ghostty-class copy-on-select).
-    /// `false` leaves the highlight in place; the explicit
-    /// `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
+    /// (CTX-0191, CTX-0371; default `false` = no implicit clipboard write,
+    /// matching kitty/ghostty). `false` leaves the highlight in place; the
+    /// explicit `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
+    /// `true` opts into ghostty-class copy-on-select.
     pub selection_auto_copy: bool,
     /// Whether hover moves keyboard focus to the hovered pane (CTX-0260
     /// `mouse.focus_follows_mouse`; default `false` = click-to-focus).
@@ -1083,10 +1085,10 @@ mod tests {
     }
 
     #[test]
-    fn selection_auto_copy_defaults_on_and_accepts_both() {
-        // CTX-0191: default-on preserves copy-on-select; both values build.
-        const { assert!(DEFAULT_SELECTION_AUTO_COPY) }
-        assert!(RuntimeConfig::default().selection_auto_copy);
+    fn selection_auto_copy_defaults_off_and_accepts_both() {
+        // CTX-0371: default-off matches kitty/ghostty; both values build.
+        const { assert!(!DEFAULT_SELECTION_AUTO_COPY) }
+        assert!(!RuntimeConfig::default().selection_auto_copy);
         RuntimeConfig::new(
             80,
             24,

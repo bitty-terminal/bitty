@@ -61,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Selection no longer auto-copies by default (CTX-0371):** `selection.auto_copy`
+  now defaults to `false` (was `true`), so a committed mouse selection keeps its
+  highlight and no longer overwrites the system clipboard (or the Linux primary
+  selection) on release. This matches kitty (`copy_on_select no`) and ghostty
+  (`copy-on-select none`). Press `Ctrl+Shift+C` to copy explicitly, or opt back
+  in with `selection = { auto_copy = true }` in `init.lua`. Selection clearing
+  (click / `Esc` / typing / IME commit) is unchanged.
+
 - **Unified panel gaps (CTX-0333):** `decoration.gaps_in` now defaults to `6`
   (was `4`), matching `decoration.gaps_out`, so the default sibling
   (panel-to-panel / panel-to-terminal) and container gaps read as one spacing.

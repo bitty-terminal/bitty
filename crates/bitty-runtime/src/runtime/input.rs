@@ -477,13 +477,13 @@ impl Runtime {
     ///   paste never fires in this path.
     /// - Holding Shift bypasses capture unconditionally to force selection
     ///   (accessibility escape).
-    /// - Otherwise the event drives presentation selection with ghostty
-    ///   copy-on-select: left press starts a drag, left release commits it and
-    ///   auto-copies to the platform clipboard (which best-effort syncs the
-    ///   primary selection on Linux, CTX-0160) — unless
-    ///   `RuntimeConfig::selection_auto_copy` is `false` (CTX-0191 opt-out:
-    ///   the highlight stays and only the explicit `copy_to_clipboard` chord
-    ///   copies); right press pastes the
+    /// - Otherwise the event drives presentation selection: left press starts
+    ///   a drag and left release commits it (the highlight stays). Auto-copy
+    ///   is opt-in (`RuntimeConfig::selection_auto_copy`, CTX-0191/CTX-0371):
+    ///   when `true` the committed selection copies to the platform clipboard
+    ///   (which best-effort syncs the primary selection on Linux, CTX-0160);
+    ///   when `false` (default, matching kitty/ghostty) only the explicit
+    ///   `copy_to_clipboard` chord copies. Right press pastes the
     ///   standard clipboard (Wayland-first backend) and middle press pastes
     ///   the platform primary selection, both through the suspicious-paste
     ///   inspection gate. All three stay fail-soft (empty source means no
@@ -645,14 +645,15 @@ impl Runtime {
                     }
                     self.pending_full_redraw = true;
                 }
-                // Ghostty copy-on-select: a committed drag auto-copies to
-                // both selections via the platform clipboard (Wayland-first,
-                // CTX-0160) — unless `selection.auto_copy` is false (CTX-0191
-                // opt-out: the highlight stays and only the explicit
-                // `copy_to_clipboard` chord copies). Fail-soft: empty
-                // selection pastes nothing and a system clipboard error is
-                // recorded for `last_clipboard_error` while the headless
-                // buffers still update; the input path never blocks.
+                // Copy-on-select is opt-in (CTX-0191/CTX-0371; default off,
+                // matching kitty/ghostty): when enabled, a committed drag
+                // auto-copies to both selections via the platform clipboard
+                // (Wayland-first, CTX-0160); when disabled the highlight stays
+                // and only the explicit `copy_to_clipboard` chord copies.
+                // Fail-soft: empty selection pastes nothing and a system
+                // clipboard error is recorded for `last_clipboard_error` while
+                // the headless buffers still update; the input path never
+                // blocks.
                 if self.config.selection_auto_copy {
                     let _ = self.auto_copy_selection();
                 }

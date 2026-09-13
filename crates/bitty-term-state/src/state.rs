@@ -878,6 +878,10 @@ impl State {
             TerminalAction::Reply { bytes } => self.replies.queue(bytes.clone()),
 
             TerminalAction::OscTitle { text } => self.title = text.clone(),
+            // Dynamic default colors (CTX-0381): grid truth is untouched.
+            // The runtime owns the active palette, query replies, and the
+            // gated set path; terminal state stays inert by contract.
+            TerminalAction::OscDynamicColor { .. } => {}
             TerminalAction::OscClipboard { .. } => {
                 // Semantically inert here by contract (RFC replay guarantee
                 // 6): clipboard effects enter state only through recorded
@@ -1573,6 +1577,7 @@ impl State {
             }
             Mode::BracketedPaste => self.modes.bracketed_paste = enabled,
             Mode::FocusEvents => self.modes.focus_events = enabled,
+            Mode::SynchronizedUpdate => self.modes.synchronized_update = enabled,
             Mode::KittyKeyboard(flags) => {
                 if enabled {
                     // Progressive flags: OR in bounded bits (candidate spec: u32, unknown bits ignored)

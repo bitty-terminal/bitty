@@ -290,6 +290,10 @@ pub enum Mode {
     BracketedPaste,
     /// Focus reporting (`?1004`).
     FocusEvents,
+    /// Synchronized updates (`?2026`, CTX-0380): the application brackets a
+    /// redraw between set and reset; presentation defers committing frames
+    /// until reset, bounded by the runtime's deferral timeout.
+    SynchronizedUpdate,
     /// Kitty keyboard protocol (`?7727` progressive flags, bitmask).
     KittyKeyboard(u32),
     /// Mouse press/release/release-drag/all-motion reporting.
@@ -381,6 +385,28 @@ pub struct Hyperlink {
     pub id: Option<BoundedString>,
     /// The hyperlink target URI.
     pub uri: BoundedString,
+}
+
+/// Which default color an `OSC 10`/`OSC 11` operation addresses (CTX-0381).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DynamicColorTarget {
+    /// `OSC 10`: the default foreground color.
+    Foreground,
+    /// `OSC 11`: the default background color.
+    Background,
+}
+
+/// Operation carried by an `OSC 10`/`OSC 11` sequence (CTX-0381).
+///
+/// The parser only classifies and bounds the payload. Answering queries and
+/// gating sets belong to the runtime, which owns the active theme palette
+/// and the set capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DynamicColorOp {
+    /// `OSC 10;?` / `OSC 11;?`: report the active color.
+    Query,
+    /// `OSC 10;<color>` / `OSC 11;<color>`: parsed set value.
+    Set(Rgb),
 }
 
 /// Semantic prompt/command zone marker carried by `OSC 133`.
@@ -614,6 +640,17 @@ pub enum TerminalAction {
     OscTitle {
         /// Title payload, length-bounded.
         text: BoundedString,
+    },
+    /// Dynamic default-color operation (`OSC 10`/`OSC 11`, CTX-0381).
+    ///
+    /// The parser resolves the payload to a bounded query or set value;
+    /// terminal state treats this as inert and the runtime answers queries
+    /// from the resolved theme palette and applies authorized sets.
+    OscDynamicColor {
+        /// Which default color the operation addresses.
+        target: DynamicColorTarget,
+        /// Query or bounded set value.
+        op: DynamicColorOp,
     },
     /// Clipboard read/write request (`OSC 52`); effects flow through the
     /// recorded policy decision, not this action (RFC replay guarantees).

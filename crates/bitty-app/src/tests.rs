@@ -519,6 +519,78 @@ fn terminal_app_poll_and_tick_are_total() {
 }
 
 #[test]
+fn window_title_sanitizer_strips_controls_and_bounds_length() {
+    use crate::terminal_app::{WINDOW_TITLE_MAX_CHARS, sanitize_window_title};
+    // Printable text survives; every control scalar (C0, DEL, C1) is dropped.
+    assert_eq!(
+        sanitize_window_title("nvim \u{1}src/\u{7f}main.rs\r\n"),
+        "nvim src/main.rs"
+    );
+    assert_eq!(sanitize_window_title("\u{1b}]0;spoof\u{9c}"), "]0;spoof");
+    // Bounded on a character boundary for ASCII and multi-byte text.
+    let long = "x".repeat(WINDOW_TITLE_MAX_CHARS + 100);
+    assert_eq!(
+        sanitize_window_title(&long).chars().count(),
+        WINDOW_TITLE_MAX_CHARS
+    );
+    let multibyte = "\u{e9}".repeat(WINDOW_TITLE_MAX_CHARS + 10);
+    let bounded = sanitize_window_title(&multibyte);
+    assert_eq!(bounded.chars().count(), WINDOW_TITLE_MAX_CHARS);
+    assert!(bounded.chars().all(|c| c == '\u{e9}'));
+}
+
+#[test]
+fn osc_title_applies_to_window_state_and_is_change_gated() {
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    assert_eq!(app.last_applied_title, None);
+    app.runtime.handle_pty_bytes(b"\x1b]2;nvim foo.rs\x07");
+    assert!(
+        app.drive_tick().is_some(),
+        "first tick presents the startup frame"
+    );
+    assert_eq!(app.last_applied_title.as_deref(), Some("nvim foo.rs"));
+    assert_eq!(app.title_applies, 1);
+    // Same title again: the change gate drops it (no titlebar churn).
+    app.runtime.handle_pty_bytes(b"\x1b]0;nvim foo.rs\x07");
+    let _ = app.drive_tick();
+    assert_eq!(app.title_applies, 1, "identical titles must not re-apply");
+    // A new title applies exactly once more.
+    app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
+    let _ = app.drive_tick();
+    assert_eq!(app.last_applied_title.as_deref(), Some("ssh prod"));
+    assert_eq!(app.title_applies, 2);
+}
+
+#[test]
+fn osc_title_sanitizes_and_empty_resets_to_static_title() {
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    app.runtime.handle_pty_bytes(b"\x1b]2;bad\x01title\x7f\x07");
+    app.apply_cold_events();
+    assert_eq!(app.last_applied_title.as_deref(), Some("badtitle"));
+    // Empty OSC 0/2 resets to the static theme title, never a blank bar.
+    app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
+    app.apply_cold_events();
+    assert_eq!(
+        app.last_applied_title.as_deref(),
+        Some(app.window_title.as_str())
+    );
+}
+
+#[test]
 fn default_startup_carries_no_demo_line() {
     // CTX-0167 / #269: real sessions show only the shell — the default
     // constructor attaches no synthetic pump, so polling consumes

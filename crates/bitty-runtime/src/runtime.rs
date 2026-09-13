@@ -106,7 +106,7 @@ use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, PersistentSelection, Rect as UiRect,
     SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
 };
-use bitty_vt::{ClipboardOp, Parser, SequenceKind};
+use bitty_vt::{ClipboardOp, DynamicColorOp, DynamicColorTarget, Parser, SequenceKind};
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, GrantRecord, HostObservation, InterceptionDecision,
@@ -237,6 +237,17 @@ pub const PTY_FORWARD_CAPACITY_CHUNKS: usize = bitty_pty::CHANNEL_CAPACITY_CHUNK
 /// collapses to [`PASTE_BANNER_FLASH_TEXT`] while the paste still pends.
 /// The flash keeps the never-silent signal without occluding the grid.
 pub const PASTE_BANNER_FULL_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Maximum time presentation defers frames while synchronized updates
+/// (`DECSET 2026`, CTX-0380) are active.
+///
+/// The contour/iTerm2 synchronized-output proposal leaves the abort bound
+/// to the terminal; Microsoft Terminal and the ansicode reference both use
+/// ~100 ms and the spec notes "a too short timeout ... won't be worse than
+/// having no synchronized output at all". When the application never sends
+/// the reset, the latest state still commits at this bound so a hung or
+/// buggy process can never stall presentation indefinitely.
+pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
@@ -450,6 +461,25 @@ pub struct Runtime {
     pending_close_confirm: Option<PendingCloseConfirm>,
     osc_clipboard_read_allowed: bool,
     osc_clipboard_write_allowed: bool,
+    /// Whether OSC 10/11 dynamic color sets are allowed (CTX-0381).
+    ///
+    /// Capability-gated like OSC 52 writes: default `false` means untrusted
+    /// PTY output cannot repaint the default fg/bg; an embedder must grant
+    /// it explicitly via [`Runtime::set_osc_color_set_allowed`]. Queries are
+    /// unaffected (read-only, answered from the resolved palette).
+    osc_color_set_allowed: bool,
+    /// Dynamic foreground override from an authorized `OSC 10` set
+    /// (CTX-0381); `None` = the resolved theme foreground.
+    dynamic_foreground: Option<[u8; 3]>,
+    /// Dynamic background override from an authorized `OSC 11` set
+    /// (CTX-0381); `None` = the resolved theme background.
+    dynamic_background: Option<[u8; 3]>,
+    /// When the active synchronized-update deferral window began (CTX-0380).
+    ///
+    /// `Some` while `DECSET 2026` is active; bounded by
+    /// [`SYNC_UPDATE_DEFER_TIMEOUT`] so the window always eventually
+    /// commits, and reset to `None` when the mode exits.
+    sync_defer_since: Option<std::time::Instant>,
     /// Count of OSC 52 writes rejected for invalid base64 (CTX-0212).
     ///
     /// Fail-closed telemetry: the clipboard is left unchanged and a loud
@@ -755,6 +785,10 @@ impl Runtime {
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            osc_color_set_allowed: false,
+            dynamic_foreground: None,
+            dynamic_background: None,
+            sync_defer_since: None,
             osc52_rejected_writes: 0,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
@@ -888,6 +922,10 @@ impl Runtime {
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
+            osc_color_set_allowed: false,
+            dynamic_foreground: None,
+            dynamic_background: None,
+            sync_defer_since: None,
             osc52_rejected_writes: 0,
             pending_activation_gesture: None,
             next_activation_gesture: 1,
@@ -1133,6 +1171,84 @@ impl Runtime {
     /// Drains all queued cold-path events in FIFO order.
     pub fn drain_cold_events(&mut self) -> Vec<ColdEvent> {
         self.cold_queue.drain()
+    }
+
+    // ------------------------------------------------------------------
+    // M1 protocol state (CTX-0380 synchronized updates, CTX-0381 dynamic colors)
+    // ------------------------------------------------------------------
+
+    /// Whether any visible grid currently has synchronized updates active
+    /// (`DECSET 2026`, CTX-0380).
+    ///
+    /// The primary state and every split-pane session own independent mode
+    /// registers, so the presentation path checks all of them: a pane that
+    /// enabled the mode defers its own atomic redraw exactly like the
+    /// primary grid. Bounding the deferral window is the present path's job
+    /// (see [`SYNC_UPDATE_DEFER_TIMEOUT`]).
+    #[must_use]
+    pub fn synchronized_update_active(&self) -> bool {
+        self.state.modes().synchronized_update
+            || self
+                .pane_sessions
+                .values()
+                .any(|session| session.state.modes().synchronized_update)
+    }
+
+    /// Allows or denies `OSC 10`/`OSC 11` dynamic color sets (CTX-0381).
+    ///
+    /// Capability-gated and default-deny, mirroring OSC 52 writes: untrusted
+    /// PTY output can never repaint the default fg/bg unless the embedder
+    /// grants this explicitly. Queries are read-only and stay answered from
+    /// the resolved palette either way.
+    pub fn set_osc_color_set_allowed(&mut self, allowed: bool) {
+        self.osc_color_set_allowed = allowed;
+    }
+
+    /// Whether `OSC 10`/`OSC 11` sets are currently allowed (CTX-0381).
+    #[must_use]
+    pub fn osc_color_set_allowed(&self) -> bool {
+        self.osc_color_set_allowed
+    }
+
+    /// Active default foreground: dynamic `OSC 10` override or resolved
+    /// theme color (CTX-0381), as opaque RGBA.
+    #[must_use]
+    pub fn active_foreground(&self) -> [u8; 4] {
+        match self.dynamic_foreground {
+            Some([r, g, b]) => [r, g, b, 0xFF],
+            None => self.config.theme.foreground,
+        }
+    }
+
+    /// Active default background: dynamic `OSC 11` override or resolved
+    /// theme color (CTX-0381), as opaque RGBA.
+    #[must_use]
+    pub fn active_background(&self) -> [u8; 4] {
+        match self.dynamic_background {
+            Some([r, g, b]) => [r, g, b, 0xFF],
+            None => self.config.theme.background,
+        }
+    }
+
+    /// Applies an authorized `OSC 10`/`OSC 11` set and forces a repaint.
+    ///
+    /// The default fg/bg live on the renderer/surface palettes, so the
+    /// override is installed there as well as retained for query replies;
+    /// `pending_full_redraw` makes default-colored cells repaint on the next
+    /// frame.
+    pub(crate) fn apply_osc_color(&mut self, target: bitty_vt::DynamicColorTarget, rgb: [u8; 3]) {
+        match target {
+            bitty_vt::DynamicColorTarget::Foreground => self.dynamic_foreground = Some(rgb),
+            bitty_vt::DynamicColorTarget::Background => self.dynamic_background = Some(rgb),
+        }
+        let palette = bitty_render::ThemePalette {
+            foreground: self.active_foreground(),
+            background: self.active_background(),
+            ..self.config.theme
+        };
+        self.renderer.set_theme_palette(palette);
+        self.surface.set_theme_palette(palette);
+        self.pending_full_redraw = true;
     }
 
     // ------------------------------------------------------------------

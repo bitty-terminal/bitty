@@ -696,6 +696,26 @@ impl Runtime {
                 }
             }
         }
+        // CTX-0380 synchronized updates: while any visible grid has
+        // `DECSET 2026` active, defer committing frames so the application
+        // can redraw atomically. Damage is retained because the frame is
+        // never marked presented; the mode exit presents the batched state.
+        // The window is bounded by `SYNC_UPDATE_DEFER_TIMEOUT` (100 ms, the
+        // contour/iTerm2-proposal consensus bound): a hung or buggy process
+        // that never sends the reset still gets its latest state committed
+        // at the bound instead of stalling presentation indefinitely. After
+        // the bound, each subsequent window commits at most every timeout.
+        if self.synchronized_update_active() {
+            let since = *self.sync_defer_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT {
+                return None;
+            }
+            // Bound reached: commit this frame, then open a fresh window so
+            // a still-active mode does not present on every later tick.
+            self.sync_defer_since = Some(now);
+        } else {
+            self.sync_defer_since = None;
+        }
         // Reflow layout tree into container before rendering so leaf Views
         // carry deterministic origins/sizes for this frame. This is headless
         // and deterministic: same layout + container always yields same

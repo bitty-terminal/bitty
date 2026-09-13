@@ -147,6 +147,25 @@ pub(crate) fn decrpm_reply(private: bool, mode: u16, value: u8) -> Vec<u8> {
     }
 }
 
+/// Standard `OSC 10`/`OSC 11` query reply for the active default color
+/// (CTX-0381).
+///
+/// xterm/kitty/Ghostty reply shape: `OSC <10|11> ; rgb:RRRR/GGGG/BBBB ST`,
+/// with each 8-bit channel duplicated to the full 16-bit range. Replies are
+/// always `ST`-terminated, matching the xterm `ctlseqs` response form.
+#[must_use]
+pub(crate) fn osc_color_reply(target: bitty_vt::DynamicColorTarget, color: [u8; 4]) -> Vec<u8> {
+    let id = match target {
+        bitty_vt::DynamicColorTarget::Foreground => 10,
+        bitty_vt::DynamicColorTarget::Background => 11,
+    };
+    format!(
+        "\x1b]{id};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+        color[0], color[0], color[1], color[1], color[2], color[2]
+    )
+    .into_bytes()
+}
+
 /// DECRQM mode value for one queried mode number against live state.
 ///
 /// `1` set, `2` reset, `0` not recognized (ANSI modes other than 4/20,
@@ -191,6 +210,7 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
                 == Some(bitty_vt::MouseCoordinateEncoding::Urxvt),
         ),
         2004 => Some(state.modes().bracketed_paste),
+        2026 => Some(state.modes().synchronized_update),
         7727 => Some(state.modes().kitty_keyboard != 0),
         _ => None,
     };
@@ -538,8 +558,8 @@ mod tests {
         );
         assert_eq!(
             decrqm_value(&state, true, 2026),
-            0,
-            "unimplemented sync mode"
+            2,
+            "synchronized updates recognized, reset by default"
         );
     }
 

@@ -58,9 +58,10 @@ mod parser;
 
 pub use action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
-    ControlChar, Count, CursorStyle, Direction, EraseDisplayMode, EraseLineMode, GraphemeCell,
-    Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, Row, SequenceKind,
-    StatusKind, TabTargets, TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, Mode, MouseCoordinateEncoding,
+    MouseTrackingMode, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
+    UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
 pub use kitty_apc::{

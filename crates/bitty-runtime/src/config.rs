@@ -563,6 +563,15 @@ pub struct RuntimeConfig {
     ///
     /// [`GridRenderer`]: bitty_render::grid::GridRenderer
     pub theme: bitty_render::ThemePalette,
+    /// Whether [`Self::theme`] was resolved from user configuration
+    /// (CTX-0381).
+    ///
+    /// `false` (the default) marks a built-in fallback palette used by
+    /// headless/unit constructions; `bitty-app` sets `true` when it carries
+    /// the preset resolved by `bitty-config`. OSC 10/11 queries are answered
+    /// only when this is set, so no reply can precede theme resolution; the
+    /// palette itself is never withheld from rendering.
+    pub theme_resolved: bool,
     /// Window padding in logical pixels on every side (CTX-0223
     /// `window.padding`). `0..=MAX_WINDOW_PADDING`; default
     /// `DEFAULT_WINDOW_PADDING` (`8`, ghostty/alacritty-class breathing
@@ -641,6 +650,7 @@ impl Default for RuntimeConfig {
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             view_appearance: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
+            theme_resolved: false,
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
             scrollbar_mode: bitty_ui::ScrollbarMode::Auto,
@@ -719,6 +729,7 @@ impl RuntimeConfig {
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
             view_appearance: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
+            theme_resolved: false,
             window_padding,
             window_radius_px,
             scrollbar_mode,

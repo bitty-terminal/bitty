@@ -40,6 +40,11 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// Focus reporting (`?1004`).
     pub focus_events: bool,
+    /// Synchronized updates (`?2026`, CTX-0380): while set, presentation
+    /// defers committing frames so an application can redraw atomically.
+    /// The runtime bounds the deferral with a timeout so a hung application
+    /// cannot stall presentation indefinitely.
+    pub synchronized_update: bool,
     /// Kitty keyboard progressive flags (`?7727`, bitmask).
     pub kitty_keyboard: u32,
     /// Active mouse-tracking protocol level (`None`: off).
@@ -62,6 +67,7 @@ impl Default for Modes {
             cursor_blinking: false,
             bracketed_paste: false,
             focus_events: false,
+            synchronized_update: false,
             kitty_keyboard: 0,
             mouse_tracking: None,
             mouse_coordinate_encoding: None,

@@ -7,9 +7,9 @@
 use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
-    ControlChar, Count, CursorStyle, Direction, EraseDisplayMode, EraseLineMode, GraphemeCell,
-    Hyperlink, Mode, MouseTrackingMode, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, Mode, MouseTrackingMode, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -355,6 +355,41 @@ fn decset_1048_maps_to_cursor_save_restore() {
 }
 
 #[test]
+fn decset_2026_maps_to_synchronized_update_mode() {
+    assert_eq!(
+        parse(b"\x1b[?2026h\x1b[?2026l"),
+        vec![
+            TerminalAction::SetMode {
+                mode: Mode::SynchronizedUpdate,
+                enabled: true,
+            },
+            TerminalAction::SetMode {
+                mode: Mode::SynchronizedUpdate,
+                enabled: false,
+            },
+        ]
+    );
+    // Nested begins are idempotent mode sets; a single reset ends them.
+    assert_eq!(
+        parse(b"\x1b[?2026h\x1b[?2026h\x1b[?2026l"),
+        vec![
+            TerminalAction::SetMode {
+                mode: Mode::SynchronizedUpdate,
+                enabled: true,
+            },
+            TerminalAction::SetMode {
+                mode: Mode::SynchronizedUpdate,
+                enabled: true,
+            },
+            TerminalAction::SetMode {
+                mode: Mode::SynchronizedUpdate,
+                enabled: false,
+            },
+        ]
+    );
+}
+
+#[test]
 fn mouse_tracking_modes_are_distinct() {
     let actions = parse(b"\x1b[?9h\x1b[?1000h\x1b[?1002h\x1b[?1003l");
     assert_eq!(
@@ -592,6 +627,92 @@ fn osc_cwd_carries_url() {
             url: BoundedString::new("file:///home/user/dir"),
         }]
     );
+}
+
+#[test]
+fn osc_dynamic_color_query_and_set_forms() {
+    assert_eq!(
+        parse(b"\x1b]10;?\x07"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Foreground,
+            op: DynamicColorOp::Query,
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]11;?\x1b\\"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Background,
+            op: DynamicColorOp::Query,
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]10;#12ab34\x07"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Foreground,
+            op: DynamicColorOp::Set(Rgb {
+                r: 0x12,
+                g: 0xAB,
+                b: 0x34
+            }),
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]11;rgb:12/ab/34\x07"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Background,
+            op: DynamicColorOp::Set(Rgb {
+                r: 0x12,
+                g: 0xAB,
+                b: 0x34
+            }),
+        }]
+    );
+    // Short forms scale narrow components to full 8-bit range.
+    assert_eq!(
+        parse(b"\x1b]10;#f0a\x07"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Foreground,
+            op: DynamicColorOp::Set(Rgb {
+                r: 0xFF,
+                g: 0x00,
+                b: 0xAA
+            }),
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]11;rgb:f/8f/ffff\x07"),
+        vec![TerminalAction::OscDynamicColor {
+            target: DynamicColorTarget::Background,
+            op: DynamicColorOp::Set(Rgb {
+                r: 0xFF,
+                g: 0x8F,
+                b: 0xFF
+            }),
+        }]
+    );
+}
+
+#[test]
+fn osc_dynamic_color_malformed_fails_closed() {
+    for (id, sequence) in [
+        (10_u32, &b"\x1b]10;\x07"[..]),          // empty payload
+        (10, &b"\x1b]10;#12345\x07"[..]),        // wrong hex length
+        (11, &b"\x1b]11;#gggggg\x07"[..]),       // non-hex digits
+        (10, &b"\x1b]10;rgb:1/2\x07"[..]),       // missing component
+        (11, &b"\x1b]11;rgb:1/2/3/4\x07"[..]),   // extra component
+        (10, &b"\x1b]10;rgb:12345/0/0\x07"[..]), // component too long
+        (11, &b"\x1b]11;not-a-color\x07"[..]),   // unknown prefix
+        (10, &b"\x1b]10;#fff;extra\x07"[..]),    // extra segment
+    ] {
+        let actions = parse(sequence);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [TerminalAction::OscUnknown { id: got, .. }] if *got == id
+            ),
+            "malformed OSC {id} must stay inert, got {actions:?} for {sequence:?}"
+        );
+    }
 }
 
 #[test]

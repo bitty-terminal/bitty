@@ -10,10 +10,21 @@
 //! bitty's own (`TERM=xterm-256color`, 256 colors, direct color, live mode
 //! register).
 
-use bitty_runtime::Runtime;
+use bitty_runtime::{Runtime, RuntimeConfig};
 
 fn replies_text(rt: &mut Runtime) -> Vec<Vec<u8>> {
     rt.take_replies().iter().map(|b| b.to_vec()).collect()
+}
+
+/// Runtime carrying a user-resolved palette (CTX-0381): OSC 10/11 queries
+/// are answered only once the theme resolved, so these tests use this
+/// constructor instead of the unresolved `Runtime::with_defaults`.
+fn themed_runtime() -> Runtime {
+    let config = RuntimeConfig {
+        theme_resolved: true,
+        ..RuntimeConfig::default()
+    };
+    Runtime::new(config).expect("themed runtime must build")
 }
 
 #[test]
@@ -211,4 +222,81 @@ fn query_flood_stays_within_reply_cap() {
     let total: usize = rt.take_replies().iter().map(|b| b.len()).sum();
     assert!(total <= 4096, "bounded replies, got {total}");
     assert!(!rt.replies_overflowed(), "flag resets after drain");
+}
+
+// ---------------------------------------------------------------------------
+// CTX-0381: OSC 10/11 dynamic fg/bg query and gated set.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn osc10_osc11_query_replies_with_active_theme_colors() {
+    let mut rt = themed_runtime();
+    rt.handle_pty_bytes(b"\x1b]10;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\".to_vec()],
+        "Bitty Dark foreground #cdd6f4 in the xterm rgb: reply form"
+    );
+    rt.handle_pty_bytes(b"\x1b]11;?\x1b\\");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![b"\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\".to_vec()],
+        "Bitty Dark background #1e1e2e in the xterm rgb: reply form"
+    );
+}
+
+#[test]
+fn osc10_query_before_theme_resolution_stays_silent() {
+    let mut rt = Runtime::with_defaults().expect("build");
+    assert!(!rt.config().theme_resolved, "defaults are unresolved");
+    rt.handle_pty_bytes(b"\x1b]10;?\x07\x1b]11;?\x07");
+    assert!(
+        replies_text(&mut rt).is_empty(),
+        "no reply before theme resolution"
+    );
+}
+
+#[test]
+fn osc10_osc11_set_is_gated_default_deny() {
+    let mut rt = themed_runtime();
+    // Default deny: untrusted output cannot repaint defaults, silently.
+    rt.handle_pty_bytes(b"\x1b]10;#112233\x07\x1b]11;rgb:44/55/66\x07");
+    assert!(replies_text(&mut rt).is_empty());
+    assert_eq!(rt.active_foreground(), [0xCD, 0xD6, 0xF4, 0xFF]);
+    assert_eq!(rt.active_background(), [0x1E, 0x1E, 0x2E, 0xFF]);
+    // Grant, then sets apply and queries report the override.
+    rt.set_osc_color_set_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]10;#112233\x07\x1b]11;rgb:44/55/66\x07");
+    rt.handle_pty_bytes(b"\x1b]10;?\x07\x1b]11;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![
+            b"\x1b]10;rgb:1111/2222/3333\x1b\\".to_vec(),
+            b"\x1b]11;rgb:4444/5555/6666\x1b\\".to_vec(),
+        ]
+    );
+    assert_eq!(rt.active_foreground(), [0x11, 0x22, 0x33, 0xFF]);
+    assert_eq!(rt.active_background(), [0x44, 0x55, 0x66, 0xFF]);
+}
+
+#[test]
+fn osc10_osc11_malformed_input_is_inert() {
+    let mut rt = themed_runtime();
+    rt.set_osc_color_set_allowed(true);
+    for sequence in [
+        &b"\x1b]10;#zzzzzz\x07"[..],
+        &b"\x1b]10;#12345\x07"[..],
+        &b"\x1b]11;rgb:1/2\x07"[..],
+        &b"\x1b]11;rgb:1/2/3/4\x07"[..],
+        &b"\x1b]10;not-a-color\x07"[..],
+        &b"\x1b]11;\x07"[..],
+    ] {
+        rt.handle_pty_bytes(sequence);
+    }
+    assert!(
+        replies_text(&mut rt).is_empty(),
+        "malformed payloads never query or reply"
+    );
+    assert_eq!(rt.active_foreground(), [0xCD, 0xD6, 0xF4, 0xFF]);
+    assert_eq!(rt.active_background(), [0x1E, 0x1E, 0x2E, 0xFF]);
 }

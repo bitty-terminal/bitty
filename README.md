@@ -1,97 +1,212 @@
 # Bitty
 
-Bitty is a pre-implementation terminal workspace. This repository
-currently contains a 16-crate Cargo workspace (see Current scaffold) plus the
-quality gates that validate it. Draft crates implement the Minimal Correct
-Terminal headless slice (`vt` + `pty` + `term-state` + `platform` + `config` +
-`render` + `ui` + `runtime` + `app`; `package`/`lua` leaves ready) under
-`publish = false` where RFCs are still draft — `0.0.1` has published 9 leaf
-crates to crates.io (`vt`, `pty`, `platform`, `config`, `package`, `lua`,
-`term-state`, `ui`, `render`) and a Linux x64 binary preview on GitHub
-Releases (`bitty-app` remains `publish = false`, preview only); it does not yet
-provide a stable public Rust API, and the detailed publish verification remains
-recorded in `docs/product/release-ladder.md` and
-`docs/product/formal-release-0.0.1.md`.
+Bitty is a terminal workspace: a GPU-rendered terminal emulator and multi-pane
+window manager for the shell, written in Rust. It runs your shell in a PTY,
+parses VT output into terminal truth, and renders panels with `wgpu` —
+horizontal/vertical splits, stacks, floating overlays, per-view appearance, and
+panel animations — configured with Lua.
 
-The accepted bootstrap boundary is recorded in
-[ADR 0001](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/decisions/adrs/ADR-0001-repository-bootstrap-baseline.md)
-and the
-[repository bootstrap guide](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/development/repository-bootstrap.md).
-Canonical product, architecture, security, and project documentation belongs in
-the [bitty-docs repository](https://github.com/bitty-terminal/bitty-docs).
+Bitty is pre-1.0 and pre-alpha. The current release line is `v0.0.20`; there is
+no stable public API, and behavior, configuration keys, and package names can
+change between releases. Canonical product, architecture, security, and
+configuration documentation lives in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs).
 
-## See the project workflow (CarryCtx)
+## Status
 
-CarryCtx is the local-first tool that records this project's tasks, decisions,
-and checkpoints. Install it globally for local development (recommended):
+Feature status below is verified against the code, tests, and releases in this
+repository. Anything not marked shipped is not a compatibility promise.
+
+| Area                                                                              | Status                       |
+| --------------------------------------------------------------------------------- | ---------------------------- |
+| Terminal core: PTY, VT parser, grid/scrollback, damage tracking                   | Shipped                      |
+| Windowed rendering (`wgpu`) with headless/software fallback                       | Shipped                      |
+| Layouts: splits, stack, overlay, workspaces, focus, resize                        | Shipped                      |
+| Scrollback search and selection                                                   | Shipped                      |
+| 30 built-in theme presets with aliases, `bitty list themes`                       | Shipped                      |
+| `bitty init` guided setup wizard                                                  | Shipped                      |
+| Lua `init.lua` config, XDG paths, named profiles                                  | Shipped                      |
+| Appearance overrides: CLI flags and per-view `views.*`                            | Shipped                      |
+| Decoration: gaps, border, radius, outline colors, content inset                   | Shipped                      |
+| Panel open/close/focus/workspace animations                                       | Shipped                      |
+| Overlay scrollbar                                                                 | Shipped                      |
+| IME composition (bounded preedit overlay + commit)                                | Shipped                      |
+| New-pane cwd inheritance (OSC 7)                                                  | Shipped                      |
+| Close confirmation for running jobs                                               | Shipped                      |
+| Safe startup (`--safe`) and `--headless` CI mode                                  | Shipped                      |
+| CLI: `run`, `ctl`, `config`, `init`, `doctor`, `list`, `inspect`, `dev`, `plugin` | Shipped                      |
+| Plugin host and `bitty plugin` manifest management                                | Early                        |
+| Third-party plugin ecosystem and SDK                                              | Early                        |
+| Stable public Rust API (1.0)                                                      | Not yet                      |
+| Remote UI and a `bittyd` daemon                                                   | Not yet (post-1.0 candidate) |
+
+"Early" means the mechanism exists and is tested, but its external contract is
+still changing; do not depend on it yet. The design corpus for text/Unicode and
+IME, plugins, packages, IPC, and agent access remains under review in
+`bitty-docs`.
+
+## Install
+
+### Arch Linux (AUR)
+
+Bitty is published to the AUR as two recipes. `bitty-bin` installs the prebuilt
+release binary and needs no local compile; `bitty` builds the workspace from
+source. They conflict, so install one:
 
 ```sh
-cargo install carryctx      # Rust toolchain, or: npm i -g carryctx
+paru -S bitty-bin   # prebuilt (recommended)
+paru -S bitty       # build from source
 ```
 
-CarryCtx engineering state (tasks, sessions, checkpoints) is not cloned. A
-fresh clone restores it from the in-repo `refs/heads/carryctx-snapshots`
-branch:
+### Prebuilt binaries
+
+[GitHub Releases](https://github.com/bitty-terminal/bitty/releases) carry
+binaries for Linux (`x86_64`), macOS (`x86_64`, Apple silicon), and Windows
+(`x86_64`, arm64), plus `.deb`, `.rpm`, `.apk`, and Arch packages for Linux.
+
+### Build from source
+
+Requires Rust — the pinned channel in `rust-toolchain.toml` is installed
+automatically by `rustup`, and the MSRV is `1.85` — plus the fontconfig and
+freetype development packages. A GPU and display are used when available;
+without them Bitty falls back to a headless path.
+
+```sh
+git clone https://github.com/bitty-terminal/bitty.git
+cd bitty
+cargo build --release --locked -p bitty-app
+./target/release/bitty
+```
+
+The produced binary is named `bitty`. It is not published on crates.io
+(`bitty-app` is `publish = false`, and the unrelated `bitty` crate name on
+crates.io is a different project), so install through the AUR, a release
+artifact, or a source build. Nine `bitty-*` library crates are published at
+`0.0.1`, but they are not a stable API.
+
+### Other packaging
+
+In-repo recipes for Homebrew, Scoop, and a Nix flake are documented in
+[`packaging/README.md`](packaging/README.md).
+
+## Quick start
+
+Run the guided setup wizard once, then launch:
+
+```sh
+bitty init    # writes $XDG_CONFIG_HOME/bitty/init.lua
+bitty         # launch your $SHELL (or /bin/sh)
+```
+
+`bitty init` prompts for a shell, theme, font family and size, panel decoration
+(gaps, border, radius), scrollback, close-confirmation mode, and a Vim keymap
+preset. Use `--yes` for defaults without a terminal and `--force` to overwrite
+an existing config (it keeps an `.bak` backup). Every step can also be answered
+with a flag:
+
+```sh
+bitty init --yes --theme tokyo-night --font-family "JetBrainsMono Nerd Font"
+```
+
+### Themes
+
+Bitty ships 30 built-in presets (Tokyo Night, Catppuccin, Gruvbox, Solarized,
+Dracula, Nord, Rose Pine, Everforest, and more), each with aliases:
+
+```sh
+bitty list themes
+bitty --theme catppuccin
+```
+
+### Common flags and commands
+
+```sh
+bitty --split v                  # vertical split
+bitty --layout stack:2           # stacked panes
+bitty --layout overlay:5,5,20,10
+bitty --headless                 # one deterministic headless tick (CI/smoke)
+bitty doctor                     # diagnose install, GPU, fonts, PTY, terminfo
+bitty ctl view split --right     # control a running instance
+bitty --help                     # full flag and subcommand reference
+```
+
+Default chrome chords use Alt as the modifier (configurable with `mod_key`):
+`Alt+h/j/k/l` and `Ctrl+Alt+arrows` move focus, `Shift+Alt+h/j/k/l` splits,
+`Shift+Ctrl+h/j/k/l` resizes, `Alt+1..9` jumps to a view, `Alt+z/m/f` toggles
+zoom/maximize/fullscreen, `Alt+w` closes, and `Ctrl+Shift+C/V` copy and paste.
+
+## Configuration
+
+Configuration is a Lua table returned from
+`$XDG_CONFIG_HOME/bitty/init.lua` (default `~/.config/bitty/init.lua`;
+`config.lua`, `--config`, and `BITTY_CONFIG` are also honored). Unknown keys
+fail closed.
+
+```lua
+return {
+  theme = "tokyo-night",
+  font = { family = "JetBrainsMono Nerd Font", size = 12 },
+  window = { opacity = 0.95, padding = 8 },
+  terminal = { scrollback = 10000 },
+  scrollbar = { mode = "auto" },
+  close_confirm = "when_busy",
+  appearance = { animations = { enabled = true } },
+}
+```
+
+Inspect the resolved file and merged values with:
+
+```sh
+bitty config path    # resolved config file path
+bitty config check   # validate and print per-key sources
+bitty config edit    # open it in $VISUAL/$EDITOR
+```
+
+The configuration schema, XDG layout, profiles, plugins, and security model are
+documented in bitty-docs:
+[Lua configuration and filesystem layout](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/configuration/lua-and-xdg.md),
+the [Configuration Model RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/configuration-model-rfc.md),
+and the [CLI reference](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/interfaces/cli.md).
+Those documents are draft design contracts; where they differ from the shipped
+`init.lua` schema above, the shipped code and `bitty config check` are
+authoritative.
+
+## Build and test
+
+All checks run through the justfile (never `npm`/`npx`/`yarn`; JavaScript tools
+run through `bun`):
+
+```sh
+just setup    # fetch deps, install Git hooks, provision pinned dev tools
+just check    # fmt-check + clippy + test + scratch-path/PTY gates + actionlint + markdownlint
+```
+
+Individual recipes: `just fmt-check`, `just clippy`, `just test`,
+`just typecheck`, `just actionlint`, `just markdownlint`. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and the development loop.
+
+## Project workflow (CarryCtx)
+
+Bitty's task, decision, and checkpoint history is managed with CarryCtx.
+CarryCtx engineering state is not cloned; a fresh checkout restores it from the
+in-repo `refs/heads/carryctx-snapshots` branch:
 
 ```sh
 just workflow-import-dry   # fetch + validate the snapshot; no DB writes
 just workflow-import       # initialize CarryCtx state if needed, then import
 ```
 
-Then `carryctx stats` reports the restored tasks, sessions, and checkpoints.
-Provenance, redaction, and `--force` behavior are covered under the
-repository snapshot documentation below.
+The commander's merge closeout publishes a redacted snapshot with
+`just workflow-publish`. Snapshots are publish-only: never merge one back, and
+rotate at the source any secret that leaked before rotation.
 
-## Current scaffold
+## License
 
-- The virtual Cargo workspace has 16 members (`vt`, `pty`, `platform`,
-  `config`, `package`, `lua`, `term-state`, `ui`, `render`, `plugin-host`,
-  `rich`, `ipc`, `agent`, `runtime`, `app`, `core`) with a `publish = false`
-  workspace root; nine leaves/branch crates are `publish = true` at
-  `0.0.1` and seven tail crates remain `publish = false` until their RFCs are
-  accepted (see `docs/product/release-ladder.md` for the DAG and publish
-  order).
-- All crates use Rust edition 2024, `resolver = "3"`, MSRV `1.85`, and the
-  pinned toolchain `1.97.1` with `rustfmt` and Clippy (`rust-toolchain.toml`,
-  `clippy.toml`). Dependencies are pinned (`wgpu 26.0`, `crossfont 0.9`,
-  `piccolo 0.3.3`, `portable-pty 0.9`, `winit 0.30`, `vte 0.15`) and workspace
-  lints enforce `unsafe_code = deny`.
-- The pinned stable toolchain includes `rustfmt` and Clippy; CI also runs a
-  `x86_64-pc-windows-gnu` check and headless tests for the `v0.1` slice.
-- `just check` runs formatting, Clippy, tests, and workflow linting without
-  rewriting source files (`fmt-check + clippy + test + actionlint +
-markdownlint`).
+Released under the `MIT OR Apache-2.0` license. See [LICENSE](LICENSE).
 
-## Workflow snapshot restore
+## Documentation
 
-CarryCtx runtime state (`.git/carryctx/state.sqlite`) is never cloned. The
-redacted engineering snapshot lives in this repository on the branch
-`refs/heads/carryctx-snapshots`, one commit per publication. The commander's
-merge closeout publishes it with `just workflow-publish`; a fresh clone
-restores its local CarryCtx DB from that branch:
-
-```sh
-just workflow-import-dry   # fetch + validate the snapshot; no DB writes
-just workflow-import       # initialize CarryCtx state if needed, then import
-```
-
-The import fetches `refs/heads/carryctx-snapshots`, refuses to replace a
-non-empty local DB without `--force` (`just workflow-import --force`), and
-prints provenance (snapshot commit + source). Snapshots are redacted
-publication artifacts produced by `carryctx export --publication`: CarryCtx
-refuses them as merge sources, so restore always uses replace mode, and a
-secret that leaked before rotation must still be rotated at the source.
-
-## Status and deferred decisions
-
-This workspace is foundation evidence, not a product release. The `v0.1`
-headless slice (shell echo, resize, backpressure — 708 tests in `ctx-0050`)
-is draft evidence awaiting independent review; the remaining crate graph
-slices, license, release profiles, release automation, publication policy,
-platform tiers, and product behavior remain deferred to separate reviewed
-decisions and tasks. See `docs/product/release-ladder.md` for the
-`0.0.1`-to-`1.0` ladder and `docs/product/g1-publish-*.md` for publish
-readiness.
-
-No commit, branch, pull request, package publication, or release is implied by
-the presence of these files.
+- [bitty-docs](https://github.com/bitty-terminal/bitty-docs) — canonical
+  product, architecture, security, configuration, and interface documents.
+- [CHANGELOG.md](CHANGELOG.md) — release history.
+- [`packaging/README.md`](packaging/README.md) — distribution and packaging.

@@ -81,6 +81,16 @@ pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 /// host never iterates unbounded sequences outside fuel accounting).
 pub const MAX_CONFIG_KEYMAPS: usize = 1024;
 
+/// Maximum bytes per background-image path (CTX-0347, RFC-0001/OQ-042:
+/// `<= 4096` bytes). The general [`MAX_CONFIG_STRING_BYTES`] host cap is
+/// tighter, so background paths use their own accepted bound.
+pub const MAX_CONFIG_BACKGROUND_PATH_BYTES: usize = 4096;
+
+/// Maximum `decoration.background_image_roots` entries read (CTX-0347,
+/// RFC-0001/OQ-042: `at most 32`; mirrors `bitty-config`
+/// `MAX_BACKGROUND_IMAGE_ROOTS`).
+pub const MAX_CONFIG_BACKGROUND_IMAGE_ROOTS: usize = 32;
+
 /// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
 const VIEW_ACCEPTED_FIELDS: &[&str] = &[
     "border_color",
@@ -209,6 +219,18 @@ pub struct DecorationData {
     pub border_width_focused: Option<i64>,
     /// Explicit idle outline width in logical px (CTX-0344).
     pub border_width_idle: Option<i64>,
+    /// Global default background-image path (CTX-0347, RFC-0001/OQ-042);
+    /// raw string, syntax-checked downstream in `bitty-config`
+    /// (fail-closed) and resolved only under an approved root.
+    pub background_image: Option<String>,
+    /// Global default background fit mode (CTX-0347): one of
+    /// `fill`/`fit`/`center`/`tile`/`stretch`; the closed enum is enforced
+    /// downstream in `bitty-config` (fail-closed).
+    pub background_fit: Option<String>,
+    /// Approved background-image roots (CTX-0347), deny-by-default; plain
+    /// path strings, bounded and syntax-checked downstream in `bitty-config`
+    /// (fail-closed). Global-only: the key is rejected inside `views.*`.
+    pub background_image_roots: Option<Vec<String>>,
 }
 
 /// Scrollbar overrides, plain data (CTX-0181; see [`FontData`] for `Option`
@@ -621,9 +643,11 @@ impl ValueSnapshot {
                 _ => has_non_string_keys = true,
             }
         }
-        // Sequence portion (keymaps arrays live here).
+        // Sequence portion (keymaps arrays live here; CTX-0347
+        // `decoration.background_image_roots` is the accepted nested array at
+        // depth 2, bounded the same way).
         let mut seq = Vec::new();
-        if depth <= 1 {
+        if depth <= 2 {
             let len = table.length().max(0) as usize;
             let want = len.min(MAX_CONFIG_KEYMAPS + 1);
             for i in 1..=(want as i64) {
@@ -1056,6 +1080,9 @@ impl ConfigData {
                             "border_width",
                             "border_width_focused",
                             "border_width_idle",
+                            "background_image",
+                            "background_fit",
+                            "background_image_roots",
                         ],
                     )?;
                     let gaps_in = match get_field(nested, "gaps_in") {
@@ -1109,6 +1136,31 @@ impl ConfigData {
                         Some(v) => Some(expect_integer("decoration.border_width_idle", v)?),
                         None => None,
                     };
+                    // CTX-0347 (RFC-0001/OQ-042): background image/fit are
+                    // plain strings here; the accepted path syntax, the
+                    // closed fit enum, the roots bound, and the deny-by-
+                    // default trust policy are enforced fail-closed in
+                    // `bitty-config` / the `bitty-rich` loader.
+                    let background_image = match get_field(nested, "background_image") {
+                        Some(v) => Some(expect_bounded_string(
+                            "decoration.background_image",
+                            v,
+                            MAX_CONFIG_BACKGROUND_PATH_BYTES,
+                        )?),
+                        None => None,
+                    };
+                    let background_fit = match get_field(nested, "background_fit") {
+                        Some(v) => Some(expect_string("decoration.background_fit", v)?),
+                        None => None,
+                    };
+                    let background_image_roots = match get_field(nested, "background_image_roots") {
+                        Some(v) => Some(expect_string_list(
+                            "decoration.background_image_roots",
+                            v,
+                            MAX_CONFIG_BACKGROUND_IMAGE_ROOTS,
+                        )?),
+                        None => None,
+                    };
                     out.decoration = Some(DecorationData {
                         gaps_in,
                         gaps_out,
@@ -1121,6 +1173,9 @@ impl ConfigData {
                         border_width,
                         border_width_focused,
                         border_width_idle,
+                        background_image,
+                        background_fit,
+                        background_image_roots,
                     });
                 }
                 "views" => {
@@ -1329,17 +1384,56 @@ fn check_nested_keys(
 
 /// Expect a string value (names the key path only, never the value).
 fn expect_string(path: &str, val: &ValueSnapshot) -> Result<String, String> {
+    expect_bounded_string(path, val, MAX_CONFIG_STRING_BYTES)
+}
+
+/// Expect a string value bounded by `max` bytes (background paths use the
+/// accepted RFC-0001/OQ-042 `<= 4096` bound, above the generic host cap).
+fn expect_bounded_string(path: &str, val: &ValueSnapshot, max: usize) -> Result<String, String> {
     match val {
         ValueSnapshot::Str(s) => {
-            if s.len() > MAX_CONFIG_STRING_BYTES {
-                return Err(format!(
-                    "{path}: string exceeds {MAX_CONFIG_STRING_BYTES} bytes"
-                ));
+            if s.len() > max {
+                return Err(format!("{path}: string exceeds {max} bytes"));
             }
             Ok(s.clone())
         }
         ValueSnapshot::Nil => Err(format!("{path}: expected string (found nil)")),
         other => Err(format!("{path}: expected string (found {})", other.kind())),
+    }
+}
+
+/// Expect a bounded array of strings (CTX-0347
+/// `decoration.background_image_roots`); map keys and non-string leaves fail
+/// closed.
+fn expect_string_list(path: &str, val: &ValueSnapshot, max: usize) -> Result<Vec<String>, String> {
+    match val {
+        ValueSnapshot::Table {
+            pairs,
+            seq,
+            truncated,
+            has_non_string_keys,
+        } => {
+            if !pairs.is_empty() || *has_non_string_keys {
+                return Err(format!("{path}: expected an array of strings"));
+            }
+            if *truncated || seq.len() > max {
+                return Err(format!("{path}: exceeds {max} entries"));
+            }
+            let mut out = Vec::with_capacity(seq.len());
+            for item in seq {
+                out.push(expect_bounded_string(
+                    path,
+                    item,
+                    MAX_CONFIG_BACKGROUND_PATH_BYTES,
+                )?);
+            }
+            Ok(out)
+        }
+        ValueSnapshot::Nil => Err(format!("{path}: expected an array of strings (found nil)")),
+        other => Err(format!(
+            "{path}: expected an array of strings (found {})",
+            other.kind()
+        )),
     }
 }
 
@@ -1446,6 +1540,16 @@ mod tests {
         match vm.eval_config(code).expect("eval must not refuse") {
             ConfigOutcome::Completed { data, .. } => *data,
             other => panic!("expected completed, got {other:?}"),
+        }
+    }
+
+    /// Evaluate `code` on a fresh default VM; panics unless the result is a
+    /// shape error, returning its message.
+    fn eval_err(code: &str) -> String {
+        let mut vm = LuaVm::new("test.config.err");
+        match vm.eval_config(code).expect("eval must not refuse") {
+            ConfigOutcome::ShapeError { message } => message,
+            other => panic!("expected shape error, got {other:?}"),
         }
     }
 
@@ -1636,6 +1740,65 @@ mod tests {
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn decoration_background_extract_and_bounds() {
+        // CTX-0347 (RFC-0001/OQ-042): the image/fit/roots keys extract as
+        // plain data; the closed fit enum and trust policy live downstream.
+        let data = eval_ok(
+            r##"return { decoration = {
+                background_image = "~/wall/one.png",
+                background_fit = "center",
+                background_image_roots = { "/srv/wall", "~/Pictures" },
+            } }"##,
+        );
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.background_image.as_deref(), Some("~/wall/one.png"));
+        assert_eq!(dec.background_fit.as_deref(), Some("center"));
+        assert_eq!(
+            dec.background_image_roots.as_deref(),
+            Some(&["/srv/wall".to_string(), "~/Pictures".to_string()][..])
+        );
+        let data = eval_ok(r#"return { decoration = {} }"#);
+        let dec = data.decoration.unwrap();
+        assert_eq!(dec.background_image, None);
+        assert_eq!(dec.background_fit, None);
+        assert_eq!(dec.background_image_roots, None);
+
+        // Wrong leaf types and an over-cap list fail closed; the map-key
+        // form is not a sequence.
+        assert!(
+            eval_err(r#"return { decoration = { background_image = 3 } }"#)
+                .contains("decoration.background_image")
+        );
+        assert!(
+            eval_err(r#"return { decoration = { background_fit = 3 } }"#)
+                .contains("decoration.background_fit")
+        );
+        assert!(
+            eval_err(r#"return { decoration = { background_image_roots = "/wall" } }"#)
+                .contains("decoration.background_image_roots")
+        );
+        assert!(
+            eval_err(r#"return { decoration = { background_image_roots = { ["a"] = 1 } } }"#)
+                .contains("decoration.background_image_roots")
+        );
+        let roots = (0..=MAX_CONFIG_BACKGROUND_IMAGE_ROOTS)
+            .map(|i| format!("\"/wall/{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let over =
+            format!("return {{ decoration = {{ background_image_roots = {{ {roots} }} }} }}");
+        assert!(eval_err(&over).contains("decoration.background_image_roots"));
+        // A path up to the accepted 4096-byte bound is not truncated here.
+        let path = format!("/{}", "a".repeat(MAX_CONFIG_BACKGROUND_PATH_BYTES - 1));
+        let code = format!("return {{ decoration = {{ background_image = \"{path}\" }} }}");
+        let data = eval_ok(&code);
+        assert_eq!(
+            data.decoration.unwrap().background_image.map(|p| p.len()),
+            Some(MAX_CONFIG_BACKGROUND_PATH_BYTES)
+        );
     }
 
     #[test]

@@ -313,6 +313,80 @@ struct ImageTexture {
     texture: Texture,
     bind: BindGroup,
 }
+
+/// Uploads one RGBA blit into the image-texture pool at `slot`, reusing the
+/// existing texture when the extent matches.
+///
+/// A free function (not a `&mut self` method) so the background-image pass
+/// can borrow the texture pool disjointly from the still-live fill/glyph
+/// submit closures (CTX-0347).
+#[allow(clippy::too_many_arguments)]
+fn upload_image(
+    textures: &mut Vec<ImageTexture>,
+    layout: &BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    opacity_buf: &Buffer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    slot: usize,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<(), RenderError> {
+    let reuse = textures
+        .get(slot)
+        .is_some_and(|entry| entry.width == width && entry.height == height);
+    if !reuse {
+        let texture = make_rgba_texture(device, width, height, "bitty-image")?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = make_bind_group(
+            device,
+            layout,
+            &view,
+            sampler,
+            opacity_buf,
+            "bitty-image-bind",
+        );
+        let entry = ImageTexture {
+            width,
+            height,
+            texture,
+            bind,
+        };
+        match textures.get_mut(slot) {
+            Some(existing) => *existing = entry,
+            None => textures.push(entry),
+        }
+    }
+    let padded =
+        batch::build_padded_rgba(rgba, width, height).ok_or(RenderError::InvalidInput {
+            reason: "image upload bytes do not match its extent",
+        })?;
+    let bytes_per_row =
+        batch::padded_rgba_bytes_per_row(width).ok_or(RenderError::InvalidInput {
+            reason: "image upload width overflows the padded row size",
+        })?;
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &textures[slot].texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &padded,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
 /// Long-lived GPU objects for one surface, reused across frames.
 pub(crate) struct GpuResources {
     format: TextureFormat,
@@ -1021,71 +1095,6 @@ impl GpuResources {
     /// texture is dropped after the new one exists). The caller has already
     /// validated the bytes and budgets via [`batch::plan_image_uploads`];
     /// this method still fails closed on any mismatch it observes.
-    fn upload_image(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        slot: usize,
-        width: u32,
-        height: u32,
-        rgba: &[u8],
-    ) -> Result<(), RenderError> {
-        let reuse = self
-            .image_textures
-            .get(slot)
-            .is_some_and(|entry| entry.width == width && entry.height == height);
-        if !reuse {
-            let texture = make_rgba_texture(device, width, height, "bitty-image")?;
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = make_bind_group(
-                device,
-                &self.image_bind_layout,
-                &view,
-                &self.image_sampler,
-                &self.opacity_buf,
-                "bitty-image-bind",
-            );
-            let entry = ImageTexture {
-                width,
-                height,
-                texture,
-                bind,
-            };
-            match self.image_textures.get_mut(slot) {
-                Some(existing) => *existing = entry,
-                None => self.image_textures.push(entry),
-            }
-        }
-        let padded =
-            batch::build_padded_rgba(rgba, width, height).ok_or(RenderError::InvalidInput {
-                reason: "image upload bytes do not match its extent",
-            })?;
-        let bytes_per_row =
-            batch::padded_rgba_bytes_per_row(width).ok_or(RenderError::InvalidInput {
-                reason: "image upload width overflows the padded row size",
-            })?;
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &self.image_textures[slot].texture,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &padded,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(height),
-            },
-            Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        Ok(())
-    }
-
     /// Draws one frame's batches inside a single render pass.
     ///
     /// `clear` is the load-operation clear color (the surface background),
@@ -1094,11 +1103,13 @@ impl GpuResources {
     /// as a defensive boundary even though callers pass a sanitized value.
     /// All buffer writes are bounds-checked before submission; overruns
     /// return [`RenderError::InvalidInput`] without touching the GPU.
-    /// Returns the number of Kitty image blits the GPU pass refused
+    /// Returns the number of image blits the GPU pass refused
     /// (malformed, oversized, or over a per-frame bound): those are skipped
     /// fail-closed and surfaced by the caller in
     /// [`PresentStats::images_skipped`](crate::gpu::PresentStats), never
-    /// dropped silently.
+    /// dropped silently. Both the per-`View` background pass (CTX-0347) and
+    /// the Kitty image pass (CTX-0291) share this count and the same
+    /// `plan_image_uploads` bounds.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_frame(
         &mut self,
@@ -1145,13 +1156,16 @@ impl GpuResources {
             });
         }
         // Paint order mirrors both CPU compositors: fills, then rounded
-        // decoration fills (CTX-0311), then glyphs, then Kitty image blits on
-        // top (CTX-0291). The image pass is bounded by
-        // `batch::plan_image_uploads` before any allocation.
+        // decoration fills (CTX-0311), then per-View background images
+        // (CTX-0347), then selection/cursor overlay fills, then glyphs, then
+        // Kitty image blits on top (CTX-0291). Both image passes are bounded
+        // by `batch::plan_image_uploads` before any allocation.
 
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
         let rounded_chunks =
             batch::chunk_rounded_fills(&draw_list.rounded_fills, surface_w, surface_h, scale);
+        let overlay_chunks =
+            batch::chunk_fills(&draw_list.overlay_fills, surface_w, surface_h, scale);
         let atlas_chunks =
             batch::chunk_atlas_glyphs(&draw_list.glyphs, surface_w, surface_h, scale);
         let inline_plan = batch::pack_inline_glyphs(&draw_list.glyphs);
@@ -1165,11 +1179,14 @@ impl GpuResources {
             .iter()
             .map(|c| c.quad_count)
             .chain(rounded_chunks.iter().map(|c| c.quad_count))
+            .chain(overlay_chunks.iter().map(|c| c.quad_count))
             .chain(atlas_chunks.iter().map(|c| c.quad_count))
             .chain(inline_chunks.iter().map(|c| c.quad_count))
             .max()
             .unwrap_or(0)
-            .max(usize::from(!draw_list.images.is_empty()));
+            .max(usize::from(
+                !draw_list.images.is_empty() || !draw_list.backgrounds.is_empty(),
+            ));
         if max_quads > 0 {
             self.ensure_indices(queue, max_quads)?;
         }
@@ -1179,65 +1196,142 @@ impl GpuResources {
         // encoder+submit across chunks reuses vertex-buffer offset 0, so later
         // `write_buffer` calls overwrite earlier chunks before the GPU draws
         // (only the last chunk painted: fullscreen top went dark stale).
-        let mut submit_fill_chunk =
-            |chunk_bytes: &[u8], quad_count: usize| -> Result<(), RenderError> {
-                if chunk_bytes.len() as u64 > fill_buffer_size() {
-                    return Err(RenderError::InvalidInput {
-                        reason: "draw batch exceeds the bounded vertex cap",
-                    });
-                }
-                queue.write_buffer(&self.fill_vb, 0, chunk_bytes);
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("bitty-present-draw-list"),
+        let submit_fill_chunk = |chunk_bytes: &[u8],
+                                 quad_count: usize,
+                                 first_pass: &mut bool|
+         -> Result<(), RenderError> {
+            if chunk_bytes.len() as u64 > fill_buffer_size() {
+                return Err(RenderError::InvalidInput {
+                    reason: "draw batch exceeds the bounded vertex cap",
                 });
-                {
-                    let load = if first_pass {
-                        LoadOp::Clear(clear)
-                    } else {
-                        LoadOp::Load
-                    };
-                    let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                        label: Some("bitty-draw-list"),
-                        color_attachments: &[Some(RenderPassColorAttachment {
-                            view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: Operations {
-                                load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-                    pass.set_pipeline(&self.fill_pipeline);
-                    // CTX-0290: the fill pipeline shares the glyph bind
-                    // layout for the opacity uniform (binding 2); bindings
-                    // 0/1 are unused by the fill shader.
-                    pass.set_bind_group(0, &self.atlas_bind, &[]);
-                    pass.set_vertex_buffer(0, self.fill_vb.slice(..chunk_bytes.len() as u64));
-                    pass.set_index_buffer(
-                        self.index_buf
-                            .slice(..(quad_count * INDICES_PER_QUAD * 2) as u64),
-                        IndexFormat::Uint16,
-                    );
-                    pass.draw_indexed(0..(quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
-                }
-                queue.submit(std::iter::once(encoder.finish()));
-                first_pass = false;
-                Ok(())
-            };
+            }
+            queue.write_buffer(&self.fill_vb, 0, chunk_bytes);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-present-draw-list"),
+            });
+            {
+                let load = if *first_pass {
+                    LoadOp::Clear(clear)
+                } else {
+                    LoadOp::Load
+                };
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("bitty-draw-list"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.fill_pipeline);
+                // CTX-0290: the fill pipeline shares the glyph bind
+                // layout for the opacity uniform (binding 2); bindings
+                // 0/1 are unused by the fill shader.
+                pass.set_bind_group(0, &self.atlas_bind, &[]);
+                pass.set_vertex_buffer(0, self.fill_vb.slice(..chunk_bytes.len() as u64));
+                pass.set_index_buffer(
+                    self.index_buf
+                        .slice(..(quad_count * INDICES_PER_QUAD * 2) as u64),
+                    IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..(quad_count * INDICES_PER_QUAD) as u32, 0, 0..1);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            *first_pass = false;
+            Ok(())
+        };
 
         for chunk in &fill_chunks {
-            submit_fill_chunk(&chunk.bytes, chunk.quad_count)?;
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
         }
 
         // CTX-0311: rounded decoration fills/rings ride the same fill
         // pipeline and vertex buffer, submitted after every plain fill so
         // the frame ring paints over corner cell backgrounds.
         for chunk in &rounded_chunks {
-            submit_fill_chunk(&chunk.bytes, chunk.quad_count)?;
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+        }
+
+        // CTX-0347: per-`View` background images paint above cell backgrounds
+        // and the decoration ring, below overlay fills and glyphs. The same
+        // `plan_image_uploads` budget applies (BG-7 aliases the accepted
+        // 32-blit / 64 MiB present bounds), so a background can never
+        // allocate beyond the accepted present ceiling. Textures ride the
+        // shared image pool; the topmost Kitty pass truncates and reuses it
+        // after this pass has already been submitted.
+        let background_plan = batch::plan_image_uploads(
+            &draw_list.backgrounds,
+            device.limits().max_texture_dimension_2d,
+        );
+        self.image_textures.truncate(background_plan.admitted.len());
+        let mut backgrounds_skipped = background_plan.skipped;
+        for (slot, &index) in background_plan.admitted.iter().enumerate() {
+            let blit = &draw_list.backgrounds[index];
+            upload_image(
+                &mut self.image_textures,
+                &self.image_bind_layout,
+                &self.image_sampler,
+                &self.opacity_buf,
+                device,
+                queue,
+                slot,
+                blit.dest.width,
+                blit.dest.height,
+                &blit.rgba,
+            )?;
+            let Some(quad) = batch::image_quad_bytes(blit.dest, surface_w, surface_h, scale) else {
+                backgrounds_skipped += 1;
+                continue;
+            };
+            queue.write_buffer(&self.image_vb, 0, &quad);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bitty-present-draw-list"),
+            });
+            {
+                let load = if first_pass {
+                    LoadOp::Clear(clear)
+                } else {
+                    LoadOp::Load
+                };
+                let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("bitty-draw-list"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.image_textures[slot].bind, &[]);
+                pass.set_vertex_buffer(0, self.image_vb.slice(..));
+                pass.set_index_buffer(
+                    self.index_buf.slice(..(INDICES_PER_QUAD * 2) as u64),
+                    IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..INDICES_PER_QUAD as u32, 0, 0..1);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            first_pass = false;
+        }
+
+        // CTX-0347: selection/cursor overlay fills paint above the background
+        // image and below glyphs.
+        for chunk in &overlay_chunks {
+            submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
         }
 
         let mut submit_glyph_chunk =
@@ -1306,10 +1400,14 @@ impl GpuResources {
         // Frames can shrink: drop cached slot textures beyond the admitted
         // set so stale image memory never outlives its frame.
         self.image_textures.truncate(image_plan.admitted.len());
-        let mut images_skipped = image_plan.skipped;
+        let mut images_skipped = image_plan.skipped + backgrounds_skipped;
         for (slot, &index) in image_plan.admitted.iter().enumerate() {
             let blit = &draw_list.images[index];
-            self.upload_image(
+            upload_image(
+                &mut self.image_textures,
+                &self.image_bind_layout,
+                &self.image_sampler,
+                &self.opacity_buf,
                 device,
                 queue,
                 slot,

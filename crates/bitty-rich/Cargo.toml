@@ -29,6 +29,14 @@ getrandom = "0.4"
 # lockfile via `arboard`, so this direct edge adds no new supply-chain
 # surface; licenses (MIT/Apache-2.0) are in the `cargo-deny` allow list.
 png = "0.18"
+# Background-image decode (CTX-0347, RFC-0001/OQ-042): the accepted format set
+# is PNG + JPEG (baseline/progressive) + static WebP. PNG alone is already
+# covered by `png`; JPEG/WebP need their own decoders, and the `image` facade
+# is already in the tree (lockfile edge via `arboard` -> `bitty-platform`), so
+# this direct edge only narrows the feature set (`default-features = false`)
+# instead of adding a new codec stack. Animated/multi-frame containers are
+# rejected by our own header sniff before this decoder ever runs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 
 [dev-dependencies]

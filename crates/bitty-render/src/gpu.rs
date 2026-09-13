@@ -470,7 +470,9 @@ impl SurfaceConfig {
 pub struct PresentStats {
     /// Logical frame counter for the surface (increments per present).
     pub frame: u64,
-    /// Number of fill rectangles in the presented `DrawList`.
+    /// Number of fill rectangles in the presented `DrawList` (cell and
+    /// decoration fills plus the overlay fills painted above background
+    /// images: selection, cursor, banners, help, scrollbar).
     pub fills: usize,
     /// Number of rounded fill/ring primitives in the presented `DrawList`
     /// (CTX-0311).
@@ -1055,6 +1057,14 @@ impl Surface {
                 for fill in &draw_list.rounded_fills {
                     fill_rounded_rect_rgba(&mut rgba, width, height, fill);
                 }
+                // CTX-0347: per-`View` background images paint above cell
+                // backgrounds and the ring, below overlay fills and glyphs.
+                for blit in &draw_list.backgrounds {
+                    blend_rgba_blit_rgba(&mut rgba, width, height, blit);
+                }
+                for fill in &draw_list.overlay_fills {
+                    fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
+                }
                 // Glyphs.
                 if let Some((texels, dims)) = atlas {
                     for glyph in &draw_list.glyphs {
@@ -1144,7 +1154,7 @@ impl Surface {
                 state.headless_rgba = Some(rgba);
                 Ok(PresentStats {
                     frame: state.frame,
-                    fills: draw_list.fills.len(),
+                    fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
                     rounded_fills: draw_list.rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: true,
@@ -1258,7 +1268,7 @@ impl Surface {
                 // CPU compositors is never silent.
                 if images_skipped > 0 {
                     eprintln!(
-                        "bitty: real-GPU present skipped {images_skipped} kitty image blit(s) (fail-closed: malformed or over budget; headless CPU blends them)"
+                        "bitty: real-GPU present skipped {images_skipped} image/background blit(s) (fail-closed: malformed or over budget; headless CPU blends them)"
                     );
                 }
                 frame.present();
@@ -1266,7 +1276,7 @@ impl Surface {
                 state.frame += 1;
                 Ok(PresentStats {
                     frame: state.frame,
-                    fills: draw_list.fills.len(),
+                    fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
                     rounded_fills: draw_list.rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: false,
@@ -1364,6 +1374,15 @@ impl Surface {
         for fill in &draw_list.rounded_fills {
             fill_rounded_rect_rgba(&mut rgba, width, height, fill);
         }
+        // CTX-0347: per-`View` background images paint above cell backgrounds
+        // and the decoration ring, below overlay fills and glyphs.
+        for blit in &draw_list.backgrounds {
+            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
+        }
+        // CTX-0347: selection/cursor/chrome overlay fills stay above them.
+        for fill in &draw_list.overlay_fills {
+            fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
+        }
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
                 match &glyph.source {
@@ -1452,7 +1471,7 @@ impl Surface {
         state.headless_rgba = Some(rgba);
         Ok(PresentStats {
             frame: state.frame,
-            fills: draw_list.fills.len(),
+            fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
             rounded_fills: draw_list.rounded_fills.len(),
             glyphs: draw_list.glyphs.len(),
             headless: true,
@@ -2022,6 +2041,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2051,6 +2072,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2231,6 +2254,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2256,6 +2281,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         }
@@ -2428,6 +2455,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2467,6 +2496,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images,
         }
@@ -2755,6 +2786,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![],
             images: vec![
                 crate::grid::ImageBlit::try_new(
@@ -2894,6 +2927,8 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![ring.clone()],
+            backgrounds: vec![],
+            overlay_fills: vec![],
             glyphs: vec![glyph],
             images: vec![],
         };

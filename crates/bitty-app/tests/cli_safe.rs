@@ -209,3 +209,84 @@ fn safe_headless_startup_succeeds_with_hostile_config() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// CTX-0347 hostile background declaration: the image path and the approved
+/// root do not exist, so any load attempt must fail. `--safe` never opens it.
+const HOSTILE_BACKGROUND_LUA: &str = r#"return {
+  decoration = {
+    background_image = "/nonexistent-ctx0347/wall.png",
+    background_fit = "tile",
+    background_image_roots = { "/nonexistent-ctx0347" },
+  },
+}
+"#;
+
+#[test]
+fn config_check_rejects_missing_background_image_naming_the_key() {
+    // CTX-0347 (RFC-0001/OQ-042): `config check` runs the exact startup
+    // background-image pipeline (root trust + format + decode + BG bounds),
+    // so a missing/bad image fails closed and names the owning key.
+    let root = scratch_root("bgcheck");
+    let hostile = root.join("hostile-bg.lua");
+    std::fs::write(&hostile, HOSTILE_BACKGROUND_LUA).expect("write hostile-bg.lua");
+    let hostile_str = hostile.to_str().expect("utf8 hostile path");
+
+    let output = run_bitty(&root, &["config", "check", "--config", hostile_str]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a missing background image must fail config check"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("decoration.background_image"),
+        "diagnostic must name the key: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn safe_config_check_ignores_hostile_background_image() {
+    // The missing path proves no file is opened: if `--safe` attempted the
+    // load, the same command would fail with exit 2.
+    let root = scratch_root("bgsafe");
+    let hostile = root.join("hostile-bg.lua");
+    std::fs::write(&hostile, HOSTILE_BACKGROUND_LUA).expect("write hostile-bg.lua");
+    let hostile_str = hostile.to_str().expect("utf8 hostile path");
+
+    let output = run_bitty(
+        &root,
+        &["config", "check", "--safe", "--config", hostile_str],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "safe config check must ignore and never open the image, stderr={:?}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn safe_headless_startup_ignores_hostile_background_image() {
+    let root = scratch_root("bgheadless");
+    write_config(&root, HOSTILE_BACKGROUND_LUA);
+    let output = run_bitty(
+        &root,
+        &[
+            "--safe",
+            "--headless",
+            "--config",
+            root.join("bitty/init.lua")
+                .to_str()
+                .expect("utf8 init path"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "safe headless startup must not open the image, stderr={:?}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

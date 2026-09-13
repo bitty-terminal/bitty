@@ -192,6 +192,27 @@ impl Runtime {
         self.config.resolve_view_outline(&target)
     }
 
+    /// Resolves one `View`'s background image and fit after per-`View`
+    /// overrides (CTX-0347, RFC-0001/OQ-042).
+    ///
+    /// Uses exactly the same public layout state as [`Self::view_outline_for`]
+    /// (stable `ViewId`, active workspace label, content kind). The approved
+    /// root policy is not part of the resolution: no selector can widen it.
+    #[must_use]
+    pub(crate) fn view_background_for(
+        &self,
+        view_id: ViewId,
+    ) -> crate::config::RuntimeViewBackground {
+        let content = self.view_content_kind(view_id);
+        let workspace_label = self.active_workspace_label();
+        let target = crate::config::RuntimeViewTarget {
+            content,
+            workspace_label,
+            view_id: view_id.0,
+        };
+        self.config.resolve_view_background(&target)
+    }
+
     /// Content kind of a leaf for `views` selector matching: `terminal` for a
     /// leaf that owns a pane session or the primary grid, `empty` otherwise
     /// (see [`Self::view_outline_for`]).

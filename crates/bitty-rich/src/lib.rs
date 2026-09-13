@@ -83,6 +83,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod background;
 pub mod blocks;
 pub mod clipboard;
 pub mod composer;
@@ -98,6 +99,15 @@ pub mod presentation;
 pub mod scene;
 pub mod shell;
 
+pub use background::{
+    BG_CACHE_MAX_BYTES, BG_CACHE_MAX_IMAGES, BG_MAX_DECODED_BYTES, BG_MAX_DIMENSION,
+    BG_MAX_ENCODED_BYTES, BG_MAX_IMAGES_PER_VIEW, BG_MAX_PATH_BYTES, BG_MAX_ROOTS,
+    BG_PRESENT_MAX_BLITS_PER_FRAME, BG_PRESENT_MAX_BYTES_PER_FRAME, BG_RASTER_CACHE_MAX_BYTES,
+    BackgroundBlit, BackgroundError, BackgroundFit, BackgroundFormat, BackgroundImage,
+    BackgroundKey, BackgroundRasterCache, BackgroundRasterKey, BackgroundRasterKeySource,
+    BackgroundStore, FitPlan, ImageHeader, check_header_bounds, decode_background,
+    expand_background_path, fit_plan, rasterize_background, sniff_image,
+};
 pub use blocks::{
     COMMAND_BLOCK_MAX, CommandBlock, CommandId, CommandState, FOLD_MAX, FoldState, SemanticRange,
     block_by_id, block_count, blocks, hidden_blocks, is_output_kind, list_blocks, visible_blocks,
@@ -142,6 +152,7 @@ pub use kitty_place::{
     KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_rect_for,
     rasterize, viewport_extent,
 };
+pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,

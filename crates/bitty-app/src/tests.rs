@@ -277,6 +277,7 @@ fn default_run_emits_no_tick_lines() {
         headless: true,
         generation: 9,
         images: 0,
+        backgrounds: 0,
         images_skipped: 0,
     };
     assert!(app.maybe_format_tick(&present).is_none());
@@ -304,6 +305,7 @@ fn verbose_run_emits_tick_lines() {
         headless: true,
         generation: 30,
         images: 1,
+        backgrounds: 0,
         images_skipped: 0,
     };
     let line = app
@@ -334,6 +336,7 @@ fn tick_line_format_carries_frame_stats() {
         headless: true,
         generation: 30,
         images: 0,
+        backgrounds: 0,
         images_skipped: 0,
     };
     let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false);
@@ -1837,15 +1840,60 @@ fn runtime_config_carries_per_view_overrides() {
         Some([0x33, 0xCC, 0xFF, 0xFF])
     );
     assert_eq!(by_selector("ws:2").border_width_idle, Some(1));
+    // CTX-0347: the app expands `~`-anchored background paths at the
+    // environment boundary before they reach the runtime.
+    let expanded = crate::config_cli::expand_home_path("~/wall/one.png").expect("expand home");
     assert_eq!(
         by_selector("view:7").background_image.as_deref(),
-        Some("~/wall/one.png")
+        Some(expanded.as_str())
     );
     assert_eq!(by_selector("view:7").background_fit.as_deref(), Some("fit"));
     // Safe mode carries no per-View rules at all.
     let safe = bitty_config::reload::fallback_builtin();
     let safe_cfg = runtime_config_from_effective(&safe).expect("safe builds");
     assert!(safe_cfg.view_appearance.is_empty());
+}
+
+#[test]
+fn runtime_config_carries_global_background_image_fit_and_roots() {
+    // CTX-0347: the global pair and the deny-by-default root list flow
+    // file -> effective -> runtime with `~` expanded at the app boundary.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r##"return { decoration = {
+            background_image = "~/wall/global.png",
+            background_fit = "tile",
+            background_image_roots = { "/srv/wall", "~/Pictures" },
+        } }"##,
+        &src,
+    )
+    .expect("background decoration parse");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(
+        cfg.background_image.as_deref(),
+        Some(
+            crate::config_cli::expand_home_path("~/wall/global.png")
+                .expect("expand image")
+                .as_str()
+        )
+    );
+    assert_eq!(cfg.background_fit, "tile");
+    assert_eq!(
+        cfg.background_image_roots,
+        vec![
+            "/srv/wall".to_string(),
+            crate::config_cli::expand_home_path("~/Pictures").expect("expand root"),
+        ]
+    );
+    // Safe mode clears the image and the roots (no file may be opened).
+    let safe_cfg = runtime_config_from_effective(&bitty_config::reload::fallback_builtin())
+        .expect("safe builds");
+    assert_eq!(safe_cfg.background_image, None);
+    assert!(safe_cfg.background_image_roots.is_empty());
 }
 
 #[test]

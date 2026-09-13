@@ -1245,6 +1245,26 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 check_width("decoration.border_width_focused", d.border_width_focused)?;
             let border_width_idle =
                 check_width("decoration.border_width_idle", d.border_width_idle)?;
+            // CTX-0347 (RFC-0001/OQ-042): the global background image and
+            // roots are `None` = "says nothing"; the path syntax and the
+            // roots bound are re-checked by `DecorationConfig::validate` and
+            // the root/format/decode trust lives in the `bitty-rich` loader.
+            // The fit enum is closed here: an unknown spelling fails with the
+            // full `decoration.background_fit` path.
+            let background_image = d.background_image.clone();
+            let background_fit = match d.background_fit.as_deref() {
+                None => None,
+                Some(raw) => match BackgroundFit::parse(raw) {
+                    Some(fit) => Some(fit),
+                    None => {
+                        return Err(ConfigError::validation(
+                            "decoration.background_fit",
+                            "must be one of fill, fit, center, tile, stretch",
+                        ));
+                    }
+                },
+            };
+            let background_image_roots = d.background_image_roots.clone();
             Some(DecorationConfig {
                 gaps_in,
                 gaps_out,
@@ -1257,6 +1277,9 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
                 border_width,
                 border_width_focused,
                 border_width_idle,
+                background_image,
+                background_fit,
+                background_image_roots,
             })
         }
     };
@@ -3536,6 +3559,111 @@ mod tests {
             let err = parse_lua_config(code, &test_source()).expect_err(code);
             assert_eq!(err.field(), Some(*field), "{code}: {err}");
         }
+    }
+
+    // ── CTX-0343 per-View overrides (RFC-0001/OQ-041) ────────────────────
+
+    #[test]
+    fn decoration_background_image_parses_and_validates() {
+        // CTX-0347 (RFC-0001/OQ-042): the global image/fit/roots parse with
+        // absent keys meaning "says nothing"; the closed fit enum fails
+        // closed at parse, and the path/roots syntax fails closed through
+        // `DecorationConfig::validate` (the ConfigPlan gate).
+        let plan = parse_lua_config(
+            r##"return { decoration = {
+                background_image = "~/wall/one.png",
+                background_fit = "tile",
+                background_image_roots = { "/srv/wallpapers", "~/Pictures" },
+            } }"##,
+            &test_source(),
+        )
+        .expect("background decoration parses");
+        let dec = plan.decoration.clone().expect("decoration present");
+        assert_eq!(dec.background_image.as_deref(), Some("~/wall/one.png"));
+        assert_eq!(dec.background_fit, Some(BackgroundFit::Tile));
+        assert_eq!(
+            dec.background_image_roots.as_deref(),
+            Some(&["/srv/wallpapers".to_string(), "~/Pictures".to_string()][..])
+        );
+        plan.validate().expect("valid background decoration");
+
+        let plan = parse_lua_config(r#"return { decoration = {} }"#, &test_source())
+            .expect("empty decoration");
+        let dec = plan.decoration.expect("decoration present");
+        assert_eq!(dec.background_image, None);
+        assert_eq!(dec.background_fit, None);
+        assert_eq!(dec.background_image_roots, None);
+
+        // The fit enum is closed at parse time.
+        let err = parse_lua_config(
+            r#"return { decoration = { background_fit = "cover" } }"#,
+            &test_source(),
+        )
+        .expect_err("unknown fit must fail closed");
+        assert_eq!(err.field(), Some("decoration.background_fit"), "{err}");
+
+        for (bad, field) in [
+            (
+                r#"return { decoration = { background_image = "relative/one.png" } }"#,
+                "decoration.background_image",
+            ),
+            (
+                r#"return { decoration = { background_image = "" } }"#,
+                "decoration.background_image",
+            ),
+            (
+                r#"return { decoration = { background_image_roots = { "rel" } } }"#,
+                "decoration.background_image_roots",
+            ),
+            (
+                r#"return { decoration = { background_image_roots = { "" } } }"#,
+                "decoration.background_image_roots",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).expect_err(bad);
+            assert_eq!(err.field(), Some(field), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn decoration_background_image_roots_bounds_fail_closed() {
+        // CTX-0347: `at most 32` entries, each `<= 4096` bytes (RFC-0001).
+        let roots = (0..=crate::types::MAX_BACKGROUND_IMAGE_ROOTS)
+            .map(|i| format!("/wall/{i}"))
+            .collect::<Vec<_>>();
+        let plan = ConfigPlan {
+            decoration: Some(DecorationConfig {
+                background_image_roots: Some(roots),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = plan.validate().expect_err("33 roots");
+        assert_eq!(err.field(), Some("decoration.background_image_roots"));
+
+        let long = format!(
+            "/{}",
+            "a".repeat(crate::types::MAX_BACKGROUND_IMAGE_PATH_BYTES)
+        );
+        let plan = ConfigPlan {
+            decoration: Some(DecorationConfig {
+                background_image: Some(long.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = plan.validate().expect_err("overlong image path");
+        assert_eq!(err.field(), Some("decoration.background_image"));
+
+        let plan = ConfigPlan {
+            decoration: Some(DecorationConfig {
+                background_image_roots: Some(vec![long]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = plan.validate().expect_err("overlong root");
+        assert_eq!(err.field(), Some("decoration.background_image_roots"));
     }
 
     // ── CTX-0343 per-View overrides (RFC-0001/OQ-041) ────────────────────

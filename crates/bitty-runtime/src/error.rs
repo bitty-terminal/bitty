@@ -24,6 +24,11 @@ pub enum RuntimeError {
     /// AC-2 on a resolved pair). The owned message names the source-attributed
     /// `views[<selector>].<field>` leaf and the failed acceptance check.
     ViewAppearance(String),
+    /// A background-image load/trust/bound failure (RFC-0001/OQ-042,
+    /// CTX-0347). The owned message names the source-attributed
+    /// `decoration.*` / `views[<selector>].background_image` key and the
+    /// rejection reason; a failed image rejects the whole config load.
+    BackgroundImage(String),
     /// Plugin host rejected the request.
     Plugin(String),
 }
@@ -38,6 +43,7 @@ impl fmt::Display for RuntimeError {
             Self::InvalidSize(msg) => write!(f, "invalid size: {msg}"),
             Self::InvalidQueueCapacity => write!(f, "cold queue capacity must be > 0"),
             Self::ViewAppearance(msg) => write!(f, "view appearance contract: {msg}"),
+            Self::BackgroundImage(msg) => write!(f, "background image: {msg}"),
             Self::Plugin(msg) => write!(f, "plugin error: {msg}"),
         }
     }

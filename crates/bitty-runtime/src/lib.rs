@@ -203,10 +203,13 @@ pub mod tabs;
 pub mod workspace;
 
 pub use config::{
-    CloseConfirmMode, RuntimeConfig, RuntimeViewOutline, RuntimeViewTarget, ViewAppearanceRule,
+    BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
+    MAX_BACKGROUND_IMAGE_ROOTS, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline,
+    RuntimeViewTarget, ViewAppearanceRule,
 };
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
+pub use runtime::background_images::validate_background_images;
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::PresentFrame;

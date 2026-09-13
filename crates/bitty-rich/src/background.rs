@@ -1,0 +1,1638 @@
+//! Bounded per-`View` background images (CTX-0347).
+//!
+//! Implements the accepted RFC-0001/OQ-042 Core-owned user-configuration
+//! contract for `decoration.background_image` / `background_fit` /
+//! `background_image_roots` and the `views.*` image fields:
+//!
+//! - **Path trust**: deny-by-default [`ResourcePolicy`] roots; a configured
+//!   path must be absolute or `~`-anchored, canonicalize, resolve to a
+//!   regular file, and stay under an approved root (symlink escapes are
+//!   re-checked after canonicalization). `/proc`, `/sys`, and `/dev` are
+//!   forbidden.
+//! - **Formats**: PNG, JPEG (baseline and progressive), and static WebP.
+//!   Animated or multi-frame containers (APNG, animated WebP, GIF) and
+//!   unsupported formats are rejected by header sniff *before* any decode.
+//! - **Limits**: BG-1..BG-7 alias the accepted image-store ceilings and the
+//!   OQ-042 design/present bounds; every byte estimate is overflow-checked
+//!   and the decode/cache path never allocates beyond a checked bound.
+//! - **Fit modes**: [`BackgroundFit`] `fill`/`fit`/`center`/`tile`/`stretch`
+//!   geometry is pure and pixel-exact ([`fit_plan`], [`rasterize_background`]).
+//! - **Caching**: [`BackgroundStore`] keys decoded images by canonical path
+//!   plus content identity (length + mtime) and holds BG-4/BG-5; the
+//!   [`BackgroundRasterCache`] holds scaled blits under the BG-7 byte cap.
+//!   Pinned (currently displayed) images are never evicted for an
+//!   unpinned admission.
+//!
+//! The module performs no decode at module scope and no I/O except inside
+//! [`BackgroundStore::load`], which the runtime calls off the present path.
+
+use crate::geometry::RectPx;
+use crate::loader::{ResourceError, ResourcePolicy, validate_resource_path};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+/// BG-1: max encoded file bytes per image (aliases IMG-1).
+pub const BG_MAX_ENCODED_BYTES: usize = 4 * 1024 * 1024;
+
+/// BG-2: max decoded dimension per axis (aliases IMG-2).
+pub const BG_MAX_DIMENSION: u32 = 4096;
+
+/// BG-3: max decoded bytes per image, `width * height * 4` (aliases IMG-3).
+pub const BG_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// BG-4: max aggregate decoded background bytes (aliases IMG-4).
+pub const BG_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// BG-5: max decoded background images resident (aliases IMG-5).
+pub const BG_CACHE_MAX_IMAGES: usize = 256;
+
+/// BG-6: max resident background images per `View` (design bound: one).
+pub const BG_MAX_IMAGES_PER_VIEW: usize = 1;
+
+/// BG-7: max background blits composited in one present frame.
+pub const BG_PRESENT_MAX_BLITS_PER_FRAME: usize = 32;
+
+/// BG-7: max padded staging bytes uploaded in one present frame.
+pub const BG_PRESENT_MAX_BYTES_PER_FRAME: usize = 64 * 1024 * 1024;
+
+/// Max scaled-blit bytes retained by [`BackgroundRasterCache`] (one BG-7
+/// frame's worth; mirrors the Kitty raster-cache policy).
+pub const BG_RASTER_CACHE_MAX_BYTES: usize = BG_PRESENT_MAX_BYTES_PER_FRAME;
+
+/// Max `background_image` path length in bytes (RFC-0001 table: `<= 4096`).
+pub const BG_MAX_PATH_BYTES: usize = 4096;
+
+/// Max `decoration.background_image_roots` entries (RFC-0001: `at most 32`).
+pub const BG_MAX_ROOTS: usize = 32;
+
+/// Accepted background formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackgroundFormat {
+    /// PNG (APNG rejected by the header sniff).
+    Png,
+    /// JPEG baseline, extended sequential, or progressive.
+    Jpeg,
+    /// Static WebP (`VP8 `, `VP8L`, or non-animated `VP8X`).
+    WebP,
+}
+
+/// Parsed image header: format plus pixel dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageHeader {
+    /// Sniffed container format.
+    pub format: BackgroundFormat,
+    /// Header width in pixels (`> 0`).
+    pub width: u32,
+    /// Header height in pixels (`> 0`).
+    pub height: u32,
+}
+
+/// Typed background-image rejection. Every variant names the failed bound or
+/// trust check; no variant carries image content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundError {
+    /// Path-policy rejection (empty, relative, traversal, forbidden prefix,
+    /// non-regular file, outside approved roots, symlink escape).
+    Resource(ResourceError),
+    /// `~`-anchored path with no available home directory.
+    HomeUnavailable,
+    /// Filesystem error while reading the approved regular file.
+    Io {
+        /// Configured path (display form).
+        path: String,
+        /// Underlying error detail.
+        detail: String,
+    },
+    /// Encoded length over BG-1.
+    EncodedTooLarge {
+        /// Actual encoded byte length.
+        actual: usize,
+        /// Accepted cap ([`BG_MAX_ENCODED_BYTES`]).
+        cap: usize,
+    },
+    /// Header dimensions are zero or over BG-2.
+    Dimensions {
+        /// Header width.
+        width: u32,
+        /// Header height.
+        height: u32,
+    },
+    /// Overflow-checked decoded estimate over BG-3.
+    DecodedTooLarge {
+        /// Checked `width * height * 4` estimate (or `u64::MAX` on overflow).
+        bytes: u64,
+        /// Accepted cap ([`BG_MAX_DECODED_BYTES`]).
+        cap: u64,
+    },
+    /// Animated or multi-frame container (APNG, animated WebP, MPO).
+    Animated {
+        /// Detected container spelling.
+        format: &'static str,
+    },
+    /// Unsupported container or codec profile (SVG, GIF, AVIF, BMP, TIFF,
+    /// lossless-JPEG profiles, 12-bit JPEG, ...).
+    UnsupportedFormat {
+        /// Human-readable refusal reason.
+        detail: String,
+    },
+    /// Truncated or malformed header/container.
+    Malformed {
+        /// Human-readable refusal reason.
+        detail: String,
+    },
+    /// Cache admission refused: even after evicting every unpinned entry the
+    /// image cannot fit BG-4/BG-5 (a single over-budget image is `BG-3`).
+    CacheFull,
+}
+
+impl std::fmt::Display for BackgroundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resource(err) => write!(f, "background image path denied: {err}"),
+            Self::HomeUnavailable => {
+                write!(
+                    f,
+                    "background image path uses '~' but no home directory is set"
+                )
+            }
+            Self::Io { path, detail } => {
+                write!(f, "background image read failed for {path}: {detail}")
+            }
+            Self::EncodedTooLarge { actual, cap } => write!(
+                f,
+                "background image is {actual} encoded bytes; BG-1 allows at most {cap}"
+            ),
+            Self::Dimensions { width, height } => write!(
+                f,
+                "background image is {width}x{height}; BG-2 allows at most \
+                 {BG_MAX_DIMENSION}x{BG_MAX_DIMENSION}"
+            ),
+            Self::DecodedTooLarge { bytes, cap } => write!(
+                f,
+                "background image decodes to {bytes} bytes; BG-3 allows at most {cap}"
+            ),
+            Self::Animated { format } => {
+                write!(
+                    f,
+                    "animated or multi-frame {format} background images are rejected"
+                )
+            }
+            Self::UnsupportedFormat { detail } => {
+                write!(f, "unsupported background image format: {detail}")
+            }
+            Self::Malformed { detail } => write!(f, "malformed background image: {detail}"),
+            Self::CacheFull => write!(
+                f,
+                "background image cache cannot admit the image within BG-4/BG-5"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BackgroundError {}
+
+impl From<ResourceError> for BackgroundError {
+    fn from(value: ResourceError) -> Self {
+        Self::Resource(value)
+    }
+}
+
+fn be32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn be16(bytes: &[u8]) -> u32 {
+    u32::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn le16(bytes: &[u8]) -> u32 {
+    u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn le24(bytes: &[u8]) -> u32 {
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+fn le32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Sniffs `bytes` as one of the accepted static formats.
+///
+/// The sniff is strict and bounded: it never reads outside the buffer, never
+/// allocates, and rejects malformed, truncated, unsupported, and animated
+/// containers before any decoder runs. Dimensions come from the container
+/// header and are checked against BG-2 by [`check_header_bounds`] (kept
+/// separate so a caller can report limit failures distinctly from format
+/// failures).
+///
+/// # Errors
+///
+/// [`BackgroundError::Animated`] for APNG / animated WebP / multi-frame
+/// containers, [`BackgroundError::UnsupportedFormat`] for a recognized but
+/// out-of-contract container (GIF, SVG, BMP, TIFF, AVIF, lossless JPEG,
+/// 12-bit JPEG), and [`BackgroundError::Malformed`] for truncated or
+/// inconsistent headers.
+pub fn sniff_image(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+        return sniff_png(bytes);
+    }
+    if bytes.len() >= 3 && bytes[..3] == [0xFF, 0xD8, 0xFF] {
+        return sniff_jpeg(bytes);
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return sniff_webp(bytes);
+    }
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return Err(BackgroundError::Animated { format: "GIF" });
+    }
+    if bytes.starts_with(b"BM") {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: "BMP is not an accepted background format".to_string(),
+        });
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: "TIFF is not an accepted background format".to_string(),
+        });
+    }
+    let head = &bytes[..bytes.len().min(256)];
+    if head.starts_with(b"<svg")
+        || head.starts_with(b"<?xml")
+        || head.windows(4).any(|w| w == b"<svg")
+    {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: "SVG is not an accepted background format".to_string(),
+        });
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif" {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: "AVIF is not an accepted background format".to_string(),
+        });
+    }
+    Err(BackgroundError::Malformed {
+        detail: "unrecognized image header".to_string(),
+    })
+}
+
+fn sniff_png(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
+    let mut offset = 8usize;
+    let mut header: Option<(u32, u32)> = None;
+    loop {
+        if offset + 8 > bytes.len() {
+            break;
+        }
+        let len = be32(&bytes[offset..offset + 4]) as usize;
+        let ctype = &bytes[offset + 4..offset + 8];
+        let Some(end) = offset.checked_add(12).and_then(|v| v.checked_add(len)) else {
+            break;
+        };
+        if end > bytes.len() {
+            break;
+        }
+        match ctype {
+            b"IHDR" => {
+                if offset != 8 || len != 13 {
+                    return Err(BackgroundError::Malformed {
+                        detail: "PNG IHDR must be the first 13-byte chunk".to_string(),
+                    });
+                }
+                let width = be32(&bytes[offset + 8..offset + 12]);
+                let height = be32(&bytes[offset + 12..offset + 16]);
+                if width == 0 || height == 0 {
+                    return Err(BackgroundError::Dimensions { width, height });
+                }
+                header = Some((width, height));
+            }
+            b"acTL" => {
+                return Err(BackgroundError::Animated { format: "APNG" });
+            }
+            b"IDAT" | b"IEND" => {}
+            _ => {}
+        }
+        offset = end;
+        if ctype == b"IEND" {
+            break;
+        }
+    }
+    let (width, height) = header.ok_or(BackgroundError::Malformed {
+        detail: "PNG is missing a complete IHDR chunk".to_string(),
+    })?;
+    Ok(ImageHeader {
+        format: BackgroundFormat::Png,
+        width,
+        height,
+    })
+}
+
+fn sniff_jpeg(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
+    let mut offset = 2usize;
+    loop {
+        while offset + 1 < bytes.len() && bytes[offset] == 0xFF && bytes[offset + 1] == 0xFF {
+            offset += 1;
+        }
+        if offset + 1 >= bytes.len() {
+            return Err(BackgroundError::Malformed {
+                detail: "truncated JPEG marker stream".to_string(),
+            });
+        }
+        if bytes[offset] != 0xFF {
+            return Err(BackgroundError::Malformed {
+                detail: "JPEG marker expected".to_string(),
+            });
+        }
+        let marker = bytes[offset + 1];
+        match marker {
+            0xD8 | 0x01 | 0xD0..=0xD7 => {
+                offset += 2;
+                continue;
+            }
+            0xD9 => {
+                return Err(BackgroundError::Malformed {
+                    detail: "JPEG ended before a frame header".to_string(),
+                });
+            }
+            _ => {}
+        }
+        if offset + 4 > bytes.len() {
+            return Err(BackgroundError::Malformed {
+                detail: "truncated JPEG segment header".to_string(),
+            });
+        }
+        let seg_len = be16(&bytes[offset + 2..offset + 4]) as usize;
+        if seg_len < 2 {
+            return Err(BackgroundError::Malformed {
+                detail: "JPEG segment length underflow".to_string(),
+            });
+        }
+        let seg_end = offset
+            .checked_add(2)
+            .and_then(|v| v.checked_add(seg_len))
+            .ok_or(BackgroundError::Malformed {
+                detail: "JPEG segment length overflow".to_string(),
+            })?;
+        if seg_end > bytes.len() {
+            return Err(BackgroundError::Malformed {
+                detail: "truncated JPEG segment".to_string(),
+            });
+        }
+        let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if is_sof {
+            if seg_len < 8 {
+                return Err(BackgroundError::Malformed {
+                    detail: "JPEG frame header too short".to_string(),
+                });
+            }
+            if !matches!(marker, 0xC0..=0xC2) {
+                return Err(BackgroundError::UnsupportedFormat {
+                    detail: format!(
+                        "JPEG frame type 0x{marker:02X} is not baseline, extended sequential, \
+                         or progressive"
+                    ),
+                });
+            }
+            let precision = bytes[offset + 4];
+            if precision != 8 {
+                return Err(BackgroundError::UnsupportedFormat {
+                    detail: format!("{precision}-bit JPEG samples are not accepted"),
+                });
+            }
+            let height = be16(&bytes[offset + 5..offset + 7]);
+            let width = be16(&bytes[offset + 7..offset + 9]);
+            if width == 0 || height == 0 {
+                return Err(BackgroundError::Dimensions { width, height });
+            }
+            return Ok(ImageHeader {
+                format: BackgroundFormat::Jpeg,
+                width,
+                height,
+            });
+        }
+        if marker == 0xDA {
+            return Err(BackgroundError::Malformed {
+                detail: "JPEG scan started before a frame header".to_string(),
+            });
+        }
+        if marker == 0xE2 && seg_len >= 2 && bytes[offset + 4..].starts_with(b"MPF\0") {
+            return Err(BackgroundError::Animated {
+                format: "MPO (JPEG)",
+            });
+        }
+        offset = seg_end;
+    }
+}
+
+fn sniff_webp(bytes: &[u8]) -> Result<ImageHeader, BackgroundError> {
+    let declared = le32(&bytes[4..8]) as usize;
+    if declared
+        .checked_add(8)
+        .is_none_or(|total| total > bytes.len())
+    {
+        return Err(BackgroundError::Malformed {
+            detail: "truncated WebP RIFF container".to_string(),
+        });
+    }
+    if bytes.len() < 20 {
+        return Err(BackgroundError::Malformed {
+            detail: "truncated WebP chunk header".to_string(),
+        });
+    }
+    let chunk_len = le32(&bytes[16..20]) as usize;
+    let chunk_end = 20usize
+        .checked_add(chunk_len)
+        .ok_or(BackgroundError::Malformed {
+            detail: "WebP chunk length overflow".to_string(),
+        })?;
+    if chunk_end > bytes.len() {
+        return Err(BackgroundError::Malformed {
+            detail: "truncated WebP chunk data".to_string(),
+        });
+    }
+    let data = &bytes[20..chunk_end];
+    match &bytes[12..16] {
+        b"VP8X" => {
+            if chunk_len < 10 {
+                return Err(BackgroundError::Malformed {
+                    detail: "WebP VP8X chunk too short".to_string(),
+                });
+            }
+            let flags = data[0];
+            if flags & 0x02 != 0 {
+                return Err(BackgroundError::Animated { format: "WebP" });
+            }
+            let width = 1 + le24(&data[4..7]);
+            let height = 1 + le24(&data[7..10]);
+            if width == 0 || height == 0 {
+                return Err(BackgroundError::Dimensions { width, height });
+            }
+            Ok(ImageHeader {
+                format: BackgroundFormat::WebP,
+                width,
+                height,
+            })
+        }
+        b"VP8 " => {
+            if chunk_len < 10 {
+                return Err(BackgroundError::Malformed {
+                    detail: "WebP VP8 frame header too short".to_string(),
+                });
+            }
+            if data[3..6] != [0x9D, 0x01, 0x2A] {
+                return Err(BackgroundError::Malformed {
+                    detail: "WebP VP8 sync code mismatch".to_string(),
+                });
+            }
+            let width = le16(&data[6..8]) & 0x3FFF;
+            let height = le16(&data[8..10]) & 0x3FFF;
+            if width == 0 || height == 0 {
+                return Err(BackgroundError::Dimensions { width, height });
+            }
+            Ok(ImageHeader {
+                format: BackgroundFormat::WebP,
+                width,
+                height,
+            })
+        }
+        b"VP8L" => {
+            if chunk_len < 5 || data[0] != 0x2F {
+                return Err(BackgroundError::Malformed {
+                    detail: "WebP VP8L signature mismatch".to_string(),
+                });
+            }
+            let bits = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            let width = (bits & 0x3FFF) + 1;
+            let height = ((bits >> 14) & 0x3FFF) + 1;
+            if width == 0 || height == 0 {
+                return Err(BackgroundError::Dimensions { width, height });
+            }
+            Ok(ImageHeader {
+                format: BackgroundFormat::WebP,
+                width,
+                height,
+            })
+        }
+        b"ANIM" => Err(BackgroundError::Animated { format: "WebP" }),
+        _ => Err(BackgroundError::UnsupportedFormat {
+            detail: "unrecognized WebP chunk".to_string(),
+        }),
+    }
+}
+
+/// Enforces BG-2 and the checked BG-3 estimate for one parsed header.
+///
+/// # Errors
+///
+/// [`BackgroundError::Dimensions`] when an axis is zero or over
+/// [`BG_MAX_DIMENSION`], [`BackgroundError::DecodedTooLarge`] when the
+/// overflow-checked `width * height * 4` estimate exceeds
+/// [`BG_MAX_DECODED_BYTES`].
+pub fn check_header_bounds(header: &ImageHeader) -> Result<(), BackgroundError> {
+    if header.width == 0
+        || header.height == 0
+        || header.width > BG_MAX_DIMENSION
+        || header.height > BG_MAX_DIMENSION
+    {
+        return Err(BackgroundError::Dimensions {
+            width: header.width,
+            height: header.height,
+        });
+    }
+    let bytes = u64::from(header.width)
+        .checked_mul(u64::from(header.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .unwrap_or(u64::MAX);
+    if bytes > BG_MAX_DECODED_BYTES as u64 {
+        return Err(BackgroundError::DecodedTooLarge {
+            bytes,
+            cap: BG_MAX_DECODED_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Expands a configured `background_image` path to an absolute path.
+///
+/// Accepts absolute paths and `~` / `~/...` (home injected so tests stay
+/// hermetic). `~user` forms and relative paths fail closed; a `~` path with
+/// no home directory fails closed.
+///
+/// # Errors
+///
+/// [`BackgroundError::Malformed`] for empty/NUL/over-long spellings,
+/// [`BackgroundError::HomeUnavailable`] for a `~` path without home, and
+/// [`BackgroundError::Resource`] with
+/// [`ResourceError::OutsideApprovedRoot`](crate::loader::ResourceError) for
+/// relative paths.
+pub fn expand_background_path(raw: &str, home: Option<&Path>) -> Result<PathBuf, BackgroundError> {
+    if raw.is_empty() {
+        return Err(BackgroundError::Malformed {
+            detail: "background image path must not be empty".to_string(),
+        });
+    }
+    if raw.len() > BG_MAX_PATH_BYTES {
+        return Err(BackgroundError::Malformed {
+            detail: format!("background image path exceeds {BG_MAX_PATH_BYTES} bytes"),
+        });
+    }
+    if raw.contains('\0') {
+        return Err(BackgroundError::Malformed {
+            detail: "background image path must not contain NUL".to_string(),
+        });
+    }
+    if raw == "~" {
+        let home = home.ok_or(BackgroundError::HomeUnavailable)?;
+        return Ok(home.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = home.ok_or(BackgroundError::HomeUnavailable)?;
+        return Ok(home.join(rest));
+    }
+    if raw.starts_with('~') {
+        return Err(BackgroundError::UnsupportedFormat {
+            detail: "'~user' background image paths are not accepted".to_string(),
+        });
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        let shown = path.display().to_string();
+        return Err(BackgroundError::Resource(
+            ResourceError::OutsideApprovedRoot {
+                path: shown.clone(),
+                canonical: shown,
+            },
+        ));
+    }
+    Ok(path)
+}
+
+/// One decoded background image (straight-alpha RGBA8, row-major).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+impl BackgroundImage {
+    /// Dimensions in pixels.
+    #[must_use]
+    pub const fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Decoded bytes (`width * height * 4`).
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+
+    /// Straight-alpha RGBA8 pixels.
+    #[must_use]
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    /// Builds an image, validating the byte length against the dims.
+    ///
+    /// # Errors
+    ///
+    /// [`BackgroundError::Malformed`] when the byte length does not equal
+    /// `width * height * 4` (checked arithmetic).
+    pub fn try_new(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, BackgroundError> {
+        let expected = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .filter(|&n| n <= usize::MAX as u64);
+        if width == 0 || height == 0 || expected.is_none_or(|n| n as usize != rgba.len()) {
+            return Err(BackgroundError::Malformed {
+                detail: "background image bytes do not match its declared dimensions".to_string(),
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
+}
+
+/// Cache identity for one approved background file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BackgroundKey {
+    /// Canonical absolute path (symlinks resolved).
+    pub canonical: PathBuf,
+    /// File length in bytes at resolution time.
+    pub len: u64,
+    /// File modification time at resolution time (`None` when unavailable).
+    pub modified: Option<SystemTime>,
+}
+
+impl BackgroundKey {
+    fn from_metadata(canonical: PathBuf, meta: &std::fs::Metadata) -> Self {
+        Self {
+            canonical,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
+/// Decoded-image store: deny-by-default roots, BG-1..BG-3 enforced at load,
+/// BG-4/BG-5 at admission, and identity-keyed reuse (`loads()` counts decodes
+/// so tests can prove an unchanged file is reused and a changed one
+/// re-decodes).
+#[derive(Debug)]
+pub struct BackgroundStore {
+    policy: ResourcePolicy,
+    entries: Vec<(BackgroundKey, Arc<BackgroundImage>)>,
+    pinned: Vec<BackgroundKey>,
+    bytes: usize,
+    loads: u64,
+}
+
+impl BackgroundStore {
+    /// Creates a store over an approved-root policy.
+    #[must_use]
+    pub fn new(policy: ResourcePolicy) -> Self {
+        Self {
+            policy,
+            entries: Vec::new(),
+            pinned: Vec::new(),
+            bytes: 0,
+            loads: 0,
+        }
+    }
+
+    /// Deny-by-default store (no approved roots; every load denied).
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self::new(ResourcePolicy::deny_all())
+    }
+
+    /// Approved-root policy.
+    #[must_use]
+    pub fn policy(&self) -> &ResourcePolicy {
+        &self.policy
+    }
+
+    /// Decoded images currently resident.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no decoded image is resident.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Aggregate decoded bytes resident.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Successful decode count (identity-mismatched reloads included).
+    #[must_use]
+    pub fn loads(&self) -> u64 {
+        self.loads
+    }
+
+    /// Marks `key` as currently displayed; pinned images are never evicted
+    /// for an unpinned admission.
+    pub fn pin(&mut self, key: &BackgroundKey) {
+        if !self.pinned.contains(key) {
+            self.pinned.push(key.clone());
+        }
+    }
+
+    /// Clears every pin (called when the displayed set is recomputed).
+    pub fn unpin_all(&mut self) {
+        self.pinned.clear();
+    }
+
+    /// Resident image for `key`, if present and identity-current.
+    #[must_use]
+    pub fn get(&self, key: &BackgroundKey) -> Option<Arc<BackgroundImage>> {
+        self.entries
+            .iter()
+            .find(|(resident, _)| resident == key)
+            .map(|(_, image)| Arc::clone(image))
+    }
+
+    /// Resolves, validates, decodes, and admits `raw` (or reuses the resident
+    /// identity), returning the cache key to pass to [`Self::get`].
+    ///
+    /// The full accepted pipeline runs in order: path syntax, canonicalize +
+    /// approved-root + regular-file trust, encoded length BG-1, header sniff,
+    /// BG-2 dimensions, checked BG-3 estimate, format/animation check, then
+    /// decode and BG-4/BG-5/BG-6 admission. Any failure leaves the store
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`BackgroundError`] naming the failed trust check, bound, or format.
+    pub fn load(
+        &mut self,
+        raw: &str,
+        home: Option<&Path>,
+    ) -> Result<BackgroundKey, BackgroundError> {
+        let expanded = expand_background_path(raw, home)?;
+        let canonical = validate_resource_path(&expanded, &self.policy)?;
+        let meta = std::fs::metadata(&canonical).map_err(|err| BackgroundError::Io {
+            path: canonical.display().to_string(),
+            detail: err.to_string(),
+        })?;
+        if meta.len() > BG_MAX_ENCODED_BYTES as u64 {
+            return Err(BackgroundError::EncodedTooLarge {
+                actual: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+                cap: BG_MAX_ENCODED_BYTES,
+            });
+        }
+        let key = BackgroundKey::from_metadata(canonical, &meta);
+        if self.get(&key).is_some() {
+            return Ok(key);
+        }
+        let bytes = self.read_file(&key.canonical)?;
+        let image = decode_background(&bytes)?;
+        self.admit(key.clone(), image)?;
+        self.loads = self.loads.saturating_add(1);
+        Ok(key)
+    }
+
+    fn read_file(&self, canonical: &Path) -> Result<Vec<u8>, BackgroundError> {
+        use std::io::Read;
+        let file = std::fs::File::open(canonical).map_err(|err| BackgroundError::Io {
+            path: canonical.display().to_string(),
+            detail: err.to_string(),
+        })?;
+        let mut buf = Vec::new();
+        file.take(BG_MAX_ENCODED_BYTES as u64 + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| BackgroundError::Io {
+                path: canonical.display().to_string(),
+                detail: err.to_string(),
+            })?;
+        if buf.len() > BG_MAX_ENCODED_BYTES {
+            return Err(BackgroundError::EncodedTooLarge {
+                actual: buf.len(),
+                cap: BG_MAX_ENCODED_BYTES,
+            });
+        }
+        Ok(buf)
+    }
+
+    fn admit(&mut self, key: BackgroundKey, image: BackgroundImage) -> Result<(), BackgroundError> {
+        let bytes = image.byte_len();
+        if bytes > BG_CACHE_MAX_BYTES {
+            return Err(BackgroundError::CacheFull);
+        }
+        while self.entries.len() >= BG_CACHE_MAX_IMAGES
+            || self.bytes.saturating_add(bytes) > BG_CACHE_MAX_BYTES
+        {
+            let Some(index) = self
+                .entries
+                .iter()
+                .position(|(resident, _)| !self.pinned.contains(resident))
+            else {
+                return Err(BackgroundError::CacheFull);
+            };
+            let (_, evicted) = self.entries.remove(index);
+            self.bytes = self.bytes.saturating_sub(evicted.byte_len());
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.push((key, Arc::new(image)));
+        Ok(())
+    }
+}
+
+/// Decodes a fully read and previously sniffed buffer into RGBA8.
+///
+/// The header sniff runs first, so this function never sees an animated or
+/// unsupported container. Dimensions are re-checked after decode so a
+/// decoder that disagrees with its header fails closed.
+///
+/// # Errors
+///
+/// [`BackgroundError::`] format/bound/malformed variants from
+/// [`sniff_image`], [`check_header_bounds`], or a refused decode.
+pub fn decode_background(bytes: &[u8]) -> Result<BackgroundImage, BackgroundError> {
+    let header = sniff_image(bytes)?;
+    check_header_bounds(&header)?;
+    let format = match header.format {
+        BackgroundFormat::Png => image::ImageFormat::Png,
+        BackgroundFormat::Jpeg => image::ImageFormat::Jpeg,
+        BackgroundFormat::WebP => image::ImageFormat::WebP,
+    };
+    let decoded = image::load_from_memory_with_format(bytes, format).map_err(|err| {
+        BackgroundError::Malformed {
+            detail: format!("decode refused: {err}"),
+        }
+    })?;
+    if decoded.width() != header.width || decoded.height() != header.height {
+        return Err(BackgroundError::Malformed {
+            detail: "decoded dimensions disagree with the header".to_string(),
+        });
+    }
+    BackgroundImage::try_new(header.width, header.height, decoded.to_rgba8().into_raw())
+}
+
+/// Accepted fit mode (RFC-0001/OQ-042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BackgroundFit {
+    /// Cover: uniform scale to cover the content rect, crop overflow.
+    #[default]
+    Fill,
+    /// Contain: uniform scale to fit inside the content rect, letterbox.
+    Fit,
+    /// Native (DPI-scaled) size, centered, cropped or letterboxed.
+    Center,
+    /// Native (DPI-scaled) size repeated from the top-left, no scaling.
+    Tile,
+    /// Non-uniform scale to exactly fill the content rect.
+    Stretch,
+}
+
+impl BackgroundFit {
+    /// Parses a canonical fit name (exact, case-sensitive).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "fill" => Some(Self::Fill),
+            "fit" => Some(Self::Fit),
+            "center" => Some(Self::Center),
+            "tile" => Some(Self::Tile),
+            "stretch" => Some(Self::Stretch),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fit => "fit",
+            Self::Center => "center",
+            Self::Tile => "tile",
+            Self::Stretch => "stretch",
+        }
+    }
+}
+
+/// One background paint plan: destination rectangle (device px) plus the
+/// source window in image pixels. `tile` re-samples the full source with
+/// wrap-around at `tile` size (also image pixels, already DPI-scaled).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FitPlan {
+    /// Destination rectangle in device pixels (inside the content rect).
+    pub dest: RectPx,
+    /// Source window `[x, y, width, height]` in image pixels.
+    pub src: [f64; 4],
+    /// Whether the source repeats from the top-left of `dest`.
+    pub tile: bool,
+    /// Tile width in image pixels (native size scaled by DPI); `0` when
+    /// `tile` is false.
+    pub tile_w: u32,
+    /// Tile height in image pixels; `0` when `tile` is false.
+    pub tile_h: u32,
+}
+
+/// Rounds a centering offset to the nearest device pixel (saturating cast).
+fn centered_offset(outer: f64, inner: f64) -> i32 {
+    let offset = ((outer - inner) * 0.5).round();
+    if offset.is_finite() { offset as i32 } else { 0 }
+}
+
+/// Computes the accepted fit-mode geometry for one content rect.
+///
+/// `dpi` scales the image's native pixel size to device pixels for the
+/// `center` and `tile` modes (the contract's "scaled by the `Window` DPI
+/// factor"); `fill`, `fit`, and `stretch` absorb any factor. `None` for a
+/// degenerate content rect or image; non-finite `dpi` degrades to `1.0`.
+#[must_use]
+pub fn fit_plan(fit: BackgroundFit, image: (u32, u32), dest: RectPx, dpi: f64) -> Option<FitPlan> {
+    let (iw, ih) = image;
+    if iw == 0 || ih == 0 || dest.width == 0 || dest.height == 0 {
+        return None;
+    }
+    let dpi = if dpi.is_finite() && dpi > 0.0 {
+        dpi
+    } else {
+        1.0
+    };
+    let iw_f = f64::from(iw);
+    let ih_f = f64::from(ih);
+    let dw = f64::from(dest.width);
+    let dh = f64::from(dest.height);
+    let native_w = iw_f * dpi;
+    let native_h = ih_f * dpi;
+    match fit {
+        BackgroundFit::Fill => {
+            let factor = (dw / native_w).max(dh / native_h);
+            let visible_w = dw / factor;
+            let visible_h = dh / factor;
+            Some(FitPlan {
+                dest,
+                src: [
+                    (iw_f - visible_w) * 0.5,
+                    (ih_f - visible_h) * 0.5,
+                    visible_w,
+                    visible_h,
+                ],
+                tile: false,
+                tile_w: 0,
+                tile_h: 0,
+            })
+        }
+        BackgroundFit::Fit => {
+            let factor = (dw / native_w).min(dh / native_h);
+            let out_w = (native_w * factor).round().clamp(1.0, dw);
+            let out_h = (native_h * factor).round().clamp(1.0, dh);
+            let x = dest.x.saturating_add(centered_offset(dw, out_w));
+            let y = dest.y.saturating_add(centered_offset(dh, out_h));
+            Some(FitPlan {
+                dest: RectPx::new(x, y, out_w as u32, out_h as u32),
+                src: [0.0, 0.0, iw_f, ih_f],
+                tile: false,
+                tile_w: 0,
+                tile_h: 0,
+            })
+        }
+        BackgroundFit::Center => {
+            let out_w = native_w.round().clamp(1.0, dw);
+            let out_h = native_h.round().clamp(1.0, dh);
+            let x = dest.x.saturating_add(centered_offset(dw, out_w));
+            let y = dest.y.saturating_add(centered_offset(dh, out_h));
+            let src_w = (out_w / dpi).min(iw_f);
+            let src_h = (out_h / dpi).min(ih_f);
+            Some(FitPlan {
+                dest: RectPx::new(x, y, out_w as u32, out_h as u32),
+                src: [
+                    (iw_f - src_w) * 0.5,
+                    (ih_f - src_h) * 0.5,
+                    src_w.max(1.0),
+                    src_h.max(1.0),
+                ],
+                tile: false,
+                tile_w: 0,
+                tile_h: 0,
+            })
+        }
+        BackgroundFit::Tile => Some(FitPlan {
+            dest,
+            src: [0.0, 0.0, iw_f, ih_f],
+            tile: true,
+            tile_w: (native_w.round() as u32).max(1),
+            tile_h: (native_h.round() as u32).max(1),
+        }),
+        BackgroundFit::Stretch => Some(FitPlan {
+            dest,
+            src: [0.0, 0.0, iw_f, ih_f],
+            tile: false,
+            tile_w: 0,
+            tile_h: 0,
+        }),
+    }
+}
+
+/// One rasterized background blit: exact destination plus straight-alpha
+/// RGBA8 bytes (`dest.area() * 4` long).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundBlit {
+    /// Destination rectangle in device pixels.
+    pub dest: RectPx,
+    /// Straight-alpha RGBA8 bytes, row-major.
+    pub rgba: Vec<u8>,
+}
+
+/// Rasterizes `image` for `fit` into the `dest` content rect (nearest
+/// neighbor, deterministic).
+///
+/// Returns `None` when the rect or image is degenerate or when the padded
+/// blit would exceed [`BG_PRESENT_MAX_BYTES_PER_FRAME`] (never allocates
+/// over the bound). `fill`/`fit`/`center`/`stretch` emit one blit possibly
+/// smaller than `dest` (the uncovered area keeps the pane background);
+/// `tile` emits one content-sized blit with the pattern repeated from the
+/// top-left.
+#[must_use]
+pub fn rasterize_background(
+    image: &BackgroundImage,
+    fit: BackgroundFit,
+    dest: RectPx,
+    dpi: f64,
+) -> Option<BackgroundBlit> {
+    let plan = fit_plan(fit, image.dimensions(), dest, dpi)?;
+    let bytes = u64::from(plan.dest.width)
+        .checked_mul(u64::from(plan.dest.height))
+        .and_then(|pixels| pixels.checked_mul(4))?;
+    if bytes > BG_PRESENT_MAX_BYTES_PER_FRAME as u64 {
+        return None;
+    }
+    let (iw, ih) = image.dimensions();
+    let out_w = plan.dest.width as usize;
+    let out_h = plan.dest.height as usize;
+    let mut rgba = vec![0u8; out_w.checked_mul(out_h)?.checked_mul(4)?];
+    let src = image.rgba();
+    let sample = |sx: usize, sy: usize, out: &mut [u8]| {
+        let index = (sy * iw as usize + sx) * 4;
+        out.copy_from_slice(&src[index..index + 4]);
+    };
+    if plan.tile {
+        let tw = plan.tile_w as usize;
+        let th = plan.tile_h as usize;
+        for py in 0..out_h {
+            let sy = ((py * ih as usize) / th) % ih as usize;
+            for px in 0..out_w {
+                let sx = ((px * iw as usize) / tw) % iw as usize;
+                let out = &mut rgba[(py * out_w + px) * 4..(py * out_w + px) * 4 + 4];
+                sample(sx, sy, out);
+            }
+        }
+    } else {
+        let [sx0, sy0, sw, sh] = plan.src;
+        for py in 0..out_h {
+            let ty = sy0 + (py as f64 + 0.5) * sh / out_h as f64;
+            let sy = (ty.floor() as i64).clamp(0, ih as i64 - 1) as usize;
+            for px in 0..out_w {
+                let tx = sx0 + (px as f64 + 0.5) * sw / out_w as f64;
+                let sx = (tx.floor() as i64).clamp(0, iw as i64 - 1) as usize;
+                let out = &mut rgba[(py * out_w + px) * 4..(py * out_w + px) * 4 + 4];
+                sample(sx, sy, out);
+            }
+        }
+    }
+    Some(BackgroundBlit {
+        dest: plan.dest,
+        rgba,
+    })
+}
+
+/// Cache key for one scaled background blit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BackgroundRasterKey {
+    /// Source image identity.
+    pub source: BackgroundRasterKeySource,
+    /// Fit mode.
+    pub fit: BackgroundFit,
+    /// Destination content rect.
+    pub dest: RectPx,
+    /// DPI factor bits (`f64::to_bits`; `Eq`-comparable).
+    pub dpi_bits: u64,
+}
+
+/// Identity-only projection of [`BackgroundKey`] (path, length, mtime) for
+/// use as a hashable raster-cache source key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BackgroundRasterKeySource {
+    /// Canonical absolute path.
+    pub canonical: PathBuf,
+    /// File length at resolution time.
+    pub len: u64,
+    /// Modification time at resolution time.
+    pub modified: Option<SystemTime>,
+}
+
+impl From<&BackgroundKey> for BackgroundRasterKeySource {
+    fn from(value: &BackgroundKey) -> Self {
+        Self {
+            canonical: value.canonical.clone(),
+            len: value.len,
+            modified: value.modified,
+        }
+    }
+}
+
+/// Bounded scaled-blit cache (oldest-first eviction, BG-7 byte cap).
+///
+/// Static frames must not re-scale a decoded image every present tick; the
+/// cache retains the scaled bytes for an unchanged `(source, fit, dest,
+/// dpi)` key. `hits`/`misses` are exposed so tests can prove reuse and
+/// invalidation.
+#[derive(Debug, Default)]
+pub struct BackgroundRasterCache {
+    entries: Vec<(BackgroundRasterKey, Arc<BackgroundBlit>)>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl BackgroundRasterCache {
+    /// Empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resident scaled bytes.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Resident blit count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no blit is resident.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Cache hits (no rasterization).
+    #[must_use]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Cache misses (rasterized).
+    #[must_use]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Drops every entry whose source identity no longer matches any key in
+    /// `live` (called when the displayed set is recomputed).
+    pub fn retain_sources(&mut self, live: &[BackgroundRasterKeySource]) {
+        self.entries.retain(|(key, blit)| {
+            let keep = live.contains(&key.source);
+            if !keep {
+                self.bytes = self.bytes.saturating_sub(blit.rgba.len());
+            }
+            keep
+        });
+    }
+
+    /// Returns the cached blit for `key`, rasterizing and admitting it on a
+    /// miss. A blit larger than the cache cap is returned uncached.
+    pub fn get_or_rasterize(
+        &mut self,
+        key: BackgroundRasterKey,
+        image: &BackgroundImage,
+    ) -> Option<Arc<BackgroundBlit>> {
+        if let Some((_, blit)) = self.entries.iter().find(|(resident, _)| *resident == key) {
+            self.hits = self.hits.saturating_add(1);
+            return Some(Arc::clone(blit));
+        }
+        self.misses = self.misses.saturating_add(1);
+        let blit = Arc::new(rasterize_background(
+            image,
+            key.fit,
+            key.dest,
+            f64::from_bits(key.dpi_bits),
+        )?);
+        let bytes = blit.rgba.len();
+        if bytes <= BG_RASTER_CACHE_MAX_BYTES {
+            while self.bytes.saturating_add(bytes) > BG_RASTER_CACHE_MAX_BYTES
+                || self.entries.len() >= BG_CACHE_MAX_IMAGES
+            {
+                if self.entries.is_empty() {
+                    break;
+                }
+                let (_, evicted) = self.entries.remove(0);
+                self.bytes = self.bytes.saturating_sub(evicted.rgba.len());
+            }
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.entries.push((key, Arc::clone(&blit)));
+        }
+        Some(blit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(suffix: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bitty-ctx0347-bg-{}-{}",
+            suffix,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    fn encode_png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            pixels.extend_from_slice(&color);
+        }
+        let mut out = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        image::ImageEncoder::write_image(
+            encoder,
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .expect("png encode");
+        out
+    }
+
+    fn encode_jpeg(width: u32, height: u32, color: [u8; 3]) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for _ in 0..(width * height) {
+            pixels.extend_from_slice(&color);
+        }
+        let mut out = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new(&mut out);
+        image::ImageEncoder::write_image(
+            encoder,
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("jpeg encode");
+        out
+    }
+
+    fn encode_webp_lossless(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            pixels.extend_from_slice(&color);
+        }
+        let mut out = Vec::new();
+        let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
+        image::ImageEncoder::write_image(
+            encoder,
+            &pixels,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .expect("webp encode");
+        out
+    }
+
+    fn write_file(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, bytes).expect("write fixture");
+        path
+    }
+
+    fn policy_for(root: &Path) -> ResourcePolicy {
+        ResourcePolicy::with_max_roots(vec![root.to_path_buf()], BG_MAX_ROOTS).expect("policy")
+    }
+
+    #[test]
+    fn accepted_formats_sniff_and_decode() {
+        let png = encode_png(3, 2, [0x10, 0x20, 0x30, 0xFF]);
+        let header = sniff_image(&png).expect("png sniff");
+        assert_eq!(header.format, BackgroundFormat::Png);
+        assert_eq!((header.width, header.height), (3, 2));
+        let image = decode_background(&png).expect("png decode");
+        assert_eq!(image.dimensions(), (3, 2));
+        assert_eq!(image.byte_len(), 3 * 2 * 4);
+
+        let jpeg = encode_jpeg(4, 5, [0xAA, 0xBB, 0xCC]);
+        let header = sniff_image(&jpeg).expect("jpeg sniff");
+        assert_eq!(header.format, BackgroundFormat::Jpeg);
+        assert_eq!((header.width, header.height), (4, 5));
+        assert!(decode_background(&jpeg).is_ok());
+
+        let webp = encode_webp_lossless(6, 7, [0x01, 0x02, 0x03, 0x80]);
+        let header = sniff_image(&webp).expect("webp sniff");
+        assert_eq!(header.format, BackgroundFormat::WebP);
+        assert_eq!((header.width, header.height), (6, 7));
+        assert!(decode_background(&webp).is_ok());
+    }
+
+    #[test]
+    fn unsupported_and_malformed_formats_rejected() {
+        let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+        assert!(matches!(
+            sniff_image(gif),
+            Err(BackgroundError::Animated { .. })
+        ));
+        let bmp = b"BM\x00\x00\x00\x00";
+        assert!(matches!(
+            sniff_image(bmp),
+            Err(BackgroundError::UnsupportedFormat { .. })
+        ));
+        let tiff = b"II*\0payload";
+        assert!(matches!(
+            sniff_image(tiff),
+            Err(BackgroundError::UnsupportedFormat { .. })
+        ));
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+        assert!(matches!(
+            sniff_image(svg),
+            Err(BackgroundError::UnsupportedFormat { .. })
+        ));
+        let avif = b"\0\0\0\x18ftypavif";
+        assert!(matches!(
+            sniff_image(avif),
+            Err(BackgroundError::UnsupportedFormat { .. })
+        ));
+        assert!(matches!(
+            sniff_image(b"not an image"),
+            Err(BackgroundError::Malformed { .. })
+        ));
+        assert!(matches!(
+            sniff_image(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0]),
+            Err(BackgroundError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn apng_and_animated_webp_rejected_by_sniff_before_decode() {
+        let png = encode_png(1, 1, [0, 0, 0, 0xFF]);
+        let mut apng = Vec::with_capacity(png.len() + 12);
+        apng.extend_from_slice(&png[..33]);
+        apng.extend_from_slice(&13u32.to_be_bytes());
+        apng.extend_from_slice(b"acTL");
+        apng.extend_from_slice(&[0; 13]);
+        apng.extend_from_slice(&[0; 4]);
+        apng.extend_from_slice(&png[33..]);
+        assert!(matches!(
+            decode_background(&apng),
+            Err(BackgroundError::Animated { format: "APNG" })
+        ));
+
+        let mut animated = Vec::new();
+        animated.extend_from_slice(b"RIFF");
+        animated.extend_from_slice(&22u32.to_le_bytes());
+        animated.extend_from_slice(b"WEBP");
+        animated.extend_from_slice(b"VP8X");
+        animated.extend_from_slice(&10u32.to_le_bytes());
+        animated.push(0x02);
+        animated.extend_from_slice(&[0; 3]);
+        animated.extend_from_slice(&[0x0F, 0x00, 0x00]);
+        animated.extend_from_slice(&[0x0F, 0x00, 0x00]);
+        assert!(matches!(
+            sniff_image(&animated),
+            Err(BackgroundError::Animated { format: "WebP" })
+        ));
+    }
+
+    #[test]
+    fn over_bg2_dimensions_rejected_from_header_only() {
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&(BG_MAX_DIMENSION + 1).to_be_bytes());
+        png.extend_from_slice(&(BG_MAX_DIMENSION + 1).to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&[0; 4]);
+        assert!(matches!(
+            decode_background(&png),
+            Err(BackgroundError::Dimensions { .. })
+        ));
+    }
+
+    #[test]
+    fn over_bg1_file_rejected_without_decode() {
+        let root = temp_root("bg1");
+        let path = write_file(&root, "big.png", &vec![0u8; BG_MAX_ENCODED_BYTES + 1]);
+        let mut store = BackgroundStore::new(policy_for(&root));
+        let err = store
+            .load(path.to_str().expect("utf8 path"), None)
+            .expect_err("over BG-1");
+        assert!(matches!(err, BackgroundError::EncodedTooLarge { .. }));
+        assert_eq!(store.loads(), 0);
+    }
+
+    #[test]
+    fn root_trust_denies_outside_symlink_escape_and_non_regular() {
+        let approved = temp_root("trust-approved");
+        let outside = temp_root("trust-outside");
+        let approved_png = write_file(&approved, "ok.png", &encode_png(2, 2, [1, 2, 3, 4]));
+        let outside_png = write_file(&outside, "no.png", &encode_png(2, 2, [1, 2, 3, 4]));
+        let link = approved.join("escape.png");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_png, &link).expect("symlink");
+
+        let mut store = BackgroundStore::new(policy_for(&approved));
+        assert!(
+            store
+                .load(approved_png.to_str().expect("utf8"), None)
+                .is_ok()
+        );
+        let denied = store
+            .load(outside_png.to_str().expect("utf8"), None)
+            .expect_err("outside root");
+        assert!(matches!(denied, BackgroundError::Resource(_)));
+        #[cfg(unix)]
+        {
+            let escaped = store
+                .load(link.to_str().expect("utf8"), None)
+                .expect_err("symlink escape");
+            assert!(matches!(escaped, BackgroundError::Resource(_)));
+        }
+        let dir = write_file(&approved, "dir.png", b"");
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir(&dir).expect("dir");
+        let denied = store
+            .load(dir.to_str().expect("utf8"), None)
+            .expect_err("directory");
+        assert!(matches!(denied, BackgroundError::Resource(_)));
+
+        let relative = store.load("relative/one.png", None).expect_err("relative");
+        assert!(matches!(relative, BackgroundError::Resource(_)));
+        let tilde = store.load("~someone/one.png", None).expect_err("~user");
+        assert!(matches!(tilde, BackgroundError::UnsupportedFormat { .. }));
+        let no_home = store.load("~/one.png", None).expect_err("no home");
+        assert!(matches!(no_home, BackgroundError::HomeUnavailable));
+    }
+
+    #[test]
+    fn home_expansion_uses_injected_home() {
+        let home = temp_root("home");
+        let path = expand_background_path("~/wall/one.png", Some(&home)).expect("expand");
+        assert_eq!(path, home.join("wall/one.png"));
+        assert_eq!(
+            expand_background_path("~", Some(&home)).expect("bare tilde"),
+            home
+        );
+    }
+
+    #[test]
+    fn cache_reuses_identity_and_redecodes_on_change() {
+        let root = temp_root("identity");
+        let path = write_file(&root, "one.png", &encode_png(2, 2, [9, 8, 7, 0xFF]));
+        let mut store = BackgroundStore::new(policy_for(&root));
+        let raw = path.to_str().expect("utf8");
+        let key = store.load(raw, None).expect("first load");
+        assert_eq!(store.loads(), 1);
+        assert_eq!(store.len(), 1);
+        let reuse = store.load(raw, None).expect("reuse");
+        assert_eq!(store.loads(), 1);
+        assert_eq!(reuse, key);
+        assert!(store.get(&key).is_some());
+
+        std::fs::write(&path, encode_png(3, 3, [1, 1, 1, 0xFF])).expect("rewrite");
+        let changed = store.load(raw, None).expect("changed identity");
+        assert_eq!(store.loads(), 2);
+        assert_ne!(changed, key);
+        let image = store.get(&changed).expect("new image");
+        assert_eq!(image.dimensions(), (3, 3));
+    }
+
+    #[test]
+    fn store_denies_all_without_roots() {
+        let root = temp_root("deny-all");
+        let path = write_file(&root, "one.png", &encode_png(1, 1, [0, 0, 0, 0xFF]));
+        let mut store = BackgroundStore::deny_all();
+        let err = store
+            .load(path.to_str().expect("utf8"), None)
+            .expect_err("deny all");
+        assert!(matches!(err, BackgroundError::Resource(_)));
+        assert_eq!(store.loads(), 0);
+    }
+
+    #[test]
+    fn fit_geometry_matches_contract() {
+        let dest = RectPx::new(100, 50, 40, 20);
+        let image = (20, 20);
+        let fill = fit_plan(BackgroundFit::Fill, image, dest, 1.0).expect("fill plan");
+        assert_eq!(fill.dest, dest);
+        assert_eq!(fill.src, [0.0, 5.0, 20.0, 10.0]);
+
+        let fit = fit_plan(BackgroundFit::Fit, image, dest, 1.0).expect("fit plan");
+        assert_eq!(fit.dest, RectPx::new(110, 50, 20, 20));
+        assert_eq!(fit.src, [0.0, 0.0, 20.0, 20.0]);
+
+        let center = fit_plan(BackgroundFit::Center, (10, 4), dest, 2.0).expect("center plan");
+        assert_eq!(center.dest, RectPx::new(110, 56, 20, 8));
+        assert_eq!(center.src, [0.0, 0.0, 10.0, 4.0]);
+
+        let center_crop = fit_plan(BackgroundFit::Center, (40, 40), dest, 2.0).expect("crop");
+        assert_eq!(center_crop.dest, RectPx::new(100, 50, 40, 20));
+        assert_eq!(center_crop.src, [10.0, 15.0, 20.0, 10.0]);
+
+        let tile = fit_plan(BackgroundFit::Tile, (10, 5), dest, 2.0).expect("tile plan");
+        assert_eq!(tile.dest, dest);
+        assert!(tile.tile);
+        assert_eq!((tile.tile_w, tile.tile_h), (20, 10));
+
+        let stretch = fit_plan(BackgroundFit::Stretch, image, dest, 3.0).expect("stretch");
+        assert_eq!(stretch.dest, dest);
+        assert_eq!(stretch.src, [0.0, 0.0, 20.0, 20.0]);
+    }
+
+    #[test]
+    fn rasterize_fill_covers_and_tile_repeats() {
+        let image = BackgroundImage::try_new(
+            2,
+            2,
+            vec![
+                1, 0, 0, 0xFF, 2, 0, 0, 0xFF, // row 0
+                3, 0, 0, 0xFF, 4, 0, 0, 0xFF, // row 1
+            ],
+        )
+        .expect("image");
+        let dest = RectPx::new(0, 0, 4, 4);
+        let fill = rasterize_background(&image, BackgroundFit::Fill, dest, 1.0).expect("fill");
+        assert_eq!(fill.dest, dest);
+        assert_eq!(fill.rgba.len(), 4 * 4 * 4);
+        assert_eq!(&fill.rgba[0..4], &[1, 0, 0, 0xFF]);
+        assert_eq!(&fill.rgba[12..16], &[2, 0, 0, 0xFF]);
+        assert_eq!(&fill.rgba[60..64], &[4, 0, 0, 0xFF]);
+
+        let tile = rasterize_background(&image, BackgroundFit::Tile, dest, 1.0).expect("tile");
+        assert_eq!(&tile.rgba[0..4], &[1, 0, 0, 0xFF]);
+        assert_eq!(&tile.rgba[8..12], &[1, 0, 0, 0xFF]);
+        assert_eq!(&tile.rgba[4 * 4..4 * 4 + 4], &[3, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn rasterize_fit_leaves_letterbox_and_center_native() {
+        let image = BackgroundImage::try_new(1, 1, vec![9, 9, 9, 0xFF]).expect("image");
+        let dest = RectPx::new(10, 20, 8, 8);
+        let fit = rasterize_background(&image, BackgroundFit::Fit, dest, 1.0).expect("fit");
+        assert_eq!(fit.dest, RectPx::new(10, 20, 8, 8));
+        assert_eq!(fit.rgba.len(), 8 * 8 * 4);
+
+        let center =
+            rasterize_background(&image, BackgroundFit::Center, dest, 2.0).expect("center");
+        assert_eq!(center.dest, RectPx::new(13, 23, 2, 2));
+        assert_eq!(center.rgba.len(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn raster_cache_reuses_and_bounds() {
+        let image = BackgroundImage::try_new(2, 2, vec![7; 2 * 2 * 4]).expect("image");
+        let dest = RectPx::new(0, 0, 4, 4);
+        let key = BackgroundRasterKey {
+            source: BackgroundRasterKeySource {
+                canonical: PathBuf::from("/approved/bg.png"),
+                len: 10,
+                modified: None,
+            },
+            fit: BackgroundFit::Fill,
+            dest,
+            dpi_bits: 1.0f64.to_bits(),
+        };
+        let mut cache = BackgroundRasterCache::new();
+        let first = cache.get_or_rasterize(key.clone(), &image).expect("miss");
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+        let second = cache.get_or_rasterize(key, &image).expect("hit");
+        assert_eq!(cache.hits(), 1);
+        assert_eq!(first, second);
+        assert!(cache.total_bytes() <= BG_RASTER_CACHE_MAX_BYTES);
+    }
+
+    #[test]
+    fn eviction_never_removes_pinned_displayed_image() {
+        let root = temp_root("pinned");
+        let a = write_file(&root, "a.png", &encode_png(2, 2, [1, 1, 1, 1]));
+        let b = write_file(&root, "b.png", &encode_png(2, 2, [2, 2, 2, 2]));
+        let mut store = BackgroundStore::new(policy_for(&root));
+        let key_a = store.load(a.to_str().expect("utf8"), None).expect("a");
+        store.pin(&key_a);
+        let key_b = store.load(b.to_str().expect("utf8"), None).expect("b");
+        assert!(store.get(&key_a).is_some(), "pinned image stays resident");
+        assert!(store.get(&key_b).is_some());
+    }
+}

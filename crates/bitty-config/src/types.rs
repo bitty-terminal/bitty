@@ -177,6 +177,10 @@ pub const MAX_WORKSPACE_LABEL: u8 = 16;
 /// owns the trust policy; this is only the syntax bound.
 pub const MAX_BACKGROUND_IMAGE_PATH_BYTES: usize = 4096;
 
+/// Maximum `decoration.background_image_roots` entries: the accepted
+/// RFC-0001/OQ-042 bound (`at most 32 entries`).
+pub const MAX_BACKGROUND_IMAGE_ROOTS: usize = 32;
+
 // ── Panel animations (RFC-0002, CTX-0341) ────────────────────────────────
 //
 // Accepted contract: a closed transition set (panel open/close, focus change,
@@ -1036,7 +1040,7 @@ impl ViewAppearanceOverride {
             }
         }
         if let Some(path) = &self.background_image {
-            validate_background_image_path(path)?;
+            validate_background_image_path("background_image", path)?;
         }
         Ok(())
     }
@@ -1048,30 +1052,66 @@ impl ViewAppearanceOverride {
 /// bytes, no NUL, and absolute or `~`-anchored. Root membership, regular-file
 /// resolution, format, dimensions, and decode are CTX-0347's load pipeline
 /// (this crate never opens a file).
-fn validate_background_image_path(path: &str) -> Result<(), ConfigError> {
+fn validate_background_image_path(field: &str, path: &str) -> Result<(), ConfigError> {
     if path.is_empty() {
-        return Err(ConfigError::validation(
-            "background_image",
-            "must be a non-empty path",
-        ));
+        return Err(ConfigError::validation(field, "must be a non-empty path"));
     }
     if path.len() > MAX_BACKGROUND_IMAGE_PATH_BYTES {
         return Err(ConfigError::validation(
-            "background_image",
+            field,
             format!("must be <= {MAX_BACKGROUND_IMAGE_PATH_BYTES} bytes"),
         ));
     }
     if path.contains('\0') {
-        return Err(ConfigError::validation(
-            "background_image",
-            "must not contain NUL bytes",
-        ));
+        return Err(ConfigError::validation(field, "must not contain NUL bytes"));
     }
     if !(path.starts_with('/') || path.starts_with('~')) {
         return Err(ConfigError::validation(
-            "background_image",
+            field,
             "must be an absolute or '~'-anchored path",
         ));
+    }
+    Ok(())
+}
+
+/// Validates the `decoration.background_image_roots` list syntax fail-closed
+/// (CTX-0347, RFC-0001/OQ-042): at most [`MAX_BACKGROUND_IMAGE_ROOTS`]
+/// entries, each a non-empty absolute or `~`-anchored path of at most
+/// [`MAX_BACKGROUND_IMAGE_PATH_BYTES`] bytes with no NUL. Root existence,
+/// canonicalization, and approved-root membership are enforced by the
+/// `bitty-rich` loader, which never opens an unapproved file.
+fn validate_background_image_roots(field: &str, roots: &[String]) -> Result<(), ConfigError> {
+    if roots.len() > MAX_BACKGROUND_IMAGE_ROOTS {
+        return Err(ConfigError::validation(
+            field,
+            format!("must contain at most {MAX_BACKGROUND_IMAGE_ROOTS} entries"),
+        ));
+    }
+    for (index, root) in roots.iter().enumerate() {
+        if root.is_empty() {
+            return Err(ConfigError::validation(
+                field,
+                format!("entry {index} must be a non-empty path"),
+            ));
+        }
+        if root.len() > MAX_BACKGROUND_IMAGE_PATH_BYTES {
+            return Err(ConfigError::validation(
+                field,
+                format!("entry {index} must be <= {MAX_BACKGROUND_IMAGE_PATH_BYTES} bytes"),
+            ));
+        }
+        if root.contains('\0') {
+            return Err(ConfigError::validation(
+                field,
+                format!("entry {index} must not contain NUL bytes"),
+            ));
+        }
+        if !(root.starts_with('/') || root.starts_with('~')) {
+            return Err(ConfigError::validation(
+                field,
+                format!("entry {index} must be an absolute or '~'-anchored path"),
+            ));
+        }
     }
     Ok(())
 }
@@ -2002,7 +2042,7 @@ impl LayoutConfig {
 /// layout.gap_cells * cell_axis`, so with the default `layout` cell gaps of
 /// `0` the effective sibling and container gaps are both the `6` logical px
 /// decoration default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationConfig {
     /// Gap between adjacent views inside one workspace, logical px.
     pub gaps_in: u32,
@@ -2039,6 +2079,19 @@ pub struct DecorationConfig {
     /// `decoration.border_width_idle`), logical px. `None` inherits the
     /// resolved base.
     pub border_width_idle: Option<u32>,
+    /// Global default background image (CTX-0347, RFC-0001/OQ-042
+    /// `decoration.background_image`). `None` means "no image contributes"
+    /// (or, per layer, "this layer says nothing"). Syntax-validated only;
+    /// root trust, format, decode, and cache bounds belong to the loader.
+    pub background_image: Option<String>,
+    /// Global default background fit mode (CTX-0347
+    /// `decoration.background_fit`). `None` resolves to `fill`.
+    pub background_fit: Option<BackgroundFit>,
+    /// Approved background-image roots (CTX-0347
+    /// `decoration.background_image_roots`), deny-by-default: `None`/empty
+    /// denies every path. Global-only policy; deliberately absent from the
+    /// `views.*` field set so a per-`View` entry can never widen it.
+    pub background_image_roots: Option<Vec<String>>,
 }
 
 impl Default for DecorationConfig {
@@ -2055,6 +2108,9 @@ impl Default for DecorationConfig {
             border_width: None,
             border_width_focused: None,
             border_width_idle: None,
+            background_image: None,
+            background_fit: None,
+            background_image_roots: None,
         }
     }
 }
@@ -2080,6 +2136,9 @@ impl DecorationConfig {
             border_width: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
             border_width_focused: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
             border_width_idle: Some(SAFE_DECORATION_BORDER_WIDTH_PX),
+            background_image: None,
+            background_fit: None,
+            background_image_roots: None,
         }
     }
 
@@ -2211,7 +2270,25 @@ impl DecorationConfig {
                 ));
             }
         }
+        // CTX-0347 (RFC-0001/OQ-042): the global background-image path uses
+        // the same syntax contract as the per-`View` field, and the approved
+        // root list is bounded (`<= 32` entries, each a bounded absolute or
+        // `~`-anchored path). Root membership, regular-file resolution,
+        // format, and decode are the loader's job in `bitty-rich`.
+        if let Some(path) = &self.background_image {
+            validate_background_image_path("decoration.background_image", path)?;
+        }
+        if let Some(roots) = &self.background_image_roots {
+            validate_background_image_roots("decoration.background_image_roots", roots)?;
+        }
         Ok(())
+    }
+
+    /// Resolves the global background fit mode (default `fill`,
+    /// RFC-0001/OQ-042 `decoration.background_fit`).
+    #[must_use]
+    pub fn resolve_background_fit(&self) -> BackgroundFit {
+        self.background_fit.unwrap_or(BackgroundFit::Fill)
     }
 
     /// Enforces the CTX-0340 minimum-contrast contract on the resolved pair
@@ -2745,8 +2822,8 @@ impl EffectiveConfig {
         let mut width_base = decoration.border_width;
         let mut width_focused = decoration.border_width_focused;
         let mut width_idle = decoration.border_width_idle;
-        let mut background_image: Option<String> = None;
-        let mut background_fit = BackgroundFit::Fill;
+        let mut background_image: Option<String> = decoration.background_image.clone();
+        let mut background_fit = decoration.resolve_background_fit();
         let mut base_src: Option<ViewLeafSource> = None;
         let mut focused_src: Option<ViewLeafSource> = None;
         let mut idle_src: Option<ViewLeafSource> = None;
@@ -4496,6 +4573,43 @@ mod tests {
         let other = ViewAppearanceTarget::new(ViewContent::Rich, 3, 9);
         let plain = config.resolve_view_appearance(theme, &other);
         assert_eq!(plain.background_image, None);
+        assert_eq!(plain.background_fit, BackgroundFit::Fill);
+    }
+
+    #[test]
+    fn view_resolution_inherits_global_background_per_field() {
+        // CTX-0347 (RFC-0001/OQ-042): the global `decoration.background_*`
+        // pair is the base tier; a `views` entry overrides per field and an
+        // unset field inherits the global value instead of shadowing it.
+        let theme = crate::theme::resolve_theme(None);
+        let mut config = EffectiveConfig {
+            views: vec![entry(
+                ViewSelector::View(7),
+                ViewAppearanceOverride {
+                    background_fit: Some(BackgroundFit::Fit),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        };
+        config.decoration.background_image = Some("~/wall/global.png".to_string());
+        config.decoration.background_fit = Some(BackgroundFit::Stretch);
+        let target = ViewAppearanceTarget::new(ViewContent::Terminal, 1, 7);
+        let resolved = config.resolve_view_appearance(theme, &target);
+        assert_eq!(
+            resolved.background_image.as_deref(),
+            Some("~/wall/global.png"),
+            "the per-View fit override must not reset the inherited image"
+        );
+        assert_eq!(resolved.background_fit, BackgroundFit::Fit);
+        // A View matching no selector keeps the global pair.
+        let other = ViewAppearanceTarget::new(ViewContent::Rich, 3, 9);
+        let plain = config.resolve_view_appearance(theme, &other);
+        assert_eq!(plain.background_image.as_deref(), Some("~/wall/global.png"));
+        assert_eq!(plain.background_fit, BackgroundFit::Stretch);
+        // The global fit default is `fill` when unset.
+        config.decoration.background_fit = None;
+        let plain = config.resolve_view_appearance(theme, &other);
         assert_eq!(plain.background_fit, BackgroundFit::Fill);
     }
 

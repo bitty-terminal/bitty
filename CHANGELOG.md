@@ -139,6 +139,24 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   `1..=32`) and `terminal.scroll_pixels_per_notch` (default `16`, range
   `1..=256`) are unchanged and continue to scale the scroll amount.
 
+### Idle-outline visibility across preset themes (CTX-0354, issue #630)
+
+- Cleared the advisory CTX-0340 AC-3 idle-outline warning (`idle >= 1.5:1`
+  against the background) for the five presets the CTX-0350 AC-2 fix left
+  below the floor: solarized-dark (`#073642` -> `#274F58`), one-dark
+  (`#323844` -> `#3B4E64`), rose-pine-dawn (`#DFDAD9` -> `#B7C1C6`),
+  everforest-dark (`#543A48` -> `#5B4E53`), and everforest-light (`#EAEDC8`
+  -> `#BCC2AC`; it was 1.00:1 and effectively invisible). Each idle is a
+  Bitty-owned blend of the preset's selection color toward its focused
+  outline, placed at the midpoint of the window where AC-2 and AC-3 both hold;
+  no AC-1/AC-2 value changes.
+- `tokyo-night-day` remains the one documented advisory exemption: no palette
+  surface or blend clears AC-3 while holding AC-2 against its focused
+  `#007197`, so it keeps the visible `#B7C1E3` selection idle (1.38:1) and
+  `bitty config check` still reports the advisory. The catalog test now
+  asserts AC-3 for every non-exempt preset, rejects a stale exemption, and
+  measures with the runtime `OutlineColor` compositing path.
+
 ### Test determinism: cwd_inherit one-shot pwd race on macOS (CTX-0376, issue #623)
 
 - `new_pane_inherits_focused_pane_osc7_cwd` and `focused_pane_selects_the_inherited_cwd`

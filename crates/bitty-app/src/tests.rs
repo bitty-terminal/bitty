@@ -1359,6 +1359,53 @@ fn runtime_config_inherits_file_selection_auto_copy() {
 }
 
 #[test]
+fn runtime_config_inherits_file_close_confirm() {
+    // CTX-0370: `close_confirm` flows file -> effective -> runtime; crate
+    // defaults stay equal (bitty-runtime must not depend on bitty-config,
+    // so the pairing is by value, pinned here). Default `when_busy`
+    // preserves the pre-0370 close behavior for idle shells.
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_CLOSE_CONFIRM_MODE.as_str(),
+        bitty_config::types::DEFAULT_CLOSE_CONFIRM.as_str()
+    );
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan =
+        parse_lua_config(r#"return { close_confirm = "never" }"#, &src).expect("never parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(
+        merged.effective.close_confirm,
+        bitty_config::CloseConfirm::Never
+    );
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.close_confirm, bitty_runtime::CloseConfirmMode::Never);
+    // Absent key rides the when_busy default end to end.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 =
+        parse_lua_config(r#"return { theme = "dark" }"#, &src2).expect("no close_confirm parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    assert_eq!(
+        merged2.effective.close_confirm,
+        bitty_config::CloseConfirm::WhenBusy
+    );
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert_eq!(
+        cfg2.close_confirm,
+        bitty_runtime::CloseConfirmMode::WhenBusy
+    );
+    assert_eq!(
+        merged2.source_of("close_confirm").unwrap().layer,
+        bitty_config::plan::LayerKind::CoreDefaults
+    );
+}
+
+#[test]
 fn runtime_config_inherits_file_focus_follows_mouse() {
     // CTX-0260: `mouse.focus_follows_mouse` flows file -> effective ->
     // runtime; crate defaults stay equal (bitty-runtime must not depend

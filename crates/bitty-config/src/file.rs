@@ -37,6 +37,7 @@
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
 //!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
+//!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
@@ -48,6 +49,11 @@
 //!   present it must be `"alt"` or `"super"` (case-insensitive, chord-mod
 //!   aliases accepted); anything else — including `ctrl`/`shift` — fails
 //!   closed with the field path.
+//!
+//! - `close_confirm` is a fully-optional top-level scalar with the same
+//!   absent-means-silent contract (CTX-0370). When present it must be
+//!   `"always"`, `"when_busy"` (default), or `"never"`; anything else fails
+//!   closed with the `close_confirm` field path.
 //!
 //! - `[font]`-equivalent tables are atomic for `family`+`size`: `font` needs
 //!   both (partial tables fail closed rather than silently filling defaults,
@@ -1349,12 +1355,27 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         Some(raw) => Some(ModKey::parse(raw)?),
     };
 
+    // CTX-0370: `close_confirm` is a fully-optional top-level scalar with the
+    // same absent-means-silent contract. When present it parses fail-closed
+    // (`CloseConfirm::parse` accepts only always/when_busy/never) so existing
+    // configs without it keep working unchanged.
+    let close_confirm = match data.close_confirm.as_deref() {
+        None => None,
+        Some(raw) => Some(crate::types::CloseConfirm::parse(raw).ok_or_else(|| {
+            ConfigError::validation(
+                "close_confirm",
+                "must be one of \"always\", \"when_busy\", \"never\"",
+            )
+        })?),
+    };
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
         window,
         terminal,
         selection,
+        close_confirm,
         layout,
         decoration,
         scrollbar,
@@ -2349,6 +2370,61 @@ mod tests {
     }
 
     #[test]
+    fn lua_close_confirm_parses_absent_means_silent_and_bad_fails_closed() {
+        // CTX-0370: absent says nothing (merge keeps lower); present parses
+        // to the typed mode; unknown values fail closed on `close_confirm`.
+        use crate::types::CloseConfirm;
+        let src = test_source();
+        let plan =
+            parse_lua_config(r#"return { theme = "dark" }"#, &src).expect("no close_confirm");
+        assert!(plan.close_confirm.is_none());
+        for (raw, expected) in [
+            ("always", CloseConfirm::Always),
+            ("when_busy", CloseConfirm::WhenBusy),
+            ("never", CloseConfirm::Never),
+        ] {
+            let plan = parse_lua_config(&format!(r#"return {{ close_confirm = "{raw}" }}"#), &src)
+                .expect("valid mode parses");
+            assert_eq!(plan.close_confirm, Some(expected));
+        }
+        for content in [
+            r#"return { close_confirm = "ALWAYS" }"#,
+            r#"return { close_confirm = "busy" }"#,
+            r#"return { close_confirm = "when-busy" }"#,
+            r#"return { close_confirm = "" }"#,
+            r#"return { close_confirm = 42 }"#,
+            r#"return { close_confirm = true }"#,
+        ] {
+            let err = parse_lua_config(content, &src).unwrap_err();
+            assert!(
+                err.to_string().contains("close_confirm"),
+                "must name field for {content:?}: {err}"
+            );
+        }
+        // End to end: the file layer's mode reaches the effective config
+        // with user attribution; the unset default stays CoreDefaults.
+        let src = test_source();
+        let plan =
+            parse_lua_config(r#"return { close_confirm = "never" }"#, &src).expect("never parses");
+        let layer = LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        assert_eq!(merged.effective.close_confirm, CloseConfirm::Never);
+        assert_eq!(
+            merged.source_of("close_confirm").unwrap().layer,
+            LayerKind::User
+        );
+        let merged_default = resolve_effective(None, None).expect("defaults");
+        assert_eq!(
+            merged_default.effective.close_confirm,
+            CloseConfirm::WhenBusy
+        );
+        assert_eq!(
+            merged_default.source_of("close_confirm").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
     fn load_user_layer_round_trip_via_tempfile() {
         let dir = std::env::temp_dir().join(format!("bitty-ctx0148-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -3139,6 +3215,31 @@ mod tests {
             (
                 "mod_key case",
                 r#"return { mod_key = "SUPER" }"#.to_string(),
+                None,
+            ),
+            (
+                "close_confirm bad",
+                r#"return { close_confirm = "sometimes" }"#.to_string(),
+                Some("close_confirm"),
+            ),
+            (
+                "close_confirm case",
+                r#"return { close_confirm = "Always" }"#.to_string(),
+                Some("close_confirm"),
+            ),
+            (
+                "close_confirm always",
+                r#"return { close_confirm = "always" }"#.to_string(),
+                None,
+            ),
+            (
+                "close_confirm when_busy",
+                r#"return { close_confirm = "when_busy" }"#.to_string(),
+                None,
+            ),
+            (
+                "close_confirm never",
+                r#"return { close_confirm = "never" }"#.to_string(),
                 None,
             ),
             (

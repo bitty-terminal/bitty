@@ -766,6 +766,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         }
         // CTX-0236: leader/mod for the shipped chrome map (default Alt).
         "mod_key" => defaults.mod_key.canonical().to_string(),
+        // CTX-0370: view/window close confirmation (default when_busy).
+        "close_confirm" => defaults.close_confirm.as_str().to_string(),
         _ => return None,
     };
     Some(ConfigInfo {
@@ -1229,7 +1231,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, selection.auto_copy, layout.gaps_in, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {
@@ -1507,6 +1509,10 @@ mod tests {
         let mod_key = inspect_config("mod_key").expect("mod_key");
         assert_eq!(mod_key.key, "mod_key");
         assert_eq!(mod_key.value, "alt");
+        // CTX-0370: the close-confirmation default is inspectable.
+        let close_confirm = inspect_config("close_confirm").expect("close_confirm");
+        assert_eq!(close_confirm.key, "close_confirm");
+        assert_eq!(close_confirm.value, "when_busy");
         // CTX-0260: hover-focus default (off) is inspectable.
         let hover = inspect_config("mouse.focus_follows_mouse").expect("mouse key");
         assert_eq!(hover.key, "mouse.focus_follows_mouse");

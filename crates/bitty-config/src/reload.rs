@@ -75,6 +75,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
 /// | `selection.auto_copy`     | RestartRequired    |
+/// | `close_confirm`           | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
 /// | `layout.gaps_out`         | RestartRequired    |
 /// | `scrollbar.mode`          | RestartRequired    |
@@ -129,6 +130,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "terminal"
         | "selection.auto_copy"
         | "selection"
+        | "close_confirm"
         | "layout.gaps_in"
         | "layout.gaps_out"
         | "layout"
@@ -349,6 +351,14 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "selection.auto_copy",
         old.selection.auto_copy.to_string(),
         new.selection.auto_copy.to_string(),
+    );
+    // CTX-0370: close confirmation is adopted at startup (RuntimeConfig is
+    // built once from the effective config), so changes are restart-required,
+    // not live.
+    push_if_changed(
+        "close_confirm",
+        old.close_confirm.as_str().to_string(),
+        new.close_confirm.as_str().to_string(),
     );
     // CTX-0177: gaps are adopted at startup (RuntimeConfig carries them into
     // every layout call), so changes are restart-required, not live.
@@ -854,6 +864,26 @@ mod tests {
         assert_eq!(r.overall, ReloadClass::RestartRequired);
         assert!(r.needs_restart);
         assert!(r.diffs.iter().any(|d| d.field == "selection.auto_copy"));
+    }
+
+    #[test]
+    fn diff_close_confirm_is_restart_required() {
+        // CTX-0370: flipping the close-confirmation mode must surface as a
+        // restart-required diff (the gate is adopted at startup; no silent
+        // no-op on reload).
+        use crate::types::CloseConfirm;
+        let old = EffectiveConfig::default();
+        assert_eq!(old.close_confirm, CloseConfirm::WhenBusy);
+        let mut new = old.clone();
+        new.close_confirm = CloseConfirm::Never;
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::RestartRequired);
+        assert!(r.needs_restart);
+        assert!(r.diffs.iter().any(|d| d.field == "close_confirm"));
+        assert_eq!(
+            classify_field("close_confirm"),
+            ReloadClass::RestartRequired
+        );
     }
 
     #[test]

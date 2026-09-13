@@ -1231,6 +1231,65 @@ impl SelectionConfig {
     }
 }
 
+/// Default close-confirmation mode (CTX-0370): `when_busy`.
+pub const DEFAULT_CLOSE_CONFIRM: CloseConfirm = CloseConfirm::WhenBusy;
+
+/// Close-confirmation mode (CTX-0370 top-level `close_confirm` key).
+///
+/// Kitty/ghostty-class close safety for views and windows, applied to the
+/// view/window close gestures:
+/// - `always`: confirm every close, even when every pane is an idle shell.
+/// - `when_busy` (default): confirm only while some pane's PTY has a running
+///   foreground job beyond the idle shell (kernel foreground process group
+///   differs from the spawned shell pid; undetectable states count as not
+///   busy).
+/// - `never`: never confirm.
+///
+/// The workspace kill-confirm gate (CTX-0257) is a separate accepted control
+/// and is not governed by this key. Project layers must not declare it: a
+/// repository-local file must not disable a data-loss guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseConfirm {
+    /// Confirm every view/window close.
+    Always,
+    /// Confirm only when a foreground job is running. Default.
+    #[default]
+    WhenBusy,
+    /// Never confirm.
+    Never,
+}
+
+impl CloseConfirm {
+    /// Parses a config string (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"always"`, `"when_busy"`, `"never"`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "always" => Some(Self::Always),
+            "when_busy" => Some(Self::WhenBusy),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::WhenBusy => "when_busy",
+            Self::Never => "never",
+        }
+    }
+}
+
+impl std::fmt::Display for CloseConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Panel-gap layout configuration (CTX-0177).
 ///
 /// Hyprland-like spacing between terminal panes, in **cells** (not pixels:
@@ -1888,6 +1947,9 @@ pub struct EffectiveConfig {
     pub terminal: TerminalConfig,
     /// Selection config (CTX-0191; default auto-copies on select).
     pub selection: SelectionConfig,
+    /// Close-confirmation mode (CTX-0370 top-level `close_confirm`; default
+    /// `when_busy`).
+    pub close_confirm: CloseConfirm,
     /// Layout config (CTX-0177 panel gaps in cells; default edge-to-edge).
     pub layout: LayoutConfig,
     /// Core-owned workspace decoration in logical px (CTX-0292; accepted
@@ -1924,6 +1986,7 @@ impl Default for EffectiveConfig {
             window: WindowConfig::default(),
             terminal: TerminalConfig::default(),
             selection: SelectionConfig::default(),
+            close_confirm: DEFAULT_CLOSE_CONFIRM,
             layout: LayoutConfig::default(),
             decoration: DecorationConfig::default(),
             scrollbar: ScrollbarConfig::default(),
@@ -2348,6 +2411,44 @@ mod tests {
         EffectiveConfig::default()
             .validate()
             .expect("default valid");
+    }
+
+    #[test]
+    fn close_confirm_defaults_when_busy_and_parses_exact_values() {
+        // CTX-0370: `close_confirm` accepts only the three exact lowercase
+        // spellings; everything else fails closed (`parse` -> None). Default
+        // is `when_busy` in both the enum and the effective config.
+        assert_eq!(DEFAULT_CLOSE_CONFIRM, CloseConfirm::WhenBusy);
+        assert_eq!(CloseConfirm::default(), CloseConfirm::WhenBusy);
+        assert_eq!(
+            EffectiveConfig::default().close_confirm,
+            CloseConfirm::WhenBusy
+        );
+        for (raw, expected) in [
+            ("always", CloseConfirm::Always),
+            ("when_busy", CloseConfirm::WhenBusy),
+            ("never", CloseConfirm::Never),
+        ] {
+            assert_eq!(CloseConfirm::parse(raw), Some(expected), "{raw}");
+            assert_eq!(expected.as_str(), raw);
+            assert_eq!(expected.to_string(), raw);
+        }
+        for raw in [
+            "",
+            " ",
+            "ALWAYS",
+            "Always",
+            "when busy",
+            "when-busy",
+            "busy",
+            "ask",
+            "auto",
+            "off",
+            "0",
+            "true",
+        ] {
+            assert_eq!(CloseConfirm::parse(raw), None, "{raw:?} must fail closed");
+        }
     }
 
     #[test]

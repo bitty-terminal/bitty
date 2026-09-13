@@ -209,6 +209,14 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare mod_key".into(),
         });
     }
+    // CTX-0370: close confirmation is a data-loss guard; a project-local
+    // file must not be able to disable or weaken it, so the key stays out of
+    // project layers (like the keymaps and the mod).
+    if plan.close_confirm.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare close_confirm".into(),
+        });
+    }
     if plan.extends.is_some() {
         return Err(ConfigError::TrustViolation {
             message: "project config must not declare extends".into(),
@@ -431,6 +439,19 @@ mod tests {
         };
         let err = validate_project_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("mod_key"));
+    }
+
+    #[test]
+    fn project_plan_rejects_close_confirm() {
+        // CTX-0370: close confirmation is a data-loss guard; a project-local
+        // file must not be able to disable it.
+        use crate::types::CloseConfirm;
+        let plan = ConfigPlan {
+            close_confirm: Some(CloseConfirm::Never),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("close_confirm"));
     }
 
     #[test]

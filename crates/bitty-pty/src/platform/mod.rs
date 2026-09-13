@@ -87,6 +87,13 @@ impl Session {
         imp::tty_name(&self.master)
     }
 
+    /// Kernel foreground process-group leader pid, when the platform exposes
+    /// one (Unix `tcgetpgrp`; always `None` on Windows ConPTY, which has no
+    /// process-group surface). Read-only and never blocks.
+    pub(crate) fn process_group_leader(&self) -> Option<u32> {
+        imp::process_group_leader(&self.master)
+    }
+
     /// Process id of the child, when applicable.
     pub(crate) fn pid(&self) -> Option<u32> {
         imp::child_pid(&self.child)

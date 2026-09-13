@@ -118,6 +118,7 @@ use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
+pub mod close_confirm;
 pub mod help;
 pub mod input;
 pub mod kitty_images;
@@ -140,6 +141,7 @@ pub use self::animations::{
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
 
+use self::close_confirm::PendingCloseConfirm;
 use self::layout_focus::{default_container, default_layout};
 use self::mouse_chrome::{AltDragState, HoverPending};
 use self::panes::PaneSession;
@@ -434,6 +436,15 @@ pub struct Runtime {
     /// repaint on the full→flash transition, then idle with the flash
     /// retained on screen (never-silent while pending).
     paste_banner_collapsed: bool,
+    /// Pending view/window close confirmation (CTX-0370).
+    ///
+    /// The gate arm for the `close_confirm` key: `view_close_request` /
+    /// `window_close_request` arm it when the mode and PTY foreground-job
+    /// state require confirmation; repeating the same close gesture confirms
+    /// and `Esc` cancels (`cancel_pending_on_escape`). Presentation is the
+    /// shared overlay pill in the present path, never grid truth. At most
+    /// one arm exists at a time.
+    pending_close_confirm: Option<PendingCloseConfirm>,
     osc_clipboard_read_allowed: bool,
     osc_clipboard_write_allowed: bool,
     /// Count of OSC 52 writes rejected for invalid base64 (CTX-0212).
@@ -737,6 +748,7 @@ impl Runtime {
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
+            pending_close_confirm: None,
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,
@@ -869,6 +881,7 @@ impl Runtime {
             search_state: SearchState::new(),
             pending_paste: None,
             pending_paste_since: None,
+            pending_close_confirm: None,
             paste_banner_collapsed: false,
             osc_clipboard_read_allowed: false,
             osc_clipboard_write_allowed: false,

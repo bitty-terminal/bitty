@@ -137,6 +137,13 @@ pub(crate) fn tty_name(_master: &Master) -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn process_group_leader(_master: &Master) -> Option<u32> {
+    // CTX-0370: ConPTY exposes no process-group/foreground surface, so busy
+    // detection is unavailable here and callers must treat `None` as
+    // "cannot determine" (never as busy) rather than inventing a guess.
+    None
+}
+
 pub(crate) fn try_clone_reader(master: &Master) -> Result<Box<dyn io::Read + Send>, PtyError> {
     master
         .inner

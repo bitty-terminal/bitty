@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Close confirmation for running jobs (CTX-0370):** closing a pane or the
+  window while a PTY still has a foreground job now prompts before discarding
+  the work. Busy detection reads the kernel foreground process group
+  (`tcgetpgrp`) and treats "foreground process group == the spawned shell" as
+  idle; undetectable states (Windows ConPTY, dead PTYs) count as not busy
+  rather than prompting blind. The gate reuses the accepted modal contract —
+  the first close gesture arms a bounded overlay pill
+  (`Running job: <name> — close pane/window anyway?`), repeating the close
+  gesture confirms, `Esc` cancels — and never introduces a new keybinding.
+  New top-level config key **`close_confirm = "always" | "when_busy" |
+"never"`** (default `when_busy`; `always` prompts even for an idle shell,
+  `never` disables). Unknown values fail closed, project config cannot
+  declare it (a repo must not disable a data-loss guard), and the key is
+  restart-required on reload. The workspace kill-confirm gate (CTX-0257) is
+  unchanged.
 - **Panel animations (CTX-0341, RFC-0002):** `appearance.animations` adds
   renderer-side, compositor-gated transitions for panel open and close, focus
   change, and workspace switch. Accepted defaults: open `150` ms /

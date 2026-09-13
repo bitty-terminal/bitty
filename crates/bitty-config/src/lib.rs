@@ -114,8 +114,8 @@ pub use theme::{
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
-    AppearanceConfig, DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry, LayoutConfig,
-    MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors,
+    AppearanceConfig, CloseConfirm, DecorationConfig, EffectiveConfig, FontConfig, KeymapEntry,
+    LayoutConfig, MouseConfig, OutlineColor, PluginSpec, ReducedMotion, ResolvedOutlineColors,
     ResolvedOutlineWidths, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
     WindowConfig,
 };

@@ -60,6 +60,44 @@ pub const MAX_SCROLLBACK_LINES: usize = bitty_term_state::SCROLLBACK_MAX_LINES;
 /// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
 pub const DEFAULT_SELECTION_AUTO_COPY: bool = true;
 
+/// Default close-confirmation mode (CTX-0370): `when_busy`.
+/// Mirrors `bitty-config` `DEFAULT_CLOSE_CONFIRM` by value (kept as a local
+/// constant because `bitty-runtime` must not depend on `bitty-config`;
+/// `bitty-app` maps the effective value across at startup and the two
+/// defaults must stay equal — covered by a cross-crate test in `bitty-app`).
+pub const DEFAULT_CLOSE_CONFIRM_MODE: CloseConfirmMode = CloseConfirmMode::WhenBusy;
+
+/// Close-confirmation mode for view/window close gestures (CTX-0370 top-level
+/// `close_confirm`).
+///
+/// Mirrors `bitty-config` `CloseConfirm` by value (no workspace dependency):
+/// `always` confirms every close, `when_busy` (default) confirms only while a
+/// pane PTY has a foreground job beyond the idle shell, `never` disables the
+/// gate. The workspace kill-confirm gate (CTX-0257) is a separate control and
+/// is not governed by this mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseConfirmMode {
+    /// Confirm every view/window close.
+    Always,
+    /// Confirm only when a foreground job is running. Default.
+    #[default]
+    WhenBusy,
+    /// Never confirm.
+    Never,
+}
+
+impl CloseConfirmMode {
+    /// Canonical spelling (matches the `bitty-config` key values).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::WhenBusy => "when_busy",
+            Self::Never => "never",
+        }
+    }
+}
+
 /// Default focus-follows-mouse behavior (CTX-0260).
 /// Mirrors `bitty-config` `DEFAULT_MOUSE_FOCUS_FOLLOWS_MOUSE` (kept as a
 /// local constant because `bitty-runtime` must not depend on
@@ -266,6 +304,10 @@ pub struct RuntimeConfig {
     /// `false` leaves the highlight in place; the explicit
     /// `copy_to_clipboard` chord (Ctrl+Shift+C) still copies.
     pub selection_auto_copy: bool,
+    /// Close-confirmation mode (CTX-0370 `close_confirm`; default
+    /// `when_busy`). Read at view/window close gestures only, never on the
+    /// input hot path.
+    pub close_confirm: CloseConfirmMode,
     /// Whether hover moves keyboard focus to the hovered pane (CTX-0260
     /// `mouse.focus_follows_mouse`; default `false` = click-to-focus).
     /// When `false`, hover never touches focus; when `true`, cursor motion
@@ -386,6 +428,7 @@ impl Default for RuntimeConfig {
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy: DEFAULT_SELECTION_AUTO_COPY,
+            close_confirm: DEFAULT_CLOSE_CONFIRM_MODE,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
@@ -462,6 +505,7 @@ impl RuntimeConfig {
             scroll_pixels_per_notch,
             scrollback: DEFAULT_SCROLLBACK_LINES,
             selection_auto_copy,
+            close_confirm: DEFAULT_CLOSE_CONFIRM_MODE,
             focus_follows_mouse: DEFAULT_FOCUS_FOLLOWS_MOUSE,
             focus_follows_mouse_delay: std::time::Duration::from_millis(u64::from(
                 DEFAULT_FOCUS_FOLLOWS_MOUSE_DELAY_MS,

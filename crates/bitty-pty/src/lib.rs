@@ -111,6 +111,8 @@ pub use builder::PtyBuilder;
 pub use builder::should_strip_graphics_fingerprint;
 pub use error::PtyError;
 pub use platform::ExitStatus;
+pub use pty::ForegroundJob;
+pub use pty::MAX_JOB_NAME_BYTES;
 pub use pty::Pty;
 pub use reader::CHANNEL_CAPACITY_CHUNKS;
 pub use reader::MAX_BUFFERED_BYTES;

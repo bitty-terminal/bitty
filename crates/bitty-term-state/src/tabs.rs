@@ -66,9 +66,7 @@ impl TabStops {
 
     /// Clears every stop.
     pub fn clear_all(&mut self) {
-        for slot in &mut self.bits {
-            *slot = false;
-        }
+        self.bits.fill(false);
     }
 
     /// The next stop strictly after `col`, or `None` when no stop remains.

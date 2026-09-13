@@ -115,7 +115,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.97.1
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - name: Install cross for aarch64 Linux (container-based)
@@ -296,7 +296,7 @@ jobs:
           cat dist/SHA256SUMS
           COMMIT="$(git rev-parse HEAD)"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "1.97.1",\n  "build_runner": "github-actions"\n}\n' "$COMMIT" "${{ github.ref_name }}" "$DATE" > dist/provenance.json
+          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "1.98.1",\n  "build_runner": "github-actions"\n}\n' "$COMMIT" "${{ github.ref_name }}" "$DATE" > dist/provenance.json
           cat dist/provenance.json
       - name: Create Release
         uses: softprops/action-gh-release@v3

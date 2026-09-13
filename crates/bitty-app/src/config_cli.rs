@@ -424,6 +424,12 @@ pub(crate) fn starter_init_lua() -> &'static str {
      \x20\x20-- inherits decoration.border; focused/idle override it. A\n\
      \x20\x20-- focused width >= idle + 1 supplies a non-color focus cue.\n\
      \x20\x20-- decoration = { border_width = 2, border_width_focused = 3, border_width_idle = 1 },\n\
+     \x20\x20-- Per-View appearance overrides (RFC-0001/OQ-041). Selector is\n\
+     \x20\x20-- \"*\", a content type (empty/terminal/rich/browser), \"ws:1..16\",\n\
+     \x20\x20-- or \"view:<ViewId>\"; tiers apply * < content < ws < view per\n\
+     \x20\x20-- field. Accepted fields: border_color[_focused|_idle],\n\
+     \x20\x20-- border_width[_focused|_idle], background_image, background_fit.\n\
+     \x20\x20-- views = { [\"*\"] = { border_color_focused = \"#33CCFF\" }, [\"ws:2\"] = { border_width_idle = 1 } },\n\
       \x20\x20-- Overlay scrollback scrollbar (auto by default: transparent at rest,\n\
       \x20\x20-- revealed on mouse proximity/hover). Uncomment to pin it visible,\n\
       \x20\x20-- or set mode = \"hidden\" to disable: scrollbar = { mode = \"always\", width = 8 },\n\
@@ -767,6 +773,78 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                         "{}",
                         check_row("decoration.border_color_idle.advisory", warning, "advisory")
                     );
+                }
+                // CTX-0343 (RFC-0001/OQ-041): report the merged per-View
+                // override set, one row per selector-qualified field, with
+                // per-field source attribution. The set is presentation-only
+                // and live-reconciled; per-View AC-1/AC-2 runs at first match.
+                for entry in &e.views {
+                    for (leaf, value) in [
+                        (
+                            "border_color",
+                            entry
+                                .overrides
+                                .border_color
+                                .map(|c| c.to_hex())
+                                .unwrap_or_else(|| String::from("(unset)")),
+                        ),
+                        (
+                            "border_color_focused",
+                            entry
+                                .overrides
+                                .border_color_focused
+                                .map(|c| c.to_hex())
+                                .unwrap_or_else(|| String::from("(unset)")),
+                        ),
+                        (
+                            "border_color_idle",
+                            entry
+                                .overrides
+                                .border_color_idle
+                                .map(|c| c.to_hex())
+                                .unwrap_or_else(|| String::from("(unset)")),
+                        ),
+                        (
+                            "border_width",
+                            entry
+                                .overrides
+                                .border_width
+                                .map_or_else(|| String::from("(unset)"), |v| v.to_string()),
+                        ),
+                        (
+                            "border_width_focused",
+                            entry
+                                .overrides
+                                .border_width_focused
+                                .map_or_else(|| String::from("(unset)"), |v| v.to_string()),
+                        ),
+                        (
+                            "border_width_idle",
+                            entry
+                                .overrides
+                                .border_width_idle
+                                .map_or_else(|| String::from("(unset)"), |v| v.to_string()),
+                        ),
+                        (
+                            "background_image",
+                            entry
+                                .overrides
+                                .background_image
+                                .clone()
+                                .unwrap_or_else(|| String::from("(unset)")),
+                        ),
+                        (
+                            "background_fit",
+                            entry
+                                .overrides
+                                .background_fit
+                                .map(|f| f.as_str().to_string())
+                                .unwrap_or_else(|| String::from("(unset)")),
+                        ),
+                    ] {
+                        let field = entry.field_path(leaf);
+                        println!("{}", check_row(&field, value, &src(&field)));
+                    }
                 }
                 // CTX-0341 (RFC-0002): report the resolved animation contract
                 // (durations/easings are already `spring`-resolved and
@@ -1117,6 +1195,31 @@ pub(crate) fn runtime_config_from_effective(
                 .min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX),
         );
         cfg.outline_width_idle = Some(widths.idle.min(bitty_runtime::config::MAX_OUTLINE_WIDTH_PX));
+        // CTX-0343 (RFC-0001/OQ-041): carry the per-`View` override rules
+        // onto the runtime config in canonical selector form. The grammar,
+        // field bounds, and per-`View` AC-1/AC-2 contract were already
+        // enforced fail-closed by `bitty-config`; the runtime repeats the
+        // selector/width validation so a direct construction stays bounded.
+        // `bitty-config` cannot be named here, so the rule is rebuilt from
+        // the public `ViewOverride` accessors by value.
+        cfg.view_appearance = effective
+            .views
+            .iter()
+            .map(|entry| bitty_runtime::ViewAppearanceRule {
+                selector: entry.selector.canonical(),
+                border_color: entry.overrides.border_color.map(|c| c.0),
+                border_color_focused: entry.overrides.border_color_focused.map(|c| c.0),
+                border_color_idle: entry.overrides.border_color_idle.map(|c| c.0),
+                border_width: entry.overrides.border_width,
+                border_width_focused: entry.overrides.border_width_focused,
+                border_width_idle: entry.overrides.border_width_idle,
+                background_image: entry.overrides.background_image.clone(),
+                background_fit: entry
+                    .overrides
+                    .background_fit
+                    .map(|f| f.as_str().to_string()),
+            })
+            .collect();
         // CTX-0355: carry the same resolved preset's terminal palette
         // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
         // config so the default-path renderer and clear color follow

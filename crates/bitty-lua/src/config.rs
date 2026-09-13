@@ -81,6 +81,32 @@ pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 /// host never iterates unbounded sequences outside fuel accounting).
 pub const MAX_CONFIG_KEYMAPS: usize = 1024;
 
+/// Maximum `views.*` selectors read (CTX-0343).
+///
+/// Extraction memory guard only: RFC-0001/OQ-041 states the `views` table
+/// adds no semantic whole-table cap (the aggregate parse is bounded by the
+/// Config VM budgets), and the closed selector grammar means at most one
+/// wildcard, one content type, one workspace, and one `ViewId` per live
+/// `View` can match. This cap sits far above the live-match ceiling so a
+/// legitimate `ws:`/`view:` set is never truncated, while one capture stays
+/// bounded. Overflow is rejected fail-closed, never partially applied.
+pub const MAX_CONFIG_VIEW_SELECTORS: usize = 512;
+
+/// The accepted `views.<selector>` field set (RFC-0001/OQ-041).
+const VIEW_ACCEPTED_FIELDS: &[&str] = &[
+    "border_color",
+    "border_color_focused",
+    "border_color_idle",
+    "border_width",
+    "border_width_focused",
+    "border_width_idle",
+    "background_image",
+    "background_fit",
+];
+
+/// Fields rejected until their owning OQ accepts them (RFC-0001/OQ-041).
+const VIEW_RESERVED_FIELDS: &[&str] = &["opacity", "blur", "animations"];
+
 /// A single key mapping, plain data mirroring `bitty-config` `KeymapEntry`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeymapData {
@@ -260,6 +286,35 @@ pub struct AnimationsData {
     pub easing_workspace: Option<String>,
 }
 
+/// One `views.<selector>` entry, plain data (RFC-0001/OQ-041, CTX-0343; see
+/// [`FontData`] for `Option` semantics).
+///
+/// The selector grammar and every field bound are validated fail-closed
+/// downstream in `bitty-config`; the extractor only enforces the closed field
+/// set (accepted fields plus reserved-field rejection) and the scalar leaf
+/// types, naming the offending key path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewOverrideData {
+    /// Raw selector key (grammar checked fail-closed downstream).
+    pub selector: String,
+    /// Base outline color, raw canonical string.
+    pub border_color: Option<String>,
+    /// Explicit focused outline color, raw canonical string.
+    pub border_color_focused: Option<String>,
+    /// Explicit idle outline color, raw canonical string.
+    pub border_color_idle: Option<String>,
+    /// Base outline width in logical px.
+    pub border_width: Option<i64>,
+    /// Explicit focused outline width in logical px.
+    pub border_width_focused: Option<i64>,
+    /// Explicit idle outline width in logical px.
+    pub border_width_idle: Option<i64>,
+    /// Background-image path (syntax/bounds checked downstream).
+    pub background_image: Option<String>,
+    /// Background fit mode string (closed enum checked downstream).
+    pub background_fit: Option<String>,
+}
+
 /// Plain-data user configuration extracted from the Lua chunk.
 ///
 /// Every field is optional: absent means "this layer says nothing". Unknown
@@ -284,6 +339,9 @@ pub struct ConfigData {
     pub layout: Option<LayoutData>,
     /// `decoration` table (CTX-0292 Core-owned workspace decoration).
     pub decoration: Option<DecorationData>,
+    /// `views` table (RFC-0001/OQ-041 per-View appearance overrides,
+    /// CTX-0343). `None` means "this layer says nothing".
+    pub views: Option<Vec<ViewOverrideData>>,
     /// `scrollbar` table (CTX-0181 overlay scrollbar).
     pub scrollbar: Option<ScrollbarData>,
     /// `mouse` table (CTX-0260 focus-follows-mouse).
@@ -320,6 +378,7 @@ impl ConfigData {
             && self.selection.is_none()
             && self.layout.is_none()
             && self.decoration.is_none()
+            && self.views.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.mod_key.is_none()
@@ -559,6 +618,9 @@ impl ValueSnapshot {
                             Self::Nil
                         } else {
                             match val {
+                                Value::Table(nested) if depth == 0 && name == "views" => {
+                                    Self::capture_views_table(ctx, nested)
+                                }
                                 Value::Table(nested) => Self::capture_table(ctx, nested, depth + 1),
                                 other => Self::capture_shallow(other),
                             }
@@ -597,6 +659,47 @@ impl ValueSnapshot {
         Self::Table {
             pairs,
             seq,
+            truncated,
+            has_non_string_keys,
+        }
+    }
+
+    /// Capture the `views` selector map with its own extraction cap
+    /// (CTX-0343): the map is bounded by [`MAX_CONFIG_VIEW_SELECTORS`] rather
+    /// than the small nested-table cap, and overflow marks `truncated` so the
+    /// typed extractor rejects the whole table fail-closed. Entry tables are
+    /// captured one level deep (their leaves are scalars).
+    fn capture_views_table<'gc>(ctx: Context<'gc>, table: Table<'gc>) -> Self {
+        let mut pairs = Vec::new();
+        let mut has_non_string_keys = false;
+        let mut truncated = false;
+        let mut count = 0usize;
+        for (key, val) in table.iter() {
+            if matches!(key, Value::Integer(_)) {
+                continue;
+            }
+            count += 1;
+            if count > MAX_CONFIG_VIEW_SELECTORS {
+                truncated = true;
+                break;
+            }
+            match key {
+                Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
+                    Ok(name) => {
+                        let child = match val {
+                            Value::Table(nested) => Self::capture_table(ctx, nested, 2),
+                            other => Self::capture_shallow(other),
+                        };
+                        pairs.push((name.to_string(), Box::new(child)));
+                    }
+                    Err(_) => has_non_string_keys = true,
+                },
+                _ => has_non_string_keys = true,
+            }
+        }
+        Self::Table {
+            pairs,
+            seq: Vec::new(),
             truncated,
             has_non_string_keys,
         }
@@ -1036,6 +1139,113 @@ impl ConfigData {
                         border_width_focused,
                         border_width_idle,
                     });
+                }
+                "views" => {
+                    // CTX-0343 (RFC-0001/OQ-041): `views = { ["ws:2"] = {
+                    // border_width_idle = 1 }, ... }` overrides appearance per
+                    // selector. The field set is closed here (accepted fields
+                    // only; reserved fields rejected with their owning OQ;
+                    // unknown fields rejected by path), leaf types are never
+                    // coerced, and the selector grammar plus every field bound
+                    // is validated fail-closed downstream in `bitty-config`.
+                    let (pairs, truncated, has_non_string_keys) = match val.as_ref() {
+                        ValueSnapshot::Table {
+                            pairs,
+                            truncated,
+                            has_non_string_keys,
+                            ..
+                        } => (pairs.as_slice(), *truncated, *has_non_string_keys),
+                        other => {
+                            return Err(format!("views: expected table (found {})", other.kind()));
+                        }
+                    };
+                    if truncated {
+                        return Err(format!(
+                            "views: exceeds {MAX_CONFIG_VIEW_SELECTORS} selectors"
+                        ));
+                    }
+                    if has_non_string_keys {
+                        return Err("views: selector keys must be strings".to_string());
+                    }
+                    let mut entries = Vec::with_capacity(pairs.len());
+                    for (selector, entry) in pairs {
+                        if selector.is_empty() {
+                            return Err("views: selector keys must be non-empty".to_string());
+                        }
+                        let entry_path = format!("views[{selector}]");
+                        let (entry_pairs, entry_truncated, entry_non_string) = match entry.as_ref()
+                        {
+                            ValueSnapshot::Table {
+                                pairs,
+                                truncated,
+                                has_non_string_keys,
+                                ..
+                            } => (pairs, *truncated, *has_non_string_keys),
+                            other => {
+                                return Err(format!(
+                                    "{entry_path}: expected table (found {})",
+                                    other.kind()
+                                ));
+                            }
+                        };
+                        if entry_truncated {
+                            return Err(format!(
+                                "{entry_path}: exceeds {MAX_CONFIG_NESTED_KEYS} fields"
+                            ));
+                        }
+                        if entry_non_string {
+                            return Err(format!("{entry_path}: field names must be strings"));
+                        }
+                        if let Some((reserved, _)) = entry_pairs
+                            .iter()
+                            .find(|(name, _)| VIEW_RESERVED_FIELDS.contains(&name.as_str()))
+                        {
+                            return Err(format!(
+                                "{entry_path}.{reserved}: reserved field (not accepted until \
+                                 its owning open question closes)"
+                            ));
+                        }
+                        check_nested_keys(&entry_path, entry_pairs, VIEW_ACCEPTED_FIELDS)?;
+                        let mut data = ViewOverrideData {
+                            selector: selector.clone(),
+                            ..Default::default()
+                        };
+                        for (name, value) in entry_pairs {
+                            let path = format!("{entry_path}.{name}");
+                            let value = value.as_ref();
+                            match name.as_str() {
+                                "border_color" => {
+                                    data.border_color = Some(expect_string(&path, value)?);
+                                }
+                                "border_color_focused" => {
+                                    data.border_color_focused = Some(expect_string(&path, value)?);
+                                }
+                                "border_color_idle" => {
+                                    data.border_color_idle = Some(expect_string(&path, value)?);
+                                }
+                                "border_width" => {
+                                    data.border_width = Some(expect_integer(&path, value)?);
+                                }
+                                "border_width_focused" => {
+                                    data.border_width_focused = Some(expect_integer(&path, value)?);
+                                }
+                                "border_width_idle" => {
+                                    data.border_width_idle = Some(expect_integer(&path, value)?);
+                                }
+                                "background_image" => {
+                                    data.background_image = Some(expect_string(&path, value)?);
+                                }
+                                "background_fit" => {
+                                    data.background_fit = Some(expect_string(&path, value)?);
+                                }
+                                // `check_nested_keys` already rejected every
+                                // other field, so this arm is unreachable.
+                                _ => {}
+                            }
+                        }
+                        entries.push(data);
+                    }
+                    out.views = Some(entries);
                 }
                 "scrollbar" => {
                     // CTX-0181: `scrollbar = { mode = "auto", width = 8 }`
@@ -1610,6 +1820,81 @@ mod tests {
                 other => panic!("{code:?}: expected shape error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn views_extract_and_absent_means_no_override() {
+        // CTX-0343: every accepted field parses as its scalar leaf; absent
+        // table/key is `None` so merge keeps the lower-precedence value.
+        let data = eval_ok(
+            r##"return { views = {
+                ["*"] = { border_color_focused = "#33CCFF" },
+                terminal = { border_color_idle = "#595959AA", border_width_focused = 3 },
+                ["ws:2"] = { border_width = 1 },
+                ["view:7"] = { background_image = "~/wall/one.png", background_fit = "fit" },
+                rich = {},
+            } }"##,
+        );
+        let views = data.views.expect("views table");
+        assert_eq!(views.len(), 5);
+        let find = |selector: &str| {
+            views
+                .iter()
+                .find(|entry| entry.selector == selector)
+                .unwrap_or_else(|| panic!("missing selector {selector}"))
+        };
+        assert_eq!(find("*").border_color_focused.as_deref(), Some("#33CCFF"));
+        let terminal = find("terminal");
+        assert_eq!(terminal.border_color_idle.as_deref(), Some("#595959AA"));
+        assert_eq!(terminal.border_width_focused, Some(3));
+        assert_eq!(find("ws:2").border_width, Some(1));
+        let view = find("view:7");
+        assert_eq!(view.background_image.as_deref(), Some("~/wall/one.png"));
+        assert_eq!(view.background_fit.as_deref(), Some("fit"));
+        assert!(find("rich").border_color.is_none());
+
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.views, None);
+        let data = eval_ok(r#"return { views = {} }"#);
+        assert_eq!(data.views.expect("present table").len(), 0);
+    }
+
+    #[test]
+    fn views_reject_unknown_reserved_and_wrong_typed_fields() {
+        let mut vm = LuaVm::new("test.views-fields");
+        for code in [
+            // Reserved until their owning OQ accepts them (OQ-038/OQ-043).
+            r#"return { views = { ["*"] = { opacity = 0.5 } } }"#,
+            r#"return { views = { ["*"] = { blur = 4 } } }"#,
+            r#"return { views = { ["*"] = { animations = { enabled = false } } } }"#,
+            // Unknown field.
+            r#"return { views = { ["*"] = { border_paint = 1 } } }"#,
+            // Wrong leaf types never coerce.
+            r#"return { views = { ["*"] = { border_width = 1.5 } } }"#,
+            r#"return { views = { ["*"] = { border_width = "3" } } }"#,
+            r#"return { views = { ["*"] = { border_color = 0x112233 } } }"#,
+            r#"return { views = { ["*"] = { background_fit = true } } }"#,
+            // Entry must be a table; selector keys must be strings.
+            r#"return { views = { ["*"] = "bold" } }"#,
+            r#"return { views = "bold" }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(message.contains("views"), "{code:?}: {message}");
+                }
+                other => panic!("{code:?}: expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn views_selector_grammar_is_validated_in_config_layer() {
+        // The extractor preserves raw selector spellings; `bitty-config`
+        // rejects unknown forms fail-closed. Here we only prove the raw key
+        // survives extraction intact for the downstream grammar check.
+        let data = eval_ok(r#"return { views = { ["ws:16"] = { border_width = 2 } } }"#);
+        let views = data.views.expect("views table");
+        assert_eq!(views[0].selector, "ws:16");
     }
 
     #[test]

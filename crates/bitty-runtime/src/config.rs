@@ -179,6 +179,134 @@ pub const DEFAULT_OUTLINE_WIDTH_IDLE: Option<u32> = None;
 /// bound fail-closed so a direct construction cannot arm an oversized ring.
 pub const MAX_OUTLINE_WIDTH_PX: u32 = 16;
 
+/// Maximum `views` entries carried on the runtime config (CTX-0343).
+///
+/// Guards against an unbounded structure reaching the present hot path; the
+/// live-match ceiling is far smaller (one `*`, one content type, one `ws:`,
+/// one `view:` per live `View`), so this never truncates a legitimate set.
+/// Overflow fails closed at mapping time, never silently.
+pub const MAX_VIEW_APPEARANCE_ENTRIES: usize = 256;
+
+/// Whether `selector` is one of the accepted RFC-0001/OQ-041 canonical
+/// selector spellings (grammar-level; matching is per `View` at present).
+///
+/// Mirrors `bitty-config`'s closed grammar without a crate dependency: `*`,
+/// a content type, `ws:<1..=16>`, or `view:<canonical decimal>`.
+fn is_runtime_view_selector(selector: &str) -> bool {
+    if selector == "*" || matches!(selector, "empty" | "terminal" | "rich" | "browser") {
+        return true;
+    }
+    if let Some(rest) = selector.strip_prefix("ws:") {
+        return canonical_decimal(rest).is_some_and(|v| (1..=16).contains(&v));
+    }
+    if let Some(rest) = selector.strip_prefix("view:") {
+        return canonical_decimal(rest).is_some_and(|v| v >= 1);
+    }
+    false
+}
+
+/// Parses a canonical decimal integer (digits only, no leading zeros).
+fn canonical_decimal(raw: &str) -> Option<u64> {
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// One `View`'s appearance-selector target (RFC-0001/OQ-041, CTX-0343).
+///
+/// Mirrors `bitty-config`'s `ViewAppearanceTarget` without a crate
+/// dependency: the content kind name, the stable numeric workspace label
+/// (`1..=16`), and the stable `ViewId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeViewTarget<'a> {
+    /// Content-type spelling (`empty`/`terminal`/`rich`/`browser`).
+    pub content: &'a str,
+    /// Stable Workspace label, `1..=16`.
+    pub workspace_label: u8,
+    /// Stable `ViewId`.
+    pub view_id: u64,
+}
+
+/// One `View`'s resolved focused/idle outline after per-`View` overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeViewOutline {
+    /// Resolved focused outline color.
+    pub focused: bitty_render::grid::Rgba8,
+    /// Resolved idle outline color.
+    pub idle: bitty_render::grid::Rgba8,
+    /// Resolved focused ring width (logical px, already defaulted).
+    pub width_focused: Option<u32>,
+    /// Resolved idle ring width (logical px, already defaulted).
+    pub width_idle: Option<u32>,
+}
+
+/// Tier of a canonical runtime selector: `*` 0, content 1, `ws:` 2, `view:` 3.
+fn runtime_selector_tier(selector: &str) -> Option<u8> {
+    if selector == "*" {
+        Some(0)
+    } else if matches!(selector, "empty" | "terminal" | "rich" | "browser") {
+        Some(1)
+    } else if selector.starts_with("ws:") {
+        Some(2)
+    } else if selector.starts_with("view:") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Whether a canonical runtime selector matches a `View` target.
+fn runtime_selector_matches(selector: &str, target: &RuntimeViewTarget<'_>) -> bool {
+    if selector == "*" {
+        return true;
+    }
+    if matches!(selector, "empty" | "terminal" | "rich" | "browser") {
+        return selector == target.content;
+    }
+    if let Some(rest) = selector.strip_prefix("ws:") {
+        return canonical_decimal(rest).is_some_and(|v| v == u64::from(target.workspace_label));
+    }
+    if let Some(rest) = selector.strip_prefix("view:") {
+        return canonical_decimal(rest).is_some_and(|v| v == target.view_id);
+    }
+    false
+}
+
+/// One per-`View` appearance override carried on the runtime config
+/// (RFC-0001/OQ-041, CTX-0343).
+///
+/// `selector` keeps the canonical selector spelling; matching is by
+/// `(selector, target)` in the runtime because `bitty-runtime` must not
+/// depend on `bitty-config`. Each field is optional; `None` inherits the
+/// next-less-specific resolved value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewAppearanceRule {
+    /// Canonical selector (`*`, `empty|terminal|rich|browser`, `ws:<n>`,
+    /// `view:<n>`).
+    pub selector: String,
+    /// Base outline color for both focus states.
+    pub border_color: Option<bitty_render::grid::Rgba8>,
+    /// Explicit focused outline color.
+    pub border_color_focused: Option<bitty_render::grid::Rgba8>,
+    /// Explicit idle outline color.
+    pub border_color_idle: Option<bitty_render::grid::Rgba8>,
+    /// Base outline width, logical px.
+    pub border_width: Option<u32>,
+    /// Explicit focused outline width, logical px.
+    pub border_width_focused: Option<u32>,
+    /// Explicit idle outline width, logical px.
+    pub border_width_idle: Option<u32>,
+    /// Background-image path (resolution only; decode/render is CTX-0347).
+    pub background_image: Option<String>,
+    /// Background fit mode spelled as the accepted enum.
+    pub background_fit: Option<String>,
+}
+
 /// Maps a Core decoration validation failure to the runtime config error
 /// (CTX-0292), naming the offending property without echoing user content.
 pub(crate) fn decoration_runtime_error(err: bitty_ui::DecorationError) -> RuntimeError {
@@ -354,6 +482,11 @@ pub struct RuntimeConfig {
     pub outline_width_focused: Option<u32>,
     /// Idle outline ring width in logical px; see [`Self::outline_width_focused`].
     pub outline_width_idle: Option<u32>,
+    /// Per-`View` appearance overrides in canonical selector form
+    /// (RFC-0001/OQ-041, CTX-0343). Empty means every `View` uses the global
+    /// resolved outline values above. Matching is by canonical selector and
+    /// the focused leaf's id; the runtime never reads terminal truth here.
+    pub view_appearance: Vec<ViewAppearanceRule>,
     /// Resolved terminal palette for `appearance.theme` (CTX-0355): window
     /// background (clear color), default foreground, cursor, selection, and
     /// the 16 ANSI colors.
@@ -442,6 +575,7 @@ impl Default for RuntimeConfig {
             outline_idle: DEFAULT_OUTLINE_IDLE,
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
+            view_appearance: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
             window_padding: DEFAULT_WINDOW_PADDING,
             window_radius_px: DEFAULT_WINDOW_RADIUS_PX,
@@ -519,6 +653,7 @@ impl RuntimeConfig {
             outline_idle: DEFAULT_OUTLINE_IDLE,
             outline_width_focused: DEFAULT_OUTLINE_WIDTH_FOCUSED,
             outline_width_idle: DEFAULT_OUTLINE_WIDTH_IDLE,
+            view_appearance: Vec::new(),
             theme: bitty_render::ThemePalette::default(),
             window_padding,
             window_radius_px,
@@ -628,7 +763,101 @@ impl RuntimeConfig {
                 ));
             }
         }
+        // CTX-0343 (RFC-0001/OQ-041): the per-`View` override set is bounded
+        // and every entry's selector/width is fail-closed. The grammar was
+        // validated by `bitty-config`; the runtime repeats the bound and
+        // entry-count checks so a direct construction can never arm an
+        // unbounded or oversized override set.
+        if self.view_appearance.len() > MAX_VIEW_APPEARANCE_ENTRIES {
+            return Err(RuntimeError::InvalidConfig(
+                "view_appearance must contain <= 256 entries",
+            ));
+        }
+        for rule in &self.view_appearance {
+            if !is_runtime_view_selector(&rule.selector) {
+                return Err(RuntimeError::InvalidConfig(
+                    "view_appearance selector must be '*', a content type, 'ws:<1..=16>', \
+                     or 'view:<ViewId>'",
+                ));
+            }
+            for width in [
+                rule.border_width,
+                rule.border_width_focused,
+                rule.border_width_idle,
+            ] {
+                if width.is_some_and(|w| w > MAX_OUTLINE_WIDTH_PX) {
+                    return Err(RuntimeError::InvalidConfig(
+                        "view_appearance outline width must be within [0, 16] logical pixels",
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Resolves one `View`'s focused/idle outline pair and ring widths
+    /// (RFC-0001/OQ-041, CTX-0343) from the global values plus every matching
+    /// per-`View` rule.
+    ///
+    /// Resolution is per field per tier (`*` < content < `ws:` < `view:`),
+    /// independent of rule order; an unset field inherits the next-less-
+    /// specific value. `target` is the `(content, workspace, view)` tuple the
+    /// caller derives from its public layout state. Background-image
+    /// resolution is config-layer only (decode/render is CTX-0347) and is
+    /// therefore not consumed here yet.
+    #[must_use]
+    pub fn resolve_view_outline(&self, target: &RuntimeViewTarget) -> RuntimeViewOutline {
+        let mut color_base = None;
+        let mut color_focused = None;
+        let mut color_idle = None;
+        let mut width_base = None;
+        let mut width_focused = None;
+        let mut width_idle = None;
+        for tier in 0..=3u8 {
+            for rule in &self.view_appearance {
+                if runtime_selector_tier(&rule.selector) != Some(tier)
+                    || !runtime_selector_matches(&rule.selector, target)
+                {
+                    continue;
+                }
+                if let Some(value) = rule.border_color {
+                    color_base = Some(value);
+                }
+                if let Some(value) = rule.border_color_focused {
+                    color_focused = Some(value);
+                }
+                if let Some(value) = rule.border_color_idle {
+                    color_idle = Some(value);
+                }
+                if let Some(value) = rule.border_width {
+                    width_base = Some(value);
+                }
+                if let Some(value) = rule.border_width_focused {
+                    width_focused = Some(value);
+                }
+                if let Some(value) = rule.border_width_idle {
+                    width_idle = Some(value);
+                }
+            }
+        }
+        RuntimeViewOutline {
+            focused: color_focused.or(color_base).unwrap_or(self.outline_focused),
+            idle: color_idle.or(color_base).unwrap_or(self.outline_idle),
+            width_focused: Some(
+                width_focused
+                    .or(width_base)
+                    .or(self.outline_width_focused)
+                    .unwrap_or(self.decoration.border as u32)
+                    .min(MAX_OUTLINE_WIDTH_PX),
+            ),
+            width_idle: Some(
+                width_idle
+                    .or(width_base)
+                    .or(self.outline_width_idle)
+                    .unwrap_or(self.decoration.border as u32)
+                    .min(MAX_OUTLINE_WIDTH_PX),
+            ),
+        }
     }
 
     /// Pixel extent for the current grid geometry, excluding window padding.

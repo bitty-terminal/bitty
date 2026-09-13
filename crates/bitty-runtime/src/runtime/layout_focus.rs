@@ -170,8 +170,36 @@ impl Runtime {
         }
     }
 
-    /// Live-adopts a resolved panel animation policy (RFC-0002, CTX-0341).
+    /// Resolves one `View`'s focused/idle outline after per-`View` overrides
+    /// (RFC-0001/OQ-041, CTX-0343).
     ///
+    /// Consumes only public runtime layout state: the `ViewId` is the stable
+    /// leaf handle, the workspace label is the active slot's 1-based index,
+    /// and the content kind is `terminal` for a leaf that owns a pane session
+    /// or the primary grid and `empty` for a session-less leaf (the only
+    /// content kinds currently composed; `rich`/`browser` join when their
+    /// surfaces land). Presentation-only: no terminal truth is read or
+    /// mutated.
+    #[must_use]
+    pub(crate) fn view_outline_for(&self, view_id: ViewId) -> crate::config::RuntimeViewOutline {
+        let content =
+            if self.pane_sessions.contains_key(&view_id) || Some(view_id) == self.primary_view {
+                "terminal"
+            } else {
+                "empty"
+            };
+        let workspace_label = u8::try_from(self.active_workspace_index() + 1)
+            .unwrap_or(u8::MAX)
+            .clamp(1, crate::runtime::workspaces::MAX_WORKSPACES as u8);
+        let target = crate::config::RuntimeViewTarget {
+            content,
+            workspace_label,
+            view_id: view_id.0,
+        };
+        self.config.resolve_view_outline(&target)
+    }
+
+    /// Live-adopts a resolved panel animation policy (RFC-0002, CTX-0341).
     /// Presentation-only; the tracker keeps any in-flight transition timing
     /// and adopts the new policy for subsequent triggers. A change forces one
     /// full redraw so the new durations/easings are observable immediately.

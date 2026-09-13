@@ -123,8 +123,10 @@ use crate::keymap::ModKey;
 use crate::migration::CURRENT_SCHEMA_VERSION;
 use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
-    AppearanceConfig, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig, MAX_FONT_FAMILY_LEN,
-    MouseConfig, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig, WindowConfig,
+    AppearanceConfig, BackgroundFit, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
+    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN,
+    MouseConfig, OutlineColor, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
+    ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1258,6 +1260,126 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             })
         }
     };
+    // CTX-0343 (RFC-0001/OQ-041): `views` is a closed-selector table of
+    // per-field appearance overrides. The Lua extractor already rejected
+    // unknown/reserved fields and wrong leaf types with the offending key
+    // path; here the selector grammar and every field bound are enforced
+    // fail-closed, never clamped. An absent (or empty) table means "this
+    // layer says nothing".
+    let views = match data.views {
+        None => None,
+        Some(entries) if entries.is_empty() => None,
+        Some(entries) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let selector = match ViewSelector::parse(&entry.selector) {
+                    Some(selector) => selector,
+                    None => {
+                        return Err(ConfigError::validation(
+                            "views",
+                            format!(
+                                "unknown selector \"{}\": expected \"*\", a content type \
+                                 (\"empty\"|\"terminal\"|\"rich\"|\"browser\"), \
+                                 \"ws:<1..=16>\", or \"view:<ViewId>\"",
+                                bounded_key(&entry.selector)
+                            ),
+                        ));
+                    }
+                };
+                let path = |field: &str| format!("views[{}].{field}", selector.canonical());
+                let parse_color = |field: &str, raw: Option<&str>| match raw {
+                    None => Ok(None),
+                    Some(text) => match OutlineColor::parse(text) {
+                        Some(color) => Ok(Some(color)),
+                        None => Err(ConfigError::validation(
+                            path(field),
+                            format!(
+                                "must be '#RRGGBB' or '#RRGGBBAA' (found \"{}\")",
+                                text.trim()
+                            ),
+                        )),
+                    },
+                };
+                let border_color = parse_color("border_color", entry.border_color.as_deref())?;
+                let border_color_focused = parse_color(
+                    "border_color_focused",
+                    entry.border_color_focused.as_deref(),
+                )?;
+                let border_color_idle =
+                    parse_color("border_color_idle", entry.border_color_idle.as_deref())?;
+                let check_width =
+                    |field: &str, raw: Option<i64>| -> Result<Option<u32>, ConfigError> {
+                        match raw {
+                            None => Ok(None),
+                            Some(v) => {
+                                if !(0..=i64::from(MAX_DECORATION_BORDER_WIDTH_PX)).contains(&v) {
+                                    return Err(ConfigError::validation(
+                                        path(field),
+                                        format!(
+                                            "must be within [0, {MAX_DECORATION_BORDER_WIDTH_PX}] \
+                                             (found {v})"
+                                        ),
+                                    ));
+                                }
+                                Ok(Some(v as u32))
+                            }
+                        }
+                    };
+                let border_width = check_width("border_width", entry.border_width)?;
+                let border_width_focused =
+                    check_width("border_width_focused", entry.border_width_focused)?;
+                let border_width_idle = check_width("border_width_idle", entry.border_width_idle)?;
+                let background_image = match entry.background_image.as_deref() {
+                    None => None,
+                    Some(text) => {
+                        if text.len() > MAX_BACKGROUND_IMAGE_PATH_BYTES {
+                            return Err(ConfigError::validation(
+                                path("background_image"),
+                                format!(
+                                    "must be <= {MAX_BACKGROUND_IMAGE_PATH_BYTES} bytes \
+                                     (found {} bytes)",
+                                    text.len()
+                                ),
+                            ));
+                        }
+                        Some(text.to_string())
+                    }
+                };
+                let background_fit = match entry.background_fit.as_deref() {
+                    None => None,
+                    Some(raw) => match BackgroundFit::parse(raw) {
+                        Some(fit) => Some(fit),
+                        None => {
+                            return Err(ConfigError::validation(
+                                path("background_fit"),
+                                "must be one of \"fill\", \"fit\", \"center\", \"tile\", \
+                                 \"stretch\"",
+                            ));
+                        }
+                    },
+                };
+                let overrides = ViewAppearanceOverride {
+                    border_color,
+                    border_color_focused,
+                    border_color_idle,
+                    border_width,
+                    border_width_focused,
+                    border_width_idle,
+                    background_image,
+                    background_fit,
+                };
+                // Fail-closed field bounds with the selector-qualified path
+                // (image path syntax lives in `ViewOverride::validate`).
+                let entry = ViewOverride {
+                    selector,
+                    overrides,
+                };
+                entry.validate()?;
+                out.push(entry);
+            }
+            Some(out)
+        }
+    };
     // CTX-0181: `scrollbar` follows the same fully-optional pattern: absent
     // table means "this layer says nothing" (plan.scrollbar None so merge
     // keeps the lower-precedence value). When the table is present, omitted
@@ -1379,6 +1501,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         close_confirm,
         layout,
         decoration,
+        views,
         scrollbar,
         mouse,
         appearance,
@@ -1391,6 +1514,20 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     };
     plan.validate()?;
     Ok(plan)
+}
+
+/// Bounds a config key for diagnostics (never echoes an unbounded hostile
+/// key; truncates at a char boundary).
+fn bounded_key(raw: &str) -> String {
+    const MAX_KEY_DISPLAY: usize = 64;
+    if raw.len() <= MAX_KEY_DISPLAY {
+        return raw.to_string();
+    }
+    let mut end = MAX_KEY_DISPLAY;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &raw[..end])
 }
 
 /// Maps a shape-error message (already `path: reason` or `undeclared field
@@ -3399,5 +3536,299 @@ mod tests {
             let err = parse_lua_config(code, &test_source()).expect_err(code);
             assert_eq!(err.field(), Some(*field), "{code}: {err}");
         }
+    }
+
+    // ── CTX-0343 per-View overrides (RFC-0001/OQ-041) ────────────────────
+
+    #[test]
+    fn views_parse_selector_and_field_set() {
+        let plan = parse_lua_config(
+            r##"return { views = {
+                ["*"] = { border_color_focused = "#33CCFF" },
+                terminal = { border_color_idle = "#595959AA", border_width_focused = 3 },
+                ["ws:2"] = { border_width = 1 },
+                ["view:7"] = { background_image = "~/wall/one.png", background_fit = "fit" },
+            } }"##,
+            &test_source(),
+        )
+        .expect("views parse");
+        let views = plan.views.expect("views present");
+        assert_eq!(views.len(), 4);
+        let by_selector = |name: &str| {
+            views
+                .iter()
+                .find(|entry| entry.selector.canonical() == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        assert_eq!(
+            by_selector("*").overrides.border_color_focused,
+            Some(OutlineColor::parse("#33CCFF").unwrap())
+        );
+        assert_eq!(
+            by_selector("terminal").overrides.border_width_focused,
+            Some(3)
+        );
+        assert_eq!(by_selector("ws:2").overrides.border_width, Some(1));
+        assert_eq!(
+            by_selector("view:7").overrides.background_image.as_deref(),
+            Some("~/wall/one.png")
+        );
+        assert_eq!(
+            by_selector("view:7").overrides.background_fit,
+            Some(BackgroundFit::Fit)
+        );
+    }
+
+    #[test]
+    fn views_reject_unknown_selector_field_and_type() {
+        let cases = [
+            (
+                r#"return { views = { ["ws:0"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            (
+                r#"return { views = { ["ws:17"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            (
+                r#"return { views = { ["ws:02"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            (
+                r#"return { views = { ["view:0"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            (
+                r#"return { views = { ["Terminal"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            (
+                r#"return { views = { ["poop"] = { border_width = 1 } } }"#,
+                "views",
+            ),
+            // Unknown field.
+            (
+                r#"return { views = { ["*"] = { border_paint = 1 } } }"#,
+                "views[*].border_paint",
+            ),
+            // Out-of-range width names the selector-qualified path.
+            (
+                r#"return { views = { ["ws:2"] = { border_width = 17 } } }"#,
+                "views[ws:2].border_width",
+            ),
+            // Unknown fit value.
+            (
+                r#"return { views = { ["*"] = { background_fit = "cover" } } }"#,
+                "views[*].background_fit",
+            ),
+            // Invalid color grammar.
+            (
+                r##"return { views = { ["*"] = { border_color = "#FFF" } } }"##,
+                "views[*].border_color",
+            ),
+        ];
+        for (code, field) in cases {
+            let err = parse_lua_config(code, &test_source()).expect_err(code);
+            assert_eq!(err.field(), Some(field), "{code}: {err}");
+        }
+    }
+
+    #[test]
+    fn views_reload_classification_is_live() {
+        use crate::reload::{ReloadClass, classify_field};
+        assert_eq!(classify_field("views"), ReloadClass::Live);
+        assert_eq!(classify_field("views[*].border_width"), ReloadClass::Live);
+        assert_eq!(classify_field("views[ws:2]"), ReloadClass::Live);
+        assert_eq!(
+            classify_field("views[view:7].border_color"),
+            ReloadClass::Live
+        );
+    }
+
+    #[test]
+    fn views_reload_diff_is_keyed_and_live() {
+        use crate::file::resolve_effective;
+        use crate::reload::{ReloadClass, diff};
+        let src = || test_source();
+        let initial = resolve_effective(
+            Some(LayeredPlan::new(
+                src(),
+                parse_lua_config(
+                    r#"return { views = { ["ws:2"] = { border_width = 1 } } }"#,
+                    &src(),
+                )
+                .expect("parse"),
+            )),
+            None,
+        )
+        .expect("merge");
+        // Value edit.
+        let edited = resolve_effective(
+            Some(LayeredPlan::new(
+                src(),
+                parse_lua_config(
+                    r#"return { views = { ["ws:2"] = { border_width = 3 } } }"#,
+                    &src(),
+                )
+                .expect("parse"),
+            )),
+            None,
+        )
+        .expect("merge");
+        let report = diff(&initial.effective, &edited.effective);
+        assert_eq!(report.overall, ReloadClass::Live);
+        assert!(
+            report.diffs.iter().any(|d| d.field == "views[ws:2]"),
+            "{:?}",
+            report.diffs
+        );
+        // Added selector is a live match-set change.
+        let added = resolve_effective(
+            Some(LayeredPlan::new(
+                src(),
+                parse_lua_config(
+                    r#"return { views = { ["ws:2"] = { border_width = 1 }, ["view:7"] = { border_width_idle = 2 } } }"#,
+                    &src(),
+                )
+                .expect("parse"),
+            )),
+            None,
+        )
+        .expect("merge");
+        let report = diff(&initial.effective, &added.effective);
+        assert_eq!(report.overall, ReloadClass::Live);
+        assert!(report.diffs.iter().any(|d| d.field == "views[view:7]"));
+        // Removing the selector falls the field back, still live.
+        let report = diff(&added.effective, &initial.effective);
+        assert_eq!(report.overall, ReloadClass::Live);
+    }
+
+    #[test]
+    fn views_reject_whole_reload_on_a_single_bad_entry() {
+        // A single invalid entry rejects the whole reload fail-closed: the
+        // valid sibling is never partially applied.
+        let err = parse_lua_config(
+            r#"return { views = {
+                ["*"] = { border_width = 1 },
+                ["view:7"] = { border_width = 99 },
+            } }"#,
+            &test_source(),
+        )
+        .expect_err("whole reload must fail closed");
+        assert_eq!(err.field(), Some("views[view:7].border_width"));
+        // The layered resolver surfaces the same error, no partial plan.
+        let src = test_source();
+        let bad = parse_lua_config(
+            r#"return { views = { ["*"] = { border_width = 99 } } }"#,
+            &src,
+        )
+        .expect_err("must reject");
+        let bad_plan = LayeredPlan::new(src, ConfigPlan::default());
+        assert!(bad_plan.plan.validate().is_ok());
+        assert_eq!(bad.field(), Some("views[*].border_width"));
+    }
+
+    #[test]
+    fn views_merge_per_selector_per_field() {
+        use crate::file::resolve_effective;
+        use crate::plan::{ConfigSource, LayerKind};
+        let profile_src = ConfigSource::new(LayerKind::Profile, Some("profiles/base.lua"));
+        let profile = LayeredPlan::new(
+            profile_src,
+            parse_lua_config(
+                r##"return { views = { ["ws:2"] = { border_color_idle = "#010203", border_width = 1 } } }"##,
+                &ConfigSource::new(LayerKind::Profile, Some("profiles/base.lua")),
+            )
+            .expect("profile parse"),
+        );
+        let user_src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+        let user = LayeredPlan::new(
+            user_src.clone(),
+            parse_lua_config(
+                r#"return { views = { ["ws:2"] = { border_width = 4 } } }"#,
+                &user_src,
+            )
+            .expect("user parse"),
+        );
+        let merged = resolve_effective(Some(user.clone()), None::<&str>).expect("merge user only");
+        assert_eq!(merged.effective.views.len(), 1);
+        // Higher layer overrides only the width; the color inherits here
+        // through the empty lower stack and stays unset at this tier.
+        let entry = &merged.effective.views[0];
+        assert_eq!(entry.overrides.border_width, Some(4));
+        assert_eq!(entry.overrides.border_color_idle, None);
+
+        // Now with both layers: the profile color survives the user width.
+        let merged = crate::merge::merge_layers(vec![profile, user]).expect("merge stack");
+        let entry = merged
+            .effective
+            .views
+            .iter()
+            .find(|entry| entry.selector.canonical() == "ws:2")
+            .expect("merged entry");
+        assert_eq!(
+            entry.overrides.border_color_idle,
+            Some(OutlineColor::parse("#010203").unwrap())
+        );
+        assert_eq!(entry.overrides.border_width, Some(4));
+        assert_eq!(
+            merged
+                .source_of("views[ws:2].border_color_idle")
+                .unwrap()
+                .layer,
+            LayerKind::Profile
+        );
+        assert_eq!(
+            merged.source_of("views[ws:2].border_width").unwrap().layer,
+            LayerKind::User
+        );
+    }
+
+    #[test]
+    fn views_merge_is_order_independent_across_layers() {
+        use crate::plan::{ConfigSource, LayerKind};
+        let make = |layer: LayerKind, path: &str, code: &str| {
+            let src = ConfigSource::new(layer, Some(path.to_string()));
+            LayeredPlan::new(src.clone(), parse_lua_config(code, &src).expect("parse"))
+        };
+        let profile = make(
+            LayerKind::Profile,
+            "profiles/base.lua",
+            r##"return { views = { ["ws:2"] = { border_width = 1 }, ["view:7"] = { border_color_focused = "#010101" } } }"##,
+        );
+        let user = make(
+            LayerKind::User,
+            "init.lua",
+            r#"return { views = { ["*"] = { border_width_idle = 2 }, ["ws:2"] = { border_width = 5 } } }"#,
+        );
+        let a =
+            crate::merge::merge_layers(vec![profile.clone(), user.clone()]).expect("merge order a");
+        let b = crate::merge::merge_layers(vec![user, profile]).expect("merge order b");
+        assert_eq!(a.effective.views, b.effective.views);
+    }
+
+    #[test]
+    fn views_safe_mode_drops_every_entry() {
+        use crate::file::resolve_effective;
+        let src = test_source();
+        let merged = resolve_effective(
+            Some(LayeredPlan::new(
+                src.clone(),
+                parse_lua_config(
+                    r##"return { views = { ["*"] = { border_color_focused = "#FF00FF", background_image = "~/wall/one.png" } } }"##,
+                    &src,
+                )
+                .expect("parse"),
+            )),
+            None,
+        )
+        .expect("merge");
+        assert_eq!(merged.effective.views.len(), 1);
+        let safe = merged.effective.with_safe_decoration();
+        assert!(safe.views.is_empty());
+        assert_eq!(
+            safe.decoration.border_color_focused,
+            Some(crate::types::SAFE_DECORATION_BORDER_FOCUSED)
+        );
     }
 }

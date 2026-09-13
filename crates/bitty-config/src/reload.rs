@@ -21,7 +21,41 @@
 //! a test update.
 
 use crate::error::ConfigError;
-use crate::types::EffectiveConfig;
+use crate::types::{EffectiveConfig, ViewOverride};
+
+/// Compact canonical description of one `views` entry for reload diffs.
+///
+/// Only set fields are listed, in schema order, so an unset field never
+/// appears to change and the before/after strings are stable.
+fn describe_view_override(entry: &ViewOverride) -> String {
+    let o = &entry.overrides;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(color) = o.border_color {
+        parts.push(format!("border_color={}", color.to_hex()));
+    }
+    if let Some(color) = o.border_color_focused {
+        parts.push(format!("border_color_focused={}", color.to_hex()));
+    }
+    if let Some(color) = o.border_color_idle {
+        parts.push(format!("border_color_idle={}", color.to_hex()));
+    }
+    if let Some(width) = o.border_width {
+        parts.push(format!("border_width={width}"));
+    }
+    if let Some(width) = o.border_width_focused {
+        parts.push(format!("border_width_focused={width}"));
+    }
+    if let Some(width) = o.border_width_idle {
+        parts.push(format!("border_width_idle={width}"));
+    }
+    if let Some(image) = &o.background_image {
+        parts.push(format!("background_image={image}"));
+    }
+    if let Some(fit) = o.background_fit {
+        parts.push(format!("background_fit={fit}"));
+    }
+    parts.join(",")
+}
 
 /// Classification for a single field change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,6 +120,12 @@ impl std::fmt::Display for ReloadClass {
 /// | unknown / undeclared      | Rejected           |
 #[must_use]
 pub fn classify_field(field: &str) -> ReloadClass {
+    // RFC-0001/OQ-041 (CTX-0343): value edits and selector match-set changes
+    // in `views.*` are both Live; a selector edit re-resolves the affected
+    // View set without recreating a View or Terminal.
+    if field == "views" || field.starts_with("views[") {
+        return ReloadClass::Live;
+    }
     match field {
         "font.family"
         | "font.size"
@@ -505,6 +545,29 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
     old_pls.sort();
     new_pls.sort();
     push_if_changed("plugins", format!("{old_pls:?}"), format!("{new_pls:?}"));
+
+    // CTX-0343: `views` diffs are keyed by canonical selector so an added,
+    // removed, or edited `*`/content/`ws:`/`view:` entry is detected as one
+    // Live match-set/value change. The merged vectors are already sorted by
+    // tier then canonical selector, so the comparison is order-independent.
+    let mut view_selectors: Vec<String> = old
+        .views
+        .iter()
+        .chain(new.views.iter())
+        .map(|entry| entry.selector.canonical())
+        .collect();
+    view_selectors.sort();
+    view_selectors.dedup();
+    for selector in view_selectors {
+        let describe = |config: &EffectiveConfig| {
+            config
+                .views
+                .iter()
+                .find(|entry| entry.selector.canonical() == selector)
+                .map_or_else(String::new, describe_view_override)
+        };
+        push_if_changed(&format!("views[{selector}]"), describe(old), describe(new));
+    }
 
     let needs_restart = diffs
         .iter()

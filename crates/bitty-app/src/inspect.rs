@@ -14,7 +14,7 @@
 //!   - `command <id>`: registry entry (core or bundled-plugin command) with
 //!     kind, class, required scopes, owner, and summary. Accepts both the dot
 //!     form (`core.terminal.text`) and the colon form
-//!     (`bitty-terminal.palette:toggle`); `:` and `.` compare equivalently.
+//!     (`bitty-terminal.project:open`); `:` and `.` compare equivalently.
 //!   - `key <chord>`: shipped keymap resolution for a chord such as
 //!     `ctrl+shift+m`. Bound chords name the owning action, context, and
 //!     layer; unbound chords succeed with `bound: false` and name the
@@ -290,7 +290,7 @@ fn example_for(target: InspectTarget) -> &'static str {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn inspect_usage() -> String {
-    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text | bitty-terminal.palette:toggle\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.workspace (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics".to_string()
+    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text | bitty-terminal.project:open\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.workspace (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics".to_string()
 }
 
 /// Full help for `bitty inspect --help` (stdout, exit 0).
@@ -303,7 +303,7 @@ pub fn inspect_help_text() -> String {
       Targets (each value incl. missing-value errors; unknown values are NotFound, exit 1):\n  \
         command <id>    Registry entry with kind, class, scopes, owner, summary.\n  \
                         Dot form (core.terminal.text) and colon form\n  \
-                        (bitty-terminal.palette:toggle) compare equivalently.\n  \
+                        (bitty-terminal.project:open) compare equivalently.\n  \
                         Core ids come from the ctl/list registry surface; plugin\n  \
                         commands come from static manifests (no VM loaded).\n  \
                         Workspace commands list both bitty-terminal.workspace:*\n  \
@@ -347,7 +347,7 @@ pub fn inspect_help_text() -> String {
         bitty inspect plugin bitty-terminal.workspace\n  \
         bitty inspect config font.size\n  \
         bitty inspect protocol kitty-graphics\n  \
-        bitty inspect command bitty-terminal.palette:toggle --format json\n"
+        bitty inspect command bitty-terminal.project:open --format json\n"
     .to_string()
 }
 
@@ -359,7 +359,7 @@ pub fn inspect_help_text() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandInfo {
     /// Stable registry id (`core.terminal.text`, `core.list.themes`,
-    /// `bitty-terminal.palette:toggle`).
+    /// `bitty-terminal.project:open`).
     pub id: &'static str,
     /// Entry kind (`command`; all surfaced entries are commands today).
     pub kind: &'static str,

@@ -15,7 +15,7 @@
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, PluginHost,
-    bundled::{palette_manifest, project_manifest, statusline_manifest},
+    bundled::{project_manifest, statusline_manifest},
 };
 use bitty_runtime::{
     Runtime,
@@ -47,6 +47,46 @@ fn granted_set_for(
         }
     }
     set
+}
+
+/// Local fixture mirroring the former bundled `bitty-terminal.palette` manifest.
+///
+/// Palette migrated to an independent first-party package (OQ-053, `bitty`
+/// `CTX-0397`), so this suite now exercises the generic Panel Runtime path
+/// against a plain manifest instead of the bundled catalog.
+fn palette_manifest() -> bitty_plugin_host::PluginManifest {
+    use bitty_plugin_host::{
+        CapabilityRequests, Compat, LazyTriggers, PluginId, PluginIdentity, PluginManifest,
+        QualifiedName,
+    };
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("ui.overlay").expect("known capability"));
+    PluginManifest {
+        identity: PluginIdentity {
+            id: PluginId::new("bitty-terminal.palette").expect("valid id"),
+            name: "Palette".to_string(),
+            version: "0.1.0".to_string(),
+            description:
+                "Command palette and picker UI via overlay slot, declarative primitives only"
+                    .to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(">=0.1,<1.0".to_string()),
+            plugin_api: Some("^1.0".to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        lazy: LazyTriggers {
+            commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
+            events: vec!["focus.changed".to_string()],
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
 }
 
 // --- default disabled --------------------------------------------------------

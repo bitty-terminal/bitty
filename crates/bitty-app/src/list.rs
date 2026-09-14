@@ -1572,7 +1572,7 @@ mod tests {
     #[test]
     fn plugins_lists_bundled_sorted_and_disabled() {
         let plugins = list_plugins();
-        assert_eq!(plugins.len(), 10);
+        assert_eq!(plugins.len(), 9);
         let ids: Vec<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
         let mut sorted = ids.clone();
         sorted.sort();
@@ -1582,6 +1582,8 @@ mod tests {
             assert!(!p.enabled);
         }
         assert!(ids.contains(&"bitty-terminal.workspace"));
+        // Palette migrated to an independent package, so it is not a bundled row.
+        assert!(!ids.contains(&"bitty-terminal.palette"));
         // Deprecated alias is not a separate list row (canonical list only),
         // but still resolves as bundled.
         assert!(!ids.contains(&"bitty-terminal.tabs"));

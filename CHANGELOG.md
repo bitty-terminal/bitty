@@ -132,6 +132,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Palette plugin extracted from the bundled catalog (CTX-0397, OQ-053):**
+  `bitty-terminal.palette` moved to the independent
+  `bitty-terminal/palette` package and is no longer part of the
+  bundled-disabled catalog, so the id can be installed through the external
+  package path. The catalog now stages nine plugins. The Core Panel Runtime
+  overlay helpers and theme bridge in `bitty-runtime::palette` are unchanged;
+  the plugin manifest, commands, and events are identical, and the independent
+  Lua package requests `ui.rich` in addition to `ui.overlay` because the
+  accepted Plugin API v1 overlay path requires it.
+
 - **Selection no longer auto-copies by default (CTX-0371):** `selection.auto_copy`
   now defaults to `false` (was `true`), so a committed mouse selection keeps its
   highlight and no longer overwrites the system clipboard (or the Linux primary

@@ -9,7 +9,7 @@
 //!                                  v                v
 //!                         cold-path queue      GridRenderer -> DrawList -> Surface::present
 //!                                  |                ^
-//!                                  +--> bounded side queue --> PluginHost (draft)
+//!                                  +--> bounded side queue --> PluginHost (accepted contracts)
 //!                                         |   owned EventPipeline + SideQueue<HostObservation>
 //!                                  v
 //!                                   grant checks / DropPolicy DropOldest (accepted v1 default, OQ-013 closed) / interception stubs
@@ -43,19 +43,20 @@
 //! drains every session. [`Runtime::close_pane_session`] tears a leaf's child
 //! down.
 //!
-//! # Plugin-host wiring (CTX-0027) — draft status, experimental review evidence
+//! # Plugin-host wiring (CTX-0027) — accepted contracts, implementation not yet verified
 //!
 //! This module owns a [`bitty_plugin_host::PluginHost`] behind the cold path.
-//! The host tracks the `plugin-platform-rfc.md` contract
-//! (`Proposed` / `draft`, `OQ-011..OQ-013`, `OQ-014`). The wiring is headless-testable
+//! The host tracks two accepted contracts: `plugin-platform-rfc.md`
+//! (`accepted` 2026-08-27, closed `OQ-011`/`OQ-012`/`OQ-013`) and
+//! `isolation-resource-rfc.md` (`accepted` 2026-08-28, closed `OQ-014`)
+//! (bitty-docs open-questions register). The wiring is headless-testable
 //! and introduces no window, GPU, or Lua VM coupling:
 //!
 //! - **Owned host:** `Runtime` owns one `PluginHost` (always present, not feature-gated
-//!   for this draft slice). Construction uses the **accepted v1 default**
+//!   for this slice). Construction uses the **accepted v1 default**
 //!   [`bitty_plugin_host::DropPolicy::DropOldest`] with per-queue `64` and side queue `128`
-//!   (experimental implementation as review evidence per the new RFC lifecycle
-//!   `Draft -> experimental review evidence -> Accepted -> normative`;
-//!   `plugin-platform-rfc.md` remains `Proposed` until independent review).
+//!   per the accepted Plugin Platform RFC (2026-08-27, frontmatter `status: accepted`;
+//!   bitty-docs open-questions register).
 //!   This choice **closes `OQ-013` § “Delivery, ordering, batching, and coalescing”**
 //!   (point 3) as the accepted v1 default. Callers that
 //!   need `DropNewest` must construct via [`Runtime::with_plugin_host`] / [`Runtime::with_plugin_drop_policy`]
@@ -193,19 +194,19 @@ use self::workspaces::{PendingWsClose, WorkspaceSlot};
 ///   in `bitty-render`). This crate does not yet expose an `attach_gpu`
 ///   API; callers must not describe it as implemented.
 ///
-/// Accepted v1 defaults for the plugin-host wiring (experimental review evidence).
+/// Accepted v1 defaults for the plugin-host wiring per the accepted contracts.
 /// These satisfy bounded-queue invariants and are headless-testable; pipeline
-/// `64` / side `128` and batch `32`/`8 KiB` remain the OQ-014 candidate values
-/// used as the v1 baseline, while the drop policy is OQ-013 closed.
+/// `64` / side `128` and batch `32`/`8 KiB` are the accepted OQ-014 baseline
+/// per the accepted Isolation Resource RFC (closed OQ-014 on 2026-08-28;
+/// bitty-docs open-questions register), while the drop policy is OQ-013 closed
+/// per the accepted Plugin Platform RFC.
 pub const DEFAULT_PLUGIN_PIPELINE_CAPACITY: usize = bitty_plugin_host::DEFAULT_QUEUE_CAPACITY;
 /// Side queue capacity for [`HostObservation`] (ADR-0003 rule 4).
 pub const DEFAULT_PLUGIN_SIDE_CAPACITY: usize = 128;
 /// Accepted v1 default drop policy — `DropOldest` (OQ-013 closed decision point).
 ///
-/// Experimental implementation as review evidence per the new RFC lifecycle
-/// (`Draft -> experimental review evidence -> Accepted -> normative`);
-/// `plugin-platform-rfc.md` remains `Proposed`/`draft` until independent
-/// review (category owner + docs curator + security reviewer).
+/// Per the accepted Plugin Platform RFC (2026-08-27, frontmatter `status: accepted`;
+/// bitty-docs open-questions register).
 pub const DEFAULT_PLUGIN_DROP_POLICY: DropPolicy = DropPolicy::DropOldest;
 
 /// Bounded pending input buffer (keyboard bytes awaiting PTY write or
@@ -653,9 +654,8 @@ impl Runtime {
     /// cols/rows with focus on that leaf and a container matching the grid.
     /// The owned [`PluginHost`] is created with the **accepted v1 default**
     /// [`DEFAULT_PLUGIN_DROP_POLICY`] (`DropOldest`, OQ-013 closed decision
-    /// point; experimental implementation as review evidence per the new RFC
-    /// lifecycle `Draft -> experimental review evidence -> Accepted -> normative`;
-    /// `plugin-platform-rfc.md` remains `Proposed` until independent review),
+    /// point per the accepted Plugin Platform RFC 2026-08-27, frontmatter
+    /// `status: accepted`; bitty-docs open-questions register),
     /// pipeline capacity [`DEFAULT_PLUGIN_PIPELINE_CAPACITY`] (64) and side
     /// capacity [`DEFAULT_PLUGIN_SIDE_CAPACITY`] (128). `DropNewest` remains
     /// available via explicit opt-in through
@@ -673,11 +673,9 @@ impl Runtime {
     /// Creates a runtime with an explicit [`DropPolicy`] for the plugin host.
     ///
     /// The caller chooses the queue-overflow policy explicitly. `DropOldest`
-    /// is the accepted v1 default (OQ-013 closed decision point; experimental
-    /// implementation as review evidence per the new RFC lifecycle
-    /// `Draft -> experimental review evidence -> Accepted -> normative` and
-    /// RFC § “Delivery, ordering, batching, and coalescing” point 3;
-    /// `plugin-platform-rfc.md` remains `Proposed` until independent review).
+    /// is the accepted v1 default (OQ-013 closed decision point per the accepted Plugin Platform RFC
+    /// 2026-08-27 and RFC § “Delivery, ordering, batching, and coalescing” point 3;
+    /// frontmatter `status: accepted`; bitty-docs open-questions register).
     /// `DropNewest` is available via explicit opt-in; this constructor makes
     /// the choice visible at the call site.
     pub fn with_plugin_drop_policy(

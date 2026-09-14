@@ -1,17 +1,16 @@
-//! `bitty-plugin-host`: draft plugin-platform host for Bitty.
+//! `bitty-plugin-host`: accepted plugin-platform host for Bitty.
 //!
-//! # Draft status — not normative
+//! # Status — accepted contracts, implementation not yet verified
 //!
-//! This crate implements the **proposed** contracts from
+//! This crate implements the accepted contracts from
 //! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-platform-rfc.md`.
-//! That RFC is still `Proposed` (frontmatter `draft`) and closes
-//! `OQ-011`, `OQ-012`, and `OQ-013` only if it is adopted after independent
+//! That RFC is `accepted` (frontmatter `status: accepted` 2026-08-27) and closed
+//! `OQ-011`, `OQ-012`, and `OQ-013` (bitty-docs open-questions register) per independent
 //! review by the category owner, a docs curator, and a security reviewer.
-//! Nothing here claims normative behavior, stable file formats, frozen
-//! capability identifiers, or a settled event-pipeline policy. The crate is
-//! intentionally `draft` / `proposed` and its contract **may change** without
-//! a semver major bump until the RFC is accepted. Do not describe its
-//! behavior as shipped until an ADR records acceptance and a release ships it.
+//! Nothing here claims normative behavior beyond the accepted contract, stable file formats, frozen
+//! capability identifiers, or a settled event-pipeline policy beyond what the RFC accepts. The implementation
+//! is `Implemented`, not yet `Verified`, and carries no compatibility promise beyond the accepted contract.
+//! Do not describe its behavior as shipped until a release ships it.
 //!
 //! The RFC's Lua runtime dependency (`lua-runtime-rfc`, `OQ-009`) is also still
 //! proposed, so this crate is **pure data + validation** on the host side: it
@@ -46,7 +45,8 @@
 //!   update pending diff approval, narrowed sets carry forward silently.
 //! - The event pipeline keeps one bounded FIFO queue per `(plugin, event-type)`,
 //!   supports coalescing where semantics allow, bounds batch size/time, and
-//!   treats overflow via the single shared open decision point.
+//!   treats overflow via the single shared policy (`DropOldest` accepted v1
+//!   default, OQ-013 closed).
 //! - The side queue that observes terminal events is strictly bounded and never
 //!   blocks the producer (ADR-0003 rule 4, threat `T-01`).
 //!
@@ -61,22 +61,20 @@
 //! | Plugin API v1 surface (OQ-011) — commands, services, settings | `registry` | [`registry::Registry`] qualified names (`plugin-id:resource`), duplicate rejection at graph construction, service interface syntax, lazy triggers |
 //! | Lifecycle and generations | `registry`, `host` | [`registry::PluginState`] `Declared->Resolved->Registered->Activated->(Suspended)->Disposed`, [`registry::Generation`] monotonic, generation disposal completeness, safe-mode skip |
 //! | Event pipeline — classes and phases (OQ-013) | `event` | [`event::EventClass`] Lifecycle/Observation/Interception, [`event::EventKind`] v1 closed set (4 interception points exactly) |
-//! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` proposed), [`event::DropPolicy`] open decision point |
+//! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` accepted v1 baseline), [`event::DropPolicy`] `DropOldest` accepted default |
 //! | Timeouts and failure policy | `event` | [`event::InterceptionDecision`] veto-wins, fail-open, [`event::should_proceed`], reentrancy rejected, interception not queued (cold-path synchronous) |
 //! | Plugin host (ADRs) | `host` | [`host::PluginHost`] owns registry + grant store + event pipeline + [`host::SideQueue`] bounded side queue; no window/GPU/PTY coupling; headless testable |
 //! | Package install verification (proposed, draft) | `install` | [`install::verify_install`] calls `bitty_package::verify_pipeline` (7 stages) before staging; `V-A`/`V-B`/`V-C` trust, capability-diff `P0-AC-030`, generation integrity `verify_all`; fail-closed owned errors + [`install::DoctorIssue`] for `bitty plugin doctor`; headless tamper/capability tests |
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
-//! | Open points remaining under OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropPolicy` open point documented; exact queue depths/timeouts remain `OQ-014` candidates |
+//! | Verification remaining under closed OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropOldest` accepted v1 default; exact queue depths/timeouts per accepted `OQ-014` budgets; remaining work is implementation verification, not open RFC points |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!
-//! Queue overflow when a queue is full was a single shared **open decision
-//! point** owned by `OQ-013` and the RFC section “Delivery, ordering, batching,
+//! Queue overflow when a queue is full was a single shared decision
+//! point owned by `OQ-013` and the RFC section “Delivery, ordering, batching,
 //! and coalescing” (point 3). That point is **closed for v1: `DropOldest` is
-//! the accepted default** (experimental implementation as review evidence per
-//! the new RFC lifecycle `Draft -> experimental review evidence -> Accepted ->
-//! normative`; `plugin-platform-rfc.md` remains `Proposed`/`draft` until
-//! independent review by category owner + docs curator + security reviewer).
+//! the accepted default** per the accepted Plugin Platform RFC (2026-08-27,
+//! frontmatter `status: accepted`; bitty-docs open-questions register).
 //! `DropNewest` remains available via explicit construction
 //! ([`event::DropPolicy::DropNewest`]) but is not the v1 default:
 //!
@@ -87,12 +85,12 @@
 //!
 //! This crate exposes both via [`event::DropPolicy`]; `DropOldest` is the
 //! accepted v1 default used by [`event::DEFAULT_QUEUE_CAPACITY`] /
-//! `DEFAULT_PLUGIN_DROP_POLICY` and `bitty-runtime::Runtime::new` (experimental
-//! review evidence; RFC remains `Proposed` until acceptance). Numeric queue
-//! depths and timeout milliseconds are `OQ-014` (proposed defaults in this
-//! crate are `64` per-queue, `32`/`8 KiB` per batch as candidate values, not
-//! normative until `OQ-014` is accepted). See
-//! `plugin-platform-rfc.md` § “Delivery, ordering, batching, and coalescing”
+//! `DEFAULT_PLUGIN_DROP_POLICY` and `bitty-runtime::Runtime::new` per the accepted
+//! Plugin Platform RFC (2026-08-27; bitty-docs open-questions register). Numeric queue
+//! depths and timeout milliseconds follow `OQ-014` closed by the accepted Isolation Resource RFC
+//! on 2026-08-28 (frontmatter `status: accepted`); this crate uses `64`
+//! per-queue, `32`/`8 KiB` per batch as the accepted v1 baseline. See
+//! the accepted `plugin-platform-rfc.md` § “Delivery, ordering, batching, and coalescing”
 //! for the authoritative trade-off statement.
 //!
 //! # Ownership rules (ADR-0003 / ADR-0004)

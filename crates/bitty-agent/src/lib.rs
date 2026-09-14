@@ -1,32 +1,36 @@
-//! `bitty-agent`: draft Agent core for Bitty.
+//! `bitty-agent`: generic Agent protocol and bounded message vocabulary for Bitty.
 //!
-//! # Draft status — not normative
+//! # Status — accepted contract, implementation not yet verified
 //!
-//! This crate implements the **proposed** Agent phase at the tail of the
+//! This crate implements the generic Agent protocol at the tail of the
 //! build-order spine (`PTY -> VT -> Grid -> Font -> GPU -> Correct Terminal`
 //! `-> Config -> Command/Event -> Plugin Runtime -> Plugin Manager ->`
 //! `DevTools -> Rich Presentation -> IPC -> Agent`) recorded in
-//! `docs/product/proposed-delivery-sequence.md`. That spine is
-//! itself **draft research**, not accepted direction; this crate is
-//! intentionally `draft` / `proposed` and its contract **may change** without
-//! a semver major bump until a normative Agent spec is accepted. Do not
-//! describe its behavior as shipped until an ADR or RFC records acceptance
-//! and a release ships it.
+//! `docs/product/proposed-delivery-sequence.md`. The Agent contract is
+//! **accepted**: the IPC and Agent RFC closed `OQ-018` on 2026-08-29 and the
+//! DevTools RFC closed `OQ-019` on 2026-08-28 (see the bitty-docs
+//! open-questions register). This crate owns the generic, host-neutral side
+//! of that contract — identity, bounded messages, observations, bounded
+//! coordination — while wire framing, transport, auth, scopes, and rate
+//! limits live in `bitty-ipc`. The implementation here is `Implemented`, not
+//! yet `Verified`; do not describe its behavior as shipped until a release
+//! ships it.
 //!
-//! No normative Agent spec exists yet. `OQ-018` (*How are local instances
-//! selected, authenticated, authorized, rate-limited, and exposed to IPC/MCP
-//! clients?*) and `OQ-019` (*When do DevTools, record/replay, debug protocol,
-//! and MCP adapter enter the roadmap?*) remain **open**. The IPC/MCP wire
-//! protocol RFC with security review that closes `OQ-018` has not landed, and
-//! the Agent integration RFC has not landed either. This crate therefore owns
-//! only the small, headless-testable surface that can be specified without
-//! closing those questions: an owned `AgentId`, bounded `AgentMessage`s, stub
-//! tool calls with **no LLM I/O**, and the bounded observation side queue
-//! required by `ADR-0003` rule 4. Every other Agent behavior (model selection,
-//! auth, consent, streaming, real tool dispatch, compaction, MCP transport) is
-//! **deferred and documented honestly** below.
+//! `OQ-018` (*How are local instances selected, authenticated, authorized,
+//! rate-limited, and exposed to IPC/MCP clients?*) is **closed** by the
+//! accepted IPC and Agent RFC (2026-08-29: instance selection, transport and
+//! framing, wire and auth, scope families, rate limits `RC-9`/`RC-10`, Agent
+//! bounded messages, consent, streaming). `OQ-019` (*When do DevTools,
+//! record/replay, debug protocol, and MCP adapter enter the roadmap?*) is
+//! **closed** by the accepted DevTools RFC (2026-08-28). This crate therefore
+//! owns the small, headless-testable vocabulary beneath those RFCs: an owned
+//! `AgentId`, bounded `AgentMessage`s, stub tool calls with **no LLM I/O**,
+//! and the bounded observation side queue required by `ADR-0003` rule 4.
+//! Model selection, auth, consent, streaming, real tool dispatch, compaction,
+//! and MCP transport live outside this crate (see the boundary sections
+//! below) and are **documented honestly** there.
 //!
-//! The security invariants that govern the future RFC are already normative
+//! The security invariants that govern the accepted RFC are already normative
 //! in the [bitty-docs security corpus](https://github.com/bitty-terminal/bitty-docs/tree/main/docs/security)
 //! (`overview.md`, `threat-model.md`, and `p0-acceptance-criteria.md`;
 //! invariants 5/6, trust boundary table,
@@ -35,7 +39,7 @@
 //! *untrusted-observation labeling*, or *per-client consent*. See the
 //! *Security alignment* section.
 //!
-//! # What this crate owns (draft, headless)
+//! # What this crate owns (generic protocol, headless)
 //!
 //! - **Identity:** [`AgentId`] — owner-qualified `owner.name` (bounded,
 //!   `MAX_AGENT_ID_LEN = 128`, segment grammar `^[a-z][a-z0-9_-]*$`).
@@ -73,30 +77,48 @@
 //!   terminal state elsewhere.
 //! - **No real tool execution.** Capability-checked dispatch, rate limits,
 //!   per-client scopes, consent prompts, and audit belong to the runtime/IPC
-//!   host (future `OQ-018` RFC) and are not implemented here.
+//!   host (accepted `OQ-018` RFC, wire side implemented in `bitty-ipc`) and
+//!   are not implemented here.
 //! - **No transport.** The `bitty-ipc` crate owns the IPC/MCP wire (bounded
-//!   `256 KiB` framing, request timeouts, stdio transport stub per `OQ-018`).
+//!   `256 KiB` framing, request timeouts, stdio transport stub per the
+//!   accepted IPC and Agent RFC that closed `OQ-018` on 2026-08-29).
 //!   This crate intentionally has **no path dependency** on `bitty-ipc` today
-//!   so the two parallel draft crates (`CTX-0031` and `CTX-0032`) can land
-//!   without a hard DAG cycle during the docs-first phase. When both land, a
-//!   thin adapter (`bitty-agent` message vocabulary `->` `bitty_ipc::Frame`)
-//!   will be added without redefining caps. Until then the transport seam is
+//!   so the two parallel crates (`CTX-0031` and `CTX-0032`) can evolve
+//!   without a hard DAG cycle. When the adapter slice lands, a thin adapter
+//!   (`bitty-agent` message vocabulary `->` `bitty_ipc::Frame`) will be added
+//!   without redefining caps. Until then the transport seam is
 //!   a documented seam, not a hidden coupling.
 //! - **No persistence, no auth, no daemon.** Selection, authentication,
-//!   authorization, and rate-limiting of local instances (`OQ-018`) and the
-//!   headless `bittyd` decision (`OQ-020`) are not modeled here.
+//!   authorization, and rate-limiting of local instances (accepted `OQ-018`
+//!   contract, enforced by `bitty-ipc`) and the headless `bittyd` decision
+//!   (`OQ-020`, accepted via ADR-0008, post-v1.0) are not modeled here.
 //! - **No prompt injection handling beyond labeling.** `AgentObservation::
 //!   TerminalOutput` is flagged `is_untrusted_surface = true`, but the actual
 //!   confused-deputy guard (`R-013`) must be enforced by the host policy that
 //!   mediates tool dispatch, not by string sniffing inside this crate.
 //!
-//! # Pipeline (candidate, not normative)
+//! # Boundary with `bitty-ai` (generic protocol here, intelligence there)
+//!
+//! `bitty-agent` is the generic, host-neutral Agent protocol: identity,
+//! bounded messages, observations, and bounded coordination. It performs
+//! **no** LLM I/O, **no** tool execution, **no** network I/O, **no** provider
+//! registry, **no** context assembly, and **no** compaction. Provider
+//! management (`ai.model` registry, model selection, credentials), context
+//! providers (workspace/project/git/diagnostics/terminal assembly and
+//! budgets), LLM invocation and streaming, and conversation compaction all
+//! belong to the independent `bitty-ai` sub-platform, which builds on these
+//! generic primitives (candidate AI Architecture direction; Core keeps this
+//! protocol skeleton neutral so non-AI harnesses pay no AI weight). Nothing
+//! in this crate imports, spawns, or shells out to a model, a network peer,
+//! or a provider plugin.
+//!
+//! # Pipeline (accepted contract, implementation not yet verified)
 //!
 //! ```text
 //! Terminal/RUNTIME state --commit--> AgentObservation --SideQueue--> AgentSession
 //!                                                            |              |
 //! User turn --AgentMessage--> Session history  <--ToolResult--'    ToolCall --stub--> (host capability gate -> real tool, deferred)
-//!          `-> future bitty-ipc frame (256 KiB, OQ-018, not yet implemented)`
+//!          `-> bitty-ipc frame (256 KiB, accepted OQ-018 contract)`
 //! ```
 //!
 //! - Hot path (`PTY -> VT -> State -> Damage -> Render`) never touches this
@@ -189,19 +211,22 @@
 //!
 //! # Drift and honesty statement
 //!
-//! No dedicated accepted Agent-core RFC exists in the docs corpus at the
-//! time of this draft. The only canonical Agent-adjacent sources are the
-//! draft spine in `proposed-delivery-sequence.md`, the candidate boundaries in
-//! `architecture/overview.md` and `core-boundaries.md`, and the open
-//! questions `OQ-018`/`OQ-019` plus the security corpus. This crate does not
-//! copy unstated fields as normative API; it interprets already-accepted
+//! The Agent contract is accepted: the IPC and Agent RFC closed `OQ-018` on
+//! 2026-08-29 (Agent bounded messages, consent, streaming) and the DevTools
+//! RFC closed `OQ-019` on 2026-08-28. The other canonical sources are the
+//! spine in `proposed-delivery-sequence.md`, the boundaries in
+//! `architecture/overview.md` and `core-boundaries.md` (AI and Agent
+//! experiences primarily in plugins), and the security corpus. This crate
+//! does not copy unstated fields as normative API; it implements the generic,
+//! host-neutral side of the accepted contract — identity, bounded messages,
+//! observations, bounded coordination — reusing the already-accepted
 //! bounded-queue and read-only-default patterns (ADR-0003 rule 4,
-//! `bitty-plugin-host::SideQueue`, `bitty-runtime::ColdQueue`) and exposes
-//! the smallest vocabulary that remains useful when a future Agent RFC lands.
-//! Its eventual placement and the exact wire framing (the `256 KiB` IPC cap
-//! lives in `bitty-ipc`, not here) will be decided when `OQ-018` is accepted.
-//! `ADR-0003` does not list `bitty-agent` in its crate graph — this crate is
-//! proposed as a **draft sibling** to `bitty-ipc` at the spine tail.
+//! `bitty-plugin-host::SideQueue`, `bitty-runtime::ColdQueue`). Wire framing,
+//! transport, auth, scopes, and rate limits live in `bitty-ipc` (the `256 KiB`
+//! IPC cap is defined there, not here); Provider, Context, LLM invocation,
+//! and compaction live in `bitty-ai`. `ADR-0003` lists `bitty-agent` as the
+//! Agent core (`Accepted` / `Implemented`, not yet `Verified`); this crate's
+//! implementation is likewise `Implemented`, not yet `Verified`.
 
 #![forbid(unsafe_code)]
 

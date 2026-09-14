@@ -377,11 +377,8 @@ pub fn file_manager_manifest() -> PluginManifest {
 
 /// `bitty-terminal.git-panel` — tiled `Panel(PanelId)` git panel.
 ///
-/// Layer 2 `[tools.git]` contract: accepted (CTX-0425, gating CTX-0400).
-/// Canonical record lives in `crates/bitty-runtime/src/git_panel.rs`
-/// ("Layer 2 `[tools.git]` contract — accepted"); the Plugin Reuse and
-/// Provider Ecology RFC itself stays draft and only the `[tools.git]`
-/// slice is accepted.
+/// Implements `[tools.git]` v1. Canonical contract:
+/// <https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-reuse-and-providers.md#accepted-toolsgit-contract-v1>
 ///
 /// Capability: `panel.provider` + `panel.create` for Panel Runtime plus
 /// `process.spawn:git` allowlisted `[tools.git]` bounded `8 KiB`/`32` and

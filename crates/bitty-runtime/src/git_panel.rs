@@ -42,108 +42,14 @@
 //! `required=false` to `required=true` is a capability increase whose grant
 //! must be re-confirmed.
 //!
-//! # Layer 2 `[tools.git]` contract — accepted (CTX-0425)
+//! Implements `[tools.git]` v1. Canonical contract:
+//! <https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-reuse-and-providers.md#accepted-toolsgit-contract-v1>
 //!
-//! Acceptance record for the git-panel gate of CTX-0400. The Plugin Reuse
-//! and Provider Ecology RFC itself stays draft (post-1.0) in
-//! `bitty-plugins-docs`; only the `[tools.git]` slice below is accepted,
-//! so an independent git-panel can declare `[tools.git]` and spawn only
-//! the allowlisted `git` binary with bounded output.
-//!
-//! - RFC: Plugin Reuse and Provider Ecology, Layer 2 System CLI
-//!   (<https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-reuse-and-providers.md>);
-//!   the `process.spawn:CONSTRAINT` grammar is owned by the accepted Plugin
-//!   Platform RFC.
-//! - Open questions: OQ-013 accepted (Plugin Platform RFC); OQ-053
-//!   accepted and closed (Bundled-Plugin Split Decision, 2026-09-14;
-//!   git-panel splits later behind this contract).
-//! - Tasks: CTX-0425 (this record) gates CTX-0400 (git-panel split);
-//!   GitHub issue `bitty-terminal/bitty#687`.
-//!
-//! ## Accepted `[tools.git]` declaration (versioned)
-//!
-//! ```toml
-//! [tools.git]
-//! required = true
-//! version = ">=2.30"
-//! ```
-//!
-//! The values pin the RFC Layer 2 sketch for git-panel: `git` must be
-//! present and satisfy the version constraint, otherwise activation fails
-//! closed with a diagnostic. The entry is static, validated before VM
-//! creation, included in the manifest hash for grant binding, and raising
-//! `required` from `false` to `true` is a capability increase whose grant
-//! must be re-confirmed. Manifest-side evidence in this repository is the
-//! declared `process.spawn:git` capability in `git_panel_manifest`
-//! (`crates/bitty-plugin-host/src/bundled.rs`); a general `[tools.*]`
-//! manifest-table validator in `bitty-package` is future work under
-//! CTX-0400, not part of this acceptance.
-//!
-//! ## Accepted `process.spawn:git` allowlist
-//!
-//! - Capability string is exactly `process.spawn:git`
-//!   (`GIT_PANEL_PROCESS_SPAWN_GIT`): closed `process.spawn` family plus
-//!   the `:git` parameter. Any other executable is denied; the check is
-//!   `GitIntegration::is_process_spawn_git_allowed` with no I/O.
-//! - Spawn goes through the host-provided surface only, never through
-//!   `os.execute`, `io.popen`, or a Lua-loaded native module (denied by
-//!   the Lua Runtime restricted library). Outputs are piped to panel UI,
-//!   never raw PTY injection.
-//! - Read-only verbs only (`GIT_ALLOWED_SUBCOMMANDS`): `status`, `diff`,
-//!   `log`, `branch`, `show`, `rev-parse`, `ls-files`. Write verbs
-//!   (`commit`, `push`, `reset`, mutating `checkout`, etc.) are absent;
-//!   staging or commit UX needs explicit user action plus a broader grant.
-//! - `GitIntegration::is_allowed_git_args` fails closed on: empty args,
-//!   more than `GIT_PANEL_MAX_GIT_ARGS` (`32`) args, any arg longer than
-//!   `GIT_PANEL_MAX_GIT_ARG_BYTES` (`256`), total args over
-//!   `GIT_PANEL_MAX_GIT_TOTAL_BYTES` (`8 KiB`), null/control characters,
-//!   shell metacharacters (`; & | \` $ ( ) < > \ " '`), a non-allowlisted
-//!   first-arg subcommand, or risky flags (`--upload-pack`,
-//!   `--receive-pack`, `--exec` and their `=` forms).
-//!
-//! ## Accepted bounded-output rules
-//!
-//! - Panel observation payloads are bounded by `GIT_PANEL_PAYLOAD_MAX_BYTES`
-//!   (`8 KiB`, bus admission boundary PR-5); listings truncate
-//!   deterministically after sorting and dedup.
-//! - `GIT_PANEL_MAX_ENTRIES` (`128`) status entries, `GIT_PANEL_MAX_COMMITS`
-//!   (`64`) commits, `GIT_PANEL_MAX_BRANCHES` (`32`) branches,
-//!   `GIT_PANEL_MAX_SELECTION` (`64`) selected items.
-//! - `GIT_PANEL_MAX_NAME_CHARS` (`128`, overlay text bound) per
-//!   branch/file name, `GIT_PANEL_MAX_COMMIT_MESSAGE_CHARS` (`256`,
-//!   overlay tooltip bound) per commit message, `GIT_PANEL_MAX_PATH_BYTES`
-//!   (`4096`) per path.
-//! - Queues `64`/`1024`/`2 MiB`/`8192` with `DropOldest` and counted
-//!   per-queue attribution (PR-1..PR-12); child processes count toward the
-//!   requesting generation (RC-1/RC-2 attribution);
-//!   `is_untrusted_surface = true` for reflected terminal bytes.
-//!
-//! ## Verification plan
-//!
-//! - `crates/bitty-runtime/tests/git_panel.rs`:
-//!   `git_panel_via_public_plugin_host_path` (granted set carries
-//!   `process.spawn:git`), `git_panel_fs_isolation_via_capability_id_and_helper_and_git_allowlist`
-//!   (allowlist admits `git` verbs and denies `rg`/bare `process.spawn`,
-//!   manifest hash deterministic with `panel.*` plus `process.spawn:git`),
-//!   `git_panel_helpers_pure_bounded_and_tiled_deterministic` (listing and
-//!   truncation bounds), `git_panel_subscribe_publish_drain_bounded_drop_oldest`
-//!   and `runtime_side_queue_drop_oldest_for_observations` (bounded
-//!   `DropOldest`), `git_panel_via_panel_runtime_public_path_bounded`
-//!   (Panel Runtime path stays bounded),
-//!   `safe_mode_rejects_git_panel_without_panic` (safe-mode startup),
-//!   `git_panel_has_no_private_channel_parity_with_third_party` (no
-//!   first-party bypass), `git_panel_is_headless_and_forbid_unsafe_single_process_winit`,
-//!   `git_panel_command_registry_bounded_and_overlay_focus_mru`,
-//!   `git_panel_reactive_via_eventbus_no_hot_path`,
-//!   `git_panel_tiled_reuses_layout_hv_deterministically`.
-//! - `crates/bitty-runtime/tests/bundled_dogfood_runtime.rs` and
-//!   `crates/bitty-plugin-host/tests/bundled_dogfood.rs` (git-panel
-//!   dogfoods the public plugin API surface with manifest, capability,
-//!   and lifecycle checks).
-//! - Gates: `just check` (fmt, clippy `-D warnings`, tests, scratch-paths,
-//!   pty-gate, actionlint, markdownlint) plus `cargo test --workspace
-//!   --all-targets --locked`, the Windows `cargo check`, and an `act -n`
-//!   workflow dry-run.
+//! Implementation evidence: `GIT_ALLOWED_SUBCOMMANDS`, `GIT_PANEL_MAX_*`,
+//! `GIT_PANEL_PROCESS_SPAWN_GIT`, `GitIntegration::is_allowed_git_args` and
+//! `is_process_spawn_git_allowed` below; manifest in
+//! `crates/bitty-plugin-host/src/bundled.rs` (`git_panel_manifest`); tests in
+//! `crates/bitty-runtime/tests/git_panel.rs`.
 
 use bitty_ui::{
     LayoutNode, SplitAxis, View, ViewId,

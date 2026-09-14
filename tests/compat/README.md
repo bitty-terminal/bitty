@@ -6,7 +6,7 @@ Headless, bounded, `forbid(unsafe)` compatibility scaffolding for M1 Hardening P
 
 ## Scope
 
-Lab root for `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui}/`. Each category holds placeholder corpora (`corpus/*.bin`, `*.txt`) and a `README.md` describing capture method, bounds, and differential harness. No window, no GPU, no network — `Parser -> TerminalAction -> State` only.
+Lab root for `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui,scrollback,graphics}/`. Each category holds placeholder corpora (`corpus/*.bin`, `*.txt`) and a `README.md` describing capture method, bounds, and differential harness. No window, no GPU, no network — `Parser -> TerminalAction -> State` only.
 
 ## Invariants
 
@@ -45,6 +45,8 @@ tests/compat/
   unicode/corpus/* + README.md       # width, wcwidth, emoji ZWJ, combining
   shell/corpus/* + README.md         # OSC 133 prompt marks, shell integration
   tui/corpus/* + README.md           # nvim/tmux/htop/fzf traces
+  scrollback/corpus/* + README.md    # scrollback retention, 1049h/1049l restore
+  graphics/corpus/* + README.md      # kitty APC G single/chunked admission
 ```
 
 ## No window/GPU leak

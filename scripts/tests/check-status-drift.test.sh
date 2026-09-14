@@ -34,7 +34,7 @@ for tag in \
 	'status-drift[crate-count]' \
 	'status-drift[submodule]' \
 	'status-drift[rfc-status]'; do
-	if ! rg -qF "$tag" <<<"$violations_out"; then
+	if ! grep -qF -e "$tag" <<<"$violations_out"; then
 		echo "FAIL: violations fixture did not trip $tag:" >&2
 		printf '%s\n' "$violations_out" >&2
 		FAIL=1

@@ -59,7 +59,9 @@ just status-drift-test
 ```
 
 Timing is under 60 seconds (about 13 seconds on the reference host).
-Deterministic: `rg` scans only, no network, fixed rule order.
+Deterministic: `git ls-files` + `grep`/`sed` scans only, no network,
+fixed rule order. There is deliberately no `rg` (ripgrep) dependency:
+`rg` is absent from `ubuntu-latest` runners.
 
 ## Escape hatch
 

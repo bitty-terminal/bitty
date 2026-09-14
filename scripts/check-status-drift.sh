@@ -74,11 +74,18 @@
 # Scope (fast, deterministic, no network):
 #   - Only tracked text: `*.rs`, `*.md` (+ `Cargo.toml`, `.gitmodules`,
 #     `CONTRIBUTING.md`, `README.md`, `AGENTS.md` where stated).
+#     Enumerated with `git ls-files -z` (tracked plus untracked-but-not-
+#     ignored, mirroring the old `rg --files` set).
 #   - Excluded: `target/**`, `.git/**`, `.worktrees/**`, `docs/**` (external
 #     submodule owned by bitty-terminal-docs), `*.bin`,
 #     `scripts/tests/fixtures/**`, this script itself.
 #   - `docs/` is excluded so the gate behaves identically with and without
 #     `git submodule update --init` (mirrors the scratch-path gate).
+#   - Tooling is limited to `git`, `grep`, `sed`, `sort`, `tr`, `find`:
+#     all present in a git checkout on `ubuntu-latest`. There is
+#     deliberately no `rg` (ripgrep) dependency — `rg` is absent from
+#     `ubuntu-latest` runners, where the first unguarded `rg` invocation
+#     killed this gate with a silent exit 127 under `set -euo pipefail`.
 #
 # Escape hatch (auditable, grep-able, mirrors pty-gate/scratch-paths):
 #   - `// status-drift-exempt: <reason>` (or `# ...` in shell/docs) on the
@@ -122,31 +129,73 @@ FAIL=0
 
 is_exempt() {
 	local file="$1" lineno="$2"
-	if sed -n "${lineno}p" "$file" 2>/dev/null | rg -q 'status-drift-exempt:'; then
+	if sed -n "${lineno}p" "$file" 2>/dev/null | grep -qF 'status-drift-exempt:'; then
 		return 0
 	fi
 	if ((lineno > 1)); then
 		local from=$((lineno > 3 ? lineno - 3 : 1))
-		if sed -n "${from},$((lineno - 1))p" "$file" 2>/dev/null | rg -q 'status-drift-exempt:'; then
+		if sed -n "${from},$((lineno - 1))p" "$file" 2>/dev/null | grep -qF 'status-drift-exempt:'; then
 			return 0
 		fi
 	fi
 	return 1
 }
 
+# Portable file enumeration (no `rg --files`): print NUL-separated scan
+# paths, one per file, relative to the scan root (leading `./` stripped,
+# as the old code already tolerated via `${file#./}`).
+#   $1 = rs_md (Rules 1: `*.rs` + `*.md`) or rs (Rule 4: `*.rs` only).
+# `git ls-files --cached --others --exclude-standard` reproduces the old
+# `rg --files` set (tracked plus untracked-but-not-ignored, `.gitignore`
+# respected; the repo carries no `.ignore`/`.rgignore` that could skew
+# `rg`). Globs below mirror the old `-g` filters. Outside a git work tree
+# (e.g. `--root` pointing at an extracted copy) fall back to `find`.
+# Always succeeds (prints nothing on enumeration failure) so callers under
+# `set -euo pipefail` stay safe.
+list_scan_files() {
+	local mode="$1" f clean
+	local -a cands=()
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		mapfile -d '' cands < <(git ls-files -z --cached --others --exclude-standard -- . 2>/dev/null || true)
+	else
+		mapfile -d '' cands < <(find . -type f -print0 2>/dev/null || true)
+	fi
+	for f in "${cands[@]}"; do
+		[[ -n "$f" ]] || continue
+		clean="${f#./}"
+		case "$mode" in
+		rs_md)
+			case "$clean" in
+			*.rs | *.md) ;;
+			*) continue ;;
+			esac
+			;;
+		rs)
+			case "$clean" in
+			*.rs) ;;
+			*) continue ;;
+			esac
+			;;
+		*)
+			echo "list_scan_files: unknown mode '$mode'" >&2
+			return 0
+			;;
+		esac
+		case "$clean" in
+		target/* | .git | .git/* | .worktrees/* | docs | docs/* | *.bin | scripts/tests/fixtures/* | scripts/check-status-drift.sh)
+			continue
+			;;
+		esac
+		printf '%s\0' "$clean"
+	done
+	return 0
+}
+
 # --- Rule 1: OQ status claims ---
 OQS=(OQ-008 OQ-011 OQ-012 OQ-013 OQ-014 OQ-018 OQ-053)
 STALE_RE='remains?[^[:alnum:]]*open|unresolved|has not landed|have not landed|not landed|not yet implemented|will be decided when|future'
 
-mapfile -d '' RULE1_FILES < <(
-	rg --files -0 --hidden \
-		-g '*.rs' -g '*.md' \
-		-g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' \
-		-g '!docs/**' -g '!*.bin' \
-		-g '!scripts/tests/fixtures/**' \
-		-g '!scripts/check-status-drift.sh' \
-		. 2>/dev/null || true
-)
+mapfile -d '' RULE1_FILES < <(list_scan_files rs_md || true)
 
 for oq in "${OQS[@]}"; do
 	for file in "${RULE1_FILES[@]}"; do
@@ -160,7 +209,7 @@ for oq in "${OQS[@]}"; do
 			# `remain open` three lines below), so match the hit line plus
 			# the next 3 lines as one window.
 			window="$(sed -n "${lineno},$((lineno + 3))p" "$clean" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-			if ! printf '%s' "$window" | rg -q -i "$STALE_RE"; then
+			if ! printf '%s' "$window" | grep -q -i -E -e "$STALE_RE"; then
 				continue
 			fi
 			# Honest closure statements name the OQ as closed in the same
@@ -168,7 +217,7 @@ for oq in "${OQS[@]}"; do
 			# remaining open for a different subject). Those pass;
 			# future-conditionals (`will be decided when ... accepted`)
 			# stay stale.
-			if printf '%s' "$window" | rg -q -w 'closed'; then
+			if printf '%s' "$window" | grep -q -w 'closed'; then
 				continue
 			fi
 			if is_exempt "$clean" "$lineno"; then
@@ -177,7 +226,7 @@ for oq in "${OQS[@]}"; do
 			echo "status-drift[oq-status]: $clean:$lineno: $oq contradicts accepted/closed register: $text"
 			FAIL=1
 		done < <(
-			rg -n --no-heading -i -e "$oq" "$clean" 2>/dev/null || true
+			grep -n -i -e "$oq" -- "$clean" 2>/dev/null || true
 		)
 	done
 done
@@ -185,7 +234,12 @@ done
 # --- Rule 2: crate count ---
 ACTUAL=0
 if [[ -f Cargo.toml ]]; then
-	ACTUAL="$(rg -o -N '"crates/[^"]+"' Cargo.toml 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+	# Braces keep the `|| true` bound to `grep` alone: without them the
+	# fallback would swallow the `sort | wc` half of the pipeline on a
+	# match. Emits 0 when no member is found so the check below reports
+	# a clean error instead of tripping `set -e` (the old unguarded
+	# `rg` here is what killed CI with exit 127 when `rg` was absent).
+	ACTUAL="$({ grep -o -E '"crates/[^"]+"' Cargo.toml 2>/dev/null || true; } | sort -u | wc -l | tr -d ' ')"
 	ACTUAL="${ACTUAL:-0}"
 fi
 if ! [[ "$ACTUAL" =~ ^[0-9]+$ ]] || ((ACTUAL == 0)); then
@@ -200,7 +254,11 @@ else
 			if is_exempt "$doc" "$lineno"; then
 				continue
 			fi
-			nums="$(printf '%s\n' "$text" | rg -o -P -i -N '[0-9]+(?=[[:space:]]*-?crates?\b)|[0-9]+(?=-crate\b)' 2>/dev/null || true)"
+			# Two-stage `grep -o`: first isolate each `N crates` / `N-crate`
+			# phrase (ERE, no PCRE lookahead needed), then the leading
+			# number. Output set matches the old
+			# `rg -o -P '[0-9]+(?=...)'` extraction.
+			nums="$(printf '%s\n' "$text" | grep -o -i -E -e '[0-9]+[[:space:]]*-?crates?\b' -e '[0-9]+-crate\b' 2>/dev/null | grep -o -E -e '[0-9]+' || true)"
 			[[ -n "$nums" ]] || continue
 			while IFS= read -r n; do
 				[[ -n "$n" ]] || continue
@@ -210,20 +268,20 @@ else
 				fi
 			done <<<"$nums"
 		done < <(
-			rg -n --no-heading -i -e '[0-9]+[[:space:]]*-?crates?\b' -e '[0-9]+-crate\b' "$doc" 2>/dev/null || true
+			grep -n -i -E -e '[0-9]+[[:space:]]*-?crates?\b' -e '[0-9]+-crate\b' -- "$doc" 2>/dev/null || true
 		)
 	done
 fi
 
 # --- Rule 3: submodule wiring ---
 if [[ -f .gitmodules ]]; then
-	if ! rg -q '\[submodule "docs"\]' .gitmodules 2>/dev/null; then
+	if ! grep -qF '[submodule "docs"]' .gitmodules 2>/dev/null; then
 		echo 'status-drift[submodule]: .gitmodules missing [submodule "docs"] mount'
 		FAIL=1
-	elif ! rg -q 'path = docs' .gitmodules 2>/dev/null; then
+	elif ! grep -qF 'path = docs' .gitmodules 2>/dev/null; then
 		echo 'status-drift[submodule]: .gitmodules docs mount missing `path = docs`'
 		FAIL=1
-	elif ! rg -q 'bitty-terminal-docs' .gitmodules 2>/dev/null; then
+	elif ! grep -qF 'bitty-terminal-docs' .gitmodules 2>/dev/null; then
 		echo 'status-drift[submodule]: .gitmodules docs mount url does not reference bitty-terminal-docs'
 		FAIL=1
 	fi
@@ -245,7 +303,7 @@ for doc in "${WIRING_DOCS[@]}"; do
 		echo "status-drift[submodule]: $doc:$lineno claims later-phase wiring: $text"
 		FAIL=1
 	done < <(
-		rg -n --no-heading -i -e "$WIRING_RE" "$doc" 2>/dev/null || true
+		grep -n -i -E -e "$WIRING_RE" -- "$doc" 2>/dev/null || true
 	)
 done
 
@@ -257,7 +315,12 @@ rfc_expected() {
 	plugin-platform)
 		for candidate in ../bitty-plugins-docs/specifications/plugin-platform-rfc.md docs/specifications/plugin-platform-rfc.md; do
 			if [[ -f "$candidate" ]]; then
-				status="$(rg -N -m1 -i -o --no-heading '(?<=^status:\s*)\S+' "$candidate" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+				# Portable `status:` frontmatter read (the old
+				# `rg '(?<=^status:\s*)\S+'` never matched: look-around
+				# needs `rg -P`, which was not passed, so the old code
+				# always fell through to the vendored value; without a
+				# sibling checkout both old and new yield `accepted`).
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
 				if [[ -n "$status" ]]; then
 					printf '%s' "$status"
 					return 0
@@ -269,7 +332,12 @@ rfc_expected() {
 	isolation-resource)
 		for candidate in ../bitty-plugins-docs/specifications/isolation-resource-rfc.md docs/specifications/isolation-resource-rfc.md; do
 			if [[ -f "$candidate" ]]; then
-				status="$(rg -N -m1 -i -o --no-heading '(?<=^status:\s*)\S+' "$candidate" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+				# Portable `status:` frontmatter read (the old
+				# `rg '(?<=^status:\s*)\S+'` never matched: look-around
+				# needs `rg -P`, which was not passed, so the old code
+				# always fell through to the vendored value; without a
+				# sibling checkout both old and new yield `accepted`).
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
 				if [[ -n "$status" ]]; then
 					printf '%s' "$status"
 					return 0
@@ -281,7 +349,12 @@ rfc_expected() {
 	ipc-agent)
 		for candidate in ../bitty-ai-docs/specifications/ipc-agent-rfc.md docs/specifications/ipc-agent-rfc.md; do
 			if [[ -f "$candidate" ]]; then
-				status="$(rg -N -m1 -i -o --no-heading '(?<=^status:\s*)\S+' "$candidate" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+				# Portable `status:` frontmatter read (the old
+				# `rg '(?<=^status:\s*)\S+'` never matched: look-around
+				# needs `rg -P`, which was not passed, so the old code
+				# always fell through to the vendored value; without a
+				# sibling checkout both old and new yield `accepted`).
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
 				if [[ -n "$status" ]]; then
 					printf '%s' "$status"
 					return 0
@@ -298,15 +371,7 @@ check_rfc() {
 	local expected
 	expected="$(rfc_expected "$name")"
 	[[ "$expected" == "accepted" ]] || return 0
-	mapfile -d '' files < <(
-		rg --files -0 --hidden \
-			-g '*.rs' \
-			-g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' \
-			-g '!docs/**' \
-			-g '!scripts/tests/fixtures/**' \
-			-g '!scripts/check-status-drift.sh' \
-			. 2>/dev/null || true
-	)
+	mapfile -d '' files < <(list_scan_files rs || true)
 	for file in "${files[@]}"; do
 		[[ -n "$file" ]] || continue
 		clean="${file#./}"
@@ -320,16 +385,16 @@ check_rfc() {
 			lineno="${hit%%:*}"
 			text="${hit#*:}"
 			lower="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
-			if ! printf '%s' "$lower" | rg -q -i 'rfc|oq-|frontmatter'; then
+			if ! printf '%s' "$lower" | grep -q -i -E -e 'rfc|oq-|frontmatter'; then
 				continue
 			fi
 			from=$((lineno > 3 ? lineno - 3 : 1))
 			to=$((lineno + 3))
 			window="$(sed -n "${from},${to}p" "$clean" 2>/dev/null || true)"
-			if ! printf '%s' "$window" | rg -q -i -e "$id_pat"; then
+			if ! printf '%s' "$window" | grep -q -i -E -e "$id_pat"; then
 				continue
 			fi
-			if printf '%s' "$window" | rg -q -i -e "$accept_pat"; then
+			if printf '%s' "$window" | grep -q -i -E -e "$accept_pat"; then
 				continue
 			fi
 			if is_exempt "$clean" "$lineno"; then
@@ -338,7 +403,7 @@ check_rfc() {
 			echo "status-drift[rfc-status]: $clean:$lineno: $name RFC claims Proposed/draft but owning frontmatter is accepted: $text"
 			FAIL=1
 		done < <(
-			rg -n --no-heading -e '\b[Pp]roposed\b' -e '\b[Dd]raft\b' "$clean" 2>/dev/null || true
+			grep -n -E -e '\b[Pp]roposed\b' -e '\b[Dd]raft\b' -- "$clean" 2>/dev/null || true
 		)
 	done
 }

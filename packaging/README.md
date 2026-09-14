@@ -4,12 +4,12 @@ This directory holds multi-distro release artifacts for Bitty `0.0.1`.
 
 ## Formats
 
-| Format    | File                                           | Distro                                      |
-| --------- | ---------------------------------------------- | ------------------------------------------- |
-| deb       | `nfpm.yaml` + `deb` packager                   | Debian 12, Ubuntu 24.04                     |
-| rpm       | `nfpm.yaml` + `rpm` packager                   | Fedora 40, RHEL 9, OpenSUSE Tumbleweed/Leap |
-| apk       | `nfpm.yaml` + `apk` packager                   | Alpine 3.20                                 |
-| archlinux | `nfpm.yaml` + `archlinux` packager, `PKGBUILD` | Arch, AUR                                   |
+| Format    | File                                                     | Distro                                      |
+| --------- | -------------------------------------------------------- | ------------------------------------------- |
+| deb       | `nfpm.yaml` + `deb` packager                             | Debian 12, Ubuntu 24.04                     |
+| rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40, RHEL 9, OpenSUSE Tumbleweed/Leap |
+| apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.20                                 |
+| archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch, AUR                                   |
 
 OpenSUSE is rpm-based; the rpm built via nfpm is tested with `rpm -qip` and installs via `zypper install`. Alpine is apk-based; apk is validated via `apk info --allow-untrusted -X`.
 
@@ -47,7 +47,7 @@ nix build .#bitty
 
 ## AUR
 
-`PKGBUILD` and `packaging/PKGBUILD` are identical Arch source-package recipes. `packaging/PKGBUILD.bin` is the `bitty-bin` template: prebuilt `bitty-x86_64-unknown-linux-gnu` release binary with a real sha256 (never `SKIP` for the binary), `arch=('x86_64')` only, `provides=('bitty')`, `conflicts=('bitty' 'bitty-nightly' 'bitty-git')`. CI publishes both via `AUR_SSH_PRIVATE_KEY` (`aur` job for `bitty`, `aur-bin` job for `bitty-bin`, gated on `vars.AUR_PUBLISH` / `vars.AUR_BIN_PUBLISH`):
+`packaging/PKGBUILD` is the single Arch source-package recipe (the former root `PKGBUILD` mirror was retired). `packaging/PKGBUILD.bin` is the `bitty-bin` template: prebuilt `bitty-x86_64-unknown-linux-gnu` release binary with a real sha256 (never `SKIP` for the binary), `arch=('x86_64')` only, `provides=('bitty')`, `conflicts=('bitty' 'bitty-nightly' 'bitty-git')`. CI publishes both via `AUR_SSH_PRIVATE_KEY` (`aur` job for `bitty`, `aur-bin` job for `bitty-bin`, gated on `vars.AUR_PUBLISH` / `vars.AUR_BIN_PUBLISH`):
 
 ```sh
 makepkg --printsrcinfo > .SRCINFO
@@ -63,15 +63,15 @@ paru -S bitty-bin   # or: yay -S bitty-bin
 
 The source package (`bitty`) compiles the whole workspace locally and needs the Rust toolchain; prefer `bitty-bin` unless you specifically need a source build. `bitty` and `bitty-bin` conflict, so install one or the other.
 
-Validation: `bash -n PKGBUILD && makepkg --printsrcinfo`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-app/Cargo.toml`, and root `PKGBUILD`/`packaging/PKGBUILD` stay identical), `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
+Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcinfo)`, plus `bash scripts/check-pkgbuild-source.sh` (source recipe installs the artifact declared by `crates/bitty-app/Cargo.toml`), `bash scripts/check-pkgbuild-bin.sh` (template render test) and `bash scripts/check-release-version.sh [--tag vX.Y.Z]` (Cargo version stays aligned with release tags so `bitty --version` matches the tag).
 
 ## Homebrew
 
-`Formula/bitty.rb` (mirrored at `homebrew/Formula/bitty.rb`) is the Homebrew Formula. Tested via `brew install --build-from-source Formula/bitty.rb && brew test bitty` and `ruby -c`.
+`packaging/homebrew/bitty.rb` is the single in-repo Homebrew Formula (build-from-source reference). The release workflow regenerates the published formula from release assets in `bitty-terminal/homebrew-tap`. Tested via `brew install --build-from-source packaging/homebrew/bitty.rb && brew test bitty` and `ruby -c`.
 
 ## Scoop
 
-`bucket/bitty.json` is the Scoop manifest (also mirrored as `packaging/scoop-bitty.json`). Validated via `python3 -m json.tool` and `checkver`.
+`packaging/scoop-bitty.json` is the single in-repo Scoop manifest. The release workflow regenerates the published manifest from release assets in `bitty-terminal/scoop-bucket`. Validated via `python3 -m json.tool` and `checkver`.
 
 ## Release Matrix
 

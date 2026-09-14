@@ -57,6 +57,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Check status drift gate (OQ/RFC/crate-count/submodule)
+        run: |
+          bash scripts/check-status-drift.sh
+          bash scripts/tests/check-status-drift.test.sh
+
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm

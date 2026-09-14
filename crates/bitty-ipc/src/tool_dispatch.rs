@@ -26,7 +26,12 @@
 //!    Clients never assert scopes.
 //! 3. **Consent**: check the per-client [`ConsentLedger`] for
 //!    `(client_id, scope)` at `now_ms`; missing or expired grants fail as
-//!    `Denied[ConsentRequired]`. Effect tools additionally require an
+//!    `Denied[ConsentRequired]`. Consent granularity is per
+//!    `(client_id, scope)` inherited from the accepted ledger — two tools
+//!    sharing one scope share consent. Per-tool identity enters via
+//!    routing (step 1), attribution (step 6), and the explicit per-call
+//!    effect opt-in below; per-tool-name ledger entries are sequel work.
+//!    Effect tools additionally require an
 //!    explicit per-call opt-in (see below); there is no bundled admin.
 //! 4. **Captured target**: validate the optional target shape up front
 //!    (host `t:<digits>` grammar via [`crate::ctl::parse_terminal_id`]),
@@ -505,16 +510,16 @@ impl ToolDispatchService {
     ///   already registered (no silent overwrite).
     /// - `LimitExceeded` when the registry is at capacity (`32`).
     pub fn register(&mut self, spec: ToolSpec, provider: ToolProvider) -> Result<(), IpcError> {
+        if self.handlers.contains_key(&spec.name) {
+            return Err(IpcError::InvalidRequest {
+                reason: format!("duplicate tool '{}'", spec.name),
+            });
+        }
         if self.handlers.len() >= MAX_TOOLS_PER_HOST {
             return Err(IpcError::LimitExceeded {
                 field: "tool registry".into(),
                 limit: MAX_TOOLS_PER_HOST,
                 actual: self.handlers.len() + 1,
-            });
-        }
-        if self.handlers.contains_key(&spec.name) {
-            return Err(IpcError::InvalidRequest {
-                reason: format!("duplicate tool '{}'", spec.name),
             });
         }
         self.handlers.insert(spec.name.clone(), (spec, provider));

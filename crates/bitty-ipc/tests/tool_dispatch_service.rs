@@ -309,3 +309,42 @@ fn host_without_handler_fails_closed() {
         .expect_err("missing handler must fail closed");
     assert!(matches!(error, IpcError::NotFound { .. }), "got {error:?}");
 }
+
+fn second_read_only_spec() -> ToolSpec {
+    ToolSpec::new(
+        "terminal_read_stats",
+        "Read bounded terminal statistics (read-only)",
+        br#"{"type":"object"}"#.to_vec(),
+        Scope::TerminalInspect,
+        true,
+    )
+    .expect("valid second read-only spec")
+}
+
+#[test]
+fn consent_is_shared_per_client_scope_not_per_tool() {
+    let mut service = ToolDispatchService::new();
+    service
+        .register(read_only_spec(), read_only_provider)
+        .expect("register first");
+    service
+        .register(second_read_only_spec(), read_only_provider)
+        .expect("register second");
+    // One grant for (client, TerminalInspect) serves both tools: consent
+    // granularity is per (client_id, scope), not per tool name.
+    let ledger = consented(CLIENT, Scope::TerminalInspect);
+    for (tool, execution_id) in [("terminal_read_zone", 1), ("terminal_read_stats", 2)] {
+        let request = ToolRequest::new(tool, br#"{}"#.to_vec()).with_target("t:1");
+        let outcome = service
+            .dispatch(
+                &request,
+                &granted(&[Scope::TerminalInspect]),
+                &ledger,
+                CLIENT,
+                NOW_MS,
+                execution_id,
+            )
+            .expect("shared consent must serve both tools");
+        assert_eq!(outcome.tool, tool);
+    }
+}

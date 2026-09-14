@@ -49,7 +49,7 @@ use crate::manifest::{
     PluginIdentity, PluginManifest, QualifiedName,
 };
 
-/// Canonical version for the five `v1` bundled plugins (SemVer 2).
+/// Canonical version for the eight `v1` bundled plugins (SemVer 2).
 const BUNDLED_VERSION: &str = "0.1.0";
 
 /// Compat range for the bundled set: `>=0.1,<1.0` with Plugin API `^1.0`.

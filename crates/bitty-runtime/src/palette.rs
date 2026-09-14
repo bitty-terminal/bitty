@@ -1,13 +1,19 @@
 #![forbid(unsafe_code)]
-//! Palette via Panel Runtime — overlay/command, bounded, no hot-path.
+//! Core Panel Runtime overlay helpers and theme bridge — bounded, no hot-path.
 //!
-//! This module is the first-party `bitty-terminal.palette` implementation
-//! hosted through the generic Panel Runtime (CTX-0102, OQ-011). Palette is
-//! the command palette and picker UI via overlay slot using declarative
-//! list/text primitives only (no shader/native window). It verifies the
-//! command registry (`owner.name:command` qualified, duplicates rejected,
-//! per-panel `32` bound, `128` char grammar) and overlay focus (`4+1`
-//! with modal exclusivity, text `128`/tooltip `256` bounds, `Palette` kind)
+//! This module is the Core Panel Runtime/theme bridge helper retained per
+//! bitty issue `#677` after the OQ-053 split (`CTX-0397`): generic
+//! overlay/panel helpers exercised through the public Panel Runtime path
+//! (CTX-0102, OQ-011) plus the `theme_*` RGBA bridge re-exposing the
+//! render-side theme values for runtime consumers. Product code consumes
+//! only the `theme_*` bridge (e.g. `theme_cursor_rgba` in the runtime tick
+//! cursor overlay). It is NOT the first-party `bitty-terminal.palette`
+//! implementation — that lives in the independent first-party package
+//! `bitty-terminal/palette`.
+//!
+//! The helpers verify the command registry (`owner.name:command` qualified,
+//! duplicates rejected, per-panel `32` bound, `128` char grammar) and overlay
+//! focus (`4+1` with modal exclusivity, text `128`/tooltip `256` bounds, `Palette` kind)
 //! via the Panel API public path only (`PanelRegistry::new` →
 //! `create_panel` → `mount_panel` → `focus_panel` with `PanelType::Helper`
 //! and `PanelRegistry::register_command` / `create_overlay` /

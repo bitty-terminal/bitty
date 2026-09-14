@@ -68,3 +68,10 @@
 {"deleted_at":"2026-09-13T14:55:33.376790080+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2DAHKRBQ6RC2MWE2DK7QX87","table_name":"worktrees"}
 {"deleted_at":"2026-09-13T16:21:00.999923597+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2DFXQ9MYTKF6M5VYF4DD0Z9","table_name":"worktrees"}
 {"deleted_at":"2026-09-14T03:18:45.316845257+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"task.dependency_removed","row_id":"01M2D7CC4SMBFEN7JH2R048KGK","table_name":"task_dependencies"}
+{"deleted_at":"2026-09-14T07:25:43.303343525+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2DKZC0G1N91RSZSE4P6Q9M6","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:25:43.329419992+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2DS6F7WY4QXTFA5WM3AWGH8","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:25:43.347706071+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2DS7NG9FSWNF0V3D2TAE9PF","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:43:23.641528959+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2E303PWKA2CTB22XY7Q2EJS","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:44:04.882640574+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2E9MVD6JJS995AR35DMSX80","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:44:04.893506431+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2EBS1872X3BQKR9PTNCJ8MK","table_name":"worktrees"}
+{"deleted_at":"2026-09-14T07:44:04.904234325+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2EBX2EGFEKEZAJP62ZTEVKV","table_name":"worktrees"}

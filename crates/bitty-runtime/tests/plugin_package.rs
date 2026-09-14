@@ -124,8 +124,14 @@ fn external_plugin_install_load_run_update_reload_disable_uninstall() {
 
     // Install v1 from an external local directory.
     let source_v1 = write_external_source(&bench, "1.0.0", "hello v1", None);
-    let report =
-        install_local_dir(&store, &source_v1, &LocalInstallOptions::default()).expect("install");
+    let report = install_local_dir(
+        &store,
+        &source_v1,
+        &LocalInstallOptions::default(),
+        &mut |_| Ok(true),
+    )
+    .expect("install")
+    .expect("approved");
     assert_eq!(report.version, "1.0.0");
     assert!(!report.updated);
     assert!(
@@ -147,8 +153,14 @@ fn external_plugin_install_load_run_update_reload_disable_uninstall() {
 
     // Update to v2 through a second local directory.
     let source_v2 = write_external_source(&bench, "2.0.0", "hello v2", None);
-    let update =
-        install_local_dir(&store, &source_v2, &LocalInstallOptions::default()).expect("update");
+    let update = install_local_dir(
+        &store,
+        &source_v2,
+        &LocalInstallOptions::default(),
+        &mut |_| Ok(true),
+    )
+    .expect("update")
+    .expect("approved");
     assert!(update.updated);
     assert_eq!(update.previous_version.as_deref(), Some("1.0.0"));
     assert!(
@@ -192,12 +204,11 @@ fn recorded_grant_is_enforced_at_activation() {
     install_local_dir(
         &store,
         &source,
-        &LocalInstallOptions {
-            approve_added_capabilities: true,
-            enable: true,
-        },
+        &LocalInstallOptions::default(),
+        &mut |_| Ok(true),
     )
-    .expect("install");
+    .expect("install")
+    .expect("approved");
 
     // Full grant: the capability-gated host call is allowed.
     let mut granted_rt = runtime(store.clone(), false, "granted");

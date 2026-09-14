@@ -44,8 +44,6 @@ pub const MANIFEST_FILE_NAME: &str = "bitty-plugin.toml";
 pub const PACKAGES_DIR: &str = "packages";
 /// Prefix of an in-flight quarantine copy (never a valid plugin id or version).
 const STAGING_PREFIX: &str = ".tmp-";
-/// VCS metadata directories are never part of a package tree.
-const VCS_DIRS: [&str; 3] = [".git", ".hg", ".svn"];
 /// Owner-only mode for staged package files (Unix).
 #[cfg(unix)]
 const STORE_FILE_MODE: u32 = 0o600;
@@ -58,20 +56,37 @@ static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// One local-directory install or update request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInstallOptions {
-    /// Approve any capability that the manifest newly requests. Without this,
-    /// an install that adds authority over the recorded grant fails closed.
-    pub approve_added_capabilities: bool,
     /// Desired load state for the installed record.
     pub enable: bool,
 }
 
 impl Default for LocalInstallOptions {
     fn default() -> Self {
-        Self {
-            approve_added_capabilities: false,
-            enable: true,
-        }
+        Self { enable: true }
     }
+}
+
+/// The exact staged snapshot a human reviewer is asked to approve.
+///
+/// It carries the canonical manifest hash and content digest of the quarantine
+/// copy that consent is bound to, plus the capability diff. The transaction
+/// that produced it commits that same snapshot: a manifest swapped in the
+/// source directory while the prompt is open can never widen the installed
+/// grant, because the installer no longer re-reads the source after consent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentRequest {
+    /// Owner-qualified plugin id.
+    pub plugin_id: String,
+    /// Reviewed version.
+    pub version: String,
+    /// Canonical manifest hash of the staged body.
+    pub manifest_hash: String,
+    /// Content digest of the staged module tree.
+    pub content_digest: String,
+    /// Capabilities added over the recorded grant.
+    pub added: Vec<String>,
+    /// Full granted capability set that will be recorded on approval.
+    pub granted: Vec<String>,
 }
 
 /// Outcome of one successful install/update transaction.
@@ -113,7 +128,10 @@ pub struct UninstallReport {
 /// Bounded, owned failure for every package-manager operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageOpError {
-    /// The source locator is unusable (missing, not a directory, symlinked).
+    /// The source cannot be resolved to a readable directory.
+    ///
+    /// A symlink to a directory is accepted and canonicalized; only an
+    /// unresolvable path or a non-directory target is rejected here.
     InvalidSource(String),
     /// The manifest is absent, unreadable, over-limit, or schema-invalid.
     Manifest {
@@ -121,6 +139,11 @@ pub enum PackageOpError {
         plugin: String,
         /// Bounded detail.
         detail: String,
+    },
+    /// The package id is reserved by the application-shipped bundled catalog.
+    BundledIdReserved {
+        /// The reserved plugin id.
+        plugin: String,
     },
     /// The module tree violates the ratified bounds or contains a native artifact.
     ModuleTree {
@@ -140,13 +163,8 @@ pub enum PackageOpError {
         /// Host version evaluated against the range.
         host: String,
     },
-    /// The transaction would add capabilities without explicit approval.
-    CapabilityApprovalRequired {
-        /// Plugin id.
-        plugin: String,
-        /// Capabilities not covered by the recorded grant.
-        added: Vec<String>,
-    },
+    /// Capability consent was aborted (for example the input stream ended).
+    ConsentAborted(String),
     /// The store could not be read or written safely.
     Store(String),
 }
@@ -158,6 +176,10 @@ impl std::fmt::Display for PackageOpError {
             Self::Manifest { plugin, detail } => {
                 write!(f, "manifest for '{plugin}': {detail}")
             }
+            Self::BundledIdReserved { plugin } => write!(
+                f,
+                "'{plugin}' is reserved by the application-shipped bundled catalog and cannot be installed from a store source"
+            ),
             Self::ModuleTree { plugin, detail } => {
                 write!(f, "module tree for '{plugin}': {detail}")
             }
@@ -170,13 +192,7 @@ impl std::fmt::Display for PackageOpError {
                 f,
                 "'{plugin}' declares {field} = '{requested}', which does not include host version {host}"
             ),
-            Self::CapabilityApprovalRequired { plugin, added } => write!(
-                f,
-                "'{plugin}' adds {} capabilit{} without approval: {}",
-                added.len(),
-                if added.len() == 1 { "y" } else { "ies" },
-                added.join(", ")
-            ),
+            Self::ConsentAborted(detail) => write!(f, "consent aborted: {detail}"),
             Self::Store(detail) => write!(f, "plugin store: {detail}"),
         }
     }
@@ -194,19 +210,28 @@ impl From<super::PluginRuntimeError> for PackageOpError {
 ///
 /// The source directory must contain `bitty-plugin.toml` at its root; the
 /// module tree is `lua/` when present, else the package root. The verified
-/// manifest body and module tree are copied into the store, the module tree is
-/// digested, and `current.json` is switched atomically.
+/// manifest body and module tree are copied into a quarantine directory and
+/// digested first. If that snapshot adds capabilities over the recorded grant,
+/// `consent` is asked to approve **that snapshot** (its canonical
+/// `manifest_hash` and `content_digest`), and the same snapshot is committed.
+/// The source is never re-read after consent, so a manifest swapped while the
+/// prompt is open can never widen the installed grant; the staged body is
+/// re-verified against the reviewed hash before commit as defense in depth.
+///
+/// Returns `Ok(None)` when consent is denied (nothing is committed).
 ///
 /// # Errors
 ///
-/// [`PackageOpError`] for an invalid source, manifest, or module tree; an
-/// incompatible `compat` declaration; unapproved added capabilities; or a
-/// store write failure. Nothing is committed unless every gate passes.
+/// [`PackageOpError`] for an invalid source, a bundled-reserved id, a manifest
+/// or module tree that violates the accepted contract, an incompatible
+/// `compat` declaration, an aborted consent callback, or a store write
+/// failure. Nothing is committed unless every gate passes.
 pub fn install_local_dir(
     store_root: &Path,
     source: &Path,
     options: &LocalInstallOptions,
-) -> Result<InstallReport, PackageOpError> {
+    consent: &mut dyn FnMut(&ConsentRequest) -> Result<bool, PackageOpError>,
+) -> Result<Option<InstallReport>, PackageOpError> {
     let source_root = std::fs::canonicalize(source).map_err(|error| {
         PackageOpError::InvalidSource(format!("'{}': {error}", source.display()))
     })?;
@@ -240,6 +265,11 @@ pub fn install_local_dir(
             detail: error.to_string(),
         })?;
     let plugin_id = manifest.identity.id.as_str().to_string();
+    // A store package must never shadow a catalog id: discovery would prefer
+    // the bundled package, and the CLI could not remove the inert store record.
+    if bitty_plugin_host::bundled::bundled_manifest_for(&plugin_id).is_some() {
+        return Err(PackageOpError::BundledIdReserved { plugin: plugin_id });
+    }
 
     let source_module_root = resolution::module_root_for(&source_root);
     if super::entry_point(&source_module_root, manifest.id()).is_none() {
@@ -249,7 +279,9 @@ pub fn install_local_dir(
                 .to_string(),
         });
     }
-    resolution::scan_module_tree(&plugin_id, &source_module_root).map_err(|error| {
+    // Pre-scan with the installer's own rules (VCS dirs skipped, symlinks
+    // rejected) so the pre-scan and the copy agree on what is a valid tree.
+    resolution::scan_module_tree_source(&plugin_id, &source_module_root).map_err(|error| {
         PackageOpError::ModuleTree {
             plugin: plugin_id.clone(),
             detail: error.to_string(),
@@ -269,12 +301,6 @@ pub fn install_local_dir(
         .map(|record| record.granted.iter().cloned().collect())
         .unwrap_or_default();
     let added: Vec<String> = granted.difference(&previous_grant).cloned().collect();
-    if !added.is_empty() && !options.approve_added_capabilities {
-        return Err(PackageOpError::CapabilityApprovalRequired {
-            plugin: plugin_id.clone(),
-            added,
-        });
-    }
 
     let version = manifest.identity.version.clone();
     let manifest_hash = manifest.manifest_hash();
@@ -309,6 +335,45 @@ pub fn install_local_dir(
                 });
             }
         };
+
+    // Consent is bound to the staged snapshot above; the source is never read
+    // again. A caller cannot approve a different manifest than the one shown.
+    if !added.is_empty() {
+        let request = ConsentRequest {
+            plugin_id: plugin_id.clone(),
+            version: version.clone(),
+            manifest_hash: manifest_hash.clone(),
+            content_digest: content_digest.clone(),
+            added: added.clone(),
+            granted: granted.iter().cloned().collect(),
+        };
+        match consent(&request) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Ok(None);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        }
+        // Defense in depth: whatever ran during consent, only the reviewed
+        // snapshot may be committed. A changed staged body fails closed.
+        let staged = std::fs::read(staging.join(MANIFEST_FILE_NAME)).map_err(|error| {
+            let _ = std::fs::remove_dir_all(&staging);
+            PackageOpError::Store(format!("cannot re-read staged manifest: {error}"))
+        })?;
+        let staged_hash = super::manifest_toml::parse_manifest(&staged)
+            .map(|manifest| manifest.manifest_hash())
+            .ok();
+        if staged_hash.as_deref() != Some(manifest_hash.as_str()) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(PackageOpError::Store(
+                "staged manifest changed after consent; nothing committed".to_string(),
+            ));
+        }
+    }
 
     let target = package_dir.join(&version);
     let mut created_target = false;
@@ -369,7 +434,7 @@ pub fn install_local_dir(
         previous_version.as_deref(),
     )?;
 
-    Ok(InstallReport {
+    Ok(Some(InstallReport {
         plugin_id,
         version,
         source_class: SourceClass::LocalPath,
@@ -380,7 +445,7 @@ pub fn install_local_dir(
         added,
         updated: previous_version.is_some(),
         previous_version,
-    })
+    }))
 }
 
 /// Set the desired load state of one stored record (atomic index write).
@@ -637,7 +702,7 @@ fn copy_tree(
             });
         }
         if metadata.is_dir() {
-            if VCS_DIRS.contains(&name.as_str()) {
+            if resolution::VCS_DIRS.contains(&name.as_str()) {
                 continue;
             }
             copy_tree(&entry, &destination.join(&name), plugin, budget)?;
@@ -800,13 +865,21 @@ mod tests {
         package
     }
 
+    /// Install with auto-approved consent (most fixtures add no capability).
+    fn install(store: &Path, source: &Path) -> InstallReport {
+        install_local_dir(store, source, &LocalInstallOptions::default(), &mut |_| {
+            Ok(true)
+        })
+        .expect("install")
+        .expect("approved")
+    }
+
     #[test]
     fn install_then_records_and_resolves() {
         let scratch = scratch("install");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.fixture", "1.0.0", None);
-        let report =
-            install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        let report = install(&store, &source);
         assert_eq!(report.plugin_id, "xuepoo.fixture");
         assert_eq!(report.version, "1.0.0");
         assert!(!report.updated);
@@ -832,15 +905,13 @@ mod tests {
         let scratch = scratch("update");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.fixture", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
-        let again = install_local_dir(&store, &source, &LocalInstallOptions::default())
-            .expect("idempotent install");
+        install(&store, &source);
+        let again = install(&store, &source);
         assert!(again.updated);
         assert_eq!(again.previous_version.as_deref(), Some("1.0.0"));
 
         let source_v2 = write_plugin(&scratch, "xuepoo.fixture", "2.0.0", None);
-        let update =
-            install_local_dir(&store, &source_v2, &LocalInstallOptions::default()).expect("update");
+        let update = install(&store, &source_v2);
         assert!(update.updated);
         assert_eq!(update.previous_version.as_deref(), Some("1.0.0"));
         assert!(store.join("packages/xuepoo.fixture/2.0.0").is_dir());
@@ -854,44 +925,140 @@ mod tests {
     }
 
     #[test]
-    fn capability_increase_requires_approval_and_narrowing_carries_forward() {
+    fn capability_increase_requires_consent_and_narrowing_carries_forward() {
         let scratch = scratch("consent");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.caps", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        install(&store, &source);
 
         let wider = write_plugin(&scratch, "xuepoo.caps", "1.1.0", Some("platform.notify"));
-        let blocked = install_local_dir(
-            &store,
-            &wider,
-            &LocalInstallOptions {
-                approve_added_capabilities: false,
-                enable: true,
-            },
-        )
-        .expect_err("added capability must block");
-        assert!(matches!(
-            blocked,
-            PackageOpError::CapabilityApprovalRequired { .. }
-        ));
-        // Fail-closed: no version 1.1.0 was staged.
+        // Denial commits nothing and reports `None`.
+        let denied =
+            install_local_dir(&store, &wider, &LocalInstallOptions::default(), &mut |_| {
+                Ok(false)
+            })
+            .expect("denied install");
+        assert!(denied.is_none());
+        assert!(!store.join("packages/xuepoo.caps/1.1.0").exists());
+        assert_eq!(
+            resolution::load_index(&store).expect("index")[0].version,
+            "1.0.0"
+        );
+
+        // Aborted consent also commits nothing.
+        let aborted =
+            install_local_dir(&store, &wider, &LocalInstallOptions::default(), &mut |_| {
+                Err(PackageOpError::ConsentAborted("eof".to_string()))
+            })
+            .expect_err("aborted consent");
+        assert!(matches!(aborted, PackageOpError::ConsentAborted(_)));
         assert!(!store.join("packages/xuepoo.caps/1.1.0").exists());
 
-        let approved = install_local_dir(
-            &store,
-            &wider,
-            &LocalInstallOptions {
-                approve_added_capabilities: true,
-                enable: true,
-            },
-        )
-        .expect("approved install");
+        let approved =
+            install_local_dir(&store, &wider, &LocalInstallOptions::default(), &mut |_| {
+                Ok(true)
+            })
+            .expect("approved install")
+            .expect("approved");
         assert_eq!(approved.added, vec!["platform.notify".to_string()]);
 
         let narrower = write_plugin(&scratch, "xuepoo.caps", "1.2.0", None);
-        let carried = install_local_dir(&store, &narrower, &LocalInstallOptions::default())
-            .expect("narrowing carries forward");
+        let carried = install(&store, &narrower);
         assert!(carried.added.is_empty());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn consent_snapshot_ignores_source_swap() {
+        let scratch = scratch("toctou");
+        let store = scratch.join("store");
+        let base = write_plugin(&scratch, "xuepoo.toctou", "1.0.0", None);
+        install(&store, &base);
+
+        let source = write_plugin(&scratch, "xuepoo.toctou", "2.0.0", Some("platform.notify"));
+        let mut swapped = false;
+        let report = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |request: &ConsentRequest| {
+                assert_eq!(request.added, vec!["platform.notify".to_string()]);
+                // Attacker swaps the source for a manifest that also requests
+                // `terminal.semantic-read` while the prompt is "open".
+                let expanded = "[plugin]\nid = \"xuepoo.toctou\"\nname = \"Fixture\"\nversion = \"2.0.0\"\n\
+                     description = \"swapped\"\n\n[compat]\nbitty = \">=0.0.1,<1.0\"\nplugin-api = \"^1.0\"\n\n\
+                     [capabilities]\nplatform.notify = true\nterminal.semantic-read = true\n";
+                std::fs::write(source.join(MANIFEST_FILE_NAME), expanded).expect("swap");
+                swapped = true;
+                Ok(true)
+            },
+        )
+        .expect("install")
+        .expect("approved");
+        assert!(swapped, "the consent callback must run");
+
+        // The committed snapshot is the reviewed one, not the swapped source.
+        assert_eq!(report.granted, vec!["platform.notify".to_string()]);
+        assert_eq!(report.added, vec!["platform.notify".to_string()]);
+        let staged =
+            std::fs::read_to_string(store.join("packages/xuepoo.toctou/2.0.0/bitty-plugin.toml"))
+                .expect("staged manifest");
+        assert!(
+            !staged.contains("terminal.semantic-read"),
+            "the swapped capability must never be committed: {staged}"
+        );
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].granted, vec!["platform.notify".to_string()]);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn bundled_id_is_reserved() {
+        let scratch = scratch("bundled");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "bitty-terminal.tabs", "1.0.0", None);
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("bundled ids must not be shadowed");
+        assert!(matches!(error, PackageOpError::BundledIdReserved { .. }));
+        assert!(!store.join("packages").exists());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn vcs_metadata_is_skipped_by_the_source_scan() {
+        let scratch = scratch("vcs");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.vcs", "1.0.0", None);
+        // A native artifact inside VCS metadata would fail the module scan if
+        // VCS directories were counted; the installer skips them.
+        std::fs::create_dir_all(source.join("lua/.git")).expect("vcs dir");
+        std::fs::write(source.join("lua/.git/evil.so"), b"native").expect("native");
+        install(&store, &source);
+        assert!(!store.join("packages/xuepoo.vcs/1.0.0/lua/.git").exists());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_source_entry_is_rejected() {
+        let scratch = scratch("symlink");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.symlink", "1.0.0", None);
+        std::os::unix::fs::symlink(source.join("lua/init.lua"), source.join("lua/link.lua"))
+            .expect("symlink");
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("symlinked source entries must be rejected");
+        assert!(matches!(error, PackageOpError::ModuleTree { .. }));
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -904,8 +1071,13 @@ mod tests {
             .expect("manifest")
             .replace("plugin-api = \"^1.0\"", "plugin-api = \">=2.0,<3.0\"");
         std::fs::write(source.join(MANIFEST_FILE_NAME), manifest).expect("rewrite");
-        let error = install_local_dir(&store, &source, &LocalInstallOptions::default())
-            .expect_err("incompatible api range must fail");
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("incompatible api range must fail");
         assert!(matches!(error, PackageOpError::Incompatible { .. }));
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -916,8 +1088,13 @@ mod tests {
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.empty", "1.0.0", None);
         std::fs::remove_file(source.join("lua/init.lua")).expect("remove entry");
-        let error = install_local_dir(&store, &source, &LocalInstallOptions::default())
-            .expect_err("missing init.lua must fail");
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("missing init.lua must fail");
         assert!(matches!(error, PackageOpError::ModuleTree { .. }));
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -927,7 +1104,7 @@ mod tests {
         let scratch = scratch("lifecycle");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.life", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        install(&store, &source);
         assert!(set_enabled(&store, "xuepoo.life", false).expect("disable"));
         assert!(!set_enabled(&store, "xuepoo.life", false).expect("no-op"));
         let records = resolution::load_index(&store).expect("index");
@@ -944,7 +1121,7 @@ mod tests {
         let scratch = scratch("tamper");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.tamper", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        install(&store, &source);
         std::fs::write(
             store.join("packages/xuepoo.tamper/1.0.0/lua/init.lua"),
             "-- tampered",
@@ -963,10 +1140,15 @@ mod tests {
         let scratch = scratch("collision");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.collide", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        install(&store, &source);
         std::fs::write(source.join("lua/extra.lua"), "return {}\n").expect("extra");
-        let error = install_local_dir(&store, &source, &LocalInstallOptions::default())
-            .expect_err("same version with different content must fail");
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("same version with different content must fail");
         assert!(matches!(error, PackageOpError::Store(_)));
         let _ = std::fs::remove_dir_all(&scratch);
     }
@@ -978,7 +1160,7 @@ mod tests {
         let scratch = scratch("modes");
         let store = scratch.join("store");
         let source = write_plugin(&scratch, "xuepoo.modes", "1.0.0", None);
-        install_local_dir(&store, &source, &LocalInstallOptions::default()).expect("install");
+        install(&store, &source);
         let file = store.join("packages/xuepoo.modes/1.0.0/lua/init.lua");
         let mode = std::fs::metadata(&file).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

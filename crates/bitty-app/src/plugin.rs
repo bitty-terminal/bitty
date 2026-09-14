@@ -1353,14 +1353,16 @@ fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRe
 }
 
 /// Best-effort read of one staged manifest body (display only, never authority).
+///
+/// The record root is validated with the same store-escape guard the runtime
+/// uses, so a crafted `current.json` can never make a read-only command open a
+/// file outside the store.
 fn read_store_manifest(
     store_root: &Path,
     record: &bitty_runtime::plugin_runtime::PluginRecord,
 ) -> Option<PluginManifest> {
-    let path = store_root
-        .join(&record.root)
-        .join(package::MANIFEST_FILE_NAME);
-    let bytes = std::fs::read(path).ok()?;
+    let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record)?;
+    let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
     manifest_toml::parse_manifest(&bytes).ok()
 }
 
@@ -1817,44 +1819,32 @@ fn install_source(
         );
         return EXIT_PLUGIN;
     }
-    let options = LocalInstallOptions {
-        approve_added_capabilities: request.yes,
-        enable: true,
+    let options = LocalInstallOptions { enable: true };
+    let approve_all = request.yes;
+    // Consent is bound to the staged snapshot the installer reviewed: the
+    // callback only decides, and the installer commits that same snapshot, so
+    // a source swapped while the prompt is open can never widen the grant.
+    let outcome = {
+        let mut consent =
+            |consent_request: &package::ConsentRequest| -> Result<bool, PackageOpError> {
+                if approve_all {
+                    return Ok(true);
+                }
+                match ask_source_consent(input, output, consent_request, source) {
+                    Ok(approved) => Ok(approved),
+                    Err(failure) => Err(PackageOpError::ConsentAborted(failure.message)),
+                }
+            };
+        package::install_local_dir(store_root, Path::new(source), &options, &mut consent)
     };
-    match package::install_local_dir(store_root, Path::new(source), &options) {
-        Ok(report) => {
+    match outcome {
+        Ok(Some(report)) => {
             report_install(&report, output);
             EXIT_OK
         }
-        Err(PackageOpError::CapabilityApprovalRequired { plugin, added }) => {
-            match ask_source_consent(input, output, &plugin, &added, source) {
-                Ok(true) => {
-                    let approved = LocalInstallOptions {
-                        approve_added_capabilities: true,
-                        enable: true,
-                    };
-                    match package::install_local_dir(store_root, Path::new(source), &approved) {
-                        Ok(report) => {
-                            report_install(&report, output);
-                            EXIT_OK
-                        }
-                        Err(error) => {
-                            eprintln!("bitty plugin: {error}");
-                            package_failure_exit(&error)
-                        }
-                    }
-                }
-                Ok(false) => {
-                    eprintln!(
-                        "bitty plugin: capability grant for '{plugin}' was not approved — nothing changed"
-                    );
-                    EXIT_GENERIC
-                }
-                Err(failure) => {
-                    eprintln!("{}", failure.message);
-                    failure.exit
-                }
-            }
+        Ok(None) => {
+            eprintln!("bitty plugin: capability grant was not approved — nothing changed");
+            EXIT_GENERIC
         }
         Err(error) => {
             eprintln!("bitty plugin: {error}");
@@ -1970,15 +1960,17 @@ fn uninstall_store(
 fn ask_source_consent(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
-    plugin: &str,
-    added: &[String],
+    request: &package::ConsentRequest,
     source: &str,
 ) -> Result<bool, PluginFailure> {
     let _ = writeln!(
         output,
-        "bitty plugin: '{plugin}' from '{source}' requests new capabilities:"
+        "bitty plugin: '{}' (version {}, manifest {}) from '{source}' requests new capabilities:",
+        request.plugin_id,
+        request.version,
+        short_hash(&request.manifest_hash)
     );
-    for capability in added {
+    for capability in &request.added {
         let effect = CapabilityId::parse(capability)
             .map(|capability| effect_statement(&capability).to_string())
             .unwrap_or_else(|_| "unknown capability".to_string());
@@ -2023,10 +2015,12 @@ fn ask_source_consent(
 fn package_failure_exit(error: &PackageOpError) -> i32 {
     match error {
         PackageOpError::Manifest { .. }
+        | PackageOpError::BundledIdReserved { .. }
         | PackageOpError::ModuleTree { .. }
-        | PackageOpError::Incompatible { .. }
-        | PackageOpError::CapabilityApprovalRequired { .. } => EXIT_PLUGIN,
-        PackageOpError::InvalidSource(_) | PackageOpError::Store(_) => EXIT_GENERIC,
+        | PackageOpError::Incompatible { .. } => EXIT_PLUGIN,
+        PackageOpError::InvalidSource(_)
+        | PackageOpError::ConsentAborted(_)
+        | PackageOpError::Store(_) => EXIT_GENERIC,
     }
 }
 

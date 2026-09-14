@@ -272,11 +272,22 @@ fn data_store(home: &Path) -> PathBuf {
 /// Write an externally authored plugin source directory (the "third party"
 /// package): manifest plus a `lua/init.lua` that registers one command.
 fn write_external_fixture(home: &Path, dir_name: &str, version: &str, greeting: &str) -> PathBuf {
+    write_external_fixture_with_id(home, dir_name, "xuepoo.external", version, greeting)
+}
+
+/// As [`write_external_fixture`], with an explicit plugin id.
+fn write_external_fixture_with_id(
+    home: &Path,
+    dir_name: &str,
+    id: &str,
+    version: &str,
+    greeting: &str,
+) -> PathBuf {
     let dir = home.join(dir_name);
     std::fs::create_dir_all(dir.join("lua")).expect("fixture lua dir");
     let manifest = format!(
         "[plugin]\n\
-         id = \"xuepoo.external\"\n\
+         id = \"{id}\"\n\
          name = \"External CLI Fixture\"\n\
          version = \"{version}\"\n\
          description = \"externally authored CLI fixture\"\n\n\
@@ -286,7 +297,7 @@ fn write_external_fixture(home: &Path, dir_name: &str, version: &str, greeting: 
          [capabilities]\n\
          platform.notify = true\n\n\
          [lazy]\n\
-         commands = [\"xuepoo.external:greet\"]\n\
+         commands = [\"{id}:greet\"]\n\
          events = []\n"
     );
     std::fs::write(dir.join("bitty-plugin.toml"), manifest).expect("fixture manifest");
@@ -464,5 +475,67 @@ fn plugin_external_remote_source_fails_closed() {
         stderr(&output)
     );
     assert!(!data_store(&home).join("current.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_external_bundled_id_is_rejected() {
+    let home = scratch_dir("external-bundled");
+    let source =
+        write_external_fixture_with_id(&home, "source", "bitty-terminal.tabs", "1.0.0", "hello");
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("bundled catalog"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!data_store(&home).join("packages").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn plugin_store_display_rejects_escaped_record_root() {
+    let home = scratch_dir("store-escape");
+    let source = write_external_fixture(&home, "source", "1.0.0", "hello");
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source.display().to_string(), "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let store = data_store(&home);
+
+    // Plant a manifest outside the store and craft `current.json` to point at
+    // it via `../`; a read-only command must never load it.
+    let outside = home.join("bitty").join("outside");
+    std::fs::create_dir_all(&outside).expect("outside dir");
+    std::fs::write(
+        outside.join("bitty-plugin.toml"),
+        "[plugin]\nid = \"xuepoo.external\"\nname = \"SHOULD NOT LOAD\"\nversion = \"9.9.9\"\n\
+         description = \"escaped record root\"\n\n[compat]\nplugin-api = \"^1.0\"\n",
+    )
+    .expect("outside manifest");
+    let index_path = store.join("current.json");
+    let index = std::fs::read_to_string(&index_path).expect("index");
+    let crafted = index.replace(
+        "\"root\":\"packages/xuepoo.external/1.0.0\"",
+        "\"root\":\"../outside\"",
+    );
+    assert_ne!(crafted, index, "the record root must be rewritten");
+    std::fs::write(&index_path, crafted).expect("crafted index");
+
+    let output = run_in(&home, &["plugin", "list"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        !text.contains("SHOULD NOT LOAD"),
+        "an escaped record root must not be read: {text}"
+    );
+    assert!(text.contains("xuepoo.external"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }

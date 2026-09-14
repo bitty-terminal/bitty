@@ -99,24 +99,23 @@
 //!   deferred to the accepted text/rfc open items; resize currently only
 //!   reconfigures the surface and PTY.
 //!
-//! # Plugin-host wiring (CTX-0027) — draft status, experimental review evidence
+//! # Plugin-host wiring (CTX-0027) — accepted contracts, implementation not yet verified
 //!
 //! This crate owns a [`bitty_plugin_host::PluginHost`] behind the cold path.
-//! The host tracks the `plugin-platform-rfc.md` contract
-//! (`Proposed` / `draft`, `OQ-011..OQ-013`, `OQ-014`; new lifecycle
-//! `Draft -> experimental review evidence -> Accepted -> normative`).
-//! Until that RFC is accepted via independent review (category owner + docs
-//! curator + security reviewer) and an ADR records acceptance, nothing here
-//! claims stable file formats or frozen capability identifiers; the
-//! experimental implementation serves as review evidence and carries no
-//! compatibility promise.
+//! The host tracks two accepted contracts: `plugin-platform-rfc.md`
+//! (`accepted` 2026-08-27, closes `OQ-011`/`OQ-012`/`OQ-013`) and
+//! `isolation-resource-rfc.md` (`accepted` 2026-08-28, closes `OQ-014`);
+//! lifecycle `Draft -> experimental review evidence -> Accepted (2026-08-27
+//! and 2026-08-28) -> normative` per independent review (category owner +
+//! docs curator + security reviewer). The implementation here is
+//! `Implemented`, not yet `Verified`: it serves as review evidence and
+//! carries no compatibility promise beyond the accepted contract.
 //!
 //! - The runtime exposes [`Runtime::register_plugin`], grant-checked stubs
 //!   (`is_capability_granted` / `dispatch_command`), event routing through the
 //!   host's [`bitty_plugin_host::EventPipeline`] with the **accepted v1 default**
-//!   [`bitty_plugin_host::DropPolicy::DropOldest`] honored (OQ-013 closed
-//!   decision point; experimental review evidence per new RFC lifecycle, RFC
-//!   remains `Proposed` until independent review), and the bounded
+//!   [`bitty_plugin_host::DropPolicy::DropOldest`] honored (accepted
+//!   `OQ-013` decision point per the Plugin Platform RFC), and the bounded
 //!   side queue per ADR-0003 rule 4. The v1 default is `DropOldest`
 //!   with pipeline `64` / side `128` and batch `32`/`8 KiB`; see
 //!   [`bitty_plugin_host::event::DropPolicy`] and the RFC § “Delivery, ordering,
@@ -124,9 +123,12 @@
 //! - The four v1 interception points (`intercept.command-dispatch`,
 //!   `intercept.terminal-spawn`, `intercept.paste`, `intercept.open-url`) are
 //!   synchronous, veto-wins, fail-open, and cold-path only. Reentrancy is
-//!   rejected, timeouts are treated as abstention, and numeric timeout/queue
-//!   budgets belong to `OQ-014` (this crate uses headless-testable candidate
-//!   values without claiming normative numbers).
+//!   rejected, timeouts are treated as abstention, and the isolation and
+//!   budget mechanisms are governed by the accepted `OQ-014` Isolation
+//!   Resource RFC (three-level queue budgets, `RC-1`/`RC-2`, failure
+//!   semantics); remaining numeric timeouts in this crate use
+//!   headless-testable values without claiming normative numbers beyond the
+//!   accepted contract.
 //! - The host never holds window/GPU/PTY handles or internal hot-path objects,
 //!   and it remains headless-testable without a Lua VM. Budgets, instruction/
 //!   memory enforcement, and real VM execution are deferred gaps.

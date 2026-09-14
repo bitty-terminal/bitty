@@ -25,8 +25,10 @@
 //! - **Real MCP/ IPC transport:** `bitty-ipc` only owns bounded framing +
 //!   `StdioTransportStub` / `McpClientStub` (no Unix socket `XDG_RUNTIME_DIR` /
 //!   Windows named pipe, no peer-credential check, no process spawn). A real
-//!   endpoint with perm `0600` / current-user ACL and per-action auth belongs to
-//!   the future IPC/MCP RFC (`OQ-018`) and remains a documented gap.
+//!   endpoint with perm `0600` / current-user ACL and per-action auth follows the
+//!   accepted IPC and Agent RFC that closed (`OQ-018`) on 2026-08-29 (frontmatter
+//!   `status: accepted`; bitty-docs open-questions register) and remains an env-gated
+//!   gap in this headless seam.
 //! - **Real PTY spawn:** `Runtime::spawn_shell` is not invoked here; this test
 //!   feeds synthetic bytes via `handle_pty_bytes` so it stays deterministic and
 //!   portable (Windows ConPTY remains `Unsupported` before its slice).
@@ -286,7 +288,9 @@ fn final_headless_integration_end_to_end() {
     assert_eq!(rt2.tick(), None);
 
     // 7. PluginHost event pipeline via Runtime: register, subscribe, publish,
-    //    drain, and verify bounded per-subscriber drops (open point OQ-013).
+    //    drain, and verify bounded per-subscriber drops (closed OQ-013 decision
+    //    point per the accepted Plugin Platform RFC 2026-08-27; bitty-docs
+    //    open-questions register).
     let manifest = minimal_plugin_manifest(
         "xuepoo.integration",
         vec!["terminal.bell", "terminal.title-changed"],
@@ -354,8 +358,9 @@ fn final_headless_integration_end_to_end() {
     );
 
     // 8. IPC framing: 256 KiB bound, Framer incremental decode, BoundedChannel,
-    //    and IpcEndpoint pending/timeout deterministic (OQ-018 candidate caps).
-    //    No socket/pipe, pure data + bounds, headless.
+    //    and IpcEndpoint pending/timeout deterministic (accepted OQ-018 contract
+    //    per the IPC and Agent RFC closed 2026-08-29; bitty-docs open-questions
+    //    register). No socket/pipe, pure data + bounds, headless.
     let small = b"hello ipc";
     let wire = encode_frame(small).expect("encode small must succeed");
     let (frame, consumed) = decode_frame(&wire).expect("decode must succeed");

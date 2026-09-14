@@ -143,9 +143,9 @@ pub enum HostObservation {
 
 // ── plugin host ───────────────────────────────────────────────────────────
 
-/// Owned draft host for the plugin platform (proposed plugin-platform RFC).
+/// Owned host for the accepted plugin platform (accepted Plugin Platform RFC 2026-08-27).
 ///
-/// Composition root of the draft contracts:
+/// Composition root of the accepted contracts (closed OQ-011/OQ-012/OQ-013; bitty-docs open-questions register):
 /// - [`Registry`]: plugin identity, dependencies, lifecycle generations,
 /// - [`GrantStore`]: capability grants bound to manifest hash, revocation, workspace narrowing,
 /// - [`EventPipeline`]: bounded per-subscriber queues, coalescing, batching, drop policy,

@@ -513,3 +513,97 @@ fn close_last_leaf_refuses_and_move_replaces_source_leaf() {
     assert_ne!(focused(&rt), moved, "the moved leaf left the source layout");
     check_invariants(&mut rt, "move singles");
 }
+
+#[test]
+fn inactive_workspace_close_preserves_active_layout_focus_and_owner() {
+    // CTX-0414 F1 (issue #668): closing an inactive workspace used to reload
+    // the active slot from its stale stash, reverting the active workspace's
+    // live leaf edits (issue repro: 2 leaves -> 1). The active workspace,
+    // its geometry, focus, and primary owner must survive both an index
+    // above and an index below the active slot.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let mut rng = Rng::new(0x0414_0668);
+    let second = op_split(&mut rt, &mut rng);
+    let owner = rt
+        .primary_view()
+        .expect("the startup leaf owns the primary grid");
+    let focus = focused(&rt);
+
+    assert_eq!(rt.workspace_new().expect("ws2"), 1);
+    assert_eq!(rt.workspace_new().expect("ws3"), 2);
+    assert!(rt.workspace_switch(0), "back to ws1");
+    assert_eq!(rt.active_workspace_index(), 0);
+    assert_eq!(rt.layout().leaf_count(), 2, "round trip keeps the split");
+    assert!(rt.layout().leaf_ids().contains(&second));
+
+    let layout_before = rt.layout().clone();
+    let frames_before = rt.present_frames();
+    let leaves_before = rt.workspace_count();
+
+    // Close the inactive workspace above the active slot (buggy code also
+    // switched the active workspace here via `index.min(len - 1)`).
+    let killed = rt.workspace_close_at(2).expect("close inactive ws3");
+    assert_eq!(killed, 0, "headless workspace owns no sessions");
+    assert_eq!(rt.workspace_count(), leaves_before - 1);
+    assert_eq!(rt.active_workspace_index(), 0, "active workspace survives");
+    assert_eq!(rt.layout().leaf_count(), 2, "live leaf edits preserved");
+    assert_eq!(rt.layout(), &layout_before, "tree geometry preserved");
+    assert_eq!(rt.present_frames(), frames_before, "frames preserved");
+    assert_eq!(rt.focused_view(), Some(focus), "focus preserved");
+    assert_eq!(rt.primary_view(), Some(owner), "primary owner preserved");
+
+    // Close the inactive workspace below the active slot: removal shifts
+    // the active index down but must keep the same live workspace loaded.
+    let killed = rt.workspace_close_at(1).expect("close inactive ws2");
+    assert_eq!(killed, 0);
+    assert_eq!(rt.workspace_count(), 1);
+    assert_eq!(rt.active_workspace_index(), 0);
+    assert_eq!(rt.layout(), &layout_before);
+    assert_eq!(rt.present_frames(), frames_before);
+    assert_eq!(rt.focused_view(), Some(focus));
+    assert_eq!(rt.primary_view(), Some(owner));
+    check_invariants(&mut rt, "after inactive closes");
+}
+
+#[test]
+fn closing_workspace_rehomes_moved_primary_owner() {
+    // CTX-0414 F2 (CTX-0405 review follow-up): a workspace close that
+    // destroys the primary owner leaf must re-home `primary_view` to a live
+    // surviving leaf, never leave it dangling on a dead id.
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let owner = rt
+        .primary_view()
+        .expect("the startup leaf owns the primary grid");
+    assert_eq!(focused(&rt), owner, "startup focus owns the primary grid");
+
+    // Move the owner leaf out of ws1 into ws2.
+    let ws2 = rt.workspace_new().expect("ws2");
+    assert!(rt.workspace_switch(0));
+    assert!(rt.set_focus(owner));
+    let moved = rt.workspace_move_focused_to(ws2).expect("move the owner");
+    assert_eq!(moved, owner);
+    assert_eq!(
+        rt.primary_view(),
+        Some(owner),
+        "a move never re-homes the owner"
+    );
+
+    // Closing ws2 destroys the moved owner: re-home to the focused
+    // survivor of the active workspace.
+    assert_eq!(rt.active_workspace_index(), 0);
+    assert_eq!(
+        rt.workspace_close_at(ws2).expect("close owner workspace"),
+        0
+    );
+    let rehomed = rt
+        .primary_view()
+        .expect("primary owner must never dangle on a dead id");
+    assert!(
+        rt.layout().leaf_ids().contains(&rehomed),
+        "re-homed owner must be a live leaf (WS-INV-7)"
+    );
+    assert_eq!(rehomed, focused(&rt), "re-homed to the focused survivor");
+    assert!(rt.is_primary_view(&rehomed));
+    assert_eq!(rt.workspace_count(), 1);
+    check_invariants(&mut rt, "after owner-workspace close");
+}

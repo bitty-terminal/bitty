@@ -488,11 +488,19 @@ impl Runtime {
     /// Remove slot `index`, remap MRU + pending arms, and load the neighbor.
     ///
     /// Removing the last slot resets it to a fresh idle leaf (the layout
-    /// never strands empty). The caller owns session teardown.
+    /// never strands empty). The active workspace survives an inactive close
+    /// (shifted down when the removed slot sat below it); only removing the
+    /// active slot itself loads its neighbor. The caller owns session
+    /// teardown.
     fn remove_workspace(&mut self, index: usize) {
         if index >= self.workspaces.len() {
             return;
         }
+        // CTX-0414: the active slot's stash is refreshed only on switch-away,
+        // so persist the live layout/focus before any slot shuffle. Closing
+        // an inactive workspace must not reload the active slot from a stale
+        // stash (live leaf edits, geometry, focus, and owners would revert).
+        self.stash_active_slot();
         self.workspaces.remove(index);
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();
@@ -527,7 +535,16 @@ impl Runtime {
             }
             None => {}
         }
-        let active = index.min(self.workspaces.len().saturating_sub(1));
+        // CTX-0414: an inactive close keeps the surviving active workspace
+        // (index-shifted when the removed slot sat below it); only removing
+        // the active slot itself loads its neighbor.
+        let active = if index < self.active_workspace {
+            self.active_workspace - 1
+        } else if index == self.active_workspace {
+            index.min(self.workspaces.len().saturating_sub(1))
+        } else {
+            self.active_workspace
+        };
         self.active_workspace = active;
         self.load_slot(active);
         self.mru_front(active);

@@ -95,12 +95,6 @@ impl PaletteIntegration {
         }
     }
 
-    /// Whether `command` is the canonical palette toggle (`bitty-terminal.palette:toggle`).
-    #[must_use]
-    pub fn is_toggle_command(command: &str) -> bool {
-        command == "bitty-terminal.palette:toggle"
-    }
-
     /// Computes centered palette overlay bounds within `container` for a
     /// palette of `width` x `height` cells. Returns `None` when the overlay
     /// would be outside container or dimensions are zero.

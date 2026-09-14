@@ -3,7 +3,9 @@
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
 //! Plugin Roadmap (`bitty-terminal.shell-integration`, `workspace`, `statusline`,
-//! `palette`, `project`, `file-manager`, `git-panel`, `browser-panel`). It
+//! `project`, `file-manager`, `git-panel`, `browser-panel`). `palette` migrated
+//! to an independent first-party package (OQ-053, `CTX-0397`) and is no longer
+//! in this catalog. It
 //! exists **only** as
 //! review evidence that the public Plugin API is complete enough for
 //! first-party use — it does not introduce a private channel.
@@ -311,36 +313,6 @@ pub fn statusline_manifest() -> PluginManifest {
                 "terminal.cwd-changed".to_string(),
                 "terminal.title-changed".to_string(),
             ],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
-/// `bitty-terminal.palette` — command palette and picker UI via overlay
-/// slot using declarative list/text primitives only (no shader/native
-/// window).
-///
-/// Capability: `ui.overlay`
-#[must_use]
-pub fn palette_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("ui.overlay").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.palette",
-            "Palette",
-            "Command palette and picker UI via overlay slot, declarative primitives only",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        lazy: LazyTriggers {
-            commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
-            events: vec!["focus.changed".to_string()],
             claims: Vec::new(),
         },
         raw_bytes_len: 512,
@@ -701,7 +673,7 @@ pub fn mail_panel_manifest() -> PluginManifest {
 
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All ten bundled-disabled manifests for `v1` (fresh install: staged but
+/// All nine bundled-disabled manifests for `v1` (fresh install: staged but
 /// not enabled). File-manager is P1 tiled Panel with `fs.read`+optional
 /// `fs.write`, git-panel is P1 tiled Panel with `process.spawn:git`
 /// allowlisted `[tools.git]`, browser-panel is P2 `View Browser` + `Panel`
@@ -716,7 +688,6 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
         shell_integration_manifest(),
         workspace_manifest(),
         statusline_manifest(),
-        palette_manifest(),
         project_manifest(),
         file_manager_manifest(),
         git_panel_manifest(),
@@ -726,7 +697,7 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
     ]
 }
 
-/// Plugin ids of the ten bundled-disabled plugins, in catalog order.
+/// Plugin ids of the nine bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -743,7 +714,7 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the ten bundled ids (canonical) or the deprecated
+/// Whether `id` is one of the nine bundled ids (canonical) or the deprecated
 /// `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
@@ -753,7 +724,6 @@ pub fn is_bundled(id: &PluginId) -> bool {
             | "bitty-terminal.workspace"
             | "bitty-terminal.tabs"
             | "bitty-terminal.statusline"
-            | "bitty-terminal.palette"
             | "bitty-terminal.project"
             | "bitty-terminal.file-manager"
             | "bitty-terminal.git-panel"
@@ -779,7 +749,6 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.workspace" => Some(workspace_manifest()),
         "bitty-terminal.tabs" => Some(tabs_manifest()),
         "bitty-terminal.statusline" => Some(statusline_manifest()),
-        "bitty-terminal.palette" => Some(palette_manifest()),
         "bitty-terminal.project" => Some(project_manifest()),
         "bitty-terminal.file-manager" => Some(file_manager_manifest()),
         "bitty-terminal.git-panel" => Some(git_panel_manifest()),
@@ -805,7 +774,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 9);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -818,7 +787,6 @@ mod tests {
                 "bitty-terminal.file-manager",
                 "bitty-terminal.git-panel",
                 "bitty-terminal.mail-panel",
-                "bitty-terminal.palette",
                 "bitty-terminal.project",
                 "bitty-terminal.shell-integration",
                 "bitty-terminal.statusline",
@@ -827,6 +795,10 @@ mod tests {
         );
         // Deprecated alias still resolves + is_bundled, but is not in the canonical list.
         assert!(!ids.contains(&"bitty-terminal.tabs".to_string()));
+        assert!(!ids.contains(&"bitty-terminal.palette".to_string()));
+        assert!(!is_bundled(
+            &PluginId::new("bitty-terminal.palette").unwrap()
+        ));
         assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
         assert!(is_bundled(
             &PluginId::new("bitty-terminal.workspace").unwrap()
@@ -904,17 +876,6 @@ mod tests {
                 .ids
                 .contains(&CapabilityId::parse("ui.rich").unwrap())
         );
-    }
-
-    #[test]
-    fn palette_manifest_capabilities() {
-        let m = palette_manifest();
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("ui.overlay").unwrap())
-        );
-        assert_eq!(m.lazy.commands.len(), 1);
     }
 
     #[test]

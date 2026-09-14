@@ -130,6 +130,7 @@ pub mod frame;
 pub mod frame_digest;
 pub mod limits;
 pub mod mcp;
+pub mod rich_fragment;
 pub mod scope;
 pub mod snapshot;
 pub mod tool_dispatch;
@@ -164,6 +165,10 @@ pub use limits::{
 pub use mcp::{
     DEFAULT_MCP_TIMEOUT_MS, MAX_MCP_PENDING, McpClientConfig, McpClientStub, McpNotification,
     McpRequest as McpIpcRequest, McpResponse as McpIpcResponse,
+};
+pub use rich_fragment::{
+    FragmentData, FragmentIngestService, MAX_FRAGMENT_TEXT_BYTES, MAX_PENDING_FRAGMENTS,
+    RichFragment,
 };
 pub use scope::{
     ConsentGrant, ConsentLedger, Scope, ScopeSet, authorize_method, required_scope_for_method,

@@ -54,8 +54,10 @@
 //!
 //! # Image store/placement status
 //!
-//! Image protocol placement semantics are out of scope pending OQ-008;
-//! see [`crate::image`] for the typed stub and its contract references.
+//! Image protocol placement semantics follow the accepted Rich Presentation RFC
+//! that closed OQ-008 on 2026-08-28 (frontmatter `status: accepted`; bitty-docs
+//! open-questions register); see [`crate::image`] for the typed placeholder and
+//! its contract references.
 
 #![forbid(unsafe_code)]
 

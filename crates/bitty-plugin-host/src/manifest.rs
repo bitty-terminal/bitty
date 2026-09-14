@@ -1,6 +1,7 @@
-//! Manifest and identity model (OQ-012, part 1).
+//! Manifest and identity model (OQ-012, part 1, closed by the accepted Plugin Platform RFC).
 //!
-//! Candidate `bitty-plugin.toml` schema per the proposed plugin-platform RFC.
+//! Accepted `bitty-plugin.toml` schema per the accepted plugin-platform RFC (2026-08-27,
+//! frontmatter `status: accepted`; bitty-docs open-questions register).
 //! Validation is total, side-effect free, and headless: no file I/O, no VM,
 //! no network. The manifest is attacker-controlled input (cloned repo,
 //! typo-squat) so every field is treated as untrusted display data and is

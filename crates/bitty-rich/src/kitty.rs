@@ -1,6 +1,7 @@
 //! Streaming Kitty graphics intake (bounded, headless-testable, no decode).
 //!
-//! OQ-008 decision remains **open**. The image RFC has not landed, so this
+//! OQ-008 is **closed** by the accepted Rich Presentation RFC on 2026-08-28
+//! (frontmatter `status: accepted`; bitty-docs open-questions register), so this
 //! module performs intake and bounds only: chunked `APC G` payloads are
 //! assembled exactly, held inertly, and exposed for headless queries. No
 //! base64 decode, no pixel allocation, no placement calculation, and no

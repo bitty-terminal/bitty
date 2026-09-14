@@ -1,9 +1,10 @@
-//! Image store/placement: bounded placeholder stub pending OQ-008 decision.
+//! Image store/placement: bounded placeholder under the accepted OQ-008 contract.
 //!
-//! The Terminal State RFC places "image protocol placement semantics
-//! (OQ-008)" explicitly out of scope, and ADR-0003 records the image-store
-//! role for this crate while leaving decoding placement to the future image
-//! RFC. This module provides a **bounded, headless-testable placeholder**
+//! The Terminal State RFC scopes "image protocol placement semantics
+//! (OQ-008)" to the Rich Presentation RFC, and ADR-0003 records the image-store
+//! role for this crate. OQ-008 is closed by the accepted Rich Presentation RFC
+//! on 2026-08-28 (frontmatter `status: accepted`; bitty-docs open-questions
+//! register). This module provides a **bounded, headless-testable placeholder**
 //! that downstream crates (render, rich presentation, plugin host) can
 //! compile against without requiring actual raster decode.
 //!
@@ -12,12 +13,13 @@
 //! - `docs/interfaces/rich-content.md` remains a **draft** (not
 //!   accepted). It sketches `RichBlock`/`Image`/`SceneNode` candidates that
 //!   are **not** implemented here.
-//! - OQ-008 decision remains **open**. No image bytes are decoded, no pixel
+//! - OQ-008 is **closed** by the accepted Rich Presentation RFC (2026-08-28).
+//!   No image bytes are decoded, no pixel
 //!   allocation tracks untrusted dimensions, and no renderer coupling exists
 //!   here. This store holds at most [`IMAGE_STORE_MAX_ENTRIES`] opaque
 //!   placeholders, each truncated to [`IMAGE_STORE_MAX_PAYLOAD_BYTES`], with
 //!   oldest-first eviction. Placement, animation, and renderer contract
-//!   await the image RFC with security review. Until then every entry is
+//!   follow the accepted image contract with security review. Every entry is
 //!   inert for rendering: it affects only bounded bookkeeping and
 //!   deterministic tests, never GPU or filesystem state.
 //!

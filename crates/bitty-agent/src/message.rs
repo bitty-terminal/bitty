@@ -64,8 +64,9 @@ impl std::str::FromStr for Role {
 ///
 /// All fields are owned (`String`, `Vec`, …) so messages are cloneable,
 /// comparable, and sendable without lifetimes. No LLM I/O is performed here;
-/// this struct is pure data that will be framed by the `bitty-ipc` transport
-/// when the `OQ-018` RFC lands.
+/// this struct is pure data framed by the `bitty-ipc` transport per the accepted
+/// IPC and Agent RFC that closed `OQ-018` on 2026-08-29 (frontmatter `status:
+/// accepted`; bitty-docs open-questions register).
 ///
 /// # Bounds (threat `T-01`, `P0-AC-024`)
 ///
@@ -162,8 +163,9 @@ impl AgentMessage {
         // Tool calls outside assistant turns are allowed structurally but
         // documented as discouraged; validate strictly only for tool role.
         // Keep the type permissive so headless tests can drive either pattern
-        // without an artificial rejection, but real hosts should enforce
-        // policy per the future CLI/IPC RFC.
+        // without an artificial rejection, but real hosts enforce policy per
+        // the accepted IPC and Agent RFC that closed OQ-018 on 2026-08-29
+        // (frontmatter `status: accepted`; bitty-docs open-questions register).
 
         // Defensive frame-size check: content + each call/result.
         let mut frame_bytes = self.content.len();

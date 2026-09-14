@@ -45,7 +45,8 @@
 //!   update pending diff approval, narrowed sets carry forward silently.
 //! - The event pipeline keeps one bounded FIFO queue per `(plugin, event-type)`,
 //!   supports coalescing where semantics allow, bounds batch size/time, and
-//!   treats overflow via the single shared open decision point.
+//!   treats overflow via the single shared policy (`DropOldest` accepted v1
+//!   default, OQ-013 closed).
 //! - The side queue that observes terminal events is strictly bounded and never
 //!   blocks the producer (ADR-0003 rule 4, threat `T-01`).
 //!
@@ -60,12 +61,12 @@
 //! | Plugin API v1 surface (OQ-011) — commands, services, settings | `registry` | [`registry::Registry`] qualified names (`plugin-id:resource`), duplicate rejection at graph construction, service interface syntax, lazy triggers |
 //! | Lifecycle and generations | `registry`, `host` | [`registry::PluginState`] `Declared->Resolved->Registered->Activated->(Suspended)->Disposed`, [`registry::Generation`] monotonic, generation disposal completeness, safe-mode skip |
 //! | Event pipeline — classes and phases (OQ-013) | `event` | [`event::EventClass`] Lifecycle/Observation/Interception, [`event::EventKind`] v1 closed set (4 interception points exactly) |
-//! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` proposed), [`event::DropPolicy`] open decision point |
+//! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` accepted v1 baseline), [`event::DropPolicy`] `DropOldest` accepted default |
 //! | Timeouts and failure policy | `event` | [`event::InterceptionDecision`] veto-wins, fail-open, [`event::should_proceed`], reentrancy rejected, interception not queued (cold-path synchronous) |
 //! | Plugin host (ADRs) | `host` | [`host::PluginHost`] owns registry + grant store + event pipeline + [`host::SideQueue`] bounded side queue; no window/GPU/PTY coupling; headless testable |
 //! | Package install verification (proposed, draft) | `install` | [`install::verify_install`] calls `bitty_package::verify_pipeline` (7 stages) before staging; `V-A`/`V-B`/`V-C` trust, capability-diff `P0-AC-030`, generation integrity `verify_all`; fail-closed owned errors + [`install::DoctorIssue`] for `bitty plugin doctor`; headless tamper/capability tests |
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
-//! | Open points remaining under OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropPolicy` open point documented; exact queue depths/timeouts remain `OQ-014` candidates |
+//! | Verification remaining under closed OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropOldest` accepted v1 default; exact queue depths/timeouts per accepted `OQ-014` budgets; remaining work is implementation verification, not open RFC points |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
 //!

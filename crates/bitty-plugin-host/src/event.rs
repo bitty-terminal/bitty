@@ -916,8 +916,8 @@ impl EventPipeline {
     /// Create a new pipeline.
     ///
     /// `drop_policy` is the shared policy for queue overflow — `DropOldest` is
-    /// the accepted v1 default (OQ-013 closed; experimental review evidence per
-    /// new RFC lifecycle, RFC remains `Proposed` until independent review).
+    /// the accepted v1 default per the accepted Plugin Platform RFC (2026-08-27,
+    /// OQ-013 closed).
     /// `DropNewest` remains available via explicit opt-in. `default_capacity`
     /// is the per-queue bound (candidate default, usually
     /// [`PER_SUBSCRIPTION_QUEUE_LIMIT`], OQ-014).

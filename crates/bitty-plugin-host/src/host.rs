@@ -178,9 +178,9 @@ impl PluginHost {
     /// Create a new host.
     ///
     /// `drop_policy` is the shared overflow policy for every per-subscriber queue.
-    /// It must be chosen explicitly because the choice is an open decision point
-    /// (see [`DropPolicy`] and `event::DropPolicy` docs). There is no implicit
-    /// settling; both candidates remain proposed.
+    /// It must be chosen explicitly (see [`DropPolicy`] and `event::DropPolicy`
+    /// docs). There is no implicit settling; `DropOldest` is the accepted v1
+    /// default, `DropNewest` remains available via explicit opt-in.
     ///
     /// `side_capacity` bounds the side queue that observes terminal events; producers
     /// never block on the subscriber.

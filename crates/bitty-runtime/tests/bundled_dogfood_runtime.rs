@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Runtime dogfood for the nine bundled-disabled plugins (CTX-0096 + file-manager CTX-0108 + git-panel CTX-0109 + browser-panel CTX-0110 + ai-panel CTX-0111 + mail-panel CTX-0112).
+//! Runtime dogfood for the eight bundled-disabled plugins (CTX-0096 + file-manager CTX-0108 + git-panel CTX-0109 + browser-panel CTX-0110 + ai-panel CTX-0111 + mail-panel CTX-0112).
 //!
 //! Proves:
 //! - default disabled: fresh `EffectiveConfig` / `Runtime::with_defaults` has
@@ -78,7 +78,7 @@ fn bundled_plugins_load_via_public_api_through_runtime() {
         rt.activate_plugin(&id)
             .unwrap_or_else(|e| panic!("activate {}: {e}", id.as_str()));
     }
-    assert_eq!(rt.plugin_host().registry().len(), 9);
+    assert_eq!(rt.plugin_host().registry().len(), 8);
     // Each plugin's subscription (if any) can be established via public API.
     let shell_id = bitty_plugin_host::PluginId::new("bitty-terminal.shell-integration").unwrap();
     rt.subscribe_plugin_event(&shell_id, EventKind::TerminalTitleChanged)
@@ -128,7 +128,7 @@ fn config_driven_enable_respects_default_disabled_and_public_api() {
     // `enabled=true` with matching id causes host activation — and still
     // via the public `declare -> resolve -> register -> activate` + grant.
     let mut rt = Runtime::with_defaults().expect("runtime");
-    let manifest = bundled::statusline_manifest();
+    let manifest = bundled::project_manifest();
     let id_str = manifest.id().to_string();
     let enabled_cfg = EffectiveConfig {
         plugins: vec![PluginSpec {
@@ -243,12 +243,12 @@ fn no_panel_runtime_browser_agent_marketplace_smuggled() {
     // with process.spawn:git, CTX-0110 View Browser + Panel controls with
     // browser.embed/navigation/file-url/storage allowlisted, CTX-0111 Panel + AgentId/AgentWorkspace 32KiB + mcp.invoke + ai.*,
     // CTX-0112 Panel + mcp.invoke:mail.* + network.connect imap/smtp + fs.read:~/mail/**).
-    // Marketplace/daemon remain excluded; bundled catalog is nine ids
-    // (including ai-panel + mail-panel; palette migrated to an independent
-    // package, splits/search beyond the five panel plugins excluded, but
-    // agent/mail now included via ai/mail panel).
+    // Marketplace/daemon remain excluded; bundled catalog is eight ids
+    // (including ai-panel + mail-panel; palette and statusline migrated to
+    // independent packages, splits/search beyond the five panel plugins
+    // excluded, but agent/mail now included via ai/mail panel).
     let ids = bundled::bundled_ids_sorted();
-    assert_eq!(ids.len(), 9);
+    assert_eq!(ids.len(), 8);
     assert!(
         !ids.iter()
             .any(|id| id.contains("splits") || id.contains("search"))

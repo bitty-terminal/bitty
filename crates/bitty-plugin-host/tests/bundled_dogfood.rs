@@ -2,8 +2,8 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the nine `v1` bundled-disabled first-party plugins
-//! (`bitty-terminal.shell-integration`, `tabs`, `statusline`,
+//! Verifies the eight `v1` bundled-disabled first-party plugins
+//! (`bitty-terminal.shell-integration`, `tabs`,
 //! `project`, `file-manager`, `git-panel`, `browser-panel`, `ai-panel`, `mail-panel`) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
@@ -20,7 +20,7 @@ use bitty_plugin_host::{
         ai_panel_manifest, all_bundled_manifests, browser_panel_manifest, bundled_ids_sorted,
         bundled_manifest_for, deprecated_alias_warning, file_manager_manifest, git_panel_manifest,
         is_bundled, is_deprecated_bundled_alias, mail_panel_manifest, project_manifest,
-        shell_integration_manifest, statusline_manifest, workspace_manifest,
+        shell_integration_manifest, workspace_manifest,
     },
 };
 
@@ -41,7 +41,7 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_validate_and_have_expected_ids() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 8);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
@@ -55,7 +55,6 @@ fn bundled_manifests_validate_and_have_expected_ids() {
             "bitty-terminal.mail-panel",
             "bitty-terminal.project",
             "bitty-terminal.shell-integration",
-            "bitty-terminal.statusline",
             "bitty-terminal.workspace",
         ]
     );
@@ -103,7 +102,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 9);
+    assert_eq!(host.registry().len(), 8);
 }
 
 #[test]
@@ -215,7 +214,6 @@ fn default_disabled_safe_mode_leaves_host_functional() {
         safe.declare(bundled_manifest_for("bitty-terminal.workspace").unwrap())
             .is_err()
     );
-    assert!(safe.declare(statusline_manifest()).is_err());
     assert!(safe.declare(project_manifest()).is_err());
     assert!(safe.declare(file_manager_manifest()).is_err());
     assert!(safe.declare(git_panel_manifest()).is_err());

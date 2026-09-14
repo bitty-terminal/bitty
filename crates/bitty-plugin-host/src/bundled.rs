@@ -2,10 +2,11 @@
 //!
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
-//! Plugin Roadmap (`bitty-terminal.shell-integration`, `workspace`, `statusline`,
-//! `project`, `file-manager`, `git-panel`, `browser-panel`). `palette` migrated
-//! to an independent first-party package (OQ-053, `CTX-0397`) and is no longer
-//! in this catalog. It
+//! Plugin Roadmap (`bitty-terminal.shell-integration`, `workspace`,
+//! `project`, `file-manager`, `git-panel`, `browser-panel`). `statusline`
+//! migrated to an independent first-party package (OQ-053, `CTX-0398`) and
+//! `palette` migrated to an independent first-party package (OQ-053,
+//! `CTX-0397`); neither is in this catalog. It
 //! exists **only** as
 //! review evidence that the public Plugin API is complete enough for
 //! first-party use — it does not introduce a private channel.
@@ -279,42 +280,6 @@ pub fn tabs_manifest() -> PluginManifest {
         required_services: Vec::new(),
         capabilities: caps,
         lazy: workspace_lazy_triggers(),
-        raw_bytes_len: 512,
-    }
-}
-
-/// `bitty-terminal.statusline` — presentation of cwd, mode, Git and task
-/// state via status-component composition.
-///
-/// Capability: `terminal.semantic-read` (cwd/mode snapshot) plus
-/// status-component composition (no terminal write).
-/// Events: `terminal.cwd-changed`, `terminal.title-changed`.
-#[must_use]
-pub fn statusline_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.statusline",
-            "Statusline",
-            "Cwd, mode, Git and task presentation via status-component composition",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        lazy: LazyTriggers {
-            commands: Vec::new(),
-            events: vec![
-                "terminal.cwd-changed".to_string(),
-                "terminal.title-changed".to_string(),
-            ],
-            claims: Vec::new(),
-        },
         raw_bytes_len: 512,
     }
 }
@@ -673,7 +638,7 @@ pub fn mail_panel_manifest() -> PluginManifest {
 
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All nine bundled-disabled manifests for `v1` (fresh install: staged but
+/// All eight bundled-disabled manifests for `v1` (fresh install: staged but
 /// not enabled). File-manager is P1 tiled Panel with `fs.read`+optional
 /// `fs.write`, git-panel is P1 tiled Panel with `process.spawn:git`
 /// allowlisted `[tools.git]`, browser-panel is P2 `View Browser` + `Panel`
@@ -687,7 +652,6 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
     vec![
         shell_integration_manifest(),
         workspace_manifest(),
-        statusline_manifest(),
         project_manifest(),
         file_manager_manifest(),
         git_panel_manifest(),
@@ -697,7 +661,7 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
     ]
 }
 
-/// Plugin ids of the nine bundled-disabled plugins, in catalog order.
+/// Plugin ids of the eight bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -714,7 +678,7 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the nine bundled ids (canonical) or the deprecated
+/// Whether `id` is one of the eight bundled ids (canonical) or the deprecated
 /// `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
@@ -723,7 +687,6 @@ pub fn is_bundled(id: &PluginId) -> bool {
         "bitty-terminal.shell-integration"
             | "bitty-terminal.workspace"
             | "bitty-terminal.tabs"
-            | "bitty-terminal.statusline"
             | "bitty-terminal.project"
             | "bitty-terminal.file-manager"
             | "bitty-terminal.git-panel"
@@ -748,7 +711,6 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.shell-integration" => Some(shell_integration_manifest()),
         "bitty-terminal.workspace" => Some(workspace_manifest()),
         "bitty-terminal.tabs" => Some(tabs_manifest()),
-        "bitty-terminal.statusline" => Some(statusline_manifest()),
         "bitty-terminal.project" => Some(project_manifest()),
         "bitty-terminal.file-manager" => Some(file_manager_manifest()),
         "bitty-terminal.git-panel" => Some(git_panel_manifest()),
@@ -774,7 +736,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 8);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -789,7 +751,6 @@ mod tests {
                 "bitty-terminal.mail-panel",
                 "bitty-terminal.project",
                 "bitty-terminal.shell-integration",
-                "bitty-terminal.statusline",
                 "bitty-terminal.workspace",
             ]
         );
@@ -798,6 +759,10 @@ mod tests {
         assert!(!ids.contains(&"bitty-terminal.palette".to_string()));
         assert!(!is_bundled(
             &PluginId::new("bitty-terminal.palette").unwrap()
+        ));
+        assert!(!ids.contains(&"bitty-terminal.statusline".to_string()));
+        assert!(!is_bundled(
+            &PluginId::new("bitty-terminal.statusline").unwrap()
         ));
         assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
         assert!(is_bundled(
@@ -861,21 +826,6 @@ mod tests {
         assert!(!is_deprecated_bundled_alias("bitty-terminal.workspace"));
         assert!(deprecated_alias_warning("bitty-terminal.tabs").is_some());
         assert!(deprecated_alias_warning("bitty-terminal.workspace").is_none());
-    }
-
-    #[test]
-    fn statusline_manifest_capabilities() {
-        let m = statusline_manifest();
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("ui.rich").unwrap())
-        );
     }
 
     #[test]

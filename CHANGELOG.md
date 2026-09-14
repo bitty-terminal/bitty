@@ -136,11 +136,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bitty-terminal.palette` moved to the independent
   `bitty-terminal/palette` package and is no longer part of the
   bundled-disabled catalog, so the id can be installed through the external
-  package path. The catalog now stages nine plugins. The Core Panel Runtime
+  package path. The catalog now stages eight plugins. The Core Panel Runtime
   overlay helpers and theme bridge in `bitty-runtime::palette` are unchanged;
   the plugin manifest, commands, and events are identical, and the independent
   Lua package requests `ui.rich` in addition to `ui.overlay` because the
   accepted Plugin API v1 overlay path requires it.
+- **Statusline plugin extracted from the bundled catalog (CTX-0398, OQ-053):**
+  the `bitty-terminal.statusline` presentation moved to the independent
+  `bitty-terminal/statusline` package and is no longer part of the
+  bundled-disabled catalog, so the id can be installed through the external
+  package path. The catalog now stages eight plugins. The workspaceline claim
+  and workspace lifecycle stay bundled in `bitty-terminal.workspace`, and
+  shell integration stays the OSC 7/133 semantic-zone provider; the plugin id,
+  capabilities (`terminal.semantic-read`, `ui.rich`), and lazy events are
+  unchanged from the bundled manifest. The Core Panel Runtime helpers in
+  `bitty-runtime::statusline` are unchanged.
 
 - **Selection no longer auto-copies by default (CTX-0371):** `selection.auto_copy`
   now defaults to `false` (was `true`), so a committed mouse selection keeps its

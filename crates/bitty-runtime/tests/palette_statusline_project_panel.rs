@@ -15,7 +15,7 @@
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, EventPayload, GrantRecord, PluginHost,
-    bundled::{project_manifest, statusline_manifest},
+    bundled::project_manifest,
 };
 use bitty_runtime::{
     Runtime,
@@ -83,6 +83,49 @@ fn palette_manifest() -> bitty_plugin_host::PluginManifest {
         lazy: LazyTriggers {
             commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
             events: vec!["focus.changed".to_string()],
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
+}
+
+/// Local fixture mirroring the former bundled `bitty-terminal.statusline` manifest.
+///
+/// Statusline migrated to an independent first-party package (OQ-053, `bitty`
+/// `CTX-0398`), so this suite now exercises the generic Panel Runtime path
+/// against a plain manifest instead of the bundled catalog.
+fn statusline_manifest() -> bitty_plugin_host::PluginManifest {
+    use bitty_plugin_host::{
+        CapabilityRequests, Compat, LazyTriggers, PluginId, PluginIdentity, PluginManifest,
+    };
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("ui.rich").expect("known capability"));
+    PluginManifest {
+        identity: PluginIdentity {
+            id: PluginId::new("bitty-terminal.statusline").expect("valid id"),
+            name: "Statusline".to_string(),
+            version: "0.1.0".to_string(),
+            description: "Cwd, mode, Git and task presentation via status-component composition"
+                .to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(">=0.1,<1.0".to_string()),
+            plugin_api: Some("^1.0".to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        lazy: LazyTriggers {
+            commands: Vec::new(),
+            events: vec![
+                "terminal.cwd-changed".to_string(),
+                "terminal.title-changed".to_string(),
+            ],
             claims: Vec::new(),
         },
         raw_bytes_len: 512,

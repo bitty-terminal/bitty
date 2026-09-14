@@ -245,8 +245,9 @@ fn no_panel_runtime_browser_agent_marketplace_smuggled() {
     // CTX-0112 Panel + mcp.invoke:mail.* + network.connect imap/smtp + fs.read:~/mail/**).
     // Marketplace/daemon remain excluded; bundled catalog is eight ids
     // (including ai-panel + mail-panel; palette and statusline migrated to
-    // independent packages, splits/search beyond the five panel plugins
-    // excluded, but agent/mail now included via ai/mail panel).
+    // independent packages, splits/search excluded beyond the five tiled
+    // panel plugins (file-manager/git/browser/ai/mail), with agent/mail
+    // now included via the ai/mail panels).
     let ids = bundled::bundled_ids_sorted();
     assert_eq!(ids.len(), 8);
     assert!(

@@ -1,6 +1,6 @@
 [package]
 name = "bitty-ipc"
-description = "Draft IPC/MCP boundary for Bitty"
+description = "Generic out-of-process IPC bridge boundary for Bitty"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["ipc", "mcp", "bitty"]
 categories = ["development-tools"]
-publish = false
+publish = true
 
 [lints]
 workspace = true

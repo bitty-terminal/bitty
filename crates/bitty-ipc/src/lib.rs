@@ -118,6 +118,7 @@ pub mod channel;
 pub mod ctl;
 pub mod devtools;
 pub mod error;
+pub mod execution;
 pub mod frame;
 pub mod frame_digest;
 pub mod limits;
@@ -138,6 +139,15 @@ pub use channel::{
     IpcResponse, MAX_CHANNEL_CAPACITY, MAX_METHOD_BYTES, MAX_PENDING_REQUESTS, RequestId,
 };
 pub use error::{ErrorClass, IpcError};
+pub use execution::{
+    DEFAULT_EXEC_TIMEOUT_MS, EXECUTION_SCOPE, EffectState, EnvPolicy, EnvVar, ExecutionProvider,
+    ExecutionRequest, ExecutionResult, ExecutionService, ExecutionStatus, MAX_EXEC_ARG_BYTES,
+    MAX_EXEC_ARGS, MAX_EXEC_ARGS_TOTAL_BYTES, MAX_EXEC_CLIENT_ID_BYTES, MAX_EXEC_CWD_BYTES,
+    MAX_EXEC_ENV_NAME_BYTES, MAX_EXEC_ENV_VALUE_BYTES, MAX_EXEC_ENV_VARS,
+    MAX_EXEC_EVIDENCE_REF_BYTES, MAX_EXEC_EVIDENCE_REFS, MAX_EXEC_OUTPUT_BUDGET_BYTES,
+    MAX_EXEC_STREAM_BYTES, MAX_EXEC_TARGET_BYTES, MAX_EXEC_TIMEOUT_MS, MAX_EXECUTABLE_BYTES,
+    MAX_TRACKED_EXECUTIONS, RawExecutionOutput,
+};
 pub use frame::{Frame, Framer, MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, decode_frame, encode_frame};
 pub use limits::{
     RC9_BURST_PER_SEC, RC9_MAX_CONNECTIONS, RC9_PAYLOAD_CAP_BYTES, RC9_REQ_PER_SEC, RC9_WINDOW_MS,

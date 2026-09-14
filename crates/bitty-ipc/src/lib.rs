@@ -51,6 +51,12 @@
 //!   itself; the `bitty-app` servo owns the listener lifecycle.
 //! - MCP stub: `mcp::McpClientStub` with bounded framing, correlation, and
 //!   deterministic timeouts (`DEFAULT_MCP_TIMEOUT_MS` 10 s, ceiling 30 s).
+//! - Out-of-process bridge client (`bridge::BridgeClient`, CTX-0419): the
+//!   published boundary for `bitty-ai`, devtools, and any future
+//!   out-of-process consumer. Composes the method registry, scope
+//!   authorization, consent ledger, bounded endpoint, and wire envelope in
+//!   dispatch order with bounded params (`MAX_BRIDGE_PARAMS_BYTES` 16 KiB).
+//!   Mechanism-only: no AI vocabulary, no network, no new dependencies.
 //!
 //! # Trust boundary
 //!
@@ -114,6 +120,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod bridge;
 pub mod channel;
 pub mod ctl;
 pub mod devtools;
@@ -134,6 +141,7 @@ pub use auth::{
     MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, VerifiedPeer,
     verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint, verify_windows_pipe,
 };
+pub use bridge::{BridgeClient, MAX_BRIDGE_CLIENT_ID_BYTES, MAX_BRIDGE_PARAMS_BYTES};
 pub use channel::{
     BoundedChannel, DEFAULT_REQUEST_CAPACITY, DEFAULT_RESPONSE_CAPACITY, IpcEndpoint, IpcRequest,
     IpcResponse, MAX_CHANNEL_CAPACITY, MAX_METHOD_BYTES, MAX_PENDING_REQUESTS, RequestId,

@@ -298,3 +298,46 @@ fn env_policy_is_closed_no_ambient_passthrough() {
         EnvPolicy::Explicit { .. } => {}
     }
 }
+
+#[test]
+fn resolve_preserves_attribution() {
+    fn unknown_provider(request: &ExecutionRequest) -> Result<RawExecutionOutput, IpcError> {
+        Ok(RawExecutionOutput {
+            target_id: request.target.clone(),
+            status: ExecutionStatus::Unknown,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            evidence_refs: Vec::new(),
+            effect_state: EffectState::Unknown,
+        })
+    }
+    let mut service = ExecutionService::with_provider(unknown_provider);
+    let request = minimal_request().with_allow_effects(true);
+    dispatch_ok(&mut service, &request, 9);
+    // Resolution rewriting client attribution must fail closed.
+    let rogue = bitty_ipc::execution::ExecutionResult::new(
+        9,
+        "anyone-else".to_owned(),
+        None,
+        ExecutionStatus::Completed,
+        Some(0),
+        "done".to_owned(),
+        String::new(),
+        false,
+        Vec::new(),
+        EffectState::Completed,
+    )
+    .expect("shape-valid rogue result");
+    let error = service
+        .resolve(9, rogue)
+        .expect_err("attribution rewrite must fail closed");
+    assert!(
+        matches!(error, IpcError::InvalidRequest { .. }),
+        "got {error:?}"
+    );
+    // Stored entry is unchanged and still needs reconciliation.
+    let stored = service.reconcile(9).expect("stored");
+    assert_eq!(stored.client_id, CLIENT);
+    assert!(stored.needs_reconciliation());
+}

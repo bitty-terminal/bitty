@@ -25,7 +25,10 @@
 //! it through [`ExecutionService::reconcile`]. Callers must reconcile first
 //! and then close the entry with [`ExecutionService::resolve`]; re-dispatch
 //! under a tracked id is rejected as `InvalidRequest`, and there is
-//! deliberately no `retry` primitive — a blind retry could run a
+//! deliberately no `retry` primitive. Same-id re-dispatch is rejected;
+//! a new id is an explicit, separately-attributed re-execution, so
+//! callers must reconcile `Unknown` before choosing to re-execute —
+//! a blind retry could run a
 //! non-idempotent command twice (031 §5: `git checkout foo` must not be
 //! assumed failed just because the response never arrived).
 //!
@@ -653,7 +656,7 @@ pub struct RawExecutionOutput {
     pub target_id: Option<String>,
     /// Process-completion view.
     pub status: ExecutionStatus,
-    /// Process exit code (`None` when unknown or canceled).
+    /// Process exit code (`None` when unknown, and conventionally when canceled).
     pub exit_code: Option<i32>,
     /// Raw stdout bytes (truncated to the effective budget by the service).
     pub stdout: String,
@@ -784,7 +787,7 @@ pub struct ExecutionResult {
     pub target: Option<String>,
     /// Process-completion view.
     pub status: ExecutionStatus,
-    /// Process exit code (`None` when unknown or canceled).
+    /// Process exit code (`None` when unknown, and conventionally when canceled).
     pub exit_code: Option<i32>,
     /// Bounded stdout summary (char-boundary truncated).
     pub stdout_summary: String,
@@ -971,7 +974,8 @@ fn default_provider(request: &ExecutionRequest) -> Result<RawExecutionOutput, Ip
 /// stored outcome is queryable through [`ExecutionService::reconcile`], and
 /// `Unknown` entries close only through [`ExecutionService::resolve`].
 /// There is no retry primitive: re-dispatch under a tracked id fails as
-/// `InvalidRequest`.
+/// `InvalidRequest`; a new id is an explicit, separately-attributed
+/// re-execution (callers must reconcile `Unknown` before re-executing).
 #[derive(Debug)]
 pub struct ExecutionService {
     /// Host execution provider (pure `fn`, dependency-free).
@@ -1158,8 +1162,10 @@ impl ExecutionService {
     /// - `NotFound` when `execution_id` has no stored outcome.
     /// - `InvalidRequest` when the stored outcome is already terminal
     ///   (no silent overwrite), when `result` carries a different
-    ///   `execution_id`, or when `result` is itself `Unknown` (resolution
-    ///   must terminate; further evidence arrives as another `resolve`).
+    ///   `execution_id`, when `result` rewrites the stored `client_id` or
+    ///   `target` attribution, or when `result` is itself `Unknown`
+    ///   (resolution must terminate; further evidence arrives as another
+    ///   `resolve`).
     pub fn resolve(&mut self, execution_id: u64, result: ExecutionResult) -> Result<(), IpcError> {
         let stored = self
             .results
@@ -1178,6 +1184,11 @@ impl ExecutionService {
                     "resolution carries id {}, want {execution_id}",
                     result.execution_id
                 ),
+            });
+        }
+        if result.client_id != stored.client_id || result.target != stored.target {
+            return Err(IpcError::InvalidRequest {
+                reason: "resolution must preserve client_id and target".into(),
             });
         }
         if result.needs_reconciliation() {

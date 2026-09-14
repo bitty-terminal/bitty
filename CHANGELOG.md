@@ -132,6 +132,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Packaging artifacts consolidated under `packaging/` (CTX-0432):** the
+  Homebrew formula moved from the duplicated `Formula/` and
+  `homebrew/Formula/` copies to `packaging/homebrew/bitty.rb`, the Scoop
+  manifest now lives only at `packaging/scoop-bitty.json`, and the root
+  `PKGBUILD` mirror was retired in favor of `packaging/PKGBUILD` (the AUR
+  publish jobs already copied the packaging recipe). The packaging guard
+  scripts and release validation no longer check the retired mirror paths.
 - **Palette plugin extracted from the bundled catalog (CTX-0397, OQ-053):**
   `bitty-terminal.palette` moved to the independent
   `bitty-terminal/palette` package and is no longer part of the

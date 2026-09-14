@@ -56,7 +56,6 @@ jobs:
         run: |
           bash -n packaging/PKGBUILD
           bash -n packaging/PKGBUILD.bin
-          bash -n PKGBUILD
           echo "PKGBUILD syntax OK"
       - name: Validate bitty-bin template (render test)
         run: |
@@ -72,12 +71,10 @@ jobs:
           fi
       - name: Validate Scoop manifest
         run: |
-          python3 -m json.tool bucket/bitty.json > /dev/null && echo "scoop manifest valid"
-          python3 -m json.tool packaging/scoop-bitty.json > /dev/null && echo "scoop packaging manifest valid"
+          python3 -m json.tool packaging/scoop-bitty.json > /dev/null && echo "scoop manifest valid"
       - name: Validate Homebrew Formula syntax
         run: |
-          ruby -c Formula/bitty.rb
-          ruby -c homebrew/Formula/bitty.rb
+          ruby -c packaging/homebrew/bitty.rb
           echo "Homebrew Formula syntax OK"
 
   build:

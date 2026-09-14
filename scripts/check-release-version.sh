@@ -4,8 +4,8 @@
 # Modes:
 #   scripts/check-release-version.sh
 #       Assert in-repo consistency: workspace version in Cargo.toml equals
-#       pkgver in PKGBUILD, packaging/PKGBUILD, packaging/PKGBUILD.bin and
-#       version in nfpm.yaml.
+#       pkgver in packaging/PKGBUILD, packaging/PKGBUILD.bin and version in
+#       nfpm.yaml.
 #   scripts/check-release-version.sh --tag v0.0.20
 #   scripts/check-release-version.sh 0.0.20
 #       Additionally assert the in-repo version equals the given release tag
@@ -68,7 +68,6 @@ check_equal() {
 	echo "check-release-version: $name = $actual (ok)"
 }
 
-check_equal "root PKGBUILD" "$(pkgbuild_pkgver "$REPO_ROOT/PKGBUILD")"
 check_equal "packaging/PKGBUILD" "$(pkgbuild_pkgver "$REPO_ROOT/packaging/PKGBUILD")"
 check_equal "packaging/PKGBUILD.bin" "$(pkgbuild_pkgver "$REPO_ROOT/packaging/PKGBUILD.bin")"
 check_equal "nfpm.yaml" "$(nfpm_version)"

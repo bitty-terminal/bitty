@@ -9,8 +9,9 @@
 # install path drift apart again, before a release tag propagates it to AUR.
 #
 # It asserts:
-#   - `PKGBUILD` and `packaging/PKGBUILD` are byte-identical (README contract)
-#   - both parse as shell and produce `.SRCINFO` via `makepkg --printsrcinfo`
+#   - `packaging/PKGBUILD` (the single canonical source recipe; the former
+#     root `PKGBUILD` mirror was retired) parses as shell and produces
+#     `.SRCINFO` via `makepkg --printsrcinfo`
 #   - `package()` installs the exact artifact declared by `[[bin]]` in
 #     `crates/bitty-app/Cargo.toml`, at `/usr/bin/bitty`
 #   - the recipe no longer references the retired `bitty-app` artifact path
@@ -20,8 +21,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ROOT_RECIPE="$REPO_ROOT/PKGBUILD"
-PACKAGING_RECIPE="$REPO_ROOT/packaging/PKGBUILD"
+RECIPE="$REPO_ROOT/packaging/PKGBUILD"
 APP_MANIFEST="$REPO_ROOT/crates/bitty-app/Cargo.toml"
 
 fail() {
@@ -29,16 +29,9 @@ fail() {
 	exit 1
 }
 
-[[ -f "$ROOT_RECIPE" ]] || fail "missing $ROOT_RECIPE"
-[[ -f "$PACKAGING_RECIPE" ]] || fail "missing $PACKAGING_RECIPE"
+[[ -f "$RECIPE" ]] || fail "missing $RECIPE"
 
-# README: the root and packaging recipes are identical.
-cmp -s "$ROOT_RECIPE" "$PACKAGING_RECIPE" ||
-	fail "PKGBUILD and packaging/PKGBUILD differ; keep them byte-identical"
-
-for recipe in "$ROOT_RECIPE" "$PACKAGING_RECIPE"; do
-	bash -n "$recipe" || fail "bash -n rejects $recipe"
-done
+bash -n "$RECIPE" || fail "bash -n rejects $RECIPE"
 
 # The artifact name is owned by crates/bitty-app/Cargo.toml: derive it from
 # the `[[bin]]` name so the check tracks the manifest instead of a literal.
@@ -58,17 +51,17 @@ done < <(awk '
 EXPECTED_BIN="${BIN_NAMES[0]}"
 INSTALL_SRC='target/release/'"$EXPECTED_BIN"''
 
-grep -Fq "install -Dm755 \"$INSTALL_SRC\" \"\$pkgdir/usr/bin/bitty\"" "$ROOT_RECIPE" ||
+grep -Fq "install -Dm755 \"$INSTALL_SRC\" \"\$pkgdir/usr/bin/bitty\"" "$RECIPE" ||
 	fail "package() must install \"$INSTALL_SRC\" to /usr/bin/bitty (declared artifact: $EXPECTED_BIN)"
 
 # Guard against the retired artifact name returning anywhere in package().
-if awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" | grep -Fq "target/release/bitty-app"; then
+if awk '/^package\(\)/,/^}/' "$RECIPE" | grep -Fq "target/release/bitty-app"; then
 	fail "package() references the retired target/release/bitty-app artifact"
 fi
 
 # `test "$(./target/release/<bin> --version)" = "$pkgver"` must reference the
 # declared artifact, not a stale one, so check() exercises what package() ships.
-grep -Fq "./$INSTALL_SRC --version" "$ROOT_RECIPE" ||
+grep -Fq "./$INSTALL_SRC --version" "$RECIPE" ||
 	fail "check() smoke must invoke ./$INSTALL_SRC --version"
 
 # Every packaged source referenced with install -Dm644 must exist in-tree
@@ -87,10 +80,10 @@ check_ref() {
 }
 
 # Expand the hicolor icon loop (`for size in ...`) across every declared size.
-ICON_TEMPLATE="$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
+ICON_TEMPLATE="$(awk '/^package\(\)/,/^}/' "$RECIPE" |
 	grep -oE 'install -Dm[0-9]+ "[^"]*\$\{size\}[^"]*"' |
 	sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)"
-read -r -a ICON_SIZES <<<"$(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
+read -r -a ICON_SIZES <<<"$(awk '/^package\(\)/,/^}/' "$RECIPE" |
 	grep -oE 'for size in [^;]+' | sed -E 's/^for size in //')" || true
 if [[ -n "$ICON_TEMPLATE" ]]; then
 	[[ "${#ICON_SIZES[@]}" -gt 0 ]] || fail "icon loop has no sizes"
@@ -101,7 +94,7 @@ fi
 # Non-parameterized install sources.
 while IFS= read -r rel; do
 	check_ref "$rel"
-done < <(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
+done < <(awk '/^package\(\)/,/^}/' "$RECIPE" |
 	grep -oE 'install -Dm[0-9]+ "[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/' |
 	grep -v '\${size}')
 [[ "$missing" -eq 0 ]] || fail "package() references files absent from the tree"
@@ -109,7 +102,7 @@ done < <(awk '/^package\(\)/,/^}/' "$ROOT_RECIPE" |
 if command -v makepkg >/dev/null 2>&1; then
 	WORK="$(mktemp -d)"
 	trap 'rm -rf "$WORK"' EXIT
-	cp "$ROOT_RECIPE" "$WORK/PKGBUILD"
+	cp "$RECIPE" "$WORK/PKGBUILD"
 	(cd "$WORK" && makepkg --printsrcinfo >.SRCINFO) ||
 		fail "makepkg --printsrcinfo rejects the source recipe"
 	grep -q "^pkgname = bitty$" "$WORK/.SRCINFO" || fail ".SRCINFO missing pkgname=bitty"

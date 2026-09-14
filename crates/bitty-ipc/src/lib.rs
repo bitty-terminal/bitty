@@ -124,6 +124,7 @@ pub mod limits;
 pub mod mcp;
 pub mod scope;
 pub mod snapshot;
+pub mod tool_dispatch;
 pub mod transport;
 pub mod wire;
 
@@ -154,6 +155,12 @@ pub use snapshot::{
     DetailLevel, MAX_SNAPSHOT_CWD_BYTES, MAX_SNAPSHOT_FULL_BYTES, MAX_SNAPSHOT_MINIMAL_BYTES,
     MAX_SNAPSHOT_STANDARD_BYTES, MAX_SNAPSHOT_ZONES, SNAPSHOT_METHOD, SemanticZone, SnapshotData,
     SnapshotRequest, SnapshotService, TerminalSnapshot, ZoneKind,
+};
+pub use tool_dispatch::{
+    MAX_TOOL_ARGS_BYTES, MAX_TOOL_CLIENT_ID_BYTES, MAX_TOOL_DESCRIPTION_LEN, MAX_TOOL_NAME_LEN,
+    MAX_TOOL_RESULT_BYTES, MAX_TOOL_SCHEMA_BYTES, MAX_TOOL_SUMMARY_BYTES, MAX_TOOL_TARGET_BYTES,
+    MAX_TOOLS_PER_HOST, ToolDispatchService, ToolExecution, ToolOutput, ToolProvider, ToolRequest,
+    ToolSpec, is_read_only_scope, validate_tool_name,
 };
 pub use transport::{DEFAULT_TRANSPORT_CAPACITY, MAX_TRANSPORT_CAPACITY, StdioTransportStub};
 pub use wire::{

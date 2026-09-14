@@ -44,6 +44,19 @@ pub const PLUGIN_INDEX_MAX_BYTES: usize = PLUGIN_MANIFEST_MAX_BYTES;
 const HEX_DIGEST_LEN: usize = 64;
 /// Native in-process artifacts that must never appear in a module tree.
 const NATIVE_ARTIFACT_EXTENSIONS: [&str; 4] = ["so", "dll", "dylib", "node"];
+/// VCS metadata directories that are never part of a package tree.
+pub(crate) const VCS_DIRS: [&str; 3] = [".git", ".hg", ".svn"];
+
+/// Which tree shape is being scanned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeScanMode {
+    /// A staged or development module tree: every entry counts, and in-tree
+    /// symlinks are followed (the canonical escape check still applies).
+    Staged,
+    /// An arbitrary install source: skip VCS metadata directories and reject
+    /// symlinked entries, matching exactly what the installer copies.
+    Source,
+}
 
 /// One resolved active source record (RFC B.4).
 ///
@@ -166,51 +179,33 @@ pub fn resolve_record(
     let (package_root, mut unverified) = match record.source_class {
         SourceClass::LocalPath => {
             let recorded = PathBuf::from(&record.root);
-            if !recorded.is_absolute() {
-                return Err(integrity(
-                    &plugin,
-                    "local-path root must be an absolute path",
-                ));
-            }
-            let canonical =
-                std::fs::canonicalize(&recorded).map_err(|error| PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("local-path root unreadable: {error}"),
+            if recorded.is_absolute() {
+                // Development flow (RFC B.5): read-only live tree, re-digested
+                // on every load; drift is reported by staying unverified.
+                let canonical = std::fs::canonicalize(&recorded).map_err(|error| {
+                    PluginRuntimeError::NotFound {
+                        plugin: plugin.clone(),
+                        detail: format!("local-path root unreadable: {error}"),
+                    }
                 })?;
-            // Never follow a changed path or a new symlink target silently: the
-            // recorded root must already be the canonical development path.
-            if canonical != recorded {
-                return Err(integrity(
-                    &plugin,
-                    "local-path root is not the canonical recorded path",
-                ));
-            }
-            (canonical, true)
-        }
-        _ => {
-            if !is_safe_relative(&record.root) {
-                return Err(integrity(
-                    &plugin,
-                    "installed root must be a safe store-relative path",
-                ));
-            }
-            let store_canonical = std::fs::canonicalize(store_root).map_err(|error| {
-                PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("store root unreadable: {error}"),
+                // Never follow a changed path or a new symlink target silently: the
+                // recorded root must already be the canonical development path.
+                if canonical != recorded {
+                    return Err(integrity(
+                        &plugin,
+                        "local-path root is not the canonical recorded path",
+                    ));
                 }
-            })?;
-            let joined = store_root.join(&record.root);
-            let canonical =
-                std::fs::canonicalize(&joined).map_err(|error| PluginRuntimeError::NotFound {
-                    plugin: plugin.clone(),
-                    detail: format!("package root missing: {error}"),
-                })?;
-            if !canonical.starts_with(&store_canonical) {
-                return Err(integrity(&plugin, "package root escapes the plugin store"));
+                (canonical, true)
+            } else {
+                // Staged local install: the package-manager copy under
+                // `packages/` is immutable, so a digest mismatch is store
+                // tampering (fail closed) while the provenance class stays
+                // visibly unverified.
+                (store_relative_root(store_root, record)?, true)
             }
-            (canonical, false)
         }
+        _ => (store_relative_root(store_root, record)?, false),
     };
 
     let module_root = module_root_for(&package_root);
@@ -254,7 +249,9 @@ pub fn resolve_record(
     let id = manifest.id().clone();
     let digest = scan_module_tree(id.as_str(), &module_root)?;
     if !digest.eq_ignore_ascii_case(&record.content_digest) {
-        if record.source_class == SourceClass::LocalPath {
+        let live_dev_tree =
+            record.source_class == SourceClass::LocalPath && Path::new(&record.root).is_absolute();
+        if live_dev_tree {
             // Drift is reported, not hidden: the package stays unverified until
             // it is re-resolved (RFC B.5 rule 3).
             unverified = true;
@@ -268,7 +265,59 @@ pub fn resolve_record(
         module_root,
         source_class: record.source_class,
         unverified,
+        granted: Some(record.granted.clone()),
     })
+}
+
+/// Canonicalize a store-relative recorded root, fail closed on escapes.
+///
+/// Shared by installed (`registry`/`git`) records and staged `local-path`
+/// records; the caller owns the provenance and trust flags.
+fn store_relative_root(
+    store_root: &Path,
+    record: &PluginRecord,
+) -> Result<PathBuf, PluginRuntimeError> {
+    let plugin = &record.plugin_id;
+    if !is_safe_relative(&record.root) {
+        return Err(integrity(
+            plugin,
+            "installed root must be a safe store-relative path",
+        ));
+    }
+    let store_canonical =
+        std::fs::canonicalize(store_root).map_err(|error| PluginRuntimeError::NotFound {
+            plugin: plugin.clone(),
+            detail: format!("store root unreadable: {error}"),
+        })?;
+    let joined = store_root.join(&record.root);
+    let canonical =
+        std::fs::canonicalize(&joined).map_err(|error| PluginRuntimeError::NotFound {
+            plugin: plugin.clone(),
+            detail: format!("package root missing: {error}"),
+        })?;
+    if !canonical.starts_with(&store_canonical) {
+        return Err(integrity(plugin, "package root escapes the plugin store"));
+    }
+    Ok(canonical)
+}
+
+/// Read-only safe resolution of a record's package root for display paths.
+///
+/// Validates the store-relative root and confirms the canonical path stays
+/// inside the store, then returns it. Any failure (unsafe root, missing path,
+/// escape) is `None`: a crafted `current.json` can never make a read-only
+/// command open a file outside the store.
+#[must_use]
+pub fn store_package_root(store_root: &Path, record: &PluginRecord) -> Option<PathBuf> {
+    if !is_safe_relative(&record.root) {
+        return None;
+    }
+    let store_canonical = std::fs::canonicalize(store_root).ok()?;
+    let canonical = std::fs::canonicalize(store_root.join(&record.root)).ok()?;
+    if !canonical.starts_with(&store_canonical) {
+        return None;
+    }
+    Some(canonical)
 }
 
 /// Compute the canonical content digest of a package's module tree.
@@ -294,6 +343,25 @@ pub fn content_digest(package_root: &Path) -> Result<String, PluginRuntimeError>
 /// [`PLUGIN_MODULE_TREE_MAX_BYTES`], and any file whose canonical path escapes
 /// the canonical root (traversal or symlink).
 pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, PluginRuntimeError> {
+    scan_module_tree_mode(plugin, root, TreeScanMode::Staged)
+}
+
+/// Pre-scan an installer source tree with the exact rules the installer
+/// copies by: VCS metadata directories are skipped and symlinked entries are
+/// rejected, so the pre-scan can never reject a tree the copy would accept (or
+/// accept one the copy would reject).
+pub(crate) fn scan_module_tree_source(
+    plugin: &str,
+    root: &Path,
+) -> Result<String, PluginRuntimeError> {
+    scan_module_tree_mode(plugin, root, TreeScanMode::Source)
+}
+
+fn scan_module_tree_mode(
+    plugin: &str,
+    root: &Path,
+    mode: TreeScanMode,
+) -> Result<String, PluginRuntimeError> {
     let canonical =
         std::fs::canonicalize(root).map_err(|error| PluginRuntimeError::ModuleTree {
             plugin: plugin.to_string(),
@@ -315,6 +383,19 @@ pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, Plug
                 detail: format!("module entry unreadable: {error}"),
             })?;
             let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| PluginRuntimeError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!("module metadata unreadable: {error}"),
+                })?;
+            if mode == TreeScanMode::Source && file_type.is_symlink() {
+                return Err(PluginRuntimeError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!("symlinked entries are not supported: '{}'", path.display()),
+                });
+            }
             let metadata = entry
                 .metadata()
                 .map_err(|error| PluginRuntimeError::ModuleTree {
@@ -322,6 +403,9 @@ pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, Plug
                     detail: format!("module metadata unreadable: {error}"),
                 })?;
             if metadata.is_dir() {
+                if mode == TreeScanMode::Source && VCS_DIRS.contains(&file_name.as_str()) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
@@ -384,7 +468,7 @@ pub(crate) fn scan_module_tree(plugin: &str, root: &Path) -> Result<String, Plug
 
 /// The module root a package is loaded from: `<root>/lua` when present, else
 /// the package root itself.
-fn module_root_for(package_root: &Path) -> PathBuf {
+pub(crate) fn module_root_for(package_root: &Path) -> PathBuf {
     let lua = package_root.join("lua");
     if lua.is_dir() {
         lua
@@ -688,6 +772,83 @@ mod tests {
         assert!(!is_safe_relative("packages/../../escape"));
         assert!(!is_safe_relative("/abs/path"));
         assert!(!is_safe_relative("./packages/bitty.a"));
+    }
+
+    #[test]
+    fn store_package_root_rejects_crafted_escape() {
+        let base = std::env::temp_dir().join(format!(
+            "bitty-store-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        std::fs::create_dir_all(store.join("packages/bitty.a/1.0.0")).expect("package dir");
+
+        // A crafted current.json whose root escapes the store must never
+        // resolve to a read path.
+        let mut crafted = record("bitty.a");
+        crafted.root = "../escape".to_string();
+        write_index(&store, std::slice::from_ref(&crafted)).expect("write index");
+        let loaded = load_index(&store).expect("load index");
+        assert!(
+            store_package_root(&store, &loaded[0]).is_none(),
+            "a crafted `../` record root must be rejected for display reads"
+        );
+
+        // An absolute root and an empty root are rejected too.
+        crafted.root = "/abs/escape".to_string();
+        assert!(store_package_root(&store, &crafted).is_none());
+        crafted.root = String::new();
+        assert!(store_package_root(&store, &crafted).is_none());
+
+        // A safe root resolves.
+        crafted.root = "packages/bitty.a/1.0.0".to_string();
+        assert!(store_package_root(&store, &crafted).is_some());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_scan_skips_vcs_and_rejects_symlinks() {
+        let base = std::env::temp_dir().join(format!(
+            "bitty-source-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let module = base.join("lua");
+        std::fs::create_dir_all(module.join(".git")).expect("vcs dir");
+        std::fs::write(module.join("init.lua"), "return {}\n").expect("init");
+        std::fs::write(module.join(".git/config"), "vcs").expect("vcs file");
+
+        // VCS metadata is skipped, so it cannot affect the source digest.
+        let with_vcs = scan_module_tree_source("xuepoo.scan", &module).expect("source scan");
+        std::fs::remove_dir_all(module.join(".git")).expect("remove vcs");
+        let without_vcs = scan_module_tree_source("xuepoo.scan", &module).expect("source scan");
+        assert_eq!(with_vcs, without_vcs, "VCS metadata must be skipped");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(module.join("init.lua"), module.join("link.lua"))
+                .expect("symlink");
+            assert!(
+                scan_module_tree_source("xuepoo.scan", &module).is_err(),
+                "the installer pre-scan rejects symlinked entries"
+            );
+            assert!(
+                scan_module_tree("xuepoo.scan", &module).is_ok(),
+                "the staged/dev scan still follows in-tree symlinks"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -18,19 +18,28 @@
 //!   prompt that fails closed on EOF). A capability increase on an existing
 //!   record blocks until approved; unchanged or narrowed sets carry forward
 //!   silently (the P0-AC-030 pattern over `bitty-plugin-host` grants).
-//! - `remove <id>` is destructive and requires `--force`; the previous
-//!   managed manifest is copied to `bitty-plugins.toml.bak` before the
-//!   rewrite. `enable`/`disable` are idempotent toggles; `enable` re-checks
-//!   the hash pin and the grant coverage and fails closed on a mismatch.
-//! - `list` shows every bundled plugin plus any recorded extra, with state
-//!   (`enabled`/`disabled`/`available`), pin status, and granted/requested
-//!   capability counts. `info` shows one plugin's static manifest plus the
-//!   recorded grants and their plain-language effect statements.
+//! - `install <path>` installs (or updates) an **external** package from a
+//!   local directory into the XDG data store
+//!   (`$XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/`): manifest,
+//!   schema, entry point, module-tree bounds, and `compat` ranges are
+//!   verified before anything is staged, added capabilities need the same
+//!   consent, and the atomic `current.json` pointer is switched last. The
+//!   runtime then discovers and activates the package as a visibly
+//!   unverified third-party (`local-path`) source. Remote (`git`) sources
+//!   fail closed with a clear message and land with the package-manager
+//!   follow-up.
+//! - `remove <id> --force` is destructive: bundled records lose their managed
+//!   entry with `bitty-plugins.toml.bak` kept; installed packages delete their
+//!   store record and staged tree. `enable`/`disable` are idempotent toggles
+//!   in the managed manifest or the store index respectively; `enable`
+//!   re-checks the hash pin and the grant coverage and fails closed on a
+//!   mismatch.
+//! - `list` shows every bundled plugin plus any recorded or installed extra,
+//!   with source, state (`enabled`/`disabled`/`available`), pin status, and
+//!   granted/requested capability counts. `info` shows one plugin's manifest
+//!   plus the recorded grants and their plain-language effect statements.
 //! - Class: local-only (no instance, no IPC, **no plugin VM and no plugin
-//!   code is ever loaded or executed**; safe-mode clean). v1 sources are the
-//!   bundled catalog (`bitty-terminal.*`); registry/Git/local-path sources
-//!   are deferred with the package manager and fail closed with a clear
-//!   error.
+//!   code is ever loaded or executed**; safe-mode clean).
 //!
 //! # Durable state
 //!
@@ -81,6 +90,10 @@ use std::path::{Path, PathBuf};
 use bitty_plugin_host::bundled::{all_bundled_manifests, bundled_manifest_for};
 use bitty_plugin_host::capability::{CapabilityId, effect_statement};
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
+use bitty_runtime::plugin_runtime::{
+    load_index, manifest_toml,
+    package::{self, LocalInstallOptions, PackageOpError},
+};
 
 // ---------------------------------------------------------------------------
 // Exit codes (stable taxonomy, cli-contract-rfc.md)
@@ -402,14 +415,16 @@ pub fn parse_plugin_request(
 pub fn plugin_usage() -> String {
     "usage: bitty plugin list [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin install <id> [--yes]\n\
+     \x20      bitty plugin install <path> [--yes]   (local directory package)\n\
      \x20      bitty plugin remove <id> --force\n\
      \x20      bitty plugin enable <id>\n\
      \x20      bitty plugin disable <id>\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
      \n\
-     Managed manifest: $XDG_CONFIG_HOME/bitty/bitty-plugins.toml (fallback\n\
-     ~/.config/bitty/bitty-plugins.toml), or beside an explicit --config path.\n\
-     v1 installs bundled plugins only (`bitty-terminal.*`); no plugin code runs.\n\
+     Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.toml\n\
+     (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
+     External packages install into $XDG_DATA_HOME/bitty/plugins (fallback\n\
+     ~/.local/share/bitty/plugins). No plugin code runs during any operation.\n\
      `bitty plugin --help` explains capabilities, consent, and exit codes."
         .to_string()
 }
@@ -422,22 +437,29 @@ pub fn plugin_help_text() -> String {
      usage: bitty plugin <verb> [args] [flags]\n\
      \n\
      verbs:\n\
-     \x20 list                        Show bundled + recorded plugins: state,\n\
-     \x20                             pin status, granted/requested capabilities.\n\
+     \x20 list                        Show bundled + installed plugins: source,\n\
+     \x20                             state, pin status, granted/requested\n\
+     \x20                             capabilities.\n\
      \x20 install <id> [--yes]        Resolve a bundled manifest, pin its hash,\n\
      \x20                             and grant requested capabilities after\n\
      \x20                             explicit consent. --yes approves without a\n\
-     \x20                             prompt; without it an interactive [y/N]\n\
-     \x20                             prompt lists every capability and effect\n\
-     \x20                             (EOF/decline aborts, nothing is written).\n\
-     \x20 remove <id> --force         Remove a record; the previous managed\n\
-     \x20                             manifest is copied to <file>.bak first.\n\
-     \x20 enable <id>                 Re-enable a recorded plugin. The manifest\n\
-     \x20                             hash pin and grant coverage are re-checked\n\
-     \x20                             and a mismatch fails closed (re-install).\n\
-     \x20 disable <id>                Disable without dropping the grant record.\n\
-     \x20 info <id>                   Static manifest + recorded state, with the\n\
-     \x20                             plain-language effect per capability.\n\
+     \x20                             prompt.\n\
+     \x20 install <path> [--yes]      Install or update an external package from\n\
+     \x20                             a local directory containing\n\
+     \x20                             bitty-plugin.toml (lua/ module root). The\n\
+     \x20                             manifest, entry point, bounds, and compat\n\
+     \x20                             ranges are verified before anything is\n\
+     \x20                             staged; added capabilities need consent.\n\
+     \x20 remove <id> --force         Remove a record: bundled records drop from\n\
+     \x20                             the managed manifest (previous copy kept as\n\
+     \x20                             .bak); installed packages delete their store\n\
+     \x20                             record and package tree.\n\
+     \x20 enable <id>                 Re-enable a recorded plugin. Bundled pins\n\
+     \x20                             and grants are re-checked; installed records\n\
+     \x20                             are switched atomically in the store index.\n\
+     \x20 disable <id>                Disable without dropping the record or grant.\n\
+     \x20 info <id>                   Manifest + recorded state, with the plain-\n\
+     \x20                             language effect per capability.\n\
      \n\
      flags:\n\
      \x20 --format table|json|jsonl   list/info output shape (default table).\n\
@@ -449,9 +471,10 @@ pub fn plugin_help_text() -> String {
      \x20 Plugin code is never executed by any `bitty plugin` operation. A\n\
      \x20 capability is granted only when the manifest requests it and consent\n\
      \x20 is explicit; grants are bound to the exact manifest hash, so a later\n\
-     \x20 manifest that adds a capability blocks until re-approved. The\n\
-     \x20 managed manifest is strict machine state: unknown keys or malformed\n\
-     \x20 values fail closed; edit it through this CLI, not by hand.\n\
+     \x20 manifest that adds a capability blocks until re-approved. Installed\n\
+     \x20 packages come from local directories (source class `local-path`),\n\
+     \x20 are stored under packages/<id>/<version>/ with an owner-only mode,\n\
+     \x20 and load as visibly unverified third-party packages.\n\
      \n\
      exit codes:\n\
      \x20 0 success | 1 aborted/io | 2 usage | 4 plugin error\n\
@@ -460,9 +483,10 @@ pub fn plugin_help_text() -> String {
      \x20 bitty plugin list\n\
      \x20 bitty plugin list --format json\n\
      \x20 bitty plugin install bitty-terminal.tabs --yes\n\
+     \x20 bitty plugin install ./my-plugin --yes\n\
+     \x20 bitty plugin info xuepoo.hello\n\
      \x20 bitty plugin disable bitty-terminal.tabs\n\
-     \x20 bitty plugin info bitty-terminal.tabs\n\
-     \x20 bitty plugin remove bitty-terminal.tabs --force"
+     \x20 bitty plugin remove xuepoo.hello --force"
         .to_string()
 }
 
@@ -1112,6 +1136,8 @@ pub struct PluginRow {
     pub description: String,
     /// Whether the id is in the bundled catalog.
     pub bundled: bool,
+    /// Provenance label (`bundled`, `registry`, `git`, `local-path`).
+    pub source: String,
     /// `enabled`/`disabled` when recorded, else `available`.
     pub state: &'static str,
     /// Recorded enabled flag.
@@ -1162,7 +1188,10 @@ pub struct CapabilityRow {
     pub granted: bool,
 }
 
-fn rows_from_state(state: &PluginState) -> Result<Vec<PluginRow>, PluginFailure> {
+fn rows_from_state(
+    state: &PluginState,
+    store_root: Option<&Path>,
+) -> Result<Vec<PluginRow>, PluginFailure> {
     let mut rows: Vec<PluginRow> = Vec::new();
     let mut manifests = all_bundled_manifests();
     manifests.sort_by_key(|manifest| manifest.id().as_str().to_string());
@@ -1198,6 +1227,7 @@ fn rows_from_state(state: &PluginState) -> Result<Vec<PluginRow>, PluginFailure>
             version: manifest.identity.version.clone(),
             description: manifest.identity.description.clone(),
             bundled: true,
+            source: "bundled".to_string(),
             state: state_label,
             enabled,
             pin_ok,
@@ -1217,6 +1247,7 @@ fn rows_from_state(state: &PluginState) -> Result<Vec<PluginRow>, PluginFailure>
         if seen.contains(id) {
             continue;
         }
+        seen.insert(id.clone());
         let record = state.get(id).expect("iterated id exists");
         rows.push(PluginRow {
             id: id.clone(),
@@ -1224,6 +1255,7 @@ fn rows_from_state(state: &PluginState) -> Result<Vec<PluginRow>, PluginFailure>
             version: "-".to_string(),
             description: "recorded plugin without a bundled manifest".to_string(),
             bundled: false,
+            source: record.source.clone(),
             state: if record.enabled {
                 "enabled"
             } else {
@@ -1237,12 +1269,109 @@ fn rows_from_state(state: &PluginState) -> Result<Vec<PluginRow>, PluginFailure>
             manifest_hash: Some(record.manifest_hash.clone()),
         });
     }
+
+    if let Some(store_root) = store_root {
+        for record in load_store_index(store_root)? {
+            if seen.contains(&record.plugin_id) {
+                continue;
+            }
+            seen.insert(record.plugin_id.clone());
+            rows.push(store_row(store_root, &record));
+        }
+    }
+
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(rows)
 }
 
-fn row_for_id(state: &PluginState, id: &str) -> Result<PluginRow, PluginFailure> {
-    rows_from_state(state)?
+/// Read the store index, mapping any failure to a read-only plugin error.
+fn load_store_index(
+    store_root: &Path,
+) -> Result<Vec<bitty_runtime::plugin_runtime::PluginRecord>, PluginFailure> {
+    load_index(store_root).map_err(|error| {
+        PluginFailure::plugin(
+            "StoreInvalid",
+            format!(
+                "bitty plugin: plugin store '{}' is unreadable: {error}",
+                store_root.display()
+            ),
+        )
+    })
+}
+
+/// Build a row for one installed (non-bundled) store record.
+///
+/// The staged manifest body is read best-effort for display only; a record
+/// whose body is unreadable still lists, with the recorded grant standing in
+/// for the requested set. Loading re-verifies the hashes and fails closed.
+fn store_row(store_root: &Path, record: &bitty_runtime::plugin_runtime::PluginRecord) -> PluginRow {
+    let manifest = read_store_manifest(store_root, record);
+    let granted: BTreeSet<CapabilityId> = record
+        .granted
+        .iter()
+        .filter_map(|raw| CapabilityId::parse(raw).ok())
+        .collect();
+    let requested = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.capabilities.all_ids().ok())
+        .unwrap_or_else(|| granted.clone());
+    PluginRow {
+        id: record.plugin_id.clone(),
+        name: manifest
+            .as_ref()
+            .map(|manifest| manifest.identity.name.clone())
+            .unwrap_or_else(|| record.plugin_id.clone()),
+        version: record.version.clone(),
+        description: manifest.as_ref().map_or_else(
+            || format!("installed from a {} source", record.source_class.as_str()),
+            |manifest| manifest.identity.description.clone(),
+        ),
+        bundled: false,
+        source: record.source_class.as_str().to_string(),
+        state: if record.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        enabled: record.enabled,
+        pin_ok: None,
+        requested,
+        granted,
+        commands: manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .lazy
+                    .commands
+                    .iter()
+                    .map(|command| command.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        manifest_hash: Some(record.manifest_hash.clone()),
+    }
+}
+
+/// Best-effort read of one staged manifest body (display only, never authority).
+///
+/// The record root is validated with the same store-escape guard the runtime
+/// uses, so a crafted `current.json` can never make a read-only command open a
+/// file outside the store.
+fn read_store_manifest(
+    store_root: &Path,
+    record: &bitty_runtime::plugin_runtime::PluginRecord,
+) -> Option<PluginManifest> {
+    let root = bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record)?;
+    let bytes = std::fs::read(root.join(package::MANIFEST_FILE_NAME)).ok()?;
+    manifest_toml::parse_manifest(&bytes).ok()
+}
+
+fn row_for_id(
+    state: &PluginState,
+    store_root: Option<&Path>,
+    id: &str,
+) -> Result<PluginRow, PluginFailure> {
+    rows_from_state(state, store_root)?
         .into_iter()
         .find(|row| row.id == id)
         .ok_or_else(|| {
@@ -1284,16 +1413,17 @@ fn format_list_table(rows: &[PluginRow], no_color: bool) -> String {
     let color = color_enabled(no_color);
     let mut out = String::new();
     let header = format!(
-        "{:<32} {:<10} {:<6} {:>8}  {}",
-        "ID", "STATE", "PIN", "GRANTED", "VERSION"
+        "{:<32} {:<10} {:<11} {:<6} {:>8}  {}",
+        "ID", "SOURCE", "STATE", "PIN", "GRANTED", "VERSION"
     );
     let _ = writeln!(out, "{}", bold(&header, color));
     for row in rows {
         let granted = format!("{}/{}", row.granted.len(), row.requested.len());
         let _ = writeln!(
             out,
-            "{:<32} {:<10} {:<6} {:>8}  {}",
+            "{:<32} {:<10} {:<11} {:<6} {:>8}  {}",
             row.id,
+            row.source,
             row.state,
             pin_label(row.pin_ok),
             granted,
@@ -1312,11 +1442,7 @@ fn format_info_table(row: &PluginRow, no_color: bool) -> String {
     let _ = writeln!(out, "{}", bold(&format!("plugin {}", row.id), color));
     let _ = writeln!(out, "  name:         {}", row.name);
     let _ = writeln!(out, "  version:      {}", row.version);
-    let _ = writeln!(
-        out,
-        "  source:       {}",
-        if row.bundled { "bundled" } else { "recorded" }
-    );
+    let _ = writeln!(out, "  source:       {}", row.source);
     let _ = writeln!(out, "  state:        {}", row.state);
     let _ = writeln!(
         out,
@@ -1407,7 +1533,7 @@ fn write_plugin_object(out: &mut String, row: &PluginRow, include_manifest: bool
         json_escape(&row.version),
         json_escape(&row.description),
         row.bundled,
-        if row.bundled { "bundled" } else { "recorded" },
+        json_escape(&row.source),
         row.state,
         row.enabled,
         match row.pin_ok {
@@ -1490,6 +1616,8 @@ pub struct PluginContext<'a> {
     pub bitty_config_env: Option<&'a str>,
     /// `XDG_CONFIG_HOME` environment value.
     pub xdg_config_home: Option<&'a str>,
+    /// `XDG_DATA_HOME` environment value (plugin store root parent).
+    pub xdg_data_home: Option<&'a str>,
     /// `HOME` environment value.
     pub home: Option<&'a str>,
     /// Pre-word global `--format` fallback (mirrors `bitty dev`).
@@ -1544,9 +1672,11 @@ pub fn run_plugin_subcommand(
             return failure.exit;
         }
     };
+    // Resolved once from injected environment values (never process env here).
+    let store_root = crate::plugin_runtime::store_root_for(context.xdg_data_home, context.home);
 
     match request.verb {
-        PluginVerb::List => match rows_from_state(&state) {
+        PluginVerb::List => match rows_from_state(&state, store_root.as_deref()) {
             Ok(rows) => {
                 match request.format {
                     PluginFormat::Table => {
@@ -1566,7 +1696,7 @@ pub fn run_plugin_subcommand(
                 Ok(_) => {}
                 Err(failure) => return fail_read_only(&request, &failure, output),
             }
-            match row_for_id(&state, id) {
+            match row_for_id(&state, store_root.as_deref(), id) {
                 Ok(row) => {
                     match request.format {
                         PluginFormat::Table => {
@@ -1582,8 +1712,11 @@ pub fn run_plugin_subcommand(
             }
         }
         PluginVerb::Install => {
-            let id = request.id.as_deref().expect("install requires an id");
-            match op_install(&mut state, id, request.yes, input, output) {
+            let operand = request.id.as_deref().expect("install requires an operand");
+            if is_source_operand(operand) {
+                return install_source(&request, operand, store_root.as_deref(), input, output);
+            }
+            match op_install(&mut state, operand, request.yes, input, output) {
                 Ok(result) => finish_mutation(&path, state, result, output),
                 Err(failure) => {
                     eprintln!("{}", failure.message);
@@ -1593,34 +1726,301 @@ pub fn run_plugin_subcommand(
         }
         PluginVerb::Enable => {
             let id = request.id.as_deref().expect("enable requires an id");
-            match op_enable(&mut state, id) {
-                Ok(result) => finish_mutation(&path, state, result, output),
-                Err(failure) => {
-                    eprintln!("{}", failure.message);
-                    failure.exit
+            if is_managed_operand(&state, id) {
+                match op_enable(&mut state, id) {
+                    Ok(result) => finish_mutation(&path, state, result, output),
+                    Err(failure) => {
+                        eprintln!("{}", failure.message);
+                        failure.exit
+                    }
                 }
+            } else {
+                set_store_enabled(&store_root, id, true, output)
             }
         }
         PluginVerb::Disable => {
             let id = request.id.as_deref().expect("disable requires an id");
-            match op_disable(&mut state, id) {
-                Ok(result) => finish_mutation(&path, state, result, output),
-                Err(failure) => {
-                    eprintln!("{}", failure.message);
-                    failure.exit
+            if is_managed_operand(&state, id) {
+                match op_disable(&mut state, id) {
+                    Ok(result) => finish_mutation(&path, state, result, output),
+                    Err(failure) => {
+                        eprintln!("{}", failure.message);
+                        failure.exit
+                    }
                 }
+            } else {
+                set_store_enabled(&store_root, id, false, output)
             }
         }
         PluginVerb::Remove => {
             let id = request.id.as_deref().expect("remove requires an id");
-            match op_remove(&mut state, id, request.force) {
-                Ok(result) => finish_mutation(&path, state, result, output),
-                Err(failure) => {
-                    eprintln!("{}", failure.message);
-                    failure.exit
+            if is_managed_operand(&state, id) {
+                match op_remove(&mut state, id, request.force) {
+                    Ok(result) => finish_mutation(&path, state, result, output),
+                    Err(failure) => {
+                        eprintln!("{}", failure.message);
+                        failure.exit
+                    }
                 }
+            } else {
+                uninstall_store(&store_root, id, request.force, output)
             }
         }
+    }
+}
+
+/// Whether an operand addresses the managed (bundled) catalog rather than the
+/// installed package store.
+fn is_managed_operand(state: &PluginState, id: &str) -> bool {
+    state.get(id).is_some() || bundled_manifest_for(id).is_some()
+}
+
+/// Whether an `install` operand names a filesystem source rather than a
+/// bundled plugin id.
+///
+/// Path separators, leading `.`/`~`, and an existing directory all select the
+/// package-manager path. A bare dotted token is a bundled id; the id grammar
+/// cannot contain separators, so the two never overlap.
+fn is_source_operand(token: &str) -> bool {
+    token.contains('/')
+        || token.contains('\\')
+        || token.starts_with('.')
+        || token.starts_with('~')
+        || Path::new(token).is_dir()
+}
+
+/// Whether an operand looks like a remote source locator (not yet supported).
+fn is_remote_source(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.starts_with("git:")
+        || lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("ssh://")
+        || lower.starts_with("git@")
+        || lower.starts_with("git://")
+}
+
+/// Install or update one plugin from a local directory into the XDG store.
+fn install_source(
+    request: &PluginRequest,
+    source: &str,
+    store_root: Option<&Path>,
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let Some(store_root) = store_root else {
+        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        return EXIT_USAGE;
+    };
+    if is_remote_source(source) {
+        eprintln!(
+            "bitty plugin: remote sources are not implemented yet; \
+             install from a local directory with `bitty plugin install <path>`"
+        );
+        return EXIT_PLUGIN;
+    }
+    let options = LocalInstallOptions { enable: true };
+    let approve_all = request.yes;
+    // Consent is bound to the staged snapshot the installer reviewed: the
+    // callback only decides, and the installer commits that same snapshot, so
+    // a source swapped while the prompt is open can never widen the grant.
+    let outcome = {
+        let mut consent =
+            |consent_request: &package::ConsentRequest| -> Result<bool, PackageOpError> {
+                if approve_all {
+                    return Ok(true);
+                }
+                match ask_source_consent(input, output, consent_request, source) {
+                    Ok(approved) => Ok(approved),
+                    Err(failure) => Err(PackageOpError::ConsentAborted(failure.message)),
+                }
+            };
+        package::install_local_dir(store_root, Path::new(source), &options, &mut consent)
+    };
+    match outcome {
+        Ok(Some(report)) => {
+            report_install(&report, output);
+            EXIT_OK
+        }
+        Ok(None) => {
+            eprintln!("bitty plugin: capability grant was not approved — nothing changed");
+            EXIT_GENERIC
+        }
+        Err(error) => {
+            eprintln!("bitty plugin: {error}");
+            package_failure_exit(&error)
+        }
+    }
+}
+
+fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Write) {
+    let action = if report.updated {
+        "updated"
+    } else {
+        "installed"
+    };
+    let _ = writeln!(
+        output,
+        "bitty plugin: {action} '{}' (version {}, {} source, manifest {}, {} capabilit{} granted, enabled)",
+        report.plugin_id,
+        report.version,
+        report.source_class.as_str(),
+        short_hash(&report.manifest_hash),
+        report.granted.len(),
+        if report.granted.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    if let Some(previous) = &report.previous_version {
+        if previous != &report.version {
+            let _ = writeln!(
+                output,
+                "bitty plugin: previous version {previous} retained for rollback under {}",
+                report.root.rsplit_once('/').map_or("-", |(dir, _)| dir)
+            );
+        }
+    }
+}
+
+/// Toggle one installed store record.
+fn set_store_enabled(
+    store_root: &Option<PathBuf>,
+    id: &str,
+    enabled: bool,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    let Some(store_root) = store_root else {
+        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        return EXIT_USAGE;
+    };
+    match package::set_enabled(store_root, id, enabled) {
+        Ok(changed) => {
+            let state = if enabled { "enabled" } else { "disabled" };
+            let _ = writeln!(
+                output,
+                "bitty plugin: '{id}' {}",
+                if changed {
+                    state.to_string()
+                } else {
+                    format!("already {state}")
+                }
+            );
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("bitty plugin: {error}");
+            package_failure_exit(&error)
+        }
+    }
+}
+
+/// Uninstall one installed store record (destructive; requires `--force`).
+fn uninstall_store(
+    store_root: &Option<PathBuf>,
+    id: &str,
+    force: bool,
+    output: &mut dyn std::io::Write,
+) -> i32 {
+    if !force {
+        eprintln!(
+            "bitty plugin: `remove {id}` is destructive; re-run with --force \
+             (the installed package tree is deleted)"
+        );
+        return EXIT_USAGE;
+    }
+    let Some(store_root) = store_root else {
+        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        return EXIT_USAGE;
+    };
+    match package::uninstall(store_root, id) {
+        Ok(report) => {
+            let _ = writeln!(
+                output,
+                "bitty plugin: removed '{}' (version {}, {} package tree)",
+                report.plugin_id,
+                report.version,
+                if report.tree_removed {
+                    "deleted"
+                } else {
+                    "already absent"
+                }
+            );
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("bitty plugin: {error}");
+            package_failure_exit(&error)
+        }
+    }
+}
+
+/// Interactive consent for capabilities a local install newly requests.
+fn ask_source_consent(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    request: &package::ConsentRequest,
+    source: &str,
+) -> Result<bool, PluginFailure> {
+    let _ = writeln!(
+        output,
+        "bitty plugin: '{}' (version {}, manifest {}) from '{source}' requests new capabilities:",
+        request.plugin_id,
+        request.version,
+        short_hash(&request.manifest_hash)
+    );
+    for capability in &request.added {
+        let effect = CapabilityId::parse(capability)
+            .map(|capability| effect_statement(&capability).to_string())
+            .unwrap_or_else(|_| "unknown capability".to_string());
+        let _ = writeln!(output, "  - {capability} — {effect}");
+    }
+    for _ in 0..MAX_CONSENT_ATTEMPTS {
+        let _ = write!(output, "Grant these capabilities? [y/N] ");
+        let _ = output.flush();
+        let mut line = String::new();
+        let read = input.read_line(&mut line).map_err(|error| {
+            PluginFailure::generic(
+                "IoError",
+                format!("bitty plugin: cannot read consent answer: {error}"),
+            )
+        })?;
+        if read == 0 {
+            return Err(PluginFailure::generic(
+                "ConsentAborted",
+                "bitty plugin: consent input ended before an answer — nothing changed".to_string(),
+            ));
+        }
+        let answer = line.trim();
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+            return Ok(true);
+        }
+        if answer.is_empty()
+            || answer.eq_ignore_ascii_case("n")
+            || answer.eq_ignore_ascii_case("no")
+        {
+            return Ok(false);
+        }
+        let _ = writeln!(output, "bitty plugin: please answer 'y' or 'n'");
+    }
+    Err(PluginFailure::generic(
+        "ConsentAborted",
+        "bitty plugin: no valid consent answer after repeated attempts — nothing changed"
+            .to_string(),
+    ))
+}
+
+/// Stable exit code for a package-manager failure.
+fn package_failure_exit(error: &PackageOpError) -> i32 {
+    match error {
+        PackageOpError::Manifest { .. }
+        | PackageOpError::BundledIdReserved { .. }
+        | PackageOpError::ModuleTree { .. }
+        | PackageOpError::Incompatible { .. } => EXIT_PLUGIN,
+        PackageOpError::InvalidSource(_)
+        | PackageOpError::ConsentAborted(_)
+        | PackageOpError::Store(_) => EXIT_GENERIC,
     }
 }
 
@@ -1690,9 +2090,8 @@ fn bundled_manifest(id: &str) -> Result<PluginManifest, PluginFailure> {
         PluginFailure::plugin(
             "UnknownPlugin",
             format!(
-                "bitty plugin: '{id}' is not a bundled plugin; v1 installs bundled ids \
-                 only (`bitty-terminal.*`) — registry/Git/local sources land with the \
-                 package manager (see `bitty plugin list`)"
+                "bitty plugin: '{id}' is not a bundled plugin; install an external package \
+                 from a local directory with `bitty plugin install <path>`"
             ),
         )
     })?;
@@ -1805,7 +2204,7 @@ fn op_enable(state: &mut PluginState, id: &str) -> Result<OpOutput, PluginFailur
     resolve_plugin_id(id)?;
     let manifest = bundled_manifest(id)?;
     let manifest_hash = manifest.manifest_hash();
-    let record = state.get(id).expect("checked");
+    let record = state.get(id).ok_or_else(|| not_installed(id))?;
     if record.manifest_hash != manifest_hash {
         return Err(PluginFailure::plugin(
             "PinMismatch",

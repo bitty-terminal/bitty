@@ -27,6 +27,12 @@ scratch-paths:
 scratch-paths-test:
     ./scripts/tests/check-scratch-paths.test.sh
 
+status-drift:
+    ./scripts/check-status-drift.sh
+
+status-drift-test:
+    ./scripts/tests/check-status-drift.test.sh
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
@@ -52,7 +58,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

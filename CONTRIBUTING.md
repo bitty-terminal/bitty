@@ -47,13 +47,19 @@ check, pre-push build check), and provisions the pinned JS dev tools under
 
 ## Development loop
 
+The workspace has 19 crates (see `Cargo.toml` `[workspace] members`).
+`scripts/check-status-drift.sh` enforces this count plus OQ/RFC status
+consistency; see `specifications/status-drift-gate.md`.
+
 All checks run through the justfile:
 
 ```bash
-just check              # fmt-check + clippy + test + scratch-path/PTY gates + actionlint + markdownlint
+just check              # fmt-check + clippy + test + scratch-path/PTY/status-drift gates + actionlint + markdownlint
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
 just test               # cargo test --workspace --all-targets --locked
+just status-drift       # scripts/check-status-drift.sh (OQ/RFC/crate-count/submodule gate)
+just status-drift-test  # scripts/tests/check-status-drift.test.sh (gate fixture tests)
 just markdownlint       # markdownlint-cli2 over the repository Markdown
 ```
 

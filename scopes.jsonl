@@ -752,3 +752,7 @@
 {"created_at":"2026-09-13T06:48:57.502016312+00:00","id":"01M2CRDDCYBDNQNM8QTB25Q97M","kind":"include","pattern":"crates/bitty-runtime/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M29ZZ6FKVX52Z11E2WCZ3FBP"}
 {"created_at":"2026-09-13T06:53:58.023254464+00:00","id":"01M2CRPJW7F15TTXGDH3QWYM76","kind":"include","pattern":"crates/bitty-rich/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M29ZZ6FKVX52Z11E2WCZ3FBP"}
 {"created_at":"2026-09-13T06:53:58.054622563+00:00","id":"01M2CRPJX6D673D9DFG1P5KGMQ","kind":"include","pattern":"crates/bitty-lua/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M29ZZ6FKVX52Z11E2WCZ3FBP"}
+{"created_at":"2026-09-13T20:51:23.744098505+00:00","id":"01M2E8KYZ040HC4VJN0PJ4J1VK","kind":"include","pattern":"crates/bitty-runtime/tests/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2DBV857BMVMX7ZD0THEY6ZC"}
+{"created_at":"2026-09-13T20:51:23.782791869+00:00","id":"01M2E8KZ06KMP0XQFNMTB5H6QH","kind":"include","pattern":"crates/bitty-runtime/src/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2DBV857BMVMX7ZD0THEY6ZC"}
+{"created_at":"2026-09-14T01:43:23.809074606+00:00","id":"01M2ESAMD1FDHHHB26Y1ZDPGPY","kind":"include","pattern":"crates/bitty-app/src/tests.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2EADCX5A210KMVYCH28WFR0"}
+{"created_at":"2026-09-14T01:43:23.841362222+00:00","id":"01M2ESAME17MGP8X4EAGTRMQGE","kind":"include","pattern":"crates/bitty-app/src/tests.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2ERTXZJ0R9AMCCMF9XRX9B2"}

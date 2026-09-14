@@ -634,9 +634,9 @@ fn demo_pump_gate_defaults_off_and_opts_in() {
 #[test]
 fn demo_pump_opt_in_delivers_greeting() {
     // CTX-0167: the gated debug path still delivers the themed greeting
-    // for harnesses that explicitly opt in. The pump thread sends
-    // asynchronously, so drain with bounded retries (no sleep: yield
-    // only) before asserting grid content.
+    // for harnesses that explicitly opt in. The pump runs on its own
+    // thread; wait for it to finish producing before draining (CTX-0413)
+    // so a loaded scheduler cannot drop the greeting.
     let rt = Runtime::with_defaults().expect("must build");
     let mut app = TerminalApp::with_demo_pump(
         rt,
@@ -646,15 +646,18 @@ fn demo_pump_opt_in_delivers_greeting() {
         SpawnSpec::default(),
     );
     assert!(app.pty_rx.is_some());
-    let mut consumed = false;
-    for _ in 0..1000 {
-        if app.poll_pty_pump() {
-            consumed = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(consumed, "opt-in demo pump must deliver bytes");
+    // CTX-0413: the pump sends on its own thread, so a fixed `yield_now`
+    // budget can expire before the OS schedules that thread under load
+    // (observed 7/30 isolated runs). Wait for the producer to finish
+    // instead of racing the scheduler: the two-chunk burst fits the
+    // 16-slot channel, so `join` cannot deadlock, and the assertion below
+    // still requires `poll_pty_pump` to drain real bytes.
+    app._pty_thread
+        .take()
+        .expect("demo pump thread must be attached")
+        .join()
+        .expect("demo pump thread must join");
+    assert!(app.poll_pty_pump(), "opt-in demo pump must deliver bytes");
     app.runtime.select_all();
     let text = app.runtime.selection_text().expect("grid text");
     assert!(
@@ -672,15 +675,16 @@ fn demo_pump_opt_in_delivers_greeting() {
     );
     app2.attach_demo_pump(bitty_config::theme::DEFAULT_THEME_NAME, "default");
     assert!(app2.pty_rx.is_some());
-    let mut consumed2 = false;
-    for _ in 0..1000 {
-        if app2.poll_pty_pump() {
-            consumed2 = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(consumed2, "attached demo pump must deliver bytes");
+    // Same deterministic drain as above (CTX-0413).
+    app2._pty_thread
+        .take()
+        .expect("attached demo pump thread must be present")
+        .join()
+        .expect("demo pump thread must join");
+    assert!(
+        app2.poll_pty_pump(),
+        "attached demo pump must deliver bytes"
+    );
     // Second attach is a no-op (does not replace the channel).
     app2.attach_demo_pump(bitty_config::theme::DEFAULT_THEME_NAME, "default");
     assert!(app2.pty_rx.is_some());

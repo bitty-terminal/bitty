@@ -488,7 +488,11 @@ fn terminal_app_poll_and_tick_are_total() {
     let _ = app.poll_pty_pump();
     let _ = app.drive_tick();
     // Opt-in debug path still drains the synthetic burst without
-    // deadlocking (pump sends async: bounded yield retries).
+    // deadlocking. CTX-0418: the pump runs on its own thread, so wait for
+    // it to finish producing before polling instead of racing it with a
+    // fixed `yield_now` budget a loaded runner can exhaust (observed 7/30
+    // isolated runs). The two-chunk burst fits the 16-slot channel, so
+    // `join` cannot deadlock; `poll_pty_pump` must still drain real bytes.
     let rt_demo = Runtime::with_defaults().expect("must build");
     let mut demo = TerminalApp::with_demo_pump(
         rt_demo,
@@ -497,15 +501,12 @@ fn terminal_app_poll_and_tick_are_total() {
         Vec::new(),
         SpawnSpec::default(),
     );
-    let mut consumed = false;
-    for _ in 0..1000 {
-        if demo.poll_pty_pump() {
-            consumed = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(consumed);
+    demo._pty_thread
+        .take()
+        .expect("demo pump thread must be attached")
+        .join()
+        .expect("demo pump thread must join");
+    assert!(demo.poll_pty_pump());
     let _ = demo.drive_tick();
     // Second tick without new bytes should be idle (frame-on-demand).
     let rt2 = Runtime::with_defaults().expect("must build");

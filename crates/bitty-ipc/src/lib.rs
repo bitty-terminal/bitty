@@ -152,8 +152,8 @@ pub use scope::{
 };
 pub use snapshot::{
     DetailLevel, MAX_SNAPSHOT_CWD_BYTES, MAX_SNAPSHOT_FULL_BYTES, MAX_SNAPSHOT_MINIMAL_BYTES,
-    MAX_SNAPSHOT_PARAMS_BYTES, MAX_SNAPSHOT_STANDARD_BYTES, MAX_SNAPSHOT_ZONES, SNAPSHOT_METHOD,
-    SemanticZone, SnapshotData, SnapshotRequest, SnapshotService, TerminalSnapshot, ZoneKind,
+    MAX_SNAPSHOT_STANDARD_BYTES, MAX_SNAPSHOT_ZONES, SNAPSHOT_METHOD, SemanticZone, SnapshotData,
+    SnapshotRequest, SnapshotService, TerminalSnapshot, ZoneKind,
 };
 pub use transport::{DEFAULT_TRANSPORT_CAPACITY, MAX_TRANSPORT_CAPACITY, StdioTransportStub};
 pub use wire::{

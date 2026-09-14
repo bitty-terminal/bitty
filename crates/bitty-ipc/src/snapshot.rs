@@ -82,10 +82,6 @@ pub const MAX_SNAPSHOT_CWD_BYTES: usize = crate::ctl::MAX_CTL_CWD_LEN;
 /// `devtools::MAX_INPUT_RING` precedent). Overflow drops oldest first.
 pub const MAX_SNAPSHOT_ZONES: usize = crate::devtools::MAX_INPUT_RING;
 
-/// Maximum request-params shape this service parses (4096,
-/// `devtools::MAX_PARAMS_BYTES` / `ctl::MAX_CTL_PARAMS_BYTES` parity).
-pub const MAX_SNAPSHOT_PARAMS_BYTES: usize = crate::devtools::MAX_PARAMS_BYTES;
-
 // ── detail level ────────────────────────────────────────────────────────────
 
 /// Caller-declared detail level resolving to an accepted byte budget.
@@ -547,7 +543,8 @@ impl SnapshotService {
     ///   no registered host provider.
     /// - `ScopeDenied` when `granted` lacks the required scope.
     /// - `InvalidRequest` / `LimitExceeded` when the request shape or the
-    ///   bounded DTO violates a budget.
+    ///   bounded DTO violates a budget, or when the provider returns data
+    ///   for a different terminal than requested.
     pub fn dispatch(
         &self,
         method: &str,
@@ -569,6 +566,14 @@ impl SnapshotService {
                 reason: format!("no host provider for '{method}'"),
             })?;
         let data = provider(request)?;
+        if data.terminal_id != request.terminal_id {
+            return Err(IpcError::InvalidRequest {
+                reason: format!(
+                    "snapshot provider returned '{}', want '{}'",
+                    data.terminal_id, request.terminal_id
+                ),
+            });
+        }
         let snapshot = bound_snapshot(request, data);
         snapshot.validate()?;
         Ok(snapshot)

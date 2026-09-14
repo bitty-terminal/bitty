@@ -223,3 +223,22 @@ fn terminal_id_grammar_is_host_shaped() {
         );
     }
 }
+
+fn wrong_terminal_provider(request: &SnapshotRequest) -> Result<SnapshotData, IpcError> {
+    let mut data = canned_provider(request)?;
+    data.terminal_id = "t:999".to_owned();
+    Ok(data)
+}
+
+#[test]
+fn provider_terminal_mismatch_fails_closed() {
+    let service = SnapshotService::with_defaults(wrong_terminal_provider);
+    let request = SnapshotRequest::new("t:7", DetailLevel::Standard);
+    let error = service
+        .dispatch(SNAPSHOT_METHOD, &request, &granted_inspect())
+        .expect_err("provider serving another terminal must fail closed");
+    assert!(
+        matches!(error, IpcError::InvalidRequest { .. }),
+        "terminal mismatch must be InvalidRequest, got {error:?}"
+    );
+}

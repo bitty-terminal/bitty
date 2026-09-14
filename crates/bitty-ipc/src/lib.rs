@@ -123,6 +123,7 @@ pub mod frame_digest;
 pub mod limits;
 pub mod mcp;
 pub mod scope;
+pub mod snapshot;
 pub mod transport;
 pub mod wire;
 
@@ -148,6 +149,11 @@ pub use mcp::{
 pub use scope::{
     ConsentGrant, ConsentLedger, Scope, ScopeSet, authorize_method, required_scope_for_method,
     validate_method_name,
+};
+pub use snapshot::{
+    DetailLevel, MAX_SNAPSHOT_CWD_BYTES, MAX_SNAPSHOT_FULL_BYTES, MAX_SNAPSHOT_MINIMAL_BYTES,
+    MAX_SNAPSHOT_STANDARD_BYTES, MAX_SNAPSHOT_ZONES, SNAPSHOT_METHOD, SemanticZone, SnapshotData,
+    SnapshotRequest, SnapshotService, TerminalSnapshot, ZoneKind,
 };
 pub use transport::{DEFAULT_TRANSPORT_CAPACITY, MAX_TRANSPORT_CAPACITY, StdioTransportStub};
 pub use wire::{

@@ -372,8 +372,12 @@ impl Runtime {
     /// Fail-soft with a surfaced error: a platform read failure pastes
     /// nothing but is recorded for [`Self::last_clipboard_error`] instead of
     /// swallowed (PR #259 review); a successful read clears the slot.
+    ///
+    /// An over-limit primary selection is read through the bounded accessor,
+    /// so it pastes its clipped prefix instead of failing closed
+    /// (CTX-0478 review).
     pub fn paste_from_primary(&mut self) -> Option<bool> {
-        let text = match self.clipboard.get_primary() {
+        let text = match self.clipboard.get_primary_bounded() {
             Ok(text) => {
                 self.clear_clipboard_error();
                 text
@@ -491,11 +495,15 @@ impl Runtime {
     /// no silent drop. Bracketed paste (`?2004`) is defense-in-depth only and
     /// wraps confirmed delivery when enabled in terminal state.
     ///
-    /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) via the clipboard
-    /// primitive before the scan, so untrusted clipboard content cannot grow
-    /// the heap without limit (T-01).
+    /// Paste is bounded to `CLIPBOARD_MAX_BYTES` (8192) before the scan
+    /// (T-01), so untrusted clipboard content cannot grow the heap without
+    /// limit. The clipboard read is bounded on purpose: an over-limit system
+    /// clipboard is clipped at a UTF-8 char boundary and pastes its prefix
+    /// instead of propagating `ClipboardPayloadTooLarge` and pasting nothing
+    /// (CTX-0478 review); the inspection gate re-applies the same
+    /// char-boundary bound via `truncate_paste_text`.
     pub fn paste_from_clipboard(&mut self) -> Result<Option<bool>, bitty_platform::PlatformError> {
-        let text = self.clipboard.get_text()?;
+        let text = self.clipboard.get_text_bounded()?;
         if text.is_empty() {
             return Ok(None);
         }

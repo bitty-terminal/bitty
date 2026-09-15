@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+use bitty_platform::clipboard::CLIPBOARD_MAX_BYTES;
 use bitty_runtime::Runtime;
 use bitty_ui::CellPos;
 
@@ -325,7 +326,8 @@ fn truncation_at_char_boundary_before_inspection_deterministic() {
     // CTX-0478: the clipboard primitive rejects over-limit payloads (typed
     // error, no silent truncation), so oversized paste input is bounded by
     // the paste gate at a char boundary instead. Deterministic across
-    // runtimes.
+    // runtimes. The end-to-end clipboard seam (an over-limit system read) is
+    // covered by `oversized_system_clipboard_pastes_bounded_prefix_not_noop`.
     let mut a = make_runtime();
     let mut b = make_runtime();
     let long = "a".repeat(9000) + "\u{202E}tail";
@@ -343,6 +345,38 @@ fn truncation_at_char_boundary_before_inspection_deterministic() {
         assert_eq!(rt.pending_input().len(), 8192);
     }
     assert_eq!(a.pending_input(), b.pending_input());
+}
+
+#[test]
+fn oversized_system_clipboard_pastes_bounded_prefix_not_noop() {
+    // CTX-0478 review regression: the clipboard read used to reject a system
+    // value over CLIPBOARD_MAX_BYTES with ClipboardPayloadTooLarge, so chord
+    // and right-click paste (`paste_from_clipboard`) delivered nothing. The
+    // paste seam now clips at a char boundary and delivers the bounded
+    // prefix, and a suspicious tail beyond the cut never reaches inspection
+    // (the BiDi below is the suspicious marker).
+    let mut rt = make_runtime();
+    let oversized = "a".repeat(CLIPBOARD_MAX_BYTES + 1000) + "\u{202E}tail";
+    rt.clipboard_mut().simulate_system_text_for_test(oversized);
+    assert!(
+        rt.clipboard_mut().get_text().is_err(),
+        "direct read must reject the simulated over-limit system value \
+         (the regression: this rejection used to propagate out of paste)"
+    );
+    rt.drain_pending_input();
+    let insp = rt
+        .paste_from_clipboard()
+        .expect("over-limit clipboard must not fail the paste")
+        .expect("non-empty clipboard must produce a paste");
+    assert!(!insp, "clean bounded prefix delivers without confirmation");
+    assert!(!rt.has_pending_paste());
+    assert!(rt.last_clipboard_error().is_none());
+    let delivered = rt.drain_pending_input();
+    assert_eq!(delivered.len(), CLIPBOARD_MAX_BYTES);
+    assert!(
+        delivered.iter().all(|byte| *byte == b'a'),
+        "delivered bytes must be the bounded prefix"
+    );
 }
 
 #[test]

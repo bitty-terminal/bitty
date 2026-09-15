@@ -61,6 +61,30 @@ fn headless_payloads_stay_bounded_on_both_selections() {
 }
 
 #[test]
+fn direct_read_rejects_while_bounded_reads_clip() {
+    // CTX-0478 review: a simulated over-limit system read rejects through the
+    // direct API (typed error) but clips through the bounded reads the paste
+    // and OSC 52 reply seams use; the lossy helpers share the bounded path
+    // instead of going empty.
+    let mut cb = Clipboard::new_headless();
+    cb.simulate_system_text_for_test("z".repeat(CLIPBOARD_MAX_BYTES + 512));
+    assert!(matches!(
+        cb.get_text(),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { .. })
+    ));
+    let text = cb.get_text_bounded().expect("bounded clipboard read");
+    assert_eq!(text.len(), CLIPBOARD_MAX_BYTES);
+    assert_eq!(cb.get_text_lossy(), text);
+    let primary = cb.get_primary_bounded().expect("bounded primary read");
+    assert_eq!(primary.len(), CLIPBOARD_MAX_BYTES);
+    assert_eq!(cb.get_primary_lossy(), primary);
+    // At the exact cap both reads agree; nothing is clipped.
+    cb.simulate_system_text_for_test(String::from("ok"));
+    assert_eq!(cb.get_text().expect("at-limit read"), "ok");
+    assert_eq!(cb.get_text_bounded().expect("at-limit bounded read"), "ok");
+}
+
+#[test]
 fn backend_hint_matches_wayland_env_signal() {
     let expected = if is_wayland_session() {
         "wayland"

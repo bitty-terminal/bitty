@@ -14,12 +14,10 @@
 //! Layer-2 contract (CTX-0425; canonical spec in `bitty-plugins-docs`
 //! `specifications/plugin-reuse-and-providers.md`, v1: seven read-only `git`
 //! verbs with `32` args of `256` bytes and `8 KiB` total) is enforced by the
-//! [`SpawnAuthorizer`] seam, whose production implementation lands with
-//! CTX-0444 (host `[tools.*]` install enforcement, issue #714). Until then
-//! [`DenyAllAuthorizer`] keeps every spawn fail-closed: the surface exists,
-//! but nothing executes. The authorizer receives the raw `(tool, args)` and
-//! returns the resolved `(executable, args)`; anything it denies never
-//! reaches [`std::process::Command`].
+//! [`SpawnAuthorizer`] seam, whose production implementation is the CTX-0444
+//! host `[tools.*]` enforcement ([`HostToolsAuthorizer`]). [`DenyAllAuthorizer`]
+//! remains as the fail-closed baseline for tests: the surface exists, and
+//! anything outside the allowlist never reaches [`std::process::Command`].
 //!
 //! # Dispatch formula (CTX-0421 / CTX-0442 order, DIR-018)
 //!
@@ -128,6 +126,9 @@ use bitty_ipc::execution::{
 use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
+use bitty_plugin_host::tools::{
+    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_valid_tool_name,
+};
 
 /// Panel-path per-stream output budget (`8 KiB`).
 ///
@@ -381,9 +382,10 @@ pub trait SpawnAuthorizer: fmt::Debug {
 
 /// Fail-closed placeholder authorizer: denies every spawn.
 ///
-/// Active until CTX-0444 lands its `[tools.*]` enforcement. The surface is
-/// fully wired, but nothing executes: every dispatch fails with
-/// `Denied[AllowlistDenied]` before any scope, consent, or process contact.
+/// Retained for tests and as the default-deny baseline. Production wiring
+/// uses [`HostToolsAuthorizer`]; this authorizer keeps every spawn
+/// fail-closed: every dispatch fails with `Denied[AllowlistDenied]` before
+/// any scope, consent, or process contact.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DenyAllAuthorizer;
 
@@ -395,9 +397,61 @@ impl SpawnAuthorizer for DenyAllAuthorizer {
     fn authorize(&self, tool: &str, _args: &[String]) -> Result<ResolvedSpawn, IpcError> {
         Err(IpcError::Denied {
             code: "AllowlistDenied".into(),
-            reason: format!(
-                "tool '{tool}' is not allowlisted ([tools.*] enforcement is not yet installed)"
-            ),
+            reason: format!("tool '{tool}' is not allowlisted (deny-all baseline)"),
+        })
+    }
+}
+
+/// Production `[tools.*]` authorizer: CTX-0444 enforcement for Layer-2 reuse
+/// (CTX-0439 wiring).
+///
+/// Validates `(tool, args)` against the accepted `[tools.git]` slice (v1)
+/// via `bitty-plugin-host` pure predicates — no I/O, no spawn — and resolves
+/// the executable argv-directly (the tool name itself; OS `PATH` resolution
+/// happens at spawn, never a caller-supplied path). Anything denied never
+/// reaches [`std::process::Command`].
+///
+/// Error attribution follows the [`SpawnAuthorizer`] contract: malformed
+/// tool names fail as `InvalidRequest`, well-formed tools without a
+/// `[tools.*]` declaration fail as `NotFound`, and declared tools with
+/// non-allowlisted args fail as `Denied[AllowlistDenied]`. Installed-manifest
+/// binding (which plugin may claim the tool) is enforced at activation via
+/// the grant snapshot, not here: this authorizer enforces the accepted
+/// tool/verb contract only.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HostToolsAuthorizer;
+
+impl SpawnAuthorizer for HostToolsAuthorizer {
+    fn tool_id(&self) -> &'static str {
+        ACCEPTED_TOOL_GIT
+    }
+
+    fn authorize(&self, tool: &str, args: &[String]) -> Result<ResolvedSpawn, IpcError> {
+        if !is_valid_tool_name(tool) {
+            return Err(IpcError::InvalidRequest {
+                reason: format!("tool name '{tool}' violates the host tool grammar"),
+            });
+        }
+        if !is_accepted_tool(tool) {
+            return Err(IpcError::NotFound {
+                reason: format!("tool '{tool}' has no [tools.*] declaration"),
+            });
+        }
+        if tool == ACCEPTED_TOOL_GIT && !is_allowed_git_args(args) {
+            return Err(IpcError::Denied {
+                code: "AllowlistDenied".into(),
+                reason: format!("tool '{tool}' args are outside the [tools.git] allowlist"),
+            });
+        }
+        if tool != ACCEPTED_TOOL_GIT {
+            return Err(IpcError::Denied {
+                code: "AllowlistDenied".into(),
+                reason: format!("tool '{tool}' is not allowlisted"),
+            });
+        }
+        Ok(ResolvedSpawn {
+            executable: tool.to_owned(),
+            args: args.to_vec(),
         })
     }
 }
@@ -553,7 +607,7 @@ impl SpawnService {
 
 /// Fail-closed validation of authorizer output (bugs in the CTX-0444
 /// implementation must not widen the surface).
-fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError> {
+pub(crate) fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError> {
     if resolved.executable.is_empty() {
         return Err(IpcError::InvalidRequest {
             reason: "resolved executable must not be empty".into(),
@@ -615,7 +669,7 @@ fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError> {
 /// (no zombie) and the outcome is `Unknown`/`Unknown` with a timeout evidence
 /// ref, so callers reconcile instead of assuming the effect did or did not
 /// land. A child that cannot start at all fails as `Unavailable`.
-fn spawn_process(
+pub(crate) fn spawn_process(
     request: &bitty_ipc::execution::ExecutionRequest,
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
     use std::process::{Command, Stdio};
@@ -781,7 +835,8 @@ fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
 /// Render a completed [`ExecutionResult`] as the `bitty.process.spawn` table.
 ///
 /// Carries `output` (bounded stdout), `stderr`, `truncated`, `exit_code`,
-/// and `untrusted` (always true): child bytes are untrusted observation data.
+/// `execution_id` (attribution handle for explicit host reconcile), and
+/// `untrusted` (always true): child bytes are untrusted observation data.
 #[must_use]
 pub fn spawn_result_to_lua(result: &ExecutionResult) -> LuaValue {
     let exit = match result.exit_code {
@@ -802,6 +857,10 @@ pub fn spawn_result_to_lua(result: &ExecutionResult) -> LuaValue {
             LuaValue::Bool(result.truncated),
         ),
         (LuaValue::String("exit_code".into()), exit),
+        (
+            LuaValue::String("execution_id".into()),
+            LuaValue::Integer(result.execution_id as i64),
+        ),
         (LuaValue::String("untrusted".into()), LuaValue::Bool(true)),
     ])
 }
@@ -930,10 +989,11 @@ fn truncate_message(mut text: String, limit: usize) -> String {
 /// re-checks scope, opt-in, and ledger consent; expiry and revocation take
 /// effect immediately.
 ///
-/// Interim authorizer: [`DenyAllAuthorizer`]. CTX-0444 replaces it with the
-/// `[tools.*]` enforcement against the installed manifest table; the seam
-/// (this function plus [`SpawnAuthorizer`]) is unchanged. Until then every
-/// spawn fails as `E_SPAWN_DENIED` after passing the grant gate.
+/// Production authorizer: [`HostToolsAuthorizer`] (CTX-0444 `[tools.*]`
+/// enforcement against the accepted Layer-2 contract; the seam — this
+/// function plus [`SpawnAuthorizer`] — is unchanged). Spawns outside the
+/// allowlist fail as `E_SPAWN_DENIED` after passing the grant gate, before
+/// any process contact.
 ///
 /// Per-call output is capped at [`SPAWN_PANEL_OUTPUT_BUDGET`] so Layer-2
 /// output always fits the panel bus admission bound. Non-zero exits fail as
@@ -941,6 +1001,9 @@ fn truncate_message(mut text: String, limit: usize) -> String {
 /// host-authored message carrying only the exit code, never child stderr
 /// bytes; timeouts fail as `E_SPAWN_TIMEOUT` via the stored `Unknown`
 /// outcome.
+///
+/// The success table carries `execution_id` (CTX-0439): Lua callers read it
+/// back for explicit reconcile via the host before re-executing.
 #[must_use]
 pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::SpawnHandler {
     use std::cell::Cell;
@@ -948,7 +1011,7 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
 
     let plugin_id = plugin_id.into();
     let service = Rc::new(std::cell::RefCell::new(SpawnService::new(Box::new(
-        DenyAllAuthorizer,
+        HostToolsAuthorizer,
     ))));
     let mut granted = ScopeSet::new();
     granted.insert(Scope::ProcessSpawn);
@@ -1511,6 +1574,65 @@ mod tests {
     fn spawn_scope_is_process_spawn() {
         assert_eq!(SPAWN_SCOPE, Scope::ProcessSpawn);
         assert_eq!(SPAWN_PANEL_OUTPUT_BUDGET, 8 * 1024);
+    }
+
+    #[test]
+    fn host_tools_authorizer_enforces_the_accepted_contract() {
+        let authorizer = HostToolsAuthorizer;
+        assert_eq!(authorizer.tool_id(), "git");
+        let resolved = authorizer
+            .authorize("git", &["status".to_owned()])
+            .expect("allowlisted verb resolves");
+        assert_eq!(resolved.executable, "git");
+        assert_eq!(resolved.args, vec!["status".to_owned()]);
+        let error = authorizer
+            .authorize(
+                "git",
+                &["commit".to_owned(), "-m".to_owned(), "x".to_owned()],
+            )
+            .expect_err("write verb must deny");
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "AllowlistDenied"
+            ),
+            "got {error:?}"
+        );
+        let error = authorizer
+            .authorize("rg", &["x".to_owned()])
+            .expect_err("undeclared tool must fail");
+        assert!(matches!(error, IpcError::NotFound { .. }), "got {error:?}");
+        let error = authorizer
+            .authorize("/bin/git", &["status".to_owned()])
+            .expect_err("path-like tool must fail");
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        let error = authorizer
+            .authorize("git", &["status".to_owned(), "--upload-pack=x".to_owned()])
+            .expect_err("smuggled flag must deny");
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "AllowlistDenied"
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn lua_table_surfaces_execution_id_for_reconcile() {
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let result = dispatch_ok(&mut service, &allowed_request("echo"), 301).expect("serves");
+        let value = spawn_result_to_lua(&result);
+        assert_eq!(
+            value.get("execution_id"),
+            Some(&LuaValue::Integer(301)),
+            "Lua callers get the id back for reconcile"
+        );
+        assert_eq!(value.get("untrusted"), Some(&LuaValue::Bool(true)));
     }
 
     #[test]

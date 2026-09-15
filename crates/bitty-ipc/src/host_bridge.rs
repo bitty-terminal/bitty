@@ -1,0 +1,749 @@
+//! Generic host bridge layer: live providers for the Phase-A pure services
+//! (CTX-0439, G-5).
+//!
+//! The Phase-A services ([`SnapshotService`](crate::snapshot::SnapshotService),
+//! [`ToolDispatchService`](crate::tool_dispatch::ToolDispatchService),
+//! [`ExecutionService`](crate::execution::ExecutionService),
+//! [`FragmentIngestService`](crate::rich_fragment::FragmentIngestService))
+//! run on test `fn` doubles; the Runtime owns no provider wiring. This module
+//! is the `bitty-ipc` half of the bridge: a bounded live store the Runtime
+//! publishes committed terminal state into, plus `fn` providers reading that
+//! store through the existing dispatch paths (unchanged grammar, registry,
+//! shape, authorize, budget, DTO-validate order). Providers stay pure `fn`
+//! pointers so the services keep their dependency-free tables; liveness
+//! arrives via publication, mirroring the `devtools` introspection live
+//! store (`publish_grid_text` precedent).
+//!
+//! # Dispatch order (unchanged)
+//!
+//! Every dispatch keeps the established order:
+//! grammar -> registry -> shape -> authorize -> handler -> provider ->
+//! bound -> DTO-validate. Provider-echo mismatch still fails as
+//! `InvalidRequest` (confused-deputy guard); the live snapshot provider
+//! matches by construction (the store is keyed by terminal id) and the
+//! dispatch re-verifies, so a compromised store entry cannot launder bytes
+//! across terminals.
+//!
+//! # Budgets (accepted contracts, verified first-hand)
+//!
+//! Every number below reuses an accepted `bitty-ipc` bound; no value is
+//! invented here:
+//!
+//! - Live store depth `<= 64` ([`MAX_LIVE_SNAPSHOTS`],
+//!   `channel::MAX_PENDING_REQUESTS`, pending-table precedent, same as
+//!   `execution::MAX_TRACKED_EXECUTIONS` and
+//!   `rich_fragment::MAX_PENDING_FRAGMENTS`). Duplicate publication
+//!   overwrites (freshest state wins: liveness, not ingestion dedup);
+//!   a new terminal id at capacity is rejected fail-closed (`Ok(false)`,
+//!   no eviction, no silent overwrite of another terminal).
+//! - Inspect tool result data `<= 16 KiB`
+//!   (`tool_dispatch::MAX_TOOL_RESULT_BYTES`); over-bound live text is cut
+//!   at a char boundary with the truncation flagged in the summary
+//!   (snapshot/execution truncate-and-flag precedent; the flag keeps the
+//!   cut honest, never silent).
+//! - Inspect tool summaries `<= 512` bytes
+//!   (`tool_dispatch::MAX_TOOL_SUMMARY_BYTES`, bounded human-message
+//!   precedent).
+//! - Client identity `1..=64` bytes (`auth::MAX_SCOPED_ID_BYTES`,
+//!   scoped-id precedent).
+//!
+//! # Trust binding (CTX-0421 review outcome)
+//!
+//! Caller-supplied `client_id` / scopes / clock are untrusted until bound
+//! here. [`HostCaller::bind`] is the single choke point: it requires an
+//! already-attested [`VerifiedPeer`](crate::auth::VerifiedPeer) (the
+//! kernel-gated owner-only transport proves the *connection* crossed the
+//! accept boundary as the runtime UID; it says nothing about which
+//! human or plugin sent the bytes), shape-checks the `client_id`, and
+//! carries **only** server-evaluated scopes plus the server clock. There
+//! is no caller-scopes input at all: dispatch sites use
+//! [`HostCaller::granted`] and [`HostCaller::now_ms`], so a caller cannot
+//! smuggle scopes or rewind the consent clock. UID-to-`client_id`
+//! allocation (which plugin may claim which id) is the servo accept
+//! boundary's job and stays sequel work; this slice enforces everything
+//! below that line and documents the remainder honestly.
+//!
+//! The module is pure data plus one bounded process-global store, headless,
+//! and `forbid(unsafe)`: it owns no socket, spawns no thread, performs no
+//! I/O, and depends on no workspace crate beyond `bitty-ipc` itself. No
+//! network, no new external crates.
+
+#![forbid(unsafe_code)]
+
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+
+use crate::auth::{MAX_SCOPED_ID_BYTES, VerifiedPeer};
+use crate::error::IpcError;
+use crate::scope::{Scope, ScopeSet};
+use crate::snapshot::{SnapshotData, SnapshotRequest};
+use crate::tool_dispatch::{
+    MAX_TOOL_RESULT_BYTES, ToolDispatchService, ToolOutput, ToolRequest, ToolSpec,
+};
+
+// ── live snapshot store ─────────────────────────────────────────────────────
+
+/// Maximum live terminals retained (`channel::MAX_PENDING_REQUESTS`, 64).
+///
+/// Pending-table precedent: a malicious or buggy publisher cannot grow the
+/// store without limit (T-01).
+pub const MAX_LIVE_SNAPSHOTS: usize = crate::channel::MAX_PENDING_REQUESTS;
+
+/// Read-only inspect tool serving bounded live terminal text.
+pub const INSPECT_TEXT_TOOL: &str = "terminal_text";
+
+/// Read-only inspect tool serving a bounded live terminal status report.
+pub const INSPECT_STATUS_TOOL: &str = "terminal_status";
+
+/// Process-global live terminal state, keyed by host terminal id.
+///
+/// Written by [`publish_live_snapshot`] (Runtime committed state), read by
+/// [`live_snapshot_provider`] and the inspect tool providers below. Bounded
+/// at [`MAX_LIVE_SNAPSHOTS`]; see the module docs for the overwrite/full
+/// policy.
+fn live_snapshot_store() -> &'static Mutex<BTreeMap<String, SnapshotData>> {
+    static STORE: OnceLock<Mutex<BTreeMap<String, SnapshotData>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Publish committed terminal state into the live store.
+///
+/// Overwrites any entry for the same terminal (freshest wins). A new
+/// terminal id at capacity stores nothing and reports `Ok(false)`
+/// (fail-closed, no eviction).
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` when `data.terminal_id` violates the host
+/// `t:<digits>` grammar, or `Internal` when the store lock is poisoned.
+pub fn publish_live_snapshot(data: SnapshotData) -> Result<bool, IpcError> {
+    crate::ctl::parse_terminal_id(&data.terminal_id).map(|_| ())?;
+    let mut store = live_snapshot_store()
+        .lock()
+        .map_err(|_| IpcError::Internal {
+            reason: "live snapshot store lock is poisoned".into(),
+        })?;
+    if !store.contains_key(&data.terminal_id) && store.len() >= MAX_LIVE_SNAPSHOTS {
+        return Ok(false);
+    }
+    store.insert(data.terminal_id.clone(), data);
+    Ok(true)
+}
+
+/// Live [`SnapshotService`](crate::snapshot::SnapshotService) provider.
+///
+/// Serves the published entry for `request.terminal_id`; the dispatch
+/// re-verifies the provider echo, so the match holds twice.
+///
+/// # Errors
+///
+/// Returns `NotFound` when no live state was published for the requested
+/// terminal, or `Internal` when the store lock is poisoned.
+pub fn live_snapshot_provider(request: &SnapshotRequest) -> Result<SnapshotData, IpcError> {
+    let store = live_snapshot_store()
+        .lock()
+        .map_err(|_| IpcError::Internal {
+            reason: "live snapshot store lock is poisoned".into(),
+        })?;
+    store
+        .get(&request.terminal_id)
+        .cloned()
+        .ok_or_else(|| IpcError::NotFound {
+            reason: format!("no live snapshot published for '{}'", request.terminal_id),
+        })
+}
+
+/// Number of live terminals currently retained (diagnostics only).
+#[must_use]
+pub fn live_snapshot_count() -> usize {
+    live_snapshot_store()
+        .lock()
+        .map(|store| store.len())
+        .unwrap_or(0)
+}
+
+/// Drop every live entry (tests only; production state is never cleared
+/// except by overwrite).
+pub fn clear_live_snapshots_for_tests() {
+    if let Ok(mut store) = live_snapshot_store().lock() {
+        store.clear();
+    }
+}
+
+// ── read-only inspect tools ─────────────────────────────────────────────────
+
+/// Truncate `text` to `budget` bytes at a char boundary.
+///
+/// Returns the bounded text plus whether truncation occurred
+/// (snapshot/execution precedent).
+fn truncate_to_budget(text: &str, budget: usize) -> (String, bool) {
+    if text.len() <= budget {
+        return (text.to_owned(), false);
+    }
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
+/// Declaration for [`INSPECT_TEXT_TOOL`] (read-only, `terminal.inspect`).
+///
+/// # Errors
+///
+/// Returns the [`ToolSpec::new`] failure when the statically valid
+/// declaration is rejected (programming error, never caller input).
+pub fn inspect_text_spec() -> Result<ToolSpec, IpcError> {
+    ToolSpec::new(
+        INSPECT_TEXT_TOOL,
+        "bounded live terminal text for one terminal (read-only inspect)",
+        b"{}".to_vec(),
+        Scope::TerminalInspect,
+        true,
+    )
+}
+
+/// Declaration for [`INSPECT_STATUS_TOOL`] (read-only, `terminal.inspect`).
+///
+/// # Errors
+///
+/// Returns the [`ToolSpec::new`] failure when the statically valid
+/// declaration is rejected (programming error, never caller input).
+pub fn inspect_status_spec() -> Result<ToolSpec, IpcError> {
+    ToolSpec::new(
+        INSPECT_STATUS_TOOL,
+        "bounded live terminal status report for one terminal (read-only inspect)",
+        b"{}".to_vec(),
+        Scope::TerminalInspect,
+        true,
+    )
+}
+
+/// Read one published entry by target (shared provider prologue).
+fn live_entry_for_tool(tool: &str, request: &ToolRequest) -> Result<SnapshotData, IpcError> {
+    let target = request
+        .target
+        .as_deref()
+        .ok_or_else(|| IpcError::InvalidRequest {
+            reason: format!("tool '{tool}' requires a captured target"),
+        })?;
+    crate::ctl::parse_terminal_id(target).map(|_| ())?;
+    let store = live_snapshot_store()
+        .lock()
+        .map_err(|_| IpcError::Internal {
+            reason: "live snapshot store lock is poisoned".into(),
+        })?;
+    store
+        .get(target)
+        .cloned()
+        .ok_or_else(|| IpcError::NotFound {
+            reason: format!("no live snapshot published for '{target}'"),
+        })
+}
+
+/// Provider for [`INSPECT_TEXT_TOOL`]: bounded live text with echo match.
+///
+/// Over-bound live text is cut at a char boundary and the cut is flagged
+/// in the summary (never silent).
+///
+/// # Errors
+///
+/// - `InvalidRequest` when the request carries no target or the target
+///   violates the host grammar.
+/// - `NotFound` when no live state was published for the target.
+/// - `Internal` when the store lock is poisoned.
+pub fn inspect_text_provider(request: &ToolRequest) -> Result<ToolOutput, IpcError> {
+    let entry = live_entry_for_tool(INSPECT_TEXT_TOOL, request)?;
+    let (data_text, truncated) = truncate_to_budget(&entry.text, MAX_TOOL_RESULT_BYTES);
+    let summary = format!(
+        "{} gen {} {}/{}B{}",
+        entry.terminal_id,
+        entry.generation,
+        data_text.len(),
+        entry.text.len(),
+        if truncated { " truncated" } else { "" }
+    );
+    let output = ToolOutput {
+        target_id: request.target.clone(),
+        data: data_text.into_bytes(),
+        summary,
+    };
+    output.validate()?;
+    Ok(output)
+}
+
+/// Provider for [`INSPECT_STATUS_TOOL`]: bounded generation/cwd/zone report.
+///
+/// The `cwd` display is cut to the accepted snapshot `cwd` bound
+/// (`snapshot::MAX_SNAPSHOT_CWD_BYTES`); the cut keeps the DTO inside the
+/// tool result budget on every path.
+///
+/// # Errors
+///
+/// - `InvalidRequest` when the request carries no target or the target
+///   violates the host grammar.
+/// - `NotFound` when no live state was published for the target.
+/// - `Internal` when the store lock is poisoned.
+pub fn inspect_status_provider(request: &ToolRequest) -> Result<ToolOutput, IpcError> {
+    let entry = live_entry_for_tool(INSPECT_STATUS_TOOL, request)?;
+    let (cwd, _) = truncate_to_budget(&entry.cwd, crate::snapshot::MAX_SNAPSHOT_CWD_BYTES);
+    let data = format!(
+        "generation: {}\ncwd: {}\nzones: {}\ntext_bytes: {}\n",
+        entry.generation,
+        cwd,
+        entry.semantic_zones.len(),
+        entry.text.len()
+    );
+    let summary = format!(
+        "{} gen {} zones {}",
+        entry.terminal_id,
+        entry.generation,
+        entry.semantic_zones.len()
+    );
+    let output = ToolOutput {
+        target_id: request.target.clone(),
+        data: data.into_bytes(),
+        summary,
+    };
+    output.validate()?;
+    Ok(output)
+}
+
+/// Register the live read-only inspect tools on `service`.
+///
+/// Registers exactly [`INSPECT_TEXT_TOOL`] and [`INSPECT_STATUS_TOOL`]
+/// (both `read_only`, both `terminal.inspect`). Effect tools are never
+/// registered here: they stay deny-by-default (`NotFound`) until their
+/// own slice wires them.
+///
+/// # Errors
+///
+/// - `InvalidRequest` when a tool name is already registered (no silent
+///   overwrite).
+/// - `LimitExceeded` when the registry is at capacity (`32`).
+pub fn register_live_inspect_tools(service: &mut ToolDispatchService) -> Result<(), IpcError> {
+    service.register(inspect_text_spec()?, inspect_text_provider)?;
+    service.register(inspect_status_spec()?, inspect_status_provider)?;
+    Ok(())
+}
+
+// ── trust binding ───────────────────────────────────────────────────────────
+
+/// Caller identity bound to an attested connection plus server-evaluated
+/// authority (CTX-0421 review outcome).
+///
+/// Construction requires an already-attested [`VerifiedPeer`]: only the
+/// kernel-gated owner-only transport could have produced it, so the bytes
+/// arrived over the accept boundary as the runtime UID. The struct carries
+/// no caller-supplied scopes and no caller-supplied clock — dispatch sites
+/// read [`HostCaller::granted`] and [`HostCaller::now_ms`] instead — so
+/// scope smuggling and clock rewinding fail by construction (there is no
+/// field to smuggle them through).
+///
+/// Explicit non-goals (sequel work, documented honestly): mapping the
+/// `client_id` string to a UID or plugin identity (the servo accept
+/// boundary allocates ids; this slice only shape-checks the label), and
+/// per-tool-name consent granularity (the accepted ledger is per
+/// `(client_id, scope)`; per-tool identity enters via routing and
+/// attribution).
+#[derive(Debug, Clone)]
+pub struct HostCaller {
+    /// Server-validated client label presented over the attested connection.
+    client_id: String,
+    /// Server-evaluated scope set (never caller-asserted).
+    granted: ScopeSet,
+    /// Server clock in ms (never caller-supplied).
+    now_ms: u64,
+}
+
+impl HostCaller {
+    /// Maximum client identity bytes (`auth::MAX_SCOPED_ID_BYTES`, 64).
+    pub const MAX_CLIENT_ID_BYTES: usize = MAX_SCOPED_ID_BYTES;
+
+    /// Bind a caller label to an attested connection and server authority.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidRequest` when `client_id` is empty.
+    /// - `LimitExceeded` when `client_id` exceeds 64 bytes.
+    pub fn bind(
+        _peer: &VerifiedPeer,
+        client_id: impl Into<String>,
+        granted: ScopeSet,
+        now_ms: u64,
+    ) -> Result<Self, IpcError> {
+        let client_id = client_id.into();
+        if client_id.is_empty() {
+            return Err(IpcError::InvalidRequest {
+                reason: "host caller client_id must not be empty".into(),
+            });
+        }
+        if client_id.len() > Self::MAX_CLIENT_ID_BYTES {
+            return Err(IpcError::LimitExceeded {
+                field: "host caller client_id".into(),
+                limit: Self::MAX_CLIENT_ID_BYTES,
+                actual: client_id.len(),
+            });
+        }
+        Ok(Self {
+            client_id,
+            granted,
+            now_ms,
+        })
+    }
+
+    /// Bound client label.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Server-evaluated scope set.
+    #[must_use]
+    pub fn granted(&self) -> &ScopeSet {
+        &self.granted
+    }
+
+    /// Server clock in ms.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::{ConsentLedger, ScopeSet};
+    use crate::snapshot::{
+        DetailLevel, SNAPSHOT_METHOD, SemanticZone, SnapshotRequest, SnapshotService, ZoneKind,
+    };
+
+    /// Serialize the store-touching tests in this module (the live store is
+    /// process-global; parallel tests must not interleave publishes).
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn live_data(terminal_id: &str, generation: u64, text: &str) -> SnapshotData {
+        SnapshotData {
+            terminal_id: terminal_id.to_owned(),
+            generation,
+            cwd: "/work".to_owned(),
+            semantic_zones: vec![SemanticZone {
+                kind: ZoneKind::Output,
+                line_start: 0,
+                line_end: 2,
+            }],
+            text: text.to_owned(),
+        }
+    }
+
+    fn granted_inspect() -> ScopeSet {
+        ScopeSet::single(Scope::TerminalInspect)
+    }
+
+    fn consented(client: &str, now_ms: u64) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(
+                client.to_owned(),
+                Scope::TerminalInspect,
+                now_ms,
+                60_000,
+                "test".to_owned(),
+            )
+            .expect("grant");
+        ledger
+    }
+
+    #[test]
+    fn bounds_match_accepted_contracts() {
+        assert_eq!(MAX_LIVE_SNAPSHOTS, crate::channel::MAX_PENDING_REQUESTS);
+        assert_eq!(HostCaller::MAX_CLIENT_ID_BYTES, MAX_SCOPED_ID_BYTES);
+        assert_eq!(MAX_TOOL_RESULT_BYTES, 16 * 1024);
+        assert_eq!(
+            crate::tool_dispatch::MAX_TOOL_SUMMARY_BYTES,
+            crate::devtools::MAX_ERROR_MESSAGE_CHARS
+        );
+    }
+
+    #[test]
+    fn live_publish_serves_through_dispatch() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:71", 9, "hello live")).expect("publish serves");
+        let service = SnapshotService::with_defaults(live_snapshot_provider);
+        let snapshot = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:71", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("live provider serves");
+        assert_eq!(snapshot.terminal_id, "t:71");
+        assert_eq!(snapshot.generation, 9);
+        assert_eq!(snapshot.cwd, "/work");
+        assert_eq!(snapshot.text, "hello live");
+        assert!(!snapshot.truncated);
+        assert!(snapshot.is_untrusted_surface);
+        assert_eq!(snapshot.semantic_zones.len(), 1);
+    }
+
+    #[test]
+    fn live_provider_miss_is_not_found() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        let service = SnapshotService::with_defaults(live_snapshot_provider);
+        let error = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:72", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect_err("unpublished terminal must fail closed");
+        assert!(matches!(error, IpcError::NotFound { .. }), "got {error:?}");
+    }
+
+    #[test]
+    fn live_publish_rejects_bad_terminal_grammar() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        let error = publish_live_snapshot(live_data("nope", 1, "x"))
+            .expect_err("bad terminal id must fail");
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        assert_eq!(live_snapshot_count(), 0);
+    }
+
+    #[test]
+    fn live_store_cap_is_fail_closed() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        for index in 0..(MAX_LIVE_SNAPSHOTS as u64) {
+            let id = format!("t:{}", 1000 + index);
+            assert!(
+                publish_live_snapshot(live_data(&id, index, "x")).expect("capacity"),
+                "slot for {id}"
+            );
+        }
+        assert_eq!(live_snapshot_count(), MAX_LIVE_SNAPSHOTS);
+        assert!(
+            !publish_live_snapshot(live_data("t:9999", 1, "x")).expect("full reports"),
+            "new terminal at capacity must report false"
+        );
+        assert!(
+            publish_live_snapshot(live_data("t:1000", 77, "fresh")).expect("overwrite serves"),
+            "overwrite of a retained terminal still serves"
+        );
+        let service = SnapshotService::with_defaults(live_snapshot_provider);
+        let snapshot = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:1000", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("freshest wins");
+        assert_eq!(snapshot.generation, 77);
+        assert_eq!(snapshot.text, "fresh");
+        clear_live_snapshots_for_tests();
+    }
+
+    #[test]
+    fn inspect_text_serves_live_bytes_with_echo() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:73", 4, "typed bytes")).expect("publish");
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        let execution = service
+            .dispatch(
+                &ToolRequest::new(INSPECT_TEXT_TOOL, b"{}".to_vec()).with_target("t:73"),
+                &granted_inspect(),
+                &consented("bridge-tests", 1_000),
+                "bridge-tests",
+                1_000,
+                41,
+            )
+            .expect("inspect serves");
+        assert_eq!(execution.tool, INSPECT_TEXT_TOOL);
+        assert_eq!(execution.target.as_deref(), Some("t:73"));
+        assert_eq!(execution.data, b"typed bytes");
+        assert!(execution.summary.contains("t:73"));
+        assert!(execution.is_untrusted_surface);
+        assert_eq!(execution.execution_id, 41);
+        assert_eq!(execution.client_id, "bridge-tests");
+    }
+
+    #[test]
+    fn inspect_status_serves_generation_cwd_zones() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:74", 6, "hello")).expect("publish");
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        let execution = service
+            .dispatch(
+                &ToolRequest::new(INSPECT_STATUS_TOOL, b"{}".to_vec()).with_target("t:74"),
+                &granted_inspect(),
+                &consented("bridge-tests", 1_000),
+                "bridge-tests",
+                1_000,
+                42,
+            )
+            .expect("status serves");
+        let body = String::from_utf8(execution.data).expect("status is UTF-8");
+        assert!(body.contains("generation: 6"), "got {body:?}");
+        assert!(body.contains("cwd: /work"), "got {body:?}");
+        assert!(body.contains("zones: 1"), "got {body:?}");
+        assert!(execution.is_untrusted_surface);
+    }
+
+    #[test]
+    fn inspect_tools_require_captured_target() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:75", 1, "x")).expect("publish");
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        for tool in [INSPECT_TEXT_TOOL, INSPECT_STATUS_TOOL] {
+            let error = service
+                .dispatch(
+                    &ToolRequest::new(tool, b"{}".to_vec()),
+                    &granted_inspect(),
+                    &consented("bridge-tests", 1_000),
+                    "bridge-tests",
+                    1_000,
+                    43,
+                )
+                .expect_err("missing target must fail closed");
+            assert!(
+                matches!(error, IpcError::InvalidRequest { .. }),
+                "got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_text_unknown_terminal_is_not_found() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        let error = service
+            .dispatch(
+                &ToolRequest::new(INSPECT_TEXT_TOOL, b"{}".to_vec()).with_target("t:76"),
+                &granted_inspect(),
+                &consented("bridge-tests", 1_000),
+                "bridge-tests",
+                1_000,
+                44,
+            )
+            .expect_err("unpublished terminal must fail closed");
+        assert!(matches!(error, IpcError::NotFound { .. }), "got {error:?}");
+    }
+
+    #[test]
+    fn inspect_text_truncation_is_flagged_never_silent() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        let big = "x".repeat(MAX_TOOL_RESULT_BYTES + 16);
+        publish_live_snapshot(live_data("t:77", 2, &big)).expect("publish");
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        let execution = service
+            .dispatch(
+                &ToolRequest::new(INSPECT_TEXT_TOOL, b"{}".to_vec()).with_target("t:77"),
+                &granted_inspect(),
+                &consented("bridge-tests", 1_000),
+                "bridge-tests",
+                1_000,
+                45,
+            )
+            .expect("over-bound text serves flagged");
+        assert!(execution.data.len() <= MAX_TOOL_RESULT_BYTES);
+        assert!(
+            execution.summary.contains("truncated"),
+            "got {:?}",
+            execution.summary
+        );
+    }
+
+    #[test]
+    fn helper_registers_only_read_only_inspect_tools() {
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        assert_eq!(service.tool_count(), 2);
+        assert_eq!(
+            service.tool_names(),
+            vec![INSPECT_STATUS_TOOL.to_owned(), INSPECT_TEXT_TOOL.to_owned()]
+        );
+        assert!(service.contains(INSPECT_TEXT_TOOL));
+        assert!(service.contains(INSPECT_STATUS_TOOL));
+    }
+
+    #[test]
+    fn inspect_dispatch_keeps_scope_and_consent_gates() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:78", 1, "gated")).expect("publish");
+        let mut service = ToolDispatchService::new();
+        register_live_inspect_tools(&mut service).expect("register");
+        let request = ToolRequest::new(INSPECT_TEXT_TOOL, b"{}".to_vec()).with_target("t:78");
+        let empty = ScopeSet::new();
+        let error = service
+            .dispatch(
+                &request,
+                &empty,
+                &consented("bridge-tests", 1_000),
+                "bridge-tests",
+                1_000,
+                46,
+            )
+            .expect_err("missing scope must deny");
+        assert!(
+            matches!(error, IpcError::ScopeDenied { .. }),
+            "got {error:?}"
+        );
+        let error = service
+            .dispatch(
+                &request,
+                &granted_inspect(),
+                &ConsentLedger::new(),
+                "bridge-tests",
+                1_000,
+                47,
+            )
+            .expect_err("missing consent must deny");
+        assert!(matches!(error, IpcError::Denied { .. }), "got {error:?}");
+    }
+
+    #[test]
+    fn host_caller_binds_shape_and_server_authority() {
+        let peer = VerifiedPeer::attested(1000);
+        let granted = granted_inspect();
+        let caller = HostCaller::bind(&peer, "bridge-tests", granted.clone(), 1_000)
+            .expect("valid label binds");
+        assert_eq!(caller.client_id(), "bridge-tests");
+        assert_eq!(caller.now_ms(), 1_000);
+        assert!(caller.granted().contains(Scope::TerminalInspect));
+        assert!(!caller.granted().contains(Scope::ProcessSpawn));
+        let error =
+            HostCaller::bind(&peer, "", granted.clone(), 1_000).expect_err("empty label must fail");
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        let error = HostCaller::bind(&peer, "x".repeat(65), granted, 1_000)
+            .expect_err("over-bound label must fail");
+        assert!(
+            matches!(error, IpcError::LimitExceeded { .. }),
+            "got {error:?}"
+        );
+    }
+}

@@ -128,6 +128,7 @@ pub mod error;
 pub mod execution;
 pub mod frame;
 pub mod frame_digest;
+pub mod host_bridge;
 pub mod limits;
 pub mod mcp;
 pub mod rich_fragment;
@@ -158,6 +159,12 @@ pub use execution::{
     MAX_TRACKED_EXECUTIONS, RawExecutionOutput,
 };
 pub use frame::{Frame, Framer, MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, decode_frame, encode_frame};
+pub use host_bridge::{
+    HostCaller, INSPECT_STATUS_TOOL, INSPECT_TEXT_TOOL, MAX_LIVE_SNAPSHOTS,
+    clear_live_snapshots_for_tests, inspect_status_provider, inspect_status_spec,
+    inspect_text_provider, inspect_text_spec, live_snapshot_count, live_snapshot_provider,
+    publish_live_snapshot, register_live_inspect_tools,
+};
 pub use limits::{
     RC9_BURST_PER_SEC, RC9_MAX_CONNECTIONS, RC9_PAYLOAD_CAP_BYTES, RC9_REQ_PER_SEC, RC9_WINDOW_MS,
     RC10_CHUNK_CEILING, RateLimiter, check_connection_cap, check_payload_cap,

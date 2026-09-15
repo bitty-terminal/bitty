@@ -33,6 +33,9 @@ status-drift:
 status-drift-test:
     ./scripts/tests/check-status-drift.test.sh
 
+workflow-publish-test:
+    ./scripts/tests/workflow-publish.test.sh
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
@@ -58,18 +61,21 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test workflow-publish-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref
-# `refs/heads/carryctx-snapshots`; the target pushes that branch only when the
-# local ref advanced (native carryctx commits one snapshot per export, so a
-# re-run publishes again rather than no-opping). Canonical closeout runs from
-# the primary checkout on branch main
-# (`cd "$BITTY_WORKSPACE/bitty" && just workflow-publish`); a detached or
-# feature worktree records that branch as the snapshot source. Dry run
-# validates the export and writes neither the ref nor the remote.
+# `refs/heads/carryctx-snapshots`; the target pushes that branch and fails
+# loudly when the local ref does not advance (native carryctx commits one
+# snapshot per export, so a re-run publishes again rather than no-opping; a
+# ref that did not advance means a stale source or a broken export).
+# Canonical closeout runs through the workspace publish-snapshots helper from
+# a fresh origin/main worktree whose basename matches the repository name
+# (see scripts/tests/workflow-publish.test.sh); a manual run from the primary
+# checkout on main is allowed only when that checkout is current with
+# origin/main. Dry run validates the export and writes neither the ref nor
+# the remote.
 workflow-publish *args:
     bash scripts/workflow-publish.sh {{args}}
 

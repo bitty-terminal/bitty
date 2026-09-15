@@ -204,8 +204,8 @@ impl Runtime {
     /// The pane reader starts direct and is promoted into a wakeup
     /// forwarder when a waker is installed (CTX-0230):
     /// [`poll_pty`](Self::poll_pty) drains every pane session on each call,
-    /// and a promoted pane additionally wakes the event loop per chunk so
-    /// pane-only output (e.g. a fresh split shell's `ESC[c`) is answered
+    /// and a promoted pane additionally wakes the event loop per batch (CTX-0476
+    /// waker merge) so pane-only output (e.g. a fresh split shell's `ESC[c`) is answered
     /// promptly. Pane replies flush to the pane's own writer on the same path.
     ///
     /// # Errors
@@ -306,9 +306,9 @@ impl Runtime {
     /// when a waker is installed (CTX-0230). Mirrors
     /// [`promote_pty_reader_to_forwarder`](Self::promote_pty_reader_to_forwarder):
     /// the forwarder blocks in `recv` (zero wakeups when quiet), forwards
-    /// each chunk into a bounded channel
+    /// each batch into a bounded channel
     /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes the shared waker once
-    /// per chunk plus once on EOF. [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// per batch plus once on EOF (CTX-0476 waker merge). [`pump_pane_sessions`](Self::pump_pane_sessions)
     /// drains the forwarding channel, so the bounded-drain contract holds
     /// end to end. Idempotent: no-op without a session, without a waker, or
     /// when already promoted.
@@ -480,11 +480,17 @@ impl Runtime {
         }
         // Collect without holding a borrow across the mutable pump calls.
         // `BTreeMap` iteration is `ViewId`-ordered, so multi-pane wakeups
-        // are deterministic.
+        // are deterministic. CTX-0476: same poll budgets as the primary path
+        // (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
+        // shared across panes, so N panes can never cost N x 1024 chunks.
+        let start = std::time::Instant::now();
+        let mut drained_bytes = 0usize;
         let mut pending: Vec<(ViewId, Vec<u8>)> = Vec::new();
         for (id, sess) in self.pane_sessions.iter() {
-            let mut per_pane = 0usize;
-            while per_pane < 1024 {
+            while pending.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                if !pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                    break;
+                }
                 // Promoted panes drain the forwarder channel; direct panes
                 // drain the pump channel. Either way the bound holds
                 // (`CHANNEL_CAPACITY_CHUNKS` x `READ_CHUNK_SIZE` per stage).
@@ -498,11 +504,17 @@ impl Runtime {
                 match chunk {
                     Some(chunk) => {
                         debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                        drained_bytes = drained_bytes.saturating_add(chunk.len());
                         pending.push((*id, chunk));
-                        per_pane += 1;
                     }
                     None => break,
                 }
+            }
+            if pending.len() >= POLL_PTY_MAX_CHUNKS
+                || drained_bytes >= POLL_PTY_MAX_BYTES
+                || (!pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET)
+            {
+                break;
             }
         }
         let drained = pending.len();

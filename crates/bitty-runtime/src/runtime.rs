@@ -124,6 +124,7 @@ pub mod animations;
 pub mod background_images;
 pub mod click;
 pub mod close_confirm;
+pub mod copy_mode;
 pub mod help;
 pub mod input;
 pub mod kitty_images;
@@ -391,6 +392,13 @@ pub struct Runtime {
     /// they read the gesture kind via [`crate::Runtime::selection_kind`]
     /// and this count without touching the tracker.
     last_click_count: u8,
+    /// Keyboard copy-mode state (CTX-0384, issue #640).
+    ///
+    /// `None` in normal operation; `Some` while the vi-style modal copy
+    /// cursor owns keyboard input (no PTY bytes, visual selection via the
+    /// CTX-0385 `SelectionKind` seams, yank to clipboard plus primary).
+    /// Bounded `O(1)` state; see `runtime::copy_mode`.
+    copy_mode: Option<crate::runtime::copy_mode::CopyModeState>,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -814,6 +822,7 @@ impl Runtime {
             click_tracker: ClickTracker::new(),
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
+            copy_mode: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -959,6 +968,7 @@ impl Runtime {
             click_tracker: ClickTracker::new(),
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
+            copy_mode: None,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

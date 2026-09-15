@@ -685,6 +685,13 @@ pub enum ChromeAction {
     /// never removes a workspace (last-workspace `>= 1` holds), and never
     /// touches the runtime-global primary PTY.
     WorkspaceMove(u64),
+    /// Enter keyboard copy mode (`enter_copy_mode`, CTX-0384 issue #640).
+    ///
+    /// Vi-style modal scrollback navigation with visual selection plus yank
+    /// (`hjkl`/arrows/`PgUp`/`PgDn`/`g`/`G` move, `v`/`V`/`Ctrl+V` select
+    /// over the CTX-0385 `SelectionKind` ranges, `y` yanks to clipboard plus
+    /// primary, `Esc` exits). Modal: no PTY input while active.
+    EnterCopyMode,
 }
 
 impl ChromeAction {
@@ -805,6 +812,10 @@ impl ChromeAction {
                 let n = require_workspace_index(arg, trimmed)?;
                 Ok(Self::WorkspaceMove(n))
             }
+            "enter_copy_mode" | "copy_mode" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::EnterCopyMode)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -840,12 +851,13 @@ impl ChromeAction {
             Self::WorkspaceLast => "workspace_last".to_string(),
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
+            Self::EnterCopyMode => "enter_copy_mode".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1083,6 +1095,10 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+?", "toggle_help"),
     ("alt+shift+?", "toggle_help"),
     ("alt+shift+/", "toggle_help"),
+    // CTX-0384 keyboard copy mode (issue #640): `ctrl+shift+space` enters the
+    // vi-style modal copy cursor (bare `space` stays shell input; the chord
+    // carries no `alt` slot so a Super flip leaves it unchanged).
+    ("ctrl+shift+space", "enter_copy_mode"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -1850,15 +1866,16 @@ mod tests {
         // Mod-aware resize) = 59, plus CTX-0263's 7 mod-independent font-zoom
         // chords = 66, plus CTX-0259's 9 Mod+Shift+Number move chords
         // (shift+alt+1..=9) = 75, plus CTX-0265's 4 help chords (alt+backtick
-        // + 3 alt+? shifted-symbol spellings) = 79 total, and the full DEC
+        // + 3 alt+? shifted-symbol spellings) = 79 total, plus CTX-0384's 1
+        // copy-mode chord (ctrl+shift+space) = 80 total, and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                79,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords"
+                80,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -2437,8 +2454,9 @@ mod tests {
         // explicit Alt spellings intact while the Super spellings stay free.
         // This task allocates NO new shipped defaults (CTX-0259 owns
         // Mod+Shift+Number, CTX-0265 owns Mod+backtick/Mod+?), so the
-        // default count stays pinned at 79 under both mods (35 shipped
-        // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help).
+        // default count stays pinned at 80 under both mods (35 shipped
+        // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
+        // + 1 copy-mode).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
             ("alt+f5", "goto_split:right"),
@@ -2466,14 +2484,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                79,
+                80,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                79 + entries.len(),
+                80 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

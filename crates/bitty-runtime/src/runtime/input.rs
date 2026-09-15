@@ -194,6 +194,31 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0384: copy mode owns the keyboard while active (no PTY bytes,
+        // no snap-to-live, no selection clearing). The inspect trace stays
+        // bounded-observable; every other path returns here.
+        if self.copy_mode.is_some() {
+            let pressed = Some(event.state == PressState::Pressed);
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+                return None;
+            }
+            self.inspect_ring.push_key(
+                &key_inspect_label(&event),
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+                pressed,
+            );
+            self.publish_inspect_snapshot();
+            let _ = self.handle_copy_mode_key(&event);
+            return None;
+        }
         // CTX-0367 IME composition guard: consume raw presses while a
         // preedit is active. winit suppresses `KeyboardInput` during the
         // preedit phase on every backend; if a platform quirk ever delivers
@@ -271,6 +296,29 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0384: copy mode owns the keyboard while active (see owned path).
+        if self.copy_mode.is_some() {
+            let pressed = Some(event.state == PressState::Pressed);
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+                return None;
+            }
+            self.inspect_ring.push_key(
+                &key_inspect_label(event),
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+                pressed,
+            );
+            self.publish_inspect_snapshot();
+            let _ = self.handle_copy_mode_key(event);
+            return None;
+        }
         // CTX-0367 IME composition guard (see the owned path): raw presses
         // are consumed while a preedit is active.
         if self.ime_preedit.is_some()
@@ -533,6 +581,13 @@ impl Runtime {
                 self.alt_pressed,
             );
             self.publish_inspect_snapshot();
+        }
+        // CTX-0384: copy mode consumes mouse selection while active (the
+        // keyboard cursor owns the highlight). The inspect trace above stays;
+        // every selection, drag, capture, and paste path below is suppressed
+        // so no PTY bytes and no highlight mutation occur while modal.
+        if self.copy_mode.is_some() {
+            return;
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
@@ -860,7 +915,11 @@ impl Runtime {
                 let lines_y = self.wheel_line_accum_y.trunc() as isize;
                 let lines_x = self.wheel_line_accum_x.trunc() as isize;
                 // Shift+wheel or no capture scrolls viewport; otherwise emit mouse wheel SGR when mouse mode active.
-                let capture_scroll = !self.shift_pressed
+                // CTX-0384: copy mode never forwards wheel SGR to the PTY
+                // (modal, no PTY input); the viewport-scroll path below stays
+                // so history remains keyboard/wheel navigable.
+                let capture_scroll = self.copy_mode.is_none()
+                    && !self.shift_pressed
                     && self.state.modes().mouse_tracking.is_some()
                     && self.state.modes().mouse_coordinate_encoding
                         == Some(bitty_vt::MouseCoordinateEncoding::Sgr);

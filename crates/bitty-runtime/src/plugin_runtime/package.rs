@@ -44,6 +44,24 @@ pub const MANIFEST_FILE_NAME: &str = "bitty-plugin.toml";
 pub const PACKAGES_DIR: &str = "packages";
 /// Prefix of an in-flight quarantine copy (never a valid plugin id or version).
 const STAGING_PREFIX: &str = ".tmp-";
+/// Maximum age of a quarantine `.tmp-*` dir before it is considered stale.
+///
+/// Crashed installs leave these behind; an in-flight staging copy is only
+/// minutes old, so 24h never collects live work while still bounding disk
+/// growth from repeated crashes.
+pub const STALE_TMP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+/// Maximum `.tmp-*` entries scanned per GC pass (bounds work on a hostile store).
+pub const STALE_TMP_MAX_SCAN: usize = 64;
+/// Maximum stale dirs removed per GC pass (bounds delete work per install).
+pub const STALE_TMP_MAX_REMOVE: usize = 32;
+/// Maximum bytes removed per GC pass (bounds delete work per install).
+///
+/// Each quarantine copy is itself bounded by the module-tree ceilings
+/// (16 MiB), so this caps pathological stores without extra walks on the
+/// happy path.
+pub const STALE_TMP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum chars kept in a prune/GC warning detail (bounded, char-safe).
+const PRUNE_WARNING_MAX_CHARS: usize = 512;
 /// Owner-only mode for staged package files (Unix).
 #[cfg(unix)]
 const STORE_FILE_MODE: u32 = 0o600;
@@ -112,6 +130,60 @@ pub struct InstallReport {
     pub updated: bool,
     /// Version replaced by this transaction, when it was an update.
     pub previous_version: Option<String>,
+    /// Post-commit cleanup warning (CTX-0417).
+    ///
+    /// `None` on the happy path. When stale `.tmp-*` GC or retained-version
+    /// pruning fails after `current.json` is committed, the install itself
+    /// already succeeded, so the failure is reported here instead of
+    /// returning `Err` and misleading the caller into thinking nothing
+    /// changed. The leftover dirs are inert (no record points at them) and
+    /// are retried on the next install.
+    pub prune_warning: Option<PruneWarning>,
+}
+
+/// Non-fatal post-commit cleanup warning (CTX-0417).
+///
+/// Carries a bounded human-readable detail; the install already succeeded
+/// when this is produced. Callers must surface it (log/stderr) but must not
+/// treat it as a transaction failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneWarning {
+    /// Bounded detail (at most `PRUNE_WARNING_MAX_CHARS` chars).
+    pub detail: String,
+}
+
+impl PruneWarning {
+    /// Build a warning, truncating `detail` on a char boundary.
+    #[must_use]
+    pub fn new(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        if detail.chars().count() <= PRUNE_WARNING_MAX_CHARS {
+            return Self { detail };
+        }
+        let truncated: String = detail.chars().take(PRUNE_WARNING_MAX_CHARS).collect();
+        Self { detail: truncated }
+    }
+}
+
+impl std::fmt::Display for PruneWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "post-commit cleanup warning: {}", self.detail)
+    }
+}
+
+impl std::error::Error for PruneWarning {}
+
+/// Stats from one stale `.tmp-*` GC pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StaleTmpGcStats {
+    /// Staging entries scanned (bounded by `STALE_TMP_MAX_SCAN`).
+    pub scanned: usize,
+    /// Stale dirs removed.
+    pub removed: usize,
+    /// Approximate bytes removed (bounded walk, early stop at budget).
+    pub bytes_removed: u64,
+    /// Entries skipped by scan/remove/byte caps or fresh mtime.
+    pub skipped: usize,
 }
 
 /// Outcome of one uninstall transaction.
@@ -312,6 +384,10 @@ pub fn install_local_dir(
         ))
     })?;
     harden_dirs(store_root, &[PACKAGES_DIR, &plugin_id])?;
+    // CTX-0417: best-effort GC of crashed-install `.tmp-*` quarantine dirs
+    // before staging. Failures are non-fatal and merged into the post-commit
+    // warning so a dirty store never blocks a fresh install.
+    let (_, gc_warning) = gc_stale_staging_dirs(&package_dir);
     let staging = package_dir.join(format!(
         "{STAGING_PREFIX}{}-{}",
         std::process::id(),
@@ -427,12 +503,25 @@ pub fn install_local_dir(
     harden_index(store_root)?;
 
     let previous_version = existing.as_ref().map(|record| record.version.clone());
-    prune_retained_versions(
+    // CTX-0417: prune runs after the current.json commit, so the update is
+    // already active here. A prune failure must not masquerade as a failed
+    // install: report it as a typed warning and let the leftover dirs be
+    // retried on the next install. Happy path stays `None`.
+    let prune_warning = match prune_retained_versions(
         store_root,
         &plugin_id,
         &version,
         previous_version.as_deref(),
-    )?;
+    ) {
+        Ok(()) => gc_warning,
+        Err(error) => {
+            let prune = PruneWarning::new(error.to_string());
+            Some(match gc_warning {
+                Some(gc) => PruneWarning::new(format!("{}; {}", gc.detail, prune.detail)),
+                None => prune,
+            })
+        }
+    };
 
     Ok(Some(InstallReport {
         plugin_id,
@@ -445,6 +534,7 @@ pub fn install_local_dir(
         added,
         updated: previous_version.is_some(),
         previous_version,
+        prune_warning,
     }))
 }
 
@@ -828,6 +918,139 @@ fn prune_retained_versions(
         }
     }
     Ok(())
+}
+
+/// Best-effort GC of stale quarantine `.tmp-*` dirs under one package dir.
+///
+/// Bounded by age (`STALE_TMP_MAX_AGE_SECS`), scan count
+/// (`STALE_TMP_MAX_SCAN`), remove count (`STALE_TMP_MAX_REMOVE`), and bytes
+/// (`STALE_TMP_MAX_BYTES`). Fresh entries (mtime unavailable, in the future,
+/// or younger than the age bound) are skipped so live concurrent staging is
+/// never collected. Failures are collected as a single typed warning instead
+/// of failing the install.
+fn gc_stale_staging_dirs(package_dir: &Path) -> (StaleTmpGcStats, Option<PruneWarning>) {
+    gc_stale_staging_dirs_with_limits(
+        package_dir,
+        STALE_TMP_MAX_AGE_SECS,
+        STALE_TMP_MAX_SCAN,
+        STALE_TMP_MAX_REMOVE,
+        STALE_TMP_MAX_BYTES,
+    )
+}
+
+fn gc_stale_staging_dirs_with_limits(
+    package_dir: &Path,
+    max_age_secs: u64,
+    max_scan: usize,
+    max_remove: usize,
+    max_bytes: u64,
+) -> (StaleTmpGcStats, Option<PruneWarning>) {
+    let mut stats = StaleTmpGcStats::default();
+    let Ok(entries) = std::fs::read_dir(package_dir) else {
+        return (stats, None);
+    };
+    let mut staging: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if staging.len() >= max_scan {
+            stats.skipped += 1;
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(STAGING_PREFIX) {
+            continue;
+        }
+        stats.scanned += 1;
+        let path = entry.path();
+        // Only dirs are staging copies; stray files with the prefix are left
+        // alone (fail-closed, never delete what the installer did not make).
+        if !path.is_dir() {
+            stats.skipped += 1;
+            continue;
+        }
+        staging.push(path);
+    }
+    staging.sort();
+    let mut first_error: Option<String> = None;
+    for path in staging {
+        if stats.removed >= max_remove || stats.bytes_removed >= max_bytes {
+            stats.skipped += 1;
+            continue;
+        }
+        if !is_stale_tmp(&path, max_age_secs) {
+            stats.skipped += 1;
+            continue;
+        }
+        let remaining = max_bytes.saturating_sub(stats.bytes_removed);
+        let size = dir_size_bounded(&path, remaining);
+        // If even the bounded size already exceeds the remaining budget,
+        // skip the rest rather than blowing the byte bound.
+        if size > remaining {
+            stats.skipped += 1;
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                stats.removed += 1;
+                stats.bytes_removed = stats.bytes_removed.saturating_add(size);
+            }
+            Err(error) => {
+                stats.skipped += 1;
+                if first_error.is_none() {
+                    first_error = Some(format!("cannot GC stale '{}': {error}", path.display()));
+                }
+            }
+        }
+    }
+    let warning = first_error.map(PruneWarning::new);
+    (stats, warning)
+}
+
+/// Whether a staging dir is old enough to be considered crashed leftovers.
+fn is_stale_tmp(path: &Path, max_age_secs: u64) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    let Ok(elapsed) = now.duration_since(modified) else {
+        // Future mtime (clock skew) or same instant: treat as fresh.
+        return false;
+    };
+    elapsed.as_secs() >= max_age_secs
+}
+
+/// Approximate dir size, stopping early once `budget` is exceeded.
+///
+/// Uses `symlink_metadata` so symlinks are never followed; unreadable entries
+/// count as 0 rather than failing the whole GC pass.
+fn dir_size_bounded(path: &Path, budget: u64) -> u64 {
+    fn walk(path: &Path, acc: &mut u64, budget: u64) {
+        if *acc > budget {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if *acc > budget {
+                return;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                walk(&path, acc, budget);
+            } else if meta.is_file() {
+                *acc = acc.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut acc = 0u64;
+    walk(path, &mut acc, budget);
+    acc
 }
 
 #[cfg(unix)]
@@ -1419,6 +1642,117 @@ mod tests {
         )
         .expect_err("spawn without [tools.git] must fail closed");
         assert!(matches!(error, PackageOpError::Manifest { .. }));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // CTX-0417: bounded GC of stale `.tmp-*` quarantine dirs.
+    #[test]
+    fn stale_tmp_gc_removes_only_stale_and_respects_bounds() {
+        let scratch = scratch("gc");
+        let package_dir = scratch.join("packages/xuepoo.gc");
+        std::fs::create_dir_all(&package_dir).expect("package dir");
+        // Two crashed staging dirs plus one real version (never collected).
+        for name in [".tmp-111-0", ".tmp-222-1"] {
+            let dir = package_dir.join(name);
+            std::fs::create_dir_all(&dir).expect("staging dir");
+            std::fs::write(dir.join("bitty-plugin.toml"), b"stale").expect("stale file");
+        }
+        let version = package_dir.join("1.0.0");
+        std::fs::create_dir_all(version.join("lua")).expect("version dir");
+
+        // Age 0: everything with a past mtime is stale, so both go.
+        let (stats, warning) =
+            gc_stale_staging_dirs_with_limits(&package_dir, 0, 64, 32, 64 * 1024 * 1024);
+        assert!(warning.is_none(), "clean GC must not warn");
+        assert_eq!(stats.removed, 2, "both stale dirs must go: {stats:?}");
+        assert!(!package_dir.join(".tmp-111-0").exists());
+        assert!(!package_dir.join(".tmp-222-1").exists());
+        assert!(
+            package_dir.join("1.0.0").is_dir(),
+            "real versions never GCd"
+        );
+
+        // Fresh entries are kept when the age bound is huge.
+        for name in [".tmp-333-0", ".tmp-444-1"] {
+            let dir = package_dir.join(name);
+            std::fs::create_dir_all(&dir).expect("staging dir");
+        }
+        let (stats, _) =
+            gc_stale_staging_dirs_with_limits(&package_dir, u64::MAX, 64, 32, 64 * 1024 * 1024);
+        assert_eq!(stats.removed, 0, "fresh staging must be kept: {stats:?}");
+        assert!(package_dir.join(".tmp-333-0").is_dir());
+
+        // Remove bound: only `max_remove` go per pass.
+        let (stats, _) =
+            gc_stale_staging_dirs_with_limits(&package_dir, 0, 64, 1, 64 * 1024 * 1024);
+        assert_eq!(stats.removed, 1, "remove cap must hold: {stats:?}");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn happy_path_install_has_no_prune_warning() {
+        let scratch = scratch("happy-warn");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.happy", "1.0.0", None);
+        let report = install(&store, &source);
+        assert!(
+            report.prune_warning.is_none(),
+            "happy path must stay warning-free: {:?}",
+            report.prune_warning
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_failure_is_reported_not_fatal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = scratch("prune-warn");
+        let store = scratch.join("store");
+        let source_v1 = write_plugin(&scratch, "xuepoo.prunewarn", "1.0.0", None);
+        let first = install(&store, &source_v1);
+        assert!(first.prune_warning.is_none());
+
+        // A retained extra version that prune must drop, made undeletable by
+        // revoking list permission on a nested dir. The parent stays writable
+        // so the new install can still commit.
+        let stale = store.join("packages/xuepoo.prunewarn/0.9.0");
+        let nested = stale.join("lua/nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        std::fs::write(stale.join("bitty-plugin.toml"), b"stale").expect("stale manifest");
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o000))
+            .expect("revoke nested");
+
+        let source_v2 = write_plugin(&scratch, "xuepoo.prunewarn", "2.0.0", None);
+        let report = install_local_dir(
+            &store,
+            &source_v2,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect("prune failure must not fail the install")
+        .expect("approved");
+
+        // The update itself succeeded and is active.
+        assert_eq!(report.version, "2.0.0");
+        assert!(store.join("packages/xuepoo.prunewarn/2.0.0").is_dir());
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].version, "2.0.0");
+        // But the cleanup failure is typed and reported, not swallowed.
+        let warning = report
+            .prune_warning
+            .as_ref()
+            .expect("prune failure must be reported");
+        assert!(
+            warning.detail.contains("cannot prune"),
+            "warning must name the prune failure: {}",
+            warning.detail
+        );
+        assert!(stale.exists(), "failed prune target stays for retry");
+
+        // Restore so the scratch cleanup can run.
+        let _ = std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

@@ -96,6 +96,7 @@ pub mod kitty_decode;
 pub mod kitty_place;
 pub mod loader;
 pub mod presentation;
+pub mod projection;
 pub mod scene;
 pub mod shell;
 
@@ -153,6 +154,7 @@ pub use kitty_place::{
     rasterize, viewport_extent,
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
+pub use projection::{ProjectedBlock, ProjectionError, project_fragments};
 pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,

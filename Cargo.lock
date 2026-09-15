@@ -286,6 +286,7 @@ dependencies = [
 name = "bitty-rich"
 version = "0.0.20"
 dependencies = [
+ "bitty-ipc",
  "bitty-platform",
  "bitty-term-state",
  "bitty-test-support",

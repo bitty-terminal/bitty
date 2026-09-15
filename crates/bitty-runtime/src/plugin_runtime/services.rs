@@ -17,7 +17,7 @@ use super::store::{self, PluginStore};
 /// Injected spawn backend for one plugin generation.
 ///
 /// Receives the Lua-validated argv and returns the bounded result table
-/// (`output`/`stderr`/`truncated`/`exit_code`/`untrusted`). The production
+/// (`output`/`stderr`/`truncated`/`exit_code`/`execution_id`/`untrusted`). The production
 /// backend is the consent-gated [`SpawnService`](super::spawn::SpawnService)
 /// path wired at activation; tests inject canned closures. `None` (no
 /// backend) fails closed with `E_SPAWN_UNAVAILABLE`.

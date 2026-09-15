@@ -142,9 +142,10 @@ fn granted_plugin_without_backend_is_unavailable() {
 }
 
 #[test]
-fn interim_backend_denies_but_never_spawns() {
-    // The activation-wired backend (deny-all allowlist until CTX-0444) fails
-    // a granted plugin as E_SPAWN_DENIED without contacting any process.
+fn production_backend_denies_unallowlisted_verbs_without_spawning() {
+    // CTX-0439: the activation-wired backend enforces the CTX-0444
+    // `[tools.git]` allowlist. A write verb fails as E_SPAWN_DENIED without
+    // contacting any process (fail-closed before scope/consent/spawn).
     let services = Rc::new(PluginServices::new(
         "bitty-terminal.git-panel",
         PluginStore::in_memory(),
@@ -156,12 +157,12 @@ fn interim_backend_denies_but_never_spawns() {
     ));
     services.set_spawn_git(true);
     services.set_spawn_backend(Some(git_spawn_backend("bitty-terminal.git-panel")));
-    let mut vm = LuaVm::new("git-panel-interim");
+    let mut vm = LuaVm::new("git-panel-production");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
             r#"
-            local ok, err = pcall(bitty.process.spawn, { "status", "--porcelain" })
+            local ok, err = pcall(bitty.process.spawn, { "commit", "-m", "nope" })
             if ok then
                 bitty.store.set("code", "NONE")
             else

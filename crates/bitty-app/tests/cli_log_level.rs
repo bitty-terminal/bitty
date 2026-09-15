@@ -54,16 +54,20 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn startup_info_lines_require_info_level() {
+    // Platform-independent info markers: the spawn-adjacent lines stay in a
+    // unix-only block below because the default shell chain falls back to
+    // `/bin/sh`, which does not exist on Windows.
+    let markers = [
+        "bitty: theme '",
+        "bitty: keymaps resolved",
+        "bitty: layout installed",
+        "bitty: effective program",
+    ];
     let root = scratch_root("quiet-default");
     let output = run_bitty(&root, &["--headless"]);
     assert_eq!(output.status.code(), Some(0));
     let err = stderr(&output);
-    for marker in [
-        "bitty: theme '",
-        "bitty: keymaps resolved",
-        "bitty: layout installed",
-        "bitty: PTY shell spawned",
-    ] {
+    for marker in markers {
         assert!(
             !err.contains(marker),
             "default (warn) must stay quiet, found {marker:?} in {err:?}"
@@ -73,17 +77,17 @@ fn startup_info_lines_require_info_level() {
     let output = run_bitty(&root, &["--headless", "--log-level", "info"]);
     assert_eq!(output.status.code(), Some(0));
     let err = stderr(&output);
-    for marker in [
-        "bitty: theme '",
-        "bitty: keymaps resolved",
-        "bitty: layout installed",
-        "bitty: PTY shell spawned",
-    ] {
+    for marker in markers {
         assert!(
             err.contains(marker),
             "--log-level info must print {marker:?}, stderr={err:?}"
         );
     }
+    #[cfg(unix)]
+    assert!(
+        err.contains("bitty: PTY shell spawned"),
+        "--log-level info must print the spawn summary, stderr={err:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

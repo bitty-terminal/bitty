@@ -3,10 +3,11 @@
 //! This module defines the **exact** accepted bundled-disabled set for `v1`
 //! per the Default Distribution RFC (`OQ-002`, accepted 2026-08-29) and the
 //! Plugin Roadmap (`bitty-terminal.shell-integration`, `workspace`,
-//! `project`, `file-manager`, `git-panel`, `browser-panel`). `statusline`
-//! migrated to an independent first-party package (OQ-053, `CTX-0398`) and
+//! `project`, `file-manager`, `browser-panel`). `statusline`
+//! migrated to an independent first-party package (OQ-053, `CTX-0398`),
 //! `palette` migrated to an independent first-party package (OQ-053,
-//! `CTX-0397`); neither is in this catalog. It
+//! `CTX-0397`), and `git-panel` migrated to an independent first-party
+//! package (OQ-053, `CTX-0400`); none is in this catalog. It
 //! exists **only** as
 //! review evidence that the public Plugin API is complete enough for
 //! first-party use — it does not introduce a private channel.
@@ -46,10 +47,10 @@
 use crate::capability::CapabilityId;
 use crate::manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-    PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
+    PluginIdentity, PluginManifest, QualifiedName,
 };
 
-/// Canonical version for the eight `v1` bundled plugins (SemVer 2).
+/// Canonical version for the seven `v1` bundled plugins (SemVer 2).
 const BUNDLED_VERSION: &str = "0.1.0";
 
 /// Compat range for the bundled set: `>=0.1,<1.0` with Plugin API `^1.0`.
@@ -380,70 +381,6 @@ pub fn file_manager_manifest() -> PluginManifest {
     }
 }
 
-/// `bitty-terminal.git-panel` — tiled `Panel(PanelId)` git panel.
-///
-/// Implements `[tools.git]` v1. Canonical contract:
-/// <https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/plugin-reuse-and-providers.md#accepted-toolsgit-contract-v1>
-///
-/// Capability: `panel.provider` + `panel.create` for Panel Runtime plus
-/// `process.spawn:git` allowlisted `[tools.git]` bounded `8 KiB`/`32` and
-/// `terminal.semantic-read` for cwd/link context plus optional
-/// `fs.read:~/projects/**` for working-tree read. System CLI reuse via
-/// `process.spawn:git(...)` with manifest-declared `[tools.git]` allowlist
-/// (per Layer 2 of `plugin-reuse-and-providers.md`), allowlisted `git` CLI
-/// outputs piped to panel UI, not raw PTY injection. Bounded `8 KiB`/`32`/
-/// `64`/`1024`/`8192` `DropOldest`, PR-1..PR-12, single-process `winit`,
-/// `is_untrusted_surface = true`, RC-1/RC-2 attribution per generation.
-#[must_use]
-pub fn git_panel_manifest() -> PluginManifest {
-    let mut caps = CapabilityRequests::default();
-    caps.ids
-        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("panel.create").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
-    caps.ids
-        .insert(CapabilityId::parse("process.spawn:git").expect("known capability"));
-    caps.filesystem.push(FilesystemRequest {
-        access: FsAccess::Read,
-        paths: vec!["~/projects/**".to_string()],
-    });
-    PluginManifest {
-        identity: bundled_identity(
-            "bitty-terminal.git-panel",
-            "Git Panel",
-            "Tiled Panel git branch/status/diff/log via process.spawn:git allowlisted [tools.git] bounded 8KiB/32/64 PR-1..12",
-        ),
-        compat: bundled_compat(),
-        dependencies: Vec::new(),
-        provided_services: Vec::new(),
-        required_services: Vec::new(),
-        capabilities: caps,
-        tools: vec![ToolDeclaration {
-            tool: "git".to_string(),
-            required: true,
-            version_req: ">=2.30".to_string(),
-        }],
-        lazy: LazyTriggers {
-            commands: vec![
-                QualifiedName::new("bitty-terminal.git-panel:open").expect("qualified"),
-                QualifiedName::new("bitty-terminal.git-panel:status").expect("qualified"),
-                QualifiedName::new("bitty-terminal.git-panel:diff").expect("qualified"),
-                QualifiedName::new("bitty-terminal.git-panel:log").expect("qualified"),
-                QualifiedName::new("bitty-terminal.git-panel:branch").expect("qualified"),
-            ],
-            events: vec![
-                "terminal.cwd-changed".to_string(),
-                "terminal.title-changed".to_string(),
-                "focus.changed".to_string(),
-            ],
-            claims: Vec::new(),
-        },
-        raw_bytes_len: 512,
-    }
-}
-
 /// `bitty-terminal.browser-panel` — `View Browser(BrowserSurfaceId)` host surface + `Panel(PanelId)` controls.
 ///
 /// Capability: `panel.provider` + `panel.create` for Panel controls plus
@@ -654,10 +591,9 @@ pub fn mail_panel_manifest() -> PluginManifest {
 
 // ── catalog helpers ───────────────────────────────────────────────────────
 
-/// All eight bundled-disabled manifests for `v1` (fresh install: staged but
+/// All seven bundled-disabled manifests for `v1` (fresh install: staged but
 /// not enabled). File-manager is P1 tiled Panel with `fs.read`+optional
-/// `fs.write`, git-panel is P1 tiled Panel with `process.spawn:git`
-/// allowlisted `[tools.git]`, browser-panel is P2 `View Browser` + `Panel`
+/// `fs.write`, browser-panel is P2 `View Browser` + `Panel`
 /// tiled with `browser.embed`/`navigation`/`file-url`/`storage` allowlisted
 /// `https` default, ai-panel is P2 `Panel` + `AgentId` bounded `32 KiB`,
 /// mail-panel is P3 `Panel` via `mcp.invoke:mail.*` + `network.connect`
@@ -670,14 +606,13 @@ pub fn all_bundled_manifests() -> Vec<PluginManifest> {
         workspace_manifest(),
         project_manifest(),
         file_manager_manifest(),
-        git_panel_manifest(),
         browser_panel_manifest(),
         ai_panel_manifest(),
         mail_panel_manifest(),
     ]
 }
 
-/// Plugin ids of the eight bundled-disabled plugins, in catalog order.
+/// Plugin ids of the seven bundled-disabled plugins, in catalog order.
 #[must_use]
 pub fn bundled_ids() -> Vec<PluginId> {
     all_bundled_manifests()
@@ -694,7 +629,7 @@ pub fn bundled_ids_sorted() -> Vec<String> {
     ids
 }
 
-/// Whether `id` is one of the eight bundled ids (canonical) or the deprecated
+/// Whether `id` is one of the seven bundled ids (canonical) or the deprecated
 /// `bitty-terminal.tabs` alias (removal ≥ v0.2.0).
 #[must_use]
 pub fn is_bundled(id: &PluginId) -> bool {
@@ -705,7 +640,6 @@ pub fn is_bundled(id: &PluginId) -> bool {
             | "bitty-terminal.tabs"
             | "bitty-terminal.project"
             | "bitty-terminal.file-manager"
-            | "bitty-terminal.git-panel"
             | "bitty-terminal.browser-panel"
             | "bitty-terminal.ai-panel"
             | "bitty-terminal.mail-panel"
@@ -729,7 +663,6 @@ pub fn bundled_manifest_for(id: &str) -> Option<PluginManifest> {
         "bitty-terminal.tabs" => Some(tabs_manifest()),
         "bitty-terminal.project" => Some(project_manifest()),
         "bitty-terminal.file-manager" => Some(file_manager_manifest()),
-        "bitty-terminal.git-panel" => Some(git_panel_manifest()),
         "bitty-terminal.browser-panel" => Some(browser_panel_manifest()),
         "bitty-terminal.ai-panel" => Some(ai_panel_manifest()),
         "bitty-terminal.mail-panel" => Some(mail_panel_manifest()),
@@ -752,7 +685,7 @@ mod tests {
     #[test]
     fn bundled_manifests_validate_and_have_expected_ids() {
         let all = all_bundled_manifests();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 7);
         for m in &all {
             assert_manifest_valid(m);
         }
@@ -763,7 +696,6 @@ mod tests {
                 "bitty-terminal.ai-panel",
                 "bitty-terminal.browser-panel",
                 "bitty-terminal.file-manager",
-                "bitty-terminal.git-panel",
                 "bitty-terminal.mail-panel",
                 "bitty-terminal.project",
                 "bitty-terminal.shell-integration",
@@ -779,6 +711,10 @@ mod tests {
         assert!(!ids.contains(&"bitty-terminal.statusline".to_string()));
         assert!(!is_bundled(
             &PluginId::new("bitty-terminal.statusline").unwrap()
+        ));
+        assert!(!ids.contains(&"bitty-terminal.git-panel".to_string()));
+        assert!(!is_bundled(
+            &PluginId::new("bitty-terminal.git-panel").unwrap()
         ));
         assert!(is_bundled(&PluginId::new("bitty-terminal.tabs").unwrap()));
         assert!(is_bundled(
@@ -914,77 +850,6 @@ mod tests {
         );
         assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
         // tiled Panel + fs isolation, no process/network
-        assert!(
-            !m.capabilities.ids.contains(
-                &CapabilityId::parse("network.connect:example.com:443")
-                    .unwrap_or_else(|_| CapabilityId::parse("fs.read:~/projects/**").unwrap())
-            )
-        );
-    }
-
-    #[test]
-    fn git_panel_manifest_process_spawn_and_panel_capabilities() {
-        let m = git_panel_manifest();
-        assert_eq!(m.capabilities.filesystem.len(), 1);
-        let read = m
-            .capabilities
-            .filesystem
-            .iter()
-            .find(|r| r.access == FsAccess::Read)
-            .unwrap();
-        assert_eq!(read.paths, vec!["~/projects/**"]);
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.provider").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("panel.create").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("terminal.semantic-read").unwrap())
-        );
-        assert!(
-            m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("process.spawn:git").unwrap())
-        );
-        assert_eq!(m.lazy.commands.len(), 5);
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.as_str() == "bitty-terminal.git-panel:open")
-        );
-        assert!(
-            m.lazy
-                .commands
-                .iter()
-                .any(|c| c.as_str() == "bitty-terminal.git-panel:status")
-        );
-        assert!(m.lazy.events.contains(&"terminal.cwd-changed".to_string()));
-        assert!(m.lazy.events.contains(&"focus.changed".to_string()));
-        let expanded_read = CapabilityId::parse("fs.read:~/projects/**").unwrap();
-        assert_eq!(
-            expanded_read.family(),
-            crate::capability::CapabilityFamily::Fs
-        );
-        let expanded_proc = CapabilityId::parse("process.spawn:git").unwrap();
-        assert_eq!(
-            expanded_proc.family(),
-            crate::capability::CapabilityFamily::Process
-        );
-        assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
-        // allowlisted git, not arbitrary process
-        assert!(
-            !m.capabilities
-                .ids
-                .contains(&CapabilityId::parse("process.spawn:rg").unwrap())
-        );
         assert!(
             !m.capabilities.ids.contains(
                 &CapabilityId::parse("network.connect:example.com:443")

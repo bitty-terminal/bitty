@@ -1,35 +1,178 @@
 #![forbid(unsafe_code)]
-//! Git panel via Panel Runtime — public API verification (CTX-0109, OQ-011).
+//! Git panel via Panel Runtime — parity verification after the OQ-053 split.
 //!
-//! Verifies `bitty-terminal.git-panel` (tiled Panel, process.spawn:git allowlisted [tools.git], bounded)
-//! as generic Panel Runtime consumer with no private channel, via the public
-//! PluginHost path (`declare → resolve → register → GrantRecord → activate →
-//! subscribe → publish → drain SideQueue DropOldest`) and PanelRegistry public
-//! path (`PanelRegistry::new → create_panel → mount_panel → focus_panel` with
-//! `PanelType::Helper` plus `register_command`/`create_overlay`/`declare_topic`/
-//! `subscribe`/`publish`/`drain_batch`), tiled `LayoutNode` `H`/`V` reuse, bounded
-//! queues `64`/`1024`/`2 MiB`/`8192`, `DropOldest`, `8 KiB` payload, `32`/`8 KiB`
-//! batch, single-process `winit` one-registry-per-window, default disabled,
-//! safe-mode reject, `forbid(unsafe)`.
+//! `bitty-terminal.git-panel` migrated to the independent first-party package
+//! `bitty-terminal/git-panel` (OQ-053, `bitty` `CTX-0400`), so this suite now
+//! exercises the generic Panel Runtime path against a local fixture manifest
+//! mirroring the former bundled manifest instead of the bundled catalog — the
+//! same fixture pattern the palette (`CTX-0397`) and statusline (`CTX-0398`)
+//! splits established. The former bundled review implementation
+//! (`bitty-runtime::git_panel`) is removed; its pure listing/allowlist
+//! helpers ship in the independent Lua package (`lua/git-panel/`) with
+//! headless Lua specs there.
 //!
-//! Mirrors file_manager_panel but for the git-panel P1 candidate
-//! with process.spawn:git allowlist and fs isolation.
+//! Contract provenance for the pinned values below: the allowlisted `git`
+//! verbs, bounds, and `[tools.git]` declaration are the accepted Layer 2
+//! `[tools.git]` slice (CTX-0425; canonical record in
+//! `bitty-plugins-docs`
+//! `specifications/plugin-reuse-and-providers.md`, accepted `[tools.git]`
+//! contract v1). The rest of that reuse RFC stays draft; only the slice
+//! gating this split is accepted. OQ-053 is accepted and closed.
+//!
+//! What this suite proves with no private channel, via the public PluginHost
+//! path (`declare → resolve → register → GrantRecord → activate → subscribe
+//! → publish → drain SideQueue DropOldest`) and the PanelRegistry public
+//! path (`PanelRegistry::new → create_panel → mount_panel → focus_panel`
+//! with `PanelType::Helper` plus `register_command`/`create_overlay`/
+//! `declare_topic`/`subscribe`/`publish`/`drain_batch`), tiled `LayoutNode`
+//! `H`/`V` reuse, bounded queues `64`/`1024`/`2 MiB`/`8192`, `DropOldest`,
+//! `8 KiB` payload, `32`/`8 KiB` batch, single-process `winit`
+//! one-registry-per-window, default disabled, safe-mode reject,
+//! `forbid(unsafe)`.
 
 use bitty_plugin_host::{
-    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::git_panel_manifest,
+    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::bundled_manifest_for,
 };
 use bitty_runtime::{
     Runtime, RuntimeConfig,
-    git_panel::{
-        GIT_PANEL_FS_READ_PATTERN, GIT_PANEL_MAX_COMMITS, GIT_PANEL_MAX_ENTRIES,
-        GIT_PANEL_PROCESS_SPAWN_GIT, GitBranch, GitFileStatus, GitIntegration, GitStatusEntry,
-        create_git_panel, git_panel_tiled_layout, validate_git_panel_config,
-    },
     registry::{BoundedPayload, PanelRegistry, PanelRegistryConfig, WorkspaceId},
 };
 use bitty_term_state::{State, TerminalAction};
-use bitty_ui::{Rect as UiRect, ViewId};
+use bitty_ui::{LayoutNode, Rect as UiRect, SplitAxis, View, ViewId};
 use bitty_vt::BoundedString;
+
+// --- former bundled contract, pinned locally ---------------------------------
+//
+// Values mirror the former bundled `git_panel_manifest`
+// (`crates/bitty-plugin-host/src/bundled.rs`) and the former
+// `bitty-runtime::git_panel` constants (`GIT_ALLOWED_SUBCOMMANDS`,
+// `GIT_PANEL_MAX_*`, `GIT_PANEL_PROCESS_SPAWN_GIT`). Canonical accepted
+// record for the allowlist, bounds, and `[tools.git]` declaration is the
+// Layer 2 `[tools.git]` slice (CTX-0425); this module is parity evidence,
+// not the contract.
+
+/// Former bundled plugin id.
+const GIT_PANEL_ID: &str = "bitty-terminal.git-panel";
+
+/// Former bundled display name.
+const GIT_PANEL_NAME: &str = "Git Panel";
+
+/// Former bundled version.
+const GIT_PANEL_VERSION: &str = "0.1.0";
+
+/// Former bundled description.
+const GIT_PANEL_DESCRIPTION: &str = "Tiled Panel git branch/status/diff/log via process.spawn:git allowlisted [tools.git] bounded 8KiB/32/64 PR-1..12";
+
+/// Former bundled compat ranges.
+const GIT_PANEL_COMPAT_BITTY: &str = ">=0.1,<1.0";
+const GIT_PANEL_COMPAT_PLUGIN_API: &str = "^1.0";
+
+/// Process spawn capability for git — allowlisted via `[tools.git]`.
+const GIT_PANEL_PROCESS_SPAWN_GIT: &str = "process.spawn:git";
+
+/// Filesystem read scope for the working tree.
+const GIT_PANEL_FS_READ_PATTERN: &str = "~/projects/**";
+
+/// Accepted read-only `git` verbs (`GIT_ALLOWED_SUBCOMMANDS`).
+const GIT_ALLOWED_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "diff",
+    "log",
+    "branch",
+    "show",
+    "rev-parse",
+    "ls-files",
+];
+
+/// Write verbs that must never be allowlisted.
+const GIT_DENIED_SUBCOMMANDS: &[&str] = &[
+    "commit", "push", "reset", "checkout", "fetch", "clone", "remote", "add",
+];
+
+/// Former bundled lazy commands.
+const GIT_PANEL_COMMANDS: &[&str] = &[
+    "bitty-terminal.git-panel:open",
+    "bitty-terminal.git-panel:status",
+    "bitty-terminal.git-panel:diff",
+    "bitty-terminal.git-panel:log",
+    "bitty-terminal.git-panel:branch",
+];
+
+/// Former bundled observation events.
+const GIT_PANEL_EVENTS: &[&str] = &[
+    "terminal.cwd-changed",
+    "terminal.title-changed",
+    "focus.changed",
+];
+
+/// Listing bounds (former `GIT_PANEL_MAX_*`).
+const GIT_PANEL_MAX_ENTRIES: usize = 128;
+const GIT_PANEL_MAX_COMMITS: usize = 64;
+const GIT_PANEL_MAX_BRANCHES: usize = 32;
+const GIT_PANEL_MAX_NAME_CHARS: usize = 128;
+const GIT_PANEL_MAX_COMMIT_MESSAGE_CHARS: usize = 256;
+const GIT_PANEL_MAX_PATH_BYTES: usize = 4096;
+const GIT_PANEL_MAX_GIT_ARGS: usize = 32;
+const GIT_PANEL_MAX_GIT_ARG_BYTES: usize = 256;
+const GIT_PANEL_MAX_GIT_TOTAL_BYTES: usize = 8192;
+const GIT_PANEL_PAYLOAD_MAX_BYTES: usize = 8192;
+const GIT_PANEL_MAX_SELECTION: usize = 64;
+
+/// Local fixture mirroring the former bundled `bitty-terminal.git-panel` manifest.
+///
+/// Git-panel migrated to an independent first-party package (OQ-053, `bitty`
+/// `CTX-0400`), so this suite now exercises the generic Panel Runtime path
+/// against a plain manifest instead of the bundled catalog.
+fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
+    use bitty_plugin_host::{
+        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
+        PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
+    };
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("panel.create").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse(GIT_PANEL_PROCESS_SPAWN_GIT).expect("known capability"));
+    caps.filesystem.push(FilesystemRequest {
+        access: FsAccess::Read,
+        paths: vec![GIT_PANEL_FS_READ_PATTERN.to_string()],
+    });
+    PluginManifest {
+        identity: PluginIdentity {
+            id: PluginId::new(GIT_PANEL_ID).expect("valid id"),
+            name: GIT_PANEL_NAME.to_string(),
+            version: GIT_PANEL_VERSION.to_string(),
+            description: GIT_PANEL_DESCRIPTION.to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(GIT_PANEL_COMPAT_BITTY.to_string()),
+            plugin_api: Some(GIT_PANEL_COMPAT_PLUGIN_API.to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        tools: vec![ToolDeclaration {
+            tool: "git".to_string(),
+            required: true,
+            version_req: ">=2.30".to_string(),
+        }],
+        lazy: LazyTriggers {
+            commands: GIT_PANEL_COMMANDS
+                .iter()
+                .map(|c| QualifiedName::new(c).expect("qualified"))
+                .collect(),
+            events: GIT_PANEL_EVENTS.iter().map(|e| e.to_string()).collect(),
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
+}
 
 fn granted_set_for(
     manifest: &bitty_plugin_host::PluginManifest,
@@ -45,6 +188,161 @@ fn granted_set_for(
         }
     }
     set
+}
+
+// --- the bundled id is freed for the independent package ---------------------
+
+#[test]
+fn git_panel_id_is_freed_from_the_bundled_catalog() {
+    // CTX-0406 reserves bundled ids: the independent package installs under
+    // this same identity through the external package path, so the bundled
+    // catalog must no longer claim it.
+    let id = bitty_plugin_host::PluginId::new(GIT_PANEL_ID).unwrap();
+    assert!(
+        !bitty_plugin_host::bundled::is_bundled(&id),
+        "git-panel must no longer be bundled"
+    );
+    assert!(
+        bundled_manifest_for(GIT_PANEL_ID).is_none(),
+        "git-panel must have no bundled manifest"
+    );
+    assert!(
+        !bitty_plugin_host::bundled::bundled_ids_sorted()
+            .iter()
+            .any(|listed| listed == GIT_PANEL_ID),
+        "git-panel must not be in the bundled id list"
+    );
+}
+
+// --- fixture matches the former bundled manifest ------------------------------
+
+#[test]
+fn git_panel_fixture_matches_former_bundled_manifest() {
+    let manifest = git_panel_manifest();
+    manifest.validate().expect("fixture must validate");
+    assert_eq!(manifest.identity.id.as_str(), GIT_PANEL_ID);
+    assert_eq!(manifest.identity.name, GIT_PANEL_NAME);
+    assert_eq!(manifest.identity.version, GIT_PANEL_VERSION);
+    assert_eq!(manifest.identity.description, GIT_PANEL_DESCRIPTION);
+    assert_eq!(
+        manifest.compat.bitty.as_deref(),
+        Some(GIT_PANEL_COMPAT_BITTY)
+    );
+    assert_eq!(
+        manifest.compat.plugin_api.as_deref(),
+        Some(GIT_PANEL_COMPAT_PLUGIN_API)
+    );
+    // Capabilities: panel.provider + panel.create + terminal.semantic-read +
+    // process.spawn:git plus fs.read scope.
+    let granted = granted_set_for(&manifest);
+    assert!(granted.contains(&CapabilityId::parse("panel.provider").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("panel.create").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("terminal.semantic-read").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("process.spawn:git").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("fs.read:~/projects/**").unwrap()));
+    assert_eq!(manifest.capabilities.filesystem.len(), 1);
+    assert_eq!(GIT_PANEL_FS_READ_PATTERN, "~/projects/**");
+    assert_eq!(GIT_PANEL_PROCESS_SPAWN_GIT, "process.spawn:git");
+    // Lazy triggers: five commands, three observation events, no claims.
+    assert_eq!(manifest.lazy.commands.len(), GIT_PANEL_COMMANDS.len());
+    for command in GIT_PANEL_COMMANDS {
+        assert!(
+            manifest
+                .lazy
+                .commands
+                .iter()
+                .any(|c| c.as_str() == *command),
+            "missing {command}"
+        );
+    }
+    assert_eq!(manifest.lazy.events.len(), GIT_PANEL_EVENTS.len());
+    for event in GIT_PANEL_EVENTS {
+        assert!(
+            manifest.lazy.events.iter().any(|e| e == event),
+            "missing {event}"
+        );
+    }
+    assert!(manifest.lazy.claims.is_empty());
+    // Manifest hash is deterministic (grant binding).
+    assert_eq!(manifest.manifest_hash(), manifest.clone().manifest_hash());
+    let mut bumped = git_panel_manifest();
+    bumped.identity.version = "0.2.0".to_string();
+    assert_ne!(bumped.manifest_hash(), manifest.manifest_hash());
+}
+
+// --- allowlisted git CLI only --------------------------------------------------
+
+#[test]
+fn git_panel_allowlist_contract_pins_seven_read_only_verbs() {
+    // Accepted `[tools.git]` slice (CTX-0425): read-only verbs only.
+    assert_eq!(GIT_ALLOWED_SUBCOMMANDS.len(), 7);
+    for verb in [
+        "status",
+        "diff",
+        "log",
+        "branch",
+        "show",
+        "rev-parse",
+        "ls-files",
+    ] {
+        assert!(
+            GIT_ALLOWED_SUBCOMMANDS.contains(&verb),
+            "allowlist must admit {verb}"
+        );
+    }
+    // Write verbs are absent; staging or commit UX needs explicit user
+    // action plus a broader grant, never ambient.
+    for verb in GIT_DENIED_SUBCOMMANDS {
+        assert!(
+            !GIT_ALLOWED_SUBCOMMANDS.contains(verb),
+            "allowlist must never admit {verb}"
+        );
+    }
+    // Capability string is exactly `process.spawn:git`: closed
+    // `process.spawn` family plus the `:git` parameter. Any other
+    // executable is denied.
+    let cap_proc = CapabilityId::parse(GIT_PANEL_PROCESS_SPAWN_GIT).unwrap();
+    assert_eq!(
+        cap_proc.family(),
+        bitty_plugin_host::CapabilityFamily::Process
+    );
+    assert_ne!(cap_proc, CapabilityId::parse("process.spawn:rg").unwrap());
+    assert_ne!(
+        cap_proc,
+        CapabilityId::parse("fs.read:~/projects/**").unwrap()
+    );
+    assert!(CapabilityId::parse("process.spawn").is_err());
+    // The fixture declares the allowlisted capability and nothing broader.
+    let manifest = git_panel_manifest();
+    assert!(
+        manifest
+            .capabilities
+            .ids
+            .contains(&CapabilityId::parse("process.spawn:git").unwrap())
+    );
+    assert!(
+        !manifest
+            .capabilities
+            .ids
+            .contains(&CapabilityId::parse("process.spawn:rg").unwrap())
+    );
+}
+
+// --- bounded output -------------------------------------------------------------
+
+#[test]
+fn git_panel_bounds_contract_pins() {
+    assert_eq!(GIT_PANEL_MAX_ENTRIES, 128);
+    assert_eq!(GIT_PANEL_MAX_COMMITS, 64);
+    assert_eq!(GIT_PANEL_MAX_BRANCHES, 32);
+    assert_eq!(GIT_PANEL_MAX_NAME_CHARS, 128);
+    assert_eq!(GIT_PANEL_MAX_COMMIT_MESSAGE_CHARS, 256);
+    assert_eq!(GIT_PANEL_MAX_PATH_BYTES, 4096);
+    assert_eq!(GIT_PANEL_MAX_GIT_ARGS, 32);
+    assert_eq!(GIT_PANEL_MAX_GIT_ARG_BYTES, 256);
+    assert_eq!(GIT_PANEL_MAX_GIT_TOTAL_BYTES, 8192);
+    assert_eq!(GIT_PANEL_PAYLOAD_MAX_BYTES, 8192);
+    assert_eq!(GIT_PANEL_MAX_SELECTION, 64);
 }
 
 // --- default disabled --------------------------------------------------------
@@ -118,10 +416,7 @@ fn git_panel_via_public_plugin_host_path() {
     let mut bumped = git_panel_manifest();
     bumped.identity.version = "0.2.0".to_string();
     assert_ne!(bumped.manifest_hash(), hash);
-    assert!(!host.is_granted(&id, &bumped.manifest_hash(), &cap_proc));
 }
-
-// --- subscribe → publish → drain via bounded SideQueue/EventPipeline DropOldest ---
 
 #[test]
 fn git_panel_subscribe_publish_drain_bounded_drop_oldest() {
@@ -186,10 +481,17 @@ fn git_panel_subscribe_publish_drain_bounded_drop_oldest() {
 
 #[test]
 fn git_panel_via_panel_runtime_public_path_bounded() {
+    // Panel creation through the public Panel Runtime path only: no private
+    // channel, no unsafe, bounded config (16/32 defaults, PR-1..PR-12).
     let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = ViewId::new(1);
-    let pid = create_git_panel(&mut reg, ws, view).expect("create git panel");
+    let handle = reg
+        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
+        .expect("create git panel");
+    reg.mount_panel(handle.id, handle.generation, view)
+        .expect("mount git panel");
+    let pid = handle.id;
     assert_eq!(reg.panel_count(), 1);
     let _raw = pid.get();
 
@@ -240,52 +542,41 @@ fn git_panel_via_panel_runtime_public_path_bounded() {
     let batch = reg2.drain_batch(h.id, topic.as_str(), 32, 8192);
     assert_eq!(batch.len(), 32);
 
-    // Tiled layout is H split, not a new primitive
-    let main = bitty_ui::View::new(ViewId::new(10), 80, 24);
-    let diff = bitty_ui::View::new(ViewId::new(11), 40, 24);
-    let tiled = GitIntegration::tiled_layout(main, Some(diff), 0.5);
-    assert!(matches!(tiled, bitty_ui::LayoutNode::Split { .. }));
+    // Tiled layout is an H split over LayoutNode primitives, not a new primitive.
+    let main = View::new(ViewId::new(10), 80, 24);
+    let diff = View::new(ViewId::new(11), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(main),
+        LayoutNode::leaf(diff),
+    );
+    assert!(matches!(tiled, LayoutNode::Split { .. }));
     assert_eq!(tiled.leaf_count(), 2);
 
-    // fs isolation via helper
-    assert!(GitIntegration::is_within_repo("~/projects/foo"));
-    assert!(!GitIntegration::is_within_repo("/etc/passwd"));
-    assert!(!GitIntegration::is_within_repo("~/projects/../evil"));
-    assert!(GitIntegration::is_fs_allowed("~/projects/foo/bar"));
-    assert!(!GitIntegration::is_fs_allowed("/tmp/evil"));
+    // fs isolation via capability grammar (no ambient read).
+    let cap_read = CapabilityId::parse("fs.read:~/projects/**").unwrap();
+    assert_eq!(cap_read.family(), bitty_plugin_host::CapabilityFamily::Fs);
+    assert_ne!(
+        cap_read,
+        CapabilityId::parse("fs.read:/etc/passwd").unwrap()
+    );
 
-    // process.spawn:git allowlist via helper
-    assert!(GitIntegration::is_allowed_git_args(&["status".to_string()]));
-    assert!(GitIntegration::is_allowed_git_args(&[
-        "diff".to_string(),
-        "--stat".to_string()
-    ]));
-    assert!(GitIntegration::is_allowed_git_args(&[
-        "log".to_string(),
-        "--oneline".to_string()
-    ]));
-    assert!(!GitIntegration::is_allowed_git_args(&["push".to_string()]));
-    assert!(!GitIntegration::is_allowed_git_args(
-        &["commit".to_string()]
-    ));
-    assert!(!GitIntegration::is_allowed_git_args(&[
-        "status".to_string(),
-        "; rm -rf /".to_string()
-    ]));
-    assert!(GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:git"
-    ));
-    assert!(!GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:rg"
-    ));
+    // process.spawn:git allowlist via capability grammar (no ambient spawn).
+    let cap_proc = CapabilityId::parse("process.spawn:git").unwrap();
+    assert_eq!(
+        cap_proc.family(),
+        bitty_plugin_host::CapabilityFamily::Process
+    );
+    assert_ne!(cap_proc, CapabilityId::parse("process.spawn:rg").unwrap());
 
-    // Config validation bounded fail-closed
+    // Config validation bounded fail-closed.
     let bad = PanelRegistryConfig {
         max_panels_per_workspace: 0,
         ..Default::default()
     };
-    assert!(validate_git_panel_config(&bad).is_err());
-    assert!(validate_git_panel_config(&PanelRegistryConfig::default()).is_ok());
+    assert!(bad.validate().is_err());
+    assert!(PanelRegistryConfig::default().validate().is_ok());
     // AlreadyMounted: same view cannot host two panels in same registry
     let mut reg3 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
     let ws_mount = WorkspaceId::new(99);
@@ -373,100 +664,6 @@ fn git_panel_via_panel_runtime_public_path_bounded() {
         reg4.grant_panel_capability(h3.id, h3.generation, "fs.read:~/projects/**")
             .is_err()
     );
-}
-
-// --- git-panel helpers pure bounded (listing, filter, tiled) --------------
-
-#[test]
-fn git_panel_helpers_pure_bounded_and_tiled_deterministic() {
-    // Branch listing: sorted deduped bounded 32
-    let raw = vec![
-        "main".to_string(),
-        "* main".to_string(),
-        "feature/foo".to_string(),
-        "bad..branch".to_string(),
-        "".to_string(),
-    ];
-    let branches = GitIntegration::list_branches(&raw);
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].name, "feature/foo");
-    assert_eq!(branches[1].name, "main");
-    // Bounded at 32
-    let many: Vec<String> = (0..50).map(|i| format!("branch{i}")).collect();
-    assert_eq!(
-        GitIntegration::list_branches(&many).len(),
-        bitty_runtime::git_panel::GIT_PANEL_MAX_BRANCHES
-    );
-    // Filter bounded, case-insensitive over name/path
-    let filtered = GitIntegration::filter_branches(&branches, "feature");
-    assert_eq!(filtered.len(), 1);
-    let filtered_ci = GitIntegration::filter_branches(&branches, "FEATURE");
-    assert_eq!(filtered.len(), filtered_ci.len());
-    // Status listing bounded 128
-    let status_raw: Vec<String> = (0..10).map(|i| format!("~/projects/file{i}.txt")).collect();
-    let status = GitIntegration::list_status_entries(&status_raw, GitFileStatus::Modified);
-    assert_eq!(status.len(), 10);
-    let many_status: Vec<String> = (0..200)
-        .map(|i| format!("~/projects/file{i}.txt"))
-        .collect();
-    assert_eq!(
-        GitIntegration::list_status_entries(&many_status, GitFileStatus::Modified).len(),
-        GIT_PANEL_MAX_ENTRIES
-    );
-    // Commit listing bounded 64
-    let commits_raw: Vec<(String, String)> = (0..10)
-        .map(|i| (format!("{:07x}", i + 0xabc000), format!("commit {i}")))
-        .collect();
-    let commits = GitIntegration::list_commits(&commits_raw);
-    assert_eq!(commits.len(), 10);
-    let many_commits: Vec<(String, String)> = (0..100)
-        .map(|i| (format!("{:07x}", i + 0xabc000), format!("commit {i}")))
-        .collect();
-    assert_eq!(
-        GitIntegration::list_commits(&many_commits).len(),
-        GIT_PANEL_MAX_COMMITS
-    );
-    // Tiled layout deterministic H split reuse
-    let main = bitty_ui::View::new(ViewId::new(20), 80, 24);
-    let diff = bitty_ui::View::new(ViewId::new(21), 40, 24);
-    let tiled = GitIntegration::tiled_layout(main.clone(), Some(diff.clone()), 0.5);
-    let allocs = tiled.layout(UiRect::new(0, 0, 80, 24));
-    assert_eq!(allocs.len(), 2);
-    // Solo (no diff) is single leaf
-    let solo = GitIntegration::tiled_layout(main, None, 0.5);
-    assert_eq!(solo.leaf_count(), 1);
-    // Vertical stack
-    let v1 = bitty_ui::View::new(ViewId::new(30), 80, 12);
-    let v2 = bitty_ui::View::new(ViewId::new(31), 80, 12);
-    let stack = GitIntegration::vertical_stack(vec![v1, v2]);
-    assert!(matches!(stack, bitty_ui::LayoutNode::Stack(_)));
-    // GitBranch creation bounded
-    let branch = GitBranch::new("feature/foo".to_string(), false).unwrap();
-    assert_eq!(branch.name, "feature/foo");
-    assert!(!branch.truncated);
-    assert!(GitBranch::new("bad..branch".to_string(), false).is_none());
-    assert!(GitBranch::new("".to_string(), false).is_none());
-    // GitStatus creation bounded
-    let entry =
-        GitStatusEntry::from_path("~/projects/foo.txt".to_string(), GitFileStatus::Modified)
-            .unwrap();
-    assert_eq!(entry.path, "~/projects/foo.txt");
-    assert_eq!(entry.status, GitFileStatus::Modified);
-    assert!(
-        GitStatusEntry::from_path("/etc/passwd".to_string(), GitFileStatus::Modified).is_none()
-    );
-    // process.spawn allowlist
-    assert!(GitIntegration::is_allowed_git_args(&["status".to_string()]));
-    assert!(!GitIntegration::is_allowed_git_args(&["push".to_string()]));
-    assert!(GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:git"
-    ));
-    assert!(!GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:rg"
-    ));
-    // Outside scope rejected
-    assert!(!GitIntegration::is_valid_branch_name(""));
-    assert!(!GitIntegration::is_valid_branch_name("bad;evil"));
 }
 
 // --- safe-mode rejects git-panel without panic ------------------------------
@@ -602,10 +799,16 @@ fn git_panel_command_registry_bounded_and_overlay_focus_mru() {
         reg.register_command(h1.id, bad_gen, "xuepoo.git:stale")
             .is_err()
     );
-    // Overlay text truncated at char boundary via GitIntegration
+    // Overlay text truncated at char boundary (overlay text bound 128).
     let long = "a".repeat(200);
-    let truncated = GitIntegration::truncate_name(&long);
-    assert_eq!(truncated.chars().count(), 128);
+    let truncated: String = long
+        .chars()
+        .take(bitty_ui::panel::MAX_OVERLAY_TEXT_LEN)
+        .collect();
+    assert_eq!(
+        truncated.chars().count(),
+        bitty_ui::panel::MAX_OVERLAY_TEXT_LEN
+    );
 }
 
 // --- panel reactive via EventBus, no hot path --------------------------------
@@ -631,13 +834,7 @@ fn git_panel_reactive_via_eventbus_no_hot_path() {
     assert!(reg.bus_events_for_panel(h.id) <= 64);
     let batch = reg.drain_batch(h.id, topic.as_str(), 32, 8192);
     assert_eq!(batch.len(), 32);
-    // Filtering is pure bounded, no hot-path
-    let raw: Vec<String> = (0..50).map(|i| format!("branch{i}")).collect();
-    let branches = GitIntegration::list_branches(&raw);
-    let filtered = GitIntegration::filter_branches(&branches, "branch1");
-    assert!(filtered.len() <= 32);
-    assert!(filtered.iter().all(|b| b.name.contains("branch1")));
-    // State observation remains pure
+    // State observation remains pure (cwd/title drive git-panel refresh).
     let mut state = State::new();
     state.apply(&TerminalAction::OscCwd {
         url: BoundedString::new("file:///home/user/projects/foo"),
@@ -647,15 +844,18 @@ fn git_panel_reactive_via_eventbus_no_hot_path() {
     });
     assert!(state.cwd_report().is_some());
     assert!(!state.title().is_empty());
-    // Rendering remains deterministic
-    let rendered_again = GitIntegration::list_branches(&raw);
-    assert_eq!(branches, rendered_again);
+    // Draining is deterministic: DropOldest keeps branch6..branch69, so two
+    // consecutive 32-batches are branch6..branch37 then branch38..branch69.
+    let batch_again = reg.drain_batch(h.id, topic.as_str(), 32, 8192);
+    assert_eq!(batch_again.len(), 32);
+    assert_eq!(batch[0].payload.as_str(), "branch6");
+    assert_eq!(batch_again[0].payload.as_str(), "branch38");
 }
 
-// --- fs isolation via CapabilityId and helper + git allowlist --------------
+// --- fs isolation via CapabilityId and the fixture manifest -------------------
 
 #[test]
-fn git_panel_fs_isolation_via_capability_id_and_helper_and_git_allowlist() {
+fn git_panel_fs_isolation_via_capability_id_and_manifest() {
     let cap_read = CapabilityId::parse("fs.read:~/projects/**").unwrap();
     assert_eq!(cap_read.family(), bitty_plugin_host::CapabilityFamily::Fs);
     assert_eq!(cap_read.as_str(), "fs.read:~/projects/**");
@@ -668,44 +868,7 @@ fn git_panel_fs_isolation_via_capability_id_and_helper_and_git_allowlist() {
     assert_ne!(cap_read, outside);
     let proc_other = CapabilityId::parse("process.spawn:rg").unwrap();
     assert_ne!(cap_proc, proc_other);
-    // Host grant isolation already proven via manifest above, here also verify helper rejects outside
-    assert!(!GitIntegration::is_within_repo("/tmp/evil"));
-    assert!(!GitIntegration::is_within_repo(
-        "~/projects/foo/../../etc/passwd"
-    ));
-    assert!(GitIntegration::is_within_repo("~/projects/foo/bar"));
-    assert!(GitIntegration::is_fs_allowed("~/projects/foo/bar"));
-    assert!(!GitIntegration::is_fs_allowed("~/projects/foo/../../etc"));
-    assert!(!GitIntegration::is_fs_allowed("/etc/passwd"));
-    // Git allowlist
-    assert!(GitIntegration::is_allowed_git_args(&["status".to_string()]));
-    assert!(GitIntegration::is_allowed_git_args(&[
-        "diff".to_string(),
-        "--stat".to_string()
-    ]));
-    assert!(!GitIntegration::is_allowed_git_args(&["push".to_string()]));
-    assert!(!GitIntegration::is_allowed_git_args(&[
-        "status".to_string(),
-        "; evil".to_string()
-    ]));
-    assert!(GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:git"
-    ));
-    assert!(!GitIntegration::is_process_spawn_git_allowed(
-        "process.spawn:rg"
-    ));
-    // Bounded listing already verified
-    let many: Vec<String> = (0..200).map(|i| format!("~/projects/file{i}")).collect();
-    assert_eq!(
-        GitIntegration::list_status_entries(&many, GitFileStatus::Modified).len(),
-        GIT_PANEL_MAX_ENTRIES
-    );
-    let many_branches: Vec<String> = (0..50).map(|i| format!("branch{i}")).collect();
-    assert_eq!(
-        GitIntegration::list_branches(&many_branches).len(),
-        bitty_runtime::git_panel::GIT_PANEL_MAX_BRANCHES
-    );
-    // Manifest hash deterministic and panel.* + process.spawn:git present
+    // Manifest hash deterministic and panel.* + process.spawn:git present.
     let m = git_panel_manifest();
     assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
     assert!(
@@ -723,6 +886,12 @@ fn git_panel_fs_isolation_via_capability_id_and_helper_and_git_allowlist() {
             .ids
             .contains(&CapabilityId::parse("process.spawn:git").unwrap())
     );
+    // Filesystem scope is exactly the working-tree read pattern.
+    assert_eq!(m.capabilities.filesystem.len(), 1);
+    assert_eq!(
+        m.capabilities.filesystem[0].paths,
+        vec![GIT_PANEL_FS_READ_PATTERN.to_string()]
+    );
 }
 
 // --- Runtime side-queue DropOldest for git-panel observations --------------
@@ -737,11 +906,16 @@ fn runtime_side_queue_drop_oldest_for_observations() {
         |o| matches!(o, bitty_plugin_host::HostObservation::TitleChanged(s) if s=="git-panel-title")
     ));
     assert!(obs.iter().any(|o| matches!(o, bitty_plugin_host::HostObservation::CwdChanged(s) if s.contains("file:///home/user/projects/proj"))));
-    // Tiled layout via git-panel helper is pure, not hot-path, bounded
-    let main = bitty_ui::View::new(ViewId::new(1), 80, 24);
-    let diff = bitty_ui::View::new(ViewId::new(2), 40, 24);
-    let tiled = GitIntegration::tiled_layout(main, Some(diff), 0.6);
-    assert!(matches!(tiled, bitty_ui::LayoutNode::Split { .. }));
+    // Tiled layout via LayoutNode primitives is pure, not hot-path, bounded.
+    let main = View::new(ViewId::new(1), 80, 24);
+    let diff = View::new(ViewId::new(2), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(main),
+        LayoutNode::leaf(diff),
+    );
+    assert!(matches!(tiled, LayoutNode::Split { .. }));
     // Flood side queue beyond 128 (default) -> DropOldest newest survive
     let mut rt2 =
         Runtime::with_plugin_host_capacity(RuntimeConfig::default(), DropPolicy::DropOldest, 64, 4)
@@ -781,17 +955,22 @@ fn runtime_side_queue_drop_oldest_for_observations() {
 
 #[test]
 fn git_panel_tiled_reuses_layout_hv_deterministically() {
-    let main = bitty_ui::View::new(ViewId::new(1), 80, 24);
-    let diff = bitty_ui::View::new(ViewId::new(2), 40, 24);
-    let tiled = git_panel_tiled_layout(main.clone(), Some(diff.clone()), 0.5);
+    let main = View::new(ViewId::new(1), 80, 24);
+    let diff = View::new(ViewId::new(2), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(main.clone()),
+        LayoutNode::leaf(diff.clone()),
+    );
     assert_eq!(tiled.leaf_count(), 2);
     let allocs = tiled.layout(UiRect::new(0, 0, 80, 24));
     assert_eq!(allocs.len(), 2);
-    let solo = git_panel_tiled_layout(main.clone(), None, 0.5);
+    let solo = LayoutNode::leaf(main.clone());
     assert_eq!(solo.leaf_count(), 1);
-    let v1 = bitty_ui::View::new(ViewId::new(3), 80, 12);
-    let v2 = bitty_ui::View::new(ViewId::new(4), 80, 12);
-    let stack = GitIntegration::vertical_stack(vec![v1, v2]);
+    let v1 = View::new(ViewId::new(3), 80, 12);
+    let v2 = View::new(ViewId::new(4), 80, 12);
+    let stack = LayoutNode::Stack(vec![LayoutNode::leaf(v1), LayoutNode::leaf(v2)]);
     assert_eq!(stack.leaf_count(), 2);
     let pid = bitty_runtime::registry::PanelId::new(1);
     let vid = ViewId::new(1);

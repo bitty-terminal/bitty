@@ -157,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bitty-terminal.palette` moved to the independent
   `bitty-terminal/palette` package and is no longer part of the
   bundled-disabled catalog, so the id can be installed through the external
-  package path. The catalog now stages eight plugins. The Core Panel Runtime
+  package path. The catalog now stages seven plugins. The Core Panel Runtime
   overlay helpers and theme bridge in `bitty-runtime::palette` are unchanged;
   the plugin manifest, commands, and events are identical, and the independent
   Lua package requests `ui.rich` in addition to `ui.overlay` because the
@@ -166,12 +166,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `bitty-terminal.statusline` presentation moved to the independent
   `bitty-terminal/statusline` package and is no longer part of the
   bundled-disabled catalog, so the id can be installed through the external
-  package path. The catalog now stages eight plugins. The workspaceline claim
+  package path. The catalog now stages seven plugins. The workspaceline claim
   and workspace lifecycle stay bundled in `bitty-terminal.workspace`, and
   shell integration stays the OSC 7/133 semantic-zone provider; the plugin id,
   capabilities (`terminal.semantic-read`, `ui.rich`), and lazy events are
   unchanged from the bundled manifest. The Core Panel Runtime helpers in
   `bitty-runtime::statusline` are unchanged.
+- **Git-panel plugin extracted from the bundled catalog (CTX-0400, OQ-053):**
+  `bitty-terminal.git-panel` moved to the independent
+  `bitty-terminal/git-panel` package and is no longer part of the
+  bundled-disabled catalog, so the id can be installed through the external
+  package path (CTX-0406 reserves bundled ids). The catalog now stages seven
+  plugins. The plugin id, capabilities (`panel.provider`, `panel.create`,
+  `process.spawn:git`, `terminal.semantic-read`, `fs.read:~/projects/**`),
+  commands (`open`, `status`, `diff`, `log`, `branch`), and observation
+  events are unchanged from the bundled manifest, and the allowlisted `git`
+  verbs (`status`, `diff`, `log`, `branch`, `show`, `rev-parse`, `ls-files`)
+  with bounded output follow the accepted Layer 2 `[tools.git]` slice
+  (CTX-0425). The bundled review implementation in
+  `bitty-runtime::git_panel` is removed; the independent Lua package carries
+  the listing and allowlist helpers. No behavior change for existing users:
+  the bundled set stays disabled by default and `bitty --safe` still rejects
+  `bitty-terminal.*` exactly like third-party ids.
 
 - **Selection no longer auto-copies by default (CTX-0371):** `selection.auto_copy`
   now defaults to `false` (was `true`), so a committed mouse selection keeps its

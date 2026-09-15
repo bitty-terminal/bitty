@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Runtime dogfood for the eight bundled-disabled plugins (CTX-0096 + file-manager CTX-0108 + git-panel CTX-0109 + browser-panel CTX-0110 + ai-panel CTX-0111 + mail-panel CTX-0112).
+//! Runtime dogfood for the seven bundled-disabled plugins (CTX-0096 + file-manager CTX-0108 + browser-panel CTX-0110 + ai-panel CTX-0111 + mail-panel CTX-0112; git-panel CTX-0109 and palette/statusline migrated to independent packages).
 //!
 //! Proves:
 //! - default disabled: fresh `EffectiveConfig` / `Runtime::with_defaults` has
@@ -13,7 +13,7 @@
 //!   side queue `Snapshot`/`HostObservation`, never grid mutation
 //! - bounded cold-path execution: `DropOldest`, per-sub 64 / per-plugin 1024
 //!   + 256 KiB / global 8192 + 2 MiB, drops attributed for `bitty plugin doctor`
-//! - Panel Runtime is the host for file-manager, git-panel, browser-panel (tiled Panel + View Browser), ai-panel (tiled Panel + AgentId/AgentWorkspace 32KiB) and mail-panel (tiled Panel + mcp.invoke:mail.* + network.connect), none for marketplace/daemon/remote UI smuggled
+//! - Panel Runtime is the host for file-manager, browser-panel (tiled Panel + View Browser), ai-panel (tiled Panel + AgentId/AgentWorkspace 32KiB) and mail-panel (tiled Panel + mcp.invoke:mail.* + network.connect), none for marketplace/daemon/remote UI smuggled
 
 use bitty_config::{EffectiveConfig, PluginSpec};
 use bitty_plugin_host::{
@@ -78,7 +78,7 @@ fn bundled_plugins_load_via_public_api_through_runtime() {
         rt.activate_plugin(&id)
             .unwrap_or_else(|e| panic!("activate {}: {e}", id.as_str()));
     }
-    assert_eq!(rt.plugin_host().registry().len(), 8);
+    assert_eq!(rt.plugin_host().registry().len(), 7);
     // Each plugin's subscription (if any) can be established via public API.
     let shell_id = bitty_plugin_host::PluginId::new("bitty-terminal.shell-integration").unwrap();
     rt.subscribe_plugin_event(&shell_id, EventKind::TerminalTitleChanged)
@@ -238,18 +238,20 @@ fn bounded_cold_path_drop_oldest_and_attributable() {
 
 #[test]
 fn no_panel_runtime_browser_agent_marketplace_smuggled() {
-    // Panel Runtime is the host for file-manager, git-panel, browser-panel, ai-panel and mail-panel
-    // (CTX-0102, CTX-0108 tiled Panel with fs.read+optional fs.write, CTX-0109
-    // with process.spawn:git, CTX-0110 View Browser + Panel controls with
+    // Panel Runtime is the host for file-manager, browser-panel, ai-panel and mail-panel
+    // (CTX-0102, CTX-0108 tiled Panel with fs.read+optional fs.write,
+    // CTX-0110 View Browser + Panel controls with
     // browser.embed/navigation/file-url/storage allowlisted, CTX-0111 Panel + AgentId/AgentWorkspace 32KiB + mcp.invoke + ai.*,
     // CTX-0112 Panel + mcp.invoke:mail.* + network.connect imap/smtp + fs.read:~/mail/**).
-    // Marketplace/daemon remain excluded; bundled catalog is eight ids
-    // (including ai-panel + mail-panel; palette and statusline migrated to
-    // independent packages, splits/search excluded beyond the five tiled
-    // panel plugins (file-manager/git/browser/ai/mail), with agent/mail
-    // now included via the ai/mail panels).
+    // Git-panel (CTX-0109, process.spawn:git) migrated to the independent
+    // bitty-terminal/git-panel package (OQ-053, CTX-0400).
+    // Marketplace/daemon remain excluded; bundled catalog is seven ids
+    // (including ai-panel + mail-panel; palette, statusline, and git-panel
+    // migrated to independent packages, splits/search excluded beyond the
+    // four tiled panel plugins (file-manager/browser/ai/mail), with
+    // agent/mail now included via the ai/mail panels).
     let ids = bundled::bundled_ids_sorted();
-    assert_eq!(ids.len(), 8);
+    assert_eq!(ids.len(), 7);
     assert!(
         !ids.iter()
             .any(|id| id.contains("splits") || id.contains("search"))
@@ -258,7 +260,7 @@ fn no_panel_runtime_browser_agent_marketplace_smuggled() {
     assert!(ids.iter().any(|id| id == "bitty-terminal.ai-panel"));
     assert!(ids.iter().any(|id| id == "bitty-terminal.mail-panel"));
     assert!(ids.contains(&"bitty-terminal.file-manager".to_string()));
-    assert!(ids.contains(&"bitty-terminal.git-panel".to_string()));
+    assert!(!ids.contains(&"bitty-terminal.git-panel".to_string()));
     assert!(ids.contains(&"bitty-terminal.browser-panel".to_string()));
     assert!(ids.contains(&"bitty-terminal.ai-panel".to_string()));
     assert!(ids.contains(&"bitty-terminal.mail-panel".to_string()));

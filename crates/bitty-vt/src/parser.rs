@@ -20,6 +20,7 @@
 //! marker needed to report terminated-but-unmapped string sequences.
 
 use crate::action::TerminalAction;
+use crate::diag::{RejectLog, warn_rejection};
 use crate::kitty_apc::{KittyApcAssembler, KittyFeedOutcome};
 use vte::Params;
 
@@ -50,6 +51,7 @@ pub struct Parser {
     apc_discarding: bool,
     held_esc: bool,
     held_in_apc: bool,
+    reject_log: RejectLog,
 }
 
 impl std::fmt::Debug for Parser {
@@ -84,6 +86,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
+            reject_log: RejectLog::default(),
         }
     }
 
@@ -100,6 +103,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
+            reject_log: RejectLog::default(),
         }
     }
 
@@ -138,6 +142,7 @@ impl Parser {
             apc_discarding,
             held_esc,
             held_in_apc,
+            reject_log,
         } = self;
         let mut bridge = Bridge { emit, dcs };
         let mut i = 0;
@@ -228,7 +233,12 @@ impl Parser {
                     // The current chunk is lost, so any in-flight `m=` stream
                     // it belonged to is corrupted: drop it fail-closed too.
                     kitty.abort();
-                    eprintln!("bitty: rejecting kitty APC: raw exceeds ledger cap: stored nothing");
+                    if let Some(occurrence) = reject_log.record() {
+                        warn_rejection(
+                            occurrence,
+                            "bitty: rejecting kitty APC: raw exceeds ledger cap: stored nothing",
+                        );
+                    }
                     i += 1;
                 } else {
                     apc_buf.push(b);

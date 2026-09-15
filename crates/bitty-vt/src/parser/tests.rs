@@ -311,6 +311,62 @@ fn sgr_extended_colors_colon_forms() {
 }
 
 #[test]
+fn sgr_incomplete_indexed_color_does_not_fabricate() {
+    // `38;5` without an index must not invent `Indexed(0)` and must not
+    // consume a parameter that belongs to another SGR code.
+    assert_eq!(parse(b"\x1b[38;5m"), vec![attrs(&[])]);
+    assert_eq!(parse(b"\x1b[48;5m"), vec![attrs(&[])]);
+    assert_eq!(parse(b"\x1b[58;5m"), vec![attrs(&[])]);
+    // Sibling codes in the same sequence still apply.
+    assert_eq!(
+        parse(b"\x1b[1;38;5m"),
+        vec![attrs(&[AttributeChange::Enable(Attribute::Bold)])]
+    );
+    // A present index still maps.
+    assert_eq!(
+        parse(b"\x1b[38;5;196m"),
+        vec![attrs(&[AttributeChange::Foreground(Color::Indexed(196))])]
+    );
+}
+
+#[test]
+fn sgr_truncated_rgb_does_not_fabricate_or_swallow() {
+    // Fewer than three components: no color change, and no parameter is
+    // consumed beyond those actually present.
+    assert_eq!(parse(b"\x1b[38;2;1;2m"), vec![attrs(&[])]);
+    assert_eq!(
+        parse(b"\x1b[1;38;2;7m"),
+        vec![attrs(&[AttributeChange::Enable(Attribute::Bold)])]
+    );
+    // Complete triples still map, including when following codes exist.
+    assert_eq!(
+        parse(b"\x1b[38;2;1;2;3m"),
+        vec![attrs(&[AttributeChange::Foreground(Color::Rgb(Rgb {
+            r: 1,
+            g: 2,
+            b: 3
+        }))])]
+    );
+    assert_eq!(
+        parse(b"\x1b[38;2;1;2;3;7m"),
+        vec![attrs(&[
+            AttributeChange::Foreground(Color::Rgb(Rgb { r: 1, g: 2, b: 3 })),
+            AttributeChange::Enable(Attribute::Inverse),
+        ])]
+    );
+}
+
+#[test]
+fn sgr_unknown_and_malformed_codes_never_reset() {
+    // Unknown codes are ignored (no state change); a bare `SGR 0` still
+    // resets, and it arrives as an explicit `0` parameter.
+    assert_eq!(parse(b"\x1b[999m"), vec![attrs(&[])]);
+    assert_eq!(parse(b"\x1b[38m"), vec![attrs(&[])]);
+    assert_eq!(parse(b"\x1b[m"), vec![attrs(&[AttributeChange::Reset])]);
+    assert_eq!(parse(b"\x1b[0m"), vec![attrs(&[AttributeChange::Reset])]);
+}
+
+#[test]
 fn sgr_underline_styles_via_colon_subparams() {
     assert_eq!(
         parse(b"\x1b[4:3m\x1b[4:5m"),
@@ -514,9 +570,12 @@ fn tab_operations_map() {
 }
 
 #[test]
-fn charset_designation_and_single_shifts() {
+fn charset_designation_locking_and_single_shifts() {
+    // `ESC N`/`ESC O` are single shifts (SS2/SS3): one-shot for the next
+    // printed scalar. `ESC n`/`ESC o` are locking shifts (LS2/LS3): they
+    // lock G2/G3 as GL persistently, exactly like `SO`/`SI` for G1/G0.
     assert_eq!(
-        parse(b"\x1b(B\x1b)0\x1b*A\x1b+0\x1bN\x1bO"),
+        parse(b"\x1b(B\x1b)0\x1b*A\x1b+0\x1bN\x1bO\x1bn\x1bo"),
         vec![
             TerminalAction::SelectCharset {
                 slot: CharsetSlot::G0,
@@ -533,6 +592,12 @@ fn charset_designation_and_single_shifts() {
             TerminalAction::SelectCharset {
                 slot: CharsetSlot::G3,
                 table: CharsetTable::DecSpecialGraphics
+            },
+            TerminalAction::SingleShiftCharset {
+                slot: CharsetSlot::G2
+            },
+            TerminalAction::SingleShiftCharset {
+                slot: CharsetSlot::G3
             },
             TerminalAction::InvokeCharset {
                 slot: CharsetSlot::G2
@@ -973,7 +1038,10 @@ fn huge_parameter_magnitude_saturates_deterministically() {
 }
 
 #[test]
-fn parameter_overflow_truncates_but_still_dispatches() {
+fn parameter_overflow_fails_closed_as_unknown() {
+    // vte drops parameters past its 32-entry cap and flags the dispatch as
+    // ignored. Interpreting the truncated parameter list would silently
+    // change terminal state, so the sequence is reported as unknown instead.
     let long_params: Vec<u8> = (0..64)
         .flat_map(|i| {
             let mut chunk = format!("{}", i + 1).into_bytes();
@@ -985,14 +1053,7 @@ fn parameter_overflow_truncates_but_still_dispatches() {
     let first = parse(&sequence);
     let second = parse(&sequence);
     assert_eq!(first, second);
-    assert_eq!(first.len(), 1);
-    match &first[0] {
-        TerminalAction::SetAttributes { attrs } => {
-            assert!(!attrs.changes.is_empty());
-            assert!(attrs.changes.len() <= 40);
-        }
-        other => panic!("expected SetAttributes, got {other:?}"),
-    }
+    assert_eq!(first, vec![unknown(SequenceKind::Csi, b'm', [0, 0])]);
 }
 
 #[test]
@@ -1132,9 +1193,10 @@ fn csi_numeric_boundary_at_u16_max_saturates_deterministically() {
 }
 
 #[test]
-fn csi_param_count_at_and_beyond_max_truncates_deterministically() {
+fn csi_param_count_at_and_beyond_max_fails_closed_deterministically() {
     // vte MAX_PARAMS = 32 (params.rs). At the cap the full 32 dispatch;
-    // beyond it extra params are dropped with `ignore=true` but still dispatch.
+    // beyond it extra params are dropped and `ignore=true` flags the
+    // sequence, which must be reported as unknown (never half-applied).
     let p32 = {
         let s = "1;".repeat(31) + "1";
         format!("\x1b[{s}m").into_bytes()
@@ -1147,19 +1209,24 @@ fn csi_param_count_at_and_beyond_max_truncates_deterministically() {
         let s = "1;".repeat(63) + "1";
         format!("\x1b[{s}m").into_bytes()
     };
-    for seq in [&p32, &p33, &p64] {
+    let at_cap = parse(&p32);
+    assert_eq!(at_cap, parse(&p32));
+    assert_eq!(at_cap.len(), 1, "at-cap sequence still dispatches");
+    match &at_cap[0] {
+        TerminalAction::SetAttributes { attrs } => {
+            assert!(attrs.changes.len() <= 32);
+        }
+        other => panic!("expected SetAttributes at cap, got {other:?}"),
+    }
+    for seq in [&p33, &p64] {
         let a1 = parse(seq);
         let a2 = parse(seq);
         assert_eq!(a1, a2, "deterministic divergence for len {}", seq.len());
-        assert_eq!(a1.len(), 1, "must still dispatch exactly one action");
-        match &a1[0] {
-            TerminalAction::SetAttributes { attrs } => {
-                assert!(!attrs.changes.is_empty());
-                // Even truncated, changes are bounded well below 1 per param.
-                assert!(attrs.changes.len() <= 64);
-            }
-            other => panic!("expected SetAttributes, got {other:?}"),
-        }
+        assert_eq!(
+            a1,
+            vec![unknown(SequenceKind::Csi, b'm', [0, 0])],
+            "over-cap params must fail closed"
+        );
     }
     // Subparam form also respects the same cap (colon notation).
     let sub = parse(b"\x1b[38:2:255:0:128;48:5:200m");
@@ -1167,15 +1234,40 @@ fn csi_param_count_at_and_beyond_max_truncates_deterministically() {
 }
 
 #[test]
-fn csi_intermediate_overflow_is_ignored_deterministically() {
-    // vte MAX_INTERMEDIATES = 2. Three intermediates forces CsiIgnore path
-    // but must not panic and must be deterministic.
+fn csi_intermediate_overflow_fails_closed_as_unknown() {
+    // vte MAX_INTERMEDIATES = 2. A third intermediate sets the ignore flag;
+    // the truncated intermediate list must never dispatch a mapped command.
     let seq = b"\x1b[   q"; // three spaces as intermediates + final 'q'
     let a1 = parse(seq);
     let a2 = parse(seq);
     assert_eq!(a1, a2);
-    // Must still produce a single terminal action (unknown or cursor-style fallback).
-    assert_eq!(a1.len(), 1);
+    assert_eq!(a1, vec![unknown(SequenceKind::Csi, b'q', *b"  ")]);
+}
+
+#[test]
+fn esc_intermediate_overflow_fails_closed_as_unknown() {
+    // Three ESC intermediates set the ignore flag; no mapped ESC command
+    // may run from the truncated intermediate list.
+    assert_eq!(
+        parse(b"\x1b   7"),
+        vec![unknown(SequenceKind::Esc, b'7', *b"  ")]
+    );
+    // Same shape with a normally mapped final byte (`c` = full reset).
+    assert_eq!(
+        parse(b"\x1b   c"),
+        vec![unknown(SequenceKind::Esc, b'c', *b"  ")]
+    );
+}
+
+#[test]
+fn dcs_header_overflow_reports_unknown_immediately() {
+    // A DCS whose header overflowed (third intermediate) is not a mapped
+    // string: it is reported once as unknown at the hook, before any
+    // terminator, and the payload stays inert.
+    let expected = vec![unknown(SequenceKind::Dcs, b'q', *b"  ")];
+    assert_eq!(parse(b"\x1bP   q"), expected);
+    assert_eq!(parse(b"\x1bP   q\x1b\\"), expected);
+    assert_eq!(parse(b"\x1bP   qpayload\x1b\\"), expected);
 }
 
 #[test]

@@ -158,6 +158,7 @@ pub fn arb_action() -> impl Strategy<Value = TerminalAction> {
         1 => (arb_slot(), arb_table())
             .prop_map(|(slot, table)| TerminalAction::SelectCharset { slot, table }),
         1 => arb_slot().prop_map(|slot| TerminalAction::InvokeCharset { slot }),
+        1 => arb_slot().prop_map(|slot| TerminalAction::SingleShiftCharset { slot }),
         1 => arb_status_kind().prop_map(|kind| TerminalAction::RequestDeviceStatus { kind }),
         1 => prop::collection::vec(any::<u8>(), 0..=64)
             .prop_map(|bytes| TerminalAction::Reply { bytes: bytes.into_boxed_slice() }),

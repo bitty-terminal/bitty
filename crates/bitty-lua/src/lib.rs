@@ -1262,9 +1262,11 @@ mod vm_unit_tests {
     fn slow_compile_times_out_without_effects() {
         // CTX-0464 gap 2: wall-clock started after Closure::load, so compile
         // work hid outside the RC-1 budget. With the clock starting before
-        // load, a near-cap comment (512 KiB, execution is one assignment) with
+        // load, a near-cap comment (~1016 KiB, execution is one assignment) with
         // a 1 ms wall budget must suspend with WallClockExceeded before
-        // executing (no global set, no completion).
+        // executing (no global set, no completion). Payload stays under the
+        // cap but is large enough that parsing alone exceeds 1 ms even on
+        // fast hosts (512 KiB parses in 0 ms on some hosts — flaky).
         let mut vm = LuaVm::with_budgets(
             "xuepoo.slow-compile",
             RC1_INSTRUCTION_BUDGET,
@@ -1272,7 +1274,7 @@ mod vm_unit_tests {
             1,
             RC2_MEMORY_PER_PLUGIN_BYTES,
         );
-        let padding = "x".repeat(512 * 1024);
+        let padding = "x".repeat(MAX_CHUNK_BYTES - 8 * 1024);
         let code = format!("--{padding}\nresult = 42");
         assert!(
             code.len() <= MAX_CHUNK_BYTES,

@@ -126,7 +126,7 @@ const GIT_PANEL_MAX_SELECTION: usize = 64;
 fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
     use bitty_plugin_host::{
         CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-        PluginIdentity, PluginManifest, QualifiedName,
+        PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
     };
     let mut caps = CapabilityRequests::default();
     caps.ids
@@ -157,6 +157,11 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: vec![ToolDeclaration {
+            tool: "git".to_string(),
+            required: true,
+            version_req: ">=2.30".to_string(),
+        }],
         lazy: LazyTriggers {
             commands: GIT_PANEL_COMMANDS
                 .iter()

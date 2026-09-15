@@ -6,26 +6,27 @@ use super::plugin::cold_to_observation;
 use super::*;
 
 /// Blocking forwarder: sole consumer of `reader`, pushing into `tx` and
-/// waking once per chunk plus once on EOF.
+/// waking once per batch plus once on EOF (CTX-0476 waker merge).
 ///
 /// - Quiet child: parked in `recv`, zero wakeups, zero CPU.
 /// - Backpressure: `send` blocks when `tx` is full, which fills the original
 ///   pump channel, which fills the kernel PTY buffer, which blocks the child.
 /// - Fail-closed: a dropped consumer breaks `send` and ends the thread with
 ///   no loss beyond already-queued chunks and no unbounded growth.
+/// - Waker merge: after the blocking `recv` yields the first chunk, up to
+///   `PTY_FORWARD_CAPACITY_CHUNKS - 1` immediately-available chunks are
+///   batched via `try_recv` and delivered with a single wakeup, so a burst
+///   of N chunks costs one event-loop wakeup instead of N (waker storm).
 pub(super) fn pty_forward_loop(
     reader: PtyReader,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     waker: PtyWaker,
 ) {
     loop {
-        match reader.recv() {
+        let first = match reader.recv() {
             Some(chunk) => {
                 debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                if tx.send(chunk).is_err() {
-                    break;
-                }
-                (waker)();
+                chunk
             }
             None => {
                 // EOF: wake once so the consumer drains final chunks promptly
@@ -33,6 +34,37 @@ pub(super) fn pty_forward_loop(
                 (waker)();
                 break;
             }
+        };
+        // Batch immediately-available follow-ups without blocking: a burst
+        // already queued in the pump channel merges into one wakeup.
+        let mut batch = Vec::with_capacity(PTY_FORWARD_CAPACITY_CHUNKS);
+        batch.push(first);
+        while batch.len() < PTY_FORWARD_CAPACITY_CHUNKS {
+            match reader.try_recv() {
+                Some(chunk) => {
+                    debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                    batch.push(chunk);
+                }
+                None => break,
+            }
+        }
+        let mut sent_any = false;
+        let mut broken = false;
+        for chunk in batch {
+            if tx.send(chunk).is_err() {
+                broken = true;
+                break;
+            }
+            sent_any = true;
+        }
+        // One wakeup per batch, and only when at least one chunk was
+        // forwarded: a dropped consumer exits without a spurious wakeup,
+        // matching the per-chunk send-then-wake ordering it replaces.
+        if sent_any {
+            (waker)();
+        }
+        if broken {
+            break;
         }
     }
     // Reap the pump thread; outcome is informational (EOF vs I/O error).
@@ -188,10 +220,11 @@ impl Runtime {
     ///
     /// The forwarder is the sole consumer of the bounded pump channel from
     /// this point: it blocks in `recv` (zero wakeups when quiet), forwards
-    /// each chunk into a second bounded channel
-    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per chunk
-    /// plus once on EOF. [`poll_pty`] drains the forwarding channel, so the
-    /// existing bounded-drain contract is preserved end to end.
+    /// each batch into a second bounded channel
+    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per batch
+    /// plus once on EOF (CTX-0476 waker merge). [`poll_pty`] drains the
+    /// forwarding channel, so the existing bounded-drain contract is
+    /// preserved end to end.
     ///
     /// Idempotent: replacing the waker re-promotes only when a direct reader
     /// is still present; an already-promoted pump keeps its original waker
@@ -302,25 +335,38 @@ impl Runtime {
     /// When a consumer stalls, the bounded channel(s) fill, the pump blocks,
     /// the kernel PTY buffer fills, and the child's writes block —
     /// end-to-end backpressure with zero data loss and zero unbounded memory
-    /// growth. This method is the consumer side: it drains all immediately
+    /// growth. This method is the consumer side: it drains immediately
     /// available chunks without blocking, feeding each through the VT parser
-    /// and terminal state.
+    /// and terminal state, stopping at the first of the CTX-0476 budgets
+    /// (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
+    /// so a hostile flood can delay but never stall the render thread; the
+    /// remainder stays queued for the next poll.
     ///
     /// Returns the number of chunks drained. `0` means either no PTY, no data
-    /// available yet, or EOF has been reached and the queue drained. Headless
+    /// available yet, or EOF has been reached and the queue drained (the
+    /// budgets stop a *busy* poll early, never before the first available
+    /// chunk). Headless
     /// tests that never called [`spawn_shell`] get `0` without error, so the
     /// same binary works headlessly (synthetic `handle_pty_bytes`) and with a
     /// real PTY (live `poll_pty`).
     pub fn poll_pty(&mut self) -> usize {
         // Collect without holding an immutable borrow across the mutable
-        // `handle_pty_bytes` call (borrow checker).
+        // `handle_pty_bytes` call (borrow checker). Bounded by chunk count,
+        // byte total, and wall time (CTX-0476); at least one chunk drains
+        // when data is available so a max-size chunk always makes progress.
+        let start = std::time::Instant::now();
+        let mut drained_bytes = 0usize;
         let chunks: Vec<Vec<u8>> = {
             if let Some(rx) = self.pty_forward_rx.as_ref() {
                 let mut out = Vec::new();
-                while out.len() < 1024 {
+                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                        break;
+                    }
                     match rx.try_recv() {
                         Ok(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            drained_bytes = drained_bytes.saturating_add(chunk.len());
                             out.push(chunk);
                         }
                         Err(_) => break,
@@ -333,10 +379,14 @@ impl Runtime {
                     return self.pump_pane_sessions();
                 };
                 let mut out = Vec::new();
-                while out.len() < 1024 {
+                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                        break;
+                    }
                     match reader.try_recv() {
                         Some(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            drained_bytes = drained_bytes.saturating_add(chunk.len());
                             out.push(chunk);
                         }
                         None => break,

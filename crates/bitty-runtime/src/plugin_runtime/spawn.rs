@@ -142,6 +142,16 @@ pub const SPAWN_PANEL_OUTPUT_BUDGET: usize = 8 * 1024;
 /// large enough to avoid hot-spinning the supervisor.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Bounded join budget for the stdout/stderr drain threads (CTX-0476).
+///
+/// After the child is reaped the pipes should EOF promptly — unless a
+/// grandchild inherited the pipe and holds it open, in which case an
+/// unbounded `join` would hang the supervisor forever. Waiting at most this
+/// long then detaching with partial output keeps `spawn_process` total: the
+/// 1 s bound is negligible against the 30 s `MAX_EXEC_TIMEOUT_MS` ceiling
+/// yet ample for a killed child's pipes to close on every platform.
+const SPAWN_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Maximum bytes of one host-authored bridge message (`E_SPAWN_*` reasons).
 ///
 /// Reuses the bounded human-message precedent
@@ -715,27 +725,40 @@ pub(crate) fn spawn_process(
     // writes on Unix yet wedges full pipes on Windows. Two threads so a child
     // filling both pipes can never wedge the supervisor, and retained memory
     // stays bounded on every path.
+    //
+    // CTX-0476: each drain publishes incrementally into a shared buffer so a
+    // bounded join can still return partial output when a grandchild inherits
+    // the pipe and holds EOF open forever.
+    use std::sync::{Arc, Mutex};
     let cap = request.effective_stream_budget().saturating_add(1);
+    let stdout_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut stdout_thread = match child.stdout.take() {
-        Some(mut pipe) => Some(
-            std::thread::Builder::new()
-                .name("bitty-spawn-stdout".into())
-                .spawn(move || drain_bounded(&mut pipe, cap))
-                .map_err(|_| IpcError::Internal {
-                    reason: "spawn stdout reaper failed to start".into(),
-                })?,
-        ),
+        Some(mut pipe) => {
+            let shared = Arc::clone(&stdout_shared);
+            Some(
+                std::thread::Builder::new()
+                    .name("bitty-spawn-stdout".into())
+                    .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                    .map_err(|_| IpcError::Internal {
+                        reason: "spawn stdout reaper failed to start".into(),
+                    })?,
+            )
+        }
         None => None,
     };
     let mut stderr_thread = match child.stderr.take() {
-        Some(mut pipe) => Some(
-            std::thread::Builder::new()
-                .name("bitty-spawn-stderr".into())
-                .spawn(move || drain_bounded(&mut pipe, cap))
-                .map_err(|_| IpcError::Internal {
-                    reason: "spawn stderr reaper failed to start".into(),
-                })?,
-        ),
+        Some(mut pipe) => {
+            let shared = Arc::clone(&stderr_shared);
+            Some(
+                std::thread::Builder::new()
+                    .name("bitty-spawn-stderr".into())
+                    .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                    .map_err(|_| IpcError::Internal {
+                        reason: "spawn stderr reaper failed to start".into(),
+                    })?,
+            )
+        }
         None => None,
     };
     // Both pipes were requested above; a missing pipe means the stdio handoff
@@ -760,8 +783,14 @@ pub(crate) fn spawn_process(
         })? {
             Some(status) => {
                 let _ = child.wait();
-                let stdout = stdout_thread.take().map_or_else(Vec::new, join_reader);
-                let stderr = stderr_thread.take().map_or_else(Vec::new, join_reader);
+                let (stdout, stdout_detached) = stdout_thread
+                    .take()
+                    .map(|h| join_drain_bounded(h, &stdout_shared))
+                    .unwrap_or_default();
+                let (stderr, stderr_detached) = stderr_thread
+                    .take()
+                    .map(|h| join_drain_bounded(h, &stderr_shared))
+                    .unwrap_or_default();
                 let (status_view, effect, code) = if status.success() {
                     (
                         ExecutionStatus::Completed,
@@ -771,34 +800,55 @@ pub(crate) fn spawn_process(
                 } else {
                     (ExecutionStatus::Failed, EffectState::Failed, status.code())
                 };
+                // A grandchild holding the pipe open detaches the drain but
+                // must not lose attribution: surface the stall as evidence so
+                // callers reconcile instead of assuming complete output.
+                let mut evidence_refs = Vec::new();
+                if stdout_detached || stderr_detached {
+                    evidence_refs.push(format!(
+                        "spawn drain detached after {} ms; grandchild may hold pipe; partial output preserved",
+                        SPAWN_DRAIN_JOIN_TIMEOUT.as_millis(),
+                    ));
+                }
                 return Ok(RawExecutionOutput {
                     target_id: request.target.clone(),
                     status: status_view,
                     exit_code: code,
                     stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
-                    evidence_refs: Vec::new(),
+                    evidence_refs,
                     effect_state: effect,
                 });
             }
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(handle) = stdout_thread.take() {
-                    let _ = handle.join();
-                }
-                if let Some(handle) = stderr_thread.take() {
-                    let _ = handle.join();
-                }
+                let (stdout, stdout_detached) = stdout_thread
+                    .take()
+                    .map(|h| join_drain_bounded(h, &stdout_shared))
+                    .unwrap_or_default();
+                let (stderr, stderr_detached) = stderr_thread
+                    .take()
+                    .map(|h| join_drain_bounded(h, &stderr_shared))
+                    .unwrap_or_default();
+                let drain_note = match (stdout_detached, stderr_detached) {
+                    (false, false) => "drain joined".to_owned(),
+                    _ => format!(
+                        "drain detached after {} ms; partial output preserved",
+                        SPAWN_DRAIN_JOIN_TIMEOUT.as_millis()
+                    ),
+                };
                 return Ok(RawExecutionOutput {
                     target_id: request.target.clone(),
                     status: ExecutionStatus::Unknown,
                     exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
                     evidence_refs: vec![format!(
-                        "spawn timeout after {} ms; child killed and reaped",
-                        request.timeout_ms
+                        "spawn timeout after {} ms; child killed and reaped; stdout {} bytes, stderr {} bytes preserved; {drain_note}",
+                        request.timeout_ms,
+                        stdout.len(),
+                        stderr.len(),
                     )],
                     effect_state: EffectState::Unknown,
                 });
@@ -808,34 +858,79 @@ pub(crate) fn spawn_process(
     }
 }
 
-/// Drain `pipe` to EOF while retaining at most `cap` bytes.
+/// Shared-buffer drain for [`spawn_process`] (CTX-0476).
 ///
-/// Bytes past `cap` are read and discarded so the child never blocks on a
-/// full pipe, however much it emits. Retained memory is bounded by
-/// `cap + 8 KiB` (one chunk); read errors end the drain early (fail-closed
-/// downstream: short output is still validated and attributed).
-fn drain_bounded(pipe: &mut impl std::io::Read, cap: usize) -> Vec<u8> {
-    let mut retained = Vec::new();
+/// Drains `pipe` to EOF while retaining at most `cap + 1` bytes in `shared`
+/// (the spare byte lets the service detect overflow and mark `truncated`).
+/// Bytes past the cap are read and discarded so the child never blocks on a
+/// full pipe, however much it emits. Publishes incrementally into `shared`
+/// so a bounded join can return partial output even when EOF never arrives
+/// (grandchild inherits the pipe). Retained memory is bounded by `cap + 8 KiB`
+/// (one chunk); read errors end the drain early (fail-closed downstream:
+/// short output is still validated and attributed). Time O(n), space O(cap)
+/// in the child output.
+fn drain_bounded_shared(
+    pipe: &mut impl std::io::Read,
+    cap: usize,
+    shared: &std::sync::Mutex<Vec<u8>>,
+) {
     let mut chunk = [0u8; 8192];
     loop {
         match pipe.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                if retained.len() <= cap {
-                    let room = cap.saturating_add(1).saturating_sub(retained.len());
-                    retained.extend_from_slice(&chunk[..n.min(room)]);
+                let mut guard = match shared.lock() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                if guard.len() <= cap {
+                    let room = cap.saturating_add(1).saturating_sub(guard.len());
+                    guard.extend_from_slice(&chunk[..n.min(room)]);
                 }
+                // Lock released before the next blocking read.
             }
             Err(_) => break,
         }
     }
-    retained
 }
 
-/// Join one drain thread; a panicked reader (unreachable: readers never panic)
-/// degrades to empty output rather than failing the whole spawn.
-fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// Clone a shared drain buffer, tolerating a poisoned mutex.
+///
+/// A panicked drain thread still leaves its partial bytes behind; callers
+/// attribute short output fail-closed downstream rather than dropping it.
+fn clone_shared(shared: &std::sync::Mutex<Vec<u8>>) -> Vec<u8> {
+    match shared.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poison) => poison.into_inner().clone(),
+    }
+}
+
+/// Bounded join for one drain thread (CTX-0476).
+///
+/// Polls `is_finished` until [`SPAWN_DRAIN_JOIN_TIMEOUT`]; a finished thread
+/// joins normally (panics degrade to shared partial, never empty), while a
+/// hung thread (grandchild holding the pipe) detaches — dropping the
+/// `JoinHandle` — and the caller keeps the partial bytes collected so far.
+/// Returns the bytes plus whether the thread was detached. Never blocks past
+/// the timeout, so `spawn_process` stays total on every path.
+fn join_drain_bounded(
+    handle: std::thread::JoinHandle<()>,
+    shared: &std::sync::Mutex<Vec<u8>>,
+) -> (Vec<u8>, bool) {
+    let deadline = std::time::Instant::now() + SPAWN_DRAIN_JOIN_TIMEOUT;
+    loop {
+        if handle.is_finished() {
+            let _ = handle.join();
+            return (clone_shared(shared), false);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Detach: dropping the handle leaves the thread running against
+            // the shared buffer (bounded by cap), while we return partial.
+            drop(handle);
+            return (clone_shared(shared), true);
+        }
+        std::thread::sleep(SPAWN_POLL_INTERVAL);
+    }
 }
 
 // ── Lua bridge mapping ──────────────────────────────────────────────────────
@@ -1093,6 +1188,20 @@ mod tests {
                 eprint!("{}", "x".repeat(1024 * 1024));
             }
             Ok("sleep") => {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Ok("partial-then-sleep") => {
+                // CTX-0476 hostile probe: emit partial output, flush, then
+                // hang past the supervisor timeout. The timeout path must
+                // preserve these bytes instead of discarding them.
+                use std::io::Write as _;
+                let payload =
+                    std::env::var(HELPER_PAYLOAD_ENV).unwrap_or_else(|_| "partial".into());
+                eprint!("{payload}");
+                let _ = std::io::stderr().flush();
+                // Also emit to stdout so both streams have partial content.
+                print!("{payload}");
+                let _ = std::io::stdout().flush();
                 std::thread::sleep(Duration::from_secs(30));
             }
             Ok("slow-echo") => {
@@ -1753,5 +1862,115 @@ mod tests {
         let stored = service.reconcile(211).expect("slow outcome stored");
         assert_eq!(stored, result);
         assert_eq!(service.len(), 1);
+    }
+
+    #[test]
+    fn timeout_preserves_partial_output() {
+        // CTX-0476 hostile probe: a child that emits output then hangs past
+        // the supervisor timeout must report Unknown with the partial bytes
+        // preserved — never empty output. The old timeout branch returned
+        // `String::new()` for both streams.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)));
+        let payload = "partial-timeout-marker-0476";
+        let request = SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                (HELPER_ENV.to_owned(), "partial-then-sleep".to_owned()),
+                (HELPER_PAYLOAD_ENV.to_owned(), payload.to_owned()),
+            ])
+            .with_allow_effects(true)
+            .with_timeout_ms(400);
+        let start = std::time::Instant::now();
+        let result = dispatch_ok(&mut service, &request, 221).expect("timeout serves");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout path hung: {:?}",
+            start.elapsed()
+        );
+        assert!(result.needs_reconciliation());
+        assert_eq!(result.exit_code, None);
+        assert!(
+            result.stdout_summary.contains(payload) || result.stderr_summary.contains(payload),
+            "timeout discarded partial output: stdout={:?} stderr={:?}",
+            result.stdout_summary,
+            result.stderr_summary
+        );
+        assert!(
+            result.evidence_refs.iter().any(|r| r.contains("timeout")),
+            "missing timeout evidence: {:?}",
+            result.evidence_refs
+        );
+        assert!(
+            result
+                .evidence_refs
+                .iter()
+                .any(|r| r.contains("bytes preserved")),
+            "timeout evidence must report preserved bytes: {:?}",
+            result.evidence_refs
+        );
+    }
+
+    #[test]
+    fn drain_join_is_bounded_when_thread_hangs() {
+        // CTX-0476 hostile probe: a drain thread that never finishes
+        // (grandchild inherits the pipe, EOF never arrives) must not hang
+        // `spawn_process` forever. The bounded join detaches within
+        // `SPAWN_DRAIN_JOIN_TIMEOUT` plus scheduling slack.
+        use std::sync::{Arc, Mutex};
+        let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(b"partial".to_vec()));
+        let shared_clone = Arc::clone(&shared);
+        let handle = std::thread::Builder::new()
+            .name("bitty-test-hung-drain".into())
+            .spawn(move || {
+                let _ = &shared_clone;
+                std::thread::sleep(Duration::from_secs(30));
+            })
+            .expect("spawn hung thread");
+        let start = std::time::Instant::now();
+        let (bytes, detached) = super::join_drain_bounded(handle, &shared);
+        assert!(detached, "hung drain must detach, not join");
+        assert_eq!(bytes, b"partial");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "bounded join hung: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(super::SPAWN_DRAIN_JOIN_TIMEOUT, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shared_drain_respects_cap_and_reports_partial() {
+        // CTX-0476: the shared drain retains at most cap+1 bytes (overflow
+        // detection spare) while still draining the pipe past the cap so the
+        // child never blocks.
+        struct Flood {
+            remaining: usize,
+        }
+        impl std::io::Read for Flood {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.remaining);
+                buf[..n].fill(b'q');
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+        use std::sync::{Arc, Mutex};
+        let cap = 16usize;
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let mut flood = Flood {
+            remaining: 64 * 1024,
+        };
+        super::drain_bounded_shared(&mut flood, cap, &shared);
+        let retained = super::clone_shared(&shared);
+        assert_eq!(
+            retained.len(),
+            cap + 1,
+            "must retain cap+1, got {}",
+            retained.len()
+        );
+        assert!(retained.iter().all(|&b| b == b'q'));
     }
 }

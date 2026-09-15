@@ -868,6 +868,50 @@ impl Runtime {
         pipeline_capacity: usize,
         side_capacity: usize,
     ) -> Result<Self, RuntimeError> {
+        Self::with_plugin_host_capacity_and_rasterizer(
+            config,
+            drop_policy,
+            pipeline_capacity,
+            side_capacity,
+            false,
+        )
+    }
+
+    /// Test-only constructor: as [`Self::with_plugin_host_capacity`] but the
+    /// glyph rasterizer is the deterministic [`HeadlessRasterizer`] instead of
+    /// the platform font stack (crossfont).
+    ///
+    /// The headless rasterizer derives every bitmap from the scalar and point
+    /// size alone — no font file, no font metrics, no host state — and the
+    /// software compositor uses integer arithmetic plus IEEE-exact `f32`
+    /// math, so a tick's [`PresentStats`] and `headless_rgba` are
+    /// byte-identical on every host. Golden tests use this seam to pin
+    /// presented frames with hardcoded digests across Linux/macOS/Windows CI;
+    /// production constructors keep the crossfont preference, so this changes
+    /// no production behavior. Hidden from rustdoc: not part of the product
+    /// surface.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::with_plugin_host_capacity`].
+    #[doc(hidden)]
+    pub fn with_deterministic_rasterizer(config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        Self::with_plugin_host_capacity_and_rasterizer(
+            config,
+            DEFAULT_PLUGIN_DROP_POLICY,
+            DEFAULT_PLUGIN_PIPELINE_CAPACITY,
+            DEFAULT_PLUGIN_SIDE_CAPACITY,
+            true,
+        )
+    }
+
+    fn with_plugin_host_capacity_and_rasterizer(
+        config: RuntimeConfig,
+        drop_policy: DropPolicy,
+        pipeline_capacity: usize,
+        side_capacity: usize,
+        deterministic_rasterizer: bool,
+    ) -> Result<Self, RuntimeError> {
         config.validate()?;
         if pipeline_capacity == 0 || side_capacity == 0 {
             return Err(RuntimeError::InvalidQueueCapacity);
@@ -894,7 +938,11 @@ impl Runtime {
         // GridRenderer re-tries deterministically with HeadlessRasterizer
         // instead of failing with_defaults on headless CI.
         let (renderer, is_crossfont) = {
-            let base = AnyRasterizer::try_crossfont();
+            let base = if deterministic_rasterizer {
+                AnyRasterizer::Headless(HeadlessRasterizer::new())
+            } else {
+                AnyRasterizer::try_crossfont()
+            };
             let is_cf = base.is_crossfont();
             let raster = FallbackRasterizer::with_default_chain(base);
             match GridRenderer::new(raster, &query, cell) {

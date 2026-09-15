@@ -1919,6 +1919,15 @@ impl CloseConfirm {
         }
     }
 
+    /// Validate a parsed value (total: the type can only hold accepted
+    /// variants; the exhaustive match keeps coverage explicit so a future
+    /// variant forces a review of project-layer policy).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Always | Self::WhenBusy | Self::Never => Ok(()),
+        }
+    }
+
     /// Canonical config spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

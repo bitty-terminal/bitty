@@ -79,25 +79,79 @@ impl TrustRecord {
         }
     }
 
-    /// Whether this record matches the given path and hash exactly.
+    /// Normalize a canonical path for comparison: trim ASCII whitespace and
+    /// strip trailing `/` or `\` separators (except a lone root). Empty
+    /// after trimming normalizes to empty (which never matches).
+    #[must_use]
+    pub fn normalize_path(canonical_path: &str) -> String {
+        let trimmed = canonical_path.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let stripped = trimmed.trim_end_matches(['/', '\\']);
+        if stripped.is_empty() {
+            // Input was all separators (e.g. `/` root): keep one separator.
+            trimmed[..1].to_string()
+        } else {
+            stripped.to_string()
+        }
+    }
+
+    /// Normalize a content hash for comparison: trim whitespace and
+    /// lowercase ASCII hex. Empty after trimming normalizes to empty
+    /// (which never matches — an empty hash must not grant trust).
+    #[must_use]
+    pub fn normalize_hash(content_hash: &str) -> String {
+        content_hash.trim().to_ascii_lowercase()
+    }
+
+    /// Whether this record matches the given path and hash under normalized
+    /// comparison. Empty path or hash on either side never matches
+    /// (fail-closed: an empty hash must not grant trust).
     #[must_use]
     pub fn matches(&self, canonical_path: &str, content_hash: &str) -> bool {
-        self.canonical_path == canonical_path && self.content_hash == content_hash
+        let want_path = Self::normalize_path(canonical_path);
+        let want_hash = Self::normalize_hash(content_hash);
+        if want_path.is_empty() || want_hash.is_empty() {
+            return false;
+        }
+        let have_path = Self::normalize_path(&self.canonical_path);
+        let have_hash = Self::normalize_hash(&self.content_hash);
+        if have_path.is_empty() || have_hash.is_empty() {
+            return false;
+        }
+        have_path == want_path && have_hash == want_hash
     }
 
     /// Whether this record *covers* the path but the hash has changed (stale).
+    ///
+    /// Path comparison is normalized like [`Self::matches`]; an empty path
+    /// never counts as covered. A hash difference — including an empty
+    /// candidate or stored hash — is stale rather than trusted.
     #[must_use]
     pub fn is_stale(&self, canonical_path: &str, content_hash: &str) -> bool {
-        self.canonical_path == canonical_path && self.content_hash != content_hash
+        let want_path = Self::normalize_path(canonical_path);
+        if want_path.is_empty() {
+            return false;
+        }
+        let have_path = Self::normalize_path(&self.canonical_path);
+        if have_path.is_empty() || have_path != want_path {
+            return false;
+        }
+        let want_hash = Self::normalize_hash(content_hash);
+        let have_hash = Self::normalize_hash(&self.content_hash);
+        have_hash != want_hash
     }
 }
 
-/// In-memory trust store (headless). The durable location and format are an
-/// RFC open item; this type is the pure-data shape so validation and trust
-/// checks are testable without a filesystem.
+/// In-memory trust store (headless) with an explicit durable file form.
+pub const MAX_TRUST_RECORDS: usize = 1024;
+/// Maximum bytes for one persisted trust file (fail-closed).
+pub const MAX_TRUST_FILE_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TrustStore {
-    /// Records keyed by canonical path.
+    /// Records keyed by normalized canonical path.
     records: HashMap<String, TrustRecord>,
 }
 
@@ -109,26 +163,40 @@ impl TrustStore {
     }
 
     /// Insert or replace a record. Returns the previous record if any.
+    ///
+    /// The map key is the normalized path so `…/proj` and `…/proj/`
+    /// alias; the stored record keeps its original spelling for
+    /// diagnostics while comparison always normalizes.
     pub fn insert(&mut self, record: TrustRecord) -> Option<TrustRecord> {
-        self.records.insert(record.canonical_path.clone(), record)
+        let key = TrustRecord::normalize_path(&record.canonical_path);
+        self.records.insert(key, record)
     }
 
-    /// Remove a record for a path.
+    /// Remove a record for a path (normalized lookup).
     pub fn remove(&mut self, canonical_path: &str) -> Option<TrustRecord> {
-        self.records.remove(canonical_path)
+        let key = TrustRecord::normalize_path(canonical_path);
+        if key.is_empty() {
+            return None;
+        }
+        self.records.remove(&key)
     }
 
-    /// Look up a record for a path.
+    /// Look up a record for a path (normalized lookup).
     #[must_use]
     pub fn get(&self, canonical_path: &str) -> Option<&TrustRecord> {
-        self.records.get(canonical_path)
+        let key = TrustRecord::normalize_path(canonical_path);
+        if key.is_empty() {
+            return None;
+        }
+        self.records.get(&key)
     }
 
     /// Check whether the given path+hash is trusted.
     ///
-    /// Returns `true` only when a record exists with exactly this path and
-    /// hash and the decision is `TrustOnce` or `TrustAlways`.
-    /// `Deny` and missing records are untrusted. This preserves the RFC's
+    /// Returns `true` only when a record exists with normalized path and
+    /// hash equality and the decision is `TrustOnce` or `TrustAlways`.
+    /// Empty path or hash never grants trust (fail-closed); `Deny` and
+    /// missing records are untrusted. This preserves the RFC's
     /// "deny as default when origin is not positively local" — the caller
     /// should synthesize `Deny` for unknown origins before calling this, and
     /// this function correctly treats absence as untrusted.
@@ -169,6 +237,138 @@ impl TrustStore {
     /// Iterate over records.
     pub fn iter(&self) -> impl Iterator<Item = &TrustRecord> {
         self.records.values()
+    }
+
+    /// Serialize to the durable line form (`path \t hash \t decision` per
+    /// line). Paths/hashes must not contain `\n`, `\r`, or `\t`; decisions
+    /// are the [`TrustDecision`] display spellings. Fail-closed on
+    /// oversized stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the store exceeds
+    /// [`MAX_TRUST_RECORDS`] or a field contains a separator.
+    pub fn serialize(&self) -> Result<String, ConfigError> {
+        if self.records.len() > MAX_TRUST_RECORDS {
+            return Err(ConfigError::validation(
+                "trust",
+                format!("must contain <= {MAX_TRUST_RECORDS} records"),
+            ));
+        }
+        let mut records: Vec<&TrustRecord> = self.records.values().collect();
+        records.sort_by(|a, b| {
+            TrustRecord::normalize_path(&a.canonical_path)
+                .cmp(&TrustRecord::normalize_path(&b.canonical_path))
+        });
+        let mut out = String::new();
+        for r in records {
+            for field in [&r.canonical_path, &r.content_hash] {
+                if field.contains(['\n', '\r', '\t']) {
+                    return Err(ConfigError::validation(
+                        "trust",
+                        "path and hash must not contain tab or newline",
+                    ));
+                }
+            }
+            out.push_str(&r.canonical_path);
+            out.push('\t');
+            out.push_str(&r.content_hash);
+            out.push('\t');
+            out.push_str(&r.decision.to_string());
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Parse the durable line form produced by [`Self::serialize`].
+    /// Unknown decisions, malformed lines, and oversized inputs fail
+    /// closed. Later lines win on duplicate normalized paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] on malformed input or bound violations.
+    pub fn deserialize(text: &str) -> Result<Self, ConfigError> {
+        if text.len() > MAX_TRUST_FILE_BYTES {
+            return Err(ConfigError::validation(
+                "trust",
+                format!("trust file must be <= {MAX_TRUST_FILE_BYTES} bytes"),
+            ));
+        }
+        let mut store = Self::new();
+        if text.trim().is_empty() {
+            return Ok(store);
+        }
+        for (idx, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 3 {
+                return Err(ConfigError::validation(
+                    "trust",
+                    format!("malformed trust record on line {}", idx + 1),
+                ));
+            }
+            let decision = match parts[2].trim() {
+                "trust-once" => TrustDecision::TrustOnce,
+                "trust-always" => TrustDecision::TrustAlways,
+                "deny" => TrustDecision::Deny,
+                other => {
+                    return Err(ConfigError::validation(
+                        "trust",
+                        format!("unknown trust decision '{other}' on line {}", idx + 1),
+                    ));
+                }
+            };
+            if store.len() >= MAX_TRUST_RECORDS {
+                return Err(ConfigError::validation(
+                    "trust",
+                    format!("must contain <= {MAX_TRUST_RECORDS} records"),
+                ));
+            }
+            store.insert(TrustRecord::new(
+                parts[0].to_string(),
+                parts[1].to_string(),
+                decision,
+            ));
+        }
+        Ok(store)
+    }
+
+    /// Persist to `path` (creates parent dirs, fail-closed on I/O).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] on serialization or filesystem failure.
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), ConfigError> {
+        let text = self.serialize()?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| ConfigError::InvalidInput {
+                    message: format!("cannot create trust dir: {e}"),
+                })?;
+            }
+        }
+        std::fs::write(path, text).map_err(|e| ConfigError::InvalidInput {
+            message: format!("cannot write trust file: {e}"),
+        })
+    }
+
+    /// Load from `path`. A missing file yields an empty store (no trust);
+    /// corrupt or oversized files fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] on I/O (other than missing file) or parse
+    /// failure.
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, ConfigError> {
+        match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(e) => Err(ConfigError::InvalidInput {
+                message: format!("cannot read trust file: {e}"),
+            }),
+            Ok(text) => Self::deserialize(&text),
+        }
     }
 }
 
@@ -546,5 +746,55 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s.remove("/a").is_some());
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn trust_empty_hash_never_matches_hostile() {
+        // CTX-0479: an empty stored or candidate hash must not grant
+        // trust (previously pure `==` matched two empty hashes).
+        let mut s = TrustStore::new();
+        s.insert(TrustRecord::new("/proj", "", TrustDecision::TrustAlways));
+        assert!(!s.is_trusted("/proj", ""));
+        assert!(!s.is_trusted("/proj", "abc"));
+        let mut s2 = TrustStore::new();
+        s2.insert(TrustRecord::new("/proj", "abc", TrustDecision::TrustAlways));
+        assert!(!s2.is_trusted("/proj", ""));
+        assert!(!s2.is_trusted("", "abc"));
+        assert!(!s2.is_trusted("   ", "abc"));
+    }
+
+    #[test]
+    fn trust_normalized_comparison_hostile() {
+        // CTX-0479: hash case/whitespace and path trailing separators
+        // alias; forged casing must not bypass, and slash variants must
+        // resolve to the same grant.
+        let mut s = TrustStore::new();
+        s.insert(TrustRecord::new(
+            "/proj",
+            "ABC123",
+            TrustDecision::TrustOnce,
+        ));
+        assert!(s.is_trusted("/proj", "abc123"));
+        assert!(s.is_trusted("  /proj  ", "  ABC123  "));
+        assert!(s.is_trusted("/proj/", "abc123"));
+        // Stale detection still fires on real content change.
+        assert!(s.is_stale("/proj/", "deadbeef"));
+        assert!(!s.is_trusted("/proj/", "deadbeef"));
+    }
+
+    #[test]
+    fn trust_durable_roundtrip_and_hostile_reject() {
+        // CTX-0479: the store survives a save/load cycle (memory-only
+        // forgets); corrupt lines and unknown decisions fail closed.
+        let mut s = TrustStore::new();
+        s.insert(TrustRecord::new("/a", "h1", TrustDecision::TrustAlways));
+        s.insert(TrustRecord::new("/b", "h2", TrustDecision::Deny));
+        let text = s.serialize().expect("serialize");
+        let back = TrustStore::deserialize(&text).expect("roundtrip");
+        assert!(back.is_trusted("/a", "h1"));
+        assert!(!back.is_trusted("/b", "h2"));
+        assert!(TrustStore::deserialize("no-tabs-here").is_err());
+        assert!(TrustStore::deserialize("/a\th1\tgrant-forever").is_err());
+        assert!(TrustStore::deserialize("").expect("empty ok").is_empty());
     }
 }

@@ -720,6 +720,17 @@ impl TerminalApp {
                     ),
                 }
             }
+            A::EnterCopyMode => {
+                // CTX-0384 (issue #640): enter modal keyboard copy mode.
+                // Re-entering while active is a fail-closed no-op; the
+                // runtime owns the vi-style cursor, visual selection over
+                // the CTX-0385 `SelectionKind` seams, and yank-to-clipboard
+                // plus primary. `Esc`/`y` exit via the runtime key path.
+                self.runtime.enter_copy_mode();
+                if let Some(label) = self.runtime.copy_mode_label() {
+                    eprintln!("bitty: keymap enter_copy_mode -> {label}");
+                }
+            }
             A::PasteFromClipboard => {
                 // CTX-0161: explicit single-owner paste chord (ctrl+shift+v).
                 // Before this binding the chord fell through to the PTY as
@@ -1053,6 +1064,32 @@ impl TerminalApp {
                         return true;
                     }
                     let matched = bitty_config::match_keymap(&self.keymaps, keyref);
+                    // CTX-0384: copy mode is modal for chrome chords too.
+                    // `Esc` routes to the runtime so copy mode exits there
+                    // (never the paste/close emergency path while modal);
+                    // the enter chord re-arms fail-closed; every other bound
+                    // chord is captured without running so focus, splits,
+                    // zoom, and paste never fire mid-copy. Unbound keys
+                    // (hjkl, v/V, y, arrows) route to the runtime copy
+                    // handler, which consumes them with no PTY bytes.
+                    if self.runtime.is_copy_mode() {
+                        use bitty_config::{
+                            ChromeAction as CopyModeAction, KeyName as CopyModeKey,
+                        };
+                        if keyref.key == CopyModeKey::Escape {
+                            return false;
+                        }
+                        match matched {
+                            Some(CopyModeAction::EnterCopyMode) => {}
+                            Some(_) => {
+                                if let Some(win) = self.window.as_ref() {
+                                    win.request_redraw();
+                                }
+                                return true;
+                            }
+                            None => return false,
+                        }
+                    }
                     let (priority, action) = self.resolve_dispatch(keyref, matched);
                     match priority {
                         DispatchPriority::Emergency => {

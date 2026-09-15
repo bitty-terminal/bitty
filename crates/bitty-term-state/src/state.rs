@@ -19,7 +19,10 @@ use crate::cell::{
 };
 use crate::charsets::Charsets;
 use crate::cursor::{Cursor, CursorPosition, SavedCursor};
-use crate::damage::{DAMAGE_HISTORY_BATCHES, Damage, DamageRect, DamagedRegion, coalesce};
+use crate::damage::{
+    DAMAGE_HISTORY_BATCHES, DAMAGE_MAX_REGIONS_PER_BATCH, Damage, DamageRect, DamagedRegion,
+    coalesce,
+};
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
 use crate::modes::{AltScreen, Modes};
@@ -777,13 +780,51 @@ impl State {
     ///
     /// History is bounded by [`DAMAGE_HISTORY_BATCHES`]; generations older
     /// than the retained window behave as a full-grid redraw request.
+    ///
+    /// The accumulated result is bounded by
+    /// [`DAMAGE_MAX_REGIONS_PER_BATCH`], the same cap the render-side frame
+    /// planner (`MAX_FRAME_REGIONS`) enforces, so both sides of the
+    /// presentation boundary stay consistent: either the exact incremental
+    /// union (when it fits) or one coarse full-grid rectangle. Over-damage
+    /// is safe; under-damage is impossible because every fallback covers
+    /// everything.
+    ///
+    /// The common path stays `O(window)` with an early empty return and no
+    /// merging: the fallback only triggers on overflow.
     #[must_use]
     pub fn damage_since(&self, generation: u64) -> Vec<DamagedRegion> {
+        if generation >= self.generation {
+            return Vec::new();
+        }
+        let full_fallback = || {
+            vec![DamagedRegion::Grid(DamageRect::full(
+                self.height as u16,
+                self.width as u16,
+            ))]
+        };
+        let Some(oldest) = self.damage_history.front() else {
+            // No retained batches but the caller is behind: without history
+            // we cannot prove what changed, so request a full redraw
+            // (conservative over-damage).
+            return full_fallback();
+        };
+        if generation.saturating_add(1) < oldest.generation {
+            return full_fallback();
+        }
         let mut regions = Vec::new();
         for batch in &self.damage_history {
             if batch.generation > generation {
+                if regions.len().saturating_add(batch.regions.len()) > DAMAGE_MAX_REGIONS_PER_BATCH
+                {
+                    return full_fallback();
+                }
                 regions.extend_from_slice(&batch.regions);
             }
+        }
+        // Defensive: a single batch already respects the per-batch cap, but
+        // scrollback ranges ride along, so re-check before returning.
+        if regions.len() > DAMAGE_MAX_REGIONS_PER_BATCH {
+            return full_fallback();
         }
         regions
     }

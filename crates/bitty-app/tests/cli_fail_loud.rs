@@ -94,6 +94,11 @@ fn default_headless_broken_shell_stays_fail_soft() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Unix-only positive control: the default shell chain falls back to
+/// `/bin/sh`, which does not exist on Windows (the Windows default-shell
+/// gap is tracked separately), so a healthy bare startup cannot be assumed
+/// cross-platform.
+#[cfg(unix)]
 #[test]
 fn fail_loud_headless_good_shell_exits_zero() {
     // Positive control: `--fail-loud` must not turn a healthy startup into

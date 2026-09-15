@@ -157,6 +157,15 @@ pub enum ModKey {
 }
 
 impl ModKey {
+    /// Validate a parsed value (total: only `alt`/`super` are representable;
+    /// the exhaustive match keeps coverage explicit so a future variant
+    /// forces a review of chrome-map and project-layer policy).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Alt | Self::Super => Ok(()),
+        }
+    }
+
     /// Canonical setting spelling (`"alt"` / `"super"`), used by
     /// `config check` attribution and reload diffs.
     #[must_use]

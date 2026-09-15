@@ -166,8 +166,33 @@ pub fn config_file_path_with_env(
     home: Option<&str>,
     file_name: &str,
 ) -> Option<PathBuf> {
+    config_file_path_with_platform_env(xdg_config_home, home, None, None, file_name)
+}
+
+/// Pure platform-aware path for one file name with injected environment
+/// values (CTX-0479): Windows `%APPDATA%` / `%LOCALAPPDATA%` participate
+/// when the Unix roots are absent.
+///
+/// Precedence: `$XDG_CONFIG_HOME` > `%APPDATA%` > `$HOME/.config` >
+/// `%LOCALAPPDATA%`. All values are trimmed; empty/whitespace yields no
+/// root. Returns `None` only when no root is usable (no panic, no
+/// hard-coded host paths — every root comes from the caller).
+#[must_use]
+pub fn config_file_path_with_platform_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+    file_name: &str,
+) -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home {
         let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(CONFIG_DIR_NAME).join(file_name));
+        }
+    }
+    if let Some(data) = appdata {
+        let trimmed = data.trim();
         if !trimmed.is_empty() {
             return Some(Path::new(trimmed).join(CONFIG_DIR_NAME).join(file_name));
         }
@@ -183,6 +208,12 @@ pub fn config_file_path_with_env(
             );
         }
     }
+    if let Some(local) = localappdata {
+        let trimmed = local.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(CONFIG_DIR_NAME).join(file_name));
+        }
+    }
     None
 }
 
@@ -195,13 +226,31 @@ pub fn default_config_path_with_env(
     config_file_path_with_env(xdg_config_home, home, INIT_LUA_NAME)
 }
 
+/// Pure canonical path (`init.lua`) with platform roots injected.
+#[must_use]
+pub fn default_config_path_with_platform_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Option<PathBuf> {
+    config_file_path_with_platform_env(xdg_config_home, home, appdata, localappdata, INIT_LUA_NAME)
+}
+
 /// Reads the live environment (`$XDG_CONFIG_HOME`, `$HOME`) for the
 /// canonical config path. Thin wrapper so unit tests stay hermetic.
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
-    default_config_path_with_env(xdg.as_deref(), home.as_deref())
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    default_config_path_with_platform_env(
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+    )
 }
 
 /// How [`probe_config_path`] resolved.
@@ -227,6 +276,22 @@ pub fn probe_config_path_with_env(
     home: Option<&str>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Option<ProbedConfig> {
+    probe_config_path_with_platform_env(explicit, xdg_config_home, home, None, None, exists)
+}
+
+/// Platform-aware probe with Windows `%APPDATA%` / `%LOCALAPPDATA%`
+/// injected (CTX-0479). Same contract as [`probe_config_path_with_env`]
+/// with the platform precedence from
+/// [`config_file_path_with_platform_env`].
+#[must_use]
+pub fn probe_config_path_with_platform_env(
+    explicit: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<ProbedConfig> {
     if let Some(p) = explicit {
         if !p.trim().is_empty() {
             return Some(ProbedConfig {
@@ -236,7 +301,13 @@ pub fn probe_config_path_with_env(
             });
         }
     }
-    let canonical = config_file_path_with_env(xdg_config_home, home, INIT_LUA_NAME)?;
+    let canonical = config_file_path_with_platform_env(
+        xdg_config_home,
+        home,
+        appdata,
+        localappdata,
+        INIT_LUA_NAME,
+    )?;
     if exists(&canonical) {
         return Some(ProbedConfig {
             path: canonical,
@@ -245,7 +316,13 @@ pub fn probe_config_path_with_env(
         });
     }
     // MSRV 1.85: no let-chains; nest instead of `if let ... && ...`.
-    if let Some(fallback) = config_file_path_with_env(xdg_config_home, home, FALLBACK_LUA_NAME) {
+    if let Some(fallback) = config_file_path_with_platform_env(
+        xdg_config_home,
+        home,
+        appdata,
+        localappdata,
+        FALLBACK_LUA_NAME,
+    ) {
         if exists(&fallback) {
             return Some(ProbedConfig {
                 path: fallback,
@@ -266,7 +343,16 @@ pub fn probe_config_path_with_env(
 pub fn probe_config_path(explicit: Option<&str>) -> Option<ProbedConfig> {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
-    probe_config_path_with_env(explicit, xdg.as_deref(), home.as_deref(), &|p| p.exists())
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    probe_config_path_with_platform_env(
+        explicit,
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+        &|p| p.exists(),
+    )
 }
 
 /// Legacy resolution returning the path only: explicit `--config` wins
@@ -623,8 +709,31 @@ pub fn validate_profile_name(name: &str) -> Result<String, ConfigError> {
 /// yields a usable root (no panic).
 #[must_use]
 pub fn config_dir_with_env(xdg_config_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    config_dir_with_platform_env(xdg_config_home, home, None, None)
+}
+
+/// Platform-aware config root with Windows `%APPDATA%` /
+/// `%LOCALAPPDATA%` injected (CTX-0479). Precedence: `$XDG_CONFIG_HOME` >
+/// `%APPDATA%` > `$HOME/.config` > `%LOCALAPPDATA%`.
+///
+/// Every root comes from the caller (no hard-coded host paths); empty or
+/// whitespace-only values are skipped. Returns `None` only when no root
+/// is usable.
+#[must_use]
+pub fn config_dir_with_platform_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home {
         let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(CONFIG_DIR_NAME));
+        }
+    }
+    if let Some(data) = appdata {
+        let trimmed = data.trim();
         if !trimmed.is_empty() {
             return Some(Path::new(trimmed).join(CONFIG_DIR_NAME));
         }
@@ -635,7 +744,30 @@ pub fn config_dir_with_env(xdg_config_home: Option<&str>, home: Option<&str>) ->
             return Some(Path::new(trimmed).join(".config").join(CONFIG_DIR_NAME));
         }
     }
+    if let Some(local) = localappdata {
+        let trimmed = local.trim();
+        if !trimmed.is_empty() {
+            return Some(Path::new(trimmed).join(CONFIG_DIR_NAME));
+        }
+    }
     None
+}
+
+/// Live-environment config root (`$XDG_CONFIG_HOME`, `%APPDATA%`,
+/// `$HOME`, `%LOCALAPPDATA%` precedence). Thin wrapper so unit tests stay
+/// hermetic via [`config_dir_with_platform_env`].
+#[must_use]
+pub fn config_dir() -> Option<PathBuf> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    config_dir_with_platform_env(
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+    )
 }
 
 /// Pure profile path for `name` with injected environment values
@@ -653,10 +785,29 @@ pub fn profile_file_path_with_env(
     xdg_config_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<PathBuf, ConfigError> {
+    profile_file_path_with_platform_env(name, xdg_config_home, home, None, None)
+}
+
+/// Platform-aware profile path with Windows roots injected (CTX-0479):
+/// `<config-dir>/profiles/<name>.lua` under
+/// [`config_dir_with_platform_env`].
+///
+/// # Errors
+///
+/// - Invalid name from [`validate_profile_name`] (fail-closed).
+/// - No usable config root (all platform roots unset/blank).
+pub fn profile_file_path_with_platform_env(
+    name: &str,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Result<PathBuf, ConfigError> {
     let valid = validate_profile_name(name)?;
-    let dir =
-        config_dir_with_env(xdg_config_home, home).ok_or_else(|| ConfigError::InvalidInput {
-            message: "no config root ($XDG_CONFIG_HOME or $HOME unset)".to_string(),
+    let dir = config_dir_with_platform_env(xdg_config_home, home, appdata, localappdata)
+        .ok_or_else(|| ConfigError::InvalidInput {
+            message: "no config root ($XDG_CONFIG_HOME, %APPDATA%, $HOME, or %LOCALAPPDATA% unset)"
+                .to_string(),
         })?;
     Ok(dir.join(PROFILES_DIR_NAME).join(format!("{valid}.lua")))
 }
@@ -671,7 +822,15 @@ pub fn profile_file_path_with_env(
 pub fn profile_file_path(name: &str) -> Result<PathBuf, ConfigError> {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").ok();
-    profile_file_path_with_env(name, xdg.as_deref(), home.as_deref())
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    profile_file_path_with_platform_env(
+        name,
+        xdg.as_deref(),
+        home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
+    )
 }
 
 /// Merges an optional file (User) layer with an optional `--theme` CLI layer
@@ -1738,6 +1897,41 @@ mod tests {
     fn missing_roots_yield_none() {
         assert_eq!(default_config_path_with_env(None, None), None);
         assert_eq!(default_config_path_with_env(Some(""), Some("  ")), None);
+    }
+
+    #[test]
+    fn platform_roots_precedence_hostile() {
+        // CTX-0479: Windows `%APPDATA%` / `%LOCALAPPDATA%` participate
+        // when Unix roots are absent; XDG still wins outright.
+        let p =
+            default_config_path_with_platform_env(None, None, Some("C:/Roaming"), None).unwrap();
+        assert_eq!(p, PathBuf::from("C:/Roaming/bitty/init.lua"));
+        let p = default_config_path_with_platform_env(None, None, None, Some("C:/Local")).unwrap();
+        assert_eq!(p, PathBuf::from("C:/Local/bitty/init.lua"));
+        let p = default_config_path_with_platform_env(
+            Some("/xdg"),
+            Some("/home/u"),
+            Some("C:/Roaming"),
+            Some("C:/Local"),
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/xdg/bitty/init.lua"));
+        // Blank APPDATA falls through to HOME, blank everything is None.
+        let p = default_config_path_with_platform_env(None, Some("/home/u"), Some("   "), None)
+            .unwrap();
+        assert_eq!(p, PathBuf::from("/home/u/.config/bitty/init.lua"));
+        assert_eq!(
+            default_config_path_with_platform_env(None, None, Some("  "), Some("")),
+            None
+        );
+        // Config dir follows the same precedence.
+        let d = config_dir_with_platform_env(None, None, Some("C:/Roaming"), None).unwrap();
+        assert_eq!(d, PathBuf::from("C:/Roaming/bitty"));
+        // Profiles resolve under the platform root.
+        let prof =
+            profile_file_path_with_platform_env("work", None, None, Some("C:/Roaming"), None)
+                .expect("appdata profile");
+        assert_eq!(prof, PathBuf::from("C:/Roaming/bitty/profiles/work.lua"));
     }
 
     #[test]

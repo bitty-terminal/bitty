@@ -470,3 +470,91 @@ fn process_namespace_is_read_only() {
         "assignment must fail: {outcome:?}"
     );
 }
+
+/// Slow-but-successful spawn service: past the cheap-call deadline, within
+/// the spawn timeout contract.
+struct SlowSpawnServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    delay_ms: u64,
+}
+
+impl HostServices for SlowSpawnServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn process_spawn(&self, _args: &[String]) -> Result<LuaValue, BridgeError> {
+        std::thread::sleep(Duration::from_millis(self.delay_ms));
+        Ok(LuaValue::table([
+            ("output", LuaValue::String("slow-ok".to_string())),
+            ("stderr", LuaValue::String(String::new())),
+            ("truncated", LuaValue::Bool(false)),
+            ("exit_code", LuaValue::Integer(0)),
+            ("untrusted", LuaValue::Bool(true)),
+        ]))
+    }
+}
+
+#[test]
+fn slow_spawn_is_delivered_not_timed_out() {
+    // FIX 2 (CTX-0445 review) pin: `process.spawn` keeps the re-entrancy
+    // guard but is exempt from the post-hoc cheap-call deadline, so a
+    // slow-but-successful spawn is delivered instead of being run to
+    // completion and then discarded as `E_TIMEOUT` — which would orphan a
+    // 64-slot registry entry Lua can never reconcile (64 such orphans =
+    // self-DoS via `LimitExceeded`). The 30 ms delay exceeds the 1 ms bridge
+    // deadline (old code returned `E_TIMEOUT` here) yet stays inside the
+    // default 50 ms VM wall budget, mirroring the existing
+    // `host_call_deadline_returns_typed_timeout` timing shape.
+    let services = Rc::new(SlowSpawnServices {
+        store: RefCell::new(BTreeMap::new()),
+        delay_ms: 30,
+    });
+    let mut vm = LuaVm::new("spawn-slow");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local result = bitty.process.spawn({ "status" })
+            bitty.store.set("output", result.output)
+            bitty.store.set("untrusted", result.untrusted)
+            bitty.store.set("exit_code", result.exit_code)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("output"),
+        Some(&LuaValue::String("slow-ok".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("untrusted"),
+        Some(&LuaValue::Bool(true))
+    );
+    assert_eq!(
+        services.store.borrow().get("exit_code"),
+        Some(&LuaValue::Integer(0))
+    );
+}

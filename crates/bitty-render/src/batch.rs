@@ -998,6 +998,107 @@ pub fn plan_image_uploads(images: &[ImageBlit], max_dimension: u32) -> ImageUplo
     plan
 }
 
+/// Maximum image quads per vertex-buffer upload (one submit per chunk).
+///
+/// Equals [`MAX_IMAGE_BLITS_PER_FRAME`] so a normal frame (at most 32
+/// admitted blits) uploads all quads contiguously and issues a single
+/// `queue.submit` for the whole image pass (CTX-0390). Frames larger than
+/// one chunk split deterministically into `Clear`-then-`Load` submits while
+/// reusing the same bounded buffer, never growing without limit.
+pub const MAX_IMAGE_QUADS_PER_BATCH: usize = MAX_IMAGE_BLITS_PER_FRAME;
+
+/// Bytes per serialized image quad (4 vertices of `pos + uv`).
+pub const IMAGE_QUAD_BYTES: usize = VERTICES_PER_QUAD * IMAGE_VERTEX_SIZE_BYTES;
+
+/// Byte size of the batched image vertex buffer (32 quads x 64 bytes).
+#[must_use]
+pub fn image_buffer_size() -> u64 {
+    (MAX_IMAGE_QUADS_PER_BATCH * VERTICES_PER_QUAD * IMAGE_VERTEX_SIZE_BYTES) as u64
+}
+
+/// One drawable image quad inside a batched submit.
+///
+/// `slot` is the positional texture slot (the enumerate index into the
+/// admitted plan, preserving the shared-pool mapping); `source_index` is
+/// the index into the original blit slice (paint order); `quad` holds the
+/// exact 64 bytes [`image_quad_bytes`] emits for that blit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageDraw {
+    /// Positional texture slot for this draw.
+    pub slot: usize,
+    /// Index into the source blit slice.
+    pub source_index: usize,
+    /// Serialized `pos + uv` vertices (64 bytes).
+    pub quad: [u8; 64],
+}
+
+/// Collects drawable quads for one image pass in paint order.
+///
+/// Iterates `admitted` (from [`plan_image_uploads`]) in order, emits one
+/// [`ImageDraw`] per blit whose [`image_quad_bytes`] serializes, and counts
+/// empty quads as extra skips (fail-closed, never a silent divergence).
+/// `slot` preserves the enumerate position so the shared texture pool
+/// mapping is unchanged by batching; vertex offsets compact separately at
+/// submit time.
+#[must_use]
+pub fn collect_image_draws(
+    blits: &[ImageBlit],
+    admitted: &[usize],
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+) -> (Vec<ImageDraw>, usize) {
+    let mut draws = Vec::new();
+    let mut extra_skipped = 0usize;
+    for (slot, &index) in admitted.iter().enumerate() {
+        let Some(blit) = blits.get(index) else {
+            extra_skipped += 1;
+            continue;
+        };
+        let Some(quad) = image_quad_bytes(blit.dest, surface_w, surface_h, scale) else {
+            extra_skipped += 1;
+            continue;
+        };
+        draws.push(ImageDraw {
+            slot,
+            source_index: index,
+            quad,
+        });
+    }
+    (draws, extra_skipped)
+}
+
+/// Splits drawable quads into bounded submit chunks (paint order).
+///
+/// Each chunk holds at most [`MAX_IMAGE_QUADS_PER_BATCH`] draws; an empty
+/// input yields no chunks (the caller issues no submit, preserving the
+/// no-image fast path). Splitting is deterministic: chunk 0 holds the first
+/// `MAX_IMAGE_QUADS_PER_BATCH` draws, chunk 1 the next, and so on.
+#[must_use]
+pub fn chunk_image_draws(draws: &[ImageDraw]) -> Vec<Vec<ImageDraw>> {
+    if draws.is_empty() {
+        return Vec::new();
+    }
+    draws
+        .chunks(MAX_IMAGE_QUADS_PER_BATCH)
+        .map(|c| c.to_vec())
+        .collect()
+}
+
+/// Serializes one submit chunk into contiguous vertex bytes.
+///
+/// The output is exactly the concatenation of each draw's 64 quad bytes in
+/// paint order, so the batched `write_buffer` uploads byte-identical vertex
+/// data to the old per-blit uploads (command-stream equivalence).
+#[must_use]
+pub fn image_batch_bytes(batch: &[ImageDraw]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(batch.len() * IMAGE_QUAD_BYTES);
+    for draw in batch {
+        out.extend_from_slice(&draw.quad);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1459,5 +1560,133 @@ mod tests {
         let plan = plan_image_uploads(&[tiny], 0);
         assert!(plan.admitted.is_empty());
         assert_eq!(plan.skipped, 1);
+    }
+
+    #[test]
+    fn image_batch_buffer_stays_capped() {
+        // 32 quads x 4 verts x 16 bytes = 2048 bytes, tiny and bounded.
+        assert_eq!(MAX_IMAGE_QUADS_PER_BATCH, MAX_IMAGE_BLITS_PER_FRAME);
+        assert_eq!(IMAGE_QUAD_BYTES, 64);
+        assert_eq!(
+            image_buffer_size(),
+            (MAX_IMAGE_QUADS_PER_BATCH * VERTICES_PER_QUAD * IMAGE_VERTEX_SIZE_BYTES) as u64
+        );
+        assert_eq!(image_buffer_size(), 2048);
+    }
+
+    #[test]
+    fn image_batches_concatenate_quad_bytes_in_paint_order() {
+        // CTX-0390 equivalence: the batched upload must be byte-identical
+        // to the old per-blit uploads concatenated in paint order, with the
+        // same slots and source indices, so one submit draws exactly what N
+        // submits drew (5 blits -> 1 submit, same pixels).
+        let blits: Vec<_> = (0..5)
+            .map(|i| {
+                crate::grid::ImageBlit::try_new(
+                    RectPx::new(i * 4, 0, 2, 2),
+                    vec![i as u8; 2 * 2 * 4],
+                )
+                .expect("matching bytes")
+            })
+            .collect();
+        let plan = plan_image_uploads(&blits, 4096);
+        assert_eq!(plan.admitted, vec![0, 1, 2, 3, 4]);
+        let (draws, extra) = collect_image_draws(&blits, &plan.admitted, 64, 64, 1.0);
+        assert_eq!(extra, 0);
+        assert_eq!(draws.len(), 5);
+        for (slot, draw) in draws.iter().enumerate() {
+            assert_eq!(draw.slot, slot, "slot must preserve admitted order");
+            assert_eq!(draw.source_index, slot);
+            let expected = image_quad_bytes(blits[slot].dest, 64, 64, 1.0).expect("non-empty");
+            assert_eq!(
+                draw.quad, expected,
+                "draw {slot} bytes must equal the per-blit quad"
+            );
+        }
+        let chunks = chunk_image_draws(&draws);
+        assert_eq!(chunks.len(), 1, "5 draws fit in one capped batch");
+        assert_eq!(chunks[0].len(), 5);
+        let bytes = image_batch_bytes(&chunks[0]);
+        assert_eq!(bytes.len(), 5 * IMAGE_QUAD_BYTES);
+        // Byte-level equivalence with the legacy per-quad stream.
+        let mut legacy = Vec::new();
+        for draw in &draws {
+            legacy.extend_from_slice(&draw.quad);
+        }
+        assert_eq!(bytes, legacy);
+        // Per-quad slices inside the batch match their source quads.
+        for (i, draw) in draws.iter().enumerate() {
+            let base = i * IMAGE_QUAD_BYTES;
+            assert_eq!(&bytes[base..base + IMAGE_QUAD_BYTES], &draw.quad);
+        }
+        // Submit-count evidence: before = 5 submits, after = 1 submit.
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn image_batches_preserve_slot_mapping_across_skipped_quads() {
+        // A blit whose quad serializes to None (empty dest) keeps its slot
+        // in the texture pool but emits no draw; later slots must not shift
+        // or they would sample the wrong texture.
+        let ok = image_blit(2, 2, 0x11);
+        let mut empty_dest = ok.clone();
+        empty_dest.dest = RectPx::new(0, 0, 0, 2);
+        // Bypass the upload plan (which would refuse the empty dest) to pin
+        // the slot-preserving contract directly.
+        let blits = vec![ok.clone(), empty_dest, ok.clone()];
+        let (draws, extra) = collect_image_draws(&blits, &[0, 1, 2], 64, 64, 1.0);
+        assert_eq!(extra, 1);
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].slot, 0);
+        assert_eq!(draws[0].source_index, 0);
+        assert_eq!(draws[1].slot, 2, "slot 2 must not shift into slot 1");
+        assert_eq!(draws[1].source_index, 2);
+        let chunks = chunk_image_draws(&draws);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(image_batch_bytes(&chunks[0]).len(), 2 * IMAGE_QUAD_BYTES);
+    }
+
+    #[test]
+    fn image_batches_split_deterministically_at_cap() {
+        // Oversized draw lists never OOM: they split into bounded chunks in
+        // paint order (first chunk full, remainder in order). The plan caps
+        // at 32, so synthesize draws past the cap to pin the split.
+        let draws: Vec<ImageDraw> = (0..MAX_IMAGE_QUADS_PER_BATCH + 1)
+            .map(|i| ImageDraw {
+                slot: i,
+                source_index: i,
+                quad: [i as u8; 64],
+            })
+            .collect();
+        let chunks = chunk_image_draws(&draws);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), MAX_IMAGE_QUADS_PER_BATCH);
+        assert_eq!(chunks[1].len(), 1);
+        assert_eq!(chunks[0][0].slot, 0);
+        assert_eq!(chunks[1][0].slot, MAX_IMAGE_QUADS_PER_BATCH);
+        for chunk in &chunks {
+            let bytes = image_batch_bytes(chunk);
+            assert!(bytes.len() as u64 <= image_buffer_size());
+            assert_eq!(bytes.len(), chunk.len() * IMAGE_QUAD_BYTES);
+        }
+        // Determinism: same input gives identical chunks.
+        let again = chunk_image_draws(&draws);
+        assert_eq!(chunks, again);
+    }
+
+    #[test]
+    fn image_batches_empty_is_noop() {
+        // No-image fast path: empty inputs produce no chunks, no bytes, and
+        // the caller must issue no submit and no buffer write.
+        let (draws, extra) = collect_image_draws(&[], &[], 64, 64, 1.0);
+        assert!(draws.is_empty());
+        assert_eq!(extra, 0);
+        assert!(chunk_image_draws(&draws).is_empty());
+        assert!(image_batch_bytes(&[]).is_empty());
+        // Out-of-range admitted indices fail closed and count.
+        let ok = image_blit(1, 1, 0x77);
+        let (draws, extra) = collect_image_draws(&[ok], &[0, 7], 64, 64, 1.0);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(extra, 1);
     }
 }

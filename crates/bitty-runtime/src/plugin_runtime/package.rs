@@ -521,50 +521,121 @@ pub fn uninstall(store_root: &Path, plugin_id: &str) -> Result<UninstallReport, 
 
 /// Verify `compat.bitty` and `compat.plugin-api` include this host.
 fn check_compat(manifest: &PluginManifest) -> Result<(), PackageOpError> {
-    let plugin = manifest.identity.id.as_str().to_string();
-    check_range(
-        &plugin,
-        "compat.bitty",
-        manifest.compat.bitty.as_deref(),
-        env!("CARGO_PKG_VERSION"),
-    )?;
-    check_range(
-        &plugin,
-        "compat.plugin-api",
-        manifest.compat.plugin_api.as_deref(),
-        bitty_lua::host::API_VERSION,
-    )
+    check_compat_with_hosts(manifest, host_bitty_version(), bitty_lua::host::API_VERSION)
 }
 
-fn check_range(
-    plugin: &str,
-    field: &str,
-    requested: Option<&str>,
-    host: &str,
-) -> Result<(), PackageOpError> {
+/// Running host Bitty version used for compat evaluation.
+///
+/// Single source for the resolve/activate re-check (CTX-0416): install,
+/// resolution, and activation must evaluate the same closed grammar against
+/// the same host line. `0.1`-line floors in declared ranges stay as written;
+/// dev-host (`0.0.x`) behavior is unchanged because bundled packages skip the
+/// re-check while store records fail closed.
+pub(crate) fn host_bitty_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Running host plugin-API version used for compat evaluation.
+pub(crate) fn host_api_version() -> &'static str {
+    bitty_lua::host::API_VERSION
+}
+
+/// Structured compat failure shared by install and resolve/activate.
+///
+/// Keeps the closed requirement grammar in one place so `resolve_record` and
+/// `activate` evaluate exactly what `install_local_dir` evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompatFailure {
+    /// Range text violates the closed grammar.
+    Invalid {
+        /// Field that failed (`compat.bitty` or `compat.plugin-api`).
+        field: String,
+        /// Bounded detail.
+        detail: String,
+    },
+    /// Host version does not satisfy the declared range.
+    Incompatible {
+        /// Field that failed.
+        field: String,
+        /// Declared range.
+        requested: String,
+        /// Host version evaluated.
+        host: String,
+    },
+}
+
+/// Evaluate `compat.bitty` / `compat.plugin-api` against explicit hosts.
+///
+/// Pure and testable: `install` passes the running hosts, while tests pass an
+/// upgraded host to simulate a host upgrade after install (CTX-0416).
+pub(crate) fn evaluate_compat(
+    bitty_req: Option<&str>,
+    api_req: Option<&str>,
+    host_bitty: &str,
+    host_api: &str,
+) -> Result<(), CompatFailure> {
+    evaluate_range("compat.bitty", bitty_req, host_bitty)?;
+    evaluate_range("compat.plugin-api", api_req, host_api)
+}
+
+/// Evaluate one compat field with the closed requirement grammar.
+fn evaluate_range(field: &str, requested: Option<&str>, host: &str) -> Result<(), CompatFailure> {
     let Some(requested) = requested else {
         return Ok(());
     };
     let range = normalize_comparators(requested);
-    let requirement = VersionReq::parse(&range).map_err(|error| PackageOpError::Manifest {
-        plugin: plugin.to_string(),
+    let requirement = VersionReq::parse(&range).map_err(|error| CompatFailure::Invalid {
+        field: field.to_string(),
         detail: format!("invalid {field} range '{requested}': {error}"),
     })?;
-    let host_version = Version::parse(host).map_err(|error| PackageOpError::Incompatible {
-        plugin: plugin.to_string(),
+    let host_version = Version::parse(host).map_err(|error| CompatFailure::Incompatible {
         field: field.to_string(),
         requested: requested.to_string(),
         host: format!("{host} (unparseable: {error})"),
     })?;
     if !requirement.matches(&host_version) {
-        return Err(PackageOpError::Incompatible {
-            plugin: plugin.to_string(),
+        return Err(CompatFailure::Incompatible {
             field: field.to_string(),
             requested: requested.to_string(),
             host: host.to_string(),
         });
     }
     Ok(())
+}
+
+/// Verify `compat.bitty` and `compat.plugin-api` against explicit hosts.
+///
+/// Test hook for the install-then-upgrade simulation: install uses the running
+/// hosts, then resolution is re-evaluated with upgraded hosts.
+pub(crate) fn check_compat_with_hosts(
+    manifest: &PluginManifest,
+    host_bitty: &str,
+    host_api: &str,
+) -> Result<(), PackageOpError> {
+    evaluate_compat(
+        manifest.compat.bitty.as_deref(),
+        manifest.compat.plugin_api.as_deref(),
+        host_bitty,
+        host_api,
+    )
+    .map_err(|failure| {
+        let plugin = manifest.identity.id.as_str().to_string();
+        match failure {
+            CompatFailure::Invalid { field: _, detail } => {
+                PackageOpError::Manifest { plugin, detail }
+            }
+            CompatFailure::Incompatible {
+                field,
+                requested,
+                host,
+            } => PackageOpError::Incompatible {
+                plugin,
+                field,
+                requested,
+                host,
+            },
+        }
+    })
 }
 
 /// Pad partial comparator operands to `X.Y.Z`.
@@ -1080,6 +1151,98 @@ mod tests {
         .expect_err("incompatible api range must fail");
         assert!(matches!(error, PackageOpError::Incompatible { .. }));
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    fn write_plugin_with_compat(
+        root: &Path,
+        id: &str,
+        version: &str,
+        bitty_req: &str,
+        api_req: &str,
+    ) -> PathBuf {
+        let package = root.join("plugin-compat");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        let manifest = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Fixture\"\nversion = \"{version}\"\n\
+             description = \"fixture\"\n\n[compat]\nbitty = \"{bitty_req}\"\nplugin-api = \"{api_req}\"\n"
+        );
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("manifest");
+        std::fs::write(
+            package.join("lua").join("init.lua"),
+            "bitty.commands.register({ id = \"".to_string()
+                + id
+                + ":greet\", run = function() return \"hi\" end })\n",
+        )
+        .expect("init");
+        package
+    }
+
+    #[test]
+    fn install_then_upgrade_host_fails_resolve_closed() {
+        // CTX-0416: install when the range includes the running host, then
+        // simulate a host upgrade where the stored range no longer applies.
+        // Both bitty and plugin-api upgrades must fail closed with a typed
+        // incompatible state and never reach a VM.
+        let scratch = scratch("upgrade");
+        let store = scratch.join("store");
+        // Narrow floor that includes the current dev host (0.0.20) but not
+        // the simulated 0.1.0 upgrade; api ^1.0 includes 1.0.0 but not 2.0.0.
+        let source = write_plugin_with_compat(
+            &scratch,
+            "xuepoo.upgrade",
+            "1.0.0",
+            ">=0.0.1,<0.0.99",
+            "^1.0",
+        );
+        install(&store, &source);
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records.len(), 1);
+        // Running host still resolves.
+        resolution::resolve_record(&store, &records[0]).expect("current host resolves");
+
+        // Simulated bitty upgrade to 0.1.0 no longer satisfies <0.0.99.
+        let upgraded_bitty =
+            resolution::resolve_record_with_hosts(&store, &records[0], "0.1.0", host_api_version())
+                .expect_err("upgraded bitty must fail closed");
+        assert!(
+            matches!(
+                upgraded_bitty,
+                crate::plugin_runtime::PluginRuntimeError::Incompatible { ref field, .. } if field == "compat.bitty"
+            ),
+            "expected typed compat.bitty incompatible, got {upgraded_bitty}"
+        );
+
+        // Simulated plugin-api upgrade to 2.0.0 no longer satisfies ^1.0.
+        let upgraded_api = resolution::resolve_record_with_hosts(
+            &store,
+            &records[0],
+            host_bitty_version(),
+            "2.0.0",
+        )
+        .expect_err("upgraded api must fail closed");
+        assert!(
+            matches!(
+                upgraded_api,
+                crate::plugin_runtime::PluginRuntimeError::Incompatible { ref field, .. } if field == "compat.plugin-api"
+            ),
+            "expected typed compat.plugin-api incompatible, got {upgraded_api}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn evaluate_compat_uses_closed_grammar() {
+        // Closed grammar: wildcards and disjunctions are rejected at parse.
+        assert!(evaluate_compat(Some("*"), None, "0.0.20", "1.0.0").is_err());
+        assert!(evaluate_compat(Some(">=0.0.1 || <1.0"), None, "0.0.20", "1.0.0").is_err());
+        // Partial comparators are padded (accepted spelling >=0.1,<1.0).
+        assert!(evaluate_compat(Some(">=0.1,<1.0"), Some("^1.0"), "0.1.0", "1.0.0").is_ok());
+        assert!(evaluate_compat(Some(">=0.1,<1.0"), Some("^1.0"), "0.0.20", "1.0.0").is_err());
+        // Absent fields mean no constraint.
+        assert!(evaluate_compat(None, None, "0.0.20", "1.0.0").is_ok());
+        let _ = host_bitty_version();
+        let _ = host_api_version();
     }
 
     #[test]

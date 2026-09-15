@@ -152,17 +152,42 @@ pub fn write_index(store_root: &Path, records: &[PluginRecord]) -> Result<(), Pl
 /// development path is required and content drift only marks the package
 /// unverified (RFC B.5), while a manifest-hash mismatch still fails closed.
 ///
+/// CTX-0416: the closed `compat.bitty` / `compat.plugin-api` grammar is
+/// re-evaluated against the running host after the manifest hash binds the
+/// record to its body. An installed package whose range no longer includes the
+/// host after an upgrade fails closed here with a typed
+/// [`PluginRuntimeError::Incompatible`] before any VM exists.
+///
 /// # Errors
 ///
 /// [`PluginRuntimeError::NotFound`] when the recorded body is absent;
 /// [`PluginRuntimeError::Integrity`] on any hash, digest, identity, or path
-/// mismatch; [`PluginRuntimeError::Manifest`]/[`ModuleTree`] for a body that
-/// violates the schema or bounds.
+/// mismatch; [`PluginRuntimeError::Incompatible`] when the stored manifest no
+/// longer includes the running host; [`PluginRuntimeError::Manifest`]/
 ///
 /// [`ModuleTree`]: PluginRuntimeError::ModuleTree
 pub fn resolve_record(
     store_root: &Path,
     record: &PluginRecord,
+) -> Result<PluginPackage, PluginRuntimeError> {
+    resolve_record_with_hosts(
+        store_root,
+        record,
+        super::package::host_bitty_version(),
+        super::package::host_api_version(),
+    )
+}
+
+/// Resolve one record against explicit host versions (CTX-0416 test hook).
+///
+/// Production callers use [`resolve_record`]; tests pass an upgraded host to
+/// simulate a host upgrade after install. The closed grammar and
+/// `0.1`-line floors are evaluated exactly as at install time.
+pub fn resolve_record_with_hosts(
+    store_root: &Path,
+    record: &PluginRecord,
+    host_bitty: &str,
+    host_api: &str,
 ) -> Result<PluginPackage, PluginRuntimeError> {
     let plugin = record.plugin_id.clone();
     // A store record may never claim first-party provenance: `bundled`
@@ -246,6 +271,12 @@ pub fn resolve_record(
         return Err(integrity(&plugin, "manifest hash mismatch"));
     }
 
+    // CTX-0416 host-upgrade re-check: the stored manifest is now bound by
+    // hash, so evaluate its closed compat grammar against the running host.
+    // Fail closed with a typed incompatible state before any VM exists; the
+    // digest scan below is skipped for incompatible packages.
+    check_host_compat(&manifest, host_bitty, host_api)?;
+
     let id = manifest.id().clone();
     let digest = scan_module_tree(id.as_str(), &module_root)?;
     if !digest.eq_ignore_ascii_case(&record.content_digest) {
@@ -266,6 +297,41 @@ pub fn resolve_record(
         source_class: record.source_class,
         unverified,
         granted: Some(record.granted.clone()),
+    })
+}
+
+/// Re-evaluate the closed compat grammar against explicit hosts.
+///
+/// Shared by [`resolve_record_with_hosts`] and the activation guard in
+/// `super`: both must reject with the same typed state without creating a VM.
+pub(crate) fn check_host_compat(
+    manifest: &bitty_plugin_host::manifest::PluginManifest,
+    host_bitty: &str,
+    host_api: &str,
+) -> Result<(), PluginRuntimeError> {
+    super::package::evaluate_compat(
+        manifest.compat.bitty.as_deref(),
+        manifest.compat.plugin_api.as_deref(),
+        host_bitty,
+        host_api,
+    )
+    .map_err(|failure| {
+        let plugin = manifest.identity.id.as_str().to_string();
+        match failure {
+            super::package::CompatFailure::Invalid { detail, .. } => {
+                PluginRuntimeError::Manifest { plugin, detail }
+            }
+            super::package::CompatFailure::Incompatible {
+                field,
+                requested,
+                host,
+            } => PluginRuntimeError::Incompatible {
+                plugin,
+                field,
+                requested,
+                host,
+            },
+        }
     })
 }
 
@@ -865,5 +931,90 @@ mod tests {
             &over_bound,
             PLUGIN_MODULE_PATH_MAX_BYTES
         ));
+    }
+
+    fn write_compat_package(
+        store: &Path,
+        id: &str,
+        bitty_req: &str,
+        api_req: &str,
+    ) -> PluginRecord {
+        let package_root = store.join(format!("packages/{id}/1.0.0"));
+        std::fs::create_dir_all(package_root.join("lua")).expect("package dirs");
+        let body = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Compat Test\"\nversion = \"1.0.0\"\n\
+             description = \"compat re-check fixture\"\n\n[compat]\nbitty = \"{bitty_req}\"\n\
+             plugin-api = \"{api_req}\"\n\n[lazy]\ncommands = [\"{id}:summary\"]\nevents = []\n"
+        );
+        std::fs::write(package_root.join("bitty-plugin.toml"), &body).expect("manifest");
+        std::fs::write(package_root.join("lua/init.lua"), "return {}\n").expect("init");
+        let manifest = crate::plugin_runtime::manifest_toml::parse_manifest(body.as_bytes())
+            .expect("manifest parses");
+        PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: "1.0.0".to_string(),
+            root: format!("packages/{id}/1.0.0"),
+            manifest_hash: manifest.manifest_hash(),
+            content_digest: content_digest(&package_root).expect("digest"),
+            enabled: true,
+            granted: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn incompatible_store_record_fails_closed_without_vm() {
+        // CTX-0416: a crafted store record whose manifest no longer includes
+        // the running host must fail at resolve with a typed incompatible
+        // state, before any digest-driven VM work.
+        let base = std::env::temp_dir().join(format!(
+            "bitty-compat-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        let record = write_compat_package(&store, "xuepoo.stale", ">=9.9.9,<10.0.0", "^1.0");
+        write_index(&store, std::slice::from_ref(&record)).expect("write index");
+        let loaded = load_index(&store).expect("load index");
+        let error = resolve_record(&store, &loaded[0]).expect_err("stale compat must fail closed");
+        assert!(
+            matches!(
+                error,
+                crate::plugin_runtime::PluginRuntimeError::Incompatible { ref field, .. }
+                if field == "compat.bitty"
+            ),
+            "expected typed compat.bitty incompatible, got {error}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_with_hosts_simulates_upgrade() {
+        // Compatible with the running host, incompatible with an upgraded one.
+        let base = std::env::temp_dir().join(format!(
+            "bitty-compat-upgrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = base.join("store");
+        let record = write_compat_package(&store, "xuepoo.narrow", ">=0.0.1,<0.0.99", "^1.0");
+        write_index(&store, std::slice::from_ref(&record)).expect("write index");
+        let loaded = load_index(&store).expect("load index");
+        resolve_record(&store, &loaded[0]).expect("current host resolves");
+        let upgraded = resolve_record_with_hosts(&store, &loaded[0], "0.1.0", "1.0.0")
+            .expect_err("upgraded host must fail closed");
+        assert!(matches!(
+            upgraded,
+            crate::plugin_runtime::PluginRuntimeError::Incompatible { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

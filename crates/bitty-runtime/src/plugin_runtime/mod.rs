@@ -261,6 +261,23 @@ pub enum PluginRuntimeError {
         /// Bounded detail.
         detail: String,
     },
+    /// Declared compatibility does not include the running host (CTX-0416).
+    ///
+    /// Surfaced at `resolve_record` and at `activate` before any VM is
+    /// created, so an installed package whose range no longer includes the
+    /// host after an upgrade fails closed instead of activating. Bundled
+    /// packages skip this check: their `>=0.1` floor stays as written and the
+    /// `0.0.x` dev host keeps loading them (DIR-019 versioning).
+    Incompatible {
+        /// Plugin id.
+        plugin: String,
+        /// Field that failed (`compat.bitty` or `compat.plugin-api`).
+        field: String,
+        /// Declared range.
+        requested: String,
+        /// Host version evaluated.
+        host: String,
+    },
     /// Lifecycle state violation.
     Lifecycle {
         /// Plugin id.
@@ -297,6 +314,15 @@ impl std::fmt::Display for PluginRuntimeError {
             Self::Integrity { plugin, detail } => {
                 write!(f, "plugin '{plugin}' integrity failure: {detail}")
             }
+            Self::Incompatible {
+                plugin,
+                field,
+                requested,
+                host,
+            } => write!(
+                f,
+                "'{plugin}' declares {field} = '{requested}', which does not include host version {host}"
+            ),
             Self::Lifecycle { plugin, detail } => {
                 write!(f, "plugin '{plugin}' lifecycle error: {detail}")
             }
@@ -524,7 +550,7 @@ impl PluginRuntime {
     /// capture-validation, or VM failures. Failure leaves no partial
     /// activation.
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
-        let (manifest, module_root, init_path, recorded_grant) = {
+        let (manifest, module_root, init_path, recorded_grant, source_class) = {
             let entry = self
                 .entries
                 .get(id)
@@ -568,8 +594,24 @@ impl PluginRuntime {
                 entry.package.module_root.clone(),
                 init_path,
                 entry.package.granted.clone(),
+                entry.package.source_class,
             )
         };
+        // CTX-0416 host-upgrade re-check at activation: the closed compat
+        // grammar is evaluated against the running host before any policy or
+        // VM work. Bundled packages skip (their `>=0.1` floor stays and the
+        // `0.0.x` dev host keeps loading them per DIR-019); every other class
+        // fails closed with a typed incompatible state and no VM.
+        if !source_class.is_bundled() {
+            if let Err(error) = resolution::check_host_compat(
+                &manifest,
+                package::host_bitty_version(),
+                package::host_api_version(),
+            ) {
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        }
         let source = read_init(&init_path)?;
 
         // Policy half: declare, resolve, register, grant, activate. The grant

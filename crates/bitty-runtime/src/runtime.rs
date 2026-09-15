@@ -137,6 +137,7 @@ pub mod pty;
 pub mod resize;
 pub mod scrollbar;
 pub mod search;
+pub mod search_mode;
 pub mod selection;
 pub mod session;
 pub mod workspaces;
@@ -399,6 +400,15 @@ pub struct Runtime {
     /// CTX-0385 `SelectionKind` seams, yank to clipboard plus primary).
     /// Bounded `O(1)` state; see `runtime::copy_mode`.
     copy_mode: Option<crate::runtime::copy_mode::CopyModeState>,
+    /// Scrollback search overlay open flag (CTX-0383, issue #639).
+    ///
+    /// `false` in normal operation; `true` while the keyboard-first modal
+    /// search overlay owns keyboard input (no PTY bytes, query editing over
+    /// the bounded `search_state` seams, viewport reveal plus live-selection
+    /// sync via `search_apply_selection`). Bounded `O(1)` flag; the query
+    /// heap stays `<=256` bytes and matches `<=1000`. See
+    /// `runtime::search_mode`.
+    search_mode: bool,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -679,6 +689,7 @@ impl std::fmt::Debug for Runtime {
             .field("search_active", &self.search_state.is_active())
             .field("search_matches", &self.search_state.match_count())
             .field("search_current", &self.search_state.current_index())
+            .field("search_mode", &self.search_mode)
             .finish_non_exhaustive()
     }
 }
@@ -823,6 +834,7 @@ impl Runtime {
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            search_mode: false,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -969,6 +981,7 @@ impl Runtime {
             selection_anchor_press: None,
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
+            search_mode: false,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

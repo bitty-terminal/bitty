@@ -731,6 +731,51 @@ impl TerminalApp {
                     eprintln!("bitty: keymap enter_copy_mode -> {label}");
                 }
             }
+            A::OpenSearch => {
+                // CTX-0383 (issue #639): open the modal search overlay.
+                // Re-entering while open is a fail-closed no-op; the
+                // runtime owns the bounded query, viewport reveal, and
+                // live-selection sync over the CTX-0061 `SearchState` seams.
+                // `Esc` exits via the runtime key path.
+                self.runtime.enter_search_mode();
+                if let Some(label) = self.runtime.search_mode_label() {
+                    eprintln!("bitty: keymap open_search -> {label}");
+                }
+            }
+            A::SearchNext => {
+                // CTX-0383: advance to the next match with reveal. No-op
+                // when the overlay is closed or empty (fail-closed).
+                if self.runtime.is_search_mode() {
+                    self.runtime.search_goto_next();
+                    if let Some(label) = self.runtime.search_mode_label() {
+                        eprintln!("bitty: keymap search_next -> {label}");
+                    }
+                } else {
+                    eprintln!("warning: keymap search_next with no search open — ignoring");
+                }
+            }
+            A::SearchPrev => {
+                // CTX-0383: back to the previous match with reveal. No-op
+                // when the overlay is closed or empty (fail-closed).
+                if self.runtime.is_search_mode() {
+                    self.runtime.search_goto_prev();
+                    if let Some(label) = self.runtime.search_mode_label() {
+                        eprintln!("bitty: keymap search_prev -> {label}");
+                    }
+                } else {
+                    eprintln!("warning: keymap search_prev with no search open — ignoring");
+                }
+            }
+            A::CloseSearch => {
+                // CTX-0383: close the overlay and clear the search.
+                // Fail-closed no-op when already closed.
+                if self.runtime.is_search_mode() {
+                    self.runtime.exit_search_mode();
+                    eprintln!("bitty: keymap close_search -> closed");
+                } else {
+                    eprintln!("warning: keymap close_search with no search open — ignoring");
+                }
+            }
             A::PasteFromClipboard => {
                 // CTX-0161: explicit single-owner paste chord (ctrl+shift+v).
                 // Before this binding the chord fell through to the PTY as
@@ -1081,6 +1126,39 @@ impl TerminalApp {
                         }
                         match matched {
                             Some(CopyModeAction::EnterCopyMode) => {}
+                            Some(_) => {
+                                if let Some(win) = self.window.as_ref() {
+                                    win.request_redraw();
+                                }
+                                return true;
+                            }
+                            None => return false,
+                        }
+                    }
+                    // CTX-0383: search overlay is modal for chrome chords
+                    // too. `Esc` routes to the runtime so search exits there
+                    // (never the paste/close emergency path while modal);
+                    // the open/next/prev/close chords re-arm through the
+                    // normal dispatch below (each is fail-closed when the
+                    // overlay state disagrees); every other bound chord is
+                    // captured without running so focus, splits, zoom, and
+                    // paste never fire mid-search. Unbound keys (query
+                    // typing, Enter, Backspace, arrows) route to the runtime
+                    // search handler, which consumes them with no PTY bytes.
+                    if self.runtime.is_search_mode() {
+                        use bitty_config::{
+                            ChromeAction as SearchModeAction, KeyName as SearchModeKey,
+                        };
+                        if keyref.key == SearchModeKey::Escape {
+                            return false;
+                        }
+                        match matched {
+                            Some(
+                                SearchModeAction::OpenSearch
+                                | SearchModeAction::SearchNext
+                                | SearchModeAction::SearchPrev
+                                | SearchModeAction::CloseSearch,
+                            ) => {}
                             Some(_) => {
                                 if let Some(win) = self.window.as_ref() {
                                     win.request_redraw();

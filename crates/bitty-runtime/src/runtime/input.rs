@@ -194,6 +194,31 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(&event);
+        // CTX-0383: search overlay owns the keyboard while open (no PTY
+        // bytes, no snap-to-live, no selection clearing). Mirrors the
+        // CTX-0384 copy-mode arm; modals stay exclusive so only one fires.
+        if self.search_mode {
+            let pressed = Some(event.state == PressState::Pressed);
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+                return None;
+            }
+            self.inspect_ring.push_key(
+                &key_inspect_label(&event),
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+                pressed,
+            );
+            self.publish_inspect_snapshot();
+            let _ = self.handle_search_mode_key(&event);
+            return None;
+        }
         // CTX-0384: copy mode owns the keyboard while active (no PTY bytes,
         // no snap-to-live, no selection clearing). The inspect trace stays
         // bounded-observable; every other path returns here.
@@ -296,6 +321,29 @@ impl Runtime {
             )
         );
         self.track_modifiers_from_key(event);
+        // CTX-0383: search overlay owns the keyboard while open (see owned path).
+        if self.search_mode {
+            let pressed = Some(event.state == PressState::Pressed);
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+                return None;
+            }
+            self.inspect_ring.push_key(
+                &key_inspect_label(event),
+                self.shift_pressed,
+                self.control_pressed,
+                self.alt_pressed,
+                pressed,
+            );
+            self.publish_inspect_snapshot();
+            let _ = self.handle_search_mode_key(event);
+            return None;
+        }
         // CTX-0384: copy mode owns the keyboard while active (see owned path).
         if self.copy_mode.is_some() {
             let pressed = Some(event.state == PressState::Pressed);
@@ -586,7 +634,9 @@ impl Runtime {
         // keyboard cursor owns the highlight). The inspect trace above stays;
         // every selection, drag, capture, and paste path below is suppressed
         // so no PTY bytes and no highlight mutation occur while modal.
-        if self.copy_mode.is_some() {
+        // CTX-0383: the search overlay consumes mouse selection the same
+        // way (the search highlight owns the selection path).
+        if self.copy_mode.is_some() || self.search_mode {
             return;
         }
         // Shift override always forces selection path.
@@ -918,7 +968,10 @@ impl Runtime {
                 // CTX-0384: copy mode never forwards wheel SGR to the PTY
                 // (modal, no PTY input); the viewport-scroll path below stays
                 // so history remains keyboard/wheel navigable.
+                // CTX-0383: the search overlay behaves the same (modal, no
+                // PTY input; wheel still scrolls the viewport).
                 let capture_scroll = self.copy_mode.is_none()
+                    && !self.search_mode
                     && !self.shift_pressed
                     && self.state.modes().mouse_tracking.is_some()
                     && self.state.modes().mouse_coordinate_encoding

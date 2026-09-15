@@ -35,6 +35,7 @@ fn minimal_manifest(id: &str, events: Vec<&str>) -> bitty_plugin_host::PluginMan
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: CapabilityRequests::default(),
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: Vec::new(),
             events: events.into_iter().map(|s| s.to_string()).collect(),

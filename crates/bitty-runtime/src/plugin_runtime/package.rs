@@ -1173,4 +1173,89 @@ mod tests {
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&scratch);
     }
+
+    fn write_git_plugin(root: &Path, id: &str, version: &str) -> PathBuf {
+        let package = root.join("git-plugin");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        let manifest = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Git Fixture\"\nversion = \"{version}\"\n\
+             description = \"git-panel shape\"\n\n[compat]\nbitty = \">=0.0.1,<1.0\"\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\npanel.provider = true\n\"process.spawn:git\" = true\n\n\
+             [[capabilities.filesystem]]\naccess = \"read\"\npaths = [\"~/projects/**\"]\n\n\
+             [tools.git]\nrequired = true\nversion = \">=2.30\"\n\n\
+             [lazy]\ncommands = [\"{id}:open\"]\nevents = []\n"
+        );
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("manifest");
+        std::fs::write(
+            package.join("lua").join("init.lua"),
+            "bitty.commands.register({ id = \"".to_string()
+                + id
+                + ":open\", run = function() return \"hi\" end })\n",
+        )
+        .expect("init");
+        package
+    }
+
+    #[test]
+    fn install_git_panel_shape_succeeds_fail_closed_before() {
+        // The three CTX-0400 exit-4 layers (quoted param keys,
+        // `[[capabilities.filesystem]]`, `[tools.git]`) must now install.
+        let scratch = scratch("git-tools");
+        let store = scratch.join("store");
+        let source = write_git_plugin(&scratch, "xuepoo.gitpanel", "0.1.0");
+        let report = install(&store, &source);
+        assert_eq!(report.plugin_id, "xuepoo.gitpanel");
+        assert!(report.granted.contains(&"process.spawn:git".to_string()));
+        assert!(report.granted.contains(&"panel.provider".to_string()));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn install_unknown_tools_section_fails_closed() {
+        let scratch = scratch("unknown-tool");
+        let store = scratch.join("store");
+        let package = scratch.join("evil-plugin");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        let manifest = "[plugin]\nid = \"xuepoo.evil\"\nname = \"E\"\nversion = \"0.1.0\"\n\
+             description = \"evil\"\n\n[capabilities]\n\"process.spawn:rg\" = true\n\n\
+             [tools.rg]\nrequired = true\nversion = \">=13\"\n";
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("manifest");
+        std::fs::write(package.join("lua").join("init.lua"), "return {}\n").expect("init");
+        let error = install_local_dir(
+            &store,
+            &package,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("unknown [tools.rg] must fail closed");
+        assert!(
+            matches!(error, PackageOpError::Manifest { .. }),
+            "expected manifest denial, got: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn install_spawn_without_tool_fails_closed() {
+        let scratch = scratch("spawn-no-tool");
+        let store = scratch.join("store");
+        let package = scratch.join("notool-plugin");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        let manifest = "[plugin]\nid = \"xuepoo.notool\"\nname = \"N\"\nversion = \"0.1.0\"\n\
+             description = \"no tool\"\n\n[capabilities]\n\"process.spawn:git\" = true\n";
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("manifest");
+        std::fs::write(package.join("lua").join("init.lua"), "return {}\n").expect("init");
+        let error = install_local_dir(
+            &store,
+            &package,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("spawn without [tools.git] must fail closed");
+        assert!(matches!(error, PackageOpError::Manifest { .. }));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }

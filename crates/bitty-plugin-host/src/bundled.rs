@@ -46,7 +46,7 @@
 use crate::capability::CapabilityId;
 use crate::manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-    PluginIdentity, PluginManifest, QualifiedName,
+    PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
 };
 
 /// Canonical version for the eight `v1` bundled plugins (SemVer 2).
@@ -94,6 +94,7 @@ pub fn shell_integration_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: Vec::new(),
             events: vec![
@@ -246,6 +247,7 @@ pub fn workspace_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
     }
@@ -279,6 +281,7 @@ pub fn tabs_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: workspace_lazy_triggers(),
         raw_bytes_len: 512,
     }
@@ -310,6 +313,7 @@ pub fn project_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.project:open").expect("qualified"),
@@ -358,6 +362,7 @@ pub fn file_manager_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.file-manager:open").expect("qualified"),
@@ -415,6 +420,11 @@ pub fn git_panel_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: vec![ToolDeclaration {
+            tool: "git".to_string(),
+            required: true,
+            version_req: ">=2.30".to_string(),
+        }],
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.git-panel:open").expect("qualified"),
@@ -475,6 +485,7 @@ pub fn browser_panel_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.browser-panel:open").expect("qualified"),
@@ -544,6 +555,7 @@ pub fn ai_panel_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.ai-panel:open").expect("qualified"),
@@ -620,6 +632,7 @@ pub fn mail_panel_manifest() -> PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![
                 QualifiedName::new("bitty-terminal.mail-panel:open").expect("qualified"),

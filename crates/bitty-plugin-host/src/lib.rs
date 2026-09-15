@@ -124,6 +124,7 @@ pub mod host;
 pub mod install;
 pub mod manifest;
 pub mod registry;
+pub mod tools;
 
 pub use capability::{
     CapabilityFamily, CapabilityId, effect_statement, validate_closed_capability,
@@ -144,7 +145,12 @@ pub use install::{DoctorIssue, InstallInputs, is_staging_allowed, verify_install
 pub use manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, MANIFEST_MAX_BYTES,
     MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,
-    MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, PluginId, PluginIdentity, PluginManifest,
-    QualifiedName,
+    MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, MAX_TOOLS, PluginId, PluginIdentity,
+    PluginManifest, QualifiedName, ToolDeclaration,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
+pub use tools::{
+    ACCEPTED_TOOL_GIT, GIT_ALLOWED_SUBCOMMANDS, MAX_GIT_ARG_BYTES, MAX_GIT_ARGS,
+    MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool, is_allowed_git_args,
+    is_tool_spawn_allowed, is_valid_tool_name,
+};

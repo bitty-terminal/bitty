@@ -354,17 +354,13 @@ fn print_run_partial_frame_places_exact_cells() {
     let mut grid = renderer();
     let list = grid.render(&snapshot, &damage).unwrap();
     assert_eq!(list.plan.mode, FrameMode::Partial);
-    assert_eq!(list.fills.len(), 2);
+    // The two adjacent same-color cells merge into one background run.
+    assert_eq!(list.fills.len(), 1);
     assert_eq!(list.glyphs.len(), 2);
 
-    // Background fills sit exactly on the two damaged cells.
     assert_eq!(
         list.fills[0].rect,
-        crate::geometry::RectPx::new(0, 0, 8, 16)
-    );
-    assert_eq!(
-        list.fills[1].rect,
-        crate::geometry::RectPx::new(8, 0, 8, 16)
+        crate::geometry::RectPx::new(0, 0, 16, 16)
     );
     assert_eq!(list.fills[0].color, DEFAULT_BG);
 
@@ -380,9 +376,99 @@ fn print_run_partial_frame_places_exact_cells() {
     let counters = grid.counters();
     assert_eq!(counters.cells_examined, 2);
     assert_eq!(counters.cells_drawn, 2);
-    assert_eq!(counters.background_fills, 2);
+    assert_eq!(counters.background_fills, 1);
     assert_eq!(counters.glyphs_emitted, 2);
     assert_eq!(counters.spacer_cells_skipped, 0);
+}
+
+#[test]
+fn adjacent_same_background_cells_merge_into_row_runs() {
+    // A full 80x24 default-background frame must emit one background
+    // rectangle per row (24), not one per cell (1920).
+    let state = state_from(&[print('a'), print('b')]);
+    let mut grid = renderer();
+    let list = grid
+        .render(&state.snapshot(), &full_damage(&state))
+        .unwrap();
+
+    assert_eq!(list.fills.len(), state.height());
+    for (row, fill) in list.fills.iter().enumerate() {
+        assert_eq!(
+            fill.rect,
+            crate::geometry::RectPx::new(0, i32::try_from(row * 16).unwrap(), 640, 16)
+        );
+        assert_eq!(fill.color, DEFAULT_BG);
+    }
+    let counters = grid.counters();
+    assert_eq!(
+        counters.background_fills,
+        u64::try_from(state.height()).unwrap()
+    );
+    assert_eq!(
+        counters.cells_examined,
+        u64::try_from(state.width() * state.height()).unwrap()
+    );
+}
+
+#[test]
+fn distinct_backgrounds_split_runs_without_bridging() {
+    // Row 0 carries three runs (default, indexed red, default); every other
+    // row stays one default run: 3 + 23 = 26 fills.
+    let state = state_from(&[
+        print('a'),
+        sgr(&[AttributeChange::Background(Color::Indexed(1))]),
+        print('b'),
+        sgr(&[AttributeChange::Background(Color::Default)]),
+        print('c'),
+    ]);
+    let mut grid = renderer();
+    let list = grid
+        .render(&state.snapshot(), &full_damage(&state))
+        .unwrap();
+
+    let row0: Vec<_> = list.fills.iter().filter(|fill| fill.rect.y == 0).collect();
+    assert_eq!(row0.len(), 3);
+    assert_eq!(row0[0].rect, crate::geometry::RectPx::new(0, 0, 8, 16));
+    assert_eq!(row0[1].rect, crate::geometry::RectPx::new(8, 0, 8, 16));
+    // The reset background merges from column 2 to the row end.
+    assert_eq!(row0[2].rect, crate::geometry::RectPx::new(16, 0, 624, 16));
+    assert_eq!(
+        row0[1].color,
+        resolve_color(Some(&Color::Indexed(1)), DEFAULT_BG)
+    );
+    assert_eq!(list.fills.len(), 3 + state.height() - 1);
+}
+
+#[test]
+fn disjoint_dirty_regions_do_not_bridge_background_runs() {
+    // Column 1 is unvisited: the two visited columns share a background but
+    // must stay two rectangles (a merged span would paint the gap).
+    let state = state_from(&[print('a'), print('b'), print('c')]);
+    let snapshot = state.snapshot();
+    let damage = Damage {
+        generation: snapshot.generation,
+        regions: Box::new([
+            DamagedRegion::Grid(DamageRect {
+                top: 0,
+                left: 0,
+                bottom: 0,
+                right: 0,
+            }),
+            DamagedRegion::Grid(DamageRect {
+                top: 0,
+                left: 2,
+                bottom: 0,
+                right: 2,
+            }),
+        ]),
+    };
+    let mut grid = renderer();
+    let list = grid.render(&snapshot, &damage).unwrap();
+
+    let row0: Vec<_> = list.fills.iter().filter(|fill| fill.rect.y == 0).collect();
+    assert_eq!(row0.len(), 2);
+    assert_eq!(row0[0].rect, crate::geometry::RectPx::new(0, 0, 8, 16));
+    assert_eq!(row0[1].rect, crate::geometry::RectPx::new(16, 0, 8, 16));
 }
 
 #[test]
@@ -393,15 +479,12 @@ fn wide_char_paints_two_columns_but_emits_one_glyph() {
     let mut grid = renderer();
     let list = grid.render(&state.snapshot(), &damage).unwrap();
 
-    // Both halves get a background fill; the leading half spans two columns.
-    assert_eq!(list.fills.len(), 2);
+    // Both halves get a background run; the spacer's half merges into the
+    // leading half's two-column rectangle.
+    assert_eq!(list.fills.len(), 1);
     assert_eq!(
         list.fills[0].rect,
         crate::geometry::RectPx::new(0, 0, 16, 16)
-    );
-    assert_eq!(
-        list.fills[1].rect,
-        crate::geometry::RectPx::new(8, 0, 8, 16)
     );
     // Exactly one glyph: the trailing half never rasterizes.
     assert_eq!(list.glyphs.len(), 1);
@@ -423,9 +506,15 @@ fn blanks_emit_background_only() {
         .render(&state.snapshot(), &full_damage(&state))
         .unwrap();
 
-    // Exactly one glyph on the whole screen; everything else is background.
+    // Exactly one glyph on the whole screen; everything else is background,
+    // merged into one full-width run per row.
     assert_eq!(list.glyphs.len(), 1);
-    assert_eq!(list.fills.len(), state.width() * state.height());
+    assert_eq!(list.fills.len(), state.height());
+    for fill in &list.fills {
+        assert_eq!(fill.color, DEFAULT_BG);
+        assert_eq!(fill.rect.width, u32::try_from(state.width()).unwrap() * 8);
+        assert_eq!(fill.rect.height, 16);
+    }
     let counters = grid.counters();
     assert_eq!(counters.blank_cells_skipped, 80 * 24 - 1);
     assert_eq!(counters.cells_examined, 80 * 24);
@@ -757,12 +846,13 @@ fn wide_uncovered_scalar_tofu_spans_both_columns() {
     let mut grid = GridRenderer::new(fake, &font_query(), cell_metrics()).unwrap();
 
     let list = grid.render(&state.snapshot(), &damage).unwrap();
-    // Leading background + spacer background + four outline edges.
-    assert_eq!(list.fills.len(), 6);
+    // Leading background (with the spacer half merged in) + four outline
+    // edges; the spacer adds no separate background rectangle.
+    assert_eq!(list.fills.len(), 5);
     assert_eq!(grid.counters().missing_glyphs, 1);
     assert_eq!(grid.counters().spacer_cells_skipped, 1);
-    // Fill order per visited cell: leading background, leading tofu edges,
-    // then the spacer background. The tofu edges are fills 1..=4.
+    // Fill order per visited cell: leading background run, then the tofu
+    // edges as fills 1..=4.
     let edges: Vec<_> = list.fills[1..5].iter().map(|fill| fill.rect).collect();
     assert!(
         edges
@@ -896,7 +986,7 @@ fn scrolled_blanks_after_sgr_reset_stay_themed() {
     let snapshot = state.snapshot();
     let mut grid = renderer();
     let list = grid.render(&snapshot, &full_damage(&state)).unwrap();
-    assert_eq!(list.fills.len(), snapshot.width * snapshot.height);
+    assert_eq!(list.fills.len(), snapshot.height);
     for fill in &list.fills {
         assert_eq!(
             fill.color, DEFAULT_BG,

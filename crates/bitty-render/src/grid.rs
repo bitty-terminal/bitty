@@ -10,8 +10,9 @@
 //!    damage-driven partial-redraw semantics of the terminal-state-rfc
 //!    damage model.
 //! 2. **Place**: every cell covered by a planned dirty rectangle is
-//!    examined. Background fills and text decorations become
-//!    [`FillRect`]s; printable characters become [`GlyphInstance`]s.
+//!    examined. Backgrounds merge into maximal horizontal same-color runs
+//!    per row (CTX-0471) and, with text decorations, become [`FillRect`]s;
+//!    printable characters become [`GlyphInstance`]s.
 //!    Trailing halves of wide characters (`spacer` cells) are skipped — the
 //!    leading half already paints across both columns. Invisible cells
 //!    suppress their glyph but keep their background.
@@ -34,9 +35,11 @@
 //! # Damage semantics
 //!
 //! Every visited cell repaints its full background (resolved, including the
-//! default background), so drawing the union of incremental frames equals a
-//! full redraw of the same final state — over-damage stays safe and
-//! under-damage is impossible, mirroring the state layer's contract.
+//! default background; adjacent same-color cells merge into one horizontal
+//! rectangle, which leaves coverage unchanged), so drawing the union of
+//! incremental frames equals a full redraw of the same final state —
+//! over-damage stays safe and under-damage is impossible, mirroring the
+//! state layer's contract.
 //! Scrollback damage ranges concern lines above the visible grid; they add
 //! no pixels on this surface (the active screen) and contribute no regions.
 //! Stale or oversized damage cannot under-damage either: planning clips
@@ -808,6 +811,64 @@ pub struct FillRect {
     pub color: Rgba8,
 }
 
+/// Rolling horizontal run of same-colored background fills in one row of
+/// one dirty rectangle (CTX-0471).
+///
+/// A visited cell's background merges into the open run when its color and
+/// vertical geometry match and its left edge is not past the run's right
+/// edge (adjacent columns, plus the wide-cell/spacer overlap). The run's
+/// first rectangle is extended in place; decorations and tofu edges emitted
+/// in between stay later in the list, so they keep drawing on top exactly
+/// as the unmerged per-cell ordering did.
+#[derive(Debug, Default)]
+struct BackgroundRun {
+    /// Index of the run's rectangle in [`DrawList::fills`].
+    fill_index: usize,
+    /// Right edge (exclusive) covered by the run so far, in pixels.
+    x_end: i32,
+    /// Run top edge in pixels.
+    y: i32,
+    /// Run height in pixels.
+    height: u32,
+    /// Run color (all merged cells must share it).
+    color: Rgba8,
+    /// Whether a run is currently open for this row.
+    open: bool,
+}
+
+impl BackgroundRun {
+    /// Merges `fill` into the open run, or starts a new run. Returns `true`
+    /// when a new fill was appended to `fills`.
+    fn merge(&mut self, fills: &mut Vec<FillRect>, fill: FillRect) -> bool {
+        let FillRect { rect, color } = fill;
+        if self.open
+            && self.color == color
+            && self.y == rect.y
+            && self.height == rect.height
+            && rect.x <= self.x_end
+        {
+            let right = self
+                .x_end
+                .max(rect.x.saturating_add(saturating_i32(u64::from(rect.width))));
+            if let Some(run) = fills.get_mut(self.fill_index) {
+                run.rect.width = saturating_u32(
+                    u64::try_from(right.saturating_sub(run.rect.x)).unwrap_or(u64::MAX),
+                );
+            }
+            self.x_end = right;
+            return false;
+        }
+        self.fill_index = fills.len();
+        self.x_end = rect.x.saturating_add(saturating_i32(u64::from(rect.width)));
+        self.y = rect.y;
+        self.height = rect.height;
+        self.color = color;
+        self.open = true;
+        fills.push(FillRect { rect, color });
+        true
+    }
+}
+
 /// Signed distance from `(px, py)` to a rounded box centered at the origin
 /// with half extents `(half_w, half_h)` and corner radius `r` (negative
 /// inside, positive outside). Shared by the software compositor and the
@@ -1155,7 +1216,10 @@ pub struct RenderCounters {
     pub missing_glyphs: u64,
     /// Cells whose glyph was suppressed by the invisible attribute.
     pub invisible_cells_skipped: u64,
-    /// Background rectangles emitted (exactly one per visited cell).
+    /// Background rectangles emitted after horizontal run merging: adjacent
+    /// visited cells with identical background color and vertical geometry
+    /// share one rectangle (CTX-0471), so this tracks color changes rather
+    /// than visited cells.
     pub background_fills: u64,
     /// Decoration rectangles emitted (underline/strikethrough bars).
     pub decorations_emitted: u64,
@@ -1627,10 +1691,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     ///
     /// Deterministic: identical `(snapshot, damage, font, insertion order)`
     /// inputs yield identical [`DrawList`] values — ordering follows the
-    /// plan's dirty rectangles then row-major cell scan, floats come only
-    /// from integer slot divisions, and no timing or randomness
-    /// participates. Errors mean the frame failed outright; partial frames
-    /// are never returned.
+    /// plan's dirty rectangles then row-major cell scan, background runs
+    /// merge only within one dirty-rectangle row, floats come only from
+    /// integer slot divisions, and no timing or randomness participates.
+    /// Errors mean the frame failed outright; partial frames are never
+    /// returned.
     ///
     /// # Errors
     ///
@@ -1676,6 +1741,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             let col_range = pixel_span_to_cells(dirty.x, dirty.width, self.cell.width);
             let row_range = pixel_span_to_cells(dirty.y, dirty.height, self.cell.height);
             for row in row_range {
+                // Background runs restart per dirty-rectangle row: a merged
+                // span must never bridge columns the plan did not visit.
+                let mut background_run = BackgroundRun::default();
                 for col in col_range.clone() {
                     let Some(term_cell) = snapshot.cells.get(row * cols + col) else {
                         // Defensive against malformed snapshots; skipping a
@@ -1683,7 +1751,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                         // that cannot exist, never corrupt real cells.
                         continue;
                     };
-                    self.place_cell(term_cell, row, col, cols, &mut list);
+                    self.place_cell(term_cell, row, col, cols, &mut list, &mut background_run);
                 }
             }
         }
@@ -1691,7 +1759,8 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     }
 
     /// Emits background, decorations, and (unless suppressed) one glyph for
-    /// a single visited cell.
+    /// a single visited cell. The cell's background merges into the row's
+    /// open same-color run (CTX-0471) instead of emitting a quad per cell.
     fn place_cell(
         &mut self,
         term_cell: &bitty_term_state::Cell,
@@ -1699,6 +1768,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         col: usize,
         grid_width: usize,
         list: &mut DrawList,
+        background_run: &mut BackgroundRun,
     ) {
         self.counters.cells_examined += 1;
 
@@ -1722,8 +1792,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         };
 
         // Every visited cell repaints its background: the union of
-        // incremental frames equals a full redraw (module docs).
-        list.fills.push(FillRect {
+        // incremental frames equals a full redraw (module docs). Adjacent
+        // same-color cells extend one rectangle so the quad count follows
+        // color changes, not cell count (CTX-0471).
+        let background = FillRect {
             rect: RectPx::new(
                 saturating_i32(left),
                 saturating_i32(top),
@@ -1735,8 +1807,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 self.cell.height,
             ),
             color: bg,
-        });
-        self.counters.background_fills += 1;
+        };
+        if background_run.merge(&mut list.fills, background) {
+            self.counters.background_fills += 1;
+        }
 
         if term_cell.spacer {
             self.counters.spacer_cells_skipped += 1;

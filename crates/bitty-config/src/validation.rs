@@ -291,6 +291,24 @@ mod tests {
     }
 
     #[test]
+    fn collect_diagnostics_reports_a_nul_shell() {
+        // CTX-0478: the precise NUL classification must surface through the
+        // diagnostic batch, not only through `ConfigPlan::validate`.
+        let plan = ConfigPlan {
+            terminal: Some(crate::types::TerminalConfig {
+                shell: Some("/bin/z\0sh".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let diags = collect_diagnostics(&plan);
+        assert!(
+            diags.iter().any(|e| e.to_string().contains("NUL")),
+            "NUL shell must appear in diagnostics: {diags:?}"
+        );
+    }
+
+    #[test]
     fn empty_stack_valid() {
         validate_stack(&[]).expect("empty stack valid");
     }

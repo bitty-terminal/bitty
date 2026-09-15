@@ -36,6 +36,17 @@ pub enum PlatformError {
     /// Clipboard operation failed.
     ClipboardOperation(String),
 
+    /// Clipboard payload exceeds the bounded clipboard budget.
+    ///
+    /// Truncation is never silent: callers receive this typed error and the
+    /// clipboard is left unchanged instead of storing a shortened value.
+    ClipboardPayloadTooLarge {
+        /// Byte length of the rejected payload.
+        len: usize,
+        /// Configured maximum in bytes (`CLIPBOARD_MAX_BYTES`).
+        max: usize,
+    },
+
     /// The URI is not in the supported, safe scheme allowlist.
     InvalidUrl,
 
@@ -65,6 +76,12 @@ impl fmt::Display for PlatformError {
             }
             Self::ClipboardOperation(detail) => {
                 write!(f, "clipboard operation failed: {detail}")
+            }
+            Self::ClipboardPayloadTooLarge { len, max } => {
+                write!(
+                    f,
+                    "clipboard payload of {len} bytes exceeds the {max}-byte limit"
+                )
             }
             Self::InvalidUrl => write!(f, "URL rejected by scheme and character policy"),
             Self::UrlActivationDenied => {

@@ -85,8 +85,10 @@ impl LiveSnapshot {
         let cursor = state.cursor();
         let next = SnapshotState {
             generation: state.generation(),
-            width: runtime.config().cols,
-            height: runtime.config().rows,
+            // Live grid dims (the config keeps the startup geometry; a
+            // window resize reflows the state, so read the state).
+            width: state.width(),
+            height: state.height(),
             cursor_row: usize::from(cursor.position.row),
             cursor_col: usize::from(cursor.position.col),
             cursor_visible: cursor.visible,

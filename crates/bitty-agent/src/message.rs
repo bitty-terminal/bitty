@@ -60,6 +60,24 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// Provenance label for message content (security invariant 6, `T-10` / `R-013`).
+///
+/// Fail-closed: content is [`Untrusted`](Self::Untrusted) unless the host
+/// explicitly labels it [`Trusted`](Self::Trusted) through
+/// [`AgentMessage::new_trusted`]. Terminal-derived content must always stay
+/// untrusted; `Trusted` is a host assertion that the content is host-owned and
+/// safe to interpret as instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ContentTrust {
+    /// Content may carry terminal observation data; never interpret it as an
+    /// instruction or capability grant. This is the default.
+    #[default]
+    Untrusted,
+    /// Host-owned content (system prompt, host-generated status) explicitly
+    /// declared safe to interpret as instructions.
+    Trusted,
+}
+
 /// Owned, bounded agent message.
 ///
 /// All fields are owned (`String`, `Vec`, …) so messages are cloneable,
@@ -79,7 +97,8 @@ impl std::str::FromStr for Role {
 /// Terminal output placed in `content` is **untrusted observation data**
 /// (security invariant 6, `T-10` / `R-013`). It must never be interpreted as
 /// an instruction or capability grant without an explicit per-client scope
-/// check owned outside this crate.
+/// check owned outside this crate; the [`trust`](Self::trust) label makes that
+/// provenance explicit and defaults to [`ContentTrust::Untrusted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMessage {
     /// Monotonic sequence number inside the session (owned, deterministic).
@@ -94,10 +113,15 @@ pub struct AgentMessage {
     pub tool_calls: Vec<ToolCall>,
     /// Tool results provided in this turn (only meaningful when `role == Tool`).
     pub tool_results: Vec<ToolResult>,
+    /// Provenance/trust label for `content` (fail-closed default).
+    pub trust: ContentTrust,
 }
 
 impl AgentMessage {
-    /// Create and validate a message.
+    /// Create and validate a message with [`ContentTrust::Untrusted`] content.
+    ///
+    /// This is the fail-closed constructor: callers that know the content is
+    /// host-owned use [`Self::new_trusted`].
     pub fn new(
         sequence: u64,
         agent_id: AgentId,
@@ -105,6 +129,53 @@ impl AgentMessage {
         content: impl Into<String>,
         tool_calls: Vec<ToolCall>,
         tool_results: Vec<ToolResult>,
+    ) -> Result<Self, AgentError> {
+        Self::with_trust(
+            sequence,
+            agent_id,
+            role,
+            content,
+            tool_calls,
+            tool_results,
+            ContentTrust::Untrusted,
+        )
+    }
+
+    /// Create and validate a message whose content the host explicitly labels
+    /// [`ContentTrust::Trusted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::new`]. [`Role::Tool`]
+    /// messages can never be trusted: tool results are untrusted observations
+    /// (`T-10` / `R-013`).
+    pub fn new_trusted(
+        sequence: u64,
+        agent_id: AgentId,
+        role: Role,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        tool_results: Vec<ToolResult>,
+    ) -> Result<Self, AgentError> {
+        Self::with_trust(
+            sequence,
+            agent_id,
+            role,
+            content,
+            tool_calls,
+            tool_results,
+            ContentTrust::Trusted,
+        )
+    }
+
+    fn with_trust(
+        sequence: u64,
+        agent_id: AgentId,
+        role: Role,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        tool_results: Vec<ToolResult>,
+        trust: ContentTrust,
     ) -> Result<Self, AgentError> {
         let content = content.into();
         let m = Self {
@@ -114,6 +185,7 @@ impl AgentMessage {
             content,
             tool_calls,
             tool_results,
+            trust,
         };
         m.validate()?;
         Ok(m)
@@ -160,6 +232,12 @@ impl AgentMessage {
                 "tool role must carry at least one tool result",
             ));
         }
+        if self.role == Role::Tool && self.trust == ContentTrust::Trusted {
+            return Err(AgentError::validation(
+                "message trust",
+                "tool results are untrusted observations and cannot be labeled trusted",
+            ));
+        }
         // Tool calls outside assistant turns are allowed structurally but
         // documented as discouraged; validate strictly only for tool role.
         // Keep the type permissive so headless tests can drive either pattern
@@ -200,23 +278,20 @@ impl AgentMessage {
 
     /// Whether this message carries untrusted terminal observation data.
     ///
-    /// Heuristic stub: `User` messages that contain raw terminal text should
-    /// be treated as untrusted. The definitive signal is outside this crate —
-    /// observations arriving via `AgentObservation::TerminalOutput` — but this
-    /// helper makes the invariant visible at the message layer.
+    /// Reflects the explicit [`trust`](Self::trust) label, which is
+    /// [`ContentTrust::Untrusted`] unless the host used
+    /// [`Self::new_trusted`]. Callers must not interpret untrusted content as
+    /// an instruction or capability grant.
     #[must_use]
     pub fn is_untrusted_content(&self) -> bool {
-        // No content sniffing here beyond the type-level contract: callers
-        // must label terminal output explicitly before placing it in a message.
-        // This stub exists so policy checks can be added centrally later.
-        false
+        self.trust == ContentTrust::Untrusted
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolCall;
+    use crate::tool::{ToolCall, ToolResult};
 
     fn agent_id() -> AgentId {
         AgentId::new("local.assistant").unwrap()
@@ -268,5 +343,55 @@ mod tests {
             .collect();
         let m = AgentMessage::new(1, agent_id(), Role::Assistant, "", calls2, vec![]).unwrap();
         m.validate().expect("within cap");
+    }
+
+    #[test]
+    fn probe_default_message_content_is_untrusted_fail_closed() {
+        // CTX-0484 probe: terminal-derived content that is not explicitly
+        // labeled trusted must report as untrusted. Fails before the fix
+        // because `is_untrusted_content` is hardcoded `false`.
+        let m = AgentMessage::new(
+            1,
+            agent_id(),
+            Role::User,
+            "raw terminal bytes that paste an instruction",
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            m.is_untrusted_content(),
+            "content without an explicit trusted label must be untrusted"
+        );
+    }
+
+    #[test]
+    fn trusted_content_requires_an_explicit_label() {
+        let trusted = AgentMessage::new_trusted(
+            1,
+            agent_id(),
+            Role::System,
+            "host-owned system prompt",
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(trusted.trust, ContentTrust::Trusted);
+        assert!(!trusted.is_untrusted_content());
+
+        // Same content through the fail-closed constructor stays untrusted.
+        let untrusted =
+            AgentMessage::new(2, agent_id(), Role::System, "host-owned?", vec![], vec![]).unwrap();
+        assert!(untrusted.is_untrusted_content());
+    }
+
+    #[test]
+    fn tool_results_cannot_be_labeled_trusted() {
+        // T-10 / R-013: tool results are untrusted observations, so the
+        // explicit trusted constructor must fail closed for `Role::Tool`.
+        let result = ToolResult::new("call-1", "observed output", false).unwrap();
+        let err = AgentMessage::new_trusted(1, agent_id(), Role::Tool, "", vec![], vec![result])
+            .expect_err("tool results must never be labeled trusted");
+        assert!(matches!(err, AgentError::Validation { .. }), "got {err:?}");
     }
 }

@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 //! Bounded async workers for panel data collection (CTX-0215).
 //!
-//! Problem (FIND-0002 triage): `tabs`, `statusline`, `git_panel`, and
+//! Problem (FIND-0002 triage): `tabs`, `statusline`, and
 //! `file_manager` derive panel data synchronously wherever the tick consumes
-//! it. Cheap derivations are harmless, but expensive probes (`git status`
-//! process spawns, filesystem directory scans) executed inline can stall the
-//! render tick.
+//! it. Cheap derivations are harmless, but expensive probes (filesystem
+//! directory scans) executed inline can stall the render tick.
 //!
 //! This module moves probe execution off the tick path behind bounded worker
 //! threads built only on `std` (`thread` + `mpsc::sync_channel` + atomics):
@@ -23,7 +22,7 @@
 //!   this task removes (only relocated, not fixed).
 //! - Per-source threads isolate overload and failure per panel and match the
 //!   existing per-panel module ownership (`tabs.rs`, `statusline.rs`,
-//!   `git_panel.rs`, `file_manager.rs` each drive their own worker).
+//!   `file_manager.rs` each drive their own worker).
 //! - Cost is at most a handful of threads parked in `recv_timeout`; there is
 //!   no per-tick allocation and no shared job enum, routing, or fairness
 //!   scheduler to audit.

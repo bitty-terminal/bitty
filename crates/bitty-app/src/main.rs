@@ -37,9 +37,10 @@
 //!    builds a headless software surface (`Surface::headless`) and the
 //!    deterministic `GridRenderer` — no display server, window, adapter, or
 //!    font file is contacted.
-//! 4. **Build layout** via [`build_layout`] from the parsed [`crate::cli::Args`] (default
-//!    single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
-//!    `--layout` spec). The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
+//! 4. **Build layout** via [`layout_cmd::try_build_layout`] from the parsed [`crate::cli::Args`]
+//!    (default single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
+//!    `--layout` spec); invalid values fail closed (exit 2) instead of
+//!    silently normalizing. The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
 //!    via `bitty-ui` types re-exported through `bitty-runtime` and calls
 //!    [`Runtime::set_layout`](bitty_runtime::Runtime::set_layout). No plugin
 //!    coupling is involved; the layout is derived purely from argv (config
@@ -298,6 +299,14 @@ fn main() {
         std::process::exit(2);
     }
 
+    // CTX-0480: invalid `--split-ratio` / `--split` / `--log-level` /
+    // `--layout` / `--focus` values fail closed (exit 2), never
+    // warn-ignored to exit 0.
+    if let Some(err) = args.cli_value_error.as_deref() {
+        eprintln!("bitty: {err}\n{}", help_text());
+        std::process::exit(2);
+    }
+
     // `bitty run -- COMMAND...` explicit child launch (CTX-0170, local
     // class). Dispatched before config load and GUI startup: no instance,
     // no IPC, no plugin VM. Exit code is the child's (passthrough);
@@ -501,7 +510,14 @@ fn main() {
     if !session_restored {
         let cols = runtime.config().cols;
         let rows = runtime.config().rows;
-        let layout = build_layout(&args, cols, rows);
+        // CTX-0480: invalid `--layout` / non-finite ratio fails closed.
+        let layout = match layout_cmd::try_build_layout(&args, cols, rows) {
+            Ok(node) => node,
+            Err(msg) => {
+                eprintln!("bitty: {msg}\n{}", help_text());
+                std::process::exit(2);
+            }
+        };
         let leaf_ids = layout.leaf_ids();
         let focused_before = runtime.focused_view();
         runtime.set_layout(layout);
@@ -514,6 +530,16 @@ fn main() {
             runtime.container()
         );
         if let Some(focus_spec) = args.focus.as_deref() {
+            // CTX-0480: syntactically unknown focus fails closed; a
+            // well-formed but unresolvable target still warns via
+            // `apply_focus` (returns false, startup continues).
+            if !layout_cmd::is_valid_focus_spec(focus_spec) {
+                eprintln!(
+                    "bitty: unknown --focus spec {focus_spec:?} (want next|prev|up|down|left|right|<id>)\n{}",
+                    help_text()
+                );
+                std::process::exit(2);
+            }
             apply_focus(&mut runtime, focus_spec);
         }
     }

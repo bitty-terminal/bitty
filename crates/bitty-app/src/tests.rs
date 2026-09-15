@@ -931,6 +931,138 @@ fn split_ratio_clamped_via_layout_node() {
 }
 
 #[test]
+fn cli_invalid_values_fail_closed_hostile() {
+    // CTX-0480: invalid values record cli_value_error (exit 2 at
+    // dispatch) instead of warn-ignoring to exit 0.
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "nope"]));
+    assert!(p.cli_value_error.is_some(), "bad ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio=nan"]));
+    assert!(p.cli_value_error.is_some(), "NaN ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio=inf"]));
+    assert!(p.cli_value_error.is_some(), "inf ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=bogus"]));
+    assert!(p.cli_value_error.is_some(), "bad split axis must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:nope"]));
+    assert!(p.cli_value_error.is_some(), "bad split ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:"]));
+    assert!(p.cli_value_error.is_some(), "empty split ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=:0.5"]));
+    assert!(p.cli_value_error.is_some(), "axisless split must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:0.5:extra"]));
+    assert!(
+        p.cli_value_error.is_some(),
+        "trailing split junk must error"
+    );
+
+    let p = parse_args(&args_of(&["bitty", "--log-level", "nope"]));
+    assert!(p.cli_value_error.is_some(), "bad log level must error");
+    assert_eq!(p.log_level, None);
+
+    let p = parse_args(&args_of(&["bitty", "--log-level"]));
+    assert!(p.cli_value_error.is_some(), "missing log level must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio"]));
+    assert!(p.cli_value_error.is_some(), "missing ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--layout"]));
+    assert!(p.cli_value_error.is_some(), "missing layout must error");
+
+    let p = parse_args(&args_of(&["bitty", "--focus"]));
+    assert!(p.cli_value_error.is_some(), "missing focus must error");
+
+    // Valid values record no error.
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "0.5"]));
+    assert!(p.cli_value_error.is_none());
+    let p = parse_args(&args_of(&["bitty", "--log-level", "debug"]));
+    assert!(p.cli_value_error.is_none());
+
+    // Negative finite ratios are out-of-range values, not parse errors:
+    // both spellings reach layout build and clamp loudly (CTX-0480).
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "-5"]));
+    assert!(p.cli_value_error.is_none());
+    assert_eq!(p.split_ratio, Some(-5.0));
+    let p = parse_args(&args_of(&["bitty", "--split=vertical:2.5"]));
+    assert!(p.cli_value_error.is_none());
+    assert_eq!(p.split_ratio, Some(2.5));
+}
+
+#[test]
+fn layout_checked_rejects_hostile_specs() {
+    // CTX-0480: silent normalizations now fail closed via
+    // try_build_layout; finite out-of-range ratios clamp loudly.
+    use crate::layout_cmd::{clamp_ratio_loudly, is_valid_focus_spec, try_build_layout};
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "bogus-spec"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:bogus:0.5"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:nope"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "stack:nope"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3,4,x"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3,4,5"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:nan"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:0.5:extra"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", ""]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    // Loud clamp: finite extremes clamp to [MIN,MAX], non-finite falls
+    // back to 0.5 with a warning.
+    assert_eq!(
+        clamp_ratio_loudly(5.0),
+        bitty_runtime::LayoutNode::MAX_RATIO
+    );
+    assert_eq!(
+        clamp_ratio_loudly(-1.0),
+        bitty_runtime::LayoutNode::MIN_RATIO
+    );
+    assert_eq!(clamp_ratio_loudly(f32::NAN), 0.5);
+
+    // Out-of-range stack counts clamp loudly; negative space-form ratios
+    // are accepted values and clamp loudly (never read as missing).
+    let args = parse_args(&args_of(&["bitty", "--layout", "stack:99"]));
+    let layout = try_build_layout(&args, 80, 24).expect("stack count clamps");
+    assert_eq!(layout.leaf_count(), 8);
+
+    let args = parse_args(&args_of(&["bitty", "--split", "h", "--split-ratio", "-5"]));
+    let layout = try_build_layout(&args, 80, 24).expect("negative ratio clamps");
+    if let bitty_runtime::LayoutNode::Split { ratio, .. } = layout {
+        assert_eq!(ratio, bitty_runtime::LayoutNode::MIN_RATIO);
+    } else {
+        panic!("expected split");
+    }
+
+    // Focus syntax gating.
+    assert!(is_valid_focus_spec("next"));
+    assert!(is_valid_focus_spec("2"));
+    assert!(!is_valid_focus_spec("bogus"));
+    assert!(!is_valid_focus_spec(""));
+}
+
+#[test]
 fn parse_config_and_theme_flags() {
     let p = parse_args(&args_of(&["bitty", "--config", "/tmp/c.toml"]));
     assert_eq!(p.config_path.as_deref(), Some("/tmp/c.toml"));

@@ -181,7 +181,7 @@ mod integration_tests {
                 license: Some("MIT".to_string()),
             },
             compat: Compat {
-                bitty: Some(">=0.5,<1.0".to_string()),
+                bitty: Some(">=0.5.0,<1.0.0".to_string()),
                 plugin_api: Some("^1.0".to_string()),
             },
             dependencies: Vec::new(),

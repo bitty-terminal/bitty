@@ -22,7 +22,7 @@ use bitty_package::{
     check_fetch_framing, verify_artifact_checksum, verify_pipeline,
 };
 use bitty_package::{
-    check_capability_diff, check_local_path_drift, digest_local_content,
+    check_capability_diff, check_compatibility, check_local_path_drift, digest_local_content,
     ensure_no_promotion_without_chain,
 };
 
@@ -79,7 +79,7 @@ fn minimal_manifest(id: &str) -> PackageManifest {
             license: Some("MIT".to_string()),
         },
         compat: Compat {
-            bitty: Some(">=0.5,<1.0".to_string()),
+            bitty: Some(">=0.5.0,<1.0.0".to_string()),
             plugin_api: Some("^1.0".to_string()),
         },
         dependencies: Vec::new(),
@@ -1091,4 +1091,151 @@ fn hostile_version_invalid_char_and_leading_zero_rejected() {
 fn hostile_requirement_empty_comparator_rejected() {
     assert!(VersionReq::parse(">=1.0,,<2.0").is_err());
     assert!(VersionReq::parse("").is_err());
+}
+
+// ── CTX-0466 compat / source hostile ───────────────────────────────────────
+
+#[test]
+fn hostile_compat_mismatched_range_rejected() {
+    // `>=2.0.0` on a 0.6.0 host passed under the old emptiness-only check.
+    let mut m = minimal_manifest("xuepoo.pkg");
+    m.compat.bitty = Some(">=2.0.0".to_string());
+    assert!(check_compatibility(&m, Some("0.6.0"), Some("1.0.0")).is_err());
+    // Legit range still passes.
+    m.compat.bitty = Some(">=0.5.0,<1.0.0".to_string());
+    assert!(check_compatibility(&m, Some("0.6.0"), Some("1.0.0")).is_ok());
+}
+
+#[test]
+fn hostile_compat_unparseable_fails_closed() {
+    for bad in ["*", "||", ">=0.5.0 || <2.0.0", "", "!!"] {
+        let mut m = minimal_manifest("xuepoo.pkg");
+        m.compat.bitty = Some(bad.to_string());
+        assert!(
+            check_compatibility(&m, Some("0.6.0"), Some("1.0.0")).is_err(),
+            "compat '{bad}' must fail closed"
+        );
+    }
+}
+
+#[test]
+fn hostile_compat_mismatch_blocks_pipeline() {
+    let mut m = minimal_manifest("xuepoo.pkg");
+    m.compat.bitty = Some(">=2.0.0".to_string());
+    let artifact = b"pkg-bytes";
+    let a_digest = sha256_hex(artifact);
+    let m_digest = m.canonical_digest();
+    let inputs = VerificationInputs {
+        artifact_bytes: artifact,
+        expected_artifact_digest: &a_digest,
+        manifest: &m,
+        expected_manifest_digest: &m_digest,
+        granted_capabilities: &[],
+        requested_capabilities: &[],
+        capability_approval: false,
+        host_bitty_version: Some("0.6.0"),
+        host_plugin_api_version: Some("1.0.0"),
+        expected_content_root: None,
+        fetch_bytes: 10,
+        fetch_elapsed_ms: 10,
+        max_fetch_bytes: 1024,
+        max_fetch_ms: 1000,
+    };
+    let report = verify_pipeline(&inputs);
+    assert!(!report.is_passed());
+    let compat = report
+        .stages
+        .iter()
+        .find(|s| s.stage == VerificationStage::CompatibilityCheck)
+        .unwrap();
+    assert!(!compat.passed);
+}
+
+#[test]
+fn hostile_source_registry_schemeless_and_malicious_rejected() {
+    for url in [
+        "registry.example.com",
+        "http://example.com",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://",
+        "https://user:pass@example.com",
+    ] {
+        let s = PackageSource::Registry {
+            url: url.to_string(),
+        };
+        assert!(s.validate().is_err(), "registry '{url}' must be rejected");
+    }
+    // Legit still passes.
+    PackageSource::Registry {
+        url: "https://registry.example.com".to_string(),
+    }
+    .validate()
+    .unwrap();
+}
+
+#[test]
+fn hostile_source_git_schemeless_and_malicious_rejected() {
+    for url in [
+        "github.com/owner/repo.git",
+        "git@github.com:owner/repo.git",
+        "file:///tmp/repo",
+        "http://github.com/owner/repo.git",
+        "https://",
+    ] {
+        let s = PackageSource::Git {
+            url: url.to_string(),
+            rev: None,
+        };
+        assert!(s.validate().is_err(), "git '{url}' must be rejected");
+    }
+    // Legit https + git+ssh still pass.
+    for url in [
+        "https://github.com/owner/repo.git",
+        "git+ssh://github.com/owner/repo.git",
+    ] {
+        PackageSource::Git {
+            url: url.to_string(),
+            rev: None,
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
+#[test]
+fn hostile_source_git_rev_oversized_and_shell_rejected() {
+    let oversized = "a".repeat(257);
+    assert!(
+        PackageSource::Git {
+            url: "https://github.com/owner/repo.git".to_string(),
+            rev: Some(oversized),
+        }
+        .validate()
+        .is_err()
+    );
+    for rev in [
+        "HEAD; rm -rf /",
+        "$(evil)",
+        "--upload-pack=evil",
+        "a..b",
+        "",
+    ] {
+        assert!(
+            PackageSource::Git {
+                url: "https://github.com/owner/repo.git".to_string(),
+                rev: Some(rev.to_string()),
+            }
+            .validate()
+            .is_err(),
+            "rev '{rev}' must be rejected"
+        );
+    }
+    // Legit SHA/tag still passes.
+    PackageSource::Git {
+        url: "https://github.com/owner/repo.git".to_string(),
+        rev: Some("abc123def456".to_string()),
+    }
+    .validate()
+    .unwrap();
 }

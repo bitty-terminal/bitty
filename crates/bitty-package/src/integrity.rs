@@ -6,6 +6,8 @@
 
 use crate::error::PackageError;
 use crate::manifest::PackageManifest;
+use crate::requirement::VersionReq;
+use crate::version::Version;
 
 // ── digest helpers ───────────────────────────────────────────────────────
 
@@ -323,43 +325,59 @@ pub fn check_capability_diff(
 
 /// Stage 6: compatibility check — host versions must satisfy manifest requirements.
 ///
-/// Minimal check: if manifest declares a requirement, host version must be non-empty
-/// and contain a dot; full semver range evaluation is deferred to resolver.
-/// For draft, we fail only when host version is absent while manifest requires one,
-/// or when version strings are obviously malformed.
+/// Real semver-range evaluation against the host version using the closed
+/// grammar (`VersionReq`, no new parsers or dependencies). Fail-closed: an
+/// unparseable requirement or host version is an incompatibility, never a pass.
+/// A `None` requirement imposes no constraint; a `Some` requirement with a
+/// missing host is an incompatibility.
 pub fn check_compatibility(
     manifest: &PackageManifest,
     host_bitty_version: Option<&str>,
     host_plugin_api_version: Option<&str>,
 ) -> Result<(), PackageError> {
-    if manifest.compat.bitty.is_some() && host_bitty_version.is_none() {
-        return Err(PackageError::Incompatible {
-            field: "compat.bitty".to_string(),
-            message: "host bitty version required but not provided".to_string(),
-        });
-    }
-    if manifest.compat.plugin_api.is_some() && host_plugin_api_version.is_none() {
-        return Err(PackageError::Incompatible {
-            field: "compat.plugin_api".to_string(),
-            message: "host plugin_api version required but not provided".to_string(),
-        });
-    }
-    // If both present, do a lightweight sanity: versions must be semver-like.
-    if let Some(v) = host_bitty_version {
-        if v.trim().is_empty() || !v.contains('.') {
+    if let Some(req) = &manifest.compat.bitty {
+        let Some(host) = host_bitty_version else {
             return Err(PackageError::Incompatible {
-                field: "host.bitty_version".to_string(),
-                message: format!("host version '{v}' is malformed"),
+                field: "compat.bitty".to_string(),
+                message: "host bitty version required but not provided".to_string(),
             });
-        }
+        };
+        check_single_compat(req, host, "compat.bitty", "host.bitty_version")?;
     }
-    if let Some(v) = host_plugin_api_version {
-        if v.trim().is_empty() || !v.contains('.') {
+    if let Some(req) = &manifest.compat.plugin_api {
+        let Some(host) = host_plugin_api_version else {
             return Err(PackageError::Incompatible {
-                field: "host.plugin_api_version".to_string(),
-                message: format!("host version '{v}' is malformed"),
+                field: "compat.plugin_api".to_string(),
+                message: "host plugin_api version required but not provided".to_string(),
             });
-        }
+        };
+        check_single_compat(req, host, "compat.plugin_api", "host.plugin_api_version")?;
+    }
+    Ok(())
+}
+
+/// Evaluate one requirement against one host version, fail-closed.
+fn check_single_compat(
+    requirement: &str,
+    host_version: &str,
+    req_field: &str,
+    host_field: &str,
+) -> Result<(), PackageError> {
+    let host = Version::parse(host_version).map_err(|e| PackageError::Incompatible {
+        field: host_field.to_string(),
+        message: format!("host version '{host_version}' is malformed: {e}"),
+    })?;
+    let req = VersionReq::parse(requirement).map_err(|e| PackageError::Incompatible {
+        field: req_field.to_string(),
+        message: format!("requirement '{requirement}' is invalid: {e}"),
+    })?;
+    if !req.matches(&host) {
+        return Err(PackageError::Incompatible {
+            field: req_field.to_string(),
+            message: format!(
+                "host version '{host_version}' does not satisfy requirement '{requirement}'"
+            ),
+        });
     }
     Ok(())
 }
@@ -543,7 +561,7 @@ mod tests {
                 license: Some("MIT".to_string()),
             },
             compat: Compat {
-                bitty: Some(">=0.5,<1.0".to_string()),
+                bitty: Some(">=0.5.0,<1.0.0".to_string()),
                 plugin_api: Some("^1.0".to_string()),
             },
             dependencies: Vec::new(),
@@ -551,6 +569,15 @@ mod tests {
             raw_bytes_len: 256,
             undeclared_fields: Vec::new(),
         }
+    }
+
+    fn manifest_with_compat(bitty: Option<&str>, plugin_api: Option<&str>) -> PackageManifest {
+        let mut m = minimal_manifest();
+        m.compat = Compat {
+            bitty: bitty.map(|s| s.to_string()),
+            plugin_api: plugin_api.map(|s| s.to_string()),
+        };
+        m
     }
 
     #[test]
@@ -657,5 +684,109 @@ mod tests {
             report.first_failure().unwrap().stage,
             VerificationStage::ArtifactChecksum
         );
+    }
+
+    #[test]
+    fn compat_rejects_mismatched_range() {
+        // CTX-0466: `>=2.0.0` must not pass on a 0.6.0 host (old
+        // emptiness-only check accepted any non-empty dotted string).
+        let m = manifest_with_compat(Some(">=2.0.0"), None);
+        let err = check_compatibility(&m, Some("0.6.0"), None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("does not satisfy"), "msg: {msg}");
+        assert!(msg.contains(">=2.0.0"), "msg: {msg}");
+    }
+
+    #[test]
+    fn compat_accepts_matching_ranges_and_legit_installs() {
+        let m = manifest_with_compat(Some(">=0.5.0,<1.0.0"), Some("^1.0"));
+        assert!(check_compatibility(&m, Some("0.6.0"), Some("1.0.0")).is_ok());
+        // Caret upper bound enforced.
+        let m2 = manifest_with_compat(Some("^1.0"), None);
+        assert!(check_compatibility(&m2, Some("1.5.0"), None).is_ok());
+        assert!(check_compatibility(&m2, Some("2.0.0"), None).is_err());
+        // Tilde.
+        let m3 = manifest_with_compat(Some("~1.2.3"), None);
+        assert!(check_compatibility(&m3, Some("1.2.5"), None).is_ok());
+        assert!(check_compatibility(&m3, Some("1.3.0"), None).is_err());
+        // Bare version means exact.
+        let m4 = manifest_with_compat(Some("1.2.3"), None);
+        assert!(check_compatibility(&m4, Some("1.2.3"), None).is_ok());
+        assert!(check_compatibility(&m4, Some("1.2.4"), None).is_err());
+        // No requirements means any host passes.
+        let m5 = manifest_with_compat(None, None);
+        assert!(check_compatibility(&m5, Some("0.6.0"), Some("1.0.0")).is_ok());
+        assert!(check_compatibility(&m5, None, None).is_ok());
+    }
+
+    #[test]
+    fn compat_fails_closed_on_unparseable() {
+        // Unparseable requirements must fail closed, never pass.
+        for bad in [
+            "",
+            "   ",
+            "*",
+            "||",
+            ">=1.0 || <2.0",
+            "^1.0, <2.0.0",
+            "not-a-version",
+            ">=1.0.0; rm -rf",
+        ] {
+            let m = manifest_with_compat(Some(bad), None);
+            assert!(
+                check_compatibility(&m, Some("0.6.0"), None).is_err(),
+                "requirement '{bad}' must fail closed"
+            );
+        }
+        // Malformed hosts fail closed when a requirement exists.
+        let m = manifest_with_compat(Some(">=0.5.0"), None);
+        for bad_host in ["", "   ", "notaversion", "01.0.0", "1.0.0*", "1.0"] {
+            assert!(
+                check_compatibility(&m, Some(bad_host), None).is_err(),
+                "host '{bad_host}' must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn compat_requires_host_when_manifest_requires() {
+        let m = manifest_with_compat(Some(">=0.5.0"), None);
+        assert!(check_compatibility(&m, None, None).is_err());
+        let m2 = manifest_with_compat(None, Some("^1.0"));
+        assert!(check_compatibility(&m2, Some("0.6.0"), None).is_err());
+        assert!(check_compatibility(&m2, Some("0.6.0"), Some("1.0.0")).is_ok());
+    }
+
+    #[test]
+    fn compat_pipeline_stage_fails_on_mismatch() {
+        // Full pipeline must surface the mismatch at CompatibilityCheck.
+        let m = manifest_with_compat(Some(">=2.0.0"), None);
+        let artifact = b"pkg-bytes";
+        let a_digest = sha256_hex(artifact);
+        let m_digest = m.canonical_digest();
+        let inputs = VerificationInputs {
+            artifact_bytes: artifact,
+            expected_artifact_digest: &a_digest,
+            manifest: &m,
+            expected_manifest_digest: &m_digest,
+            granted_capabilities: &[],
+            requested_capabilities: &[],
+            capability_approval: false,
+            host_bitty_version: Some("0.6.0"),
+            host_plugin_api_version: None,
+            expected_content_root: None,
+            fetch_bytes: 10,
+            fetch_elapsed_ms: 10,
+            max_fetch_bytes: 1024,
+            max_fetch_ms: 1000,
+        };
+        let report = verify_pipeline(&inputs);
+        assert!(!report.passed);
+        let compat = report
+            .stages
+            .iter()
+            .find(|s| s.stage == VerificationStage::CompatibilityCheck)
+            .unwrap();
+        assert!(!compat.passed, "compat stage must fail: {report:?}");
     }
 }

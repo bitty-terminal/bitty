@@ -348,7 +348,11 @@ fn parse_single_comparator(seg: &str) -> Result<Comparator, PackageError> {
             actual: ver_str.len(),
         });
     }
-    let ver = Version::parse(ver_str)?;
+    // Accept caret/tilde-style shorthand (`1.0` => `1.0.0`, `1` => `1.0.0`)
+    // for consistency with the caret/tilde path and the manifest doc examples
+    // (`>=0.5,<1.0`). Fail-closed on malformed (e.g. four components).
+    let normalized = normalize_version_str(ver_str)?;
+    let ver = Version::parse(&normalized)?;
     Ok(Comparator { op, version: ver })
 }
 
@@ -452,5 +456,22 @@ mod tests {
     #[test]
     fn caret_tilde_with_comma_rejected() {
         assert!(VersionReq::parse("^1.2.3, <2.0.0").is_err());
+    }
+
+    #[test]
+    fn comparator_shorthand_normalized() {
+        // CTX-0466: comparators accept `X.Y`/`X` shorthand like caret/tilde,
+        // matching the manifest doc examples (`>=0.5,<1.0`).
+        let r = VersionReq::parse(">=0.5,<1.0").unwrap();
+        assert_eq!(r.comparators.len(), 2);
+        let v = Version::parse("0.6.0").unwrap();
+        assert!(r.matches(&v));
+        let v2 = Version::parse("1.0.0").unwrap();
+        assert!(!r.matches(&v2));
+        // Bare shorthand also normalizes.
+        let rb = VersionReq::parse("1.0").unwrap();
+        assert!(rb.matches(&Version::parse("1.0.0").unwrap()));
+        // Four components still rejected fail-closed.
+        assert!(VersionReq::parse(">=1.2.3.4").is_err());
     }
 }

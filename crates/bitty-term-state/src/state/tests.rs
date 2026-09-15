@@ -32,14 +32,14 @@ fn combining_mark_attaches_to_preceding_cell_without_advance() {
     assert_eq!(s.cursor().position.col, 1);
     let snap = s.snapshot();
     assert_eq!(snap.cells[0].glyph, 'e');
-    assert_eq!(snap.cells[0].zerowidth, vec!['\u{0301}']);
+    assert_eq!(snap.cells[0].zerowidth.as_slice(), &['\u{0301}']);
     assert!(snap.cells[1].is_blank());
     assert!(s.check_invariants().is_ok());
     // ZWJ attaches the same way (complex-script joiner).
     prints(&mut s, "a\u{200D}");
     let snap = s.snapshot();
     assert_eq!(snap.cells[1].glyph, 'a');
-    assert_eq!(snap.cells[1].zerowidth, vec!['\u{200D}']);
+    assert_eq!(snap.cells[1].zerowidth.as_slice(), &['\u{200D}']);
     assert_eq!(s.cursor().position.col, 2);
     assert!(s.check_invariants().is_ok());
 }
@@ -81,7 +81,7 @@ fn combining_after_wide_char_attaches_to_lead_half() {
     prints(&mut s, "\u{4E2D}\u{0301}");
     let snap = s.snapshot();
     assert_eq!(snap.cells[0].glyph, '\u{4E2D}');
-    assert_eq!(snap.cells[0].zerowidth, vec!['\u{0301}']);
+    assert_eq!(snap.cells[0].zerowidth.as_slice(), &['\u{0301}']);
     assert!(snap.cells[1].spacer);
     assert!(snap.cells[1].zerowidth.is_empty());
     assert_eq!(s.cursor().position.col, 2);
@@ -102,7 +102,10 @@ fn combining_preserves_deferred_wrap_latch() {
     assert!(s.cursor().pending_wrap);
     assert_eq!(s.cursor().position.row, 0);
     let snap = s.snapshot();
-    assert_eq!(snap.cells[GRID_COLUMNS - 1].zerowidth, vec!['\u{0301}']);
+    assert_eq!(
+        snap.cells[GRID_COLUMNS - 1].zerowidth.as_slice(),
+        &['\u{0301}']
+    );
     prints(&mut s, "y");
     assert_eq!(s.cursor().position.row, 1);
     assert_eq!(s.cursor().position.col, 1);

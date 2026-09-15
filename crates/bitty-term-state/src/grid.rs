@@ -109,7 +109,7 @@ impl Grid {
     /// Fills every cell of the grid with `fill`.
     pub fn fill_all(&mut self, erase_style: &Style) {
         for slot in &mut self.cells {
-            *slot = Cell::erased(erase_style.clone());
+            *slot = Cell::erased(*erase_style);
         }
         self.wraps.fill(false);
     }
@@ -127,7 +127,7 @@ impl Grid {
         let right = right.min(cols.saturating_sub(1));
         for r in top..=bottom {
             for c in left..=right {
-                self.set(r as usize, c as usize, Cell::erased(erase_style.clone()));
+                self.set(r as usize, c as usize, Cell::erased(*erase_style));
             }
         }
         for r in top..=bottom {
@@ -165,7 +165,7 @@ impl Grid {
             }
         }
         for c in start..=end {
-            self.set(row, c, Cell::erased(erase_style.clone()));
+            self.set(row, c, Cell::erased(*erase_style));
         }
         // Row content changed: break any soft continuation starting here.
         // Incoming continuation is preserved (the previous row still flows
@@ -185,8 +185,8 @@ impl Grid {
         // Cut between staying cells and movers: a spacer at `col` moves
         // while its lead at `col - 1` stays; blank both.
         if col > 0 && self.get(row, col).spacer {
-            self.set(row, col - 1, Cell::erased(erase_style.clone()));
-            self.set(row, col, Cell::erased(erase_style.clone()));
+            self.set(row, col - 1, Cell::erased(*erase_style));
+            self.set(row, col, Cell::erased(*erase_style));
         }
         // Movers occupy sources `[col..=last - n]`. A lead at `last - n`
         // would move away from its overwritten spacer; a spacer at
@@ -195,21 +195,21 @@ impl Grid {
         if n <= last - col {
             let move_end = last - n;
             if self.get(row, move_end).width == 2 && !self.get(row, move_end).spacer {
-                self.set(row, move_end, Cell::erased(erase_style.clone()));
-                self.set(row, move_end + 1, Cell::erased(erase_style.clone()));
+                self.set(row, move_end, Cell::erased(*erase_style));
+                self.set(row, move_end + 1, Cell::erased(*erase_style));
             }
             let move_start = col + n;
             if move_start <= last && self.get(row, move_start).spacer {
-                self.set(row, move_start - 1, Cell::erased(erase_style.clone()));
+                self.set(row, move_start - 1, Cell::erased(*erase_style));
             }
         }
         for target in (col + n..=last).rev() {
             let source = target - n;
-            let moved = self.get(row, source).clone();
+            let moved = *self.get(row, source);
             self.set(row, target, moved);
         }
         for c in col..(col + n).min(last + 1) {
-            self.set(row, c, Cell::erased(erase_style.clone()));
+            self.set(row, c, Cell::erased(*erase_style));
         }
         self.set_wrapped(row, false);
     }
@@ -226,25 +226,25 @@ impl Grid {
         // Cut between staying cells and destroyed cells: a spacer at `col`
         // is destroyed while its lead at `col - 1` stays; blank both.
         if col > 0 && self.get(row, col).spacer {
-            self.set(row, col - 1, Cell::erased(erase_style.clone()));
-            self.set(row, col, Cell::erased(erase_style.clone()));
+            self.set(row, col - 1, Cell::erased(*erase_style));
+            self.set(row, col, Cell::erased(*erase_style));
         }
         // Cut between destroyed cells and the first mover at `col + n`: a
         // spacer there moves without its lead (which is overwritten by the
         // shift); blank both.
         let source_start = col + n;
         if source_start <= last && self.get(row, source_start).spacer {
-            self.set(row, source_start, Cell::erased(erase_style.clone()));
+            self.set(row, source_start, Cell::erased(*erase_style));
             if source_start > 0 {
-                self.set(row, source_start - 1, Cell::erased(erase_style.clone()));
+                self.set(row, source_start - 1, Cell::erased(*erase_style));
             }
         }
         for target in col..=last {
             let source = target + n;
             let cell = if source <= last {
-                self.get(row, source).clone()
+                *self.get(row, source)
             } else {
-                Cell::erased(erase_style.clone())
+                Cell::erased(*erase_style)
             };
             self.set(row, target, cell);
         }
@@ -262,20 +262,20 @@ impl Grid {
         let mut changed = false;
         let mut i = 0;
         while i < self.cols {
-            let cell = self.get(row, i).clone();
+            let cell = *self.get(row, i);
             if cell.spacer {
                 let paired = i > 0 && {
                     let lead = self.get(row, i - 1);
                     lead.width == 2 && !lead.spacer
                 };
                 if !paired {
-                    self.set(row, i, Cell::erased(erase_style.clone()));
+                    self.set(row, i, Cell::erased(*erase_style));
                     changed = true;
                 }
             } else if cell.width == 2 {
                 let paired_trailer = i + 1 < self.cols && self.get(row, i + 1).spacer;
                 if !paired_trailer {
-                    self.set(row, i, Cell::erased(erase_style.clone()));
+                    self.set(row, i, Cell::erased(*erase_style));
                     changed = true;
                 } else {
                     i += 1;
@@ -309,7 +309,7 @@ impl Grid {
                 let w = self.wrapped(r + 1);
                 self.set_wrapped(r, w);
             }
-            let mut blank = vec![Cell::erased(erase_style.clone()); self.cols];
+            let mut blank = vec![Cell::erased(*erase_style); self.cols];
             self.replace_row(bottom, &mut blank);
             self.set_wrapped(bottom, false);
         }
@@ -337,7 +337,7 @@ impl Grid {
                 let w = self.wrapped(r);
                 self.set_wrapped(r + 1, w);
             }
-            let mut blank = vec![Cell::erased(erase_style.clone()); self.cols];
+            let mut blank = vec![Cell::erased(*erase_style); self.cols];
             self.replace_row(top, &mut blank);
             self.set_wrapped(top, false);
         }
@@ -382,12 +382,12 @@ impl Grid {
         if new_rows == self.rows && new_cols == self.cols {
             return;
         }
-        let mut new_cells = vec![Cell::erased(erase_style.clone()); new_rows * new_cols];
+        let mut new_cells = vec![Cell::erased(*erase_style); new_rows * new_cols];
         let copy_rows = self.rows.min(new_rows);
         let copy_cols = self.cols.min(new_cols);
         for r in 0..copy_rows {
             for c in 0..copy_cols {
-                let src = self.get(r, c).clone();
+                let src = *self.get(r, c);
                 new_cells[r * new_cols + c] = src;
             }
         }
@@ -398,19 +398,19 @@ impl Grid {
             let row_slice = &mut new_cells[start..start + new_cols];
             let mut i = 0;
             while i < new_cols {
-                let cell = row_slice[i].clone();
+                let cell = row_slice[i];
                 if cell.spacer {
                     let paired = i > 0 && {
                         let lead = &row_slice[i - 1];
                         lead.width == 2 && !lead.spacer
                     };
                     if !paired {
-                        row_slice[i] = Cell::erased(erase_style.clone());
+                        row_slice[i] = Cell::erased(*erase_style);
                     }
                 } else if cell.width == 2 {
                     let paired_trailer = i + 1 < new_cols && row_slice[i + 1].spacer;
                     if !paired_trailer {
-                        row_slice[i] = Cell::erased(erase_style.clone());
+                        row_slice[i] = Cell::erased(*erase_style);
                     } else {
                         i += 1;
                     }
@@ -446,7 +446,7 @@ impl ScreenPair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cell::{Cell, Style};
+    use crate::cell::{Cell, Style, Zerowidth};
 
     fn glyph(ch: char) -> Cell {
         Cell {
@@ -455,7 +455,7 @@ mod tests {
             width: 1,
             spacer: false,
             hyperlink: None,
-            zerowidth: Vec::new(),
+            zerowidth: Zerowidth::new(),
         }
     }
 
@@ -491,11 +491,11 @@ mod tests {
             1,
             Cell {
                 glyph: '中',
-                style: style.clone(),
+                style,
                 width: 2,
                 spacer: false,
                 hyperlink: None,
-                zerowidth: Vec::new(),
+                zerowidth: Zerowidth::new(),
             },
         );
         g.set(0, 2, Cell::wide_spacer(style));

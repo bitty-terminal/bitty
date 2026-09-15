@@ -873,7 +873,7 @@ impl PersistentSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitty_term_state::{Cell, Style};
+    use bitty_term_state::{Cell, Style, Zerowidth};
 
     fn make_snapshot(cells_grid: Vec<Vec<char>>) -> Snapshot {
         // cells_grid is rows x cols with ' ' blank, '中' wide char via two entries: '中' at lead, '\0' spacer marker.
@@ -894,7 +894,7 @@ mod tests {
                             width: 2,
                             spacer: false,
                             hyperlink: None,
-                            zerowidth: Vec::new(),
+                            zerowidth: Zerowidth::new(),
                         });
                     } else {
                         cells.push(Cell {
@@ -903,7 +903,7 @@ mod tests {
                             width: 1,
                             spacer: false,
                             hyperlink: None,
-                            zerowidth: Vec::new(),
+                            zerowidth: Zerowidth::new(),
                         });
                     }
                 }

@@ -14,7 +14,9 @@ use bitty_vt::{
     TerminalAction, ZoneKind,
 };
 
-use crate::cell::{AttributeChangeKind, Attributes, Cell, HyperlinkId, Style, char_cell_width};
+use crate::cell::{
+    AttributeChangeKind, Attributes, Cell, HyperlinkId, Style, Zerowidth, char_cell_width,
+};
 use crate::charsets::Charsets;
 use crate::cursor::{Cursor, CursorPosition, SavedCursor};
 use crate::damage::{DAMAGE_HISTORY_BATCHES, Damage, DamageRect, DamagedRegion, coalesce};
@@ -553,7 +555,7 @@ impl State {
         if physical.len() < new_rows {
             let need = new_rows - physical.len();
             for _ in 0..need {
-                physical.push((vec![Cell::erased(erase.clone()); new_cols], false));
+                physical.push((vec![Cell::erased(*erase); new_cols], false));
             }
         }
         let split = physical.len() - new_rows;
@@ -985,11 +987,10 @@ impl State {
         // orphaned (RFC invariant 2). All probes read the ORIGINAL cells.
         let last_col_idx = self.width - 1;
         let erase = self.bce_style();
-        let old_at_col = self.screens_active().get(row, col).clone();
-        let old_ahead =
-            (col < last_col_idx).then(|| self.screens_active().get(row, col + 1).clone());
+        let old_at_col = *self.screens_active().get(row, col);
+        let old_ahead = (col < last_col_idx).then(|| *self.screens_active().get(row, col + 1));
         if old_at_col.spacer && col > 0 {
-            let cleared = Cell::erased(erase.clone());
+            let cleared = Cell::erased(erase);
             self.screens_active_mut().set(row, col - 1, cleared);
             let c = (col - 1) as u16;
             self.damage_grid_rect(c, c, c, c);
@@ -997,7 +998,7 @@ impl State {
         match glyph_width {
             1 => {
                 if old_at_col.width == 2 && !old_at_col.spacer && col < last_col_idx {
-                    let cleared = Cell::erased(erase.clone());
+                    let cleared = Cell::erased(erase);
                     self.screens_active_mut().set(row, col + 1, cleared);
                     let c = (col + 1) as u16;
                     self.damage_grid_rect(c, c, c, c);
@@ -1009,7 +1010,7 @@ impl State {
                 // at `col + 2` survives unpaired.
                 if let Some(ahead) = old_ahead {
                     if ahead.width == 2 && !ahead.spacer && col + 2 <= last_col_idx {
-                        let cleared = Cell::erased(erase.clone());
+                        let cleared = Cell::erased(erase);
                         self.screens_active_mut().set(row, col + 2, cleared);
                         let c = (col + 2) as u16;
                         self.damage_grid_rect(c, c, c, c);
@@ -1026,18 +1027,18 @@ impl State {
                 &insert_erase,
             );
         }
-        let style = self.cursor.style.clone();
+        let style = self.cursor.style;
         let link = self.current_hyperlink;
         self.screens_active_mut().set(
             row,
             col,
             Cell {
                 glyph: ch,
-                style: style.clone(),
+                style,
                 width: glyph_width,
                 spacer: false,
                 hyperlink: link,
-                zerowidth: Vec::new(),
+                zerowidth: Zerowidth::new(),
             },
         );
         if glyph_width == 2 {
@@ -1091,7 +1092,7 @@ impl State {
             }
             target_col -= 1;
         }
-        let mut cell = self.screens_active().get(target_row, target_col).clone();
+        let mut cell = *self.screens_active().get(target_row, target_col);
         if !cell.push_zerowidth(mark) {
             return;
         }
@@ -1238,7 +1239,7 @@ impl State {
         self.saved_cursors[slot] = Some(SavedCursor {
             position: self.cursor.position,
             pending_wrap: self.cursor.pending_wrap,
-            style: self.cursor.style.clone(),
+            style: self.cursor.style,
             origin_mode: self.modes.origin,
             auto_wrap: self.modes.auto_wrap,
             charsets: self.charsets.clone(),
@@ -1606,7 +1607,7 @@ impl State {
             self.primary_save = Some(ScreenSave {
                 cursor_position: self.cursor.position,
                 pending_wrap: self.cursor.pending_wrap,
-                style: self.cursor.style.clone(),
+                style: self.cursor.style,
                 cursor_style: self.cursor.cursor_style,
                 cursor_visible: self.cursor.visible,
                 origin_mode: self.modes.origin,
@@ -1827,7 +1828,7 @@ fn trim_row_to_leads(cells: &[Cell]) -> Vec<Cell> {
         if cell.spacer {
             continue;
         }
-        leads.push(cell.clone());
+        leads.push(*cell);
     }
     while leads.last().is_some_and(Cell::is_blank) {
         leads.pop();
@@ -1845,14 +1846,14 @@ fn trim_row_to_leads(cells: &[Cell]) -> Vec<Cell> {
 fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(Vec<Cell>, bool)> {
     let new_cols = new_cols.max(1);
     if logical.is_empty() {
-        return vec![(vec![Cell::erased(erase.clone()); new_cols], false)];
+        return vec![(vec![Cell::erased(*erase); new_cols], false)];
     }
     let mut out: Vec<(Vec<Cell>, bool)> = Vec::new();
     let mut cur: Vec<Cell> = Vec::with_capacity(new_cols);
     let mut used = 0usize;
     let mut flush_row = |cur: &mut Vec<Cell>, used: &mut usize, wrapped: bool| {
         while *used < new_cols {
-            cur.push(Cell::erased(erase.clone()));
+            cur.push(Cell::erased(*erase));
             *used += 1;
         }
         let row = std::mem::replace(cur, Vec::with_capacity(new_cols));
@@ -1864,17 +1865,17 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
         if used + w > new_cols {
             if w == 2 && used + 1 == new_cols {
                 // One column left: pad it blank, wide starts next row.
-                cur.push(Cell::erased(erase.clone()));
+                cur.push(Cell::erased(*erase));
                 used += 1;
                 flush_row(&mut cur, &mut used, true);
             } else {
                 flush_row(&mut cur, &mut used, true);
             }
         }
-        cur.push(lead.clone());
+        cur.push(*lead);
         used += 1;
         if w == 2 {
-            cur.push(Cell::wide_spacer(lead.style.clone()));
+            cur.push(Cell::wide_spacer(lead.style));
             used += 1;
         }
     }

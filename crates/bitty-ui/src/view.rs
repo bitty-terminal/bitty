@@ -232,14 +232,14 @@ impl View {
                     for c in 0..cols {
                         let src_col = self.col_offset as usize + c;
                         if src_col < src.len() {
-                            out.push(src[src_col].clone());
+                            out.push(src[src_col]);
                         } else {
-                            out.push(blank.clone());
+                            out.push(blank);
                         }
                     }
                 } else {
                     for _ in 0..cols {
-                        out.push(blank.clone());
+                        out.push(blank);
                     }
                 }
             } else if combined < total {
@@ -250,7 +250,7 @@ impl View {
                     if grid_row < snap.height && src_col < snap.width {
                         let idx = grid_row * snap.width + src_col;
                         if let Some(cell) = snap.cells.get(idx) {
-                            let mut cloned = cell.clone();
+                            let mut cloned = *cell;
                             // Clip wide-pair overflow at the viewport's right edge:
                             // if a leading half would need its spacer beyond the
                             // viewport edge, demote to single width.
@@ -258,21 +258,21 @@ impl View {
                                 cloned.width = 1;
                             }
                             if cloned.spacer && c == 0 {
-                                out.push(blank.clone());
+                                out.push(blank);
                             } else {
                                 out.push(cloned);
                             }
                         } else {
-                            out.push(blank.clone());
+                            out.push(blank);
                         }
                     } else {
-                        out.push(blank.clone());
+                        out.push(blank);
                     }
                 }
             } else {
                 // Beyond combined buffer (viewport taller than history+grid).
                 for _ in 0..cols {
-                    out.push(blank.clone());
+                    out.push(blank);
                 }
             }
         }

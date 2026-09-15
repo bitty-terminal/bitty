@@ -117,7 +117,7 @@ pub(crate) enum AttributeChangeKind {
 }
 
 /// Foreground, background, underline color, and emphasis of one cell.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Style {
     /// Foreground color; `None` is the default palette entry.
     pub foreground: Option<Color>,
@@ -129,8 +129,100 @@ pub struct Style {
     pub attributes: Attributes,
 }
 
+/// Bounded inline combining-mark buffer replacing the heap `Vec<char>`.
+///
+/// Stores up to [`MAX_ZEROWIDTH_CHARS`] scalars inline as `[char; 5] + len`
+/// (CTX-0389, issue #645): no heap allocation per cell, so cloning a
+/// scrollback snapshot is a `memcpy` instead of per-cell `malloc` + cache
+/// thrash. `Copy` so [`Cell`] can be `Copy` and snapshots clone fast.
+///
+/// Fail-closed on overflow: [`Zerowidth::push`] returns `false` without
+/// mutating when full, never panics. Unused tail slots stay `'\0'` and are
+/// excluded from equality and hashing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Zerowidth {
+    chars: [char; MAX_ZEROWIDTH_CHARS],
+    len: u8,
+}
+
+impl Zerowidth {
+    /// Empty buffer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            chars: ['\0'; MAX_ZEROWIDTH_CHARS],
+            len: 0,
+        }
+    }
+
+    /// Number of retained marks.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether no marks are retained.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Retained marks in arrival order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[char] {
+        &self.chars[..self.len as usize]
+    }
+
+    /// Iterate retained marks in arrival order.
+    pub fn iter(&self) -> std::slice::Iter<'_, char> {
+        self.as_slice().iter()
+    }
+
+    /// Whether `mark` is retained (mirrors `Vec::contains`).
+    #[must_use]
+    pub fn contains(&self, mark: &char) -> bool {
+        self.as_slice().contains(mark)
+    }
+
+    /// Append one mark, fail-closed when full.
+    ///
+    /// Returns `false` without mutating when already holding
+    /// [`MAX_ZEROWIDTH_CHARS`] scalars; the caller drops the excess.
+    pub fn push(&mut self, mark: char) -> bool {
+        if self.len as usize >= MAX_ZEROWIDTH_CHARS {
+            return false;
+        }
+        self.chars[self.len as usize] = mark;
+        self.len += 1;
+        true
+    }
+}
+
+impl PartialEq for Zerowidth {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Zerowidth {}
+
+impl std::hash::Hash for Zerowidth {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl<'a> IntoIterator for &'a Zerowidth {
+    type Item = &'a char;
+    type IntoIter = std::slice::Iter<'a, char>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// One grid cell: total by construction (RFC invariant 2).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cell {
     /// Leading Unicode scalar displayed in this cell; `' '` when erased.
     ///
@@ -151,7 +243,7 @@ pub struct Cell {
     ///
     /// Bounded by [`MAX_ZEROWIDTH_CHARS`] (threat T-01); spacers never
     /// carry combining marks. Empty for erased and spacer cells.
-    pub zerowidth: Vec<char>,
+    pub zerowidth: Zerowidth,
 }
 
 impl Cell {
@@ -164,7 +256,7 @@ impl Cell {
             width: 1,
             spacer: false,
             hyperlink: None,
-            zerowidth: Vec::new(),
+            zerowidth: Zerowidth::new(),
         }
     }
 
@@ -177,7 +269,7 @@ impl Cell {
             width: 2,
             spacer: true,
             hyperlink: None,
-            zerowidth: Vec::new(),
+            zerowidth: Zerowidth::new(),
         }
     }
 
@@ -191,15 +283,14 @@ impl Cell {
     ///
     /// Returns `false` without mutating when the buffer already holds
     /// [`MAX_ZEROWIDTH_CHARS`] scalars, so untrusted combining runs cannot
-    /// grow the heap (threat T-01). The caller drops the excess scalar.
+    /// grow memory (threat T-01). The caller drops the excess scalar.
     /// Spacers reject every mark (`false`) because marks belong to the
     /// leading half.
     pub fn push_zerowidth(&mut self, mark: char) -> bool {
-        if self.spacer || self.zerowidth.len() >= MAX_ZEROWIDTH_CHARS {
+        if self.spacer {
             return false;
         }
-        self.zerowidth.push(mark);
-        true
+        self.zerowidth.push(mark)
     }
 }
 
@@ -338,12 +429,12 @@ mod tests {
         cell.glyph = 'e';
         assert!(cell.push_zerowidth('\u{0301}'));
         assert!(cell.push_zerowidth('\u{200D}'));
-        assert_eq!(cell.zerowidth, vec!['\u{0301}', '\u{200D}']);
+        assert_eq!(cell.zerowidth.as_slice(), &['\u{0301}', '\u{200D}']);
         for _ in 0..MAX_ZEROWIDTH_CHARS {
             cell.push_zerowidth('\u{0300}');
         }
         assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
-        // Full buffer drops without growth.
+        // Full buffer drops without growth, never panics (fail-closed).
         assert!(!cell.push_zerowidth('\u{0302}'));
         assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
     }
@@ -383,5 +474,75 @@ mod tests {
             false,
         ));
         assert_eq!(attrs.underline, UnderlineStyle::None);
+    }
+
+    #[test]
+    fn zerowidth_is_inline_bounded_and_copy() {
+        // CTX-0389 (#645): no heap Vec per cell; inline [char; 5] + len.
+        // 5 chars (20 bytes) + len byte padded to char alignment = 24 bytes,
+        // same stack size as a Vec header but with no heap allocation and
+        // Copy memcpy clone for snapshots.
+        assert_eq!(std::mem::size_of::<Zerowidth>(), 24);
+        assert!(std::mem::size_of::<Zerowidth>() <= 24);
+        // Cell stays sane for a 10k x 100 scrollback (1M cells); the win is
+        // no per-cell heap, not a smaller header.
+        assert!(std::mem::size_of::<Cell>() <= 96);
+        // Copy semantics: copies are independent values, not shared heap.
+        let mut first = Zerowidth::new();
+        assert!(first.push('\u{0301}'));
+        let second = first;
+        assert_eq!(first.as_slice(), second.as_slice());
+        assert!(second.contains(&'\u{0301}'));
+        assert_eq!(second.len(), 1);
+        // Equality and hashing ignore unused tail slots.
+        let mut third = Zerowidth::new();
+        assert!(third.push('\u{0301}'));
+        assert_eq!(second, third);
+        assert!(second.iter().eq(third.iter()));
+    }
+
+    #[test]
+    fn zerowidth_overflow_truncates_fail_closed_never_panics() {
+        // Fill exactly to cap, then overflow must return false without
+        // mutating and without panicking.
+        let mut buffer = Zerowidth::new();
+        for index in 0..MAX_ZEROWIDTH_CHARS {
+            assert!(buffer.push(char::from_u32(0x0300 + index as u32).unwrap_or('\u{0300}')));
+        }
+        assert_eq!(buffer.len(), MAX_ZEROWIDTH_CHARS);
+        let before = buffer;
+        assert!(!buffer.push('\u{0302}'));
+        assert_eq!(buffer.len(), MAX_ZEROWIDTH_CHARS);
+        assert_eq!(buffer, before);
+        // Cell-level overflow also fails closed (spacer already covered).
+        let mut cell = Cell::erased(Style::default());
+        for _ in 0..MAX_ZEROWIDTH_CHARS {
+            cell.push_zerowidth('\u{0300}');
+        }
+        assert!(!cell.push_zerowidth('\u{0302}'));
+        assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+    }
+
+    #[test]
+    fn snapshot_clone_is_bounded_no_heap_thrash() {
+        // Targeted timing assertion for the hot path (no criterion bench for
+        // Cell alone; benches/terminal_state.rs covers State::apply).
+        // Cloning 100k cells (10k-line x 100-col scrollback is 1M; 100k keeps
+        // CI fast) must stay well under a generous bound; a Vec-per-cell
+        // clone with heap churn would blow this on debug builds.
+        let cell = Cell::erased(Style::default());
+        let row = vec![cell; 1000];
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        for _ in 0..100 {
+            let cloned = row.clone();
+            total += cloned.len();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(total, 100_000);
+        assert!(
+            elapsed.as_millis() < 500,
+            "100x clone of 1k cells took {elapsed:?}, expected < 500ms"
+        );
     }
 }

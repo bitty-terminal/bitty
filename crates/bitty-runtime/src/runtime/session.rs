@@ -1439,9 +1439,14 @@ impl Runtime {
                     self.rows.min(u16::MAX as usize) as u16,
                 ));
             if let Err(err) = self.spawn_shell_for_view(view, &program, &tail, cols, rows) {
-                eprintln!(
-                    "warning: workspace switch pane {view:?} shell spawn failed ({err}) — pane stays empty"
-                );
+                // Rate-limited (CTX-0473): session restore replays spawns for
+                // every view; a broken recipe must not flood stderr.
+                if let Some(suppressed) = self.spawn_log.admit_now() {
+                    eprintln!(
+                        "warning: workspace switch pane {view:?} shell spawn failed ({err}) — pane stays empty{}",
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
             }
         }
     }

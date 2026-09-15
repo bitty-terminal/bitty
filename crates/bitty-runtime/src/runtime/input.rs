@@ -463,15 +463,14 @@ impl Runtime {
     /// owner leaf (CTX-0359); with no writer live, bytes fall back to the
     /// bounded headless buffer. Best-effort, never panics.
     pub(super) fn push_input_bytes_multipane(&mut self, bytes: &[u8]) {
-        use std::io::Write as _;
         // CTX-0243: direct multipane sends must also snap (normally already
         // snapped by `push_input_bytes`; idempotent second snap is a no-op).
         self.snap_focused_to_live();
         match self.focus.focused() {
             Some(focused) => {
                 if let Some(sess) = self.pane_sessions.get_mut(&focused) {
-                    let _ = sess.writer.write_all(bytes);
-                    let _ = sess.writer.flush();
+                    let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);
+                    self.record_input_write_loss(dropped, flush_failed);
                     return;
                 }
                 // CTX-0359: only the primary owner leaf may fall back to
@@ -492,11 +491,26 @@ impl Runtime {
             }
         }
         if let Some(writer) = self.pty_writer.as_mut() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+            let (dropped, flush_failed) = write_input_best_effort(writer, bytes);
+            self.record_input_write_loss(dropped, flush_failed);
             return;
         }
         self.buffer_input_headless(bytes);
+    }
+
+    /// Record best-effort input write loss (CTX-0473).
+    ///
+    /// A failed `write_all` counts the whole buffer as dropped (the partial
+    /// count on error is unspecified); a failed `flush` is reported separately
+    /// because the bytes may or may not have reached the child.
+    fn record_input_write_loss(&mut self, dropped: usize, flush_failed: bool) {
+        if dropped > 0 {
+            self.input_write_dropped_bytes =
+                self.input_write_dropped_bytes.wrapping_add(dropped as u64);
+        }
+        if flush_failed {
+            self.write_flush_failures = self.write_flush_failures.wrapping_add(1);
+        }
     }
 
     /// Headless / no-writer input path: bounded buffer with drop-oldest.
@@ -533,6 +547,13 @@ impl Runtime {
     #[must_use]
     pub fn pending_input_dropped(&self) -> u64 {
         self.pending_input_dropped
+    }
+
+    /// Input bytes dropped because the focused writer failed mid-write
+    /// (CTX-0473). Wrapping telemetry; bytes that never reached the shell.
+    #[must_use]
+    pub fn input_write_dropped_bytes(&self) -> u64 {
+        self.input_write_dropped_bytes
     }
 
     /// Views the pending input buffer without draining (headless helper).
@@ -1199,5 +1220,59 @@ impl Runtime {
     #[must_use]
     pub fn last_cursor(&self) -> Option<CursorPosition> {
         self.last_cursor
+    }
+}
+
+/// Best-effort PTY input write (CTX-0473): `(bytes_dropped, flush_failed)`.
+///
+/// A failed `write_all` counts the whole buffer as dropped (the partial count
+/// on error is unspecified); a failed `flush` is reported separately because
+/// the bytes may or may not have reached the child.
+fn write_input_best_effort<W: std::io::Write>(writer: &mut W, bytes: &[u8]) -> (usize, bool) {
+    if writer.write_all(bytes).is_err() {
+        return (bytes.len(), false);
+    }
+    (0, writer.flush().is_err())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_input_best_effort;
+    use std::io::Write;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("simulated write failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailingWriter;
+
+    impl Write for FlushFailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated flush failure"))
+        }
+    }
+
+    #[test]
+    fn input_write_failure_counts_whole_buffer_dropped() {
+        let (dropped, flush_failed) = write_input_best_effort(&mut FailingWriter, b"abc");
+        assert_eq!(dropped, 3);
+        assert!(!flush_failed);
+    }
+
+    #[test]
+    fn input_flush_failure_is_reported() {
+        let (dropped, flush_failed) = write_input_best_effort(&mut FlushFailingWriter, b"abc");
+        assert_eq!(dropped, 0);
+        assert!(flush_failed);
     }
 }

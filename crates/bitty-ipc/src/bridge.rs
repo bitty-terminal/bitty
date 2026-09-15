@@ -243,7 +243,11 @@ impl BridgeClient {
     /// inbound, and correlate through the pending table.
     ///
     /// Returns `true` when `id` correlated to a known in-flight request.
-    /// Unknown ids return `false` without insertion (fail-closed).
+    /// Unknown ids (never issued, already completed, or already expired)
+    /// return `false` **without buffering anything** (fail-closed
+    /// pre-enqueue): a hostile peer spraying uncorrelated answers cannot
+    /// fill the bounded inbound queue and deny service to legitimate
+    /// correlations.
     ///
     /// # Errors
     ///
@@ -262,6 +266,9 @@ impl BridgeClient {
         } else {
             IpcResponse::success(id, payload)?
         };
+        if self.endpoint.peek_pending(id).is_none() {
+            return Ok(false);
+        }
         self.endpoint.send_response(response)?;
         Ok(self.endpoint.complete(id))
     }
@@ -373,6 +380,44 @@ mod tests {
         let big = vec![0u8; crate::frame::MAX_FRAME_BYTES + 1];
         assert!(bridge.answer(RequestId(7), big, false).is_err());
         assert_eq!(bridge.pending_count(), 0);
+    }
+
+    #[test]
+    fn answer_unknown_id_buffers_nothing_under_flood() {
+        // Hostile: 64 unknown answers must not fill the 64-deep inbound
+        // queue and deny service to a legitimate correlation.
+        let mut bridge = consented();
+        for i in 0..64u64 {
+            let unknown = RequestId(900_000 + i);
+            assert!(
+                !bridge
+                    .answer(unknown, b"{}".to_vec(), false)
+                    .expect("unknown answer fits")
+            );
+        }
+        assert!(
+            bridge.take_response().is_none(),
+            "unknown ids must buffer nothing"
+        );
+        let id = bridge
+            .call("terminal.snapshot", b"{}".to_vec(), NOW_MS)
+            .unwrap();
+        assert!(bridge.answer(id, b"ok".to_vec(), false).unwrap());
+        assert!(bridge.take_response().is_some());
+    }
+
+    #[test]
+    fn answer_double_delivery_does_not_buffer_twice() {
+        let mut bridge = consented();
+        let id = bridge
+            .call("terminal.snapshot", b"{}".to_vec(), NOW_MS)
+            .unwrap();
+        assert!(bridge.answer(id, b"{}".to_vec(), false).unwrap());
+        // Already completed: second delivery correlates to nothing and
+        // must not consume inbound capacity.
+        assert!(!bridge.answer(id, b"{}".to_vec(), false).unwrap());
+        assert!(bridge.take_response().is_some());
+        assert!(bridge.take_response().is_none());
     }
 
     #[test]

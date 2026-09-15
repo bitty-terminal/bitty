@@ -304,8 +304,15 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         let final_byte = u8::try_from(u32::from(action)).unwrap_or(0);
+        if ignore {
+            // vte dropped parameters or intermediates past its fixed caps
+            // and flagged the sequence. Interpreting the truncated list would
+            // silently change terminal state, so fail closed to unknown.
+            self.unknown_csi(intermediates, final_byte);
+            return;
+        }
         let private = intermediates.contains(&b'?');
 
         if intermediates == *b" " && final_byte == b'q' {
@@ -582,7 +589,13 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         }
     }
 
-    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if ignore {
+            // Intermediates past vte's cap were dropped; never dispatch a
+            // mapped ESC command from a truncated header.
+            self.unknown_esc(intermediates, byte);
+            return;
+        }
         match (intermediates, byte) {
             ([], b'7') => self.emit(TerminalAction::CursorSave),
             ([], b'8') => self.emit(TerminalAction::CursorRestore),
@@ -596,12 +609,14 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                 mode: Mode::ApplicationKeypad,
                 enabled: false,
             }),
-            ([], b'N') => self.emit(TerminalAction::InvokeCharset {
+            // Single shifts: one-shot, consumed by the next printed scalar.
+            ([], b'N') => self.emit(TerminalAction::SingleShiftCharset {
                 slot: CharsetSlot::G2,
             }),
-            ([], b'O') => self.emit(TerminalAction::InvokeCharset {
+            ([], b'O') => self.emit(TerminalAction::SingleShiftCharset {
                 slot: CharsetSlot::G3,
             }),
+            // Locking shifts: G2/G3 become GL persistently (LS2/LS3).
             ([], b'n') => self.emit(TerminalAction::InvokeCharset {
                 slot: CharsetSlot::G2,
             }),
@@ -758,11 +773,25 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         }
     }
 
-    fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let final_byte = u8::try_from(u32::from(action)).unwrap_or(0);
+        let packed = pack_intermediates(intermediates);
+        if ignore {
+            // The DCS header overflowed vte's caps: never treat it as a
+            // mapped string. Report the unknown sequence immediately and
+            // leave the payload inert; `unhook` stays silent for it.
+            self.dcs.active = false;
+            self.emit(TerminalAction::Unknown(UnrecognizedSequence {
+                kind: SequenceKind::Dcs,
+                final_byte,
+                intermediates: packed,
+            }));
+            return;
+        }
         let capture = &mut self.dcs;
         capture.active = true;
-        capture.final_byte = u8::try_from(u32::from(action)).unwrap_or(0);
-        capture.intermediates = pack_intermediates(intermediates);
+        capture.final_byte = final_byte;
+        capture.intermediates = packed;
     }
 
     fn unhook(&mut self) {

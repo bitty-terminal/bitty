@@ -55,28 +55,41 @@ fn extended_color(
     }
     match sub_params(params, current + 1).and_then(<[u16]>::first) {
         Some(5) => {
-            let index = sub_params(params, current + 2)
+            // A missing index is malformed: never fabricate `Indexed(0)`.
+            // Consume only the specifier pair so later parameters are free
+            // to be parsed as their own SGR codes.
+            match sub_params(params, current + 2)
                 .and_then(<[u16]>::first)
                 .copied()
-                .unwrap_or(0);
-            changes.push(change_for(
-                target,
-                Color::Indexed(u8::try_from(index).unwrap_or(u8::MAX)),
-            ));
-            3
+            {
+                Some(index) => {
+                    changes.push(change_for(
+                        target,
+                        Color::Indexed(u8::try_from(index).unwrap_or(u8::MAX)),
+                    ));
+                    3
+                }
+                None => 2,
+            }
         }
         Some(2) => {
-            let rgb: Vec<u16> = (2..=4)
+            let components: Vec<u16> = (2..=4)
                 .filter_map(|offset| {
                     sub_params(params, current + offset)
                         .and_then(<[u16]>::first)
                         .copied()
                 })
                 .collect();
-            if let Some(color) = color_from_rgb(&rgb) {
-                changes.push(change_for(target, color));
+            match color_from_rgb(&components) {
+                Some(color) => {
+                    changes.push(change_for(target, color));
+                    5
+                }
+                // Truncated triple: no color, and consume only the
+                // components that were actually present. Returning 5 here
+                // would swallow followers beyond the present parameters.
+                None => 2 + components.len(),
             }
-            5
         }
         _ => 1,
     }
@@ -240,7 +253,11 @@ pub(super) fn parse_sgr(params: &Params) -> TerminalAction {
         };
         index += consumed;
     }
-    if changes.is_empty() {
+    // A parameterless `SGR` (`ESC [ m`) arrives as an explicit `0` parameter
+    // and resets via the `0` arm above. Unknown or malformed parameters are
+    // ignored (empty diff, no state change): fabricating a full reset for a
+    // hostile sequence would itself be a state-changing bug.
+    if changes.is_empty() && params.is_empty() {
         changes.push(AttributeChange::Reset);
     }
     TerminalAction::SetAttributes {

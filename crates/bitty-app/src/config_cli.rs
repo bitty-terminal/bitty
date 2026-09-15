@@ -1097,29 +1097,38 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
 /// speed, selection auto-copy, panel gaps, and hover-focus come from the
 /// file/CLI/default chain (already validated by `bitty-config`, so
 /// construction is expected to succeed — failures stay fail-closed).
-pub(crate) fn runtime_config_from_effective(
+/// Engaged defense-in-depth clamps are collected as warnings (CTX-0482);
+/// semantic bounds (scrollback) stay fail-closed.
+pub(crate) fn runtime_config_from_effective_with_warnings(
     effective: &bitty_config::EffectiveConfig,
-) -> Result<bitty_runtime::RuntimeConfig, String> {
+) -> Result<(bitty_runtime::RuntimeConfig, Vec<String>), String> {
+    let mut warnings: Vec<String> = Vec::new();
     let defaults = bitty_runtime::RuntimeConfig::default();
     let (cell_width, cell_height) = effective.font.default_effective_cell();
     // CTX-0177: `bitty-config` validates `0..=MAX_LAYOUT_GAP_CELLS` (u32) and
     // `bitty-runtime` mirrors the bound in u16; the clamp below is
     // defense-in-depth so a future bound drift can never wrap the cast.
-    let gaps_in = effective
-        .layout
-        .gaps_in
-        .min(u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS)) as u16;
-    let gaps_out = effective
-        .layout
-        .gaps_out
-        .min(u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS)) as u16;
+    let gaps_in = clamp_in_depth(
+        effective.layout.gaps_in,
+        u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS),
+        "layout.gaps_in",
+        &mut warnings,
+    ) as u16;
+    let gaps_out = clamp_in_depth(
+        effective.layout.gaps_out,
+        u32::from(bitty_runtime::config::MAX_LAYOUT_GAP_CELLS),
+        "layout.gaps_out",
+        &mut warnings,
+    ) as u16;
     // CTX-0223: `window.padding` flows file -> effective -> runtime the same
     // way (validated `0..=64` by `bitty-config`; clamped here so a future
     // bound drift can never wrap the cast).
-    let window_padding = effective
-        .window
-        .padding
-        .min(bitty_runtime::config::MAX_WINDOW_PADDING);
+    let window_padding = clamp_in_depth(
+        effective.window.padding,
+        bitty_runtime::config::MAX_WINDOW_PADDING,
+        "window.padding",
+        &mut warnings,
+    );
     // CTX-0241 S0: `window.radius_px` flows the same way (validated
     // `0..=24` by `bitty-config`; clamped here so a future bound drift can
     // never wrap the cast). S0 is a parsed no-op: stored on the runtime
@@ -1134,10 +1143,12 @@ pub(crate) fn runtime_config_from_effective(
         "auto" => bitty_runtime::ScrollbarMode::Auto,
         _ => bitty_runtime::ScrollbarMode::Hidden,
     };
-    let scrollbar_width = effective
-        .scrollbar
-        .width
-        .min(bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX);
+    let scrollbar_width = clamp_in_depth(
+        effective.scrollbar.width,
+        bitty_runtime::config::MAX_SCROLLBAR_WIDTH_PX,
+        "scrollbar.width",
+        &mut warnings,
+    );
     // CTX-0370: `close_confirm` flows file -> effective -> runtime by value
     // (`bitty-runtime` owns no `bitty-config` dependency); the match is
     // total with a fail-closed `when_busy` fallback so a future variant
@@ -1148,34 +1159,47 @@ pub(crate) fn runtime_config_from_effective(
         bitty_config::CloseConfirm::Never => bitty_runtime::CloseConfirmMode::Never,
         bitty_config::CloseConfirm::WhenBusy => bitty_runtime::CloseConfirmMode::WhenBusy,
     };
-    let window_radius_px = effective
-        .window
-        .radius_px
-        .min(bitty_runtime::config::MAX_WINDOW_RADIUS_PX);
+    let window_radius_px = clamp_in_depth(
+        effective.window.radius_px,
+        bitty_runtime::config::MAX_WINDOW_RADIUS_PX,
+        "window.radius_px",
+        &mut warnings,
+    );
     // CTX-0292: Core-owned workspace decoration flows file -> effective ->
     // runtime (`bitty-config` validates the accepted CTX-0118 ranges; the
     // clamps below are defense-in-depth so a future bound drift can never
     // wrap the u16 cast).
     let decoration = bitty_runtime::Decoration::new(
-        effective
-            .decoration
-            .gaps_in
-            .min(u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX)) as u16,
-        effective
-            .decoration
-            .gaps_out
-            .min(u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX)) as u16,
-        effective
-            .decoration
-            .border
-            .min(u32::from(bitty_runtime::config::MAX_DECORATION_BORDER_PX)) as u16,
-        effective
-            .decoration
-            .radius
-            .min(u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX)) as u16,
-        effective.decoration.content_inset.min(u32::from(
-            bitty_runtime::config::MAX_DECORATION_CONTENT_INSET_PX,
-        )) as u16,
+        clamp_in_depth(
+            effective.decoration.gaps_in,
+            u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX),
+            "decoration.gaps_in",
+            &mut warnings,
+        ) as u16,
+        clamp_in_depth(
+            effective.decoration.gaps_out,
+            u32::from(bitty_runtime::config::MAX_DECORATION_GAP_PX),
+            "decoration.gaps_out",
+            &mut warnings,
+        ) as u16,
+        clamp_in_depth(
+            effective.decoration.border,
+            u32::from(bitty_runtime::config::MAX_DECORATION_BORDER_PX),
+            "decoration.border",
+            &mut warnings,
+        ) as u16,
+        clamp_in_depth(
+            effective.decoration.radius,
+            u32::from(bitty_runtime::config::MAX_DECORATION_RADIUS_PX),
+            "decoration.radius",
+            &mut warnings,
+        ) as u16,
+        clamp_in_depth(
+            effective.decoration.content_inset,
+            u32::from(bitty_runtime::config::MAX_DECORATION_CONTENT_INSET_PX),
+            "decoration.content_inset",
+            &mut warnings,
+        ) as u16,
     );
     // CTX-0297: `terminal.scrollback` bounds retained history at terminal
     // creation. Unlike the clamped geometry knobs above, an out-of-range
@@ -1258,12 +1282,13 @@ pub(crate) fn runtime_config_from_effective(
         // CTX-0334: the dwell delay flows the same way. `bitty-config`
         // already bounds it fail-closed; clamp here as defense-in-depth so
         // a future bound drift can never exceed the runtime's timer bound.
-        cfg.focus_follows_mouse_delay = std::time::Duration::from_millis(u64::from(
-            effective
-                .mouse
-                .focus_follows_mouse_delay_ms
-                .min(bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS),
-        ));
+        cfg.focus_follows_mouse_delay =
+            std::time::Duration::from_millis(u64::from(clamp_in_depth(
+                effective.mouse.focus_follows_mouse_delay_ms,
+                bitty_runtime::config::MAX_FOCUS_FOLLOWS_MOUSE_DELAY_MS,
+                "mouse.focus_follows_mouse_delay_ms",
+                &mut warnings,
+            )));
         // CTX-0370: the close-confirmation mode rides the validated runtime
         // config (same post-construction pattern as hover-focus).
         cfg.close_confirm = close_confirm;
@@ -1343,9 +1368,44 @@ pub(crate) fn runtime_config_from_effective(
         // CTX-0297: effective `terminal.scrollback` is carried the same way;
         // terminal creation captures it as the retention cap.
         cfg.scrollback = scrollback;
-        cfg
+        (cfg, warnings)
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))
+}
+
+/// [`runtime_config_from_effective_with_warnings`] with engaged
+/// defense-in-depth clamps reported on stderr through the log gate
+/// (CTX-0482, issue #763). Values keep their clamp semantics, so an
+/// engaged clamp is a visible warning naming the key, never a silent
+/// normalization.
+pub(crate) fn runtime_config_from_effective(
+    effective: &bitty_config::EffectiveConfig,
+) -> Result<bitty_runtime::RuntimeConfig, String> {
+    let (config, warnings) = runtime_config_from_effective_with_warnings(effective)?;
+    for warning in warnings {
+        crate::logging::warn(move || warning);
+    }
+    Ok(config)
+}
+
+/// Defense-in-depth clamp (CTX-0482): `bitty-config` already validated the
+/// value, so a clamp that engages means upstream bound drift. The value is
+/// still bounded (never a wrapped cast), but the engaged key is named in
+/// `warnings` instead of changing silently.
+fn clamp_in_depth<T: Ord + Copy + std::fmt::Display>(
+    value: T,
+    max: T,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> T {
+    if value > max {
+        warnings.push(format!(
+            "bitty: {key} = {value} exceeds the runtime bound {max} — clamped (upstream validation drift)"
+        ));
+        max
+    } else {
+        value
+    }
 }
 
 /// Maps the resolved `bitty-config` animation contract onto the runtime

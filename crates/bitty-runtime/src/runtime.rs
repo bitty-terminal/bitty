@@ -417,6 +417,14 @@ pub struct Runtime {
     /// [`help::HELP_MAX_ROWS`]. Painted only while `help_visible`; the
     /// paint truncates to the panel with a `+N more` tail.
     help_rows: Vec<String>,
+    /// Panel-overlay modal bit (CTX-0482, issue #763).
+    ///
+    /// Presentation-only authority fed by the panel overlay integration
+    /// from [`bitty_ui::panel::OverlayManager::modal_active`] (see
+    /// [`Runtime::set_overlay_modal_active`]). `false` while no panel
+    /// overlays are live; the app's capture predicate reads it through
+    /// [`Runtime::overlay_modal_active`].
+    overlay_modal_active: bool,
     /// Next workspace creation sequence (display names `ws{seq}`).
     next_workspace_seq: u64,
     container: UiRect,
@@ -1011,6 +1019,7 @@ impl Runtime {
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),
+            overlay_modal_active: false,
             next_workspace_seq: 2,
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
@@ -1158,6 +1167,7 @@ impl Runtime {
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),
+            overlay_modal_active: false,
             next_workspace_seq: 2,
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
@@ -1304,6 +1314,28 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    /// Sets the panel-overlay modal bit (CTX-0482, issue #763).
+    ///
+    /// The panel integration drives this from
+    /// [`bitty_ui::panel::OverlayManager::modal_active`] transitions: while
+    /// a modal panel overlay is shown, the app's single capture predicate
+    /// must swallow chrome chords instead of running them behind the modal.
+    /// This bit is the *only* modal authority the panel overlay system may
+    /// use; layout overlays (`LayoutNode::Overlay`) and `PresentationMode`
+    /// never carry modal semantics.
+    pub fn set_overlay_modal_active(&mut self, active: bool) {
+        self.overlay_modal_active = active;
+    }
+
+    /// Whether a modal panel overlay currently captures dispatch (CTX-0482).
+    ///
+    /// `false` by default: no panel overlays are live in this slice, so the
+    /// predicate behaves exactly as before until the panel path sets it.
+    #[must_use]
+    pub fn overlay_modal_active(&self) -> bool {
+        self.overlay_modal_active
     }
 
     /// Snapshot of terminal truth for renderers or tests.

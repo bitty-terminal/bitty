@@ -33,6 +33,16 @@
 //!
 //! This crate (`bitty-ui`) depends only on `bitty-term-state`; this module
 //! adds no new crate dependency.
+//!
+//! # Overlay ownership (accepted decision, CTX-0482 / issue #763)
+//!
+//! Three overlay systems exist and must not be conflated:
+//! [`LayoutNode::Overlay`](crate::layout::LayoutNode::Overlay) owns geometry
+//! and paint order, [`OverlayManager`](crate::panel::OverlayManager) owns
+//! presentation stacking plus the single panel-modal authority, and this
+//! enum owns the requested per-leaf display mode (transitions gated, solver
+//! ignores it, never paints). A new overlay feature extends exactly one
+//! owner; see `OverlayManager` for the full decision text.
 
 #![forbid(unsafe_code)]
 

@@ -233,13 +233,17 @@ impl TerminalApp {
         }
         match self.runtime.save_session_on_exit() {
             bitty_runtime::SessionExitSaveOutcome::Saved(summary) => {
-                eprintln!(
-                    "bitty: session saved ({reason}: workspaces={} panes={} lines={} bytes={})",
-                    summary.workspaces, summary.panes, summary.scrollback_lines, summary.bytes
-                );
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: session saved ({reason}: workspaces={} panes={} lines={} bytes={})",
+                        summary.workspaces, summary.panes, summary.scrollback_lines, summary.bytes
+                    )
+                });
             }
             bitty_runtime::SessionExitSaveOutcome::Warned(err) => {
-                eprintln!("bitty: session save failed ({err}) — exiting anyway");
+                crate::logging::warn(|| {
+                    format!("bitty: session save failed ({err}) — exiting anyway")
+                });
             }
             bitty_runtime::SessionExitSaveOutcome::SkippedNoStateDir => {}
         }
@@ -405,7 +409,9 @@ impl TerminalApp {
                 eprintln!("{line}");
             }
             if self.runtime.replies_overflowed() {
-                eprintln!("warning: terminal reply queue overflowed (bounded cap)");
+                crate::logging::warn(|| {
+                    String::from("warning: terminal reply queue overflowed (bounded cap)")
+                });
             }
             // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
             // When no writer is present (headless), replies stay queued for `take_replies` observation.
@@ -483,7 +489,7 @@ impl TerminalApp {
         let inner = target.inner_size();
         // Only attempt GPU when we have a non-zero physical size
         if inner.width() == 0 || inner.height() == 0 {
-            eprintln!("bitty: gpu attach skipped (zero-size surface)");
+            crate::logging::info(|| String::from("bitty: gpu attach skipped (zero-size surface)"));
             return;
         }
         // CTX-0142: adopt the live DPI scale at attach (the compositor may
@@ -505,35 +511,45 @@ impl TerminalApp {
                     match surface.configure_with_opacity(&gpu, extent, self.window_opacity) {
                         Ok(()) => {
                             if self.window_opacity < 1.0 && !surface.opacity_alpha_supported() {
-                                eprintln!(
-                                    "bitty: window.opacity={:.3} unsupported on this GPU surface (no premultiplied alpha mode) — staying opaque",
-                                    bitty_platform::sanitize_opacity(self.window_opacity)
-                                );
+                                crate::logging::warn(|| {
+                                    format!(
+                                        "bitty: window.opacity={:.3} unsupported on this GPU surface (no premultiplied alpha mode) — staying opaque",
+                                        bitty_platform::sanitize_opacity(self.window_opacity)
+                                    )
+                                });
                             }
                             self.runtime.attach_gpu(gpu, surface);
-                            eprintln!(
-                                "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} crossfont={})",
-                                extent.width(),
-                                extent.height(),
-                                self.runtime.dpi_scale(),
-                                snap.width,
-                                snap.height,
-                                self.runtime.is_crossfont()
-                            );
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} crossfont={})",
+                                    extent.width(),
+                                    extent.height(),
+                                    self.runtime.dpi_scale(),
+                                    snap.width,
+                                    snap.height,
+                                    self.runtime.is_crossfont()
+                                )
+                            });
                         }
                         Err(err) => {
-                            eprintln!(
-                                "bitty: gpu surface configure failed ({err}) — staying headless"
-                            );
+                            crate::logging::warn(|| {
+                                format!(
+                                    "bitty: gpu surface configure failed ({err}) — staying headless"
+                                )
+                            });
                         }
                     }
                 }
                 Err(err) => {
-                    eprintln!("bitty: gpu surface creation failed ({err}) — staying headless");
+                    crate::logging::warn(|| {
+                        format!("bitty: gpu surface creation failed ({err}) — staying headless")
+                    });
                 }
             },
             Err(err) => {
-                eprintln!("bitty: gpu initialize failed ({err}) — staying headless (CI fallback)");
+                crate::logging::warn(|| {
+                    format!("bitty: gpu initialize failed ({err}) — staying headless (CI fallback)")
+                });
             }
         }
     }
@@ -571,7 +587,7 @@ impl AppHandler for TerminalApp {
                 control_proxy.wake_pty();
             })));
         }
-        eprintln!("bitty: pty wakeup armed (event-loop proxy)");
+        crate::logging::info(|| String::from("bitty: pty wakeup armed (event-loop proxy)"));
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
@@ -624,7 +640,7 @@ impl AppHandler for TerminalApp {
         };
         let should_exit = self.runtime.handle_platform_event(event.clone());
         if should_exit {
-            eprintln!("bitty: exit requested ({event:?})");
+            crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
             self.save_session_best_effort("exit");
             ctx.exit();
             return;
@@ -704,19 +720,23 @@ impl AppHandler for TerminalApp {
                             // (deterministic fallback, no panic). On a real display we get a wgpu surface
                             // via winit's SurfaceTarget and present via tick.
                             self.try_attach_gpu(&handle_for_gpu);
-                            eprintln!(
-                                "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={} ime=allowed",
-                                id.get(),
-                                self.runtime.has_gpu(),
-                                self.runtime.is_crossfont(),
-                                self.runtime.focused_view(),
-                                self.runtime.leaf_count()
-                            );
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={} ime=allowed",
+                                    id.get(),
+                                    self.runtime.has_gpu(),
+                                    self.runtime.is_crossfont(),
+                                    self.runtime.focused_view(),
+                                    self.runtime.leaf_count()
+                                )
+                            });
                         }
                         Err(err) => {
-                            eprintln!(
-                                "bitty: window creation failed ({err}) — continuing headless (no GPU, no display)"
-                            );
+                            crate::logging::warn(|| {
+                                format!(
+                                    "bitty: window creation failed ({err}) — continuing headless (no GPU, no display)"
+                                )
+                            });
                         }
                     }
                 }
@@ -749,23 +769,25 @@ impl AppHandler for TerminalApp {
                             let physical = self.window.as_ref().map(|win| win.inner_size());
                             self.runtime.apply_dpi_scale(factor.get(), physical);
                             let snap = self.runtime.snapshot();
-                            eprintln!(
-                                "bitty: dpi adopted scale={} dpi={} grid={}x{} physical={} surface={:?}",
-                                factor.get(),
-                                self.runtime.dpi_scale(),
-                                snap.width,
-                                snap.height,
-                                physical.map_or(String::from("none"), |p| format!(
-                                    "{}x{}",
-                                    p.width(),
-                                    p.height()
-                                )),
-                                self.runtime.surface_extent().map(|e| format!(
-                                    "{}x{}",
-                                    e.width(),
-                                    e.height()
-                                )),
-                            );
+                            crate::logging::info(|| {
+                                format!(
+                                    "bitty: dpi adopted scale={} dpi={} grid={}x{} physical={} surface={:?}",
+                                    factor.get(),
+                                    self.runtime.dpi_scale(),
+                                    snap.width,
+                                    snap.height,
+                                    physical.map_or(String::from("none"), |p| format!(
+                                        "{}x{}",
+                                        p.width(),
+                                        p.height()
+                                    )),
+                                    self.runtime.surface_extent().map(|e| format!(
+                                        "{}x{}",
+                                        e.width(),
+                                        e.height()
+                                    )),
+                                )
+                            });
                         }
                         if let Some(win) = self.window.as_ref() {
                             win.request_redraw();

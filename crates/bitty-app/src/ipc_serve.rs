@@ -94,9 +94,11 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
     #[cfg(not(unix))]
     {
         let _ = descriptor;
-        eprintln!(
-            "bitty: ipc socket serving is unavailable on this platform (continuing without IPC)"
-        );
+        crate::logging::warn(|| {
+            String::from(
+                "bitty: ipc socket serving is unavailable on this platform (continuing without IPC)",
+            )
+        });
         IpcServeGuard {
             enabled: false,
             socket_path: String::new(),
@@ -141,7 +143,7 @@ fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
             }
         }
         Err(reason) => {
-            eprintln!("bitty: ipc disabled (fail-soft): {reason}");
+            crate::logging::warn(|| format!("bitty: ipc disabled (fail-soft): {reason}"));
             IpcServeGuard {
                 enabled: false,
                 socket_path: String::new(),
@@ -226,7 +228,9 @@ fn accept_loop(
         match listener.accept() {
             Ok((stream, _)) => {
                 if active.load(Ordering::SeqCst) >= bitty_ipc::devtools::max_connections() {
-                    eprintln!("bitty: ipc connection shed (at RC-9 cap, newest first)");
+                    crate::logging::warn(|| {
+                        String::from("bitty: ipc connection shed (at RC-9 cap, newest first)")
+                    });
                     drop(stream);
                     continue;
                 }
@@ -248,7 +252,7 @@ fn accept_loop(
                 ));
             }
             Err(err) => {
-                eprintln!("bitty: ipc accept error: {err}");
+                crate::logging::warn(|| format!("bitty: ipc accept error: {err}"));
                 std::thread::sleep(Duration::from_millis(
                     bitty_ipc::devtools::ACCEPT_POLL_INTERVAL_MS * 5,
                 ));
@@ -326,7 +330,9 @@ fn serve_stream(
         match bitty_ipc::devtools::transport_attested_peer(&server.socket_path, runtime_uid) {
             Ok(peer) => peer,
             Err(err) => {
-                eprintln!("bitty: ipc connection rejected (endpoint verification): {err}");
+                crate::logging::warn(|| {
+                    format!("bitty: ipc connection rejected (endpoint verification): {err}")
+                });
                 return;
             }
         };
@@ -352,14 +358,16 @@ fn serve_stream(
     ) {
         Ok(stats) => {
             if stats.denied > 0 || stats.framing_errors > 0 {
-                eprintln!(
-                    "bitty: ipc connection closed (requests={} denied={} framing_errors={})",
-                    stats.requests, stats.denied, stats.framing_errors
-                );
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: ipc connection closed (requests={} denied={} framing_errors={})",
+                        stats.requests, stats.denied, stats.framing_errors
+                    )
+                });
             }
         }
         Err(err) => {
-            eprintln!("bitty: ipc connection rejected: {err}");
+            crate::logging::warn(|| format!("bitty: ipc connection rejected: {err}"));
         }
     }
 }

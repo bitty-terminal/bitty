@@ -495,8 +495,9 @@ impl Runtime {
                         // (Ghostty `clipboard_response` pattern), so
                         // tmux/neovim queries terminate instead of hanging.
                         // The lossy read keeps the reply path total: a
-                        // system-clipboard failure falls back to the last
-                        // known buffer rather than answering with silence.
+                        // system-clipboard failure answers with an empty
+                        // payload rather than replaying a stale value
+                        // (CTX-0478), and the reply is always sent.
                         let text = self.clipboard.get_text_lossy();
                         let reply = osc52_read_reply(&text);
                         self.state.apply(&TerminalAction::Reply {

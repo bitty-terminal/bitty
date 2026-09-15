@@ -137,21 +137,28 @@ fn copy_selection_to_clipboard_headless() {
 }
 
 #[test]
-fn clipboard_is_bounded_and_truncates() {
+fn clipboard_rejects_over_limit_payloads_without_truncating() {
     let mut rt = make_runtime();
     let long = "x".repeat(9000);
-    // Direct clipboard write truncates to CLIPBOARD_MAX_BYTES (8192) at char boundary.
+    // CTX-0478: an over-limit payload is a typed rejection, never a silently
+    // truncated write; the previous clipboard value is preserved.
+    let err = rt
+        .clipboard_mut()
+        .set_text(long)
+        .expect_err("over-limit set must be rejected");
+    assert!(matches!(
+        err,
+        bitty_platform::PlatformError::ClipboardPayloadTooLarge {
+            len: 9000,
+            max: 8192
+        }
+    ));
+    assert_eq!(rt.clipboard().headless_contents(), "");
+    // At the exact cap the write lands whole and pastes whole (bounded).
+    let at_limit = "y".repeat(8192);
     rt.clipboard_mut()
-        .set_text(long.clone())
-        .expect("set must succeed headless");
-    assert_eq!(rt.clipboard().headless_contents().len(), 8192);
-    assert!(rt.clipboard().headless_contents().chars().all(|c| c == 'x'));
-    // Copy of a long selection also bounded via clipboard primitive.
-    // Fill snapshot with long text? Instead test paste bounded.
-    let long_paste = "y".repeat(9000);
-    rt.clipboard_mut()
-        .set_text(long_paste)
-        .expect("set long paste");
+        .set_text(at_limit)
+        .expect("at-limit set succeeds");
     rt.drain_pending_input();
     let insp = rt.paste_from_clipboard().expect("paste").expect("insp");
     // Long clean paste (all 'y') is delivered immediately, no pending.

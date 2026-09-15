@@ -39,14 +39,25 @@ fn headless_clear_empties_both_buffers_and_surfaces_ok() {
 
 #[test]
 fn headless_payloads_stay_bounded_on_both_selections() {
+    // CTX-0478: over-limit payloads are rejected with a typed error instead
+    // of being silently truncated; the previous value is preserved.
     let mut cb = Clipboard::new_headless();
+    cb.set_text("seed".to_string()).expect("seed");
     let long = "x".repeat(CLIPBOARD_MAX_BYTES + 64);
-    cb.set_text(long).expect("bounded set");
-    assert_eq!(cb.headless_contents().len(), CLIPBOARD_MAX_BYTES);
-    assert_eq!(cb.primary_contents().len(), CLIPBOARD_MAX_BYTES);
+    match cb.set_text(long) {
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { len, max }) => {
+            assert_eq!(max, CLIPBOARD_MAX_BYTES);
+            assert_eq!(len, CLIPBOARD_MAX_BYTES + 64);
+        }
+        other => panic!("expected ClipboardPayloadTooLarge, got {other:?}"),
+    }
+    assert_eq!(cb.headless_contents(), "seed");
+    assert_eq!(cb.primary_contents(), "seed");
     let emoji = "😀".repeat((CLIPBOARD_MAX_BYTES / 4) + 5);
-    cb.set_primary(emoji).expect("bounded primary");
-    assert!(cb.primary_contents().len() <= CLIPBOARD_MAX_BYTES);
+    assert!(matches!(
+        cb.set_primary(emoji),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { .. })
+    ));
 }
 
 #[test]

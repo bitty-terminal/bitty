@@ -252,3 +252,221 @@ fn host_call_deadline_returns_typed_timeout() {
         Some(&LuaValue::String("E_TIMEOUT".to_string()))
     );
 }
+
+struct SpawnServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    calls: RefCell<Vec<Vec<String>>>,
+    deny: bool,
+}
+
+impl HostServices for SpawnServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
+        self.calls.borrow_mut().push(args.to_vec());
+        if self.deny {
+            return Err(BridgeError::capability_denied("process.spawn:git"));
+        }
+        Ok(LuaValue::table([
+            ("output", LuaValue::String("M  staged.lua".to_string())),
+            ("stderr", LuaValue::String(String::new())),
+            ("truncated", LuaValue::Bool(false)),
+            ("exit_code", LuaValue::Integer(0)),
+            ("untrusted", LuaValue::Bool(true)),
+        ]))
+    }
+}
+
+fn install_spawn(vm: &mut LuaVm, services: Rc<SpawnServices>) {
+    let services: Rc<dyn HostServices> = services;
+    vm.install_host_module(services, MarshallingLimits::default(), 50)
+        .expect("install");
+}
+
+#[test]
+fn process_spawn_unavailable_by_default() {
+    // FakeServices does not override process_spawn: the default fails closed
+    // with E_SPAWN_UNAVAILABLE (the CTX-0400 git-panel gap).
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("spawn-unavailable");
+    install(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.process.spawn, { "status", "--porcelain" })
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_SPAWN_UNAVAILABLE".to_string()))
+    );
+}
+
+#[test]
+fn process_spawn_serves_bounded_table() {
+    let services = Rc::new(SpawnServices {
+        store: RefCell::new(BTreeMap::new()),
+        calls: RefCell::new(Vec::new()),
+        deny: false,
+    });
+    let mut vm = LuaVm::new("spawn-ok");
+    install_spawn(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local result = bitty.process.spawn({ "status", "--porcelain" })
+            bitty.store.set("output", result.output)
+            bitty.store.set("untrusted", result.untrusted)
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("output"),
+        Some(&LuaValue::String("M  staged.lua".to_string()))
+    );
+    assert_eq!(
+        services.store.borrow().get("untrusted"),
+        Some(&LuaValue::Bool(true))
+    );
+    assert_eq!(
+        services.calls.borrow().as_slice(),
+        &[vec!["status".to_string(), "--porcelain".to_string()]]
+    );
+}
+
+#[test]
+fn process_spawn_denied_stays_typed() {
+    let services = Rc::new(SpawnServices {
+        store: RefCell::new(BTreeMap::new()),
+        calls: RefCell::new(Vec::new()),
+        deny: true,
+    });
+    let mut vm = LuaVm::new("spawn-denied");
+    install_spawn(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.process.spawn, { "status" })
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_CAPABILITY_DENIED".to_string()))
+    );
+}
+
+#[test]
+fn process_spawn_rejects_malformed_argv() {
+    for (tag, chunk) in [
+        (
+            "non-table",
+            r#"local ok, err = pcall(bitty.process.spawn, "status")"#.to_string(),
+        ),
+        (
+            "empty",
+            r#"local ok, err = pcall(bitty.process.spawn, {})"#.to_string(),
+        ),
+        (
+            "non-string",
+            r#"local ok, err = pcall(bitty.process.spawn, { "status", 42 })"#.to_string(),
+        ),
+        (
+            "sparse",
+            r#"local t = {} t[1] = "status" t[3] = "x" local ok, err = pcall(bitty.process.spawn, t)"#
+                .to_string(),
+        ),
+    ] {
+        let services = Rc::new(SpawnServices {
+            store: RefCell::new(BTreeMap::new()),
+            calls: RefCell::new(Vec::new()),
+            deny: false,
+        });
+        let mut vm = LuaVm::new(format!("spawn-bad-{tag}"));
+        install_spawn(&mut vm, services.clone());
+        let outcome = vm
+            .execute_bounded(&format!(
+                r#"
+            {chunk}
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#
+            ))
+            .expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{tag}: {outcome:?}"
+        );
+        let code = services.store.borrow().get("code").cloned();
+        assert!(
+            matches!(
+                code,
+                Some(LuaValue::String(ref s))
+                if s == "E_VALUE_TYPE" || s == "E_VALUE_NODES" || s == "E_VALUE_BYTES"
+            ),
+            "{tag}: got {code:?}"
+        );
+        assert!(
+            services.calls.borrow().is_empty(),
+            "{tag}: malformed argv must not reach the service"
+        );
+    }
+}
+
+#[test]
+fn process_namespace_is_read_only() {
+    let mut vm = LuaVm::new("spawn-readonly");
+    install(&mut vm, Rc::new(FakeServices::default()));
+    let outcome = vm
+        .execute_bounded("bitty.process.spawn = 1")
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::RuntimeError(_)),
+        "assignment must fail: {outcome:?}"
+    );
+}

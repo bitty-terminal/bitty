@@ -25,6 +25,7 @@ pub mod manifest_toml;
 pub mod package;
 pub mod resolution;
 pub mod services;
+pub mod spawn;
 pub mod store;
 
 use std::cell::RefCell;
@@ -617,6 +618,9 @@ impl PluginRuntime {
         let platform_notify = granted
             .iter()
             .any(|capability| capability.as_str() == "platform.notify");
+        let spawn_git = granted
+            .iter()
+            .any(|capability| capability.as_str() == "process.spawn:git");
         let plugin_services = Rc::new(PluginServices::new(
             id.as_str(),
             store,
@@ -626,6 +630,14 @@ impl PluginRuntime {
             terminal_read,
             platform_notify,
         ));
+        // CTX-0445: Layer-2 spawn surface. The grant gate lives here; the
+        // execution backend closes over the consent ledger and (until
+        // CTX-0444) a deny-all allowlist, so granted-but-unenforced tools
+        // still fail closed as E_SPAWN_DENIED, never ambient.
+        if spawn_git {
+            plugin_services.set_spawn_git(true);
+            plugin_services.set_spawn_backend(Some(spawn::git_spawn_backend(id.as_str())));
+        }
         let mut vm = LuaVm::new(id.as_str());
         vm.with_module_root(module_root.clone());
         {

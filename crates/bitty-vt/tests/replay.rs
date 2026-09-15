@@ -8,8 +8,8 @@
 use bitty_vt::{
     Attribute, AttributeChange, AttributeDiff, BoundedBytes, BoundedString, ClipboardOp, Color,
     ControlChar, Count, CursorStyle, Direction, EraseDisplayMode, EraseLineMode, GraphemeCell,
-    Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Row, SequenceKind, StatusKind,
-    TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb,
+    Row, SequenceKind, StatusKind, TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 
 fn parse_twice(bytes: &[u8]) -> Vec<TerminalAction> {
@@ -258,7 +258,7 @@ fn fixture_fullscreen_app_replay() {
 }
 
 /// OSC coverage sweep including clipboard query/write, cwd reports,
-/// unknown codes, and payload truncation at the bounded cap.
+/// palette set (CTX-0392 OSC 4), and payload truncation at the bounded cap.
 #[test]
 fn fixture_osc_sweep_replay() {
     let oversized = "z".repeat(bitty_vt::BoundedString::MAX_LEN + 64);
@@ -278,9 +278,17 @@ fn fixture_osc_sweep_replay() {
         TerminalAction::OscCwd {
             url: BoundedString::new("file:///tmp/wd"),
         },
-        TerminalAction::OscUnknown {
-            id: 4,
-            data: BoundedBytes::new(b"1;#ff0000".to_vec()),
+        // CTX-0392: OSC 4 is now a mapped family (was OscUnknown before).
+        TerminalAction::OscPalette {
+            ops: vec![PaletteOp {
+                index: 1,
+                op: PaletteColorOp::Set(Rgb {
+                    r: 0xFF,
+                    g: 0x00,
+                    b: 0x00,
+                }),
+            }]
+            .into_boxed_slice(),
         },
         TerminalAction::OscTitle {
             text: BoundedString::new("z".repeat(BoundedString::MAX_LEN)),

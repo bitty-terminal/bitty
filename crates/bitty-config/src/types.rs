@@ -2504,10 +2504,22 @@ impl MouseConfig {
 /// preset ([`crate::theme::DEFAULT_THEME_NAME`]), a known name resolves to
 /// its exact values, and an unknown name falls back to the default (logged).
 /// No config-file I/O happens here; the identifier is already-parsed data.
+///
+/// CTX-0392: the optional inline `colors` table carries a bounded custom
+/// palette ([`crate::theme::CustomPalette`]) from the already-trusted user
+/// config file. OQ-047 stays `Open`, so no theme-file path exists: `colors`
+/// never names a file, only inline hex leaves. When present it must be a
+/// complete palette (4 chrome colors plus exactly 16 ANSI entries); partial
+/// tables fail closed at the file loader, and the effective outline
+/// AC-1/AC-2 contract is enforced against the custom background.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppearanceConfig {
     /// Optional theme identifier.
     pub theme: Option<String>,
+    /// Optional inline custom palette (CTX-0392). `None` means "this layer
+    /// says nothing"; a present value is a complete validated palette and
+    /// scalar-replaces any lower layer's palette at merge.
+    pub colors: Option<crate::theme::CustomPalette>,
     /// Panel animation overrides (RFC-0002, CTX-0341). `None` means "this
     /// layer says nothing"; a present value deep-merges per leaf, and the
     /// effective concrete [`AnimationsConfig`] lives on [`EffectiveConfig`].
@@ -2532,10 +2544,24 @@ impl AppearanceConfig {
                 ));
             }
         }
+        // `colors` holds parsed bytes, so structural validation already
+        // happened at the file loader; nothing further to check here (the
+        // outline AC-1/AC-2 contract against the custom background runs on
+        // `EffectiveConfig::validate`).
         if let Some(a) = &self.animations {
             a.validate()?;
         }
         Ok(())
+    }
+
+    /// Effective background for outline-contract validation: the custom
+    /// palette background when present, else the preset background.
+    #[must_use]
+    pub fn effective_background(&self) -> [u8; 3] {
+        if let Some(custom) = &self.colors {
+            return custom.background;
+        }
+        crate::theme::resolve_theme(self.theme.as_deref()).background
     }
 }
 
@@ -2692,6 +2718,32 @@ impl Default for EffectiveConfig {
 }
 
 impl EffectiveConfig {
+    /// Effective theme for validation and rendering (CTX-0392).
+    ///
+    /// The base preset comes from `appearance.theme` via the built-in
+    /// registry; when `appearance.colors` is present its chrome colors and
+    /// 16 ANSI entries replace the preset's, while the Bitty-owned outline
+    /// tokens (`border_focused`/`border_idle`) stay from the preset. This
+    /// keeps the accepted AC-1/AC-2 derivation (preset tokens) while
+    /// validating them against the custom background, and never touches a
+    /// theme file (OQ-047 stays `Open`).
+    #[must_use]
+    pub fn effective_theme(&self) -> crate::theme::Theme {
+        let base = *crate::theme::resolve_theme(self.appearance.theme.as_deref());
+        if let Some(custom) = &self.appearance.colors {
+            crate::theme::Theme {
+                background: custom.background,
+                foreground: custom.foreground,
+                cursor: custom.cursor,
+                selection: custom.selection,
+                ansi: custom.ansi,
+                ..base
+            }
+        } else {
+            base
+        }
+    }
+
     /// Returns the built-in safe configuration: every field at its core
     /// default except the Core-owned decoration forced to the safe-mode values
     /// (`0/0/1/0/0` geometry and the opaque `#FFFFFF`/`#808080` outline pair)
@@ -2732,15 +2784,17 @@ impl EffectiveConfig {
         // CTX-0340: the outline pair is resolvable only after merge, so the
         // AC-1/AC-2 contrast contract is enforced on the effective resolved
         // pair against the selected theme's background (AC-3 stays advisory).
-        let theme = crate::theme::resolve_theme(self.appearance.theme.as_deref());
-        self.decoration.validate_outline_contract(theme)?;
+        // CTX-0392: the background is the custom palette background when
+        // `appearance.colors` is present (same floors, custom ground).
+        let theme = self.effective_theme();
+        self.decoration.validate_outline_contract(&theme)?;
         // CTX-0343: a violating `views.*` override that is resolvable now
         // (`*` or a content-type selector) rejects the WHOLE reload with a
         // source-attributed `views[<selector>].<field>` diagnostic. The
         // `ws:`/`view:` tiers are still inert at merge time; the runtime
         // first-match path (View creation/bind/move) validates those pairs
         // fail-closed before they are committed.
-        self.validate_view_targets(theme, &RESOLVABLE_VIEW_TARGETS)?;
+        self.validate_view_targets(&theme, &RESOLVABLE_VIEW_TARGETS)?;
         self.scrollbar.validate()?;
         self.mouse.validate()?;
         self.appearance.validate()?;

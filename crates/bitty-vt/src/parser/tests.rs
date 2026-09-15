@@ -8,8 +8,9 @@ use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
     ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, Mode, MouseTrackingMode, Rgb, Row,
-    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
+    MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
+    UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -713,6 +714,115 @@ fn osc_dynamic_color_malformed_fails_closed() {
             "malformed OSC {id} must stay inert, got {actions:?} for {sequence:?}"
         );
     }
+}
+
+#[test]
+fn osc4_query_and_set_forms() {
+    // Single query.
+    assert_eq!(
+        parse(b"\x1b]4;1;?\x07"),
+        vec![TerminalAction::OscPalette {
+            ops: vec![PaletteOp {
+                index: 1,
+                op: PaletteColorOp::Query,
+            }]
+            .into_boxed_slice(),
+        }]
+    );
+    // Single set with #RRGGBB.
+    assert_eq!(
+        parse(b"\x1b]4;2;#12ab34\x07"),
+        vec![TerminalAction::OscPalette {
+            ops: vec![PaletteOp {
+                index: 2,
+                op: PaletteColorOp::Set(Rgb {
+                    r: 0x12,
+                    g: 0xAB,
+                    b: 0x34
+                }),
+            }]
+            .into_boxed_slice(),
+        }]
+    );
+    // Multi-pair: query + set in one sequence, wire order preserved.
+    assert_eq!(
+        parse(b"\x1b]4;1;?;2;rgb:11/22/33\x1b\\"),
+        vec![TerminalAction::OscPalette {
+            ops: vec![
+                PaletteOp {
+                    index: 1,
+                    op: PaletteColorOp::Query,
+                },
+                PaletteOp {
+                    index: 2,
+                    op: PaletteColorOp::Set(Rgb {
+                        r: 0x11,
+                        g: 0x22,
+                        b: 0x33
+                    }),
+                },
+            ]
+            .into_boxed_slice(),
+        }]
+    );
+    // Boundary indices 0 and 255.
+    for index in [0u8, 255u8] {
+        let seq = format!("\x1b]4;{index};?\x07").into_bytes();
+        assert_eq!(
+            parse(&seq),
+            vec![TerminalAction::OscPalette {
+                ops: vec![PaletteOp {
+                    index,
+                    op: PaletteColorOp::Query,
+                }]
+                .into_boxed_slice(),
+            }],
+            "boundary index {index}"
+        );
+    }
+    assert_eq!(MAX_OSC4_OPS, 16, "pair bound pinned");
+}
+
+#[test]
+fn osc4_malformed_fails_closed() {
+    for sequence in [
+        &b"\x1b]4;\x07"[..],              // empty payload
+        &b"\x1b]4;1\x07"[..],             // odd segments (index without spec)
+        &b"\x1b]4;?;?\x07"[..],           // non-numeric index
+        &b"\x1b]4;256;?\x07"[..],         // index out of range
+        &b"\x1b]4;-1;?\x07"[..],          // negative index
+        &b"\x1b]4;1;#12345\x07"[..],      // wrong hex length
+        &b"\x1b]4;1;#gggggg\x07"[..],     // non-hex digits
+        &b"\x1b]4;1;rgb:1/2\x07"[..],     // missing component
+        &b"\x1b]4;1;not-a-color\x07"[..], // unknown prefix
+        &b"\x1b]4;1;?;2\x07"[..],         // trailing odd segment
+    ] {
+        let actions = parse(sequence);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [TerminalAction::OscUnknown { id: 4, .. }]
+            ),
+            "malformed OSC 4 must stay inert, got {actions:?} for {sequence:?}"
+        );
+    }
+    // Pair-count overflow fails closed (17 pairs > 16 bound).
+    let mut seq = b"\x1b]4;".to_vec();
+    for i in 0..17u32 {
+        if i > 0 {
+            seq.push(b';');
+        }
+        seq.extend_from_slice(format!("{i};?").as_bytes());
+    }
+    seq.extend_from_slice(b"\x07");
+    let actions = parse(&seq);
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [TerminalAction::OscUnknown { id: 4, .. }]
+        ),
+        "17-pair OSC 4 must stay inert, got {actions:?}"
+    );
 }
 
 #[test]

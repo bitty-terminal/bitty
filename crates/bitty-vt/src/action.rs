@@ -409,6 +409,42 @@ pub enum DynamicColorOp {
     Set(Rgb),
 }
 
+/// Operation carried by one `OSC 4` palette pair (CTX-0392, issue #648).
+///
+/// The parser only classifies and bounds the payload. Answering queries and
+/// gating sets belong to the runtime, which owns the active 256-entry
+/// palette and the set capability (shared with OSC 10/11 gating).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PaletteColorOp {
+    /// `OSC 4;<index>;?`: report the active color for `index`.
+    Query,
+    /// `OSC 4;<index>;<color>`: parsed set value for `index`.
+    Set(Rgb),
+}
+
+/// One bounded `OSC 4` palette operation: an index plus its query/set op.
+///
+/// Indices are `0..=255` (fixed 256-entry shape, no growth). Malformed
+/// indices, colors, or pair structures never produce this type; the caller
+/// records the whole sequence as inert instead (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaletteOp {
+    /// Palette index `0..=255`.
+    pub index: u8,
+    /// Query or bounded set value.
+    pub op: PaletteColorOp,
+}
+
+/// Maximum `OSC 4` pairs honored per sequence (CTX-0392).
+///
+/// Bounds one escape sequence's work: xterm allows many `;<index>;<spec>`
+/// pairs per `OSC 4`, but each pair is a query reply or a gated set, so an
+/// unbounded pair count would let untrusted PTY bytes force unbounded reply
+/// growth. 16 pairs cover real-world uses (single-index sets/queries and
+/// small batch recolors) while keeping replies bounded (< 1 KiB); longer
+/// sequences fail closed as inert.
+pub const MAX_OSC4_OPS: usize = 16;
+
 /// Semantic prompt/command zone marker carried by `OSC 133`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ZoneKind {
@@ -651,6 +687,17 @@ pub enum TerminalAction {
         target: DynamicColorTarget,
         /// Query or bounded set value.
         op: DynamicColorOp,
+    },
+    /// Palette operation (`OSC 4`, CTX-0392).
+    ///
+    /// The parser resolves the payload to at most [`MAX_OSC4_OPS`] bounded
+    /// index/query-or-set pairs; terminal state treats this as inert and
+    /// the runtime answers queries from the active 256-entry palette and
+    /// applies authorized sets under the shared OSC color-set gate.
+    /// Malformed sequences never reach this variant (fail-closed inert).
+    OscPalette {
+        /// Bounded index/query-or-set pairs in wire order.
+        ops: Box<[PaletteOp]>,
     },
     /// Clipboard read/write request (`OSC 52`); effects flow through the
     /// recorded policy decision, not this action (RFC replay guarantees).

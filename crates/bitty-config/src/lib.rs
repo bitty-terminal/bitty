@@ -108,9 +108,9 @@ pub use reload::{
     ReloadClass, ReloadReport, classify_field, diff, fallback_builtin, reconcile_live,
 };
 pub use theme::{
-    ALL_PRESETS, BITTY_DARK, DARK_THEME_ALIAS, DEFAULT_THEME_NAME, Theme, ThemeCategory,
-    ThemeResolution, default_theme, list_presets, normalize_theme_name, resolve_theme,
-    resolve_theme_with_status,
+    ALL_PRESETS, BITTY_DARK, CUSTOM_PALETTE_ANSI_COUNT, CustomPalette, DARK_THEME_ALIAS,
+    DEFAULT_THEME_NAME, Theme, ThemeCategory, ThemeResolution, default_theme, list_presets,
+    normalize_theme_name, resolve_theme, resolve_theme_with_status,
 };
 pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
 pub use types::{
@@ -167,6 +167,7 @@ mod integration_tests {
                     ..Default::default()
                 }),
                 appearance: Some(AppearanceConfig {
+                    colors: None,
                     theme: Some("dark".into()),
                     animations: None,
                 }),

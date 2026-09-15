@@ -9,8 +9,8 @@ use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
-    Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, Row, SequenceKind, StatusKind,
-    TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
+    MAX_OSC4_OPS, Mode, MouseCoordinateEncoding, MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb,
+    Row, SequenceKind, StatusKind, TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -237,6 +237,54 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Parses an `OSC 4` payload segment list (CTX-0392).
+///
+/// Accepted shape: even-count `;<index>;<spec>` pairs (`index` decimal
+/// `0..=255`, `spec` `?` query or the same color grammar as OSC 10/11:
+/// `#RGB`, `#RRGGBB`, `rgb:R/G/B` 1-4 hex digits per component). At least
+/// one pair and at most [`MAX_OSC4_OPS`] pairs; the whole sequence fails
+/// closed (`None`) on an odd segment count, empty payload, non-decimal or
+/// out-of-range index, malformed color, or pair-count overflow, so the
+/// caller records it as inert and live palette state never corrupts.
+/// The input is already length-bounded by the parser's OSC collector.
+fn parse_osc4(rest: &[&[u8]]) -> Option<Vec<PaletteOp>> {
+    if rest.is_empty() || rest.len() % 2 != 0 {
+        return None;
+    }
+    let pairs = rest.len() / 2;
+    if pairs == 0 || pairs > MAX_OSC4_OPS {
+        return None;
+    }
+    let mut ops = Vec::with_capacity(pairs);
+    for chunk in rest.chunks_exact(2) {
+        let index = parse_palette_index(chunk[0])?;
+        let op = if chunk[1] == b"?" {
+            PaletteColorOp::Query
+        } else {
+            PaletteColorOp::Set(parse_dynamic_color_spec(chunk[1])?)
+        };
+        ops.push(PaletteOp { index, op });
+    }
+    Some(ops)
+}
+
+/// Parses one `OSC 4` palette index: ASCII decimal `0..=255`, digits only
+/// (no sign, no whitespace, no `+`, no hex). Empty and out-of-range fail
+/// closed.
+fn parse_palette_index(raw: &[u8]) -> Option<u8> {
+    if raw.is_empty() || raw.len() > 3 || !raw.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // Reject leading-zero ambiguity? No: `007` is a valid wire spelling for
+    // 7 (xterm accepts it); canonicalization is the runtime's job. Only
+    // digits-only and range matter here.
+    let mut value: u32 = 0;
+    for &digit in raw {
+        value = value * 10 + u32::from(digit - b'0');
+    }
+    u8::try_from(value).ok()
 }
 
 impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
@@ -619,6 +667,21 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     }
                 }
             }
+            4 => match parse_osc4(rest) {
+                Some(ops) => self.emit(TerminalAction::OscPalette {
+                    ops: ops.into_boxed_slice(),
+                }),
+                // Malformed payloads fail closed: no query, no set; the
+                // sequence is recorded as inert telemetry only, so live
+                // palette state never corrupts.
+                None => {
+                    let data = join_segments(rest);
+                    self.emit(TerminalAction::OscUnknown {
+                        id,
+                        data: BoundedBytes::new(data),
+                    });
+                }
+            },
             7 => {
                 let joined = join_segments(rest);
                 let url = String::from_utf8_lossy(&joined).into_owned();

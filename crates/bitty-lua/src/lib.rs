@@ -64,7 +64,11 @@ pub mod config;
 pub mod host;
 mod stdlib;
 
-pub use config::{ConfigData, ConfigOutcome, FontData, KeymapData, TerminalData, WindowData};
+pub use config::{
+    AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
+    LayoutData, MouseData, ScrollbarData, SelectionData, TerminalData, ViewOverrideData,
+    WindowData,
+};
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, CommandRegistration, EventSubscription,
     HostServices, LuaValue, MarshallingLimits, RegistrationCapture, SNAPSHOT_MAX_BYTES,

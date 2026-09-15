@@ -94,6 +94,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "mouse.focus_follows_mouse"
         | "mouse.focus_follows_mouse_delay_ms"
         | "appearance.theme"
+        | "appearance.colors"
         | "appearance.animations.enabled"
         | "appearance.animations.reduced_motion"
         | "appearance.animations.duration_ms.open"
@@ -565,6 +566,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "mouse.focus_follows_mouse_delay_ms",
     "mouse",
     "appearance.theme",
+    "appearance.colors",
     "appearance.animations.enabled",
     "appearance.animations.reduced_motion",
     "appearance.animations.duration_ms.open",
@@ -1314,6 +1316,54 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                     MergeClass::ScalarReplace,
                 );
                 attribution.insert("appearance".to_string(), src.clone());
+            }
+            // CTX-0392: the inline custom palette scalar-replaces like
+            // `appearance.theme`; absent means "says nothing". Present is a
+            // complete validated palette (never a partial merge).
+            {
+                let field = "appearance.colors";
+                if is_policy {
+                    if app.colors.is_some() {
+                        policy_fields.insert(field.to_string(), src.clone());
+                        effective.appearance.colors = app.colors;
+                        let prev = attribution.get(field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                        attribution.insert("appearance".to_string(), src.clone());
+                    }
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    if app.colors.is_some() {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    }
+                } else if app.colors.is_some() {
+                    let prev = attribution.get(field).cloned();
+                    effective.appearance.colors = app.colors;
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                    attribution.insert("appearance".to_string(), src.clone());
+                }
             }
             // RFC-0002: the animations table deep-merges per leaf; every
             // present leaf is scalar-replace with its own attribution.
@@ -2153,6 +2203,53 @@ fn merge_layers_allow_policy_violations(
                     MergeClass::ScalarReplace,
                 );
                 attribution.insert("appearance".to_string(), src.clone());
+            }
+            // CTX-0392: the inline custom palette scalar-replaces like
+            // `appearance.theme`; absent means "says nothing".
+            {
+                let field = "appearance.colors";
+                if is_policy {
+                    if app.colors.is_some() {
+                        policy_fields.insert(field.to_string(), src.clone());
+                        effective.appearance.colors = app.colors;
+                        let prev = attribution.get(field).cloned();
+                        record_attribution(
+                            &mut attribution,
+                            &mut conflicts,
+                            field,
+                            prev,
+                            src,
+                            MergeClass::ScalarReplace,
+                        );
+                        attribution.insert("appearance".to_string(), src.clone());
+                    }
+                } else if let Some(policy_src) = policy_fields.get(field) {
+                    if app.colors.is_some() {
+                        policy_violations.push(ConfigError::NonOverridable {
+                            field: field.to_string(),
+                            policy_source: policy_src.describe(),
+                            attempted_source: src.describe(),
+                        });
+                        conflicts.push(MergeConflict {
+                            field: field.to_string(),
+                            previous_source: policy_src.clone(),
+                            new_source: src.clone(),
+                            merge_class: MergeClass::ScalarReplace,
+                        });
+                    }
+                } else if app.colors.is_some() {
+                    let prev = attribution.get(field).cloned();
+                    effective.appearance.colors = app.colors;
+                    record_attribution(
+                        &mut attribution,
+                        &mut conflicts,
+                        field,
+                        prev,
+                        src,
+                        MergeClass::ScalarReplace,
+                    );
+                    attribution.insert("appearance".to_string(), src.clone());
+                }
             }
             // RFC-0002: the animations table deep-merges per leaf (second
             // merge path: allow-policy-violations variant for diagnostics).
@@ -3630,6 +3727,7 @@ mod tests {
             ConfigSource::new(LayerKind::SystemDefaults, Some("system.lua")),
             ConfigPlan {
                 appearance: Some(crate::types::AppearanceConfig {
+                    colors: None,
                     theme: None,
                     animations: Some(AnimationsOverride {
                         duration_open: Some(250),
@@ -3645,6 +3743,7 @@ mod tests {
             ConfigSource::new(LayerKind::User, Some("user.lua")),
             ConfigPlan {
                 appearance: Some(crate::types::AppearanceConfig {
+                    colors: None,
                     theme: None,
                     animations: Some(AnimationsOverride {
                         duration_open: Some(500),

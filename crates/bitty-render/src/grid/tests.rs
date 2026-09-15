@@ -1609,3 +1609,27 @@ fn overlay_text_advances_by_cell_width_and_clips_in_cells() {
     let clipped = grid.overlay_text_glyphs("a\u{4F60}b", (0, 0), 3, DEFAULT_FG);
     assert_eq!(clipped.len(), 2, "cell-clipped overlay drops the overflow");
 }
+
+#[test]
+fn ctx0392_custom_palette_maps_and_dynamic_overrides() {
+    use bitty_config::theme::CustomPalette;
+    let ansi: Vec<String> = (0..16).map(|_| "#112233".to_string()).collect();
+    let custom = CustomPalette::from_hex("#1e1e2e", "#cdd6f4", "#f5e0dc", "#313244", &ansi)
+        .expect("custom parses");
+    let palette = super::ThemePalette::from_custom(&custom);
+    assert_eq!(palette.background, [0x1E, 0x1E, 0x2E, 0xFF]);
+    assert_eq!(palette.ansi[0], [0x11, 0x22, 0x33]);
+    // Dynamic layer starts empty and overrides through palette_rgb_in.
+    assert_eq!(super::palette_rgb_in(&palette, 1), [0x11, 0x22, 0x33]);
+    let mut live = palette;
+    live.dynamic[1] = Some([0xAA, 0xBB, 0xCC]);
+    live.dynamic[200] = Some([0x01, 0x02, 0x03]);
+    assert_eq!(super::palette_rgb_in(&live, 1), [0xAA, 0xBB, 0xCC]);
+    assert_eq!(super::palette_rgb_in(&live, 200), [0x01, 0x02, 0x03]);
+    // Fixed 256 shape: boundary indices addressable, no growth.
+    assert_eq!(live.dynamic.len(), 256);
+    live.dynamic[0] = Some([0x00, 0x00, 0x00]);
+    live.dynamic[255] = Some([0xFF, 0xFF, 0xFF]);
+    assert_eq!(super::palette_rgb_in(&live, 0), [0x00, 0x00, 0x00]);
+    assert_eq!(super::palette_rgb_in(&live, 255), [0xFF, 0xFF, 0xFF]);
+}

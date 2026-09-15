@@ -683,9 +683,27 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
-        // CTX-0334: commit a pending hover activation whose dwell deadline
-        // has elapsed before the frame's focus/highlight is resolved. The
-        // app arms a timed wake at `hover_activation_deadline`, so this
+        if self.tick_time_gates(now) {
+            return None;
+        }
+        let basis = self.collect_tick_basis(now)?;
+        let mut layers = self.build_leaf_primitives(&basis, now);
+        if let Some(paint) = layers.cursor.take() {
+            layers.any_needs_draw |= self.paint_cursor(&paint, &mut layers.combined_overlay);
+        }
+        self.paint_frame_overlays(&basis, now, &mut layers);
+        self.paint_kitty_images(&basis, &mut layers);
+        self.present_assembled_frame(basis, layers)
+    }
+
+    /// Phase 1 (CTX-0474): time-based gates that can defer the whole frame.
+    ///
+    /// Commits a due hover activation, folds the CTX-0192 paste banner
+    /// between its full and flash phases, and enforces the CTX-0380
+    /// synchronized-update defer window. Returns `true` when the frame must
+    /// be skipped this tick (defer window still open); the caller returns
+    /// `None` and retains all damage.
+    fn tick_time_gates(&mut self, now: std::time::Instant) -> bool {
         // fires even when the pointer stopped moving.
         self.apply_hover_deadline(now);
         // CTX-0192 transient: collapse the full banner to the flash once its
@@ -720,7 +738,7 @@ impl Runtime {
         if self.synchronized_update_active() {
             let since = *self.sync_defer_since.get_or_insert(now);
             if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT {
-                return None;
+                return true;
             }
             // Bound reached: commit this frame, then open a fresh window so
             // a still-active mode does not present on every later tick.
@@ -728,6 +746,17 @@ impl Runtime {
         } else {
             self.sync_defer_since = None;
         }
+        false
+    }
+
+    /// Phase 2 (CTX-0474): collect the per-frame basis or short-circuit idle.
+    ///
+    /// Reflows the layout, resolves focus/kitty-origin/alt-latch, compares
+    /// per-origin generations and layout/focus edits, advances animations,
+    /// and returns `None` (after recording the consumed generations) when
+    /// the frame is idle or the layout is empty. The returned [`TickBasis`]
+    /// is owned so every later phase can still take `&mut self`.
+    fn collect_tick_basis(&mut self, now: std::time::Instant) -> Option<TickBasis> {
         // Reflow layout tree into container before rendering so leaf Views
         // carry deterministic origins/sizes for this frame. This is headless
         // and deterministic: same layout + container always yields same
@@ -847,7 +876,7 @@ impl Runtime {
         // `pending_full_redraw`; `last == u64::MAX` marks the first frame.
         // Everything else re-renders per origin from its own damage ring, so a
         // split no longer repaints every pane just because sessions exist.
-        let mut full_frame = pending_full || last == u64::MAX;
+        let full_frame = pending_full || last == u64::MAX;
 
         // For single-window slice we need per-view scrollback viewport and cursor.
         // Build id->View map for scroll/IME lookups.
@@ -908,7 +937,38 @@ impl Runtime {
         // `PresentStats::cells_examined`/`glyphs_emitted`.
         let cells_before = self.renderer.counters().cells_examined;
         let glyphs_before = self.renderer.counters().glyphs_emitted;
+        Some(TickBasis {
+            snapshot,
+            allocations,
+            focused,
+            full_frame,
+            current_gen,
+            kitty_origin,
+            kitty_origin_alt,
+            kitty_origin_scrollback,
+            view_map,
+            pad_px,
+            ring_ctx,
+            cells_before,
+            glyphs_before,
+        })
+    }
 
+    /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
+    ///
+    /// Walks every visible allocation, reusing a retained leaf whose origin
+    /// and scroll offset are unchanged and re-rendering the rest from its
+    /// own damage ring; retries once when an atlas exhaustion reset
+    /// invalidates the retained lists mid-pass. Returns the assembled
+    /// [`FrameLayers`] with the overlay and image layers still empty.
+    fn build_leaf_primitives(&mut self, basis: &TickBasis, now: std::time::Instant) -> FrameLayers {
+        let snapshot = &basis.snapshot;
+        let allocations = &basis.allocations;
+        let view_map = &basis.view_map;
+        let pad_px = basis.pad_px;
+        let current_gen = basis.current_gen;
+        let ring_ctx = basis.ring_ctx;
+        let mut full_frame = basis.full_frame;
         // CTX-0386: build the combined leaf primitives. Both present paths
         // clear the surface and composite one complete list per frame, so a
         // clean leaf contributes its retained primitives verbatim instead of a
@@ -923,7 +983,7 @@ impl Runtime {
             let mut built = CombinedLeaves::default();
             let evictions_before = self.renderer.atlas_stats().2;
 
-            for frame in &allocations {
+            for frame in allocations {
                 if frame.content.width == 0 || frame.content.height == 0 {
                     continue;
                 }
@@ -1064,7 +1124,7 @@ impl Runtime {
                         built.cursor = self.reused_cursor_paint(
                             frame,
                             view_id,
-                            &snapshot,
+                            snapshot,
                             origin_px_x,
                             origin_px_y,
                         );
@@ -1088,14 +1148,14 @@ impl Runtime {
                 // Erased source for session-less leaves that do not own the
                 // primary; `viewport_snapshot` pads it to the allocation below.
                 let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
-                    Some(erased_snapshot(&snapshot))
+                    Some(erased_snapshot(snapshot))
                 } else {
                     None
                 };
                 let base_snap: &Snapshot = pane_snap
                     .as_ref()
                     .or(erased_snap.as_ref())
-                    .unwrap_or(&snapshot);
+                    .unwrap_or(snapshot);
                 // Determine viewport snapshot: when view scroll_offset !=0,
                 // visible_cells composites scrollback.
                 let view_snapshot = if let Some(v) = view {
@@ -1198,24 +1258,61 @@ impl Runtime {
             self.presented_leaf_frames.clear();
             full_frame = true;
         };
-
         // CTX-0386: a retained list is only valid for a leaf visible this
         // frame; a hidden or closed leaf re-renders when it returns.
         self.presented_leaf_frames
             .retain(|id, _| allocations.iter().any(|frame| frame.view == *id));
-
-        let combined_fills = built.fills;
-        let mut combined_rounded = built.rounded;
-        // CTX-0347: background blits ride the retryable leaf pass; the overlay
-        // layer (cursor, selection, chrome) is recomposed per frame above them.
-        let combined_backgrounds = built.backgrounds;
-        let mut combined_glyphs = built.glyphs;
-        let mut any_needs_draw = built.needs_draw;
-        let mut combined_overlay: Vec<bitty_render::grid::FillRect> = Vec::new();
-        if let Some(paint) = built.cursor {
-            any_needs_draw |= self.paint_cursor(&paint, &mut combined_overlay);
+        FrameLayers {
+            combined_fills: built.fills,
+            combined_rounded: built.rounded,
+            combined_backgrounds: built.backgrounds,
+            combined_glyphs: built.glyphs,
+            any_needs_draw: built.needs_draw,
+            cursor: built.cursor,
+            ..FrameLayers::default()
         }
+    }
 
+    /// Phase 4 (CTX-0474): paint every overlay layer in the accepted order.
+    ///
+    /// Closing rings, selection highlight, IME preedit, the three pending
+    /// confirmation banners, the help panel, then the scrollbar thumb. The
+    /// kitty image layer is painted afterwards by [`Self::paint_kitty_images`].
+    fn paint_frame_overlays(
+        &mut self,
+        basis: &TickBasis,
+        now: std::time::Instant,
+        layers: &mut FrameLayers,
+    ) {
+        self.paint_closing_rings(basis.pad_px, now, layers);
+        self.paint_selection_highlight(
+            &basis.allocations,
+            &basis.view_map,
+            &basis.snapshot,
+            basis.pad_px,
+            layers,
+        );
+        self.paint_ime_preedit(layers);
+        self.paint_pending_banners(
+            &basis.allocations,
+            &basis.view_map,
+            basis.pad_px,
+            now,
+            layers,
+        );
+        self.paint_help_overlay(&basis.allocations, &basis.view_map, basis.pad_px, layers);
+        self.paint_scrollbar_overlay(layers);
+    }
+
+    /// RFC-0002 close transition: fade the retained rings of Views closed
+    /// during the current transition (CTX-0474 extraction; body moved
+    /// verbatim from `tick_at`).
+    fn paint_closing_rings(
+        &mut self,
+        pad_px: i32,
+        now: std::time::Instant,
+        layers: &mut FrameLayers,
+    ) {
         // RFC-0002 (CTX-0341): paint the retained frames of Views closed
         // during the current close transition. A closed View has no live
         // allocation, so its last presented ring fades out over the accepted
@@ -1238,15 +1335,28 @@ impl Runtime {
                 closing.frame.width,
                 closing.frame.height,
             );
-            combined_rounded.push(bitty_render::grid::RoundedFill {
-                frame: ring_frame,
-                border: closing.border,
-                radius: closing.radius,
-                color: bitty_render::grid::scale_alpha(closing.color, factor),
-            });
-            any_needs_draw = true;
+            layers
+                .combined_rounded
+                .push(bitty_render::grid::RoundedFill {
+                    frame: ring_frame,
+                    border: closing.border,
+                    radius: closing.radius,
+                    color: bitty_render::grid::scale_alpha(closing.color, factor),
+                });
+            layers.any_needs_draw = true;
         }
+    }
 
+    /// CTX-0158 selection highlight (CTX-0474 extraction; body moved
+    /// verbatim from `tick_at`).
+    fn paint_selection_highlight(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        view_map: &std::collections::HashMap<ViewId, View>,
+        snapshot: &Snapshot,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
         // Selection highlight overlay (CTX-0158, ghostty selection rendering):
         // presentation-only fills in the theme selection color, painted above
         // cell backgrounds. `DrawList` paint order is fills first, then
@@ -1283,16 +1393,20 @@ impl Runtime {
                                 for mut fill in rects {
                                     fill.rect.x = px_add(fill.rect.x, origin_px_x);
                                     fill.rect.y = px_add(fill.rect.y, origin_px_y);
-                                    combined_overlay.push(fill);
+                                    layers.combined_overlay.push(fill);
                                 }
-                                any_needs_draw = true;
+                                layers.any_needs_draw = true;
                             }
                         }
                     }
                 }
             }
         }
+    }
 
+    /// CTX-0367 inline IME preedit overlay (CTX-0474 extraction; body moved
+    /// verbatim from `tick_at`).
+    fn paint_ime_preedit(&mut self, layers: &mut FrameLayers) {
         // IME preedit overlay (CTX-0367): presentation-only, never Terminal
         // Truth. The preedit string, a single-pixel underline, and the
         // composition caret paint at the focused caret armed inside the
@@ -1350,7 +1464,7 @@ impl Runtime {
                     // Background, underline, then glyphs: fills paint before
                     // glyphs in the `DrawList` order, so the text stays
                     // legible on the tint.
-                    combined_overlay.push(bitty_render::grid::FillRect {
+                    layers.combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             base_x,
                             base_y,
@@ -1359,7 +1473,7 @@ impl Runtime {
                         ),
                         color: [0x33, 0x33, 0x33, 0xCC],
                     });
-                    combined_overlay.push(bitty_render::grid::FillRect {
+                    layers.combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             base_x,
                             underline_y,
@@ -1368,13 +1482,13 @@ impl Runtime {
                         ),
                         color: [0xFF, 0xFF, 0x00, 0xFF],
                     });
-                    combined_glyphs.extend(glyphs);
+                    layers.combined_glyphs.extend(glyphs);
                     // Composition caret: static bar at the IME cursor cell
                     // (blink policy stays an embedder concern, matching the
                     // Terminal cursor gate). Clamped into the drawn span.
                     let caret_bar_cells = caret_cells.min(drawn_cells);
                     let caret_bar_x = px_offset_cells(base_x, caret_bar_cells as u16, live.width);
-                    combined_overlay.push(bitty_render::grid::FillRect {
+                    layers.combined_overlay.push(bitty_render::grid::FillRect {
                         rect: bitty_render::geometry::RectPx::new(
                             caret_bar_x,
                             base_y,
@@ -1383,179 +1497,105 @@ impl Runtime {
                         ),
                         color: self.config.theme.cursor,
                     });
-                    any_needs_draw = true;
+                    layers.any_needs_draw = true;
                 }
             }
         }
+    }
 
-        // Pending-paste confirmation banner (CTX-0186, transient CTX-0192):
-        // presentation-only overlay on the focused view's bottom row,
-        // right-aligned compact pill (not full-width) to avoid occluding the
-        // grid. Gated on `has_pending_paste()`; text is the bounded compact
-        // `pending_paste_summary()` for `PASTE_BANNER_FULL_DURATION`, then the
-        // minimal `PASTE_BANNER_FLASH_TEXT` while pending (never-silent).
-        // Overlay only: pushes fills+glyphs onto the combined frame, never
-        // touches grid cells, scrollback, or the pending bytes. Esc-cancel
-        // and repeat-confirm paths are unchanged; clearing pending repaints
-        // once without the banner via `pending_full_redraw`.
+    /// Paints one right-aligned bottom-row confirmation pill onto the overlay
+    /// layer (CTX-0474 extraction: shared verbatim body of the CTX-0186 paste,
+    /// CTX-0257 workspace-close, and CTX-0370 view/window-close banners).
+    /// No-op when there is no target leaf or its frame is empty.
+    fn paint_banner_pill(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        focused: Option<ViewId>,
+        banner: &str,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        let Some(fid) = focused else {
+            return;
+        };
+        let Some(frame) = allocations.iter().find(|frame| frame.view == fid) else {
+            return;
+        };
+        if frame.rows == 0 || frame.cols == 0 {
+            return;
+        }
+        let live = self.live_cell_metrics();
+        let max_cells = usize::from(frame.cols);
+        // Compact pill: only as wide as the text (clipped
+        // to the view), right-aligned so most of the row
+        // stays visible.
+        let text_cells = banner.chars().count().min(max_cells).max(1);
+        // CTX-0253 F4: pill/full widths and the
+        // right-aligned origin accumulate in `u64`/`i64`
+        // (see `px_span_usize`/`px_span`) so hostile cell
+        // metrics cannot wrap the products or the sums.
+        let pill_w = px_span_usize(text_cells, live.width);
+        let full_w = px_span(frame.cols, live.width);
+        let origin_px_x = px_add(
+            px_add(pad_px, frame.content.x),
+            px_side(full_w.saturating_sub(pill_w)),
+        );
+        let banner_y = px_add(
+            px_offset_cells(frame.content.y, frame.rows.saturating_sub(1), live.height),
+            pad_px,
+        );
+        layers.combined_overlay.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(origin_px_x, banner_y, pill_w, live.height),
+            color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
+        });
+        let glyphs = self.renderer.overlay_text_glyphs(
+            banner,
+            (origin_px_x, banner_y),
+            max_cells,
+            bitty_render::grid::PENDING_PASTE_BANNER_FG,
+        );
+        layers.combined_glyphs.extend(glyphs);
+        layers.any_needs_draw = true;
+    }
+
+    /// CTX-0186/CTX-0257/CTX-0370 pending confirmation banners in paint
+    /// order (paste, workspace close, view/window close), each gated on its
+    /// own pending predicate (CTX-0474 extraction).
+    fn paint_pending_banners(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        view_map: &std::collections::HashMap<ViewId, View>,
+        pad_px: i32,
+        now: std::time::Instant,
+        layers: &mut FrameLayers,
+    ) {
+        let focused = self.focused_view().or(view_map.keys().next().copied());
         if self.has_pending_paste() {
             if let Some(banner) = self.paste_banner_text_at(now) {
-                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
-                        if frame.rows > 0 && frame.cols > 0 {
-                            let live = self.live_cell_metrics();
-                            let max_cells = usize::from(frame.cols);
-                            // Compact pill: only as wide as the text (clipped
-                            // to the view), right-aligned so most of the row
-                            // stays visible.
-                            let text_cells = banner.chars().count().min(max_cells).max(1);
-                            // CTX-0253 F4: pill/full widths and the
-                            // right-aligned origin accumulate in `u64`/`i64`
-                            // (see `px_span_usize`/`px_span`) so hostile cell
-                            // metrics cannot wrap the products or the sums.
-                            let pill_w = px_span_usize(text_cells, live.width);
-                            let full_w = px_span(frame.cols, live.width);
-                            let origin_px_x = px_add(
-                                px_add(pad_px, frame.content.x),
-                                px_side(full_w.saturating_sub(pill_w)),
-                            );
-                            let banner_y = px_add(
-                                px_offset_cells(
-                                    frame.content.y,
-                                    frame.rows.saturating_sub(1),
-                                    live.height,
-                                ),
-                                pad_px,
-                            );
-                            combined_overlay.push(bitty_render::grid::FillRect {
-                                rect: bitty_render::geometry::RectPx::new(
-                                    origin_px_x,
-                                    banner_y,
-                                    pill_w,
-                                    live.height,
-                                ),
-                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
-                            });
-                            let glyphs = self.renderer.overlay_text_glyphs(
-                                &banner,
-                                (origin_px_x, banner_y),
-                                max_cells,
-                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
-                            );
-                            combined_glyphs.extend(glyphs);
-                            any_needs_draw = true;
-                        }
-                    }
-                }
+                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
             }
         }
-
-        // Pending workspace-close confirmation banner (CTX-0257): same
-        // presentation-only overlay pill as the paste banner (steady text
-        // while the arm holds — no full/flash phases — reusing the paste
-        // pill colors so no new theme token is needed for the entry slice).
-        // Gated on `has_pending_ws_close()`; text is the bounded
-        // `ws_close_banner_text()`. Overlay only, never grid truth;
-        // repeat-confirm and Esc-cancel paths repaint via
-        // `pending_full_redraw`.
         if self.has_pending_ws_close() {
             if let Some(banner) = self.ws_close_banner_text() {
-                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
-                        if frame.rows > 0 && frame.cols > 0 {
-                            let live = self.live_cell_metrics();
-                            let max_cells = usize::from(frame.cols);
-                            let text_cells = banner.chars().count().min(max_cells).max(1);
-                            let pill_w = px_span_usize(text_cells, live.width);
-                            let full_w = px_span(frame.cols, live.width);
-                            let origin_px_x = px_add(
-                                px_add(pad_px, frame.content.x),
-                                px_side(full_w.saturating_sub(pill_w)),
-                            );
-                            let banner_y = px_add(
-                                px_offset_cells(
-                                    frame.content.y,
-                                    frame.rows.saturating_sub(1),
-                                    live.height,
-                                ),
-                                pad_px,
-                            );
-                            combined_overlay.push(bitty_render::grid::FillRect {
-                                rect: bitty_render::geometry::RectPx::new(
-                                    origin_px_x,
-                                    banner_y,
-                                    pill_w,
-                                    live.height,
-                                ),
-                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
-                            });
-                            let glyphs = self.renderer.overlay_text_glyphs(
-                                &banner,
-                                (origin_px_x, banner_y),
-                                max_cells,
-                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
-                            );
-                            combined_glyphs.extend(glyphs);
-                            any_needs_draw = true;
-                        }
-                    }
-                }
+                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
             }
         }
-
-        // Pending view/window close confirmation banner (CTX-0370): the
-        // same presentation-only overlay pill as the paste and
-        // workspace-close banners (steady text while the arm holds).
-        // Gated on `has_pending_close_confirm()`; text is the bounded
-        // `close_confirm_banner_text()`. Overlay only, never grid truth;
-        // repeat-confirm and Esc-cancel paths repaint via
-        // `pending_full_redraw`. Painted after the workspace-close pill so
-        // a window arm reads on top when both are somehow armed.
         if self.has_pending_close_confirm() {
             if let Some(banner) = self.close_confirm_banner_text() {
-                if let Some(fid) = self.focused_view().or(view_map.keys().next().copied()) {
-                    if let Some(frame) = allocations.iter().find(|frame| frame.view == fid) {
-                        if frame.rows > 0 && frame.cols > 0 {
-                            let live = self.live_cell_metrics();
-                            let max_cells = usize::from(frame.cols);
-                            let text_cells = banner.chars().count().min(max_cells).max(1);
-                            let pill_w = px_span_usize(text_cells, live.width);
-                            let full_w = px_span(frame.cols, live.width);
-                            let origin_px_x = px_add(
-                                px_add(pad_px, frame.content.x),
-                                px_side(full_w.saturating_sub(pill_w)),
-                            );
-                            let banner_y = px_add(
-                                px_offset_cells(
-                                    frame.content.y,
-                                    frame.rows.saturating_sub(1),
-                                    live.height,
-                                ),
-                                pad_px,
-                            );
-                            combined_overlay.push(bitty_render::grid::FillRect {
-                                rect: bitty_render::geometry::RectPx::new(
-                                    origin_px_x,
-                                    banner_y,
-                                    pill_w,
-                                    live.height,
-                                ),
-                                color: bitty_render::grid::PENDING_PASTE_BANNER_BG,
-                            });
-                            let glyphs = self.renderer.overlay_text_glyphs(
-                                &banner,
-                                (origin_px_x, banner_y),
-                                max_cells,
-                                bitty_render::grid::PENDING_PASTE_BANNER_FG,
-                            );
-                            combined_glyphs.extend(glyphs);
-                            any_needs_draw = true;
-                        }
-                    }
-                }
+                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
             }
         }
+    }
 
+    /// CTX-0265 which-key help panel (CTX-0474 extraction; body moved
+    /// verbatim from `tick_at`).
+    fn paint_help_overlay(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        view_map: &std::collections::HashMap<ViewId, View>,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
         // Help popup panel (CTX-0265, 009 which-key): centered floating
         // overlay listing the live registry rows. Presentation-only like
         // the banners above (fills + glyphs, never grid truth); painted
@@ -1564,15 +1604,19 @@ impl Runtime {
         // `runtime::help`; toggle/dismiss paths repaint via
         // `pending_full_redraw`.
         if self.paint_help_panel(
-            &allocations,
-            &view_map,
+            allocations,
+            view_map,
             pad_px,
-            &mut combined_overlay,
-            &mut combined_glyphs,
+            &mut layers.combined_overlay,
+            &mut layers.combined_glyphs,
         ) {
-            any_needs_draw = true;
+            layers.any_needs_draw = true;
         }
+    }
 
+    /// CTX-0181 overlay scrollbar thumb (CTX-0474 extraction; body moved
+    /// verbatim from `tick_at`).
+    fn paint_scrollbar_overlay(&mut self, layers: &mut FrameLayers) {
         // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect        // on the focused leaf's right edge, painted above grid content like
         // the selection highlight. Never grid truth: no layout, container,
         // or cell mutation, and `hidden` (default) resolves to no fill.
@@ -1581,11 +1625,25 @@ impl Runtime {
         let scrollbar_now = self.scrollbar_thumb_fill();
         let paints = scrollbar_now.is_some();
         if let Some(fill) = scrollbar_now {
-            combined_overlay.push(fill);
-            any_needs_draw = true;
+            layers.combined_overlay.push(fill);
+            layers.any_needs_draw = true;
         }
         self.scrollbar_visible = paints;
+    }
 
+    /// Phase 5 (CTX-0474): the CTX-0248/0252/0254 kitty image layer.
+    ///
+    /// Topmost focused-origin blits, budget-checked before rasterizing and
+    /// skipped while the focused view inspects scrollback. Body moved
+    /// verbatim from `tick_at`.
+    fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
+        let snapshot = &basis.snapshot;
+        let allocations = &basis.allocations;
+        let view_map = &basis.view_map;
+        let pad_px = basis.pad_px;
+        let kitty_origin = basis.kitty_origin;
+        let kitty_origin_alt = basis.kitty_origin_alt;
+        let kitty_origin_scrollback = basis.kitty_origin_scrollback;
         // Kitty images (CTX-0248, budget + cache CTX-0252 F2, origin
         // binding CTX-0254): topmost present-layer blits on the focused
         // leaf, composited after fills and glyphs. Never grid truth: no
@@ -1611,7 +1669,6 @@ impl Runtime {
         // bytes keyed by placement + image identity, destination rect,
         // source dims, scrollback sequence, and geometry, so static frames
         // reuse blits while scroll/geometry changes miss (never stale).
-        let mut combined_images: Vec<bitty_render::grid::ImageBlit> = Vec::new();
         if kitty_origin_alt {
             self.kitty_images.clear_origin(kitty_origin);
             self.kitty_raster_cache.clear();
@@ -1717,27 +1774,46 @@ impl Runtime {
                                 if let Ok(blit) =
                                     bitty_render::grid::ImageBlit::try_new(dest, scaled)
                                 {
-                                    combined_images.push(blit);
+                                    layers.combined_images.push(blit);
                                 }
                             }
-                            if !combined_images.is_empty() {
-                                any_needs_draw = true;
+                            if !layers.combined_images.is_empty() {
+                                layers.any_needs_draw = true;
                             }
                         }
                     }
                 }
             }
         }
+    }
 
+    /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
+    /// and build [`PresentStats`]; returns `None` on an empty or idle frame
+    /// after recording the consumed generations. Body moved verbatim from
+    /// `tick_at`.
+    fn present_assembled_frame(
+        &mut self,
+        basis: TickBasis,
+        layers: FrameLayers,
+    ) -> Option<PresentStats> {
+        let TickBasis {
+            snapshot,
+            allocations,
+            focused,
+            current_gen,
+            cells_before,
+            glyphs_before,
+            ..
+        } = basis;
         self.pending_full_redraw = false;
 
-        if !any_needs_draw
-            && combined_fills.is_empty()
-            && combined_rounded.is_empty()
-            && combined_backgrounds.is_empty()
-            && combined_overlay.is_empty()
-            && combined_glyphs.is_empty()
-            && combined_images.is_empty()
+        if !layers.any_needs_draw
+            && layers.combined_fills.is_empty()
+            && layers.combined_rounded.is_empty()
+            && layers.combined_backgrounds.is_empty()
+            && layers.combined_overlay.is_empty()
+            && layers.combined_glyphs.is_empty()
+            && layers.combined_images.is_empty()
         {
             // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
             // But ensure generation advances for idle detection.
@@ -1751,9 +1827,9 @@ impl Runtime {
         // headless_present beyond fill/glyph counts, so we create a minimal
         // plan that reports needs_draw == true when we have content.
         // CTX-0252 F2: latch the presented blit count before the move below.
-        let kitty_blits = combined_images.len();
+        let kitty_blits = layers.combined_images.len();
         // CTX-0347: latch the presented background-blit count too.
-        let background_blits = combined_backgrounds.len();
+        let background_blits = layers.combined_backgrounds.len();
         // CTX-0386: the 1x1 plan probe below is the frame's last renderer
         // call; an atlas exhaustion reset inside it would invalidate every
         // retained slot, so drop the stores afterwards and let the next frame
@@ -1817,12 +1893,12 @@ impl Runtime {
             // not survive (see present_plan_extent), and the dirty rect must
             // cover the combined frame when content exists.
             tmp_list.generation = current_gen;
-            tmp_list.fills = combined_fills;
-            tmp_list.rounded_fills = combined_rounded;
-            tmp_list.backgrounds = combined_backgrounds;
-            tmp_list.overlay_fills = combined_overlay;
-            tmp_list.glyphs = combined_glyphs;
-            tmp_list.images = combined_images;
+            tmp_list.fills = layers.combined_fills;
+            tmp_list.rounded_fills = layers.combined_rounded;
+            tmp_list.backgrounds = layers.combined_backgrounds;
+            tmp_list.overlay_fills = layers.combined_overlay;
+            tmp_list.glyphs = layers.combined_glyphs;
+            tmp_list.images = layers.combined_images;
             let plan_extent = self.present_plan_extent();
             tmp_list.plan.extent = plan_extent;
             if tmp_list.fills.is_empty()
@@ -1928,6 +2004,63 @@ impl Runtime {
             images_skipped: stats.images_skipped,
         })
     }
+}
+
+/// Owned per-frame inputs collected by [`Runtime::collect_tick_basis`] and
+/// shared by every later `tick_at` phase (CTX-0474). Owned only — it never
+/// borrows `Runtime`, so each phase method can still take `&mut self`.
+struct TickBasis {
+    /// Grid snapshot backing the primary origin and the overlays.
+    snapshot: Snapshot,
+    /// Decorated leaf allocations for this frame.
+    allocations: Vec<layout_focus::PresentFrame>,
+    /// Focused leaf at collection time.
+    focused: Option<ViewId>,
+    /// Whether any full-invalidation source armed a full frame.
+    full_frame: bool,
+    /// Max grid generation across origins (present stats + damage).
+    current_gen: u64,
+    /// Kitty origin token: `None` for the primary grid, else the pane view.
+    kitty_origin: Option<u64>,
+    /// Resolved alt-screen state of the kitty origin.
+    kitty_origin_alt: bool,
+    /// Resolved scrollback length of the kitty origin.
+    kitty_origin_scrollback: usize,
+    /// id -> View map for scroll/selection/IME lookups.
+    view_map: std::collections::HashMap<ViewId, View>,
+    /// Physical window padding inset.
+    pad_px: i32,
+    /// Loop-invariant decoration-ring inputs.
+    ring_ctx: RingFrameContext,
+    /// Renderer cells-examined counter baseline for the stats delta.
+    cells_before: u64,
+    /// Renderer glyphs-emitted counter baseline for the stats delta.
+    glyphs_before: u64,
+}
+
+/// Combined draw layers assembled by the present phases (CTX-0474).
+///
+/// The leaf pass fills the grid layers and the cursor; the overlay phases
+/// append to the overlay, glyph, and image layers. [`Runtime::tick_at`]
+/// drains the cursor and hands the struct to the finalize phase.
+#[derive(Default)]
+struct FrameLayers {
+    /// Combined leaf cell fills (translated into window space).
+    combined_fills: Vec<bitty_render::grid::FillRect>,
+    /// Combined decoration rings.
+    combined_rounded: Vec<bitty_render::grid::RoundedFill>,
+    /// CTX-0347 per-`View` background blits.
+    combined_backgrounds: Vec<bitty_render::grid::ImageBlit>,
+    /// Overlay fills (cursor, selection, banners, scrollbar).
+    combined_overlay: Vec<bitty_render::grid::FillRect>,
+    /// Combined glyph instances (leaf plus overlay text).
+    combined_glyphs: Vec<bitty_render::grid::GlyphInstance>,
+    /// CTX-0248 kitty image blits.
+    combined_images: Vec<bitty_render::grid::ImageBlit>,
+    /// Whether any layer contributed draw work this frame.
+    any_needs_draw: bool,
+    /// Deferred focused-cursor overlay (CTX-0386); drained before overlays.
+    cursor: Option<CursorPaint>,
 }
 
 #[cfg(test)]

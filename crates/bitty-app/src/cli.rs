@@ -27,6 +27,12 @@ pub(crate) struct Args {
     /// ignored and decoration is forced to the safe `0/0/1/0/0` geometry
     /// with the opaque outline pair (CTX-0346, R-009/P0-AC-019).
     pub(crate) safe: bool,
+    /// When true (`--fail-loud`) a requested startup step that fails is
+    /// fatal instead of fail-soft: a failed primary shell spawn, a failed
+    /// startup pane shell, or an attempted-but-unavailable IPC servo aborts
+    /// with a non-zero exit code (CTX-0481, issue #762). The default keeps
+    /// the documented fail-soft path where headless smoke still ticks.
+    pub(crate) fail_loud: bool,
     /// When true print help and exit 0.
     pub(crate) help: bool,
     /// When true print version and exit 0.
@@ -278,6 +284,7 @@ impl Args {
         Self {
             headless: false,
             safe: false,
+            fail_loud: false,
             help: false,
             version: false,
             program: None,
@@ -356,6 +363,11 @@ impl Args {
 /// - `-h` / `--help` → help
 /// - `-V` / `--version` → version
 /// - `--headless` → headless smoke (also triggered by `BITTY_HEADLESS=1`)
+/// - `--safe` → safe recovery mode (no third-party plugin VM, built-in safe
+///   effective config)
+/// - `--fail-loud` → a failed requested startup step (shell spawn, pane
+///   shells, IPC servo) aborts with a non-zero exit code instead of the
+///   default fail-soft warning path (CTX-0481; also `BITTY_FAIL_LOUD=1`)
 /// - `--split [AXIS]` → split layout (AXIS = horizontal|h / vertical|v, default horizontal)
 /// - `--split=AXIS[:RATIO]` → split with optional ratio
 /// - `--split-ratio RATIO` → ratio for split
@@ -435,6 +447,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
     // CTX-0190: honour BITTY_VERBOSE without editing argv (mirrors BITTY_HEADLESS).
     if std::env::var("BITTY_VERBOSE").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
         out.verbose = true;
+    }
+    // CTX-0481: honour BITTY_FAIL_LOUD for CI runners (mirrors BITTY_HEADLESS).
+    if std::env::var("BITTY_FAIL_LOUD").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
+        out.fail_loud = true;
     }
     if raw.len() <= 1 {
         return out;
@@ -692,6 +708,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--safe" => {
                 out.safe = true;
+                i += 1;
+            }
+            "--fail-loud" => {
+                out.fail_loud = true;
                 i += 1;
             }
             "--stack" => {
@@ -1350,6 +1370,9 @@ pub(crate) fn help_text() -> String {
                             plugin VM), and use the built-in safe config\n  \
                             (decoration 0/0/1/0/0, opaque outline pair);\n  \
                             ignores --config/BITTY_CONFIG/profiles/CLI overrides\n  \
+               --fail-loud  Fail-loud startup: a failed shell/pane spawn or\n  \
+                            IPC servo aborts with a non-zero exit code\n  \
+                            instead of the default fail-soft warning path\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
                --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \

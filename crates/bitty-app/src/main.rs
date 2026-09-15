@@ -480,7 +480,7 @@ fn main() {
         match runtime.restore_session_on_startup(args.safe) {
             bitty_runtime::SessionStartupOutcome::Restored(summary) => {
                 eprintln!(
-                    "bitty: session restored (workspaces={} panes={} lines={} pending={})",
+                    "bitty: session restored (workspaces={} panes={} lines={} pending={}; inactive panes respawn on first switch)",
                     summary.workspaces, summary.panes, summary.scrollback_lines, summary.pending
                 );
                 true

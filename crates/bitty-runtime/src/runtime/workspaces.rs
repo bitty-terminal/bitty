@@ -409,6 +409,13 @@ impl Runtime {
         self.active_workspace = index;
         self.load_slot(index);
         self.mru_front(index);
+        // CTX-0393 (P2-2): lazily respawn restored panes that are still
+        // pending — a restored inactive workspace arrives with layout plus
+        // history but no live shells, so the first switch here gives each
+        // pending leaf its fresh shell (best-effort, primary-recipe replay).
+        // Covers every switch path: prev/next/last/focus all funnel through
+        // this function. No-op without pending leaves.
+        self.spawn_session_pending_for_active();
         self.pending_full_redraw = true;
         true
     }

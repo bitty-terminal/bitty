@@ -11,8 +11,9 @@
 use std::path::PathBuf;
 
 use bitty_runtime::runtime::session::{
-    MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE, decode_session, encode_session,
-    session_file_for, state_home_for,
+    MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE,
+    PaneSnapshot, SESSION_FORMAT_VERSION, SessionError, SessionSnapshot, WorkspaceSnapshot,
+    decode_session, encode_session, session_file_for, state_home_for,
 };
 use bitty_runtime::{Focus, LayoutNode, Runtime, SplitAxis, View, ViewId};
 
@@ -256,4 +257,186 @@ fn xdg_state_helpers_derive_session_paths_without_hardcoded_hosts() {
 
     let file = session_file_for(Some("/tmp/xdg-state"), None).expect("file resolves");
     assert_eq!(file, PathBuf::from("/tmp/xdg-state/bitty/sessions/session"));
+}
+
+/// P2-1: the secret-capable session file must be owner-only from the first
+/// byte — no crash window at `0644`.
+#[cfg(unix)]
+#[test]
+fn saved_file_is_created_mode_0600() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch_dir("mode");
+    let path = dir.join("session");
+    let rt = Runtime::with_defaults().expect("defaults build");
+    rt.save_session_to_path(&path).expect("save works");
+    let mode = std::fs::metadata(&path)
+        .expect("stat saved file")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "session file must be 0600, got {mode:o}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P3-5: `ViewId`s are runtime-global — one leaf id backing a pane in two
+/// workspaces must reject the whole file.
+#[test]
+fn duplicate_view_id_across_workspaces_is_rejected() {
+    let raw = concat!(
+        "bitty-session v1\n",
+        "workspaces 2 active 0 mru 0,1\n",
+        "workspace 1 7\n",
+        "name ws1\n",
+        "layout (leaf 7 80 24)\n",
+        "pane 7 80 24 0 0\n",
+        "end-pane\n",
+        "end-workspace\n",
+        "workspace 2 7\n",
+        "name ws2\n",
+        "layout (leaf 7 80 24)\n",
+        "pane 7 80 24 0 0\n",
+        "end-pane\n",
+        "end-workspace\n",
+        "end-session\n",
+    );
+    let err = decode_session(raw.as_bytes()).expect_err("duplicate pane must fail");
+    assert!(
+        format!("{err}").contains("duplicate pane"),
+        "unexpected error: {err}"
+    );
+}
+
+/// P3-6: a workspace with no leaves would apply as a dead workspace.
+#[test]
+fn empty_stack_workspace_is_rejected() {
+    let raw = concat!(
+        "bitty-session v1\n",
+        "workspaces 1 active 0 mru 0\n",
+        "workspace 1 none\n",
+        "name ws1\n",
+        "layout (stack)\n",
+        "end-workspace\n",
+        "end-session\n",
+    );
+    let err = decode_session(raw.as_bytes()).expect_err("empty workspace must fail");
+    assert!(
+        format!("{err}").contains("empty workspace"),
+        "unexpected error: {err}"
+    );
+}
+
+/// P3-9 self-compatibility: 3000 backslashes fit the raw cwd bound but
+/// escape to 6000 bytes — past the decode line cap. Encode must reject
+/// before any I/O so its own output always decodes.
+#[test]
+fn hostile_cwd_that_escapes_past_line_cap_fails_closed_pre_io() {
+    let hostile = "\\".repeat(3000);
+    assert!(hostile.len() <= MAX_SESSION_CWD_BYTES);
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::leaf(View::new(ViewId::new(7), 80, 24)),
+            focus: Some(ViewId::new(7)),
+            panes: vec![PaneSnapshot {
+                view: ViewId::new(7),
+                cwd: Some(hostile),
+                scrollback: Vec::new(),
+            }],
+        }],
+        active: 0,
+        mru: vec![0],
+    };
+    let err = encode_session(&snap).expect_err("hostile cwd must fail closed");
+    assert!(
+        matches!(
+            err,
+            SessionError::TooLarge {
+                what: "session line",
+                ..
+            }
+        ),
+        "unexpected error: {err}"
+    );
+    // No over-blocking: a max-size cwd without escapes still encodes, and
+    // accepted output always decodes.
+    let mut ok_snap = snap.clone();
+    ok_snap.workspaces[0].panes[0].cwd = Some("a".repeat(MAX_SESSION_CWD_BYTES));
+    let bytes = encode_session(&ok_snap).expect("max raw cwd still encodes");
+    decode_session(&bytes).expect("encode output must always decode");
+}
+
+/// P3-7 companion: no file at all is a quiet clean start. The load-side
+/// `NotFound` mapping (a delete raced between the exists-probe and the
+/// read, which cannot be arranged deterministically here) is unit-tested
+/// in `session.rs` against `startup_outcome_from_load`.
+#[test]
+fn missing_session_file_is_quiet_fresh_start() {
+    let dir = scratch_dir("missing");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir_str = dir.to_string_lossy().into_owned();
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let outcome = rt.restore_session_on_startup_with_env(false, Some(dir_str.as_str()), None);
+    assert!(
+        matches!(
+            outcome,
+            bitty_runtime::runtime::session::SessionStartupOutcome::Fresh
+        ),
+        "missing file must be quiet Fresh, got {outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// P2-2: a restored inactive workspace arrives with layout plus pending
+/// history but no live shells; the first switch to it must respawn the
+/// pending leaves (fresh shells, hydrated history) instead of leaving
+/// them empty forever.
+#[test]
+#[cfg(unix)]
+fn inactive_workspace_respawns_pending_panes_on_first_switch() {
+    bitty_test_support::require_pty!();
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.spawn_shell("/bin/sh")
+        .expect("primary shell records recipe");
+
+    let leaf = |id: u64, history: &str| WorkspaceSnapshot {
+        seq: id,
+        name: format!("ws{id}"),
+        layout: LayoutNode::leaf(View::new(ViewId::new(id), 80, 24)),
+        focus: Some(ViewId::new(id)),
+        panes: vec![PaneSnapshot {
+            view: ViewId::new(id),
+            cwd: None,
+            scrollback: vec![history.to_string()],
+        }],
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![leaf(100, "ws0-history"), leaf(200, "ws1-history")],
+        active: 0,
+        mru: vec![0, 1],
+    };
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert_eq!(
+        rt.session_pending_len(),
+        1,
+        "inactive leaf history must wait pending"
+    );
+    assert!(!rt.has_pane_session(&ViewId::new(200)));
+
+    assert!(rt.workspace_switch(1), "switch to inactive workspace");
+    assert!(
+        rt.has_pane_session(&ViewId::new(200)),
+        "first switch must respawn the pending leaf"
+    );
+    assert!(
+        rt.pane_pid(&ViewId::new(200)).is_some(),
+        "respawned leaf must own a live child"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "pending history must drain into the fresh shell"
+    );
 }

@@ -6,6 +6,9 @@
 //! processes do not: shells respawn fresh in the captured `OSC 7` cwd
 //! (fail-open to the platform default when the report is missing, stale, or
 //! no longer a directory) and scrollback rehydrates as immutable history.
+//! Startup spawns only the active workspace's shells; a restored inactive
+//! workspace arrives with layout plus pending history and respawns its
+//! shells lazily on the first switch to it (bounded, best-effort).
 //!
 //! # Format (v1, hand-rolled, no new dependencies)
 //!
@@ -39,9 +42,11 @@
 //! leave a temp file behind: temps are never read, so a partial write is
 //! always ignored (the previous complete session stays authoritative).
 //! Concurrent savers are last-writer-wins; each rename is still atomic, so
-//! the file is never partial. Saves clean stale `<file>.tmp.*` siblings
-//! best-effort. Oversize snapshots fail closed *before* touching the
-//! filesystem, so a failed save never truncates a good session.
+//! the file is never partial. Stale `<file>.tmp.*` siblings are swept
+//! best-effort *before* writing — never after the rename, so a concurrent
+//! saver's live temp is never deleted. Oversize snapshots fail closed
+//! *before* touching the filesystem, so a failed save never truncates a
+//! good session.
 //!
 //! # Bounds (fail-closed: any violation rejects the whole file)
 //!
@@ -76,8 +81,11 @@
 //! The session file contains working-directory URLs and scrollback text,
 //! which routinely include sensitive material (typed secrets, tokens in
 //! command output, private paths). It is plaintext with no encryption; on
-//! Unix the file is created mode `0600` (a chmod failure aborts the save
-//! rather than leaving a readable file). Session contents are never written
+//! Unix the temp file is created mode `0600` from the first byte —
+//! create-time mode plus an immediate pre-write chmod, both covered by the
+//! single `sync_all`, so no crash window ever exposes it at `0644` (a mode
+//! failure aborts the save rather than leaving a readable file). Session
+//! contents are never written
 //! to logs: every error carries only kinds and counts, and callers must
 //! keep it that way (no `{:?}` of snapshots, lines, or cwds in eprintln).
 //! Do not attach session files to bug reports. `bitty --safe` never reads
@@ -634,6 +642,9 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
     }
     let mut total_panes = 0usize;
     let mut seqs = std::collections::BTreeSet::new();
+    // P3-5: leaf ids are runtime-global — one id backing panes in two
+    // workspaces would alias two histories onto one session.
+    let mut all_views = std::collections::BTreeSet::new();
     for ws in &snap.workspaces {
         if !seqs.insert(ws.seq) {
             return Err(SessionError::Corrupt("workspace seq"));
@@ -642,6 +653,16 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
             return Err(SessionError::Corrupt("workspace name"));
         }
         let leaves = ws.layout.leaf_ids();
+        // P3-6: every workspace restores at least one live leaf; an empty
+        // stack would otherwise apply as a dead workspace.
+        if leaves.is_empty() {
+            return Err(SessionError::Corrupt("empty workspace"));
+        }
+        for leaf in &leaves {
+            if !all_views.insert(*leaf) {
+                return Err(SessionError::Corrupt("duplicate pane"));
+            }
+        }
         if leaves.len() > MAX_SESSION_PANES_PER_WORKSPACE {
             return Err(SessionError::Corrupt("too many panes"));
         }
@@ -737,6 +758,19 @@ pub fn encode_session(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
         out.push_str("end-workspace\n");
     }
     out.push_str("end-session\n");
+    // P3-9 self-compatibility: escaped whole-line fields (cwd, scrollback)
+    // can exceed the decode line cap while the raw text stays within its
+    // own bound (e.g. 3000 backslashes escape to 6000 bytes). Reject here,
+    // fail-closed before any I/O, so accepted output always decodes.
+    for line in out.split('\n') {
+        if line.len() > MAX_SESSION_LINE_BYTES {
+            return Err(SessionError::TooLarge {
+                what: "session line",
+                actual: line.len(),
+                limit: MAX_SESSION_LINE_BYTES,
+            });
+        }
+    }
     let bytes = out.into_bytes();
     if bytes.len() > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge {
@@ -1077,6 +1111,11 @@ fn io_error(context: &'static str, err: std::io::Error) -> SessionError {
 }
 
 /// Writes `bytes` atomically to `path` (temp + fsync + rename + 0600).
+///
+/// P2-1: the temp file is `0600` from the first byte — create-time mode
+/// plus an immediate pre-write chmod — so the single `sync_all` covers
+/// data and mode together and no crash window exposes the secret-capable
+/// file at `0644`. A mode failure aborts the save.
 fn save_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
     if bytes.len() > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge {
@@ -1090,18 +1129,35 @@ fn save_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
             std::fs::create_dir_all(parent).map_err(|e| io_error("create session dir", e))?;
         }
     }
+    // P3-3: sweep crashed-save litter BEFORE writing, never after the
+    // rename — a post-rename sweep would delete a concurrent saver's live
+    // temp sibling in another process.
+    clean_temp_siblings(path);
     let temp = temp_sibling_for(path);
     let _ = std::fs::remove_file(&temp);
     let write_result = (|| -> Result<(), std::io::Error> {
         use std::io::Write as _;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp)?
+        };
+        #[cfg(not(unix))]
         let mut file = std::fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
         #[cfg(unix)]
         {
+            // Defense in depth: the mode is already 0600 from create;
+            // re-assert before the first byte so the sync below covers both.
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        file.write_all(bytes)?;
+        file.sync_all()?;
         drop(file);
         std::fs::rename(&temp, path)?;
         if let Some(parent) = path.parent() {
@@ -1117,12 +1173,24 @@ fn save_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
         let _ = std::fs::remove_file(&temp);
         return Err(io_error("write session file", err));
     }
-    clean_temp_siblings(path);
     Ok(())
 }
 
 /// Reads a session file with a hard size cap (missing → [`SessionError::NotFound`]).
+///
+/// P3-4: a `symlink_metadata` pre-check avoids an unbounded allocation
+/// against a hostile file; the post-read length check stays as the TOCTOU
+/// backstop (the file may grow between the check and the read).
 fn load_bytes_capped(path: &Path) -> Result<Vec<u8>, SessionError> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.len() > MAX_SESSION_FILE_BYTES as u64 {
+            return Err(SessionError::TooLarge {
+                what: "session file",
+                actual: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+                limit: MAX_SESSION_FILE_BYTES,
+            });
+        }
+    }
     let bytes = std::fs::read(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             SessionError::NotFound
@@ -1143,6 +1211,20 @@ fn load_bytes_capped(path: &Path) -> Result<Vec<u8>, SessionError> {
 // ---------------------------------------------------------------------------
 // Runtime integration (capture / apply / startup / exit)
 // ---------------------------------------------------------------------------
+
+/// Maps a session-load result to a startup outcome (pure, for tests).
+///
+/// P3-7: `NotFound` — including a delete raced between the exists-probe and
+/// the read — is a quiet clean start, never a warning.
+fn startup_outcome_from_load(
+    result: Result<SessionRestoreSummary, SessionError>,
+) -> SessionStartupOutcome {
+    match result {
+        Ok(summary) => SessionStartupOutcome::Restored(summary),
+        Err(SessionError::NotFound) => SessionStartupOutcome::Fresh,
+        Err(err) => SessionStartupOutcome::FreshWithWarning(err),
+    }
+}
 
 impl Runtime {
     /// Captures the current session: every workspace slot (the active slot
@@ -1316,6 +1398,54 @@ impl Runtime {
         path.is_dir().then_some(path)
     }
 
+    /// Spawns shells for the active workspace's still-pending leaves (P2-2).
+    ///
+    /// Startup spawns only the active layout's shells, so a restored
+    /// session's inactive workspaces arrive with layout plus pending history
+    /// but no live shells. The first [`Runtime::workspace_switch`] onto such
+    /// a workspace calls here: every active leaf that still has a pending
+    /// restore and no live session gets a fresh shell replaying the primary
+    /// attach recipe (startup parity with `workspace_new`), which hydrates
+    /// the pending scrollback and seeds the spawn cwd from the captured
+    /// `OSC 7` report. Best-effort with loud warnings; leaves already owning
+    /// a session are untouched. No-op before any successful primary attach
+    /// (no recipe to replay) or with nothing pending.
+    pub(super) fn spawn_session_pending_for_active(&mut self) {
+        let Some((program, args)) = self.primary_spawn.clone() else {
+            return;
+        };
+        let targets: Vec<ViewId> = self
+            .layout
+            .leaf_ids()
+            .into_iter()
+            .filter(|view| {
+                self.session_pending.contains_key(view)
+                    && !self.pane_sessions.contains_key(view)
+                    && Some(*view) != self.primary_view
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let frames = self.present_frames();
+        let tail: Vec<&str> = args.iter().map(String::as_str).collect();
+        for view in targets {
+            let (cols, rows) = frames
+                .iter()
+                .find(|frame| frame.view == view)
+                .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+                .unwrap_or((
+                    self.cols.min(u16::MAX as usize) as u16,
+                    self.rows.min(u16::MAX as usize) as u16,
+                ));
+            if let Err(err) = self.spawn_shell_for_view(view, &program, &tail, cols, rows) {
+                eprintln!(
+                    "warning: workspace switch pane {view:?} shell spawn failed ({err}) — pane stays empty"
+                );
+            }
+        }
+    }
+
     /// Captures, encodes, and atomically persists the session to `path`.
     pub fn save_session_to_path(&self, path: &Path) -> Result<SessionSaveSummary, SessionError> {
         let snap = self.capture_session_snapshot();
@@ -1372,10 +1502,7 @@ impl Runtime {
         if !path.exists() {
             return SessionStartupOutcome::Fresh;
         }
-        match self.load_session_from_path(&path) {
-            Ok(summary) => SessionStartupOutcome::Restored(summary),
-            Err(err) => SessionStartupOutcome::FreshWithWarning(err),
-        }
+        startup_outcome_from_load(self.load_session_from_path(&path))
     }
 
     /// Startup restore from the live environment (see the `_with_env` twin
@@ -1394,9 +1521,9 @@ impl Runtime {
     pub fn save_session_on_exit(&self) -> SessionExitSaveOutcome {
         match self.save_session_to_default_path() {
             Ok(summary) => SessionExitSaveOutcome::Saved(summary),
-            Err(SessionError::NoStateDir | SessionError::NotFound) => {
-                SessionExitSaveOutcome::SkippedNoStateDir
-            }
+            // Nit: only a missing state dir is silent. Any other failure
+            // (including a `NotFound` surfaced mid-save) warns loudly.
+            Err(SessionError::NoStateDir) => SessionExitSaveOutcome::SkippedNoStateDir,
             Err(err) => SessionExitSaveOutcome::Warned(err),
         }
     }
@@ -1459,6 +1586,34 @@ mod tests {
         assert!(decode_layout("(leaf 1 0 24)").is_err());
         assert!(decode_layout("(split x 1 (leaf 1 80 24) (leaf 2 80 24))").is_err());
         assert!(decode_layout("").is_err());
+    }
+
+    #[test]
+    fn startup_outcome_maps_raced_not_found_to_quiet_fresh() {
+        // P3-7: a delete raced between the exists-probe and the read is a
+        // quiet clean start, never a warning; anything else still warns.
+        assert!(matches!(
+            startup_outcome_from_load(Err(SessionError::NotFound)),
+            SessionStartupOutcome::Fresh
+        ));
+        assert!(matches!(
+            startup_outcome_from_load(Err(SessionError::NoStateDir)),
+            SessionStartupOutcome::FreshWithWarning(_)
+        ));
+        assert!(matches!(
+            startup_outcome_from_load(Err(SessionError::Corrupt("marker"))),
+            SessionStartupOutcome::FreshWithWarning(_)
+        ));
+        let summary = SessionRestoreSummary {
+            workspaces: 1,
+            panes: 1,
+            scrollback_lines: 0,
+            pending: 0,
+        };
+        assert!(matches!(
+            startup_outcome_from_load(Ok(summary)),
+            SessionStartupOutcome::Restored(_)
+        ));
     }
 
     #[test]

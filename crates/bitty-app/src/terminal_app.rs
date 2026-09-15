@@ -823,6 +823,12 @@ impl AppHandler for TerminalApp {
                     }
                 }
             }
+            // P3-8 defense-in-depth: `PlatformEvent::Exiting` is already
+            // saved-and-exited by the `should_exit` early return above
+            // (`handle_platform_event` reports `true` for it), so this arm
+            // is unreachable today. It stays as a backstop: if the router
+            // ever stops reporting `Exiting`, the loop still saves (atomic,
+            // idempotent) and exits instead of silently dropping the session.
             PlatformEvent::Exiting => {
                 self.save_session_best_effort("loop-exiting");
                 ctx.exit();

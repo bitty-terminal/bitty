@@ -711,6 +711,7 @@ mod tests {
             provided_services: Vec::new(),
             required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
+            tools: Vec::new(),
             lazy: LazyTriggers {
                 commands: commands
                     .into_iter()

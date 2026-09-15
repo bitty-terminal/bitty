@@ -38,6 +38,16 @@ pub const MAX_NAME_LEN: usize = 128;
 pub const MAX_DESCRIPTION_LEN: usize = 1024;
 /// Maximum license expression length.
 pub const MAX_LICENSE_LEN: usize = 256;
+/// Maximum declared Layer-2 system-CLI tools.
+pub const MAX_TOOLS: usize = 8;
+/// Maximum tool name length (policy bound, mirrors id-segment bound).
+pub const MAX_TOOL_NAME_LEN: usize = 64;
+/// Maximum tool version-requirement length (mirrors compat bound).
+pub const MAX_TOOL_VERSION_REQ_LEN: usize = 128;
+/// The only accepted Layer-2 tool (CTX-0425 v1).
+///
+/// Any other `[tools.*]` table fails closed until its own slice is accepted.
+pub const ACCEPTED_TOOLS: &[&str] = &["git"];
 
 // ── plugin id ────────────────────────────────────────────────────────────
 
@@ -382,6 +392,52 @@ impl FilesystemRequest {
     }
 }
 
+// ── Layer-2 system-CLI tools (accepted `[tools.git]` v1, CTX-0425) ────────
+
+/// One Layer-2 system-CLI tool declaration (`[tools.<name>]`).
+///
+/// Only the accepted slice passes: `tool` must be `git` (see
+/// [`ACCEPTED_TOOLS`]), `required` pins fail-closed activation when the tool
+/// is missing or mismatched, and `version_req` pins the version constraint
+/// re-checked by `bitty plugin doctor`. Any other tool table fails closed
+/// until its own slice is accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDeclaration {
+    /// Tool name (e.g. `git`).
+    pub tool: String,
+    /// Whether activation fails closed when the tool is missing/mismatched.
+    pub required: bool,
+    /// Version constraint (e.g. `>=2.30`).
+    pub version_req: String,
+}
+
+impl ToolDeclaration {
+    /// Validate this declaration as untrusted input (fail-closed).
+    pub fn validate(&self) -> Result<(), PluginError> {
+        if !crate::tools::is_valid_tool_name(&self.tool) {
+            return Err(PluginError::manifest(
+                "tools",
+                format!(
+                    "tool name '{}' must match [a-z0-9]+(-[a-z0-9]+)* (max {MAX_TOOL_NAME_LEN})",
+                    self.tool
+                ),
+            ));
+        }
+        if !ACCEPTED_TOOLS.contains(&self.tool.as_str()) {
+            return Err(PluginError::manifest(
+                "tools",
+                format!(
+                    "unknown tool '{}' (only {} accepted until its own slice is accepted)",
+                    self.tool,
+                    ACCEPTED_TOOLS.join(", ")
+                ),
+            ));
+        }
+        validate_version_req(&self.version_req, "tools.version")?;
+        Ok(())
+    }
+}
+
 // ── manifest structs ─────────────────────────────────────────────────────
 
 /// Identity block `[plugin]`.
@@ -536,6 +592,19 @@ impl CapabilityRequests {
         for id in &self.ids {
             // Re-parse to ensure no bypass via direct construction.
             CapabilityId::parse(id.as_str())?;
+            // Filesystem authority must use `[[capabilities.filesystem]]`
+            // (structured requests), never a bool `fs.read:*` / `fs.write:*`
+            // key (fail-closed; mirrors the transitional validator).
+            let raw = id.as_str();
+            let head = raw.split_once(':').map(|(h, _)| h).unwrap_or(raw);
+            if head == "fs.read" || head == "fs.write" {
+                return Err(PluginError::manifest(
+                    "capabilities.filesystem",
+                    format!(
+                        "capability '{raw}' must use '[[capabilities.filesystem]]', not a boolean key"
+                    ),
+                ));
+            }
         }
 
         // Filesystem requests: check per-kind bounds and total pattern text.
@@ -671,6 +740,8 @@ pub struct PluginManifest {
     pub required_services: Vec<(String, String)>,
     /// Requested capabilities.
     pub capabilities: CapabilityRequests,
+    /// Layer-2 system-CLI tool declarations (`[tools.*]`, accepted v1: only `git`).
+    pub tools: Vec<ToolDeclaration>,
     /// Lazy trigger declarations.
     pub lazy: LazyTriggers,
     /// Raw manifest byte length (for the 256 KiB size check).
@@ -678,16 +749,19 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v2`).
+    /// Deterministic canonical bytes for hash binding (draft `bitty-manifest-v3`).
     ///
     /// Sorted, cross-platform, no wall-clock. Covers identity, compat, resolved
     /// capability set (including filesystem `fs.read:PARAM`/`fs.write:PARAM` expansion),
-    /// dependencies, provided services, and required services. Used to bind grant records to the exact manifest
+    /// dependencies, provided services, required services, and Layer-2 `tools`
+    /// declarations. Used to bind grant records to the exact manifest
     /// that was approved (`hash(manifest) == record.manifest_hash`).
+    /// Raising `tools.<name>.required` from `false` to `true` changes the hash
+    /// and is a capability increase whose grant must be re-confirmed.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = String::new();
-        buf.push_str("bitty-manifest-v2\n");
+        buf.push_str("bitty-manifest-v3\n");
         buf.push_str(self.identity.id.as_str());
         buf.push('|');
         buf.push_str(&self.identity.version);
@@ -757,6 +831,18 @@ impl PluginManifest {
             buf.push_str(&s);
             buf.push(',');
         }
+        buf.push('|');
+        // Layer-2 tools sorted (v3 segment: `tool=required:version_req`).
+        let mut tools: Vec<String> = self
+            .tools
+            .iter()
+            .map(|t| format!("{}={}:{}", t.tool, t.required, t.version_req))
+            .collect();
+        tools.sort_unstable();
+        for t in tools {
+            buf.push_str(&t);
+            buf.push(',');
+        }
         buf.into_bytes()
     }
 
@@ -780,6 +866,9 @@ impl PluginManifest {
     ///   (16 max, duplicate interfaces rejected; satisfaction is resolve-time),
     /// - capability closed-set validation (unknown identifiers fail, no wildcards),
     /// - filesystem pattern bounds,
+    /// - Layer-2 `tools` declarations (accepted v1: only `git`; unknown tools
+    ///   fail closed; `process.spawn:<tool>` requires `[tools.<tool>]` and vice
+    ///   versa),
     /// - lazy trigger bounds,
     /// - manifest size already supplied via `raw_bytes_len`.
     pub fn validate(&self) -> Result<(), PluginError> {
@@ -858,6 +947,66 @@ impl PluginManifest {
         self.capabilities.validate()?;
         self.lazy.validate()?;
 
+        if self.tools.len() > MAX_TOOLS {
+            return Err(PluginError::LimitExceeded {
+                field: "tools".to_string(),
+                limit: MAX_TOOLS,
+                actual: self.tools.len(),
+            });
+        }
+        for decl in &self.tools {
+            decl.validate()?;
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for decl in &self.tools {
+                if !seen.insert(decl.tool.clone()) {
+                    return Err(PluginError::Duplicate {
+                        kind: "tool".to_string(),
+                        value: decl.tool.clone(),
+                    });
+                }
+            }
+        }
+        // Pairing: `process.spawn:<tool>` requires `[tools.<tool>]` and vice
+        // versa (fail-closed; prevents spawn authority without a versioned
+        // tool declaration and tool declarations without capability consent).
+        {
+            let mut spawn_tools = BTreeSet::new();
+            for id in &self.capabilities.ids {
+                let raw = id.as_str();
+                if let Some((head, param)) = raw.split_once(':') {
+                    if head == "process.spawn" {
+                        spawn_tools.insert(param.to_string());
+                    }
+                }
+            }
+            for tool in &spawn_tools {
+                if !self.tools.iter().any(|t| t.tool == *tool) {
+                    return Err(PluginError::manifest(
+                        "tools",
+                        format!(
+                            "capability 'process.spawn:{tool}' requires a '[tools.{tool}]' declaration"
+                        ),
+                    ));
+                }
+            }
+            for decl in &self.tools {
+                let expected = format!("process.spawn:{}", decl.tool);
+                if !self
+                    .capabilities
+                    .ids
+                    .iter()
+                    .any(|id| id.as_str() == expected)
+                {
+                    return Err(PluginError::manifest(
+                        "capabilities",
+                        format!("'[tools.{}]' requires capability '{expected}'", decl.tool),
+                    ));
+                }
+            }
+        }
+
         // Total pattern text is also checked inside capabilities; duplicate capability ids
         // would have been deduplicated in the BTreeSet (no error, just one grant check).
 
@@ -900,6 +1049,7 @@ mod tests {
             provided_services: Vec::new(),
             required_services: Vec::new(),
             capabilities: CapabilityRequests::default(),
+            tools: Vec::new(),
             lazy: LazyTriggers::default(),
             raw_bytes_len: 512,
         }
@@ -1080,6 +1230,121 @@ mod tests {
             .ids
             .insert(CapabilityId::parse("terminal.semantic-read").unwrap());
         assert_ne!(m1.manifest_hash(), m4.manifest_hash());
+    }
+
+    fn manifest_with_git_tool(id: &str) -> PluginManifest {
+        let mut m = minimal_manifest(id);
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("process.spawn:git").unwrap());
+        m.tools.push(ToolDeclaration {
+            tool: "git".to_string(),
+            required: true,
+            version_req: ">=2.30".to_string(),
+        });
+        m
+    }
+
+    #[test]
+    fn tools_git_accepted_pairing_validates() {
+        let m = manifest_with_git_tool("xuepoo.tools");
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn tools_reject_unknown_tool() {
+        let mut m = minimal_manifest("xuepoo.tools");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("process.spawn:rg").unwrap());
+        m.tools.push(ToolDeclaration {
+            tool: "rg".to_string(),
+            required: true,
+            version_req: ">=13".to_string(),
+        });
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn tools_reject_path_manipulation_names() {
+        for evil in [
+            "/usr/bin/git",
+            "./git",
+            "../evil",
+            "git.exe",
+            "git;evil",
+            "git evil",
+            "",
+        ] {
+            let decl = ToolDeclaration {
+                tool: evil.to_string(),
+                required: true,
+                version_req: ">=2.30".to_string(),
+            };
+            assert!(decl.validate().is_err(), "must reject {evil:?}");
+        }
+    }
+
+    #[test]
+    fn tools_require_capability_pairing_both_directions() {
+        // Spawn capability without declaration fails closed.
+        let mut m = minimal_manifest("xuepoo.pair");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("process.spawn:git").unwrap());
+        assert!(m.validate().is_err());
+
+        // Declaration without capability fails closed.
+        let mut m = minimal_manifest("xuepoo.pair");
+        m.tools.push(ToolDeclaration {
+            tool: "git".to_string(),
+            required: true,
+            version_req: ">=2.30".to_string(),
+        });
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn filesystem_bool_keys_fail_closed_require_table() {
+        // `fs.read:~/x = true` must fail (use `[[capabilities.filesystem]]`).
+        let mut m = minimal_manifest("xuepoo.fsbool");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("fs.read:~/projects/**").unwrap());
+        assert!(m.validate().is_err());
+
+        let mut m = minimal_manifest("xuepoo.fsbool");
+        m.capabilities
+            .ids
+            .insert(CapabilityId::parse("fs.write:~/projects/**").unwrap());
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn tools_reject_duplicates_and_bad_version() {
+        let mut m = manifest_with_git_tool("xuepoo.dup");
+        m.tools.push(ToolDeclaration {
+            tool: "git".to_string(),
+            required: false,
+            version_req: ">=2.30".to_string(),
+        });
+        assert!(m.validate().is_err());
+
+        let mut m = manifest_with_git_tool("xuepoo.badver");
+        m.tools[0].version_req = String::new();
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn manifest_hash_covers_tools() {
+        let m1 = minimal_manifest("xuepoo.thash");
+        let m2 = manifest_with_git_tool("xuepoo.thash");
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
+        // Flipping `required` is a capability increase (hash must change).
+        let mut m3 = m2.clone();
+        m3.tools[0].required = false;
+        assert_ne!(m2.manifest_hash(), m3.manifest_hash());
+        assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
     }
 }
 

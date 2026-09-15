@@ -80,6 +80,7 @@ fn palette_manifest() -> bitty_plugin_host::PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: vec![QualifiedName::new("bitty-terminal.palette:toggle").expect("qualified")],
             events: vec!["focus.changed".to_string()],
@@ -120,6 +121,7 @@ fn statusline_manifest() -> bitty_plugin_host::PluginManifest {
         provided_services: Vec::new(),
         required_services: Vec::new(),
         capabilities: caps,
+        tools: Vec::new(),
         lazy: LazyTriggers {
             commands: Vec::new(),
             events: vec![

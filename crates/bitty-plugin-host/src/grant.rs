@@ -99,6 +99,14 @@ pub struct GrantStore {
     records: BTreeMap<String, GrantRecord>,
     /// Denial markers to prevent re-prompt loops (per plugin id).
     denials: BTreeSet<String>,
+    /// Per-capability denials from single-capability revocation (CTX-0465).
+    ///
+    /// A single-capability revoke persists here so the revoked capability
+    /// cannot be silently re-prompted or re-granted: `is_granted` fails
+    /// closed on denied entries, and re-grant requires explicit
+    /// [`GrantStore::clear_cap_denial`] (user action), never a bare
+    /// `insert`. Keyed by plugin id, then the denied capability set.
+    denied_caps: BTreeMap<String, BTreeSet<CapabilityId>>,
 }
 
 impl GrantStore {
@@ -154,6 +162,9 @@ impl GrantStore {
         if !declared.contains(capability) {
             return false;
         }
+        if self.is_cap_denied(plugin_id, capability) {
+            return false;
+        }
         let Some(rec) = self.get(plugin_id) else {
             return false;
         };
@@ -187,9 +198,14 @@ impl GrantStore {
 
     /// Revoke grants for `plugin_id`.
     ///
-    /// If `capability` is `Some`, remove only that capability; otherwise remove
-    /// the whole grant record. The host must detach affected handlers at the
-    /// next dispatch boundary and report what was revoked.
+    /// If `capability` is `Some`, remove only that capability and persist a
+    /// per-capability denial (CTX-0465): re-prompting or re-granting the
+    /// revoked capability requires explicit [`GrantStore::clear_cap_denial`].
+    /// When the last granted capability is revoked this way, the record is
+    /// removed and a plugin-level denial marker is set, exactly as for a
+    /// full revoke. Otherwise remove the whole grant record. The host must
+    /// detach affected handlers at the next dispatch boundary and report
+    /// what was revoked.
     pub fn revoke(
         &mut self,
         plugin_id: &PluginId,
@@ -210,6 +226,23 @@ impl GrantStore {
                     "capability '{cap}' not granted for '{}'",
                     plugin_id.as_str()
                 )));
+            }
+            // Persist the denial before any escalation so the explicit deny
+            // state survives even when the record itself is removed below.
+            self.denied_caps
+                .entry(key.clone())
+                .or_default()
+                .insert(cap.clone());
+            if rec.granted.is_empty() {
+                // Last capability out: escalate to a full revoke (remove the
+                // record, persist the plugin-level denial marker).
+                self.records.remove(&key);
+                self.denials.insert(key);
+                return Ok(RevokeReport {
+                    plugin_id: plugin_id.clone(),
+                    revoked: vec![cap.clone()],
+                    fully_revoked: true,
+                });
             }
             Ok(RevokeReport {
                 plugin_id: plugin_id.clone(),
@@ -239,6 +272,35 @@ impl GrantStore {
     #[must_use]
     pub fn is_denied(&self, plugin_id: &PluginId) -> bool {
         self.denials.contains(plugin_id.as_str())
+    }
+
+    /// Whether `capability` was individually revoked for `plugin_id` (CTX-0465).
+    ///
+    /// Re-prompting or re-granting a denied capability requires explicit
+    /// [`GrantStore::clear_cap_denial`]; a bare `insert` never clears it.
+    #[must_use]
+    pub fn is_cap_denied(&self, plugin_id: &PluginId, capability: &CapabilityId) -> bool {
+        self.denied_caps
+            .get(plugin_id.as_str())
+            .is_some_and(|set| set.contains(capability))
+    }
+
+    /// Clear a per-capability denial after explicit user action (CTX-0465).
+    ///
+    /// Returns `true` when a denial was present and removed. Re-granting the
+    /// capability afterwards (via `insert`) then works; without this call the
+    /// denial persists across `insert` calls so hostile packages cannot
+    /// re-prompt revoked capabilities back into the grant in a loop.
+    pub fn clear_cap_denial(&mut self, plugin_id: &PluginId, capability: &CapabilityId) -> bool {
+        let key = plugin_id.as_str();
+        let removed = self
+            .denied_caps
+            .get_mut(key)
+            .is_some_and(|set| set.remove(capability));
+        if removed && self.denied_caps.get(key).is_some_and(|set| set.is_empty()) {
+            self.denied_caps.remove(key);
+        }
+        removed
     }
 
     /// Workspace narrowing: intersect `granted` with `workspace_allowed`, rejecting any addition.
@@ -285,6 +347,7 @@ impl GrantStore {
     pub fn clear(&mut self) {
         self.records.clear();
         self.denials.clear();
+        self.denied_caps.clear();
     }
 }
 
@@ -359,6 +422,64 @@ mod tests {
         assert!(!report.fully_revoked);
         assert!(!store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
         assert!(store.is_granted(&pid, "h", &cap("terminal.semantic-read"), &declared));
+    }
+
+    #[test]
+    fn revoke_single_capability_records_denial() {
+        // CTX-0465: a single-capability revoke must persist an explicit
+        // denial — no silent re-prompt / re-grant loop.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("terminal.semantic-read"));
+        granted.insert(cap("ui.rich"));
+        store.insert(GrantRecord::granted(pid.clone(), "h", granted.clone(), 1));
+        let declared = CapabilityRequests {
+            ids: granted.clone(),
+            ..CapabilityRequests::default()
+        };
+
+        let report = store.revoke(&pid, Some(&cap("ui.rich"))).unwrap();
+        assert_eq!(report.revoked, vec![cap("ui.rich")]);
+        assert!(!report.fully_revoked);
+        assert!(store.is_cap_denied(&pid, &cap("ui.rich")));
+        assert!(!store.is_cap_denied(&pid, &cap("terminal.semantic-read")));
+        assert!(!store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
+        assert!(store.is_granted(&pid, "h", &cap("terminal.semantic-read"), &declared));
+
+        // A bare re-grant (no explicit clearance) must NOT resurrect the
+        // revoked capability: the denial survives `insert`.
+        store.insert(GrantRecord::granted(pid.clone(), "h", granted, 2));
+        assert!(store.is_cap_denied(&pid, &cap("ui.rich")));
+        assert!(!store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
+
+        // Explicit user action clears the denial; only then does re-grant work.
+        assert!(store.clear_cap_denial(&pid, &cap("ui.rich")));
+        assert!(!store.is_cap_denied(&pid, &cap("ui.rich")));
+        assert!(!store.clear_cap_denial(&pid, &cap("ui.rich")));
+        let mut granted2 = BTreeSet::new();
+        granted2.insert(cap("terminal.semantic-read"));
+        granted2.insert(cap("ui.rich"));
+        store.insert(GrantRecord::granted(pid.clone(), "h", granted2, 3));
+        assert!(store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
+    }
+
+    #[test]
+    fn revoke_last_capability_escalates_to_full_denial() {
+        // CTX-0465: revoking the final granted capability removes the record
+        // and sets the plugin-level denial marker, exactly like a full revoke.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("ui.rich"));
+        store.insert(GrantRecord::granted(pid.clone(), "h", granted, 1));
+
+        let report = store.revoke(&pid, Some(&cap("ui.rich"))).unwrap();
+        assert_eq!(report.revoked, vec![cap("ui.rich")]);
+        assert!(report.fully_revoked);
+        assert!(store.get(&pid).is_none());
+        assert!(store.is_denied(&pid));
+        assert!(store.is_cap_denied(&pid, &cap("ui.rich")));
     }
 
     #[test]

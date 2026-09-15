@@ -336,6 +336,24 @@ impl PluginHost {
                 record.manifest_hash
             )));
         }
+        // Explicit per-capability denials (single-capability revocation,
+        // CTX-0465) fail closed here as an explicit re-grant error, not a
+        // generic missing grant: re-prompting a revoked capability requires
+        // explicit user action (`clear_cap_denial`), never a silent
+        // re-request.
+        let explicitly_denied: Vec<String> = required
+            .iter()
+            .filter(|cap| self.grants.is_cap_denied(id, cap))
+            .map(|cap| cap.as_str().to_string())
+            .collect();
+        if !explicitly_denied.is_empty() {
+            return Err(PluginError::grant(format!(
+                "explicitly denied capabilities for '{}' (hash {}): {}; explicit re-grant required",
+                id.as_str(),
+                hash,
+                explicitly_denied.join(", ")
+            )));
+        }
         // Every declared capability must be granted for this hash.
         let mut missing: Vec<String> = Vec::new();
         for cap in &required {
@@ -482,6 +500,21 @@ impl PluginHost {
                 })
                 .map(|cap| cap.as_str().to_string())
                 .collect();
+            // Explicit per-capability denials (CTX-0465) surface as an
+            // explicit re-grant error even when the grant is also missing.
+            let explicitly_denied: Vec<String> = required
+                .iter()
+                .filter(|cap| self.grants.is_cap_denied(id, cap))
+                .map(|cap| cap.as_str().to_string())
+                .collect();
+            if !explicitly_denied.is_empty() {
+                return Err(PluginError::grant(format!(
+                    "explicitly denied capabilities for '{}' (manifest hash {}): {}; explicit re-grant required",
+                    id.as_str(),
+                    hash,
+                    explicitly_denied.join(", ")
+                )));
+            }
             if !missing.is_empty() {
                 return Err(PluginError::grant(format!(
                     "missing grants for '{}' (hash {}): {}",

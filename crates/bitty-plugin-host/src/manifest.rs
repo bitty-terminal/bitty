@@ -343,6 +343,59 @@ pub struct FilesystemRequest {
     pub paths: Vec<String>,
 }
 
+/// Home-scoped dot-directories that always hold secrets (CTX-0465).
+///
+/// A filesystem pattern naming one of these — as a `~/` prefix or as any
+/// `/`-separated segment (e.g. `**/.ssh/**`) — fails closed. Bare relative
+/// patterns that merely pass *through* a project-local directory with the
+/// same name are collateral: name grants precisely instead.
+const FS_SENSITIVE_HOME_NAMES: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"];
+
+/// Two-level sensitive prefixes under `~/` (credential helpers).
+const FS_SENSITIVE_HOME_PREFIXES: &[&str] = &["~/.config/gh/", "~/.config/gcloud/"];
+
+/// Whether a filesystem glob `pattern` escapes its sandbox or names secrets.
+///
+/// Denies (fail-closed):
+/// - absolute paths: leading `/`, Windows drive (`C:/`, `C:\`), UNC (`\\`);
+/// - `~user/` homes (only bare `~` / `~/...` stay expressible);
+/// - `..` segments on either separator (`../`, `..\\`, embedded, trailing);
+/// - sensitive credential locations (`~/.ssh/...`, any `.ssh`/`.gnupg`/
+///   `.aws`/`.azure`/`.kube`/`.docker` segment, `~/.config/gh|gcloud/...`).
+#[must_use]
+pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
+    if pattern.starts_with('/') || pattern.starts_with("\\\\") {
+        return true;
+    }
+    let bytes = pattern.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+    {
+        return true;
+    }
+    if pattern.starts_with('~') && pattern != "~" && !pattern.starts_with("~/") {
+        return true;
+    }
+    if pattern.split(['/', '\\']).any(|segment| segment == "..") {
+        return true;
+    }
+    for prefix in FS_SENSITIVE_HOME_PREFIXES {
+        let dir = prefix.trim_end_matches('/');
+        if pattern == dir || pattern.starts_with(prefix) {
+            return true;
+        }
+    }
+    if pattern
+        .split('/')
+        .any(|segment| FS_SENSITIVE_HOME_NAMES.contains(&segment))
+    {
+        return true;
+    }
+    false
+}
+
 impl FilesystemRequest {
     /// Validate this request.
     pub fn validate(&self) -> Result<(), PluginError> {
@@ -377,6 +430,14 @@ impl FilesystemRequest {
                 return Err(PluginError::manifest(
                     "capabilities.filesystem.paths",
                     "path pattern must not contain control characters or whitespace",
+                ));
+            }
+            if is_hostile_fs_pattern(p) {
+                return Err(PluginError::manifest(
+                    "capabilities.filesystem.paths",
+                    format!(
+                        "path pattern '{p}' is hostile (absolute path, '..' traversal, foreign home, or sensitive credential location)"
+                    ),
                 ));
             }
             total += p.len();
@@ -1114,6 +1175,71 @@ mod tests {
             assert!(
                 manifest.validate().is_err(),
                 "manifest should reject {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_filesystem_rejects_absolute_traversal_and_sensitive() {
+        // CTX-0465 hostile probes: absolute paths, `..` segments (both
+        // separators), `~user` homes, and sensitive-prefix patterns must
+        // fail closed at manifest validation.
+        for path in [
+            "/etc/passwd",
+            "/etc/**",
+            "/etc/../etc/passwd",
+            "../secret",
+            "a/../../b",
+            "~/../etc/passwd",
+            "~root/.ssh/id_rsa",
+            "~/.ssh/id_rsa",
+            "~/.ssh",
+            "~/.ssh/**",
+            "~/.gnupg/**",
+            "~/.aws/credentials",
+            "~/.azure/**",
+            "**/.ssh/**",
+            "docs/../../.ssh/id_rsa",
+            "C:/Windows/System32/**",
+            "C:\\Windows\\System32\\**",
+            "\\\\server\\share\\**",
+            "/proc/self/environ",
+            "/sys/**",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_err(),
+                "hostile fs pattern {path:?} must be denied"
+            );
+            let mut manifest = minimal_manifest("xuepoo.test");
+            manifest.capabilities.filesystem.push(FilesystemRequest {
+                access: FsAccess::Write,
+                paths: vec![path.to_string()],
+            });
+            assert!(
+                manifest.validate().is_err(),
+                "manifest must reject hostile fs pattern {path:?}"
+            );
+        }
+        // Legit panel use keeps working.
+        for path in [
+            "~/projects/**",
+            "~/mail/**",
+            "~/Documents/**/*.md",
+            "~/docs/*.md",
+            "notes/**",
+            "docs/**/*.md",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_ok(),
+                "legit fs pattern {path:?} must stay allowed"
             );
         }
     }

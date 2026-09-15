@@ -57,12 +57,12 @@
 //! | Manifest and identity (OQ-012, part 1) | `manifest` | [`manifest::PluginManifest`] + [`manifest::PluginId`] + [`manifest::QualifiedName`] + hard limits (256 KiB, 128 commands, 256 events, 32 patterns/kind, 16 services, 8 deps, 8 KiB pattern text) |
 //! | Identity and compatibility | `manifest` | [`manifest::PluginId`] qualified `owner.name`, [`manifest::Compat`] semver ranges, duplicate detection |
 //! | Identifier grammar and families (OQ-012, part 2) | `capability` | [`capability::CapabilityId`] closed grammar `family.resource[.scope][:PARAM]`, deny-by-default, no wildcards, high-risk flag, [`capability::effect_statement`] |
-//! | Grant lifecycle | `grant` | [`grant::GrantRecord`] hash binding, [`grant::GrantStore`] revoke/re-grant/deny-loop prevention, workspace narrowing (`apply_workspace_narrowing` rejects additions) |
+//! | Grant lifecycle | `grant` | [`grant::GrantRecord`] hash binding, [`grant::GrantStore`] revoke/re-grant/deny-loop prevention (per-capability denials, CTX-0465), workspace narrowing (`apply_workspace_narrowing` rejects additions) |
 //! | Plugin API v1 surface (OQ-011) — commands, services, settings | `registry` | [`registry::Registry`] qualified names (`plugin-id:resource`), duplicate rejection at graph construction, service interface syntax, lazy triggers |
 //! | Lifecycle and generations | `registry`, `host` | [`registry::PluginState`] `Declared->Resolved->Registered->Activated->(Suspended)->Disposed`, [`registry::Generation`] monotonic, generation disposal completeness, safe-mode skip |
 //! | Event pipeline — classes and phases (OQ-013) | `event` | [`event::EventClass`] Lifecycle/Observation/Interception, [`event::EventKind`] v1 closed set (4 interception points exactly) |
 //! | Delivery, ordering, batching, and coalescing | `event` | [`event::EventQueue`] per-subscriber bounded FIFO, coalescing for title/cwd/focus/selection, [`event::DEFAULT_BATCH_EVENTS`]/[`event::DEFAULT_BATCH_BYTES`] (`<=32` / `8 KiB` accepted v1 baseline), [`event::DropPolicy`] `DropOldest` accepted default |
-//! | Timeouts and failure policy | `event` | [`event::InterceptionDecision`] veto-wins, fail-open, [`event::should_proceed`], reentrancy rejected, interception not queued (cold-path synchronous) |
+//! | Timeouts and failure policy | `event` | [`event::InterceptionDecision`] veto-wins, fail-closed timeouts (CTX-0465), [`event::should_proceed`], reentrancy rejected, interception not queued (cold-path synchronous) |
 //! | Plugin host (ADRs) | `host` | [`host::PluginHost`] owns registry + grant store + event pipeline + [`host::SideQueue`] bounded side queue; no window/GPU/PTY coupling; headless testable |
 //! | Package install verification (proposed, draft) | `install` | [`install::verify_install`] calls `bitty_package::verify_pipeline` (7 stages) before staging; `V-A`/`V-B`/`V-C` trust, capability-diff `P0-AC-030`, generation integrity `verify_all`; fail-closed owned errors + [`install::DoctorIssue`] for `bitty plugin doctor`; headless tamper/capability tests |
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
@@ -146,11 +146,11 @@ pub use manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, MANIFEST_MAX_BYTES,
     MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,
     MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, MAX_TOOLS, PluginId, PluginIdentity,
-    PluginManifest, QualifiedName, ToolDeclaration,
+    PluginManifest, QualifiedName, ToolDeclaration, is_hostile_fs_pattern,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
 pub use tools::{
-    ACCEPTED_TOOL_GIT, GIT_ALLOWED_SUBCOMMANDS, MAX_GIT_ARG_BYTES, MAX_GIT_ARGS,
-    MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool, is_allowed_git_args,
-    is_tool_spawn_allowed, is_valid_tool_name,
+    ACCEPTED_TOOL_GIT, DENIED_SPAWN_ENV_VARS, GIT_ALLOWED_SUBCOMMANDS, MAX_GIT_ARG_BYTES,
+    MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool, is_allowed_git_args,
+    is_safe_spawn_env, is_tool_spawn_allowed, is_valid_tool_name,
 };

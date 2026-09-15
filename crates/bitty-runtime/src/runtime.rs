@@ -71,7 +71,7 @@
 //! - **Event routing:** `register_plugin` validates and registers a manifest via
 //!   `declare → resolve → register`; subscriptions and publishing go through the
 //!   host's [`bitty_plugin_host::EventPipeline`]. Interception handlers are synchronous,
-//!   veto-wins, fail-open, and remain cold-path only (the four v1 points
+//!   veto-wins, fail-closed on timeout (CTX-0465), and remain cold-path only (the four v1 points
 //!   `intercept.command-dispatch/terminal-spawn/paste/open-url`).
 //! - **Grant stubs:** `is_capability_granted`, `insert_grant`, `revoke_grant`, and
 //!   `dispatch_command` (grant-checked) are headless stubs with no file I/O; they

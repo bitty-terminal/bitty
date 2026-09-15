@@ -1882,6 +1882,11 @@ fn report_install(report: &package::InstallReport, output: &mut dyn std::io::Wri
             );
         }
     }
+    // CTX-0417: post-commit cleanup is non-fatal but must be visible: the
+    // install already succeeded, so warn instead of failing.
+    if let Some(warning) = &report.prune_warning {
+        eprintln!("warning: bitty plugin: {warning}");
+    }
 }
 
 /// Toggle one installed store record.

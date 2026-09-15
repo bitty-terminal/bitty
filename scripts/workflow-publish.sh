@@ -5,14 +5,18 @@
 # redacts every table row and project.json, stamps manifest.redacted, and
 # commits exactly one snapshot to the fixed public ref
 # `refs/heads/carryctx-snapshots`. CarryCtx never touches the network, so this
-# target pushes that local ref itself — but only when the ref actually
-# advanced. Native carryctx commits one snapshot per export, so a re-run
-# publishes again rather than no-opping; the guard skips only a ref that did
-# not advance.
+# target pushes that local ref itself — and fails loudly when the ref does not
+# advance after export. Native carryctx commits one snapshot per export, so a
+# re-run publishes again rather than no-opping; a ref that did not advance
+# means a stale source or a broken export, never a silent success.
 #
-# Trigger: the commander's merge closeout runs `just workflow-publish` from the
-# primary checkout (NOT a git hook: GitHub squash-merges never fire local
-# hooks, and `carryctx hooks install` behavior is intentionally untouched).
+# Trigger: the commander's merge closeout runs the workspace publish-snapshots
+# helper, which publishes each repo from a fresh origin/main worktree whose
+# basename matches the repository name (NOT a git hook: GitHub squash-merges
+# never fire local hooks, and `carryctx hooks install` behavior is
+# intentionally untouched). A manual `just workflow-publish` from the primary
+# checkout on main is allowed only when that checkout is current with
+# origin/main.
 # The companion CI gate (`snapshot-source`) verifies the pushed snapshot's
 # `CarryCtx-Source` trailer matches main HEAD.
 #
@@ -21,8 +25,8 @@
 #      redacts the bundle and commits it to `refs/heads/carryctx-snapshots`.
 #   2. Refuses to push unless the committed `manifest.json` is stamped
 #      `redacted: true`.
-#   3. Pushes `refs/heads/carryctx-snapshots` to the remote only when the local
-#      ref changed; otherwise prints a no-op message.
+#   3. Pushes `refs/heads/carryctx-snapshots` to the remote; fails loudly when
+#      the local ref did not advance (CTX-0434 defect 4).
 #
 # The local CarryCtx DB is never modified. `--dry-run` validates the export and
 # writes neither the ref nor the remote.
@@ -128,6 +132,13 @@ PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 # repository name derived from the remote.
 PROJECT_NAME="$(basename "$PROJECT")"
 REPO_NAME="$(basename "$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url "$REMOTE" 2>/dev/null || true)" .git)"
+if [[ -z "$REPO_NAME" ]]; then
+	if [[ "$ALLOW_NAME_MISMATCH" == 1 ]]; then
+		log "WARN: cannot determine repository name from remote '$REMOTE' URL; --allow-name-mismatch set, CarryCtx-Source trailer may record the wrong project token"
+	else
+		fail "cannot determine repository name from remote '$REMOTE' URL; refusing to publish with a basename-derived CarryCtx-Source trailer. Fix the remote URL or pass --allow-name-mismatch."
+	fi
+fi
 if [[ -n "$REPO_NAME" && "$PROJECT_NAME" != "$REPO_NAME" ]]; then
 	if [[ "$ALLOW_NAME_MISMATCH" == 1 ]]; then
 		log "WARN: checkout basename '$PROJECT_NAME' != repository name '$REPO_NAME'; --allow-name-mismatch set"
@@ -151,11 +162,24 @@ if [[ "${BRANCH:-}" != "main" ]]; then
 			if [[ "$HEAD_SHA" == "$MAIN_SHA" ]]; then
 				log "checkout is detached at $REMOTE/main ($HEAD_SHA)"
 			else
-				log "WARN: checkout is detached at $HEAD_SHA, behind $REMOTE/main ($MAIN_SHA); the publication gate flags it until main is republished"
+				fail "checkout is detached at $HEAD_SHA, behind $REMOTE/main ($MAIN_SHA); refusing stale publication. Re-run the closeout from a fresh $REMOTE/main worktree (or pass --allow-non-main to record the stale source explicitly)."
 			fi
 		else
 			fail "checkout is on branch '${BRANCH:-detached}' at ${HEAD_SHA:-unknown}, which is not main and not reachable from $REMOTE/main; run the closeout from the primary checkout on main (or pass --allow-non-main). A feature-branch publication records a revision the snapshot-source gate can never match."
 		fi
+	fi
+fi
+
+# A primary checkout on branch main can also be stale (behind origin/main).
+# The closeout helper always publishes from a fresh origin/main worktree; a
+# manual run from a behind main must fail loudly rather than stamp a stale
+# CarryCtx-Source (CTX-0434 defect 2).
+if [[ "${BRANCH:-}" == "main" && "$ALLOW_NON_MAIN" == 0 ]]; then
+	HEAD_ON_MAIN="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse HEAD 2>/dev/null || true)"
+	MAIN_TIP="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse -q --verify "refs/remotes/$REMOTE/main" 2>/dev/null || true)"
+	if [[ -n "$HEAD_ON_MAIN" && -n "$MAIN_TIP" && "$HEAD_ON_MAIN" != "$MAIN_TIP" ]] &&
+		timeout "$GIT_TIMEOUT" git -C "$PROJECT" merge-base --is-ancestor "$HEAD_ON_MAIN" "$MAIN_TIP" 2>/dev/null; then
+		fail "checkout on branch 'main' at $HEAD_ON_MAIN is behind $REMOTE/main ($MAIN_TIP); fetch/pull main before publishing (or pass --allow-non-main to record the stale source explicitly)."
 	fi
 fi
 
@@ -207,8 +231,7 @@ if ! grep -Eq '"redacted"[[:space:]]*:[[:space:]]*true' <<<"$MANIFEST"; then
 fi
 
 if [[ -n "$BEFORE" && "$BEFORE" == "$AFTER" ]]; then
-	log "publication already current at ${AFTER:0:12}; nothing to push"
-	exit 0
+	fail "snapshot ref $PUB_REF did not advance after export (still ${AFTER:0:12}); refusing silent success. The export source was stale or the export produced no new snapshot."
 fi
 
 log "pushing $PUB_REF (${BEFORE:0:12} -> ${AFTER:0:12}) to $REMOTE"

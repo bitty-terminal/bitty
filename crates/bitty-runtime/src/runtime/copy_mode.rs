@@ -98,6 +98,10 @@ impl Runtime {
         if self.copy_mode.is_some() {
             return;
         }
+        // CTX-0383: modals stay exclusive — entering copy exits search.
+        if self.search_mode {
+            self.exit_search_mode();
+        }
         let snap = self.state.snapshot();
         let term_cursor = snap.cursor.position;
         let raw = CellPos::new(term_cursor.row, term_cursor.col);

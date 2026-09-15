@@ -692,6 +692,32 @@ pub enum ChromeAction {
     /// over the CTX-0385 `SelectionKind` ranges, `y` yanks to clipboard plus
     /// primary, `Esc` exits). Modal: no PTY input while active.
     EnterCopyMode,
+    /// Open the scrollback search overlay (`open_search`, CTX-0383 issue #639).
+    ///
+    /// Keyboard-first modal overlay over the bounded CTX-0060/0061 search
+    /// seams (`State::search`, `SearchState`): typing edits the bounded
+    /// query (`<=256` bytes), `Enter` advances with viewport reveal plus
+    /// live-selection sync, `Shift+Enter` goes back, `Esc` exits and
+    /// clears (typing always edits the query; `n`/`N` are query text,
+    /// not navigation). Modal: no PTY input while active. Default `ctrl+shift+f`
+    /// (kitty parity; carries no `alt` slot so a Super flip leaves it).
+    OpenSearch,
+    /// Advance to the next search match (`search_next`, CTX-0383).
+    ///
+    /// No default binding: driven from the overlay (`Enter`) or via an
+    /// explicit user bind. Fail-closed no-op when search is inactive.
+    SearchNext,
+    /// Go back to the previous search match (`search_prev`, CTX-0383).
+    ///
+    /// No default binding: driven from the overlay (`Shift+Enter`) or
+    /// via an explicit user bind. Fail-closed no-op when search is inactive.
+    SearchPrev,
+    /// Close the search overlay (`close_search`, CTX-0383).
+    ///
+    /// No default binding: `Esc` already exits via the runtime modal path;
+    /// this action lets users bind an explicit closer. Fail-closed no-op
+    /// when search is inactive.
+    CloseSearch,
 }
 
 impl ChromeAction {
@@ -816,6 +842,22 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::EnterCopyMode)
             }
+            "open_search" | "search" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::OpenSearch)
+            }
+            "search_next" | "search_down" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::SearchNext)
+            }
+            "search_prev" | "search_previous" | "search_up" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::SearchPrev)
+            }
+            "close_search" | "search_close" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::CloseSearch)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -852,12 +894,16 @@ impl ChromeAction {
             Self::WorkspaceFocus(n) => format!("workspace_focus:{n}"),
             Self::WorkspaceMove(n) => format!("workspace_move:{n}"),
             Self::EnterCopyMode => "enter_copy_mode".to_string(),
+            Self::OpenSearch => "open_search".to_string(),
+            Self::SearchNext => "search_next".to_string(),
+            Self::SearchPrev => "search_prev".to_string(),
+            Self::CloseSearch => "close_search".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1099,6 +1145,11 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // vi-style modal copy cursor (bare `space` stays shell input; the chord
     // carries no `alt` slot so a Super flip leaves it unchanged).
     ("ctrl+shift+space", "enter_copy_mode"),
+    // CTX-0383 scrollback search overlay (issue #639): `ctrl+shift+f` opens
+    // the keyboard-first search overlay (kitty parity; bare `f` stays shell
+    // input; no `alt` slot so a Super flip leaves it unchanged).
+    // Next/prev/close are overlay keys plus explicit-bind actions.
+    ("ctrl+shift+f", "open_search"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -1867,15 +1918,16 @@ mod tests {
         // chords = 66, plus CTX-0259's 9 Mod+Shift+Number move chords
         // (shift+alt+1..=9) = 75, plus CTX-0265's 4 help chords (alt+backtick
         // + 3 alt+? shifted-symbol spellings) = 79 total, plus CTX-0384's 1
-        // copy-mode chord (ctrl+shift+space) = 80 total, and the full DEC
+        // copy-mode chord (ctrl+shift+space) = 80 total, plus CTX-0383's 1
+        // search chord (ctrl+shift+f) = 81 total, and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                80,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord"
+                81,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 4 help chords + 1 copy-mode chord + 1 search chord"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -2454,9 +2506,9 @@ mod tests {
         // explicit Alt spellings intact while the Super spellings stay free.
         // This task allocates NO new shipped defaults (CTX-0259 owns
         // Mod+Shift+Number, CTX-0265 owns Mod+backtick/Mod+?), so the
-        // default count stays pinned at 80 under both mods (35 shipped
+        // default count stays pinned at 81 under both mods (35 shipped
         // + 4 workspace + 4 resize + 16 arrow + 9 move + 7 zoom + 4 help
-        // + 1 copy-mode).
+        // + 1 copy-mode + 1 search).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
             ("alt+f5", "goto_split:right"),
@@ -2484,14 +2536,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                80,
+                81,
                 "no new shipped defaults under mod {:?}",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                80 + entries.len(),
+                81 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

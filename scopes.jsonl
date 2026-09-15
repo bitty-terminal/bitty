@@ -756,3 +756,4 @@
 {"created_at":"2026-09-13T20:51:23.782791869+00:00","id":"01M2E8KZ06KMP0XQFNMTB5H6QH","kind":"include","pattern":"crates/bitty-runtime/src/**","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2DBV857BMVMX7ZD0THEY6ZC"}
 {"created_at":"2026-09-14T01:43:23.809074606+00:00","id":"01M2ESAMD1FDHHHB26Y1ZDPGPY","kind":"include","pattern":"crates/bitty-app/src/tests.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2EADCX5A210KMVYCH28WFR0"}
 {"created_at":"2026-09-14T01:43:23.841362222+00:00","id":"01M2ESAME17MGP8X4EAGTRMQGE","kind":"include","pattern":"crates/bitty-app/src/tests.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2ERTXZJ0R9AMCCMF9XRX9B2"}
+{"created_at":"2026-09-15T12:23:06.579808034+00:00","id":"01M2JGAPJKVE14J0G4ZNE07RKC","kind":"include","pattern":"crates/bitty-runtime/src/ai_panel.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M2JG58VNR6TRJA30KXQ55B3J"}

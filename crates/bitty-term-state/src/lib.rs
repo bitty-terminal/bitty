@@ -89,7 +89,9 @@ pub use bitty_vt::{
     CursorStyle, Hyperlink, Mode, MouseCoordinateEncoding, MouseTrackingMode, Rgb, StatusKind,
     TerminalAction, UnderlineStyle, ZoneKind,
 };
-pub use cell::{Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, char_cell_width};
+pub use cell::{
+    Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, Zerowidth, char_cell_width,
+};
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};
 pub use image::{

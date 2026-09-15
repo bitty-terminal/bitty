@@ -90,11 +90,18 @@ impl Runtime {
         let reader = pty.take_reader().map_err(RuntimeError::from)?;
         let writer = pty.take_writer().map_err(RuntimeError::from)?;
         // Replace any previously spawned child (drop kills old). A prior
-        // wakeup forwarder (if any) is detached: it owns the old reader and
-        // exits on EOF/disconnect once the old PTY is dropped.
+        // wakeup forwarder (if any) is joined with a bound (CTX-0472):
+        // drop its receiver so `send` fails fast, drop the old `Pty`
+        // (EOF unblocks the pump, which unblocks the forwarder's `recv`),
+        // then join with `FORWARDER_JOIN_TIMEOUT` instead of detaching.
+        // A timeout detaches (thread exits on EOF/disconnect alone) but
+        // never hangs respawn on a wedged child.
+        let old_handle = self.pty_forward_handle.take();
         self.pty_forward_rx = None;
-        self.pty_forward_handle = None;
         self.pty = Some(pty);
+        if let Some(handle) = old_handle {
+            let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
+        }
         self.pty_reader = Some(reader);
         self.pty_writer = Some(writer);
         // CTX-0359: the primary shell is painted and typed into through the
@@ -245,10 +252,23 @@ impl Runtime {
         let writer = pty.take_writer().map_err(RuntimeError::from)?;
         // All fallible steps done: publish the session. A replaced session's
         // old `Pty` drops here, killing + reaping its child (no zombie).
+        // Its forwarder is joined with a bound (CTX-0472) instead of
+        // detached: take the old session out first so its receiver/`Pty`
+        // drop (EOF unblocks the pump, `send` fails fast), join the old
+        // handle, then publish the fresh session.
         // CTX-0297: the pane terminal captures the configured scrollback
         // capacity at creation (restart-required reload class).
         let mut state = State::with_scrollback_lines(self.config.scrollback);
         state.resize(cols as usize, rows as usize);
+        let old_session = self.pane_sessions.remove(&view);
+        let old_handle = old_session.and_then(|mut old| {
+            drop(old.forward_rx.take());
+            old.forward_handle.take()
+            // `old` (including its `Pty`) drops here: EOF unblocks pump.
+        });
+        if let Some(handle) = old_handle {
+            let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
+        }
         self.pane_sessions.insert(
             view,
             PaneSession {
@@ -379,21 +399,32 @@ impl Runtime {
     }
 
     /// Tears down the leaf's private shell session, if any. The owned `Pty`
-    /// drops, killing and reaping the child without leaking a zombie.
+    /// drops, killing and reaping the child without leaking a zombie. Its
+    /// forwarder is joined with a bound (CTX-0472) instead of detached.
     /// Returns true when a session was removed.
     pub fn close_pane_session(&mut self, view: &ViewId) -> bool {
         // CTX-0370: a pending close confirmation for this pane dies with its
         // session, so a later unrelated close can never "confirm" a stale arm.
         self.clear_pending_close_for_view(*view);
-        let removed = self.pane_sessions.remove(view).is_some();
-        if removed {
-            // CTX-0254: drop the closed pane's placements with its grid, so
-            // a later leaf reusing the numeric id can never inherit stale
-            // image pixels (origin tokens are `ViewId.0` values).
-            self.kitty_images.clear_origin(Some(view.0));
-            self.pending_full_redraw = true;
+        let old_session = self.pane_sessions.remove(view);
+        let Some(mut old) = old_session else {
+            return false;
+        };
+        // Drop receiver + `Pty` first (EOF unblocks pump, `send` fails
+        // fast), then bound the join. Timeout detaches but never hangs
+        // the close path on a wedged child.
+        drop(old.forward_rx.take());
+        let old_handle = old.forward_handle.take();
+        drop(old);
+        if let Some(handle) = old_handle {
+            let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
-        removed
+        // CTX-0254: drop the closed pane's placements with its grid, so
+        // a later leaf reusing the numeric id can never inherit stale
+        // image pixels (origin tokens are `ViewId.0` values).
+        self.kitty_images.clear_origin(Some(view.0));
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Re-syncs every pane session's grid + PTY winsize to its leaf's

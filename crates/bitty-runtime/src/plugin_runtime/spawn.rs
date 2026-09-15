@@ -127,7 +127,7 @@ use bitty_ipc::scope::{ConsentLedger, Scope, ScopeSet};
 use bitty_ipc::{ExecutionService, IpcError};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::tools::{
-    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_valid_tool_name,
+    ACCEPTED_TOOL_GIT, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env, is_valid_tool_name,
 };
 
 /// Panel-path per-stream output budget (`8 KiB`).
@@ -316,6 +316,14 @@ impl SpawnRequest {
         }
         for (name, value) in &self.env {
             EnvVar::new(name.clone(), value.clone())?;
+        }
+        // CTX-0465: pager hijack closed at the spawn surface — explicit env
+        // must never carry PAGER / GIT_PAGER (the external pager program git
+        // would execute). Fail-closed before routing, scope, or consent.
+        if !is_safe_spawn_env(&self.env) {
+            return Err(IpcError::InvalidRequest {
+                reason: "spawn env must not set PAGER or GIT_PAGER (pager hijack)".into(),
+            });
         }
         if self.timeout_ms == 0 {
             return Err(IpcError::InvalidRequest {
@@ -1480,6 +1488,38 @@ mod tests {
             matches!(error, IpcError::Unavailable { .. }),
             "got {error:?}"
         );
+    }
+
+    #[test]
+    fn pager_env_is_rejected_before_authorizer() {
+        // CTX-0465 hostile probe: PAGER / GIT_PAGER explicit env must fail
+        // closed at shape validation (never reaches authorizer or process).
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen.clone())));
+        for (id, pager) in ["PAGER", "GIT_PAGER"].iter().enumerate() {
+            let request = SpawnRequest::new("test", vec!["x".to_owned()])
+                .with_env(vec![(pager.to_string(), "evil".to_owned())])
+                .with_allow_effects(true);
+            let error = dispatch_ok(&mut service, &request, 200 + id as u64)
+                .expect_err("pager env must fail closed");
+            assert!(
+                matches!(error, IpcError::InvalidRequest { .. }),
+                "got {error:?}"
+            );
+        }
+        assert!(
+            seen.borrow().is_empty(),
+            "pager env must fail before routing"
+        );
+        // Benign and near-miss env still passes shape validation.
+        SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("MY_PAGER".to_owned(), "x".to_owned()),
+            ])
+            .with_allow_effects(true)
+            .validate()
+            .expect("benign env must validate");
     }
 
     #[test]

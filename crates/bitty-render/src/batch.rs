@@ -1099,6 +1099,19 @@ pub fn image_batch_bytes(batch: &[ImageDraw]) -> Vec<u8> {
     out
 }
 
+/// Byte range of the shared quad-0 index slice reused for EVERY per-quad
+/// image draw within a submit chunk.
+///
+/// Each draw binds its own 4-vertex slice (`i * 64..i * 64 + 64`, always
+/// valid indices `0..3`), so the index buffer slice must stay the constant
+/// quad-0 range `[0,1,2,0,2,3]` (`0..12` bytes). Per-draw index offsets
+/// (`i * 12..`) address vertices outside the bound 4-vertex slice for
+/// `i > 0` and render wrong pixels — see CTX-0390 review finding.
+#[must_use]
+pub fn image_quad_index_byte_range() -> (u64, u64) {
+    (0, (INDICES_PER_QUAD * 2) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,5 +1701,20 @@ mod tests {
         let (draws, extra) = collect_image_draws(&[ok], &[0, 7], 64, 64, 1.0);
         assert_eq!(draws.len(), 1);
         assert_eq!(extra, 1);
+    }
+
+    #[test]
+    fn image_quad_index_slice_is_quad_zero_for_every_draw() {
+        // Regression test (CTX-0390 review): every per-quad draw must bind
+        // the shared quad-0 index bytes `[0,1,2,0,2,3]` (0..12), because the
+        // vertex slice already isolates the quad (valid indices 0..3).
+        // Per-draw offsets (i * 12..) address out-of-range vertices for
+        // i > 0 and render wrong pixels for N > 1.
+        let (start, end) = image_quad_index_byte_range();
+        assert_eq!((start, end), (0, 12));
+        assert_eq!(end as usize - start as usize, INDICES_PER_QUAD * 2);
+        let quad0 = quad_indices_for(1).expect("quad 0 builds");
+        assert_eq!(quad0, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(indices_to_le_bytes(&quad0).len(), (end - start) as usize);
     }
 }

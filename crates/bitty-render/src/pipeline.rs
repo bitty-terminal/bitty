@@ -1026,11 +1026,14 @@ impl GpuResources {
                     })?;
                 let v_start = (i * batch::IMAGE_QUAD_BYTES) as u64;
                 let v_end = v_start + batch::IMAGE_QUAD_BYTES as u64;
-                let i_start = (i * INDICES_PER_QUAD * 2) as u64;
-                let i_end = i_start + (INDICES_PER_QUAD * 2) as u64;
+                // Shared quad-0 index slice for every draw: the vertex slice
+                // already isolates this quad (valid indices 0..3), so
+                // per-draw index offsets would address out-of-range vertices
+                // for i > 0 (CTX-0390 review finding).
+                let i_end = batch::image_quad_index_byte_range().1;
                 pass.set_bind_group(0, &bind.bind, &[]);
                 pass.set_vertex_buffer(0, self.image_vb.slice(v_start..v_end));
-                pass.set_index_buffer(self.index_buf.slice(i_start..i_end), IndexFormat::Uint16);
+                pass.set_index_buffer(self.index_buf.slice(0..i_end), IndexFormat::Uint16);
                 pass.draw_indexed(0..INDICES_PER_QUAD as u32, 0, 0..1);
             }
         }

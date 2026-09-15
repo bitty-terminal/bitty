@@ -19,14 +19,17 @@ pub fn granted_scopes_for_servo() -> bitty_ipc::ScopeSet {
     ipc_ctl::elevation_from_env(std::env::var("BITTY_CTL_ELEVATE").ok().as_deref())
 }
 
-/// Drain the global queue, applying each action to `runtime`.
+/// [`drain_global_control_queue`] with a pre-mutation hook (CTX-0481, #762).
 ///
-/// Called on the main thread between ticks. Each action is re-authorized
-/// against `granted` before any mutation (defense in depth: the enqueue
-/// path already authorized). Returns the number drained.
-pub fn drain_global_control_queue(
+/// `before_mutation(runtime, method)` runs for an authorized
+/// layout-mutating verb before it applies; the app uses it to restore an
+/// active pane zoom so the verb lands on the real tiled tree instead of the
+/// single-leaf zoom proxy (which the zoom restore would later discard,
+/// dropping the new pane). Read-only verbs never invoke the hook.
+pub fn drain_global_control_queue_with(
     runtime: &mut bitty_runtime::Runtime,
     granted: &bitty_ipc::ScopeSet,
+    mut before_mutation: impl FnMut(&mut bitty_runtime::Runtime, &str),
 ) -> usize {
     let mut count = 0usize;
     loop {
@@ -34,10 +37,36 @@ pub fn drain_global_control_queue(
             break;
         };
         count += 1;
+        // Authorize before the hook: an unauthorized verb must never touch
+        // zoom or layout state. `apply_control_envelope` re-authorizes
+        // (defense in depth).
+        if ipc_ctl::authorize_ctl_method(&item.method, granted).is_ok()
+            && method_mutates_layout(&item.method)
+        {
+            before_mutation(runtime, &item.method);
+        }
         let reply = apply_control_envelope(runtime, &item.method, item.params.as_deref(), granted);
         let _ = item.reply.send(reply);
     }
     count
+}
+
+/// Whether `method` can mutate the layout tree (CTX-0481, #762).
+///
+/// Zoom restore must run before any of these so a ctl verb never applies to
+/// the single-leaf zoom proxy. Read-only verbs and focus/send/text stay out:
+/// they must not disturb an active zoom.
+pub fn method_mutates_layout(method: &str) -> bool {
+    matches!(
+        method,
+        ipc_ctl::METHOD_SPAWN_TERMINAL
+            | ipc_ctl::METHOD_CLOSE_TERMINAL
+            | ipc_ctl::METHOD_SPLIT_VIEW
+            | ipc_ctl::METHOD_NEW_WORKSPACE
+            | ipc_ctl::METHOD_CLOSE_WORKSPACE
+            | ipc_ctl::METHOD_FOCUS_WORKSPACE
+            | ipc_ctl::METHOD_MOVE_WORKSPACE
+    )
 }
 
 /// Validate + authorize + apply one control envelope against `runtime`.

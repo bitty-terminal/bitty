@@ -6,7 +6,7 @@ description = "Runtime fixture exercising the Gap A bridge and Gap C host servic
 license = "MIT"
 
 [compat]
-bitty = ">=0.5,<1.0"
+bitty = ">=0.0.1,<1.0"
 plugin-api = "^1.0"
 
 [capabilities]

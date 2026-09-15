@@ -102,8 +102,8 @@ pub fn is_valid_tool_name(name: &str) -> bool {
 /// no config override (`-c` exact, `--config-env` prefix), no repo escape
 /// (`--git-dir` / `--work-tree` prefix), no file-write or external-driver
 /// flags (`--output` / `--ext-diff` / `--textconv` prefix), and verb-aware
-/// `branch` pinning (mutating shorts/longs plus bare creation denied; see
-/// inline).
+/// `branch` pinning (mutating shorts/longs, bundled clusters, plus bare
+/// creation denied; see inline).
 #[must_use]
 pub fn is_allowed_git_args(args: &[String]) -> bool {
     if args.is_empty() || args.len() > MAX_GIT_ARGS {
@@ -186,6 +186,9 @@ pub fn is_allowed_git_args(args: &[String]) -> bool {
                 || arg == "-M"
                 || arg == "-c"
                 || arg == "-C"
+                || arg == "-f"
+                || arg == "-u"
+                || arg == "-t"
             {
                 return false;
             }
@@ -193,8 +196,36 @@ pub fn is_allowed_git_args(args: &[String]) -> bool {
                 || arg.starts_with("--move")
                 || arg.starts_with("--copy")
                 || arg.starts_with("--rename")
+                || arg.starts_with("--force")
+                || arg.starts_with("--set-upstream-to")
+                || arg.starts_with("--unset-upstream")
+                || arg.starts_with("--track")
+                || arg.starts_with("--edit-description")
             {
                 return false;
+            }
+            // Bundled single-dash clusters: `-av` means `-a -v`.
+            // Deny any single-dash cluster containing a mutating short
+            // (`d`/`D`/`m`/`M`/`c`/`C`/`f`) plus `-u` glued (`-u<value>`,
+            // e.g. `-uorigin/main`, writes repo config args-alone) and
+            // `-t` (boolean track; `-at` would smuggle `-t` past exact).
+            // `--no-track` stays allowed: double-dash, never reaches here.
+            // Allowed list shorts (`-a`/`-v`/`-l`) contain none of these
+            // letters, so `-av`/`-vv` stay allowed (asserted in tests).
+            if arg.starts_with('-') && !arg.starts_with("--") && arg.len() >= 2 {
+                let cluster = &arg[1..];
+                if cluster.contains('d')
+                    || cluster.contains('D')
+                    || cluster.contains('m')
+                    || cluster.contains('M')
+                    || cluster.contains('c')
+                    || cluster.contains('C')
+                    || cluster.contains('f')
+                    || cluster.contains('u')
+                    || cluster.contains('t')
+                {
+                    return false;
+                }
             }
         }
         // Bare `branch <name>` creates a ref: positional (non-flag) args
@@ -522,6 +553,185 @@ mod tests {
         assert!(is_allowed_git_args(&[
             "log".to_string(),
             "--oneline".to_string()
+        ]));
+    }
+
+    #[test]
+    fn git_args_deny_branch_force_exact_and_long() {
+        // Exact `-f` (bare + with positional hardening: positional backstop
+        // would also catch `branch -f <name>`, explicit deny is hardening).
+        for args in [
+            vec!["branch", "-f"],
+            vec!["branch", "-f", "newbranch"],
+            vec!["branch", "-f=foo"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Prefix `--force` (bare / `=` / separate-value forms).
+        for args in [
+            vec!["branch", "--force"],
+            vec!["branch", "--force=foo"],
+            vec!["branch", "--force", "newbranch"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Bundled: `-af` / `-vf` smuggle `-f` past exact.
+        for flag in ["-af", "-vf", "-fa"] {
+            assert!(
+                !is_allowed_git_args(&["branch".to_string(), flag.to_string()]),
+                "branch {flag} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn git_args_deny_branch_upstream() {
+        // Exact `-u` + glued `-u<value>` (writes repo config args-alone).
+        for args in [
+            vec!["branch", "-u"],
+            vec!["branch", "-u", "origin/main"],
+            vec!["branch", "-uorigin/main"],
+            vec!["branch", "-u=foo"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Prefix `--set-upstream-to` (bare / `=` / separate value).
+        for args in [
+            vec!["branch", "--set-upstream-to"],
+            vec!["branch", "--set-upstream-to=origin/main"],
+            vec!["branch", "--set-upstream-to", "origin/main"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Prefix `--unset-upstream` (bare / `=` / with branch operand).
+        for args in [
+            vec!["branch", "--unset-upstream"],
+            vec!["branch", "--unset-upstream=foo"],
+            vec!["branch", "--unset-upstream", "mybranch"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Bundled: `-au` smuggles `-u` past exact.
+        for flag in ["-au", "-ua"] {
+            assert!(
+                !is_allowed_git_args(&["branch".to_string(), flag.to_string()]),
+                "branch {flag} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn git_args_deny_branch_track() {
+        // Exact `-t` (bare + bundled smuggling).
+        for args in [vec!["branch", "-t"], vec!["branch", "-t=foo"]] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Prefix `--track` (bare / `=` / separate operands).
+        // `--no-track` stays allowed (safe default, `starts_with("--track")`
+        // does not match the `--no-` prefix).
+        for args in [
+            vec!["branch", "--track"],
+            vec!["branch", "--track=foo"],
+            vec!["branch", "--track", "newbranch", "origin/main"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+        // Bundled: `-at` smuggles `-t` past exact.
+        for flag in ["-at", "-ta"] {
+            assert!(
+                !is_allowed_git_args(&["branch".to_string(), flag.to_string()]),
+                "branch {flag} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn git_args_deny_branch_edit_description() {
+        // Writes branch description (bare / `=` / with branch operand).
+        for args in [
+            vec!["branch", "--edit-description"],
+            vec!["branch", "--edit-description=foo"],
+            vec!["branch", "--edit-description", "mybranch"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "branch {args:?} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn git_args_deny_branch_bundled_shorts() {
+        // Single-dash clusters containing any of d/D/m/M/c/C/f/u/t denied.
+        for flag in [
+            "-ad", "-aD", "-am", "-aM", "-ac", "-aC", "-af", "-au", "-at", "-avm", "-da", "-Dm",
+            "-vd",
+        ] {
+            assert!(
+                !is_allowed_git_args(&["branch".to_string(), flag.to_string()]),
+                "branch {flag} must be denied"
+            );
+        }
+        // Glued `-u<value>` form.
+        assert!(!is_allowed_git_args(&[
+            "branch".to_string(),
+            "-uorigin/main".to_string()
+        ]));
+    }
+
+    #[test]
+    fn git_args_allow_branch_list_clusters() {
+        // Verified basis: `-av`/`-vv`/`-a`/`-v` contain none of the denied
+        // cluster letters d/D/m/M/c/C/f/u/t, and `--list`/`--show-current`
+        // are double-dash (cluster rule is single-dash only) — confirm here
+        // so a future allowed flag containing a denied letter fails loudly.
+        for flag in ["-av", "-vv", "-a", "-v"] {
+            let cluster = flag.strip_prefix('-').expect("single-dash flag");
+            assert!(
+                !cluster.contains(['d', 'D', 'm', 'M', 'c', 'C', 'f', 'u', 't']),
+                "{flag} must contain none of the denied cluster letters"
+            );
+            assert!(
+                is_allowed_git_args(&["branch".to_string(), flag.to_string()]),
+                "branch {flag} must stay allowed"
+            );
+        }
+        assert!(is_allowed_git_args(&[
+            "branch".to_string(),
+            "--list".to_string()
+        ]));
+        assert!(is_allowed_git_args(&[
+            "branch".to_string(),
+            "--show-current".to_string()
         ]));
     }
 

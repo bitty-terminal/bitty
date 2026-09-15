@@ -88,3 +88,4 @@
 {"deleted_at":"2026-09-14T20:42:37.841566705+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2GMSMNP6YCVQTG3E4XPVS1H","table_name":"worktrees"}
 {"deleted_at":"2026-09-14T21:44:38.100826803+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2GR37Y3646G2R4DACDW7V0D","table_name":"worktrees"}
 {"deleted_at":"2026-09-14T22:17:45.058147463+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2GTPSGB6DAAA4J5ME9N0P60","table_name":"worktrees"}
+{"deleted_at":"2026-09-15T01:56:58.866727224+00:00","deleted_by":null,"project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","reason":"worktree.removed","row_id":"01M2HCFN2T2CJM6HEDCEPHGHWF","table_name":"worktrees"}

@@ -65,10 +65,10 @@ fn foreign_gesture() -> ActivationGesture {
     });
     scratch.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     scratch
         .take_activation_gesture()
@@ -344,10 +344,10 @@ fn platform_hyperlink_activation_mints_single_use_gesture() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     let gesture = rt
         .take_activation_gesture()
@@ -419,10 +419,10 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     assert!(
         rt.take_activation_gesture().is_none(),
@@ -437,10 +437,10 @@ fn hostile_hyperlink_does_not_consume_gesture_slot() {
     });
     rt2.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     assert!(
         rt2.take_activation_gesture().is_some(),
@@ -460,10 +460,10 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     assert!(rt.take_activation_gesture().is_none());
     // Then safe link overwriting same cell (carriage return to col 0).
@@ -474,10 +474,10 @@ fn hostile_then_safe_in_same_runtime_preserves_gesture_for_safe() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     let gesture = rt
         .take_activation_gesture()
@@ -504,10 +504,10 @@ fn hyperlink_activation_overflow_is_handled_without_panic() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            MouseButton::Left,
+            PressState::Released,
+        )),
     });
     // Should not panic; may or may not mint depending on clamped cell.
     let _ = rt.take_activation_gesture();

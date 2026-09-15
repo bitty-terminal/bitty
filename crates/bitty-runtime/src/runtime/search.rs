@@ -40,14 +40,19 @@ impl Runtime {
     /// linger as stale grid coords). Headless and bounded.
     pub fn restore_persistent_selection(&mut self, pers: PersistentSelection) -> bool {
         if let Some(sel) = pers.to_grid_selection(&self.state) {
+            self.selection_anchor_press = Some(sel.anchor);
             self.selection = Some(sel);
             self.selection_dragging = sel.active;
+            if !sel.active {
+                self.selection_anchor_press = None;
+            }
             true
         } else {
             // Buffer is either pruned or now in history: clear live selection.
             // Caller may still use `pers.text(&state)` for history highlight.
             self.selection = None;
             self.selection_dragging = false;
+            self.selection_anchor_press = None;
             false
         }
     }
@@ -264,6 +269,7 @@ impl Runtime {
         };
         // Try to restore as live-grid selection.
         if let Some(sel) = pers.to_grid_selection(&self.state) {
+            self.selection_anchor_press = if sel.active { Some(sel.anchor) } else { None };
             self.selection = Some(sel);
             self.selection_dragging = sel.active;
             true
@@ -271,6 +277,7 @@ impl Runtime {
             // In history or pruned: leave a history highlight but clear live selection.
             self.selection = None;
             self.selection_dragging = false;
+            self.selection_anchor_press = None;
             false
         }
     }

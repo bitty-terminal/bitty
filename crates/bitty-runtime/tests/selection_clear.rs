@@ -63,17 +63,11 @@ fn named_key(named: NamedKey, state: PressState) -> bitty_platform::KeyEvent {
 }
 
 fn mouse_press(button: MouseButton) -> MouseEvent {
-    MouseEvent {
-        button,
-        state: PressState::Pressed,
-    }
+    MouseEvent::new(button, PressState::Pressed)
 }
 
 fn mouse_release(button: MouseButton) -> MouseEvent {
-    MouseEvent {
-        button,
-        state: PressState::Released,
-    }
+    MouseEvent::new(button, PressState::Released)
 }
 
 /// Physical position for a grid cell with the readable 9x19 cell metrics.

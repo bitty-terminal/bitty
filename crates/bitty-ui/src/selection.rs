@@ -125,6 +125,67 @@ impl Selection {
         }
     }
 
+    /// Creates a word selection (double-click gesture, CTX-0385).
+    ///
+    /// The caller is expected to pass a word-expanded range (see
+    /// [`Selection::word_at`] and [`Selection::word_drag`]); this constructor
+    /// only tags the kind so drag extension and text dispatch stay typed.
+    #[must_use]
+    pub fn word(anchor: CellPos, focus: CellPos) -> Self {
+        Self {
+            anchor,
+            focus,
+            kind: SelectionKind::Word,
+            active: true,
+        }
+    }
+
+    /// Creates a line selection (triple-click gesture, CTX-0385).
+    #[must_use]
+    pub fn line(anchor: CellPos, focus: CellPos) -> Self {
+        Self {
+            anchor,
+            focus,
+            kind: SelectionKind::Line,
+            active: true,
+        }
+    }
+
+    /// Creates a rectangular block selection (`Alt` modifier, CTX-0385).
+    #[must_use]
+    pub fn block(anchor: CellPos, focus: CellPos) -> Self {
+        Self {
+            anchor,
+            focus,
+            kind: SelectionKind::Block,
+            active: true,
+        }
+    }
+
+    /// True when this is a stream drag selection.
+    #[must_use]
+    pub fn is_simple(self) -> bool {
+        matches!(self.kind, SelectionKind::Simple)
+    }
+
+    /// True when this is a double-click word selection.
+    #[must_use]
+    pub fn is_word(self) -> bool {
+        matches!(self.kind, SelectionKind::Word)
+    }
+
+    /// True when this is a triple-click line selection.
+    #[must_use]
+    pub fn is_line(self) -> bool {
+        matches!(self.kind, SelectionKind::Line)
+    }
+
+    /// True when this is a rectangular block selection.
+    #[must_use]
+    pub fn is_block(self) -> bool {
+        matches!(self.kind, SelectionKind::Block)
+    }
+
     /// Creates an empty (collapsed) selection at `pos`.
     #[must_use]
     pub fn collapsed(pos: CellPos) -> Self {
@@ -349,12 +410,127 @@ impl Selection {
     /// clipboard, polluting pasted shell input. A span that ends mid-row
     /// keeps its exact cells, so an explicitly selected trailing space is
     /// preserved.
+    ///
+    /// `Block` selections dispatch to rectangular extraction
+    /// ([`Selection::block_text`]): each row contributes exactly its column
+    /// window with no edge trim, so the rectangle survives copy. All other
+    /// kinds (`Simple`/`Word`/`Line`) share the row-major path — word and
+    /// line gestures expand their endpoints before storing, so no per-kind
+    /// text algebra is needed (CTX-0385 foundation for copy-mode/search).
     #[must_use]
     pub fn text(self, snapshot: &Snapshot) -> String {
+        if self.kind == SelectionKind::Block {
+            return self.block_text(snapshot);
+        }
         let clamped = self.clamped(snapshot);
         let snapped = clamped.snapped(Some(snapshot));
         let range = snapped.normalized();
         selected_text_for_range(snapshot, range)
+    }
+
+    /// Produces rectangular text for a block selection (CTX-0385).
+    ///
+    /// Each row in the anchor/focus row window contributes exactly the column
+    /// window `[cmin, cmax]` (both snapped to leading, clamped to the grid),
+    /// joined with `\n`. Unlike [`Selection::text`], no edge trim applies:
+    /// the rectangle is preserved verbatim (padding spaces kept) so columnar
+    /// pastes realign. Wide leaders emit once; spacers are skipped. Total
+    /// over all inputs (empty grid yields empty text).
+    #[must_use]
+    pub fn block_text(self, snapshot: &Snapshot) -> String {
+        if snapshot.width == 0 || snapshot.height == 0 {
+            return String::new();
+        }
+        let clamped = self.clamped(snapshot);
+        let snapped = clamped.snapped(Some(snapshot));
+        let (rmin, rmax) = if snapped.anchor.row <= snapped.focus.row {
+            (snapped.anchor.row, snapped.focus.row)
+        } else {
+            (snapped.focus.row, snapped.anchor.row)
+        };
+        let (cmin, cmax) = if snapped.anchor.col <= snapped.focus.col {
+            (snapped.anchor.col, snapped.focus.col)
+        } else {
+            (snapped.focus.col, snapped.anchor.col)
+        };
+        selected_text_for_block(snapshot, rmin, rmax, cmin, cmax)
+    }
+
+    /// Builds a word-drag selection from the initial press cell and the
+    /// current drag cell (CTX-0385).
+    ///
+    /// Both endpoints expand to their containing words via
+    /// [`Selection::word_at`]; drag direction follows the raw press order
+    /// (`current >= anchor_press` extends forward, else backward), so the
+    /// anchor word stays pinned while the focus word tracks the pointer.
+    /// Pure and total: positions clamp and snap before expansion.
+    #[must_use]
+    pub fn word_drag(snapshot: &Snapshot, anchor_press: CellPos, current: CellPos) -> Self {
+        let a = snap_to_leading(snapshot, clamp_pos(snapshot, anchor_press));
+        let c = snap_to_leading(snapshot, clamp_pos(snapshot, current));
+        let anchor_word = Self::word_at(snapshot, a);
+        let focus_word = Self::word_at(snapshot, c);
+        if c >= a {
+            Self {
+                anchor: anchor_word.start,
+                focus: focus_word.end,
+                kind: SelectionKind::Word,
+                active: true,
+            }
+        } else {
+            Self {
+                anchor: anchor_word.end,
+                focus: focus_word.start,
+                kind: SelectionKind::Word,
+                active: true,
+            }
+        }
+    }
+
+    /// Builds a line-drag selection covering whole lines between the press
+    /// row and the current row (CTX-0385, triple-click-drag).
+    ///
+    /// Columns are ignored: the anchor is always column `0` of the press row
+    /// side and the focus column `width - 1` (snapped) of the current side.
+    /// Pure and total over all inputs.
+    #[must_use]
+    pub fn line_drag(snapshot: &Snapshot, anchor_press: CellPos, current: CellPos) -> Self {
+        if snapshot.width == 0 || snapshot.height == 0 {
+            return Self {
+                anchor: anchor_press,
+                focus: current,
+                kind: SelectionKind::Line,
+                active: true,
+            };
+        }
+        let max_row = snapshot.height.saturating_sub(1) as u16;
+        let a_row = anchor_press.row.min(max_row);
+        let c_row = current.row.min(max_row);
+        let last_col = snapshot.width.saturating_sub(1) as u16;
+        let (start_row, end_row) = if c_row >= a_row {
+            (a_row, c_row)
+        } else {
+            (c_row, a_row)
+        };
+        let anchor = CellPos::new(start_row, 0);
+        let focus = snap_to_leading(snapshot, CellPos::new(end_row, last_col));
+        // Preserve drag direction in anchor/focus order for callers that
+        // inspect it; `normalized` still sorts for rendering.
+        if c_row >= a_row {
+            Self {
+                anchor,
+                focus,
+                kind: SelectionKind::Line,
+                active: true,
+            }
+        } else {
+            Self {
+                anchor: focus,
+                focus: anchor,
+                kind: SelectionKind::Line,
+                active: true,
+            }
+        }
     }
 }
 
@@ -466,6 +642,49 @@ fn selected_text_for_range(snapshot: &Snapshot, range: SelectionRange) -> String
         }
         out.push_str(&line);
         if row != end.row {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn selected_text_for_block(
+    snapshot: &Snapshot,
+    rmin: u16,
+    rmax: u16,
+    cmin: u16,
+    cmax: u16,
+) -> String {
+    let mut out = String::new();
+    for row in rmin..=rmax {
+        let row_usize = row as usize;
+        if row_usize >= snapshot.height {
+            break;
+        }
+        let mut line = String::new();
+        let mut col = cmin as usize;
+        let end = cmax as usize;
+        while col <= end && col < snapshot.width {
+            let idx = row_usize * snapshot.width + col;
+            if let Some(cell) = snapshot.cells.get(idx) {
+                if cell.spacer {
+                    col += 1;
+                    continue;
+                }
+                if cell.is_blank() {
+                    line.push(' ');
+                } else {
+                    line.push(cell.glyph);
+                }
+                if cell.width == 2 {
+                    col += 2;
+                    continue;
+                }
+            }
+            col += 1;
+        }
+        out.push_str(&line);
+        if row != rmax {
             out.push('\n');
         }
     }
@@ -1056,5 +1275,114 @@ mod tests {
         ]);
         let sel = Selection::simple(CellPos::new(0, 0), CellPos::new(2, 0));
         assert_eq!(sel.text(&snap), "a\n\nb");
+    }
+
+    #[test]
+    fn kind_constructors_tag_and_predicates_agree() {
+        let a = CellPos::new(0, 0);
+        let b = CellPos::new(0, 2);
+        let simple = Selection::simple(a, b);
+        assert!(simple.is_simple() && !simple.is_word() && !simple.is_line() && !simple.is_block());
+        let word = Selection::word(a, b);
+        assert!(word.is_word() && !word.is_simple());
+        assert_eq!(word.kind, SelectionKind::Word);
+        let line = Selection::line(a, b);
+        assert!(line.is_line());
+        let block = Selection::block(a, b);
+        assert!(block.is_block());
+        assert_eq!(block.kind, SelectionKind::Block);
+    }
+
+    #[test]
+    fn word_drag_expands_forward_by_words() {
+        // Row: "foo bar baz": words at 0-2, 4-6, 8-10.
+        let snap = make_snapshot(vec![vec![
+            'f', 'o', 'o', ' ', 'b', 'a', 'r', ' ', 'b', 'a', 'z',
+        ]]);
+        // Press inside "foo", drag into "bar": covers both words + space.
+        let sel = Selection::word_drag(&snap, CellPos::new(0, 1), CellPos::new(0, 5));
+        assert!(sel.is_word());
+        assert_eq!(sel.anchor, CellPos::new(0, 0));
+        assert_eq!(sel.focus, CellPos::new(0, 6));
+        assert_eq!(sel.text(&snap), "foo bar");
+    }
+
+    #[test]
+    fn word_drag_extends_backward_by_words() {
+        let snap = make_snapshot(vec![vec![
+            'f', 'o', 'o', ' ', 'b', 'a', 'r', ' ', 'b', 'a', 'z',
+        ]]);
+        // Press inside "bar", drag back into "foo".
+        let sel = Selection::word_drag(&snap, CellPos::new(0, 5), CellPos::new(0, 1));
+        assert!(sel.is_word());
+        // Backward: anchor is the press word end, focus the earlier word start.
+        assert_eq!(sel.anchor, CellPos::new(0, 6));
+        assert_eq!(sel.focus, CellPos::new(0, 0));
+        assert_eq!(sel.normalized().start, CellPos::new(0, 0));
+        assert_eq!(sel.normalized().end, CellPos::new(0, 6));
+    }
+
+    #[test]
+    fn word_drag_on_delimiter_stays_collapsed_pin() {
+        let snap = make_snapshot(vec![vec!['a', ' ', 'b']]);
+        // Press on the space (delimiter): single-cell word.
+        let sel = Selection::word_drag(&snap, CellPos::new(0, 1), CellPos::new(0, 1));
+        assert!(sel.is_word());
+        assert_eq!(sel.anchor, CellPos::new(0, 1));
+        assert_eq!(sel.focus, CellPos::new(0, 1));
+    }
+
+    #[test]
+    fn line_drag_covers_whole_lines_forward_and_backward() {
+        let snap = make_snapshot(vec![
+            vec!['a', 'b', 'c'],
+            vec!['d', 'e', 'f'],
+            vec!['g', 'h', 'i'],
+        ]);
+        let fwd = Selection::line_drag(&snap, CellPos::new(0, 1), CellPos::new(2, 0));
+        assert!(fwd.is_line());
+        assert_eq!(fwd.normalized().start, CellPos::new(0, 0));
+        assert_eq!(fwd.normalized().end, CellPos::new(2, 2));
+        assert_eq!(fwd.text(&snap), "abc\ndef\nghi");
+        let back = Selection::line_drag(&snap, CellPos::new(2, 2), CellPos::new(0, 0));
+        assert!(back.is_line());
+        assert_eq!(back.normalized().start, CellPos::new(0, 0));
+        assert_eq!(back.normalized().end, CellPos::new(2, 2));
+    }
+
+    #[test]
+    fn block_text_is_rectangular_with_no_edge_trim() {
+        let snap = make_snapshot(vec![
+            vec!['a', 'b', 'c', 'd'],
+            vec!['e', 'f', 'g', 'h'],
+            vec!['i', 'j', 'k', 'l'],
+        ]);
+        // Columns 1-2 across all rows.
+        let sel = Selection::block(CellPos::new(0, 1), CellPos::new(2, 2));
+        assert!(sel.is_block());
+        assert_eq!(sel.block_text(&snap), "bc\nfg\njk");
+        // `text` dispatches to the rectangular path for blocks.
+        assert_eq!(sel.text(&snap), "bc\nfg\njk");
+        // Reversed corners give the same rectangle.
+        let rev = Selection::block(CellPos::new(2, 2), CellPos::new(0, 1));
+        assert_eq!(rev.text(&snap), "bc\nfg\njk");
+        // Block containment is rectangular, independent of row-major order.
+        assert!(sel.contains_block(CellPos::new(1, 1), None));
+        assert!(!sel.contains_block(CellPos::new(1, 0), None));
+    }
+
+    #[test]
+    fn block_text_preserves_rectangle_including_padding() {
+        // Row 0 "ab  ", rows are padded: a mid-grid block keeps its spaces.
+        let snap = make_snapshot(vec![vec!['a', 'b', ' ', ' '], vec!['c', 'd', ' ', ' ']]);
+        let sel = Selection::block(CellPos::new(0, 0), CellPos::new(1, 3));
+        assert_eq!(sel.block_text(&snap), "ab  \ncd  ");
+    }
+
+    #[test]
+    fn block_text_skips_wide_spacers_without_splitting() {
+        let snap = make_snapshot(vec![vec!['A', '中', '\0', 'B']]);
+        let sel = Selection::block(CellPos::new(0, 0), CellPos::new(0, 3));
+        assert_eq!(sel.text(&snap), "A中B");
     }
 }

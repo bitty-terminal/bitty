@@ -456,8 +456,16 @@ impl Runtime {
             if clamped.is_empty() {
                 self.selection = None;
                 self.selection_dragging = false;
+                self.selection_anchor_press = None;
             } else {
                 self.selection = Some(clamped);
+                // Keep the drag pin in bounds for future word/line extension.
+                if let Some(pin) = self.selection_anchor_press {
+                    let max_row = snap.height.saturating_sub(1) as u16;
+                    let max_col = snap.width.saturating_sub(1) as u16;
+                    self.selection_anchor_press =
+                        Some(CellPos::new(pin.row.min(max_row), pin.col.min(max_col)));
+                }
             }
         }
         // Search UI integration (CTX-0061): clamp matches to new geometry; refresh
@@ -575,6 +583,8 @@ impl Runtime {
                     // Cursor left window: end drag if active (deterministic).
                     if self.selection_dragging {
                         self.selection_dragging = false;
+                        self.selection_anchor_press = None;
+                        self.click_tracker.reset();
                         if let Some(mut sel) = self.selection {
                             sel.active = false;
                             self.selection = Some(sel);

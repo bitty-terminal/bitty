@@ -229,10 +229,7 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Pressed,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Pressed)),
     });
     // Drag
     rt.handle_platform_event(PlatformEvent::Window {
@@ -242,10 +239,7 @@ fn mouse_event_flow_drives_selection_via_platform_event() {
     assert!(rt.is_selection_dragging());
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Released)),
     });
     assert!(!rt.is_selection_dragging());
     assert_eq!(rt.selection_text().as_deref(), Some("drag "));
@@ -269,10 +263,7 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
     });
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Pressed,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Pressed)),
     });
     for pos in waypoints {
         rt.handle_platform_event(PlatformEvent::Window {
@@ -282,10 +273,7 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
     }
     rt.handle_platform_event(PlatformEvent::Window {
         window_id,
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Released)),
     });
 }
 
@@ -387,20 +375,14 @@ fn multiline_selection_pastes_through_repeat_confirm_gate() {
     // held pending with a visible summary, nothing delivered silently.
     rt.drain_pending_input();
     rt.handle_cursor_moved(cell_pos(0, 0));
-    rt.handle_mouse_input(MouseEvent {
-        button: MouseButton::Right,
-        state: PressState::Pressed,
-    });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
     assert!(rt.has_pending_paste());
     assert!(rt.pending_input().is_empty());
     let summary = rt.pending_paste_summary().expect("summary");
     assert!(summary.contains("3 lines"), "summary: {summary}");
     // Repeat-confirm (identical right-click, unchanged clipboard) delivers
     // every line with newlines intact.
-    rt.handle_mouse_input(MouseEvent {
-        button: MouseButton::Right,
-        state: PressState::Pressed,
-    });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
     assert!(!rt.has_pending_paste());
     assert_eq!(rt.pending_input(), b"line1\nline2\nline3");
 }
@@ -415,10 +397,7 @@ fn multiline_primary_pastes_through_repeat_confirm_gate() {
     // Middle-click reads the primary selection through the same gate.
     rt.drain_pending_input();
     rt.handle_cursor_moved(cell_pos(0, 0));
-    rt.handle_mouse_input(MouseEvent {
-        button: MouseButton::Middle,
-        state: PressState::Pressed,
-    });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Middle, PressState::Pressed));
     assert!(rt.has_pending_paste(), "newline primary needs confirm");
     assert!(rt.pending_input().is_empty());
     assert!(rt.confirm_pending_paste(true));

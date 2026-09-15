@@ -67,17 +67,11 @@ fn mouse_headless_runtime_auto_copy(text: &str) -> Runtime {
 }
 
 fn mouse_press(button: bitty_platform::MouseButton) -> bitty_platform::MouseEvent {
-    bitty_platform::MouseEvent {
-        button,
-        state: PressState::Pressed,
-    }
+    bitty_platform::MouseEvent::new(button, PressState::Pressed)
 }
 
 fn mouse_release(button: bitty_platform::MouseButton) -> bitty_platform::MouseEvent {
-    bitty_platform::MouseEvent {
-        button,
-        state: PressState::Released,
-    }
+    bitty_platform::MouseEvent::new(button, PressState::Released)
 }
 
 #[test]

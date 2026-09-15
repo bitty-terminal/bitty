@@ -356,6 +356,13 @@ pub struct KeyEvent {
     pub is_synthetic: bool,
 }
 
+/// Minimum click count (single click).
+pub const MOUSE_CLICK_COUNT_MIN: u8 = 1;
+/// Maximum click count tracked (triple-click); higher counts wrap to single.
+pub const MOUSE_CLICK_COUNT_MAX: u8 = 3;
+/// Default click count for translated winit events (winit carries no count).
+pub const MOUSE_CLICK_COUNT_DEFAULT: u8 = MOUSE_CLICK_COUNT_MIN;
+
 /// A mouse button press/release event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MouseEvent {
@@ -363,6 +370,46 @@ pub struct MouseEvent {
     pub button: MouseButton,
     /// New state of the button.
     pub state: PressState,
+    /// Consecutive press count at the same position (`1` single, `2` double,
+    /// `3` triple). Fail-closed: `0` normalizes to `1`, values above
+    /// [`MOUSE_CLICK_COUNT_MAX`] clamp to it. The platform translation always
+    /// emits [`MOUSE_CLICK_COUNT_DEFAULT`]; the runtime click tracker is the
+    /// authority that recomputes the count from press time and cell.
+    pub click_count: u8,
+}
+
+impl MouseEvent {
+    /// Creates a single-click event (the winit translation default).
+    #[must_use]
+    pub const fn new(button: MouseButton, state: PressState) -> Self {
+        Self {
+            button,
+            state,
+            click_count: MOUSE_CLICK_COUNT_DEFAULT,
+        }
+    }
+
+    /// Creates an event with an explicit click count (fail-closed normalized).
+    #[must_use]
+    pub const fn with_click_count(button: MouseButton, state: PressState, click_count: u8) -> Self {
+        Self {
+            button,
+            state,
+            click_count: Self::normalized_click_count(click_count),
+        }
+    }
+
+    /// Normalizes a wire click count fail-closed (`0` to `1`, above max clamps).
+    #[must_use]
+    pub const fn normalized_click_count(count: u8) -> u8 {
+        if count < MOUSE_CLICK_COUNT_MIN {
+            MOUSE_CLICK_COUNT_MIN
+        } else if count > MOUSE_CLICK_COUNT_MAX {
+            MOUSE_CLICK_COUNT_MAX
+        } else {
+            count
+        }
+    }
 }
 
 /// A physical mouse button.
@@ -642,10 +689,10 @@ pub(crate) fn translate_key_parts(
 }
 
 pub(crate) fn map_mouse_input(state: ElementState, button: WinitMouseButton) -> WindowEventKind {
-    WindowEventKind::MouseInput(MouseEvent {
-        button: MouseButton::from(button),
-        state: PressState::from(state),
-    })
+    WindowEventKind::MouseInput(MouseEvent::new(
+        MouseButton::from(button),
+        PressState::from(state),
+    ))
 }
 
 pub(crate) fn map_mouse_wheel(delta: MouseScrollDelta) -> Option<ScrollDelta> {
@@ -902,18 +949,39 @@ mod tests {
                 state: ElementState::Pressed,
                 button: WinitMouseButton::Left,
             }),
-            Some(WindowEventKind::MouseInput(MouseEvent {
-                button: MouseButton::Left,
-                state: PressState::Pressed,
-            }))
+            Some(WindowEventKind::MouseInput(MouseEvent::new(
+                MouseButton::Left,
+                PressState::Pressed,
+            )))
         );
         assert_eq!(
             map_mouse_input(ElementState::Released, WinitMouseButton::Other(9)),
-            WindowEventKind::MouseInput(MouseEvent {
-                button: MouseButton::Other(9),
-                state: PressState::Released,
-            })
+            WindowEventKind::MouseInput(MouseEvent::new(
+                MouseButton::Other(9),
+                PressState::Released,
+            ))
         );
+    }
+
+    #[test]
+    fn mouse_click_count_defaults_and_normalizes_fail_closed() {
+        assert_eq!(
+            MOUSE_CLICK_COUNT_DEFAULT, MOUSE_CLICK_COUNT_MIN,
+            "translated events are single-click"
+        );
+        assert_eq!(MouseEvent::normalized_click_count(0), 1);
+        assert_eq!(MouseEvent::normalized_click_count(1), 1);
+        assert_eq!(MouseEvent::normalized_click_count(2), 2);
+        assert_eq!(MouseEvent::normalized_click_count(3), 3);
+        assert_eq!(MouseEvent::normalized_click_count(4), MOUSE_CLICK_COUNT_MAX);
+        assert_eq!(
+            MouseEvent::normalized_click_count(u8::MAX),
+            MOUSE_CLICK_COUNT_MAX
+        );
+        let wire = MouseEvent::with_click_count(MouseButton::Left, PressState::Pressed, 0);
+        assert_eq!(wire.click_count, 1);
+        let clamped = MouseEvent::with_click_count(MouseButton::Left, PressState::Pressed, 9);
+        assert_eq!(clamped.click_count, MOUSE_CLICK_COUNT_MAX);
     }
 
     #[test]

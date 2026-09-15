@@ -478,7 +478,13 @@ impl Runtime {
     /// - Holding Shift bypasses capture unconditionally to force selection
     ///   (accessibility escape).
     /// - Otherwise the event drives presentation selection: left press starts
-    ///   a drag and left release commits it (the highlight stays). Auto-copy
+    ///   a drag and left release commits it (the highlight stays). The press
+    ///   count comes from the bounded [`ClickTracker`](super::click::ClickTracker)
+    ///   (CTX-0385): single starts a stream drag, double a word selection
+    ///   ([`Selection::word_at`]), triple a full line ([`Selection::line_at`]),
+    ///   and `Alt`+press a rectangular block. Drag after a multi-click
+    ///   extends word/line-wise; the wire `click_count` is advisory and the
+    ///   tracker is the authority. Auto-copy
     ///   is opt-in (`RuntimeConfig::selection_auto_copy`, CTX-0191/CTX-0371):
     ///   when `true` the committed selection copies to the platform clipboard
     ///   (which best-effort syncs the primary selection on Linux, CTX-0160);
@@ -490,6 +496,19 @@ impl Runtime {
     ///   bytes, never a panic or block) but platform failures are recorded
     ///   for [`Self::last_clipboard_error`] instead of swallowed.
     pub fn handle_mouse_input(&mut self, event: bitty_platform::MouseEvent) {
+        self.handle_mouse_input_at(event, std::time::Instant::now());
+    }
+
+    /// [`Self::handle_mouse_input`] with an explicit wall clock (CTX-0385).
+    ///
+    /// Virtual-clock seam so headless tests drive double/triple-click timing
+    /// deterministically without sleeping; production callers pass
+    /// `Instant::now()` via [`Self::handle_mouse_input`].
+    pub fn handle_mouse_input_at(
+        &mut self,
+        event: bitty_platform::MouseEvent,
+        now: std::time::Instant,
+    ) {
         // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
         // Coordinates come from the last known cursor position mapped to cell
         // space (clamped); `None` when the cursor never entered the window.
@@ -626,7 +645,23 @@ impl Runtime {
                     // stealing focus, coherent with the hover path.
                     self.click_focus_at(pos);
                     let cell = self.cursor_to_cell(pos);
-                    self.start_selection(cell);
+                    // CTX-0385: the tracker is the click-count authority
+                    // (wire `click_count` is advisory); non-left buttons
+                    // already returned above, so only left chains here.
+                    let count = self.click_tracker.press(event.button, cell, now);
+                    self.last_click_count = count;
+                    // `Alt`+press starts a rectangular block when the press
+                    // was not consumed as a float move above (tiled layouts
+                    // fall through here); Shift does not suppress it.
+                    if self.alt_pressed {
+                        self.start_block_selection(cell);
+                    } else if count == 2 {
+                        self.start_word_selection(cell);
+                    } else if count >= super::click::CLICK_COUNT_MAX {
+                        self.start_line_selection(cell);
+                    } else {
+                        self.start_selection(cell);
+                    }
                 } else if self.selection.is_some() {
                     // CTX-0166: click without cursor tracking still dismisses
                     // the highlight (no stale rect when `last_cursor` is None).
@@ -639,6 +674,8 @@ impl Runtime {
                     self.end_selection(cell);
                 } else {
                     self.selection_dragging = false;
+                    self.selection_anchor_press = None;
+                    self.click_tracker.reset();
                     if let Some(mut sel) = self.selection {
                         sel.active = false;
                         self.selection = Some(sel);
@@ -659,6 +696,9 @@ impl Runtime {
                 }
             }
             (MouseButton::Right, PressState::Pressed) => {
+                // Any non-left press breaks a pending multi-click chain
+                // (fail-closed: paste clicks never arm word/line mode).
+                self.click_tracker.reset();
                 // Ghostty `paste` right-click action for the standard
                 // clipboard (Wayland-first via the platform backend,
                 // CTX-0160). Fail-soft: empty clipboards paste nothing and
@@ -671,6 +711,7 @@ impl Runtime {
                 }
             }
             (MouseButton::Middle, PressState::Pressed) => {
+                self.click_tracker.reset();
                 // Ghostty `primary-paste` middle-click action for the
                 // platform primary selection (fail-soft like right-click;
                 // read failures are recorded inside `paste_from_primary`).

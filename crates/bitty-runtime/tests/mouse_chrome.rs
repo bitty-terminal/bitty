@@ -23,17 +23,11 @@ fn named_key(named: NamedKey, state: PressState) -> bitty_platform::KeyEvent {
 }
 
 fn press(button: MouseButton) -> bitty_platform::MouseEvent {
-    bitty_platform::MouseEvent {
-        button,
-        state: PressState::Pressed,
-    }
+    bitty_platform::MouseEvent::new(button, PressState::Pressed)
 }
 
 fn release(button: MouseButton) -> bitty_platform::MouseEvent {
-    bitty_platform::MouseEvent {
-        button,
-        state: PressState::Released,
-    }
+    bitty_platform::MouseEvent::new(button, PressState::Released)
 }
 
 /// Cursor pixels landing on container cell (col, row) under the default

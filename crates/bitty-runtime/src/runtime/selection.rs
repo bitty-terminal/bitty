@@ -58,6 +58,7 @@ impl Runtime {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_dragging = false;
+        self.selection_anchor_press = None;
         self.pending_full_redraw = true;
     }
 
@@ -65,9 +66,26 @@ impl Runtime {
     pub fn set_selection(&mut self, selection: Selection) {
         let snap = self.state.snapshot();
         let clamped = selection.clamped(&snap).snapped(Some(&snap));
+        self.selection_anchor_press = Some(clamped.anchor);
         self.selection = Some(clamped);
         self.selection_dragging = clamped.active;
         self.pending_full_redraw = true;
+    }
+
+    /// Current selection kind, if a selection exists (CTX-0385).
+    ///
+    /// Extension point for keyboard copy mode (CTX-0384) and scrollback
+    /// search UI (CTX-0383): they branch on the typed kind without touching
+    /// the click tracker.
+    #[must_use]
+    pub fn selection_kind(&self) -> Option<SelectionKind> {
+        self.selection.map(|s| s.kind)
+    }
+
+    /// Click count of the last left press (`1..=3`, CTX-0385).
+    #[must_use]
+    pub fn last_click_count(&self) -> u8 {
+        self.last_click_count
     }
 
     /// Starts a new selection at `pos` (mouse down).
@@ -75,6 +93,7 @@ impl Runtime {
         let snap = self.state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        self.selection_anchor_press = Some(snapped);
         self.selection = Some(Selection {
             anchor: snapped,
             focus: snapped,
@@ -85,9 +104,75 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
+    /// Starts a word selection at `pos` (double-click, CTX-0385).
+    ///
+    /// Expands to the containing word via [`Selection::word_at`]; a press on
+    /// a delimiter yields a collapsed single cell (no selection on release,
+    /// matching stream semantics). Drag after this extends word-wise via
+    /// [`Self::update_selection`].
+    pub fn start_word_selection(&mut self, pos: CellPos) {
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        self.selection_anchor_press = Some(snapped);
+        let range = Selection::word_at(&snap, snapped);
+        self.selection = Some(Selection {
+            anchor: range.start,
+            focus: range.end,
+            kind: SelectionKind::Word,
+            active: true,
+        });
+        self.selection_dragging = true;
+        self.pending_full_redraw = true;
+    }
+
+    /// Starts a line selection at `pos` row (triple-click, CTX-0385).
+    ///
+    /// Covers the whole row via [`Selection::line_at`]; drag after this
+    /// extends line-wise. Columns of `pos` are ignored.
+    pub fn start_line_selection(&mut self, pos: CellPos) {
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        self.selection_anchor_press = Some(snapped);
+        let range = Selection::line_at(&snap, snapped.row);
+        self.selection = Some(Selection {
+            anchor: range.start,
+            focus: range.end,
+            kind: SelectionKind::Line,
+            active: true,
+        });
+        self.selection_dragging = true;
+        self.pending_full_redraw = true;
+    }
+
+    /// Starts a rectangular block selection at `pos` (`Alt` modifier, CTX-0385).
+    ///
+    /// The anchor and focus start collapsed; drag extends the rectangle.
+    /// Text extraction stays rectangular via [`Selection::block_text`].
+    pub fn start_block_selection(&mut self, pos: CellPos) {
+        let snap = self.state.snapshot();
+        let clamped = clamp_cell_pos(&snap, pos);
+        let snapped = bitty_ui::snap_to_leading(&snap, clamped);
+        self.selection_anchor_press = Some(snapped);
+        self.selection = Some(Selection {
+            anchor: snapped,
+            focus: snapped,
+            kind: SelectionKind::Block,
+            active: true,
+        });
+        self.selection_dragging = true;
+        self.pending_full_redraw = true;
+    }
+
     /// Updates the current selection's focus to `pos` (mouse drag).
+    ///
+    /// Kind-aware (CTX-0385): `Simple`/`Block` move the focus; `Word`
+    /// re-expands word-wise around the pinned press cell
+    /// ([`Selection::word_drag`]); `Line` covers whole lines between the
+    /// press row and `pos` ([`Selection::line_drag`]).
     pub fn update_selection(&mut self, pos: CellPos) {
-        let Some(mut sel) = self.selection else {
+        let Some(sel) = self.selection else {
             return;
         };
         if !self.selection_dragging {
@@ -96,28 +181,64 @@ impl Runtime {
         let snap = self.state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        sel.focus = snapped;
-        sel.active = true;
-        self.selection = Some(sel);
+        let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
+        let next = match sel.kind {
+            SelectionKind::Simple | SelectionKind::Block => {
+                let mut next = sel;
+                next.focus = snapped;
+                next.active = true;
+                next
+            }
+            SelectionKind::Word => Selection::word_drag(&snap, anchor_press, snapped),
+            SelectionKind::Line => Selection::line_drag(&snap, anchor_press, snapped),
+        };
+        self.selection = Some(next);
         self.pending_full_redraw = true;
     }
 
     /// Ends the selection at `pos` (mouse up) and leaves it active for copy.
+    ///
+    /// Kind-aware like [`Self::update_selection`]: a press+release without
+    /// motion keeps the word/line expansion from the press, while a drag
+    /// re-expands to the release cell.
+    ///
+    /// A release far from the press cell (beyond
+    /// [`super::click::MULTI_CLICK_MAX_CELL_DISTANCE`]) was a drag, not a
+    /// click: the click chain resets so the next press starts at single
+    /// (standard click-vs-drag classification; a double-click word with no
+    /// pointer motion still chains to triple).
     pub fn end_selection(&mut self, pos: CellPos) {
-        let Some(mut sel) = self.selection else {
+        let Some(sel) = self.selection else {
             return;
         };
         let snap = self.state.snapshot();
         let clamped = clamp_cell_pos(&snap, pos);
         let snapped = bitty_ui::snap_to_leading(&snap, clamped);
-        sel.focus = snapped;
-        sel.active = false;
+        let anchor_press = self.selection_anchor_press.unwrap_or(sel.anchor);
+        let was_drag = super::click::cell_distance(anchor_press, snapped)
+            > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+        let mut finished = match sel.kind {
+            SelectionKind::Simple | SelectionKind::Block => {
+                let mut next = sel;
+                next.focus = snapped;
+                next
+            }
+            SelectionKind::Word => Selection::word_drag(&snap, anchor_press, snapped),
+            SelectionKind::Line => Selection::line_drag(&snap, anchor_press, snapped),
+        };
+        finished.active = false;
         self.selection_dragging = false;
+        self.selection_anchor_press = None;
+        if was_drag {
+            self.click_tracker.reset();
+        }
         // Keep zero-length selections as None to avoid empty copies.
-        if sel.anchor == sel.focus {
+        // Note: a double-click word of length > 1 survives (anchor != focus);
+        // a delimiter press collapses and clears, matching stream semantics.
+        if finished.anchor == finished.focus {
             self.selection = None;
         } else {
-            self.selection = Some(sel);
+            self.selection = Some(finished);
         }
         self.pending_full_redraw = true;
     }

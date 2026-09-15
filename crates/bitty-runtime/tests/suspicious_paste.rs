@@ -483,10 +483,7 @@ fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
     // CTX-0223: (8, 8) is grid cell (0, 0) under the default 8px padding.
     rt.handle_cursor_moved(CursorPosition { x: 8.0, y: 8.0 });
     // Same entry the right-click mouse path uses.
-    rt.handle_mouse_input(MouseEvent {
-        button: MouseButton::Right,
-        state: PressState::Pressed,
-    });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
     assert!(rt.has_pending_paste(), "3-line right-click must gate");
     assert_eq!(rt.pending_input(), b"", "no silent delivery before confirm");
     let summary = rt
@@ -497,10 +494,7 @@ fn ctx0186_multiline_right_click_paste_is_visible_and_repeat_confirms() {
         "summary must name line count: {summary:?}"
     );
     // Second identical right-click confirms and delivers both lines.
-    rt.handle_mouse_input(MouseEvent {
-        button: MouseButton::Right,
-        state: PressState::Pressed,
-    });
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Right, PressState::Pressed));
     assert!(!rt.has_pending_paste());
     assert_eq!(rt.pending_input(), b"aaa\nbbb\nccc");
 }

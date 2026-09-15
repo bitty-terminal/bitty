@@ -81,20 +81,14 @@ fn move_to(rt: &mut Runtime, x: f64, y: f64) {
 fn press(rt: &mut Runtime) {
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: window(),
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Pressed,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Pressed)),
     });
 }
 
 fn release(rt: &mut Runtime) {
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: window(),
-        kind: WindowEventKind::MouseInput(MouseEvent {
-            button: MouseButton::Left,
-            state: PressState::Released,
-        }),
+        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Released)),
     });
 }
 

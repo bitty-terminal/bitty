@@ -120,6 +120,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+pub mod click;
 pub mod close_confirm;
 pub mod help;
 pub mod input;
@@ -143,6 +144,7 @@ pub use self::animations::{
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
 
+use self::click::ClickTracker;
 use self::close_confirm::PendingCloseConfirm;
 use self::layout_focus::{default_container, default_layout};
 use self::mouse_chrome::{AltDragState, HoverPending};
@@ -363,6 +365,24 @@ pub struct Runtime {
     clipboard: Clipboard,
     selection: Option<Selection>,
     selection_dragging: bool,
+    /// Bounded multi-click tracker for word/line selection (CTX-0385).
+    ///
+    /// `O(1)` state (last press time, cell, button, count); the runtime is
+    /// the authority — the wire [`bitty_platform::MouseEvent::click_count`]
+    /// is advisory and recomputed here from press time and cell.
+    click_tracker: ClickTracker,
+    /// Raw press cell that started the current selection drag (CTX-0385).
+    ///
+    /// `O(1)`: one cell that pins word/line drag extension direction
+    /// (`word_drag`/`line_drag` compare the live pointer against this, not
+    /// against the expanded range). `None` when no selection is active.
+    selection_anchor_press: Option<CellPos>,
+    /// Click count of the last left press (`1..=3`, CTX-0385).
+    ///
+    /// Extension point for copy-mode (CTX-0384) and search UI (CTX-0383):
+    /// they read the gesture kind via [`crate::Runtime::selection_kind`]
+    /// and this count without touching the tracker.
+    last_click_count: u8,
     /// Active overlay-scrollbar thumb drag (CTX-0181).
     ///
     /// Press+move on the painted thumb scrolls the focused view through the
@@ -782,6 +802,9 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            click_tracker: ClickTracker::new(),
+            selection_anchor_press: None,
+            last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,
@@ -923,6 +946,9 @@ impl Runtime {
             clipboard: Clipboard::new(),
             selection: None,
             selection_dragging: false,
+            click_tracker: ClickTracker::new(),
+            selection_anchor_press: None,
+            last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             scrollbar_drag: None,
             scrollbar_cursor_left: false,
             scrollbar_visible: false,

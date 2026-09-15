@@ -113,6 +113,12 @@ pub(crate) struct TerminalApp {
     /// info (paste confirm/cancel, startup summary) and warnings/errors
     /// bypass this gate and always emit.
     pub(crate) log_level: LogLevel,
+    /// Session persistence gate (CTX-0393): exit paths save the session
+    /// best-effort when true. Startup clears it for `--safe` (recovery must
+    /// neither read nor clobber the saved session) and `--headless`
+    /// (deterministic CI must not clobber it either). Default true so tests
+    /// using [`Self::with_theme`] keep the production behavior.
+    pub(crate) session_persistence: bool,
 }
 
 impl TerminalApp {
@@ -147,6 +153,7 @@ impl TerminalApp {
             zoom_backup: None,
             spawn_spec,
             log_level: LogLevel::default_level(),
+            session_persistence: true,
         }
     }
 
@@ -183,6 +190,7 @@ impl TerminalApp {
             zoom_backup: None,
             spawn_spec,
             log_level: LogLevel::default_level(),
+            session_persistence: true,
         }
     }
 
@@ -204,6 +212,37 @@ impl TerminalApp {
     /// [`crate::logging::effective_log_level`]; tests set it explicitly to prove gating.
     pub(crate) fn set_log_level(&mut self, level: LogLevel) {
         self.log_level = level;
+    }
+
+    /// Enables or disables session save-on-exit (CTX-0393). Production
+    /// startup passes `!safe && !headless`: safe recovery and headless
+    /// smoke runs must never overwrite the saved session.
+    pub(crate) fn set_session_persistence(&mut self, enabled: bool) {
+        self.session_persistence = enabled;
+    }
+
+    /// Best-effort session save for exit paths (CTX-0393): one bounded
+    /// capture plus one atomic write, no retries. Loud one-line outcome on
+    /// stderr (counts only, never session contents); failures never block
+    /// shutdown. Raw `SIGTERM`/`SIGHUP` that bypasses the event loop skips
+    /// this hook (documented gap); the atomic format still rules out a
+    /// partial file.
+    fn save_session_best_effort(&self, reason: &'static str) {
+        if !self.session_persistence {
+            return;
+        }
+        match self.runtime.save_session_on_exit() {
+            bitty_runtime::SessionExitSaveOutcome::Saved(summary) => {
+                eprintln!(
+                    "bitty: session saved ({reason}: workspaces={} panes={} lines={} bytes={})",
+                    summary.workspaces, summary.panes, summary.scrollback_lines, summary.bytes
+                );
+            }
+            bitty_runtime::SessionExitSaveOutcome::Warned(err) => {
+                eprintln!("bitty: session save failed ({err}) — exiting anyway");
+            }
+            bitty_runtime::SessionExitSaveOutcome::SkippedNoStateDir => {}
+        }
     }
 
     /// Sets the window opacity applied at creation and GPU attach
@@ -586,6 +625,7 @@ impl AppHandler for TerminalApp {
         let should_exit = self.runtime.handle_platform_event(event.clone());
         if should_exit {
             eprintln!("bitty: exit requested ({event:?})");
+            self.save_session_best_effort("exit");
             ctx.exit();
             return;
         }
@@ -784,6 +824,7 @@ impl AppHandler for TerminalApp {
                 }
             }
             PlatformEvent::Exiting => {
+                self.save_session_best_effort("loop-exiting");
                 ctx.exit();
             }
             _ => {}

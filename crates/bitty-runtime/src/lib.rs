@@ -214,6 +214,17 @@ pub use runtime::background_images::validate_background_images;
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::PresentFrame;
+pub use runtime::session::{
+    MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_GRID_DIM, MAX_SESSION_LAYOUT_DEPTH,
+    MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_TEXT_BYTES, MAX_SESSION_NAME_CHARS,
+    MAX_SESSION_PANES_PER_WORKSPACE, MAX_SESSION_PANES_TOTAL,
+    MAX_SESSION_SCROLLBACK_LINES_PER_PANE, MAX_SESSION_WORKSPACES, PaneSnapshot,
+    PendingPaneRestore, SESSION_APP_DIR_NAME, SESSION_FILE_NAME, SESSION_FORMAT_VERSION,
+    SESSIONS_DIR_NAME, SessionError, SessionExitSaveOutcome, SessionRestoreSummary,
+    SessionSaveSummary, SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot, decode_session,
+    encode_session, session_dir, session_dir_for, session_file, session_file_for, state_home,
+    state_home_for,
+};
 pub use runtime::workspaces::{MAX_WORKSPACES, WsCloseRequest};
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, ClosingFrame,

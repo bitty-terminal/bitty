@@ -32,6 +32,10 @@ behavior, stable formats, or settled publisher-trust policy.
   staging while activation is a separate transaction it never performs.
 - No runtime or platform coupling, and no registry or revocation
   infrastructure beyond in-memory stub stores.
+- `V-C` (`TrustMode::Signed`) signature verification is unimplemented and
+  fail-closed (bitty#743): `verify_signature` rejects every record — no
+  signature scheme exists, so nothing signed can verify until the `OQ-029`
+  key-management design lands. `V-A`/`V-B` are unaffected.
 
 ## Layout
 

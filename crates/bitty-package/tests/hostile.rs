@@ -14,8 +14,7 @@ use bitty_package::{
 };
 use bitty_package::{IndexEntry, PackageIndex, resolve, resolve_preserving_locked};
 use bitty_package::{
-    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, stub_sign,
-    verify_signature,
+    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, verify_signature,
 };
 use bitty_package::{
     MANIFEST_MAX_BYTES, MAX_ARTIFACT_BYTES, VerificationInputs, VerificationStage,
@@ -592,6 +591,40 @@ fn corrupt_package_cap_divergent_head_rejected_at_manifest_time() {
 
 // ── signature mismatch ─────────────────────────────────────────────────────
 
+// bitty#743 (CTX-0462): the V-C stub computed SHA-256(key_id||manifest||artifact)
+// as a signature, so anyone holding the *public* key_id could mint a
+// passing record. This test forges without touching any signing helper.
+#[test]
+fn forged_signature_with_public_key_id_rejected() {
+    let mut keys = KeyStore::new();
+    keys.insert(KeyRecord {
+        key_id: "k1".to_string(),
+        public_key_hex: "c".repeat(64),
+        revoked: false,
+    })
+    .unwrap();
+    let m = sha256_hex(b"manifest-bytes");
+    let a = sha256_hex(b"artifact-bytes");
+    // Attacker input: public key_id plus digests only. Recompute the
+    // publicly-documented stub formula directly.
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(b"k1");
+    preimage.extend_from_slice(m.as_bytes());
+    preimage.extend_from_slice(a.as_bytes());
+    let base = sha256_hex(&preimage);
+    let forged = format!("{base}{base}");
+    let sig = SignatureRecord {
+        key_id: "k1".to_string(),
+        signature_hex: forged,
+        manifest_digest: m.clone(),
+        artifact_digest: a.clone(),
+    };
+    assert!(
+        verify_signature(&sig, &keys, &m, &a).is_err(),
+        "forgeable stub accepted an attacker-minted signature"
+    );
+}
+
 #[test]
 fn signature_mismatch_unknown_key_rejected() {
     let mut keys = KeyStore::new();
@@ -603,10 +636,9 @@ fn signature_mismatch_unknown_key_rejected() {
     .unwrap();
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
-    let sig_hex = stub_sign("k1", &m, &a);
     let bad = SignatureRecord {
         key_id: "unknown".to_string(),
-        signature_hex: sig_hex,
+        signature_hex: "d".repeat(128),
         manifest_digest: m.clone(),
         artifact_digest: a.clone(),
     };
@@ -624,11 +656,10 @@ fn signature_mismatch_revoked_key_rejected() {
     .unwrap();
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
-    let sig_hex = stub_sign("k1", &m, &a);
     keys.revoke("k1").unwrap();
     let sig = SignatureRecord {
         key_id: "k1".to_string(),
-        signature_hex: sig_hex,
+        signature_hex: "d".repeat(128),
         manifest_digest: m.clone(),
         artifact_digest: a.clone(),
     };
@@ -647,10 +678,9 @@ fn signature_mismatch_over_different_bytes_rejected() {
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
     let m2 = sha256_hex(b"other");
-    let sig_hex = stub_sign("k1", &m, &a);
     let sig = SignatureRecord {
         key_id: "k1".to_string(),
-        signature_hex: sig_hex,
+        signature_hex: "d".repeat(128),
         manifest_digest: m2.clone(),
         artifact_digest: a.clone(),
     };
@@ -679,6 +709,8 @@ fn signature_mismatch_bad_hex_len_rejected() {
 
 #[test]
 fn signature_valid_then_revoked_fails_stale_snapshot() {
+    // V-C is unavailable (bitty#743): the record is rejected before and
+    // after revocation; revocation state itself is still tracked.
     let mut keys = KeyStore::new();
     keys.insert(KeyRecord {
         key_id: "k1".to_string(),
@@ -688,15 +720,16 @@ fn signature_valid_then_revoked_fails_stale_snapshot() {
     .unwrap();
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
-    let sig_hex = stub_sign("k1", &m, &a);
     let sig = SignatureRecord {
         key_id: "k1".to_string(),
-        signature_hex: sig_hex.clone(),
+        signature_hex: "d".repeat(128),
         manifest_digest: m.clone(),
         artifact_digest: a.clone(),
     };
-    verify_signature(&sig, &keys, &m, &a).unwrap();
+    let err = verify_signature(&sig, &keys, &m, &a).unwrap_err();
+    assert!(err.to_string().contains("unavailable"));
     keys.revoke("k1").unwrap();
+    assert!(!keys.is_trusted("k1"));
     assert!(verify_signature(&sig, &keys, &m, &a).is_err());
 }
 
@@ -704,6 +737,9 @@ fn signature_valid_then_revoked_fails_stale_snapshot() {
 
 #[test]
 fn publisher_key_rotation_new_key_valid_old_revoked_stale_fails() {
+    // V-C is unavailable (bitty#743), so both records are rejected; the
+    // store still enforces rotation semantics (revoked k1 untrusted, k2
+    // trusted) for the future scheme.
     let mut keys = KeyStore::new();
     keys.insert(KeyRecord {
         key_id: "k1".to_string(),
@@ -721,22 +757,24 @@ fn publisher_key_rotation_new_key_valid_old_revoked_stale_fails() {
     let a = sha256_hex(b"a");
     let sig_k2 = SignatureRecord {
         key_id: "k2".to_string(),
-        signature_hex: stub_sign("k2", &m, &a),
+        signature_hex: "d".repeat(128),
         manifest_digest: m.clone(),
         artifact_digest: a.clone(),
     };
-    verify_signature(&sig_k2, &keys, &m, &a).unwrap();
+    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_err());
     // Rotate: revoke k1
     keys.revoke("k1").unwrap();
+    assert!(!keys.is_trusted("k1"));
+    assert!(keys.is_trusted("k2"));
     let sig_k1 = SignatureRecord {
         key_id: "k1".to_string(),
-        signature_hex: stub_sign("k1", &m, &a),
+        signature_hex: "d".repeat(128),
         manifest_digest: m.clone(),
         artifact_digest: a.clone(),
     };
     assert!(verify_signature(&sig_k1, &keys, &m, &a).is_err());
-    // k2 still valid
-    verify_signature(&sig_k2, &keys, &m, &a).unwrap();
+    // k2 still rejected as well: no scheme verifies anything yet.
+    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_err());
 }
 
 #[test]

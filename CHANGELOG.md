@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Host `bitty.process.spawn` surface for Layer-2 system-CLI execution
+  (CTX-0445, OQ-013/OQ-053):** a bounded, consent-gated spawn surface that
+  executes only allowlisted `[tools.*]` binaries/verbs. Every spawn checks
+  request shape, allowlist routing (seam owned by CTX-0444; deny-all until it
+  lands), `process.spawn` scope, explicit effect opt-in, and per-spawn
+  `ConsentLedger` consent, then runs argv-only (never a shell) with a closed
+  environment, concurrent bounded drain (no deadlocks), timeout kill+reap
+  (timeout reports `Unknown`, never blind failure), and
+  `is_untrusted_surface` labeling. The Lua bridge exposes
+  `bitty.process.spawn({ ... })` returning
+  `{ output, stderr, truncated, exit_code, untrusted }` with typed
+  `E_SPAWN_UNAVAILABLE` / `E_CAPABILITY_DENIED` / `E_SPAWN_DENIED` /
+  `E_SPAWN_TIMEOUT` / `E_SPAWN_FAILED` errors; per-call output on the panel
+  path is capped at `8 KiB` to fit panel bus admission.
 - **Configurable per-panel background image (CTX-0347, RFC-0001/OQ-042):**
   `decoration.background_image` / `background_fit` set a global background
   image and `views.<selector>.background_image` / `background_fit` override it

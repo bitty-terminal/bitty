@@ -6,13 +6,22 @@
 //! gating is evaluated from the grant snapshot taken at activation; an absent
 //! grant fails closed before any side effect.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
 use bitty_lua::{BridgeError, HostServices, LuaValue, SNAPSHOT_MAX_BYTES};
 
 use super::store::{self, PluginStore};
+
+/// Injected spawn backend for one plugin generation.
+///
+/// Receives the Lua-validated argv and returns the bounded result table
+/// (`output`/`stderr`/`truncated`/`exit_code`/`untrusted`). The production
+/// backend is the consent-gated [`SpawnService`](super::spawn::SpawnService)
+/// path wired at activation; tests inject canned closures. `None` (no
+/// backend) fails closed with `E_SPAWN_UNAVAILABLE`.
+pub type SpawnHandler = Rc<dyn Fn(&[String]) -> Result<LuaValue, BridgeError>>;
 
 /// Read-only typed settings source (owned by `bitty-config` in the app).
 pub trait SettingsSource {
@@ -123,6 +132,8 @@ pub struct PluginServices {
     notifications: Rc<RefCell<NotificationQueue>>,
     terminal_read: bool,
     platform_notify: bool,
+    spawn_git: Cell<bool>,
+    spawn_backend: RefCell<Option<SpawnHandler>>,
 }
 
 impl PluginServices {
@@ -145,7 +156,30 @@ impl PluginServices {
             notifications,
             terminal_read,
             platform_notify,
+            spawn_git: Cell::new(false),
+            spawn_backend: RefCell::new(None),
         }
+    }
+
+    /// Grant (or revoke) the `process.spawn:git` Layer-2 spawn surface.
+    ///
+    /// Set from the activation grant snapshot (`process.spawn:git` present);
+    /// absent grants fail closed at call time. The execution backend itself
+    /// is injected separately via [`Self::set_spawn_backend`].
+    pub fn set_spawn_git(&self, granted: bool) {
+        self.spawn_git.set(granted);
+    }
+
+    /// Whether the `process.spawn:git` spawn surface is granted.
+    #[must_use]
+    pub fn has_spawn_git(&self) -> bool {
+        self.spawn_git.get()
+    }
+
+    /// Inject the spawn execution backend (`None` restores fail-closed
+    /// `E_SPAWN_UNAVAILABLE`).
+    pub fn set_spawn_backend(&self, backend: Option<SpawnHandler>) {
+        *self.spawn_backend.borrow_mut() = backend;
     }
 
     /// Read-only store view (tests, diagnostics).
@@ -238,5 +272,83 @@ impl HostServices for PluginServices {
             urgency,
         });
         Ok(accepted)
+    }
+
+    fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
+        if !self.spawn_git.get() {
+            return Err(BridgeError::capability_denied("process.spawn:git"));
+        }
+        let backend = self.spawn_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                "E_SPAWN_UNAVAILABLE",
+                "host spawn backend is not configured",
+            )
+        })?;
+        backend(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_runtime::store::PluginStore;
+
+    fn services() -> PluginServices {
+        PluginServices::new(
+            "xuepoo.test",
+            PluginStore::in_memory(),
+            Rc::new(EmptySettings),
+            Rc::new(UnavailableSnapshot),
+            Rc::new(RefCell::new(NotificationQueue::new(8))),
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn spawn_without_grant_denies_capability() {
+        let services = services();
+        let error = services
+            .process_spawn(&["status".to_owned()])
+            .expect_err("grant absent must deny");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    }
+
+    #[test]
+    fn spawn_without_backend_is_unavailable() {
+        let services = services();
+        services.set_spawn_git(true);
+        assert!(services.has_spawn_git());
+        let error = services
+            .process_spawn(&["status".to_owned()])
+            .expect_err("backend absent must be unavailable");
+        assert_eq!(error.code, "E_SPAWN_UNAVAILABLE");
+    }
+
+    #[test]
+    fn spawn_with_backend_passes_argv_through() {
+        let services = services();
+        services.set_spawn_git(true);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_clone = seen.clone();
+        services.set_spawn_backend(Some(Rc::new(move |args: &[String]| {
+            seen_clone.borrow_mut().push(args.to_vec());
+            Ok(LuaValue::table([(
+                "output",
+                LuaValue::String("ok".to_owned()),
+            )]))
+        })));
+        let result = services
+            .process_spawn(&["status".to_owned(), "--porcelain".to_owned()])
+            .expect("backend serves");
+        assert_eq!(
+            result.get("output"),
+            Some(&LuaValue::String("ok".to_owned()))
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[vec!["status".to_owned(), "--porcelain".to_owned()]]
+        );
     }
 }

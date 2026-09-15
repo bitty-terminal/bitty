@@ -49,6 +49,13 @@ pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
 /// Default host-call deadline in milliseconds (reuses `RC-1`).
 pub const DEFAULT_HOST_DEADLINE_MS: u64 = crate::RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Maximum `process.spawn` argv entries accepted from Lua (bounded-list
+/// precedent; the host allowlist enforces a tighter per-tool count).
+pub const SPAWN_LUA_MAX_ARGS: usize = 64;
+
+/// Maximum bytes of one `process.spawn` argv entry accepted from Lua (params
+/// bound precedent; the host allowlist enforces a tighter per-tool count).
+pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// Maximum bytes of one source module file accepted by `require`.
@@ -302,9 +309,12 @@ impl std::error::Error for BridgeError {}
 
 /// Host service boundary implemented by `bitty-runtime`.
 ///
-/// Every method is synchronous and non-blocking. Implementors are expected to
+/// Every method is synchronous and non-blocking, except [`HostServices::process_spawn`].
+/// Implementors are expected to
 /// be cheap and bounded; the bridge deadline-checks each call and fails closed
-/// with `E_TIMEOUT`, and rejects re-entrant calls. Capability gating is the
+/// with `E_TIMEOUT`, and rejects re-entrant calls. `process.spawn` is exempt
+/// from the post-hoc deadline (see [`HostServices::process_spawn`]) but keeps
+/// the re-entrancy rejection. Capability gating is the
 /// caller's responsibility (it decides what `services` are reachable), but
 /// implementations should still fail closed.
 pub trait HostServices {
@@ -318,6 +328,30 @@ pub trait HostServices {
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
     /// Hand a notification to the platform asynchronously; returns acceptance.
     fn notify_show(&self, payload: &LuaValue) -> Result<bool, BridgeError>;
+    /// Spawn an allowlisted system CLI with `args` as its argv (no shell).
+    ///
+    /// The default implementation fails closed with `E_SPAWN_UNAVAILABLE`;
+    /// the runtime overrides it with the consent-gated, bounded spawn
+    /// surface (CTX-0445). The tool identity is resolved host-side from the
+    /// caller's grant, so Lua supplies only the argv array. The returned
+    /// table carries at least `output` (bounded string), `truncated` (bool),
+    /// `exit_code` (integer), and `untrusted` (always true): child bytes are
+    /// untrusted observation data, never instructions.
+    ///
+    /// Unlike every other host method this call is long-running and governed
+    /// by the spawn timeout contract (default 5 s, maximum 30 s, enforced by
+    /// killing and reaping the child), so the bridge keeps only the
+    /// re-entrancy guard and skips the post-hoc cheap-call deadline: a
+    /// slow-but-successful spawn is delivered instead of being stored and
+    /// then discarded as `E_TIMEOUT` (which would orphan a 64-slot registry
+    /// entry Lua can never reconcile).
+    fn process_spawn(&self, _args: &[String]) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            "E_SPAWN_UNAVAILABLE",
+            "host has no process.spawn surface",
+        ))
+    }
     /// Current monotonic host time in milliseconds (for timer scheduling).
     fn now_millis(&self) -> u64 {
         0
@@ -400,8 +434,18 @@ struct BridgeState {
     in_call: Rc<Cell<bool>>,
 }
 
+/// Re-entrancy guard for one bridge call: clears `in_call` on drop.
+struct CallGuard(Rc<Cell<bool>>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 impl BridgeState {
-    fn bounded<T>(&self, f: impl FnOnce() -> Result<T, BridgeError>) -> Result<T, BridgeError> {
+    /// Enter one bridge call, rejecting re-entrant calls fail-closed.
+    fn enter(&self) -> Result<CallGuard, BridgeError> {
         if self.in_call.get() {
             return Err(BridgeError::new(
                 "runtime",
@@ -410,19 +454,38 @@ impl BridgeState {
             ));
         }
         self.in_call.set(true);
-        struct Reset(Rc<Cell<bool>>);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                self.0.set(false);
-            }
-        }
-        let _reset = Reset(self.in_call.clone());
+        Ok(CallGuard(self.in_call.clone()))
+    }
+
+    fn bounded<T>(&self, f: impl FnOnce() -> Result<T, BridgeError>) -> Result<T, BridgeError> {
+        let _guard = self.enter()?;
         let start = Instant::now();
         let out = f()?;
         if start.elapsed() > Duration::from_millis(self.deadline_ms) {
             return Err(BridgeError::timeout());
         }
         Ok(out)
+    }
+
+    /// Spawn-aware bridge guard: keeps the re-entrancy rejection but skips
+    /// the post-hoc cheap-call deadline.
+    ///
+    /// `process.spawn` is a supervised long-running call with its own
+    /// explicit timeout contract (default 5 s, maximum 30 s, enforced by
+    /// killing and reaping the child): applying the 50 ms cheap-call
+    /// deadline post-hoc would run the spawn to completion, store its
+    /// outcome in the bounded 64-slot execution registry, then discard the
+    /// delivered value as `E_TIMEOUT` — orphaning a registry slot Lua can
+    /// never reconcile (64 such orphans = self-DoS via `LimitExceeded`).
+    /// With this guard every stored spawn outcome is delivered to its
+    /// caller, so the registry bound covers delivered outcomes only and
+    /// stays fail-closed by design. The re-entrancy guard still applies.
+    fn bounded_spawn<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, BridgeError>,
+    ) -> Result<T, BridgeError> {
+        let _guard = self.enter()?;
+        f()
     }
 }
 
@@ -792,6 +855,28 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("notify table accepts 'show'");
 
+    let process = Table::new(&ctx);
+    process
+        .set(
+            ctx,
+            "spawn",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let raw = stack.get(0);
+                    let value =
+                        LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
+                    let args = spawn_argv(&value).map_err(|e| e.to_error(ctx))?;
+                    let result = state
+                        .bounded_spawn(|| state.services.process_spawn(&args))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, result.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("process table accepts 'spawn'");
+
     let timers = Table::new(&ctx);
     timers
         .set(
@@ -881,6 +966,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts terminal");
     root.set(ctx, "notify", readonly_table(ctx, notify))
         .expect("root accepts notify");
+    root.set(ctx, "process", readonly_table(ctx, process))
+        .expect("root accepts process");
     root.set(ctx, "timers", readonly_table(ctx, timers))
         .expect("root accepts timers");
     Value::Table(readonly_table(ctx, root))
@@ -1006,6 +1093,63 @@ fn readonly_table<'gc>(ctx: Context<'gc>, real: Table<'gc>) -> Table<'gc> {
         .expect("metatable accepts __metatable");
     proxy.set_metatable(&ctx, Some(metatable));
     proxy
+}
+
+/// Extract a 1-based argv array of strings from a marshalled Lua value.
+///
+/// Fails closed with `E_VALUE_*` when the value is not a dense 1-based
+/// string array, is empty, exceeds [`SPAWN_LUA_MAX_ARGS`], or carries an
+/// entry past [`SPAWN_LUA_MAX_ARG_BYTES`]. Tighter per-tool bounds live
+/// host-side with the allowlist (CTX-0444); this is shape only.
+fn spawn_argv(value: &LuaValue) -> Result<Vec<String>, BridgeError> {
+    let LuaValue::Table(pairs) = value else {
+        return Err(BridgeError::value(
+            "E_VALUE_TYPE",
+            "process.spawn expects an argv array table",
+        ));
+    };
+    if pairs.is_empty() {
+        return Err(BridgeError::value(
+            "E_VALUE_TYPE",
+            "process.spawn argv must not be empty",
+        ));
+    }
+    if pairs.len() > SPAWN_LUA_MAX_ARGS {
+        return Err(BridgeError::value(
+            "E_VALUE_NODES",
+            "process.spawn argv exceeds the entry limit",
+        ));
+    }
+    let mut args = Vec::with_capacity(pairs.len());
+    for (index, (key, item)) in pairs.iter().enumerate() {
+        let want = index as i64 + 1;
+        if *key != LuaValue::Integer(want) {
+            return Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "process.spawn argv must be a dense 1-based array",
+            ));
+        }
+        let LuaValue::String(text) = item else {
+            return Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "process.spawn argv entries must be strings",
+            ));
+        };
+        if text.is_empty() {
+            return Err(BridgeError::value(
+                "E_VALUE_TYPE",
+                "process.spawn argv entries must not be empty",
+            ));
+        }
+        if text.len() > SPAWN_LUA_MAX_ARG_BYTES {
+            return Err(BridgeError::value(
+                "E_VALUE_BYTES",
+                "process.spawn argv entry exceeds the byte limit",
+            ));
+        }
+        args.push(text.clone());
+    }
+    Ok(args)
 }
 
 fn required_string<'gc>(

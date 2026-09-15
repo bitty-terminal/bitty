@@ -47,7 +47,7 @@
 use crate::capability::CapabilityId;
 use crate::manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
-    PluginIdentity, PluginManifest, QualifiedName, ToolDeclaration,
+    PluginIdentity, PluginManifest, QualifiedName,
 };
 
 /// Canonical version for the seven `v1` bundled plugins (SemVer 2).

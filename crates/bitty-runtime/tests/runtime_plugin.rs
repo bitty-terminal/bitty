@@ -303,13 +303,18 @@ fn dispatch_command_checks_ownership_and_grant() {
 }
 
 #[test]
-fn interception_veto_wins_and_fail_open() {
+fn interception_veto_wins_and_fail_closed_timeout() {
+    // CTX-0465: timed-out interceptors deny (fail closed), never proceed.
     assert!(!Runtime::intercept_command_dispatch(
         &[HostDecision::Approve, HostDecision::Veto],
         false
     ));
-    assert!(Runtime::intercept_command_dispatch(
+    assert!(!Runtime::intercept_command_dispatch(
         &[HostDecision::Approve, HostDecision::Veto],
+        true
+    ));
+    assert!(!Runtime::intercept_command_dispatch(
+        &[HostDecision::Approve],
         true
     ));
     assert!(Runtime::intercept_paste(&[HostDecision::Approve], false));

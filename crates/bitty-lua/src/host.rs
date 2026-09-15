@@ -49,6 +49,23 @@ pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
 /// Default host-call deadline in milliseconds (reuses `RC-1`).
 pub const DEFAULT_HOST_DEADLINE_MS: u64 = crate::RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Default `process.spawn` bridge deadline in milliseconds (`5 s`).
+///
+/// Cites the spawn timeout contract documented on
+/// [`HostServices::process_spawn`] (default 5 s, maximum 30 s, enforced by
+/// killing and reaping the child, CTX-0445): the bridge timeout path for
+/// spawn uses this deadline, not the 50 ms cheap-call deadline, so
+/// slow-but-successful spawns within contract are delivered while spawns past
+/// contract fail-closed with typed `E_TIMEOUT` and no result delivered.
+pub const SPAWN_TIMEOUT_MS: u64 = 5_000;
+
+/// Maximum `process.spawn` bridge deadline in milliseconds (`30 s`).
+///
+/// Upper bound for [`LuaVm::set_spawn_deadline_ms`]; mirrors the spawn
+/// contract maximum (CTX-0445). Larger values are refused fail-closed with
+/// [`VmError::Budget`](crate::VmError::Budget).
+pub const SPAWN_TIMEOUT_MAX_MS: u64 = 30_000;
+
 /// Maximum `process.spawn` argv entries accepted from Lua (bounded-list
 /// precedent; the host allowlist enforces a tighter per-tool count).
 pub const SPAWN_LUA_MAX_ARGS: usize = 64;
@@ -311,10 +328,15 @@ impl std::error::Error for BridgeError {}
 ///
 /// Every method is synchronous and non-blocking, except [`HostServices::process_spawn`].
 /// Implementors are expected to
-/// be cheap and bounded; the bridge deadline-checks each call and fails closed
-/// with `E_TIMEOUT`, and rejects re-entrant calls. `process.spawn` is exempt
-/// from the post-hoc deadline (see [`HostServices::process_spawn`]) but keeps
-/// the re-entrancy rejection. Capability gating is the
+/// be cheap and bounded; the bridge deadline-checks each call fail-closed
+/// with `E_TIMEOUT` (check-then-act inside the budget: the bridge checks its
+/// expiry before invoking, passes the expiry to mutating/spawn calls, and
+/// checks again after; mutating/spawn implementations must check the expiry
+/// before committing or delivering, so post-deadline effects never commit),
+/// and rejects re-entrant calls. `process.spawn` flows through the same
+/// bridge timeout path with its own spawn deadline
+/// ([`SPAWN_TIMEOUT_MS`]/[`SPAWN_TIMEOUT_MAX_MS`], default 5 s, maximum 30 s,
+/// CTX-0464) instead of the 50 ms cheap-call deadline. Capability gating is the
 /// caller's responsibility (it decides what `services` are reachable), but
 /// implementations should still fail closed.
 pub trait HostServices {
@@ -322,12 +344,46 @@ pub trait HostServices {
     fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError>;
     /// Atomically write a plugin-scoped store entry.
     fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError>;
+    /// Expiry-aware `store_set` for the pre-commit timeout path (CTX-0464).
+    ///
+    /// The bridge passes its call expiry (`start + deadline`); implementations
+    /// must check `Instant::now() > expiry` before committing and fail-closed
+    /// with [`BridgeError::timeout`] without mutating when expired, so
+    /// post-deadline effects never commit. The default checks expiry before
+    /// delegating to [`HostServices::store_set`] (fail-fast when already
+    /// expired; slow-during-call commits remain the delegate's responsibility
+    /// — real services are in-memory fast, tests override to prove no-commit).
+    fn store_set_with_expiry(
+        &self,
+        key: &str,
+        value: LuaValue,
+        expiry: Instant,
+    ) -> Result<(), BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.store_set(key, value)
+    }
     /// Read a typed setting; `Ok(None)` means absent.
     fn settings_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError>;
     /// Read a bounded committed terminal snapshot for `scope`.
     fn terminal_snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
     /// Hand a notification to the platform asynchronously; returns acceptance.
     fn notify_show(&self, payload: &LuaValue) -> Result<bool, BridgeError>;
+    /// Expiry-aware `notify_show` for the pre-commit timeout path (CTX-0464).
+    ///
+    /// Same contract as [`HostServices::store_set_with_expiry`]: check expiry
+    /// before enqueueing, fail-closed with timeout without side effects.
+    fn notify_show_with_expiry(
+        &self,
+        payload: &LuaValue,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.notify_show(payload)
+    }
     /// Spawn an allowlisted system CLI with `args` as its argv (no shell).
     ///
     /// The default implementation fails closed with `E_SPAWN_UNAVAILABLE`;
@@ -338,19 +394,42 @@ pub trait HostServices {
     /// `exit_code` (integer), and `untrusted` (always true): child bytes are
     /// untrusted observation data, never instructions.
     ///
-    /// Unlike every other host method this call is long-running and governed
-    /// by the spawn timeout contract (default 5 s, maximum 30 s, enforced by
-    /// killing and reaping the child), so the bridge keeps only the
-    /// re-entrancy guard and skips the post-hoc cheap-call deadline: a
-    /// slow-but-successful spawn is delivered instead of being stored and
-    /// then discarded as `E_TIMEOUT` (which would orphan a 64-slot registry
-    /// entry Lua can never reconcile).
+    /// CTX-0464: unlike every other host method this call is long-running and
+    /// governed by the spawn timeout contract (default 5 s, maximum 30 s,
+    /// enforced by killing and reaping the child), so the bridge enforces the
+    /// spawn deadline ([`SPAWN_TIMEOUT_MS`], configurable via
+    /// [`LuaVm::set_spawn_deadline_ms`](crate::LuaVm::set_spawn_deadline_ms))
+    /// through the same check-then-act timeout path instead of skipping the
+    /// deadline entirely: a slow-but-successful spawn within contract is
+    /// delivered, a spawn past contract fails-closed with `E_TIMEOUT` and no
+    /// result delivered. The old skip-timeout behavior orphaned no registry
+    /// slot here (the 64-slot registry lives host-side in the spawn service),
+    /// but hid unbounded waits outside any bridge budget.
     fn process_spawn(&self, _args: &[String]) -> Result<LuaValue, BridgeError> {
         Err(BridgeError::new(
             "runtime",
             "E_SPAWN_UNAVAILABLE",
             "host has no process.spawn surface",
         ))
+    }
+    /// Expiry-aware `process_spawn` for the spawn bridge timeout path
+    /// (CTX-0464).
+    ///
+    /// The bridge passes its spawn expiry (`start + spawn_deadline`);
+    /// implementations must check expiry after waiting and before delivering,
+    /// returning [`BridgeError::timeout`] without a result when expired. The
+    /// host remains responsible for killing and reaping the child on timeout.
+    /// The default checks expiry before delegating (fail-fast); slow backends
+    /// override to check after waiting (tests prove timeout honored).
+    fn process_spawn_with_expiry(
+        &self,
+        args: &[String],
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.process_spawn(args)
     }
     /// Current monotonic host time in milliseconds (for timer scheduling).
     fn now_millis(&self) -> u64 {
@@ -431,6 +510,7 @@ struct BridgeState {
     capture: Rc<RefCell<RegistrationCapture>>,
     limits: MarshallingLimits,
     deadline_ms: u64,
+    spawn_deadline_ms: Rc<Cell<u64>>,
     in_call: Rc<Cell<bool>>,
 }
 
@@ -457,35 +537,63 @@ impl BridgeState {
         Ok(CallGuard(self.in_call.clone()))
     }
 
-    fn bounded<T>(&self, f: impl FnOnce() -> Result<T, BridgeError>) -> Result<T, BridgeError> {
+    /// Check-then-act bridge guard for cheap host calls (CTX-0464 gap 3).
+    ///
+    /// Fail-closed with typed `E_TIMEOUT`: checks the call expiry before
+    /// invoking `f` (no side effects when already expired), passes the expiry
+    /// to `f` so mutating services can check before committing
+    /// (see `store_set_with_expiry`/`notify_show_with_expiry`), and checks
+    /// again after. The old applied-then-timeout ran `f` to completion then
+    /// discarded its committed side effects as `E_TIMEOUT`; the new path
+    /// guarantees post-deadline effects never commit when services honor the
+    /// expiry (tests prove it; real services are in-memory fast).
+    fn bounded<T>(
+        &self,
+        f: impl FnOnce(Instant) -> Result<T, BridgeError>,
+    ) -> Result<T, BridgeError> {
         let _guard = self.enter()?;
         let start = Instant::now();
-        let out = f()?;
-        if start.elapsed() > Duration::from_millis(self.deadline_ms) {
+        let expiry = start + Duration::from_millis(self.deadline_ms);
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let out = f(expiry)?;
+        if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
         Ok(out)
     }
 
-    /// Spawn-aware bridge guard: keeps the re-entrancy rejection but skips
-    /// the post-hoc cheap-call deadline.
+    /// Spawn bridge guard through the same timeout path with the spawn
+    /// deadline (CTX-0464 gap 4).
     ///
     /// `process.spawn` is a supervised long-running call with its own
     /// explicit timeout contract (default 5 s, maximum 30 s, enforced by
-    /// killing and reaping the child): applying the 50 ms cheap-call
-    /// deadline post-hoc would run the spawn to completion, store its
-    /// outcome in the bounded 64-slot execution registry, then discard the
-    /// delivered value as `E_TIMEOUT` — orphaning a registry slot Lua can
-    /// never reconcile (64 such orphans = self-DoS via `LimitExceeded`).
-    /// With this guard every stored spawn outcome is delivered to its
-    /// caller, so the registry bound covers delivered outcomes only and
-    /// stays fail-closed by design. The re-entrancy guard still applies.
+    /// killing and reaping the child, CTX-0445): the old guard kept only the
+    /// re-entrancy rejection with no timeout handle, hiding unbounded waits
+    /// outside any bridge budget. The new guard enforces the spawn deadline
+    /// (`SPAWN_TIMEOUT_MS` by default, configurable via
+    /// `LuaVm::set_spawn_deadline_ms`) check-then-act like [`Self::bounded`]:
+    /// slow-but-within-contract spawns are still delivered (the existing
+    /// `slow_spawn_is_delivered_not_timed_out` pin keeps passing), spawns past
+    /// contract fail-closed with `E_TIMEOUT` and no result delivered. The
+    /// re-entrancy guard still applies.
     fn bounded_spawn<T>(
         &self,
-        f: impl FnOnce() -> Result<T, BridgeError>,
+        f: impl FnOnce(Instant) -> Result<T, BridgeError>,
     ) -> Result<T, BridgeError> {
         let _guard = self.enter()?;
-        f()
+        let start = Instant::now();
+        let spawn_ms = self.spawn_deadline_ms.get();
+        let expiry = start + Duration::from_millis(spawn_ms);
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let out = f(expiry)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        Ok(out)
     }
 }
 
@@ -537,6 +645,7 @@ impl LuaVm {
             capture: self.capture.clone(),
             limits,
             deadline_ms,
+            spawn_deadline_ms: self.spawn_deadline_ms.clone(),
             in_call: self.in_bridge_call.clone(),
         });
 
@@ -586,7 +695,7 @@ impl LuaVm {
             ctx.stash(piccolo::Executor::start(ctx, func, piccolo::Variadic(argv)))
         });
 
-        match self.drive_stashed(stashed)? {
+        match self.drive_stashed(stashed, Instant::now())? {
             crate::DriveOutcome::Suspended { reason, .. } => Err(VmError::Suspended { reason }),
             crate::DriveOutcome::Failed { message } => Err(VmError::Load(message)),
             crate::DriveOutcome::Ready { stashed } => {
@@ -720,7 +829,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         }
                     };
                     let value = state
-                        .bounded(|| state.services.settings_get(&key))
+                        .bounded(|_expiry| state.services.settings_get(&key))
                         .map_err(|e| e.to_error(ctx))?;
                     match value {
                         Some(value) => stack.replace(ctx, value.to_lua(ctx)),
@@ -752,7 +861,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         }
                     };
                     let value = state
-                        .bounded(|| state.services.store_get(&key))
+                        .bounded(|_expiry| state.services.store_get(&key))
                         .map_err(|e| e.to_error(ctx))?;
                     match value {
                         Some(value) => stack.replace(ctx, value.to_lua(ctx)),
@@ -785,7 +894,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     state
-                        .bounded(|| state.services.store_set(&key, value))
+                        .bounded(|expiry| state.services.store_set_with_expiry(&key, value, expiry))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Boolean(true));
                     Ok(CallbackReturn::Return)
@@ -825,7 +934,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         }
                     };
                     let snapshot = state
-                        .bounded(|| state.services.terminal_snapshot(&scope))
+                        .bounded(|_expiry| state.services.terminal_snapshot(&scope))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, snapshot.to_lua(ctx));
                     Ok(CallbackReturn::Return)
@@ -846,7 +955,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(payload, state.limits).map_err(|e| e.to_error(ctx))?;
                     let accepted = state
-                        .bounded(|| state.services.notify_show(&value))
+                        .bounded(|expiry| state.services.notify_show_with_expiry(&value, expiry))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Boolean(accepted));
                     Ok(CallbackReturn::Return)
@@ -868,7 +977,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let args = spawn_argv(&value).map_err(|e| e.to_error(ctx))?;
                     let result = state
-                        .bounded_spawn(|| state.services.process_spawn(&args))
+                        .bounded_spawn(|expiry| {
+                            state.services.process_spawn_with_expiry(&args, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)

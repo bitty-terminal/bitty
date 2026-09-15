@@ -558,3 +558,201 @@ fn slow_spawn_is_delivered_not_timed_out() {
         Some(&LuaValue::Integer(0))
     );
 }
+
+// ── CTX-0464 sandbox gaps: pre-commit timeout + spawn bridge timeout ─────
+
+/// Slow mutating store: sleeps 30 ms on key `k`, fast otherwise.
+///
+/// Old `store_set` (pre-fix bridge path) sleeps then writes unconditionally,
+/// so a 1 ms deadline still commits `k` before returning `E_TIMEOUT`
+/// (applied-then-timeout). The new `store_set_with_expiry` sleeps then checks
+/// the bridge expiry before committing, so post-deadline effects never commit
+/// (check-then-act inside the budget).
+struct SlowStoreServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+}
+
+impl HostServices for SlowStoreServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if key == "k" {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn store_set_with_expiry(
+        &self,
+        key: &str,
+        value: LuaValue,
+        expiry: std::time::Instant,
+    ) -> Result<(), BridgeError> {
+        if key == "k" {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        if std::time::Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+}
+
+#[test]
+fn post_deadline_effects_never_commit() {
+    // CTX-0464 gap 3: bounded() ran f() to completion then checked the
+    // deadline, so slow store_set committed `k` even when returning
+    // E_TIMEOUT. After the fix the bridge passes its expiry to the service
+    // and the service checks before committing, so `k` is absent while the
+    // typed timeout is still delivered via the fast `code` write.
+    let services = Rc::new(SlowStoreServices {
+        store: RefCell::new(BTreeMap::new()),
+    });
+    let mut vm = LuaVm::new("pre-commit");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.store.set, "k", "v")
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_TIMEOUT".to_string())),
+        "slow write must report typed timeout"
+    );
+    assert!(
+        services.store.borrow().get("k").is_none(),
+        "post-deadline write must never commit"
+    );
+}
+
+/// Slow spawn with expiry-aware backend for the spawn bridge timeout path.
+struct TimeoutSpawnServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+    delay_ms: u64,
+}
+
+impl HostServices for TimeoutSpawnServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+
+    fn process_spawn(&self, _args: &[String]) -> Result<LuaValue, BridgeError> {
+        std::thread::sleep(Duration::from_millis(self.delay_ms));
+        Ok(LuaValue::table([
+            ("output", LuaValue::String("slow-ok".to_string())),
+            ("stderr", LuaValue::String(String::new())),
+            ("truncated", LuaValue::Bool(false)),
+            ("exit_code", LuaValue::Integer(0)),
+            ("untrusted", LuaValue::Bool(true)),
+        ]))
+    }
+
+    fn process_spawn_with_expiry(
+        &self,
+        _args: &[String],
+        expiry: std::time::Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        std::thread::sleep(Duration::from_millis(self.delay_ms));
+        if std::time::Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        Ok(LuaValue::table([
+            ("output", LuaValue::String("slow-ok".to_string())),
+            ("stderr", LuaValue::String(String::new())),
+            ("truncated", LuaValue::Bool(false)),
+            ("exit_code", LuaValue::Integer(0)),
+            ("untrusted", LuaValue::Bool(true)),
+        ]))
+    }
+}
+
+#[test]
+fn spawn_timeout_honored() {
+    // CTX-0464 gap 4: bounded_spawn kept only the re-entrancy guard with no
+    // bridge timeout handle, so slow spawns never timed out. After the fix
+    // spawn flows through the bridge timeout path with its own deadline
+    // (default 5 s, configurable down to 1 ms for tests): a 50 ms spawn with
+    // a 10 ms spawn deadline must fail-closed with typed E_TIMEOUT and no
+    // result delivered.
+    let services = Rc::new(TimeoutSpawnServices {
+        store: RefCell::new(BTreeMap::new()),
+        delay_ms: 50,
+    });
+    let mut vm = LuaVm::new("spawn-timeout");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
+        .expect("install");
+    vm.set_spawn_deadline_ms(10).expect("spawn deadline");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, res = pcall(bitty.process.spawn, { "status" })
+            if ok then
+                bitty.store.set("output", res.output)
+            else
+                bitty.store.set("code", res.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_TIMEOUT".to_string())),
+        "slow spawn past its deadline must report typed timeout"
+    );
+    assert!(
+        services.store.borrow().get("output").is_none(),
+        "timed-out spawn result must never be delivered"
+    );
+}

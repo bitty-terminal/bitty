@@ -193,6 +193,14 @@ impl ConfigPlan {
         if let Some(s) = &self.selection {
             s.validate()?;
         }
+        if let Some(c) = &self.close_confirm {
+            c.validate()
+                .map_err(|e| ConfigError::validation("close_confirm", e.to_string()))?;
+        }
+        if let Some(m) = &self.mod_key {
+            m.validate()
+                .map_err(|e| ConfigError::validation("mod_key", e.to_string()))?;
+        }
         if let Some(l) = &self.layout {
             l.validate()?;
         }

@@ -21,10 +21,22 @@
 //! - **Fit modes**: [`BackgroundFit`] `fill`/`fit`/`center`/`tile`/`stretch`
 //!   geometry is pure and pixel-exact ([`fit_plan`], [`rasterize_background`]).
 //! - **Caching**: [`BackgroundStore`] keys decoded images by canonical path
-//!   plus content identity (length + mtime) and holds BG-4/BG-5; the
-//!   [`BackgroundRasterCache`] holds scaled blits under the BG-7 byte cap.
-//!   Pinned (currently displayed) images are never evicted for an
-//!   unpinned admission.
+//!   plus the identity of the bytes actually read and decoded on one pinned
+//!   file descriptor (exact length, post-read mtime, and a best-effort
+//!   content hash) and holds BG-4/BG-5; the [`BackgroundRasterCache`] holds
+//!   scaled blits under the BG-7 byte cap. Pinned (currently displayed)
+//!   images are never evicted for an unpinned admission.
+//!
+//! The cache key is atomic with the decoded bytes by construction: a rewrite
+//! that preserves `(length, mtime)` but changes the bytes re-decodes under a
+//! fresh key instead of serving the stale entry, and a file that changes
+//! mid-read fails closed instead of caching. (Residual: the content hash is
+//! FNV-1a/64, a non-cryptographic identity aid; a deliberate collision
+//! crafted with filesystem-write plus mtime control is theoretical but not
+//! ruled out. A symlink swapped between trust validation and `open`, or a
+//! FIFO swapped in to block the open, is likewise outside this layer's
+//! fd-pinned read; the post-open regular-file guard narrows but does not
+//! close those path-level races.)
 //!
 //! The module performs no decode at module scope and no I/O except inside
 //! [`BackgroundStore::load`], which the runtime calls off the present path.
@@ -817,24 +829,45 @@ impl BackgroundImage {
 }
 
 /// Cache identity for one approved background file.
+///
+/// The identity is derived from the bytes actually read and decoded on a
+/// single pinned file descriptor (see [`BackgroundStore::load`]), never from
+/// a path-level `metadata` taken before the read: `len` is the exact number
+/// of bytes decoded, `modified` is the post-read `fstat` of the same
+/// descriptor, and `content_hash` is a best-effort content fingerprint of
+/// those bytes. A rewrite that preserves `(len, modified)` but changes the
+/// bytes therefore re-decodes under a fresh key instead of serving the stale
+/// entry (CTX-0467 key-poison hardening). The hash is FNV-1a/64 over the
+/// (BG-1-bounded) buffer: std-only, no new dependencies. It is a
+/// defense-in-depth identity aid, not a cryptographic digest; a deliberate
+/// 64-bit collision crafted alongside filesystem-write and mtime control
+/// remains a theoretical residual (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackgroundKey {
     /// Canonical absolute path (symlinks resolved).
     pub canonical: PathBuf,
-    /// File length in bytes at resolution time.
+    /// Exact length in bytes of the buffer that was decoded.
     pub len: u64,
-    /// File modification time at resolution time (`None` when unavailable).
+    /// File modification time from the post-read `fstat` of the same fd.
     pub modified: Option<SystemTime>,
+    /// FNV-1a/64 over the exact bytes that were decoded.
+    pub content_hash: u64,
 }
 
-impl BackgroundKey {
-    fn from_metadata(canonical: PathBuf, meta: &std::fs::Metadata) -> Self {
-        Self {
-            canonical,
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        }
+/// Best-effort content fingerprint for [`BackgroundKey`].
+///
+/// FNV-1a over 64 bits, computed inline so the crate gains no new
+/// dependency. The input is already bounded by BG-1, so the pass is linear
+/// in at most 4MiB plus one byte.
+fn content_hash(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
+    hash
 }
 
 /// Decoded-image store: deny-by-default roots, BG-1..BG-3 enforced at load,
@@ -925,14 +958,20 @@ impl BackgroundStore {
     /// identity), returning the cache key to pass to [`Self::get`].
     ///
     /// The full accepted pipeline runs in order: path syntax, canonicalize +
-    /// approved-root + regular-file trust, encoded length BG-1, header sniff,
-    /// BG-2 dimensions, checked BG-3 estimate, format/animation check, then
-    /// decode and BG-4/BG-5/BG-6 admission. Any failure leaves the store
+    /// approved-root + regular-file trust, single-`open` fd-pinned read with
+    /// BG-1 enforced on the actual bytes, post-read `fstat` re-verification,
+    /// header sniff, BG-2 dimensions, checked BG-3 estimate, format/animation
+    /// check, then decode and BG-4/BG-5/BG-6 admission. The cache key is
+    /// derived from the bytes actually decoded (length, post-read mtime, and
+    /// content hash), so a file swapped between trust and use can never lodge
+    /// foreign bytes under a stale key. Any failure leaves the store
     /// unchanged.
     ///
     /// # Errors
     ///
     /// [`BackgroundError`] naming the failed trust check, bound, or format.
+    /// A file whose length or mtime changes mid-read fails closed with
+    /// [`BackgroundError::Io`] rather than caching undecided bytes.
     pub fn load(
         &mut self,
         raw: &str,
@@ -940,33 +979,66 @@ impl BackgroundStore {
     ) -> Result<BackgroundKey, BackgroundError> {
         let expanded = expand_background_path(raw, home)?;
         let canonical = validate_resource_path(&expanded, &self.policy)?;
-        let meta = std::fs::metadata(&canonical).map_err(|err| BackgroundError::Io {
+        // Single-open, fd-pinned acquisition (CTX-0467): no path-level
+        // `metadata` runs before the open, so there is no check-to-use window
+        // between a first stat and a later re-open. Every observation below
+        // comes from this one descriptor.
+        let file = std::fs::File::open(&canonical).map_err(|err| BackgroundError::Io {
             path: canonical.display().to_string(),
             detail: err.to_string(),
         })?;
-        if meta.len() > BG_MAX_ENCODED_BYTES as u64 {
+        let pre = file.metadata().map_err(|err| BackgroundError::Io {
+            path: canonical.display().to_string(),
+            detail: err.to_string(),
+        })?;
+        if !pre.is_file() {
+            return Err(BackgroundError::Resource(ResourceError::NotRegularFile {
+                path: canonical.display().to_string(),
+            }));
+        }
+        if pre.len() > BG_MAX_ENCODED_BYTES as u64 {
             return Err(BackgroundError::EncodedTooLarge {
-                actual: usize::try_from(meta.len()).unwrap_or(usize::MAX),
+                actual: usize::try_from(pre.len()).unwrap_or(usize::MAX),
                 cap: BG_MAX_ENCODED_BYTES,
             });
         }
-        let key = BackgroundKey::from_metadata(canonical, &meta);
+        let bytes = Self::read_file(&file, &canonical)?;
+        // Re-verify on the same descriptor: any length or mtime delta across
+        // the read means the bytes are undecided, so fail closed instead of
+        // deriving an identity from them.
+        let post = file.metadata().map_err(|err| BackgroundError::Io {
+            path: canonical.display().to_string(),
+            detail: err.to_string(),
+        })?;
+        if post.len() != pre.len() || post.modified().ok() != pre.modified().ok() {
+            return Err(BackgroundError::Io {
+                path: canonical.display().to_string(),
+                detail: "background image changed during read; refusing cached identity"
+                    .to_string(),
+            });
+        }
+        // Identity is atomic with the decoded bytes: length and hash come
+        // from the buffer itself, mtime from the post-read `fstat` above.
+        let key = BackgroundKey {
+            canonical,
+            len: bytes.len() as u64,
+            modified: post.modified().ok(),
+            content_hash: content_hash(&bytes),
+        };
         if self.get(&key).is_some() {
             return Ok(key);
         }
-        let bytes = self.read_file(&key.canonical)?;
         let image = decode_background(&bytes)?;
         self.admit(key.clone(), image)?;
         self.loads = self.loads.saturating_add(1);
         Ok(key)
     }
 
-    fn read_file(&self, canonical: &Path) -> Result<Vec<u8>, BackgroundError> {
+    /// Reads at most BG-1 plus one probe byte from an already-open pinned
+    /// descriptor. The cap is enforced on the actual bytes, so allocation is
+    /// bounded even when the pre-read length was stale.
+    fn read_file(file: &std::fs::File, canonical: &Path) -> Result<Vec<u8>, BackgroundError> {
         use std::io::Read;
-        let file = std::fs::File::open(canonical).map_err(|err| BackgroundError::Io {
-            path: canonical.display().to_string(),
-            detail: err.to_string(),
-        })?;
         let mut buf = Vec::new();
         file.take(BG_MAX_ENCODED_BYTES as u64 + 1)
             .read_to_end(&mut buf)
@@ -1394,16 +1466,20 @@ pub struct BackgroundRasterKey {
     pub dpi_bits: u64,
 }
 
-/// Identity-only projection of [`BackgroundKey`] (path, length, mtime) for
-/// use as a hashable raster-cache source key.
+/// Identity-only projection of [`BackgroundKey`] (path, length, mtime, content
+/// hash) for use as a hashable raster-cache source key. The hash rides along
+/// so an mtime-spoofed rewrite that re-keys the image store cannot reuse a
+/// stale scaled blit either.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackgroundRasterKeySource {
     /// Canonical absolute path.
     pub canonical: PathBuf,
-    /// File length at resolution time.
+    /// Exact length of the decoded buffer.
     pub len: u64,
-    /// Modification time at resolution time.
+    /// Modification time from the post-read `fstat`.
     pub modified: Option<SystemTime>,
+    /// FNV-1a/64 over the exact bytes that were decoded.
+    pub content_hash: u64,
 }
 
 impl From<&BackgroundKey> for BackgroundRasterKeySource {
@@ -1412,6 +1488,7 @@ impl From<&BackgroundKey> for BackgroundRasterKeySource {
             canonical: value.canonical.clone(),
             len: value.len,
             modified: value.modified,
+            content_hash: value.content_hash,
         }
     }
 }
@@ -2245,6 +2322,7 @@ mod tests {
                 canonical: PathBuf::from("/approved/bg.png"),
                 len: 10,
                 modified: None,
+                content_hash: 0,
             },
             fit: BackgroundFit::Fill,
             dest,
@@ -2271,5 +2349,66 @@ mod tests {
         let key_b = store.load(b.to_str().expect("utf8"), None).expect("b");
         assert!(store.get(&key_a).is_some(), "pinned image stays resident");
         assert!(store.get(&key_b).is_some());
+    }
+
+    #[test]
+    fn key_poison_same_len_mtime_serves_fresh_bytes() {
+        // Hostile probe (CTX-0467/06): a file rewritten with different bytes
+        // that keeps the cached (length, mtime) identity must NOT serve the
+        // stale image. The cache key must be atomic with the decoded bytes.
+        let root = temp_root("poison");
+        let path = root.join("wall.png");
+        // Find two solid colors with identical encoded lengths so the rewrite
+        // preserves the length half of the identity.
+        let palette = [
+            [9u8, 8, 7, 0xFF],
+            [1, 1, 1, 0xFF],
+            [0xAA, 0xBB, 0xCC, 0xFF],
+            [0, 0, 0, 0xFF],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x11, 0x22, 0x33, 0xFF],
+        ];
+        let mut pair = None;
+        'search: for (index, first) in palette.iter().enumerate() {
+            for second in palette.iter().skip(index + 1) {
+                let encoded_a = encode_png(4, 4, *first);
+                let encoded_b = encode_png(4, 4, *second);
+                if encoded_a.len() == encoded_b.len() && encoded_a != encoded_b {
+                    pair = Some((encoded_a, encoded_b));
+                    break 'search;
+                }
+            }
+        }
+        let (bytes_a, bytes_b) = pair.expect("equal-length color pair");
+        std::fs::write(&path, &bytes_a).expect("write A");
+        let mut store = BackgroundStore::new(policy_for(&root));
+        let raw = path.to_str().expect("utf8");
+        let key_a = store.load(raw, None).expect("first load");
+        assert_eq!(store.loads(), 1);
+        let mtime_a = std::fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        // Attacker rewrites the content but restores the mtime, keeping the
+        // (length, mtime) identity while the bytes change.
+        std::fs::write(&path, &bytes_b).expect("write B");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen")
+            .set_modified(mtime_a)
+            .expect("restore mtime");
+        let key_b = store
+            .load(raw, None)
+            .expect("second load decodes fresh bytes");
+        assert_ne!(
+            key_b, key_a,
+            "poisoned identity must not hit the stale entry"
+        );
+        assert_eq!(store.loads(), 2, "fresh bytes must re-decode");
+        let image = store.get(&key_b).expect("fresh image resident");
+        let expected = decode_background(&bytes_b).expect("reference decode");
+        assert_eq!(image.dimensions(), (4, 4));
+        assert_eq!(image.rgba(), expected.rgba());
     }
 }

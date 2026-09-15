@@ -71,7 +71,7 @@
 //! - **Event routing:** `register_plugin` validates and registers a manifest via
 //!   `declare → resolve → register`; subscriptions and publishing go through the
 //!   host's [`bitty_plugin_host::EventPipeline`]. Interception handlers are synchronous,
-//!   veto-wins, fail-open, and remain cold-path only (the four v1 points
+//!   veto-wins, fail-closed on timeout (CTX-0465), and remain cold-path only (the four v1 points
 //!   `intercept.command-dispatch/terminal-spawn/paste/open-url`).
 //! - **Grant stubs:** `is_capability_granted`, `insert_grant`, `revoke_grant`, and
 //!   `dispatch_command` (grant-checked) are headless stubs with no file I/O; they
@@ -240,6 +240,53 @@ pub type PtyWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 /// still bounded, fail-closed, and backpressured end to end.
 pub const PTY_FORWARD_CAPACITY_CHUNKS: usize = bitty_pty::CHANNEL_CAPACITY_CHUNKS;
 
+/// Bounded join wait for PTY forwarder threads on teardown paths (CTX-0472).
+///
+/// Forwarder threads block in `PtyReader::recv` until the pump reaches EOF
+/// (child exit / `Pty` drop) or the forwarding consumer is dropped. Teardown
+/// must never hang the owner on a wedged child: joins wait at most this
+/// long, then detach and report the leak via the `bool` return. generous
+/// for prompt EOF (local PTY teardown is sub-millisecond) while bounding
+/// worst-case `Drop` latency.
+pub const FORWARDER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll interval while waiting for a forwarder thread to finish (CTX-0472).
+///
+/// Keeps timeout joins responsive without spinning: the join loop parks
+/// briefly between `is_finished` polls.
+const FORWARDER_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Joins a PTY forwarder thread with a bounded wait (CTX-0472).
+///
+/// Polls `is_finished` until `timeout` elapses, then joins when finished.
+/// Returns `true` when the thread was joined, `false` on timeout (the
+/// handle is dropped detached; the thread still owns its `PtyReader` and
+/// exits on EOF/disconnect without touching `Runtime` state). Never blocks
+/// beyond `timeout` plus one poll slice. Pure move helper shared by the
+/// primary and per-pane teardown paths.
+pub(super) fn join_forwarder_with_timeout(
+    handle: std::thread::JoinHandle<()>,
+    timeout: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    // Fast path: already finished (common on EOF-driven teardown).
+    if handle.is_finished() {
+        let _ = handle.join();
+        return true;
+    }
+    while start.elapsed() < timeout {
+        std::thread::sleep(FORWARDER_JOIN_POLL);
+        if handle.is_finished() {
+            let _ = handle.join();
+            return true;
+        }
+    }
+    // Timeout: detach rather than hang teardown. The thread exits on
+    // EOF/disconnect; its waker clone may fire once post-detach, so wakers
+    // must stay idempotent and Runtime-independent (see `PtyWaker` docs).
+    false
+}
+
 /// Full compact banner visible duration (CTX-0192).
 ///
 /// A gated paste shows the compact one-line summary for this long, then
@@ -275,7 +322,8 @@ pub struct Runtime {
     /// Wakeup-pump forwarding receiver (active after [`Runtime::set_pty_waker`]
     /// promotes the direct reader). Bounded [`PTY_FORWARD_CAPACITY_CHUNKS`].
     pty_forward_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    /// Forwarder thread handle (detached on respawn; exits on EOF/disconnect).
+    /// Forwarder thread handle (joined with [`FORWARDER_JOIN_TIMEOUT`] on
+    /// respawn/shutdown/drop; detached only on join timeout).
     pty_forward_handle: Option<std::thread::JoinHandle<()>>,
     /// Readability callback moved (cloned) into the forwarder on promotion.
     pty_waker: Option<PtyWaker>,
@@ -694,7 +742,78 @@ impl std::fmt::Debug for Runtime {
     }
 }
 
+impl Drop for Runtime {
+    /// Bounded teardown (CTX-0472): clears the waker so no post-destroy wake
+    /// can observe torn-down state, drops forwarding receivers so blocked
+    /// `send`s fail fast, drops owned `Pty`s so pumps reach EOF, then joins
+    /// forwarder threads with [`FORWARDER_JOIN_TIMEOUT`].
+    ///
+    /// Never panics and never hangs beyond the join timeout plus one poll
+    /// slice per thread. A timed-out thread is detached (still owns its
+    /// `PtyReader`, exits on EOF/disconnect); wakers must remain idempotent
+    /// and Runtime-independent for that one post-detach wake.
+    fn drop(&mut self) {
+        self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT);
+    }
+}
+
 impl Runtime {
+    /// Bounded teardown of PTY forwarder threads (CTX-0472).
+    ///
+    /// Clears the waker, drops forwarding receivers, drops owned `Pty`s
+    /// (killing + reaping children so pumps reach EOF), then joins each
+    /// forwarder with [`FORWARDER_JOIN_TIMEOUT`]. Returns `true` when every
+    /// owned forwarder was joined, `false` when at least one timed out and
+    /// was detached. Never panics, never blocks beyond the timeout.
+    pub fn shutdown(&mut self) -> bool {
+        self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT)
+    }
+
+    /// Teardown with an explicit join bound (CTX-0472).
+    ///
+    /// Same contract as [`shutdown`](Self::shutdown) with a caller-supplied
+    /// `timeout` for tests and embedders with tighter/looser budgets.
+    /// A zero timeout still drops the waker/receivers/`Pty`s promptly and
+    /// joins only already-finished threads.
+    pub fn shutdown_with_timeout(&mut self, timeout: std::time::Duration) -> bool {
+        // Clear first: no new promotes, no post-destroy wakes from retained
+        // state. In-flight forwarders hold their own waker clone and may
+        // fire once on EOF; that clone is Runtime-independent by contract.
+        self.pty_waker = None;
+        // Drop receivers so a forwarder blocked in `send` fails fast instead
+        // of holding the pump backpressure chain open.
+        self.pty_forward_rx = None;
+        for sess in self.pane_sessions.values_mut() {
+            sess.forward_rx = None;
+        }
+        // Take forwarder handles before dropping PTYs so timeout joins own
+        // them. Handles are joined after the PTY drops below unblock pumps.
+        let primary_handle = self.pty_forward_handle.take();
+        let mut pane_handles = Vec::new();
+        for sess in self.pane_sessions.values_mut() {
+            if let Some(handle) = sess.forward_handle.take() {
+                pane_handles.push(handle);
+            }
+        }
+        // Drop owned PTYs to unblock pumps (EOF), which unblocks forwarders
+        // parked in `recv`. Primary first, then panes (clearing drops every
+        // pane `Pty`, killing + reaping pane children). Post-shutdown
+        // `pane_count` reads 0, matching primary `has_pty() == false`.
+        drop(self.pty.take());
+        self.pane_sessions.clear();
+        let mut joined_all = true;
+        if let Some(handle) = primary_handle {
+            if !join_forwarder_with_timeout(handle, timeout) {
+                joined_all = false;
+            }
+        }
+        for handle in pane_handles {
+            if !join_forwarder_with_timeout(handle, timeout) {
+                joined_all = false;
+            }
+        }
+        joined_all
+    }
     /// Creates a runtime from `config`, validating the config eagerly and
     /// building the headless software surface and deterministic renderer.
     ///

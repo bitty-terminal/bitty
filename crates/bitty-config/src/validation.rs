@@ -106,6 +106,21 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(e);
         }
     }
+    if let Some(v) = &plan.selection {
+        if let Err(e) = v.validate() {
+            out.push(e);
+        }
+    }
+    if let Some(v) = &plan.close_confirm {
+        if let Err(e) = v.validate() {
+            out.push(ConfigError::validation("close_confirm", e.to_string()));
+        }
+    }
+    if let Some(v) = &plan.mod_key {
+        if let Err(e) = v.validate() {
+            out.push(ConfigError::validation("mod_key", e.to_string()));
+        }
+    }
     if let Some(v) = &plan.layout {
         if let Err(e) = v.validate() {
             out.push(e);
@@ -156,6 +171,13 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
                 if let Err(e) = p.validate() {
                     out.push(e);
                 }
+            }
+        }
+    }
+    if let Some(entries) = &plan.views {
+        for entry in entries {
+            if let Err(e) = entry.validate() {
+                out.push(e);
             }
         }
     }
@@ -221,6 +243,51 @@ mod tests {
         let diags = collect_diagnostics(&plan);
         // at least 3 errors: undeclared, font family empty, window opacity oob
         assert!(diags.len() >= 3);
+    }
+
+    #[test]
+    fn collect_diagnostics_covers_views_hostile() {
+        // CTX-0479: an out-of-range `views` entry must surface in the
+        // batch (previously never collected).
+        use crate::types::{ViewAppearanceOverride, ViewOverride, ViewSelector};
+        let plan = ConfigPlan {
+            views: Some(vec![ViewOverride {
+                selector: ViewSelector::Wildcard,
+                overrides: ViewAppearanceOverride {
+                    border_width: Some(crate::types::MAX_DECORATION_BORDER_WIDTH_PX + 1),
+                    ..Default::default()
+                },
+            }]),
+            ..Default::default()
+        };
+        let diags = collect_diagnostics(&plan);
+        assert!(
+            diags
+                .iter()
+                .any(|e| e.to_string().contains("views") || format!("{e:?}").contains("views")),
+            "views error must be collected, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn collect_diagnostics_covers_selection_close_confirm_mod_key() {
+        // CTX-0479: selection/close_confirm/mod_key must be visited (they
+        // are total today, so a valid batch stays empty rather than
+        // silently skipping the fields).
+        use crate::keymap::ModKey;
+        use crate::types::{CloseConfirm, SelectionConfig};
+        let plan = ConfigPlan {
+            selection: Some(SelectionConfig { auto_copy: true }),
+            close_confirm: Some(CloseConfirm::Never),
+            mod_key: Some(ModKey::Super),
+            ..Default::default()
+        };
+        let diags = collect_diagnostics(&plan);
+        assert!(
+            diags.is_empty(),
+            "total fields must validate clean: {diags:?}"
+        );
+        plan.validate().expect("plan covers the same fields");
     }
 
     #[test]

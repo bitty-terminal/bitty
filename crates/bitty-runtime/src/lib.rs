@@ -122,8 +122,8 @@
 //!   batching, and coalescing” for the authoritative trade-off statement.
 //! - The four v1 interception points (`intercept.command-dispatch`,
 //!   `intercept.terminal-spawn`, `intercept.paste`, `intercept.open-url`) are
-//!   synchronous, veto-wins, fail-open, and cold-path only. Reentrancy is
-//!   rejected, timeouts are treated as abstention, and the isolation and
+//!   synchronous, veto-wins, fail-closed on timeout (CTX-0465), and cold-path
+//!   only. Reentrancy is rejected, timeouts deny, and the isolation and
 //!   budget mechanisms are governed by the accepted `OQ-014` Isolation
 //!   Resource RFC (three-level queue budgets, `RC-1`/`RC-2`, failure
 //!   semantics); remaining numeric timeouts in this crate use

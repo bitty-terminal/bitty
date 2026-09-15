@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::error::PackageError;
-use crate::integrity::{is_valid_hex_digest, validate_hex_digest};
+use crate::integrity::validate_hex_digest;
 use crate::manifest::PackageId;
 
 // ── trust mode ───────────────────────────────────────────────────────────
@@ -154,11 +154,17 @@ impl TrustStore {
 // ── signature verification (V-C) ─────────────────────────────────────────
 
 /// Publisher signature over manifest + artifact digests.
+///
+/// Reserved wire shape for the future V-C scheme (OQ-029 key-directory
+/// design): `signature_hex` holds a 64-byte signature as 128 hex chars
+/// (Ed25519-sized). No signature scheme is implemented yet (bitty#743), so
+/// [`verify_signature`] rejects every record fail-closed; this type only
+/// carries and bounds untrusted input until the scheme lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureRecord {
     /// Key id that supposedly signed this release.
     pub key_id: String,
-    /// Signature bytes as 128-hex (64-byte stub signature).
+    /// Signature bytes as 128 hex (reserved 64-byte signature, Ed25519-sized).
     pub signature_hex: String,
     /// Manifest digest that was signed.
     pub manifest_digest: String,
@@ -181,12 +187,13 @@ impl SignatureRecord {
                 actual: self.key_id.len(),
             });
         }
-        // Stub signature: 128 hex chars (64 bytes). In real impl this may vary by algorithm.
+        // Reserved 64-byte signature shape (128 hex chars). No scheme verifies
+        // it yet; the bound only keeps untrusted input well-formed.
         if self.signature_hex.len() != 128
             || !self.signature_hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(PackageError::signature(
-                "signature must be 128 hex chars (stub 64-byte signature)",
+                "signature must be 128 hex chars (reserved 64-byte signature)",
             ));
         }
         validate_hex_digest(&self.manifest_digest, "signature.manifest_digest")?;
@@ -196,6 +203,11 @@ impl SignatureRecord {
 }
 
 /// Authenticated key record.
+///
+/// Reserved wire shape for the future V-C scheme (OQ-029 key-directory
+/// design): `public_key_hex` holds a 32-byte public key as 64 hex chars
+/// (Ed25519-sized). The store still tracks enrollment and revocation state,
+/// but nothing verifies against it until the scheme lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRecord {
     /// Key id.
@@ -218,7 +230,7 @@ impl KeyRecord {
             || !self.public_key_hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(PackageError::signature(
-                "public_key_hex must be 64 hex chars (stub 32-byte key)",
+                "public_key_hex must be 64 hex chars (reserved 32-byte public key)",
             ));
         }
         Ok(())
@@ -272,100 +284,34 @@ impl KeyStore {
 
 /// Verify a signature record against a key store and expected digests.
 ///
-/// Fail-closed (PL-AC-004): unsigned artifact, signature over different bytes,
-/// unknown key, or revoked key are all rejected before staging and never reach
-/// the store. The signature is checked as binding both digests; mismatched
-/// digests mean the signature was over different bytes.
+/// Fail-closed (PL-AC-004, bitty#743 / CTX-0462): V-C signature verification
+/// is currently UNAVAILABLE — no signature scheme is implemented, so every
+/// record is rejected and `TrustMode::Signed` installs cannot proceed.
 ///
-/// Stub verification: `signature_hex` must equal `sha256_hex(key_id + manifest_digest + artifact_digest)`
-/// truncated/extended to 128 hex (first 64 bytes of SHA-256 hex duplicated). This is
-/// deterministic and testable without real crypto, but demonstrates the fail-closed property:
-/// only a signature produced over exactly those bytes with the correct key verifies.
+/// Background: the previous implementation accepted
+/// `SHA-256(key_id || manifest_digest || artifact_digest)` as a signature.
+/// That value is computable by anyone holding the public `key_id`, so it
+/// proved nothing about the publisher and any attacker could forge it. The
+/// forgeable check and its mint helper are removed entirely; this function
+/// refuses to verify rather than accepting a forgeable record.
+///
+/// Reserved format for the follow-up real scheme (OQ-029 key-directory
+/// design): Ed25519-shaped fields — 32-byte public keys (`public_key_hex`,
+/// 64 hex) and 64-byte signatures (`signature_hex`, 128 hex). Malformed
+/// input is rejected with a format error; well-formed input is rejected as
+/// unverifiable until the scheme lands. Both paths fail closed.
 pub fn verify_signature(
     sig: &SignatureRecord,
-    keys: &KeyStore,
-    expected_manifest_digest: &str,
-    expected_artifact_digest: &str,
+    _keys: &KeyStore,
+    _expected_manifest_digest: &str,
+    _expected_artifact_digest: &str,
 ) -> Result<(), PackageError> {
+    // Malformed input stays rejected with a format error (fail-closed).
     sig.validate()?;
 
-    // Check that the signature was over the expected digests (no different-bytes pass).
-    if !sig
-        .manifest_digest
-        .eq_ignore_ascii_case(expected_manifest_digest)
-    {
-        return Err(PackageError::signature(format!(
-            "signature manifest digest {} does not match expected {}",
-            sig.manifest_digest, expected_manifest_digest
-        )));
-    }
-    if !sig
-        .artifact_digest
-        .eq_ignore_ascii_case(expected_artifact_digest)
-    {
-        return Err(PackageError::signature(format!(
-            "signature artifact digest {} does not match expected {}",
-            sig.artifact_digest, expected_artifact_digest
-        )));
-    }
-
-    // Unknown key.
-    let key = keys
-        .get(&sig.key_id)
-        .ok_or_else(|| PackageError::signature(format!("unknown signing key '{}'", sig.key_id)))?;
-
-    // Revoked key.
-    if key.revoked {
-        return Err(PackageError::signature(format!(
-            "signing key '{}' is revoked",
-            sig.key_id
-        )));
-    }
-
-    // Digest format checks (already validated).
-    if !is_valid_hex_digest(expected_manifest_digest)
-        || !is_valid_hex_digest(expected_artifact_digest)
-    {
-        return Err(PackageError::signature(
-            "expected digests must be valid 64-hex",
-        ));
-    }
-
-    // Stub deterministic check: signature must be SHA-256(key_id || manifest || artifact) hex doubled.
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(sig.key_id.as_bytes());
-    preimage.extend_from_slice(expected_manifest_digest.as_bytes());
-    preimage.extend_from_slice(expected_artifact_digest.as_bytes());
-    let base = crate::integrity::sha256_hex(&preimage);
-    // Extend to 128 hex by repeating base twice and truncating to 128.
-    let mut expected_sig = base.clone();
-    expected_sig.push_str(&base);
-    expected_sig.truncate(128);
-    if !sig.signature_hex.eq_ignore_ascii_case(&expected_sig) {
-        return Err(PackageError::signature(
-            "signature verification failed: signature does not match key and digests",
-        ));
-    }
-
-    Ok(())
-}
-
-/// Produce a stub signature for testing (not a real cryptographic signature).
-///
-/// Callers that need a valid signature for a trusted key should use this
-/// helper; it computes the same deterministic value that `verify_signature`
-/// expects, so tests can mint “validly signed” artifacts.
-#[must_use]
-pub fn stub_sign(key_id: &str, manifest_digest: &str, artifact_digest: &str) -> String {
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(key_id.as_bytes());
-    preimage.extend_from_slice(manifest_digest.as_bytes());
-    preimage.extend_from_slice(artifact_digest.as_bytes());
-    let base = crate::integrity::sha256_hex(&preimage);
-    let mut sig = base.clone();
-    sig.push_str(&base);
-    sig.truncate(128);
-    sig
+    Err(PackageError::signature(
+        "V-C signature verification is unavailable: no signature scheme is implemented (bitty#743); refusing to verify rather than accepting a forgeable record",
+    ))
 }
 
 #[cfg(test)]
@@ -432,8 +378,21 @@ mod tests {
         assert!(store.check(&pid("xuepoo.a"), "new").is_ok());
     }
 
+    // Well-formed record over the expected digests with a trusted key is
+    // still rejected: no scheme is implemented, so nothing may verify
+    // (bitty#743 / CTX-0462). The error must say verification is unavailable,
+    // not that the record was malformed.
+    fn well_formed_sig(key_id: &str, m: &str, a: &str) -> SignatureRecord {
+        SignatureRecord {
+            key_id: key_id.to_string(),
+            signature_hex: "d".repeat(128),
+            manifest_digest: m.to_string(),
+            artifact_digest: a.to_string(),
+        }
+    }
+
     #[test]
-    fn signature_valid() {
+    fn signature_unavailable_rejects_well_formed_record() {
         let mut keys = KeyStore::new();
         keys.insert(KeyRecord {
             key_id: "k1".to_string(),
@@ -443,14 +402,40 @@ mod tests {
         .unwrap();
         let m = sha256_hex(b"manifest");
         let a = sha256_hex(b"artifact");
-        let sig_hex = stub_sign("k1", &m, &a);
+        let sig = well_formed_sig("k1", &m, &a);
+        let err = verify_signature(&sig, &keys, &m, &a).unwrap_err();
+        assert!(
+            err.to_string().contains("unavailable"),
+            "expected unavailable fail-closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn forged_record_with_public_key_id_rejected() {
+        // Attacker knows only the public key_id and recomputes the removed
+        // stub formula directly — no signing helper exists anymore.
+        let mut keys = KeyStore::new();
+        keys.insert(KeyRecord {
+            key_id: "k1".to_string(),
+            public_key_hex: "c".repeat(64),
+            revoked: false,
+        })
+        .unwrap();
+        let m = sha256_hex(b"manifest");
+        let a = sha256_hex(b"artifact");
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"k1");
+        preimage.extend_from_slice(m.as_bytes());
+        preimage.extend_from_slice(a.as_bytes());
+        let base = sha256_hex(&preimage);
+        let forged = format!("{base}{base}");
         let sig = SignatureRecord {
             key_id: "k1".to_string(),
-            signature_hex: sig_hex,
+            signature_hex: forged,
             manifest_digest: m.clone(),
             artifact_digest: a.clone(),
         };
-        verify_signature(&sig, &keys, &m, &a).unwrap();
+        assert!(verify_signature(&sig, &keys, &m, &a).is_err());
     }
 
     #[test]
@@ -464,35 +449,19 @@ mod tests {
         .unwrap();
         let m = sha256_hex(b"manifest");
         let a = sha256_hex(b"artifact");
-        let sig_hex = stub_sign("k1", &m, &a);
 
         // Unknown key
-        let bad_key = SignatureRecord {
-            key_id: "unknown".to_string(),
-            signature_hex: sig_hex.clone(),
-            manifest_digest: m.clone(),
-            artifact_digest: a.clone(),
-        };
+        let bad_key = well_formed_sig("unknown", &m, &a);
         assert!(verify_signature(&bad_key, &keys, &m, &a).is_err());
 
-        // Signature over different bytes
+        // Record over different bytes than expected
         let m2 = sha256_hex(b"other");
-        let sig_over_different = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: sig_hex.clone(),
-            manifest_digest: m2.clone(),
-            artifact_digest: a.clone(),
-        };
+        let sig_over_different = well_formed_sig("k1", &m2, &a);
         assert!(verify_signature(&sig_over_different, &keys, &m, &a).is_err());
 
         // Revoked key
         keys.revoke("k1").unwrap();
-        let sig = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: sig_hex,
-            manifest_digest: m.clone(),
-            artifact_digest: a.clone(),
-        };
+        let sig = well_formed_sig("k1", &m, &a);
         assert!(verify_signature(&sig, &keys, &m, &a).is_err());
 
         // Unsigned (bad hex length)
@@ -506,7 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_key_rotated_still_verifies() {
+    fn key_rotation_store_semantics_without_verification() {
+        // The key store still tracks enrollment and revocation (needed by the
+        // future scheme); verification itself stays unavailable throughout.
         let mut keys = KeyStore::new();
         keys.insert(KeyRecord {
             key_id: "k1".to_string(),
@@ -520,22 +491,15 @@ mod tests {
             revoked: false,
         })
         .unwrap();
+        assert!(keys.is_trusted("k1"));
+        assert!(keys.is_trusted("k2"));
         let m = sha256_hex(b"m");
         let a = sha256_hex(b"a");
-        let sig = SignatureRecord {
-            key_id: "k2".to_string(),
-            signature_hex: stub_sign("k2", &m, &a),
-            manifest_digest: m.clone(),
-            artifact_digest: a.clone(),
-        };
-        verify_signature(&sig, &keys, &m, &a).unwrap();
-        // k1 still revoked? Not revoked, so also still valid.
-        let sig1 = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: stub_sign("k1", &m, &a),
-            manifest_digest: m.clone(),
-            artifact_digest: a.clone(),
-        };
-        verify_signature(&sig1, &keys, &m, &a).unwrap();
+        assert!(verify_signature(&well_formed_sig("k2", &m, &a), &keys, &m, &a).is_err());
+        keys.revoke("k1").unwrap();
+        assert!(!keys.is_trusted("k1"));
+        assert!(keys.is_trusted("k2"));
+        assert!(verify_signature(&well_formed_sig("k1", &m, &a), &keys, &m, &a).is_err());
+        assert!(verify_signature(&well_formed_sig("k2", &m, &a), &keys, &m, &a).is_err());
     }
 }

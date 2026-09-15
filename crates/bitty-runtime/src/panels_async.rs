@@ -45,10 +45,13 @@
 //!   and snapshot payloads `T` must already respect the owning panel's
 //!   bounds (e.g. `<=128` entries, `8 KiB` bus payload cap). Counters use
 //!   wrapping/saturating arithmetic and never allocate.
-//! - Teardown is prompt and joined: [`PanelWorker::shutdown`] signals the
-//!   worker, wakes it, and joins the thread. [`Drop`] performs the same
-//!   best-effort join without panicking, so an abandoned worker cannot
-//!   outlive its owner silently or hang teardown.
+//! - Teardown is bounded and joined: [`PanelWorker::shutdown`] signals the
+//!   worker, wakes it, and joins with [`PANEL_WORKER_SHUTDOWN_TIMEOUT`].
+//!   [`Drop`] performs the same bounded join without panicking, so an
+//!   abandoned worker cannot outlive its owner silently or hang teardown.
+//!   Cancellable probes (see `try_spawn_cancellable`) exit promptly on the
+//!   shutdown flag; a wedged non-cancellable probe detaches at the timeout
+//!   instead of hanging the owner.
 //!
 //! # Example
 //!
@@ -92,6 +95,17 @@ pub const PANEL_WORKER_MAX_QUEUE_CAP: usize = 16;
 /// interval even without an explicit [`PanelWorker::request_refresh`], so
 /// snapshots stay fresh without tick involvement.
 pub const PANEL_WORKER_DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bounded shutdown join wait for panel workers (CTX-0472).
+///
+/// Teardown must never hang the owner on a wedged probe: [`PanelWorker::shutdown`]
+/// and [`Drop`] wait at most this long for an in-flight probe, then detach.
+/// Generous for normal probes (filesystem scans are millisecond-scale) while
+/// bounding worst-case teardown latency.
+pub const PANEL_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for a panel worker to finish (CTX-0472).
+const PANEL_WORKER_JOIN_POLL: Duration = Duration::from_millis(5);
 
 /// Latest completed snapshot slot shared between the worker thread (writer)
 /// and the tick (reader). The writer swaps an `Arc` pointer under a brief
@@ -140,6 +154,32 @@ impl<T> PanelWorker<T> {
     where
         T: Clone + Send + Sync + 'static,
     {
+        Self::try_spawn_cancellable(name, initial, queue_cap, poll_interval, move |_| {
+            Some(probe())
+        })
+    }
+
+    /// Spawns a worker with a cancellable probe (CTX-0472).
+    ///
+    /// The probe receives the worker's shutdown flag and returns `Some(value)`
+    /// to publish or `None` to skip (cancelled). A well-behaved probe polls
+    /// the flag during long work and returns `None` promptly after it is set,
+    /// so [`shutdown`](Self::shutdown) never waits out a full slow probe.
+    /// The run loop also skips publishing when shutdown arrived mid-probe,
+    /// so torn-down state never observes a stale snapshot.
+    ///
+    /// Same fail-closed `queue_cap` / `poll_interval` contract as
+    /// [`try_spawn`](Self::try_spawn).
+    pub fn try_spawn_cancellable(
+        name: &str,
+        initial: Option<T>,
+        queue_cap: usize,
+        poll_interval: Duration,
+        probe: impl Fn(&AtomicBool) -> Option<T> + Send + 'static,
+    ) -> Result<Self, RuntimeError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
         if queue_cap == 0 || queue_cap > PANEL_WORKER_MAX_QUEUE_CAP {
             return Err(RuntimeError::InvalidQueueCapacity);
         }
@@ -182,14 +222,15 @@ impl<T> PanelWorker<T> {
     }
 
     /// Worker main loop: serve refresh tokens and periodic polls, one probe
-    /// per wake with coalescing drain. Probes run outside the slot lock.
+    /// per wake with coalescing drain. Probes run outside the slot lock and
+    /// receive the shutdown flag so long work can cancel early (CTX-0472).
     fn run(
         rx: mpsc::Receiver<()>,
         slot: Arc<Mutex<SnapshotSlot<T>>>,
         shutdown_flag: Arc<AtomicBool>,
         queued: Arc<AtomicUsize>,
         poll_interval: Duration,
-        probe: impl Fn() -> T,
+        probe: impl Fn(&AtomicBool) -> Option<T>,
     ) where
         T: Send + Sync + 'static,
     {
@@ -208,7 +249,20 @@ impl<T> PanelWorker<T> {
             if shutdown_flag.load(Ordering::Relaxed) {
                 break;
             }
-            let value = probe();
+            let Some(value) = probe(&shutdown_flag) else {
+                // Cancelled probe: skip publish, re-check shutdown before
+                // the next wake so a shutdown arriving mid-probe exits
+                // without publishing a stale snapshot.
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            };
+            // A shutdown that arrived mid-probe must not publish: torn-down
+            // state never observes a stale snapshot.
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             let fresh = Arc::new(value);
             if let Ok(mut guard) = slot.lock() {
                 guard.latest = Some(fresh);
@@ -260,17 +314,51 @@ impl<T> PanelWorker<T> {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
-    /// Signals shutdown, wakes the worker, and joins the thread. Prompt:
-    /// at most one in-flight probe plus join. Idempotent and panic-free.
-    pub fn shutdown(&mut self) {
+    /// Signals shutdown, wakes the worker, and joins with a bound (CTX-0472).
+    ///
+    /// Waits at most [`PANEL_WORKER_SHUTDOWN_TIMEOUT`] for an in-flight
+    /// probe, then detaches rather than hanging teardown. Idempotent and
+    /// panic-free. A cancellable probe (see
+    /// [`try_spawn_cancellable`](Self::try_spawn_cancellable)) that polls
+    /// its shutdown flag exits promptly; a non-cancellable probe still
+    /// bounds teardown to the timeout. Returns `true` when joined.
+    pub fn shutdown(&mut self) -> bool {
+        self.shutdown_with_timeout(PANEL_WORKER_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Shutdown with an explicit join bound (CTX-0472).
+    ///
+    /// Same contract as [`shutdown`](Self::shutdown) with a caller-supplied
+    /// `timeout` for tests and embedders with tighter/looser budgets.
+    /// Returns `true` when the thread was joined, `false` on timeout
+    /// (handle detached; the worker exits on its next shutdown check
+    /// without touching owner state). Never blocks beyond `timeout` plus
+    /// one poll slice. A zero timeout still signals shutdown and joins
+    /// only already-finished threads.
+    pub fn shutdown_with_timeout(&mut self, timeout: Duration) -> bool {
         self.shutdown_flag.store(true, Ordering::Relaxed);
         // Best-effort wake so join does not wait out the poll interval.
         // The token may be shed or orphaned after exit; the worker's
         // saturating accounting keeps `pending()` bounded regardless.
         let _ = self.tx.try_send(());
-        if let Some(handle) = self.handle.take() {
+        let Some(handle) = self.handle.take() else {
+            return true;
+        };
+        if handle.is_finished() {
             let _ = handle.join();
+            return true;
         }
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            std::thread::sleep(PANEL_WORKER_JOIN_POLL);
+            if handle.is_finished() {
+                let _ = handle.join();
+                return true;
+            }
+        }
+        // Timeout: detach rather than hang teardown. The worker owns only
+        // its slot/shutdown clones and exits on its next flag check.
+        false
     }
 }
 
@@ -509,6 +597,94 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "Drop join must not hang teardown"
+        );
+    }
+
+    /// CTX-0472 hostile: shutdown on a wedged non-cancellable probe must
+    /// return within the timeout instead of hanging the owner.
+    #[test]
+    fn shutdown_with_timeout_bounds_wedged_probe() {
+        let mut worker = PanelWorker::try_spawn(
+            "wedged",
+            Some(0_u64),
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_secs(60),
+            || {
+                std::thread::sleep(Duration::from_secs(30));
+                1_u64
+            },
+        )
+        .expect("valid worker config");
+        worker.request_refresh();
+        // Settle so the worker is parked inside the wedged probe.
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        let joined = worker.shutdown_with_timeout(Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(!joined, "wedged probe must time out, not join");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown_with_timeout hung on wedged probe: {elapsed:?}"
+        );
+    }
+
+    /// CTX-0472: a cancellable probe that polls its flag exits promptly and
+    /// publishes nothing after shutdown.
+    #[test]
+    fn cancellable_probe_exits_promptly_without_stale_publish() {
+        let mut worker = PanelWorker::try_spawn_cancellable(
+            "cancellable",
+            None,
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_secs(60),
+            |cancel| {
+                // Hostile long work that polls the flag in slices.
+                for _ in 0..100 {
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(99_u64)
+            },
+        )
+        .expect("valid worker config");
+        worker.request_refresh();
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        let joined = worker.shutdown_with_timeout(Duration::from_secs(5));
+        let elapsed = start.elapsed();
+        assert!(joined, "cancellable probe must join within the bound");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancellable shutdown hung: {elapsed:?}"
+        );
+        // Cancelled mid-probe: no stale snapshot published.
+        assert_eq!(worker.latest(), None);
+        assert_eq!(worker.generation(), 0);
+    }
+
+    /// CTX-0472 hostile: `Drop` on a slow probe never hangs teardown.
+    #[test]
+    fn drop_bounds_slow_probe_teardown() {
+        let start = Instant::now();
+        {
+            let _worker = PanelWorker::try_spawn(
+                "drop-slow",
+                None,
+                PANEL_WORKER_DEFAULT_QUEUE_CAP,
+                Duration::from_secs(60),
+                || {
+                    std::thread::sleep(Duration::from_secs(30));
+                    1_u64
+                },
+            )
+            .expect("valid worker config");
+            // Dropped while the probe may still be queued/running.
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Drop must bound slow-probe teardown"
         );
     }
 }

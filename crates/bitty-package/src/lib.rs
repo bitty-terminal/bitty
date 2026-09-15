@@ -86,7 +86,7 @@
 //! | Lifecycle overview — 6 states | `lifecycle` | [`lifecycle::PackageState`] 6-state enum, [`lifecycle::can_transition`] gate table, [`lifecycle::LifecycleRegistry`] fail-closed registry |
 //! | Integrity verification chain — 7 stages | `integrity` | [`integrity::VerificationStage`] ordered 7-stage enum, [`integrity::verify_pipeline`] fan-in, [`integrity::sha256_hex`] SHA-256 hex, `H-A`/`H-B`/`H-C` binding |
 //! | Manifest hashing schemes H-A/B/C | `manifest`, `lockfile`, `integrity` | [`manifest::PackageManifest::canonical_bytes`] deterministic canonical form (`bitty-manifest-v1`), [`manifest::PackageManifest::canonical_digest`] `H-B`, [`lockfile::PackageDigests`] triple, [`integrity::verify_artifact_checksum`] `H-A`, `content_root` `H-C` |
-//! | Publisher trust options V-A/B/C | `trust` | [`trust::TrustMode`] `V-A`/`V-B`/`V-C`, [`trust::TrustStore`] TOFU pin with `check` -> `TrustPinChanged`, [`trust::KeyStore`] + [`trust::verify_signature`] fail-closed `V-C`, `stub_sign` helper |
+//! | Publisher trust options V-A/B/C | `trust` | [`trust::TrustMode`] `V-A`/`V-B`/`V-C`, [`trust::TrustStore`] TOFU pin with `check` -> `TrustPinChanged`, [`trust::KeyStore`] enrollment/revocation store, [`trust::verify_signature`] fail-closed `V-C` (unavailable until a real scheme lands, bitty#743) |
 //! | Local-path development packages | `source` | [`source::PackageSource::LocalPath`] degenerate record, [`source::digest_local_content`] + [`source::check_local_path_drift`] drift detection, [`source::ensure_no_promotion_without_chain`] provenance separation |
 //! | Staged activation lifecycle — phases + S1/S2 | `activation` | [`activation::ActivationPhase`] 5-phase txn, [`activation::Environment`] generation ring with atomic `current` pointer (`S1` rename/`S2` generations recommendation: generations history + one atomic select), [`activation::activate`] fault-injection per phase, all-or-nothing commit semantics |
 //! | Safe rollback — retained environments | `activation` | [`activation::Generation`] immutable entry + `verify_integrity` self-verification, [`activation::RetentionPolicy`] `N=2` (+current) bounded prune, never removes current |
@@ -102,8 +102,10 @@
 //!
 //! - **Depends on:** nothing (pure `std`). No workspace-crate dependencies.
 //! - **No third-party dependencies** (pure `std` plus vendored SHA-256).
-//!   The RFC's crypto is stubbed deterministically; real signatures will
-//!   land with the `bitty-plugins-docs` key-management design.
+//!   `V-C` signature verification is unimplemented and fail-closed
+//!   (bitty#743): no signature scheme exists, so `verify_signature` rejects
+//!   every record rather than accepting a forgeable one. Real signatures land
+//!   with the `OQ-029` key-management design.
 //! - **Never holds** GPU objects, window handles, PTY file descriptors, or
 //!   internal Rust hot-path objects. It is pure data + validation.
 //! - **`#![forbid(unsafe_code)]`** at crate and workspace level; `MSRV 1.85`,
@@ -158,8 +160,7 @@ pub use source::{
     PackageSource, check_local_path_drift, digest_local_content, ensure_no_promotion_without_chain,
 };
 pub use trust::{
-    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, stub_sign,
-    verify_signature,
+    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, verify_signature,
 };
 pub use version::{MAX_VERSION_LEN, Version};
 
@@ -181,7 +182,7 @@ mod integration_tests {
                 license: Some("MIT".to_string()),
             },
             compat: Compat {
-                bitty: Some(">=0.5,<1.0".to_string()),
+                bitty: Some(">=0.5.0,<1.0.0".to_string()),
                 plugin_api: Some("^1.0".to_string()),
             },
             dependencies: Vec::new(),
@@ -362,7 +363,8 @@ mod integration_tests {
         // Publisher key change is loud.
         assert!(trust.check(&pid, "key-2").is_err());
 
-        // V-C signed verification.
+        // V-C signed verification is unavailable: even a well-formed record
+        // for a trusted key is rejected fail-closed (bitty#743).
         let mut keys = KeyStore::new();
         keys.insert(KeyRecord {
             key_id: "k1".to_string(),
@@ -372,15 +374,15 @@ mod integration_tests {
         .unwrap();
         let m = sha256_hex(b"m");
         let a = sha256_hex(b"a");
-        let sig_hex = stub_sign("k1", &m, &a);
         let sig = SignatureRecord {
             key_id: "k1".to_string(),
-            signature_hex: sig_hex,
+            signature_hex: "d".repeat(128),
             manifest_digest: m.clone(),
             artifact_digest: a.clone(),
         };
-        verify_signature(&sig, &keys, &m, &a).unwrap();
-        // Revoked key fails closed.
+        let err = verify_signature(&sig, &keys, &m, &a).unwrap_err();
+        assert!(err.to_string().contains("unavailable"));
+        // Revoked key fails closed as well.
         keys.revoke("k1").unwrap();
         assert!(verify_signature(&sig, &keys, &m, &a).is_err());
     }

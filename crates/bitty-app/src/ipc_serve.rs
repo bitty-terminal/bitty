@@ -282,15 +282,18 @@ impl Drop for ActiveCount {
 /// Serve one accepted stream: timeouts, accept-boundary auth, dispatch loop.
 ///
 /// Peer identity is verified at the accept boundary before [`serve_connection`]
-/// reads the first byte: this stream arrived on the owner-only (`0600`)
-/// socket the servo bound itself, so the kernel already refused any other UID
-/// at `connect`. [`bitty_ipc::devtools::transport_attested_peer`] folds that
-/// attestation into a sanitized [`bitty_ipc::auth::VerifiedPeer`] marker
-/// carrying no credential bytes; [`serve_connection`] takes only the marker,
-/// so no `PeerCredentials`-typed value flows into the serving counters or the
-/// `eprintln` logging below (CodeQL `cleartext logging of sensitive
-/// information` clean by construction). See `transport_attested_peer` for the
-/// contract and the recorded `SO_PEERCRED` hardening for CTX-0159.
+/// reads the first byte: the bound socket endpoint is re-verified per
+/// connection (`0700` dir + `0600` socket, both owned by `runtime_uid`, no
+/// symlinks) via [`bitty_ipc::devtools::transport_attested_peer`], which folds
+/// the `0600` kernel gate (only the owner UID could have connected) plus an
+/// explicit headless UID check into a sanitized
+/// [`bitty_ipc::auth::VerifiedPeer`] marker carrying no credential bytes.
+/// Verification failure drops the connection before the first byte is read
+/// (fail-closed, one stderr line, never serving). [`serve_connection`] takes
+/// only the marker, so no `PeerCredentials`-typed value flows into the serving
+/// counters or the `eprintln` logging below (CodeQL `cleartext logging of
+/// sensitive information` clean by construction). See `transport_attested_peer`
+/// for the contract and the recorded `SO_PEERCRED` hardening for CTX-0159.
 #[cfg(unix)]
 fn serve_stream(
     mut stream: std::os::unix::net::UnixStream,
@@ -316,9 +319,17 @@ fn serve_stream(
     {
         return;
     }
-    // Accept-boundary verification: attested marker first, serving second.
-    // No credential-typed value survives past this line.
-    let verified = bitty_ipc::devtools::transport_attested_peer(runtime_uid);
+    // Accept-boundary verification: verified marker first, serving second.
+    // No credential-typed value survives past this line. Fail-closed: a
+    // tampered endpoint drops the connection before the first byte is read.
+    let verified =
+        match bitty_ipc::devtools::transport_attested_peer(&server.socket_path, runtime_uid) {
+            Ok(peer) => peer,
+            Err(err) => {
+                eprintln!("bitty: ipc connection rejected (endpoint verification): {err}");
+                return;
+            }
+        };
     let mut context = bitty_ipc::devtools::ServeContext::new(server);
     // CTX-0244: this connection passed peer-credential verification at the
     // Unix-socket accept boundary (P0-AC-021), so per-call local-only
@@ -385,8 +396,15 @@ mod tests {
 
         // Regression for CodeQL HIGH `cleartext logging of sensitive
         // information`: the serving path accepts only the pre-verified marker
-        // produced at the accept boundary, never raw credentials.
-        let verified = bitty_ipc::devtools::transport_attested_peer(1000);
+        // produced at the accept boundary, never raw credentials. Socketpair
+        // has no filesystem endpoint, so the headless peer-UID check mints
+        // the marker here; live connections use `transport_attested_peer`
+        // (endpoint verification) in `serve_stream`.
+        let verified = bitty_ipc::verify_peer_for_connection(
+            bitty_ipc::PeerCredentials::new(1000, 1000, 1),
+            1000,
+        )
+        .unwrap();
         // Type-level proof: `serve_connection` takes `VerifiedPeer`.
         fn accepts_verified(_: bitty_ipc::auth::VerifiedPeer) {}
         accepts_verified(verified);

@@ -311,16 +311,17 @@ impl Runtime {
 
     /// Accumulate interceptor decisions for a single user action (veto-wins, deterministic).
     ///
-    /// This mirrors the RFC fail-open, veto-wins policy: a single `Veto` vetoes
-    /// regardless of handler order; otherwise the action proceeds.
+    /// This mirrors the RFC veto-wins policy with fail-closed timeouts
+    /// (CTX-0465): a single `Veto` vetoes regardless of handler order, and a
+    /// timed-out interceptor denies; otherwise the action proceeds.
     #[must_use]
     pub fn accumulate_interceptions(decisions: &[InterceptionDecision]) -> InterceptionDecision {
         bitty_plugin_host::accumulate_interceptions(decisions)
     }
 
-    /// Whether an intercepted action should proceed (`true`) or be vetoed (`false`) under fail-open.
+    /// Whether an intercepted action should proceed (`true`) or be vetoed (`false`) under fail-closed timeouts (CTX-0465).
     ///
-    /// Timeouts are treated as abstention: the host proceeds without the plugin, records a
+    /// Timeouts deny: the host does not proceed without the plugin, records a
     /// violation, and disables the handler after repeated violations (threshold deferred to `OQ-014`).
     #[must_use]
     pub fn should_proceed_for_intercept(decision: InterceptionDecision, timed_out: bool) -> bool {
@@ -340,7 +341,7 @@ impl Runtime {
     /// Interception helper for `intercept.command-dispatch` (v1 of four points).
     ///
     /// Callers collect per-handler [`InterceptionDecision`]s (e.g. from future VM invocations)
-    /// and pass them here; the host applies veto-wins and fail-open semantics.
+    /// and pass them here; the host applies veto-wins and fail-closed timeout semantics.
     /// Reentrancy (a handler triggering another interception on the same thread) is rejected
     /// by the caller — nested interception is not defined behavior (RFC).
     #[must_use]
@@ -348,7 +349,7 @@ impl Runtime {
         Self::should_proceed_after_interceptions(decisions, timed_out)
     }
 
-    /// `intercept.terminal-spawn` stub — same fail-open, veto-wins policy.
+    /// `intercept.terminal-spawn` stub — same fail-closed, veto-wins policy.
     #[must_use]
     pub fn intercept_terminal_spawn(decisions: &[InterceptionDecision], timed_out: bool) -> bool {
         Self::should_proceed_after_interceptions(decisions, timed_out)

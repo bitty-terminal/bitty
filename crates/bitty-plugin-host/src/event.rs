@@ -2,7 +2,7 @@
 //!
 //! Three classes (lifecycle, observation, interception) with the v1 interception
 //! set of exactly four actions. Each `(plugin, event-type)` subscription gets
-//! one bounded FIFO queue. Coalescing, bounded batches, fail-open timeouts,
+//! one bounded FIFO queue. Coalescing, bounded batches, fail-closed timeouts,
 //! and the single shared decision point for queue overflow are modelled
 //! here.
 //!
@@ -1313,7 +1313,7 @@ impl EventPipeline {
         }
     }
 
-    /// Interception timeout (hard limit) in milliseconds (stub, fail-open semantics).
+    /// Interception timeout (hard limit) in milliseconds (stub, fail-closed semantics).
     ///
     /// `None` means the RFC open point has not been assigned a numeric budget yet (OQ-014).
     #[must_use]
@@ -1420,7 +1420,7 @@ impl EventPipeline {
     }
 }
 
-// ── interception result (fail-open, veto-wins, reentrancy) ───────────────
+// ── interception result (fail-closed, veto-wins, reentrancy) ───────────────
 
 /// Outcome of an interception handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1444,15 +1444,16 @@ pub fn accumulate_interceptions(decisions: &[InterceptionDecision]) -> Intercept
     }
 }
 
-/// Whether an action should proceed under the fail-open policy.
+/// Whether an action should proceed under the fail-closed policy.
 ///
-/// Timeouts and errors are treated as abstention: the host proceeds with the
-/// user action without the plugin, records a violation, and disables the
+/// A timed-out interceptor DENIES: the host must not perform the user action
+/// without its veto (a hung or malicious handler must never be bypassed by
+/// running out the clock). The host records a violation and disables the
 /// handler after repeated violations in a window.
 #[must_use]
 pub fn should_proceed(decision: InterceptionDecision, timed_out: bool) -> bool {
     if timed_out {
-        return true;
+        return false;
     }
     match decision {
         InterceptionDecision::Veto => false,
@@ -1675,9 +1676,13 @@ mod tests {
     }
 
     #[test]
-    fn fail_open_on_timeout() {
-        assert!(should_proceed(InterceptionDecision::Veto, true));
+    fn fail_closed_on_timeout() {
+        assert!(!should_proceed(InterceptionDecision::Veto, true));
+        assert!(!should_proceed(InterceptionDecision::Abstain, true));
+        assert!(!should_proceed(InterceptionDecision::Approve, true));
         assert!(!should_proceed(InterceptionDecision::Veto, false));
+        assert!(should_proceed(InterceptionDecision::Abstain, false));
+        assert!(should_proceed(InterceptionDecision::Approve, false));
     }
 
     #[test]

@@ -14,6 +14,19 @@ pub const MAX_SOURCE_URL_LEN: usize = 2048;
 pub const MAX_REV_LEN: usize = 256;
 /// Maximum local path length.
 pub const MAX_PATH_LEN: usize = 1024;
+/// Maximum host length (DNS 253).
+const MAX_HOST_LEN: usize = 253;
+/// Maximum userinfo length for `git+ssh` URLs.
+const MAX_USERINFO_LEN: usize = 64;
+
+// ── URL scheme policy (CTX-0466) ─────────────────────────────────────────
+//
+// Registry fetches artifacts and must use TLS: `https://` only.
+// Git may use `https://` (TLS) or `git+ssh://` (explicit SSH transport).
+// Everything else — `http`, `ftp`, `file`, `ssh://`, `git://`, scp-like
+// `git@host:path`, `javascript:`, `data:`, schemeless paths — is rejected
+// fail-closed in v1. Plain `ssh://` and scp-like syntax are deferred to a
+// future RFC; use the explicit `git+ssh://` form.
 
 // ── source enum ──────────────────────────────────────────────────────────
 
@@ -79,9 +92,7 @@ impl PackageSource {
                         actual: url.len(),
                     });
                 }
-                if url.contains(' ') {
-                    return Err(PackageError::source("registry url must not contain spaces"));
-                }
+                validate_source_url(url, &["https://"], "source.registry.url")?;
             }
             Self::Git { url, rev } => {
                 if url.trim().is_empty() {
@@ -94,6 +105,7 @@ impl PackageSource {
                         actual: url.len(),
                     });
                 }
+                validate_source_url(url, &["https://", "git+ssh://"], "source.git.url")?;
                 if let Some(r) = rev {
                     if r.len() > MAX_REV_LEN {
                         return Err(PackageError::LimitExceeded {
@@ -107,6 +119,7 @@ impl PackageSource {
                             "git rev when present must not be empty",
                         ));
                     }
+                    validate_git_rev(r)?;
                 }
             }
             Self::LocalPath {
@@ -145,6 +158,167 @@ impl PackageSource {
     pub fn has_registry_provenance(&self) -> bool {
         matches!(self, Self::Registry { .. })
     }
+}
+
+// ── URL + rev validation (CTX-0466, hand-rolled, no new deps) ───────────
+
+/// Validate a registry/git URL against an allowlisted scheme set.
+///
+/// Checks, fail-closed: no control/space/backslash anywhere, exact lowercase
+/// scheme prefix, non-empty authority, valid host (charset + label rules),
+/// optional numeric port, and a remainder with no control/space/backslash.
+/// Userinfo (`user@`) is rejected for `https://` and allowed only for
+/// `git+ssh://` with a restricted charset (the `git@` convention).
+fn validate_source_url(url: &str, allowed: &[&str], field: &str) -> Result<(), PackageError> {
+    if url
+        .bytes()
+        .any(|b| b.is_ascii_control() || b == b' ' || b == b'\\')
+    {
+        return Err(PackageError::source(format!(
+            "{field} must not contain whitespace, control characters, or backslashes"
+        )));
+    }
+    let scheme = allowed
+        .iter()
+        .find(|s| url.starts_with(**s))
+        .ok_or_else(|| {
+            PackageError::source(format!(
+                "{field} scheme must be one of {} (got '{url}')",
+                allowed.join(", ")
+            ))
+        })?;
+    let rest = &url[scheme.len()..];
+    if rest.is_empty() {
+        return Err(PackageError::source(format!("{field} is missing a host")));
+    }
+    // Authority ends at the first '/', '?', or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let remainder = &rest[auth_end..];
+    if authority.is_empty() {
+        return Err(PackageError::source(format!("{field} is missing a host")));
+    }
+    // Userinfo handling: only `git+ssh://` may carry `user@`.
+    let allow_userinfo = *scheme == "git+ssh://";
+    let hostport = if let Some(at) = authority.rfind('@') {
+        if !allow_userinfo {
+            return Err(PackageError::source(format!(
+                "{field} must not contain userinfo"
+            )));
+        }
+        let userinfo = &authority[..at];
+        let hostport = &authority[at + 1..];
+        if userinfo.is_empty()
+            || userinfo.len() > MAX_USERINFO_LEN
+            || !userinfo
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return Err(PackageError::source(format!(
+                "{field} has invalid userinfo"
+            )));
+        }
+        if hostport.is_empty() {
+            return Err(PackageError::source(format!("{field} is missing a host")));
+        }
+        hostport
+    } else {
+        authority
+    };
+    // Optional port.
+    let host = if let Some(colon) = hostport.rfind(':') {
+        let (h, port_str) = (&hostport[..colon], &hostport[colon + 1..]);
+        if h.is_empty() {
+            return Err(PackageError::source(format!("{field} is missing a host")));
+        }
+        if port_str.is_empty()
+            || port_str.len() > 5
+            || !port_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(PackageError::source(format!("{field} has invalid port")));
+        }
+        let port: u32 = port_str
+            .parse()
+            .map_err(|_| PackageError::source(format!("{field} has invalid port")))?;
+        if port == 0 || port > 65535 {
+            return Err(PackageError::source(format!("{field} has invalid port")));
+        }
+        h
+    } else {
+        hostport
+    };
+    validate_host(host, field)?;
+    // Remainder (path/query/fragment): no control/space/backslash (already
+    // checked globally; re-assert for a precise message).
+    if remainder
+        .bytes()
+        .any(|b| b.is_ascii_control() || b == b' ' || b == b'\\')
+    {
+        return Err(PackageError::source(format!(
+            "{field} path must not contain whitespace, control characters, or backslashes"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a DNS-style host: charset, length, and per-label rules.
+fn validate_host(host: &str, field: &str) -> Result<(), PackageError> {
+    if host.is_empty() || host.len() > MAX_HOST_LEN {
+        return Err(PackageError::source(format!("{field} has invalid host")));
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return Err(PackageError::source(format!("{field} has invalid host")));
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(PackageError::source(format!("{field} has invalid host")));
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err(PackageError::source(format!("{field} has invalid host")));
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Err(PackageError::source(format!("{field} has invalid host")));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a git revision: closed charset plus structural guards.
+///
+/// Allowed: ASCII alphanumeric plus `. - _ / +`. Additionally the rev must
+/// start and end alphanumeric (rejects leading `-//.` option/path confusion
+/// and trailing slashes), and must not contain `..` (range/parent operator)
+/// or `//` (empty segment). Length is enforced by the caller (`MAX_REV_LEN`
+/// kept); this function enforces charset and structure. `None` (unresolved)
+/// is handled by the caller.
+fn validate_git_rev(rev: &str) -> Result<(), PackageError> {
+    if !rev
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b'+'))
+    {
+        return Err(PackageError::source(
+            "git rev contains invalid characters (allowed: A-Z a-z 0-9 . - _ / +)",
+        ));
+    }
+    let bytes = rev.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return Err(PackageError::source(
+            "git rev must start and end with an alphanumeric character",
+        ));
+    }
+    if rev.contains("..") || rev.contains("//") {
+        return Err(PackageError::source(
+            "git rev must not contain '..' or '//'",
+        ));
+    }
+    Ok(())
 }
 
 // ── local-path drift helpers ─────────────────────────────────────────────
@@ -287,5 +461,155 @@ mod tests {
             content_digest: "c".repeat(64),
         };
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn registry_accepts_legit_https() {
+        for url in [
+            "https://registry.example.com",
+            "https://example.com",
+            "https://example.com/registry",
+            "https://registry.example.com:443/v1",
+            "https://localhost:8080/registry",
+        ] {
+            let s = PackageSource::Registry {
+                url: url.to_string(),
+            };
+            assert!(s.validate().is_ok(), "legit registry '{url}' must pass");
+        }
+    }
+
+    #[test]
+    fn registry_rejects_schemeless_and_malicious() {
+        // CTX-0466: schemeless / non-https / missing-host URLs must fail closed.
+        for url in [
+            "registry.example.com",
+            "example.com/foo",
+            "/etc/passwd",
+            "http://example.com",
+            "ftp://example.com/pkg",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/plain,hi",
+            "git://example.com/repo.git",
+            "ssh://example.com/repo.git",
+            "https://",
+            "https:///path",
+            "https://exa mple.com",
+            "https://example..com",
+            "https://-bad.com",
+            "https://bad-.com",
+            "https://user:pass@example.com",
+            "https://example.com/foo bar",
+            "HTTPS://example.com",
+        ] {
+            let s = PackageSource::Registry {
+                url: url.to_string(),
+            };
+            assert!(s.validate().is_err(), "registry '{url}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn git_accepts_https_and_git_ssh() {
+        for url in [
+            "https://github.com/owner/repo.git",
+            "https://example.com/owner/repo",
+            "git+ssh://github.com/owner/repo.git",
+            "git+ssh://git@github.com/owner/repo.git",
+        ] {
+            let s = PackageSource::Git {
+                url: url.to_string(),
+                rev: None,
+            };
+            assert!(s.validate().is_ok(), "legit git '{url}' must pass");
+        }
+    }
+
+    #[test]
+    fn git_rejects_schemeless_and_malicious() {
+        // scp-like syntax, plain ssh/git/file/http, and malformed hosts fail closed.
+        for url in [
+            "github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "ssh://github.com/owner/repo.git",
+            "git://github.com/owner/repo.git",
+            "http://github.com/owner/repo.git",
+            "file:///tmp/repo",
+            "ftp://example.com/repo.git",
+            "javascript:alert(1)",
+            "https://",
+            "git+ssh://",
+            "https://exa mple.com/repo.git",
+            "https://example..com/repo.git",
+            "git+ssh://example..com/repo.git",
+            "https://user:pass@example.com/repo.git",
+            "https://example.com/repo bar.git",
+            "HTTPS://example.com/repo.git",
+        ] {
+            let s = PackageSource::Git {
+                url: url.to_string(),
+                rev: None,
+            };
+            assert!(s.validate().is_err(), "git '{url}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn git_rev_accepts_legit_and_rejects_hostile() {
+        // Legit: full SHAs, tags, branches (None means unresolved and is ok).
+        let ok_revs = [
+            "abc123def456789012345678901234567890abcd",
+            "v1.2.3",
+            "main",
+            "feature/foo",
+            "refs/tags/v1.0.0",
+        ];
+        for rev in ok_revs {
+            let s = PackageSource::Git {
+                url: "https://github.com/owner/repo.git".to_string(),
+                rev: Some(rev.to_string()),
+            };
+            assert!(s.validate().is_ok(), "legit rev '{rev}' must pass");
+        }
+        let bad_revs = [
+            "HEAD; rm -rf /",
+            "$(evil)",
+            "`evil`",
+            "rev with space",
+            "rev\nnewline",
+            "rev\0nul",
+            "--upload-pack=evil",
+            "../escape",
+            "a..b",
+            "a//b",
+            "/leading",
+            "trailing/",
+            "-leading-dash",
+            ".leading-dot",
+            "",
+            "   ",
+        ];
+        for rev in bad_revs {
+            let s = PackageSource::Git {
+                url: "https://github.com/owner/repo.git".to_string(),
+                rev: Some(rev.to_string()),
+            };
+            assert!(s.validate().is_err(), "rev '{rev}' must be rejected");
+        }
+        // Oversized rev rejected, 256B cap kept.
+        let oversized = "a".repeat(MAX_REV_LEN + 1);
+        let s = PackageSource::Git {
+            url: "https://github.com/owner/repo.git".to_string(),
+            rev: Some(oversized),
+        };
+        assert!(s.validate().is_err());
+        // Exactly at cap with valid charset passes.
+        let at_cap = "a".repeat(MAX_REV_LEN);
+        let s2 = PackageSource::Git {
+            url: "https://github.com/owner/repo.git".to_string(),
+            rev: Some(at_cap),
+        };
+        assert!(s2.validate().is_ok());
     }
 }

@@ -258,6 +258,8 @@ fn grant_revocation_and_hash_binding_for_bundled() {
     );
     let report = host.revoke(&id, Some(&fs_cap)).unwrap();
     assert_eq!(report.revoked.len(), 1);
+    // CTX-0465: single-capability revoke persists an explicit denial.
+    assert!(host.grants().is_cap_denied(&id, &fs_cap));
     assert!(
         !host
             .grants()

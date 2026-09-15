@@ -91,6 +91,28 @@ pub fn is_valid_tool_name(name: &str) -> bool {
     true
 }
 
+/// Environment variables never passed to a Layer-2 spawn (pager hijack).
+pub const DENIED_SPAWN_ENV_VARS: &[&str] = &["PAGER", "GIT_PAGER"];
+
+/// Whether explicit spawn `env` is safe for a Layer-2 spawn.
+///
+/// Fail-closed: any entry naming a denied pager variable fails, regardless
+/// of value — even `GIT_PAGER=cat` would legitimize the channel. Exact,
+/// case-sensitive match (`MY_PAGER` and friends stay allowed); the spawn
+/// surface must call this before `env_clear()` + explicit `env()`.
+///
+/// [`DENIED_SPAWN_ENV_VARS`] is the policy list; this predicate is the
+/// enforcement point for the spawn surface (`bitty-runtime` `SpawnRequest`).
+#[must_use]
+pub fn is_safe_spawn_env(env: &[(String, String)]) -> bool {
+    for (name, _) in env {
+        if DENIED_SPAWN_ENV_VARS.contains(&name.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `args` is an allowlisted `git` invocation under `[tools.git]`.
 ///
 /// Pure, bounded, fail-closed: `args` must be non-empty, `args[0]` in
@@ -99,11 +121,14 @@ pub fn is_valid_tool_name(name: &str) -> bool {
 /// NUL/control/shell metacharacters, no risky flags (exact `--upload-pack`,
 /// `--receive-pack`, `--exec` plus the `--upload-pack=` / `--receive-pack=` /
 /// `--exec=` prefixed forms for verb smuggling via `--exec=`-style flags),
-/// no config override (`-c` exact, `--config-env` prefix), no repo escape
-/// (`--git-dir` / `--work-tree` prefix), no file-write or external-driver
-/// flags (`--output` / `--ext-diff` / `--textconv` prefix), and verb-aware
-/// `branch` pinning (mutating shorts/longs, bundled clusters, plus bare
-/// creation denied; see inline).
+/// no config override (`-c` exact and `-c<key>=<val>` glued, `--config` in
+/// every form including `--config-env`), no repo escape (`-C` exact and
+/// `-C<path>` glued for every verb, `--git-dir` / `--work-tree` prefix), no
+/// pager driver (`--paginate` / `--pager` prefix; `--no-pager` stays
+/// allowed), no file-write or external-driver flags (`--output` /
+/// `--ext-diff` / `--textconv` prefix), and verb-aware `branch` pinning
+/// (mutating shorts/longs, bundled clusters, plus bare creation denied;
+/// see inline).
 #[must_use]
 pub fn is_allowed_git_args(args: &[String]) -> bool {
     if args.is_empty() || args.len() > MAX_GIT_ARGS {
@@ -154,21 +179,36 @@ pub fn is_allowed_git_args(args: &[String]) -> bool {
         if arg.contains("--exec=") {
             return false;
         }
-        // Config override via `-c key=val` (exact only: `--cached`,
-        // `--color`, etc. must keep working).
-        if arg == "-c" {
+        // Config override via `-c key=val`: exact `-c` plus glued
+        // `-c<key>=<val>` (e.g. `-ccore.pager=evil`). Single-dash only:
+        // `--cached` / `--color` (double-dash) must keep working.
+        if arg.starts_with("-c") && !arg.starts_with("--") {
+            return false;
+        }
+        // Repo escape via `-C <path>` / `-C<path>` (run in directory):
+        // denied for every verb, not just `branch` (whose arm already
+        // denies `-C` for its own copy semantics). No panel use needs it.
+        if arg.starts_with("-C") && !arg.starts_with("--") {
+            return false;
+        }
+        // Pager driver: `--paginate` / `--pager` force an external pager
+        // program (external-process vector). `--no-pager` stays allowed
+        // (safe default; it matches neither prefix).
+        if arg.starts_with("--paginate") || arg.starts_with("--pager") {
             return false;
         }
         // File-write / external-driver / repo-escape / env-config flags.
         // Prefix denial covers both bare (`--output`) and `=...` forms
         // (`--output=/tmp/pwned.txt`); `--no-ext-diff` / `--no-textconv`
         // stay allowed (safe defaults, `--no-` prefix does not match).
+        // `--config` covers `--config`, `--config=<k>=<v>`, and
+        // `--config-env` uniformly (config override in every long form).
         if arg.starts_with("--output")
             || arg.starts_with("--ext-diff")
             || arg.starts_with("--textconv")
             || arg.starts_with("--git-dir")
             || arg.starts_with("--work-tree")
-            || arg.starts_with("--config-env")
+            || arg.starts_with("--config")
         {
             return false;
         }
@@ -806,6 +846,142 @@ mod tests {
             "--oneline".to_string()
         ]));
         assert!(is_allowed_git_args(&["show".to_string()]));
+    }
+
+    #[test]
+    fn probe_glued_c_config_override_denied() {
+        // CTX-0465 hostile probe: glued `-c<key>=<val>` bypasses the exact
+        // `-c` denial and smuggles `core.pager` / arbitrary config.
+        for args in [
+            vec!["log", "-ccore.pager=evil"],
+            vec!["status", "-cfoo=bar"],
+            vec!["diff", "-ccore.pager=less -R"],
+            vec!["show", "-cprotocol.ext.allow=always"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "glued -c bypass {args:?} must be denied"
+            );
+        }
+        // Legit double-dash forms must keep working.
+        assert!(is_allowed_git_args(&[
+            "diff".to_string(),
+            "--cached".to_string()
+        ]));
+        assert!(is_allowed_git_args(&[
+            "log".to_string(),
+            "--oneline".to_string()
+        ]));
+    }
+
+    #[test]
+    fn probe_config_long_form_denied_uniformly() {
+        // CTX-0465 hostile probe: `--config` (non-env) bypasses the
+        // `--config-env`-only denial.
+        for args in [
+            vec!["log", "--config", "core.pager=evil"],
+            vec!["status", "--config=core.pager=evil"],
+            vec!["diff", "--config", "protocol.ext.allow=always"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "long --config bypass {args:?} must be denied"
+            );
+        }
+        assert!(is_allowed_git_args(&[
+            "diff".to_string(),
+            "--cached".to_string()
+        ]));
+    }
+
+    #[test]
+    fn probe_capital_c_repo_escape_denied_all_verbs() {
+        // CTX-0465 hostile probe: `-C <path>` / `-C<path>` (run-in-directory)
+        // is denied only in the `branch` arm; every other verb lets it
+        // through as a repo escape.
+        for verb in GIT_ALLOWED_SUBCOMMANDS {
+            for args in [
+                vec![*verb, "-C"],
+                vec![*verb, "-C/tmp/evil"],
+                vec![*verb, "-C", "/tmp/evil"],
+            ] {
+                let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                assert!(
+                    !is_allowed_git_args(&owned),
+                    "repo-escape -C bypass {args:?} must be denied"
+                );
+            }
+        }
+        // Legit panel use keeps working.
+        assert!(is_allowed_git_args(&["branch".to_string()]));
+        assert!(is_allowed_git_args(&[
+            "log".to_string(),
+            "-m".to_string(),
+            "--oneline".to_string()
+        ]));
+        assert!(is_allowed_git_args(&["show".to_string(), "-m".to_string()]));
+    }
+
+    #[test]
+    fn probe_pager_driver_flags_denied() {
+        // CTX-0465 hostile probe: pager-driving flags force an external
+        // pager program (external-process vector via captured pipes).
+        for args in [
+            vec!["log", "--paginate"],
+            vec!["diff", "--pager"],
+            vec!["status", "--paginate=never"],
+            vec!["show", "--pager=evil"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                !is_allowed_git_args(&owned),
+                "pager bypass {args:?} must be denied"
+            );
+        }
+        // Safe defaults and legit patch display keep working.
+        assert!(is_allowed_git_args(&[
+            "diff".to_string(),
+            "--no-pager".to_string()
+        ]));
+        assert!(is_allowed_git_args(&[
+            "log".to_string(),
+            "-p".to_string(),
+            "--oneline".to_string()
+        ]));
+        assert!(is_allowed_git_args(&[
+            "diff".to_string(),
+            "--no-ext-diff".to_string()
+        ]));
+    }
+
+    #[test]
+    fn probe_pager_env_passthrough_denied() {
+        // CTX-0465 hostile probe: explicit spawn env carrying PAGER /
+        // GIT_PAGER re-opens the pager vector closed for argv/config.
+        assert!(!is_safe_spawn_env(&[(
+            "GIT_PAGER".to_string(),
+            "cat".to_string()
+        )]));
+        assert!(!is_safe_spawn_env(&[(
+            "PAGER".to_string(),
+            "less -R".to_string()
+        )]));
+        assert!(!is_safe_spawn_env(&[
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("GIT_PAGER".to_string(), "cat".to_string()),
+        ]));
+        // Benign env stays allowed; near-miss names are exact-match only.
+        assert!(is_safe_spawn_env(&[]));
+        assert!(is_safe_spawn_env(&[(
+            "LANG".to_string(),
+            "C.UTF-8".to_string()
+        )]));
+        assert!(is_safe_spawn_env(&[(
+            "MY_PAGER".to_string(),
+            "x".to_string()
+        )]));
     }
 
     #[test]

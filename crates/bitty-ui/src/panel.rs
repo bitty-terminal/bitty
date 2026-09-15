@@ -293,6 +293,26 @@ fn truncate_bounded(s: &str, max_chars: usize) -> (String, bool) {
 }
 
 /// Per-window overlay manager enforcing `4+1` bound.
+///
+/// # Overlay ownership (accepted decision, CTX-0482 / issue #763)
+///
+/// Three overlay systems exist in this workspace; each owns exactly one
+/// concern and they never share state:
+///
+/// - `LayoutNode::Overlay` (this crate, [`crate::layout`]) owns *geometry*:
+///   base + overlay bounds and paint tier order. Never modal, never
+///   keyboard-owning, never mutated by the manager below.
+/// - `OverlayManager` (this type) owns *presentation stacking and modal
+///   exclusivity* over the `4+1` envelope. [`Self::modal_active`] is the
+///   single modal authority for panel overlays: the integration feeds it to
+///   `bitty_runtime::Runtime::set_overlay_modal_active`, whose bit the app's
+///   one capture predicate reads. It never paints grid truth.
+/// - `PresentationMode` ([`crate::presentation`]) owns *requested per-leaf
+///   display mode*; transitions stay gated and the layout solver ignores it.
+///   It never stacks, paints, or captures keys.
+///
+/// A new overlay feature must extend exactly one of these owners rather than
+/// adding a fourth system or a parallel modal gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverlayManager {
     overlays: Vec<Overlay>,
@@ -318,6 +338,8 @@ impl OverlayManager {
         self.overlays.is_empty()
     }
 
+    /// Whether a modal overlay is active (single modal authority for panel
+    /// overlays; see the ownership decision above).
     #[must_use]
     pub fn modal_active(&self) -> bool {
         self.overlays.iter().any(|o| o.is_modal())
@@ -789,7 +811,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, OverlayError::TooManyOverlays { .. }));
         // modal still allowed (4+1)
-        mgr.create_overlay(OverlayKind::Modal, container, "modal", None, 1)
+        let modal_id = mgr
+            .create_overlay(OverlayKind::Modal, container, "modal", None, 1)
             .unwrap();
         assert_eq!(mgr.len(), 5);
         // second modal fails
@@ -804,6 +827,12 @@ mod tests {
         mgr.create_overlay(OverlayKind::NonModal, container, "again", None, 1)
             .unwrap();
         assert_eq!(mgr.len(), 5);
+        // CTX-0482 overlay-ownership pin: this manager is the single
+        // panel-modal authority, and its bit tracks exactly the modal
+        // overlay (the app predicate reads it through the runtime).
+        assert!(mgr.modal_active(), "the modal overlay owns the modal bit");
+        mgr.dismiss(modal_id);
+        assert!(!mgr.modal_active(), "dismissing the modal releases the bit");
     }
 
     #[test]

@@ -1343,8 +1343,8 @@ pub(crate) fn help_text() -> String {
             -v, --verbose    Emit per-frame `bitty tick` stats on stderr\n  \
                              (shorthand for --log-level debug; default quiet)\n  \
                 --log-level LEVEL  Stderr level: error|warn|info|debug|trace\n  \
-                             (default warn; tick stats need debug|trace;\n  \
-                             also BITTY_LOG/RUST_LOG)\n  \
+                             (default warn: startup info lines need info,\n  \
+                             tick stats need debug|trace; also BITTY_LOG/RUST_LOG)\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
                --safe       Safe mode: do not load third-party plugins (no\n  \
                             plugin VM), and use the built-in safe config\n  \

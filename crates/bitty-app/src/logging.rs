@@ -1,5 +1,7 @@
 //! Stderr verbosity gating (`--verbose` / `--log-level` / `BITTY_LOG` / `RUST_LOG`).
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::cli::Args;
 
 /// Diagnostic verbosity for stderr logs (CTX-0190).
@@ -59,25 +61,81 @@ impl LogLevel {
 
 /// Derives a [`LogLevel`] from a `BITTY_LOG`/`RUST_LOG`-style value.
 ///
-/// Accepts bare levels (`debug`, `trace`, ...) and `RUST_LOG`-style filters
-/// (`bitty=debug`, `info,bitty-app=trace`, `warn`). Scans case-insensitively
-/// for the most verbose level named anywhere in the value so existing
-/// `RUST_LOG=debug` / `RUST_LOG=trace` habits keep working without a second
-/// system. Returns `None` when no known level appears.
+/// Accepts bare levels (`debug`, `trace`, ...) and `RUST_LOG`-style
+/// comma-separated directives (`bitty=debug`, `info,bitty-app=trace`,
+/// `warn`). Each directive is `[target=]level`: a level only counts when it
+/// parses exactly, so a target name that merely contains a level word
+/// (`mydebug=warn`, CTX-0482) never flips the gate. Bare levels set the
+/// global candidate; directives for this app's own targets (`bitty*`) set
+/// the more specific candidate and win over the global one. Directives for
+/// other targets are ignored (this gate renders only bitty diagnostics).
+/// Returns `None` when no applicable level appears.
 pub(crate) fn log_level_from_env_value(value: &str) -> Option<LogLevel> {
-    let lower = value.to_lowercase();
-    if lower.contains("trace") {
-        Some(LogLevel::Trace)
-    } else if lower.contains("debug") {
-        Some(LogLevel::Debug)
-    } else if lower.contains("info") {
-        Some(LogLevel::Info)
-    } else if lower.contains("warn") {
-        Some(LogLevel::Warn)
-    } else if lower.contains("error") {
-        Some(LogLevel::Error)
-    } else {
-        None
+    let mut global: Option<LogLevel> = None;
+    let mut app: Option<LogLevel> = None;
+    for directive in value.split(',') {
+        let directive = directive.trim();
+        if directive.is_empty() {
+            continue;
+        }
+        let (target, level_text) = match directive.split_once('=') {
+            Some((target, level)) => (target.trim(), level.trim()),
+            None => ("", directive),
+        };
+        let Some(level) = LogLevel::parse(level_text) else {
+            continue;
+        };
+        if target.is_empty() {
+            global = Some(level);
+        } else if target.starts_with("bitty") {
+            app = Some(level);
+        }
+    }
+    app.or(global)
+}
+
+// ── process-wide stderr gate (CTX-0482) ───────────────────────────────────
+
+/// Installed once by `main` from [`effective_log_level`]; diagnostics on
+/// non-args paths (spawn, plugin activation, IPC servo) read it so startup
+/// lines stop bypassing `--log-level` without threading a level through
+/// every helper signature.
+static STDERR_GATE: AtomicU8 = AtomicU8::new(LogLevel::Warn as u8);
+
+/// Installs the process-wide stderr gate (CTX-0482).
+pub(crate) fn install_stderr_gate(level: LogLevel) {
+    STDERR_GATE.store(level as u8, Ordering::Relaxed);
+}
+
+/// Current process-wide stderr gate (default [`LogLevel::Warn`]).
+fn stderr_gate() -> LogLevel {
+    match STDERR_GATE.load(Ordering::Relaxed) {
+        0 => LogLevel::Error,
+        2 => LogLevel::Info,
+        3 => LogLevel::Debug,
+        4 => LogLevel::Trace,
+        // 1 and any future/unknown code: quiet default (fail-soft logging).
+        _ => LogLevel::Warn,
+    }
+}
+
+/// Emits an info-class diagnostic when the gate allows it (CTX-0482).
+///
+/// The closure keeps the disabled path allocation-free (same discipline as
+/// the tick-line gate).
+pub(crate) fn info(message: impl FnOnce() -> String) {
+    if stderr_gate() >= LogLevel::Info {
+        eprintln!("{}", message());
+    }
+}
+
+/// Emits a warning when the gate allows it (CTX-0482).
+///
+/// Warnings sit at [`LogLevel::Warn`]: visible at the default and at
+/// `info`/`debug`/`trace`, silenced only by an explicit `--log-level error`.
+pub(crate) fn warn(message: impl FnOnce() -> String) {
+    if stderr_gate() >= LogLevel::Warn {
+        eprintln!("{}", message());
     }
 }
 

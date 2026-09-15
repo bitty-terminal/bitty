@@ -149,7 +149,7 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
 
     let method = request.wire_method().unwrap_or("bitty.debug/ping");
     let params = request.wire_params();
-    match ctl_roundtrip(&target.socket_path, method, params.as_deref()) {
+    match ctl_roundtrip(&target.socket_path, method, params.as_deref(), uid) {
         Err(message) => {
             if emit_json {
                 println!(

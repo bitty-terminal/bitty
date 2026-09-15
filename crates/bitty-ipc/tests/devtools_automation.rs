@@ -26,9 +26,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::devtools::{
-    AutomationFamily, Dispatcher, ServeContext, ServerInfo, clear_automation_for_tests,
-    clear_introspection_for_tests, issue_automation_bearer, prepare_socket_dir, publish_grid_text,
-    serve_connection, transport_attested_peer,
+    AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
+    clear_automation_for_tests, clear_introspection_for_tests, issue_automation_bearer,
+    prepare_socket_dir, publish_grid_text, serve_connection, transport_attested_peer,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
@@ -126,7 +126,9 @@ fn spawn_automation_server(
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let verified = transport_attested_peer(unit_owner_uid(&socket_path));
+        let dir = prepare_socket_dir(&socket_path).unwrap();
+        let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
+        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("automation-proof".to_string(), socket_path.clone(), 80, 24);
         let context = ServeContext::with_granted_session(&server, granted, &session);
@@ -149,13 +151,6 @@ fn spawn_automation_server(
         assert!(stats.requests >= 1, "expected test requests");
         assert_eq!(stats.responses, stats.requests);
     })
-}
-
-#[cfg(unix)]
-fn unit_owner_uid(path: &str) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
 }
 
 #[test]

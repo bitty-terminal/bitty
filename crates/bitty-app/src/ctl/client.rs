@@ -185,15 +185,24 @@ pub struct CtlIpcOutcome {
 /// Unix-only (the servo is unix-only); non-unix returns unavailable.
 /// Time-bounded (`ipc_ctl::CTL_TIMEOUT` read/write timeouts, shared with
 /// the server-side reply wait) so a dead peer cannot hang the CLI.
+///
+/// The socket endpoint is verified before connect (`0700` dir + `0600`
+/// socket, both owned by `runtime_uid`, no symlinks): a forged
+/// `BITTY_SOCKET`/`--socket` path pointing at another owner's endpoint
+/// fails closed here, before any request byte is sent.
 #[cfg(unix)]
 pub fn ctl_roundtrip(
     socket_path: &str,
     method: &str,
     params: Option<&str>,
+    runtime_uid: u32,
 ) -> Result<CtlIpcOutcome, String> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
+    bitty_ipc::devtools::verify_socket_endpoint_for_connect(socket_path, runtime_uid).map_err(
+        |err| format!("bitty ctl: socket endpoint verification failed for {socket_path:?}: {err}"),
+    )?;
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| format!("bitty ctl: cannot connect to {socket_path:?}: {err}"))?;
     stream
@@ -244,6 +253,7 @@ pub fn ctl_roundtrip(
     _socket_path: &str,
     _method: &str,
     _params: Option<&str>,
+    _runtime_uid: u32,
 ) -> Result<CtlIpcOutcome, String> {
     Err(String::from(
         "bitty ctl: IPC control requires a unix platform",

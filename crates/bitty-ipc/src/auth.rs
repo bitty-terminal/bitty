@@ -381,11 +381,11 @@ impl ChildTokenStore {
             .tokens
             .get(token_str)
             .ok_or_else(|| IpcError::Unauthenticated {
-                reason: format!("unknown child token '{token_str}'"),
+                reason: String::from("unknown child token"),
             })?;
         if tok.is_expired(now_ms) {
             return Err(IpcError::Unauthenticated {
-                reason: format!("child token '{token_str}' expired"),
+                reason: String::from("child token expired"),
             });
         }
         if tok.scope != scope || tok.scoped_id != scoped_id {
@@ -602,5 +602,55 @@ mod tests {
         let attested = VerifiedPeer::attested(1000);
         let verified = verify_peer_for_connection(good, 1000).unwrap();
         assert_eq!(attested, verified);
+    }
+
+    #[test]
+    fn child_token_errors_are_token_free() {
+        // Hostile: error reasons must never echo token material (which may
+        // be logged). Unknown and expired paths return static strings.
+        let mut store = ChildTokenStore::new();
+        let secret = String::from("secret-token-abc123XYZ");
+        store
+            .insert(
+                ChildToken::new(
+                    secret.clone(),
+                    Scope::TerminalInspect,
+                    "t:4".into(),
+                    0,
+                    1000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let unknown = store
+            .verify(
+                "attacker-probe-token-zzz999",
+                Scope::TerminalInspect,
+                "t:4",
+                500,
+            )
+            .unwrap_err();
+        let unknown_reason = match unknown {
+            IpcError::Unauthenticated { reason } => reason,
+            other => panic!("expected Unauthenticated, got {other:?}"),
+        };
+        assert!(
+            !unknown_reason.contains("attacker-probe-token-zzz999"),
+            "unknown-token error must not echo token: {unknown_reason}"
+        );
+        assert_eq!(unknown_reason, "unknown child token");
+
+        let expired_err = store
+            .verify(secret.as_str(), Scope::TerminalInspect, "t:4", 1000)
+            .unwrap_err();
+        let expired_reason = match expired_err {
+            IpcError::Unauthenticated { reason } => reason,
+            other => panic!("expected Unauthenticated, got {other:?}"),
+        };
+        assert!(
+            !expired_reason.contains(&secret),
+            "expired-token error must not echo token: {expired_reason}"
+        );
+        assert_eq!(expired_reason, "child token expired");
     }
 }

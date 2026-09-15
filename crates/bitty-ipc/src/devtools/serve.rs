@@ -5,7 +5,7 @@ use super::json::truncate_chars;
 
 use crate::auth::VerifiedPeer;
 #[cfg(unix)]
-use crate::auth::{DIR_MODE, SOCKET_MODE};
+use crate::auth::{DIR_MODE, PeerCredentials, SOCKET_MODE, verify_peer_uid};
 use crate::error::IpcError;
 use crate::frame::{MAX_FRAME_BYTES, encode_frame};
 use crate::limits::{RC9_MAX_CONNECTIONS, RateLimiter};
@@ -21,6 +21,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// verbatim; otherwise `<base>/bitty/<instance>.sock` where `base` is
 /// `xdg_runtime_dir` (`XDG_RUNTIME_DIR`) or `/run/user/<uid>`, and `instance`
 /// is `instance_id` (`BITTY_INSTANCE_ID`) or `"default"`.
+///
+/// This function is pure advisory path resolution only: a non-empty
+/// `BITTY_SOCKET` is returned after NUL/length checks with no ownership or
+/// peer verification. Callers must verify the returned path before bind or
+/// connect via [`verify_socket_endpoint_for_connect`] (client pre-connect)
+/// or the bind-time [`prepare_socket_dir`] + [`attest_bound_socket`] pair
+/// plus per-connection [`transport_attested_peer`] (server accept).
+/// Connecting to or serving an unverified `BITTY_SOCKET` path fails closed
+/// at those boundaries, never here.
 ///
 /// Validation: socket paths over [`MAX_SOCKET_PATH_BYTES`] payload bytes or
 /// containing NUL are rejected fail-closed; instance ids must be 1..=64 ASCII
@@ -616,6 +625,117 @@ pub fn attest_bound_socket(socket_path: &str, dir: &DirAttestation) -> Result<u3
     Ok(sock_uid)
 }
 
+/// Verify an existing socket endpoint before connect or accept (unix).
+///
+/// Read-only fail-closed checks for `BITTY_SOCKET` and other resolved paths:
+/// the parent directory must exist with mode `0700` owned by `runtime_uid`,
+/// and the socket file must exist with mode `0600` owned by `runtime_uid`;
+/// symlinks at either layer are rejected outright (no follow). Missing paths
+/// fail with `Unavailable` (cannot attest what cannot be stated); mode,
+/// owner, or symlink violations fail with `Unauthenticated` (caller must not
+/// connect or serve).
+///
+/// Server bind uses [`prepare_socket_dir`] + [`attest_bound_socket`] instead
+/// (they create and chmod); this function is for pre-connect verification
+/// (client) and per-connection re-verification (server accept via
+/// [`transport_attested_peer`]).
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` for empty/NUL/overlong paths, `Unavailable` for
+/// filesystem failures, and `Unauthenticated` for ownership/mode/symlink
+/// violations.
+#[cfg(unix)]
+pub fn verify_socket_endpoint_for_connect(
+    socket_path: &str,
+    runtime_uid: u32,
+) -> Result<(), IpcError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if socket_path.is_empty() {
+        return Err(IpcError::InvalidRequest {
+            reason: "socket path is empty".into(),
+        });
+    }
+    if socket_path.contains('\0') {
+        return Err(IpcError::InvalidRequest {
+            reason: "socket path contains NUL".into(),
+        });
+    }
+    if socket_path.len() > MAX_SOCKET_PATH_BYTES {
+        return Err(IpcError::InvalidRequest {
+            reason: format!(
+                "socket path too long for AF_UNIX ({} > {MAX_SOCKET_PATH_BYTES} payload bytes)",
+                socket_path.len()
+            ),
+        });
+    }
+    let path = std::path::Path::new(socket_path);
+    let parent = path.parent().ok_or_else(|| IpcError::InvalidRequest {
+        reason: "socket path has no parent directory".into(),
+    })?;
+    if parent.as_os_str().is_empty() {
+        return Err(IpcError::InvalidRequest {
+            reason: "socket path has no parent directory".into(),
+        });
+    }
+    let dir_meta = std::fs::symlink_metadata(parent).map_err(|err| IpcError::Unavailable {
+        reason: format!("cannot stat socket directory {}: {err}", parent.display()),
+    })?;
+    if dir_meta.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket directory {} is a symlink (refusing to connect)",
+                parent.display()
+            ),
+        });
+    }
+    let dir_mode = dir_meta.mode() & 0o777;
+    if dir_mode != DIR_MODE {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket directory mode {dir_mode:o} != {:o} (must be 0700; refusing to connect)",
+                DIR_MODE
+            ),
+        });
+    }
+    if dir_meta.uid() != runtime_uid {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket directory owner {} != runtime {runtime_uid} (refusing to connect)",
+                dir_meta.uid()
+            ),
+        });
+    }
+    let sock_meta =
+        std::fs::symlink_metadata(socket_path).map_err(|err| IpcError::Unavailable {
+            reason: format!("cannot stat socket {socket_path}: {err}"),
+        })?;
+    if sock_meta.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: "socket is a symlink (refusing to connect)".into(),
+        });
+    }
+    let sock_mode = sock_meta.mode() & 0o777;
+    if sock_mode != SOCKET_MODE {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket mode {sock_mode:o} != {:o} (must be 0600; refusing to connect)",
+                SOCKET_MODE
+            ),
+        });
+    }
+    if sock_meta.uid() != runtime_uid {
+        return Err(IpcError::Unauthenticated {
+            reason: format!(
+                "socket owner {} != runtime {runtime_uid} (refusing to connect)",
+                sock_meta.uid()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Non-unix stub: socket-directory serving requires a unix platform.
 #[cfg(not(unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,6 +757,17 @@ pub fn prepare_socket_dir(_socket_path: &str) -> Result<DirAttestation, IpcError
 /// Non-unix stub for [`attest_bound_socket`](fn.attest_bound_socket).
 #[cfg(not(unix))]
 pub fn attest_bound_socket(_socket_path: &str, _dir: &DirAttestation) -> Result<u32, IpcError> {
+    Err(IpcError::Unavailable {
+        reason: "unix socket serving requires a unix platform".into(),
+    })
+}
+
+/// Non-unix stub for [`verify_socket_endpoint_for_connect`](fn.verify_socket_endpoint_for_connect).
+#[cfg(not(unix))]
+pub fn verify_socket_endpoint_for_connect(
+    _socket_path: &str,
+    _runtime_uid: u32,
+) -> Result<(), IpcError> {
     Err(IpcError::Unavailable {
         reason: "unix socket serving requires a unix platform".into(),
     })
@@ -799,30 +930,75 @@ where
     stream.flush()
 }
 
-/// Peer identity attested by the transport layer instead of `SO_PEERCRED`.
+/// Peer identity verified at the accept boundary (`SO_PEERCRED`-class).
 ///
-/// Contract (caller must uphold): the transport kernel-gates peer identity,
-/// i.e. only the attested UID could have opened this stream. That holds for
-/// the servo's owner-only socket file (`0600`): the kernel refuses `connect`
-/// from any other UID with `EACCES` before userspace runs, so the socket
-/// owner is the peer. A forged `BITTY_SOCKET` pointing elsewhere still fails
-/// because the servo only serves the path it bound and attested itself.
+/// Verifies the bound socket endpoint before minting the sanitized
+/// [`VerifiedPeer`] marker: the parent directory must be `0700` owned by
+/// `runtime_uid` and the socket file must be `0600` owned by `runtime_uid`,
+/// with symlinks rejected at either layer (see
+/// [`verify_socket_endpoint_for_connect`]). On success the endpoint owner is
+/// wired explicitly through the headless [`verify_peer_uid`](crate::auth::verify_peer_uid)
+/// primitive (the `0600` kernel gate means only the owner UID could have
+/// connected, so the socket owner is the peer proxy), and the marker is
+/// minted only after that check passes.
 ///
-/// Returns a sanitized [`VerifiedPeer`] marker carrying no credential bytes:
-/// the accept boundary in `bitty-app/src/ipc_serve.rs` calls this before
-/// [`serve_connection`], so no `PeerCredentials`-typed value flows into the
-/// serving/logging path.
+/// A forged `BITTY_SOCKET` pointing elsewhere fails here (wrong owner, mode,
+/// or symlink) before [`serve_connection`] reads the first byte. The accept
+/// boundary in `bitty-app/src/ipc_serve.rs` calls this per connection, so
+/// endpoint replacement after bind cannot escalate to serving.
 ///
-/// `SO_PEERCRED` per-connection re-verification (defense in depth against
-/// file-descriptor passing) needs either nightly
+/// Returns a sanitized [`VerifiedPeer`] marker carrying no credential bytes,
+/// so no `PeerCredentials`-typed value flows into the serving/logging path.
+///
+/// True per-connection `SO_PEERCRED` re-verification against file-descriptor
+/// passing (defense in depth beyond the `0600` gate) needs either nightly
 /// `peer_credentials_unix_socket` (still unstable, rust-lang/rust#42839) or
-/// a reviewed `unsafe` `getsockopt` seam, both out of scope for this
-/// fail-soft slice; it is recorded hardening for CTX-0159. The headless
-/// [`crate::auth::verify_peer_uid`] primitive and its tests already encode
-/// the check the live seam will call.
-#[must_use]
-pub fn transport_attested_peer(runtime_uid: u32) -> VerifiedPeer {
-    VerifiedPeer::attested(runtime_uid)
+/// a reviewed `unsafe` `getsockopt` seam, both `forbid(unsafe)`-incompatible
+/// here; it remains recorded hardening for CTX-0159.
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` for malformed paths, `Unavailable` for
+/// filesystem failures, and `Unauthenticated` for ownership/mode/symlink or
+/// peer-UID violations (fail-closed: the caller must drop the connection).
+#[cfg(unix)]
+pub fn transport_attested_peer(
+    socket_path: &str,
+    runtime_uid: u32,
+) -> Result<VerifiedPeer, IpcError> {
+    verify_socket_endpoint_for_connect(socket_path, runtime_uid)?;
+    // SO_PEERCRED-class wiring: the verified socket owner is the peer proxy
+    // under the 0600 gate. Re-read the owner for the UID check so the
+    // headless primitive, not just the endpoint check, gates the marker.
+    let sock_uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(socket_path)
+            .map(|m| m.uid())
+            .map_err(|err| IpcError::Unavailable {
+                reason: format!("cannot stat socket {socket_path}: {err}"),
+            })?
+    };
+    let sock_gid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(socket_path)
+            .map(|m| m.gid())
+            .map_err(|err| IpcError::Unavailable {
+                reason: format!("cannot stat socket {socket_path}: {err}"),
+            })?
+    };
+    verify_peer_uid(PeerCredentials::new(sock_uid, sock_gid, 0), runtime_uid)?;
+    Ok(VerifiedPeer::attested(runtime_uid))
+}
+
+/// Non-unix stub for [`transport_attested_peer`](fn.transport_attested_peer).
+#[cfg(not(unix))]
+pub fn transport_attested_peer(
+    _socket_path: &str,
+    _runtime_uid: u32,
+) -> Result<VerifiedPeer, IpcError> {
+    Err(IpcError::Unavailable {
+        reason: "unix socket serving requires a unix platform".into(),
+    })
 }
 
 /// Maximum concurrent connections served (`RC-9`, shed newest).

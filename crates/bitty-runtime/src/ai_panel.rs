@@ -56,8 +56,34 @@ use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
 pub const AI_PANEL_CAPABILITY_PANEL_PROVIDER: &str = "panel.provider";
 /// Panel create capability for ai-panel.
 pub const AI_PANEL_CAPABILITY_PANEL_CREATE: &str = "panel.create";
-/// Agent terminal context capability (per Terminal with generation, 32KiB budget).
+/// Deprecated agent terminal context capability (per Terminal with generation, 32KiB budget).
+///
+/// DEPRECATED (CTX-0460 D-1, removal >= v0.2.0): agent terminal-context
+/// reads resolve through [`AI_PANEL_TERMINAL_SNAPSHOT_METHOD`]
+/// (`terminal.snapshot`) with a ledgered `terminal.inspect` grant via
+/// [`AiPanelIntegration::resolve_terminal_context`]. New code must use the
+/// generic path. Stored `agent.context.terminal` grants keep exact-match
+/// behavior during the compat window; pair with
+/// [`AiPanelIntegration::deprecated_terminal_capability_warning`] to surface
+/// the deprecation. See `specifications/ai-surface-reconciliation.md` D-1.
+#[deprecated(
+    since = "0.1.0",
+    note = "use AI_PANEL_TERMINAL_SNAPSHOT_METHOD with terminal.inspect ledger grant (agent.context.terminal removal >= v0.2.0)"
+)]
 pub const AI_PANEL_CAPABILITY_AGENT_CONTEXT_TERMINAL: &str = "agent.context.terminal";
+/// Generic terminal snapshot method serving agent terminal-context reads
+/// (CTX-0420 canonical, CTX-0460 D-1). Replaces the deprecated
+/// `agent.context.terminal` authority: observation flows without the
+/// `agent.*` string through `SnapshotService::dispatch` under the existing
+/// `terminal.inspect` scope with a ledgered per-target grant.
+pub const AI_PANEL_TERMINAL_SNAPSHOT_METHOD: &str = bitty_ipc::SNAPSHOT_METHOD;
+/// Generic scope authorizing terminal-context reads (`terminal.inspect`).
+/// Kept as a string so capability tables and ledger grants read the same
+/// wire-stable value as [`bitty_ipc::Scope::TerminalInspect`].
+pub const AI_PANEL_TERMINAL_INSPECT_SCOPE: &str = "terminal.inspect";
+/// Maximum client identity bytes for terminal-context reads
+/// (`auth::MAX_SCOPED_ID_BYTES`, 64, scoped-id precedent).
+pub const AI_PANEL_MAX_CLIENT_ID_BYTES: usize = bitty_ipc::MAX_SCOPED_ID_BYTES;
 /// Agent workspace context capability (per Workspace, 32KiB budget).
 pub const AI_PANEL_CAPABILITY_AGENT_CONTEXT_WORKSPACE: &str = "agent.context.workspace";
 /// Agent memory persist capability — opt-in only (`0600`, `<=7 days`, no exfiltration), requires param `persist`.
@@ -261,9 +287,151 @@ impl AiPanelIntegration {
     }
 
     /// Whether `candidate` is the exact `agent.context.terminal` capability string.
+    ///
+    /// DEPRECATED (CTX-0460 D-1, removal >= v0.2.0): kept for stored-grant
+    /// compat only. New code must resolve terminal-context reads through
+    /// [`Self::resolve_terminal_context`] (`terminal.snapshot` +
+    /// `terminal.inspect` ledger grant) and surface
+    /// [`Self::deprecated_terminal_capability_warning`] for old strings.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use resolve_terminal_context with terminal.snapshot + terminal.inspect ledger grant (agent.context.terminal removal >= v0.2.0)"
+    )]
     #[must_use]
     pub fn is_agent_context_terminal_allowed(candidate: &str) -> bool {
-        candidate == AI_PANEL_CAPABILITY_AGENT_CONTEXT_TERMINAL
+        candidate == "agent.context.terminal"
+    }
+
+    // -- Terminal-context migration (D-1 canonical) ---------------------------
+    //
+    // Agent terminal-context reads resolve through the generic bounded
+    // snapshot read service (CTX-0420) with ledgered per-target grants.
+    // The request names one host terminal (`t:<digits>` target); authority
+    // is the server-evaluated `ScopeSet` (must contain `terminal.inspect`)
+    // plus the server-evaluated `ConsentLedger` (must hold an active
+    // `(client_id, terminal.inspect)` grant at `now_ms`). Dispatch keeps
+    // the established order (grammar -> registry -> shape -> authorize ->
+    // handler -> provider-echo match -> bound -> DTO-validate) with
+    // fail-closed denials and no partial state. Snapshot `Full` (32 KiB)
+    // equals [`AI_PANEL_CONTEXT_BUDGET_BYTES`], so resolved text never
+    // exceeds the AI context budget; truncation is flagged, never silent.
+
+    /// Whether `granted` carries the generic `terminal.inspect` scope for
+    /// terminal-context reads.
+    #[must_use]
+    pub fn is_terminal_snapshot_scope_granted(granted: &bitty_ipc::ScopeSet) -> bool {
+        granted.contains(bitty_ipc::Scope::TerminalInspect)
+    }
+
+    /// Whether `ledger` holds an active `(client_id, terminal.inspect)`
+    /// grant at `now_ms` for terminal-context reads.
+    #[must_use]
+    pub fn is_terminal_snapshot_consent_granted(
+        ledger: &bitty_ipc::ConsentLedger,
+        client_id: &str,
+        now_ms: u64,
+    ) -> bool {
+        ledger.is_granted(client_id, bitty_ipc::Scope::TerminalInspect, now_ms)
+    }
+
+    /// Whether a terminal-context read is authorized by both the scope set
+    /// and the consent ledger (no dispatch, no side effects).
+    #[must_use]
+    pub fn is_terminal_context_granted(
+        granted: &bitty_ipc::ScopeSet,
+        ledger: &bitty_ipc::ConsentLedger,
+        client_id: &str,
+        now_ms: u64,
+    ) -> bool {
+        Self::is_terminal_snapshot_scope_granted(granted)
+            && Self::is_terminal_snapshot_consent_granted(ledger, client_id, now_ms)
+    }
+
+    /// Deprecation warning for a stored terminal-context capability string.
+    ///
+    /// Returns `Some(warning)` when `candidate` is the deprecated
+    /// `agent.context.terminal` string, `None` otherwise (including for
+    /// the generic `terminal.snapshot` method and `terminal.inspect`
+    /// scope). Mirrors the `tabs` alias `deprecated_alias_warning`
+    /// precedent: old grants keep working during the compat window while
+    /// surfacing the removal version.
+    #[must_use]
+    pub fn deprecated_terminal_capability_warning(candidate: &str) -> Option<String> {
+        if candidate == "agent.context.terminal" {
+            Some(format!(
+                "deprecated: capability 'agent.context.terminal' is an alias for '{method}' with '{scope}' ledger grant (removal >= v0.2.0); use the generic snapshot read service",
+                method = AI_PANEL_TERMINAL_SNAPSHOT_METHOD,
+                scope = AI_PANEL_TERMINAL_INSPECT_SCOPE,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve one bounded terminal-context read through the generic
+    /// snapshot service (D-1 canonical).
+    ///
+    /// Requires the server-evaluated `granted` scopes to contain
+    /// `terminal.inspect` and the server-evaluated `ledger` to hold an
+    /// active `(client_id, terminal.inspect)` grant at `now_ms`; the
+    /// request names one host terminal target (`t:<digits>`). Dispatches
+    /// via `SnapshotService::dispatch` on
+    /// [`AI_PANEL_TERMINAL_SNAPSHOT_METHOD`], preserving fail-closed
+    /// denials, per-detail budgets, char-boundary truncation with the
+    /// `truncated` flag, `is_untrusted_surface` labeling, and the
+    /// provider-echo match (confused-deputy guard).
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidRequest` when `client_id` is empty or `terminal_id`
+    ///   violates the host grammar, or when the provider echoes a
+    ///   different terminal than requested.
+    /// - `LimitExceeded` when `client_id` exceeds
+    ///   [`AI_PANEL_MAX_CLIENT_ID_BYTES`] or the bounded DTO exceeds the
+    ///   AI context budget (unreachable while `Full` equals the budget;
+    ///   fail-closed against future drift).
+    /// - `ScopeDenied` when `granted` lacks `terminal.inspect`.
+    /// - `Denied[ConsentRequired]` when the ledger lacks an active grant.
+    /// - `NotFound` when no live state was published for the target or the
+    ///   method has no registered provider.
+    pub fn resolve_terminal_context(
+        service: &bitty_ipc::SnapshotService,
+        request: &bitty_ipc::SnapshotRequest,
+        granted: &bitty_ipc::ScopeSet,
+        ledger: &bitty_ipc::ConsentLedger,
+        client_id: &str,
+        now_ms: u64,
+    ) -> Result<bitty_ipc::TerminalSnapshot, bitty_ipc::IpcError> {
+        if client_id.is_empty() {
+            return Err(bitty_ipc::IpcError::InvalidRequest {
+                reason: "terminal context client_id must not be empty".into(),
+            });
+        }
+        if client_id.len() > AI_PANEL_MAX_CLIENT_ID_BYTES {
+            return Err(bitty_ipc::IpcError::LimitExceeded {
+                field: "terminal context client_id".into(),
+                limit: AI_PANEL_MAX_CLIENT_ID_BYTES,
+                actual: client_id.len(),
+            });
+        }
+        if !ledger.is_granted(client_id, bitty_ipc::Scope::TerminalInspect, now_ms) {
+            return Err(bitty_ipc::IpcError::Denied {
+                code: "ConsentRequired".into(),
+                reason: format!(
+                    "missing consent for '{}' on scope '{}'",
+                    AI_PANEL_TERMINAL_SNAPSHOT_METHOD, AI_PANEL_TERMINAL_INSPECT_SCOPE,
+                ),
+            });
+        }
+        let snapshot = service.dispatch(AI_PANEL_TERMINAL_SNAPSHOT_METHOD, request, granted)?;
+        if snapshot.text.len() > AI_PANEL_CONTEXT_BUDGET_BYTES {
+            return Err(bitty_ipc::IpcError::LimitExceeded {
+                field: "terminal context text".into(),
+                limit: AI_PANEL_CONTEXT_BUDGET_BYTES,
+                actual: snapshot.text.len(),
+            });
+        }
+        Ok(snapshot)
     }
 
     /// Whether `candidate` is the exact `agent.context.workspace` capability string.
@@ -669,9 +837,14 @@ impl AiPanelIntegration {
 /// Returns the panel handle on success; caller must still activate the
 /// associated plugin via the public PluginHost path (`declare → resolve →
 /// register → GrantRecord → activate`) for capabilities
-/// `panel.provider` + `panel.create` + `agent.context.terminal` +
-/// `agent.context.workspace` + `agent.memory:persist` + `mcp.invoke:TOOL` +
-/// `ai.provider`/`ai.stream`/`ai.model`. The `AgentId` + `AgentWorkspace`
+/// `panel.provider` + `panel.create` + `agent.context.workspace` +
+/// `agent.memory:persist` + `mcp.invoke:TOOL` + `ai.provider`/`ai.stream`/
+/// `ai.model`. Terminal observation is D-1 canonical: reads resolve through
+/// [`AI_PANEL_TERMINAL_SNAPSHOT_METHOD`] (`terminal.snapshot`) with a
+/// ledgered `terminal.inspect` grant via
+/// [`AiPanelIntegration::resolve_terminal_context`]; the deprecated
+/// `agent.context.terminal` string remains exact-match compat only
+/// (removal >= v0.2.0). The `AgentId` + `AgentWorkspace`
 /// pair is ephemeral and generation-scoped; no filesystem `~/projects/**`
 /// is implied and no `~` expansion is performed here.
 pub fn create_ai_panel(
@@ -888,6 +1061,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn mcp_bounded_framing_and_per_tool_capability() {
         assert_eq!(AI_PANEL_MCP_MAX_FRAME_BYTES, 256 * 1024);
         assert_eq!(AI_PANEL_MCP_MAX_IN_FLIGHT_BYTES, 512 * 1024);
@@ -1182,5 +1356,275 @@ mod tests {
         assert!(!AiPanelIntegration::is_context_bounded(
             &"a".repeat(32 * 1024 + 1)
         ));
+    }
+
+    // -- D-1 migration (CTX-0460, TDD red-first) -------------------------------
+    //
+    // Agent terminal-context reads resolve through the generic bounded
+    // snapshot read service with ledgered per-target grants. These tests
+    // pin the canonical path before the implementation lands.
+
+    fn d1_canned_terminal(
+        request: &bitty_ipc::SnapshotRequest,
+    ) -> Result<bitty_ipc::SnapshotData, bitty_ipc::IpcError> {
+        Ok(bitty_ipc::SnapshotData {
+            terminal_id: request.terminal_id.clone(),
+            generation: 7,
+            cwd: "file:///example/wd".to_owned(),
+            semantic_zones: Vec::new(),
+            text: "typed-live-bytes".to_owned(),
+        })
+    }
+
+    fn d1_granted_inspect() -> bitty_ipc::ScopeSet {
+        bitty_ipc::ScopeSet::single(bitty_ipc::Scope::TerminalInspect)
+    }
+
+    fn d1_consented(client: &str, now_ms: u64) -> bitty_ipc::ConsentLedger {
+        let mut ledger = bitty_ipc::ConsentLedger::new();
+        ledger
+            .grant(
+                client.to_owned(),
+                bitty_ipc::Scope::TerminalInspect,
+                now_ms,
+                60_000,
+                "test".to_owned(),
+            )
+            .expect("grant");
+        ledger
+    }
+
+    #[test]
+    fn d1_terminal_context_resolves_through_generic_snapshot_service() {
+        let service = bitty_ipc::SnapshotService::with_defaults(d1_canned_terminal);
+        let snapshot = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("t:1", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000,
+        )
+        .expect("generic read serves");
+        assert_eq!(snapshot.terminal_id, "t:1");
+        assert_eq!(snapshot.generation, 7);
+        assert!(snapshot.text.contains("typed-live-bytes"));
+        assert!(snapshot.is_untrusted_surface);
+        assert!(snapshot.text.len() <= AI_PANEL_CONTEXT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn d1_terminal_context_requires_scope_and_ledger_grants() {
+        let service = bitty_ipc::SnapshotService::with_defaults(d1_canned_terminal);
+        let request = bitty_ipc::SnapshotRequest::new("t:1", bitty_ipc::DetailLevel::Standard);
+        // Missing ledger grant fails closed even with scope.
+        let denied = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &request,
+            &d1_granted_inspect(),
+            &bitty_ipc::ConsentLedger::new(),
+            "agent-tests",
+            1_000,
+        )
+        .expect_err("missing consent must fail closed");
+        assert!(
+            matches!(
+                denied,
+                bitty_ipc::IpcError::Denied { ref code, .. } if code == "ConsentRequired"
+            ),
+            "got {denied:?}"
+        );
+        // Missing scope fails closed even with ledger.
+        let denied = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &request,
+            &bitty_ipc::ScopeSet::new(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000,
+        )
+        .expect_err("missing scope must fail closed");
+        assert!(
+            matches!(denied, bitty_ipc::IpcError::ScopeDenied { .. }),
+            "got {denied:?}"
+        );
+        // Gate helpers agree.
+        assert!(AiPanelIntegration::is_terminal_snapshot_scope_granted(
+            &d1_granted_inspect()
+        ));
+        assert!(!AiPanelIntegration::is_terminal_snapshot_scope_granted(
+            &bitty_ipc::ScopeSet::new()
+        ));
+        assert!(AiPanelIntegration::is_terminal_snapshot_consent_granted(
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000
+        ));
+        assert!(!AiPanelIntegration::is_terminal_snapshot_consent_granted(
+            &bitty_ipc::ConsentLedger::new(),
+            "agent-tests",
+            1_000
+        ));
+        assert!(AiPanelIntegration::is_terminal_context_granted(
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000
+        ));
+        assert!(!AiPanelIntegration::is_terminal_context_granted(
+            &d1_granted_inspect(),
+            &bitty_ipc::ConsentLedger::new(),
+            "agent-tests",
+            1_000
+        ));
+    }
+
+    #[test]
+    fn d1_terminal_context_denials_are_fail_closed() {
+        // Unknown terminal: no published provider data.
+        fn missing(
+            request: &bitty_ipc::SnapshotRequest,
+        ) -> Result<bitty_ipc::SnapshotData, bitty_ipc::IpcError> {
+            let _ = request;
+            Err(bitty_ipc::IpcError::NotFound {
+                reason: "no live snapshot published for 't:9'".into(),
+            })
+        }
+        let service = bitty_ipc::SnapshotService::with_defaults(missing);
+        let error = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("t:9", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000,
+        )
+        .expect_err("unpublished must fail closed");
+        assert!(
+            matches!(error, bitty_ipc::IpcError::NotFound { .. }),
+            "got {error:?}"
+        );
+        // Provider-echo mismatch fails closed (confused-deputy guard).
+        fn mismatched(
+            request: &bitty_ipc::SnapshotRequest,
+        ) -> Result<bitty_ipc::SnapshotData, bitty_ipc::IpcError> {
+            let _ = request;
+            Ok(bitty_ipc::SnapshotData {
+                terminal_id: "t:2".to_owned(),
+                generation: 1,
+                cwd: String::new(),
+                semantic_zones: Vec::new(),
+                text: "other".to_owned(),
+            })
+        }
+        let service = bitty_ipc::SnapshotService::with_defaults(mismatched);
+        let error = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("t:1", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000,
+        )
+        .expect_err("echo mismatch must fail closed");
+        assert!(
+            matches!(error, bitty_ipc::IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        // Bad terminal grammar fails closed before any provider contact.
+        let service = bitty_ipc::SnapshotService::with_defaults(d1_canned_terminal);
+        let error = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("nope", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            1_000,
+        )
+        .expect_err("bad grammar must fail closed");
+        assert!(
+            matches!(error, bitty_ipc::IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+        // Expired ledger grant fails closed.
+        let error = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("t:1", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "agent-tests",
+            61_001,
+        )
+        .expect_err("expired consent must fail closed");
+        assert!(
+            matches!(
+                error,
+                bitty_ipc::IpcError::Denied { ref code, .. } if code == "ConsentRequired"
+            ),
+            "got {error:?}"
+        );
+        // Empty client identity fails closed.
+        let error = AiPanelIntegration::resolve_terminal_context(
+            &service,
+            &bitty_ipc::SnapshotRequest::new("t:1", bitty_ipc::DetailLevel::Standard),
+            &d1_granted_inspect(),
+            &d1_consented("agent-tests", 1_000),
+            "",
+            1_000,
+        )
+        .expect_err("empty client must fail closed");
+        assert!(
+            matches!(error, bitty_ipc::IpcError::InvalidRequest { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn d1_terminal_context_budget_matches_32kib_and_deprecation_compat() {
+        // Generic Full budget equals the AI context budget: no invented bound.
+        assert_eq!(
+            bitty_ipc::MAX_SNAPSHOT_FULL_BYTES,
+            AI_PANEL_CONTEXT_BUDGET_BYTES
+        );
+        assert_eq!(AI_PANEL_CONTEXT_BUDGET_BYTES, 32 * 1024);
+        assert_eq!(AI_PANEL_TERMINAL_SNAPSHOT_METHOD, "terminal.snapshot");
+        assert_eq!(
+            AI_PANEL_TERMINAL_SNAPSHOT_METHOD,
+            bitty_ipc::SNAPSHOT_METHOD
+        );
+        assert_eq!(AI_PANEL_TERMINAL_INSPECT_SCOPE, "terminal.inspect");
+        assert_eq!(
+            AI_PANEL_TERMINAL_INSPECT_SCOPE,
+            bitty_ipc::Scope::TerminalInspect.as_str()
+        );
+        // Deprecated capability keeps exact-match compat during the window.
+        #[allow(deprecated)]
+        {
+            assert!(AiPanelIntegration::is_agent_context_terminal_allowed(
+                "agent.context.terminal"
+            ));
+            assert!(!AiPanelIntegration::is_agent_context_terminal_allowed(
+                "agent.context.workspace"
+            ));
+            assert_eq!(
+                AI_PANEL_CAPABILITY_AGENT_CONTEXT_TERMINAL,
+                "agent.context.terminal"
+            );
+        }
+        // Deprecation warning surfaces for stored grants; generic path is quiet.
+        assert!(
+            AiPanelIntegration::deprecated_terminal_capability_warning("agent.context.terminal")
+                .is_some()
+        );
+        assert!(
+            AiPanelIntegration::deprecated_terminal_capability_warning("agent.context.workspace")
+                .is_none()
+        );
+        assert!(
+            AiPanelIntegration::deprecated_terminal_capability_warning(
+                AI_PANEL_TERMINAL_SNAPSHOT_METHOD
+            )
+            .is_none()
+        );
     }
 }

@@ -114,6 +114,11 @@ impl Runtime {
         // Clear pending input on new shell: fresh session, no stale keystrokes.
         self.pending_input.clear();
         self.pending_input_dropped = 0;
+        // CTX-0393: hydrate captured scrollback into the primary grid when
+        // this spawn fulfils a restored session (no-op otherwise).
+        if let Some(owner) = self.primary_view {
+            let _ = self.hydrate_session_pending_for(owner);
+        }
         Ok(())
     }
 
@@ -149,18 +154,27 @@ impl Runtime {
     /// The caller then keeps the PTY default (`$HOME`/`USERPROFILE`, else the
     /// process cwd; ghostty `working-directory = home` parity).
     fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
-        let source = self.focused_view()?;
-        if source == target {
-            return None;
+        if let Some(source) = self.focused_view() {
+            if source != target {
+                let report = match self.pane_sessions.get(&source) {
+                    Some(session) => session.state.cwd_report(),
+                    // A session-less focused leaf (the primary grid owner) reports
+                    // through the runtime-global state.
+                    None => self.state.cwd_report(),
+                };
+                if let Some(report) = report {
+                    if let Some(path) = osc7_cwd_path(report) {
+                        if path.is_dir() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
         }
-        let report = match self.pane_sessions.get(&source) {
-            Some(session) => session.state.cwd_report(),
-            // A session-less focused leaf (the primary grid owner) reports
-            // through the runtime-global state.
-            None => self.state.cwd_report(),
-        }?;
-        let path = osc7_cwd_path(report)?;
-        path.is_dir().then_some(path)
+        // CTX-0393: a restored session seeds the spawn cwd from the captured
+        // `OSC 7` report when no live pane has reported a usable directory
+        // yet. Still fail-open: `None` keeps the PTY default.
+        self.session_pending_cwd(&target)
     }
 
     /// Spawns `program` with `args` as the private shell of layout leaf
@@ -255,6 +269,10 @@ impl Runtime {
         // onto the fresh grid (same stale-pixel class the close path fixes).
         // Stored images survive inertly under the store caps.
         self.kitty_images.clear_origin(Some(view.0));
+        // CTX-0393: a restored session hydrates the fresh grid with the
+        // captured scrollback (immutable history; the shell itself is new).
+        // No-op without a pending restore for this leaf.
+        let _ = self.hydrate_session_pending_for(view);
         // If a waker is already installed (split after `set_pty_waker`),
         // promote immediately so the new pane wakes the loop too (CTX-0230).
         if self.pty_waker.is_some() {
@@ -575,7 +593,10 @@ impl Runtime {
 /// percent-decoded, and the result must be absolute for the target platform.
 /// Returns `None` for a missing/relative path, malformed escapes, or
 /// non-UTF-8 decoded bytes.
-fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
+///
+/// Shared with the session-restore spawn-cwd fallback (CTX-0393), which
+/// replays a captured report through the same validation.
+pub(super) fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
     let rest = report.strip_prefix("file://")?;
     let slash = rest.find('/')?;
     let decoded = String::from_utf8(percent_decode(&rest[slash..])?).ok()?;

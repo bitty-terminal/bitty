@@ -626,6 +626,75 @@ impl State {
         self.scrollback.iter()
     }
 
+    /// Rehydrates scrollback history from plain-text lines (CTX-0393 session
+    /// restore).
+    ///
+    /// Each line becomes one immutable scrollback entry at the current grid
+    /// width: wide scalars keep lead-plus-spacer atomicity (a wide scalar
+    /// without room wraps no tail — the line truncates there, mirroring
+    /// resize reflow), combining marks ride on their base cell, control
+    /// scalars degrade to `U+FFFD`, and short lines pad with erased cells.
+    /// Lines append oldest-first; over-capacity input prunes oldest-first
+    /// through the buffer's configured bound, so memory stays bounded no
+    /// matter the input length. Callers bound the input (the session layer
+    /// caps lines per pane); this method stays total over any input and
+    /// returns the pushed line count. It records no damage: restore callers
+    /// force a full present after rehydration.
+    pub fn restore_scrollback_text(&mut self, lines: &[&str]) -> usize {
+        let width = self.width.max(1);
+        let blank = Style::default();
+        let mut pushed = 0usize;
+        for text in lines {
+            let mut cells: Vec<Cell> = Vec::with_capacity(width);
+            for scalar in text.chars() {
+                if cells.len() >= width {
+                    break;
+                }
+                let scalar = if scalar.is_control() {
+                    '\u{FFFD}'
+                } else {
+                    scalar
+                };
+                match char_cell_width(scalar) {
+                    0 => {
+                        if let Some(prev) = cells.last_mut() {
+                            let _ = prev.push_zerowidth(scalar);
+                        }
+                    }
+                    2 => {
+                        if cells.len() + 2 <= width {
+                            cells.push(Cell {
+                                glyph: scalar,
+                                style: blank,
+                                width: 2,
+                                spacer: false,
+                                hyperlink: None,
+                                zerowidth: Zerowidth::new(),
+                            });
+                            cells.push(Cell::wide_spacer(blank));
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => cells.push(Cell {
+                        glyph: scalar,
+                        style: blank,
+                        width: 1,
+                        spacer: false,
+                        hyperlink: None,
+                        zerowidth: Zerowidth::new(),
+                    }),
+                }
+            }
+            while cells.len() < width {
+                cells.push(Cell::erased(blank));
+            }
+            self.scrollback.push_with_wrap(cells, false);
+            pushed += 1;
+        }
+        pushed
+    }
+
     /// Retained semantic-zone records oldest first.
     pub fn zones(&self) -> impl Iterator<Item = &ZoneRecord> {
         self.zones.iter()

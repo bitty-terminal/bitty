@@ -137,6 +137,7 @@ pub mod resize;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
+pub mod session;
 pub mod workspaces;
 
 pub use self::animations::{
@@ -346,6 +347,11 @@ pub struct Runtime {
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     workspace_mru: std::collections::VecDeque<usize>,
+    /// Pending per-pane session restores (CTX-0393): scrollback + cwd for
+    /// session-less leaves, drained into the fresh grid by the next
+    /// successful spawn of each leaf. Keyed by [`ViewId`]; bounded by the
+    /// session decode caps. Never logged (may hold sensitive text).
+    session_pending: BTreeMap<ViewId, session::PendingPaneRestore>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
     /// Whether the help popup (CTX-0265) is currently shown.
@@ -650,6 +656,7 @@ impl std::fmt::Debug for Runtime {
             .field("focused", &self.focus.focused())
             .field("workspace_count", &self.workspaces.len())
             .field("active_workspace", &self.active_workspace)
+            .field("session_pending", &self.session_pending.len())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
@@ -860,6 +867,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            session_pending: BTreeMap::new(),
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),
@@ -1004,6 +1012,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            session_pending: BTreeMap::new(),
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),

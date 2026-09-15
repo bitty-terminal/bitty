@@ -459,9 +459,46 @@ fn main() {
         std::process::exit(1);
     }
 
+    // CTX-0393 session restore: browser-like reopen (layout + focus MRU +
+    // scrollback history + per-pane cwd; dead processes are never revived —
+    // shells respawn fresh and the history is immutable). Explicit
+    // layout/focus flags win over the saved session, and `--safe` never
+    // reads session state (recovery startup). Headless smoke stays
+    // deterministic and skips restore too. Any failure starts clean with a
+    // one-line warning (counts only, never session contents).
+    let session_restored = if args.safe
+        || args.headless
+        || args.split_axis.is_some()
+        || args.split_ratio.is_some()
+        || args.stack
+        || args.overlay
+        || args.layout.is_some()
+        || args.focus.is_some()
+    {
+        false
+    } else {
+        match runtime.restore_session_on_startup(args.safe) {
+            bitty_runtime::SessionStartupOutcome::Restored(summary) => {
+                eprintln!(
+                    "bitty: session restored (workspaces={} panes={} lines={} pending={}; inactive panes respawn on first switch)",
+                    summary.workspaces, summary.panes, summary.scrollback_lines, summary.pending
+                );
+                true
+            }
+            bitty_runtime::SessionStartupOutcome::FreshWithWarning(err) => {
+                eprintln!("bitty: session restore failed ({err}) — starting fresh");
+                false
+            }
+            bitty_runtime::SessionStartupOutcome::Fresh
+            | bitty_runtime::SessionStartupOutcome::SkippedSafeMode => false,
+        }
+    };
+
     // Layout wiring: construct LayoutNode via bitty-ui types (re-exported through bitty-runtime),
     // call Runtime::set_layout, then apply focus. Keeps app thin; no config/plugin coupling.
-    {
+    // A restored session already owns the layout + focus: argv wiring runs
+    // only for a fresh start so the two never fight over the tree.
+    if !session_restored {
         let cols = runtime.config().cols;
         let rows = runtime.config().rows;
         let layout = build_layout(&args, cols, rows);
@@ -605,6 +642,10 @@ fn main() {
     // Key info (paste confirm/cancel, startup summary, errors) bypasses the
     // gate and always emits; devtools keeps full fidelity via Runtime::tick.
     app.set_log_level(effective_log_level(&args));
+    // CTX-0393: safe recovery and headless smoke runs never overwrite the
+    // saved session on exit (the safe run owns a default layout, not the
+    // user's session).
+    app.set_session_persistence(!args.safe && !args.headless);
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {

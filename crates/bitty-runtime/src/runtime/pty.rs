@@ -20,16 +20,19 @@ pub(super) fn pty_forward_loop(
 ) {
     loop {
         match reader.recv() {
-            Some(chunk) => {
+            Ok(Some(chunk)) => {
                 debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                 if tx.send(chunk).is_err() {
                     break;
                 }
                 (waker)();
             }
-            None => {
-                // EOF: wake once so the consumer drains final chunks promptly
-                // instead of waiting for an incidental wakeup.
+            Ok(None) | Err(_) => {
+                // Clean EOF, or a pump I/O failure after every queued chunk
+                // was delivered: either way wake once so the consumer drains
+                // final chunks promptly instead of waiting for an incidental
+                // wakeup. The pump outcome is informational here and is
+                // surfaced by `join` below.
                 (waker)();
                 break;
             }
@@ -335,11 +338,13 @@ impl Runtime {
                 let mut out = Vec::new();
                 while out.len() < 1024 {
                     match reader.try_recv() {
-                        Some(chunk) => {
+                        bitty_pty::PtyRecv::Chunk(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                             out.push(chunk);
                         }
-                        None => break,
+                        bitty_pty::PtyRecv::Empty
+                        | bitty_pty::PtyRecv::Eof
+                        | bitty_pty::PtyRecv::Error(_) => break,
                     }
                 }
                 out

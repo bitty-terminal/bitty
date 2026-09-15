@@ -7,9 +7,10 @@
 //!   line-oriented programs treat as EOF. Then call [`Pty::wait`].
 //! - **Hard:** [`Pty::kill`] sends SIGKILL-equivalent termination;
 //!   [`Pty::shutdown`] kills and reaps in one step.
-//! - **Leak-free by default:** dropping [`Pty`] kills any unreaped child and
-//!   blocks until it is reaped, so no zombie processes outlive the handle.
-//!   Callers needing graceful shutdown must perform it before dropping.
+//! - **Bounded cleanup by default:** dropping [`Pty`] kills any unreaped
+//!   child and reaps it within [`DROP_REAP_TIMEOUT`], so a well-behaved
+//!   child never survives as a zombie and the dropper can never hang.
+//!   Callers wanting a clean status must shut down before dropping.
 
 use crate::error::PtyError;
 use crate::platform::ExitStatus;
@@ -23,6 +24,14 @@ use crate::writer::PtyWriter;
 /// kernel status check (`try_wait`), so a 5 ms cadence bounds CPU while
 /// keeping reap latency negligible against second-scale timeouts.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Upper bound on the synchronous kill-and-reap performed by [`Pty`]'s
+/// `Drop` (CTX-0477). SIGKILL is normally delivered and reaped within
+/// milliseconds; the bound exists only so a pathological child — an
+/// uninterruptible-sleep process or a ConPTY that never signals exit —
+/// cannot hang the dropper. A child that outlives the bound is left to the
+/// kernel instead of blocking the caller.
+const DROP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum bytes of a process name reported in [`ForegroundJob::name`]
 /// (CTX-0370). The kernel interface (`/proc/<pid>/comm`) already caps names
@@ -133,14 +142,17 @@ impl Pty {
     ///
     /// The returned [`PtyReader`] pumps kernel reads into a bounded channel
     /// on a dedicated thread; see the [`reader`](crate::reader) module docs
-    /// for the backpressure contract. May be called only once per PTY.
+    /// for the backpressure contract. May be called only once per PTY. The
+    /// reader stays unclaimed when the pump thread cannot be spawned
+    /// (surfaced as [`PtyError::Io`]), so a later retry is possible.
     pub fn take_reader(&mut self) -> Result<PtyReader, PtyError> {
         if self.reader_taken {
             return Err(PtyError::HalfAlreadyTaken("reader"));
         }
         let raw = self.session.try_clone_reader()?;
+        let reader = PtyReader::spawn(ReaderSource::new(raw), READ_CHUNK_SIZE)?;
         self.reader_taken = true;
-        Ok(PtyReader::spawn(ReaderSource::new(raw), READ_CHUNK_SIZE))
+        Ok(reader)
     }
 
     /// Takes exclusive ownership of the input side.
@@ -331,6 +343,25 @@ mod tests {
         assert_eq!(status.code(), 3);
     }
 
+    #[test]
+    fn drop_reaps_a_live_child_without_blocking() {
+        // CTX-0477 hang regression: the old Drop called the unbounded
+        // `Session::wait`, which never returns for a child that never
+        // signals exit. Drop must kill and reap a live child (here `cat`,
+        // blocked on stdin) within the documented bound.
+        bitty_test_support::require_pty!();
+        let pty = crate::PtyBuilder::new("/bin/cat")
+            .spawn()
+            .expect("spawn cat");
+        let start = std::time::Instant::now();
+        drop(pty);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < DROP_REAP_TIMEOUT + Duration::from_secs(1),
+            "Drop blocked for {elapsed:?} (bound {DROP_REAP_TIMEOUT:?})"
+        );
+    }
+
     /// Polls `check` until it returns `Some`, or panics past `timeout`.
     fn wait_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
         let deadline = std::time::Instant::now() + timeout;
@@ -399,12 +430,13 @@ mod tests {
 impl Drop for Pty {
     fn drop(&mut self) {
         if !self.reaped {
-            // Kill first (deterministic), then block on reaping so no zombie
-            // survives the handle. SIGKILL cannot be caught by a healthy
-            // child, so the wait terminates even for misbehaving programs.
+            // Kill first (deterministic), then reap through the bounded
+            // timeout path so the dropper cannot hang: SIGKILL cannot be
+            // caught by a healthy child, and a child that never becomes
+            // reapable within DROP_REAP_TIMEOUT is left to the kernel rather
+            // than blocking here (CTX-0477).
             let _ = self.session.kill();
-            let _ = self.session.wait();
-            self.reaped = true;
+            let _ = self.wait_timeout(DROP_REAP_TIMEOUT);
         }
     }
 }

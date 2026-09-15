@@ -531,6 +531,32 @@ impl Runtime {
                     }
                 }
             }
+            // OSC 4 palette set/query (CTX-0392): the parser already
+            // classified and bounded the payload to at most MAX_OSC4_OPS
+            // pairs (malformed forms never reach this arm). Queries are
+            // answered from the active 256-entry palette only — no reply
+            // before theme resolution — and sets share the OSC color-set
+            // gate (default deny) with OSC 10/11.
+            if let TerminalAction::OscPalette { ops } = &action {
+                for pair in ops.iter() {
+                    match pair.op {
+                        PaletteColorOp::Query => {
+                            if self.config.theme_resolved {
+                                let rgb = self.active_palette_color(pair.index);
+                                let reply = crate::queries::osc_palette_reply(pair.index, rgb);
+                                self.state.apply(&TerminalAction::Reply {
+                                    bytes: reply.into_boxed_slice(),
+                                });
+                            }
+                        }
+                        PaletteColorOp::Set(rgb) => {
+                            if self.osc_color_set_allowed {
+                                self.apply_osc_palette(pair.index, [rgb.r, rgb.g, rgb.b]);
+                            }
+                        }
+                    }
+                }
+            }
             // Kitty graphics (CTX-0256): the parser already base64-unwrapped
             // and reassembled `m=` chunks under the ledger cap, so `payload`
             // is decoded bytes ready for the existing intake seam. Route to

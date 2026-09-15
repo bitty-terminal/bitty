@@ -154,6 +154,13 @@ pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
 /// previously hardcoded fallback; a selected preset is resolved once in the
 /// app layer and carried here so the clear color, default cell colors, and
 /// ANSI 0–15 all follow `appearance.theme`.
+///
+/// CTX-0392 adds the bounded dynamic layer: `dynamic` is the fixed
+/// 256-entry OSC 4 override table (`None` = no override, `Some(rgb)` =
+/// live override). Fixed shape, no growth: an index outside `0..=255` is
+/// unrepresentable, and malformed OSC 4 never writes here (fail-closed).
+/// Queries and `palette_rgb_in` read through this layer first, so 0–15
+/// custom/preset ANSI plus 16–255 cube/ramp all honor live overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemePalette {
     /// Window clear color and default cell background.
@@ -166,6 +173,9 @@ pub struct ThemePalette {
     pub selection: Rgba8,
     /// The 16 ANSI colors, indices 0–15 (8 normal + 8 bright).
     pub ansi: [[u8; 3]; 16],
+    /// Live OSC 4 overrides, index-addressed `0..=255` (CTX-0392).
+    /// Fixed 256-entry shape, no growth; `None` inherits the base below.
+    pub dynamic: [Option<[u8; 3]>; 256],
 }
 
 impl ThemePalette {
@@ -174,6 +184,7 @@ impl ThemePalette {
     /// This is the single mapping from the config-side [`Theme`] to the
     /// render-side palette; RGB channels are copied verbatim and alpha is
     /// forced opaque for the four chrome colors (the preset has no alpha).
+    /// The dynamic layer starts empty (`[None; 256]`).
     ///
     /// [`Theme`]: bitty_config::theme::Theme
     #[must_use]
@@ -199,7 +210,47 @@ impl ThemePalette {
                 0xFF,
             ],
             ansi: theme.ansi,
+            dynamic: [None; 256],
         }
+    }
+
+    /// Resolves an inline custom palette (CTX-0392) to the render side.
+    ///
+    /// Same mapping as [`Self::from_theme`] but from the validated
+    /// [`CustomPalette`](bitty_config::theme::CustomPalette): chrome colors
+    /// become opaque `Rgba8`, ANSI copies verbatim, dynamic starts empty.
+    #[must_use]
+    pub fn from_custom(custom: &bitty_config::theme::CustomPalette) -> Self {
+        Self {
+            background: [
+                custom.background[0],
+                custom.background[1],
+                custom.background[2],
+                0xFF,
+            ],
+            foreground: [
+                custom.foreground[0],
+                custom.foreground[1],
+                custom.foreground[2],
+                0xFF,
+            ],
+            cursor: [custom.cursor[0], custom.cursor[1], custom.cursor[2], 0xFF],
+            selection: [
+                custom.selection[0],
+                custom.selection[1],
+                custom.selection[2],
+                0xFF,
+            ],
+            ansi: custom.ansi,
+            dynamic: [None; 256],
+        }
+    }
+
+    /// Active RGB for palette `index` (CTX-0392): the live OSC 4 override
+    /// when present, else the base 16 ANSI / cube / ramp.
+    #[must_use]
+    pub fn active_index(self, index: u8) -> [u8; 3] {
+        palette_rgb_in(&self, index)
     }
 
     /// The designed default preset (Bitty Dark), byte-identical to the
@@ -363,10 +414,14 @@ pub fn palette_rgb(index: u8) -> [u8; 3] {
     palette_rgb_in(&ThemePalette::bitty_dark(), index)
 }
 
-/// Theme-aware [`palette_rgb`]: indices 0–15 come from `palette.ansi`; the
-/// 6x6x6 cube and grayscale ramp stay xterm-compatible.
+/// Theme-aware [`palette_rgb`]: live OSC 4 overrides win; else indices
+/// 0–15 come from `palette.ansi`; the 6x6x6 cube and grayscale ramp stay
+/// xterm-compatible.
 #[must_use]
 pub fn palette_rgb_in(palette: &ThemePalette, index: u8) -> [u8; 3] {
+    if let Some(rgb) = palette.dynamic[index as usize] {
+        return rgb;
+    }
     if index < 16 {
         return palette.ansi[index as usize];
     }

@@ -1275,8 +1275,11 @@ pub(crate) fn runtime_config_from_effective(
         // token / `decoration.border_color` / explicit pair and carry it onto
         // the runtime config. The `bitty-config` validation already enforced
         // AC-1/AC-2 fail-closed against the same theme background.
-        let theme = bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref());
-        let outline = effective.decoration.resolve_outline(theme);
+        // CTX-0392: the effective theme folds in `appearance.colors` when
+        // present (preset tokens, custom background/ANSI), so outlines and
+        // the runtime palette stay on the same ground.
+        let theme = effective.effective_theme();
+        let outline = effective.decoration.resolve_outline(&theme);
         cfg.outline_focused = outline.focused.0;
         cfg.outline_idle = outline.idle.0;
         // CTX-0344 (RFC-0001/OQ-045): resolve the focus/idle outline-width
@@ -1314,10 +1317,21 @@ pub(crate) fn runtime_config_from_effective(
         // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
         // config so the default-path renderer and clear color follow
         // `appearance.theme` instead of the hardcoded Bitty Dark fallback.
-        cfg.theme = bitty_runtime::ThemePalette::from_theme(theme);
-        // CTX-0381: mark the palette as user-resolved so OSC 10/11 queries
-        // are answered from it; headless/unit configs keep the false default
-        // and stay silent (no reply before theme resolution).
+        // CTX-0392: when `appearance.colors` is present the custom palette
+        // replaces the preset's chrome/ANSI (same fixed shape, validated
+        // hex, 16 entries); outline tokens stay preset-owned.
+        cfg.theme = match &effective.appearance.colors {
+            Some(custom) => bitty_runtime::ThemePalette::from_custom(custom),
+            None => {
+                let preset =
+                    bitty_config::theme::resolve_theme(effective.appearance.theme.as_deref());
+                bitty_runtime::ThemePalette::from_theme(preset)
+            }
+        };
+        // CTX-0381/CTX-0392: mark the palette as user-resolved so OSC 10/11
+        // and OSC 4 queries are answered from it; headless/unit configs keep
+        // the false default and stay silent (no reply before theme
+        // resolution).
         cfg.theme_resolved = true;
         // RFC-0002 (CTX-0341): map the resolved effective animation contract
         // onto the runtime policy. Durations are already bounded by

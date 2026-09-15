@@ -437,6 +437,7 @@ impl CliOverrides {
         let plan = ConfigPlan {
             appearance: Some(AppearanceConfig {
                 theme: Some(trimmed.to_string()),
+                colors: None,
                 animations: None,
             }),
             schema_version: Some(CURRENT_SCHEMA_VERSION),
@@ -508,6 +509,7 @@ impl CliOverrides {
         };
         let appearance = theme.as_deref().map(|t| AppearanceConfig {
             theme: Some(t.to_string()),
+            colors: None,
             animations: None,
         });
         let plan = ConfigPlan {
@@ -932,9 +934,79 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         }
     };
 
-    let appearance = match (theme, animations) {
-        (None, None) => None,
-        (theme, animations) => Some(AppearanceConfig { theme, animations }),
+    let appearance = match (theme, data.appearance_colors, animations) {
+        (None, None, None) => None,
+        (theme, colors_data, animations) => {
+            // CTX-0392: inline `appearance.colors` custom palette. Complete
+            // palette required (4 chrome + exactly 16 ANSI); any missing,
+            // short/long, or malformed leaf rejects the whole reload
+            // fail-closed so live state can never corrupt. Hex grammar is
+            // `#RRGGBB` only; no file path is accepted (OQ-047 stays Open).
+            let colors = match colors_data {
+                None => None,
+                Some(c) => {
+                    let background = c.background.as_deref().ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors.background",
+                            "table 'appearance.colors' requires 'background' (\"#RRGGBB\")",
+                        )
+                    })?;
+                    let foreground = c.foreground.as_deref().ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors.foreground",
+                            "table 'appearance.colors' requires 'foreground' (\"#RRGGBB\")",
+                        )
+                    })?;
+                    let cursor = c.cursor.as_deref().ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors.cursor",
+                            "table 'appearance.colors' requires 'cursor' (\"#RRGGBB\")",
+                        )
+                    })?;
+                    let selection = c.selection.as_deref().ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors.selection",
+                            "table 'appearance.colors' requires 'selection' (\"#RRGGBB\")",
+                        )
+                    })?;
+                    let ansi = c.ansi.as_deref().ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors.ansi",
+                            "table 'appearance.colors' requires 'ansi' (16 \"#RRGGBB\" entries)",
+                        )
+                    })?;
+                    if ansi.len() != crate::theme::CUSTOM_PALETTE_ANSI_COUNT {
+                        return Err(ConfigError::validation(
+                            "appearance.colors.ansi",
+                            format!(
+                                "must contain exactly {} entries (found {})",
+                                crate::theme::CUSTOM_PALETTE_ANSI_COUNT,
+                                ansi.len()
+                            ),
+                        ));
+                    }
+                    let palette = crate::theme::CustomPalette::from_hex(
+                        background,
+                        foreground,
+                        cursor,
+                        selection,
+                        ansi,
+                    )
+                    .ok_or_else(|| {
+                        ConfigError::validation(
+                            "appearance.colors",
+                            "must be canonical \"#RRGGBB\" hex (background, foreground, cursor, selection plus 16 ansi entries)",
+                        )
+                    })?;
+                    Some(palette)
+                }
+            };
+            Some(AppearanceConfig {
+                theme,
+                colors,
+                animations,
+            })
+        }
     };
     let font = match data.font {
         None => None,
@@ -3958,5 +4030,69 @@ mod tests {
             safe.decoration.border_color_focused,
             Some(crate::types::SAFE_DECORATION_BORDER_FOCUSED)
         );
+    }
+}
+
+#[cfg(test)]
+mod ctx0392_tests {
+    use super::*;
+    use crate::plan::{ConfigSource, LayerKind};
+
+    fn ctx0392_source() -> ConfigSource {
+        ConfigSource::new(LayerKind::User, Some("init.lua"))
+    }
+
+    fn ctx0392_ansi16(hex: &str) -> String {
+        (0..16)
+            .map(|_| format!("\"{hex}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn lua_custom_palette_parses_and_validates() {
+        let ansi = ctx0392_ansi16("#112233");
+        let content = format!(
+            "return {{ appearance = {{ theme = \"dark\", colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }} }} }} }}"
+        );
+        let plan = parse_lua_config(&content, &ctx0392_source()).expect("custom parses");
+        let colors = plan
+            .appearance
+            .as_ref()
+            .and_then(|a| a.colors.as_ref())
+            .expect("colors present");
+        assert_eq!(colors.background, [0x1E, 0x1E, 0x2E]);
+        assert_eq!(colors.ansi.len(), 16);
+        let merged = crate::merge::merge_layers(vec![LayeredPlan::new(ctx0392_source(), plan)])
+            .expect("merge");
+        merged.effective.validate().expect("custom valid");
+        assert_eq!(
+            merged.effective.effective_theme().background,
+            [0x1E, 0x1E, 0x2E]
+        );
+    }
+
+    #[test]
+    fn lua_custom_palette_malformed_fails_closed() {
+        let bad = "return { appearance = { colors = { background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\" } } }";
+        assert!(parse_lua_config(bad, &ctx0392_source()).is_err());
+        let ansi15 = (0..15)
+            .map(|_| "\"#112233\"")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bad = format!(
+            "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi15} }} }} }} }}"
+        );
+        assert!(parse_lua_config(&bad, &ctx0392_source()).is_err());
+        let ansi = ctx0392_ansi16("#zzzzzz");
+        let bad = format!(
+            "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }} }} }} }}"
+        );
+        assert!(parse_lua_config(&bad, &ctx0392_source()).is_err());
+        let ansi = ctx0392_ansi16("#112233");
+        let bad = format!(
+            "return {{ appearance = {{ colors = {{ background = \"#1e1e2e\", foreground = \"#cdd6f4\", cursor = \"#f5e0dc\", selection = \"#313244\", ansi = {{ {ansi} }}, theme_file = \"x.lua\" }} }} }}"
+        );
+        assert!(parse_lua_config(&bad, &ctx0392_source()).is_err());
     }
 }

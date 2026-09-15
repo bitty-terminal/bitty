@@ -107,7 +107,9 @@ use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, PersistentSelection, Rect as UiRect,
     SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
 };
-use bitty_vt::{ClipboardOp, DynamicColorOp, DynamicColorTarget, Parser, SequenceKind};
+use bitty_vt::{
+    ClipboardOp, DynamicColorOp, DynamicColorTarget, PaletteColorOp, Parser, SequenceKind,
+};
 
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, Event, EventKind, GrantRecord, HostObservation, InterceptionDecision,
@@ -1216,17 +1218,21 @@ impl Runtime {
                 .any(|session| session.state.modes().synchronized_update)
     }
 
-    /// Allows or denies `OSC 10`/`OSC 11` dynamic color sets (CTX-0381).
+    /// Allows or denies `OSC 10`/`OSC 11` and `OSC 4` dynamic color sets
+    /// (CTX-0381, CTX-0392).
     ///
     /// Capability-gated and default-deny, mirroring OSC 52 writes: untrusted
-    /// PTY output can never repaint the default fg/bg unless the embedder
-    /// grants this explicitly. Queries are read-only and stay answered from
-    /// the resolved palette either way.
+    /// PTY output can never repaint the default fg/bg or the 256-entry
+    /// palette unless the embedder grants this explicitly. Queries are
+    /// read-only and stay answered from the resolved palette either way.
+    /// One flag gates both families (the accepted shared gating): `OSC 4`
+    /// sets ride the same capability as `OSC 10`/`OSC 11`.
     pub fn set_osc_color_set_allowed(&mut self, allowed: bool) {
         self.osc_color_set_allowed = allowed;
     }
 
-    /// Whether `OSC 10`/`OSC 11` sets are currently allowed (CTX-0381).
+    /// Whether `OSC 10`/`OSC 11`/`OSC 4` sets are currently allowed
+    /// (CTX-0381, CTX-0392).
     #[must_use]
     pub fn osc_color_set_allowed(&self) -> bool {
         self.osc_color_set_allowed
@@ -1268,6 +1274,33 @@ impl Runtime {
             background: self.active_background(),
             ..self.config.theme
         };
+        self.renderer.set_theme_palette(palette);
+        self.surface.set_theme_palette(palette);
+        self.pending_full_redraw = true;
+    }
+
+    /// Active palette entry for `index` (CTX-0392 OSC 4): the live override
+    /// when present, else the base custom/preset ANSI / cube / ramp.
+    ///
+    /// Reads through the fixed 256-entry dynamic layer on the resolved
+    /// theme palette, so custom palettes, presets, and OSC 4 overrides
+    /// compose in one place. Used for query replies; rendering resolves the
+    /// same way via `palette_rgb_in`.
+    #[must_use]
+    pub fn active_palette_color(&self, index: u8) -> [u8; 3] {
+        bitty_render::grid::palette_rgb_in(&self.config.theme, index)
+    }
+
+    /// Applies one authorized `OSC 4` set and forces a repaint (CTX-0392).
+    ///
+    /// The override is installed on the resolved theme palette's fixed
+    /// 256-entry dynamic layer (no growth, index-addressed) as well as on
+    /// the renderer/surface palettes; `pending_full_redraw` makes
+    /// indexed-colored cells repaint on the next frame. Out-of-range
+    /// indices are unrepresentable (`u8`), so no bounds check can fail.
+    pub(crate) fn apply_osc_palette(&mut self, index: u8, rgb: [u8; 3]) {
+        self.config.theme.dynamic[index as usize] = Some(rgb);
+        let palette = self.config.theme;
         self.renderer.set_theme_palette(palette);
         self.surface.set_theme_palette(palette);
         self.pending_full_redraw = true;

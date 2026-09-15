@@ -105,6 +105,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `decoration.background_fit`       | Live       |
 /// | `decoration.background_image_roots` | Live     |
 /// | `appearance.theme`        | Live               |
+/// | `appearance.colors`       | Live               |
 /// | `mod_key`                 | Live               |
 /// | `keymaps`                 | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
@@ -155,6 +156,7 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "decoration.background_image_roots"
         | "decoration"
         | "appearance.theme"
+        | "appearance.colors"
         | "appearance.animations.enabled"
         | "appearance.animations.reduced_motion"
         | "appearance.animations.duration_ms.open"
@@ -449,6 +451,14 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "appearance.theme",
         format!("{:?}", old.appearance.theme),
         format!("{:?}", new.appearance.theme),
+    );
+    // CTX-0392: the inline custom palette reconciles live like the theme
+    // name (presentation-only; no PTY/terminal recreation). Compared by
+    // value so identical palettes produce no diff.
+    push_if_changed(
+        "appearance.colors",
+        format!("{:?}", old.appearance.colors),
+        format!("{:?}", new.appearance.colors),
     );
     // RFC-0002: presentation-only animation chrome is adopted live by the
     // runtime (`set_animations`), so each leaf reconciles live like the
@@ -1195,5 +1205,33 @@ mod tests {
         assert!(!cur.animations.enabled);
         assert_eq!(cur.animations.duration_ms.open, 300);
         assert_eq!(cur.animations.easing.focus, AnimationEasing::Linear);
+    }
+}
+
+#[cfg(test)]
+mod ctx0392_tests {
+    use super::*;
+    use crate::theme::CustomPalette;
+
+    fn custom(bg: &str) -> CustomPalette {
+        let ansi: Vec<String> = (0..16).map(|_| "#112233".to_string()).collect();
+        CustomPalette::from_hex(bg, "#cdd6f4", "#f5e0dc", "#313244", &ansi).expect("custom")
+    }
+
+    #[test]
+    fn colors_diff_is_live_and_reconciles() {
+        let old = EffectiveConfig::default();
+        let mut new = old.clone();
+        new.appearance.colors = Some(custom("#1e1e2e"));
+        let r = diff(&old, &new);
+        assert_eq!(r.overall, ReloadClass::Live);
+        assert!(r.diffs.iter().any(|d| d.field == "appearance.colors"));
+        assert_eq!(classify_field("appearance.colors"), ReloadClass::Live);
+        let mut cur = old;
+        reconcile_live(&mut cur, &new).expect("colors must reconcile live");
+        assert_eq!(
+            cur.appearance.colors.unwrap().background,
+            [0x1E, 0x1E, 0x2E]
+        );
     }
 }

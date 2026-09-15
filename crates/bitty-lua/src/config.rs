@@ -297,6 +297,30 @@ pub struct AnimationsData {
     pub easing_workspace: Option<String>,
 }
 
+/// Inline custom palette, plain data (CTX-0392, issue #648; see [`FontData`]
+/// for `Option` semantics).
+///
+/// OQ-047 stays `Open`: no theme-file path exists. This is the inline
+/// `appearance.colors` table only (`background`, `foreground`, `cursor`,
+/// `selection` plus exactly 16 `ansi` hex strings). Every leaf is optional
+/// here so the extractor can distinguish "table absent" from "key absent";
+/// completeness (all 4 chrome colors plus 16 ANSI entries) is enforced
+/// fail-closed downstream in `bitty-config` (missing/short/long/malformed
+/// rejects the whole reload, never a partial palette).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ColorsData {
+    /// Background hex string when the key is set.
+    pub background: Option<String>,
+    /// Foreground hex string when the key is set.
+    pub foreground: Option<String>,
+    /// Cursor hex string when the key is set.
+    pub cursor: Option<String>,
+    /// Selection hex string when the key is set.
+    pub selection: Option<String>,
+    /// ANSI hex strings in order when the array is set.
+    pub ansi: Option<Vec<String>>,
+}
+
 /// One `views.<selector>` entry, plain data (RFC-0001/OQ-041, CTX-0343; see
 /// [`FontData`] for `Option` semantics).
 ///
@@ -336,6 +360,8 @@ pub struct ConfigData {
     pub theme: Option<String>,
     /// `appearance.theme` (wins over the alias when both are present).
     pub appearance_theme: Option<String>,
+    /// `appearance.colors` table (CTX-0392 inline custom palette).
+    pub appearance_colors: Option<ColorsData>,
     /// `appearance.animations` table (RFC-0002, CTX-0341).
     pub animations: Option<AnimationsData>,
     /// `font` table.
@@ -382,6 +408,7 @@ impl ConfigData {
     pub fn is_empty(&self) -> bool {
         self.theme.is_none()
             && self.appearance_theme.is_none()
+            && self.appearance_colors.is_none()
             && self.animations.is_none()
             && self.font.is_none()
             && self.window.is_none()
@@ -597,10 +624,13 @@ impl ValueSnapshot {
 
     /// Capture one table level; nested tables recurse at most three times
     /// (`depth` 0 = top, 1 = nested, 2 = deeper table such as
-    /// `appearance.animations`, 3 = `duration_ms`/`easing` leaves, 4 = stop
-    /// with `Nil` children). The RFC-0002 animations table is the deepest
-    /// known shape; deeper tables fail closed as `Nil` and are rejected by
-    /// the typed extractor.
+    /// `appearance.animations` / `appearance.colors`, 3 =
+    /// `duration_ms`/`easing` leaves or the `colors.ansi` array, 4 = stop
+    /// with `Nil` children). The RFC-0002 animations table was the deepest
+    /// known shape; CTX-0392 adds the `colors.ansi` string array at depth 3
+    /// (same bounded array pattern as CTX-0347
+    /// `decoration.background_image_roots` at depth 2). Deeper tables fail
+    /// closed as `Nil` and are rejected by the typed extractor.
     fn capture_table<'gc>(ctx: Context<'gc>, table: Table<'gc>, depth: u8) -> Self {
         let cap = if depth == 0 {
             MAX_CONFIG_TOP_KEYS + 1
@@ -645,9 +675,10 @@ impl ValueSnapshot {
         }
         // Sequence portion (keymaps arrays live here; CTX-0347
         // `decoration.background_image_roots` is the accepted nested array at
-        // depth 2, bounded the same way).
+        // depth 2 and CTX-0392 `appearance.colors.ansi` at depth 3, bounded
+        // the same way).
         let mut seq = Vec::new();
-        if depth <= 2 {
+        if depth <= 3 {
             let len = table.length().max(0) as usize;
             let want = len.min(MAX_CONFIG_KEYMAPS + 1);
             for i in 1..=(want as i64) {
@@ -836,9 +867,52 @@ impl ConfigData {
                 "theme" => out.theme = Some(expect_string(key, val)?),
                 "appearance" => {
                     let nested = expect_table(key, val)?;
-                    check_nested_keys(key, nested, &["theme", "animations"])?;
+                    check_nested_keys(key, nested, &["theme", "colors", "animations"])?;
                     if let Some(t) = get_field(nested, "theme") {
                         out.appearance_theme = Some(expect_string("appearance.theme", t)?);
+                    }
+                    // CTX-0392: inline `appearance.colors` custom palette.
+                    // Closed table of hex strings plus a 16-entry `ansi`
+                    // array; completeness and hex grammar are enforced
+                    // fail-closed downstream in `bitty-config`.
+                    if let Some(colors) = get_field(nested, "colors") {
+                        let colors_table = expect_table("appearance.colors", colors)?;
+                        check_nested_keys(
+                            "appearance.colors",
+                            colors_table,
+                            &["background", "foreground", "cursor", "selection", "ansi"],
+                        )?;
+                        let background = match get_field(colors_table, "background") {
+                            Some(v) => Some(expect_string("appearance.colors.background", v)?),
+                            None => None,
+                        };
+                        let foreground = match get_field(colors_table, "foreground") {
+                            Some(v) => Some(expect_string("appearance.colors.foreground", v)?),
+                            None => None,
+                        };
+                        let cursor = match get_field(colors_table, "cursor") {
+                            Some(v) => Some(expect_string("appearance.colors.cursor", v)?),
+                            None => None,
+                        };
+                        let selection = match get_field(colors_table, "selection") {
+                            Some(v) => Some(expect_string("appearance.colors.selection", v)?),
+                            None => None,
+                        };
+                        let ansi = match get_field(colors_table, "ansi") {
+                            Some(v) => Some(expect_string_list(
+                                "appearance.colors.ansi",
+                                v,
+                                MAX_CONFIG_NESTED_KEYS.max(16) + 1,
+                            )?),
+                            None => None,
+                        };
+                        out.appearance_colors = Some(ColorsData {
+                            background,
+                            foreground,
+                            cursor,
+                            selection,
+                            ansi,
+                        });
                     }
                     // RFC-0002: `appearance.animations` is a closed table of
                     // typed leaves; strings/integers/bools only (never

@@ -1360,6 +1360,107 @@ pub fn resolve_theme(name: Option<&str>) -> &'static Theme {
     theme
 }
 
+/// Bounded user-supplied palette (CTX-0392, issue #648).
+///
+/// OQ-047 conformance: OQ-047 stays `Open` (custom and third-party theme
+/// files are unsupported; the reserved XDG `themes/` directory is inert and
+/// no theme-file schema exists). This type therefore covers only the inline
+/// `appearance.colors` table evaluated from the already-trusted user config
+/// file (`init.lua`/`config.lua` via the `bitty-lua` sandbox). No new file
+/// path, no theme-file loading, and no path-trust widening: the accepted
+/// model is unchanged.
+///
+/// Shape (fail-closed, fixed, no growth):
+/// `background`, `foreground`, `cursor`, `selection` plus exactly 16 ANSI
+/// entries (`ansi[16]`). Every leaf is a canonical `#RRGGBB` hex string in
+/// config; this struct stores the parsed `sRGB` bytes. `#RGB`, `#RRGGBBAA`,
+/// named colors, `rgb()` syntax, and any other spelling are rejected by
+/// [`Self::parse_hex_rgb`] (never coerced, never clamped). Missing leaves
+/// or a short/long `ansi` array reject the whole reload fail-closed, so a
+/// malformed palette can never corrupt live state.
+///
+/// The AC-1/AC-2 outline invariants are enforced by
+/// `EffectiveConfig::validate` against the custom background (same floors
+/// as presets: focused `>= 3:1` vs background, focused `>= 3:1` vs idle
+/// unless the width cue holds); this type owns only structural validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustomPalette {
+    /// Window clear color and default cell background.
+    pub background: [u8; 3],
+    /// Default glyph color.
+    pub foreground: [u8; 3],
+    /// Block cursor fill.
+    pub cursor: [u8; 3],
+    /// Selection background fill.
+    pub selection: [u8; 3],
+    /// The 16 ANSI colors, indices 0-15.
+    pub ansi: [[u8; 3]; 16],
+}
+
+/// Expected ANSI entry count for [`CustomPalette`].
+pub const CUSTOM_PALETTE_ANSI_COUNT: usize = 16;
+
+impl CustomPalette {
+    /// Parses one canonical `#RRGGBB` spelling into `sRGB` bytes.
+    ///
+    /// Fail-closed: `None` for any other grammar (missing `#`, wrong digit
+    /// count, non-hex bytes, `#RGB`, `#RRGGBBAA`, named colors). Trims
+    /// surrounding whitespace like the outline parser; overlong input is
+    /// rejected, never truncated.
+    #[must_use]
+    pub fn parse_hex_rgb(raw: &str) -> Option<[u8; 3]> {
+        let trimmed = raw.trim();
+        if trimmed.len() != 7 {
+            return None;
+        }
+        let body = trimmed.strip_prefix('#')?;
+        if body.len() != 6 {
+            return None;
+        }
+        let bytes = body.as_bytes();
+        let hex_byte = |start: usize| -> Option<u8> {
+            let hi = (*bytes.get(start)? as char).to_digit(16)?;
+            let lo = (*bytes.get(start + 1)? as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        };
+        Some([hex_byte(0)?, hex_byte(2)?, hex_byte(4)?])
+    }
+
+    /// Builds a palette from already-split hex spellings.
+    ///
+    /// `ansi` must contain exactly [`CUSTOM_PALETTE_ANSI_COUNT`] entries.
+    /// `None` on any malformed leaf or wrong `ansi` length (fail-closed).
+    #[must_use]
+    pub fn from_hex(
+        background: &str,
+        foreground: &str,
+        cursor: &str,
+        selection: &str,
+        ansi: &[String],
+    ) -> Option<Self> {
+        if ansi.len() != CUSTOM_PALETTE_ANSI_COUNT {
+            return None;
+        }
+        let mut parsed = [[0u8; 3]; CUSTOM_PALETTE_ANSI_COUNT];
+        for (slot, raw) in parsed.iter_mut().zip(ansi.iter()) {
+            *slot = Self::parse_hex_rgb(raw)?;
+        }
+        Some(Self {
+            background: Self::parse_hex_rgb(background)?,
+            foreground: Self::parse_hex_rgb(foreground)?,
+            cursor: Self::parse_hex_rgb(cursor)?,
+            selection: Self::parse_hex_rgb(selection)?,
+            ansi: parsed,
+        })
+    }
+
+    /// Canonical `#RRGGBB` spelling of one stored entry.
+    #[must_use]
+    pub fn hex_entry(rgb: [u8; 3]) -> String {
+        format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,5 +1928,60 @@ mod tests {
             assert_eq!(theme.ansi[4], a4, "{name} ansi4");
             assert_eq!(theme.ansi[15], a15, "{name} ansi15");
         }
+    }
+
+    // CTX-0392: bounded inline custom palette (fail-closed hex, 16 entries).
+    #[test]
+    fn custom_palette_hex_parses_canonical_only() {
+        assert_eq!(
+            CustomPalette::parse_hex_rgb("#1e1e2e"),
+            Some([0x1E, 0x1E, 0x2E])
+        );
+        assert_eq!(
+            CustomPalette::parse_hex_rgb("  #CDD6F4  "),
+            Some([0xCD, 0xD6, 0xF4])
+        );
+        // Fail-closed: every non-canonical spelling rejects.
+        for bad in [
+            "",
+            "1e1e2e",
+            "#1e1",
+            "#1e1e2eAA",
+            "#gggggg",
+            "red",
+            "rgb(1,2,3)",
+            "#12345",
+            "#1234567",
+            "# 1e1e2e",
+        ] {
+            assert_eq!(
+                CustomPalette::parse_hex_rgb(bad),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_palette_requires_16_ansi() {
+        let ansi16: Vec<String> = (0..16).map(|_| "#112233".to_string()).collect();
+        let ansi15: Vec<String> = (0..15).map(|_| "#112233".to_string()).collect();
+        let ansi17: Vec<String> = (0..17).map(|_| "#112233".to_string()).collect();
+        assert!(
+            CustomPalette::from_hex("#1e1e2e", "#cdd6f4", "#f5e0dc", "#313244", &ansi16).is_some()
+        );
+        assert!(
+            CustomPalette::from_hex("#1e1e2e", "#cdd6f4", "#f5e0dc", "#313244", &ansi15).is_none(),
+            "15 entries must fail closed"
+        );
+        assert!(
+            CustomPalette::from_hex("#1e1e2e", "#cdd6f4", "#f5e0dc", "#313244", &ansi17).is_none(),
+            "17 entries must fail closed"
+        );
+        // Malformed leaf fails the whole palette (no partial state).
+        assert!(
+            CustomPalette::from_hex("#1e1e2e", "not-a-color", "#f5e0dc", "#313244", &ansi16)
+                .is_none()
+        );
     }
 }

@@ -884,6 +884,11 @@ impl State {
             // The runtime owns the active palette, query replies, and the
             // gated set path; terminal state stays inert by contract.
             TerminalAction::OscDynamicColor { .. } => {}
+            // Palette operations (CTX-0392 OSC 4): grid truth is untouched.
+            // The runtime owns the active 256-entry palette, query replies,
+            // and the gated set path; terminal state stays inert by contract
+            // (malformed sequences never reach this arm).
+            TerminalAction::OscPalette { .. } => {}
             TerminalAction::OscClipboard { .. } => {
                 // Semantically inert here by contract (RFC replay guarantee
                 // 6): clipboard effects enter state only through recorded

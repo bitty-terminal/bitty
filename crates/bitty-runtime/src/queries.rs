@@ -166,6 +166,22 @@ pub(crate) fn osc_color_reply(target: bitty_vt::DynamicColorTarget, color: [u8; 
     .into_bytes()
 }
 
+/// Standard `OSC 4` query reply for one palette index (CTX-0392).
+///
+/// xterm reply shape: `OSC 4 ; <index> ; rgb:RRRR/GGGG/BBBB ST`, with each
+/// 8-bit channel duplicated to the full 16-bit range. Always
+/// `ST`-terminated. Multi-query sequences concatenate one such unit per
+/// queried index in wire order; the caller bounds the pair count via
+/// [`bitty_vt::MAX_OSC4_OPS`], so the combined reply stays < 1 KiB.
+#[must_use]
+pub(crate) fn osc_palette_reply(index: u8, rgb: [u8; 3]) -> Vec<u8> {
+    format!(
+        "\x1b]4;{index};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+        rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2]
+    )
+    .into_bytes()
+}
+
 /// DECRQM mode value for one queried mode number against live state.
 ///
 /// `1` set, `2` reset, `0` not recognized (ANSI modes other than 4/20,

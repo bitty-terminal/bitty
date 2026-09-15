@@ -300,3 +300,92 @@ fn osc10_osc11_malformed_input_is_inert() {
     assert_eq!(rt.active_foreground(), [0xCD, 0xD6, 0xF4, 0xFF]);
     assert_eq!(rt.active_background(), [0x1E, 0x1E, 0x2E, 0xFF]);
 }
+
+// ---------------------------------------------------------------------------
+// CTX-0392: OSC 4 palette set/query (fixed 256-entry shape, fail-closed).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn osc4_query_replies_with_active_palette_color() {
+    let mut rt = themed_runtime();
+    // Bitty Dark ANSI 1 is #f38ba8.
+    rt.handle_pty_bytes(b"\x1b]4;1;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\".to_vec()],
+    );
+    // Cube index 16 is #000000 in the xterm ramp.
+    rt.handle_pty_bytes(b"\x1b]4;16;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![b"\x1b]4;16;rgb:0000/0000/0000\x1b\\".to_vec()],
+    );
+}
+
+#[test]
+fn osc4_query_before_theme_resolution_stays_silent() {
+    let mut rt = Runtime::with_defaults().expect("build");
+    assert!(!rt.config().theme_resolved, "defaults are unresolved");
+    rt.handle_pty_bytes(b"\x1b]4;1;?\x07\x1b]4;2;?\x07");
+    assert!(
+        replies_text(&mut rt).is_empty(),
+        "no reply before theme resolution"
+    );
+}
+
+#[test]
+fn osc4_set_is_gated_default_deny() {
+    let mut rt = themed_runtime();
+    // Default deny: untrusted output cannot recolor the palette, silently.
+    rt.handle_pty_bytes(b"\x1b]4;1;#112233\x07");
+    assert!(replies_text(&mut rt).is_empty());
+    assert_eq!(rt.active_palette_color(1), [0xF3, 0x8B, 0xA8]);
+    // Grant, then sets apply and queries report the override.
+    rt.set_osc_color_set_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]4;1;#112233\x07");
+    assert_eq!(rt.active_palette_color(1), [0x11, 0x22, 0x33]);
+    rt.handle_pty_bytes(b"\x1b]4;1;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![b"\x1b]4;1;rgb:1111/2222/3333\x1b\\".to_vec()],
+    );
+    // High indices (cube/ramp) also override with the fixed 256 shape.
+    rt.handle_pty_bytes(b"\x1b]4;200;#aabbcc\x07");
+    assert_eq!(rt.active_palette_color(200), [0xAA, 0xBB, 0xCC]);
+}
+
+#[test]
+fn osc4_multi_pair_query_replies_in_order() {
+    let mut rt = themed_runtime();
+    rt.handle_pty_bytes(b"\x1b]4;0;?;1;?\x07");
+    assert_eq!(
+        replies_text(&mut rt),
+        vec![
+            b"\x1b]4;0;rgb:4545/4747/5a5a\x1b\\".to_vec(),
+            b"\x1b]4;1;rgb:f3f3/8b8b/a8a8\x1b\\".to_vec(),
+        ],
+    );
+}
+
+#[test]
+fn osc4_malformed_input_is_inert() {
+    let mut rt = themed_runtime();
+    rt.set_osc_color_set_allowed(true);
+    for sequence in [
+        &b"\x1b]4;\x07"[..],
+        &b"\x1b]4;1\x07"[..],
+        &b"\x1b]4;256;?\x07"[..],
+        &b"\x1b]4;1;#12345\x07"[..],
+        &b"\x1b]4;1;not-a-color\x07"[..],
+        &b"\x1b]4;1;?;2\x07"[..],
+    ] {
+        rt.handle_pty_bytes(sequence);
+    }
+    assert!(
+        replies_text(&mut rt).is_empty(),
+        "malformed payloads never query or reply"
+    );
+    // Palette untouched (spot-check low + high indices).
+    assert_eq!(rt.active_palette_color(1), [0xF3, 0x8B, 0xA8]);
+    assert_eq!(rt.active_palette_color(16), [0x00, 0x00, 0x00]);
+}

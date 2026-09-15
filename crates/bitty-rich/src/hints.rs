@@ -81,6 +81,15 @@
 //! [`dispatch`] returns [`DispatchError::UnknownLabel`], and an unarmed
 //! [`HintSession::feed`] returns [`HintFeedError::NotArmed`]. No I/O, no
 //! wall-clock, no randomness, no unsafe.
+//!
+//! # Wiring status (CTX-0391 / GitHub #647): future, not yet shipped
+//!
+//! Headless P3 is implemented and tested here, but no `bitty-app` or
+//! `bitty-runtime` input/render path instantiates it yet. Wiring needs a
+//! Leader chord, session state, batch collection from truth, compositor
+//! painting, and focus/scroll/clipboard routing -- a full feature, not a P2
+//! fix. Until then this module is intentionally unused by the app; the
+//! tracked follow-up is #647. Do not wire ad hoc.
 
 #![forbid(unsafe_code)]
 
@@ -1831,6 +1840,20 @@ mod tests {
         assert!(!live.is_armed());
         assert!(live.batch().is_none());
         assert_eq!(live.feed(&mut fold, 'j', "a"), Err(HintFeedError::NotArmed));
+    }
+
+    #[test]
+    fn hints_wiring_status_is_future_not_silent() {
+        // CTX-0391 / #647 decision record: headless P3 works here, but no
+        // app input/render path arms a session yet. This pins the disarmed
+        // default so the module cannot look wired by accident.
+        let session = HintSession::new();
+        assert!(!session.is_armed(), "fresh session must start disarmed");
+        assert!(session.batch().is_none());
+        let empty = HintRegistry::new();
+        let batch = HintBatch::build(1, &empty);
+        assert!(batch.is_empty(), "empty registry yields empty batch");
+        assert_eq!(batch.overlay_cost(), 0);
     }
 
     #[test]

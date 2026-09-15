@@ -52,7 +52,9 @@
 //!   (alias `show_help`; CTX-0265 help popup, defaults `alt+`` plus the
 //!   `alt+?` shifted-symbol spellings), `open_composer` (Command Composer
 //!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
-//!   so Normal Mode stays byte-identical until the user opts in),
+//!   so Normal Mode stays byte-identical until the user opts in; CTX-0391 /
+//!   #647: not yet shipped -- parses for forward compat but the app only
+//!   warns, so leave `alt+e` unbound for shell use until wired),
 //!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
 //!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
 //!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move:
@@ -646,7 +648,9 @@ pub enum ChromeAction {
     /// fresh config keeps Normal Mode byte-identical (the 008 §14 boundary).
     /// The user opts in with `{ chord = "alt+e", action = "open_composer" }`;
     /// the single-character schema rule already forces a modifier, so the
-    /// open chord can never shadow bare shell typing.
+    /// open chord can never shadow bare shell typing. CTX-0391 / #647:
+    /// not yet shipped -- parses for forward compat but the app only warns,
+    /// so leave `alt+e` unbound for shell use until wired.
     OpenComposer,
     /// Create a fresh workspace and switch to it (`workspace_new`, CTX-0257
     /// DEC-0034 entry, default chord `alt+n`). The new workspace starts as

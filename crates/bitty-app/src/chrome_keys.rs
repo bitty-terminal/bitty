@@ -547,15 +547,18 @@ impl TerminalApp {
                 }
             }
             A::OpenComposer => {
-                // CTX-0227 (008 route P4): manual composer open through the
-                // single-owner keymap (suggested chord `alt+e`). The chord
-                // is consumed here so its bytes never reach the PTY; the
-                // composer session itself lives in `bitty-rich` (headless,
-                // tested there) and the overlay/panel presentation is a
-                // follow-up — until then the open signal is logged and no
-                // input routing changes (Normal Mode stays byte-identical).
+                // CTX-0391 / GitHub #647 (unbind path): the composer session
+                // itself lives headless in `bitty-rich` and the overlay/panel
+                // presentation plus editor spawn are not yet wired into the
+                // app. Wiring here would need ComposerSession state, input
+                // routing, PTY submit, and process-spawn policy — a full
+                // feature, not a P2 fix. Until then `open_composer` parses
+                // for forward compat but is never in defaults: unbound Alt+E
+                // reaches the shell, and an explicitly bound chord is
+                // consumed here as inert with a loud warning (no editor, no
+                // routing change, Normal Mode stays byte-identical).
                 eprintln!(
-                    "bitty: keymap open_composer -> composer open requested (manual open only; Normal Mode input still goes to the PTY)"
+                    "warning: keymap open_composer is not yet shipped (see #647); chord ignored, no editor launched"
                 );
             }
             A::NewSplit(dir) => {
@@ -2750,6 +2753,43 @@ mod tests {
             "added chord listed: {:?}",
             app.runtime.help_rows()
         );
+    }
+
+    #[test]
+    fn open_composer_is_inert_and_unbound_by_default() {
+        // CTX-0391 / #647 unbind path: composer UI plus editor spawn are not
+        // yet wired (would need session state, routing, PTY submit, and
+        // process policy). Until then defaults stay unbound so Alt+E reaches
+        // the shell, and an explicitly bound chord is inert with a warning.
+        use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
+        let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+        assert!(
+            !maps.iter().any(|m| m.action == ChromeAction::OpenComposer),
+            "defaults must not bind open_composer so Alt+E stays shell input"
+        );
+        let alt_e = KeyRef {
+            key: KeyName::Char('e'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            match_keymap(&maps, alt_e),
+            None,
+            "unbound Alt+E must fall through to the PTY"
+        );
+        // Bound-but-inert: no runtime mutation, no editor, no routing change.
+        let mut app = help_test_app(maps);
+        let leafs = app.runtime.leaf_count();
+        let leaves = app.runtime.layout().leaf_ids();
+        let focused = app.runtime.focused_view();
+        let help = app.runtime.help_visible();
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
+        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
+        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        assert_eq!(app.runtime.help_visible(), help, "help unchanged");
     }
 
     #[test]

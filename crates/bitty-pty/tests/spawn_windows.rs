@@ -47,6 +47,7 @@
 #![cfg(windows)]
 
 use std::io::Write;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -127,11 +128,14 @@ fn read_until(
                 out.extend_from_slice(&chunk);
                 reply_to_dsrs(writer, &out, &mut dsrs_answered);
             }
-            // EOF (child gone and pump drained) or pump ended: whatever we
-            // have is all there is; the caller asserts on it.
+            // Clean EOF (child gone and pump drained): whatever we have is
+            // all there is; the caller asserts on it.
             Ok(None) => break,
+            // The pump ended with an I/O failure: same terminal meaning for
+            // this harness — stop reading and let the caller assert.
+            Err(RecvTimeoutError::Disconnected) => break,
             // Tick elapsed with no data: loop around and re-check deadline.
-            Err(_) => continue,
+            Err(RecvTimeoutError::Timeout) => continue,
         }
     }
     out

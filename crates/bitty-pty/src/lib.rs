@@ -75,7 +75,7 @@
 //! use std::io::Write;
 //! writer.write_all(b"ping\n")?;
 //! // `cat` echoes the line back through the bounded channel.
-//! if let Some(chunk) = reader.recv() {
+//! if let Ok(Some(chunk)) = reader.recv() {
 //!     assert!(chunk.windows(4).any(|w| w == b"ping"));
 //! }
 //! drop(writer);          // graceful: sends EOF to the child
@@ -117,5 +117,6 @@ pub use pty::Pty;
 pub use reader::CHANNEL_CAPACITY_CHUNKS;
 pub use reader::MAX_BUFFERED_BYTES;
 pub use reader::PtyReader;
+pub use reader::PtyRecv;
 pub use reader::READ_CHUNK_SIZE;
 pub use writer::PtyWriter;

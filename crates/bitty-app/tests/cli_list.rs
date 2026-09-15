@@ -237,15 +237,16 @@ fn list_plugins_table_contains_bundled() {
 }
 
 #[test]
-fn list_plugins_json_count_is_seven() {
+fn list_plugins_json_count_is_six() {
     let output = run_bitty(&["list", "plugins", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(0));
     let doc = parse_stdout_json(&stdout(&output));
     assert!(doc.contains("\"kind\":\"plugins\""));
-    assert!(doc.contains("\"count\":7"), "count: {:?}", doc.text());
+    assert!(doc.contains("\"count\":6"), "count: {:?}", doc.text());
     assert!(!doc.contains("bitty-terminal.palette"));
     assert!(!doc.contains("bitty-terminal.statusline"));
     assert!(!doc.contains("bitty-terminal.git-panel"));
+    assert!(!doc.contains("bitty-terminal.file-manager"));
 }
 
 #[test]

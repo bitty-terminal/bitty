@@ -1,35 +1,142 @@
 #![forbid(unsafe_code)]
-//! File manager via Panel Runtime — public API verification (CTX-0108, OQ-011).
+//! File manager via Panel Runtime — parity verification after the OQ-053 split.
 //!
-//! Verifies `bitty-terminal.file-manager` (tiled Panel, fs.read + optional fs.write)
-//! as generic Panel Runtime consumer with no private channel, via the public
-//! PluginHost path (`declare → resolve → register → GrantRecord → activate →
-//! subscribe → publish → drain SideQueue DropOldest`) and PanelRegistry public
-//! path (`PanelRegistry::new → create_panel → mount_panel → focus_panel` with
-//! `PanelType::Helper` plus `register_command`/`create_overlay`/`declare_topic`/
-//! `subscribe`/`publish`/`drain_batch`), tiled `LayoutNode` `H`/`V` reuse, bounded
-//! queues `64`/`1024`/`2 MiB`/`8192`, `DropOldest`, `8 KiB` payload, `32`/`8 KiB`
-//! batch, single-process `winit` one-registry-per-window, default disabled,
-//! safe-mode reject, `forbid(unsafe)`.
+//! `bitty-terminal.file-manager` migrated to the independent first-party package
+//! `bitty-terminal/file-manager` (OQ-053, `bitty` `CTX-0399`), so this suite now
+//! exercises the generic Panel Runtime path against a local fixture manifest
+//! mirroring the former bundled manifest instead of the bundled catalog — the
+//! same fixture pattern the palette (`CTX-0397`), statusline (`CTX-0398`), and
+//! git-panel (`CTX-0400`) splits established. The former bundled review
+//! implementation (`bitty-runtime::file_manager`) is removed; its pure
+//! listing/navigation/preview policy ships in the independent Lua package
+//! (`lua/file-manager/`) with headless Lua specs there.
 //!
-//!mirrors palette_statusline_project_panel but for the file-manager P1 candidate
-//! with tiled workspace and fs isolation.
+//! What this suite proves with no private channel, via the public PluginHost
+//! path (`declare → resolve → register → GrantRecord → activate → subscribe
+//! → publish → drain SideQueue DropOldest`) and the PanelRegistry public
+//! path (`PanelRegistry::new → create_panel → mount_panel → focus_panel`
+//! with `PanelType::Helper` plus `register_command`/`create_overlay`/
+//! `declare_topic`/`subscribe`/`publish`/`drain_batch`), tiled `LayoutNode`
+//! `H`/`V` reuse, bounded queues `64`/`1024`/`2 MiB`/`8192`, `DropOldest`,
+//! `8 KiB` payload, `32`/`8 KiB` batch, single-process `winit`
+//! one-registry-per-window, default disabled, safe-mode reject,
+//! `forbid(unsafe)`.
 
 use bitty_plugin_host::{
-    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::file_manager_manifest,
+    CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::bundled_manifest_for,
 };
 use bitty_runtime::{
     Runtime, RuntimeConfig,
-    file_manager::{
-        FILE_MANAGER_FS_READ_PATTERN, FILE_MANAGER_FS_WRITE_PATTERN, FILE_MANAGER_MAX_ENTRIES,
-        FileEntry, FileKind, FileManagerIntegration, create_file_manager_panel,
-        file_manager_tiled_layout, validate_file_manager_panel_config,
-    },
     registry::{BoundedPayload, PanelRegistry, PanelRegistryConfig, WorkspaceId},
 };
 use bitty_term_state::{State, TerminalAction};
-use bitty_ui::{Rect as UiRect, ViewId};
+use bitty_ui::{LayoutNode, Rect as UiRect, SplitAxis, View, ViewId};
 use bitty_vt::BoundedString;
+
+// --- former bundled contract, pinned locally ---------------------------------
+//
+// Values mirror the former bundled `file_manager_manifest`
+// (`crates/bitty-plugin-host/src/bundled.rs`) and the former
+// `bitty-runtime::file_manager` constants (`FILE_MANAGER_MAX_*`,
+// `FILE_MANAGER_FS_*`). This module is parity evidence, not the contract.
+
+/// Former bundled plugin id.
+const FILE_MANAGER_ID: &str = "bitty-terminal.file-manager";
+
+/// Former bundled display name.
+const FILE_MANAGER_NAME: &str = "File Manager";
+
+/// Former bundled version.
+const FILE_MANAGER_VERSION: &str = "0.1.0";
+
+/// Former bundled description.
+const FILE_MANAGER_DESCRIPTION: &str =
+    "Tiled Panel file manager with fs.read + optional fs.write, bounded 8KiB/32/64 PR-1..12";
+
+/// Former bundled compat ranges.
+const FILE_MANAGER_COMPAT_BITTY: &str = ">=0.1,<1.0";
+const FILE_MANAGER_COMPAT_PLUGIN_API: &str = "^1.0";
+
+/// Filesystem read scope.
+const FILE_MANAGER_FS_READ_PATTERN: &str = "~/projects/**";
+
+/// Filesystem write scope (optional, user-confirmed mutations only).
+const FILE_MANAGER_FS_WRITE_PATTERN: &str = "~/projects/**";
+
+/// Former bundled lazy commands.
+const FILE_MANAGER_COMMANDS: &[&str] = &[
+    "bitty-terminal.file-manager:open",
+    "bitty-terminal.file-manager:preview",
+    "bitty-terminal.file-manager:rename",
+];
+
+/// Former bundled observation events.
+const FILE_MANAGER_EVENTS: &[&str] = &[
+    "terminal.cwd-changed",
+    "terminal.title-changed",
+    "focus.changed",
+];
+
+/// Listing bounds (former `FILE_MANAGER_MAX_*`).
+const FILE_MANAGER_MAX_ENTRIES: usize = 128;
+const FILE_MANAGER_MAX_NAME_CHARS: usize = 128;
+const FILE_MANAGER_MAX_PATH_BYTES: usize = 4096;
+const FILE_MANAGER_MAX_SELECTION: usize = 64;
+const FILE_MANAGER_PAYLOAD_MAX_BYTES: usize = 8192;
+
+/// Local fixture mirroring the former bundled `bitty-terminal.file-manager` manifest.
+///
+/// File-manager migrated to an independent first-party package (OQ-053, `bitty`
+/// `CTX-0399`), so this suite now exercises the generic Panel Runtime path
+/// against a plain manifest instead of the bundled catalog.
+fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
+    use bitty_plugin_host::{
+        CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, PluginId,
+        PluginIdentity, PluginManifest, QualifiedName,
+    };
+    let mut caps = CapabilityRequests::default();
+    caps.ids
+        .insert(CapabilityId::parse("panel.provider").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("panel.create").expect("known capability"));
+    caps.ids
+        .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
+    caps.filesystem.push(FilesystemRequest {
+        access: FsAccess::Read,
+        paths: vec![FILE_MANAGER_FS_READ_PATTERN.to_string()],
+    });
+    caps.filesystem.push(FilesystemRequest {
+        access: FsAccess::Write,
+        paths: vec![FILE_MANAGER_FS_WRITE_PATTERN.to_string()],
+    });
+    PluginManifest {
+        identity: PluginIdentity {
+            id: PluginId::new(FILE_MANAGER_ID).expect("valid id"),
+            name: FILE_MANAGER_NAME.to_string(),
+            version: FILE_MANAGER_VERSION.to_string(),
+            description: FILE_MANAGER_DESCRIPTION.to_string(),
+            license: Some("MIT".to_string()),
+        },
+        compat: Compat {
+            bitty: Some(FILE_MANAGER_COMPAT_BITTY.to_string()),
+            plugin_api: Some(FILE_MANAGER_COMPAT_PLUGIN_API.to_string()),
+        },
+        dependencies: Vec::new(),
+        provided_services: Vec::new(),
+        required_services: Vec::new(),
+        capabilities: caps,
+        tools: Vec::new(),
+        lazy: LazyTriggers {
+            commands: FILE_MANAGER_COMMANDS
+                .iter()
+                .map(|c| QualifiedName::new(c).expect("qualified"))
+                .collect(),
+            events: FILE_MANAGER_EVENTS.iter().map(|e| e.to_string()).collect(),
+            claims: Vec::new(),
+        },
+        raw_bytes_len: 512,
+    }
+}
 
 fn granted_set_for(
     manifest: &bitty_plugin_host::PluginManifest,
@@ -45,6 +152,115 @@ fn granted_set_for(
         }
     }
     set
+}
+
+// --- the bundled id is freed for the independent package ---------------------
+
+#[test]
+fn file_manager_id_is_freed_from_the_bundled_catalog() {
+    // CTX-0406 reserves bundled ids: the independent package installs under
+    // this same identity through the external package path, so the bundled
+    // catalog must no longer claim it.
+    let id = bitty_plugin_host::PluginId::new(FILE_MANAGER_ID).unwrap();
+    assert!(
+        !bitty_plugin_host::bundled::is_bundled(&id),
+        "file-manager must no longer be bundled"
+    );
+    assert!(
+        bundled_manifest_for(FILE_MANAGER_ID).is_none(),
+        "file-manager must have no bundled manifest"
+    );
+    assert!(
+        !bitty_plugin_host::bundled::bundled_ids_sorted()
+            .iter()
+            .any(|listed| listed == FILE_MANAGER_ID),
+        "file-manager must not be in the bundled id list"
+    );
+}
+
+// --- fixture matches the former bundled manifest ------------------------------
+
+#[test]
+fn file_manager_fixture_matches_former_bundled_manifest() {
+    let manifest = file_manager_manifest();
+    manifest.validate().expect("fixture must validate");
+    assert_eq!(manifest.identity.id.as_str(), FILE_MANAGER_ID);
+    assert_eq!(manifest.identity.name, FILE_MANAGER_NAME);
+    assert_eq!(manifest.identity.version, FILE_MANAGER_VERSION);
+    assert_eq!(manifest.identity.description, FILE_MANAGER_DESCRIPTION);
+    assert_eq!(
+        manifest.compat.bitty.as_deref(),
+        Some(FILE_MANAGER_COMPAT_BITTY)
+    );
+    assert_eq!(
+        manifest.compat.plugin_api.as_deref(),
+        Some(FILE_MANAGER_COMPAT_PLUGIN_API)
+    );
+    // Capabilities: panel.provider + panel.create + terminal.semantic-read +
+    // fs.read + optional fs.write.
+    let granted = granted_set_for(&manifest);
+    assert!(granted.contains(&CapabilityId::parse("panel.provider").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("panel.create").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("terminal.semantic-read").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("fs.read:~/projects/**").unwrap()));
+    assert!(granted.contains(&CapabilityId::parse("fs.write:~/projects/**").unwrap()));
+    assert_eq!(manifest.capabilities.filesystem.len(), 2);
+    assert_eq!(FILE_MANAGER_FS_READ_PATTERN, "~/projects/**");
+    assert_eq!(FILE_MANAGER_FS_WRITE_PATTERN, "~/projects/**");
+    // Lazy triggers: three commands, three observation events, no claims.
+    assert_eq!(manifest.lazy.commands.len(), FILE_MANAGER_COMMANDS.len());
+    for command in FILE_MANAGER_COMMANDS {
+        assert!(
+            manifest
+                .lazy
+                .commands
+                .iter()
+                .any(|c| c.as_str() == *command),
+            "missing {command}"
+        );
+    }
+    assert_eq!(manifest.lazy.events.len(), FILE_MANAGER_EVENTS.len());
+    for event in FILE_MANAGER_EVENTS {
+        assert!(
+            manifest.lazy.events.iter().any(|e| e == event),
+            "missing {event}"
+        );
+    }
+    assert!(manifest.lazy.claims.is_empty());
+    // Manifest hash is deterministic (grant binding).
+    assert_eq!(manifest.manifest_hash(), manifest.clone().manifest_hash());
+    let mut bumped = file_manager_manifest();
+    bumped.identity.version = "0.2.0".to_string();
+    assert_ne!(bumped.manifest_hash(), manifest.manifest_hash());
+}
+
+// --- bounded output -------------------------------------------------------------
+
+#[test]
+fn file_manager_bounds_contract_pins() {
+    assert_eq!(FILE_MANAGER_MAX_ENTRIES, 128);
+    assert_eq!(FILE_MANAGER_MAX_NAME_CHARS, 128);
+    assert_eq!(FILE_MANAGER_MAX_PATH_BYTES, 4096);
+    assert_eq!(FILE_MANAGER_MAX_SELECTION, 64);
+    assert_eq!(FILE_MANAGER_PAYLOAD_MAX_BYTES, 8192);
+    assert_eq!(FILE_MANAGER_FS_READ_PATTERN, "~/projects/**");
+    assert_eq!(FILE_MANAGER_FS_WRITE_PATTERN, "~/projects/**");
+    // No spawn authority in this plugin.
+    let manifest = file_manager_manifest();
+    assert!(
+        !manifest
+            .capabilities
+            .ids
+            .iter()
+            .any(|id| id.as_str().starts_with("process.spawn"))
+    );
+    assert!(
+        !manifest
+            .capabilities
+            .ids
+            .iter()
+            .any(|id| id.as_str().starts_with("network.connect"))
+    );
 }
 
 // --- default disabled --------------------------------------------------------
@@ -73,23 +289,11 @@ fn file_manager_via_public_plugin_host_path() {
     let id = manifest.id().clone();
     let hash = manifest.manifest_hash();
     let granted = granted_set_for(&manifest);
-    // Must contain panel.provider + panel.create + terminal.semantic-read + fs.read + fs.write
     assert!(granted.contains(&CapabilityId::parse("panel.provider").unwrap()));
     assert!(granted.contains(&CapabilityId::parse("panel.create").unwrap()));
     assert!(granted.contains(&CapabilityId::parse("terminal.semantic-read").unwrap()));
     assert!(granted.contains(&CapabilityId::parse("fs.read:~/projects/**").unwrap()));
     assert!(granted.contains(&CapabilityId::parse("fs.write:~/projects/**").unwrap()));
-    assert_eq!(manifest.capabilities.filesystem.len(), 2);
-    assert_eq!(FILE_MANAGER_FS_READ_PATTERN, "~/projects/**");
-    assert_eq!(FILE_MANAGER_FS_WRITE_PATTERN, "~/projects/**");
-    assert_eq!(manifest.lazy.commands.len(), 3);
-    assert!(
-        manifest
-            .lazy
-            .commands
-            .iter()
-            .any(|c| c.as_str() == "bitty-terminal.file-manager:open")
-    );
 
     let mut host = PluginHost::new(DropPolicy::DropOldest, 16);
     host.declare(manifest.clone()).expect("declare");
@@ -182,9 +386,12 @@ fn file_manager_panel_via_panel_runtime_public_path_bounded() {
     let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("panel reg");
     let ws = WorkspaceId::new(1);
     let view = ViewId::new(1);
-    let pid = create_file_manager_panel(&mut reg, ws, view).expect("create file-manager panel");
+    let handle = reg
+        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
+        .expect("create file-manager panel");
+    reg.mount_panel(handle.id, handle.generation, view)
+        .expect("mount file-manager panel");
     assert_eq!(reg.panel_count(), 1);
-    let _raw = pid.get();
 
     // Command registry single owner: register open, duplicate rejected
     let mut reg2 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
@@ -233,33 +440,25 @@ fn file_manager_panel_via_panel_runtime_public_path_bounded() {
     let batch = reg2.drain_batch(h.id, topic.as_str(), 32, 8192);
     assert_eq!(batch.len(), 32);
 
-    // Tiled layout is H split, not a new primitive
-    let main = bitty_ui::View::new(ViewId::new(10), 80, 24);
-    let preview = bitty_ui::View::new(ViewId::new(11), 40, 24);
-    let tiled = FileManagerIntegration::tiled_layout(main, Some(preview), 0.5);
-    assert!(matches!(tiled, bitty_ui::LayoutNode::Split { .. }));
+    // Tiled layout is H split via LayoutNode primitives, not a new primitive
+    let main = View::new(ViewId::new(10), 80, 24);
+    let preview = View::new(ViewId::new(11), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(main),
+        LayoutNode::leaf(preview),
+    );
+    assert!(matches!(tiled, LayoutNode::Split { .. }));
     assert_eq!(tiled.leaf_count(), 2);
-
-    // fs isolation via helper
-    assert!(FileManagerIntegration::is_within_read_scope(
-        "~/projects/foo"
-    ));
-    assert!(!FileManagerIntegration::is_within_read_scope("/etc/passwd"));
-    assert!(!FileManagerIntegration::is_within_read_scope(
-        "~/projects/../evil"
-    ));
-    assert!(FileManagerIntegration::is_fs_write_allowed(
-        "~/projects/foo/bar"
-    ));
-    assert!(!FileManagerIntegration::is_fs_write_allowed("/tmp/evil"));
 
     // Config validation bounded fail-closed
     let bad = PanelRegistryConfig {
         max_panels_per_workspace: 0,
         ..Default::default()
     };
-    assert!(validate_file_manager_panel_config(&bad).is_err());
-    assert!(validate_file_manager_panel_config(&PanelRegistryConfig::default()).is_ok());
+    assert!(bad.validate().is_err());
+    assert!(PanelRegistryConfig::default().validate().is_ok());
     // AlreadyMounted: same view cannot host two panels in same registry
     let mut reg3 = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
     let ws_mount = WorkspaceId::new(99);
@@ -347,70 +546,6 @@ fn file_manager_panel_via_panel_runtime_public_path_bounded() {
         reg4.grant_panel_capability(h3.id, h3.generation, "fs.read:~/projects/**")
             .is_err()
     );
-}
-
-// --- file-manager helpers pure bounded (listing, filter, tiled) --------------
-
-#[test]
-fn file_manager_helpers_pure_bounded_and_tiled_deterministic() {
-    // Listing helper: sorted deduped bounded 128
-    let raw = vec![
-        "~/projects/b".to_string(),
-        "~/projects/a".to_string(),
-        "~/projects/a".to_string(),
-        "/etc/passwd".to_string(),
-        "~/projects/c".to_string(),
-    ];
-    let listed = FileManagerIntegration::list_entries(&raw);
-    assert_eq!(listed.len(), 3);
-    assert_eq!(listed[0].path, "~/projects/a");
-    assert_eq!(listed[1].path, "~/projects/b");
-    // Bounded at 128
-    let many: Vec<String> = (0..200)
-        .map(|i| format!("~/projects/file{i}.txt"))
-        .collect();
-    assert_eq!(
-        FileManagerIntegration::list_entries(&many).len(),
-        FILE_MANAGER_MAX_ENTRIES
-    );
-    // Filter bounded, case-insensitive over name/path
-    let entries = FileManagerIntegration::list_entries(&many[..10]);
-    let filtered = FileManagerIntegration::filter_entries(&entries, "file1");
-    assert!(!filtered.is_empty() && filtered.len() <= 10);
-    let filtered_ci = FileManagerIntegration::filter_entries(&entries, "FILE1");
-    assert_eq!(filtered.len(), filtered_ci.len());
-    // Tiled layout deterministic H split reuse
-    let main = bitty_ui::View::new(ViewId::new(20), 80, 24);
-    let preview = bitty_ui::View::new(ViewId::new(21), 40, 24);
-    let tiled = FileManagerIntegration::tiled_layout(main.clone(), Some(preview.clone()), 0.5);
-    let allocs = tiled.layout(UiRect::new(0, 0, 80, 24));
-    assert_eq!(allocs.len(), 2);
-    // Solo (no preview) is single leaf
-    let solo = FileManagerIntegration::tiled_layout(main, None, 0.5);
-    assert_eq!(solo.leaf_count(), 1);
-    // Vertical stack
-    let v1 = bitty_ui::View::new(ViewId::new(30), 80, 12);
-    let v2 = bitty_ui::View::new(ViewId::new(31), 80, 12);
-    let stack = FileManagerIntegration::vertical_stack(vec![v1, v2]);
-    assert!(matches!(stack, bitty_ui::LayoutNode::Stack(_)));
-    // FileEntry creation bounded
-    let entry =
-        FileEntry::from_path("~/projects/foo.txt".to_string(), Some(FileKind::File)).unwrap();
-    assert_eq!(entry.name, "foo.txt");
-    assert!(!entry.truncated);
-    assert_eq!(entry.kind, FileKind::File);
-    // Long name truncated
-    let long_name = "a".repeat(200);
-    let long_path = format!("~/projects/{long_name}");
-    let long_entry = FileEntry::from_path(long_path, None).unwrap();
-    assert_eq!(long_entry.name.chars().count(), 128);
-    assert!(long_entry.truncated);
-    // Invalid path yields None
-    assert!(FileEntry::from_path("/etc/passwd".to_string(), None).is_none());
-    assert!(FileEntry::from_path("~/projects/../evil".to_string(), None).is_none());
-    // Outside scope rejected by is_valid/is_within
-    assert!(!FileManagerIntegration::is_valid_path(""));
-    assert!(!FileManagerIntegration::is_valid_path("~/projects/\0evil"));
 }
 
 // --- safe-mode rejects file-manager without panic ------------------------------
@@ -504,54 +639,6 @@ fn file_manager_is_headless_and_forbid_unsafe_single_process_winit() {
     assert!(dbg2.contains("TerminalRegistry"));
 }
 
-// --- command registry bounded and overlay focus MRU ---------------------------
-
-#[test]
-fn file_manager_command_registry_bounded_and_overlay_focus_mru() {
-    let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).unwrap();
-    let ws = WorkspaceId::new(10);
-    let v1 = ViewId::new(10);
-    let v2 = ViewId::new(11);
-    let h1 = reg
-        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
-        .unwrap();
-    let h2 = reg
-        .create_panel(bitty_ui::panel::PanelType::Helper, Some(ws))
-        .unwrap();
-    reg.mount_panel(h1.id, h1.generation, v1).unwrap();
-    reg.mount_panel(h2.id, h2.generation, v2).unwrap();
-    // Register commands per panel, up to 32 bound.
-    for i in 0..32 {
-        reg.register_command(h1.id, h1.generation, &format!("xuepoo.fm:cmd{i}"))
-            .unwrap();
-    }
-    assert!(
-        reg.register_command(h1.id, h1.generation, "xuepoo.fm:overflow")
-            .is_err()
-    );
-    // Duplicate across panels rejected
-    assert!(
-        reg.register_command(h2.id, h2.generation, "xuepoo.fm:cmd0")
-            .is_err()
-    );
-    // Focus MRU per Workspace per Window (PanelFocus)
-    reg.focus_panel(h1.id, h1.generation, ws).unwrap();
-    reg.focus_panel(h2.id, h2.generation, ws).unwrap();
-    assert_eq!(reg.focused_panel(ws), Some(h2.id));
-    assert_eq!(reg.mru_order(ws), vec![h2.id, h1.id]);
-    assert_eq!(reg.command_owner("xuepoo.fm:cmd0"), Some(h1.id));
-    // Generation isolation: stale handle rejected
-    let bad_gen = bitty_runtime::registry::Generation(h1.generation.get().wrapping_add(100));
-    assert!(
-        reg.register_command(h1.id, bad_gen, "xuepoo.fm:stale")
-            .is_err()
-    );
-    // Overlay text truncated at char boundary via FileManagerIntegration
-    let long = "a".repeat(200);
-    let truncated = FileManagerIntegration::truncate_name(&long);
-    assert_eq!(truncated.chars().count(), 128);
-}
-
 // --- panel reactive via EventBus, no hot path --------------------------------
 
 #[test]
@@ -577,16 +664,6 @@ fn file_manager_panel_reactive_via_eventbus_no_hot_path() {
     assert!(reg.bus_events_for_panel(h.id) <= 64);
     let batch = reg.drain_batch(h.id, topic.as_str(), 32, 8192);
     assert_eq!(batch.len(), 32);
-    // Filtering is pure bounded, no hot-path
-    let raw: Vec<String> = (0..50).map(|i| format!("~/projects/file{i}.txt")).collect();
-    let entries = FileManagerIntegration::list_entries(&raw);
-    let filtered = FileManagerIntegration::filter_entries(&entries, "file1");
-    assert!(filtered.len() <= 128);
-    assert!(
-        filtered
-            .iter()
-            .all(|e| e.name.contains("file1") || e.path.contains("file1"))
-    );
     // State observation remains pure
     let mut state = State::new();
     state.apply(&TerminalAction::OscCwd {
@@ -597,15 +674,12 @@ fn file_manager_panel_reactive_via_eventbus_no_hot_path() {
     });
     assert!(state.cwd_report().is_some());
     assert!(!state.title().is_empty());
-    // Rendering remains deterministic
-    let rendered_again = FileManagerIntegration::list_entries(&raw);
-    assert_eq!(entries, rendered_again);
 }
 
-// --- fs isolation via CapabilityId and helper --------------------------------
+// --- fs isolation via CapabilityId --------------------------------------------
 
 #[test]
-fn file_manager_fs_isolation_via_capability_id_and_helper() {
+fn file_manager_fs_isolation_via_capability_id() {
     let cap_read = CapabilityId::parse("fs.read:~/projects/**").unwrap();
     assert_eq!(cap_read.family(), bitty_plugin_host::CapabilityFamily::Fs);
     assert_eq!(cap_read.as_str(), "fs.read:~/projects/**");
@@ -613,28 +687,6 @@ fn file_manager_fs_isolation_via_capability_id_and_helper() {
     assert_eq!(cap_write.family(), bitty_plugin_host::CapabilityFamily::Fs);
     let outside = CapabilityId::parse("fs.read:/tmp/**").unwrap();
     assert_ne!(cap_read, outside);
-    // Host grant isolation already proven via manifest above, here also verify helper rejects outside
-    assert!(!FileManagerIntegration::is_within_read_scope("/tmp/evil"));
-    assert!(!FileManagerIntegration::is_within_read_scope(
-        "~/projects/foo/../../etc/passwd"
-    ));
-    assert!(FileManagerIntegration::is_within_read_scope(
-        "~/projects/foo/bar"
-    ));
-    assert!(FileManagerIntegration::is_fs_allowed("~/projects/foo/bar"));
-    assert!(FileManagerIntegration::is_fs_write_allowed(
-        "~/projects/foo/bar"
-    ));
-    assert!(!FileManagerIntegration::is_fs_allowed(
-        "~/projects/foo/../../etc"
-    ));
-    assert!(!FileManagerIntegration::is_fs_write_allowed("/etc/passwd"));
-    // Bounded listing already verified
-    let many: Vec<String> = (0..200).map(|i| format!("~/projects/file{i}")).collect();
-    assert_eq!(
-        FileManagerIntegration::list_entries(&many).len(),
-        FILE_MANAGER_MAX_ENTRIES
-    );
     // Manifest hash deterministic and panel.* present
     let m = file_manager_manifest();
     assert_eq!(m.manifest_hash(), m.clone().manifest_hash());
@@ -660,11 +712,16 @@ fn runtime_side_queue_drop_oldest_for_observations() {
     let obs = rt.drain_plugin_observations();
     assert!(obs.iter().any(|o| matches!(o, bitty_plugin_host::HostObservation::TitleChanged(s) if s=="file-manager-title")));
     assert!(obs.iter().any(|o| matches!(o, bitty_plugin_host::HostObservation::CwdChanged(s) if s.contains("file:///home/user/projects/proj"))));
-    // Tiled layout via file-manager helper is pure, not hot-path, bounded
-    let main = bitty_ui::View::new(ViewId::new(1), 80, 24);
-    let preview = bitty_ui::View::new(ViewId::new(2), 40, 24);
-    let tiled = FileManagerIntegration::tiled_layout(main, Some(preview), 0.6);
-    assert!(matches!(tiled, bitty_ui::LayoutNode::Split { .. }));
+    // Tiled layout via LayoutNode primitives is pure, not hot-path, bounded
+    let main = View::new(ViewId::new(1), 80, 24);
+    let preview = View::new(ViewId::new(2), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.6,
+        LayoutNode::leaf(main),
+        LayoutNode::leaf(preview),
+    );
+    assert!(matches!(tiled, LayoutNode::Split { .. }));
     // Flood side queue beyond 128 (default) -> DropOldest newest survive
     let mut rt2 =
         Runtime::with_plugin_host_capacity(RuntimeConfig::default(), DropPolicy::DropOldest, 64, 4)
@@ -706,19 +763,24 @@ fn runtime_side_queue_drop_oldest_for_observations() {
 fn file_manager_tiled_panel_reuses_layout_hv_deterministically() {
     // File manager proves tiled Panel(PanelId) workspace reuse of LayoutNode H/V
     // with panel content, not a PTY, bounded 32 leaves, PR-1..PR-12.
-    let main = bitty_ui::View::new(ViewId::new(1), 80, 24);
-    let preview = bitty_ui::View::new(ViewId::new(2), 40, 24);
-    let tiled = file_manager_tiled_layout(main.clone(), Some(preview.clone()), 0.5);
+    let main = View::new(ViewId::new(1), 80, 24);
+    let preview = View::new(ViewId::new(2), 40, 24);
+    let tiled = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(main.clone()),
+        LayoutNode::leaf(preview.clone()),
+    );
     assert_eq!(tiled.leaf_count(), 2);
     let allocs = tiled.layout(UiRect::new(0, 0, 80, 24));
     assert_eq!(allocs.len(), 2);
     // Solo file manager panel (no preview) is single leaf
-    let solo = file_manager_tiled_layout(main.clone(), None, 0.5);
+    let solo = LayoutNode::leaf(main.clone());
     assert_eq!(solo.leaf_count(), 1);
     // Vertical stack for file list details
-    let v1 = bitty_ui::View::new(ViewId::new(3), 80, 12);
-    let v2 = bitty_ui::View::new(ViewId::new(4), 80, 12);
-    let stack = FileManagerIntegration::vertical_stack(vec![v1, v2]);
+    let v1 = View::new(ViewId::new(3), 80, 12);
+    let v2 = View::new(ViewId::new(4), 80, 12);
+    let stack = LayoutNode::stack(vec![LayoutNode::leaf(v1), LayoutNode::leaf(v2)]);
     assert_eq!(stack.leaf_count(), 2);
     // PanelId distinct from ViewId via type system
     let pid = bitty_runtime::registry::PanelId::new(1);

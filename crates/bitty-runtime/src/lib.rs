@@ -184,7 +184,6 @@ pub mod ai_panel;
 pub mod browser_panel;
 pub mod config;
 pub mod error;
-pub mod file_manager;
 pub mod host_bridge;
 pub mod inspect;
 pub mod mail_panel;

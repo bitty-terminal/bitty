@@ -2,9 +2,9 @@
 
 //! Bundled dogfood evidence for CTX-0096 (P2, area:plugin).
 //!
-//! Verifies the seven `v1` bundled-disabled first-party plugins
+//! Verifies the six `v1` bundled-disabled first-party plugins
 //! (`bitty-terminal.shell-integration`, `tabs`,
-//! `project`, `file-manager`, `browser-panel`, `ai-panel`, `mail-panel`) dogfood the **public** Plugin API with manifest / capability /
+//! `project`, `browser-panel`, `ai-panel`, `mail-panel`) dogfood the **public** Plugin API with manifest / capability /
 //! lifecycle parity to any third-party `xuepoo.*` plugin, default-disabled
 //! (no implicit enable), safe-mode compatibility, Terminal Truth protection
 //! (observation via bounded side queue, never direct `State` write), and
@@ -18,9 +18,8 @@ use bitty_plugin_host::{
     PluginHost, PluginId,
     bundled::{
         ai_panel_manifest, all_bundled_manifests, browser_panel_manifest, bundled_ids_sorted,
-        bundled_manifest_for, deprecated_alias_warning, file_manager_manifest, is_bundled,
-        is_deprecated_bundled_alias, mail_panel_manifest, project_manifest,
-        shell_integration_manifest, workspace_manifest,
+        bundled_manifest_for, deprecated_alias_warning, is_bundled, is_deprecated_bundled_alias,
+        mail_panel_manifest, project_manifest, shell_integration_manifest, workspace_manifest,
     },
 };
 
@@ -41,7 +40,7 @@ fn granted_set_for(manifest: &bitty_plugin_host::PluginManifest) -> BTreeSet<Cap
 #[test]
 fn bundled_manifests_validate_and_have_expected_ids() {
     let all = all_bundled_manifests();
-    assert_eq!(all.len(), 7);
+    assert_eq!(all.len(), 6);
     for m in &all {
         m.validate().expect("bundled must validate");
     }
@@ -50,7 +49,6 @@ fn bundled_manifests_validate_and_have_expected_ids() {
         vec![
             "bitty-terminal.ai-panel",
             "bitty-terminal.browser-panel",
-            "bitty-terminal.file-manager",
             "bitty-terminal.mail-panel",
             "bitty-terminal.project",
             "bitty-terminal.shell-integration",
@@ -101,7 +99,7 @@ fn bundled_plugins_load_via_public_api_with_grant_checks() {
             bitty_plugin_host::PluginState::Activated
         );
     }
-    assert_eq!(host.registry().len(), 7);
+    assert_eq!(host.registry().len(), 6);
 }
 
 #[test]
@@ -214,7 +212,6 @@ fn default_disabled_safe_mode_leaves_host_functional() {
             .is_err()
     );
     assert!(safe.declare(project_manifest()).is_err());
-    assert!(safe.declare(file_manager_manifest()).is_err());
     assert!(safe.declare(browser_panel_manifest()).is_err());
     assert!(safe.declare(ai_panel_manifest()).is_err());
     assert!(safe.declare(mail_panel_manifest()).is_err());

@@ -188,6 +188,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the listing and allowlist helpers. No behavior change for existing users:
   the bundled set stays disabled by default and `bitty --safe` still rejects
   `bitty-terminal.*` exactly like third-party ids.
+- **File-manager plugin extracted from the bundled catalog (CTX-0399, OQ-053):**
+  `bitty-terminal.file-manager` moved to the independent
+  `bitty-terminal/file-manager` package and is no longer part of the
+  bundled-disabled catalog, so the id can be installed through the external
+  package path (CTX-0406 reserves bundled ids). The catalog now stages six
+  plugins. The plugin id, capabilities (`panel.provider`, `panel.create`,
+  `terminal.semantic-read`, `fs.read:~/projects/**`, optional
+  `fs.write:~/projects/**`), commands (`open`, `preview`, `rename`), and
+  observation events are unchanged from the bundled manifest. The bundled
+  review implementation in `bitty-runtime::file_manager` is removed; the
+  independent Lua package carries the pure listing/navigation/preview policy
+  (no spawn; fs access host-mediated) with a headless Lua suite. No behavior
+  change for existing users: the bundled set stays disabled by default and
+  `bitty --safe` still rejects `bitty-terminal.*` exactly like third-party
+  ids.
 
 - **Selection no longer auto-copies by default (CTX-0371):** `selection.auto_copy`
   now defaults to `false` (was `true`), so a committed mouse selection keeps its

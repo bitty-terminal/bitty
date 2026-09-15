@@ -696,19 +696,20 @@ pub enum ChromeAction {
     ///
     /// Keyboard-first modal overlay over the bounded CTX-0060/0061 search
     /// seams (`State::search`, `SearchState`): typing edits the bounded
-    /// query (`<=256` bytes), `Enter`/`n` advances with viewport reveal plus
-    /// live-selection sync, `Shift+Enter`/`N` goes back, `Esc` exits and
-    /// clears. Modal: no PTY input while active. Default `ctrl+shift+f`
+    /// query (`<=256` bytes), `Enter` advances with viewport reveal plus
+    /// live-selection sync, `Shift+Enter` goes back, `Esc` exits and
+    /// clears (typing always edits the query; `n`/`N` are query text,
+    /// not navigation). Modal: no PTY input while active. Default `ctrl+shift+f`
     /// (kitty parity; carries no `alt` slot so a Super flip leaves it).
     OpenSearch,
     /// Advance to the next search match (`search_next`, CTX-0383).
     ///
-    /// No default binding: driven from the overlay (`Enter`/`n`) or via an
+    /// No default binding: driven from the overlay (`Enter`) or via an
     /// explicit user bind. Fail-closed no-op when search is inactive.
     SearchNext,
     /// Go back to the previous search match (`search_prev`, CTX-0383).
     ///
-    /// No default binding: driven from the overlay (`Shift+Enter`/`N`) or
+    /// No default binding: driven from the overlay (`Shift+Enter`) or
     /// via an explicit user bind. Fail-closed no-op when search is inactive.
     SearchPrev,
     /// Close the search overlay (`close_search`, CTX-0383).

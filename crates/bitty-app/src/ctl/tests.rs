@@ -1529,7 +1529,11 @@ fn control_socketpair_roundtrip_headless_live_instance() {
     client
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
-    let peer = bitty_ipc::devtools::transport_attested_peer(0);
+    // Socketpair has no filesystem endpoint: mint the marker via the headless
+    // peer-UID check (same marker type the accept boundary produces after
+    // endpoint verification).
+    let peer = bitty_ipc::verify_peer_for_connection(bitty_ipc::PeerCredentials::new(0, 0, 1), 0)
+        .expect("headless peer check");
     let handle = std::thread::spawn(move || {
         let mut limiter = bitty_ipc::RateLimiter::rc9_default();
         let clock = || 0u64;
@@ -1747,13 +1751,6 @@ fn wm_connect(path: &str) -> std::os::unix::net::UnixStream {
     }
 }
 
-#[cfg(unix)]
-fn wm_owner_uid(path: &str) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
-}
-
 /// Serve one connection on a real socket with explicit granted scopes.
 /// Returns the server thread; it asserts request/response parity itself.
 #[cfg(unix)]
@@ -1770,7 +1767,10 @@ fn spawn_wm_server(
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
-        let verified = bitty_ipc::devtools::transport_attested_peer(wm_owner_uid(&socket_path));
+        let dir = bitty_ipc::devtools::prepare_socket_dir(&socket_path).unwrap();
+        let runtime_uid = bitty_ipc::devtools::attest_bound_socket(&socket_path, &dir).unwrap();
+        let verified =
+            bitty_ipc::devtools::transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = bitty_ipc::devtools::Dispatcher::with_defaults();
         let server = bitty_ipc::devtools::ServerInfo::new(
             "wm-proof".to_string(),

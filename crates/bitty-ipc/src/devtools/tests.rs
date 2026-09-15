@@ -402,7 +402,14 @@ fn serve_connection_ping_pong_over_socketpair() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let dispatcher = Dispatcher::with_defaults();
     let context = test_context();
-    let peer = transport_attested_peer(1000);
+    // Socketpair has no filesystem endpoint to attest: use the headless
+    // peer-UID check directly (same marker type the accept boundary mints
+    // after endpoint verification).
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
     let mut limiter = RateLimiter::rc9_default();
     let clock = || 0u64;
 
@@ -447,7 +454,28 @@ fn serve_path_takes_verified_marker_only() {
     // into the serving path. Accept-boundary verification is fail-closed.
     let good = PeerCredentials::new(1000, 1000, 1);
     let verified = verify_peer_for_connection(good, 1000).unwrap();
-    let attested = transport_attested_peer(1000);
+
+    // Endpoint attestation on a properly owned 0700/0600 socket mints the
+    // same marker type (unit euid owns the temp endpoint it just created).
+    let attested = {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("bitty-ctx0463-{}-marker", std::process::id()));
+        let socket_path = base.join("bitty/m.sock");
+        let socket_str = socket_path.to_str().unwrap().to_string();
+        let _dir = prepare_socket_dir(&socket_str).unwrap();
+        // Bind then enforce 0600 like the servo does via attest_bound_socket.
+        let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+        std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let euid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(&socket_str).unwrap().uid()
+        };
+        let marker = transport_attested_peer(&socket_str, euid).unwrap();
+        drop(listener);
+        std::fs::remove_dir_all(&base).ok();
+        marker
+    };
     assert_eq!(verified, attested);
 
     // Foreign UID cannot produce a marker: rejected before any byte read.
@@ -495,7 +523,11 @@ fn serve_connection_rate_limits_with_error_response() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
     let dispatcher = Dispatcher::with_defaults();
     let context = test_context();
-    let peer = transport_attested_peer(1000);
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
     let mut limiter = RateLimiter::new(100, 1);
     let clock = || 0u64;
 
@@ -544,7 +576,11 @@ fn serve_connection_oversize_frame_closes() {
         .unwrap();
     let dispatcher = Dispatcher::with_defaults();
     let context = test_context();
-    let peer = transport_attested_peer(1000);
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .unwrap();
     let mut limiter = RateLimiter::rc9_default();
     let clock = || 0u64;
 
@@ -670,6 +706,149 @@ fn attest_bound_socket_rejects_symlink() {
     // Fail-closed before chmod: the link target keeps its pre-existing mode.
     let target_mode = std::fs::metadata(&real).unwrap().mode() & 0o777;
     assert_eq!(target_mode, 0o644);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0463 (issue 744): the accept boundary must verify the endpoint
+/// instead of attesting the UID verbatim. Happy path mints a marker;
+/// tampered endpoints and UID mismatches fail closed.
+#[cfg(unix)]
+#[test]
+fn transport_attested_peer_verifies_endpoint() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0463-{}-attested", std::process::id()));
+    let socket_path = base.join("bitty/a.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_str).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&socket_str).unwrap().uid();
+
+    // Happy path: owned 0700/0600 endpoint mints a marker.
+    assert!(transport_attested_peer(&socket_str, euid).is_ok());
+
+    // Hostile: wrong runtime UID fails closed (no marker minted).
+    let foreign = euid.wrapping_add(1);
+    let err = transport_attested_peer(&socket_str, foreign).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "foreign UID must fail closed, got: {err:?}"
+    );
+
+    // Hostile: loosened socket mode fails closed.
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = transport_attested_peer(&socket_str, euid).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "0644 socket must fail closed, got: {err:?}"
+    );
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Hostile: loosened directory mode fails closed.
+    let leaf = base.join("bitty");
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = transport_attested_peer(&socket_str, euid).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "0755 dir must fail closed, got: {err:?}"
+    );
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0463 (issue 744): symlinked endpoints fail closed at the accept
+/// boundary, even when the link target is well-formed.
+#[cfg(unix)]
+#[test]
+fn transport_attested_peer_rejects_symlinked_endpoint() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!(
+        "bitty-ctx0463-{}-attested-link",
+        std::process::id()
+    ));
+    let dir_path = base.join("bitty");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let real = dir_path.join("real.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&real).unwrap().uid();
+
+    let link = dir_path.join("link.sock");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err = transport_attested_peer(link.to_str().unwrap(), euid).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "symlinked socket must fail closed, got: {err:?}"
+    );
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0463 (issue 744): `resolve_socket_path` is pure advisory resolution;
+/// a non-empty `BITTY_SOCKET` is returned verbatim after shape checks, so
+/// the connect boundary must verify ownership before use.
+#[cfg(unix)]
+#[test]
+fn bitty_socket_verbatim_path_still_requires_verification() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // Pure resolution returns the advisory path with no endpoint checks.
+    let path =
+        resolve_socket_path(1000, Some("/run/user/1000"), Some("/tmp/custom.sock"), None).unwrap();
+    assert_eq!(path, "/tmp/custom.sock");
+
+    // The same path fails verification when the endpoint is absent or
+    // tampered: missing socket is Unavailable (fail-closed, never connect).
+    let missing = verify_socket_endpoint_for_connect(&path, 1000);
+    assert!(
+        matches!(
+            missing,
+            Err(IpcError::Unavailable { .. }) | Err(IpcError::Unauthenticated { .. })
+        ),
+        "unverifiable BITTY_SOCKET path must fail closed, got: {missing:?}"
+    );
+
+    // Tampered live endpoint: 0644 socket fails verification.
+    let base =
+        std::env::temp_dir().join(format!("bitty-ctx0463-{}-bitty-socket", std::process::id()));
+    let socket_path = base.join("bitty/b.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_str).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    // Deliberately leave the servo chmod undone: raw bind mode is not 0600.
+    let euid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&socket_str).unwrap().uid()
+    };
+    let _ = euid;
+    let resolved = resolve_socket_path(euid, None, Some(&socket_str), None).unwrap();
+    assert_eq!(resolved, socket_str);
+    // Raw bind mode (umask-derived) must not verify without the 0600 chmod.
+    let raw_mode = std::fs::symlink_metadata(&socket_str).unwrap().mode() & 0o777;
+    if raw_mode != 0o600 {
+        let err = verify_socket_endpoint_for_connect(&socket_str, euid).unwrap_err();
+        assert!(
+            matches!(err, IpcError::Unauthenticated { .. }),
+            "non-0600 BITTY_SOCKET endpoint must fail closed, got: {err:?}"
+        );
+    }
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(verify_socket_endpoint_for_connect(&socket_str, euid).is_ok());
+
+    // Shape violations still fail at resolution (fail-closed, no verify needed).
+    assert!(resolve_socket_path(1000, None, Some("/tmp/a\0b.sock"), None).is_err());
+    let long = "x".repeat(MAX_SOCKET_PATH_BYTES + 1);
+    assert!(resolve_socket_path(1000, None, Some(&long), None).is_err());
+    // Shape violations fail at verification too.
+    assert!(verify_socket_endpoint_for_connect("", euid).is_err());
+    assert!(verify_socket_endpoint_for_connect("/tmp/a\0b.sock", euid).is_err());
+
+    drop(listener);
     std::fs::remove_dir_all(&base).ok();
 }
 

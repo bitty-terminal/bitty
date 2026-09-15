@@ -15,8 +15,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::devtools::{
-    Dispatcher, MAX_SOCKET_PATH_BYTES, SUN_LEN_MACOS, ServeContext, ServerInfo, prepare_socket_dir,
-    serve_connection, transport_attested_peer,
+    Dispatcher, MAX_SOCKET_PATH_BYTES, SUN_LEN_MACOS, ServeContext, ServerInfo,
+    attest_bound_socket, prepare_socket_dir, serve_connection, transport_attested_peer,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::limits::RateLimiter;
@@ -72,8 +72,12 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        // Accept-boundary auth: attested marker only, no raw credentials.
-        let verified = transport_attested_peer(unit_owner_uid(&socket_path));
+        // Accept-boundary auth, production-equivalent: bind-time attestation
+        // (0600 + owner) then per-connection endpoint verification. No raw
+        // credentials flow into the serving path.
+        let dir = prepare_socket_dir(&socket_path).unwrap();
+        let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
+        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("e2e".to_string(), socket_path.clone(), 80, 24);
         let context = ServeContext::new(&server);
@@ -96,13 +100,6 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         assert!(stats.requests >= min_requests, "expected test requests");
         assert_eq!(stats.responses, stats.requests);
     })
-}
-
-#[cfg(unix)]
-fn unit_owner_uid(path: &str) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
 }
 
 #[test]

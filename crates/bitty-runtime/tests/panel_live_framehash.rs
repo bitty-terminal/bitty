@@ -354,9 +354,10 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use bitty_ipc::devtools::{
-        AutomationFamily, Dispatcher, ServeContext, ServerInfo, clear_automation_for_tests,
-        clear_introspection_for_tests, issue_automation_bearer_with_ttl, prepare_socket_dir,
-        publish_frame_rgba, publish_grid_text, serve_connection, transport_attested_peer,
+        AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
+        clear_automation_for_tests, clear_introspection_for_tests,
+        issue_automation_bearer_with_ttl, prepare_socket_dir, publish_frame_rgba,
+        publish_grid_text, serve_connection, transport_attested_peer,
     };
     use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
     use bitty_ipc::limits::RateLimiter;
@@ -418,13 +419,9 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
-        let verified = {
-            use std::os::unix::fs::MetadataExt;
-            let uid = std::fs::metadata(&socket_path)
-                .map(|m| m.uid())
-                .unwrap_or(0);
-            transport_attested_peer(uid)
-        };
+        let dir = prepare_socket_dir(&socket_path).expect("re-prepare");
+        let runtime_uid = attest_bound_socket(&socket_path, &dir).expect("attest");
+        let verified = transport_attested_peer(&socket_path, runtime_uid).expect("verify");
         let dispatcher = Dispatcher::with_defaults();
         let info = ServerInfo::new("panel-live-proof".to_string(), socket_path.clone(), 80, 24);
         let mut context =

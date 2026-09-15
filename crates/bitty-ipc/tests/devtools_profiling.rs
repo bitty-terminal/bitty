@@ -498,8 +498,9 @@ mod socket {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use bitty_ipc::devtools::{
-        Dispatcher, ServeContext, ServerInfo, clear_profiling_for_tests, prepare_socket_dir,
-        publish_frame_stats, publish_process_stats, serve_connection, transport_attested_peer,
+        Dispatcher, ServeContext, ServerInfo, attest_bound_socket, clear_profiling_for_tests,
+        prepare_socket_dir, publish_frame_stats, publish_process_stats, serve_connection,
+        transport_attested_peer,
     };
     use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
     use bitty_ipc::limits::RateLimiter;
@@ -565,13 +566,6 @@ mod socket {
         }
     }
 
-    #[cfg(unix)]
-    fn unit_owner_uid(path: &str) -> u32 {
-        use std::os::unix::fs::MetadataExt;
-
-        std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
-    }
-
     fn spawn_profiling_server(
         socket_path: String,
         granted: ScopeSet,
@@ -582,7 +576,9 @@ mod socket {
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let verified = transport_attested_peer(unit_owner_uid(&socket_path));
+            let dir = prepare_socket_dir(&socket_path).unwrap();
+            let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
+            let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
             let dispatcher = Dispatcher::with_defaults();
             let server =
                 ServerInfo::new("profiling-proof".to_string(), socket_path.clone(), 80, 24);

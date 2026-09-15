@@ -27,10 +27,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitty_ipc::devtools::{
-    AutomationFamily, Dispatcher, ServeContext, ServerInfo, clear_automation_for_tests,
-    clear_introspection_for_tests, frame_audit_len_for_tests, issue_automation_bearer_with_ttl,
-    prepare_socket_dir, publish_frame_rgba, publish_grid_text, serve_connection,
-    transport_attested_peer,
+    AutomationFamily, Dispatcher, ServeContext, ServerInfo, attest_bound_socket,
+    clear_automation_for_tests, clear_introspection_for_tests, frame_audit_len_for_tests,
+    issue_automation_bearer_with_ttl, prepare_socket_dir, publish_frame_rgba, publish_grid_text,
+    serve_connection, transport_attested_peer,
 };
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 use bitty_ipc::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
@@ -145,7 +145,9 @@ fn spawn_digest_server(
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let _verified = transport_attested_peer(unit_owner_uid(&socket_path));
+        let dir = prepare_socket_dir(&socket_path).unwrap();
+        let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
+        let _verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("digest-proof".to_string(), socket_path.clone(), 80, 24);
         // Production-equivalent: the accept boundary verified a local peer,
@@ -171,13 +173,6 @@ fn spawn_digest_server(
         assert!(stats.requests >= 1, "expected test requests");
         assert_eq!(stats.responses, stats.requests);
     })
-}
-
-#[cfg(unix)]
-fn unit_owner_uid(path: &str) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-
-    std::fs::metadata(path).map(|m| m.uid()).unwrap_or(0)
 }
 
 #[test]

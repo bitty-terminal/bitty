@@ -1,0 +1,19 @@
+title = "bitty gitleaks configuration"
+
+# CTX-0415 / GitHub #672: placeholder fixtures in
+# crates/bitty-agent/src/tool.rs tests are synthetic sequential strings
+# (ghp_abcdefgh12345678, abcdefgh12345678), never real credentials. They
+# exercise the credential scrubber and must stay greppable in tests, so they
+# are allowlisted here instead of being rotated or removed. If a real secret
+# is ever suspected, rotate at the source and do not extend this list.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "CTX-0415 placeholder fixtures in bitty-agent tool.rs tests, not real secrets (issue #672)"
+targetRules = ["generic-api-key"]
+regexes = [
+  '''ghp_abcdefgh12345678''',
+  '''abcdefgh12345678''',
+]

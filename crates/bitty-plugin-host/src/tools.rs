@@ -189,6 +189,7 @@ pub fn is_allowed_git_args(args: &[String]) -> bool {
                 || arg == "-f"
                 || arg == "-u"
                 || arg == "-t"
+                || arg == "--set-upstream"
             {
                 return false;
             }
@@ -607,11 +608,15 @@ mod tests {
                 "branch {args:?} must be denied"
             );
         }
-        // Prefix `--set-upstream-to` (bare / `=` / separate value).
+        // Prefix `--set-upstream-to` (bare / `=` / separate value) plus the
+        // deprecated exact `--set-upstream` (fatal on modern git, denied
+        // here as defense-in-depth for older toolchains; same config write).
         for args in [
             vec!["branch", "--set-upstream-to"],
             vec!["branch", "--set-upstream-to=origin/main"],
             vec!["branch", "--set-upstream-to", "origin/main"],
+            vec!["branch", "--set-upstream"],
+            vec!["branch", "--set-upstream", "origin/main"],
         ] {
             let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
             assert!(

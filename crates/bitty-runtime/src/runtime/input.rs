@@ -275,9 +275,11 @@ impl Runtime {
         {
             self.clear_selection();
         }
-        // CTX-0186: Esc while a paste is pending cancels the confirmation
-        // dialog. The Esc is consumed (never reaches the PTY) so a dismissal
-        // cannot also drive shell/vim state.
+        // CTX-0186/CTX-0475: Esc cancels a pending confirmation gate (paste /
+        // workspace close / view close) and is consumed there so the dismissal
+        // cannot also drive shell/vim state. Dismissing the informational help
+        // overlay does NOT consume the press, so a fullscreen app still
+        // receives `Esc` (issue #756).
         if self.cancel_pending_on_escape(&event) {
             return None;
         }
@@ -389,7 +391,7 @@ impl Runtime {
         {
             self.clear_selection();
         }
-        // CTX-0186: Esc while a paste is pending cancels (see owned path).
+        // CTX-0186/CTX-0475: scoped Esc cancel (see owned path).
         if self.cancel_pending_on_escape(event) {
             return None;
         }

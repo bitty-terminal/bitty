@@ -2910,8 +2910,9 @@ mod tests {
     #[test]
     fn help_toggle_gestures_drive_intercept_and_esc_dismisses() {
         // End-to-end through the real intercept: Mod+backtick shows,
-        // `Esc` (unbound, routed to `Runtime`) dismisses without PTY
-        // bytes, and the same chord re-arms afterwards.
+        // `Esc` (unbound, routed to `Runtime`) dismisses and still delivers
+        // the Esc to the PTY (the popup is informational, CTX-0475), and the
+        // same chord re-arms afterwards.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let mut app = help_test_app(maps);
@@ -2923,9 +2924,10 @@ mod tests {
         assert!(!drive_chrome(&mut app, no_mods()));
         assert!(!drive_chrome(&mut app, named_press(NamedKey::Escape)));
         assert!(!app.runtime.help_visible(), "Esc dismisses");
-        assert!(
-            app.runtime.drain_pending_input().is_empty(),
-            "dismissal Esc never reaches the PTY"
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"\x1b",
+            "CTX-0475: informational dismissal still delivers Esc to the PTY"
         );
         // Same-chord toggle still works after an Esc dismissal.
         assert!(!drive_chrome(&mut app, alt_mods()));

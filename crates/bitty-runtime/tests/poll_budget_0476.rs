@@ -11,7 +11,7 @@ use bitty_runtime::{
     POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, Runtime, RuntimeConfig,
 };
 
-const WAIT: Duration = Duration::from_secs(15);
+const WAIT: Duration = Duration::from_secs(30);
 
 #[test]
 fn poll_budgets_match_accepted_pipeline_bounds() {
@@ -55,6 +55,10 @@ fn burst_drains_bounded_per_poll_without_loss() {
     // budget, total progress converges, and the DONE marker arrives without
     // loss. Under the old 1024-chunk collect the first poll would have
     // drained the whole 300 KiB burst in one render-thread stall.
+    //
+    // No `tick` in the loop: state updates happen in `handle_pty_bytes`, and
+    // a software present here would dominate the loop on headless CI without
+    // exercising anything under test.
     let deadline = Instant::now() + WAIT;
     let mut polls = 1usize;
     let mut total_chunks = first;
@@ -68,7 +72,6 @@ fn burst_drains_bounded_per_poll_without_loss() {
         );
         total_chunks += n;
         polls += 1;
-        rt.tick();
         let text: String = rt.snapshot().cells.iter().map(|c| c.glyph).collect();
         if text.contains("DONE-MARKER-0476") {
             found = true;
@@ -85,8 +88,12 @@ fn burst_drains_bounded_per_poll_without_loss() {
         found,
         "DONE marker never arrived after {total_chunks} chunks in {polls} polls"
     );
+    // Loss floor: every chunk is at most `READ_CHUNK_SIZE`, so delivering the
+    // whole 300 KiB burst requires at least this many chunks. Fewer means the
+    // pump dropped data even though the tail marker arrived.
+    let min_chunks = 300_000usize.div_ceil(bitty_pty::READ_CHUNK_SIZE);
     assert!(
-        total_chunks >= 2,
-        "300 KiB burst should take multiple bounded polls, got {total_chunks}"
+        total_chunks >= min_chunks,
+        "burst under-delivered: {total_chunks} chunks < {min_chunks} for 300 KiB"
     );
 }

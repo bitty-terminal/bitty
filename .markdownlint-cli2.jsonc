@@ -4,7 +4,7 @@
     "MD013": false,
     "MD024": { "siblings_only": true },
     "MD033": false,
-    "MD041": false
+    "MD041": false,
   },
   "globs": ["**/*.md"],
   "ignores": [
@@ -15,6 +15,6 @@
     "site",
     ".worktrees",
     "docs",
-    "recording/references/health-audit-2026-08-30.md"
-  ]
+    "recording/references/health-audit-2026-08-30.md",
+  ],
 }

@@ -2,5 +2,5 @@
 # Provides font stack inside cross image; host apt fallback remains via release.yml continue-on-error.
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
-    "apt-get update && apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev libfreetype6-dev || echo 'cross pre-build apt fallback, continuing'",
+  "apt-get update && apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev libfreetype6-dev || echo 'cross pre-build apt fallback, continuing'",
 ]

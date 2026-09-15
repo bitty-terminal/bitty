@@ -157,9 +157,11 @@ impl Grid {
         }
         if start > 0 && self.get(row, start).spacer {
             start -= 1;
-        } else if self.get(row, end).width == 2 && end < last {
+        }
+        if self.get(row, end).width == 2 && end < last {
             // The range ends inside a wide pair only if it stops on a
-            // leading half whose spacer sits at `end + 1`.
+            // leading half whose spacer sits at `end + 1`. Independent of
+            // the start expansion above: both edges must expand (CTX-0469).
             if self.get(row, end + 1).spacer {
                 end += 1;
             }
@@ -382,6 +384,7 @@ impl Grid {
         if new_rows == self.rows && new_cols == self.cols {
             return;
         }
+        let width_unchanged = new_cols == self.cols;
         let mut new_cells = vec![Cell::erased(*erase_style); new_rows * new_cols];
         let copy_rows = self.rows.min(new_rows);
         let copy_cols = self.cols.min(new_cols);
@@ -421,8 +424,21 @@ impl Grid {
         self.rows = new_rows;
         self.cols = new_cols;
         self.cells = new_cells;
-        // Truncation breaks all continuations (no rewrapping here).
-        self.wraps = vec![false; new_rows];
+        if width_unchanged {
+            // Height-only: no rewrapping happens, so existing continuations
+            // stay trustworthy (CTX-0469). Keep the overlapping prefix; new
+            // rows start unwrapped. The last row never continues onward.
+            let mut wraps = vec![false; new_rows];
+            let keep = self.wraps.len().min(new_rows);
+            wraps[..keep].copy_from_slice(&self.wraps[..keep]);
+            if let Some(last) = wraps.last_mut() {
+                *last = false;
+            }
+            self.wraps = wraps;
+        } else {
+            // Truncation breaks all continuations (no rewrapping here).
+            self.wraps = vec![false; new_rows];
+        }
     }
 }
 
@@ -545,5 +561,61 @@ mod tests {
         assert!(g.row(1).iter().all(Cell::is_blank));
         // Bottom row was displaced and discarded, not preserved.
         assert!(g.row(2).iter().all(Cell::is_blank));
+    }
+
+    #[test]
+    fn erase_range_expands_both_edges_over_wide_pairs() {
+        // Hostile probe (CTX-0469): a range whose start lands on a spacer
+        // AND whose end lands on a leading half must expand on BOTH sides.
+        // The old `if/else if` expanded one side only and left an orphan.
+        let mut g = Grid::new(1, 8);
+        let style = Style::default();
+        for (lead, text) in [(1, '中'), (5, '文')] {
+            g.set(
+                0,
+                lead,
+                Cell {
+                    glyph: text,
+                    style,
+                    width: 2,
+                    spacer: false,
+                    hyperlink: None,
+                    zerowidth: Zerowidth::new(),
+                },
+            );
+            g.set(0, lead + 1, Cell::wide_spacer(style));
+        }
+        g.erase_range_in_row(0, 2, 5, &Style::default());
+        for c in [1, 2, 5, 6] {
+            assert!(g.get(0, c).is_blank(), "col {c} must be erased whole");
+        }
+        assert!(!g.get(0, 6).spacer, "no orphan spacer may remain");
+    }
+
+    #[test]
+    fn resize_height_only_preserves_wrap_flags() {
+        // Hostile probe (CTX-0469): a height-only resize must not clear
+        // soft-wrap continuation flags (no rewrapping happens here).
+        let mut g = Grid::new(3, 4);
+        g.set_wrapped(0, true);
+        g.set_wrapped(1, true);
+        g.resize(5, 4, &Style::default());
+        assert!(g.wrapped(0));
+        assert!(g.wrapped(1));
+        assert!(!g.wrapped(4));
+        g.resize(2, 4, &Style::default());
+        assert!(g.wrapped(0));
+        // Row 1 is now the last row, which never continues onward.
+        assert!(!g.wrapped(1));
+    }
+
+    #[test]
+    fn resize_width_change_still_breaks_continuations() {
+        // Width changes rewrap elsewhere; this truncate/pad primitive must
+        // keep clearing continuations in that case.
+        let mut g = Grid::new(3, 4);
+        g.set_wrapped(0, true);
+        g.resize(3, 6, &Style::default());
+        assert!(!g.wrapped(0));
     }
 }

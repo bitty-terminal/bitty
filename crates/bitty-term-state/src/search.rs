@@ -248,21 +248,16 @@ impl State {
             out.truncate(max_results);
             return out;
         }
-        // Live grid rows
-        let snap = self.snapshot();
-        if snap.width == 0 || snap.height == 0 {
-            return out;
-        }
-        for row in 0..snap.height {
+        // Live grid rows, borrowed without cloning: a full snapshot would
+        // copy up to MAX_GRID_DIM squared (1M) cells per search call
+        // (CTX-0469). Row slices observe exactly what `snapshot()` copies.
+        for row in 0..self.height() {
             if out.len() >= max_results {
                 break;
             }
-            let start = row * snap.width;
-            let end = start + snap.width;
-            if end > snap.cells.len() {
+            let Some(cells) = self.live_grid_row(row) else {
                 break;
-            }
-            let cells = &snap.cells[start..end];
+            };
             let (text, map) = line_text_and_map(cells);
             let occ = find_all_occurrences(&text, &pat, options.case_sensitive);
             for byte_off in occ {

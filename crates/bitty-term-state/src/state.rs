@@ -52,12 +52,29 @@ pub const GRID_ROWS: usize = 24;
 pub const MAX_GRID_DIM: usize = 1000;
 
 /// Cap on distinct hyperlink identities retained (bounded memory per
-/// threat T-01). Beyond the cap, new distinct links degrade to no link.
+/// threat T-01). Past the cap the oldest entry is evicted first (the
+/// [`ImageStore`] precedent); evicted ids fail closed to no link while new
+/// links keep working (CTX-0469).
 pub const HYPERLINK_TABLE_MAX: usize = 1024;
 
 /// Cap on retained semantic-zone records (`OSC 133`), oldest dropped
 /// first; bounded memory per threat T-01.
 pub const ZONE_RECORDS_MAX: usize = 1024;
+
+/// One retained hyperlink identity: a stable monotonic id plus the OSC 8
+/// `id=` parameter and target URI.
+///
+/// Ids are never reused within an id space: eviction drops the oldest entry
+/// and live cells holding its id fail closed ([`State::hyperlink_entry`]
+/// returns `None`) instead of ever resolving to a different URI (CTX-0469).
+/// The counter resets only via [`State::full_reset`] or once per 2^32
+/// distinct links (which clears the table first), so reuse is impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HyperlinkEntry {
+    id: HyperlinkId,
+    id_param: Option<BoundedString>,
+    uri: BoundedString,
+}
 
 /// Version embedded in snapshots (RFC: reads occur through versioned
 /// snapshots only).
@@ -148,7 +165,8 @@ pub struct State {
     replies: Replies,
     title: BoundedString,
     cwd_report: Option<BoundedString>,
-    hyperlink_table: Vec<(Option<BoundedString>, BoundedString)>,
+    hyperlink_table: VecDeque<HyperlinkEntry>,
+    next_hyperlink_id: u32,
     current_hyperlink: Option<HyperlinkId>,
     zones: VecDeque<ZoneRecord>,
     zone_counter: u64,
@@ -198,7 +216,8 @@ impl State {
             replies: Replies::new(),
             title: BoundedString::new(""),
             cwd_report: None,
-            hyperlink_table: Vec::new(),
+            hyperlink_table: VecDeque::new(),
+            next_hyperlink_id: 0,
             current_hyperlink: None,
             zones: VecDeque::new(),
             zone_counter: 0,
@@ -276,79 +295,58 @@ impl State {
         // Snapshot old logical lines + primary cursor offset before mutating,
         // so a width reflow can keep the cursor on the same content. Only
         // when the primary screen is active; alt-screen cursors clamp.
-        let (old_logicals, cursor_logical): (Vec<Vec<Cell>>, Option<(usize, usize)>) =
-            if !alt_active && cols != old_cols {
-                let crow = self.cursor.position.row as usize;
-                let ccol = self.cursor.position.col as usize;
-                let sb_len = self.scrollback.len();
-                let total = sb_len + old_rows;
-                let mut logicals: Vec<Vec<Cell>> = Vec::new();
-                let mut cur: Vec<Cell> = Vec::new();
-                // (logical_idx, seg_start_in_logical) per combined row.
-                let mut row_map: Vec<(usize, usize)> = Vec::with_capacity(total);
-                for combined in 0..total {
-                    let (segment, wrapped) = if combined < sb_len {
-                        let line = self.scrollback.line(combined).expect("scrollback index");
-                        (trim_row_to_leads(&line.cells), line.wrapped)
-                    } else {
-                        let gr = combined - sb_len;
-                        let row_cells = self.screens.main.row(gr).to_vec();
-                        let w = if gr + 1 < old_rows {
-                            self.screens.main.wrapped(gr)
-                        } else {
-                            false
-                        };
-                        (trim_row_to_leads(&row_cells), w)
-                    };
-                    row_map.push((logicals.len(), cur.len()));
-                    cur.extend(segment);
-                    if !wrapped {
-                        logicals.push(std::mem::take(&mut cur));
-                    }
+        // Collected once and reused by the reflow below (single pass,
+        // CTX-0469); the cursor mapping additionally reuses the reflow's
+        // per-logical row counts instead of rewrapping every logical again.
+        let width_changed = cols != old_cols;
+        let (old_logicals, row_map): (Vec<Vec<Cell>>, Vec<(usize, usize)>) = if width_changed {
+            Self::collect_logical_lines(&self.screens.main, &self.scrollback, old_rows)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let cursor_logical: Option<(usize, usize)> = if !alt_active && width_changed {
+            let crow = self.cursor.position.row as usize;
+            let ccol = self.cursor.position.col as usize;
+            let sb_len = self.scrollback.len();
+            // Cursor offset: leads before `ccol` within its row, clamped
+            // to the trimmed segment (blank tail -> end-of-content).
+            let cursor_combined = sb_len + crow;
+            let (cli, seg_start) = row_map[cursor_combined];
+            let row_cells = self.screens.main.row(crow).to_vec();
+            let mut units_before = 0usize;
+            for (idx, cell) in row_cells.iter().enumerate() {
+                if idx >= ccol {
+                    break;
                 }
-                if !cur.is_empty() || logicals.is_empty() {
-                    logicals.push(std::mem::take(&mut cur));
+                if !cell.spacer {
+                    units_before += 1;
                 }
-                // Cursor offset: leads before `ccol` within its row, clamped
-                // to the trimmed segment (blank tail -> end-of-content).
-                let cursor_combined = sb_len + crow;
-                let (cli, seg_start) = row_map[cursor_combined];
-                let row_cells = self.screens.main.row(crow).to_vec();
-                let mut units_before = 0usize;
-                for (idx, cell) in row_cells.iter().enumerate() {
-                    if idx >= ccol {
-                        break;
-                    }
-                    if !cell.spacer {
-                        units_before += 1;
-                    }
-                }
-                let seg_len = {
-                    // Re-derive this row's trimmed segment length.
-                    let rc = self.screens.main.row(crow).to_vec();
-                    trim_row_to_leads(&rc).len()
-                };
-                let offset = seg_start + units_before.min(seg_len);
-                (logicals, Some((cli, offset)))
-            } else {
-                (Vec::new(), None)
-            };
-        if cols == old_cols {
+            }
+            let seg_len = trim_row_to_leads(&row_cells).len();
+            let offset = seg_start + units_before.min(seg_len);
+            Some((cli, offset))
+        } else {
+            None
+        };
+        let reflow_counts: Vec<usize> = if cols == old_cols {
             // Height-only: no logical rewrapping. Truncate/pad both grids;
             // scrollback widths already match.
             self.screens.main.resize(rows, cols, &erase);
             self.screens.alt.resize(rows, cols, &erase);
+            Vec::new()
         } else {
             // Width change: reflow primary (main + scrollback), truncate alt.
-            Self::reflow_primary(
+            let counts = Self::reflow_primary(
                 &mut self.screens.main,
                 &mut self.scrollback,
+                &old_logicals,
                 cols,
                 rows,
                 &erase,
             );
             self.screens.alt.resize(rows, cols, &erase);
-        }
+            counts
+        };
         // Resize tab lattice: preserve stops that still fit, default for new columns.
         let old_len = self.tabs.len();
         let mut new_tabs = crate::tabs::TabStops::default_lattice(cols);
@@ -374,17 +372,10 @@ impl State {
                 let logical = &old_logicals[line_idx];
                 // Rewrap just this logical to locate the target row/col.
                 let (row_off, col) = map_unit_to_rewrapped(logical, unit_offset, cols, &erase);
-                // Locate this logical's start in the new total order by
-                // rewrapping all old logicals the same way reflow did.
-                // (Bounded: same work as reflow, resize-rare.)
-                let mut total_idx = 0usize;
-                for (li, ll) in old_logicals.iter().enumerate() {
-                    let nrows = rewrap_one_logical(ll, cols, &erase).len();
-                    if li == line_idx {
-                        break;
-                    }
-                    total_idx += nrows;
-                }
+                // This logical's start in the new total order is the prefix
+                // sum of the reflow's per-logical row counts (no second
+                // rewrapping pass, CTX-0469).
+                let total_idx: usize = reflow_counts.iter().take(line_idx).sum();
                 let target_total = total_idx + row_off;
                 let new_sb_len = self.scrollback.len();
                 if target_total < new_sb_len {
@@ -475,6 +466,53 @@ impl State {
         damage
     }
 
+    /// Collects combined (scrollback + grid) physical rows into logical
+    /// lines by unwrapping via soft-wrap flags, oldest first. Called once by
+    /// [`State::resize`] and consumed by [`State::reflow_primary`], so a
+    /// width resize collects exactly once (CTX-0469).
+    ///
+    /// Returns the logical lines plus a per-combined-row map of
+    /// `(logical_idx, seg_start_in_logical)` for cursor bookkeeping. The
+    /// last grid row is always a hard break (no next grid row).
+    /// Deterministic, headless, bounded.
+    fn collect_logical_lines(
+        main: &Grid,
+        scrollback: &Scrollback,
+        old_rows: usize,
+    ) -> (Vec<Vec<Cell>>, Vec<(usize, usize)>) {
+        let sb_len = scrollback.len();
+        let total = sb_len + old_rows;
+        let mut logicals: Vec<Vec<Cell>> = Vec::new();
+        let mut cur: Vec<Cell> = Vec::new();
+        // (logical_idx, seg_start_in_logical) per combined row.
+        let mut row_map: Vec<(usize, usize)> = Vec::with_capacity(total);
+        for combined in 0..total {
+            let (segment, wrapped) = if combined < sb_len {
+                let line = scrollback.line(combined).expect("scrollback index");
+                (trim_row_to_leads(&line.cells), line.wrapped)
+            } else {
+                let gr = combined - sb_len;
+                let row_cells = main.row(gr).to_vec();
+                // Last grid row has no next grid row: hard break.
+                let w = if gr + 1 < old_rows {
+                    main.wrapped(gr)
+                } else {
+                    false
+                };
+                (trim_row_to_leads(&row_cells), w)
+            };
+            row_map.push((logicals.len(), cur.len()));
+            cur.extend(segment);
+            if !wrapped {
+                logicals.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() || logicals.is_empty() {
+            logicals.push(std::mem::take(&mut cur));
+        }
+        (logicals, row_map)
+    }
+
     /// Reflows the primary screen (`grid` + `scrollback`) to a new width,
     /// bottom-aligning the last `new_rows` physical rows into the grid.
     ///
@@ -485,51 +523,27 @@ impl State {
     /// absorb up to the height reduction before the bottom-align split
     /// (CTX-0312), so a width+height shrink keeps real content visible.
     /// Deterministic, headless, bounded.
+    ///
+    /// Returns the physical row count per input logical line so callers can
+    /// map positions without rewrapping again (CTX-0469).
     fn reflow_primary(
         grid: &mut crate::grid::Grid,
         scrollback: &mut crate::scrollback::Scrollback,
+        logicals: &[Vec<Cell>],
         new_cols: usize,
         new_rows: usize,
         erase: &Style,
-    ) {
+    ) -> Vec<usize> {
         let new_cols = new_cols.max(1);
         let new_rows = new_rows.max(1);
-        let (old_rows, old_cols) = grid.dims();
-        // Collect combined physical rows oldest-first.
-        let sb_len = scrollback.len();
-        let total = sb_len + old_rows;
-        let mut logicals: Vec<Vec<Cell>> = Vec::new();
-        let mut cur: Vec<Cell> = Vec::new();
-        for combined in 0..total {
-            let (segment, wrapped) = if combined < sb_len {
-                let line = scrollback.line(combined).expect("scrollback index");
-                (trim_row_to_leads(&line.cells), line.wrapped)
-            } else {
-                let gr = combined - sb_len;
-                let row_cells = grid.row(gr).to_vec();
-                // Last grid row has no next grid row: hard break.
-                let w = if gr + 1 < old_rows {
-                    grid.wrapped(gr)
-                } else {
-                    false
-                };
-                // Old width is irrelevant here: `trim_row_to_leads` drops
-                // spacers/padding, keeping only content leads.
-                let _ = old_cols;
-                (trim_row_to_leads(&row_cells), w)
-            };
-            cur.extend(segment);
-            if !wrapped {
-                logicals.push(std::mem::take(&mut cur));
-            }
-        }
-        if !cur.is_empty() || logicals.is_empty() {
-            logicals.push(std::mem::take(&mut cur));
-        }
-        // Rewrap every logical line.
+        let (old_rows, _) = grid.dims();
+        // Rewrap every logical line, recording row counts for the caller.
         let mut physical: Vec<(Vec<Cell>, bool)> = Vec::new();
-        for ll in &logicals {
-            physical.extend(rewrap_one_logical(ll, new_cols, erase));
+        let mut row_counts: Vec<usize> = Vec::with_capacity(logicals.len());
+        for ll in logicals {
+            let rewrapped = rewrap_one_logical(ll, new_cols, erase);
+            row_counts.push(rewrapped.len());
+            physical.extend(rewrapped);
         }
         // CTX-0312: when the height shrinks in the same call as a width
         // change, trailing blank viewport rows absorb the reduction first.
@@ -580,6 +594,7 @@ impl State {
             new_wraps.push(*wrapped);
         }
         grid.replace_grid(new_rows, new_cols, new_cells, new_wraps);
+        row_counts
     }
 
     /// The live cursor.
@@ -713,27 +728,31 @@ impl State {
     /// Resolves a [`HyperlinkId`] to its `(id, uri)` pair when present.
     ///
     /// `id` is the optional OSC 8 `id=` parameter; `uri` is the target.
+    /// Evicted or unknown ids fail closed (`None`): an id never resolves
+    /// to a different URI than the one it was issued for (CTX-0469).
     #[must_use]
     pub fn hyperlink_entry(&self, id: HyperlinkId) -> Option<(Option<&str>, &str)> {
-        let index = id.as_u32() as usize;
         self.hyperlink_table
-            .get(index)
-            .map(|(opt_id, uri)| (opt_id.as_ref().map(BoundedString::as_str), uri.as_str()))
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| {
+                (
+                    entry.id_param.as_ref().map(BoundedString::as_str),
+                    entry.uri.as_str(),
+                )
+            })
     }
 
     /// Iterates the hyperlink table oldest first; `(HyperlinkId, Option<id>,
     /// uri)`.
     pub fn hyperlink_table(&self) -> impl Iterator<Item = (HyperlinkId, Option<&str>, &str)> + '_ {
-        self.hyperlink_table
-            .iter()
-            .enumerate()
-            .map(|(idx, (opt_id, uri))| {
-                (
-                    HyperlinkId::new(idx as u32),
-                    opt_id.as_ref().map(BoundedString::as_str),
-                    uri.as_str(),
-                )
-            })
+        self.hyperlink_table.iter().map(|entry| {
+            (
+                entry.id,
+                entry.id_param.as_ref().map(BoundedString::as_str),
+                entry.uri.as_str(),
+            )
+        })
     }
 
     /// The hyperlink currently applied to newly printed cells, if any.
@@ -827,6 +846,21 @@ impl State {
             return full_fallback();
         }
         regions
+    }
+
+    /// Borrows one active-screen row without cloning (CTX-0469).
+    ///
+    /// [`State::search`] uses this instead of [`State::snapshot`]: a full
+    /// snapshot clones up to `MAX_GRID_DIM` squared (1M) cells per call.
+    /// Returns `None` when `row` is out of bounds.
+    #[must_use]
+    pub fn live_grid_row(&self, row: usize) -> Option<&[Cell]> {
+        let (rows, _) = self.screens_active().dims();
+        if row < rows {
+            Some(self.screens_active().row(row))
+        } else {
+            None
+        }
     }
 
     /// Builds a versioned snapshot of the active screen.
@@ -1765,18 +1799,32 @@ impl State {
                 let existing = self
                     .hyperlink_table
                     .iter()
-                    .position(|(id, uri)| *id == key_id && *uri == key_uri);
+                    .find(|entry| entry.id_param == key_id && entry.uri == key_uri)
+                    .map(|entry| entry.id);
                 let resolved = match existing {
-                    Some(index) => Some(HyperlinkId::new(index as u32)),
+                    Some(id) => Some(id),
                     None => {
-                        if self.hyperlink_table.len() < HYPERLINK_TABLE_MAX {
-                            self.hyperlink_table.push((key_id, key_uri));
-                            Some(HyperlinkId::new((self.hyperlink_table.len() - 1) as u32))
-                        } else {
-                            // Table at capacity: degrade to no link rather
-                            // than grow without bound (threat T-01).
-                            None
+                        if self.next_hyperlink_id == u32::MAX {
+                            // Once per 2^32 distinct links: clear the table
+                            // before resetting the id space so an id can
+                            // never be reissued for a different URI.
+                            self.hyperlink_table.clear();
+                            self.next_hyperlink_id = 0;
                         }
+                        if self.hyperlink_table.len() >= HYPERLINK_TABLE_MAX {
+                            // Bounded memory (threat T-01): evict the oldest
+                            // entry. Its live cells fail closed to no link
+                            // instead of degrading every future link (CTX-0469).
+                            self.hyperlink_table.pop_front();
+                        }
+                        let id = HyperlinkId::new(self.next_hyperlink_id);
+                        self.next_hyperlink_id += 1;
+                        self.hyperlink_table.push_back(HyperlinkEntry {
+                            id,
+                            id_param: key_id,
+                            uri: key_uri,
+                        });
+                        Some(id)
                     }
                 };
                 self.current_hyperlink = resolved;
@@ -1809,8 +1857,15 @@ impl State {
         let payload: Box<[u8]> = match kind {
             StatusKind::OperatingStatus => b"\x1b[0n".to_vec().into_boxed_slice(),
             StatusKind::CursorPosition => {
+                // Saturating: a cursor restored above the region with origin
+                // mode on (DECSC/DECSTBM/DECRC) must report row 1, never
+                // panic on a bare u16 subtraction (CTX-0469).
                 let row = if self.modes.origin {
-                    self.cursor.position.row - self.scroll_region_top + 1
+                    self.cursor
+                        .position
+                        .row
+                        .saturating_sub(self.scroll_region_top)
+                        + 1
                 } else {
                     self.cursor.position.row + 1
                 };
@@ -1863,6 +1918,7 @@ impl State {
         self.title = BoundedString::new("");
         self.cwd_report = None;
         self.hyperlink_table.clear();
+        self.next_hyperlink_id = 0;
         self.current_hyperlink = None;
         self.zones.clear();
         self.zone_counter = 0;

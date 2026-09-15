@@ -1264,6 +1264,11 @@ fn validate_tool_name(name: &str) -> Result<(), AgentError> {
 
 #[cfg(test)]
 mod tests {
+    // CTX-0415 / GitHub #672: the `ghp_abcdefgh12345678` and
+    // `abcdefgh12345678` literals below are synthetic sequential fixtures
+    // exercising the scrubber, never real credentials. They are allowlisted
+    // in `.gitleaks.toml` (generic-api-key) so the supply-chain gate stays
+    // meaningful; do not rotate, and do not add real secrets here.
     use super::*;
 
     fn spec(name: &str) -> ToolSpec {

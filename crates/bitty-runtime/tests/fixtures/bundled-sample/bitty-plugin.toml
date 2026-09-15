@@ -14,9 +14,5 @@ terminal.semantic-read = true
 platform.notify = true
 
 [lazy]
-commands = [
-  "bitty-featured.sample:summary",
-]
-events = [
-  "terminal.opened",
-]
+commands = ["bitty-featured.sample:summary"]
+events = ["terminal.opened"]

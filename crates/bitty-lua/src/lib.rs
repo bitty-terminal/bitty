@@ -72,7 +72,7 @@ pub use config::{
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, CommandRegistration, EventSubscription,
     HostServices, LuaValue, MarshallingLimits, RegistrationCapture, SNAPSHOT_MAX_BYTES,
-    TimerRegistration,
+    SPAWN_TIMEOUT_MAX_MS, SPAWN_TIMEOUT_MS, TimerRegistration,
 };
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
@@ -127,6 +127,18 @@ pub const RC6_FD_PER_PLUGIN: usize = 16;
 /// (~10k checks for a full-budget run), small enough to keep check latency
 /// tight.
 pub const SLICE_FUEL: i32 = 1024;
+
+/// Maximum Lua chunk bytes accepted by [`LuaVm::drive_chunk`] (`1 MiB`).
+///
+/// Cites `PLUGIN_INIT_MAX_BYTES` (bitty-runtime, `1 MiB` `init.lua` ceiling)
+/// and [`crate::host::MODULE_FILE_MAX_BYTES`] (`1 MiB` module source ceiling)
+/// as precedents: `1 MiB` is the loosest legitimate Lua source the host hands
+/// to `drive_chunk`. Tighter call-site caps still apply
+/// (`MAX_CONFIG_FILE_BYTES` `64 KiB` in bitty-config, `EVENT_MAX_BYTES`
+/// `8 KiB` in bitty-plugin-host). Larger chunks are hostile unbounded
+/// `Closure::load` work and fail-closed with [`VmError::Budget`], without
+/// suspending or touching the heap.
+pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -343,6 +355,10 @@ pub struct LuaVm {
     pub(crate) marshalling_limits: host::MarshallingLimits,
     /// Bridge call deadline in milliseconds (reuses RC-1 by default).
     pub(crate) host_deadline_ms: u64,
+    /// Spawn bridge deadline in milliseconds, shared with the installed
+    /// `BridgeState` via `Rc` so `set_spawn_deadline_ms` updates live
+    /// callbacks. Defaults to [`host::SPAWN_TIMEOUT_MS`].
+    pub(crate) spawn_deadline_ms: Rc<Cell<u64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +430,7 @@ impl LuaVm {
             host_installed: false,
             marshalling_limits: host::MarshallingLimits::default(),
             host_deadline_ms: host::DEFAULT_HOST_DEADLINE_MS,
+            spawn_deadline_ms: Rc::new(Cell::new(host::SPAWN_TIMEOUT_MS)),
         }
     }
 
@@ -496,6 +513,36 @@ impl LuaVm {
     #[must_use]
     pub fn memory_limit(&self) -> usize {
         self.memory_limit
+    }
+
+    /// Spawn bridge deadline in milliseconds.
+    ///
+    /// Defaults to [`host::SPAWN_TIMEOUT_MS`]; shared with the installed
+    /// bridge via `Rc` so updates apply to live callbacks.
+    #[must_use]
+    pub fn spawn_deadline_ms(&self) -> u64 {
+        self.spawn_deadline_ms.get()
+    }
+
+    /// Set the spawn bridge deadline (`1..=SPAWN_TIMEOUT_MAX_MS`).
+    ///
+    /// Fail-closed with [`VmError::Budget`] when out of range; the spawn
+    /// contract (default 5 s, maximum 30 s, enforced by killing and reaping
+    /// the child) bounds how long `process.spawn` may run before the bridge
+    /// returns typed `E_TIMEOUT` without delivering a result.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::Budget`] when `ms` is zero or past the maximum.
+    pub fn set_spawn_deadline_ms(&mut self, ms: u64) -> Result<(), VmError> {
+        if ms == 0 || ms > host::SPAWN_TIMEOUT_MAX_MS {
+            return Err(VmError::Budget(format!(
+                "spawn deadline must be 1..={} ms",
+                host::SPAWN_TIMEOUT_MAX_MS
+            )));
+        }
+        self.spawn_deadline_ms.set(ms);
+        Ok(())
     }
 
     /// Reset a suspended VM to `Ready` (explicit re-grant required per FS-2).
@@ -616,12 +663,29 @@ impl LuaVm {
     /// finished executor back for result extraction. Final completion checks
     /// (warning/memory/instruction) run inside, so every `Ready` already
     /// passed them; callers only inspect the executor mode and take results.
+    ///
+    /// CTX-0464: chunks larger than [`MAX_CHUNK_BYTES`] are refused
+    /// fail-closed with [`VmError::Budget`] before touching the VM, and the
+    /// wall-clock starts before `Closure::load` so compile work counts toward
+    /// the RC-1 budget (slow compiles suspend without executing).
     pub(crate) fn drive_chunk(&mut self, code: &str) -> Result<DriveOutcome, VmError> {
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
                 reason: reason.clone(),
             });
         }
+
+        if code.len() > MAX_CHUNK_BYTES {
+            return Err(VmError::Budget(format!(
+                "chunk exceeds {MAX_CHUNK_BYTES} bytes ({} bytes)",
+                code.len()
+            )));
+        }
+
+        // CTX-0464 gap 2: the wall-clock starts before compile/load so slow
+        // compiles time out without effects. The chunk cap above bounds how
+        // much compile work can hide here (at most 1 MiB of source).
+        let start = Instant::now();
 
         // Load closure — deterministic, no I/O beyond source bytes.
         let code_owned = code.to_string();
@@ -638,6 +702,36 @@ impl LuaVm {
                     }
                 },
             );
+
+        // Compile-inside-budget: if load (plus scheduling around it) already
+        // exceeded the wall budget, suspend fail-closed without executing.
+        // No Lua code ran, so no globals, registrations, or host calls exist
+        // to roll back; bookkeeping mirrors the wall-exceed path in
+        // `drive_stashed`.
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if elapsed_ms >= self.wall_budget_ms {
+            let reason = SuspendReason::WallClockExceeded {
+                elapsed_ms,
+                budget_ms: self.wall_budget_ms,
+            };
+            self.total_executions = self.total_executions.wrapping_add(1);
+            self.status = VmStatus::Suspended(reason.clone());
+            self.suspension_count = self.suspension_count.wrapping_add(1);
+            self.instructions_used = 0;
+            self.wall_elapsed_ms = elapsed_ms;
+            self.memory_used = self.lua.total_memory();
+            if elapsed_ms >= self.warning_ms {
+                self.warning_triggered = true;
+                self.warning_count = self.warning_count.wrapping_add(1);
+            }
+            return Ok(DriveOutcome::Suspended {
+                reason,
+                instructions_used: 0,
+                wall_elapsed_ms: elapsed_ms,
+                memory_used: self.memory_used,
+            });
+        }
+
         let stashed = match (stashed_opt, load_error) {
             (Some(s), None) => s,
             (None, Some(msg)) => {
@@ -650,17 +744,20 @@ impl LuaVm {
             }
         };
 
-        self.drive_stashed(stashed)
+        self.drive_stashed(stashed, start)
     }
 
     /// Shared budget-enforced stepping loop over an already-loaded executor.
     ///
     /// Used by [`LuaVm::drive_chunk`] and by host-bridge invocation
     /// ([`LuaVm::call_function`](crate::LuaVm::call_function)); RC-1/RC-2
-    /// enforcement is identical in both paths.
+    /// enforcement is identical in both paths. `start` is the wall-clock
+    /// origin: for `drive_chunk` it predates `Closure::load` (compile counts),
+    /// for `call_function` it is the invocation entry (no compile).
     pub(crate) fn drive_stashed(
         &mut self,
         stashed: StashedExecutor,
+        start: Instant,
     ) -> Result<DriveOutcome, VmError> {
         if let VmStatus::Suspended(reason) = &self.status {
             return Err(VmError::Suspended {
@@ -682,15 +779,14 @@ impl LuaVm {
         let mut total_used: u64 = 0;
         let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
 
-        // Execution wall-clock starts after chunk load: the RC-1 50 ms budget
-        // bounds VM execution (what the fuel/instruction budget also bounds),
-        // not compile + host scheduling stalls around `Closure::load`. Compile
-        // input sizes are bounded at call sites (config: 64 KiB / 2048 lines;
-        // plugin events: 8 KiB), so excluding load cannot hide unbounded work.
-        // This fixes trivial configs suspending with WallClockExceeded on
-        // loaded hosts (e.g. 252 parallel tests on CI) where the thread can
-        // sit descheduled for the whole budget before stepping once.
-        let start = Instant::now();
+        // CTX-0464: `start` predates `Closure::load` for `drive_chunk`
+        // (compile counts toward the RC-1 wall budget; the chunk cap bounds
+        // how much compile work can hide here), and marks invocation entry
+        // for `call_function` (no compile). The previous after-load origin
+        // let unbounded compile hide outside the budget; the cap plus this
+        // origin keeps trivial-config CI flakes bounded (compile of at most
+        // 1 MiB cannot deschedule a whole 50 ms budget on its own, and any
+        // excess suspends fail-closed here or in `drive_chunk`).
 
         // Pre-check memory before stepping (fail-closed per FS-7).
         let mem_before = self.lua.total_memory();
@@ -968,6 +1064,14 @@ impl LuaVm {
                 reason: reason.clone(),
             });
         }
+        // CTX-0464: chunk cap applies even on the synthetic path, fail-closed
+        // before any wall bookkeeping.
+        if code.len() > MAX_CHUNK_BYTES {
+            return Err(VmError::Budget(format!(
+                "chunk exceeds {MAX_CHUNK_BYTES} bytes ({} bytes)",
+                code.len()
+            )));
+        }
         // Fast-path: if synthetic elapsed already exceeds budgets, suspend
         // deterministically without touching Lua (proves wall exceed).
         let elapsed_ms = synthetic_elapsed.as_millis() as u64;
@@ -1133,5 +1237,59 @@ mod vm_unit_tests {
             other => panic!("expected completion, got {other:?}"),
         }
         assert!(!vm.is_suspended());
+    }
+
+    #[test]
+    fn chunk_over_cap_rejected_fail_closed() {
+        // CTX-0464 gap 1: drive_chunk -> Closure::load was unbounded. Chunks
+        // larger than MAX_CHUNK_BYTES (1 MiB, citing PLUGIN_INIT_MAX_BYTES and
+        // MODULE_FILE_MAX_BYTES precedent) must be refused fail-closed with a
+        // typed Budget error, without suspending or touching the heap.
+        let mut vm = LuaVm::new("xuepoo.chunk-cap");
+        let big = "a".repeat(MAX_CHUNK_BYTES + 1);
+        let err = vm
+            .execute(&big)
+            .expect_err("oversized chunk must be refused");
+        assert!(
+            matches!(err, VmError::Budget(_)),
+            "expected typed Budget error, got {err:?}"
+        );
+        assert!(!vm.is_suspended());
+        assert_eq!(vm.suspension_count(), 0);
+    }
+
+    #[test]
+    fn slow_compile_times_out_without_effects() {
+        // CTX-0464 gap 2: wall-clock started after Closure::load, so compile
+        // work hid outside the RC-1 budget. With the clock starting before
+        // load, a near-cap comment (512 KiB, execution is one assignment) with
+        // a 1 ms wall budget must suspend with WallClockExceeded before
+        // executing (no global set, no completion).
+        let mut vm = LuaVm::with_budgets(
+            "xuepoo.slow-compile",
+            RC1_INSTRUCTION_BUDGET,
+            1,
+            1,
+            RC2_MEMORY_PER_PLUGIN_BYTES,
+        );
+        let padding = "x".repeat(512 * 1024);
+        let code = format!("--{padding}\nresult = 42");
+        assert!(
+            code.len() <= MAX_CHUNK_BYTES,
+            "test chunk must stay under the cap"
+        );
+        let outcome = vm.execute(&code).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ExecuteOutcome::Suspended {
+                    reason: SuspendReason::WallClockExceeded { .. },
+                    ..
+                }
+            ),
+            "expected wall suspend including compile time, got {outcome:?}"
+        );
+        assert!(vm.is_suspended());
+        assert_eq!(vm.test_global("result"), None);
     }
 }

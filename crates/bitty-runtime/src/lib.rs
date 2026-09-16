@@ -209,9 +209,12 @@ pub use config::{
 };
 pub use error::RuntimeError;
 pub use execution::{
-    DEFAULT_MAX_JOBS, JobCancel, JobError, JobEvent, JobId, JobIo, JobKind, JobLifetime, JobOrigin,
-    JobRegistry, JobSnapshot, JobSpec, JobState, JobStop, JobTimeouts, MAX_JOB_ORIGIN_BYTES,
-    MAX_STORED_JOB_EVENTS,
+    DEFAULT_MAX_JOBS, DeliveryState, EventClass, EventReplay, JobCancel, JobError, JobEvent, JobId,
+    JobIo, JobKind, JobLifetime, JobOrigin, JobRegistry, JobSnapshot, JobSpec, JobState, JobStop,
+    JobTimeouts, MAX_EVENT_REPLAY, MAX_JOB_ORIGIN_BYTES, MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES,
+    MAX_READ_LINES, MAX_STORED_CRITICAL_EVENTS, MAX_STORED_JOB_EVENTS,
+    MAX_STORED_OBSERVATION_EVENTS, OutputFilter, OutputIndex, OutputStream, OutputView, ReadOutput,
+    StoredEvent,
 };
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;

@@ -81,26 +81,26 @@ fn owner(name: &str) -> JobPrincipal {
     JobPrincipal::new(name).expect("valid principal")
 }
 
-/// Whether the harness stdin is a terminal (controlling-terminal probe).
+/// Whether the harness stdin is a Unix terminal (live-echo probe gate).
 ///
 /// PTY children spawned from a piped harness stdin still start, but the
 /// echo round-trip needs a live line discipline on both ends; without a
 /// controlling terminal the child blocks before stdin and the poll would
-/// wait out its deadline instead of proving anything.
+/// wait out its deadline instead of proving anything. Windows always skips:
+/// ConPTY has no line-discipline echo for a `lines()` reader the way Unix
+/// does, and this exact poll held Windows CI past its 30-minute timeout.
 #[cfg(unix)]
-fn stdin_is_terminal() -> bool {
-    // `isatty(0)` without libc: a zero-size `TIOCGWINSZ` probe fails on
-    // pipes and succeeds on terminals. Implemented via the `stty` fallback
-    // would spawn a process; instead read `/proc/self/fd/0` link target.
+fn unix_harness_terminal() -> bool {
+    // `/proc/self/fd/0` resolves to `/dev/pts/N` for terminal-backed stdin
+    // and to `pipe:`/`/dev/null`/a regular path otherwise.
     std::fs::read_link("/proc/self/fd/0")
         .map(|target| target.to_string_lossy().contains("/dev/pts/"))
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
-fn stdin_is_terminal() -> bool {
-    // ConPTY hosts always provide a console for the harness; assume live.
-    true
+fn unix_harness_terminal() -> bool {
+    false
 }
 
 fn wait_for(
@@ -561,17 +561,20 @@ fn attach_requires_attach_and_a_live_job() {
 
 // ── write_input: PTY delivery proof for the owner, denial for strangers ─────
 ///
-/// Live-PTY echo runs only where the harness holds a controlling terminal
-/// (CI `windows-latest` debug shells included): without one the spawned
-/// child blocks before reading stdin and the echo poll never observes the
-/// marker, so this test asserts the enforceable half everywhere (denial +
-/// closed-stdin honesty, covered above) and performs the live round-trip
-/// only when stdin is itself a terminal.
+/// Live-PTY echo needs a real line discipline on the child side. CI and
+/// sandbox harnesses without a controlling terminal (or with a ConPTY that
+/// does not echo stdin to a `lines()` reader the way Unix does) would block
+/// the child before stdin and the echo poll would wait out its deadline
+/// instead of proving anything — on Windows CI this exact poll held the
+/// whole job past the 30-minute timeout. The enforceable half (denial +
+/// closed-stdin honesty) is covered by the sibling tests above on every
+/// platform; this test performs the live round-trip only where the harness
+/// itself holds a Unix terminal, and skips honestly elsewhere.
 #[test]
 fn write_input_reaches_a_pty_job_for_the_owner_only() {
     require_pty!();
-    if !stdin_is_terminal() {
-        eprintln!("SKIP live-PTY echo: harness holds no controlling terminal");
+    if !unix_harness_terminal() {
+        eprintln!("SKIP live-PTY echo: harness holds no Unix terminal");
         return;
     }
     let registry = JobRegistry::new();

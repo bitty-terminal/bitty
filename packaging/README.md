@@ -11,7 +11,25 @@ This directory holds multi-distro release artifacts for Bitty `0.0.1`.
 | apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (native `x86_64-unknown-linux-musl`) |
 | archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch, AUR                                        |
 
-OpenSUSE is rpm-based; the rpm built via nfpm is tested with `rpm -qip` and installs via `zypper install`. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`) and is validated via `apk add --allow-untrusted` plus `bitty --version` on a clean Alpine container.
+OpenSUSE is rpm-based; the rpm built via nfpm is tested with `rpm -qip` and installs via `zypper install`. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
+
+## Install smoke
+
+Every Linux package is install-smoked in a clean container of its own distro
+before a release can be published (034 item 5): Ubuntu 24.04 (`dpkg -i`),
+Fedora (`dnf install ./bitty.rpm`), Arch (`pacman -U`), and Alpine 3.22
+(`apk add --allow-untrusted ./bitty.apk`). Each leg then runs `bitty --version`,
+`bitty doctor`, and the headless smoke (`bitty --headless`).
+
+`.github/workflows/release.yml` runs the four legs as the `verify-install`
+matrix and the `release` job gates on it, so a package that installs or runs
+nowhere cannot be published. Run one leg locally with:
+
+```sh
+scripts/install-smoke.sh --distro ubuntu --package dist/bitty-x86_64-unknown-linux-gnu.deb
+# or point at a directory of downloaded artifacts:
+scripts/install-smoke.sh --distro arch --dir pkg
+```
 
 ## Nfpm
 
@@ -105,6 +123,6 @@ inside `scripts/make-macos-dmg.sh`; the job mounts the DMG and launches both
 slices before upload. The app is intentionally unsigned — codesign/notarize is
 deferred (034 item 11) — and the bare triple binaries keep shipping.
 
-Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, an Alpine-job apk install check, and optional AUR/Homebrew/Scoop bumps gated on secrets.
+Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, clean-container install smoke jobs for Ubuntu/Fedora/Arch/Alpine, and optional AUR/Homebrew/Scoop bumps gated on secrets.
 
 All packaging keeps bounded contracts: no unbounded file lists, no unsafe, fixed version substitution, scripts are no-ops.

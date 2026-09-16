@@ -946,6 +946,28 @@ mod tests {
     }
 
     #[test]
+    fn service_requirements_partial_comparator_matches() {
+        // CTX-0493: in-use spelling `>=2.30` zero-pads to `>=2.30.0` and must
+        // resolve, not fail closed as an unparseable requirement.
+        let mut reg = Registry::new();
+        reg.declare(manifest_with_services(
+            "xuepoo.provider",
+            vec![("markdown.render", "2.30.1")],
+            vec![],
+        ))
+        .unwrap();
+        reg.declare(manifest_with_services(
+            "xuepoo.consumer",
+            vec![],
+            vec![("markdown.render", ">=2.30")],
+        ))
+        .unwrap();
+        reg.resolve_all().unwrap();
+        assert_eq!(state_of(&reg, "xuepoo.provider"), PluginState::Resolved);
+        assert_eq!(state_of(&reg, "xuepoo.consumer"), PluginState::Resolved);
+    }
+
+    #[test]
     fn service_requirements_cycle_fails_closed() {
         let mut reg = Registry::new();
         reg.declare(manifest_with_services(

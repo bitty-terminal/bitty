@@ -1462,6 +1462,11 @@ mod tests {
         // Partial comparators are padded (accepted spelling >=0.1,<1.0).
         assert!(evaluate_compat(Some(">=0.1,<1.0"), Some("^1.0"), "0.1.0", "1.0.0").is_ok());
         assert!(evaluate_compat(Some(">=0.1,<1.0"), Some("^1.0"), "0.0.20", "1.0.0").is_err());
+        // CTX-0493: reported official-entry spelling zero-pads to X.Y.0 too.
+        assert!(evaluate_compat(Some(">=0.5,<1.0"), Some("^1.0"), "0.6.0", "1.0.0").is_ok());
+        assert!(evaluate_compat(Some(">=0.5,<1.0"), Some("^1.0"), "0.4.9", "1.0.0").is_err());
+        // CTX-0493: unrepresentable caret bound is a clean grammar error, not a panic.
+        assert!(evaluate_compat(Some("^4294967295"), None, "0.0.20", "1.0.0").is_err());
         // Absent fields mean no constraint.
         assert!(evaluate_compat(None, None, "0.0.20", "1.0.0").is_ok());
         let _ = host_bitty_version();

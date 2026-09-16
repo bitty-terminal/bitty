@@ -329,13 +329,26 @@ impl Runtime {
             sess.reader = Some(reader);
             return;
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
-        let handle = std::thread::Builder::new()
-            .name("bitty-pty-wakeup".to_owned())
-            .spawn(move || super::pty::pty_forward_loop(reader, tx, waker))
-            .expect("std thread spawn cannot fail with default builder options");
-        sess.forward_rx = Some(rx);
-        sess.forward_handle = Some(handle);
+        match super::pty::spawn_forwarder_default(reader, waker) {
+            Ok(parts) => {
+                sess.forward_rx = Some(parts.rx);
+                sess.forward_handle = Some(parts.handle);
+            }
+            Err(failure) => {
+                // Fail-closed (CTX-0473): the pane keeps its direct pump.
+                if let Some(reader) = failure.reader {
+                    sess.reader = Some(reader);
+                }
+                self.forwarder_spawn_failures = self.forwarder_spawn_failures.wrapping_add(1);
+                if let Some(suppressed) = self.spawn_log.admit_now() {
+                    eprintln!(
+                        "bitty: pane wakeup forwarder spawn failed for {view:?} ({}): using direct pump{}",
+                        failure.error,
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+        }
     }
 
     /// Whether one pane's reader is promoted into a wakeup forwarder
@@ -582,6 +595,7 @@ impl Runtime {
     /// `tick` (like the primary post-tick flush) so replies queued outside
     /// the pump still reach the pane's shell promptly.
     pub fn write_pane_replies(&mut self, view: ViewId) -> usize {
+        use std::io::Write as _;
         let Some(sess) = self.pane_sessions.get_mut(&view) else {
             return 0;
         };
@@ -589,18 +603,18 @@ impl Runtime {
         if replies.is_empty() {
             return 0;
         }
-        let mut total = 0usize;
-        use std::io::Write as _;
-        for chunk in replies {
-            // Each chunk is bounded; total bounded by the reply cap (4 KiB).
-            // Best-effort, fail-closed: on write error break and drop remainder.
-            if sess.writer.write_all(&chunk).is_ok() {
-                total += chunk.len();
-            } else {
-                break;
-            }
+        // Each chunk is bounded; total bounded by the reply cap (4 KiB).
+        // Best-effort, fail-closed (CTX-0473): the lost remainder is accounted,
+        // never silently swallowed.
+        let (total, dropped) = super::pty::write_chunks(&mut sess.writer, &replies);
+        let flush_failed = sess.writer.flush().is_err();
+        if dropped > 0 {
+            self.reply_write_dropped_bytes =
+                self.reply_write_dropped_bytes.wrapping_add(dropped as u64);
         }
-        let _ = sess.writer.flush();
+        if flush_failed {
+            self.write_flush_failures = self.write_flush_failures.wrapping_add(1);
+        }
         total
     }
 

@@ -474,6 +474,22 @@ fn osc52_write_invalid_base64_fails_closed() {
 }
 
 #[test]
+fn osc52_invalid_write_flood_is_log_throttled() {
+    // CTX-0473: a hostile child can reject at child-output rate; the exact
+    // counter must keep counting while stderr stays bounded.
+    let mut rt = make_runtime();
+    rt.set_osc_clipboard_write_allowed(true);
+    for _ in 0..16 {
+        rt.handle_pty_bytes(b"\x1b]52;c;!!!\x07");
+    }
+    assert_eq!(rt.osc52_rejected_writes(), 16, "counter stays exact");
+    assert!(
+        rt.suppressed_diagnostics() > 0,
+        "hostile reject flood must be rate-limited on stderr"
+    );
+}
+
+#[test]
 fn osc52_write_then_read_round_trips_exact() {
     let mut rt = make_runtime();
     rt.set_osc_clipboard_write_allowed(true);

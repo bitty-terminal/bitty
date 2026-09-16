@@ -129,6 +129,7 @@ pub mod help;
 pub mod input;
 pub mod kitty_images;
 pub mod layout_focus;
+pub mod log_throttle;
 pub mod mouse_chrome;
 pub mod panes;
 pub mod plugin;
@@ -608,6 +609,26 @@ pub struct Runtime {
     /// (wrapping) lets headless tests and the embedder observe the event
     /// without touching the real clipboard.
     osc52_rejected_writes: u64,
+    /// Input bytes dropped because the focused writer failed mid-write
+    /// (CTX-0473). Wrapping telemetry: bytes that never reached the shell.
+    input_write_dropped_bytes: u64,
+    /// Reply bytes dropped because a PTY writer failed mid-write (CTX-0473).
+    /// Covers the primary reply path and every per-pane reply path.
+    reply_write_dropped_bytes: u64,
+    /// Best-effort `flush` failures on reply/input writers (CTX-0473), where
+    /// the bytes may or may not have reached the child.
+    write_flush_failures: u64,
+    /// Wakeup-forwarder thread spawns refused by the OS (CTX-0473).
+    ///
+    /// Fail-closed: the reader is handed back to the direct pump path and the
+    /// runtime keeps running instead of panicking (`expect`) or going dark.
+    forwarder_spawn_failures: u64,
+    /// Rate-limited diagnostics for the OSC 52 reject hot path (CTX-0473).
+    osc52_log: log_throttle::LogThrottle,
+    /// Rate-limited diagnostics for the kitty-image reject hot path (CTX-0473).
+    kitty_log: log_throttle::LogThrottle,
+    /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
+    spawn_log: log_throttle::LogThrottle,
     pending_activation_gesture: Option<ActivationGesture>,
     next_activation_gesture: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
@@ -1001,6 +1022,22 @@ impl Runtime {
             dynamic_background: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
+            input_write_dropped_bytes: 0,
+            reply_write_dropped_bytes: 0,
+            write_flush_failures: 0,
+            forwarder_spawn_failures: 0,
+            osc52_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            kitty_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            spawn_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
             pending_activation_gesture: None,
             next_activation_gesture: 1,
             kitty_flags: 0,
@@ -1148,6 +1185,22 @@ impl Runtime {
             dynamic_background: None,
             sync_defer_since: None,
             osc52_rejected_writes: 0,
+            input_write_dropped_bytes: 0,
+            reply_write_dropped_bytes: 0,
+            write_flush_failures: 0,
+            forwarder_spawn_failures: 0,
+            osc52_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            kitty_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
+            spawn_log: log_throttle::LogThrottle::new(
+                log_throttle::LOG_THROTTLE_WINDOW,
+                log_throttle::LOG_THROTTLE_BURST,
+            ),
             pending_activation_gesture: None,
             next_activation_gesture: 1,
             kitty_flags: 0,

@@ -386,9 +386,14 @@ impl Runtime {
                 ));
             let tail: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Err(err) = self.spawn_shell_for_view(fresh_id, &program, &tail, cols, rows) {
-                eprintln!(
-                    "warning: workspace_new pane {fresh_id:?} shell spawn failed ({err}) — workspace {seq} starts empty"
-                );
+                // Rate-limited (CTX-0473): a broken recipe must not flood stderr
+                // as workspaces are created in a loop.
+                if let Some(suppressed) = self.spawn_log.admit_now() {
+                    eprintln!(
+                        "warning: workspace_new pane {fresh_id:?} shell spawn failed ({err}) — workspace {seq} starts empty{}",
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
             }
         }
         self.pending_full_redraw = true;

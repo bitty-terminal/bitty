@@ -1018,7 +1018,8 @@ impl State {
             }
 
             TerminalAction::SelectCharset { slot, table } => self.charsets.designate(*slot, *table),
-            TerminalAction::InvokeCharset { slot } => self.charsets.invoke(*slot),
+            TerminalAction::InvokeCharset { slot } => self.charsets.lock(*slot),
+            TerminalAction::SingleShiftCharset { slot } => self.charsets.arm_single(*slot),
 
             TerminalAction::RequestDeviceStatus { kind } => self.request_device_status(*kind),
             TerminalAction::Reply { bytes } => self.replies.queue(bytes.clone()),
@@ -1273,8 +1274,8 @@ impl State {
                 self.cursor.position.col = 0;
                 self.cursor.pending_wrap = false;
             }
-            0x0E => self.charsets.invoke(bitty_vt::CharsetSlot::G1),
-            0x0F => self.charsets.invoke(bitty_vt::CharsetSlot::G0),
+            0x0E => self.charsets.lock(bitty_vt::CharsetSlot::G1),
+            0x0F => self.charsets.lock(bitty_vt::CharsetSlot::G0),
             0x84 => self.index_linefeed(),
             0x85 => {
                 self.cursor.position.col = 0;

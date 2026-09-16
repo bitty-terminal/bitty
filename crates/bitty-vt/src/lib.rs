@@ -53,6 +53,7 @@
 
 mod action;
 mod bounded;
+mod diag;
 pub mod kitty_apc;
 mod parser;
 

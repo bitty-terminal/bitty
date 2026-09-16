@@ -335,6 +335,16 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   the installed proxy (structural identity, reflow-stable), and a ctl
   pre-mutation hook routes layout-mutating verbs so a ctl split can no longer
   land on the zoom proxy and be dropped by the later zoom restore.
+- **Caret/tilde upper-bound overflow errors cleanly; shorthand stays accepted
+  (CTX-0493, issue #793):** `^4294967295`, `^0.4294967295`, and
+  `~1.4294967295` no longer panic under overflow checks or silently wrap to a
+  never-matching range; the caret/tilde upper-bound increments use
+  `checked_add` and fail with a clean `PackageError` ("has no representable
+  successor"), while the maximal representable bounds (`^4294967294`,
+  `~4294967295.4294967294`) still expand. Partial comparator shorthand
+  (`>=0.5,<1.0`, `>=2.30`) remains accepted (zero-padded to `>=0.5.0,<1.0.0`
+  and `>=2.30.0` by CTX-0466) and is now regression-pinned across
+  `bitty-package`, `bitty-runtime`, and `bitty-plugin-host`.
 
 ### Security
 
@@ -397,6 +407,51 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   table and the not-yet-delivered request queue, so a timed-out request can
   never execute after its deadline; and answers for unknown/expired/completed
   ids are dropped before enqueue instead of filling the 64-deep inbound queue.
+- **Composer external editor is allowlisted with owner-only temp files
+  (CTX-0485, issue #799):** `$VISUAL`/`$EDITOR` are no longer trusted as an
+  executable name. The composer resolves only the exact bare names
+  `nvim`/`vim`/`vi` (`EDITOR_ALLOWLIST`); the first non-empty variable wins and
+  a hostile value fails closed with `EditorError::NotAllowed` before any temp
+  file is written or child spawned (no fallback to the other variable), so
+  `EDITOR=sh`, paths, flags, spaces, and shell metacharacters are denied. The
+  composer temp file drops its `.sh` suffix so no editor plugin, file manager,
+  or OS handler treats terminal content as executable, and stays owner-only:
+  on Unix the file is created with mode `0o600`, the mode is re-asserted after
+  the write, and a permission failure deletes the file and fails closed.
+  Non-Unix inherits the per-user temp-directory ACL (documented residual).
+- **OSC 8 `file:` links are never presented; clipboard writes default to Gated
+  (CTX-0486, issue #802):** OSC 8 hyperlink presentation now accepts only
+  `http`/`https`/`mailto` URIs, so untrusted output can no longer surface a
+  clickable local-file span (`file:///etc/passwd`, case variants, and encoded
+  spellings are rejected outright); opening a local file remains the runtime's
+  explicit `FileUrlActivation` gesture path. The OSC 52 write-capture state
+  carries a `ClipboardPolicy` defaulting to `Gated`: `Gated`/`Denied` reject
+  every write with the new `ClipboardOutcome::WriteDenied`, store nothing, and
+  count `denied_writes`, and only an explicit `Allow` captures, so a granted
+  read can never expose a payload that was not explicitly allowed.
+- **Spawn environments deny git config and external-process vectors
+  (CTX-0488, issue #804):** explicit spawn env entries are validated before
+  routing, scope, or consent against a denylist that closes the env-encoded
+  forms of the argv gate: `GIT_CONFIG`, `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_NOSYSTEM`/`SYSTEM`/`GLOBAL` and the
+  numbered `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` families;
+  `GIT_EXTERNAL_DIFF`, `GIT_DIFF_OPTS`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`,
+  `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS`,
+  `SSH_ASKPASS`, and `GIT_EXEC_PATH`; and the repo-identity escapes
+  `GIT_DIR`/`GIT_WORK_TREE`.
+  Matching is ASCII case-insensitive and prefix-aware for the numbered
+  families, so a case-folded Windows lookup cannot bypass; near-miss and benign
+  settings (`MY_PAGER`, `GIT_TERMINAL_PROMPT`, `LANG`) stay allowed.
+- **Filesystem patterns reject overbroad roots and sensitive locations
+  (CTX-0489, issue #796):** manifest `fs.read`/`fs.write` validation no longer
+  accepts a `~`-rooted pattern that matches unknown home children — bare `~`,
+  `~/`, `~/**`, `~/*`, `~/.*`, and foreign `~user` homes fail closed because a
+  literal first child must pin the grant. Sensitive credential segments
+  (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, and the
+  `~/.config/gh`/`gcloud` prefixes) match ASCII case-insensitively on either
+  `/` or `\`, and empty/`.` segments are normalized away first so
+  `~/.config/./gh/...` and `~//.config/gh/...` cannot bypass; valid narrowing
+  patterns such as `~/projects/**` and `~/.config/ghost/**` stay allowed.
 
 ### Per-pane damage tracking: splits stop forcing full repaint (CTX-0386, issue #642)
 

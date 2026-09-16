@@ -275,7 +275,8 @@ jobs:
           sed "s/^arch:.*/arch: $NFPM_ARCH/" nfpm.yaml > /tmp/nfpm.yaml
           cat /tmp/nfpm.yaml
           # Honor the matrix packagers list so a target only emits the packages
-          # it declares (aarch64 Linux: deb,rpm). x86_64 lists all four.
+          # it declares (x86_64 Linux: deb,rpm,archlinux; aarch64 Linux:
+          # deb,rpm). The apk is built by the `build-alpine` job.
           IFS=',' read -ra PACKAGERS <<< "${{ matrix.packagers }}"
           for pkg in "${PACKAGERS[@]}"; do
             nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target "dist/bitty-${{ matrix.target }}.${pkg}"
@@ -320,11 +321,10 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install pinned Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-          bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
 
       - name: Build bitty binary (native musl, dynamic)
         env:

@@ -425,9 +425,109 @@ jobs:
               bitty --version
             '
 
+  # Windows x86_64 portable ZIP (CTX-0455 / 034 item 10): unzip-and-run with no
+  # installer. The archive is assembled on Linux from the x86_64 MSVC artifact
+  # (fixed payload list, `bitty.exe` at the archive root) and a clean Windows
+  # runner then expands it and runs the executable. The bare `.exe` assets keep
+  # shipping for Scoop and direct downloads; ARM64 stays a bare `.exe` for now.
+  windows-zip:
+    name: Windows x86_64 Portable ZIP
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download x86_64 executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc
+          path: dist
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(bash scripts/check-release-version.sh --print)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+
+      - name: Assemble portable ZIP
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ZIP="dist/bitty-${VERSION}-windows-x86_64.zip"
+          bash scripts/make-windows-zip.sh \
+            --version "$VERSION" \
+            --exe dist/bitty-x86_64-pc-windows-msvc.exe \
+            --output "$ZIP"
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc-zip
+          path: dist/bitty-*-windows-x86_64.zip*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Clean-runner acceptance for the portable ZIP (034 item 10): a fresh Windows
+  # runner expands the published archive and runs `bitty.exe --version`.
+  verify-windows-zip:
+    name: Verify Windows ZIP unzip-and-run
+    needs: windows-zip
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download portable ZIP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-pc-windows-msvc-zip
+          path: pkg
+
+      - name: Expand archive and run bitty.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -Path pkg -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'portable ZIP artifact not found' }
+          Write-Host "archive: $($zip.Name)"
+          if ($zip.BaseName -notmatch '^bitty-(?<version>.+)-windows-x86_64$') {
+            throw "unexpected archive name: $($zip.BaseName)"
+          }
+          $version = $Matches['version']
+          $dest = Join-Path $env:RUNNER_TEMP 'bitty-portable-zip'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zip.FullName -DestinationPath $dest
+          $dirs = @(Get-ChildItem -Path $dest -Directory)
+          if ($dirs.Count -ne 0) {
+            throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
+          }
+          $expected = @('bitty.exe', 'LICENSE', 'README.md', 'CHANGELOG.md')
+          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+          if (Compare-Object $expected $actual) {
+            throw "archive contents mismatch: $($actual -join ', ')"
+          }
+          $exe = Join-Path $dest 'bitty.exe'
+          $output = & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "bitty --version exited $LASTEXITCODE" }
+          Write-Host "bitty --version => $output"
+          if ("$output" -notmatch [regex]::Escape($version)) {
+            throw "version mismatch: archive $version, binary $output"
+          }
+
   release:
     name: Create GitHub Release
-    needs: [build, build-alpine, verify-alpine]
+    needs: [build, build-alpine, verify-alpine, windows-zip, verify-windows-zip]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')

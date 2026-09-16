@@ -96,8 +96,15 @@ Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcin
 - linux x64 musl (`x86_64-unknown-linux-musl`, Alpine 3.22 container, native musl build) — the `.apk`
 - windows x64 (`x86_64-pc-windows-msvc`, windows-latest)
 - windows aarch64 (`aarch64-pc-windows-msvc`, windows-latest)
+- windows x64 portable ZIP (`bitty-<version>-windows-x86_64.zip`, `windows-zip` job)
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
+
+The portable ZIP packs `bitty.exe` with `LICENSE`, `README.md` and
+`CHANGELOG.md` at the archive root (assembled by `scripts/make-windows-zip.sh`,
+no installer); the bare `.exe` assets keep shipping for Scoop and direct
+downloads. The `verify-windows-zip` job unzips on a clean Windows runner and
+runs `bitty.exe --version`.
 
 Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, an Alpine-job apk install check, and optional AUR/Homebrew/Scoop bumps gated on secrets.
 

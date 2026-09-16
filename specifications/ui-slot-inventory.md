@@ -220,6 +220,24 @@ overlay content (**accepted** boundary). A future `PickerProvider`
 (one effective provider per invocation in the draft table) must accept this
 note as its composition constraint when its own contract is written.
 
+## Overlay ownership decision (accepted, CTX-0482)
+
+Three overlay systems exist in the workspace and each owns exactly one
+concern; they never share state:
+
+| System                                                     | Owns                                                                                                        | Does not own                                 |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `LayoutNode::Overlay` (`crates/bitty-ui/src/layout.rs`)    | Geometry (base + overlay bounds) and paint tier order                                                       | Modality, key capture, per-leaf display mode |
+| `OverlayManager` (`crates/bitty-ui/src/panel.rs`)          | Presentation stacking over the `4+1` envelope and the single panel-overlay modal authority (`modal_active`) | Grid truth, geometry, per-leaf mode          |
+| `PresentationMode` (`crates/bitty-ui/src/presentation.rs`) | Requested per-leaf display mode (transitions gated; the solver ignores it)                                  | Painting, stacking, modality                 |
+
+The panel-overlay modal authority is surfaced through the runtime bit
+(`Runtime::overlay_modal_active`, set from `OverlayManager::modal_active` by
+the panel integration) and read by the app's single modal-capture predicate
+(`crates/bitty-app/src/chrome_keys.rs`; CTX-0482). A new overlay feature
+extends exactly one owner instead of adding a fourth system or a parallel
+modal gate.
+
 ## Shipped versus accepted versus draft versus open ledger
 
 | Claim                                                                                                           | Status                  | Authority                                                                                            |
@@ -231,6 +249,7 @@ note as its composition constraint when its own contract is written.
 | Statusline 8 / 64 / 128 envelope, `&#124;` join, observation-only helpers, reactive-event allowlist             | Shipped                 | `crates/bitty-runtime/src/statusline.rs` and its tests                                               |
 | Palette overlay envelope (128 chars, 32 commands, centered/clipped, focus MRU)                                  | Shipped                 | `crates/bitty-runtime/src/palette.rs` and its tests                                                  |
 | Overlay `4+1` bound with fail-closed typed errors; panel workspace/window bounds; 8 KiB bus payload bound       | Shipped                 | `crates/bitty-ui/src/panel.rs`, `crates/bitty-runtime/src/registry/panel.rs` and their tests         |
+| Overlay ownership: geometry / stacking + modal bit / requested mode stay disjoint, one owner each               | Accepted                | This record (`CTX-0482`); ownership decision in `crates/bitty-ui/src/panel.rs`                       |
 | `workspaceline` exclusive claim; duplicate diagnosed not last-wins; `tabline` deprecated alias                  | Shipped                 | `crates/bitty-plugin-host/src/bundled.rs` and its tests                                              |
 | `bitty.ui.mount` / `update` host implementation                                                                 | Missing (tracked)       | `CTX-0428` (ready); `crates/bitty-lua/src/host.rs` has no mount path                                 |
 | `StatusProvider` / `PickerProvider` / `ContextProvider` ecology                                                 | Draft, post-1.0         | Plugin Reuse and Provider Ecology RFC (status: draft)                                                |

@@ -32,11 +32,10 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Prepare dummy artifacts for nfpm validation
         run: |
-          mkdir -p target/release terminfo
+          mkdir -p target/release
           echo '#!/bin/sh
           echo "bitty 0.0.1"' > target/release/bitty
           chmod +x target/release/bitty
-          echo "# dummy" > terminfo/bitty.terminfo
       - name: Validate nfpm (deb/rpm/apk/archlinux)
         run: |
           nfpm package --config nfpm.yaml --packager deb --target /tmp/bitty.deb
@@ -63,6 +62,9 @@ jobs:
       - name: Validate source PKGBUILD (artifact-install consistency)
         run: |
           bash scripts/check-pkgbuild-source.sh
+      - name: Check terminfo shipping decision (034 item 6)
+        run: |
+          bash scripts/check-terminfo.sh
       - name: Check release version alignment (Cargo <-> packaging <-> tag)
         run: |
           bash scripts/check-release-version.sh

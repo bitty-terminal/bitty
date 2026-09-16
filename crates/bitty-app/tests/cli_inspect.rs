@@ -341,7 +341,7 @@ fn inspect_config_unknown_is_not_found() {
 }
 
 #[test]
-fn inspect_protocol_stub_state() {
+fn inspect_protocol_supported_state() {
     let output = run_bitty(&["inspect", "protocol", "kitty-graphics", "--format", "json"]);
     assert_eq!(
         output.status.code(),
@@ -353,7 +353,7 @@ fn inspect_protocol_stub_state() {
     assert!(
         text.contains("\"target\":\"protocol\"")
             && text.contains("kitty-graphics")
-            && text.contains("\"status\":\"stub\""),
+            && text.contains("\"status\":\"supported\""),
         "json must name support state, got {text:?}"
     );
 }

@@ -31,6 +31,8 @@ are documented in `src/lib.rs`.
 - `Cargo.toml` — package metadata and the `piccolo` dependency.
 - `src/lib.rs` — crate docs with the role, budgets, and determinism sections.
 - `src/host.rs` — VM lifecycle, budget enforcement, and host calls.
+- `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /
+  `bitty.ui.update`) and the bounded `UiNode` model.
 - `src/config.rs` — configuration-chunk evaluation and table extraction.
 - `src/stdlib.rs` — restricted standard-library construction.
 - `tests/` — headless budget and isolation tests.

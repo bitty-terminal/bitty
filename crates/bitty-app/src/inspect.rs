@@ -53,9 +53,9 @@
 //!   defaults only; precedence documented, file layers owned by
 //!   `bitty config check`).
 //! - Protocols reuse the honest support states reported by `bitty doctor`
-//!   (kitty-graphics stub, sixel unsupported) plus the `bitty-rich` OSC
-//!   surfaces (hyperlink OSC 8, shell integration OSC 133) and the OSC 52
-//!   clipboard policy gate.
+//!   (kitty-graphics supported as a bounded subset, sixel unsupported) plus
+//!   the `bitty-rich` OSC surfaces (hyperlink OSC 8, shell integration
+//!   OSC 133) and the OSC 52 clipboard policy gate.
 //!
 //! # Exit codes (stable taxonomy)
 //!
@@ -808,8 +808,8 @@ pub struct ProtocolInfo {
 const PROTOCOLS: &[(&str, &str, &str)] = &[
     (
         "kitty-graphics",
-        "stub",
-        "Bounded placeholder stub only (bitty-rich KittyGraphicsStub): escape intake parses, no raster present. Inline images arrive in a later slice.",
+        "supported",
+        "Bounded inline images ship end-to-end: APC intake, decode (f=100 PNG, f=24 RGB, f=32 RGBA), cursor-anchored placement, present-layer blit. Transmit-only and unknown a= actions store without painting; animation is deferred.",
     ),
     (
         "sixel",
@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn protocol_lookup_covers_aliases() {
         let kitty = inspect_protocol("kitty-graphics").expect("kitty");
-        assert_eq!(kitty.status, "stub");
+        assert_eq!(kitty.status, "supported");
         assert_eq!(kitty.owner, "core");
         assert!(inspect_protocol("kitty").is_some());
         assert_eq!(
@@ -1610,6 +1610,6 @@ mod tests {
         let proto = inspect_protocol("kitty-graphics").unwrap();
         let table = format_protocol_table("kitty-graphics", &proto);
         assert!(table.contains("kitty-graphics"));
-        assert!(table.contains("stub"));
+        assert!(table.contains("supported"));
     }
 }

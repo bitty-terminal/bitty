@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>run.bitty.Bitty</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <name>Bitty</name>
+  <summary>Minimal correct terminal workspace</summary>
+  <description>
+    <p>Bitty is a terminal workspace built around a minimal correct terminal core. Terminal state, PTY ownership, and protocol correctness stay in the core; optional experiences ship as isolated plugins.</p>
+  </description>
+  <launchable type="desktop-id">run.bitty.Bitty.desktop</launchable>
+  <url type="homepage">https://github.com/bitty-terminal/bitty</url>
+  <url type="bugtracker">https://github.com/bitty-terminal/bitty/issues</url>
+  <developer id="run.bitty">
+    <name>Bitty Terminal</name>
+  </developer>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <provides>
+    <binary>bitty</binary>
+  </provides>
+  <icon type="stock">bitty</icon>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.0.20" date="2026-09-11"/>
+  </releases>
+</component>

@@ -33,6 +33,7 @@ use piccolo::{
     Callback, CallbackReturn, Closure, Context, Error, Function, StashedFunction, Table, Value,
 };
 
+use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
 /// Version of the host bridge line exposed as `bitty.api_version`.
@@ -436,6 +437,72 @@ pub trait HostServices {
     /// Current monotonic host time in milliseconds (for timer scheduling).
     fn now_millis(&self) -> u64 {
         0
+    }
+    /// Mount one validated v1 declarative component into an accepted slot.
+    ///
+    /// The bridge validates the `slot`/`component` pair against the accepted
+    /// v1 contract before this call; the implementation owns capability
+    /// gating (`ui.rich`; `ui.overlay` for the `overlay` slot; an exclusive
+    /// claim for `tabline`) and the generation-owned block registry. Returns
+    /// the opaque, generation-owned `block_id` handle.
+    ///
+    /// The default implementation fails closed: a host without a mount path
+    /// can never gain ambient authority from the always-present `bitty.ui`
+    /// namespace (`LUA-OQ-2`).
+    fn ui_mount(&self, _slot: &str, _component: &UiNode) -> Result<i64, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            "E_UI_UNAVAILABLE",
+            "host has no ui.mount surface",
+        ))
+    }
+    /// Expiry-aware `ui_mount` for the pre-commit timeout path (CTX-0464).
+    ///
+    /// Mounting commits a generation-owned block, so the bridge uses the
+    /// check-then-act mutating path: implementations must check
+    /// `Instant::now() > expiry` before committing and fail-closed with
+    /// [`BridgeError::timeout`] without mutating when expired. The default
+    /// checks expiry before delegating (fail-fast; in-memory registries
+    /// commit instantly).
+    fn ui_mount_with_expiry(
+        &self,
+        slot: &str,
+        component: &UiNode,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_mount(slot, component)
+    }
+    /// Replace a mounted block's scene subtree, incrementing its version.
+    ///
+    /// Returns `Ok(false)` for a stale or foreign handle; the accepted
+    /// `E_UI_COMPONENT_INVALID` component check runs in the bridge before
+    /// this call. The default implementation fails closed like
+    /// [`HostServices::ui_mount`].
+    fn ui_update(&self, _handle: i64, _component: &UiNode) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            "E_UI_UNAVAILABLE",
+            "host has no ui.update surface",
+        ))
+    }
+    /// Expiry-aware `ui_update` for the pre-commit timeout path (CTX-0464).
+    ///
+    /// Same contract as [`HostServices::ui_mount_with_expiry`]: an update
+    /// commits a replacement subtree, so an expired call returns
+    /// [`BridgeError::timeout`] and leaves the last-known-good block intact.
+    fn ui_update_with_expiry(
+        &self,
+        handle: i64,
+        component: &UiNode,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_update(handle, component)
     }
 }
 
@@ -1099,6 +1166,72 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("timers table accepts 'cancel'");
 
+    let ui = Table::new(&ctx);
+    ui.set(
+        ctx,
+        "mount",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let slot = match stack.get(0) {
+                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    _ => {
+                        return Err(
+                            component_invalid("ui.mount slot must be a string").to_error(ctx)
+                        );
+                    }
+                };
+                if !is_ui_slot(&slot) {
+                    return Err(component_invalid(format!(
+                        "unknown UI slot '{}'",
+                        bounded_token(&slot)
+                    ))
+                    .to_error(ctx));
+                }
+                let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                let handle = state
+                    .bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_mount_with_expiry(&slot, &component, expiry)
+                    })
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, Value::Integer(handle));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("ui table accepts 'mount'");
+    ui.set(
+        ctx,
+        "update",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let handle = match stack.get(0) {
+                    Value::Integer(handle) => handle,
+                    _ => {
+                        return Err(component_invalid(
+                            "ui.update handle must be an integer block handle",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                let component = read_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                let updated = state
+                    .bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_update_with_expiry(handle, &component, expiry)
+                    })
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, Value::Boolean(updated));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("ui table accepts 'update'");
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -1116,6 +1249,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts notify");
     root.set(ctx, "process", readonly_table(ctx, process))
         .expect("root accepts process");
+    root.set(ctx, "ui", readonly_table(ctx, ui))
+        .expect("root accepts ui");
     root.set(ctx, "timers", readonly_table(ctx, timers))
         .expect("root accepts timers");
     Value::Table(readonly_table(ctx, root))
@@ -1241,6 +1376,20 @@ fn readonly_table<'gc>(ctx: Context<'gc>, real: Table<'gc>) -> Table<'gc> {
         .expect("metatable accepts __metatable");
     proxy.set_metatable(&ctx, Some(metatable));
     proxy
+}
+
+/// Bound an untrusted token echoed into a host-authored diagnostic.
+///
+/// Error messages carry at most the offending token, never the full payload
+/// (bridge contract): truncate on a char boundary and mark the cut.
+fn bounded_token(token: &str) -> String {
+    const MAX_CHARS: usize = 32;
+    if token.chars().count() <= MAX_CHARS {
+        return token.to_string();
+    }
+    let mut bounded: String = token.chars().take(MAX_CHARS).collect();
+    bounded.push('…');
+    bounded
 }
 
 /// Extract a 1-based argv array of strings from a marshalled Lua value.

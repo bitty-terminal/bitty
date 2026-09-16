@@ -428,12 +428,20 @@ impl WindowConfig {
     }
 }
 
+/// The fixed Linux application ID (CTX-0452 / 034 item 7): Wayland `app_id`,
+/// X11 `WM_CLASS`, the `.desktop` file name, and the AppStream metainfo `<id>`
+/// all use this value. Recorded in `packaging/README.md`; the ID is never
+/// renamed silently.
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "run.bitty.Bitty";
+
 /// Application identifier for window-system grouping.
 ///
-/// Sets the Wayland `app_id` and the X11 `WM_CLASS` instance/general pair
-/// to `bitty` so compositors (`hyprctl clients` → `class: bitty`) and the
-/// shipped `bitty.desktop` (`StartupWMClass=bitty`) agree. Verified against
-/// the vendored winit 0.30.13 API: both
+/// Sets the Wayland `app_id` and the X11 `WM_CLASS` instance/general pair to
+/// [`APP_ID`] so compositors (`hyprctl clients` → `class: run.bitty.Bitty`)
+/// and the shipped `run.bitty.Bitty.desktop` (`StartupWMClass=run.bitty.Bitty`)
+/// agree, and so the window identity matches the AppStream metainfo component
+/// ID. Verified against the vendored winit 0.30.13 API: both
 /// `winit::platform::wayland::WindowAttributesExtWayland::with_name` and
 /// `winit::platform::x11::WindowAttributesExtX11::with_name` set the same
 /// shared `platform_specific.name` field, so one value covers both
@@ -442,8 +450,8 @@ impl WindowConfig {
 fn apply_app_id(attributes: WindowAttributes) -> WindowAttributes {
     use winit::platform::wayland::WindowAttributesExtWayland as WaylandExt;
     use winit::platform::x11::WindowAttributesExtX11 as X11Ext;
-    let attributes = WaylandExt::with_name(attributes, "bitty", "bitty");
-    X11Ext::with_name(attributes, "bitty", "bitty")
+    let attributes = WaylandExt::with_name(attributes, APP_ID, APP_ID);
+    X11Ext::with_name(attributes, APP_ID, APP_ID)
 }
 
 /// Non-Linux targets have no Wayland/X11 app-id concept; keep attributes

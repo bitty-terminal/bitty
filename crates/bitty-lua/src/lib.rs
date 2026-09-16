@@ -63,6 +63,7 @@ use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
 pub mod config;
 pub mod host;
 mod stdlib;
+pub mod ui;
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
@@ -74,6 +75,7 @@ pub use host::{
     HostServices, LuaValue, MarshallingLimits, RegistrationCapture, SNAPSHOT_MAX_BYTES,
     SPAWN_TIMEOUT_MAX_MS, SPAWN_TIMEOUT_MS, TimerRegistration,
 };
+pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 

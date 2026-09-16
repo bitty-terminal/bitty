@@ -8,7 +8,7 @@ Resize and reflow corpus — deterministic grid reflow, scroll region, alt-scree
 
 - Resize events: `PhysicalSize` to logical grid via `RuntimeConfig::grid_from_pixels` (8×16 cell), `State::resize` (bounded `[1,1000]` per dimension, scrollback reflow), `map_resize_to_surface_extent` (zero-size skip). Captured from `vttest` menu 2 (screen resize) and from `bitty-runtime` headless resize fixtures.
 - Ghostty / kitty / WezTerm differential — feed same resize + byte burst and compare `Snapshot` dimensions / `Damage` regions to reference dumped grid; zero-size minimized/occluded contract must be honest (skip) per `bitty_platform::map_resize_to_surface_extent`.
-- Existing baseline — `crates/bitty-runtime/tests/v01_minimal_terminal.rs::v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically` (800×600 → 100×37, horizontal split 100 → 50+50, zero skip), `crates/bitty-term-state/tests/resize_scrollback.rs`, `crates/bitty-runtime/tests/resize_scrollback.rs`.
+- Existing baseline — `crates/bitty-runtime/tests/v01_minimal_terminal.rs::v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically` (800×600 → 100×37, horizontal split 100 → 50+50, zero skip), `crates/bitty-ui/tests/resize_scrollback.rs`, `crates/bitty-runtime/tests/resize_scrollback.rs`.
 
 ## Bounds
 

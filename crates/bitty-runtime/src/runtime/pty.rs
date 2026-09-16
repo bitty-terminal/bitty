@@ -24,13 +24,16 @@ pub(super) fn pty_forward_loop(
 ) {
     loop {
         let first = match reader.recv() {
-            Some(chunk) => {
+            Ok(Some(chunk)) => {
                 debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                 chunk
             }
-            None => {
-                // EOF: wake once so the consumer drains final chunks promptly
-                // instead of waiting for an incidental wakeup.
+            Ok(None) | Err(_) => {
+                // Clean EOF, or a pump I/O failure after every queued chunk
+                // was delivered: either way wake once so the consumer drains
+                // final chunks promptly instead of waiting for an incidental
+                // wakeup. The pump outcome is informational here and is
+                // surfaced by `join` below.
                 (waker)();
                 break;
             }
@@ -41,11 +44,16 @@ pub(super) fn pty_forward_loop(
         batch.push(first);
         while batch.len() < PTY_FORWARD_CAPACITY_CHUNKS {
             match reader.try_recv() {
-                Some(chunk) => {
+                bitty_pty::PtyRecv::Chunk(chunk) => {
                     debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                     batch.push(chunk);
                 }
-                None => break,
+                // Nothing queued right now, or the stream is over
+                // (EOF/failure); the blocking `recv` above reports the
+                // terminal outcome on the next iteration.
+                bitty_pty::PtyRecv::Empty
+                | bitty_pty::PtyRecv::Eof
+                | bitty_pty::PtyRecv::Error(_) => break,
             }
         }
         let mut sent_any = false;
@@ -505,12 +513,14 @@ impl Runtime {
                         break;
                     }
                     match reader.try_recv() {
-                        Some(chunk) => {
+                        bitty_pty::PtyRecv::Chunk(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
                             drained_bytes = drained_bytes.saturating_add(chunk.len());
                             out.push(chunk);
                         }
-                        None => break,
+                        bitty_pty::PtyRecv::Empty
+                        | bitty_pty::PtyRecv::Eof
+                        | bitty_pty::PtyRecv::Error(_) => break,
                     }
                 }
                 out

@@ -510,7 +510,12 @@ impl Runtime {
                 let chunk = if let Some(rx) = sess.forward_rx.as_ref() {
                     rx.try_recv().ok()
                 } else if let Some(reader) = sess.reader.as_ref() {
-                    reader.try_recv()
+                    match reader.try_recv() {
+                        bitty_pty::PtyRecv::Chunk(chunk) => Some(chunk),
+                        bitty_pty::PtyRecv::Empty
+                        | bitty_pty::PtyRecv::Eof
+                        | bitty_pty::PtyRecv::Error(_) => None,
+                    }
                 } else {
                     None
                 };

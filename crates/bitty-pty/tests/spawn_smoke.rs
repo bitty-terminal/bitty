@@ -18,7 +18,7 @@ const ECHO_TIMEOUT: Duration = Duration::from_secs(10);
 /// bounded channel. Returns the concatenation.
 fn drain(reader: &bitty_pty::PtyReader, deadline: std::time::Instant) -> Vec<u8> {
     let mut out = Vec::new();
-    while let Some(chunk) = reader.recv() {
+    while let Ok(Some(chunk)) = reader.recv() {
         assert!(
             chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
             "chunk exceeded declared read size"
@@ -480,7 +480,7 @@ fn shell_echo_via_sh_with_bounded_backpressure() {
                 // Also prove try_recv path does not break backpressure:
                 // a non-blocking poll after the blocking recv should not panic
                 // and must respect the same bound if it yields data.
-                if let Some(extra) = reader.try_recv() {
+                if let bitty_pty::PtyRecv::Chunk(extra) = reader.try_recv() {
                     assert!(extra.len() <= bitty_pty::READ_CHUNK_SIZE);
                     out.extend_from_slice(&extra);
                 }
@@ -526,7 +526,7 @@ fn backpressure_bound_holds_under_flood() {
     let mut chunks = 0usize;
     let mut max_chunk = 0usize;
     // Drain until EOF, asserting per-chunk bound holds even under flood.
-    while let Some(chunk) = reader.recv() {
+    while let Ok(Some(chunk)) = reader.recv() {
         assert!(
             chunk.len() <= bitty_pty::READ_CHUNK_SIZE,
             "flood chunk {} exceeds READ_CHUNK_SIZE {}",

@@ -36,11 +36,15 @@
 //!   caller writes the returned bytes to the PTY in a single write and the
 //!   shell line editor receives Unicode/multiline content paste-safely.
 //! * **External editor** (008 section 16): [`edit_externally`] writes the
-//!   buffer to a `0600` temp file under the OS temp dir, spawns
-//!   `$VISUAL`/`$EDITOR` ([`resolve_editor`]) with a bounded timeout plus
-//!   kill, reads the file back, deletes it, and returns to the composer.
-//!   Every failure is fail-closed: the buffer is untouched and the temp
-//!   file is still deleted ([`TempComposerFile`] RAII guard).
+//!   buffer to a `0600` temp file under the OS temp dir, spawns the
+//!   `$VISUAL`/`$EDITOR` program ([`resolve_editor`]) with a bounded
+//!   timeout plus kill, reads the file back, deletes it, and returns to
+//!   the composer. The program is matched exactly against
+//!   [`EDITOR_ALLOWLIST`] (bare `nvim`/`vim`/`vi` only): arbitrary
+//!   executables, paths, and flag strings are denied with
+//!   [`EditorError::NotAllowed`] before any file is written or process is
+//!   spawned. Every failure is fail-closed: the buffer is untouched and
+//!   the temp file is still deleted ([`TempComposerFile`] RAII guard).
 //!
 //! # Hard boundary (008 section 14, load-bearing)
 //!
@@ -69,6 +73,7 @@
 //! | [`frame_submit`] output | `content + 13` bytes | `TooLarge` before framing, nothing emitted |
 //! | temp file write/read | [`COMPOSER_MAX_BYTES`] | `TooLarge` fail-closed, file still deleted |
 //! | editor wait | caller `timeout`, capped at [`EDITOR_TIMEOUT_MAX`] (300 s) | kill + `Timeout` error |
+//! | editor program | [`EDITOR_ALLOWLIST`] (3 bare names) | `NotAllowed` before temp/spawn, no fallback |
 //! | editor path/args | one file arg only, no shell | spaces in path are data, never split |
 //!
 //! No I/O except the editor round-trip, no wall-clock except the editor
@@ -117,6 +122,18 @@ pub const EDITOR_TIMEOUT_MAX: Duration = Duration::from_secs(300);
 const EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Temp file name prefix (inside [`std::env::temp_dir`]).
 const TEMP_PREFIX: &str = "bitty-composer-";
+
+/// Editor programs admitted by [`resolve_editor`], matched exactly.
+///
+/// `$VISUAL`/`$EDITOR` are attacker-influenced environment inputs: treating
+/// the value as an executable name lets a hostile environment spawn an
+/// arbitrary program on the composer temp file. The allowlist keeps the
+/// execution surface to the known terminal editors this slice supports.
+/// Bare names only: a value containing a path separator, whitespace, a
+/// flag, or any other character is not on the list and is denied before
+/// the temp file exists or a child is spawned. Extending the list is a
+/// deliberate, reviewable change.
+pub const EDITOR_ALLOWLIST: &[&str] = &["nvim", "vim", "vi"];
 
 // ---------------------------------------------------------------------------
 // CommandBuffer
@@ -1064,19 +1081,30 @@ pub fn frame_submit(content: &str) -> Result<Vec<u8>, BufferError> {
 // External editor round-trip ($VISUAL / $EDITOR, secure temp file)
 // ---------------------------------------------------------------------------
 
-/// Picks the editor program: `$VISUAL`, else `$EDITOR` (trimmed, non-empty).
+/// Picks the editor program: `$VISUAL`, else `$EDITOR` (trimmed).
 ///
-/// Returns `None` when neither is set — the caller fails closed (composer
-/// content preserved) instead of guessing `vi`.
-#[must_use]
-pub fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Option<String> {
+/// The first non-empty value wins and is matched exactly against
+/// [`EDITOR_ALLOWLIST`]; a hostile first candidate is denied instead of
+/// silently falling through to the other variable, so a misconfigured
+/// `$VISUAL` cannot hide behind a benign `$EDITOR`.
+///
+/// # Errors
+/// [`EditorError::NoEditor`] when neither variable is set (or both blank);
+/// [`EditorError::NotAllowed`] when the chosen value is not one of the
+/// allowlisted bare program names.
+pub fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Result<String, EditorError> {
     for raw in [visual, editor].into_iter().flatten() {
         let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+        if trimmed.is_empty() {
+            continue;
         }
+        return if EDITOR_ALLOWLIST.contains(&trimmed) {
+            Ok(trimmed.to_string())
+        } else {
+            Err(EditorError::NotAllowed)
+        };
     }
-    None
+    Err(EditorError::NoEditor)
 }
 
 /// Why the external-editor round-trip failed.
@@ -1087,6 +1115,11 @@ pub fn resolve_editor(visual: Option<&str>, editor: Option<&str>) -> Option<Stri
 pub enum EditorError {
     /// Neither `$VISUAL` nor `$EDITOR` is set.
     NoEditor,
+    /// The chosen program is not in [`EDITOR_ALLOWLIST`].
+    ///
+    /// Carries no payload: the rejected value is attacker-influenced and is
+    /// never echoed into errors or logs. The allowlist itself is public.
+    NotAllowed,
     /// Temp file could not be created/written.
     WriteFailed(String),
     /// Editor could not be spawned.
@@ -1112,6 +1145,11 @@ impl std::fmt::Display for EditorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoEditor => f.write_str("no editor: set $VISUAL or $EDITOR"),
+            Self::NotAllowed => write!(
+                f,
+                "editor not allowed: only bare {} are accepted",
+                EDITOR_ALLOWLIST.join("/")
+            ),
             Self::WriteFailed(e) => write!(f, "composer temp file write failed: {e}"),
             Self::SpawnFailed(e) => write!(f, "editor spawn failed: {e}"),
             Self::Timeout => write!(f, "editor timed out and was killed"),
@@ -1167,8 +1205,11 @@ fn unique_temp_path(dir: &Path) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // No extension on purpose: a `.sh` (or any handler-associated) suffix
+    // invites an editor plugin, file manager, or OS handler to treat the
+    // temp file as executable content. The name is an opaque label only.
     dir.join(format!(
-        "{TEMP_PREFIX}{}-{}-{seq}.sh",
+        "{TEMP_PREFIX}{}-{}-{seq}",
         std::process::id(),
         nanos
     ))
@@ -1176,13 +1217,21 @@ fn unique_temp_path(dir: &Path) -> PathBuf {
 
 /// Writes `content` to a fresh `0600` temp file under `dir`.
 ///
-/// The file is created with `create_new` (never overwrites) and restricted
-/// to owner-only on Unix before any content lands. Size is bounded at
-/// [`COMPOSER_MAX_BYTES`].
+/// On Unix the create call itself applies `mode(0o600)` so the file is
+/// never more permissive than owner-only, even for the instant between
+/// creation and the first byte; the mode is re-asserted after the write
+/// and a failure to enforce it deletes the file and fails closed
+/// ([`EditorError::WriteFailed`]) rather than leaving a readable secret.
+/// Size is bounded at [`COMPOSER_MAX_BYTES`].
+///
+/// Non-Unix confidentiality is a documented residual:
+/// [`create_owner_only_new`] cannot set a restrictive OS ACL from safe
+/// Rust, so the file inherits the per-user temp-directory ACL; fail-closed
+/// ordering and RAII cleanup are the platform-uniform guarantees.
 ///
 /// # Errors
 /// [`EditorError::TooLarge`] when `content` exceeds the cap;
-/// [`EditorError::WriteFailed`] on any filesystem failure.
+/// [`EditorError::WriteFailed`] on any filesystem or permission failure.
 pub fn write_composer_temp(content: &str, dir: &Path) -> Result<TempComposerFile, EditorError> {
     if content.len() > COMPOSER_MAX_BYTES {
         return Err(EditorError::TooLarge {
@@ -1194,13 +1243,13 @@ pub fn write_composer_temp(content: &str, dir: &Path) -> Result<TempComposerFile
     let mut last_err = String::from("no attempt");
     for _ in 0..8 {
         let path = unique_temp_path(dir);
-        let open = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path);
+        let open = create_owner_only_new(&path);
         match open {
             Ok(mut file) => {
-                restrict_owner_only(&path);
+                if let Err(e) = restrict_owner_only(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
                 if let Err(e) = file.write_all(content.as_bytes()) {
                     let _ = std::fs::remove_file(&path);
                     return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
@@ -1210,7 +1259,13 @@ pub fn write_composer_temp(content: &str, dir: &Path) -> Result<TempComposerFile
                     return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
                 }
                 drop(file);
-                restrict_owner_only(&path);
+                // Re-assert after the write: if the mode drifted (or a
+                // platform ignored the create-time mode) the secret never
+                // survives on disk in a readable state.
+                if let Err(e) = restrict_owner_only(&path) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(EditorError::WriteFailed(truncate_err(e.to_string())));
+                }
                 return Ok(TempComposerFile { path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1223,17 +1278,45 @@ pub fn write_composer_temp(content: &str, dir: &Path) -> Result<TempComposerFile
     Err(EditorError::WriteFailed(truncate_err(last_err)))
 }
 
+/// Creates the temp file `create_new` (never overwrites an existing path).
+///
+/// On Unix the create-time mode is `0o600`, so the file is owner-only from
+/// the first instant it exists. Non-Unix has no safe-std way to set a
+/// restrictive DACL (a Windows security descriptor needs Win32 calls that
+/// this `forbid(unsafe_code)` crate cannot make, and the workspace takes no
+/// ACL dependency): the file inherits the per-user OS temp directory ACL.
+/// That residual is recorded in the task decision and PR, not claimed as
+/// owner-only.
 #[cfg(unix)]
-fn restrict_owner_only(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let perm = std::fs::Permissions::from_mode(0o600);
-    let _ = std::fs::set_permissions(path, perm);
+fn create_owner_only_new(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
 }
 
 #[cfg(not(unix))]
-fn restrict_owner_only(_path: &Path) {
-    // Windows ACL owner-only restriction needs platform APIs; temp-dir
-    // placement plus immediate unlink is the documented best-effort there.
+fn create_owner_only_new(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Re-asserts owner-only permissions; errors are propagated so the caller
+/// can delete the file instead of keeping a readable copy.
+#[cfg(unix)]
+fn restrict_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_owner_only(_path: &Path) -> std::io::Result<()> {
+    // See `create_owner_only_new`: no safe-std ACL API on this platform.
+    Ok(())
 }
 
 fn truncate_err(mut s: String) -> String {
@@ -1245,6 +1328,11 @@ fn truncate_err(mut s: String) -> String {
 
 /// Spawns `editor` with the temp path as its only argument and waits up to
 /// `timeout` (clamped to [`EDITOR_TIMEOUT_MAX`).
+///
+/// Low-level primitive: it does **not** apply [`EDITOR_ALLOWLIST`]. The
+/// environment-driven path ([`edit_externally`]) resolves through
+/// [`resolve_editor`] first, so a caller reaching for this function is
+/// explicitly naming its own program (mirroring `Command::new`).
 ///
 /// No shell: the program string is passed to `Command::new` unsplit, and
 /// the temp path travels as one argv element, so spaces in either are data.
@@ -1313,7 +1401,8 @@ pub fn read_composer_back(path: &Path) -> Result<String, EditorError> {
 
 /// Full external-editor round-trip against `buffer`:
 ///
-/// 1. resolves `$VISUAL`/`$EDITOR` ([`resolve_editor`], fail-closed),
+/// 1. resolves and allowlists `$VISUAL`/`$EDITOR` ([`resolve_editor`],
+///    fail-closed; a hostile value is denied before any side effect),
 /// 2. writes a `0600` temp file under `dir` (or [`std::env::temp_dir`]
 ///    when `None`),
 /// 3. spawns the editor with a bounded timeout + kill,
@@ -1334,7 +1423,7 @@ pub fn edit_externally(
     timeout: Duration,
     dir: Option<&Path>,
 ) -> Result<String, EditorError> {
-    let program = resolve_editor(visual, editor).ok_or(EditorError::NoEditor)?;
+    let program = resolve_editor(visual, editor)?;
     let owned_dir;
     let dir: &Path = match dir {
         Some(d) => d,
@@ -1343,9 +1432,24 @@ pub fn edit_externally(
             &owned_dir
         }
     };
+    editor_round_trip(buffer, &program, timeout, dir)
+}
+
+/// Round-trip core with an already-resolved program: temp write, bounded
+/// spawn, bounded UTF-8 read-back, RAII delete, buffer install.
+///
+/// Private so only [`edit_externally`] (allowlist-enforced) reaches it in
+/// production; tests inside this module use it to execute fake editor
+/// scripts at arbitrary paths that the allowlist correctly rejects.
+fn editor_round_trip(
+    buffer: &mut CommandBuffer,
+    program: &str,
+    timeout: Duration,
+    dir: &Path,
+) -> Result<String, EditorError> {
     let temp = write_composer_temp(buffer.as_str(), dir)?;
     let temp_path = temp.path().to_path_buf();
-    let run = run_editor(&program, &temp_path, timeout);
+    let run = run_editor(program, &temp_path, timeout);
     // Read back only when the editor succeeded; every path drops `temp`
     // (deleting the file) before returning.
     match run {
@@ -1618,15 +1722,86 @@ mod tests {
     fn resolve_editor_prefers_visual_then_editor() {
         assert_eq!(
             resolve_editor(Some("nvim"), Some("vim")),
-            Some("nvim".to_string())
+            Ok("nvim".to_string())
         );
-        assert_eq!(resolve_editor(None, Some("vim")), Some("vim".to_string()));
+        assert_eq!(resolve_editor(None, Some("vim")), Ok("vim".to_string()));
         assert_eq!(
             resolve_editor(Some("  "), Some("vim")),
-            Some("vim".to_string())
+            Ok("vim".to_string())
         );
-        assert_eq!(resolve_editor(None, None), None);
-        assert_eq!(resolve_editor(Some(""), Some("  ")), None);
+        assert_eq!(resolve_editor(None, None), Err(EditorError::NoEditor));
+        assert_eq!(
+            resolve_editor(Some(""), Some("  ")),
+            Err(EditorError::NoEditor)
+        );
+    }
+
+    #[test]
+    fn resolve_editor_rejects_non_allowlisted_programs() {
+        // Hostile `$EDITOR`/`$VISUAL` values must never resolve to a
+        // spawnable program: arbitrary executables, shells, interpreters,
+        // flag strings, separators, relative paths, case variants, and
+        // control bytes are all rejected with `NotAllowed` (distinct from
+        // "unset"), not silently ignored.
+        for hostile in [
+            "sh",
+            "bash",
+            "/bin/sh",
+            "/usr/bin/env",
+            "/tmp/evil/nvim",
+            "curl",
+            "python3",
+            "rm",
+            "nvim --cmd '!sh'",
+            "nvim -u NONE",
+            "vim;id",
+            "vim|id",
+            "vim$(id)",
+            "vim`id`",
+            "vi\nrm",
+            "vi\0",
+            "NVIM",
+            "Vim",
+            "./nvim",
+            "../nvim",
+            "..",
+            "/",
+        ] {
+            assert_eq!(
+                resolve_editor(Some(hostile), None),
+                Err(EditorError::NotAllowed),
+                "hostile editor must be rejected: {hostile:?}"
+            );
+            assert_eq!(
+                resolve_editor(None, Some(hostile)),
+                Err(EditorError::NotAllowed),
+                "hostile $EDITOR must be rejected: {hostile:?}"
+            );
+        }
+        // A hostile `$VISUAL` never falls through to a benign `$EDITOR`:
+        // first non-empty candidate wins or the round trip is denied.
+        assert_eq!(
+            resolve_editor(Some("sh"), Some("vim")),
+            Err(EditorError::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn resolve_editor_accepts_allowlisted_bare_names() {
+        let allowed = ["nvim", "vim", "vi"];
+        assert_eq!(EDITOR_ALLOWLIST, allowed);
+        for name in allowed {
+            assert_eq!(
+                resolve_editor(None, Some(name)),
+                Ok(name.to_string()),
+                "allowlisted editor must resolve: {name}"
+            );
+            // Surrounding whitespace is trimmed before the exact match.
+            assert_eq!(
+                resolve_editor(None, Some(&format!("  {name}  "))),
+                Ok(name.to_string())
+            );
+        }
     }
 
     // -- editor round-trip with fake editor script ----------------------------
@@ -1658,7 +1833,14 @@ mod tests {
         path
     }
 
-    /// Runs `edit_externally`, retrying transient ETXTBSY spawns.
+    /// Runs the private round-trip seam with an explicit program path,
+    /// retrying transient ETXTBSY spawns.
+    ///
+    /// The allowlisted `$VISUAL`/`$EDITOR` path is exercised by
+    /// `resolve_editor_*` tests; the live-spawn tests use the private
+    /// `editor_round_trip` seam directly so they can execute fake editor
+    /// scripts at arbitrary temp paths (never reachable through the
+    /// allowlist).
     ///
     /// Under parallel `cargo test` load the kernel can refuse `execve` of a
     /// just-written fake editor with "Text file busy (os error 26)" even
@@ -1676,7 +1858,7 @@ mod tests {
     ) -> Result<String, EditorError> {
         let mut last: Option<EditorError> = None;
         for _ in 0..20 {
-            match edit_externally(buf, None, Some(editor), timeout, Some(dir)) {
+            match editor_round_trip(buf, editor, timeout, dir) {
                 Ok(out) => return Ok(out),
                 Err(EditorError::SpawnFailed(msg)) if msg.contains("Text file busy") => {
                     last = Some(EditorError::SpawnFailed(msg));
@@ -1758,6 +1940,92 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(before.len(), after.len());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn edit_externally_disallowed_editor_is_not_spawned() {
+        require_pty!();
+        let dir = workdir();
+        let marker = dir.join("spawn-marker");
+        // A hostile editor that would create a marker file if executed.
+        let script = fake_editor_script(
+            &dir,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/spawn-marker\"\n",
+        );
+        let mut buf = CommandBuffer::with_content("untouched").expect("seed");
+        let err = edit_externally(
+            &mut buf,
+            None,
+            Some(&script.to_string_lossy()),
+            Duration::from_secs(10),
+            Some(&dir),
+        )
+        .expect_err("non-allowlisted path must be denied");
+        assert_eq!(err, EditorError::NotAllowed);
+        assert_eq!(buf.as_str(), "untouched", "buffer preserved on denial");
+        assert!(!marker.exists(), "disallowed editor was spawned");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "denial must happen before any temp file is written"
+        );
+    }
+
+    #[test]
+    fn edit_externally_rejects_shell_and_flags_before_side_effects() {
+        let dir = workdir();
+        let before: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        for hostile in ["sh", "/bin/sh", "nvim -u NONE", "vim;id"] {
+            let mut buf = CommandBuffer::with_content("untouched").expect("seed");
+            let err = edit_externally(
+                &mut buf,
+                Some(hostile),
+                Some("vim"),
+                Duration::from_secs(5),
+                Some(&dir),
+            )
+            .expect_err("hostile editor must be denied");
+            assert_eq!(err, EditorError::NotAllowed);
+            assert_eq!(buf.as_str(), "untouched");
+        }
+        let after: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "denied edits must not create temp files"
+        );
+    }
+
+    #[test]
+    fn temp_file_name_is_not_script_suffixed() {
+        let dir = workdir();
+        let temp = write_composer_temp("echo hi", &dir).expect("write temp");
+        let name = temp
+            .path()
+            .file_name()
+            .expect("temp has a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with(TEMP_PREFIX), "unexpected name: {name}");
+        assert!(
+            !name.to_ascii_lowercase().ends_with(".sh"),
+            "script suffix invites handler/editor execution: {name}"
+        );
+        assert!(
+            temp.path().extension().is_none(),
+            "composer temp must stay extensionless: {name}"
+        );
     }
 
     #[test]

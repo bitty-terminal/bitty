@@ -4,14 +4,14 @@ This directory holds multi-distro release artifacts for Bitty `0.0.1`.
 
 ## Formats
 
-| Format    | File                                                     | Distro                                      |
-| --------- | -------------------------------------------------------- | ------------------------------------------- |
-| deb       | `nfpm.yaml` + `deb` packager                             | Debian 12, Ubuntu 24.04                     |
-| rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40, RHEL 9, OpenSUSE Tumbleweed/Leap |
-| apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.20                                 |
-| archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch, AUR                                   |
+| Format    | File                                                     | Distro                                           |
+| --------- | -------------------------------------------------------- | ------------------------------------------------ |
+| deb       | `nfpm.yaml` + `deb` packager                             | Debian 12, Ubuntu 24.04                          |
+| rpm       | `nfpm.yaml` + `rpm` packager                             | Fedora 40, RHEL 9, OpenSUSE Tumbleweed/Leap      |
+| apk       | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (native `x86_64-unknown-linux-musl`) |
+| archlinux | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch, AUR                                        |
 
-OpenSUSE is rpm-based; the rpm built via nfpm is tested with `rpm -qip` and installs via `zypper install`. Alpine is apk-based; apk is validated via `apk info --allow-untrusted -X`.
+OpenSUSE is rpm-based; the rpm built via nfpm is tested with `rpm -qip` and installs via `zypper install`. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`) and is validated via `apk add --allow-untrusted` plus `bitty --version` on a clean Alpine container.
 
 ## Nfpm
 
@@ -79,11 +79,12 @@ Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcin
 
 - linux x64 (`x86_64-unknown-linux-gnu`, ubuntu-latest)
 - linux aarch64 (`aarch64-unknown-linux-gnu`, ubuntu-latest cross via `aarch64-linux-gnu-gcc`)
+- linux x64 musl (`x86_64-unknown-linux-musl`, Alpine 3.22 container, native musl build) — the `.apk`
 - windows x64 (`x86_64-pc-windows-msvc`, windows-latest)
 - windows aarch64 (`aarch64-pc-windows-msvc`, windows-latest)
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
 
-Plus nfpm packaging for linux x64/aarch64 and optional AUR/Homebrew/Scoop bumps gated on secrets.
+Plus nfpm packaging for linux x64/aarch64 and an Alpine-job apk install check, and optional AUR/Homebrew/Scoop bumps gated on secrets.
 
 All packaging keeps bounded contracts: no unbounded file lists, no unsafe, fixed version substitution, scripts are no-ops.

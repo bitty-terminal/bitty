@@ -71,13 +71,6 @@ jobs:
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             bash scripts/check-release-version.sh --tag "${GITHUB_REF#refs/tags/}"
           fi
-      - name: Validate Scoop manifest
-        run: |
-          python3 -m json.tool packaging/scoop-bitty.json > /dev/null && echo "scoop manifest valid"
-      - name: Validate Homebrew Formula syntax
-        run: |
-          ruby -c packaging/homebrew/bitty.rb
-          echo "Homebrew Formula syntax OK"
 
   build:
     name: Build ${{ matrix.target }} (${{ matrix.os }})

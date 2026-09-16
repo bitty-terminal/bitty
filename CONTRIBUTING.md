@@ -47,7 +47,7 @@ check, pre-push build check), and provisions the pinned JS dev tools under
 
 ## Development loop
 
-The workspace has 20 crates (see `Cargo.toml` `[workspace] members`).
+The workspace has 21 crates (see `Cargo.toml` `[workspace] members`).
 `scripts/check-status-drift.sh` enforces this count plus OQ/RFC status
 consistency; see `specifications/status-drift-gate.md`.
 

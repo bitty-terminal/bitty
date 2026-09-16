@@ -87,7 +87,8 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             arch: amd64
-            packagers: "deb,rpm,apk,archlinux"
+            # apk is musl-only and comes from the `build-alpine` job (CTX-0447).
+            packagers: "deb,rpm,archlinux"
           # Linux ARM64 cross build (CTX-0446 / 034 item 1): ubuntu-22.04 keeps
           # the glibc baseline older; the cross install/build branches below key
           # off this target. Packagers stay deb,rpm until ARM64 packaging is
@@ -274,7 +275,8 @@ jobs:
           sed "s/^arch:.*/arch: $NFPM_ARCH/" nfpm.yaml > /tmp/nfpm.yaml
           cat /tmp/nfpm.yaml
           # Honor the matrix packagers list so a target only emits the packages
-          # it declares (aarch64 Linux: deb,rpm). x86_64 lists all four.
+          # it declares (x86_64 Linux: deb,rpm,archlinux; aarch64 Linux:
+          # deb,rpm). The apk is built by the `build-alpine` job.
           IFS=',' read -ra PACKAGERS <<< "${{ matrix.packagers }}"
           for pkg in "${PACKAGERS[@]}"; do
             nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target "dist/bitty-${{ matrix.target }}.${pkg}"
@@ -299,9 +301,104 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Native musl build (CTX-0447 / 034 item 2). The .apk must ship a musl binary
+  # and Alpine's runtime is musl, so it is built inside an Alpine container
+  # instead of repackaging the glibc binary from `build`. `-crt-static` yields
+  # a dynamically linked musl binary: fontconfig/FreeType link against the
+  # system libraries and runtime dlopen (Vulkan/X11/Wayland) keeps working,
+  # which a fully static musl binary cannot do.
+  build-alpine:
+    name: Build x86_64-unknown-linux-musl (Alpine)
+    needs: validate
+    runs-on: ubuntu-latest
+    container: alpine:3.22
+    timeout-minutes: 30
+    steps:
+      - name: Install Alpine build prerequisites
+        run: |
+          apk add --no-cache bash git build-base curl ca-certificates pkgconf \
+            fontconfig-dev freetype-dev nfpm
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Build bitty binary (native musl, dynamic)
+        env:
+          RUSTFLAGS: "-C target-feature=-crt-static"
+        shell: bash
+        run: cargo build --release --locked -p bitty-app
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/bitty dist/bitty-x86_64-unknown-linux-musl
+          sha256sum dist/bitty-x86_64-unknown-linux-musl | tee dist/bitty-x86_64-unknown-linux-musl.sha256
+
+      - name: Assert the binary is musl, not glibc
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk add --no-cache binutils
+          readelf -l target/release/bitty | grep -q 'ld-musl-x86_64.so.1'
+          if readelf -l target/release/bitty | grep -q 'ld-linux'; then
+            echo "::error::musl build carries a glibc interpreter" >&2
+            exit 1
+          fi
+          readelf -d target/release/bitty | grep NEEDED
+
+      - name: Package apk (nfpm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          nfpm package --config nfpm.yaml --packager apk \
+            --target dist/bitty-x86_64-unknown-linux-musl.apk
+          ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-x86_64-unknown-linux-musl
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Clean-container install check for the musl .apk (CTX-0447 acceptance: the
+  # package installs on a clean Alpine and `bitty --version` runs). Per-distro
+  # runtime dependencies are 034 item 4, so the font stack the binary links is
+  # installed explicitly before the package.
+  verify-alpine:
+    name: Verify apk installs (clean Alpine)
+    needs: build-alpine
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download musl apk
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-x86_64-unknown-linux-musl
+          path: pkg
+
+      - name: Install into a clean Alpine container
+        run: |
+          set -euo pipefail
+          apk_file="$(find pkg -maxdepth 1 -name '*.apk' -print -quit)"
+          test -n "$apk_file"
+          docker run --rm -v "$PWD/pkg:/pkg:ro" -e "APK_FILE=$(basename "$apk_file")" \
+            alpine:3.22 sh -euc '
+              apk add --no-cache fontconfig freetype libgcc
+              apk add --no-cache --allow-untrusted "/pkg/$APK_FILE"
+              bitty --version
+            '
+
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-alpine, verify-alpine]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')

@@ -283,15 +283,21 @@ enum NoiseSite {
 /// and the whole run touches ≤`MAX_SAMPLES` samples. No `unsafe`, no window.
 #[must_use]
 pub fn measure_latency(iterations: usize) -> LatencyReport {
-    measure_latency_with_hook(iterations, |_| {})
+    measure_latency_with_hook(iterations, |_, _| {})
 }
 
 /// [`measure_latency`] with a scheduler-noise injection hook for tests.
 ///
 /// Production callers pass a no-op closure, which monomorphizes away; the
 /// CTX-0494 probe passes a closure that sleeps at chosen [`NoiseSite`]s to
-/// reproduce shared-runner descheduling deterministically.
-fn measure_latency_with_hook(iterations: usize, mut noise: impl FnMut(NoiseSite)) -> LatencyReport {
+/// reproduce shared-runner descheduling deterministically. The hook receives
+/// the 0-based iteration index as its first argument so a probe can interleave
+/// independently measured legs in one run (CTX-0500) instead of comparing legs
+/// measured at different times, when shared-runner load is not comparable.
+fn measure_latency_with_hook(
+    iterations: usize,
+    mut noise: impl FnMut(usize, NoiseSite),
+) -> LatencyReport {
     let iterations = iterations.clamp(1, MAX_SAMPLES);
     let mut rt = Runtime::with_defaults().expect("headless runtime must build for latency tracer");
     // Prime: first tick must present full redraw so idle baseline is clean.
@@ -329,7 +335,7 @@ fn measure_latency_with_hook(iterations: usize, mut noise: impl FnMut(NoiseSite)
         let key = keys[i % keys.len()].clone();
         let t0 = Instant::now();
         // CTX-0494 probe site: a deschedule here is a pure scheduler gap.
-        noise(NoiseSite::BetweenStages);
+        noise(i, NoiseSite::BetweenStages);
 
         // Stage 1: encode (keydown → bytes).
         let t_encode = Instant::now();
@@ -354,7 +360,7 @@ fn measure_latency_with_hook(iterations: usize, mut noise: impl FnMut(NoiseSite)
         // Stage 4: state → render → present (tick).
         let t_render = Instant::now();
         // CTX-0494 probe site: a deschedule here is charged to measured work.
-        noise(NoiseSite::InsideRender);
+        noise(i, NoiseSite::InsideRender);
         let presented = rt.tick().is_some();
         let render_dur = t_render.elapsed();
         if !presented {
@@ -664,62 +670,126 @@ mod tests {
         );
     }
 
+    // CTX-0500 differential probe constants.
+    //
+    // The CTX-0494 probe compared a noisy leg's work floor against the absolute
+    // PB-4 × 4 ceiling (32 ms) and false-red on a loaded shared runner, where a
+    // benign leg's *own* floor reached 33.699 ms (PR #821 Quality gates). The
+    // fix measures one clean leg and two noisy legs interleaved in the *same*
+    // run and applies relative bounds, so shared-runner load cancels from the
+    // comparison; the exact PB-4 8/15 ms verdicts stay pinned by
+    // `pb4_work_budget_classification_is_exact`.
+
+    /// Samples per interleaved leg of the differential probe.
+    ///
+    /// The pre-fix probe measured its between-stage leg with only 6 samples, so
+    /// one loaded burst decided the floor. Three legs of 32 samples keep the
+    /// per-leg floor (the minimum of the leg) comparable across legs, and the
+    /// whole probe runs in a few seconds.
+    const HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG: usize = 32;
+
+    /// Interleaved legs per probe run: clean (0), benign noise (1), regression
+    /// (2). `iteration % HEADLESS_NOISE_PROBE_LEGS` selects the leg.
+    const HEADLESS_NOISE_PROBE_LEGS: usize = 3;
+
+    /// Benign leg: between-stage scheduler gaps plus occasional in-stage tails.
+    const HEADLESS_NOISE_PROBE_BENIGN_LEG: usize = 1;
+
+    /// Regression leg: uniform in-stage work on every sample.
+    const HEADLESS_NOISE_PROBE_REGRESSION_LEG: usize = 2;
+
+    /// Scheduler gap (ms) injected *between* stages of the benign leg.
+    ///
+    /// Past [`HEADLESS_WALL_CLOCK_CEILING_MS`] (120 ms) so the probe proves a
+    /// deschedule between stages inflates wall clock only, never measured work.
+    const HEADLESS_NOISE_GAP_MS: u64 = 150;
+
+    /// In-stage tail (ms) injected every [`HEADLESS_NOISE_TAIL_EVERY`] samples
+    /// of the benign leg.
+    ///
+    /// Past the old 4× percentile ceiling (PB-4 p99 × 4 = 60 ms) so the probe
+    /// keeps reproducing the CTX-0494 false-red mechanism, while staying below
+    /// the tail pathology guard (PB-4 p99 × 8 = 120 ms).
+    const HEADLESS_NOISE_TAIL_MS: u64 = 64;
+
+    /// One in-stage tail every N benign samples: 8 of 32, so the p99 estimator
+    /// at n=32 (the second-highest sample) samples a tail even if a few benign
+    /// samples fail to present.
+    const HEADLESS_NOISE_TAIL_EVERY: usize = 4;
+
+    /// Uniform in-stage work (ms) injected on *every* sample of the regression
+    /// leg: 5 × PB-4 p50, deliberately well past
+    /// [`HEADLESS_NOISE_REGRESSION_DELTA_MS`] so the additive verdict keeps
+    /// margin when shared-runner load lands unevenly on the two legs.
+    const HEADLESS_NOISE_REGRESSION_MS: u64 = 5 * crate::PB4_LATENCY_MS_P50;
+
+    /// Multiplicative tolerance applied to the same-run clean work floor when
+    /// deciding whether a benign leg's floor is explained by scheduler noise.
+    ///
+    /// Only covers per-leg sampling jitter: shared-runner load cancels because
+    /// the legs are interleaved in one run. It must stay well under
+    /// `HEADLESS_NOISE_GAP_MS / clean_floor` so a between-stage gap wrongly
+    /// charged as work still fails the benign verdict.
+    const HEADLESS_NOISE_FLOOR_RATIO: f64 = 3.0;
+
+    /// Additive slack (ms) added on top of the scaled clean floor, covering the
+    /// small-floor case where the ratio alone would be sub-millisecond.
+    const HEADLESS_NOISE_FLOOR_SLACK_MS: f64 = 4.0;
+
+    /// Minimum additive lift (ms) a uniform in-stage regression must produce on
+    /// the work floor: 2 × PB-4 p50.
+    ///
+    /// Additive, not a ratio: shared-runner load inflates the clean and
+    /// regressed floors together, so their difference isolates the pipeline
+    /// work the probe injected.
+    const HEADLESS_NOISE_REGRESSION_DELTA_MS: f64 = 2.0 * crate::PB4_LATENCY_MS_P50 as f64;
+
+    /// Benign-leg verdict (CTX-0500): the candidate work floor is consistent
+    /// with the clean floor measured in the same interleaved run.
+    fn work_floor_follows_clean(clean: &LatencyReport, candidate: &LatencyReport) -> bool {
+        candidate.min_work_ms
+            <= clean.min_work_ms * HEADLESS_NOISE_FLOOR_RATIO + HEADLESS_NOISE_FLOOR_SLACK_MS
+    }
+
+    /// Regression verdict (CTX-0500): the candidate work floor exceeds the
+    /// clean floor of the same run by at least the documented additive delta.
+    fn work_floor_regressed(clean: &LatencyReport, candidate: &LatencyReport) -> bool {
+        candidate.min_work_ms >= clean.min_work_ms + HEADLESS_NOISE_REGRESSION_DELTA_MS
+    }
+
+    /// Presented per-sample work (ms) of one interleaved leg, in iteration
+    /// order, for building a deterministic per-leg report.
+    fn leg_work_ms(report: &LatencyReport, leg: usize) -> Vec<f64> {
+        report
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| s.presented && i % HEADLESS_NOISE_PROBE_LEGS == leg)
+            .map(|(_, s)| s.work_ms())
+            .collect()
+    }
+
     #[test]
     fn headless_work_budget_discriminates_scheduler_noise_from_work() {
-        // CTX-0494 red-before-fix probe: the shipped percentile work ceilings
+        // CTX-0500 red-before-fix probe. The shipped percentile work ceilings
         // (PB-4 × 4 = 32/60 ms) false-red when a shared runner deschedules the
         // tracer *inside* a stage timer, because that preemption is charged to
-        // the stage sum. The floor gate must tolerate that noise while still
-        // failing a genuine work regression.
+        // the stage sum; the CTX-0494 floor (`min_work_ms`) fixed that. But the
+        // CTX-0494 probe then compared the floor to the same *absolute* 32 ms
+        // ceiling and false-red again when the runner loaded the benign leg's
+        // own clean floor to 33.699 ms (PR #821). This probe keeps the floor
+        // discriminator but makes its bounds relative to a clean leg measured
+        // in the same interleaved run, so runner load cancels.
         use std::thread;
 
-        // (1) A scheduler gap between stages inflates wall clock far past the
-        // liveness ceiling but cannot move measured work.
-        let between = measure_latency_with_hook(6, |site| {
-            if site == NoiseSite::BetweenStages {
-                thread::sleep(Duration::from_millis(150));
-            }
-        });
-        assert!(
-            between.p99_ms > HEADLESS_WALL_CLOCK_CEILING_MS,
-            "injected between-stage gaps must inflate wall clock past the liveness ceiling (got {:.3} ms)",
-            between.p99_ms
-        );
-        assert!(
-            between.min_work_ms < HEADLESS_WORK_FLOOR_CEILING_MS,
-            "between-stage gaps are not work: floor {:.3} ms must stay < {:.0} ms",
-            between.min_work_ms,
-            HEADLESS_WORK_FLOOR_CEILING_MS
-        );
-
-        // (2) In-stage preemption on a small tail lifts the work percentiles
-        // over the old 4× ceiling while the floor stays clean — the exact
-        // false-red mechanism (work p50 33.4 ms / p99 62.103 ms).
-        let mut seen = 0usize;
-        let tail = measure_latency_with_hook(HEADLESS_BUDGET_SAMPLES, |site| {
-            if site == NoiseSite::InsideRender {
-                seen += 1;
-                if seen % 40 == 0 {
-                    thread::sleep(Duration::from_millis(80));
-                }
-            }
-        });
         let old_p99_work_ceiling = crate::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
-        assert!(
-            tail.p99_work_ms > old_p99_work_ceiling,
-            "in-stage tail preemption must exceed the old 4× percentile ceiling (got {:.3} ms)",
-            tail.p99_work_ms
-        );
-        assert!(
-            tail.min_work_ms < HEADLESS_WORK_FLOOR_CEILING_MS,
-            "tail preemption must not move the work floor (got {:.3} ms)",
-            tail.min_work_ms
-        );
 
-        // The observed CI shape (floor ~16 ms, median 33.4 ms, p99 62.103 ms)
-        // is a false red for the old percentile gate and is accepted by the
-        // fixed floor gate; pinned deterministically so the contract cannot
-        // depend on runner timing.
+        // ---- Deterministic shape pins (no timing; runner-independent) ----
+
+        // The CI-observed CTX-0494 shape (floor 16 ms, median 33.4 ms,
+        // p99 62.103 ms) is a false red for the old percentile gate and is
+        // accepted by the fixed floor gate. Pin it through `report_from_work`
+        // so the contract cannot depend on runner timing.
         let mut ci_shape = vec![16.0; 100];
         ci_shape.extend(vec![33.4; 97]);
         ci_shape.extend([62.103; 3]);
@@ -733,18 +803,134 @@ mod tests {
             "observed CI p99 62.103 ms must trip the old p99 gate"
         );
         assert_headless_work_budget(&ci_shape);
-
-        // (3) A uniform in-stage work regression raises every sample, floor
-        // included, so the fixed gate must still fail.
-        let regressed = measure_latency_with_hook(8, |site| {
-            if site == NoiseSite::InsideRender {
-                thread::sleep(Duration::from_millis(34));
-            }
-        });
+        // (c) A benign in-stage tail inflates the work percentiles past the old
+        // 4× ceiling but must not trip the tail pathology guard.
         assert!(
-            regressed.min_work_ms >= HEADLESS_WORK_FLOOR_CEILING_MS,
-            "uniform work inflation must raise the floor above {:.0} ms (got {:.3} ms)",
-            HEADLESS_WORK_FLOOR_CEILING_MS,
+            ci_shape.p99_work_ms < HEADLESS_WORK_TAIL_CEILING_MS,
+            "benign tail p99 {:.3} ms must stay under the {:.0} ms tail guard",
+            ci_shape.p99_work_ms,
+            HEADLESS_WORK_TAIL_CEILING_MS
+        );
+
+        // The PR #821 false-red, deterministic: a loaded runner put a benign
+        // leg's own floor at 33.699 ms, past the absolute 32 ms ceiling. The
+        // differential verdict accepts a benign floor that tracks the clean
+        // floor of the same run...
+        let loaded_clean = report_from_work(&[33.699; HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG]);
+        let loaded_benign = report_from_work(&[33.699; HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG]);
+        assert!(
+            work_floor_follows_clean(&loaded_clean, &loaded_benign),
+            "a loaded-runner clean floor {:.3} ms must not reject a benign floor {:.3} ms (PR #821 false red)",
+            loaded_clean.min_work_ms,
+            loaded_benign.min_work_ms
+        );
+        // ... while a uniform shift of the same shape is still a regression.
+        let loaded_regressed = report_from_work(
+            &[33.699 + HEADLESS_NOISE_REGRESSION_MS as f64; HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG],
+        );
+        assert!(
+            work_floor_regressed(&loaded_clean, &loaded_regressed),
+            "uniform work inflation must register above the clean floor + {:.0} ms delta",
+            HEADLESS_NOISE_REGRESSION_DELTA_MS
+        );
+        // (b) A between-stage gap wrongly charged as work has a floor at least
+        // the injected gap high and must fail the benign verdict.
+        let clean_shape = report_from_work(&[16.0; HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG]);
+        let mis_charged = report_from_work(
+            &[16.0 + HEADLESS_NOISE_GAP_MS as f64; HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG],
+        );
+        assert!(
+            !work_floor_follows_clean(&clean_shape, &mis_charged),
+            "a between-stage gap charged as work must exceed the benign floor band"
+        );
+
+        // ---- Real-timing differential: clean vs benign vs regression ----
+
+        // One interleaved run: every third sample is clean, benign-noised, or
+        // uniformly regressed, so all three legs sample the same runner load
+        // and the floors are comparable.
+        let report = measure_latency_with_hook(
+            HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG * HEADLESS_NOISE_PROBE_LEGS,
+            |iteration, site| match (iteration % HEADLESS_NOISE_PROBE_LEGS, site) {
+                (HEADLESS_NOISE_PROBE_BENIGN_LEG, NoiseSite::BetweenStages) => {
+                    thread::sleep(Duration::from_millis(HEADLESS_NOISE_GAP_MS));
+                }
+                (HEADLESS_NOISE_PROBE_BENIGN_LEG, NoiseSite::InsideRender)
+                    if (iteration / HEADLESS_NOISE_PROBE_LEGS) % HEADLESS_NOISE_TAIL_EVERY == 0 =>
+                {
+                    thread::sleep(Duration::from_millis(HEADLESS_NOISE_TAIL_MS));
+                }
+                (HEADLESS_NOISE_PROBE_REGRESSION_LEG, NoiseSite::InsideRender) => {
+                    thread::sleep(Duration::from_millis(HEADLESS_NOISE_REGRESSION_MS));
+                }
+                _ => {}
+            },
+        );
+        assert_eq!(
+            report.samples.len(),
+            HEADLESS_NOISE_PROBE_SAMPLES_PER_LEG * HEADLESS_NOISE_PROBE_LEGS
+        );
+
+        let clean = report_from_work(&leg_work_ms(&report, 0));
+        let benign = report_from_work(&leg_work_ms(&report, HEADLESS_NOISE_PROBE_BENIGN_LEG));
+        let regressed =
+            report_from_work(&leg_work_ms(&report, HEADLESS_NOISE_PROBE_REGRESSION_LEG));
+        eprintln!(
+            "CTX-0500 differential work floors (ms): clean={:.4} benign={:.4} regressed={:.4} \
+             (benign bound {:.4}, regression bound {:.4}; ratio {:.1}, slack {:.0}, delta {:.0})",
+            clean.min_work_ms,
+            benign.min_work_ms,
+            regressed.min_work_ms,
+            clean.min_work_ms * HEADLESS_NOISE_FLOOR_RATIO + HEADLESS_NOISE_FLOOR_SLACK_MS,
+            clean.min_work_ms + HEADLESS_NOISE_REGRESSION_DELTA_MS,
+            HEADLESS_NOISE_FLOOR_RATIO,
+            HEADLESS_NOISE_FLOOR_SLACK_MS,
+            HEADLESS_NOISE_REGRESSION_DELTA_MS
+        );
+        // The gap is real: every benign sample carries the between-stage sleep
+        // in wall clock, so even the leg's minimum total clears the liveness
+        // ceiling while its work floor does not move.
+        let benign_min_total_ms = report
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                s.presented && i % HEADLESS_NOISE_PROBE_LEGS == HEADLESS_NOISE_PROBE_BENIGN_LEG
+            })
+            .map(|(_, s)| s.total_ms())
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            benign_min_total_ms > HEADLESS_WALL_CLOCK_CEILING_MS,
+            "injected between-stage gaps must inflate wall clock past the liveness ceiling (min {:.3} ms)",
+            benign_min_total_ms
+        );
+
+        // (b) Between-stage gaps are not work: the benign floor tracks the clean
+        // floor measured in the same run (relative; the absolute ceiling is not
+        // consulted, so runner load cannot false-red it).
+        assert!(
+            work_floor_follows_clean(&clean, &benign),
+            "between-stage gaps are not work: benign floor {:.3} ms must track clean floor {:.3} ms",
+            benign.min_work_ms,
+            clean.min_work_ms
+        );
+
+        // (c) The benign in-stage tails lift the work percentiles past the old
+        // 4× ceiling (the CTX-0494 false red) without moving the floor — the
+        // tail is real preemption, not a pipeline regression.
+        assert!(
+            benign.p99_work_ms > old_p99_work_ceiling,
+            "in-stage tail preemption must exceed the old 4× percentile ceiling (got {:.3} ms)",
+            benign.p99_work_ms
+        );
+
+        // (a) Uniform in-stage work inflation raises every regressed sample,
+        // floor included, so the additive verdict must register it.
+        assert!(
+            work_floor_regressed(&clean, &regressed),
+            "uniform work inflation must raise the floor above clean + {:.0} ms (clean {:.3} ms, regressed {:.3} ms)",
+            HEADLESS_NOISE_REGRESSION_DELTA_MS,
+            clean.min_work_ms,
             regressed.min_work_ms
         );
     }

@@ -138,7 +138,7 @@ pub use hyperlink::{HyperlinkInfo, HyperlinkSpan};
 pub use image::{
     AlternateScope, ClipRect, DecodedImage, ImageId, ImagePlacement, ImageSource, ImageStore,
     ImageStoreError, PixelFormat, PlacementAnchor, PlacementGeometry, PlacementId,
-    ScrollBehavior as ImageScrollBehavior,
+    ScrollBehavior as ImageScrollBehavior, payload_fingerprint,
 };
 pub use kitty::{KittyGraphicsStub, KittyPlaceholder, KittyPlaceholderId};
 pub use kitty_decode::{

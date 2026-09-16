@@ -215,6 +215,17 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
 
+      # 034 item 4 / CTX-0449: fail the package when the declared per-distro
+      # runtime deps in nfpm.yaml diverge from the binary's ldd/readelf -d
+      # output (missing, unlinked, or unmapped sonames). aarch64 deb/rpm stay
+      # on the tolerant MVP path (034 item 8) and are not gated yet.
+      - name: Verify runtime deps (ldd + readelf vs nfpm declarations)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          bash scripts/check-runtime-deps.sh \
+            --binary "target/${{ matrix.target }}/release/bitty" \
+            --packagers "${{ matrix.packagers }}"
+
       - name: Rename artifact
         shell: bash
         run: |
@@ -351,6 +362,15 @@ jobs:
             exit 1
           fi
           readelf -d target/release/bitty | grep NEEDED
+
+      # 034 item 4 / CTX-0449: the apk declarations (fontconfig, freetype,
+      # libgcc) must match the musl binary's ldd/readelf -d output.
+      - name: Verify runtime deps (ldd + readelf vs nfpm declarations)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v readelf >/dev/null 2>&1 || apk add --no-cache binutils
+          bash scripts/check-runtime-deps.sh --binary target/release/bitty --packagers apk
 
       - name: Package apk (nfpm)
         shell: bash

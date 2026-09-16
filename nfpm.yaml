@@ -49,3 +49,30 @@ rpm:
 archlinux:
   pkgbase: bitty
   packager: Bitty Maintainers <maintainers@bitty-terminal.dev>
+# Runtime dependencies per format (034 item 4): the packages that provide the
+# ELF sonames the release binary links (fontconfig, FreeType, libgcc_s), in
+# each distro's package nomenclature. Keep in sync with
+# packaging/linux/runtime-deps.toml; scripts/check-runtime-deps.sh fails the
+# package when these declared names diverge from the binary's ldd/readelf -d
+# output. Base libraries (glibc, musl, ld.so) are intentionally not declared.
+overrides:
+  deb:
+    depends:
+      - libfontconfig1
+      - libfreetype6
+      - libgcc-s1
+  rpm:
+    depends:
+      - fontconfig
+      - freetype
+      - libgcc
+  apk:
+    depends:
+      - fontconfig
+      - freetype
+      - libgcc
+  archlinux:
+    depends:
+      - fontconfig
+      - freetype2
+      - gcc-libs

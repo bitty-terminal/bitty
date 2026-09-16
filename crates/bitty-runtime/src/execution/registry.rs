@@ -11,7 +11,7 @@
 //! races). Terminating a job kills the direct child only — owned-process-tree
 //! kill and typed cancel outcomes are CTX-0512.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 use std::process::Child;
@@ -24,9 +24,11 @@ use bitty_ipc::execution::EnvPolicy;
 use bitty_pty::{Pty, PtyBuilder, PtyReader};
 
 use super::closed_pipe_command;
+use super::delivery::{DeliveryLog, DeliveryState, EventReplay};
 use super::model::{
     JobCancel, JobError, JobEvent, JobId, JobIo, JobSnapshot, JobSpec, JobState, JobStop,
 };
+use super::output::{OutputIndex, OutputSink, OutputView, ReadOutput};
 
 /// Default registry capacity.
 ///
@@ -37,7 +39,11 @@ use super::model::{
 pub const DEFAULT_MAX_JOBS: usize = bitty_ipc::execution::MAX_TRACKED_EXECUTIONS;
 
 /// Maximum queued lifecycle events before the oldest is dropped.
-pub const MAX_STORED_JOB_EVENTS: usize = 256;
+///
+/// Kept for phase-1 API compatibility: it equals the observation-lane bound,
+/// and [`JobRegistry::events_dropped`] now reports the sum of both delivery
+/// lanes.
+pub const MAX_STORED_JOB_EVENTS: usize = super::delivery::MAX_STORED_OBSERVATION_EVENTS;
 
 /// Supervisor poll interval (CTX-0445 spawn poll precedent).
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -97,7 +103,7 @@ impl JobRegistry {
                 capacity,
                 next_id: 1,
                 jobs: BTreeMap::new(),
-                events: EventQueue::new(MAX_STORED_JOB_EVENTS),
+                events: DeliveryLog::new(),
             })),
         }
     }
@@ -135,7 +141,7 @@ impl JobRegistry {
     /// the supervisor thread cannot be created (the record is removed again).
     pub fn spawn(&self, spec: JobSpec) -> Result<JobId, JobError> {
         spec.validate()?;
-        let (id, control) = {
+        let (id, control, output) = {
             let mut inner = lock_inner(&self.shared);
             inner.evict_expired(now_ms());
             if inner.jobs.len() >= inner.capacity {
@@ -145,6 +151,7 @@ impl JobRegistry {
             }
             let id = inner.allocate_id()?;
             let control = Arc::new(JobControl::new());
+            let output = OutputSink::default();
             inner.jobs.insert(
                 id,
                 JobRecord {
@@ -154,14 +161,15 @@ impl JobRegistry {
                     started_at_ms: None,
                     finished_at_ms: None,
                     control: Arc::clone(&control),
+                    output: output.clone(),
                 },
             );
-            (id, control)
+            (id, control, output)
         };
         let shared = Arc::clone(&self.shared);
         thread::Builder::new()
             .name(format!("bitty-job-{}", id.get()))
-            .spawn(move || supervise(shared, id, spec, control))
+            .spawn(move || supervise(shared, id, spec, control, output))
             .map_err(|error| {
                 let mut inner = lock_inner(&self.shared);
                 inner.jobs.remove(&id);
@@ -218,15 +226,96 @@ impl JobRegistry {
     }
 
     /// Drains up to `limit` queued lifecycle events in order.
+    ///
+    /// This is the phase-1 consumption shape, kept unchanged: it removes the
+    /// oldest retained events across both delivery lanes in `seq` order.
+    /// Consumers that need reconnect replay should use
+    /// [`JobRegistry::events_since`] instead, which retains history and
+    /// reports delivery states.
     #[must_use]
     pub fn drain_events(&self, limit: usize) -> Vec<JobEvent> {
         lock_inner(&self.shared).events.drain(limit)
     }
 
-    /// Lifecycle events dropped by the bounded observation queue so far.
+    /// Lifecycle events dropped by the bounded delivery lanes so far (both
+    /// lanes summed; see [`JobRegistry::observation_dropped`] and
+    /// [`JobRegistry::critical_dropped`] for the split).
     #[must_use]
     pub fn events_dropped(&self) -> u64 {
         lock_inner(&self.shared).events.dropped()
+    }
+
+    /// Observation events dropped by their lane so far (UI-only lifecycle
+    /// notices; never terminal stops).
+    #[must_use]
+    pub fn observation_dropped(&self) -> u64 {
+        lock_inner(&self.shared).events.observation_dropped()
+    }
+
+    /// Critical events dropped by their lane so far (terminal stops; the
+    /// lane is sized so ordinary observation pressure never drops one).
+    #[must_use]
+    pub fn critical_dropped(&self) -> u64 {
+        lock_inner(&self.shared).events.critical_dropped()
+    }
+
+    /// Replays retained events newer than `since` in `seq` order (CTX-0513).
+    ///
+    /// `since` is an event `seq` (0 replays from the origin); the returned
+    /// [`EventReplay::next_seq`] is the cursor for the next call. Replays
+    /// mark returned events delivered; the consumer confirms handling with
+    /// [`JobRegistry::acknowledge`]. History older than the retained window
+    /// sets [`EventReplay::gap`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::InvalidCursor`] when `since` is past the head.
+    pub fn events_since(&self, since: u64, limit: usize) -> Result<EventReplay, JobError> {
+        lock_inner(&self.shared).events.replay_since(since, limit)
+    }
+
+    /// Marks `seq` acknowledged (idempotent at-least-once close-out).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownEvent`] when `seq` is not retained
+    /// (unknown, or removed by [`JobRegistry::drain_events`]).
+    pub fn acknowledge(&self, seq: u64) -> Result<DeliveryState, JobError> {
+        lock_inner(&self.shared).events.acknowledge(seq)
+    }
+
+    /// Newest retained event `seq` (0 when the log is empty).
+    #[must_use]
+    pub fn event_head_seq(&self) -> u64 {
+        lock_inner(&self.shared).events.head_seq()
+    }
+
+    /// Reads retained output of one tracked job (CTX-0513).
+    ///
+    /// The request is validated fail-closed before anything is read; the
+    /// returned view carries truncation honesty flags so callers can
+    /// distinguish "the child wrote this much" from "this much survived".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownJob`] when `id` is not tracked, and
+    /// [`JobError::InvalidRead`] when the request is over-bound.
+    pub fn read_output(&self, id: JobId, read: ReadOutput) -> Result<OutputView, JobError> {
+        let validated = read.validate()?;
+        let inner = lock_inner(&self.shared);
+        let record = inner.jobs.get(&id).ok_or(JobError::UnknownJob(id))?;
+        Ok(record.output.read(&validated))
+    }
+
+    /// Metadata-only output index of one tracked job (totals, never bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::UnknownJob`] when `id` is not tracked.
+    pub fn output_index(&self, id: JobId) -> Result<OutputIndex, JobError> {
+        let inner = lock_inner(&self.shared);
+        let record = inner.jobs.get(&id).ok_or(JobError::UnknownJob(id))?;
+        Ok(record.output.index())
     }
 
     /// Evicts finished records whose retention elapsed before `now_ms`,
@@ -250,7 +339,7 @@ struct RegistryInner {
     capacity: usize,
     next_id: u64,
     jobs: BTreeMap<JobId, JobRecord>,
-    events: EventQueue,
+    events: DeliveryLog,
 }
 
 impl RegistryInner {
@@ -289,6 +378,7 @@ struct JobRecord {
     started_at_ms: Option<u64>,
     finished_at_ms: Option<u64>,
     control: Arc<JobControl>,
+    output: OutputSink,
 }
 
 impl JobRecord {
@@ -299,6 +389,7 @@ impl JobRecord {
             spec: self.spec.clone(),
             started_at_ms: self.started_at_ms,
             finished_at_ms: self.finished_at_ms,
+            output: self.output.index(),
         }
     }
 }
@@ -365,46 +456,15 @@ impl ActivityClock {
     }
 }
 
-/// Bounded FIFO of lifecycle events; the oldest is dropped at capacity
-/// (reliable delivery is CTX-0513).
-#[derive(Debug)]
-struct EventQueue {
-    events: VecDeque<JobEvent>,
-    capacity: usize,
-    dropped: u64,
-}
-
-impl EventQueue {
-    fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "event queue capacity must be > 0");
-        Self {
-            events: VecDeque::with_capacity(capacity),
-            capacity,
-            dropped: 0,
-        }
-    }
-
-    fn push(&mut self, event: JobEvent) {
-        if self.events.len() >= self.capacity {
-            self.events.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-        }
-        self.events.push_back(event);
-    }
-
-    fn drain(&mut self, limit: usize) -> Vec<JobEvent> {
-        let take = limit.min(self.events.len());
-        self.events.drain(..take).collect()
-    }
-
-    fn dropped(&self) -> u64 {
-        self.dropped
-    }
-}
-
 // ── supervision ─────────────────────────────────────────────────────────────
 
-fn supervise(shared: Shared, id: JobId, spec: JobSpec, control: Arc<JobControl>) {
+fn supervise(
+    shared: Shared,
+    id: JobId,
+    spec: JobSpec,
+    control: Arc<JobControl>,
+    output: OutputSink,
+) {
     lock_inner(&shared).events.push(JobEvent::Queued {
         id,
         at_ms: now_ms(),
@@ -413,7 +473,7 @@ fn supervise(shared: Shared, id: JobId, spec: JobSpec, control: Arc<JobControl>)
         finish(&shared, id, JobStop::Cancelled);
         return;
     }
-    let mut backend = match Backend::start(&spec, Arc::clone(&control.clock)) {
+    let mut backend = match Backend::start(&spec, Arc::clone(&control.clock), output) {
         Ok(backend) => backend,
         Err(_) => {
             // Spawn failures are reported as a terminal state, never as a
@@ -425,6 +485,10 @@ fn supervise(shared: Shared, id: JobId, spec: JobSpec, control: Arc<JobControl>)
     mark_running(&shared, id);
     let stop = watch(&spec, &mut backend, &control);
     backend.terminate();
+    // The terminal state is published before the detached drain threads
+    // finish feeding the store (pipes hold buffered bytes after the process
+    // is gone); output quiescence is a read-side concern, and waits must
+    // never block a supervisor thread on a drain.
     finish(&shared, id, stop);
 }
 
@@ -496,10 +560,14 @@ enum Backend {
 }
 
 impl Backend {
-    fn start(spec: &JobSpec, clock: Arc<ActivityClock>) -> Result<Self, String> {
+    fn start(
+        spec: &JobSpec,
+        clock: Arc<ActivityClock>,
+        output: OutputSink,
+    ) -> Result<Self, String> {
         match spec.io {
-            JobIo::Pipes => PipeJob::start(spec, clock).map(Self::Pipe),
-            JobIo::Pty => PtyJob::start(spec, clock).map(Self::Pty),
+            JobIo::Pipes => PipeJob::start(spec, clock, output).map(Self::Pipe),
+            JobIo::Pty => PtyJob::start(spec, clock, output).map(Self::Pty),
         }
     }
 
@@ -522,28 +590,42 @@ impl Backend {
 
 /// Pipe-backed job: closed stdin, piped stdout/stderr, bounded drain.
 ///
-/// Phase 1 retains no output bytes (the store is CTX-0513); the drain
-/// threads exist to keep the child unblocked and to timestamp activity for
-/// the idle deadline.
+/// Each drain thread feeds its stream into the job's bounded output store
+/// (newest bytes win, oldest evicted first) and timestamps activity for the
+/// idle deadline. Drain handles are joined (not detached) once the child is
+/// reaped, so the store is quiescent before the supervisor publishes the
+/// terminal event. A grandchild that inherits a pipe can still delay that
+/// join; owned-process-tree cleanup stays CTX-0512.
 struct PipeJob {
     child: Child,
     exited: bool,
+    drains: Vec<thread::JoinHandle<()>>,
 }
 
 impl PipeJob {
-    fn start(spec: &JobSpec, clock: Arc<ActivityClock>) -> Result<Self, String> {
+    fn start(
+        spec: &JobSpec,
+        clock: Arc<ActivityClock>,
+        output: OutputSink,
+    ) -> Result<Self, String> {
         let mut command =
             closed_pipe_command(&spec.program, &spec.args, spec.cwd.as_deref(), &spec.env);
         let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let mut drains = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            spawn_drain(stdout, Arc::clone(&clock));
+            drains.push(spawn_stdout_drain(
+                stdout,
+                Arc::clone(&clock),
+                output.clone(),
+            ));
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_drain(stderr, clock);
+            drains.push(spawn_stderr_drain(stderr, clock, output));
         }
         Ok(Self {
             child,
             exited: false,
+            drains,
         })
     }
 
@@ -554,7 +636,28 @@ impl PipeJob {
         match self.child.try_wait() {
             Ok(Some(_)) => {
                 self.exited = true;
+                // Reap the child, then join the drains so buffered pipe
+                // bytes land in the store before the terminal event. The
+                // drains end at EOF once the last writer (the child) is
+                // gone; a grandchild holding a pipe open delays this join.
+                // To keep the supervisor fail-closed instead of wedged,
+                // the join is time-boxed (CTX-0512 owns process-tree
+                // cleanup): bytes drained so far stay in the store either
+                // way.
                 let _ = self.child.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !self.drains.iter().all(|drain| drain.is_finished()) {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                for drain in self.drains.drain(..) {
+                    if !drain.is_finished() {
+                        continue;
+                    }
+                    let _ = drain.join();
+                }
                 true
             }
             Ok(None) => false,
@@ -570,6 +673,16 @@ impl PipeJob {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Best-effort drain join: never block termination on a grandchild
+        // holding a pipe (CTX-0512 owns process-tree cleanup). A thread that
+        // has not finished keeps its store clone until EOF, still under the
+        // per-stream bound, while the record keeps the bytes drained so far.
+        for drain in self.drains.drain(..) {
+            if !drain.is_finished() {
+                continue;
+            }
+            let _ = drain.join();
+        }
         self.exited = true;
     }
 }
@@ -586,7 +699,11 @@ struct PtyJob {
 }
 
 impl PtyJob {
-    fn start(spec: &JobSpec, clock: Arc<ActivityClock>) -> Result<Self, String> {
+    fn start(
+        spec: &JobSpec,
+        clock: Arc<ActivityClock>,
+        output: OutputSink,
+    ) -> Result<Self, String> {
         let mut builder = PtyBuilder::new(&spec.program);
         builder = builder.args(spec.args.iter().cloned());
         if let Some(cwd) = &spec.cwd {
@@ -599,7 +716,7 @@ impl PtyJob {
         }
         let mut pty = builder.spawn().map_err(|error| error.to_string())?;
         let reader = pty.take_reader().map_err(|error| error.to_string())?;
-        spawn_pty_drain(reader, clock);
+        spawn_pty_drain(reader, clock, output);
         Ok(Self { pty, exited: false })
     }
 
@@ -628,34 +745,68 @@ impl PtyJob {
     }
 }
 
-/// Drains one pipe to EOF without retaining bytes, touching `clock` per
-/// chunk. The thread is detached on purpose: a grandchild that inherits the
-/// pipe must not be able to keep the job alive (owned-process-tree cleanup
-/// is CTX-0512). Memory stays bounded because nothing is retained.
-fn spawn_drain(mut pipe: impl Read + Send + 'static, clock: Arc<ActivityClock>) {
-    let _ = thread::Builder::new()
+/// Drains one stdout pipe into the bounded store, touching `clock` per
+/// chunk (both stdout activity and the drain keep the idle clock honest).
+/// The handle is joined after the child is reaped (see [`PipeJob`]); memory
+/// stays bounded because the store evicts oldest-first.
+fn spawn_stdout_drain(
+    mut pipe: impl Read + Send + 'static,
+    clock: Arc<ActivityClock>,
+    output: OutputSink,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
         .name("bitty-job-drain".into())
         .spawn(move || {
             let mut chunk = [0u8; DRAIN_CHUNK_BYTES];
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => clock.touch(),
+                    Ok(n) => {
+                        clock.touch();
+                        output.push_stdout(&chunk[..n]);
+                    }
                 }
             }
-        });
+        })
+        .expect("job drain thread spawns")
 }
 
-/// Drains a PTY reader until EOF, touching `clock` per chunk. Detached for
-/// the same reason as [`spawn_drain`]; the reader channel is bounded by the
-/// `bitty-pty` backpressure contract.
-fn spawn_pty_drain(reader: PtyReader, clock: Arc<ActivityClock>) {
+/// Drains one stderr pipe into the bounded store; joined like
+/// [`spawn_stdout_drain`].
+fn spawn_stderr_drain(
+    mut pipe: impl Read + Send + 'static,
+    clock: Arc<ActivityClock>,
+    output: OutputSink,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("bitty-job-drain".into())
+        .spawn(move || {
+            let mut chunk = [0u8; DRAIN_CHUNK_BYTES];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        clock.touch();
+                        output.push_stderr(&chunk[..n]);
+                    }
+                }
+            }
+        })
+        .expect("job drain thread spawns")
+}
+
+/// Drains a PTY reader into the bounded stdout store, touching `clock` per
+/// chunk. Detached for the same reason as [`spawn_stdout_drain`]; the reader
+/// channel is bounded by the `bitty-pty` backpressure contract. PTY output
+/// has no separate stderr: the terminal merges both streams.
+fn spawn_pty_drain(reader: PtyReader, clock: Arc<ActivityClock>, output: OutputSink) {
     let _ = thread::Builder::new()
         .name("bitty-job-pty-drain".into())
         .spawn(move || {
             while let Ok(Some(chunk)) = reader.recv() {
                 if !chunk.is_empty() {
                     clock.touch();
+                    output.push_stdout(&chunk);
                 }
             }
         });
@@ -665,6 +816,8 @@ fn spawn_pty_drain(reader: PtyReader, clock: Arc<ActivityClock>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::delivery::MAX_STORED_OBSERVATION_EVENTS;
+    use super::super::output::OutputStream;
     use super::*;
     use crate::execution::{DEFAULT_RETENTION_TTL, JobLifetime, JobOrigin, JobTimeouts};
     use std::time::Duration;
@@ -859,22 +1012,41 @@ mod tests {
     }
 
     #[test]
-    fn event_queue_drops_oldest_and_counts() {
+    fn observation_lane_drops_oldest_and_counts() {
         let id = JobId::from_raw(1).expect("non-zero");
-        let mut queue = EventQueue::new(2);
-        queue.push(JobEvent::Queued { id, at_ms: 1 });
-        queue.push(JobEvent::Started { id, at_ms: 2 });
-        queue.push(JobEvent::Stopped {
-            id,
-            stop: JobStop::Exited,
-            at_ms: 3,
-        });
-        assert_eq!(queue.dropped(), 1);
-        let drained = queue.drain(10);
-        assert_eq!(drained.len(), 2);
-        assert!(matches!(drained[0], JobEvent::Started { at_ms: 2, .. }));
-        assert!(matches!(drained[1], JobEvent::Stopped { at_ms: 3, .. }));
-        assert_eq!(queue.drain(10).len(), 0);
+        let mut log = DeliveryLog::new();
+        for at_ms in 1..=(MAX_STORED_OBSERVATION_EVENTS as u64 + 1) {
+            log.push(JobEvent::Queued { id, at_ms });
+        }
+        assert_eq!(log.observation_dropped(), 1);
+        assert_eq!(log.critical_dropped(), 0);
+        assert_eq!(log.dropped(), 1);
+        let drained = log.drain(MAX_STORED_OBSERVATION_EVENTS + 1);
+        assert_eq!(drained.len(), MAX_STORED_OBSERVATION_EVENTS);
+        assert!(matches!(drained[0], JobEvent::Queued { at_ms: 2, .. }));
+        assert!(log.drain(10).is_empty());
+    }
+
+    #[test]
+    fn snapshots_carry_an_empty_output_index_until_bytes_arrive() {
+        let registry = JobRegistry::new();
+        let id = registry.spawn(missing_spec()).expect("tracked");
+        let snapshot = wait_terminal(&registry, id);
+        assert_eq!(snapshot.output, OutputIndex::default());
+        assert!(!snapshot.output.is_truncated());
+        assert_eq!(
+            registry.output_index(id).expect("tracked"),
+            OutputIndex::default()
+        );
+        let read = ReadOutput::new(OutputStream::Stdout)
+            .validate()
+            .expect("valid");
+        let view = registry
+            .read_output(id, ReadOutput::new(OutputStream::Stdout))
+            .expect("readable");
+        assert!(view.text.is_empty());
+        assert!(!view.truncated);
+        let _ = read;
     }
 
     #[test]

@@ -567,6 +567,9 @@ pub struct JobSnapshot {
     pub started_at_ms: Option<u64>,
     /// Terminal time (epoch milliseconds), once stopped.
     pub finished_at_ms: Option<u64>,
+    /// Metadata-only output index (CTX-0513): exact byte totals and
+    /// truncation flags; never raw bytes.
+    pub output: super::output::OutputIndex,
 }
 
 /// Result of an accepted cancel request.
@@ -601,6 +604,21 @@ pub enum JobError {
         /// Owned failure reason.
         reason: String,
     },
+    /// The output read request was over-bound; nothing was read.
+    InvalidRead {
+        /// Owned validation reason.
+        reason: String,
+    },
+    /// The replay cursor is past the event head.
+    InvalidCursor {
+        /// Owned validation reason.
+        reason: String,
+    },
+    /// The event seq is not retained (unknown or already drained).
+    UnknownEvent {
+        /// The requested seq.
+        seq: u64,
+    },
 }
 
 impl JobError {
@@ -608,6 +626,22 @@ impl JobError {
         Self::InvalidSpec {
             reason: reason.into(),
         }
+    }
+
+    pub(crate) fn invalid_read(reason: impl Into<String>) -> Self {
+        Self::InvalidRead {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn invalid_cursor(reason: impl Into<String>) -> Self {
+        Self::InvalidCursor {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn unknown_event(seq: u64) -> Self {
+        Self::UnknownEvent { seq }
     }
 }
 
@@ -620,6 +654,9 @@ impl fmt::Display for JobError {
                 write!(f, "job registry is full (limit {limit})")
             }
             Self::Unavailable { reason } => write!(f, "job supervisor unavailable: {reason}"),
+            Self::InvalidRead { reason } => write!(f, "invalid output read: {reason}"),
+            Self::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
+            Self::UnknownEvent { seq } => write!(f, "unknown job event {seq}"),
         }
     }
 }
@@ -813,5 +850,17 @@ mod tests {
             "job registry is full (limit 4)"
         );
         assert!(JobError::invalid_spec("bad").to_string().contains("bad"));
+        assert!(
+            JobError::invalid_read("bad").to_string().contains("bad"),
+            "read errors stay owned and stable"
+        );
+        assert!(
+            JobError::invalid_cursor("bad").to_string().contains("bad"),
+            "cursor errors stay owned and stable"
+        );
+        assert_eq!(
+            JobError::unknown_event(42).to_string(),
+            "unknown job event 42"
+        );
     }
 }

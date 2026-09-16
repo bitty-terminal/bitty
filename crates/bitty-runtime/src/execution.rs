@@ -1,4 +1,5 @@
-//! Phase-1 execution supervisor: AI-agnostic async job foundation (CTX-0511).
+//! Phase-2 execution supervisor: async jobs plus bounded output and
+//! reliable event delivery (CTX-0511 + CTX-0513).
 //!
 //! This module is the Core-side foundation of the execution-host boundary
 //! (research record 044, captured as DIR-026 in the `bitty-docs` draft
@@ -18,8 +19,16 @@
 //!   any kind, so long `Service`/`Watch` jobs are never killed by an
 //!   ordinary timeout.
 //! - Event-driven lifecycle: one supervisor thread per job observes exit,
-//!   cancel, and deadlines, then publishes [`JobEvent`]s into a bounded
-//!   observation queue a runtime can drain.
+//!   cancel, and deadlines, then publishes [`JobEvent`]s into the bounded
+//!   two-lane delivery log a runtime can drain or replay across an IPC
+//!   disconnect.
+//! - Bounded output: per-stream newest-wins byte stores with tail/filter
+//!   reads ([`ReadOutput`]) and metadata-only [`OutputIndex`] snapshots, so
+//!   raw stdout never grows memory or a database.
+//! - Critical/observation delivery: terminal `Stopped` events are
+//!   [`EventClass::Critical`] (at-least-once, replayable, acknowledged) and
+//!   queue/start notices are [`EventClass::Observation`] (drop-oldest,
+//!   UI-only, never a model wake-up).
 //! - Origin is provenance only: [`JobOrigin`] records "started from here"
 //!   and no lifecycle path is coupled to it.
 //!
@@ -28,9 +37,6 @@
 //! - Structured outcomes, owned-process-tree kill, typed cancel with
 //!   generation fencing: CTX-0512. [`JobStop`] is an interim observation
 //!   only, and cancel terminates the direct child.
-//! - Output retention/tail/filter and reliable at-least-once event delivery
-//!   with IPC reconnect: CTX-0513. This slice drains pipes without retaining
-//!   bytes; it keeps only activity timestamps (which the idle clock needs).
 //! - Capability-scoped job operations (`observe`/`read_output`/`write_input`/
 //!   `signal`/`cancel`/`attach`/`transfer`): CTX-0514. Only in-process
 //!   callers exist today and no IPC verb is exposed here.
@@ -41,25 +47,40 @@
 //!
 //! - AI-agnostic vocabulary: no `AgentId`/`TaskId`/LLM/prompt symbol.
 //! - Bounds: program/args/cwd/env reuse the accepted CTX-0442 limits by
-//!   delegating to `ExecutionRequest::validate`; registry size, event queue,
-//!   provenance, and deadlines are bounded or explicit, and overflow fails
-//!   closed.
+//!   delegating to `ExecutionRequest::validate`; registry size, delivery
+//!   lanes, output bytes, read shapes, provenance, and deadlines are bounded
+//!   or explicit, and overflow fails closed. Critical terminal events have
+//!   their own lane so observation pressure can never mask a `Stopped`.
 //! - No shell: specs are argv-first and processes are built with
 //!   [`std::process::Command`] directly; nothing routes through `bash -c`.
 //! - No zombie or wedged child: every supervisor path kills and reaps its
-//!   direct child, and drain threads are detached so a grandchild holding a
-//!   pipe cannot pin a job in `Running`.
+//!   direct child, and pipe drain threads are joined after the reap so the
+//!   output store is quiescent before the terminal event (a grandchild
+//!   holding a pipe open delays the join; owned-process-tree cleanup stays
+//!   CTX-0512). A job's own network failure is recorded as the observed stop
+//!   plus retained stderr facts; no separate `network_error` classification
+//!   is invented.
 
+mod delivery;
 mod model;
+mod output;
 mod registry;
 
 use std::process::{Command, Stdio};
 
 use bitty_ipc::execution::EnvPolicy;
 
+pub use delivery::{
+    DeliveryState, EventClass, EventReplay, MAX_EVENT_REPLAY, MAX_STORED_CRITICAL_EVENTS,
+    MAX_STORED_OBSERVATION_EVENTS, StoredEvent,
+};
 pub use model::{
     DEFAULT_RETENTION_TTL, JobCancel, JobError, JobEvent, JobId, JobIo, JobKind, JobLifetime,
     JobOrigin, JobSnapshot, JobSpec, JobState, JobStop, JobTimeouts, MAX_JOB_ORIGIN_BYTES,
+};
+pub use output::{
+    MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES, MAX_READ_LINES, OutputFilter, OutputIndex,
+    OutputStream, OutputView, ReadOutput,
 };
 pub use registry::{DEFAULT_MAX_JOBS, JobRegistry, MAX_STORED_JOB_EVENTS};
 

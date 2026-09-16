@@ -79,6 +79,13 @@ done
 command -v zip >/dev/null 2>&1 || die "zip not found"
 command -v unzip >/dev/null 2>&1 || die "unzip not found"
 
+# The archive is created from inside the staging directory, so a relative
+# --output must be anchored to the invocation directory first (the release job
+# passes `dist/...zip` from the repository root).
+if [[ "$OUTPUT" != /* ]]; then
+	OUTPUT="$PWD/${OUTPUT#./}"
+fi
+
 for f in "${PAYLOAD[@]}"; do
 	[[ -f "$REPO_ROOT/$f" ]] || die "payload file not found: $f"
 done

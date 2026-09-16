@@ -1,0 +1,26 @@
+[package]
+name = "bitty-panels"
+description = "Staged first-party panel experience implementations (extraction wave)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty"
+keywords = ["terminal", "panels", "bitty"]
+categories = ["command-line-utilities"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bitty-agent = { path = "../bitty-agent" }
+bitty-ipc = { path = "../bitty-ipc" }
+bitty-runtime = { path = "../bitty-runtime" }
+bitty-ui = { path = "../bitty-ui" }
+
+[dev-dependencies]
+bitty-config = { path = "../bitty-config" }
+bitty-plugin-host = { path = "../bitty-plugin-host" }
+bitty-term-state = { path = "../bitty-term-state" }
+bitty-vt = { path = "../bitty-vt" }

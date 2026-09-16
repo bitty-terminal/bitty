@@ -1,6 +1,6 @@
 # Status drift gate (CTX-0437)
 
-The workspace has 19 crates (see `Cargo.toml` `[workspace] members`).
+The workspace has 20 crates (see `Cargo.toml` `[workspace] members`).
 `scripts/check-status-drift.sh` enforces this count against
 `CONTRIBUTING.md` and this document; see the script header for the full
 rule set.

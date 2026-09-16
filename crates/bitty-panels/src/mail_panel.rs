@@ -2,7 +2,12 @@
 //! Mail panel via Panel Runtime — tiled Panel, `mcp.invoke:mail.*` + `network.connect` + `fs.read` local cache, bounded, no hot-path.
 //!
 //! This module is the first-party `bitty-terminal.mail-panel` implementation
-//! hosted through the generic Panel Runtime (CTX-0102, OQ-011). Mail panel
+//! hosted through the generic Panel Runtime (CTX-0102, OQ-011). Since the
+//! CTX-0438 extraction wave it lives in the `bitty-panels` staging crate
+//! outside the microkernel runtime and consumes only the public Panel Runtime
+//! path (`bitty_runtime::registry` plus `bitty_ui` primitives); the plugin
+//! split itself stays gated on the panel-provider contract (OQ-058) and the
+//! credential-source contract (OQ-054/OQ-055), owning task CTX-0403. Mail panel
 //! is a tiled `Panel(PanelId)` workspace (reuses `LayoutNode` `H`/`V` with
 //! panel content, not a PTY) for mail listing, reading, compose UX composed
 //! from capability-checked `mcp`/`network` service (helper-process-backed
@@ -45,7 +50,7 @@ use bitty_ui::{
     panel::{MAX_OVERLAY_TEXT_LEN, MAX_OVERLAY_TOOLTIP_LEN},
 };
 
-use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
+use bitty_runtime::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
 
 // ---------------------------------------------------------------------------
 // Capability patterns — each a distinct gate, no ambient, no first-party bypass
@@ -94,15 +99,16 @@ pub const MAIL_PANEL_MAX_FOLDER_CHARS: usize = 64;
 /// Maximum bytes per path — mirrors parser `BoundedString::MAX_LEN` `4096` and project/mail path bound.
 pub const MAIL_PANEL_MAX_PATH_BYTES: usize = 4096;
 /// Maximum bytes per mail arg payload — bounded `8 KiB` (PR-5) at bus admission, also MCP `256 KiB` framing reuse but capped `8 KiB` here for mail JSON.
-pub const MAIL_PANEL_PAYLOAD_MAX_BYTES: usize = crate::registry::BUS_EVENT_MAX_BYTES;
+pub const MAIL_PANEL_PAYLOAD_MAX_BYTES: usize = bitty_runtime::registry::BUS_EVENT_MAX_BYTES;
 /// Maximum MCP frame bytes reuse — `8 KiB` per mail tool payload (same as BUS_EVENT_MAX_BYTES).
-pub const MAIL_PANEL_MCP_MAX_FRAME_BYTES: usize = crate::registry::BUS_EVENT_MAX_BYTES;
+pub const MAIL_PANEL_MCP_MAX_FRAME_BYTES: usize = bitty_runtime::registry::BUS_EVENT_MAX_BYTES;
 /// Maximum selection size — bounded `64` mirroring per-subscription bound (PR-7).
-pub const MAIL_PANEL_MAX_SELECTION: usize = crate::registry::BUS_PER_SUBSCRIPTION_LIMIT;
+pub const MAIL_PANEL_MAX_SELECTION: usize = bitty_runtime::registry::BUS_PER_SUBSCRIPTION_LIMIT;
 /// Maximum panels per workspace for mail-panel — mirrors `MAX_PANELS_PER_WORKSPACE` `32` PR-1.
-pub const MAIL_PANEL_MAX_PANELS_PER_WORKSPACE: usize = crate::registry::MAX_PANELS_PER_WORKSPACE;
+pub const MAIL_PANEL_MAX_PANELS_PER_WORKSPACE: usize =
+    bitty_runtime::registry::MAX_PANELS_PER_WORKSPACE;
 /// Maximum panels per window — mirrors `MAX_PANELS_PER_WINDOW` `64` PR-2 but capped by helper RC-3 aggregate.
-pub const MAIL_PANEL_MAX_PANELS_PER_WINDOW: usize = crate::registry::MAX_PANELS_PER_WINDOW;
+pub const MAIL_PANEL_MAX_PANELS_PER_WINDOW: usize = bitty_runtime::registry::MAX_PANELS_PER_WINDOW;
 
 /// Canonical mail-panel commands (qualified `owner.name:command`).
 pub const MAIL_PANEL_COMMAND_OPEN: &str = "bitty-terminal.mail-panel:open";
@@ -857,13 +863,10 @@ impl MailIntegration {
 /// placement but is not allocated here.
 pub fn create_mail_panel(
     registry: &mut PanelRegistry,
-    workspace: crate::registry::WorkspaceId,
+    workspace: bitty_runtime::registry::WorkspaceId,
     view: ViewId,
-) -> Result<PanelId, crate::registry::PanelError> {
-    let ty = PanelType::Helper;
-    let handle = registry.create_panel(ty, Some(workspace))?;
-    registry.mount_panel(handle.id, handle.generation, view)?;
-    Ok(handle.id)
+) -> Result<PanelId, bitty_runtime::registry::PanelError> {
+    crate::scaffold::create_mounted_panel(registry, PanelType::Helper, workspace, view)
 }
 
 /// Validates that mail panel creation respects bounded defaults and leaves
@@ -872,8 +875,8 @@ pub fn create_mail_panel(
 /// subscriptions `<=32` per panel, drop handled by bus admission.
 pub fn validate_mail_panel_config(
     cfg: &PanelRegistryConfig,
-) -> Result<(), crate::registry::PanelError> {
-    cfg.validate()
+) -> Result<(), bitty_runtime::registry::PanelError> {
+    crate::scaffold::validate_registry_config(cfg)
 }
 
 /// Creates a mail tiled layout via `LayoutNode` primitives (H/V) and mounts
@@ -889,7 +892,7 @@ pub fn mail_panel_tiled_layout(main: View, preview: Option<View>, ratio: f32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{PanelRegistry, PanelRegistryConfig, WorkspaceId};
+    use bitty_runtime::registry::{PanelRegistry, PanelRegistryConfig, WorkspaceId};
     use bitty_ui::Rect as UiRect;
     use bitty_ui::ViewId;
     use bitty_ui::panel::PanelType;
@@ -1337,14 +1340,15 @@ mod tests {
         for i in 0..80 {
             reg2.publish(
                 &topic,
-                crate::registry::BoundedPayload::try_new(format!("~/mail/msg{i}.json")).unwrap(),
+                bitty_runtime::registry::BoundedPayload::try_new(format!("~/mail/msg{i}.json"))
+                    .unwrap(),
             )
             .unwrap();
         }
         assert!(reg2.bus_events_for_panel(h.id) <= 64);
         assert!(reg2.bus_total_events() <= 8192);
         let large = "a".repeat(9 * 1024);
-        assert!(crate::registry::BoundedPayload::try_new(large).is_err());
+        assert!(bitty_runtime::registry::BoundedPayload::try_new(large).is_err());
         let batch = reg2.drain_batch(h.id, topic.as_str(), 32, 8192);
         assert_eq!(batch.len(), 32);
         assert!(!MailIntegration::is_fs_allowed("/etc/passwd"));

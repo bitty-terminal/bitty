@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+use bitty_platform::clipboard::CLIPBOARD_MAX_BYTES;
 use bitty_platform::{
     CursorPosition, MouseButton, MouseEvent, PhysicalSize, PlatformEvent, PressState,
     WindowEventKind, WindowId,
@@ -137,21 +138,28 @@ fn copy_selection_to_clipboard_headless() {
 }
 
 #[test]
-fn clipboard_is_bounded_and_truncates() {
+fn clipboard_rejects_over_limit_payloads_without_truncating() {
     let mut rt = make_runtime();
     let long = "x".repeat(9000);
-    // Direct clipboard write truncates to CLIPBOARD_MAX_BYTES (8192) at char boundary.
+    // CTX-0478: an over-limit payload is a typed rejection, never a silently
+    // truncated write; the previous clipboard value is preserved.
+    let err = rt
+        .clipboard_mut()
+        .set_text(long)
+        .expect_err("over-limit set must be rejected");
+    assert!(matches!(
+        err,
+        bitty_platform::PlatformError::ClipboardPayloadTooLarge {
+            len: 9000,
+            max: 8192
+        }
+    ));
+    assert_eq!(rt.clipboard().headless_contents(), "");
+    // At the exact cap the write lands whole and pastes whole (bounded).
+    let at_limit = "y".repeat(8192);
     rt.clipboard_mut()
-        .set_text(long.clone())
-        .expect("set must succeed headless");
-    assert_eq!(rt.clipboard().headless_contents().len(), 8192);
-    assert!(rt.clipboard().headless_contents().chars().all(|c| c == 'x'));
-    // Copy of a long selection also bounded via clipboard primitive.
-    // Fill snapshot with long text? Instead test paste bounded.
-    let long_paste = "y".repeat(9000);
-    rt.clipboard_mut()
-        .set_text(long_paste)
-        .expect("set long paste");
+        .set_text(at_limit)
+        .expect("at-limit set succeeds");
     rt.drain_pending_input();
     let insp = rt.paste_from_clipboard().expect("paste").expect("insp");
     // Long clean paste (all 'y') is delivered immediately, no pending.
@@ -160,6 +168,27 @@ fn clipboard_is_bounded_and_truncates() {
     // Length is bounded to CLIPBOARD_MAX_BYTES via clipboard primitive.
     assert_eq!(rt.pending_input().len(), 8192);
     assert_eq!(rt.clipboard().headless_contents().len(), 8192);
+}
+
+#[test]
+fn oversized_primary_selection_pastes_bounded_prefix() {
+    // CTX-0478 review: middle-click paste reads through the bounded primary
+    // accessor, so an over-limit primary selection pastes its clipped prefix
+    // instead of failing closed.
+    let mut rt = make_runtime();
+    let oversized = "p".repeat(CLIPBOARD_MAX_BYTES + 300);
+    rt.clipboard_mut().simulate_system_text_for_test(oversized);
+    assert!(
+        rt.clipboard_mut().get_primary().is_err(),
+        "direct primary read must reject the over-limit system value"
+    );
+    rt.drain_pending_input();
+    let insp = rt.paste_from_primary().expect("non-empty primary paste");
+    assert!(!insp, "clean bounded prefix delivers without confirmation");
+    assert!(rt.last_clipboard_error().is_none());
+    let delivered = rt.drain_pending_input();
+    assert_eq!(delivered.len(), CLIPBOARD_MAX_BYTES);
+    assert!(delivered.iter().all(|byte| *byte == b'p'));
 }
 
 #[test]
@@ -560,6 +589,38 @@ fn osc52_read_reply_stays_within_reply_cap() {
     assert!(reply.len() <= 4096, "reply must fit the reply cap");
     assert!(reply.starts_with(b"\x1b]52;c;"), "reply must be OSC 52");
     assert!(reply.ends_with(b"\x07"), "reply must be BEL-terminated");
+}
+
+#[test]
+fn osc52_read_reply_clips_oversized_clipboard() {
+    // CTX-0478 review: an over-limit system clipboard used to answer the
+    // OSC 52 read query with an empty payload. The bounded lossy read clips
+    // it, so the reply matches the at-limit reply instead of going empty.
+    let mut at_limit = make_runtime();
+    at_limit
+        .clipboard_mut()
+        .set_text("q".repeat(CLIPBOARD_MAX_BYTES))
+        .expect("at-limit set must succeed");
+    at_limit.set_osc_clipboard_read_allowed(true);
+    at_limit.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    let expected = at_limit.take_replies();
+
+    let mut oversized = make_runtime();
+    oversized
+        .clipboard_mut()
+        .simulate_system_text_for_test("q".repeat(CLIPBOARD_MAX_BYTES + 900));
+    oversized.set_osc_clipboard_read_allowed(true);
+    oversized.handle_pty_bytes(b"\x1b]52;c;?\x07");
+    let replies = oversized.take_replies();
+    assert_eq!(replies.len(), 1, "allowed read must answer exactly once");
+    assert_eq!(
+        replies, expected,
+        "oversized clipboard must answer the clipped payload"
+    );
+    assert!(
+        replies[0].len() > b"\x1b]52;c;\x07".len(),
+        "oversized clipboard must not answer with an empty payload"
+    );
 }
 
 #[test]

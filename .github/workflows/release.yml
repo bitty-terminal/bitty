@@ -123,39 +123,47 @@ jobs:
           toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
-      - name: Install cross for aarch64 Linux (container-based)
+      # Linux ARM64 is cross-compiled on x86_64 with Ubuntu's aarch64 toolchain
+      # (CTX-0446 / 034 item 1). The container-based `cross` path never linked:
+      # its image installs host-arch fontconfig/FreeType, and the old fallback
+      # never had arm64 native libs. A real arm64 multiarch sysroot replaces
+      # both. The runner's host `cc` still links build scripts and proc macros.
+      - name: Install aarch64 cross toolchain and arm64 native deps
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          cargo install cross --git https://github.com/cross-rs/cross --locked || cargo install cross --locked || echo "cross install failed, will use native fallback"
-          cross --version || echo "cross not available"
-
-      - name: Install cross compilation deps (Linux aarch64, fallback)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        continue-on-error: true
-        run: |
-          sudo dpkg --add-architecture arm64 || true
+          set -euo pipefail
+          sudo dpkg --add-architecture arm64
+          # Ubuntu's main/security archives serve amd64 only; arm64 packages come
+          # from ports.ubuntu.com. Restrict the existing sources to amd64 and add
+          # the arm64 ports archive (classic .list and deb822 .sources forms).
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i -E '/^deb(-src)?[[:space:]]/ s/^deb(-src)?[[:space:]]+/deb\1 [arch=amd64] /' "$f"
+          done
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            tmp="$(mktemp)"
+            awk '
+              /^Types:/ { print; print "Architectures: amd64"; next }
+              /^Architectures:/ { next }
+              { print }
+            ' "$f" > "$tmp"
+            sudo cp "$tmp" "$f"
+            rm -f "$tmp"
+          done
           . /etc/os-release
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo awk '
-              /^Types:/ {
-                print;
-                print "Architectures: amd64";
-                next;
-              }
-              /^Architectures:/ { next; }
-              { print; }
-            ' /etc/apt/sources.list.d/ubuntu.sources | sudo tee /etc/apt/sources.list.d/ubuntu.sources >/dev/null || true
-          fi
-          cat <<EOF | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null || true
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports
-          Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-backports ${VERSION_CODENAME}-security
-          Components: main universe restricted multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-          EOF
-          sudo apt-get update || true
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross pkg-config libfontconfig1-dev:arm64 libfreetype6-dev:arm64 || echo "apt cross deps failed, will rely on cross container"
+          {
+            echo "Types: deb"
+            echo "URIs: http://ports.ubuntu.com/ubuntu-ports"
+            echo "Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-backports ${VERSION_CODENAME}-security"
+            echo "Components: main universe restricted multiverse"
+            echo "Architectures: arm64"
+            echo "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"
+          } | sudo tee /etc/apt/sources.list.d/ubuntu-ports-arm64.sources >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+            pkg-config libfontconfig1-dev:arm64 libfreetype6-dev:arm64
 
       - name: Install font stack (Linux x64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -163,36 +171,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
 
-      - name: Build bitty binary (aarch64 via cross container)
+      - name: Build bitty binary (Linux aarch64 cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           PKG_CONFIG_ALLOW_CROSS: "1"
-        run: |
-          set -euo pipefail
-          if command -v cross >/dev/null 2>&1; then
-            echo "Building aarch64 with cross (container) ..."
-            cross build --release --locked -p bitty-app --target ${{ matrix.target }} || {
-              echo "cross build failed, attempting native cargo fallback"
-              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-              CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-              CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-              PKG_CONFIG_ALLOW_CROSS=1 \
-              PKG_CONFIG_PATH_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig \
-              PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig \
-              PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu=/ \
-              cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
-            }
-          else
-            echo "cross not found, using native cargo with aarch64 linker"
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
-            CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
-            PKG_CONFIG_ALLOW_CROSS=1 \
-            PKG_CONFIG_PATH_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig \
-            PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig \
-            PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu=/ \
-            cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
-          fi
+          PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu: /
+        run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
 
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'

@@ -78,7 +78,7 @@ Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcin
 `.github/workflows/release.yml` builds for:
 
 - linux x64 (`x86_64-unknown-linux-gnu`, ubuntu-latest)
-- linux aarch64 (`aarch64-unknown-linux-gnu`, ubuntu-latest cross via `aarch64-linux-gnu-gcc`)
+- linux aarch64 (`aarch64-unknown-linux-gnu`, ubuntu-22.04 cross via `aarch64-linux-gnu-gcc`)
 - windows x64 (`x86_64-pc-windows-msvc`, windows-latest)
 - windows aarch64 (`aarch64-pc-windows-msvc`, windows-latest)
 - macos x64 (`x86_64-apple-darwin`, macos-14)

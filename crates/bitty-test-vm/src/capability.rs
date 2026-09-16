@@ -145,11 +145,15 @@ mod tests {
 
     #[test]
     fn find_on_path_scans_in_order_and_stops_at_first_hit() {
-        let path = OsStr::new("/opt/a:/opt/b:/opt/c");
-        let probe = |p: &Path| p == Path::new("/opt/b/qemu-img");
+        // Build the PATH value with the platform separator (`;` on Windows)
+        // and compare with `Path` joins so the test is separator-agnostic.
+        let dirs = ["/opt/a", "/opt/b", "/opt/c"];
+        let path = std::env::join_paths(dirs).expect("join PATH entries");
+        let hit = Path::new(dirs[1]).join("qemu-img");
+        let probe = |candidate: &Path| candidate == hit;
         assert_eq!(
-            find_on_path(Some(path), "qemu-img", probe),
-            Some(PathBuf::from("/opt/b/qemu-img"))
+            find_on_path(Some(path.as_os_str()), "qemu-img", probe),
+            Some(hit)
         );
     }
 

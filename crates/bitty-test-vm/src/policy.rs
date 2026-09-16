@@ -681,29 +681,37 @@ mod tests {
     fn overlay_command_backs_the_base_image() {
         let plan = plan("arch", Cadence::Pr, "arch-1");
         let args = plan.qemu_img_create_args();
-        assert_eq!(
-            args,
-            [
-                "create",
-                "-f",
-                "qcow2",
-                "-F",
-                "qcow2",
-                "-b",
-                "/vm-root/images/base/arch.qcow2",
-                "/vm-root/runs/arch-1/arch-overlay.qcow2",
-            ]
+        assert_eq!(args[0], "create");
+        assert!(args.windows(2).any(|w| w == ["-f", "qcow2"]));
+        assert!(args.windows(2).any(|w| w == ["-F", "qcow2"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-b" && Path::new(&w[1]) == plan.base_image()),
+            "{args:?}"
         );
-        assert!(!args.iter().any(|a| a.ends_with(".iso")));
+        assert_eq!(
+            Path::new(args.last().expect("overlay arg")),
+            plan.overlay_image()
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.to_ascii_lowercase().ends_with(".iso"))
+        );
     }
 
     #[test]
     fn domain_xml_boots_the_overlay_and_has_no_iso() {
         let plan = plan("arch", Cadence::Pr, "arch-1");
         let xml = plan.domain_xml();
+        let overlay = plan.overlay_image().to_string_lossy().into_owned();
+        let base = plan.base_image().to_string_lossy().into_owned();
         assert!(xml.contains("<domain type='kvm'>"));
-        assert!(xml.contains("arch-1/arch-overlay.qcow2"));
-        assert!(!xml.contains("arch.qcow2'"), "base must not be a disk");
+        assert!(
+            xml.contains(overlay.as_str()),
+            "overlay must be the boot disk"
+        );
+        assert!(!xml.contains(base.as_str()), "base must not be a disk");
         assert!(!xml.to_ascii_lowercase().contains(".iso"));
         assert!(xml.contains("<name>bitty-vm-arch-1-arch</name>"));
         assert!(xml.contains("org.qemu.guest_agent.0"));

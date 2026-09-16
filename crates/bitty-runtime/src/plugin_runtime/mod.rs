@@ -47,7 +47,7 @@ pub use resolution::{
 };
 pub use services::{
     EmptySettings, Notification, NotificationQueue, PluginServices, SettingsSource, SnapshotSource,
-    UnavailableSnapshot,
+    UiAccess, UiBlock, UiBlocks, UnavailableSnapshot,
 };
 pub use store::PluginStore;
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -663,6 +663,12 @@ impl PluginRuntime {
         let spawn_git = granted
             .iter()
             .any(|capability| capability.as_str() == "process.spawn:git");
+        let ui_rich = granted
+            .iter()
+            .any(|capability| capability.as_str() == "ui.rich");
+        let ui_overlay = granted
+            .iter()
+            .any(|capability| capability.as_str() == "ui.overlay");
         let plugin_services = Rc::new(PluginServices::new(
             id.as_str(),
             store,
@@ -672,6 +678,15 @@ impl PluginRuntime {
             terminal_read,
             platform_notify,
         ));
+        // CTX-0428: accepted Plugin API v1 `ui.mount`/`ui.update` gates. The
+        // grant snapshot decides `ui.rich`/`ui.overlay`; the manifest's
+        // `[lazy].claims` list decides the exclusive `tabline` slot. Defaults
+        // stay closed, so a missing setter call can never widen authority.
+        plugin_services.set_ui_access(UiAccess {
+            rich: ui_rich,
+            overlay: ui_overlay,
+            claims: manifest.lazy.claims.clone(),
+        });
         // CTX-0445: Layer-2 spawn surface. The grant gate lives here; the
         // execution backend closes over the consent ledger and (until
         // CTX-0444) a deny-all allowlist, so granted-but-unenforced tools

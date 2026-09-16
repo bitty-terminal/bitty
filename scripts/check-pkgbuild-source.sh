@@ -15,7 +15,7 @@
 #   - `package()` installs the exact artifact declared by `[[bin]]` in
 #     `crates/bitty-app/Cargo.toml`, at `/usr/bin/bitty`
 #   - the recipe no longer references the retired `bitty-app` artifact path
-#   - every desktop/icon/terminfo source referenced by `package()` exists
+#   - every desktop/icon source referenced by `package()` exists
 #
 # Usage: scripts/check-pkgbuild-source.sh
 set -euo pipefail
@@ -64,8 +64,7 @@ fi
 grep -Fq "./$INSTALL_SRC --version" "$RECIPE" ||
 	fail "check() smoke must invoke ./$INSTALL_SRC --version"
 
-# Every packaged source referenced with install -Dm644 must exist in-tree
-# (terminfo is optional and guarded by `[ -f ... ]` in the recipe).
+# Every packaged source referenced with install -Dm644 must exist in-tree.
 missing=0
 check_ref() {
 	local rel="${1#./}"

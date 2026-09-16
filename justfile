@@ -41,6 +41,12 @@ runtime-deps-test:
 runtime-deps binary packagers:
     ./scripts/check-runtime-deps.sh --binary {{binary}} --packagers {{packagers}}
 
+terminfo-check:
+    ./scripts/check-terminfo.sh
+
+terminfo-test:
+    ./scripts/tests/check-terminfo.test.sh
+
 workflow-publish-test:
     ./scripts/tests/workflow-publish.test.sh
 
@@ -69,7 +75,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test workflow-publish-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test workflow-publish-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

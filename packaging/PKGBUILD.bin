@@ -50,7 +50,4 @@ package() {
     install -Dm644 "packaging/icons/hicolor/${size}x${size}/apps/bitty.png" "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/bitty.png"
   done
   install -Dm644 packaging/icons/hicolor/scalable/apps/bitty.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/bitty.svg"
-  if [ -f terminfo/bitty.terminfo ]; then
-    install -Dm644 terminfo/bitty.terminfo "${pkgdir}/usr/share/terminfo/b/bitty"
-  fi
 }

@@ -377,14 +377,17 @@ fn is_literal_fs_segment(segment: &str) -> bool {
 ///   name a literal first child;
 /// - overbroad home roots: bare `~`, `~/`, `~\`, and any `~`-rooted pattern
 ///   whose first component is not a literal name (`~/**`, `~/*`, `~/.*/**`,
-///   `~/.`) — these match unknown home children, sensitive dot-directories
-///   included;
+///   `~/.`, `~/./**`) — these match unknown home children, sensitive
+///   dot-directories included;
 /// - `..` segments on either separator (`../`, `..\\`, embedded, trailing);
 /// - sensitive credential locations, case-insensitively and on either
 ///   separator (`~/.ssh/...`, `~\.SSH\...`, any `.ssh`/`.gnupg`/`.aws`/
 ///   `.azure`/`.kube`/`.docker` segment, `~/.config/gh|gcloud/...`), with
 ///   empty and `.` segments normalized away first so spelling variants like
-///   `~/.config/./gh/...` or `~//.config/gh/...` still match.
+///   `~/.config/./gh/...` or `~//.config/gh/...` still match; a leading run
+///   of no-op segments is preserved, because it keeps the pattern relative
+///   (`./~/.config/gh/x` names a literal `~` directory, not the credential
+///   prefix).
 #[must_use]
 pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
     if pattern.starts_with('/') || pattern.starts_with("\\\\") {
@@ -407,25 +410,37 @@ pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
     if segments.contains(&"..") {
         return true;
     }
-    if home_scoped
-        && !segments
+    // `.` and empty segments are no-ops on the target filesystem, so the
+    // overbroad and positional scans run on a normalized view. A leading run
+    // of them pins the pattern as relative (`./~/.config/gh/x` names a
+    // literal `~` directory) and is preserved, while interior spellings such
+    // as `~/.config/./gh/...` and `~/.config//gh/...` collapse onto
+    // `~/.config/gh/...` exactly — otherwise a trivial spelling variant
+    // bypasses the credential guards.
+    let normalized: Vec<&str> = match segments
+        .iter()
+        .position(|segment| !segment.is_empty() && *segment != ".")
+    {
+        Some(root) => segments[..root]
             .iter()
-            .skip(1)
-            .find(|segment| !segment.is_empty())
+            .copied()
+            .chain(
+                segments[root..]
+                    .iter()
+                    .copied()
+                    .filter(|segment| !segment.is_empty() && *segment != "."),
+            )
+            .collect(),
+        None => Vec::new(),
+    };
+    if home_scoped
+        && !normalized
+            .get(1)
             .is_some_and(|segment| is_literal_fs_segment(segment))
     {
         // Overbroad home root: no literal first child pins the grant.
         return true;
     }
-    // Positional scans run on a normalized view: empty and `.` segments are
-    // no-ops on the target filesystem, so `~/.config/./gh/...` and
-    // `~/.config//gh/...` must match `~/.config/gh/...` exactly; otherwise a
-    // trivial spelling variant bypasses the credential-prefix guard.
-    let normalized: Vec<&str> = segments
-        .iter()
-        .copied()
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .collect();
     if normalized.iter().any(|segment| {
         FS_SENSITIVE_HOME_NAMES
             .iter()
@@ -1423,6 +1438,131 @@ mod tests {
         // Legit patterns survive: literal home children, near-miss segment
         // names, and `.`-prefixed relative paths through a literal directory.
         for path in ["~/projects/**", "~/.config/ghost/**", "./~/x"] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_ok(),
+                "legit fs pattern {path:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_filesystem_normalizes_dot_empty_segments_before_overbroad_check() {
+        // CTX-0495 (P2 follow-up of the #800 re-review): the overbroad-home
+        // guard skipped empty segments via `find(first non-empty)` but still
+        // treated `.` as a first child, so `.`-spelled equivalents of allowed
+        // patterns were denied. The literal-first-child test must run on the
+        // normalized view, while every previous overbroad and
+        // sensitive-prefix denial stays closed.
+        //
+        // Overbroad home roots keep collapsing to the bare home even with
+        // `.`/empty spelling: no literal child pins the grant.
+        for path in [
+            "~",
+            "~/",
+            "~//",
+            "~/.//",
+            "~/.",
+            "~/./",
+            "~/./**",
+            "~/.//**",
+            "~/././**",
+            "~/.//.//**",
+            "~\\",
+            "~\\.\\**",
+            "~/.\\**",
+            "~/*",
+            "~/.*",
+            "~/./.*",
+            "~/.*/**",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_err(),
+                "overbroad home pattern {path:?} must stay denied"
+            );
+            let mut manifest = minimal_manifest("xuepoo.test");
+            manifest.capabilities.filesystem.push(FilesystemRequest {
+                access: FsAccess::Write,
+                paths: vec![path.to_string()],
+            });
+            assert!(
+                manifest.validate().is_err(),
+                "manifest must reject overbroad home pattern {path:?}"
+            );
+        }
+        // Sensitive names and credential prefixes stay denied however the
+        // no-op segments are spelled (both separators).
+        for path in [
+            "~/./.ssh/id_rsa",
+            "~/.ssh/./id_rsa",
+            "~//.ssh",
+            "~/./.config/gh/hosts.yml",
+            "~/./.config/gcloud/credentials.db",
+            "~/.config/./gh/hosts.yml",
+            "~/.config//gh/hosts.yml",
+            "~//.config/gh/hosts.yml",
+            "~/.config/./gcloud/./credentials.db",
+            "~\\.config\\.\\gh\\hosts.yml",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_err(),
+                "sensitive spelling {path:?} must stay denied"
+            );
+            let mut manifest = minimal_manifest("xuepoo.test");
+            manifest.capabilities.filesystem.push(FilesystemRequest {
+                access: FsAccess::Write,
+                paths: vec![path.to_string()],
+            });
+            assert!(
+                manifest.validate().is_err(),
+                "manifest must reject sensitive spelling {path:?}"
+            );
+        }
+        // Newly allowed: `.`/empty segments are no-ops outside the overbroad
+        // and positional scans, so these are equivalent to allowed forms.
+        for path in [
+            "~/./projects/**",
+            "~/.//projects/**",
+            "~/././projects/**",
+            "~/.//.//projects/**",
+            "~\\.\\projects\\**",
+            "~/./.config/ghost/**",
+            "~/.//.config/ghost/**",
+            "~/./.config",
+            "~/./.config/foo/**",
+            "~/./.sshrc",
+            "./~/.config/gh/x",
+            ".//~/.config/ghost/**",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_ok(),
+                "normalized-equivalent fs pattern {path:?} must be allowed"
+            );
+        }
+        // Legit patterns keep working unchanged.
+        for path in [
+            "~/projects/**",
+            "~/.config/ghost/**",
+            "./~/x",
+            "~/.config",
+            "~/docs/*.md",
+            "docs/**/*.md",
+        ] {
             let req = FilesystemRequest {
                 access: FsAccess::Read,
                 paths: vec![path.to_string()],

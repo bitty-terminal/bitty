@@ -440,3 +440,89 @@ fn inactive_workspace_respawns_pending_panes_on_first_switch() {
         "pending history must drain into the fresh shell"
     );
 }
+
+/// CTX-0461 (CTX-0393 P3 follow-up): the close path installs a slot exactly
+/// like a switch, so a close that lands on a restored workspace with pending
+/// history must respawn that workspace's pending leaves. `workspace_switch`
+/// early-returns on the already-active index, so without the close-path hook
+/// those leaves would stay empty forever. Closing an inactive restored
+/// workspace must also drop the pending restores of the leaves it destroys
+/// (they can never respawn; the entries would linger and misreport).
+#[test]
+#[cfg(unix)]
+fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
+    bitty_test_support::require_pty!();
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.spawn_shell("/bin/sh")
+        .expect("primary shell records recipe");
+
+    let leaf = |id: u64, history: &str| WorkspaceSnapshot {
+        seq: id,
+        name: format!("ws{id}"),
+        layout: LayoutNode::leaf(View::new(ViewId::new(id), 80, 24)),
+        focus: Some(ViewId::new(id)),
+        panes: vec![PaneSnapshot {
+            view: ViewId::new(id),
+            cwd: None,
+            scrollback: vec![history.to_string()],
+        }],
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![
+            leaf(100, "ws0-history"),
+            leaf(200, "ws1-history"),
+            leaf(300, "ws2-history"),
+            leaf(400, "ws3-history"),
+        ],
+        active: 0,
+        mru: vec![0, 1, 2, 3],
+    };
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert_eq!(
+        rt.session_pending_len(),
+        3,
+        "inactive leaves arrive pending"
+    );
+
+    // ws1 gets a live shell on its first switch (CTX-0393 P2-2), then the
+    // active workspace closes through the kill-confirm gate: the close loads
+    // ws2, whose pending leaf must respawn on this path.
+    assert!(rt.workspace_switch(1), "switch to ws1");
+    assert!(rt.has_pane_session(&ViewId::new(200)));
+    assert!(matches!(
+        rt.workspace_close_request(),
+        bitty_runtime::WsCloseRequest::Pending { .. }
+    ));
+    assert!(
+        rt.confirm_pending_ws_close(),
+        "confirm kills ws1 and closes it"
+    );
+    assert!(
+        rt.has_pane_session(&ViewId::new(300)),
+        "close must respawn the loaded workspace's pending leaf"
+    );
+    assert!(
+        rt.pane_pid(&ViewId::new(300)).is_some(),
+        "respawned leaf must own a live child"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        1,
+        "ws2's history drained; only ws3 (never activated) stays pending"
+    );
+
+    // Closing an inactive restored workspace (ws3, pending-only) takes its
+    // pending restores with it: leaf 400 can never respawn, so its entry
+    // must not linger in the map.
+    assert_eq!(
+        rt.workspace_close_at(2).expect("close inactive ws3"),
+        0,
+        "pending-only workspace tears down no sessions"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "removed leaves must not linger pending"
+    );
+}

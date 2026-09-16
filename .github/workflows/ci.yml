@@ -187,6 +187,14 @@ jobs:
       - name: Check dependencies (licenses, bans, sources)
         run: cargo deny check
 
+      # Observation only (research 042 item 5, CTX-0505): duplicated transitive
+      # versions are expected from winit/wgpu/crossfont/arboard/image/
+      # portable-pty and must not be force-unified. `cargo tree --duplicates`
+      # exits 0; this step prints the resolved duplicates for PR visibility and
+      # never fails the job.
+      - name: Observe duplicate dependency versions (informational)
+        run: cargo tree --workspace --duplicates --locked
+
       # unmaintained advisories for ttf-parser/paste are tracked via deny.toml
       # and ignored for audit until upstream replacement lands (winit/metal paths)
       # cargo-deny and cargo-audit share ~/.cargo/advisory-db; deny populates it

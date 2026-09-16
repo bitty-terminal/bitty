@@ -75,8 +75,8 @@
 //! to RGBA8 step in [`kitty_decode`] (fail-closed, allocation-checked, no
 //! renderer coupling). All tests run on GPU-less CI via pure logic on
 //! `State`/`Snapshot` values, except the composer external-editor round-trip
-//! (OS temp file plus `$VISUAL`/`$EDITOR` child process, exercised with
-//! fake editor scripts). Where rendering geometry is needed (hyperlink
+//! (OS temp file plus an allowlisted `$VISUAL`/`$EDITOR` child process,
+//! exercised with fake editor scripts). Where rendering geometry is needed (hyperlink
 //! underline rects, kitty placeholder rects) the caller supplies a
 //! [`CellMetrics`] (`width x height` in pixels) and receives owned
 //! [`RectPx`] values; no renderer is borrowed.
@@ -119,10 +119,11 @@ pub use clipboard::{
 pub use composer::{
     BufferError, COMPOSER_MAX_BYTES, COMPOSER_OPEN_CHORD, ChordParseError, CommandBuffer,
     ComposerChord, ComposerFeedError, ComposerFeedOutcome, ComposerKey, ComposerKeyEvent,
-    ComposerKeys, ComposerKeysError, ComposerSession, EDITOR_TIMEOUT_DEFAULT, EDITOR_TIMEOUT_MAX,
-    EditorError, OpenChord, OpenChordError, PASTE_CLOSE, PASTE_OPEN, SUBMIT_TERMINATOR,
-    TempComposerFile, edit_externally, frame_submit, normal_mode_passthrough, read_composer_back,
-    resolve_editor, run_editor, should_auto_offer, validate_open_chord, write_composer_temp,
+    ComposerKeys, ComposerKeysError, ComposerSession, EDITOR_ALLOWLIST, EDITOR_TIMEOUT_DEFAULT,
+    EDITOR_TIMEOUT_MAX, EditorError, OpenChord, OpenChordError, PASTE_CLOSE, PASTE_OPEN,
+    SUBMIT_TERMINATOR, TempComposerFile, edit_externally, frame_submit, normal_mode_passthrough,
+    read_composer_back, resolve_editor, run_editor, should_auto_offer, validate_open_chord,
+    write_composer_temp,
 };
 pub use geometry::{CellMetrics, ExtentPx, RectPx};
 pub use hints::{

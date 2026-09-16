@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use super::apply::drain_global_control_queue;
+use super::apply::drain_global_control_queue_with;
 use super::apply::{apply_control_envelope, snapshot_text};
 use super::client::extract_string_from;
 #[cfg(unix)]
@@ -1572,7 +1572,7 @@ fn control_socketpair_roundtrip_headless_live_instance() {
         // loops in production — this spin is test-only).
         let granted = bitty_ipc::ScopeSet::cli_default();
         for _ in 0..100 {
-            let drained = drain_global_control_queue(rt, &granted);
+            let drained = drain_global_control_queue_with(rt, &granted, |_, _| {});
             if drained > 0 {
                 break;
             }
@@ -1677,7 +1677,8 @@ fn control_enqueue_wakes_then_drains_without_render_tick() {
     // Idle-window proof part 2: one drain, no render tick, applies the
     // verb against the live `Runtime` and unblocks the waiter. The drain
     // re-authorizes at apply (defense in depth); only the wakeup is new.
-    let drained = drain_global_control_queue(&mut rt, &bitty_ipc::ScopeSet::cli_default());
+    let drained =
+        drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::cli_default(), |_, _| {});
     assert_eq!(drained, 1, "exactly the enqueued verb must drain");
     let reply = worker.join().expect("worker thread must finish");
     assert!(reply.ok, "drained verb must succeed: {reply:?}");
@@ -1872,7 +1873,7 @@ impl WmHarness {
         let id = self.send_envelope(method, params);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         loop {
-            if drain_global_control_queue(&mut self.rt, &self.granted) > 0 {
+            if drain_global_control_queue_with(&mut self.rt, &self.granted, |_, _| {}) > 0 {
                 break;
             }
             assert!(
@@ -2363,4 +2364,72 @@ fn wm_automation_surface_tracks_split_layout() {
     clear_automation_for_tests();
     clear_introspection_for_tests();
     std::fs::remove_file(&socket_path).ok();
+}
+
+// ── CTX-0481 (#762): ctl drain + zoom ownership ──────────────────────────
+
+/// The pre-mutation hook must run for exactly the layout-mutating verbs and
+/// before the verb applies, so the app can restore a zoom proxy first
+/// instead of letting a split land on the single-leaf proxy and then be
+/// dropped when zoom toggles off.
+#[cfg(unix)]
+#[test]
+fn drain_offers_layout_mutations_to_the_pre_mutation_hook() {
+    use super::apply::{drain_global_control_queue_with, method_mutates_layout};
+
+    // Classification: layout-mutating verbs vs read-only verbs.
+    for method in [
+        ipc_ctl::METHOD_SPAWN_TERMINAL,
+        ipc_ctl::METHOD_CLOSE_TERMINAL,
+        ipc_ctl::METHOD_SPLIT_VIEW,
+        ipc_ctl::METHOD_NEW_WORKSPACE,
+        ipc_ctl::METHOD_CLOSE_WORKSPACE,
+        ipc_ctl::METHOD_FOCUS_WORKSPACE,
+        ipc_ctl::METHOD_MOVE_WORKSPACE,
+    ] {
+        assert!(
+            method_mutates_layout(method),
+            "{method} mutates the layout and must restore zoom first"
+        );
+    }
+    for method in [
+        ipc_ctl::METHOD_LIST_WINDOWS,
+        ipc_ctl::METHOD_LIST_VIEWS,
+        ipc_ctl::METHOD_LIST_TERMINALS,
+        ipc_ctl::METHOD_SEND_INPUT,
+        ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+        ipc_ctl::METHOD_FOCUS_VIEW,
+        ipc_ctl::METHOD_RELOAD_CONFIG,
+    ] {
+        assert!(
+            !method_mutates_layout(method),
+            "{method} must not disturb an active zoom"
+        );
+    }
+
+    let _guard = hold_wm_lock();
+    let mut rt = bitty_runtime::Runtime::with_defaults().expect("must build");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(ipc_ctl::PendingControl {
+            method: ipc_ctl::METHOD_SPLIT_VIEW.to_string(),
+            params: Some(ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+            id_raw: String::from("1"),
+            reply: tx,
+        });
+    let mut seen: Option<String> = None;
+    let drained = drain_global_control_queue_with(
+        &mut rt,
+        &bitty_ipc::ScopeSet::cli_default(),
+        |_runtime, method| seen = Some(method.to_string()),
+    );
+    assert_eq!(drained, 1, "the queued verb must drain");
+    assert_eq!(
+        seen.as_deref(),
+        Some(ipc_ctl::METHOD_SPLIT_VIEW),
+        "the hook must run before the layout-mutating verb applies"
+    );
+    assert_eq!(rt.leaf_count(), 2, "the split still applied after the hook");
 }

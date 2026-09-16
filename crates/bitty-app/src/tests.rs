@@ -182,6 +182,38 @@ fn parse_headless_flag() {
     assert!(p.headless && p.help);
 }
 
+// CTX-0481 fail-loud startup: the opt-in flag and the IPC failure policy.
+#[test]
+fn parse_fail_loud_flag() {
+    assert!(
+        !parse_args(&args_of(&["bitty"])).fail_loud,
+        "default stays fail-soft"
+    );
+    assert!(parse_args(&args_of(&["bitty", "--fail-loud"])).fail_loud);
+    // `--` escape hatch: `--fail-loud` after `--` is a program name.
+    let p = parse_args(&args_of(&["bitty", "--", "--fail-loud"]));
+    assert!(!p.fail_loud);
+    assert_eq!(p.program.as_deref(), Some("--fail-loud"));
+}
+
+#[test]
+fn fail_loud_makes_an_unavailable_ipc_servo_fatal_only_when_opted_in() {
+    // The fail-soft default keeps a serving failure non-fatal; `--fail-loud`
+    // turns the same failure into a startup abort with a non-zero code.
+    let failed = ipc_serve::IpcServeGuard::failed_for_tests("bind /x failed");
+    assert!(ipc_serve_failure_exit(false, &failed).is_none());
+    let (code, message) = ipc_serve_failure_exit(true, &failed).expect("fatal under --fail-loud");
+    assert_eq!(code, EXIT_STARTUP);
+    assert!(
+        message.contains("--fail-loud") && message.contains("bind /x failed"),
+        "diagnostic must name the flag and the reason, got {message:?}"
+    );
+    // A healthy or merely unsupported (disabled, no reason) servo is never
+    // fatal, even with --fail-loud.
+    let disabled = ipc_serve::IpcServeGuard::disabled_for_tests();
+    assert!(ipc_serve_failure_exit(true, &disabled).is_none());
+}
+
 // CTX-0190 quiet-default logging: parsing + level gating.
 #[test]
 fn parse_verbose_flags() {
@@ -553,23 +585,29 @@ fn osc_title_applies_to_window_state_and_is_change_gated() {
         Vec::new(),
         SpawnSpec::default(),
     );
-    assert_eq!(app.last_applied_title, None);
+    assert_eq!(app.window.last_applied_title, None);
     app.runtime.handle_pty_bytes(b"\x1b]2;nvim foo.rs\x07");
     assert!(
         app.drive_tick().is_some(),
         "first tick presents the startup frame"
     );
-    assert_eq!(app.last_applied_title.as_deref(), Some("nvim foo.rs"));
-    assert_eq!(app.title_applies, 1);
+    assert_eq!(
+        app.window.last_applied_title.as_deref(),
+        Some("nvim foo.rs")
+    );
+    assert_eq!(app.window.title_applies, 1);
     // Same title again: the change gate drops it (no titlebar churn).
     app.runtime.handle_pty_bytes(b"\x1b]0;nvim foo.rs\x07");
     let _ = app.drive_tick();
-    assert_eq!(app.title_applies, 1, "identical titles must not re-apply");
+    assert_eq!(
+        app.window.title_applies, 1,
+        "identical titles must not re-apply"
+    );
     // A new title applies exactly once more.
     app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
     let _ = app.drive_tick();
-    assert_eq!(app.last_applied_title.as_deref(), Some("ssh prod"));
-    assert_eq!(app.title_applies, 2);
+    assert_eq!(app.window.last_applied_title.as_deref(), Some("ssh prod"));
+    assert_eq!(app.window.title_applies, 2);
 }
 
 #[test]
@@ -584,13 +622,13 @@ fn osc_title_sanitizes_and_empty_resets_to_static_title() {
     );
     app.runtime.handle_pty_bytes(b"\x1b]2;bad\x01title\x7f\x07");
     app.apply_cold_events();
-    assert_eq!(app.last_applied_title.as_deref(), Some("badtitle"));
+    assert_eq!(app.window.last_applied_title.as_deref(), Some("badtitle"));
     // Empty OSC 0/2 resets to the static theme title, never a blank bar.
     app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
     app.apply_cold_events();
     assert_eq!(
-        app.last_applied_title.as_deref(),
-        Some(app.window_title.as_str())
+        app.window.last_applied_title.as_deref(),
+        Some(app.window.title.as_str())
     );
 }
 
@@ -2383,7 +2421,7 @@ fn window_opacity_reaches_platform_config() {
         SpawnSpec::default(),
     )
     .with_window_opacity(0.9);
-    assert!((app.window_opacity - 0.9).abs() < f32::EPSILON);
+    assert!((app.window.opacity - 0.9).abs() < f32::EPSILON);
 }
 
 #[test]

@@ -286,6 +286,19 @@ fn accept_loop(
                     continue;
                 }
                 active.fetch_add(1, Ordering::SeqCst);
+                // CTX-0506: BSD/macOS `accept()` inherits `O_NONBLOCK` from
+                // the non-blocking listener (Linux clears it), so the served
+                // stream would return `WouldBlock` on its first read and be
+                // closed as an idle connection before the peer's first frame
+                // arrived. Restore blocking semantics explicitly; the
+                // per-connection read/write timeouts in `serve_stream` remain
+                // the idle bound.
+                if let Err(err) = normalize_accepted_stream(&stream) {
+                    crate::logging::warn(|| format!("bitty: ipc connection setup failed: {err}"));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    drop(stream);
+                    continue;
+                }
                 let dispatcher = Arc::clone(&dispatcher);
                 let server = server.clone();
                 let active = Arc::clone(&active);
@@ -310,6 +323,18 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// Restore blocking reads on a freshly accepted stream (CTX-0506).
+///
+/// BSD/macOS `accept()` inherits `O_NONBLOCK` from the non-blocking listener
+/// (Linux clears it), so a served stream can return `WouldBlock` on its first
+/// read and be closed as an idle connection before the peer's first frame
+/// arrives. The per-connection read/write timeouts set in `serve_stream`
+/// remain the idle bound after normalization.
+#[cfg(unix)]
+fn normalize_accepted_stream(stream: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)
 }
 
 /// RAII decrement for the active-connection counter.
@@ -464,6 +489,51 @@ mod tests {
         };
         assert_eq!(descriptor.cols, 80);
         assert_eq!(descriptor.rows, 24);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_stream_is_normalized_to_blocking() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::time::{Duration, Instant};
+
+        // Regression (CTX-0506): BSD/macOS `accept()` inherits `O_NONBLOCK`
+        // from a non-blocking listener, so an un-normalized accepted stream
+        // returns `WouldBlock` on its first read and the connection is closed
+        // as idle before the first frame arrives. A slow writer proves the
+        // normalized stream waits for the byte instead of returning early.
+        let dir = std::env::temp_dir().join(format!("bitty-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("s.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let mut client = UnixStream::connect(&path).expect("connect");
+        let (mut stream, _) = listener.accept().expect("accept");
+        normalize_accepted_stream(&stream).expect("normalize");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = client.write_all(b"x");
+        });
+        let start = Instant::now();
+        let mut byte = [0u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .expect("normalized stream must wait for the peer byte");
+        assert_eq!(byte, [b'x']);
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "read returned before the peer wrote; stream stayed non-blocking"
+        );
+        drop(stream);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

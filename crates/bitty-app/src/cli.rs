@@ -27,6 +27,12 @@ pub(crate) struct Args {
     /// ignored and decoration is forced to the safe `0/0/1/0/0` geometry
     /// with the opaque outline pair (CTX-0346, R-009/P0-AC-019).
     pub(crate) safe: bool,
+    /// When true (`--fail-loud`) a requested startup step that fails is
+    /// fatal instead of fail-soft: a failed primary shell spawn, a failed
+    /// startup pane shell, or an attempted-but-unavailable IPC servo aborts
+    /// with a non-zero exit code (CTX-0481, issue #762). The default keeps
+    /// the documented fail-soft path where headless smoke still ticks.
+    pub(crate) fail_loud: bool,
     /// When true print help and exit 0.
     pub(crate) help: bool,
     /// When true print version and exit 0.
@@ -45,6 +51,12 @@ pub(crate) struct Args {
     /// program to spawn (a typo must not execute a binary); after a
     /// program is set, dash-tokens are that program's argv tail instead.
     pub(crate) unknown_flag: Option<String>,
+    /// First invalid `--split-ratio` / `--split` / `--log-level` /
+    /// `--layout` / `--focus` value (CTX-0480 fail-closed, exit 2).
+    /// Warn-ignored values previously exited 0 and silently ran the
+    /// default; now the startup dispatch prints usage and exits 2.
+    /// Missing values for the same flags are recorded here as well.
+    pub(crate) cli_value_error: Option<String>,
     /// Optional split axis (from `--split`).
     pub(crate) split_axis: Option<SplitAxis>,
     /// Optional split ratio (from `--split-ratio` or `--split` colon form).
@@ -278,11 +290,13 @@ impl Args {
         Self {
             headless: false,
             safe: false,
+            fail_loud: false,
             help: false,
             version: false,
             program: None,
             program_args: Vec::new(),
             unknown_flag: None,
+            cli_value_error: None,
             split_axis: None,
             split_ratio: None,
             stack: false,
@@ -350,12 +364,64 @@ impl Args {
     }
 }
 
+/// Record the first invalid `--split-ratio` / `--split` / `--log-level` /
+/// `--layout` / `--focus` value so startup dispatch can fail closed
+/// (CTX-0480, exit 2). Parsing stays total; `main` prints the recorded
+/// message plus usage and exits 2.
+fn record_value_error(out: &mut Args, msg: String) {
+    if out.cli_value_error.is_none() {
+        out.cli_value_error = Some(msg);
+    }
+}
+
+/// Validate a `--split-ratio` value: numeric finite `f32`. Range is *not*
+/// rejected here — out-of-range finite values clamp loudly at layout build
+/// ([`crate::layout_cmd::clamp_ratio_loudly`]); non-numeric or non-finite
+/// values are usage errors.
+fn validate_split_ratio_value(val: &str) -> Result<f32, String> {
+    match val.trim().parse::<f32>() {
+        Ok(f) if f.is_finite() => Ok(f),
+        _ => Err(format!(
+            "invalid --split-ratio value {val:?} (want a finite number, e.g. 0.5)"
+        )),
+    }
+}
+
+/// Validate a `--split` value (`AXIS`, `AXIS:RATIO`, or `:RATIO`) for the
+/// fail-closed dispatch path (CTX-0480). A colon whose ratio side is empty
+/// or unparsable is an error instead of a silent 0.5 default; non-finite
+/// ratios are errors. Finite out-of-range ratios stay raw and clamp loudly
+/// at layout build.
+fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), String> {
+    let (axis, ratio) = parse_split_token(val);
+    if let Some((_, ratio_part)) = val.split_once(':') {
+        if ratio.is_none() && ratio_part.trim().parse::<f32>().is_err() {
+            return Err(format!(
+                "invalid --split ratio {val:?} (want a finite number)"
+            ));
+        }
+    }
+    if let Some(r) = ratio {
+        if !r.is_finite() {
+            return Err(format!(
+                "invalid --split ratio {val:?} (want a finite number)"
+            ));
+        }
+    }
+    Ok((axis, ratio))
+}
+
 /// Parses `raw` (including `argv[0]` at index 0) into [`Args`].
 ///
 /// Recognised flags:
 /// - `-h` / `--help` → help
 /// - `-V` / `--version` → version
 /// - `--headless` → headless smoke (also triggered by `BITTY_HEADLESS=1`)
+/// - `--safe` → safe recovery mode (no third-party plugin VM, built-in safe
+///   effective config)
+/// - `--fail-loud` → a failed requested startup step (shell spawn, pane
+///   shells, IPC servo) aborts with a non-zero exit code instead of the
+///   default fail-soft warning path (CTX-0481; also `BITTY_FAIL_LOUD=1`)
 /// - `--split [AXIS]` → split layout (AXIS = horizontal|h / vertical|v, default horizontal)
 /// - `--split=AXIS[:RATIO]` → split with optional ratio
 /// - `--split-ratio RATIO` → ratio for split
@@ -435,6 +501,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
     // CTX-0190: honour BITTY_VERBOSE without editing argv (mirrors BITTY_HEADLESS).
     if std::env::var("BITTY_VERBOSE").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
         out.verbose = true;
+    }
+    // CTX-0481: honour BITTY_FAIL_LOUD for CI runners (mirrors BITTY_HEADLESS).
+    if std::env::var("BITTY_FAIL_LOUD").is_ok_and(|v| v == "1" || v.to_lowercase() == "true") {
+        out.fail_loud = true;
     }
     if raw.len() <= 1 {
         return out;
@@ -543,10 +613,9 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
         }
         if token.starts_with("--split-ratio=") {
             let val = token.trim_start_matches("--split-ratio=");
-            if let Ok(f) = val.parse::<f32>() {
-                out.split_ratio = Some(f);
-            } else {
-                eprintln!("warning: invalid --split-ratio value {val:?} — ignoring");
+            match validate_split_ratio_value(val) {
+                Ok(f) => out.split_ratio = Some(f),
+                Err(msg) => record_value_error(&mut out, msg),
             }
             i += 1;
             continue;
@@ -554,17 +623,28 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
         if token.starts_with("--split=") {
             let val = token.trim_start_matches("--split=");
             // val may be "h:0.3" or "horizontal" etc.
-            let (axis, ratio) = parse_split_token(val);
-            if let Some(ax) = axis {
-                out.split_axis = Some(ax);
-            } else if !val.is_empty() {
-                eprintln!("warning: unknown --split axis {val:?} — defaulting to horizontal");
-                out.split_axis = Some(SplitAxis::Horizontal);
-            } else {
-                out.split_axis = Some(SplitAxis::Horizontal);
-            }
-            if let Some(r) = ratio {
-                out.split_ratio = Some(r);
+            match validate_split_value(val) {
+                Ok((axis, ratio)) => {
+                    if let Some(ax) = axis {
+                        out.split_axis = Some(ax);
+                    } else {
+                        if !val.trim().is_empty() {
+                            // CTX-0480: unknown axis fails closed instead of
+                            // silently defaulting to horizontal.
+                            record_value_error(
+                                &mut out,
+                                format!(
+                                    "unknown --split axis {val:?} (want h|horizontal|v|vertical[:ratio])"
+                                ),
+                            );
+                        }
+                        out.split_axis = Some(SplitAxis::Horizontal);
+                    }
+                    if let Some(r) = ratio {
+                        out.split_ratio = Some(r);
+                    }
+                }
+                Err(msg) => record_value_error(&mut out, msg),
             }
             i += 1;
             continue;
@@ -644,8 +724,9 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             let val = token.trim_start_matches("--log-level=");
             match LogLevel::parse(val) {
                 Some(level) => out.log_level = Some(level),
-                None => eprintln!(
-                    "warning: unknown --log-level {val:?} (want error|warn|info|debug|trace) — ignoring"
+                None => record_value_error(
+                    &mut out,
+                    format!("unknown --log-level {val:?} (want error|warn|info|debug|trace)"),
                 ),
             }
             i += 1;
@@ -692,6 +773,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--safe" => {
                 out.safe = true;
+                i += 1;
+            }
+            "--fail-loud" => {
+                out.fail_loud = true;
                 i += 1;
             }
             "--stack" => {
@@ -888,14 +973,26 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     let next = raw[i + 1].clone();
                     let (axis, ratio) = parse_split_token(&next);
                     if axis.is_some() || ratio.is_some() {
-                        if let Some(ax) = axis {
-                            out.split_axis = Some(ax);
-                        } else {
-                            // axis parse failed but ratio present? Keep default axis
-                            out.split_axis = Some(SplitAxis::Horizontal);
-                        }
-                        if let Some(r) = ratio {
-                            out.split_ratio = Some(r);
+                        match validate_split_value(&next) {
+                            Ok((ax, r)) => {
+                                if let Some(ax) = ax {
+                                    out.split_axis = Some(ax);
+                                } else {
+                                    // CTX-0480: bare `:ratio` without an axis is a
+                                    // usage error (previously silently horizontal).
+                                    record_value_error(
+                                        &mut out,
+                                        format!(
+                                            "unknown --split axis {next:?} (want h|horizontal|v|vertical[:ratio])"
+                                        ),
+                                    );
+                                    out.split_axis = Some(SplitAxis::Horizontal);
+                                }
+                                if let Some(r) = r {
+                                    out.split_ratio = Some(r);
+                                }
+                            }
+                            Err(msg) => record_value_error(&mut out, msg),
                         }
                         i += 2;
                     } else {
@@ -909,16 +1006,22 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
             }
             "--split-ratio" => {
-                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
-                    let next = &raw[i + 1];
-                    if let Ok(f) = next.parse::<f32>() {
-                        out.split_ratio = Some(f);
-                    } else {
-                        eprintln!("warning: invalid --split-ratio value {next:?} — ignoring");
+                // A negative token is a value, not a flag: out-of-range
+                // finite ratios clamp loudly at layout build (CTX-0480).
+                if i + 1 < raw.len()
+                    && (!raw[i + 1].starts_with('-') || looks_like_negative_number(&raw[i + 1]))
+                {
+                    let next = raw[i + 1].clone();
+                    match validate_split_ratio_value(&next) {
+                        Ok(f) => out.split_ratio = Some(f),
+                        Err(msg) => record_value_error(&mut out, msg),
                     }
                     i += 2;
                 } else {
-                    eprintln!("warning: --split-ratio needs a numeric value — ignoring");
+                    record_value_error(
+                        &mut out,
+                        "--split-ratio needs a numeric value (e.g. 0.5)".to_string(),
+                    );
                     i += 1;
                 }
             }
@@ -927,8 +1030,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.layout = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!(
-                        "warning: --layout needs a value (single|split:h[:ratio]|stack[:n]|overlay[:x,y,w,h]) — ignoring"
+                    record_value_error(
+                        &mut out,
+                        "--layout needs a value (single|split:h[:ratio]|stack[:n]|overlay[:x,y,w,h])"
+                            .to_string(),
                     );
                     i += 1;
                 }
@@ -938,8 +1043,9 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.focus = Some(raw[i + 1].clone());
                     i += 2;
                 } else {
-                    eprintln!(
-                        "warning: --focus needs a value (next|prev|up|down|left|right|<id>) — ignoring"
+                    record_value_error(
+                        &mut out,
+                        "--focus needs a value (next|prev|up|down|left|right|<id>)".to_string(),
                     );
                     i += 1;
                 }
@@ -1010,14 +1116,18 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     let val = raw[i + 1].clone();
                     match LogLevel::parse(&val) {
                         Some(level) => out.log_level = Some(level),
-                        None => eprintln!(
-                            "warning: unknown --log-level {val:?} (want error|warn|info|debug|trace) — ignoring"
+                        None => record_value_error(
+                            &mut out,
+                            format!(
+                                "unknown --log-level {val:?} (want error|warn|info|debug|trace)"
+                            ),
                         ),
                     }
                     i += 2;
                 } else {
-                    eprintln!(
-                        "warning: --log-level needs a value (error|warn|info|debug|trace) — ignoring"
+                    record_value_error(
+                        &mut out,
+                        "--log-level needs a value (error|warn|info|debug|trace)".to_string(),
                     );
                     i += 1;
                 }
@@ -1350,6 +1460,9 @@ pub(crate) fn help_text() -> String {
                             plugin VM), and use the built-in safe config\n  \
                             (decoration 0/0/1/0/0, opaque outline pair);\n  \
                             ignores --config/BITTY_CONFIG/profiles/CLI overrides\n  \
+               --fail-loud  Fail-loud startup: a failed shell/pane spawn or\n  \
+                            IPC servo aborts with a non-zero exit code\n  \
+                            instead of the default fail-soft warning path\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
                --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \

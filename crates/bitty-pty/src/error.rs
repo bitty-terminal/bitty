@@ -40,6 +40,10 @@ pub enum PtyError {
     ChildAlreadyReaped,
     /// A single-use resource (reader or writer half) was already taken.
     HalfAlreadyTaken(&'static str),
+    /// The program or an argument contained a NUL byte, which cannot survive
+    /// `execve`; rejected before spawn instead of surfacing as an opaque
+    /// backend failure (CTX-0478).
+    NulInProgram,
 }
 
 impl PtyError {
@@ -67,6 +71,9 @@ impl fmt::Display for PtyError {
             PtyError::Upstream(msg) => write!(f, "pty backend error: {msg}"),
             PtyError::ChildAlreadyReaped => write!(f, "child process status already reaped"),
             PtyError::HalfAlreadyTaken(what) => write!(f, "{what} half already taken"),
+            PtyError::NulInProgram => {
+                write!(f, "program and arguments must not contain NUL bytes")
+            }
         }
     }
 }
@@ -106,6 +113,7 @@ mod tests {
             PtyError::Upstream("opaque".to_owned()),
             PtyError::ChildAlreadyReaped,
             PtyError::HalfAlreadyTaken("reader"),
+            PtyError::NulInProgram,
         ];
         for err in cases {
             assert!(!err.to_string().is_empty());

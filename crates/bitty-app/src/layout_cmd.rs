@@ -11,6 +11,9 @@ use crate::spawn::parse_split_axis;
 fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode> {
     let lower = spec.to_ascii_lowercase();
     let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     if trimmed == "single" || trimmed == "leaf" || trimmed == "1" {
         return Some(LayoutNode::leaf(View::new(ViewId::new(1), cols, rows)));
     }
@@ -31,9 +34,19 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
         let mut parts = rest.split(':');
         let axis_part = parts.next().unwrap_or("").trim();
         let ratio_part = parts.next().map(str::trim);
-        let axis = parse_split_axis(axis_part).unwrap_or(SplitAxis::Horizontal);
+        // CTX-0480: unknown axis fails closed (no silent horizontal).
+        let axis = parse_split_axis(axis_part)?;
+        // Reject trailing junk (`split:h:0.5:extra`).
+        if parts.next().is_some() {
+            return None;
+        }
         let ratio = if let Some(r_str) = ratio_part {
-            r_str.parse::<f32>().unwrap_or(0.5)
+            match r_str.parse::<f32>() {
+                Ok(r) if r.is_finite() => clamp_ratio_loudly(r),
+                // CTX-0480: non-numeric/non-finite ratio fails closed
+                // (no silent 0.5).
+                _ => return None,
+            }
         } else {
             0.5
         };
@@ -52,7 +65,17 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
         let n: usize = if rest.is_empty() {
             2
         } else {
-            rest.parse::<usize>().unwrap_or(2).clamp(1, 8)
+            match rest.parse::<usize>() {
+                // CTX-0480: non-numeric stack count fails closed (no
+                // silent 2); out-of-range clamps loudly.
+                Ok(n) => {
+                    if !(1..=8).contains(&n) {
+                        eprintln!("bitty: --layout stack count {n} out of range [1,8] — clamping");
+                    }
+                    n.clamp(1, 8)
+                }
+                Err(_) => return None,
+            }
         };
         let mut children = Vec::with_capacity(n);
         for id in 1..=n as u64 {
@@ -75,12 +98,15 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
                 bounds,
             ));
         }
-        // parse x,y,w,h
-        let nums: Vec<u16> = rest
+        // parse x,y,w,h — every component must parse and there must be
+        // exactly four: a dropped component is malformed, never a silent
+        // partial geometry (CTX-0480).
+        let nums = rest
             .split(',')
-            .filter_map(|s| s.trim().parse::<u16>().ok())
-            .collect();
-        if nums.len() == 4 {
+            .map(|s| s.trim().parse::<u16>().ok())
+            .collect::<Option<Vec<u16>>>()
+            .filter(|nums| nums.len() == 4);
+        if let Some(nums) = nums {
             let base = View::new(ViewId::new(1), cols, rows);
             let over = View::new(ViewId::new(2), nums[2] as usize, nums[3] as usize);
             let bounds = UiRect::new(nums[0], nums[1], nums[2], nums[3]);
@@ -90,17 +116,31 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
                 bounds,
             ));
         }
-        // fallback to default overlay on parse failure
-        let base = View::new(ViewId::new(1), cols, rows);
-        let over = View::new(ViewId::new(2), 20.min(cols), 10.min(rows));
-        let bounds = UiRect::new(5, 5, 20.min(cols as u16), 10.min(rows as u16));
-        return Some(LayoutNode::overlay(
-            LayoutNode::leaf(base),
-            LayoutNode::leaf(over),
-            bounds,
-        ));
+        // CTX-0480: malformed overlay geometry fails closed (no silent
+        // default overlay).
+        return None;
     }
     None
+}
+
+/// Clamp a raw split ratio to `[MIN_RATIO, MAX_RATIO]` loudly (CTX-0480).
+/// Finite out-of-range values clamp with a stderr warning; non-finite
+/// values fall back to `0.5` with a warning (callers should already have
+/// failed closed on non-finite CLI input — this is defense in depth).
+pub(crate) fn clamp_ratio_loudly(raw: f32) -> f32 {
+    if !raw.is_finite() {
+        eprintln!("bitty: split ratio {raw:?} is not finite — using 0.5");
+        return 0.5;
+    }
+    let clamped = raw.clamp(LayoutNode::MIN_RATIO, LayoutNode::MAX_RATIO);
+    if (clamped - raw).abs() > f32::EPSILON {
+        eprintln!(
+            "bitty: split ratio {raw} out of range [{}, {}] — clamping to {clamped}",
+            LayoutNode::MIN_RATIO,
+            LayoutNode::MAX_RATIO
+        );
+    }
+    clamped
 }
 
 /// Build the startup layout from CLI flags (precedence: `--layout` >
@@ -111,13 +151,48 @@ fn parse_layout_spec(spec: &str, cols: usize, rows: usize) -> Option<LayoutNode>
 /// after startup (split, spawn, new workspace) must allocate through
 /// [`Runtime::next_view_id_global`], the single globally unique allocator
 /// (CTX-0378); never derive an id from one layout's max.
+///
+/// This is the warn-fallback compatibility form: an unknown `--layout`
+/// spec warns and falls through to the flag precedence. Startup dispatch
+/// must use [`try_build_layout`] to fail closed (exit 2) instead.
 pub(crate) fn build_layout(args: &Args, cols: usize, rows: usize) -> LayoutNode {
+    match try_build_layout(args, cols, rows) {
+        Ok(node) => node,
+        Err(msg) => {
+            eprintln!("warning: {msg} — falling back");
+            // Fall through to the flag precedence without the bad spec.
+            let mut fallback = Args::new();
+            fallback.stack = args.stack;
+            fallback.overlay = args.overlay;
+            fallback.split_axis = args.split_axis;
+            fallback.split_ratio = args.split_ratio;
+            match try_build_layout(&fallback, cols, rows) {
+                Ok(node) => node,
+                Err(_) => LayoutNode::leaf(View::new(ViewId::new(1), cols, rows)),
+            }
+        }
+    }
+}
+
+/// Fail-closed layout construction (CTX-0480, exit 2 at dispatch).
+/// Same precedence as [`build_layout`] but an invalid `--layout` spec or
+/// a non-finite `--split-ratio` is an `Err` (no silent fallback).
+/// Finite out-of-range ratios clamp loudly via [`clamp_ratio_loudly`].
+pub(crate) fn try_build_layout(
+    args: &Args,
+    cols: usize,
+    rows: usize,
+) -> Result<LayoutNode, String> {
     // Precedence: --layout > --stack > --overlay > --split > single
     if let Some(spec) = args.layout.as_deref() {
-        if let Some(node) = parse_layout_spec(spec, cols, rows) {
-            return node;
+        match parse_layout_spec(spec, cols, rows) {
+            Some(node) => return Ok(node),
+            None => {
+                return Err(format!(
+                    "unknown --layout spec {spec:?} (want single|split:h[:ratio]|stack[:n]|overlay[:x,y,w,h])"
+                ));
+            }
         }
-        eprintln!("warning: unknown --layout spec {spec:?} — falling back");
     }
     if args.stack {
         let n = 2usize;
@@ -125,21 +200,47 @@ pub(crate) fn build_layout(args: &Args, cols: usize, rows: usize) -> LayoutNode 
         for id in 1..=n as u64 {
             children.push(LayoutNode::leaf(View::new(ViewId::new(id), cols, rows)));
         }
-        return LayoutNode::stack(children);
+        return Ok(LayoutNode::stack(children));
     }
     if args.overlay {
         let base = View::new(ViewId::new(1), cols, rows);
         let over = View::new(ViewId::new(2), 20.min(cols), 10.min(rows));
         let bounds = UiRect::new(5, 5, 20.min(cols as u16), 10.min(rows as u16));
-        return LayoutNode::overlay(LayoutNode::leaf(base), LayoutNode::leaf(over), bounds);
+        return Ok(LayoutNode::overlay(
+            LayoutNode::leaf(base),
+            LayoutNode::leaf(over),
+            bounds,
+        ));
     }
     if let Some(axis) = args.split_axis {
-        let ratio = args.split_ratio.unwrap_or(0.5);
+        let raw = args.split_ratio.unwrap_or(0.5);
+        if !raw.is_finite() {
+            return Err(format!(
+                "invalid --split-ratio value {raw:?} (want a finite number)"
+            ));
+        }
+        let ratio = clamp_ratio_loudly(raw);
         let a = View::new(ViewId::new(1), cols, rows);
         let b = View::new(ViewId::new(2), cols, rows);
-        return LayoutNode::split(axis, ratio, LayoutNode::leaf(a), LayoutNode::leaf(b));
+        return Ok(LayoutNode::split(
+            axis,
+            ratio,
+            LayoutNode::leaf(a),
+            LayoutNode::leaf(b),
+        ));
     }
-    LayoutNode::leaf(View::new(ViewId::new(1), cols, rows))
+    Ok(LayoutNode::leaf(View::new(ViewId::new(1), cols, rows)))
+}
+
+/// Whether a `--focus` spec is syntactically valid (CTX-0480).
+/// Directions, `n`/`p` aliases, and numeric ids are valid; anything else
+/// must fail closed at dispatch instead of warn-ignoring to exit 0.
+pub(crate) fn is_valid_focus_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    match lower.as_str() {
+        "next" | "n" | "prev" | "previous" | "p" | "up" | "down" | "left" | "right" => true,
+        _ => spec.trim().parse::<u64>().is_ok(),
+    }
 }
 
 pub(crate) fn apply_focus(runtime: &mut Runtime, spec: &str) -> bool {

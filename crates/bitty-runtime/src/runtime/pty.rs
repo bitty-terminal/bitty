@@ -6,26 +6,27 @@ use super::plugin::cold_to_observation;
 use super::*;
 
 /// Blocking forwarder: sole consumer of `reader`, pushing into `tx` and
-/// waking once per chunk plus once on EOF.
+/// waking once per batch plus once on EOF (CTX-0476 waker merge).
 ///
 /// - Quiet child: parked in `recv`, zero wakeups, zero CPU.
 /// - Backpressure: `send` blocks when `tx` is full, which fills the original
 ///   pump channel, which fills the kernel PTY buffer, which blocks the child.
 /// - Fail-closed: a dropped consumer breaks `send` and ends the thread with
 ///   no loss beyond already-queued chunks and no unbounded growth.
+/// - Waker merge: after the blocking `recv` yields the first chunk, up to
+///   `PTY_FORWARD_CAPACITY_CHUNKS - 1` immediately-available chunks are
+///   batched via `try_recv` and delivered with a single wakeup, so a burst
+///   of N chunks costs one event-loop wakeup instead of N (waker storm).
 pub(super) fn pty_forward_loop(
     reader: PtyReader,
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     waker: PtyWaker,
 ) {
     loop {
-        match reader.recv() {
+        let first = match reader.recv() {
             Some(chunk) => {
                 debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-                if tx.send(chunk).is_err() {
-                    break;
-                }
-                (waker)();
+                chunk
             }
             None => {
                 // EOF: wake once so the consumer drains final chunks promptly
@@ -33,10 +34,148 @@ pub(super) fn pty_forward_loop(
                 (waker)();
                 break;
             }
+        };
+        // Batch immediately-available follow-ups without blocking: a burst
+        // already queued in the pump channel merges into one wakeup.
+        let mut batch = Vec::with_capacity(PTY_FORWARD_CAPACITY_CHUNKS);
+        batch.push(first);
+        while batch.len() < PTY_FORWARD_CAPACITY_CHUNKS {
+            match reader.try_recv() {
+                Some(chunk) => {
+                    debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                    batch.push(chunk);
+                }
+                None => break,
+            }
+        }
+        let mut sent_any = false;
+        let mut broken = false;
+        for chunk in batch {
+            if tx.send(chunk).is_err() {
+                broken = true;
+                break;
+            }
+            sent_any = true;
+        }
+        // One wakeup per batch, and only when at least one chunk was
+        // forwarded: a dropped consumer exits without a spurious wakeup,
+        // matching the per-chunk send-then-wake ordering it replaces.
+        if sent_any {
+            (waker)();
+        }
+        if broken {
+            break;
         }
     }
     // Reap the pump thread; outcome is informational (EOF vs I/O error).
     let _ = reader.join();
+}
+
+/// Handle to a spawned wakeup forwarder plus its consumer channel.
+pub(super) struct ForwarderParts {
+    pub(super) rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(super) handle: std::thread::JoinHandle<()>,
+}
+
+/// A refused forwarder spawn: the spawn error plus the reader recovered from
+/// the shared slot (`None` only when an injected test spawner already ran the
+/// body and consumed it).
+pub(super) struct SpawnFailure {
+    pub(super) reader: Option<PtyReader>,
+    pub(super) error: std::io::Error,
+}
+
+/// Take the parked payload, tolerating a poisoned lock (fail-closed, no panic).
+fn lock_take<T>(slot: &std::sync::Mutex<Option<T>>) -> Option<T> {
+    match slot.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+/// Run `body` on a newly spawned thread, parking `payload` so a refused spawn
+/// hands it back instead of dropping it (CTX-0473).
+///
+/// `spawn` performs the actual thread creation (production:
+/// [`std::thread::Builder`]); injecting it lets tests exercise the refusal
+/// path deterministically. On `Err` the payload was never lost: it is returned
+/// so the caller can keep a degraded path alive rather than panic or go dark.
+pub(super) fn spawn_recovering<P: Send + 'static>(
+    payload: P,
+    body: impl FnOnce(P) + Send + 'static,
+    spawn: impl FnOnce(
+        Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<std::thread::JoinHandle<()>, (Option<P>, std::io::Error)> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(payload)));
+    let thread_slot = std::sync::Arc::clone(&slot);
+    let boxed: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+        if let Some(payload) = lock_take(&thread_slot) {
+            body(payload);
+        }
+    });
+    match spawn(boxed) {
+        Ok(handle) => Ok(handle),
+        Err(error) => Err((lock_take(&slot), error)),
+    }
+}
+
+/// Spawn the PTY wakeup forwarder for `reader`, fail-closed (CTX-0473).
+///
+/// On success the forwarder owns `reader`; on spawn refusal the reader comes
+/// back in [`SpawnFailure`] so the caller can restore the direct pump path.
+pub(super) fn spawn_forwarder(
+    reader: PtyReader,
+    waker: PtyWaker,
+    spawn: impl FnOnce(
+        Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<ForwarderParts, SpawnFailure> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
+    spawn_recovering(
+        reader,
+        move |reader| pty_forward_loop(reader, tx, waker),
+        spawn,
+    )
+    .map(|handle| ForwarderParts { rx, handle })
+    .map_err(|(reader, error)| SpawnFailure { reader, error })
+}
+
+/// [`spawn_forwarder`] using the production named-thread builder.
+pub(super) fn spawn_forwarder_default(
+    reader: PtyReader,
+    waker: PtyWaker,
+) -> Result<ForwarderParts, SpawnFailure> {
+    spawn_forwarder(reader, waker, |body| {
+        std::thread::Builder::new()
+            .name("bitty-pty-wakeup".to_owned())
+            .spawn(body)
+    })
+}
+
+/// Best-effort bounded write of `chunks` to `writer` (CTX-0473).
+///
+/// Writes in order and stops at the first failure (fail-closed). Returns
+/// `(bytes_written, bytes_dropped)`; a chunk whose `write_all` failed is
+/// counted whole as dropped, since the partial count on error is unspecified.
+pub(super) fn write_chunks<W: std::io::Write>(
+    writer: &mut W,
+    chunks: &[Box<[u8]>],
+) -> (usize, usize) {
+    let mut written = 0usize;
+    let mut dropped = 0usize;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if writer.write_all(chunk).is_ok() {
+            written += chunk.len();
+        } else {
+            dropped += chunk.len();
+            for rest in &chunks[idx + 1..] {
+                dropped += rest.len();
+            }
+            break;
+        }
+    }
+    (written, dropped)
 }
 
 /// OSC 52 read-reply framing overhead: `ESC ] 52 ; c ;` (7 bytes) plus the
@@ -188,10 +327,11 @@ impl Runtime {
     ///
     /// The forwarder is the sole consumer of the bounded pump channel from
     /// this point: it blocks in `recv` (zero wakeups when quiet), forwards
-    /// each chunk into a second bounded channel
-    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per chunk
-    /// plus once on EOF. [`poll_pty`] drains the forwarding channel, so the
-    /// existing bounded-drain contract is preserved end to end.
+    /// each batch into a second bounded channel
+    /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per batch
+    /// plus once on EOF (CTX-0476 waker merge). [`poll_pty`] drains the
+    /// forwarding channel, so the existing bounded-drain contract is
+    /// preserved end to end.
     ///
     /// Idempotent: replacing the waker re-promotes only when a direct reader
     /// is still present; an already-promoted pump keeps its original waker
@@ -239,13 +379,27 @@ impl Runtime {
             self.pty_reader = Some(reader);
             return;
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
-        let handle = std::thread::Builder::new()
-            .name("bitty-pty-wakeup".to_owned())
-            .spawn(move || pty_forward_loop(reader, tx, waker))
-            .expect("std thread spawn cannot fail with default builder options");
-        self.pty_forward_rx = Some(rx);
-        self.pty_forward_handle = Some(handle);
+        match spawn_forwarder_default(reader, waker) {
+            Ok(parts) => {
+                self.pty_forward_rx = Some(parts.rx);
+                self.pty_forward_handle = Some(parts.handle);
+            }
+            Err(failure) => {
+                // Fail-closed (CTX-0473): restore the reader so the direct
+                // pump path keeps the child's output flowing; never panic.
+                if let Some(reader) = failure.reader {
+                    self.pty_reader = Some(reader);
+                }
+                self.forwarder_spawn_failures = self.forwarder_spawn_failures.wrapping_add(1);
+                if let Some(suppressed) = self.spawn_log.admit_now() {
+                    eprintln!(
+                        "bitty: PTY wakeup forwarder spawn failed ({}): using direct pump{}",
+                        failure.error,
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+        }
     }
 
     /// Whether a PTY child is currently owned.
@@ -302,25 +456,38 @@ impl Runtime {
     /// When a consumer stalls, the bounded channel(s) fill, the pump blocks,
     /// the kernel PTY buffer fills, and the child's writes block —
     /// end-to-end backpressure with zero data loss and zero unbounded memory
-    /// growth. This method is the consumer side: it drains all immediately
+    /// growth. This method is the consumer side: it drains immediately
     /// available chunks without blocking, feeding each through the VT parser
-    /// and terminal state.
+    /// and terminal state, stopping at the first of the CTX-0476 budgets
+    /// (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
+    /// so a hostile flood can delay but never stall the render thread; the
+    /// remainder stays queued for the next poll.
     ///
     /// Returns the number of chunks drained. `0` means either no PTY, no data
-    /// available yet, or EOF has been reached and the queue drained. Headless
+    /// available yet, or EOF has been reached and the queue drained (the
+    /// budgets stop a *busy* poll early, never before the first available
+    /// chunk). Headless
     /// tests that never called [`spawn_shell`] get `0` without error, so the
     /// same binary works headlessly (synthetic `handle_pty_bytes`) and with a
     /// real PTY (live `poll_pty`).
     pub fn poll_pty(&mut self) -> usize {
         // Collect without holding an immutable borrow across the mutable
-        // `handle_pty_bytes` call (borrow checker).
+        // `handle_pty_bytes` call (borrow checker). Bounded by chunk count,
+        // byte total, and wall time (CTX-0476); at least one chunk drains
+        // when data is available so a max-size chunk always makes progress.
+        let start = std::time::Instant::now();
+        let mut drained_bytes = 0usize;
         let chunks: Vec<Vec<u8>> = {
             if let Some(rx) = self.pty_forward_rx.as_ref() {
                 let mut out = Vec::new();
-                while out.len() < 1024 {
+                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                        break;
+                    }
                     match rx.try_recv() {
                         Ok(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            drained_bytes = drained_bytes.saturating_add(chunk.len());
                             out.push(chunk);
                         }
                         Err(_) => break,
@@ -333,10 +500,14 @@ impl Runtime {
                     return self.pump_pane_sessions();
                 };
                 let mut out = Vec::new();
-                while out.len() < 1024 {
+                while out.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                    if !out.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                        break;
+                    }
                     match reader.try_recv() {
                         Some(chunk) => {
                             debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                            drained_bytes = drained_bytes.saturating_add(chunk.len());
                             out.push(chunk);
                         }
                         None => break,
@@ -475,9 +646,15 @@ impl Runtime {
                             Err(reason) => {
                                 self.osc52_rejected_writes =
                                     self.osc52_rejected_writes.wrapping_add(1);
-                                eprintln!(
-                                    "bitty: rejecting invalid OSC 52 clipboard write ({reason}): no clipboard change"
-                                );
+                                // Rate-limited (CTX-0473): hostile PTY bytes can
+                                // reject at child-output rate; the counter above
+                                // stays exact while stderr stays bounded.
+                                if let Some(suppressed) = self.osc52_log.admit_now() {
+                                    eprintln!(
+                                        "bitty: rejecting invalid OSC 52 clipboard write ({reason}): no clipboard change{}",
+                                        log_throttle::suppressed_suffix(suppressed)
+                                    );
+                                }
                                 continue;
                             }
                         };
@@ -495,8 +672,11 @@ impl Runtime {
                         // (Ghostty `clipboard_response` pattern), so
                         // tmux/neovim queries terminate instead of hanging.
                         // The lossy read keeps the reply path total: a
-                        // system-clipboard failure falls back to the last
-                        // known buffer rather than answering with silence.
+                        // system-clipboard failure answers with an empty
+                        // payload rather than replaying a stale value
+                        // (CTX-0478), an over-limit clipboard answers with
+                        // its clipped prefix instead of an empty payload
+                        // (CTX-0478 review), and the reply is always sent.
                         let text = self.clipboard.get_text_lossy();
                         let reply = osc52_read_reply(&text);
                         self.state.apply(&TerminalAction::Reply {
@@ -577,7 +757,14 @@ impl Runtime {
                 if let Err(err) = self.kitty_display_image(
                     *format_f, *width_s, *height_v, *action_a, *cols_c, *rows_r, payload, 0,
                 ) {
-                    eprintln!("bitty: rejecting kitty image ({err}): stored nothing");
+                    // Rate-limited (CTX-0473): a hostile child can spam rejected
+                    // kitty payloads; the parser's own warnings stay bounded too.
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting kitty image ({err}): stored nothing{}",
+                            log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
                 }
             }
             let damage = self.state.apply(&action);
@@ -689,6 +876,7 @@ impl Runtime {
     /// (fail-closed, reply dropped, overflow already counted). Returns the
     /// total bytes successfully written (≤ 4 KiB, bounded).
     pub fn write_replies(&mut self) -> usize {
+        use std::io::Write as _;
         if self.pty_writer.is_none() {
             return 0;
         }
@@ -699,18 +887,18 @@ impl Runtime {
         let Some(writer) = self.pty_writer.as_mut() else {
             return 0;
         };
-        let mut total = 0usize;
-        use std::io::Write as _;
-        for chunk in replies {
-            // Each chunk is bounded; total bounded by REPLY_CAP_BYTES (4 KiB).
-            // Best-effort, fail-closed: on write error break and drop remainder.
-            if writer.write_all(&chunk).is_ok() {
-                total += chunk.len();
-            } else {
-                break;
-            }
+        // Each chunk is bounded; total bounded by REPLY_CAP_BYTES (4 KiB).
+        // Best-effort, fail-closed (CTX-0473): the first write error stops the
+        // drain and the lost remainder is accounted, never silently swallowed.
+        let (total, dropped) = write_chunks(writer, &replies);
+        let flush_failed = writer.flush().is_err();
+        if dropped > 0 {
+            self.reply_write_dropped_bytes =
+                self.reply_write_dropped_bytes.wrapping_add(dropped as u64);
         }
-        let _ = writer.flush();
+        if flush_failed {
+            self.write_flush_failures = self.write_flush_failures.wrapping_add(1);
+        }
         total
     }
 
@@ -724,5 +912,124 @@ impl Runtime {
     #[must_use]
     pub fn replies_overflowed(&self) -> bool {
         self.state.replies_overflowed()
+    }
+
+    /// Reply bytes dropped because a PTY writer failed mid-write (CTX-0473).
+    ///
+    /// Wrapping telemetry covering the primary and per-pane reply paths:
+    /// bytes that never reached the child's shell.
+    #[must_use]
+    pub fn reply_write_dropped_bytes(&self) -> u64 {
+        self.reply_write_dropped_bytes
+    }
+
+    /// Best-effort writer `flush` failures on reply/input paths (CTX-0473).
+    #[must_use]
+    pub fn write_flush_failures(&self) -> u64 {
+        self.write_flush_failures
+    }
+
+    /// Wakeup-forwarder thread spawns refused by the OS (CTX-0473).
+    ///
+    /// The direct pump path is retained instead; non-zero means degraded
+    /// wakeups, never a dropped reader.
+    #[must_use]
+    pub fn forwarder_spawn_failures(&self) -> u64 {
+        self.forwarder_spawn_failures
+    }
+
+    /// Hot-path diagnostics suppressed by the log throttle (CTX-0473).
+    ///
+    /// Counts OSC 52/kitty reject and spawn-failure messages dropped to keep a
+    /// hostile child from flooding stderr; the underlying event counters
+    /// remain exact.
+    #[must_use]
+    pub fn suppressed_diagnostics(&self) -> u64 {
+        self.osc52_log
+            .suppressed()
+            .saturating_add(self.kitty_log.suppressed())
+            .saturating_add(self.spawn_log.suppressed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writer that accepts `ok_chunks` writes then errors. It reports the full
+    /// buffer written, so each `write_all` consumes exactly one `write` call.
+    struct FailingWriter {
+        ok_chunks: usize,
+        chunks: usize,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.chunks += 1;
+            if self.chunks > self.ok_chunks {
+                return Err(std::io::Error::other("simulated write failure"));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn boxed(items: &[&[u8]]) -> Vec<Box<[u8]>> {
+        items.iter().map(|item| (*item).into()).collect()
+    }
+
+    #[test]
+    fn write_chunks_reports_written_and_dropped_remainder() {
+        let data = boxed(&[b"aa", b"bbb", b"c"]);
+        let mut writer = FailingWriter {
+            ok_chunks: 1,
+            chunks: 0,
+        };
+        let (written, dropped) = write_chunks(&mut writer, &data);
+        assert_eq!(written, 2);
+        assert_eq!(dropped, 3 + 1, "failed chunk plus remainder counted");
+    }
+
+    #[test]
+    fn write_chunks_all_ok_drops_nothing() {
+        let data = boxed(&[b"aa", b"bbb", b"c"]);
+        let mut writer = FailingWriter {
+            ok_chunks: usize::MAX,
+            chunks: 0,
+        };
+        let (written, dropped) = write_chunks(&mut writer, &data);
+        assert_eq!(written, 6);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn spawn_recovering_returns_payload_when_spawn_refused() {
+        let result = spawn_recovering(
+            7u32,
+            |_| {},
+            |_body| Err(std::io::Error::other("simulated spawn refusal")),
+        );
+        let (payload, _error) = result.expect_err("spawn must be refused");
+        assert_eq!(payload, Some(7), "payload must not be lost on refusal");
+    }
+
+    #[test]
+    fn spawn_recovering_runs_body_on_success() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let body_seen = std::sync::Arc::clone(&seen);
+        let handle = spawn_recovering(
+            7u32,
+            move |payload| *body_seen.lock().expect("lock") = Some(payload),
+            |body| {
+                body();
+                Ok(std::thread::spawn(|| {}))
+            },
+        )
+        .expect("spawn succeeds");
+        handle.join().expect("join dummy handle");
+        assert_eq!(*seen.lock().expect("lock"), Some(7));
     }
 }

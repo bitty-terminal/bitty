@@ -30,7 +30,17 @@
 //!   `get_primary` reads the primary selection the same way. There is no
 //!   silent cross-selection fallback, so read failures are visible instead of
 //!   being swallowed. Callers that want best-effort use `get_text_lossy` /
-//!   `get_primary_lossy`, which fall back to the in-memory buffers.
+//!   `get_primary_lossy`, which return an empty string when the system read
+//!   fails rather than replaying a stale in-memory value.
+//! - Payloads are bounded by [`CLIPBOARD_MAX_BYTES`] without silent
+//!   truncation: an over-limit write, or an over-limit system read through
+//!   the direct [`Clipboard::get_text`] / [`Clipboard::get_primary`] APIs,
+//!   fails with `PlatformError::ClipboardPayloadTooLarge`, and a rejected
+//!   write leaves both selections unchanged (CTX-0478). The bounded reads
+//!   [`Clipboard::get_text_bounded`] / [`Clipboard::get_primary_bounded`],
+//!   used by the paste and OSC 52 reply seams, clip an over-limit system
+//!   value at a UTF-8 char boundary instead of rejecting it, so an oversized
+//!   clipboard never pastes (or answers) nothing (CTX-0478 review).
 //! - The secondary selection is never used: it is unavailable on Wayland and
 //!   returns an error there by design.
 //!
@@ -122,6 +132,15 @@ pub struct Clipboard {
     headless_buf: String,
     primary_buf: String,
     headless_only: bool,
+    /// Why the system clipboard could not be opened, when [`Self::new`]
+    /// degraded to the headless buffer. `None` when a system handle exists or
+    /// the handle was constructed headless on purpose. Kept so a swallowed
+    /// display/backend failure stays observable (CTX-0478).
+    init_error: Option<String>,
+    /// Test seam: raw read result substituted for the platform backend on
+    /// every regular/primary read. `None` in production; set by
+    /// [`Clipboard::simulate_system_text_for_test`].
+    simulated_read: Option<String>,
 }
 
 impl std::fmt::Debug for Clipboard {
@@ -131,6 +150,7 @@ impl std::fmt::Debug for Clipboard {
             .field("headless_len", &self.headless_buf.len())
             .field("primary_len", &self.primary_buf.len())
             .field("backend_hint", &self.backend_hint())
+            .field("headless_reason", &self.headless_reason())
             .finish()
     }
 }
@@ -154,12 +174,16 @@ impl Clipboard {
                 headless_buf: String::new(),
                 primary_buf: String::new(),
                 headless_only: false,
+                init_error: None,
+                simulated_read: None,
             },
-            Err(_) => Self {
+            Err(err) => Self {
                 inner: None,
                 headless_buf: String::new(),
                 primary_buf: String::new(),
                 headless_only: false,
+                init_error: Some(err.to_string()),
+                simulated_read: None,
             },
         }
     }
@@ -175,6 +199,8 @@ impl Clipboard {
                 headless_buf: String::new(),
                 primary_buf: String::new(),
                 headless_only: false,
+                init_error: None,
+                simulated_read: None,
             }),
             Err(err) => Err(PlatformError::ClipboardUnavailable(err.to_string())),
         }
@@ -189,7 +215,19 @@ impl Clipboard {
             headless_buf: String::new(),
             primary_buf: String::new(),
             headless_only: true,
+            init_error: None,
+            simulated_read: None,
         }
+    }
+
+    /// Why the system clipboard could not be opened, when this handle
+    /// degraded to the headless buffer via [`Self::new`].
+    ///
+    /// `None` when a system handle exists or when the handle is headless by
+    /// construction ([`Self::new_headless`], [`Self::new_strict`]).
+    #[must_use]
+    pub fn headless_reason(&self) -> Option<&str> {
+        self.init_error.as_deref()
     }
 
     /// Whether the clipboard is operating headlessly (no system handle).
@@ -227,8 +265,11 @@ impl Clipboard {
 
     /// Writes `text` to the regular clipboard and syncs the primary selection.
     ///
-    /// `text` is truncated to [`CLIPBOARD_MAX_BYTES`] before any system call
-    /// (T-01). When headless, both buffers are updated and `Ok` is returned.
+    /// `text` is bounded by [`CLIPBOARD_MAX_BYTES`] before any system call;
+    /// an over-limit payload is rejected with
+    /// [`PlatformError::ClipboardPayloadTooLarge`] and both selections are
+    /// left unchanged (no silent truncation, CTX-0478). When headless, both
+    /// buffers are updated and `Ok` is returned.
     ///
     /// On Linux the primary selection is synced best-effort after the
     /// regular clipboard write: a primary failure never fails the call when
@@ -244,33 +285,33 @@ impl Clipboard {
     /// possible. Callers that want best-effort should use
     /// [`Self::set_text_lossy`] and keep the buffers.
     pub fn set_text(&mut self, text: String) -> Result<(), PlatformError> {
-        let truncated = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        ensure_within_limit(text.len())?;
         if self.headless_only {
-            self.headless_buf = truncated.clone();
-            self.primary_buf = truncated;
+            self.headless_buf = text.clone();
+            self.primary_buf = text;
             return Ok(());
         }
         if let Some(inner) = self.inner.as_mut() {
-            let clipboard_result = set_clipboard_text(inner, truncated.clone());
+            let clipboard_result = set_clipboard_text(inner, text.clone());
             // Best-effort primary sync (Linux only; no-op elsewhere).
             // Routed through `set_primary_selection` (wl-copy-first on
             // Wayland) so the sync benefits from the fork-safe CLI path.
-            let _primary_result = set_primary_selection(inner, &truncated);
+            let _primary_result = set_primary_selection(inner, &text);
             match clipboard_result {
                 Ok(()) => {
-                    self.headless_buf = truncated.clone();
-                    self.primary_buf = truncated;
+                    self.headless_buf = text.clone();
+                    self.primary_buf = text;
                     Ok(())
                 }
                 Err(err) => {
-                    self.headless_buf = truncated.clone();
-                    self.primary_buf = truncated;
+                    self.headless_buf = text.clone();
+                    self.primary_buf = text;
                     Err(PlatformError::ClipboardOperation(err))
                 }
             }
         } else {
-            self.headless_buf = truncated.clone();
-            self.primary_buf = truncated;
+            self.headless_buf = text.clone();
+            self.primary_buf = text;
             Ok(())
         }
     }
@@ -278,12 +319,13 @@ impl Clipboard {
     /// Writes `text` to the primary selection only (middle-click /
     /// `wl-paste --primary`).
     ///
-    /// Truncated to [`CLIPBOARD_MAX_BYTES`] before the system call. On
-    /// Wayland the write prefers the `wl-copy --primary` CLI (fork-safe from
-    /// multithreaded processes) and falls back to the `arboard` primary path
-    /// when the CLI is missing or cannot be started. On non-Linux platforms
-    /// there is no primary selection: the primary buffer is updated headlessly
-    /// and `Ok` is returned without touching the OS.
+    /// Bounded by [`CLIPBOARD_MAX_BYTES`] with a typed rejection (see
+    /// [`Self::set_text`]). On Wayland the write prefers the `wl-copy
+    /// --primary` CLI (fork-safe from multithreaded processes) and falls back
+    /// to the `arboard` primary path when the CLI is missing or cannot be
+    /// started. On non-Linux platforms there is no primary selection: the
+    /// primary buffer is updated headlessly and `Ok` is returned without
+    /// touching the OS.
     ///
     /// # Errors
     ///
@@ -292,24 +334,24 @@ impl Clipboard {
     /// `PlatformError::ClipboardOperation`. The primary buffer is still
     /// updated.
     pub fn set_primary(&mut self, text: String) -> Result<(), PlatformError> {
-        let truncated = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        ensure_within_limit(text.len())?;
         if self.headless_only {
-            self.primary_buf = truncated;
+            self.primary_buf = text;
             return Ok(());
         }
         if let Some(inner) = self.inner.as_mut() {
-            match set_primary_selection(inner, &truncated) {
+            match set_primary_selection(inner, &text) {
                 Ok(()) => {
-                    self.primary_buf = truncated;
+                    self.primary_buf = text;
                     Ok(())
                 }
                 Err(err) => {
-                    self.primary_buf = truncated;
+                    self.primary_buf = text;
                     Err(PlatformError::ClipboardOperation(err))
                 }
             }
         } else {
-            self.primary_buf = truncated;
+            self.primary_buf = text;
             Ok(())
         }
     }
@@ -321,77 +363,158 @@ impl Clipboard {
         let _ = self.set_text(text);
     }
 
-    /// Reads text from the regular clipboard, truncating to
+    /// Reads text from the regular clipboard, bounded by
     /// [`CLIPBOARD_MAX_BYTES`] after the system call. When headless, returns
     /// the buffer contents.
     ///
     /// # Errors
     ///
     /// When a system clipboard is present and the read fails, returns
-    /// `PlatformError::ClipboardOperation`. Headless `get_text` never fails.
-    /// There is no silent fallback to the primary selection: use
+    /// `PlatformError::ClipboardOperation`; an over-limit system value is
+    /// rejected with `PlatformError::ClipboardPayloadTooLarge` instead of
+    /// being truncated. Paste and reply seams that must stay total use
+    /// [`Self::get_text_bounded`], which clips instead of rejecting. A
+    /// headless handle with no simulated system read never fails. There is
+    /// no silent fallback to the primary selection: use
     /// [`Self::get_primary`] explicitly or [`Self::get_text_lossy`] for
     /// best-effort reads.
     pub fn get_text(&mut self) -> Result<String, PlatformError> {
-        if self.headless_only {
-            return Ok(self.headless_buf.clone());
+        let text = self
+            .read_text_raw()
+            .map_err(PlatformError::ClipboardOperation)?;
+        ensure_within_limit(text.len())?;
+        self.headless_buf = text.clone();
+        Ok(text)
+    }
+
+    /// Reads text from the primary selection (middle-click /
+    /// `wl-paste --primary`), bounded by [`CLIPBOARD_MAX_BYTES`].
+    ///
+    /// On non-Linux platforms returns the primary buffer without touching
+    /// the OS. A headless handle with no simulated system read never fails.
+    ///
+    /// # Errors
+    ///
+    /// When a system clipboard is present and the primary read fails, returns
+    /// `PlatformError::ClipboardOperation`; an over-limit system value is
+    /// rejected with `PlatformError::ClipboardPayloadTooLarge` instead of
+    /// being truncated.
+    pub fn get_primary(&mut self) -> Result<String, PlatformError> {
+        let text = self
+            .read_primary_raw()
+            .map_err(PlatformError::ClipboardOperation)?;
+        ensure_within_limit(text.len())?;
+        self.primary_buf = text.clone();
+        Ok(text)
+    }
+
+    /// Bounded regular-clipboard read for the paste and OSC 52 reply seams.
+    ///
+    /// Identical to [`Self::get_text`] except that an over-limit system value
+    /// is clipped at a UTF-8 char boundary within [`CLIPBOARD_MAX_BYTES`]
+    /// instead of failing with [`PlatformError::ClipboardPayloadTooLarge`]:
+    /// a large clipboard pastes its bounded prefix instead of pasting nothing
+    /// (CTX-0478 review). The result is always at most
+    /// [`CLIPBOARD_MAX_BYTES`] bytes; the runtime paste gate re-applies its
+    /// own char-boundary bound before inspection and delivery.
+    ///
+    /// # Errors
+    ///
+    /// When a system clipboard is present and the read fails, returns
+    /// `PlatformError::ClipboardOperation`.
+    pub fn get_text_bounded(&mut self) -> Result<String, PlatformError> {
+        let text = self
+            .read_text_raw()
+            .map_err(PlatformError::ClipboardOperation)?;
+        let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        self.headless_buf = text.clone();
+        Ok(text)
+    }
+
+    /// Bounded primary-selection read for the middle-click paste seam.
+    ///
+    /// Identical to [`Self::get_primary`] except that an over-limit system
+    /// value is clipped at a UTF-8 char boundary within
+    /// [`CLIPBOARD_MAX_BYTES`] instead of failing with
+    /// [`PlatformError::ClipboardPayloadTooLarge`] (CTX-0478 review).
+    ///
+    /// # Errors
+    ///
+    /// When a system clipboard is present and the read fails, returns
+    /// `PlatformError::ClipboardOperation`.
+    pub fn get_primary_bounded(&mut self) -> Result<String, PlatformError> {
+        let text = self
+            .read_primary_raw()
+            .map_err(PlatformError::ClipboardOperation)?;
+        let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        self.primary_buf = text.clone();
+        Ok(text)
+    }
+
+    /// Raw regular-clipboard text from the read funnel: a simulated system
+    /// read when a test seeded one, otherwise the platform backend when a
+    /// system handle exists, otherwise the headless buffer.
+    ///
+    /// The direct and bounded reads share this funnel, so the bound decision
+    /// is identical for a simulated and a real system read.
+    fn read_text_raw(&mut self) -> Result<String, String> {
+        if let Some(text) = self.simulated_read.clone() {
+            return Ok(text);
         }
         if let Some(inner) = self.inner.as_mut() {
-            match get_clipboard_text(inner) {
-                Ok(text) => {
-                    let truncated = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
-                    self.headless_buf = truncated.clone();
-                    Ok(truncated)
-                }
-                Err(err) => Err(PlatformError::ClipboardOperation(err)),
-            }
+            get_clipboard_text(inner)
         } else {
             Ok(self.headless_buf.clone())
         }
     }
 
-    /// Reads text from the primary selection (middle-click /
-    /// `wl-paste --primary`), truncating to [`CLIPBOARD_MAX_BYTES`].
-    ///
-    /// On non-Linux platforms returns the primary buffer without touching
-    /// the OS. Headless `get_primary` never fails.
-    ///
-    /// # Errors
-    ///
-    /// When a system clipboard is present and the primary read fails, returns
-    /// `PlatformError::ClipboardOperation`.
-    pub fn get_primary(&mut self) -> Result<String, PlatformError> {
-        if self.headless_only {
-            return Ok(self.primary_buf.clone());
+    /// Raw primary-selection text from the read funnel; see
+    /// [`Self::read_text_raw`].
+    fn read_primary_raw(&mut self) -> Result<String, String> {
+        if let Some(text) = self.simulated_read.clone() {
+            return Ok(text);
         }
         if let Some(inner) = self.inner.as_mut() {
-            match get_primary_text(inner) {
-                Ok(text) => {
-                    let truncated = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
-                    self.primary_buf = truncated.clone();
-                    Ok(truncated)
-                }
-                Err(err) => Err(PlatformError::ClipboardOperation(err)),
-            }
+            get_primary_text(inner)
         } else {
             Ok(self.primary_buf.clone())
         }
     }
 
-    /// Best-effort regular-clipboard read that returns `Ok` even on system
-    /// error: falls back to the headless buffer.
-    #[must_use]
-    pub fn get_text_lossy(&mut self) -> String {
-        self.get_text()
-            .unwrap_or_else(|_| self.headless_buf.clone())
+    /// Test seam: makes every subsequent regular and primary read return
+    /// `text` as if the system clipboard had produced it, without touching
+    /// the OS.
+    ///
+    /// The simulated value flows through the same read funnel as a real
+    /// system read: the direct reads reject an over-limit value with
+    /// [`PlatformError::ClipboardPayloadTooLarge`] while the bounded reads
+    /// clip it. Production writes reject over-limit payloads, so this is the
+    /// only way to put an over-limit *system* read in front of the runtime
+    /// paste seam without a display server (CTX-0478 review).
+    pub fn simulate_system_text_for_test(&mut self, text: String) {
+        self.simulated_read = Some(text);
     }
 
-    /// Best-effort primary read that falls back to the primary buffer on
-    /// system error.
+    /// Best-effort regular-clipboard read that never returns an error.
+    ///
+    /// Returns an empty string when the system read fails: replaying the last
+    /// in-memory value would present a stale clipboard as current (CTX-0478).
+    /// An over-limit system value is clipped to its bounded prefix by the
+    /// bounded read instead of being dropped (CTX-0478 review), so the OSC 52
+    /// read reply stays non-empty for a large clipboard. Headless reads still
+    /// return the buffer.
+    #[must_use]
+    pub fn get_text_lossy(&mut self) -> String {
+        self.get_text_bounded().unwrap_or_default()
+    }
+
+    /// Best-effort primary read that returns an empty string when the system
+    /// read fails, rather than replaying a stale buffer (CTX-0478). An
+    /// over-limit system value is clipped to its bounded prefix instead of
+    /// being dropped (CTX-0478 review).
     #[must_use]
     pub fn get_primary_lossy(&mut self) -> String {
-        self.get_primary()
-            .unwrap_or_else(|_| self.primary_buf.clone())
+        self.get_primary_bounded().unwrap_or_default()
     }
 
     /// Clears both system and headless clipboard to empty string.
@@ -442,6 +565,12 @@ impl Default for Clipboard {
     }
 }
 
+/// Clips `text` to at most `max_bytes`, cutting at a UTF-8 char boundary so
+/// the result is always valid UTF-8.
+///
+/// Used by the bounded reads, which deliberately clip an over-limit system
+/// value to a pasteable prefix instead of rejecting the paste. Mirrors the
+/// runtime paste gate's `truncate_paste_text` char-boundary semantics.
 fn truncate_to_bytes(text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
@@ -451,6 +580,21 @@ fn truncate_to_bytes(text: String, max_bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// Rejects a payload larger than [`CLIPBOARD_MAX_BYTES`] with a typed error.
+///
+/// The old behavior silently truncated at a UTF-8 boundary; truncation is now
+/// explicit and the caller decides how to handle the rejection (CTX-0478).
+/// The direct reads keep this rejection; the bounded reads clip instead.
+fn ensure_within_limit(len: usize) -> Result<(), PlatformError> {
+    if len > CLIPBOARD_MAX_BYTES {
+        return Err(PlatformError::ClipboardPayloadTooLarge {
+            len,
+            max: CLIPBOARD_MAX_BYTES,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(all(
@@ -760,23 +904,111 @@ mod tests {
     }
 
     #[test]
-    fn headless_truncates_at_max_bytes_on_char_boundary() {
+    fn headless_rejects_over_max_without_truncating() {
+        // CTX-0478: an over-limit payload is a typed error, never a silently
+        // shortened write; the previous value is preserved.
         let mut cb = Clipboard::new_headless();
+        cb.set_text("keep".to_string()).expect("seed");
         let long = "a".repeat(CLIPBOARD_MAX_BYTES + 100);
-        cb.set_text(long).expect("headless set");
-        assert_eq!(cb.headless_contents().len(), CLIPBOARD_MAX_BYTES);
-        assert_eq!(cb.primary_contents().len(), CLIPBOARD_MAX_BYTES);
-        // 4-byte emoji boundary
+        let err = cb.set_text(long).expect_err("over-limit set must fail");
+        match err {
+            PlatformError::ClipboardPayloadTooLarge { len, max } => {
+                assert_eq!(max, CLIPBOARD_MAX_BYTES);
+                assert_eq!(len, CLIPBOARD_MAX_BYTES + 100);
+            }
+            other => panic!("expected ClipboardPayloadTooLarge, got {other:?}"),
+        }
+        assert_eq!(cb.headless_contents(), "keep");
+        assert_eq!(cb.primary_contents(), "keep");
+        // The primary-only path is bounded the same way.
         let emoji = "😀".repeat((CLIPBOARD_MAX_BYTES / 4) + 10);
-        cb.set_text(emoji).expect("emoji set");
-        assert!(cb.headless_contents().len() <= CLIPBOARD_MAX_BYTES);
+        assert!(matches!(
+            cb.set_primary(emoji),
+            Err(PlatformError::ClipboardPayloadTooLarge { .. })
+        ));
+        assert_eq!(cb.primary_contents(), "keep");
+        // At the exact limit the write still succeeds.
+        let exact = "b".repeat(CLIPBOARD_MAX_BYTES);
+        cb.set_text(exact.clone()).expect("limit is inclusive");
+        assert_eq!(cb.headless_contents(), exact);
+    }
+
+    #[test]
+    fn headless_handles_report_no_init_error() {
+        // CTX-0478: a headless handle (by construction) has no swallowed
+        // backend failure to report.
+        let cb = Clipboard::new_headless();
+        assert_eq!(cb.headless_reason(), None);
+        assert!(format!("{cb:?}").contains("headless_reason"));
+    }
+
+    #[test]
+    fn degraded_handle_reports_the_init_error() {
+        // CTX-0478 review (non-blocking): the `Some` path of `headless_reason`
+        // was untested. `Clipboard::new` records the swallowed `arboard` init
+        // failure when no display is reachable; that state cannot be forced
+        // deterministically on a desktop, so it is constructed directly here
+        // (the mapping from `new` is exercised in degraded environments).
+        let cb = Clipboard {
+            inner: None,
+            headless_buf: String::new(),
+            primary_buf: String::new(),
+            headless_only: false,
+            init_error: Some(String::from("display unavailable")),
+            simulated_read: None,
+        };
+        assert_eq!(cb.headless_reason(), Some("display unavailable"));
+        assert!(cb.is_headless());
+        assert!(format!("{cb:?}").contains("display unavailable"));
+    }
+
+    #[test]
+    fn direct_read_rejects_over_limit_while_bounded_read_clips() {
+        // CTX-0478 review regression: an over-limit system read used to fail
+        // the paste (the typed rejection propagated out of `get_text`). The
+        // direct reads keep that typed rejection; the bounded reads used by
+        // the paste/OSC 52 seams clip at a char boundary instead.
+        let mut cb = Clipboard::new_headless();
+        cb.simulate_system_text_for_test("x".repeat(CLIPBOARD_MAX_BYTES + 64));
+        assert!(matches!(
+            cb.get_text(),
+            Err(PlatformError::ClipboardPayloadTooLarge { len, max })
+                if len == CLIPBOARD_MAX_BYTES + 64 && max == CLIPBOARD_MAX_BYTES
+        ));
+        let text = cb.get_text_bounded().expect("bounded read must succeed");
+        assert_eq!(text.len(), CLIPBOARD_MAX_BYTES);
+        assert!(text.bytes().all(|byte| byte == b'x'));
+        // The read-back buffer stays in sync with the clipped value.
+        assert_eq!(cb.headless_contents(), text);
+        assert_eq!(cb.get_text_lossy(), text);
+        assert!(matches!(
+            cb.get_primary(),
+            Err(PlatformError::ClipboardPayloadTooLarge { .. })
+        ));
+        let primary = cb
+            .get_primary_bounded()
+            .expect("bounded primary read must succeed");
+        assert_eq!(primary.len(), CLIPBOARD_MAX_BYTES);
+        assert_eq!(cb.primary_contents(), primary);
+        assert_eq!(cb.get_primary_lossy(), primary);
+        // At the cap both reads agree; nothing is clipped.
+        cb.simulate_system_text_for_test(String::from("ok"));
+        assert_eq!(cb.get_text().expect("at-limit read"), "ok");
+        assert_eq!(cb.get_text_bounded().expect("at-limit bounded read"), "ok");
+    }
+
+    #[test]
+    fn bounded_read_cuts_emoji_on_char_boundary() {
+        let mut cb = Clipboard::new_headless();
+        cb.simulate_system_text_for_test("😀".repeat((CLIPBOARD_MAX_BYTES / 4) + 10));
         assert!(
-            cb.headless_contents().len() % 4 == 0
-                || cb.headless_contents().len() < CLIPBOARD_MAX_BYTES
+            cb.get_text().is_err(),
+            "direct read must reject an over-limit system value"
         );
-        cb.set_primary("😀".repeat((CLIPBOARD_MAX_BYTES / 4) + 10))
-            .expect("emoji primary");
-        assert!(cb.primary_contents().len() <= CLIPBOARD_MAX_BYTES);
+        let text = cb.get_text_bounded().expect("bounded read must succeed");
+        assert!(text.len() <= CLIPBOARD_MAX_BYTES);
+        assert_eq!(text.len() % 4, 0, "emoji must be cut on a char boundary");
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
     }
 
     #[test]

@@ -400,6 +400,15 @@ impl<T> BoundedChannel<T> {
         self.inner.drain(..take).collect()
     }
 
+    /// Retain only the entries for which `pred` returns `true`, preserving
+    /// order. Used by timeout reaping to drop expired queued requests so
+    /// they can never be handed over for execution after their deadline.
+    /// The `dropped` counter is untouched: expirations are reported by the
+    /// reaper's return value, not conflated with eviction attribution.
+    pub fn retain(&mut self, mut pred: impl FnMut(&T) -> bool) {
+        self.inner.retain(|item| pred(item));
+    }
+
     /// Peek at the oldest entry without consuming.
     #[must_use]
     pub fn peek(&self) -> Option<&T> {
@@ -560,9 +569,13 @@ impl IpcEndpoint {
     }
 
     /// Return ids whose deadlines are at or past `now_ms`, removing them from
-    /// the pending table. Deadline order is by insertion `request.id` order;
-    /// callers must not rely on sorted-by-deadline output — they must check
-    /// each id individually.
+    /// the pending table **and** from the not-yet-handed-over request queue.
+    ///
+    /// Queue removal is load-bearing: without it an expired request stays
+    /// queued and a later `recv_request` would hand it over for execution
+    /// after its deadline (exec-after-timeout). Deadline order is by
+    /// insertion `request.id` order; callers must not rely on
+    /// sorted-by-deadline output — they must check each id individually.
     pub fn drain_expired(&mut self, now_ms: u64) -> Vec<RequestId> {
         let expired: Vec<u64> = self
             .pending
@@ -577,6 +590,9 @@ impl IpcEndpoint {
             .collect();
         for id in &expired {
             self.pending.remove(id);
+        }
+        if !expired.is_empty() {
+            self.requests.retain(|req| !expired.contains(&req.id.0));
         }
         expired.into_iter().map(RequestId).collect()
     }
@@ -707,6 +723,40 @@ mod tests {
         let expired = ep.drain_expired(1000);
         assert_eq!(expired, vec![id]);
         assert_eq!(ep.pending_count(), 0);
+    }
+
+    #[test]
+    fn drain_expired_removes_queued_requests_no_exec_after_timeout() {
+        // Hostile: a request still queued (never handed over) must not be
+        // executable after its deadline passes.
+        let mut ep = IpcEndpoint::with_capacity(8, 8);
+        let id = ep.create_request("m".into(), vec![], 0, 1000).unwrap();
+        assert_eq!(ep.request_len(), 1);
+        let expired = ep.drain_expired(1000);
+        assert_eq!(expired, vec![id]);
+        assert_eq!(ep.pending_count(), 0);
+        assert_eq!(
+            ep.request_len(),
+            0,
+            "expired request must not remain queued for execution"
+        );
+        assert!(
+            ep.recv_request().is_none(),
+            "no exec-after-timeout from the queue"
+        );
+    }
+
+    #[test]
+    fn drain_expired_keeps_live_queued_requests() {
+        let mut ep = IpcEndpoint::with_capacity(8, 8);
+        let _short = ep.create_request("a".into(), vec![], 0, 500).unwrap();
+        let live = ep.create_request("b".into(), vec![], 0, 5000).unwrap();
+        let expired = ep.drain_expired(1000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(ep.pending_count(), 1);
+        assert_eq!(ep.request_len(), 1);
+        let remaining = ep.recv_request().expect("live request survives");
+        assert_eq!(remaining.id, live);
     }
 
     #[test]

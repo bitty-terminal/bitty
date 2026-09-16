@@ -133,15 +133,37 @@ pub const INDICES_PER_QUAD: usize = 6;
 /// linear pipe and the single store-encode lifts every mid-tone
 /// (CTX-0222: gray 128 presented as 188, theme `#1e1e2e` as `(96,96,118)`).
 /// Decoding here keeps the `Srgb` target (and its correct blending) while
-/// presenting byte-exact colors.
+/// presenting byte-exact colors. The decode is table-backed (CTX-0471):
+/// see [`srgb8_to_linear_lut`].
 #[must_use]
 pub fn srgb8_to_linear(byte: u8) -> f32 {
-    let v = f32::from(byte) / 255.0;
-    if v <= 0.04045 {
-        v / 12.92
-    } else {
-        ((v + 0.055) / 1.055).powf(2.4)
-    }
+    srgb8_to_linear_lut()[usize::from(byte)]
+}
+
+/// Process-wide decode table for every 8-bit sRGB value (CTX-0471).
+///
+/// A full frame decodes two RGB triples per fill quad; evaluating two
+/// `powf` calls per channel per quad is measurable CPU on the present
+/// path. The EOTF input domain is exactly 256 values, so it is tabulated
+/// once (`OnceLock`) and every lookup after the first is a bounds-checked
+/// array index. Values are bit-identical to the evaluated formula.
+static SRGB8_TO_LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+
+/// Returns the shared 256-entry decode table, building it on first use.
+#[must_use]
+fn srgb8_to_linear_lut() -> &'static [f32; 256] {
+    SRGB8_TO_LINEAR.get_or_init(|| {
+        let mut table = [0.0_f32; 256];
+        for (slot, byte) in table.iter_mut().zip(0u8..=u8::MAX) {
+            let v = f32::from(byte) / 255.0;
+            *slot = if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            };
+        }
+        table
+    })
 }
 
 /// Converts straight-alpha `Rgba8` bytes to normalized shader floats.
@@ -1149,6 +1171,37 @@ mod tests {
         assert_eq!(srgb8_to_linear(255), 1.0);
         // Low-end linear branch (v <= 0.04045, i.e. byte <= 10).
         assert!((srgb8_to_linear(10) - (10.0 / 255.0) / 12.92).abs() < 1e-7);
+    }
+
+    #[test]
+    fn srgb_decode_is_table_backed_and_byte_exact() {
+        // One shared 256-entry table serves every lookup (no per-call
+        // `powf`), and every entry equals the EOTF reference bit-for-bit.
+        let table = srgb8_to_linear_lut();
+        assert_eq!(table.len(), 256);
+        assert!(std::ptr::eq(table, srgb8_to_linear_lut()));
+
+        let reference = |byte: u8| -> f32 {
+            let v = f32::from(byte) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        for byte in 0u8..=255 {
+            let expected = reference(byte);
+            assert_eq!(
+                srgb8_to_linear(byte).to_bits(),
+                expected.to_bits(),
+                "lookup byte {byte:#04X}"
+            );
+            assert_eq!(
+                table[usize::from(byte)].to_bits(),
+                expected.to_bits(),
+                "table byte {byte:#04X}"
+            );
+        }
     }
 
     #[test]

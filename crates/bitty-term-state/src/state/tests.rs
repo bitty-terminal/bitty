@@ -644,6 +644,40 @@ fn locking_shift_g2_locks_gl_until_changed() {
 }
 
 #[test]
+fn ctx_0469_origin_cpr_with_cursor_above_region_saturates() {
+    // Hostile probe (CTX-0469): DECSC saves (row, origin) together, but a
+    // later DECSTBM homes only the live cursor. DECRC then restores a
+    // cursor above the region with origin mode on; the post-action clamp
+    // pulls it into the region and DSR-CPR stays sane (no panic).
+    let mut s = State::new();
+    s.apply(&TerminalAction::SetScrollRegion {
+        top: Row(5),
+        bottom: Row(10),
+    });
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::Origin,
+        enabled: true,
+    });
+    assert_eq!(s.cursor().position.row, 4);
+    s.apply(&TerminalAction::CursorSave);
+    s.apply(&TerminalAction::SetScrollRegion {
+        top: Row(8),
+        bottom: Row(10),
+    });
+    s.apply(&TerminalAction::CursorRestore);
+    // Restored above the region: clamped to the region top.
+    assert_eq!(s.cursor().position.row, 7);
+    assert!(s.modes().origin);
+    s.apply(&TerminalAction::RequestDeviceStatus {
+        kind: StatusKind::CursorPosition,
+    });
+    let replies = s.take_replies();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(&replies[0][..], b"\x1b[1;1R");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn single_shift_g2_applies_to_one_scalar_only() {
     // SS2 (`ESC N`) submits `SingleShiftCharset G2`: exactly one print is
     // translated and the locking shift is untouched.
@@ -659,5 +693,103 @@ fn single_shift_g2_applies_to_one_scalar_only() {
     let snap = s.snapshot();
     assert_eq!(snap.cells[0].glyph, '\u{2500}');
     assert_eq!(snap.cells[1].glyph, 'q');
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0469_origin_cpr_bare_subtraction_saturates() {
+    // White-box companion (CTX-0469): even if the cursor ever sits above
+    // the region with origin mode on, the CPR synthesis must saturate
+    // instead of panicking on a bare u16 subtraction.
+    let mut s = State::new();
+    s.cursor.position.row = 4;
+    s.cursor.position.col = 2;
+    s.modes.origin = true;
+    s.scroll_region_top = 7;
+    s.scroll_region_bottom = 9;
+    s.request_device_status(StatusKind::CursorPosition);
+    let replies = s.take_replies();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(&replies[0][..], b"\x1b[1;3R");
+}
+
+#[test]
+fn ctx_0469_hyperlink_table_evicts_oldest_and_keeps_accepting() {
+    // Hostile probe (CTX-0469): past 1024 distinct links the table must
+    // evict oldest-first (ImageStore precedent) instead of degrading every
+    // future link to None permanently. Evicted ids fail closed (None).
+    use crate::state::HYPERLINK_TABLE_MAX;
+    let mut s = State::new();
+    let link = |i: usize| bitty_vt::Hyperlink {
+        id: None,
+        uri: BoundedString::new(format!("https://example.invalid/{i}")),
+    };
+    s.apply(&TerminalAction::OscHyperlink {
+        link: Some(link(0)),
+    });
+    let first_id = s.current_hyperlink().expect("first link accepted");
+    assert_eq!(
+        s.hyperlink_entry(first_id),
+        Some((None, "https://example.invalid/0"))
+    );
+    for i in 1..=HYPERLINK_TABLE_MAX + 4 {
+        s.apply(&TerminalAction::OscHyperlink {
+            link: Some(link(i)),
+        });
+        assert!(
+            s.current_hyperlink().is_some(),
+            "link {i} must still be accepted past capacity"
+        );
+    }
+    assert_eq!(s.hyperlink_count(), HYPERLINK_TABLE_MAX);
+    assert!(
+        s.hyperlink_entry(first_id).is_none(),
+        "evicted id must fail closed"
+    );
+    let newest = s.current_hyperlink().expect("newest link accepted");
+    assert_eq!(
+        s.hyperlink_entry(newest),
+        Some((None, "https://example.invalid/1028"))
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0469_live_grid_row_matches_snapshot_row() {
+    // The zero-copy search/render path must observe exactly what the
+    // cloning snapshot path observes.
+    let mut s = State::new();
+    prints(&mut s, "hello 中 world");
+    let snap = s.snapshot();
+    assert_eq!(snap.width, GRID_COLUMNS);
+    for row in 0..snap.height {
+        let live = s.live_grid_row(row).expect("row in bounds");
+        let start = row * snap.width;
+        assert_eq!(live, &snap.cells[start..start + snap.width]);
+    }
+    assert!(s.live_grid_row(snap.height).is_none());
+}
+
+#[test]
+fn ctx_0469_height_only_resize_keeps_wraps_and_content() {
+    // End-to-end companion of the grid probe: State height-only resizes
+    // preserve continuation flags and overlapping cells.
+    let mut s = State::new();
+    prints(&mut s, &"x".repeat(GRID_COLUMNS));
+    prints(&mut s, "yz");
+    let before = s.snapshot();
+    assert!(before.cells[GRID_COLUMNS] != before.cells[GRID_COLUMNS + 1]);
+    assert!(
+        s.screens.main.wrapped(0),
+        "row 0 continues onto row 1 after wrap"
+    );
+    s.resize(GRID_COLUMNS, GRID_ROWS + 4);
+    assert_eq!(s.height(), GRID_ROWS + 4);
+    assert!(
+        s.screens.main.wrapped(0),
+        "height-only resize keeps continuation flags"
+    );
+    let after = s.snapshot();
+    assert_eq!(&after.cells[..GRID_COLUMNS], &before.cells[..GRID_COLUMNS]);
     assert!(s.check_invariants().is_ok());
 }

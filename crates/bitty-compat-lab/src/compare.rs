@@ -52,6 +52,26 @@ pub const EXPECTED_HEIGHT: usize = 24;
 /// bumps and rejected regenerated baselines).
 pub const EXPECTED_HASH_VERSION: u32 = bitty_term_state::canonical_public::CANONICAL_HASH_VERSION;
 
+/// Reference terminals for the differential columns, in fixed order.
+///
+/// Single source of truth shared with the release matrix
+/// ([`crate::matrix::REFERENCE_TERMS`]); never duplicate the list.
+pub const REFERENCE_BACKENDS: &[&str] = &["ghostty", "kitty", "wezterm", "alacritty"];
+
+/// Differential status for one reference backend on one corpus.
+///
+/// `Absent` means no reference dump exists for the corpus — it is not a claim
+/// that the backend agreed, and it must never be rendered as `PASS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceOutcome {
+    /// Replay text matched the backend dump.
+    Match,
+    /// Replay text differed from the backend dump.
+    Mismatch,
+    /// No dump for this corpus; nothing was compared.
+    Absent,
+}
+
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
     // Canonical singular `recording/` (workspace rename); legacy plural
     // `recordings/` retained as fallback only, always after the singular
@@ -441,7 +461,7 @@ fn load_reference_texts_for_corpus(corpus_rel: &str) -> Vec<(String, String)> {
     // when available; otherwise graceful skip. Each file is bounded.
     // CTX-0114 adds `alacritty` as fourth terminal for release matrix.
     let mut out = Vec::new();
-    for backend in ["ghostty", "kitty", "wezterm", "alacritty"] {
+    for backend in REFERENCE_BACKENDS {
         for dir in reference_dir(backend) {
             if !dir.is_dir() {
                 continue;
@@ -596,6 +616,32 @@ fn compare_one_self(dump: &BittyDump) -> Option<String> {
     // once per batch but `damage_since` can remain empty. No invariant here;
     // generation accounting is proven separately by `State::check_invariants`.
     None
+}
+
+/// Differential status of every reference backend for one corpus.
+///
+/// Returns `(backend, outcome)` in [`REFERENCE_BACKENDS`] order, computed from
+/// the reference dumps on disk. A backend with no dump for this corpus is
+/// [`ReferenceOutcome::Absent`] — the matrix must render it as a skip, never
+/// as agreement (CTX-0484).
+#[must_use]
+pub fn reference_outcomes_for_corpus(
+    corpus_rel: &str,
+    snapshot: &bitty_term_state::Snapshot,
+) -> Vec<(&'static str, ReferenceOutcome)> {
+    let refs = load_reference_texts_for_corpus(corpus_rel);
+    let ours_text = snapshot_to_text(snapshot);
+    REFERENCE_BACKENDS
+        .iter()
+        .map(|backend| {
+            let outcome = match refs.iter().find(|(b, _)| b == backend) {
+                Some((_, text)) if *text == ours_text => ReferenceOutcome::Match,
+                Some(_) => ReferenceOutcome::Mismatch,
+                None => ReferenceOutcome::Absent,
+            };
+            (*backend, outcome)
+        })
+        .collect()
 }
 
 /// Compare a single dump against self-consistency and any reference backends.

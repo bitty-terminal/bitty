@@ -24,7 +24,10 @@
 //! workspace). Idle workspaces (no pane sessions — a fresh shell on the
 //! runtime-global primary counts as idle) close immediately. The primary
 //! PTY is runtime-global, not workspace-owned, so closing never tears it
-//! down; primary-shell teardown on workspace close is a follow-up.
+//! down; primary-shell teardown on workspace close is a follow-up. A close
+//! that destroys the primary owner re-homes the grid onto the loaded slot's
+//! focused leaf and drains that leaf's pending restore into the primary grid
+//! (CTX-0501), so no pending entry is stranded without a spawn path.
 //!
 //! Move discipline (CTX-0259, never a kill): [`Runtime::workspace_move_focused_to`]
 //! reparents the focused leaf (with its pane session, untouched) into the
@@ -575,6 +578,16 @@ impl Runtime {
             if !self.live_view_raws().contains(&owner.0) {
                 self.primary_view = self.focus.focused();
                 self.sync_primary_geometry();
+                // CTX-0501: the re-homed leaf may still carry a pending
+                // restore. Primary ownership supersedes the pane spawn — the
+                // hook below skips the owner by design — so drain that
+                // history into the primary grid (parity with
+                // `rehydrate_pane`'s owner branch and the startup primary
+                // attach). Otherwise the entry lingers with no path that can
+                // ever spawn it and `session_pending_len` misreports.
+                if let Some(new_owner) = self.primary_view {
+                    let _ = self.hydrate_session_pending_for(new_owner);
+                }
             }
         }
         // CTX-0461 (CTX-0393 P3 follow-up): the close path installs a slot

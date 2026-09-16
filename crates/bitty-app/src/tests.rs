@@ -182,6 +182,21 @@ fn parse_headless_flag() {
     assert!(p.headless && p.help);
 }
 
+// CTX-0506 test-mode E2E surface: the opt-in flag, never ambient.
+#[test]
+fn parse_test_mode_flag() {
+    assert!(
+        !parse_args(&args_of(&["bitty"])).test_mode,
+        "test mode is opt-in only"
+    );
+    assert!(parse_args(&args_of(&["bitty", "--test-mode"])).test_mode);
+    // `--` escape hatch: `--test-mode` after `--` is a program name.
+    let p = parse_args(&args_of(&["bitty", "--", "--test-mode"]));
+    assert!(!p.test_mode);
+    assert_eq!(p.program.as_deref(), Some("--test-mode"));
+    assert!(help_text().contains("--test-mode"));
+}
+
 // CTX-0481 fail-loud startup: the opt-in flag and the IPC failure policy.
 #[test]
 fn parse_fail_loud_flag() {

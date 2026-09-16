@@ -12,6 +12,10 @@
 #       version (leading `v` optional). The release workflow runs this mode on
 #       tag pushes so `bitty --version` always matches the release tag
 #       (issue #227: version used to lie at 0.0.1 while packages moved on).
+#   scripts/check-release-version.sh --print
+#       Print the workspace version and exit 0. Release jobs use this to name
+#       artifacts (DMG, portable ZIP) on workflow_dispatch runs, where no tag
+#       supplies the version.
 #
 # Fails non-zero on any mismatch. Bumps happen by changing the workspace
 # version (single source of truth) plus the packaging files together, in the
@@ -20,6 +24,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXPECTED_TAG_VERSION=""
+PRINT_ONLY=0
+
+if [[ "${1:-}" == "--print" ]]; then
+	PRINT_ONLY=1
+	shift
+fi
 
 if [[ "${1:-}" == "--tag" ]]; then
 	EXPECTED_TAG_VERSION="${2:-}"
@@ -56,6 +66,12 @@ nfpm_version() {
 	[[ -n "$ver" ]] || fail "could not parse version from nfpm.yaml"
 	printf '%s' "$ver"
 }
+
+if [[ "$PRINT_ONLY" -eq 1 ]]; then
+	workspace_version
+	echo
+	exit 0
+fi
 
 WS_VER="$(workspace_version)"
 echo "check-release-version: workspace version = $WS_VER"

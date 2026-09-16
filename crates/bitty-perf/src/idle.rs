@@ -340,6 +340,20 @@ fn sample_self_cpu_pct() -> Option<f64> {
     }
 }
 
+/// Verdict for the PB-7 CPU-budget sample.
+///
+/// Absence of a sample is not evidence of compliance: an unavailable sample is
+/// [`Unmeasured`](Self::Unmeasured), never `Met` (CTX-0484).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuBudgetVerdict {
+    /// Sample present and at or below `PB7_IDLE_CPU_PCT`.
+    Met,
+    /// Sample present and above `PB7_IDLE_CPU_PCT`.
+    Exceeded,
+    /// No usable sample (e.g. `ps` unavailable); the budget is unverified.
+    Unmeasured,
+}
+
 impl IdleReport {
     /// Returns `true` when all frame-on-demand checks passed.
     #[must_use]
@@ -347,11 +361,21 @@ impl IdleReport {
         self.checks.iter().all(|c| c.passed) && self.clean_is_clean
     }
 
-    /// Returns `true` when PB-7 CPU budget (≤1 %) is met for the sampled value.
+    /// PB-7 CPU verdict for the bounded sample (fail-closed when absent).
+    #[must_use]
+    pub fn cpu_budget_verdict(&self) -> CpuBudgetVerdict {
+        match self.sampled_cpu_pct {
+            Some(pct) if pct <= super::PB7_IDLE_CPU_PCT as f64 => CpuBudgetVerdict::Met,
+            Some(_) => CpuBudgetVerdict::Exceeded,
+            None => CpuBudgetVerdict::Unmeasured,
+        }
+    }
+
+    /// Returns `true` only when a CPU sample exists and is within the PB-7
+    /// budget. An unmeasured budget is reported as not met, never as passing.
     #[must_use]
     pub fn meets_cpu_budget(&self) -> bool {
-        self.sampled_cpu_pct
-            .is_none_or(|pct| pct <= super::PB7_IDLE_CPU_PCT as f64)
+        matches!(self.cpu_budget_verdict(), CpuBudgetVerdict::Met)
     }
 
     /// Formats a human-readable summary for bench output and evidence docs.
@@ -367,7 +391,7 @@ impl IdleReport {
             self.clean_is_clean,
             self.sampled_cpu_pct
                 .map(|pct| format!("{pct:.2}%"))
-                .unwrap_or_else(|| "n/a (ps unavailable)".to_string()),
+                .unwrap_or_else(|| "unmeasured (no sample)".to_string()),
             super::PB7_IDLE_CPU_PCT,
             self.elapsed.as_secs_f64() * 1000.0
         ));
@@ -380,11 +404,13 @@ impl IdleReport {
             ));
         }
         // PB-7 verdict: zero wakeups == every idle tick returns None, so
-        // Wait loop burns no CPU beyond damage check. CPU sample is a soft proxy.
-        let cpu_verdict = if self.meets_cpu_budget() {
-            "PASS"
-        } else {
-            "ABOVE_BUDGET"
+        // Wait loop burns no CPU beyond damage check. The CPU sample is a
+        // soft, bounded proxy; an absent sample is reported UNMEASURED
+        // rather than passing vacuously (CTX-0484).
+        let cpu_verdict = match self.cpu_budget_verdict() {
+            CpuBudgetVerdict::Met => "PASS",
+            CpuBudgetVerdict::Exceeded => "ABOVE_BUDGET",
+            CpuBudgetVerdict::Unmeasured => "UNMEASURED",
         };
         out.push_str(&format!(
             "  PB-7 verdict: frame-on-demand={} cpu {cpu_verdict} — zero periodic wakeups when idle (tick==None)\n",
@@ -444,5 +470,51 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing idle check {expected}");
         }
+    }
+
+    #[test]
+    fn probe_unmeasured_cpu_sample_is_not_met() {
+        // CTX-0484 probe: an unavailable CPU sample (e.g. no `ps`) must never
+        // read as "met". Fails before the fix because `is_none_or` vacuously
+        // passes when the sample is `None`.
+        let report = IdleReport {
+            checks: Vec::new(),
+            idle_tick_mean_us: 0.0,
+            clean_render_mean_us: 0.0,
+            clean_is_clean: true,
+            sampled_cpu_pct: None,
+            elapsed: Duration::ZERO,
+        };
+        assert!(
+            !report.meets_cpu_budget(),
+            "a missing CPU sample must not be reported as within budget"
+        );
+    }
+
+    #[test]
+    fn cpu_budget_verdict_is_tri_state_and_fail_closed() {
+        let with_sample = |pct: Option<f64>| IdleReport {
+            checks: Vec::new(),
+            idle_tick_mean_us: 0.0,
+            clean_render_mean_us: 0.0,
+            clean_is_clean: true,
+            sampled_cpu_pct: pct,
+            elapsed: Duration::ZERO,
+        };
+
+        let within = with_sample(Some(0.5));
+        assert_eq!(within.cpu_budget_verdict(), CpuBudgetVerdict::Met);
+        assert!(within.meets_cpu_budget());
+
+        let over = with_sample(Some(super::super::PB7_IDLE_CPU_PCT as f64 + 0.1));
+        assert_eq!(over.cpu_budget_verdict(), CpuBudgetVerdict::Exceeded);
+        assert!(!over.meets_cpu_budget());
+
+        let unmeasured = with_sample(None);
+        assert_eq!(
+            unmeasured.cpu_budget_verdict(),
+            CpuBudgetVerdict::Unmeasured
+        );
+        assert!(!unmeasured.meets_cpu_budget());
     }
 }

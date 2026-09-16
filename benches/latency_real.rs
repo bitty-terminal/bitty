@@ -12,7 +12,8 @@
 #![forbid(unsafe_code)]
 
 use bitty_perf::latency::{
-    HEADLESS_BUDGET_SAMPLES, HEADLESS_WALL_CLOCK_CEILING_MS, measure_latency,
+    HEADLESS_BUDGET_SAMPLES, HEADLESS_SHARED_RUNNER_FACTOR, HEADLESS_WALL_CLOCK_CEILING_MS,
+    HEADLESS_WORK_P50_CEILING_MS, HEADLESS_WORK_P99_CEILING_MS, measure_latency,
     measure_latency_with_pty_echo,
 };
 
@@ -71,8 +72,35 @@ fn main() {
         "sanity: p99 should stay << {HEADLESS_WALL_CLOCK_CEILING_MS:.0} ms even on CI (got {:.3} ms)",
         fast.p99_ms
     );
+    // CTX-0484: the wall-clock ceiling is a liveness guard only. The real
+    // budget is asserted on measured pipeline work (stage-sum, no scheduler
+    // gaps) within the documented shared-runner allowance.
+    assert!(
+        fast.p50_work_ms < HEADLESS_WORK_P50_CEILING_MS,
+        "work p50 {:.3} ms must be < {:.0} ms (PB-4 p50 × {HEADLESS_SHARED_RUNNER_FACTOR} shared-runner factor)",
+        fast.p50_work_ms,
+        HEADLESS_WORK_P50_CEILING_MS
+    );
+    assert!(
+        fast.p99_work_ms < HEADLESS_WORK_P99_CEILING_MS,
+        "work p99 {:.3} ms must be < {:.0} ms (PB-4 p99 × {HEADLESS_SHARED_RUNNER_FACTOR} shared-runner factor)",
+        fast.p99_work_ms,
+        HEADLESS_WORK_P99_CEILING_MS
+    );
     println!(
-        "sanity {HEADLESS_BUDGET_SAMPLES}-sample p99 {:.3} ms within headroom",
-        fast.p99_ms
+        "sanity {HEADLESS_BUDGET_SAMPLES}-sample p99 {:.3} ms within headroom; work p50 {:.3} ms / p99 {:.3} ms ({} {})",
+        fast.p99_ms,
+        fast.p50_work_ms,
+        fast.p99_work_ms,
+        if fast.meets_work_p50() {
+            "PB-4 work p50 PASS"
+        } else {
+            "PB-4 work p50 ABOVE"
+        },
+        if fast.meets_work_p99() {
+            "PB-4 work p99 PASS"
+        } else {
+            "PB-4 work p99 ABOVE"
+        }
     );
 }

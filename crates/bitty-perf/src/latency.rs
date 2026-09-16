@@ -48,6 +48,24 @@ pub const HEADLESS_BUDGET_SAMPLES: usize = 200;
 /// where the test thread can be descheduled for a whole quantum.
 pub const HEADLESS_WALL_CLOCK_CEILING_MS: f64 = 120.0;
 
+/// Shared-runner allowance applied to the PB-4 budget for the headless
+/// *work* ceilings (the sum of measured stage durations, which excludes the
+/// scheduler gaps that inflate wall clock).
+///
+/// The exact PB-4 budgets are gated by `benches/latency_real.rs` and Tier 1
+/// evidence. This factor only covers cache/CPU contention on a shared runner;
+/// a real regression of the pipeline itself still trips the ceiling, because
+/// work is measured over the stage timers rather than the whole run.
+pub const HEADLESS_SHARED_RUNNER_FACTOR: f64 = 4.0;
+
+/// Headless work ceiling (ms) for p50: PB-4 p50 × [`HEADLESS_SHARED_RUNNER_FACTOR`].
+pub const HEADLESS_WORK_P50_CEILING_MS: f64 =
+    super::PB4_LATENCY_MS_P50 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
+
+/// Headless work ceiling (ms) for p99: PB-4 p99 × [`HEADLESS_SHARED_RUNNER_FACTOR`].
+pub const HEADLESS_WORK_P99_CEILING_MS: f64 =
+    super::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
+
 /// Creates a deterministic `KeyEvent` for a printable character `c`.
 ///
 /// Pure, headless, bounded — no window required.
@@ -82,6 +100,29 @@ fn named_key_event(key: NamedKey) -> KeyEvent {
 // Sample
 // ---------------------------------------------------------------------------
 
+/// Which measurement path produced a [`LatencyReport`].
+///
+/// Reported explicitly so a silent fallback to the synthetic echo model is
+/// never read as real-PTY evidence (CTX-0484).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyMode {
+    /// Key bytes injected straight into `handle_pty_bytes` (no child process).
+    InjectedEcho,
+    /// A real `cat` child echoed the bytes through the PTY (`poll_pty`).
+    RealPtyEcho,
+}
+
+impl LatencyMode {
+    /// Stable lower-case label used in summaries and evidence.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InjectedEcho => "injected-echo",
+            Self::RealPtyEcho => "real-pty-echo",
+        }
+    }
+}
+
 /// One key-to-screen latency sample with stage breakdown (all bounded tracing).
 #[derive(Debug, Clone, Copy)]
 pub struct LatencySample {
@@ -110,6 +151,21 @@ impl LatencySample {
     pub fn total_ms(&self) -> f64 {
         self.total.as_secs_f64() * 1000.0
     }
+
+    /// Sum of the measured stage durations (pipeline work).
+    ///
+    /// Unlike [`total`](Self::total), this excludes the scheduler gaps between
+    /// stages, so it is the cost the pipeline itself controls (CTX-0484).
+    #[must_use]
+    pub fn work(&self) -> Duration {
+        self.encode + self.handle_key + self.pty_to_state + self.render_present
+    }
+
+    /// Pipeline work in milliseconds.
+    #[must_use]
+    pub fn work_ms(&self) -> f64 {
+        self.work().as_secs_f64() * 1000.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +185,14 @@ pub struct LatencyReport {
     pub mean_ms: f64,
     /// Max total ms.
     pub max_ms: f64,
+    /// p50 of measured pipeline work (stage-sum) ms.
+    pub p50_work_ms: f64,
+    /// p99 of measured pipeline work (stage-sum) ms.
+    pub p99_work_ms: f64,
+    /// Fastest presented sample's pipeline work (stage-sum) ms.
+    pub min_work_ms: f64,
+    /// Which measurement path produced the samples (never inferred).
+    pub mode: LatencyMode,
     /// Whether headless software seam was used (no real compositor).
     pub headless: bool,
     /// Number of samples that failed to present (should be 0 for this tracer).
@@ -141,6 +205,28 @@ fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
     }
     let rank = (pct / 100.0 * (sorted_ms.len() as f64 - 1.0)).round() as usize;
     sorted_ms[rank.min(sorted_ms.len() - 1)]
+}
+
+fn mean(sorted_ms: &[f64]) -> f64 {
+    if sorted_ms.is_empty() {
+        0.0
+    } else {
+        sorted_ms.iter().sum::<f64>() / sorted_ms.len() as f64
+    }
+}
+
+/// Presented wall-clock totals and pipeline work, sorted ascending.
+fn presented_series(samples: &[LatencySample]) -> (Vec<f64>, Vec<f64>) {
+    let mut totals = Vec::with_capacity(samples.len());
+    let mut work = Vec::with_capacity(samples.len());
+    for s in samples.iter().filter(|s| s.presented) {
+        totals.push(s.total_ms());
+        work.push(s.work_ms());
+    }
+    let cmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    totals.sort_by(cmp);
+    work.sort_by(cmp);
+    (totals, work)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,20 +333,7 @@ pub fn measure_latency(iterations: usize) -> LatencyReport {
     }
 
     // Percentiles over presented samples only (idle no-damage ticks are not latency).
-    let mut presented_ms: Vec<f64> = samples
-        .iter()
-        .filter(|s| s.presented)
-        .map(|s| s.total_ms())
-        .collect();
-    presented_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p50 = percentile(&presented_ms, 50.0);
-    let p99 = percentile(&presented_ms, 99.0);
-    let mean = if presented_ms.is_empty() {
-        0.0
-    } else {
-        presented_ms.iter().sum::<f64>() / presented_ms.len() as f64
-    };
-    let max = presented_ms.last().copied().unwrap_or(0.0);
+    let (presented_ms, presented_work) = presented_series(&samples);
     let headless = samples.first().is_some_and(|_| {
         // Runtime is headless by construction in this tracer (is_headless true)
         // unless a real GPU was attached externally.
@@ -269,10 +342,14 @@ pub fn measure_latency(iterations: usize) -> LatencyReport {
 
     LatencyReport {
         samples,
-        p50_ms: p50,
-        p99_ms: p99,
-        mean_ms: mean,
-        max_ms: max,
+        p50_ms: percentile(&presented_ms, 50.0),
+        p99_ms: percentile(&presented_ms, 99.0),
+        mean_ms: mean(&presented_ms),
+        max_ms: presented_ms.last().copied().unwrap_or(0.0),
+        p50_work_ms: percentile(&presented_work, 50.0),
+        p99_work_ms: percentile(&presented_work, 99.0),
+        min_work_ms: presented_work.first().copied().unwrap_or(0.0),
+        mode: LatencyMode::InjectedEcho,
         headless,
         idle_misses,
     }
@@ -369,45 +446,54 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
         }
     }
 
-    let mut presented_ms: Vec<f64> = samples
-        .iter()
-        .filter(|s| s.presented)
-        .map(|s| s.total_ms())
-        .collect();
-    presented_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p50 = percentile(&presented_ms, 50.0);
-    let p99 = percentile(&presented_ms, 99.0);
-    let mean = if presented_ms.is_empty() {
-        0.0
-    } else {
-        presented_ms.iter().sum::<f64>() / presented_ms.len() as f64
-    };
-    let max = presented_ms.last().copied().unwrap_or(0.0);
+    let (presented_ms, presented_work) = presented_series(&samples);
 
     LatencyReport {
         samples,
-        p50_ms: p50,
-        p99_ms: p99,
-        mean_ms: mean,
-        max_ms: max,
+        p50_ms: percentile(&presented_ms, 50.0),
+        p99_ms: percentile(&presented_ms, 99.0),
+        mean_ms: mean(&presented_ms),
+        max_ms: presented_ms.last().copied().unwrap_or(0.0),
+        p50_work_ms: percentile(&presented_work, 50.0),
+        p99_work_ms: percentile(&presented_work, 99.0),
+        min_work_ms: presented_work.first().copied().unwrap_or(0.0),
+        mode: LatencyMode::RealPtyEcho,
         headless: rt.is_headless(),
         idle_misses,
     }
 }
 
 impl LatencyReport {
-    /// Returns `true` when PB-4 p50 (8 ms) is met.
+    /// Returns `true` when PB-4 p50 (8 ms) is met on the wall clock.
     #[must_use]
     pub fn meets_p50(&self) -> bool {
         self.p50_ms <= super::PB4_LATENCY_MS_P50 as f64
     }
-    /// Returns `true` when PB-4 p99 (15 ms) is met.
+    /// Returns `true` when PB-4 p99 (15 ms) is met on the wall clock.
     #[must_use]
     pub fn meets_p99(&self) -> bool {
         self.p99_ms <= super::PB4_LATENCY_MS_P99 as f64
     }
+    /// Returns `true` when the measured pipeline work meets PB-4 p50.
+    ///
+    /// This is the budget verdict that is not diluted by scheduler gaps: a
+    /// wall-clock percentile can only be missed because of them, never met
+    /// because of them.
+    #[must_use]
+    pub fn meets_work_p50(&self) -> bool {
+        self.p50_work_ms <= super::PB4_LATENCY_MS_P50 as f64
+    }
+    /// Returns `true` when the measured pipeline work meets PB-4 p99.
+    #[must_use]
+    pub fn meets_work_p99(&self) -> bool {
+        self.p99_work_ms <= super::PB4_LATENCY_MS_P99 as f64
+    }
 
     /// Formats a human-readable summary for bench output and evidence docs.
+    ///
+    /// Discloses the measurement [`mode`](Self::mode) and the work cost so a
+    /// fallback run is never mistaken for real-PTY evidence and the PB-4
+    /// verdict can be read off the reported work percentiles.
     #[must_use]
     pub fn format_summary(&self) -> String {
         let verdict = if self.meets_p50() && self.meets_p99() {
@@ -417,15 +503,26 @@ impl LatencyReport {
         } else {
             "ABOVE_BUDGET"
         };
+        let work_verdict = if self.meets_work_p50() && self.meets_work_p99() {
+            "work PASS p50+p99"
+        } else if self.meets_work_p50() {
+            "work PASS p50 (p99 exceeded)"
+        } else {
+            "work ABOVE_BUDGET"
+        };
         let mut out = String::new();
         out.push_str(&format!(
-            "latency — p50 {:.3} ms / p99 {:.3} ms / mean {:.3} ms / max {:.3} ms (budget p50 {} ms p99 {} ms) headless={} idle_misses={} [{verdict}]\n",
+            "latency — mode={} p50 {:.3} ms / p99 {:.3} ms / mean {:.3} ms / max {:.3} ms (budget p50 {} ms p99 {} ms) work p50 {:.3} ms / p99 {:.3} ms / min {:.3} ms headless={} idle_misses={} [{verdict}; {work_verdict}]\n",
+            self.mode.label(),
             self.p50_ms,
             self.p99_ms,
             self.mean_ms,
             self.max_ms,
             super::PB4_LATENCY_MS_P50,
             super::PB4_LATENCY_MS_P99,
+            self.p50_work_ms,
+            self.p99_work_ms,
+            self.min_work_ms,
             self.headless,
             self.idle_misses
         ));
@@ -493,6 +590,27 @@ mod tests {
             report.p99_ms,
             HEADLESS_WALL_CLOCK_CEILING_MS
         );
+        // CTX-0484: the wall-clock ceilings above are only a liveness/pathology
+        // guard. The real budget is asserted on measured *work* (stage-sum,
+        // which excludes scheduler gaps between stages) within the documented
+        // shared-runner allowance; `pb4_work_budget_classification_is_exact`
+        // pins the exact 8/15 ms verdicts that the bench/Tier 1 gate owns.
+        assert!(
+            report.p50_work_ms < HEADLESS_WORK_P50_CEILING_MS,
+            "work p50 {:.3} ms must be < {:.0} ms (PB-4 p50 {} ms × {} shared-runner factor)",
+            report.p50_work_ms,
+            HEADLESS_WORK_P50_CEILING_MS,
+            crate::PB4_LATENCY_MS_P50,
+            HEADLESS_SHARED_RUNNER_FACTOR
+        );
+        assert!(
+            report.p99_work_ms < HEADLESS_WORK_P99_CEILING_MS,
+            "work p99 {:.3} ms must be < {:.0} ms (PB-4 p99 {} ms × {} shared-runner factor)",
+            report.p99_work_ms,
+            HEADLESS_WORK_P99_CEILING_MS,
+            crate::PB4_LATENCY_MS_P99,
+            HEADLESS_SHARED_RUNNER_FACTOR
+        );
         // Bounded stage tracing: encode is the hot-path stage whose work must
         // stay sub-millisecond; the pathological guard stays.
         for s in &report.samples {
@@ -505,6 +623,69 @@ mod tests {
             presented >= report.samples.len() / 2,
             "presented {presented}/{} must be >= half",
             report.samples.len()
+        );
+    }
+
+    #[test]
+    fn pb4_work_budget_classification_is_exact() {
+        // CTX-0484: the real PB-4 ceilings (p50 8 ms / p99 15 ms) are
+        // classified on measured work, deterministically and independently of
+        // the runner. A synthetic distribution above the budget must be
+        // reported as above budget, not masked by loose wall-clock ceilings.
+        let sample = |work_ms: f64| LatencySample {
+            total: Duration::from_secs_f64(work_ms / 1000.0),
+            encode: Duration::ZERO,
+            handle_key: Duration::ZERO,
+            pty_to_state: Duration::ZERO,
+            render_present: Duration::from_secs_f64(work_ms / 1000.0),
+            presented: true,
+        };
+        let report = |work: &[f64]| {
+            let samples: Vec<LatencySample> = work.iter().copied().map(sample).collect();
+            let (totals, work) = presented_series(&samples);
+            LatencyReport {
+                samples,
+                p50_ms: percentile(&totals, 50.0),
+                p99_ms: percentile(&totals, 99.0),
+                mean_ms: mean(&totals),
+                max_ms: totals.last().copied().unwrap_or(0.0),
+                p50_work_ms: percentile(&work, 50.0),
+                p99_work_ms: percentile(&work, 99.0),
+                min_work_ms: work.first().copied().unwrap_or(0.0),
+                mode: LatencyMode::InjectedEcho,
+                headless: true,
+                idle_misses: 0,
+            }
+        };
+
+        let within = report(&[1.0; 200]);
+        assert!(within.meets_work_p50(), "1 ms work meets the 8 ms p50");
+        assert!(within.meets_work_p99(), "1 ms work meets the 15 ms p99");
+
+        let above_p50 = report(&[9.0; 200]);
+        assert!(
+            !above_p50.meets_work_p50(),
+            "9 ms work must fail the 8 ms p50"
+        );
+        assert!(
+            above_p50.meets_work_p99(),
+            "9 ms work is still inside the 15 ms p99"
+        );
+
+        // A stalled tail misses p99 while the median stays inside p50: the two
+        // verdicts are independent and each compares its own percentile.
+        let mut skewed = vec![1.0; 197];
+        skewed.extend([100.0, 100.0, 100.0]);
+        let skewed = report(&skewed);
+        assert!(
+            skewed.meets_work_p50(),
+            "median work {:.3} ms is inside the 8 ms p50",
+            skewed.p50_work_ms
+        );
+        assert!(
+            !skewed.meets_work_p99(),
+            "p99 work {:.3} ms must fail the 15 ms p99",
+            skewed.p99_work_ms
         );
     }
 
@@ -585,5 +766,56 @@ mod tests {
             report.p99_ms,
             p99_limit
         );
+    }
+
+    #[test]
+    fn probe_report_discloses_measurement_mode_and_work_cost() {
+        // CTX-0484 probe: a report must disclose which path produced it
+        // (injected echo vs a real `cat` PTY) and how much pipeline work it
+        // measured, so a silent fallback is never read as real-PTY evidence.
+        // Fails before the fix because `format_summary` discloses neither.
+        let report = measure_latency(HEADLESS_BUDGET_SAMPLES);
+        let mut work: Vec<f64> = report
+            .samples
+            .iter()
+            .filter(|s| s.presented)
+            .map(LatencySample::work_ms)
+            .collect();
+        work.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!(
+            "CTX-0484 probe work_ms min={:.4} p50={:.4} p99={:.4} max={:.4} n={}",
+            work.first().copied().unwrap_or(0.0),
+            report.p50_work_ms,
+            report.p99_work_ms,
+            work.last().copied().unwrap_or(0.0),
+            work.len()
+        );
+        let summary = report.format_summary();
+        assert!(
+            summary.contains("mode="),
+            "summary must disclose the measurement mode: {summary}"
+        );
+        assert!(
+            summary.contains("work p50"),
+            "summary must disclose measured pipeline work: {summary}"
+        );
+        assert_eq!(report.mode, LatencyMode::InjectedEcho);
+        assert_eq!(report.min_work_ms, work.first().copied().unwrap_or(0.0));
+
+        // The real-PTY variant must never be mislabeled: whatever path actually
+        // ran, the report names it and the summary agrees.
+        let pty = measure_latency_with_pty_echo(HEADLESS_BUDGET_SAMPLES);
+        let pty_summary = pty.format_summary();
+        assert!(
+            pty_summary.contains(&format!("mode={}", pty.mode.label())),
+            "PTY-echo summary must match its mode: {pty_summary}"
+        );
+        if pty.mode == LatencyMode::InjectedEcho {
+            assert_eq!(
+                pty.mode.label(),
+                "injected-echo",
+                "fallback must be labeled as injected, not as real PTY echo"
+            );
+        }
     }
 }

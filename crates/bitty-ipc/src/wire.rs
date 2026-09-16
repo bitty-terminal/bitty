@@ -32,7 +32,9 @@
 //! ```
 //!
 //! Rules (per RFC):
-//! - `v` must be `1` in this RFC; unknown versions are rejected whole.
+//! - `v` must be a supported version. A client offers the versions it speaks
+//!   and [`negotiate_wire_version`] selects the highest mutual one (v1 today);
+//!   versions outside [`SUPPORTED_WIRE_VERSIONS`] are rejected whole.
 //! - `method` validation: non-empty, `<= 128` bytes, no control bytes
 //!   (`0x00-0x1F`, `0x7F`), no interior whitespace, segments match
 //!   `^[a-z][a-z0-9_]*$` separated by `.`.
@@ -53,8 +55,16 @@ use crate::scope::validate_method_name;
 
 // ── constants ───────────────────────────────────────────────────────────────
 
-/// Wire version v1 (only version in this RFC).
+/// Wire version v1 (the current contract version).
 pub const WIRE_VERSION: u16 = 1;
+
+/// Wire versions this runtime can speak, highest first.
+///
+/// This is the single source of truth for both envelope validation and
+/// `hello`-style negotiation: the runtime advertises this set and selects the
+/// highest version the client also supports (IPC and Agent RFC §Versioning).
+/// A future wire version appends here without changing the selection logic.
+pub const SUPPORTED_WIRE_VERSIONS: &[u16] = &[WIRE_VERSION];
 
 /// Maximum bytes for correlation `id` (bounded 64 bytes).
 pub const MAX_ID_BYTES: usize = 64;
@@ -67,19 +77,47 @@ pub const MAX_METHOD_BYTES: usize = crate::channel::MAX_METHOD_BYTES;
 
 // ── validation ─────────────────────────────────────────────────────────────
 
-/// Validate wire version.
+/// Validate wire version against the supported set.
 ///
 /// # Errors
 ///
-/// Returns `VersionMismatch` when `v != 1`.
+/// Returns `VersionMismatch` when `v` is not one of
+/// [`SUPPORTED_WIRE_VERSIONS`]. Callers that receive a client's version list
+/// should first run [`negotiate_wire_version`].
 pub fn validate_wire_version(v: u16) -> Result<(), IpcError> {
-    if v == WIRE_VERSION {
+    if SUPPORTED_WIRE_VERSIONS.contains(&v) {
         Ok(())
     } else {
         Err(IpcError::VersionMismatch {
             expected: WIRE_VERSION,
             actual: v,
         })
+    }
+}
+
+/// Negotiate the wire version with a client advertising `client_versions`.
+///
+/// Returns the highest version supported by both peers. Fail-closed: a client
+/// that offers no mutually supported version is rejected with
+/// [`IpcError::VersionMismatch`] whose `actual` is the highest client version
+/// offered (`0` when the client offered none). The runtime advertises
+/// [`SUPPORTED_WIRE_VERSIONS`] in the discovery file and the `hello` response.
+///
+/// # Errors
+///
+/// Returns `VersionMismatch` when `client_versions` has no overlap with
+/// [`SUPPORTED_WIRE_VERSIONS`].
+pub fn negotiate_wire_version(client_versions: &[u16]) -> Result<u16, IpcError> {
+    match SUPPORTED_WIRE_VERSIONS
+        .iter()
+        .copied()
+        .find(|v| client_versions.contains(v))
+    {
+        Some(v) => Ok(v),
+        None => Err(IpcError::VersionMismatch {
+            expected: WIRE_VERSION,
+            actual: client_versions.iter().copied().max().unwrap_or(0),
+        }),
     }
 }
 

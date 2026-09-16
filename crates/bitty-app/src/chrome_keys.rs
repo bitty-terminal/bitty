@@ -584,7 +584,9 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// a display server or a live `Runtime`: `matched` is the
 /// [`bitty_config::match_keymap`] result for `keyref`, and the pending flags
 /// are the app's modal surface (`Runtime::has_pending_paste` /
-/// `Runtime::has_pending_ws_close` / `Runtime::has_pending_close_confirm`).
+/// `Runtime::has_pending_ws_close` / `Runtime::has_pending_close_confirm`
+/// plus the CTX-0482 panel-overlay bit fed by
+/// `OverlayManager::modal_active`).
 /// Returns the winning layer plus the action to run when the layer dispatches
 /// one (`User` only; `Modal` swallows, `Plugin` is inert, `Terminal` routes).
 ///
@@ -593,7 +595,10 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 /// focused view, so the `close_view` chord confirms exactly that arm.
 ///
 /// Table (first match wins):
-/// - `Esc` with any modal pending -> `(Emergency, None)`.
+/// - `Esc` with a pending confirmation -> `(Emergency, None)` (the cancel
+///   path; a panel overlay does not take Esc onto that path).
+/// - `Esc` with only the panel-overlay modal -> `(Terminal, None)`: the
+///   panel owns its own dismissal and a remapped `Esc` must not run.
 /// - modal pending + bound chord that confirms THAT modal (repeat the
 ///   arming chord: `paste_from_clipboard` while a paste pends,
 ///   `workspace_close` while a workspace-close pends, `close_view` while a
@@ -610,14 +615,23 @@ fn resolve_priority_for(
     ws_close_pending: bool,
     close_confirm_pending: bool,
     close_confirm_view: bool,
+    panel_modal_active: bool,
 ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
     use bitty_config::{ChromeAction as A, KeyName};
-    let modal_active = paste_pending || ws_close_pending || close_confirm_pending;
+    let confirm_modal_active = paste_pending || ws_close_pending || close_confirm_pending;
+    let modal_active = confirm_modal_active || panel_modal_active;
     // Emergency/reserved first: Esc cancels any pending confirmation even
     // when the user remapped `escape` (the remap only applies with no
     // modal active, where this arm never fires).
-    if modal_active && keyref.key == KeyName::Escape {
+    if confirm_modal_active && keyref.key == KeyName::Escape {
         return (DispatchPriority::Emergency, None);
+    }
+    // Panel-overlay modal: Esc is the overlay's own dismissal key and every
+    // bound chord is captured below. Route it to the runtime (the panel
+    // path) instead of the confirm-cancel emergency arm, and never let a
+    // remapped `Esc` action run behind the modal.
+    if modal_active && keyref.key == KeyName::Escape {
+        return (DispatchPriority::Terminal, None);
     }
     match matched {
         Some(action) if modal_active => {
@@ -1128,17 +1142,20 @@ impl TerminalApp {
 impl TerminalApp {
     /// True while a modal confirmation captures command dispatch (CTX-0275).
     ///
-    /// Today's app-level modal surface is the two pending-confirm gates:
-    /// the suspicious-paste confirmation (`Runtime::has_pending_paste`) and
-    /// the workspace kill-confirm (`Runtime::has_pending_ws_close`). Panel
-    /// overlays already enforce creation-exclusivity
-    /// (`OverlayManager::modal_active`); when they gain key dispatch, their
-    /// active-modal bit must feed this same predicate so one capture rule
-    /// covers every modal kind.
+    /// One capture rule for every modal kind (CTX-0482, #763): the
+    /// runtime-owned pending confirmations (suspicious paste, workspace
+    /// kill, pane close) plus the panel-overlay modal bit
+    /// ([`bitty_runtime::Runtime::overlay_modal_active`]), which the panel
+    /// integration drives from `OverlayManager::modal_active()`. Copy and
+    /// search modes keep their bespoke modal arms in
+    /// [`Self::intercept_chrome_key`] (their confirm gestures differ), but
+    /// every new modal surface feeds this predicate instead of growing a
+    /// fourth gate.
     pub(crate) fn modal_capture_active(&self) -> bool {
         self.runtime.has_pending_paste()
             || self.runtime.has_pending_ws_close()
             || self.runtime.has_pending_close_confirm()
+            || self.runtime.overlay_modal_active()
     }
 
     /// Classify one matchable keypress into its dispatch layer (CTX-0275).
@@ -1151,24 +1168,30 @@ impl TerminalApp {
         keyref: bitty_config::KeyRef,
         matched: Option<bitty_config::ChromeAction>,
     ) -> (DispatchPriority, Option<bitty_config::ChromeAction>) {
-        // Single capture predicate first (panel-modal bits feed
-        // `modal_capture_active` itself when overlay dispatch lands); the
-        // per-gate reads below only pick the confirm gesture.
-        let (paste_pending, ws_close_pending, close_confirm_pending, close_confirm_view) =
-            if self.modal_capture_active() {
-                (
-                    self.runtime.has_pending_paste(),
-                    self.runtime.has_pending_ws_close(),
-                    self.runtime.has_pending_close_confirm(),
-                    // CTX-0370: only an arm on the currently focused view is
-                    // confirmed by the close-view chord.
-                    self.runtime
-                        .pending_close_view()
-                        .is_some_and(|view| self.runtime.focused_view() == Some(view)),
-                )
-            } else {
-                (false, false, false, false)
-            };
+        // Single capture predicate first (the panel-overlay bit feeds
+        // `modal_capture_active` itself); the per-gate reads below only
+        // pick the confirm gesture.
+        let (
+            paste_pending,
+            ws_close_pending,
+            close_confirm_pending,
+            close_confirm_view,
+            panel_modal_active,
+        ) = if self.modal_capture_active() {
+            (
+                self.runtime.has_pending_paste(),
+                self.runtime.has_pending_ws_close(),
+                self.runtime.has_pending_close_confirm(),
+                // CTX-0370: only an arm on the currently focused view is
+                // confirmed by the close-view chord.
+                self.runtime
+                    .pending_close_view()
+                    .is_some_and(|view| self.runtime.focused_view() == Some(view)),
+                self.runtime.overlay_modal_active(),
+            )
+        } else {
+            (false, false, false, false, false)
+        };
         resolve_priority_for(
             keyref,
             matched,
@@ -1176,6 +1199,7 @@ impl TerminalApp {
             ws_close_pending,
             close_confirm_pending,
             close_confirm_view,
+            panel_modal_active,
         )
     }
 
@@ -2678,30 +2702,30 @@ mod tests {
         };
         // Emergency beats everything, even a user `escape` remap.
         assert_eq!(
-            resolve_priority_for(esc, Some(A::CloseView), true, false, false, false),
+            resolve_priority_for(esc, Some(A::CloseView), true, false, false, false, false,),
             (DispatchPriority::Emergency, None)
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, true, false, false),
+            resolve_priority_for(esc, None, false, true, false, false, false,),
             (DispatchPriority::Emergency, None)
         );
         // No modal: bound -> User, unbound -> Terminal (pre-0275 behavior).
         assert_eq!(
-            resolve_priority_for(esc, Some(A::CloseView), false, false, false, false),
+            resolve_priority_for(esc, Some(A::CloseView), false, false, false, false, false,),
             (DispatchPriority::User, Some(A::CloseView))
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, false, false),
+            resolve_priority_for(esc, None, false, false, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         // Unbound keys fall through even with a modal up (the dialog
         // captures commands, not typing).
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, false, false, false),
+            resolve_priority_for(bare_x, None, true, false, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, true, false, false),
+            resolve_priority_for(bare_x, None, true, true, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
         // Either gate captures a bound non-confirm chord...
@@ -2712,7 +2736,8 @@ mod tests {
                 true,
                 false,
                 false,
-                false
+                false,
+                false,
             ),
             (DispatchPriority::Modal, None)
         );
@@ -2723,7 +2748,8 @@ mod tests {
                 false,
                 true,
                 false,
-                false
+                false,
+                false,
             ),
             (DispatchPriority::Modal, None)
         );
@@ -2735,18 +2761,35 @@ mod tests {
                 true,
                 false,
                 false,
-                false
+                false,
+                false,
             ),
             (DispatchPriority::User, Some(A::PasteFromClipboard))
         );
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::WorkspaceClose), false, true, false, false),
+            resolve_priority_for(
+                alt_w,
+                Some(A::WorkspaceClose),
+                false,
+                true,
+                false,
+                false,
+                false,
+            ),
             (DispatchPriority::User, Some(A::WorkspaceClose))
         );
         // ...and crossed gestures stay captured (a close chord never
         // confirms a paste, a paste chord never confirms a close).
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::WorkspaceClose), true, false, false, false),
+            resolve_priority_for(
+                alt_w,
+                Some(A::WorkspaceClose),
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
             (DispatchPriority::Modal, None)
         );
         assert_eq!(
@@ -2756,7 +2799,8 @@ mod tests {
                 false,
                 true,
                 false,
-                false
+                false,
+                false,
             ),
             (DispatchPriority::Modal, None)
         );
@@ -2769,24 +2813,67 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
             ),
             (DispatchPriority::Modal, None)
         );
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, true),
+            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, true, false,),
             (DispatchPriority::User, Some(A::CloseView)),
             "arm on the focused view: repeat close confirms"
         );
         assert_eq!(
-            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, false),
+            resolve_priority_for(alt_w, Some(A::CloseView), false, false, true, false, false,),
             (DispatchPriority::Modal, None),
             "window arm (or another view): the close chord is captured"
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, true, true),
+            resolve_priority_for(esc, None, false, false, true, true, false),
             (DispatchPriority::Emergency, None),
             "Esc cancels a close-confirm arm"
+        );
+        // CTX-0482: the panel-overlay modal captures bound chords...
+        assert_eq!(
+            resolve_priority_for(
+                alt_h,
+                Some(A::GotoSplit(SplitDir::Left)),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            (DispatchPriority::Modal, None),
+            "a panel modal captures bound non-confirm chords"
+        );
+        // ...but `Esc` is the panel's own dismissal path: it routes to the
+        // runtime (Terminal), never the confirm-cancel emergency arm, and a
+        // remapped `Esc` action must not run behind the modal.
+        assert_eq!(
+            resolve_priority_for(esc, Some(A::CloseView), false, false, false, false, true),
+            (DispatchPriority::Terminal, None)
+        );
+        // A pending confirmation still owns `Esc` even with the panel modal
+        // up: cancelling the confirmation is the emergency gesture.
+        assert_eq!(
+            resolve_priority_for(esc, None, true, false, false, false, true),
+            (DispatchPriority::Emergency, None)
+        );
+        // The panel modal's confirm gestures are not exempt: only the
+        // pending-confirmation chords confirm (a paste chord neither
+        // confirms nor runs while only the panel modal is active).
+        assert_eq!(
+            resolve_priority_for(
+                paste_chord,
+                Some(A::PasteFromClipboard),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            (DispatchPriority::Modal, None)
         );
         // Plugin slot denies by default for every key shape.
         for keyref in [esc, alt_h, alt_w, paste_chord, bare_x] {

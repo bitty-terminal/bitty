@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::scrollback::SCROLLBACK_DEFAULT_LINES;
-use bitty_vt::{AttributeChange, AttributeDiff, Color, ControlChar, GraphemeCell};
+use bitty_vt::{
+    AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, Color, ControlChar, GraphemeCell,
+};
 
 fn prints(state: &mut State, text: &str) {
     for c in text.chars() {
@@ -617,6 +619,31 @@ fn ctx_0205_large_tab_backward_stops_at_zero() {
 }
 
 #[test]
+fn locking_shift_g2_locks_gl_until_changed() {
+    // LS2 (`ESC n`) submits `InvokeCharset G2`: GL stays on G2 for every
+    // subsequent print until another locking shift changes it.
+    let mut s = State::new();
+    s.apply(&TerminalAction::SelectCharset {
+        slot: CharsetSlot::G2,
+        table: CharsetTable::DecSpecialGraphics,
+    });
+    s.apply(&TerminalAction::InvokeCharset {
+        slot: CharsetSlot::G2,
+    });
+    prints(&mut s, "qq");
+    let snap = s.snapshot();
+    assert_eq!(snap.cells[0].glyph, '\u{2500}');
+    assert_eq!(snap.cells[1].glyph, '\u{2500}');
+    // SI locks GL back to G0 (ASCII).
+    s.apply(&TerminalAction::InvokeCharset {
+        slot: CharsetSlot::G0,
+    });
+    prints(&mut s, "q");
+    assert_eq!(s.snapshot().cells[2].glyph, 'q');
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn ctx_0469_origin_cpr_with_cursor_above_region_saturates() {
     // Hostile probe (CTX-0469): DECSC saves (row, origin) together, but a
     // later DECSTBM homes only the live cursor. DECRC then restores a
@@ -647,6 +674,25 @@ fn ctx_0469_origin_cpr_with_cursor_above_region_saturates() {
     let replies = s.take_replies();
     assert_eq!(replies.len(), 1);
     assert_eq!(&replies[0][..], b"\x1b[1;1R");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn single_shift_g2_applies_to_one_scalar_only() {
+    // SS2 (`ESC N`) submits `SingleShiftCharset G2`: exactly one print is
+    // translated and the locking shift is untouched.
+    let mut s = State::new();
+    s.apply(&TerminalAction::SelectCharset {
+        slot: CharsetSlot::G2,
+        table: CharsetTable::DecSpecialGraphics,
+    });
+    s.apply(&TerminalAction::SingleShiftCharset {
+        slot: CharsetSlot::G2,
+    });
+    prints(&mut s, "qq");
+    let snap = s.snapshot();
+    assert_eq!(snap.cells[0].glyph, '\u{2500}');
+    assert_eq!(snap.cells[1].glyph, 'q');
     assert!(s.check_invariants().is_ok());
 }
 

@@ -17,10 +17,17 @@
 //! Linux, macOS, and Windows CI; the production crossfont path stays covered
 //! by its own tests.
 //!
-//! The digests were recorded against `tick_at` before the phase extraction;
-//! a change here means the refactor changed the frame, not that the golden
-//! value should be refreshed. Refresh only with an explicit
-//! behavior-change task.
+//! The digests were re-recorded under CTX-0492 (issue #792): #785 (CTX-0471)
+//! merged after these constants were first recorded and made the software
+//! compositor merge adjacent same-color cell backgrounds into maximal
+//! horizontal runs. The folded [`PresentStats`] counters therefore changed
+//! (`fills` now counts merged rectangles; the empty first frame went
+//! 1673 -> 23) while the composited RGBA stayed byte-identical: reverting
+//! #785 restores every previous digest exactly and the FNV-1a hash of
+//! `headless_rgba` is unchanged for the whole matrix. The phase extraction
+//! itself remains behavior-preserving; a change here still means the frame
+//! changed, not that the golden value should be refreshed. Refresh only with
+//! an explicit behavior-change task.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -102,7 +109,7 @@ fn assert_digest(name: &str, rt: &Runtime, stats: &PresentStats, golden: u64) {
 fn golden_first_frame_then_idle() {
     let mut rt = make_runtime();
     let first = rt.tick().expect("first tick presents");
-    assert_digest("first_frame", &rt, &first, 0x690e_47af_d572_be8b);
+    assert_digest("first_frame", &rt, &first, 0xd4aa_0a9b_8ff1_e093);
     assert!(rt.tick().is_none(), "no damage -> idle");
 }
 
@@ -110,13 +117,13 @@ fn golden_first_frame_then_idle() {
 fn golden_pty_bytes_incremental() {
     let mut rt = make_runtime();
     let first = rt.tick().expect("first tick presents");
-    assert_digest("pty_first", &rt, &first, 0x690e_47af_d572_be8b);
+    assert_digest("pty_first", &rt, &first, 0xd4aa_0a9b_8ff1_e093);
     rt.handle_pty_bytes(b"hello ");
     let a = rt.tick().expect("first bytes present");
-    assert_digest("pty_a", &rt, &a, 0xf1d8_07f4_d7a8_2529);
+    assert_digest("pty_a", &rt, &a, 0x9226_c642_4091_634d);
     rt.handle_pty_bytes(b"world");
     let b = rt.tick().expect("second bytes present");
-    assert_digest("pty_b", &rt, &b, 0x2fc2_a625_a766_735a);
+    assert_digest("pty_b", &rt, &b, 0x3ba5_778d_03f0_2802);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -126,13 +133,13 @@ fn golden_alt_screen_enter_and_leave() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes(b"\x1b[?1049h");
     let enter = rt.tick().expect("alt entry presents");
-    assert_digest("alt_enter", &rt, &enter, 0x0a85_c451_b0a8_9fd1);
+    assert_digest("alt_enter", &rt, &enter, 0xbd9a_0204_5394_f28d);
     rt.handle_pty_bytes(b"vim");
     let paint = rt.tick().expect("alt content presents");
-    assert_digest("alt_paint", &rt, &paint, 0x3234_1302_fa13_0b4a);
+    assert_digest("alt_paint", &rt, &paint, 0xde3d_feee_1f48_ce22);
     rt.handle_pty_bytes(b"\x1b[?1049l");
     let leave = rt.tick().expect("alt exit presents");
-    assert_digest("alt_leave", &rt, &leave, 0xa8a1_81bc_5a03_640b);
+    assert_digest("alt_leave", &rt, &leave, 0xc4c2_f0e6_fc09_13bf);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -155,7 +162,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(false),
         "banner must still be in the full phase"
     );
-    assert_digest("paste_full", &rt, &full, 0x15d9_76fa_2991_d881);
+    assert_digest("paste_full", &rt, &full, 0xce86_d149_6cd1_56a5);
     let flash_at = t0 + PASTE_BANNER_FULL_DURATION + Duration::from_secs(30);
     let flash = rt.tick_at(flash_at).expect("collapse transition presents");
     assert_eq!(
@@ -163,7 +170,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(true),
         "banner must have collapsed to the flash"
     );
-    assert_digest("paste_flash", &rt, &flash, 0xca7a_70cd_3e08_6698);
+    assert_digest("paste_flash", &rt, &flash, 0x7e17_4c18_c27d_50b0);
     assert!(
         rt.tick_at(flash_at + Duration::from_millis(200)).is_none(),
         "banner phase is steady -> idle"
@@ -180,10 +187,10 @@ fn golden_help_overlay_shown_then_hidden() {
     ]);
     assert!(rt.toggle_help(), "help toggles on");
     let shown = rt.tick().expect("overlay present");
-    assert_digest("help_shown", &rt, &shown, 0xf1e1_1a3c_9e08_317b);
+    assert_digest("help_shown", &rt, &shown, 0xe0a5_b913_7c79_1063);
     assert!(!rt.toggle_help(), "help toggles off");
     let hidden = rt.tick().expect("dismissal present");
-    assert_digest("help_hidden", &rt, &hidden, 0x7337_9067_060f_6441);
+    assert_digest("help_hidden", &rt, &hidden, 0xf2cb_44f7_c55f_14d9);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -194,7 +201,7 @@ fn golden_selection_overlay() {
     let _ = rt.tick().expect("grid present");
     rt.select_all();
     let selected = rt.tick().expect("selection present");
-    assert_digest("selection", &rt, &selected, 0x31fa_761d_4aee_51c2);
+    assert_digest("selection", &rt, &selected, 0x96d7_060f_b3c8_adb6);
 }
 
 #[test]
@@ -203,10 +210,10 @@ fn golden_ime_preedit_overlay() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_ime_preedit(Some("preedit".to_string()), Some(2));
     let shown = rt.tick().expect("preedit present");
-    assert_digest("preedit_shown", &rt, &shown, 0xf40d_e48b_ad48_2d76);
+    assert_digest("preedit_shown", &rt, &shown, 0xa834_3196_5f79_26c6);
     rt.handle_ime_preedit(None, None);
     let cleared = rt.tick().expect("preedit clear present");
-    assert_digest("preedit_cleared", &rt, &cleared, 0x7337_9067_060f_6441);
+    assert_digest("preedit_cleared", &rt, &cleared, 0xf2cb_44f7_c55f_14d9);
 }
 
 #[test]
@@ -221,7 +228,7 @@ fn golden_split_leaves() {
     ));
     rt.handle_pty_bytes(b"split");
     let split = rt.tick().expect("split present");
-    assert_digest("split", &rt, &split, 0xb40c_d682_edfc_f502);
+    assert_digest("split", &rt, &split, 0x68bf_f27e_44ec_0a40);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -234,7 +241,7 @@ fn golden_scrollback_viewport() {
     let _ = rt.tick().expect("grid present");
     assert!(rt.scroll_focused_page(true), "scroll up pages the view");
     let scrolled = rt.tick().expect("scrolled present");
-    assert_digest("scrollback", &rt, &scrolled, 0xc95a_1200_572c_1a91);
+    assert_digest("scrollback", &rt, &scrolled, 0x263d_addf_0b3a_1749);
 }
 
 #[test]
@@ -243,5 +250,5 @@ fn golden_wide_and_combining_glyphs() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("A\u{4e2d}\u{1f389}e\u{0301}".as_bytes());
     let mixed = rt.tick().expect("mixed-width present");
-    assert_digest("wide_combining", &rt, &mixed, 0xbdcf_4b2a_7b57_4bec);
+    assert_digest("wide_combining", &rt, &mixed, 0x7bd7_d28d_3f2f_ac70);
 }

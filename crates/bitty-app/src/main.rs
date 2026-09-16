@@ -250,7 +250,7 @@ use init::{
 #[cfg(test)]
 use config_cli::{
     appearance_flag_for_field, cli_overrides_from_args, layer_source_label,
-    resolve_editor_with_env, starter_init_lua,
+    resolve_editor_with_env, runtime_config_from_effective_with_warnings, starter_init_lua,
 };
 
 // ---------------------------------------------------------------------------
@@ -294,6 +294,9 @@ fn ipc_serve_failure_exit(
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let args = parse_args(&raw);
+    // CTX-0482 (#763): install the process-wide stderr gate once so startup
+    // diagnostics obey `--log-level` instead of printing unconditionally.
+    logging::install_stderr_gate(effective_log_level(&args));
 
     // `bitty list --help` shows list help (never needs an instance or VM);
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
@@ -466,16 +469,18 @@ fn main() {
             std::process::exit(2);
         }
     };
-    eprintln!(
-        "bitty: theme '{}' (resolution={:?} source={})",
-        app_config.theme.name, app_config.resolution, app_config.source
-    );
+    logging::info(|| {
+        format!(
+            "bitty: theme '{}' (resolution={:?} source={})",
+            app_config.theme.name, app_config.resolution, app_config.source
+        )
+    });
     // CTX-0153: resolve the keymap table (shipped defaults + user overrides).
     // Unknown actions/chords fail closed here exactly as in `config check`;
     // the merge already validated entries, so this is defense in depth.
     let keymaps = match bitty_config::resolve_keymaps(&app_config.effective) {
         Ok(maps) => {
-            eprintln!("bitty: keymaps resolved ({} entries)", maps.len());
+            logging::info(|| format!("bitty: keymaps resolved ({} entries)", maps.len()));
             maps
         }
         Err(err) => {
@@ -524,14 +529,19 @@ fn main() {
     } else {
         match runtime.restore_session_on_startup(args.safe) {
             bitty_runtime::SessionStartupOutcome::Restored(summary) => {
-                eprintln!(
-                    "bitty: session restored (workspaces={} panes={} lines={} pending={}; inactive panes respawn on first switch)",
-                    summary.workspaces, summary.panes, summary.scrollback_lines, summary.pending
-                );
+                logging::info(|| {
+                    format!(
+                        "bitty: session restored (workspaces={} panes={} lines={} pending={}; inactive panes respawn on first switch)",
+                        summary.workspaces,
+                        summary.panes,
+                        summary.scrollback_lines,
+                        summary.pending
+                    )
+                });
                 true
             }
             bitty_runtime::SessionStartupOutcome::FreshWithWarning(err) => {
-                eprintln!("bitty: session restore failed ({err}) — starting fresh");
+                logging::warn(|| format!("bitty: session restore failed ({err}) — starting fresh"));
                 false
             }
             bitty_runtime::SessionStartupOutcome::Fresh
@@ -557,14 +567,16 @@ fn main() {
         let leaf_ids = layout.leaf_ids();
         let focused_before = runtime.focused_view();
         runtime.set_layout(layout);
-        eprintln!(
-            "bitty: layout installed — leafs={} ids={:?} focused_before={:?} focused_after={:?} container={:?}",
-            runtime.leaf_count(),
-            leaf_ids,
-            focused_before,
-            runtime.focused_view(),
-            runtime.container()
-        );
+        logging::info(|| {
+            format!(
+                "bitty: layout installed — leafs={} ids={:?} focused_before={:?} focused_after={:?} container={:?}",
+                runtime.leaf_count(),
+                leaf_ids,
+                focused_before,
+                runtime.focused_view(),
+                runtime.container()
+            )
+        });
         if let Some(focus_spec) = args.focus.as_deref() {
             // CTX-0480: syntactically unknown focus fails closed; a
             // well-formed but unresolvable target still warns via
@@ -616,11 +628,13 @@ fn main() {
         config_shell: config_shell.clone(),
     };
     let effective = resolve_spawn_program(&args, config_shell.as_deref(), shell_env.as_deref());
-    eprintln!(
-        "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
-        args.program.is_some(),
-        config_shell.is_some()
-    );
+    logging::info(|| {
+        format!(
+            "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
+            args.program.is_some(),
+            config_shell.is_some()
+        )
+    });
     let spawn_result = if let Some(program) = args.program.as_deref() {
         let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
         if tail.is_empty() {
@@ -636,11 +650,13 @@ fn main() {
     // immediate non-zero exit so headless/CI greens only prove a live shell.
     let startup_spawn_failed = match spawn_result {
         Ok(()) => {
-            eprintln!(
-                "bitty: PTY shell spawned (has_pty={} has_reader={})",
-                runtime.has_pty(),
-                runtime.has_pty_reader()
-            );
+            logging::info(|| {
+                format!(
+                    "bitty: PTY shell spawned (has_pty={} has_reader={})",
+                    runtime.has_pty(),
+                    runtime.has_pty_reader()
+                )
+            });
             // CTX-0176: startup multi-leaf layouts (`--split`/`--stack`/
             // `--layout`) give every non-focused leaf its own shell too; the
             // focused leaf keeps the primary session spawned above.
@@ -650,9 +666,11 @@ fn main() {
             spawn_startup_pane_shells(&mut runtime, &spawn_spec) > 0
         }
         Err(err) => {
-            eprintln!(
-                "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
-            );
+            logging::warn(|| {
+                format!(
+                    "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
+                )
+            });
             true
         }
     };
@@ -698,7 +716,7 @@ fn main() {
         rows: runtime.config().rows,
     });
     if ipc_serve.is_enabled() {
-        eprintln!("bitty: ipc serving {}", ipc_serve.socket_path());
+        logging::info(|| format!("bitty: ipc serving {}", ipc_serve.socket_path()));
     }
     // CTX-0481 (#762): an attempted-but-rejected servo has a reason; under
     // `--fail-loud` it exits non-zero instead of silently continuing
@@ -727,8 +745,9 @@ fn main() {
     // CTX-0190: apply the stderr verbosity gate before the event loop so
     // per-frame `bitty tick` lines stay quiet by default and appear only
     // with `--verbose` / `--log-level debug|trace` (or BITTY_LOG/RUST_LOG).
-    // Key info (paste confirm/cancel, startup summary, errors) bypasses the
-    // gate and always emits; devtools keeps full fidelity via Runtime::tick.
+    // CTX-0482: the process-wide gate installed in `main` covers startup
+    // info/warn diagnostics; user-facing key info (paste confirm/cancel)
+    // stays unconditional; devtools keeps full fidelity via Runtime::tick.
     app.set_log_level(effective_log_level(&args));
     // CTX-0393: safe recovery and headless smoke runs never overwrite the
     // saved session on exit (the safe run owns a default layout, not the
@@ -737,9 +756,11 @@ fn main() {
     let headless_fallback_needed = match App::run(app) {
         Ok(()) => std::process::exit(0),
         Err(PlatformError::DisplayUnavailable(detail)) => {
-            eprintln!(
-                "bitty: no usable display server ({detail}) — falling back to headless smoke (CI path)"
-            );
+            logging::warn(|| {
+                format!(
+                    "bitty: no usable display server ({detail}) — falling back to headless smoke (CI path)"
+                )
+            });
             true
         }
         Err(other) => {

@@ -102,26 +102,32 @@ fn spawn_with_fallback(
     let no_args: &[&str] = &[];
     match spawn(default, no_args) {
         Ok(()) => {
-            eprintln!("bitty: spawned default shell {default:?}");
+            crate::logging::info(|| format!("bitty: spawned default shell {default:?}"));
             Ok(())
         }
         Err(err) if default != FALLBACK_SHELL => {
-            eprintln!(
-                "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {FALLBACK_SHELL:?}"
-            );
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {FALLBACK_SHELL:?}"
+                )
+            });
             match spawn(FALLBACK_SHELL, no_args) {
                 Ok(()) => {
-                    eprintln!("bitty: spawned fallback shell {FALLBACK_SHELL:?}");
+                    crate::logging::info(|| {
+                        format!("bitty: spawned fallback shell {FALLBACK_SHELL:?}")
+                    });
                     Ok(())
                 }
                 Err(fallback_err) => {
-                    eprintln!("bitty: spawn_shell({FALLBACK_SHELL:?}) failed: {fallback_err}");
+                    crate::logging::warn(|| {
+                        format!("bitty: spawn_shell({FALLBACK_SHELL:?}) failed: {fallback_err}")
+                    });
                     Err(fallback_err)
                 }
             }
         }
         Err(err) => {
-            eprintln!("bitty: spawn_shell({default:?}) failed: {err}");
+            crate::logging::warn(|| format!("bitty: spawn_shell({default:?}) failed: {err}"));
             Err(err)
         }
     }
@@ -202,7 +208,11 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
         if let Err(err) =
             spawn_pane_shell(runtime, spec, *id, rect.width.max(1), rect.height.max(1))
         {
-            eprintln!("warning: startup pane {id:?} shell spawn failed ({err}) — pane stays empty");
+            crate::logging::warn(|| {
+                format!(
+                    "warning: startup pane {id:?} shell spawn failed ({err}) — pane stays empty"
+                )
+            });
             failed += 1;
         }
     }

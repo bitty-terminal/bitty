@@ -28,11 +28,11 @@ fn __bitty_job_helper_entry__() {
         Ok("quiet") => {}
         // Stay alive well past every test deadline.
         Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
-        // Emit a tick every 100 ms for 30 s.
+        // Emit a tick every 50 ms for 15 s.
         Ok("emit") => {
             for _ in 0..300 {
                 eprint!("tick");
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         // Announce readiness, then stay alive (interactive PTY shape).
@@ -195,12 +195,12 @@ fn output_activity_resets_the_idle_deadline() {
     let registry = JobRegistry::new();
     let spec = helper_spec("emit")
         .with_kind(JobKind::Watch)
-        .with_timeouts(JobTimeouts::default().with_idle(Duration::from_millis(500)));
+        .with_timeouts(JobTimeouts::default().with_idle(Duration::from_millis(700)));
     let id = registry.spawn(spec).expect("tracked");
     wait_running(&registry, id);
-    // The child emits every 100 ms, so a 500 ms idle window keeps it alive
+    // The child emits every 50 ms, so a 700 ms idle window keeps it alive
     // well past its own length.
-    std::thread::sleep(Duration::from_millis(900));
+    std::thread::sleep(Duration::from_millis(600));
     assert_eq!(registry.get(id).expect("tracked").state, JobState::Running);
     assert_eq!(registry.cancel(id), Ok(JobCancel::Requested));
     let stopped = wait_terminal(&registry, id);

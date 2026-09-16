@@ -345,23 +345,41 @@ pub struct FilesystemRequest {
 
 /// Home-scoped dot-directories that always hold secrets (CTX-0465).
 ///
-/// A filesystem pattern naming one of these — as a `~/` prefix or as any
-/// `/`-separated segment (e.g. `**/.ssh/**`) — fails closed. Bare relative
-/// patterns that merely pass *through* a project-local directory with the
-/// same name are collateral: name grants precisely instead.
+/// A filesystem pattern naming one of these — as a `~/`/`~\` prefix or as any
+/// segment on either separator (e.g. `**/.ssh/**`) — fails closed. Matching is
+/// ASCII case-insensitive because the target filesystem may be
+/// case-insensitive (Windows/macOS); bare relative patterns that merely pass
+/// *through* a project-local directory with the same name are collateral: name
+/// grants precisely instead.
 const FS_SENSITIVE_HOME_NAMES: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker"];
 
-/// Two-level sensitive prefixes under `~/` (credential helpers).
-const FS_SENSITIVE_HOME_PREFIXES: &[&str] = &["~/.config/gh/", "~/.config/gcloud/"];
+/// Sensitive two-level prefixes under `~/` (credential helpers), matched as
+/// case-insensitive segments on either separator.
+const FS_SENSITIVE_HOME_PREFIXES: &[&[&str]] =
+    &[&["~", ".config", "gh"], &["~", ".config", "gcloud"]];
+
+/// Whether a glob segment is a literal name rather than a wildcard matcher.
+///
+/// The sensitive denylist can only certify a pattern whose leading home child
+/// is a concrete name: a first segment containing glob syntax matches an
+/// unknown set of home children, which includes the sensitive dot-directories.
+fn is_literal_fs_segment(segment: &str) -> bool {
+    !segment.is_empty() && !segment.contains(['*', '?', '[', ']', '{', '}'])
+}
 
 /// Whether a filesystem glob `pattern` escapes its sandbox or names secrets.
 ///
 /// Denies (fail-closed):
 /// - absolute paths: leading `/`, Windows drive (`C:/`, `C:\`), UNC (`\\`);
-/// - `~user/` homes (only bare `~` / `~/...` stay expressible);
+/// - `~user/` homes: only a `~`-rooted pattern stays expressible, and it must
+///   name a literal first child;
+/// - overbroad home roots: bare `~`, `~/`, `~\`, and any `~`-rooted pattern
+///   whose first component is not a literal name (`~/**`, `~/*`, `~/.*/**`) —
+///   these match unknown home children, sensitive dot-directories included;
 /// - `..` segments on either separator (`../`, `..\\`, embedded, trailing);
-/// - sensitive credential locations (`~/.ssh/...`, any `.ssh`/`.gnupg`/
-///   `.aws`/`.azure`/`.kube`/`.docker` segment, `~/.config/gh|gcloud/...`).
+/// - sensitive credential locations, case-insensitively and on either
+///   separator (`~/.ssh/...`, `~\.SSH\...`, any `.ssh`/`.gnupg`/`.aws`/
+///   `.azure`/`.kube`/`.docker` segment, `~/.config/gh|gcloud/...`).
 #[must_use]
 pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
     if pattern.starts_with('/') || pattern.starts_with("\\\\") {
@@ -375,23 +393,41 @@ pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
     {
         return true;
     }
-    if pattern.starts_with('~') && pattern != "~" && !pattern.starts_with("~/") {
+    let segments: Vec<&str> = pattern.split(['/', '\\']).collect();
+    let home_scoped = segments.first() == Some(&"~");
+    if pattern.starts_with('~') && !home_scoped {
+        // `~user` names a foreign home; only `~` itself may root a pattern.
         return true;
     }
-    if pattern.split(['/', '\\']).any(|segment| segment == "..") {
+    if segments.contains(&"..") {
+        return true;
+    }
+    if home_scoped
+        && !segments
+            .iter()
+            .skip(1)
+            .find(|segment| !segment.is_empty())
+            .is_some_and(|segment| is_literal_fs_segment(segment))
+    {
+        // Overbroad home root: no literal first child pins the grant.
+        return true;
+    }
+    if segments.iter().any(|segment| {
+        FS_SENSITIVE_HOME_NAMES
+            .iter()
+            .any(|name| segment.eq_ignore_ascii_case(name))
+    }) {
         return true;
     }
     for prefix in FS_SENSITIVE_HOME_PREFIXES {
-        let dir = prefix.trim_end_matches('/');
-        if pattern == dir || pattern.starts_with(prefix) {
+        if segments.len() >= prefix.len()
+            && segments[..prefix.len()]
+                .iter()
+                .zip(prefix.iter())
+                .all(|(segment, expected)| segment.eq_ignore_ascii_case(expected))
+        {
             return true;
         }
-    }
-    if pattern
-        .split('/')
-        .any(|segment| FS_SENSITIVE_HOME_NAMES.contains(&segment))
-    {
-        return true;
     }
     false
 }
@@ -436,7 +472,7 @@ impl FilesystemRequest {
                 return Err(PluginError::manifest(
                     "capabilities.filesystem.paths",
                     format!(
-                        "path pattern '{p}' is hostile (absolute path, '..' traversal, foreign home, or sensitive credential location)"
+                        "path pattern '{p}' is hostile (absolute path, '..' traversal, foreign/overbroad home, or sensitive credential location)"
                     ),
                 ));
             }
@@ -1232,6 +1268,86 @@ mod tests {
             "~/docs/*.md",
             "notes/**",
             "docs/**/*.md",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_ok(),
+                "legit fs pattern {path:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_filesystem_rejects_overbroad_home_and_case_separator_variants() {
+        // CTX-0489 (follow-up of #772 residual 2/3): bare/overbroad home
+        // patterns match the whole home — sensitive dot-directories included —
+        // without ever naming them, and exact-case `/`-only segment matching
+        // misses `.SSH`-style and `~\.ssh\...` variants on case-insensitive
+        // Windows/macOS filesystems.
+        for path in [
+            "~",
+            "~/",
+            "~\\",
+            "~//",
+            "~/**",
+            "~\\**",
+            "~/*",
+            "~/.*",
+            "~/.*/**",
+            "~/[.]ssh/**",
+            "~/.SSH",
+            "~/.SSH/**",
+            "~/.Aws/credentials",
+            "~/.GNUPG/**",
+            "~/.AZURE/**",
+            "~/.KUBE/config",
+            "~/.DOCKER/config.json",
+            "~/.config/GH/hosts.yml",
+            "~/.CONFIG/gcloud/credentials.db",
+            "~\\.ssh\\id_rsa",
+            "~\\.AWS\\credentials",
+            "~\\projects\\.SSH\\id_rsa",
+            "**/.AWS/**",
+            "docs/.SSH/id_rsa",
+            "~root\\",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_err(),
+                "overbroad/variant fs pattern {path:?} must be denied"
+            );
+            let mut manifest = minimal_manifest("xuepoo.test");
+            manifest.capabilities.filesystem.push(FilesystemRequest {
+                access: FsAccess::Write,
+                paths: vec![path.to_string()],
+            });
+            assert!(
+                manifest.validate().is_err(),
+                "manifest must reject overbroad/variant fs pattern {path:?}"
+            );
+        }
+        // Legit patterns survive: a literal first home child keeps working on
+        // either separator, and near-miss segment names are not collateral.
+        for path in [
+            "~/projects/**",
+            "~/mail/**",
+            "~/Documents/**/*.md",
+            "~/docs/*.md",
+            "notes/**",
+            "docs/**/*.md",
+            "~/.config",
+            "~/.config/foo/**",
+            "~/.config/ghost/**",
+            "~/.sshrc",
+            "~/.awsome/notes.md",
+            "~\\.config\\foo\\**",
+            "~\\projects\\**",
         ] {
             let req = FilesystemRequest {
                 access: FsAccess::Read,

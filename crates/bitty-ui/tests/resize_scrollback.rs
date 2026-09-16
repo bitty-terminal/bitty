@@ -1,4 +1,8 @@
-//! Resize and scrollback integration for `bitty-term-state` and `bitty-ui`.
+//! Resize and scrollback integration for `bitty-ui` over `bitty-term-state`.
+//!
+//! Moved here from `bitty-term-state` (CTX-0504) so that crate keeps a strict
+//! DAG per ADR-0003 rule 1; `bitty-ui` already depends on the state core, so
+//! the View+State composition proof keeps identical coverage.
 //! Headless, deterministic, and bounded: no window, no GPU, no PTY, no filesystem.
 //! This file proves the singular reflow (truncate/pad with orphan repair) for
 //! terminal resize and the scrollback-aware View viewport composition.

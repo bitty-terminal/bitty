@@ -330,8 +330,10 @@ impl std::error::Error for BridgeError {}
 /// Implementors are expected to
 /// be cheap and bounded; the bridge deadline-checks each call fail-closed
 /// with `E_TIMEOUT` (check-then-act inside the budget: the bridge checks its
-/// expiry before invoking, passes the expiry to mutating/spawn calls, and
-/// checks again after; mutating/spawn implementations must check the expiry
+/// expiry before invoking and passes the expiry to mutating/spawn calls;
+/// read-only calls are also checked after delivery, while mutating calls are
+/// not re-checked after success because a committed effect must never be
+/// reported as a timeout; mutating/spawn implementations must check the expiry
 /// before committing or delivering, so post-deadline effects never commit),
 /// and rejects re-entrant calls. `process.spawn` flows through the same
 /// bridge timeout path with its own spawn deadline
@@ -537,16 +539,17 @@ impl BridgeState {
         Ok(CallGuard(self.in_call.clone()))
     }
 
-    /// Check-then-act bridge guard for cheap host calls (CTX-0464 gap 3).
+    /// Check-then-act bridge guard for cheap read-only host calls (CTX-0464
+    /// gap 3).
     ///
     /// Fail-closed with typed `E_TIMEOUT`: checks the call expiry before
     /// invoking `f` (no side effects when already expired), passes the expiry
-    /// to `f` so mutating services can check before committing
-    /// (see `store_set_with_expiry`/`notify_show_with_expiry`), and checks
-    /// again after. The old applied-then-timeout ran `f` to completion then
-    /// discarded its committed side effects as `E_TIMEOUT`; the new path
+    /// to `f` where relevant, and checks again after, so a slow read is never
+    /// delivered past its budget. Mutating calls use
+    /// [`Self::bounded_mutation`] instead: a committed effect must never be
+    /// discarded as a timeout (the old applied-then-timeout bug). The new path
     /// guarantees post-deadline effects never commit when services honor the
-    /// expiry (tests prove it; real services are in-memory fast).
+    /// expiry (tests prove it; real read services are in-memory fast).
     fn bounded<T>(
         &self,
         f: impl FnOnce(Instant) -> Result<T, BridgeError>,
@@ -562,6 +565,36 @@ impl BridgeState {
             return Err(BridgeError::timeout());
         }
         Ok(out)
+    }
+
+    /// Check-then-act bridge guard for mutating host calls
+    /// (`store_set_with_expiry`/`notify_show_with_expiry`).
+    ///
+    /// Identical pre-call deadline and re-entrancy guard as [`Self::bounded`],
+    /// but with **no post-call deadline failure**: once `f` returns `Ok` the
+    /// mutation has committed, so raising `E_TIMEOUT` afterwards would be the
+    /// applied-then-timeout bug CTX-0464 removed — the effect lands while the
+    /// plugin is told the call failed. The service keeps the pre-commit guard
+    /// (checks the passed expiry before committing), so an already-expired
+    /// call still fails closed with no effect.
+    ///
+    /// This matters for the real plugin store: `bitty.store.set` performs
+    /// bounded but non-instant atomic temp-then-rename I/O, and on slow
+    /// platforms (Windows CI filesystem scanning a freshly created state
+    /// file) that write can exceed the 50 ms cheap-call budget after it has
+    /// already committed. Reporting a committed write as `E_TIMEOUT` would
+    /// fail the plugin callback spuriously (CTX-0477).
+    fn bounded_mutation<T>(
+        &self,
+        f: impl FnOnce(Instant) -> Result<T, BridgeError>,
+    ) -> Result<T, BridgeError> {
+        let _guard = self.enter()?;
+        let start = Instant::now();
+        let expiry = start + Duration::from_millis(self.deadline_ms);
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        f(expiry)
     }
 
     /// Spawn bridge guard through the same timeout path with the spawn
@@ -894,7 +927,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     state
-                        .bounded(|expiry| state.services.store_set_with_expiry(&key, value, expiry))
+                        .bounded_mutation(|expiry| {
+                            state.services.store_set_with_expiry(&key, value, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Boolean(true));
                     Ok(CallbackReturn::Return)
@@ -955,7 +990,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(payload, state.limits).map_err(|e| e.to_error(ctx))?;
                     let accepted = state
-                        .bounded(|expiry| state.services.notify_show_with_expiry(&value, expiry))
+                        .bounded_mutation(|expiry| {
+                            state.services.notify_show_with_expiry(&value, expiry)
+                        })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, Value::Boolean(accepted));
                     Ok(CallbackReturn::Return)

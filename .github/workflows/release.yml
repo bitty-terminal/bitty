@@ -266,7 +266,7 @@ jobs:
           GOPATH_BIN="$(go env GOPATH)/bin"
           export PATH="$GOPATH_BIN:$PATH"
           echo "$GOPATH_BIN" >> "$GITHUB_PATH"
-          mkdir -p target/release
+          mkdir -p target/release dist
           cp "target/${{ matrix.target }}/release/bitty" target/release/bitty
           # Map target arch to nfpm arch
           NFPM_ARCH="${{ matrix.arch }}"
@@ -279,9 +279,18 @@ jobs:
           # deb,rpm). The apk is built by the `build-alpine` job.
           IFS=',' read -ra PACKAGERS <<< "${{ matrix.packagers }}"
           for pkg in "${PACKAGERS[@]}"; do
-            nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target "dist/bitty-${{ matrix.target }}.${pkg}"
-            ls -lh "dist/bitty-${{ matrix.target }}.${pkg}"
+            if [[ "$pkg" == "archlinux" ]]; then
+              # CTX-0448 / 034 item 3: an explicit `bitty-<target>.archlinux`
+              # target produced a name pacman cannot install. A directory
+              # target makes nfpm emit its conventional pacman name,
+              # bitty-<version>-<pkgrel>-<arch>.pkg.tar.zst.
+              nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target dist
+            else
+              nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target "dist/bitty-${{ matrix.target }}.${pkg}"
+              ls -lh "dist/bitty-${{ matrix.target }}.${pkg}"
+            fi
           done
+          ls -lh dist/
 
       - name: Upload artifacts (aarch64, tolerant)
         if: matrix.target == 'aarch64-unknown-linux-gnu'

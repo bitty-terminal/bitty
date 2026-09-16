@@ -363,11 +363,15 @@ fn oversized_component_is_rejected_before_any_mount() {
         &["ui.rich"],
         &[],
         r#"
-        local piece = {}
-        for index = 1, 8192 do piece[index] = "x" end
-        piece = table.concat(piece)
-        local text = piece
-        for _ = 1, 33 do text = text .. piece end
+        -- 44 KiB linear chunk appended six times: over SCN-3, inside RC-1.
+        local unit_parts = {}
+        for index = 1, 1024 do unit_parts[index] = "x" end
+        local unit = table.concat(unit_parts)
+        local chunk_units = {}
+        for index = 1, 44 do chunk_units[index] = unit end
+        local chunk = table.concat(chunk_units)
+        local text = chunk
+        for _ = 1, 5 do text = text .. chunk end
         local ok, err = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = text })
         bitty.store.set("ok", ok)
         bitty.store.set("code", ok and "NONE" or err.code)

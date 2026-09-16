@@ -280,11 +280,18 @@ fn oversized_text_and_node_count_rejected() {
     run(
         &mut vm,
         r#"
-        local piece = {}
-        for index = 1, 8192 do piece[index] = "x" end
-        piece = table.concat(piece)
-        local text = piece
-        for _ = 1, 33 do text = text .. piece end
+        -- Keep the probe inside the fixed RC-1 50 ms wall budget: `table.concat`
+        -- is capped at 64 KiB, so build a 44 KiB chunk linearly and append it a
+        -- bounded number of times (repeated `..` over many small pieces is
+        -- O(n^2) and flaked on loaded CI runners).
+        local unit_parts = {}
+        for index = 1, 1024 do unit_parts[index] = "x" end
+        local unit = table.concat(unit_parts)
+        local chunk_units = {}
+        for index = 1, 44 do chunk_units[index] = unit end
+        local chunk = table.concat(chunk_units)
+        local text = chunk
+        for _ = 1, 5 do text = text .. chunk end
         local ok_text, err_text = pcall(bitty.ui.mount, "top", { kind = "Text", text = text })
         local children = {}
         for index = 1, 2049 do
@@ -327,11 +334,15 @@ fn oversized_update_rejected_before_commit() {
         r#"
         local handle = bitty.ui.mount("statusline", { kind = "Text", text = "ok" })
         bitty.store.set("handle", handle)
-        local piece = {}
-        for index = 1, 8192 do piece[index] = "x" end
-        piece = table.concat(piece)
-        local text = piece
-        for _ = 1, 33 do text = text .. piece end
+        -- 44 KiB linear chunk appended six times: over SCN-3, inside RC-1.
+        local unit_parts = {}
+        for index = 1, 1024 do unit_parts[index] = "x" end
+        local unit = table.concat(unit_parts)
+        local chunk_units = {}
+        for index = 1, 44 do chunk_units[index] = unit end
+        local chunk = table.concat(chunk_units)
+        local text = chunk
+        for _ = 1, 5 do text = text .. chunk end
         local ok, err = pcall(bitty.ui.update, handle, { kind = "Text", text = text })
         bitty.store.set("ok", ok)
         bitty.store.set("code", ok and "NONE" or err.code)

@@ -1,0 +1,64 @@
+# Linux runtime shared-library mapping (034 item 4).
+#
+# Single source of truth for the runtime dependencies the release binary links:
+# each direct `NEEDED` soname found by `readelf -d` maps to the package that
+# provides it for every nfpm package format. `scripts/check-runtime-deps.sh`
+# joins this table with `readelf -d`/`ldd` output and with the
+# `overrides.<format>.depends` declarations in `nfpm.yaml`, and fails the
+# package when they diverge.
+#
+# Values:
+#   "base"  the library ships with the distro base system (libc, ld.so); it
+#           must NOT be declared as a package dependency.
+#   name    the distro package providing the soname; the format must declare
+#           exactly the mapped names for the binary it ships.
+#
+# A format with no entry for a soname means the soname must not appear in that
+# format's binary (for example glibc sonames in the musl apk); the gate fails
+# on such a binary instead of silently declaring the wrong package.
+#
+# Layout note: 034 sketched `packaging/linux/{common,deb,rpm,alpine,arch}/`.
+# nfpm has no per-distro config files, so the documented minimal equivalent is
+# one `nfpm.yaml` with `overrides` plus this mapping file; see
+# `packaging/linux/README.md`.
+
+[sonames."libfontconfig.so.1"]
+deb = "libfontconfig1"
+rpm = "fontconfig"
+apk = "fontconfig"
+archlinux = "fontconfig"
+
+[sonames."libfreetype.so.6"]
+deb = "libfreetype6"
+rpm = "freetype"
+apk = "freetype"
+archlinux = "freetype2"
+
+[sonames."libgcc_s.so.1"]
+deb = "libgcc-s1"
+rpm = "libgcc"
+apk = "libgcc"
+archlinux = "gcc-libs"
+
+[sonames."libm.so.6"]
+deb = "base"
+rpm = "base"
+archlinux = "base"
+
+[sonames."libc.so.6"]
+deb = "base"
+rpm = "base"
+archlinux = "base"
+
+[sonames."ld-linux-x86-64.so.2"]
+deb = "base"
+rpm = "base"
+archlinux = "base"
+
+[sonames."ld-linux-aarch64.so.1"]
+deb = "base"
+rpm = "base"
+archlinux = "base"
+
+[sonames."libc.musl-x86_64.so.1"]
+apk = "base"

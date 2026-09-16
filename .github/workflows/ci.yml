@@ -62,6 +62,16 @@ jobs:
           bash scripts/check-status-drift.sh
           bash scripts/tests/check-status-drift.test.sh
 
+      # 034 item 4 / CTX-0449: the declared deb/rpm/archlinux runtime deps must
+      # cover exactly the sonames the linked binary needs. The fixture test
+      # pins the gate logic; the debug-binary run catches nfpm.yaml and
+      # packaging/linux/runtime-deps.toml drift on every PR.
+      - name: Check runtime dependency declarations (ldd/readelf gate)
+        run: |
+          bash scripts/tests/check-runtime-deps.test.sh
+          cargo build --locked -p bitty-app
+          bash scripts/check-runtime-deps.sh --binary target/debug/bitty --packagers deb,rpm,archlinux
+
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm

@@ -704,9 +704,10 @@ mod tests {
                 }
             }
         });
+        let old_p99_work_ceiling = crate::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
         assert!(
-            tail.p99_work_ms > HEADLESS_WORK_FLOOR_CEILING_MS,
-            "in-stage tail preemption must show in the work percentiles (got {:.3} ms)",
+            tail.p99_work_ms > old_p99_work_ceiling,
+            "in-stage tail preemption must exceed the old 4× percentile ceiling (got {:.3} ms)",
             tail.p99_work_ms
         );
         assert!(
@@ -714,8 +715,24 @@ mod tests {
             "tail preemption must not move the work floor (got {:.3} ms)",
             tail.min_work_ms
         );
-        // The fixed gate accepts this false-red distribution.
-        assert_headless_work_budget(&tail);
+
+        // The observed CI shape (floor ~16 ms, median 33.4 ms, p99 62.103 ms)
+        // is a false red for the old percentile gate and is accepted by the
+        // fixed floor gate; pinned deterministically so the contract cannot
+        // depend on runner timing.
+        let mut ci_shape = vec![16.0; 100];
+        ci_shape.extend(vec![33.4; 97]);
+        ci_shape.extend([62.103; 3]);
+        let ci_shape = report_from_work(&ci_shape);
+        assert!(
+            ci_shape.p50_work_ms > HEADLESS_SHARED_RUNNER_FACTOR * crate::PB4_LATENCY_MS_P50 as f64,
+            "observed CI median 33.4 ms must trip the old p50 gate"
+        );
+        assert!(
+            ci_shape.p99_work_ms > old_p99_work_ceiling,
+            "observed CI p99 62.103 ms must trip the old p99 gate"
+        );
+        assert_headless_work_budget(&ci_shape);
 
         // (3) A uniform in-stage work regression raises every sample, floor
         // included, so the fixed gate must still fail.
@@ -732,43 +749,48 @@ mod tests {
         );
     }
 
+    /// Builds a deterministic report from per-sample work values (no timing),
+    /// so budget-shape contracts can be pinned without runner dependence.
+    fn report_from_work(work_ms: &[f64]) -> LatencyReport {
+        let samples: Vec<LatencySample> = work_ms
+            .iter()
+            .copied()
+            .map(|work_ms| LatencySample {
+                total: Duration::from_secs_f64(work_ms / 1000.0),
+                encode: Duration::ZERO,
+                handle_key: Duration::ZERO,
+                pty_to_state: Duration::ZERO,
+                render_present: Duration::from_secs_f64(work_ms / 1000.0),
+                presented: true,
+            })
+            .collect();
+        let (totals, work) = presented_series(&samples);
+        LatencyReport {
+            samples,
+            p50_ms: percentile(&totals, 50.0),
+            p99_ms: percentile(&totals, 99.0),
+            mean_ms: mean(&totals),
+            max_ms: totals.last().copied().unwrap_or(0.0),
+            p50_work_ms: percentile(&work, 50.0),
+            p99_work_ms: percentile(&work, 99.0),
+            min_work_ms: work.first().copied().unwrap_or(0.0),
+            mode: LatencyMode::InjectedEcho,
+            headless: true,
+            idle_misses: 0,
+        }
+    }
+
     #[test]
     fn pb4_work_budget_classification_is_exact() {
         // CTX-0484: the real PB-4 ceilings (p50 8 ms / p99 15 ms) are
         // classified on measured work, deterministically and independently of
         // the runner. A synthetic distribution above the budget must be
         // reported as above budget, not masked by loose wall-clock ceilings.
-        let sample = |work_ms: f64| LatencySample {
-            total: Duration::from_secs_f64(work_ms / 1000.0),
-            encode: Duration::ZERO,
-            handle_key: Duration::ZERO,
-            pty_to_state: Duration::ZERO,
-            render_present: Duration::from_secs_f64(work_ms / 1000.0),
-            presented: true,
-        };
-        let report = |work: &[f64]| {
-            let samples: Vec<LatencySample> = work.iter().copied().map(sample).collect();
-            let (totals, work) = presented_series(&samples);
-            LatencyReport {
-                samples,
-                p50_ms: percentile(&totals, 50.0),
-                p99_ms: percentile(&totals, 99.0),
-                mean_ms: mean(&totals),
-                max_ms: totals.last().copied().unwrap_or(0.0),
-                p50_work_ms: percentile(&work, 50.0),
-                p99_work_ms: percentile(&work, 99.0),
-                min_work_ms: work.first().copied().unwrap_or(0.0),
-                mode: LatencyMode::InjectedEcho,
-                headless: true,
-                idle_misses: 0,
-            }
-        };
-
-        let within = report(&[1.0; 200]);
+        let within = report_from_work(&[1.0; 200]);
         assert!(within.meets_work_p50(), "1 ms work meets the 8 ms p50");
         assert!(within.meets_work_p99(), "1 ms work meets the 15 ms p99");
 
-        let above_p50 = report(&[9.0; 200]);
+        let above_p50 = report_from_work(&[9.0; 200]);
         assert!(
             !above_p50.meets_work_p50(),
             "9 ms work must fail the 8 ms p50"
@@ -782,7 +804,7 @@ mod tests {
         // verdicts are independent and each compares its own percentile.
         let mut skewed = vec![1.0; 197];
         skewed.extend([100.0, 100.0, 100.0]);
-        let skewed = report(&skewed);
+        let skewed = report_from_work(&skewed);
         assert!(
             skewed.meets_work_p50(),
             "median work {:.3} ms is inside the 8 ms p50",

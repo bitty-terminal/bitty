@@ -29,7 +29,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v5 adds the synchronized-update mode (`CTX-0380` `DECSET 2026`): prior
 /// versions omitted it, so states differing only in the presentation
 /// deferral flag collided.
-pub const CANONICAL_HASH_VERSION: u32 = 5;
+/// v6 adds the hyperlink id-space position (`CTX-0490`): prior versions
+/// omitted `next_hyperlink_id`, so states differing only in the ids their
+/// next links would receive collided.
+pub const CANONICAL_HASH_VERSION: u32 = 6;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -193,6 +196,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 5);
+        assert_eq!(CANONICAL_HASH_VERSION, 6);
     }
 }

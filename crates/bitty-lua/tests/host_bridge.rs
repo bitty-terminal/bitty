@@ -655,6 +655,94 @@ fn post_deadline_effects_never_commit() {
     );
 }
 
+/// Slow-but-committing mutation whose write itself is the commit.
+///
+/// This mirrors the real plugin store: the service performs a fast
+/// pre-commit expiry check (per the `*_with_expiry` contract) and then does
+/// bounded but non-instant atomic temp-then-rename I/O that can exceed the
+/// cheap-call budget on slow filesystems. It reports success because the
+/// effect landed.
+struct SlowCommitServices {
+    store: RefCell<BTreeMap<String, LuaValue>>,
+}
+
+impl HostServices for SlowCommitServices {
+    fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(self.store.borrow().get(key).cloned())
+    }
+
+    fn store_set(&self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
+        if key == "k" {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        self.store.borrow_mut().insert(key.to_string(), value);
+        Ok(())
+    }
+
+    fn store_set_with_expiry(
+        &self,
+        key: &str,
+        value: LuaValue,
+        expiry: std::time::Instant,
+    ) -> Result<(), BridgeError> {
+        if std::time::Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.store_set(key, value)
+    }
+
+    fn settings_get(&self, _key: &str) -> Result<Option<LuaValue>, BridgeError> {
+        Ok(None)
+    }
+
+    fn terminal_snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::capability_denied("terminal.semantic-read"))
+    }
+
+    fn notify_show(&self, _payload: &LuaValue) -> Result<bool, BridgeError> {
+        Err(BridgeError::capability_denied("platform.notify"))
+    }
+}
+
+#[test]
+fn committed_mutation_is_not_reported_as_timeout() {
+    // CTX-0477: `bitty.store.set` persists atomically (temp-then-rename) and
+    // on the Windows CI filesystem that write can exceed the 50 ms cheap-call
+    // budget after committing. Before the fix `bounded()` re-checked the
+    // deadline after `f` returned and raised E_TIMEOUT on an effect that had
+    // already landed (applied-then-timeout), failing the plugin callback.
+    // Mutating calls must deliver the committed result instead.
+    let services = Rc::new(SlowCommitServices {
+        store: RefCell::new(BTreeMap::new()),
+    });
+    let mut vm = LuaVm::new("commit");
+    let services_dyn: Rc<dyn HostServices> = services.clone();
+    vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
+        .expect("install");
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok = pcall(bitty.store.set, "k", "v")
+            bitty.store.set("code", ok and "OK" or "ERR")
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("OK".to_string())),
+        "a committed slow write must not be reported as a timeout"
+    );
+    assert_eq!(
+        services.store.borrow().get("k"),
+        Some(&LuaValue::String("v".to_string())),
+        "the committed value must be observable"
+    );
+}
+
 /// Slow spawn with expiry-aware backend for the spawn bridge timeout path.
 struct TimeoutSpawnServices {
     store: RefCell<BTreeMap<String, LuaValue>>,

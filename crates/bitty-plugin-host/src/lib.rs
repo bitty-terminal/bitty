@@ -150,7 +150,7 @@ pub use manifest::{
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
 pub use tools::{
-    ACCEPTED_TOOL_GIT, DENIED_SPAWN_ENV_VARS, GIT_ALLOWED_SUBCOMMANDS, MAX_GIT_ARG_BYTES,
-    MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool, is_allowed_git_args,
-    is_safe_spawn_env, is_tool_spawn_allowed, is_valid_tool_name,
+    ACCEPTED_TOOL_GIT, DENIED_SPAWN_ENV_PREFIXES, DENIED_SPAWN_ENV_VARS, GIT_ALLOWED_SUBCOMMANDS,
+    MAX_GIT_ARG_BYTES, MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool,
+    is_allowed_git_args, is_safe_spawn_env, is_tool_spawn_allowed, is_valid_tool_name,
 };

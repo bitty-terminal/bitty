@@ -48,23 +48,41 @@ pub const HEADLESS_BUDGET_SAMPLES: usize = 200;
 /// where the test thread can be descheduled for a whole quantum.
 pub const HEADLESS_WALL_CLOCK_CEILING_MS: f64 = 120.0;
 
-/// Shared-runner allowance applied to the PB-4 budget for the headless
-/// *work* ceilings (the sum of measured stage durations, which excludes the
-/// scheduler gaps that inflate wall clock).
+/// Shared-runner allowance applied to the PB-4 p50 budget for the tight
+/// headless *work-floor* ceiling (the sum of measured stage durations).
 ///
 /// The exact PB-4 budgets are gated by `benches/latency_real.rs` and Tier 1
 /// evidence. This factor only covers cache/CPU contention on a shared runner;
-/// a real regression of the pipeline itself still trips the ceiling, because
-/// work is measured over the stage timers rather than the whole run.
+/// a real regression of the pipeline itself still trips the ceiling. The tight
+/// gate applies it to the *fastest* presented sample's work (`min_work_ms`),
+/// because scheduler preemption only ever adds time: the floor is the
+/// noise-robust estimator of the pipeline's own cost, while the median and
+/// percentiles of a contended runner measure the runner (CTX-0494).
 pub const HEADLESS_SHARED_RUNNER_FACTOR: f64 = 4.0;
 
-/// Headless work ceiling (ms) for p50: PB-4 p50 × [`HEADLESS_SHARED_RUNNER_FACTOR`].
-pub const HEADLESS_WORK_P50_CEILING_MS: f64 =
+/// Shared-runner allowance applied to the PB-4 p99 budget for the generous
+/// headless *work-tail* ceiling.
+///
+/// Percentile work on a shared runner is dominated by in-stage preemption:
+/// CTX-0494 observed work p50 33.4 ms on Linux Wayland (#794) and work p99
+/// 62.103 ms on Windows (PR #805 evidence) while the uncontended CI floor is
+/// ~16 ms (benches, runs 35049612299 / 35056876992). The tail ceiling is
+/// therefore only a pathology guard, not the PB-4 budget: a real pipeline
+/// regression is caught by the work floor above and by the deterministic
+/// `pb4_work_budget_classification_is_exact` verdicts.
+pub const HEADLESS_SHARED_RUNNER_TAIL_FACTOR: f64 = 8.0;
+
+/// Tight headless work-floor ceiling (ms): PB-4 p50 ×
+/// [`HEADLESS_SHARED_RUNNER_FACTOR`] (4 × 8 ms = 32 ms). Applied to
+/// [`LatencyReport::min_work_ms`].
+pub const HEADLESS_WORK_FLOOR_CEILING_MS: f64 =
     super::PB4_LATENCY_MS_P50 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
 
-/// Headless work ceiling (ms) for p99: PB-4 p99 × [`HEADLESS_SHARED_RUNNER_FACTOR`].
-pub const HEADLESS_WORK_P99_CEILING_MS: f64 =
-    super::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
+/// Generous headless work-tail ceiling (ms): PB-4 p99 ×
+/// [`HEADLESS_SHARED_RUNNER_TAIL_FACTOR`] (8 × 15 ms = 120 ms). Applied to the
+/// work percentiles as a pathology guard only.
+pub const HEADLESS_WORK_TAIL_CEILING_MS: f64 =
+    super::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_TAIL_FACTOR;
 
 /// Creates a deterministic `KeyEvent` for a printable character `c`.
 ///
@@ -233,6 +251,24 @@ fn presented_series(samples: &[LatencySample]) -> (Vec<f64>, Vec<f64>) {
 // Measurement
 // ---------------------------------------------------------------------------
 
+/// Scheduler-noise injection site for the CTX-0494 shared-runner probe.
+///
+/// [`measure_latency_with_hook`] calls the hook at these points so a test can
+/// simulate, deterministically, what a loaded shared runner does to the tracer:
+///
+/// * [`NoiseSite::BetweenStages`] — between `keydown` and the first stage
+///   timer. A deschedule here inflates wall clock but no measured stage, so it
+///   must not move the work floor.
+/// * [`NoiseSite::InsideRender`] — after the render/present timer starts and
+///   before `Runtime::tick`. A deschedule here inflates wall clock *and*
+///   measured work, which is exactly why percentile work is not a robust gate
+///   while the work floor is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoiseSite {
+    BetweenStages,
+    InsideRender,
+}
+
 /// Measures key-to-screen latency over `iterations` synthetic key events.
 ///
 /// Each iteration:
@@ -247,6 +283,15 @@ fn presented_series(samples: &[LatencySample]) -> (Vec<f64>, Vec<f64>) {
 /// and the whole run touches ≤`MAX_SAMPLES` samples. No `unsafe`, no window.
 #[must_use]
 pub fn measure_latency(iterations: usize) -> LatencyReport {
+    measure_latency_with_hook(iterations, |_| {})
+}
+
+/// [`measure_latency`] with a scheduler-noise injection hook for tests.
+///
+/// Production callers pass a no-op closure, which monomorphizes away; the
+/// CTX-0494 probe passes a closure that sleeps at chosen [`NoiseSite`]s to
+/// reproduce shared-runner descheduling deterministically.
+fn measure_latency_with_hook(iterations: usize, mut noise: impl FnMut(NoiseSite)) -> LatencyReport {
     let iterations = iterations.clamp(1, MAX_SAMPLES);
     let mut rt = Runtime::with_defaults().expect("headless runtime must build for latency tracer");
     // Prime: first tick must present full redraw so idle baseline is clean.
@@ -283,6 +328,8 @@ pub fn measure_latency(iterations: usize) -> LatencyReport {
     for i in 0..iterations {
         let key = keys[i % keys.len()].clone();
         let t0 = Instant::now();
+        // CTX-0494 probe site: a deschedule here is a pure scheduler gap.
+        noise(NoiseSite::BetweenStages);
 
         // Stage 1: encode (keydown → bytes).
         let t_encode = Instant::now();
@@ -306,6 +353,8 @@ pub fn measure_latency(iterations: usize) -> LatencyReport {
 
         // Stage 4: state → render → present (tick).
         let t_render = Instant::now();
+        // CTX-0494 probe site: a deschedule here is charged to measured work.
+        noise(NoiseSite::InsideRender);
         let presented = rt.tick().is_some();
         let render_dur = t_render.elapsed();
         if !presented {
@@ -549,6 +598,36 @@ impl LatencyReport {
 mod tests {
     use super::*;
 
+    /// Tight headless work-budget gate, robust to shared-runner scheduler noise.
+    ///
+    /// CTX-0494: the stage-sum percentiles still absorb preemption that lands
+    /// *inside* a stage timer, so on a loaded runner they measure the runner
+    /// (observed work p50 33.4 ms on Linux Wayland, #794; work p99 62.103 ms on
+    /// Windows, PR #805) rather than the pipeline. The floor (`min_work_ms`,
+    /// the fastest presented sample) is the noise-robust estimator of the
+    /// pipeline's own cost: preemption only ever adds time, while a genuine
+    /// regression moves every sample, so the floor crosses the ceiling first.
+    /// The exact PB-4 8/15 ms verdicts are owned by
+    /// `pb4_work_budget_classification_is_exact` and the bench/Tier 1 gate.
+    fn assert_headless_work_budget(report: &LatencyReport) {
+        assert!(
+            report.min_work_ms < HEADLESS_WORK_FLOOR_CEILING_MS,
+            "work floor {:.3} ms must be < {:.0} ms (PB-4 p50 {} ms × {} shared-runner factor)",
+            report.min_work_ms,
+            HEADLESS_WORK_FLOOR_CEILING_MS,
+            crate::PB4_LATENCY_MS_P50,
+            HEADLESS_SHARED_RUNNER_FACTOR
+        );
+        assert!(
+            report.p99_work_ms < HEADLESS_WORK_TAIL_CEILING_MS,
+            "work p99 {:.3} ms must stay below the {:.0} ms pathology ceiling (PB-4 p99 {} ms × {} tail factor)",
+            report.p99_work_ms,
+            HEADLESS_WORK_TAIL_CEILING_MS,
+            crate::PB4_LATENCY_MS_P99,
+            HEADLESS_SHARED_RUNNER_TAIL_FACTOR
+        );
+    }
+
     #[test]
     fn latency_tracer_is_bounded_and_meets_budget_headless() {
         let report = measure_latency(HEADLESS_BUDGET_SAMPLES);
@@ -557,60 +636,19 @@ mod tests {
             HEADLESS_BUDGET_SAMPLES,
             "bounded samples"
         );
-        // PB-4 budget is p50 8 ms / p99 15 ms on Tier 1; this unit test is
-        // intentionally loose to stay green under CI parallelism where p50 was
-        // observed at 11–21 ms and p99 flaked at 16.6 ms across 5/5 legs,
-        // 52.872 ms on macOS ARM64 (run 33502295193), and 51 ms on Windows.
-        // Real budget is gated by benches/latency_real.rs and Tier 1 evidence,
-        // not this unit test. Keep bounded p50/p99 to tolerate scheduler
-        // jitter; the bench gates the true budget (8/15 ms).
-        let p50_limit = if std::env::var("CI").is_ok() {
-            60.0
-        } else {
-            30.0
-        };
-        assert!(
-            report.p50_ms < p50_limit,
-            "p50 {:.3} ms must be < {:.0} ms headless (relaxed for CI parallelism; budget 8 ms gated by bench)",
-            report.p50_ms,
-            p50_limit
-        );
-        // CTX-0410 / #659: at n=50 `percentile(99)` returned the single maximum
-        // (rank round(0.99*49)=49), so one scheduler-stalled sample (204.432 ms
-        // on Windows CI) decided a p99 budget. HEADLESS_BUDGET_SAMPLES=200 makes
-        // this a true p99 that excludes the two worst presented samples. The
-        // presented count is a deterministic function of the key mix (no timing
-        // dependence), so the allowance is a fixed 1% of the run. The ceiling is
-        // unchanged, so a shifted distribution (a real regression, not one
-        // descheduled sample) still fails; `headless_p99_tolerates_one_scheduler_
-        // stall_but_not_a_regression` pins that contract.
+        // Wall clock on a shared runner includes scheduler gaps between and
+        // inside stages, so it is only a liveness/pathology guard. p50 ≤ p99 by
+        // construction, so the single p99 bound covers both; the tight budget
+        // is asserted on measured work by `assert_headless_work_budget`, and
+        // the exact PB-4 8/15 ms verdicts are pinned deterministically by
+        // `pb4_work_budget_classification_is_exact` and the bench/Tier 1 gate.
         assert!(
             report.p99_ms < HEADLESS_WALL_CLOCK_CEILING_MS,
-            "p99 {:.3} ms must be < {:.0} ms headless (relaxed for CI parallelism/macOS flaky; budget 15 ms gated by bench)",
+            "wall p99 {:.3} ms must be < {:.0} ms headless liveness ceiling (budget gated by work floor + bench)",
             report.p99_ms,
             HEADLESS_WALL_CLOCK_CEILING_MS
         );
-        // CTX-0484: the wall-clock ceilings above are only a liveness/pathology
-        // guard. The real budget is asserted on measured *work* (stage-sum,
-        // which excludes scheduler gaps between stages) within the documented
-        // shared-runner allowance; `pb4_work_budget_classification_is_exact`
-        // pins the exact 8/15 ms verdicts that the bench/Tier 1 gate owns.
-        assert!(
-            report.p50_work_ms < HEADLESS_WORK_P50_CEILING_MS,
-            "work p50 {:.3} ms must be < {:.0} ms (PB-4 p50 {} ms × {} shared-runner factor)",
-            report.p50_work_ms,
-            HEADLESS_WORK_P50_CEILING_MS,
-            crate::PB4_LATENCY_MS_P50,
-            HEADLESS_SHARED_RUNNER_FACTOR
-        );
-        assert!(
-            report.p99_work_ms < HEADLESS_WORK_P99_CEILING_MS,
-            "work p99 {:.3} ms must be < {:.0} ms (PB-4 p99 {} ms × {} shared-runner factor)",
-            report.p99_work_ms,
-            HEADLESS_WORK_P99_CEILING_MS,
-            crate::PB4_LATENCY_MS_P99,
-            HEADLESS_SHARED_RUNNER_FACTOR
-        );
+        assert_headless_work_budget(&report);
         // Bounded stage tracing: encode is the hot-path stage whose work must
         // stay sub-millisecond; the pathological guard stays.
         for s in &report.samples {
@@ -627,42 +665,132 @@ mod tests {
     }
 
     #[test]
+    fn headless_work_budget_discriminates_scheduler_noise_from_work() {
+        // CTX-0494 red-before-fix probe: the shipped percentile work ceilings
+        // (PB-4 × 4 = 32/60 ms) false-red when a shared runner deschedules the
+        // tracer *inside* a stage timer, because that preemption is charged to
+        // the stage sum. The floor gate must tolerate that noise while still
+        // failing a genuine work regression.
+        use std::thread;
+
+        // (1) A scheduler gap between stages inflates wall clock far past the
+        // liveness ceiling but cannot move measured work.
+        let between = measure_latency_with_hook(6, |site| {
+            if site == NoiseSite::BetweenStages {
+                thread::sleep(Duration::from_millis(150));
+            }
+        });
+        assert!(
+            between.p99_ms > HEADLESS_WALL_CLOCK_CEILING_MS,
+            "injected between-stage gaps must inflate wall clock past the liveness ceiling (got {:.3} ms)",
+            between.p99_ms
+        );
+        assert!(
+            between.min_work_ms < HEADLESS_WORK_FLOOR_CEILING_MS,
+            "between-stage gaps are not work: floor {:.3} ms must stay < {:.0} ms",
+            between.min_work_ms,
+            HEADLESS_WORK_FLOOR_CEILING_MS
+        );
+
+        // (2) In-stage preemption on a small tail lifts the work percentiles
+        // over the old 4× ceiling while the floor stays clean — the exact
+        // false-red mechanism (work p50 33.4 ms / p99 62.103 ms).
+        let mut seen = 0usize;
+        let tail = measure_latency_with_hook(HEADLESS_BUDGET_SAMPLES, |site| {
+            if site == NoiseSite::InsideRender {
+                seen += 1;
+                if seen % 40 == 0 {
+                    thread::sleep(Duration::from_millis(80));
+                }
+            }
+        });
+        let old_p99_work_ceiling = crate::PB4_LATENCY_MS_P99 as f64 * HEADLESS_SHARED_RUNNER_FACTOR;
+        assert!(
+            tail.p99_work_ms > old_p99_work_ceiling,
+            "in-stage tail preemption must exceed the old 4× percentile ceiling (got {:.3} ms)",
+            tail.p99_work_ms
+        );
+        assert!(
+            tail.min_work_ms < HEADLESS_WORK_FLOOR_CEILING_MS,
+            "tail preemption must not move the work floor (got {:.3} ms)",
+            tail.min_work_ms
+        );
+
+        // The observed CI shape (floor ~16 ms, median 33.4 ms, p99 62.103 ms)
+        // is a false red for the old percentile gate and is accepted by the
+        // fixed floor gate; pinned deterministically so the contract cannot
+        // depend on runner timing.
+        let mut ci_shape = vec![16.0; 100];
+        ci_shape.extend(vec![33.4; 97]);
+        ci_shape.extend([62.103; 3]);
+        let ci_shape = report_from_work(&ci_shape);
+        assert!(
+            ci_shape.p50_work_ms > HEADLESS_SHARED_RUNNER_FACTOR * crate::PB4_LATENCY_MS_P50 as f64,
+            "observed CI median 33.4 ms must trip the old p50 gate"
+        );
+        assert!(
+            ci_shape.p99_work_ms > old_p99_work_ceiling,
+            "observed CI p99 62.103 ms must trip the old p99 gate"
+        );
+        assert_headless_work_budget(&ci_shape);
+
+        // (3) A uniform in-stage work regression raises every sample, floor
+        // included, so the fixed gate must still fail.
+        let regressed = measure_latency_with_hook(8, |site| {
+            if site == NoiseSite::InsideRender {
+                thread::sleep(Duration::from_millis(34));
+            }
+        });
+        assert!(
+            regressed.min_work_ms >= HEADLESS_WORK_FLOOR_CEILING_MS,
+            "uniform work inflation must raise the floor above {:.0} ms (got {:.3} ms)",
+            HEADLESS_WORK_FLOOR_CEILING_MS,
+            regressed.min_work_ms
+        );
+    }
+
+    /// Builds a deterministic report from per-sample work values (no timing),
+    /// so budget-shape contracts can be pinned without runner dependence.
+    fn report_from_work(work_ms: &[f64]) -> LatencyReport {
+        let samples: Vec<LatencySample> = work_ms
+            .iter()
+            .copied()
+            .map(|work_ms| LatencySample {
+                total: Duration::from_secs_f64(work_ms / 1000.0),
+                encode: Duration::ZERO,
+                handle_key: Duration::ZERO,
+                pty_to_state: Duration::ZERO,
+                render_present: Duration::from_secs_f64(work_ms / 1000.0),
+                presented: true,
+            })
+            .collect();
+        let (totals, work) = presented_series(&samples);
+        LatencyReport {
+            samples,
+            p50_ms: percentile(&totals, 50.0),
+            p99_ms: percentile(&totals, 99.0),
+            mean_ms: mean(&totals),
+            max_ms: totals.last().copied().unwrap_or(0.0),
+            p50_work_ms: percentile(&work, 50.0),
+            p99_work_ms: percentile(&work, 99.0),
+            min_work_ms: work.first().copied().unwrap_or(0.0),
+            mode: LatencyMode::InjectedEcho,
+            headless: true,
+            idle_misses: 0,
+        }
+    }
+
+    #[test]
     fn pb4_work_budget_classification_is_exact() {
         // CTX-0484: the real PB-4 ceilings (p50 8 ms / p99 15 ms) are
         // classified on measured work, deterministically and independently of
         // the runner. A synthetic distribution above the budget must be
         // reported as above budget, not masked by loose wall-clock ceilings.
-        let sample = |work_ms: f64| LatencySample {
-            total: Duration::from_secs_f64(work_ms / 1000.0),
-            encode: Duration::ZERO,
-            handle_key: Duration::ZERO,
-            pty_to_state: Duration::ZERO,
-            render_present: Duration::from_secs_f64(work_ms / 1000.0),
-            presented: true,
-        };
-        let report = |work: &[f64]| {
-            let samples: Vec<LatencySample> = work.iter().copied().map(sample).collect();
-            let (totals, work) = presented_series(&samples);
-            LatencyReport {
-                samples,
-                p50_ms: percentile(&totals, 50.0),
-                p99_ms: percentile(&totals, 99.0),
-                mean_ms: mean(&totals),
-                max_ms: totals.last().copied().unwrap_or(0.0),
-                p50_work_ms: percentile(&work, 50.0),
-                p99_work_ms: percentile(&work, 99.0),
-                min_work_ms: work.first().copied().unwrap_or(0.0),
-                mode: LatencyMode::InjectedEcho,
-                headless: true,
-                idle_misses: 0,
-            }
-        };
-
-        let within = report(&[1.0; 200]);
+        let within = report_from_work(&[1.0; 200]);
         assert!(within.meets_work_p50(), "1 ms work meets the 8 ms p50");
         assert!(within.meets_work_p99(), "1 ms work meets the 15 ms p99");
 
-        let above_p50 = report(&[9.0; 200]);
+        let above_p50 = report_from_work(&[9.0; 200]);
         assert!(
             !above_p50.meets_work_p50(),
             "9 ms work must fail the 8 ms p50"
@@ -676,7 +804,7 @@ mod tests {
         // verdicts are independent and each compares its own percentile.
         let mut skewed = vec![1.0; 197];
         skewed.extend([100.0, 100.0, 100.0]);
-        let skewed = report(&skewed);
+        let skewed = report_from_work(&skewed);
         assert!(
             skewed.meets_work_p50(),
             "median work {:.3} ms is inside the 8 ms p50",

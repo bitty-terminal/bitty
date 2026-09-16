@@ -6,8 +6,18 @@
 //! module does **not** mutate that table. It interprets snapshot cells (each carries an optional
 //! [`HyperlinkId`]) against the table to produce spans, hit tests, and
 //! headless overlay geometry.
+//!
+//! # URI policy (CTX-0486)
+//!
+//! Only `http`/`https`/`mailto` URIs are presented (see
+//! [`is_safe_hyperlink_uri`]). The `file:` scheme is rejected outright: a
+//! terminal program must never be able to surface a clickable local-file
+//! link, because the click path leads to an OS handler. Opening a local
+//! file stays the runtime's separate, explicit `FileUrlActivation`
+//! capability path (mouse gesture + plugin intercept), which this layer
+//! neither grants nor bypasses.
 
-use bitty_platform::{validate_file_url, validate_url};
+use bitty_platform::validate_url;
 use bitty_term_state::{HyperlinkId, Snapshot, State};
 
 use crate::geometry::{CellMetrics, RectPx};
@@ -22,14 +32,22 @@ pub const HYPERLINK_ID_MAX: usize = bitty_vt::BoundedString::MAX_LEN;
 /// Validates a terminal-provided URI before it reaches an OS URL handler.
 ///
 /// This intentionally does not normalize or invoke a shell. Exact, lowercase
-/// schemes and one-layer percent-encoding checks prevent scheme obfuscation.
+/// schemes and one-layer percent-encoding checks prevent scheme obfuscation
+/// (`validate_url` accepts only `http`/`https`/`mailto`).
+///
+/// # `file:` policy
+///
+/// OSC 8 hyperlinks never carry local-file activation: `file:` is rejected
+/// outright (all case variants, since only the three lowercase schemes
+/// match). Terminal output is untrusted, and a clickable local-file link
+/// whose activation path reaches the OS handler is an unwanted capability
+/// for remote or hostile output. Opening a local file remains the runtime's
+/// separate, explicit `FileUrlActivation` path (runtime-issued mouse
+/// gesture, plugin intercept, and `validate_file_url`), which this
+/// presentation layer neither grants nor bypasses.
 #[must_use]
 pub fn is_safe_hyperlink_uri(uri: &str) -> bool {
-    if uri.starts_with("file:") {
-        validate_file_url(uri).is_ok()
-    } else {
-        validate_url(uri).is_ok()
-    }
+    validate_url(uri).is_ok()
 }
 
 /// Resolved hyperlink target plus its optional `id=` parameter.
@@ -452,6 +470,14 @@ mod tests {
             "https://example.test/\nnext",
             "file:///tmp/a|b",
             "https://example.test/%",
+            // CTX-0486 file: policy: no case variant is ever clickable.
+            "file:///etc/passwd",
+            "file:///tmp/report.txt",
+            "file://attacker/share",
+            "file://server/share",
+            "FILE:///etc/passwd",
+            "FiLe:///etc/passwd",
+            "file:///tmp/%2e%2e/etc/passwd",
         ] {
             assert!(!is_safe_hyperlink_uri(uri), "accepted hostile URI: {uri:?}");
         }
@@ -463,11 +489,39 @@ mod tests {
             "https://example.test/path?q=a%20b",
             "http://127.0.0.1:8080/",
             "mailto:user@example.test",
-            "file:///tmp/report.txt",
         ] {
             assert!(
                 is_safe_hyperlink_uri(uri),
                 "rejected supported URI: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_scheme_hyperlinks_are_never_presented() {
+        // Remote output must not turn a local path into a clickable span on
+        // any presentation surface (hit test, span list, overlay rects).
+        for uri in [
+            "file:///etc/passwd",
+            "file:///tmp/report.txt",
+            "file://attacker/share",
+        ] {
+            let mut state = State::new();
+            state.apply(&TerminalAction::OscHyperlink {
+                link: Some(Hyperlink {
+                    id: None,
+                    uri: BoundedString::new(uri),
+                }),
+            });
+            print(&mut state, "x");
+            let snapshot = state.snapshot();
+            assert!(
+                hyperlink_at(&snapshot, &state, 0, 0).is_none(),
+                "file: link hit-testable: {uri}"
+            );
+            assert!(
+                hyperlink_spans(&snapshot, &state).is_empty(),
+                "file: link produced a span: {uri}"
             );
         }
     }

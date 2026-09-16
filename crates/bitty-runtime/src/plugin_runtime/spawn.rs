@@ -327,12 +327,16 @@ impl SpawnRequest {
         for (name, value) in &self.env {
             EnvVar::new(name.clone(), value.clone())?;
         }
-        // CTX-0465: pager hijack closed at the spawn surface — explicit env
-        // must never carry PAGER / GIT_PAGER (the external pager program git
-        // would execute). Fail-closed before routing, scope, or consent.
+        // CTX-0465/CTX-0488: pager, env-encoded git config override, and
+        // external-process vectors are closed at the spawn surface — explicit
+        // env must never carry PAGER/GIT_PAGER, GIT_CONFIG* (including the
+        // numbered GIT_CONFIG_KEY_*/GIT_CONFIG_VALUE_* pairs), or
+        // GIT_EXTERNAL_DIFF/GIT_DIFF_OPTS and the adjacent exec vectors.
+        // Fail-closed before routing, scope, or consent.
         if !is_safe_spawn_env(&self.env) {
             return Err(IpcError::InvalidRequest {
-                reason: "spawn env must not set PAGER or GIT_PAGER (pager hijack)".into(),
+                reason: "spawn env must not set pager, git config override, or external-process variables"
+                    .into(),
             });
         }
         if self.timeout_ms == 0 {
@@ -1623,6 +1627,56 @@ mod tests {
         // Benign and near-miss env still passes shape validation.
         SpawnRequest::new("test", vec!["x".to_owned()])
             .with_env(vec![
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("MY_PAGER".to_owned(), "x".to_owned()),
+            ])
+            .with_allow_effects(true)
+            .validate()
+            .expect("benign env must validate");
+    }
+
+    #[test]
+    fn probe_git_config_and_external_process_env_rejected_before_authorizer() {
+        // CTX-0488 hostile probe: GIT_CONFIG_* env re-opens the `-c`/`--config`
+        // override vector closed at argv level; GIT_EXTERNAL_DIFF/GIT_DIFF_OPTS
+        // re-open external-process execution. All must fail closed at shape
+        // validation, before the authorizer or process spawn.
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen.clone())));
+        let vectors: Vec<Vec<(String, String)>> = vec![
+            vec![
+                ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+                ("GIT_CONFIG_KEY_0".to_owned(), "core.pager".to_owned()),
+                ("GIT_CONFIG_VALUE_0".to_owned(), "evil".to_owned()),
+            ],
+            vec![(
+                "GIT_CONFIG_PARAMETERS".to_owned(),
+                "'core.pager=evil'".to_owned(),
+            )],
+            vec![("GIT_EXTERNAL_DIFF".to_owned(), "/tmp/evil".to_owned())],
+            vec![("GIT_DIFF_OPTS".to_owned(), "--ext-diff".to_owned())],
+            vec![("GIT_SSH_COMMAND".to_owned(), "/tmp/evil".to_owned())],
+            vec![("GIT_SEQUENCE_EDITOR".to_owned(), "/tmp/evil".to_owned())],
+        ];
+        for (id, env) in vectors.into_iter().enumerate() {
+            let request = SpawnRequest::new("test", vec!["x".to_owned()])
+                .with_env(env)
+                .with_allow_effects(true);
+            let error = dispatch_ok(&mut service, &request, 300 + id as u64)
+                .expect_err("config/external-process env must fail closed");
+            assert!(
+                matches!(error, IpcError::InvalidRequest { .. }),
+                "got {error:?}"
+            );
+        }
+        assert!(
+            seen.borrow().is_empty(),
+            "hostile env must fail before routing or spawn"
+        );
+        // Benign git settings still pass shape validation.
+        SpawnRequest::new("test", vec!["x".to_owned()])
+            .with_env(vec![
+                ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
                 ("LANG".to_owned(), "C.UTF-8".to_owned()),
                 ("MY_PAGER".to_owned(), "x".to_owned()),
             ])

@@ -83,8 +83,8 @@ fn runtime_real_shell_echo_bounded_backpressure() {
     // Verify a non-blocking try_recv after drain respects the same bound
     // when we manually take the reader (headless fallback path keeps working).
     if let Some(reader) = rt.take_pty_reader() {
-        // Reader was drained; further try_recv must be None or EOF chunk.
-        if let Some(chunk) = reader.try_recv() {
+        // Reader was drained; further try_recv must be empty/EOF, never a chunk.
+        if let bitty_pty::PtyRecv::Chunk(chunk) = reader.try_recv() {
             assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
         }
         // Do not join here; runtime will reap pty on drop.

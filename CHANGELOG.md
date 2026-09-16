@@ -143,6 +143,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content inside each view frame, so text no longer sits flush against the
   panel margin line. Exposed via `init.lua`, validated fail-closed, and
   mirrored in `bitty check`/`bitty inspect`.
+- **`--fail-loud` startup mode (CTX-0481, issue #762):** `bitty --fail-loud`
+  (or `BITTY_FAIL_LOUD=1`) aborts startup with exit 1 when the primary shell,
+  a startup pane shell, or the IPC servo fails or is rejected, instead of
+  continuing in a degraded session; the default stays fail-soft and a
+  platform-unsupported IPC servo is never fatal.
+- **IPC wire version negotiation (CTX-0484, issue #765):** `bitty-ipc`
+  advertises `SUPPORTED_WIRE_VERSIONS` and offers
+  `negotiate_wire_version(&[u16])`, which selects the highest mutual version
+  and fails closed with `VersionMismatch` when there is no overlap (IPC and
+  Agent RFC, Versioning section).
 
 ### Changed
 
@@ -228,6 +238,165 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   scroll-speed keys `terminal.scroll_lines_per_notch` (default `3`, range
   `1..=32`) and `terminal.scroll_pixels_per_notch` (default `16`, range
   `1..=256`) are unchanged and continue to scale the scroll amount.
+- **`Esc` is consumed only by confirmation gates (CTX-0475, issue #756):** an
+  `Esc` press is consumed only when it cancels a real confirmation gate
+  (suspicious-paste, workspace kill-confirm, close-confirm); dismissing the
+  informational help popup now passes `Esc` through and delivers `\x1b` to the
+  focused PTY, so fullscreen apps (vim/less) no longer desync their mode
+  state. Gate semantics are unchanged: a cancelled paste or close never leaks
+  bytes to the PTY, and when a gate and the help popup coincide both close and
+  the gate keeps the consume.
+- **Invalid CLI layout/focus/log values fail closed (CTX-0480, issue #761):**
+  invalid `--split`, `--split-ratio`, `--log-level`, `--layout`, and `--focus`
+  values now print usage and exit 2 instead of warning and running defaults
+  (including `--split=h:junk`, `h:`, `:0.5` without an axis, and malformed
+  `--layout` specs such as partial overlay geometry or non-finite ratios);
+  finite out-of-range ratios/stack counts still clamp loudly, negative
+  space-form `--split-ratio -5` is parsed as an out-of-range value and clamps
+  like `--split-ratio=-5`, and an unresolvable-but-valid `--focus <id>` still
+  warns and continues.
+- **Clipboard payload limits are explicit (CTX-0478, issue #759):**
+  `set_text`/`set_primary`/`get_text`/`get_primary` reject over-limit payloads
+  with the new typed `ClipboardPayloadTooLarge { len, max }` instead of
+  truncating silently (a rejected write leaves both selections unchanged); the
+  bounded accessors used by chord/right-click paste and the OSC 52 read reply
+  clip an oversized value at a UTF-8 char boundary (8 KiB default), so an
+  oversized system clipboard pastes its bounded prefix instead of becoming a
+  silent no-op; lossy reads return an empty string on a system read failure
+  instead of replaying a stale in-memory value.
+- **Agent/perf/compat surfaces are honest (CTX-0484, issue #765):**
+  `AgentMessage` carries an explicit `ContentTrust` label (default
+  `Untrusted`, `Trusted` only via the new `AgentMessage::new_trusted`, and
+  `Role::Tool` messages can never be trusted); `IdleReport` gains a tri-state
+  `cpu_budget_verdict()` (`Met`/`Exceeded`/`Unmeasured`, with
+  `meets_cpu_budget()` false when unmeasured); `LatencyReport` discloses its
+  measurement `mode` (injected echo vs real PTY echo) and adds work
+  p50/p99/min; and the compat-lab matrix derives reference outcomes from the
+  on-disk dumps instead of hardcoding `SKIP`.
+
+### Fixed
+
+- **Bounded damage history with full-grid fallback (CTX-0468, issue #749):**
+  `State::damage_since` returns a single full-grid region when the requested
+  generation predates the oldest retained damage batch, when a stale caller
+  has no retained history, or before the union can exceed the 256-region cap,
+  instead of returning only surviving partial batches and under-painting.
+  Up-to-date callers keep the O(1)/O(window) path, and every fallback
+  over-damages to the full grid, never under-damages.
+- **Terminal state erase/resize/reflow/hyperlink correctness (CTX-0469, issue
+  #750):** erase ranges expand both wide-pair edges independently; a
+  height-only resize preserves wrapped-line continuation flags (width changes
+  still break them); search reads the live grid row instead of cloning up to
+  1M cells; width-resize reflow collects logical lines once and reuses its
+  per-line row counts; the 256-region damage cap is evaluated before quadratic
+  merge work; origin-mode CPR uses saturating subtraction (a cursor above the
+  region reports row 1); and the hyperlink table evicts oldest-first with
+  monotonic ids, so an evicted id fails closed to no link and is never reused.
+- **Runtime teardown joins forwarders with bounds (CTX-0472, issue #753):**
+  `Runtime` gains `Drop`/`shutdown`/`shutdown_with_timeout`, which clear the
+  waker, drop receivers and owned PTYs, and join primary and pane forwarders
+  with a 500 ms bound; respawn and pane close join the old forwarders instead
+  of detaching them; the panel worker probe is cancellable and its shutdown is
+  bounded at 2 s, so teardown can no longer hang on a wedged worker.
+- **Runtime hot-path hygiene (CTX-0473, issue #754):** forwarder-thread spawn
+  refusal no longer panics or drops the `PtyReader` (the reader is handed back
+  so the child's output keeps flowing; the refusal is counted and warned);
+  best-effort PTY writes and flushes now account written/dropped bytes instead
+  of silently discarding failures; and OSC 52/kitty reject and spawn-failure
+  logging is throttled (4 messages per 1 s per site, with a suppressed-count
+  suffix) so a hostile flood cannot spool unbounded stderr.
+- **Spawn timeouts preserve output; PTY polling is budgeted (CTX-0476, issue
+  #757):** a timed-out `bitty.process.spawn` now returns the stdout/stderr
+  bytes collected before the kill (with byte-count evidence) instead of empty
+  strings, and drain joins are bounded at 1 s (a stalled grandchild-held pipe
+  is detached and reported as an evidence ref); `poll_pty` and
+  `pump_pane_sessions` share one global budget (32 chunks / 256 KiB / 10 ms
+  per poll) and the forwarder coalesces immediately-available chunks behind a
+  single wakeup, so a hostile flood can no longer stall the render thread or
+  storm the event loop.
+- **PTY and diagnostics platform gaps (CTX-0478, issue #759):** a foreground
+  job name is re-checked against the current foreground group after the read
+  (a reused pid no longer reports an unrelated process; the pid is still
+  reported); `terminal.shell` or spawn argv containing NUL reports a precise
+  "must not contain NUL bytes" diagnostic via `PtyError::NulInProgram`;
+  `Clipboard::new` records and exposes why it degraded to the headless buffer
+  via `headless_reason()`; and ConPTY's missing foreground surface is
+  documented and pinned as "cannot determine" (never busy) on Windows.
+- **Config validation coverage, trust comparison, platform roots (CTX-0479,
+  issue #760):** diagnostics now cover `selection`, `close_confirm`, `mod_key`,
+  and `views`; the config trust comparison is normalized and round-trips
+  through its durable store form; and Windows `%APPDATA%`/`%LOCALAPPDATA%`
+  participate in config-root resolution.
+- **Live plugin snapshots and zoom ownership (CTX-0481, issue #762):** the
+  plugin `LiveSnapshot` commits the runtime's committed generation from
+  `drive_tick` with live geometry, cursor, alt-screen mode, and title, and
+  refuses a generation regression, so the frozen generation-1 view cannot
+  recur; `ZoomState` restores the real tree only while the runtime still holds
+  the installed proxy (structural identity, reflow-stable), and a ctl
+  pre-mutation hook routes layout-mutating verbs so a ctl split can no longer
+  land on the zoom proxy and be dropped by the later zoom restore.
+
+### Security
+
+- **Package trust verification is fail-closed (CTX-0462, issue #743):** the
+  forgeable V-C signature stub (a `verify_signature` that recomputed
+  `SHA-256(key_id || manifest || artifact)`, mintable by anyone holding the
+  public `key_id`) is removed. Signature records are now rejected as
+  unavailable, so `TrustMode::Signed` installs fail closed instead of
+  accepting forgeries; the reserved Ed25519-shaped wire fields stay for the
+  OQ-029 follow-up (bitty#767, DEC-0059). V-A/V-B verification and
+  signature-first pin ordering are unchanged.
+- **Devtools IPC transport verifies its endpoint (CTX-0463, issue #744):**
+  `transport_attested_peer` re-verifies the bound endpoint per connection
+  (0700 directory and 0600 socket, both owned by the runtime uid, symlinks
+  rejected), the client checks the same ownership before connecting, and a
+  `BITTY_SOCKET` override is verified rather than trusted verbatim; child
+  token error paths return static, token-free reasons. True per-connection
+  `SO_PEERCRED` fd checks stay deferred (tracked for CTX-0159).
+- **Lua sandbox budgets cover compile and host calls (CTX-0464, issue #745):**
+  `drive_chunk` refuses chunks over a 1 MiB cap before parsing; the wall-clock
+  budget now includes `Closure::load`, so an over-budget compile suspends with
+  `WallClockExceeded` without executing; mutating host services (`store.*`,
+  `notify.show`) re-check the call deadline so post-deadline effects never
+  commit; and `bitty.process.spawn` runs under its own deadline (5 s default,
+  30 s max). Tighter call-site caps (64 KiB config, 8 KiB events) still apply.
+- **Plugin host predicates are hardened (CTX-0465, issue #746):** the
+  allowlisted `git` verbs deny glued `-c*`/`-C*`, every `--config*` form, and
+  `--paginate`/`--pager` (`--no-pager` stays allowed), and spawn environments
+  reject `PAGER`/`GIT_PAGER`; manifest `fs.read`/`fs.write` patterns reject
+  absolute paths, `~user/`, `..` on either separator, and credential
+  locations (`~/.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`,
+  `~/.config/gh|gcloud`) while patterns like `~/projects/**` remain valid; an
+  intercept timeout now denies for every decision (was proceed); a
+  per-capability revoke persists its denial until an explicit re-grant
+  (`clear_cap_denial`), and revoking the last capability still escalates to a
+  full revoke.
+- **Package compat ranges and source URLs are validated (CTX-0466, issue
+  #747):** installs evaluate the real `VersionReq` against the host version
+  fail-closed (mismatched, unparseable, or missing host rejected), source URLs
+  are scheme-allowlisted (registry `https` only; git `https` and `git+ssh`),
+  host/userinfo/port shapes are checked, and git revisions get charset and
+  structure checks while mutable names (`HEAD`, branches) remain allowed with
+  SHA pinning recommended, not enforced. Shorthand comparators (`1.2`)
+  normalize to `1.2.0`; IPv6 hosts, scp-like `git@host:` URLs, and plain
+  `ssh://` stay rejected in v1.
+- **Rich background identity and kitty chunked caps (CTX-0467, part of issue
+  #748):** background images are acquired through a single fd-pinned open with
+  pre/post fstat re-verification and cached under a key derived from the
+  decoded bytes (length, post-read mtime, FNV-1a/64 content hash), so a
+  same-length rewrite with a restored mtime re-decodes instead of poisoning
+  the cache; chunked kitty transmissions are bounded by the unified 4 KiB
+  per-transmission cap, over-cap transfers fail `Oversize` before buffering,
+  and chunked admission never evicts resident images (fits-cap-but-no-room and
+  count-full completion fail `LedgerFull`) while only single-shot ingest
+  evicts.
+- **IPC channel/bridge hostile-peer robustness (CTX-0483, issue #764):**
+  `RateLimiter` now honors `limit_per_sec` with a token bucket (sustained load
+  capped at the configured rate, bursts up to `burst` still allowed, backwards
+  clock steps accrue nothing); expired requests are removed from the pending
+  table and the not-yet-delivered request queue, so a timed-out request can
+  never execute after its deadline; and answers for unknown/expired/completed
+  ids are dropped before enqueue instead of filling the 64-deep inbound queue.
 
 ### Per-pane damage tracking: splits stop forcing full repaint (CTX-0386, issue #642)
 

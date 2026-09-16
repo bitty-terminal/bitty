@@ -65,6 +65,11 @@ jobs:
       - name: Check terminfo shipping decision (034 item 6)
         run: |
           bash scripts/check-terminfo.sh
+      - name: Check desktop integration and AppStream metadata (034 item 7)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends appstream desktop-file-utils libxml2-utils
+          bash scripts/check-desktop-integration.sh
       - name: Check release version alignment (Cargo <-> packaging <-> tag)
         run: |
           bash scripts/check-release-version.sh

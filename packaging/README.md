@@ -50,6 +50,35 @@ After installing or replacing icons, refresh the desktop icon cache so launchers
 gtk-update-icon-cache -f -t /usr/share/icons/hicolor   # adjust the prefix if installing elsewhere
 ```
 
+## Desktop integration and AppStream
+
+The fixed Linux application ID is `run.bitty.Bitty` (the reverse-DNS form of
+`bitty.run`). One ID is used everywhere so desktop grouping, D-Bus, and any
+future Flatpak identity agree from the start; the choice is recorded here and
+must not be renamed silently:
+
+- `.desktop` file: `packaging/run.bitty.Bitty.desktop`, installed to
+  `/usr/share/applications/run.bitty.Bitty.desktop`, with
+  `StartupWMClass=run.bitty.Bitty`.
+- AppStream metainfo: `packaging/run.bitty.Bitty.metainfo.xml`, installed to
+  `/usr/share/metainfo/run.bitty.Bitty.metainfo.xml`; `<id>` and
+  `<launchable type="desktop-id">` use the same ID.
+- Window identity: `const APP_ID` in `crates/bitty-platform/src/app.rs` sets the
+  Wayland `app_id` and the X11 `WM_CLASS` pair to the same value.
+- Icons keep the icon-theme name `bitty` (`Icon=bitty`); the theme name is not
+  the application ID.
+
+The metainfo carries name, summary, description, project/metadata license,
+homepage, bug tracker, categories, release info, and the stock `bitty` icon.
+Store screenshots are not produced yet (034 item 7 keeps screenshot production
+out of scope); `appstreamcli validate` passes without them.
+
+Validation: `bash scripts/check-desktop-integration.sh` asserts the ID agreement
+across these files and runs `xmllint`, `appstreamcli validate`, and
+`desktop-file-validate` when installed; `bash scripts/tests/check-desktop-integration.test.sh`
+covers each drift case. Both run in `just check` and the CI Quality gates job,
+and the release `validate` job reruns the gate.
+
 ## Nix Flake
 
 `flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.98.1`, filtered source bounded, no unsafe. Check:

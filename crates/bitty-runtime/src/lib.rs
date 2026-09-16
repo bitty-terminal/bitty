@@ -183,6 +183,7 @@
 pub mod browser_panel;
 pub mod config;
 pub mod error;
+pub mod execution;
 pub mod host_bridge;
 pub mod inspect;
 pub mod palette;
@@ -207,6 +208,11 @@ pub use config::{
     RuntimeViewTarget, ViewAppearanceRule,
 };
 pub use error::RuntimeError;
+pub use execution::{
+    DEFAULT_MAX_JOBS, JobCancel, JobError, JobEvent, JobId, JobIo, JobKind, JobLifetime, JobOrigin,
+    JobRegistry, JobSnapshot, JobSpec, JobState, JobStop, JobTimeouts, MAX_JOB_ORIGIN_BYTES,
+    MAX_STORED_JOB_EVENTS,
+};
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};

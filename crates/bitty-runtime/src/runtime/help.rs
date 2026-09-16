@@ -152,9 +152,12 @@ impl Runtime {
 
     /// Hide the help popup without further effect (CTX-0265 `Esc` path).
     ///
-    /// Returns `true` when the popup was visible (the caller consumed the
-    /// key); `false` otherwise (routing untouched). Forces a repaint on a
-    /// real dismissal so the panel clears on the next tick.
+    /// Returns `true` when the popup was visible (something was dismissed);
+    /// `false` otherwise (routing untouched). Forces a repaint on a real
+    /// dismissal so the panel clears on the next tick. CTX-0475: the `Esc`
+    /// that dismisses the popup is **not** consumed by
+    /// [`Runtime::cancel_pending_on_escape`](crate::Runtime), so the caller
+    /// keeps routing the press to the PTY (the overlay is informational).
     pub fn dismiss_help(&mut self) -> bool {
         if !self.help_visible {
             return false;

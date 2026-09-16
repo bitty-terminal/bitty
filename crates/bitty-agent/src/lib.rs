@@ -241,8 +241,8 @@ pub mod tool;
 pub use error::{AgentError, ErrorClass};
 pub use id::{AgentId, MAX_AGENT_ID_LEN, MAX_AGENT_ID_SEGMENT_LEN};
 pub use message::{
-    AgentMessage, MAX_MESSAGE_BYTES, MAX_MESSAGE_FRAME_BYTES, MAX_MESSAGES_PER_SESSION,
-    MAX_SESSION_BYTES, Role,
+    AgentMessage, ContentTrust, MAX_MESSAGE_BYTES, MAX_MESSAGE_FRAME_BYTES,
+    MAX_MESSAGES_PER_SESSION, MAX_SESSION_BYTES, Role,
 };
 pub use observation::{AgentObservation, MAX_OBSERVATION_BYTES, MAX_OBSERVATION_FRAME_BYTES};
 pub use queue::SideQueue;

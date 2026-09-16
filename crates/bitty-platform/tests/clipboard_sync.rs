@@ -39,14 +39,49 @@ fn headless_clear_empties_both_buffers_and_surfaces_ok() {
 
 #[test]
 fn headless_payloads_stay_bounded_on_both_selections() {
+    // CTX-0478: over-limit payloads are rejected with a typed error instead
+    // of being silently truncated; the previous value is preserved.
     let mut cb = Clipboard::new_headless();
+    cb.set_text("seed".to_string()).expect("seed");
     let long = "x".repeat(CLIPBOARD_MAX_BYTES + 64);
-    cb.set_text(long).expect("bounded set");
-    assert_eq!(cb.headless_contents().len(), CLIPBOARD_MAX_BYTES);
-    assert_eq!(cb.primary_contents().len(), CLIPBOARD_MAX_BYTES);
+    match cb.set_text(long) {
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { len, max }) => {
+            assert_eq!(max, CLIPBOARD_MAX_BYTES);
+            assert_eq!(len, CLIPBOARD_MAX_BYTES + 64);
+        }
+        other => panic!("expected ClipboardPayloadTooLarge, got {other:?}"),
+    }
+    assert_eq!(cb.headless_contents(), "seed");
+    assert_eq!(cb.primary_contents(), "seed");
     let emoji = "😀".repeat((CLIPBOARD_MAX_BYTES / 4) + 5);
-    cb.set_primary(emoji).expect("bounded primary");
-    assert!(cb.primary_contents().len() <= CLIPBOARD_MAX_BYTES);
+    assert!(matches!(
+        cb.set_primary(emoji),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { .. })
+    ));
+}
+
+#[test]
+fn direct_read_rejects_while_bounded_reads_clip() {
+    // CTX-0478 review: a simulated over-limit system read rejects through the
+    // direct API (typed error) but clips through the bounded reads the paste
+    // and OSC 52 reply seams use; the lossy helpers share the bounded path
+    // instead of going empty.
+    let mut cb = Clipboard::new_headless();
+    cb.simulate_system_text_for_test("z".repeat(CLIPBOARD_MAX_BYTES + 512));
+    assert!(matches!(
+        cb.get_text(),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { .. })
+    ));
+    let text = cb.get_text_bounded().expect("bounded clipboard read");
+    assert_eq!(text.len(), CLIPBOARD_MAX_BYTES);
+    assert_eq!(cb.get_text_lossy(), text);
+    let primary = cb.get_primary_bounded().expect("bounded primary read");
+    assert_eq!(primary.len(), CLIPBOARD_MAX_BYTES);
+    assert_eq!(cb.get_primary_lossy(), primary);
+    // At the exact cap both reads agree; nothing is clipped.
+    cb.simulate_system_text_for_test(String::from("ok"));
+    assert_eq!(cb.get_text().expect("at-limit read"), "ok");
+    assert_eq!(cb.get_text_bounded().expect("at-limit bounded read"), "ok");
 }
 
 #[test]

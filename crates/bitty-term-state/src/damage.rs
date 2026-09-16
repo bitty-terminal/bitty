@@ -110,12 +110,18 @@ impl Damage {
 /// the replay contract: identical action sequences produce byte-identical
 /// `regions` vectors.
 pub(crate) fn coalesce(
-    mut rects: Vec<DamageRect>,
+    rects: Vec<DamageRect>,
     mut scroll_events: Vec<(u64, u64)>,
     grid_rows: u16,
     grid_cols: u16,
 ) -> Vec<DamagedRegion> {
-    if rects.len() > 1 {
+    // Decide the coarse fallback BEFORE any quadratic merge work (CTX-0469):
+    // a hostile batch with tens of thousands of rects must degrade in
+    // linear time. Over-damage is safe per the module contract, matching
+    // `plan_frame`'s input-count cap on the render side.
+    let rects_over_cap = rects.len() > DAMAGE_MAX_REGIONS_PER_BATCH;
+    let mut rects = rects;
+    if !rects_over_cap && rects.len() > 1 {
         rects.sort_unstable_by(|a, b| {
             (a.top, a.left, a.bottom, a.right).cmp(&(b.top, b.left, b.bottom, b.right))
         });
@@ -234,5 +240,48 @@ mod tests {
         let many: Vec<DamageRect> = (0..600u16).step_by(2).map(|r| rect(r, 0, r, 79)).collect();
         let out = coalesce(many, vec![], 24, 80);
         assert_eq!(out, vec![DamagedRegion::Grid(DamageRect::full(24, 80))]);
+    }
+
+    #[test]
+    fn cap_is_evaluated_before_merge_not_after() {
+        // Hostile probe (CTX-0469): identical rects would merge down to one
+        // region, but the batch cap must force the coarse fallback BEFORE
+        // any quadratic merge work so hostile rect floods stay bounded.
+        let many = vec![rect(0, 0, 0, 0); DAMAGE_MAX_REGIONS_PER_BATCH + 1];
+        let out = coalesce(many, vec![], 24, 80);
+        assert_eq!(out, vec![DamagedRegion::Grid(DamageRect::full(24, 80))]);
+    }
+
+    #[test]
+    fn hostile_rect_flood_stays_bounded_and_keeps_scroll_events() {
+        // 20k pairwise-disjoint rects (even rows never touch) must degrade
+        // fast: the fallback is decided up front, while scrollback ranges
+        // still merge normally afterwards.
+        let many: Vec<DamageRect> = (0..20_000u32)
+            .map(|i| {
+                let r = (i % 20_000) as u16 * 2;
+                rect(r, 0, r, 79)
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let out = coalesce(many, vec![(4, 2), (7, 1)], 24, 80);
+        assert_eq!(
+            out,
+            vec![
+                DamagedRegion::Grid(DamageRect::full(24, 80)),
+                DamagedRegion::Scrollback {
+                    first_line_id: 4,
+                    count: 2
+                },
+                DamagedRegion::Scrollback {
+                    first_line_id: 7,
+                    count: 1
+                },
+            ]
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "rect flood must degrade without quadratic merge"
+        );
     }
 }

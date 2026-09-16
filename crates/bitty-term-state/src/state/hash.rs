@@ -84,12 +84,13 @@ impl State {
         }
 
         h.u32(self.hyperlink_table.len() as u32);
-        for (id, uri) in &self.hyperlink_table {
-            h.option_tag(id.is_some());
-            if let Some(id) = id {
+        for entry in &self.hyperlink_table {
+            h.u32(entry.id.as_u32());
+            h.option_tag(entry.id_param.is_some());
+            if let Some(id) = &entry.id_param {
                 h.str(id.as_str());
             }
-            h.str(uri.as_str());
+            h.str(entry.uri.as_str());
         }
         h.option_tag(self.current_hyperlink.is_some());
         if let Some(link) = self.current_hyperlink {

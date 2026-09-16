@@ -134,6 +134,8 @@ bitty --split v                  # vertical split
 bitty --layout stack:2           # stacked panes
 bitty --layout overlay:5,5,20,10
 bitty --headless                 # one deterministic headless tick (CI/smoke)
+bitty --headless --fail-loud     # same smoke, but exit non-zero if the shell
+                                 # or IPC servo fails to start
 bitty doctor                     # diagnose install, GPU, fonts, PTY, terminfo
 bitty ctl view split --right     # control a running instance
 bitty --help                     # full flag and subcommand reference

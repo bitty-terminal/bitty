@@ -195,7 +195,7 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
 #[cfg(test)]
 mod tests;
 
-pub use apply::{drain_global_control_queue, granted_scopes_for_servo};
+pub use apply::{drain_global_control_queue_with, granted_scopes_for_servo, method_mutates_layout};
 pub use client::{
     CtlIpcOutcome, ResolvedTarget, ctl_roundtrip, list_live_instances, resolve_ctl_target,
 };

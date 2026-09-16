@@ -114,8 +114,8 @@ pub const MATRIX: &[MatrixEntry] = &[
     },
 ];
 
-/// Reference terminals for differential columns.
-pub const REFERENCE_TERMS: &[&str] = &["ghostty", "kitty", "wezterm", "alacritty"];
+/// Reference terminals for differential columns (shared, fixed order).
+pub const REFERENCE_TERMS: &[&str] = crate::compare::REFERENCE_BACKENDS;
 
 /// Maximum entries — matrix length must match.
 pub const MATRIX_LEN: usize = 14;
@@ -166,14 +166,18 @@ pub fn check_matrix_files_exist() -> Result<(), String> {
     Ok(())
 }
 
-/// Generate machine-readable matrix JSON (bounded <16 KiB, sorted keys).
+/// Generate machine-readable matrix JSON (bounded <16 KiB, deterministic).
 ///
 /// For each entry replays `parse_bounded` → `State` → `Snapshot` and records
 /// `bytes_len`, `actions_len`, `state_hash`, `width`, `height`, `generation`,
-/// plus `self PASS` (deterministic replay) and `reference SKIPPED` placeholders
-/// for 4 terminals (actual reference diff is performed by `compare_all` when
-/// backend dumps exist). No network, no display.
+/// plus `self PASS` (deterministic replay). Each `references` column is
+/// computed from the reference dumps on disk ([`crate::compare`]):
+/// `PASS` (matched), `FAIL` (mismatched), or `SKIP` (no dump for this corpus) —
+/// never a fabricated placeholder. The top-level `reference_evidence` field
+/// states whether any reference comparison was performed at all. No network,
+/// no display.
 pub fn generate_matrix_json() -> Result<String, String> {
+    use crate::compare::ReferenceOutcome;
     use crate::{MAX_ACTIONS, MAX_CORPUS_BYTES, actions_to_snapshot, parse_bounded};
     let mut out = String::new();
     out.push_str("{\n");
@@ -191,6 +195,7 @@ pub fn generate_matrix_json() -> Result<String, String> {
     ));
     out.push_str("  },\n");
     out.push_str("  \"entries\": [\n");
+    let mut any_reference_compared = false;
     for (idx, entry) in MATRIX.iter().enumerate() {
         let path = corpus_path(entry);
         let bytes = std::fs::read(&path).map_err(|e| format!("read {:?}: {e}", path))?;
@@ -255,14 +260,41 @@ pub fn generate_matrix_json() -> Result<String, String> {
         out.push_str(&format!("      \"height\": {},\n", snapshot.height));
         out.push_str(&format!("      \"generation\": {},\n", snapshot.generation));
         out.push_str("      \"self\": \"PASS\",\n");
-        out.push_str("      \"references\": {\"ghostty\": \"SKIP\", \"kitty\": \"SKIP\", \"wezterm\": \"SKIP\", \"alacritty\": \"SKIP\"}\n");
+        let refs = crate::compare::reference_outcomes_for_corpus(entry.corpus_rel, &snapshot);
+        out.push_str("      \"references\": {");
+        for (i, (backend, outcome)) in refs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let status = match outcome {
+                ReferenceOutcome::Match => {
+                    any_reference_compared = true;
+                    "PASS"
+                }
+                ReferenceOutcome::Mismatch => {
+                    any_reference_compared = true;
+                    "FAIL"
+                }
+                ReferenceOutcome::Absent => "SKIP",
+            };
+            out.push_str(&format!("\"{backend}\": \"{status}\""));
+        }
+        out.push_str("}\n");
         if idx + 1 < MATRIX.len() {
             out.push_str("    },\n");
         } else {
             out.push_str("    }\n");
         }
     }
-    out.push_str("  ]\n");
+    out.push_str("  ],\n");
+    out.push_str(&format!(
+        "  \"reference_evidence\": \"{}\"\n",
+        if any_reference_compared {
+            "present"
+        } else {
+            "absent"
+        }
+    ));
     out.push_str("}\n");
     if out.len() > 16 * 1024 {
         return Err(format!("matrix json {} > 16 KiB", out.len()));
@@ -317,6 +349,52 @@ mod tests {
     }
 
     #[test]
+    fn matrix_reference_statuses_are_derived_from_disk() {
+        // CTX-0484: every entry's reference column is the computed differential
+        // status, and `reference_evidence` states whether anything was actually
+        // compared. No fabricated PASS/SKIP placeholders.
+        let j = generate_matrix_json().expect("matrix json");
+        assert_eq!(
+            j.matches("\"self\": \"PASS\"").count(),
+            MATRIX.len(),
+            "every entry must report its deterministic replay as self PASS"
+        );
+        let mut any_compared = false;
+        for entry in MATRIX {
+            let path = corpus_path(entry);
+            let bytes = std::fs::read(&path).expect("corpus");
+            let snapshot = crate::actions_to_snapshot(&crate::parse_bounded(&bytes));
+            let outcomes =
+                crate::compare::reference_outcomes_for_corpus(entry.corpus_rel, &snapshot);
+            assert_eq!(outcomes.len(), REFERENCE_TERMS.len());
+            for (backend, outcome) in outcomes {
+                let expected = match outcome {
+                    crate::compare::ReferenceOutcome::Match => {
+                        any_compared = true;
+                        "PASS"
+                    }
+                    crate::compare::ReferenceOutcome::Mismatch => {
+                        any_compared = true;
+                        "FAIL"
+                    }
+                    crate::compare::ReferenceOutcome::Absent => "SKIP",
+                };
+                let needle = format!("\"{backend}\": \"{expected}\"");
+                assert!(
+                    j.contains(&needle),
+                    "{} missing derived reference status {needle}",
+                    entry.surface
+                );
+            }
+        }
+        let expected_evidence = if any_compared { "present" } else { "absent" };
+        assert!(
+            j.contains(&format!("\"reference_evidence\": \"{expected_evidence}\"")),
+            "reference_evidence must match the computed outcomes in {j}"
+        );
+    }
+
+    #[test]
     fn matrix_generate_is_headless_no_winit_wgpu() {
         // Ensure matrix module does not embed forbidden window/GPU types.
         // We check that the crate does not depend on those crates via
@@ -327,5 +405,17 @@ mod tests {
         // Cheap check: ensure the file is non-empty and mentions headless.
         assert!(src.contains("headless"));
         assert!(src.len() > 1000);
+    }
+
+    #[test]
+    fn probe_matrix_discloses_reference_evidence_state() {
+        // CTX-0484 probe: the matrix must say whether reference evidence
+        // exists instead of hardcoding `SKIP` for every backend. Fails before
+        // the fix because the generator emits no reference-evidence marker.
+        let j = generate_matrix_json().expect("matrix json");
+        assert!(
+            j.contains("\"reference_evidence\""),
+            "matrix must disclose the reference evidence state: {j}"
+        );
     }
 }

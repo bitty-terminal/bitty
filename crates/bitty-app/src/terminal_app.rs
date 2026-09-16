@@ -1,6 +1,5 @@
 //! Window/platform event handler for the composition root (`TerminalApp`).
 
-use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
@@ -9,9 +8,8 @@ use bitty_platform::{
     PhysicalSize, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
 };
 use bitty_render::gpu::GpuContext;
-use bitty_runtime::{LayoutNode, Runtime};
+use bitty_runtime::Runtime;
 
-use crate::chrome_keys::AppModifiers;
 use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
@@ -52,17 +50,13 @@ pub(crate) fn sanitize_window_title(raw: &str) -> String {
 // App handler
 // ---------------------------------------------------------------------------
 
-/// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
-/// The Correct Terminal handler: owns `Runtime`, an optional window, and the
-/// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
-/// only when explicitly attached for debug/tests).
-/// All business stays in `bitty-runtime`; this type only wires
-/// `PlatformEvent` → `Runtime` and `tick` → present, with real `GpuContext`
-/// attachment for the single-window vertical slice.
-pub(crate) struct TerminalApp {
-    pub(crate) runtime: Runtime,
+/// OS-window bookkeeping coalesced out of `TerminalApp` (CTX-0481 state
+/// slimming): the handle, its identity, the resolved static title, opacity,
+/// and the IME/title synchronization counters all move together and share
+/// one lifetime.
+pub(crate) struct WindowState {
     /// Window title carrying the resolved theme preset + source layer.
-    pub(crate) window_title: String,
+    pub(crate) title: String,
     /// Window opacity from the effective config (CTX-0223
     /// `window.opacity`; default `1.0` = opaque). Applied to the platform
     /// [`WindowConfig`](bitty_platform::WindowConfig) at creation and to the
@@ -70,20 +64,14 @@ pub(crate) struct TerminalApp {
     /// blending where supported, and the renderer scales its premultiplied
     /// output so the value has a visible effect. Platforms without
     /// premultiplied compositing stay opaque with a loud warning.
-    pub(crate) window_opacity: f32,
-    pub(crate) window: Option<WindowHandle>,
-    pub(crate) window_id: Option<WindowId>,
+    pub(crate) opacity: f32,
+    pub(crate) handle: Option<WindowHandle>,
+    pub(crate) id: Option<WindowId>,
     /// Physical-pixel caret rect last pushed to the platform IME via
     /// `WindowHandle::set_ime_cursor_area` (CTX-0367). Change detection
     /// keeps the sync to one call per actual caret move instead of one per
     /// frame.
     pub(crate) ime_cursor_area: Option<bitty_runtime::ImeCursorArea>,
-    /// Demo pump channel when explicitly attached for debug/tests
-    /// (`None` in real sessions — CTX-0167).
-    pub(crate) pty_rx: Option<Receiver<Vec<u8>>>,
-    pub(crate) _pty_thread: Option<JoinHandle<()>>,
-    /// Count of `tick` calls that presented a frame.
-    pub(crate) presented_frames: u64,
     /// Last OS window title applied from `ColdEvent::TitleChanged`
     /// (CTX-0382). `None` until the first OSC 0/2 arrives; the change gate
     /// keeps identical titles from churning the titlebar.
@@ -91,20 +79,45 @@ pub(crate) struct TerminalApp {
     /// Count of sanitized title applications (CTX-0382 diagnostics): stays
     /// at one per distinct title, proving no per-frame churn.
     pub(crate) title_applies: u64,
-    /// Resolved keymap table (shipped defaults + user overrides).
-    pub(crate) keymaps: Vec<bitty_config::ResolvedKeymap>,
-    /// App-side modifier mirror for chord matching.
-    pub(crate) app_mods: AppModifiers,
-    /// Chrome-owned keys with an unreleased press (CTX-0229 press-to-release
-    /// ownership). A consumed chord owns its key until the physical release:
-    /// repeats/duplicates arriving after modifier decay stay swallowed
-    /// instead of leaking shell bytes (e.g. `Ctrl+Shift+V` paste followed by
-    /// a `V` repeat with `Ctrl` already released must not type `V`).
-    /// Releases and focus transitions clear entries (same staleness bound as
-    /// the CTX-0187 mirror clear); bounded by simultaneously held keys.
-    pub(crate) chrome_held: HashSet<bitty_config::KeyName>,
-    /// Layout stashed by `toggle_zoom`; `None` when not zoomed.
-    pub(crate) zoom_backup: Option<LayoutNode>,
+}
+
+impl WindowState {
+    fn new(title: String) -> Self {
+        Self {
+            title,
+            opacity: 1.0,
+            handle: None,
+            id: None,
+            ime_cursor_area: None,
+            last_applied_title: None,
+            title_applies: 0,
+        }
+    }
+}
+
+/// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
+/// The Correct Terminal handler: owns `Runtime`, an optional window, and the
+/// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
+/// only when explicitly attached for debug/tests).
+/// All business stays in `bitty-runtime`; this type only wires
+/// `PlatformEvent` → `Runtime` and `tick` → present, with real `GpuContext`
+/// attachment for the single-window vertical slice.
+///
+/// CTX-0481 state slimming: cohesive state lives in [`WindowState`] and
+/// [`crate::chrome_keys::ChromeState`] so this type keeps only the core
+/// runtime, pump, and gate fields.
+pub(crate) struct TerminalApp {
+    pub(crate) runtime: Runtime,
+    /// Window handle, title, opacity, and IME/title counters.
+    pub(crate) window: WindowState,
+    /// Demo pump channel when explicitly attached for debug/tests
+    /// (`None` in real sessions — CTX-0167).
+    pub(crate) pty_rx: Option<Receiver<Vec<u8>>>,
+    pub(crate) _pty_thread: Option<JoinHandle<()>>,
+    /// Count of `tick` calls that presented a frame.
+    pub(crate) presented_frames: u64,
+    /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
+    pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
     /// program/shell resolution (CTX-0176).
     pub(crate) spawn_spec: SpawnSpec,
@@ -119,6 +132,11 @@ pub(crate) struct TerminalApp {
     /// (deterministic CI must not clobber it either). Default true so tests
     /// using [`Self::with_theme`] keep the production behavior.
     pub(crate) session_persistence: bool,
+    /// Shared live plugin snapshot (CTX-0481): `drive_tick` commits the
+    /// runtime's committed generation here so `bitty.terminal.snapshot`
+    /// never serves the frozen generation-1 view. `None` when no plugin VM
+    /// exists or a test does not exercise the bridge.
+    pub(crate) live_snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
 }
 
 impl TerminalApp {
@@ -137,23 +155,15 @@ impl TerminalApp {
     ) -> Self {
         Self {
             runtime,
-            window_title: window_title_for_theme(theme_name, source),
-            window_opacity: 1.0,
-            window: None,
-            window_id: None,
-            ime_cursor_area: None,
+            window: WindowState::new(window_title_for_theme(theme_name, source)),
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
-            last_applied_title: None,
-            title_applies: 0,
-            keymaps,
-            app_mods: AppModifiers::default(),
-            chrome_held: HashSet::new(),
-            zoom_backup: None,
+            chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
             session_persistence: true,
+            live_snapshot: None,
         }
     }
 
@@ -174,23 +184,15 @@ impl TerminalApp {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
         Self {
             runtime,
-            window_title: window_title_for_theme(theme_name, source),
-            window_opacity: 1.0,
-            window: None,
-            window_id: None,
-            ime_cursor_area: None,
+            window: WindowState::new(window_title_for_theme(theme_name, source)),
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
-            last_applied_title: None,
-            title_applies: 0,
-            keymaps,
-            app_mods: AppModifiers::default(),
-            chrome_held: HashSet::new(),
-            zoom_backup: None,
+            chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
             session_persistence: true,
+            live_snapshot: None,
         }
     }
 
@@ -255,7 +257,20 @@ impl TerminalApp {
     /// [`WindowConfig`](bitty_platform::WindowConfig) and the renderer
     /// surface, so out-of-range inputs degrade instead of failing creation.
     pub(crate) fn with_window_opacity(mut self, opacity: f32) -> Self {
-        self.window_opacity = opacity;
+        self.window.opacity = opacity;
+        self
+    }
+
+    /// Attaches the shared live plugin snapshot (CTX-0481). Production
+    /// startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`] so
+    /// `bitty.terminal.snapshot` tracks committed state; tests and
+    /// plugin-less runs leave it `None`.
+    pub(crate) fn with_live_snapshot(
+        mut self,
+        snapshot: Option<std::rc::Rc<crate::plugin_runtime::LiveSnapshot>>,
+    ) -> Self {
+        self.live_snapshot = snapshot;
         self
     }
 
@@ -370,14 +385,14 @@ impl TerminalApp {
     /// platform rect in place: winit exposes no clear call, and the OS
     /// hides the candidate window on focus loss by itself.
     pub(crate) fn sync_ime_cursor_area(&mut self) {
-        let Some(window) = self.window.as_ref() else {
+        let Some(window) = self.window.handle.as_ref() else {
             return;
         };
         let area = self.runtime.ime_cursor_area();
-        if area == self.ime_cursor_area {
+        if area == self.window.ime_cursor_area {
             return;
         }
-        self.ime_cursor_area = area;
+        self.window.ime_cursor_area = area;
         if let Some(area) = area {
             window.set_ime_cursor_area(area.x, area.y, area.width, area.height);
         }
@@ -388,8 +403,20 @@ impl TerminalApp {
         // `bitty ctl` mutations (send/split/focus/close/spawn/reload) apply
         // on the main thread — the sole `Runtime` owner — with server-side
         // scope enforcement (never ambient authority).
-        let _ =
-            ctl::drain_global_control_queue(&mut self.runtime, &ctl::granted_scopes_for_servo());
+        // CTX-0481 (#762): a layout-mutating ctl verb must never land on the
+        // single-leaf zoom proxy — the pre-mutation hook restores the real
+        // tree first (with the staleness/generation check inside
+        // `ZoomState`), so the eventual zoom restore cannot drop the pane
+        // the verb created.
+        let _ = ctl::drain_global_control_queue_with(
+            &mut self.runtime,
+            &ctl::granted_scopes_for_servo(),
+            |runtime, method| {
+                if ctl::method_mutates_layout(method) {
+                    self.chrome.zoom.restore_for_mutation(runtime);
+                }
+            },
+        );
         // CTX-0382: drain cold-path events on every tick — including
         // deferred (synchronized update) and idle ticks — because a title
         // change produces no grid damage and would otherwise sit in the
@@ -399,6 +426,13 @@ impl TerminalApp {
         // Ensure replies that were queued before tick are flushed before present:
         // the runtime's tick consumes snapshot+damage and composites.
         let stats = self.runtime.tick();
+        // CTX-0481 (#762): after the tick commits, publish the live plugin
+        // snapshot so plugins observe the committed generation instead of a
+        // frozen generation-1 view. Monotonic: a regression is refused by
+        // the source itself.
+        if let Some(snapshot) = self.live_snapshot.as_ref() {
+            snapshot.publish(&self.runtime);
+        }
         // CTX-0367: the presented frame refreshed the focused caret; forward
         // it to the platform so the OS IME preedit/candidate window tracks
         // the terminal cursor (DPI-correct physical pixels, change-gated).
@@ -465,16 +499,16 @@ impl TerminalApp {
     pub(crate) fn apply_window_title(&mut self, raw: &str) {
         let sanitized = sanitize_window_title(raw);
         let title = if sanitized.is_empty() {
-            self.window_title.clone()
+            self.window.title.clone()
         } else {
             sanitized
         };
-        if self.last_applied_title.as_deref() == Some(title.as_str()) {
+        if self.window.last_applied_title.as_deref() == Some(title.as_str()) {
             return;
         }
-        self.last_applied_title = Some(title.clone());
-        self.title_applies += 1;
-        if let Some(window) = self.window.as_ref() {
+        self.window.last_applied_title = Some(title.clone());
+        self.window.title_applies += 1;
+        if let Some(window) = self.window.handle.as_ref() {
             window.set_title(&title);
         }
     }
@@ -508,13 +542,13 @@ impl TerminalApp {
                     // and the effective window opacity (CTX-0290): the
                     // renderer scales its premultiplied output so the
                     // compositor can blend the window at `window.opacity`.
-                    match surface.configure_with_opacity(&gpu, extent, self.window_opacity) {
+                    match surface.configure_with_opacity(&gpu, extent, self.window.opacity) {
                         Ok(()) => {
-                            if self.window_opacity < 1.0 && !surface.opacity_alpha_supported() {
+                            if self.window.opacity < 1.0 && !surface.opacity_alpha_supported() {
                                 crate::logging::warn(|| {
                                     format!(
                                         "bitty: window.opacity={:.3} unsupported on this GPU surface (no premultiplied alpha mode) — staying opaque",
-                                        bitty_platform::sanitize_opacity(self.window_opacity)
+                                        bitty_platform::sanitize_opacity(self.window.opacity)
                                     )
                                 });
                             }
@@ -676,7 +710,7 @@ impl AppHandler for TerminalApp {
             } else if had_pending && probe_kind == "esc" {
                 eprintln!("bitty: paste confirmation cancelled (Esc)");
             }
-            if let Some(win) = self.window.as_ref() {
+            if let Some(win) = self.window.handle.as_ref() {
                 win.request_redraw();
             }
         }
@@ -689,7 +723,7 @@ impl AppHandler for TerminalApp {
                 // we keep running headlessly and still tick, rather than
                 // aborting the process (mirrors `App::run`'s
                 // `DisplayUnavailable` mapping).
-                if self.window.is_none() {
+                if self.window.handle.is_none() {
                     let default_size = LogicalSize::new(800.0, 600.0).unwrap_or_else(|_| {
                         // LogicalSize validation only fails for non-finite or
                         // negative inputs; hard-coded values are valid, so
@@ -698,14 +732,14 @@ impl AppHandler for TerminalApp {
                         LogicalSize::new(640.0, 480.0).expect("fallback size must be valid")
                     });
                     let config = WindowConfig::new()
-                        .with_title(self.window_title.clone())
+                        .with_title(self.window.title.clone())
                         .with_inner_size(default_size)
-                        .with_opacity(self.window_opacity)
+                        .with_opacity(self.window.opacity)
                         .with_visible(true);
                     match ctx.create_window(config) {
                         Ok(handle) => {
                             let id = handle.id();
-                            self.window_id = Some(id);
+                            self.window.id = Some(id);
                             // CTX-0367: opt the window into platform IME
                             // events (winit defaults to IME disabled, which
                             // is exactly why fcitx5 could not compose).
@@ -714,7 +748,7 @@ impl AppHandler for TerminalApp {
                             handle.set_ime_allowed(true);
                             // Clone handle before moving into try_attach_gpu (which borrows self mutably)
                             let handle_for_gpu = handle.clone();
-                            self.window = Some(handle);
+                            self.window.handle = Some(handle);
                             // Single-window vertical slice: try real GPU attach with crossfont atlas.
                             // On headless CI this fails with NoCompatibleAdapter and we stay headless
                             // (deterministic fallback, no panic). On a real display we get a wgpu surface
@@ -741,7 +775,7 @@ impl AppHandler for TerminalApp {
                     }
                 }
                 // Resumed is a good point to request the first redraw.
-                if let Some(win) = self.window.as_ref() {
+                if let Some(win) = self.window.handle.as_ref() {
                     win.request_redraw();
                 } else {
                     // Headless: still drive one tick so CI-like smoke appears
@@ -766,7 +800,7 @@ impl AppHandler for TerminalApp {
                         // Resized needs no extra work: runtime derives from
                         // the same live scaled cells.
                         if let WindowEventKind::ScaleFactorChanged(factor) = &kind {
-                            let physical = self.window.as_ref().map(|win| win.inner_size());
+                            let physical = self.window.handle.as_ref().map(|win| win.inner_size());
                             self.runtime.apply_dpi_scale(factor.get(), physical);
                             let snap = self.runtime.snapshot();
                             crate::logging::info(|| {
@@ -789,7 +823,7 @@ impl AppHandler for TerminalApp {
                                 )
                             });
                         }
-                        if let Some(win) = self.window.as_ref() {
+                        if let Some(win) = self.window.handle.as_ref() {
                             win.request_redraw();
                         } else {
                             let _ = self.drive_tick();
@@ -810,7 +844,7 @@ impl AppHandler for TerminalApp {
                 // tick produced a present (frame-on-demand).
                 self.poll_pty_pump();
                 if self.drive_tick().is_some() {
-                    if let Some(win) = self.window.as_ref() {
+                    if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();
                     }
                 }
@@ -840,7 +874,7 @@ impl AppHandler for TerminalApp {
                 // damage exists and request a redraw only on present
                 // (frame-on-demand; quiet shells idle with no further wakes).
                 if self.drive_tick().is_some() {
-                    if let Some(win) = self.window.as_ref() {
+                    if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();
                     }
                 }

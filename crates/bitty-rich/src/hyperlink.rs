@@ -1,9 +1,9 @@
 //! OSC 8 hyperlink presentation (bounded, headless-testable).
 //!
 //! Terminal truth owns the hyperlink table (`bitty_term_state::State`),
-//! bounded at [`HYPERLINK_TABLE_MAX`] (1024) per threat T-01; new distinct
-//! links beyond the cap degrade to no link. This module does **not** mutate
-//! that table. It interprets snapshot cells (each carries an optional
+//! bounded at [`HYPERLINK_TABLE_MAX`] (1024) per threat T-01; past the cap
+//! the oldest entry is evicted and its ids fail closed to no link. This
+//! module does **not** mutate that table. It interprets snapshot cells (each carries an optional
 //! [`HyperlinkId`]) against the table to produce spans, hit tests, and
 //! headless overlay geometry.
 
@@ -35,7 +35,8 @@ pub fn is_safe_hyperlink_uri(uri: &str) -> bool {
 /// Resolved hyperlink target plus its optional `id=` parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HyperlinkInfo {
-    /// Opaque hyperlink id; stable for the lifetime of the owning `State`.
+    /// Opaque hyperlink id; stable while its entry is retained (evicted ids
+    /// fail closed via [`State::hyperlink_entry`]).
     pub hyperlink_id: HyperlinkId,
     /// Optional `id=` parameter from OSC 8 (`id=foo` in `OSC 8 ;id=foo;uri`).
     pub id_param: Option<String>,
@@ -66,7 +67,7 @@ pub struct HyperlinkSpan {
 }
 
 /// Resolves `id` against `state`'s hyperlink table; `None` when the id is
-/// stale (e.g. capped table degraded to no link, or snapshot from another
+/// stale (e.g. evicted under the table cap, or snapshot from another
 /// generation).
 #[must_use]
 pub fn hyperlink_info(state: &State, id: HyperlinkId) -> Option<HyperlinkInfo> {
@@ -345,7 +346,10 @@ mod tests {
     }
 
     #[test]
-    fn table_bound_degrades_to_no_link() {
+    fn table_bound_evicts_oldest_and_keeps_accepting() {
+        // CTX-0469: past the cap the oldest entry is evicted oldest-first
+        // (fail-closed for its live cells) while new links keep working;
+        // the old permanent degrade is gone.
         let mut state = State::new();
         for i in 0..bitty_term_state::HYPERLINK_TABLE_MAX + 5 {
             state.apply(&TerminalAction::OscHyperlink {
@@ -358,7 +362,8 @@ mod tests {
             // `Print` uses the just-registered id.
             state.apply(&TerminalAction::OscHyperlink { link: None });
         }
-        // Now table is at cap; next distinct link should degrade.
+        // Now table is at cap; the next distinct link evicts the oldest
+        // instead of degrading.
         state.apply(&TerminalAction::OscHyperlink {
             link: Some(Hyperlink {
                 id: Some(BoundedString::new("overflow")),
@@ -367,8 +372,21 @@ mod tests {
         });
         print(&mut state, "x");
         let snap = state.snapshot();
-        // The overflow link was degraded -> cell has no hyperlink.
-        assert!(snap.cells[0].hyperlink.is_none() || hyperlink_at(&snap, &state, 0, 0).is_none());
+        // The overflow link was accepted: the cell resolves to its URI.
+        let hit = hyperlink_at(&snap, &state, 0, 0).expect("overflow link resolves");
+        assert_eq!(hit.uri, "https://overflow.dev");
+        assert_eq!(hit.id_param.as_deref(), Some("overflow"));
+        // The oldest entries were evicted: `id0` no longer appears.
+        assert!(
+            state
+                .hyperlink_table()
+                .all(|(_, id_param, _)| id_param != Some("id0")),
+            "evicted id_param must be gone"
+        );
+        assert_eq!(
+            state.hyperlink_count(),
+            bitty_term_state::HYPERLINK_TABLE_MAX
+        );
     }
 
     #[test]

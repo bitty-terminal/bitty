@@ -193,9 +193,14 @@ pub(crate) fn spawn_pane_shell(
 /// shell is sized to its leaf allocation. Best-effort: per-leaf failures
 /// warn loudly and leave that pane empty (CTX-0359: never a silent mirror
 /// of the primary grid). Call only after a successful primary spawn.
-pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) {
+///
+/// Returns the number of panes whose shell failed (CTX-0481): the
+/// `--fail-loud` startup path turns any non-zero count into a non-zero
+/// exit instead of the default warning-only continuation.
+pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) -> usize {
     let primary = runtime.focused_view();
     let allocs = runtime.layout_allocations();
+    let mut failed = 0usize;
     for (id, rect) in &allocs {
         if Some(*id) == primary {
             continue;
@@ -208,8 +213,10 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
                     "warning: startup pane {id:?} shell spawn failed ({err}) — pane stays empty"
                 )
             });
+            failed += 1;
         }
     }
+    failed
 }
 
 /// True when `token` looks like a negative number (`-5`, `-0.1`) rather

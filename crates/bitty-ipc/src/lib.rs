@@ -194,8 +194,9 @@ pub use tool_dispatch::{
 };
 pub use transport::{DEFAULT_TRANSPORT_CAPACITY, MAX_TRANSPORT_CAPACITY, StdioTransportStub};
 pub use wire::{
-    CHUNK_CEILING, MAX_ID_BYTES, MAX_JSON_DEPTH, WIRE_VERSION, validate_chunk,
-    validate_request_envelope, validate_response_envelope, validate_wire_version,
+    CHUNK_CEILING, MAX_ID_BYTES, MAX_JSON_DEPTH, SUPPORTED_WIRE_VERSIONS, WIRE_VERSION,
+    negotiate_wire_version, validate_chunk, validate_request_envelope, validate_response_envelope,
+    validate_wire_version,
 };
 
 /// Crate-level re-exports that remain draft or stable per RFC.

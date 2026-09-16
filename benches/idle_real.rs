@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_perf::idle::check_idle;
+use bitty_perf::idle::{CpuBudgetVerdict, check_idle};
 
 fn main() {
     println!("idle_real — PB-7 idle resource (CTX-0100 frame-on-demand invariant, bounded)");
@@ -46,10 +46,11 @@ fn main() {
         report.clean_render_mean_us
     );
 
-    if !report.meets_cpu_budget() {
+    if report.cpu_budget_verdict() != CpuBudgetVerdict::Met {
         eprintln!(
-            "note: sampled_cpu {:?} exceeds PB-7 1% — expected only on noisy CI (real 10 min on Tier 1 gates)",
-            report.sampled_cpu_pct
+            "note: PB-7 CPU sample {:?} is {:?} — the real 10 min ≤1 % measurement is gated on the Tier 1 reference machine",
+            report.sampled_cpu_pct,
+            report.cpu_budget_verdict()
         );
     }
 }

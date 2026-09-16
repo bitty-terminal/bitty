@@ -8,11 +8,14 @@
 //! # Bounding policy
 //!
 //! Memory is bounded by construction: at most [`GlyphCache::capacity`]
-//! entries are retained. When the cache is full and a *new* key arrives, the
-//! whole map is cleared before inserting (wholesale eviction). This is
-//! deliberately simple and deterministic; per-entry LRU would add bookkeeping
-//! for marginal gain at terminal working-set sizes. Errors are **not**
-//! cached: a transient upstream failure must not poison a key forever.
+//! entries are retained. When the cache is full and a *new* key arrives,
+//! exactly the least recently used entry is evicted (CTX-0471). Recency is
+//! a monotone lookup counter stamped on every hit and insert; eviction
+//! takes the smallest stamp, so a workload with more distinct glyphs than
+//! the capacity (for example a CJK screen) keeps the hot working set
+//! instead of dropping every cached glyph each time the table fills.
+//! Errors are **not** cached: a transient upstream failure must not poison
+//! a key forever, and a failed rasterization never evicts a live entry.
 //!
 //! The default capacity of 2048 covers several full screens of distinct
 //! glyphs across styles; worst case memory is bounded by capacity times the
@@ -43,14 +46,23 @@ pub enum CachedGlyph<'a> {
     Blank,
 }
 
+/// One retained lookup: the bitmap (or cached blank) plus its recency
+/// stamp for LRU eviction.
+#[derive(Debug)]
+struct CacheEntry {
+    bitmap: Option<GlyphBitmap>,
+    last_used: u64,
+}
+
 /// Memoizing decorator around a [`GlyphRasterizer`].
 #[derive(Debug)]
 pub struct GlyphCache<R: GlyphRasterizer> {
     rasterizer: R,
-    entries: HashMap<RasterKey, Option<GlyphBitmap>>,
+    entries: HashMap<RasterKey, CacheEntry>,
     capacity: usize,
     lookups_hit: u64,
     lookups_missed: u64,
+    clock: u64,
 }
 
 impl<R: GlyphRasterizer> GlyphCache<R> {
@@ -72,6 +84,7 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
             capacity,
             lookups_hit: 0,
             lookups_missed: 0,
+            clock: 0,
         })
     }
 
@@ -142,22 +155,56 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
     ///
     /// Propagates rasterizer failures without caching them (see module docs).
     pub fn glyph(&mut self, key: RasterKey) -> Result<CachedGlyph<'_>, RenderError> {
-        if !self.entries.contains_key(&key) {
-            self.lookups_missed = self.lookups_missed.saturating_add(1);
-            if self.entries.len() >= self.capacity {
-                // Wholesale eviction keeps the bound obvious and the policy
-                // deterministic; see module docs.
-                self.entries.clear();
-            }
-            let entry = self.rasterizer.rasterize(key)?;
-            self.entries.insert(key, entry);
-        } else {
+        let now = self.tick();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = now;
             self.lookups_hit = self.lookups_hit.saturating_add(1);
+        } else {
+            self.lookups_missed = self.lookups_missed.saturating_add(1);
+            // Rasterize first: a failed rasterization must not evict a live
+            // entry (errors are never cached).
+            let bitmap = self.rasterizer.rasterize(key)?;
+            if self.entries.len() >= self.capacity {
+                self.evict_lru();
+            }
+            self.entries.insert(
+                key,
+                CacheEntry {
+                    bitmap,
+                    last_used: now,
+                },
+            );
         }
         Ok(match &self.entries[&key] {
-            Some(bitmap) => CachedGlyph::Bitmap(bitmap),
-            None => CachedGlyph::Blank,
+            CacheEntry {
+                bitmap: Some(bitmap),
+                ..
+            } => CachedGlyph::Bitmap(bitmap),
+            CacheEntry { bitmap: None, .. } => CachedGlyph::Blank,
         })
+    }
+
+    /// Advances the recency clock for one lookup.
+    ///
+    /// The counter wraps (one tick per lookup, so the wrap horizon is 2^64
+    /// lookups); stamps are unique up to that horizon, which keeps eviction
+    /// independent of `HashMap` iteration order.
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    /// Evicts exactly the least recently used entry. Called only when the
+    /// cache is at capacity, so a victim always exists.
+    fn evict_lru(&mut self) {
+        if let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| *key)
+        {
+            self.entries.remove(&victim);
+        }
     }
 }
 
@@ -309,20 +356,60 @@ mod tests {
     }
 
     #[test]
-    fn wholesale_eviction_keeps_the_bound() {
+    fn lru_eviction_keeps_the_bound_and_retains_hot_entries() {
         let mut cache = GlyphCache::new(FakeRasterizer::default(), 4).unwrap();
         let font = cache.load_font(&font_query()).unwrap();
         for ch in 'a'..'e' {
             let _ = cache.glyph(RasterKey::new(ch, font, 12.0).unwrap());
         }
         assert_eq!(cache.len(), 4);
+        assert_eq!(cache.rasterizer.rasterize_calls.get(), 4);
 
-        // Overflowing insert clears, then inserts exactly one entry.
-        let _ = cache.glyph(RasterKey::new('z', font, 12.0).unwrap());
-        assert_eq!(cache.len(), 1);
-        // The evicted entries rasterize again on demand.
+        // Touch 'a' so 'b' becomes the least recently used entry.
         let _ = cache.glyph(RasterKey::new('a', font, 12.0).unwrap());
-        assert_eq!(cache.rasterizer.rasterize_calls.get(), 6);
+        let _ = cache.glyph(RasterKey::new('z', font, 12.0).unwrap());
+        // One entry evicted, bound held, no wholesale clear.
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.rasterizer.rasterize_calls.get(), 5);
+
+        // The hot entry survived; the cold one rasterizes again on demand.
+        let before = cache.rasterizer.rasterize_calls.get();
+        let _ = cache.glyph(RasterKey::new('a', font, 12.0).unwrap());
+        assert_eq!(
+            cache.rasterizer.rasterize_calls.get(),
+            before,
+            "most recently used entry must stay cached"
+        );
+        let _ = cache.glyph(RasterKey::new('b', font, 12.0).unwrap());
+        assert_eq!(
+            cache.rasterizer.rasterize_calls.get(),
+            before + 1,
+            "least recently used entry must have been evicted"
+        );
+    }
+
+    #[test]
+    fn eviction_ignores_failed_rasterizations() {
+        // A transient upstream failure must not evict a live entry.
+        let mut cache = GlyphCache::new(FakeRasterizer::default(), 2).unwrap();
+        let font = cache.load_font(&font_query()).unwrap();
+        let a = RasterKey::new('a', font, 12.0).unwrap();
+        let b = RasterKey::new('b', font, 12.0).unwrap();
+        let _ = cache.glyph(a).unwrap();
+        let _ = cache.glyph(b).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        cache.rasterizer.fail_next.set(true);
+        let z = RasterKey::new('z', font, 12.0).unwrap();
+        assert!(matches!(
+            cache.glyph(z),
+            Err(RenderError::UpstreamRasterizer(_))
+        ));
+        // Both resident entries are still cached.
+        let before = cache.rasterizer.rasterize_calls.get();
+        let _ = cache.glyph(a).unwrap();
+        let _ = cache.glyph(b).unwrap();
+        assert_eq!(cache.rasterizer.rasterize_calls.get(), before);
     }
 
     #[test]

@@ -64,12 +64,14 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
     })
 }
 
-/// Write a plugin with explicit capability and claim declarations.
+/// Write a plugin with explicit capability, claim, and reserved-command
+/// declarations.
 fn write_plugin(
     root: &Path,
     id: &str,
     capabilities: &[&str],
     claims: &[&str],
+    commands: &[&str],
     init_src: &str,
 ) -> PathBuf {
     let plugin = root.join(id);
@@ -82,6 +84,11 @@ fn write_plugin(
     let claims_toml = claims
         .iter()
         .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let commands_toml = commands
+        .iter()
+        .map(|c| format!("\"{id}:{c}\""))
         .collect::<Vec<_>>()
         .join(", ");
     std::fs::write(
@@ -100,7 +107,7 @@ plugin-api = "^1.0"
 {caps_toml}
 
 [lazy]
-commands = []
+commands = [{commands_toml}]
 events = []
 claims = [{claims_toml}]
 "#
@@ -136,9 +143,23 @@ impl Fixture {
         claims: &[&str],
         init_src: &str,
     ) -> Self {
+        Self::activate_with_commands(tag, id, capabilities, claims, &[], init_src)
+    }
+
+    /// Activate a fixture that also reserves `commands` in `[lazy].commands`
+    /// and registers them from `init_src` (used by the handle-invalidation
+    /// probes that must re-enter the VM after activation).
+    fn activate_with_commands(
+        tag: &str,
+        id: &str,
+        capabilities: &[&str],
+        claims: &[&str],
+        commands: &[&str],
+        init_src: &str,
+    ) -> Self {
         let root = temp_dir(&format!("{tag}-root"));
         let data = temp_dir(&format!("{tag}-data"));
-        write_plugin(&root, id, capabilities, claims, init_src);
+        write_plugin(&root, id, capabilities, claims, commands, init_src);
         let mut runtime = runtime(vec![root.clone()], data.clone());
         runtime.discover();
         let id = plugin_id(id);
@@ -396,14 +417,28 @@ fn oversized_component_is_rejected_before_any_mount() {
 
 #[test]
 fn reload_starts_the_next_generation_with_a_fresh_registry() {
-    let mut fixture = Fixture::activate(
+    let mut fixture = Fixture::activate_with_commands(
         "reload",
         "bitty-featured.uireload",
         &["ui.rich"],
         &[],
+        &["probe"],
         r#"
-        local ok, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "gen" })
-        bitty.store.set("stale", ok and bitty.ui.update(handle + 1000, { kind = "Text", text = "x" }))
+        bitty.commands.register({
+          id = "probe",
+          title = "Probe",
+          run = function(key)
+            local ok = bitty.ui.update(bitty.store.get("old_handle"), { kind = "Text", text = "v2" })
+            bitty.store.set(key, ok)
+            return ok
+          end,
+        })
+        local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "gen" })
+        bitty.store.set("handle", mounted and handle or -1)
+        -- Remember the first generation's real handle across the reload.
+        if bitty.store.get("old_handle") == nil then
+          bitty.store.set("old_handle", mounted and handle or -1)
+        end
         return {}
         "#,
     );
@@ -413,6 +448,22 @@ fn reload_starts_the_next_generation_with_a_fresh_registry() {
         .expect("services")
         .clone();
     first.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    // A real generation-1 handle serves updates before the reload.
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_command(
+                &fixture.id,
+                "probe",
+                &[LuaValue::String("before".to_string())],
+            )
+            .expect("dispatch"),
+        LuaValue::Bool(true)
+    );
+    let first_handle = match store_value(&fixture.runtime, &fixture.id, "old_handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("mount must return a handle, got {other:?}"),
+    };
 
     fixture
         .runtime
@@ -427,10 +478,150 @@ fn reload_starts_the_next_generation_with_a_fresh_registry() {
         !Rc::ptr_eq(&first, &second),
         "reload must build a new generation-owned services instance"
     );
+    // The next generation mounts its own block...
     second.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
-    assert_eq!(
-        store_value(&fixture.runtime, &fixture.id, "stale"),
-        Some(LuaValue::Bool(false)),
-        "stale handles report false, never error"
+    let second_handle = second
+        .with_ui_blocks(|blocks| blocks.iter().next().map(|(handle, _)| handle))
+        .expect("second generation retains its own block");
+    assert_ne!(
+        first_handle, second_handle,
+        "generation-owned handles must not alias across reload"
     );
+    // ...and the real pre-reload handle is dead, not aliased onto it.
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_command(
+                &fixture.id,
+                "probe",
+                &[LuaValue::String("after_reload".to_string())],
+            )
+            .expect("dispatch"),
+        LuaValue::Bool(false),
+        "a real pre-reload handle must report false after reload, never error"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "after_reload"),
+        Some(LuaValue::Bool(false))
+    );
+}
+
+/// The same generation's handles must die at suspend and stay dead after a
+/// resume until the plugin mounts again (issue #854 acceptance).
+#[test]
+fn suspend_invalidates_handles_until_remount() {
+    let mut fixture = Fixture::activate_with_commands(
+        "suspend",
+        "bitty-featured.uisuspend",
+        &["ui.rich"],
+        &[],
+        &["probe", "probe_old", "remount"],
+        r#"
+        bitty.commands.register({
+          id = "probe",
+          title = "Probe",
+          run = function(key)
+            local ok = bitty.ui.update(bitty.store.get("handle"), { kind = "Text", text = "v2" })
+            bitty.store.set(key, ok)
+            return ok
+          end,
+        })
+        bitty.commands.register({
+          id = "probe_old",
+          title = "Probe old",
+          run = function(key)
+            local ok = bitty.ui.update(bitty.store.get("old_handle"), { kind = "Text", text = "v2" })
+            bitty.store.set(key, ok)
+            return ok
+          end,
+        })
+        bitty.commands.register({
+          id = "remount",
+          title = "Remount",
+          run = function()
+            local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "again" })
+            if mounted then bitty.store.set("handle", handle) end
+            return mounted
+          end,
+        })
+        local mounted, handle = pcall(bitty.ui.mount, "statusline", { kind = "Text", text = "gen" })
+        bitty.store.set("handle", mounted and handle or -1)
+        bitty.store.set("old_handle", mounted and handle or -1)
+        return {}
+        "#,
+    );
+    let services = fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .clone();
+    services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    let first_handle = match store_value(&fixture.runtime, &fixture.id, "handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("mount must return a handle, got {other:?}"),
+    };
+
+    let probe = |fixture: &mut Fixture, command: &str, key: &str| {
+        fixture
+            .runtime
+            .dispatch_command(&fixture.id, command, &[LuaValue::String(key.to_string())])
+            .expect("dispatch")
+    };
+
+    // update-before-suspend: the live handle serves.
+    assert_eq!(probe(&mut fixture, "probe", "before"), LuaValue::Bool(true));
+
+    fixture.runtime.suspend(&fixture.id).expect("suspend");
+    services.with_ui_blocks(|blocks| {
+        assert!(
+            blocks.is_empty(),
+            "suspend must clear the generation's host-side block registry"
+        )
+    });
+
+    // update-after-suspend: the same real handle is dead.
+    assert_eq!(
+        probe(&mut fixture, "probe", "during"),
+        LuaValue::Bool(false)
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "during"),
+        Some(LuaValue::Bool(false))
+    );
+
+    fixture.runtime.resume(&fixture.id).expect("resume");
+    // update-after-resume: still dead until the plugin mounts again.
+    assert_eq!(probe(&mut fixture, "probe", "after"), LuaValue::Bool(false));
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "after"),
+        Some(LuaValue::Bool(false))
+    );
+
+    // Re-mount mints a fresh handle; the pre-suspend handle stays dead.
+    assert_eq!(
+        fixture
+            .runtime
+            .dispatch_command(&fixture.id, "remount", &[])
+            .expect("dispatch"),
+        LuaValue::Bool(true)
+    );
+    let second_handle = match store_value(&fixture.runtime, &fixture.id, "handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("remount must return a handle, got {other:?}"),
+    };
+    assert_ne!(
+        first_handle, second_handle,
+        "a remount after suspend must mint a fresh handle"
+    );
+    assert_eq!(
+        probe(&mut fixture, "probe", "post_remount"),
+        LuaValue::Bool(true),
+        "the fresh handle must serve"
+    );
+    assert_eq!(
+        probe(&mut fixture, "probe_old", "stale_after_remount"),
+        LuaValue::Bool(false),
+        "the pre-suspend handle must stay dead after a remount"
+    );
+    services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
 }

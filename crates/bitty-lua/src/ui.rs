@@ -252,13 +252,20 @@ impl UiNode {
                 "component children must be an array table",
             ));
         };
-        let mut indexed: Vec<(i64, &LuaValue)> = pairs
-            .iter()
-            .filter_map(|(key, child)| match key {
-                LuaValue::Integer(index) => Some((*index, child)),
-                _ => None,
-            })
-            .collect();
+        let mut indexed: Vec<(i64, &LuaValue)> = Vec::with_capacity(pairs.len());
+        for (key, child) in pairs {
+            match key {
+                LuaValue::Integer(index) => indexed.push((*index, child)),
+                // A mixed table (array entries plus named fields) or any other
+                // key shape is malformed input, not an array; fail closed
+                // rather than silently dropping the named entries.
+                _ => {
+                    return Err(component_invalid(
+                        "component children must be a dense 1-based array",
+                    ));
+                }
+            }
+        }
         indexed.sort_by_key(|(index, _)| *index);
         let mut nodes = Vec::with_capacity(indexed.len());
         for (position, (index, child)) in indexed.into_iter().enumerate() {
@@ -398,6 +405,26 @@ mod tests {
         assert_eq!(
             UiNode::from_lua_value(&value)
                 .expect_err("sparse children")
+                .code,
+            "E_UI_COMPONENT_INVALID"
+        );
+    }
+
+    #[test]
+    fn mixed_children_keys_rejected_as_dense_array() {
+        let value = LuaValue::table([
+            ("kind", LuaValue::String("Row".to_string())),
+            (
+                "children",
+                LuaValue::Table(vec![
+                    (LuaValue::Integer(1), text("dense")),
+                    (LuaValue::String("note".to_string()), text("named")),
+                ]),
+            ),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&value)
+                .expect_err("mixed children keys")
                 .code,
             "E_UI_COMPONENT_INVALID"
         );

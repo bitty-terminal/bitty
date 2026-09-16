@@ -702,6 +702,9 @@ impl PluginRuntime {
             entry.state = LifecycleState::Loading;
             entry.generation = entry.generation.saturating_add(1);
             entry.services = Some(plugin_services.clone());
+            // CTX-0428: bind the UI handle epoch to this activation generation
+            // before `init.lua` runs, so handles cannot alias across reload.
+            plugin_services.set_ui_epoch(entry.generation);
         }
         let services: Rc<dyn HostServices> = plugin_services.clone();
         if let Err(error) = vm.install_host_module(
@@ -785,6 +788,11 @@ impl PluginRuntime {
 
     /// Suspend an active plugin (`Active -> Suspended`), retaining its VM.
     ///
+    /// CTX-0428: the generation's UI block handles are invalidated host-side
+    /// (`UiBlocks` cleared), so `bitty.ui.update` on a pre-suspend handle
+    /// fails closed with `false` after the suspend and after a resume, until
+    /// the plugin mounts again.
+    ///
     /// # Errors
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
@@ -800,6 +808,9 @@ impl PluginRuntime {
             ));
         }
         entry.state = LifecycleState::Suspended;
+        if let Some(services) = entry.services.as_ref() {
+            services.clear_ui_blocks();
+        }
         let _ = self.host.suspend(id);
         Ok(())
     }
@@ -844,6 +855,11 @@ impl PluginRuntime {
         entry.state = LifecycleState::Disposing;
         entry.vm = None;
         entry.registrations = RegistrationCapture::new();
+        // CTX-0428: a disposed generation's handles are dead; clear the host
+        // registry so a stale handle cannot be served while the entry lingers.
+        if let Some(services) = entry.services.as_ref() {
+            services.clear_ui_blocks();
+        }
         entry.state = LifecycleState::Disposed;
         let _ = self.host.remove(id);
         Ok(())

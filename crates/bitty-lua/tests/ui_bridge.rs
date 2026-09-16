@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use bitty_lua::ui::UI_MAX_TEXT_BYTES;
+use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
-    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, UiNode,
+    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits,
+    RC1_INSTRUCTION_BUDGET, RC1_WARNING_MS, RC2_MEMORY_PER_PLUGIN_BYTES, UiNode,
 };
 
 #[derive(Default)]
@@ -85,6 +86,41 @@ fn install(vm: &mut LuaVm, services: Rc<UiServices>, deadline_ms: u64) {
     let services: Rc<dyn HostServices> = services;
     vm.install_host_module(services, MarshallingLimits::default(), deadline_ms)
         .expect("install");
+}
+
+/// Marshal byte headroom `UI_MARSHAL_LIMITS` grants over
+/// [`UI_MAX_TEXT_BYTES`] (`bitty_lua::ui`). The probe below must stay under it
+/// so the rejection is proven to come from the `SCN-3` scene walk, never from
+/// the raw marshalling ceiling that runs first.
+const UI_MARSHAL_BYTE_HEADROOM: usize = 64 * 1024;
+
+/// Wall budget for the multi-input oversize probe, deliberately wider than
+/// the RC-1 default ([`bitty_lua::RC1_WALL_CLOCK_BUDGET_MS`], 50 ms).
+///
+/// The probe marshals and validates two largest-accepted-shape inputs (a
+/// 256 KiB+ text and an over-budget node scene) in one cold path. That path
+/// costs ~2 ms of CPU locally, yet measured 50-58 ms on shared CI runners
+/// under parallel test contention (the PX-2726 flake) - the inflation is
+/// scheduling latency, not CPU work, so a cheaper probe alone cannot make the
+/// fixed 50 ms window deterministic. The property under test is the
+/// `SCN-1`/`SCN-3` size rejection, not the wall budget; the padded budget
+/// keeps that rejection deterministic on slow runners while the instruction,
+/// memory, and host-mutation deadlines keep their accepted defaults. The
+/// hot-path wall-budget contract stays covered by `measurement_lua`, and the
+/// assertions below pin the probe to one node past the `SCN-1` ceiling and
+/// inside the marshalling headroom, so a weakened size bound cannot pass.
+const OVERSIZE_PROBE_WALL_BUDGET_MS: u64 = 250;
+
+/// Probe VM carrying [`OVERSIZE_PROBE_WALL_BUDGET_MS`] and otherwise default
+/// RC budgets.
+fn oversized_probe_vm(id: &str) -> LuaVm {
+    LuaVm::with_budgets(
+        id,
+        RC1_INSTRUCTION_BUDGET,
+        OVERSIZE_PROBE_WALL_BUDGET_MS,
+        RC1_WARNING_MS,
+        RC2_MEMORY_PER_PLUGIN_BYTES,
+    )
 }
 
 fn run(vm: &mut LuaVm, source: &str) {
@@ -224,6 +260,7 @@ fn excluded_unknown_and_malformed_components_rejected() {
           { kind = "Row" },
           { kind = "Row", children = "nope" },
           { kind = "Column", children = { [2] = { kind = "Text", text = "gap" } } },
+          { kind = "Row", children = { [1] = { kind = "Text", text = "x" }, note = "mixed" } },
           "not a table",
         }
         local failures = 0
@@ -275,35 +312,36 @@ fn depth_sixteen_accepted_seventeen_rejected() {
 #[test]
 fn oversized_text_and_node_count_rejected() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("budgets");
+    let mut vm = oversized_probe_vm("budgets");
     install(&mut vm, services.clone(), 200);
     run(
         &mut vm,
-        r#"
-        -- Keep the probe inside the fixed RC-1 50 ms wall budget: `table.concat`
-        -- is capped at 64 KiB, so build a 44 KiB chunk linearly and append it a
-        -- bounded number of times (repeated `..` over many small pieces is
-        -- O(n^2) and flaked on loaded CI runners).
-        local unit_parts = {}
-        for index = 1, 1024 do unit_parts[index] = "x" end
-        local unit = table.concat(unit_parts)
-        local chunk_units = {}
-        for index = 1, 44 do chunk_units[index] = unit end
-        local chunk = table.concat(chunk_units)
-        local text = chunk
-        for _ = 1, 5 do text = text .. chunk end
-        local ok_text, err_text = pcall(bitty.ui.mount, "top", { kind = "Text", text = text })
-        local children = {}
-        for index = 1, 2049 do
-          children[index] = { kind = "Text", text = "" }
-        end
-        local ok_nodes, err_nodes = pcall(bitty.ui.mount, "top", {
-          kind = "Row", children = children
-        })
-        bitty.store.set("text_len", #text)
-        bitty.store.set("text_code", ok_text and "NONE" or err_text.code)
-        bitty.store.set("nodes_code", ok_nodes and "NONE" or err_nodes.code)
-        "#,
+        &format!(
+            r#"
+            -- 44 KiB linear chunk appended six times: over SCN-3, inside RC-1.
+            local unit_parts = {{}}
+            for index = 1, 1024 do unit_parts[index] = "x" end
+            local unit = table.concat(unit_parts)
+            local chunk_units = {{}}
+            for index = 1, 44 do chunk_units[index] = unit end
+            local chunk = table.concat(chunk_units)
+            local text = chunk
+            for _ = 1, 5 do text = text .. chunk end
+            local ok_text, err_text = pcall(bitty.ui.mount, "top", {{ kind = "Text", text = text }})
+            local children = {{}}
+            for index = 1, {children} do
+              children[index] = {{ kind = "Text", text = "" }}
+            end
+            local ok_nodes, err_nodes = pcall(bitty.ui.mount, "top", {{
+              kind = "Row", children = children
+            }})
+            bitty.store.set("text_len", #text)
+            bitty.store.set("node_count", #children + 1)
+            bitty.store.set("text_code", ok_text and "NONE" or err_text.code)
+            bitty.store.set("nodes_code", ok_nodes and "NONE" or err_nodes.code)
+            "#,
+            children = UI_MAX_NODES,
+        ),
     );
     let length = match stored(&services, "text_len") {
         Some(LuaValue::Integer(length)) => length,
@@ -312,6 +350,16 @@ fn oversized_text_and_node_count_rejected() {
     assert!(
         length as usize > UI_MAX_TEXT_BYTES,
         "probe text must exceed the SCN-3 ceiling, got {length}"
+    );
+    assert!(
+        length as usize <= UI_MAX_TEXT_BYTES + UI_MARSHAL_BYTE_HEADROOM,
+        "probe text must stay inside the marshalling headroom so the SCN-3
+         scene walk, not the marshalling ceiling, rejects it; got {length}"
+    );
+    assert_eq!(
+        stored(&services, "node_count"),
+        Some(LuaValue::Integer((UI_MAX_NODES + 1) as i64)),
+        "probe scene must be exactly one node past the SCN-1 ceiling"
     );
     assert_eq!(
         stored(&services, "text_code"),

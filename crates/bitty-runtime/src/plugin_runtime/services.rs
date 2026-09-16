@@ -170,32 +170,82 @@ impl UiBlock {
 
 /// Bounded per-generation block registry (`SCN-4`/`SCN-5` numbers).
 ///
-/// Handles are opaque, generation-owned integers: the registry lives inside
-/// one [`PluginServices`], so a handle from a suspended, reloaded, or disposed
-/// generation is foreign to the next one and `update` reports `false` instead
-/// of touching another generation's blocks.
+/// Handles are opaque, generation-owned integers encoded as
+/// `(epoch << 32) | counter`: the registry lives inside one [`PluginServices`]
+/// and the runtime pins `epoch` to the activation generation, so a handle from
+/// a suspended, reloaded, or disposed generation is foreign to the next one
+/// and `update` reports `false` instead of touching another generation's
+/// blocks. Clearing the registry on suspend/dispose keeps the monotonic
+/// counter, so handles never alias across a clear either.
 ///
 /// The registry caps are host-owned fail-closed bounds for this bridge slice:
 /// the accepted `SCN-4`/`SCN-5` budgets are terminal-wide (all plugins), and
 /// the terminal-wide accounting is owned by the host composer. Exceeding a
 /// registry cap fails closed with `E_UI_BLOCK_BUDGET` (`budget` class), a host
 /// diagnostic pending an accepted stable plugin-visible code.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UiBlocks {
     blocks: Vec<(i64, UiBlock)>,
-    next_handle: i64,
+    epoch: u32,
+    next_counter: u32,
     aggregated_text_bytes: usize,
 }
 
+/// Bits of the handle reserved for the generation epoch. Capped at 31 so every
+/// composed `i64` handle stays positive (the surface types handles as opaque
+/// integers; positivity is diagnostic only).
+const UI_HANDLE_EPOCH_BITS: u32 = 31;
+
+/// Mask selecting the generation epoch bits of a handle.
+const UI_HANDLE_EPOCH_MASK: u32 = (1 << UI_HANDLE_EPOCH_BITS) - 1;
+
+impl Default for UiBlocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UiBlocks {
-    /// An empty registry.
+    /// An empty registry (epoch `0`, first handle counter `1`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             blocks: Vec::new(),
-            next_handle: 1,
+            epoch: 0,
+            next_counter: 1,
             aggregated_text_bytes: 0,
         }
+    }
+
+    /// Pin the generation epoch this registry mints handles for.
+    ///
+    /// Set once per activation/reload before the generation's `init.lua` runs;
+    /// changing it after mounts would strand live handles, so the runtime only
+    /// calls this on a freshly built registry.
+    fn set_epoch(&mut self, epoch: u32) {
+        self.epoch = epoch;
+    }
+
+    /// Drop every retained block (`suspend`/`dispose` invalidation) while
+    /// keeping the epoch and the monotonic counter, so a handle minted before
+    /// the clear can never alias one minted after it.
+    fn clear(&mut self) {
+        self.blocks.clear();
+        self.aggregated_text_bytes = 0;
+    }
+
+    /// Compose the next generation-owned handle, or fail closed when this
+    /// generation has exhausted its counter (unreachable in practice).
+    fn next_handle(&self) -> Result<i64, BridgeError> {
+        if self.next_counter == u32::MAX {
+            return Err(BridgeError::new(
+                "budget",
+                "E_UI_BLOCK_BUDGET",
+                "ui block handle counter exhausted for this generation",
+            ));
+        }
+        let epoch = i64::from(self.epoch & UI_HANDLE_EPOCH_MASK);
+        Ok((epoch << 32) | i64::from(self.next_counter))
     }
 
     /// Number of retained blocks.
@@ -241,8 +291,8 @@ impl UiBlocks {
                 "ui block text budget exceeded (2 MiB aggregated)",
             ));
         }
-        let handle = self.next_handle;
-        self.next_handle = self.next_handle.saturating_add(1);
+        let handle = self.next_handle()?;
+        self.next_counter = self.next_counter.saturating_add(1);
         self.aggregated_text_bytes = total;
         self.blocks.push((
             handle,
@@ -279,7 +329,7 @@ impl UiBlocks {
         self.aggregated_text_bytes = total;
         let block = &mut self.blocks[position].1;
         block.node = node;
-        block.version = block.version.wrapping_add(1).max(1);
+        block.version = block.version.saturating_add(1);
         Ok(true)
     }
 }
@@ -338,6 +388,24 @@ impl PluginServices {
     #[must_use]
     pub fn ui_access(&self) -> UiAccess {
         self.ui_access.borrow().clone()
+    }
+
+    /// Pin the UI handle epoch to the activation generation.
+    ///
+    /// Called once per activation/reload on the freshly built services, before
+    /// the generation's `init.lua` runs, so handles minted by different
+    /// generations never collide.
+    pub fn set_ui_epoch(&self, epoch: u32) {
+        self.ui_blocks.borrow_mut().set_epoch(epoch);
+    }
+
+    /// Invalidate every block handle this generation minted (suspend/dispose).
+    ///
+    /// The registry is host-side state: clearing it makes `bitty.ui.update`
+    /// on a pre-suspend handle fail closed (`false`) after suspend and after
+    /// resume until the plugin mounts again.
+    pub fn clear_ui_blocks(&self) {
+        self.ui_blocks.borrow_mut().clear();
     }
 
     /// Read-only mounted-block view (tests, diagnostics, presentation wiring).
@@ -697,17 +765,63 @@ mod tests {
     #[test]
     fn generation_handles_are_foreign_across_instances() {
         let first = ui_services(rich_only());
+        first.set_ui_epoch(7);
         let handle = first
             .ui_mount("statusline", &UiNode::text("gen1"))
             .expect("mount");
         let second = ui_services(rich_only());
+        second.set_ui_epoch(8);
+        let own = second
+            .ui_mount("statusline", &UiNode::text("gen2"))
+            .expect("mount");
+        assert_ne!(
+            handle, own,
+            "handles minted by different generations must not alias"
+        );
         assert!(
             !second
                 .ui_update(handle, &UiNode::text("gen2"))
                 .expect("foreign lookup is not an error"),
-            "a handle from another generation must report false"
+            "a handle from another generation must report false even when the
+             next generation has its own live block"
         );
-        second.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+        assert!(
+            second
+                .ui_update(own, &UiNode::text("gen2b"))
+                .expect("own handle serves"),
+            "the next generation's own handle must still serve"
+        );
+        second.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    }
+
+    #[test]
+    fn clear_invalidates_handles_without_aliasing_remounts() {
+        let services = ui_services(rich_only());
+        services.set_ui_epoch(3);
+        let first = services
+            .ui_mount("statusline", &UiNode::text("gen1"))
+            .expect("mount");
+        services.clear_ui_blocks();
+        services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+        assert!(
+            !services
+                .ui_update(first, &UiNode::text("stale"))
+                .expect("stale lookup is not an error"),
+            "a cleared handle must report false"
+        );
+        let second = services
+            .ui_mount("statusline", &UiNode::text("gen2"))
+            .expect("remount");
+        assert_ne!(
+            first, second,
+            "a remount after a clear must mint a fresh handle"
+        );
+        assert!(
+            services
+                .ui_update(second, &UiNode::text("gen2b"))
+                .expect("fresh handle serves"),
+            "the remounted handle must serve"
+        );
     }
 
     #[test]

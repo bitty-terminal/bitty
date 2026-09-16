@@ -320,7 +320,6 @@ dependencies = [
 name = "bitty-term-state"
 version = "0.0.20"
 dependencies = [
- "bitty-ui",
  "bitty-vt",
  "proptest",
 ]

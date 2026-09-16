@@ -19,6 +19,12 @@ use crate::spawn::{looks_like_negative_number, parse_split_token};
 pub(crate) struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
     pub(crate) headless: bool,
+    /// When true (`--test-mode`) run the deterministic headless E2E servo
+    /// loop instead of the graphical event loop (CTX-0506, research 043):
+    /// the real Runtime plus the `BITTY_SOCKET` IPC surface, no display, no
+    /// GPU, no VM, until the elevated `bitty.debug/testExit` verb applies.
+    /// Grants no new authority; takes precedence over `--headless`.
+    pub(crate) test_mode: bool,
     /// When true (`--safe`) never create a third-party plugin VM, never
     /// read the third-party store tree (recovery startup, RFC A.4 rule 6),
     /// and select the built-in safe effective config
@@ -289,6 +295,7 @@ impl Args {
     pub(crate) fn new() -> Self {
         Self {
             headless: false,
+            test_mode: false,
             safe: false,
             fail_loud: false,
             help: false,
@@ -769,6 +776,10 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--headless" => {
                 out.headless = true;
+                i += 1;
+            }
+            "--test-mode" => {
+                out.test_mode = true;
                 i += 1;
             }
             "--safe" => {
@@ -1456,6 +1467,10 @@ pub(crate) fn help_text() -> String {
                              (default warn: startup info lines need info,\n  \
                              tick stats need debug|trace; also BITTY_LOG/RUST_LOG)\n  \
                --headless   Run a single headless tick smoke and exit (CI)\n  \
+               --test-mode  Run the deterministic headless E2E servo loop\n  \
+                            (no display/GPU/VM): real runtime + BITTY_SOCKET IPC\n  \
+                            until `bitty.debug/testExit` (debug.control\n  \
+                            elevation); grants no new authority\n  \
                --safe       Safe mode: do not load third-party plugins (no\n  \
                             plugin VM), and use the built-in safe config\n  \
                             (decoration 0/0/1/0/0, opaque outline pair);\n  \

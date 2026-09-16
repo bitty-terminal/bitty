@@ -22,8 +22,8 @@ bitty-pty = { path = "../bitty-pty" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-config = { path = "../bitty-config" }
 bitty-ui = { path = "../bitty-ui" }
-pollster = "1.0"
-winit = "0.30.13"
+pollster = { workspace = true }
+winit = { workspace = true }
 
 [[bench]]
 name = "vt_throughput"

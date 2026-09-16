@@ -84,22 +84,28 @@ case "$DISTRO" in
 ubuntu)
 	IMAGE="ubuntu:24.04"
 	CANONICAL="bitty.deb"
-	GLOBS=(-name '*.deb')
+	PRIMARY_GLOB='*.deb'
+	FALLBACK_GLOB=""
 	;;
 fedora)
 	IMAGE="fedora:latest"
 	CANONICAL="bitty.rpm"
-	GLOBS=(-name '*.rpm')
+	PRIMARY_GLOB='*.rpm'
+	FALLBACK_GLOB=""
 	;;
 arch)
 	IMAGE="archlinux:latest"
 	CANONICAL="bitty.pkg.tar.zst"
-	GLOBS=('(' -name '*.pkg.tar.zst' -o -name '*.archlinux' ')')
+	# Prefer the standard suffix; accept the historical one when it is the only
+	# package present (CTX-0448).
+	PRIMARY_GLOB='*.pkg.tar.zst'
+	FALLBACK_GLOB='*.archlinux'
 	;;
 alpine)
 	IMAGE="alpine:3.22"
 	CANONICAL="bitty.apk"
-	GLOBS=(-name '*.apk')
+	PRIMARY_GLOB='*.apk'
+	FALLBACK_GLOB=""
 	;;
 *)
 	die "unknown distro '$DISTRO' (expected ubuntu, fedora, arch or alpine)"
@@ -114,7 +120,10 @@ fi
 
 if [[ -n "$DIR" ]]; then
 	[[ -d "$DIR" ]] || die "package directory not found: $DIR"
-	PACKAGE="$(find "$DIR" -maxdepth 1 -type f "${GLOBS[@]}" -print -quit)"
+	PACKAGE="$(find "$DIR" -maxdepth 1 -type f -name "$PRIMARY_GLOB" -print -quit)"
+	if [[ -z "$PACKAGE" && -n "$FALLBACK_GLOB" ]]; then
+		PACKAGE="$(find "$DIR" -maxdepth 1 -type f -name "$FALLBACK_GLOB" -print -quit)"
+	fi
 	[[ -n "$PACKAGE" ]] || die "no $DISTRO package found in $DIR"
 fi
 [[ -f "$PACKAGE" ]] || die "package not found: $PACKAGE"

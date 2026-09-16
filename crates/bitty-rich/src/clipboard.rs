@@ -4,13 +4,25 @@
 //! - OSC 52 **write** is "gated opt-in" (requires user permission).
 //! - OSC 52 **read/query** is "out of M1": denied even when configured.
 //!
-//! This module never touches the platform clipboard. It captures bounded
+//! This module never touches the platform clipboard. It records bounded
 //! `OSC 52` write requests as inert events and denies reads by default, so
 //! the same PTY byte stream always yields the same observable clipboard
-//! outcome. The eventual permission/policy channel (RFC replay guarantee 6:
-//! policy decisions enter via explicit environment inputs) is intentionally
-//! not implemented here — this is the headless bookkeeping seam that policy
-//! gates.
+//! outcome.
+//!
+//! # Capture is explicit (CTX-0486)
+//!
+//! Recording a write payload is itself a policy decision: a terminal
+//! program must not be able to seed the headless clipboard model silently
+//! and then read it back through a granted read. [`ClipboardState`]
+//! therefore carries a [`ClipboardPolicy`] (default [`ClipboardPolicy::Gated`]);
+//! writes are retained only under an explicit [`ClipboardPolicy::Allow`]
+//! (the embedder's post-consent capability). `Gated` and `Denied` return
+//! [`ClipboardOutcome::WriteDenied`], retain nothing, and count
+//! [`ClipboardState::denied_writes`]. A granted read over a non-`Allow`
+//! state therefore returns an empty payload. The consent prompt itself
+//! stays outside this headless seam (RFC replay guarantee 6: policy
+//! decisions enter via explicit environment inputs); `Allow` is the
+//! capability the embedder supplies once consent exists.
 //!
 //! # One-time read grants (CTX-0213)
 //!
@@ -52,13 +64,17 @@ pub const CLIPBOARD_MAX_OUTSTANDING_GRANTS: usize = 16;
 /// Outcome of handling an `OSC 52` action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardOutcome {
-    /// A write request was captured (bounded). Delivery to the platform
-    /// clipboard is not performed here; a future policy gate will decide
-    /// whether to forward it.
+    /// A write request was captured (bounded) under an explicit
+    /// [`ClipboardPolicy::Allow`]. Delivery to the platform clipboard is
+    /// not performed here; the embedder decides whether to forward it.
     WriteCaptured {
         /// Truncated payload as delivered by the parser (already bounded).
         data: BoundedBytes,
     },
+    /// A write request was denied: the state's [`ClipboardPolicy`] is not
+    /// [`ClipboardPolicy::Allow`], so nothing was retained and no payload
+    /// is exposed. Counted in [`ClipboardState::denied_writes`].
+    WriteDenied,
     /// A read/query request was denied: no live, in-scope one-time token
     /// was presented (M1 default-deny, preserved by CTX-0213).
     ReadDenied,
@@ -72,22 +88,23 @@ pub enum ClipboardOutcome {
     Ignored,
 }
 
-/// Whether the embedder would allow clipboard writes.
+/// Whether clipboard writes are captured by [`ClipboardState`].
 ///
-/// This draft exposes the type so callers can thread a decision without
-/// baking a default-allow path. The crate itself always returns
-/// `WriteCaptured` regardless of policy; the caller decides whether to
-/// forward to the platform.
+/// Capture is explicit: the default [`ClipboardPolicy::Gated`] is
+/// default-deny, so an embedder that has not obtained consent cannot
+/// accidentally retain a terminal program's payload. Only an explicit
+/// [`ClipboardPolicy::Allow`] (the pre-granted capability the embedder
+/// mints after user consent) records the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ClipboardPolicy {
-    /// Prompt or pre-granted capability required (M1 expectation). Callers
-    /// should require explicit consent before forwarding.
+    /// Prompt or pre-granted capability required (M1 expectation). The
+    /// state retains nothing until the embedder switches to `Allow` after
+    /// consent; writes are denied meanwhile.
     #[default]
     Gated,
-    /// Writes are denied outright.
+    /// Writes are denied outright and can never be captured.
     Denied,
-    /// Writes are allowed without prompt (not recommended; kept for tests
-    /// and for a future pre-granted capability token).
+    /// Writes are captured without prompt (the post-consent capability).
     Allow,
 }
 
@@ -188,6 +205,8 @@ pub struct ClipboardState {
     next_ordinal: u64,
     pub(crate) denied_reads: u64,
     pub(crate) captured_writes: u64,
+    pub(crate) denied_writes: u64,
+    policy: ClipboardPolicy,
 }
 
 impl std::fmt::Debug for ClipboardState {
@@ -198,6 +217,8 @@ impl std::fmt::Debug for ClipboardState {
             .field("next_ordinal", &self.next_ordinal)
             .field("denied_reads", &self.denied_reads)
             .field("captured_writes", &self.captured_writes)
+            .field("denied_writes", &self.denied_writes)
+            .field("policy", &self.policy)
             .finish()
     }
 }
@@ -209,16 +230,38 @@ impl Default for ClipboardState {
 }
 
 impl ClipboardState {
-    /// An empty clipboard state.
+    /// An empty clipboard state under the default (deny) policy.
+    ///
+    /// OSC 52 writes are **not** captured until the embedder constructs
+    /// with [`ClipboardPolicy::Allow`] via [`with_policy`](Self::with_policy)
+    /// after user consent.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_policy(ClipboardPolicy::default())
+    }
+
+    /// An empty clipboard state with an explicit capture policy.
+    ///
+    /// [`ClipboardPolicy::Allow`] records OSC 52 write payloads (the
+    /// post-consent capability); `Gated` and `Denied` retain nothing and
+    /// return [`ClipboardOutcome::WriteDenied`].
+    #[must_use]
+    pub fn with_policy(policy: ClipboardPolicy) -> Self {
         Self {
             history: Vec::new(),
             grants: Vec::new(),
             next_ordinal: 1,
             denied_reads: 0,
             captured_writes: 0,
+            denied_writes: 0,
+            policy,
         }
+    }
+
+    /// The active capture policy.
+    #[must_use]
+    pub fn policy(&self) -> ClipboardPolicy {
+        self.policy
     }
 
     /// Mints a single-use read token for `scope` from OS entropy.
@@ -244,12 +287,14 @@ impl ClipboardState {
     }
 
     /// Handles one [`TerminalAction`] as a clipboard event; returns the
-    /// outcome and records bounded history for writes.
+    /// outcome and records bounded history for writes only when the state's
+    /// [`ClipboardPolicy`] is [`ClipboardPolicy::Allow`].
     ///
-    /// Token-less path: writes are captured, reads are always
-    /// [`ClipboardOutcome::ReadDenied`], and outstanding grants are neither
-    /// consulted nor consumed. Deterministic: same action sequence yields
-    /// same history and same counters on every platform.
+    /// Token-less path: writes follow the capture policy (default deny),
+    /// reads are always [`ClipboardOutcome::ReadDenied`], and outstanding
+    /// grants are neither consulted nor consumed. Deterministic: same
+    /// action sequence yields same history and same counters on every
+    /// platform.
     pub fn handle_action(&mut self, action: &TerminalAction) -> ClipboardOutcome {
         // Scope is unchecked on the token-less path: without a token every
         // read is denied regardless of scope.
@@ -258,7 +303,10 @@ impl ClipboardState {
 
     /// Handles one [`TerminalAction`] with an optional one-time read token.
     ///
-    /// - Writes ignore the token and are captured as in [`handle_action`].
+    /// - Writes ignore the token and follow the state's
+    ///   [`ClipboardPolicy`]: captured only under
+    ///   [`ClipboardPolicy::Allow`], otherwise
+    ///   [`ClipboardOutcome::WriteDenied`] with nothing retained.
     /// - Reads with `Some(token)` whose bytes match a live grant **and**
     ///   whose `scope` equals the grant's scope consume that grant
     ///   atomically (removed before the outcome is built, so no replay)
@@ -277,6 +325,10 @@ impl ClipboardState {
         match action {
             TerminalAction::OscClipboard { op, data } => match op {
                 ClipboardOp::Write => {
+                    if self.policy != ClipboardPolicy::Allow {
+                        self.denied_writes = self.denied_writes.wrapping_add(1);
+                        return ClipboardOutcome::WriteDenied;
+                    }
                     let req = ClipboardRequest {
                         op: *op,
                         data: data.clone(),
@@ -339,6 +391,12 @@ impl ClipboardState {
         self.captured_writes
     }
 
+    /// Number of write requests denied by policy since creation or clear.
+    #[must_use]
+    pub fn denied_writes(&self) -> u64 {
+        self.denied_writes
+    }
+
     /// Number of read/query requests denied since creation or clear.
     #[must_use]
     pub fn denied_reads(&self) -> u64 {
@@ -367,12 +425,14 @@ impl ClipboardState {
     /// terminal actions in this slice).
     ///
     /// Outstanding grants are revoked as well: tokens minted before the
-    /// clear are denied afterwards.
+    /// clear are denied afterwards. The [`ClipboardPolicy`] is configuration
+    /// and is preserved.
     pub fn clear(&mut self) {
         self.history.clear();
         self.grants.clear();
         self.captured_writes = 0;
         self.denied_reads = 0;
+        self.denied_writes = 0;
         self.next_ordinal = 1;
     }
 
@@ -410,13 +470,59 @@ mod tests {
 
     #[test]
     fn write_is_captured_bounded() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         let outcome = state.handle_action(&write(b"hello"));
         assert!(matches!(outcome, ClipboardOutcome::WriteCaptured { .. }));
         assert_eq!(state.len(), 1);
         assert_eq!(state.last_write().unwrap().data.as_bytes(), b"hello");
         assert_eq!(state.captured_writes(), 1);
+        assert_eq!(state.denied_writes(), 0);
         assert_eq!(state.denied_reads(), 0);
+    }
+
+    #[test]
+    fn write_is_denied_by_default_without_explicit_capture() {
+        // CTX-0486: the default posture is default-deny. A terminal program
+        // must not seed the headless clipboard model silently.
+        let mut state = ClipboardState::new();
+        assert_eq!(state.policy(), ClipboardPolicy::Gated);
+        let outcome = state.handle_action(&write(b"secret"));
+        assert_eq!(outcome, ClipboardOutcome::WriteDenied);
+        assert!(state.is_empty(), "denied write must not be retained");
+        assert!(state.last_write().is_none());
+        assert_eq!(state.captured_writes(), 0);
+        assert_eq!(state.denied_writes(), 1);
+    }
+
+    #[test]
+    fn gated_and_denied_policies_never_capture() {
+        for policy in [ClipboardPolicy::Gated, ClipboardPolicy::Denied] {
+            let mut state = ClipboardState::with_policy(policy);
+            let outcome = state.handle_action(&write(b"secret"));
+            assert_eq!(outcome, ClipboardOutcome::WriteDenied, "policy {policy:?}");
+            assert!(state.is_empty(), "policy {policy:?} retained a write");
+            assert_eq!(state.captured_writes(), 0);
+            assert_eq!(state.denied_writes(), 1);
+        }
+    }
+
+    #[test]
+    fn granted_read_cannot_expose_an_uncaptured_write() {
+        let mut state = ClipboardState::new();
+        state.handle_action(&write(b"secret"));
+        let token = grant(&mut state, 4);
+        let outcome = state.handle_action_with_token(&read(), Some(&token), ClipboardGrantScope(4));
+        match outcome {
+            ClipboardOutcome::ReadGranted { data } => {
+                assert!(
+                    data.as_bytes().is_empty(),
+                    "granted read exposed an uncaptured payload"
+                );
+            }
+            other => panic!("expected ReadGranted, got {other:?}"),
+        }
+        assert_eq!(state.captured_writes(), 0);
+        assert_eq!(state.denied_writes(), 1);
     }
 
     #[test]
@@ -439,8 +545,8 @@ mod tests {
 
     #[test]
     fn payload_truncation_is_deterministic() {
-        let mut a = ClipboardState::new();
-        let mut b = ClipboardState::new();
+        let mut a = ClipboardState::with_policy(ClipboardPolicy::Allow);
+        let mut b = ClipboardState::with_policy(ClipboardPolicy::Allow);
         let long = vec![0xAB_u8; CLIPBOARD_MAX_PAYLOAD_BYTES + 50];
         let action = write(&long);
         let out_a = a.handle_action(&action);
@@ -456,7 +562,7 @@ mod tests {
 
     #[test]
     fn history_is_bounded_fifo() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         for i in 0..CLIPBOARD_MAX_HISTORY + 5 {
             state.handle_action(&write(&[i as u8]));
         }
@@ -471,8 +577,8 @@ mod tests {
 
     #[test]
     fn deterministic_ordinals() {
-        let mut a = ClipboardState::new();
-        let mut b = ClipboardState::new();
+        let mut a = ClipboardState::with_policy(ClipboardPolicy::Allow);
+        let mut b = ClipboardState::with_policy(ClipboardPolicy::Allow);
         a.handle_action(&write(b"one"));
         b.handle_action(&write(b"one"));
         a.handle_action(&write(b"two"));
@@ -483,13 +589,15 @@ mod tests {
 
     #[test]
     fn clear_resets() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         state.handle_action(&write(b"x"));
         state.handle_action(&read());
         state.clear();
         assert!(state.is_empty());
         assert_eq!(state.captured_writes(), 0);
+        assert_eq!(state.denied_writes(), 0);
         assert_eq!(state.denied_reads(), 0);
+        assert_eq!(state.policy(), ClipboardPolicy::Allow, "policy is config");
     }
 
     fn grant(state: &mut ClipboardState, scope: u64) -> ClipboardReadToken {
@@ -500,7 +608,7 @@ mod tests {
 
     #[test]
     fn grant_allows_single_read_then_replay_is_denied() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         state.handle_action(&write(b"secret"));
         let token = grant(&mut state, 7);
         assert_eq!(state.outstanding_grants(), 1);
@@ -539,7 +647,7 @@ mod tests {
 
     #[test]
     fn forged_token_is_denied_and_keeps_live_grant() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         state.handle_action(&write(b"data"));
         let token = grant(&mut state, 3);
         // A token minted by another state (different entropy) is unknown here.
@@ -557,7 +665,7 @@ mod tests {
 
     #[test]
     fn cross_scope_reuse_is_denied() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         state.handle_action(&write(b"scoped"));
         let token = grant(&mut state, 11);
 
@@ -574,7 +682,7 @@ mod tests {
 
     #[test]
     fn tokenless_path_stays_denied_with_outstanding_grant() {
-        let mut state = ClipboardState::new();
+        let mut state = ClipboardState::with_policy(ClipboardPolicy::Allow);
         state.handle_action(&write(b"data"));
         let token = grant(&mut state, 5);
 

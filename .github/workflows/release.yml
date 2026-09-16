@@ -403,9 +403,9 @@ jobs:
   # a package that cannot install and run must not reach a release. The Alpine
   # leg keeps the CTX-0447 musl-apk check and extends it with the same
   # --version / doctor / headless smoke as the other distros. Per-distro
-  # runtime dependencies are 034 item 4 (CTX-0449), so the font stack the
-  # binary links is installed explicitly by scripts/install-smoke.sh until
-  # those declarations ship in every package.
+  # runtime dependencies are 034 item 4 (CTX-0449) and ship with the packages;
+  # scripts/install-smoke.sh still installs the font stack explicitly so the
+  # smoke does not depend on how each distro resolves them.
   verify-install:
     name: Install smoke (${{ matrix.distro }})
     needs: [build, build-alpine]

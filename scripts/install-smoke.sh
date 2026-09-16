@@ -3,10 +3,9 @@
 # its distro and run the --version / doctor / headless smoke (034 item 5).
 #
 # The host must have docker and network access to the distro repositories; the
-# container is discarded with `--rm`. Runtime libraries are preinstalled
-# explicitly because the released packages on main do not declare them yet
-# (034 item 4 / CTX-0449 lands the declarations); keeping the prep explicit
-# means the smoke passes on both sides of that change.
+# container is discarded with `--rm`. Runtime libraries are installed
+# explicitly so the smoke stays independent of how each distro resolves the
+# package's declared runtime dependencies (034 item 4 / CTX-0449).
 #
 # Usage:
 #   scripts/install-smoke.sh --distro ubuntu|fedora|arch|alpine --dir DIR

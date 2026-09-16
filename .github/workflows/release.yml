@@ -88,6 +88,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             arch: amd64
             packagers: "deb,rpm,apk,archlinux"
+          # Linux ARM64 cross build (CTX-0446 / 034 item 1): ubuntu-22.04 keeps
+          # the glibc baseline older; the cross install/build branches below key
+          # off this target. Packagers stay deb,rpm until ARM64 packaging is
+          # hardened (034 item 8); apk is musl-only (CTX-0447).
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            packagers: "deb,rpm"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             arch: amd64
@@ -249,7 +257,10 @@ jobs:
           # Override arch in nfpm.yaml via env substitution (simple sed)
           sed "s/^arch:.*/arch: $NFPM_ARCH/" nfpm.yaml > /tmp/nfpm.yaml
           cat /tmp/nfpm.yaml
-          for pkg in deb rpm apk archlinux; do
+          # Honor the matrix packagers list so a target only emits the packages
+          # it declares (aarch64 Linux: deb,rpm). x86_64 lists all four.
+          IFS=',' read -ra PACKAGERS <<< "${{ matrix.packagers }}"
+          for pkg in "${PACKAGERS[@]}"; do
             nfpm package --config /tmp/nfpm.yaml --packager "$pkg" --target "dist/bitty-${{ matrix.target }}.${pkg}"
             ls -lh "dist/bitty-${{ matrix.target }}.${pkg}"
           done

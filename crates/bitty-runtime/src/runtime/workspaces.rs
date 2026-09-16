@@ -513,7 +513,14 @@ impl Runtime {
         // an inactive workspace must not reload the active slot from a stale
         // stash (live leaf edits, geometry, focus, and owners would revert).
         self.stash_active_slot();
+        // CTX-0461: leaves destroyed with the workspace can never respawn,
+        // so capture them before the removal to drop any pending restores
+        // they still hold (stale entries leak and misreport session state).
+        let removed_leaves = self.workspaces[index].layout.leaf_ids();
         self.workspaces.remove(index);
+        for view in removed_leaves {
+            self.session_pending.remove(&view);
+        }
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();
             let leaf = View::new(fresh_id, self.cols, self.rows);
@@ -570,6 +577,13 @@ impl Runtime {
                 self.sync_primary_geometry();
             }
         }
+        // CTX-0461 (CTX-0393 P3 follow-up): the close path installs a slot
+        // exactly like a switch, so the loaded workspace's still-pending
+        // leaves respawn here too (CTX-0393 P2-2 parity). Without this,
+        // closing the active workspace would land on a restored workspace
+        // with empty panes, and `workspace_switch` early-returns on the
+        // already-active index so no later switch could rescue them.
+        self.spawn_session_pending_for_active();
         self.pending_full_redraw = true;
     }
 

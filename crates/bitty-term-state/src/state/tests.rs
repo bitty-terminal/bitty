@@ -755,6 +755,113 @@ fn ctx_0469_hyperlink_table_evicts_oldest_and_keeps_accepting() {
 }
 
 #[test]
+fn ctx_0490_hyperlink_lookup_resolves_contiguous_window_after_eviction() {
+    // CTX-0490 (item 1): FIFO issuance keeps the resident window contiguous
+    // and ascending. Lookup must resolve every resident id and fail closed
+    // outside the window; the O(1) front-id arithmetic relies on this
+    // invariant, so pin it.
+    use crate::state::HYPERLINK_TABLE_MAX;
+    let mut s = State::new();
+    let link = |i: usize| bitty_vt::Hyperlink {
+        id: None,
+        uri: BoundedString::new(format!("https://example.invalid/{i}")),
+    };
+    for i in 0..HYPERLINK_TABLE_MAX + 7 {
+        s.apply(&TerminalAction::OscHyperlink {
+            link: Some(link(i)),
+        });
+    }
+    assert_eq!(s.hyperlink_count(), HYPERLINK_TABLE_MAX);
+    let window: Vec<(HyperlinkId, Option<&str>, &str)> = s.hyperlink_table().collect();
+    let first = window[0].0.as_u32();
+    for (offset, (id, id_param, uri)) in window.iter().enumerate() {
+        assert_eq!(
+            id.as_u32(),
+            first + offset as u32,
+            "resident ids must stay contiguous"
+        );
+        assert_eq!(
+            s.hyperlink_entry(*id),
+            Some((*id_param, *uri)),
+            "resident id {id:?} must resolve to its own uri"
+        );
+    }
+    assert_eq!(window[0].2, "https://example.invalid/7");
+    assert_eq!(
+        s.hyperlink_entry(HyperlinkId::new(first - 1)),
+        None,
+        "evicted id fails closed"
+    );
+    let newest = window[window.len() - 1].0;
+    assert_eq!(
+        s.hyperlink_entry(HyperlinkId::new(newest.as_u32() + 1)),
+        None,
+        "unissued id fails closed"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn ctx_0490_hyperlink_wrap_restarts_id_space_after_clear() {
+    // CTX-0490 (item 2): the id space is u32. When the counter would wrap,
+    // the table is cleared and issuance restarts at zero — cells that kept a
+    // pre-wrap id can then resolve to a post-wrap entry. Pin the documented
+    // bound instead of claiming reuse is impossible.
+    let mut s = State::new();
+    let link = |uri: &str| bitty_vt::Hyperlink {
+        id: None,
+        uri: BoundedString::new(uri),
+    };
+    s.apply(&TerminalAction::OscHyperlink {
+        link: Some(link("https://pre-wrap.invalid/0")),
+    });
+    let stale = s.hyperlink_table().next().expect("first entry").0;
+    assert_eq!(stale.as_u32(), 0);
+    // White-box: park the counter at the wrap boundary instead of issuing
+    // 2^32 distinct links.
+    s.next_hyperlink_id = u32::MAX;
+    s.apply(&TerminalAction::OscHyperlink {
+        link: Some(link("https://post-wrap.invalid/")),
+    });
+    assert_eq!(s.hyperlink_count(), 1, "wrap clears the resident table");
+    assert_eq!(s.current_hyperlink().expect("post-wrap link").as_u32(), 0);
+    assert_eq!(
+        s.hyperlink_entry(stale),
+        Some((None, "https://post-wrap.invalid/")),
+        "documented bounded reuse: a pre-wrap id can resolve post-wrap"
+    );
+}
+
+#[test]
+fn ctx_0490_state_hash_covers_hyperlink_id_space() {
+    // CTX-0490 (item 4): the canonical hash must distinguish states whose
+    // only difference is the next hyperlink id to be issued.
+    let mut a = State::new();
+    let mut b = State::new();
+    for i in 0..3 {
+        let link = |uri: &str| bitty_vt::Hyperlink {
+            id: None,
+            uri: BoundedString::new(uri),
+        };
+        let uri = format!("https://example.invalid/{i}");
+        a.apply(&TerminalAction::OscHyperlink {
+            link: Some(link(&uri)),
+        });
+        b.apply(&TerminalAction::OscHyperlink {
+            link: Some(link(&uri)),
+        });
+    }
+    assert_eq!(
+        a.state_hash(),
+        b.state_hash(),
+        "identical states hash equal"
+    );
+    // Same resident table, different id-space position: must not collide.
+    b.next_hyperlink_id = 99;
+    assert_ne!(a.state_hash(), b.state_hash());
+}
+
+#[test]
 fn ctx_0469_live_grid_row_matches_snapshot_row() {
     // The zero-copy search/render path must observe exactly what the
     // cloning snapshot path observes.

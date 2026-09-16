@@ -34,7 +34,7 @@
 //!
 //! | Collection | Cap | Policy |
 //! |---|---|---|
-//! | [`hyperlink::HYPERLINK_TABLE_MAX`] (via term-state) | 1024 | new distinct link degrades to no link |
+//! | [`hyperlink::HYPERLINK_TABLE_MAX`] (via term-state) | 1024 | oldest evicted; evicted ids fail closed, new links keep working |
 //! | [`shell::SHELL_ZONE_MAX`] mirrors `ZONE_RECORDS_MAX` | 1024 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_HISTORY`] | 16 | oldest dropped |
 //! | [`clipboard::CLIPBOARD_MAX_PAYLOAD_BYTES`] | 4096 | truncation at cap |

@@ -276,7 +276,17 @@ fn expand_caret(ver: &Version) -> Result<Vec<Comparator>, PackageError> {
         version: ver.clone(),
     };
     let upper_ver = if ver.major > 0 {
-        Version::parse(&format!("{}.0.0", ver.major + 1)).map_err(|e| {
+        // CTX-0493: checked increment; `u32::MAX` has no representable successor.
+        let next_major = ver.major.checked_add(1).ok_or_else(|| {
+            PackageError::manifest(
+                "dependencies.version_req",
+                format!(
+                    "caret upper bound overflow: major {} has no representable successor",
+                    ver.major
+                ),
+            )
+        })?;
+        Version::parse(&format!("{next_major}.0.0")).map_err(|e| {
             PackageError::manifest(
                 "dependencies.version_req",
                 format!("caret upper bound overflow: {e}"),
@@ -284,7 +294,16 @@ fn expand_caret(ver: &Version) -> Result<Vec<Comparator>, PackageError> {
         })?
     } else {
         // major==0, minor>0
-        Version::parse(&format!("0.{}.0", ver.minor + 1)).map_err(|e| {
+        let next_minor = ver.minor.checked_add(1).ok_or_else(|| {
+            PackageError::manifest(
+                "dependencies.version_req",
+                format!(
+                    "caret upper bound overflow: minor {} has no representable successor",
+                    ver.minor
+                ),
+            )
+        })?;
+        Version::parse(&format!("0.{next_minor}.0")).map_err(|e| {
             PackageError::manifest(
                 "dependencies.version_req",
                 format!("caret upper bound overflow: {e}"),
@@ -304,7 +323,17 @@ fn expand_tilde(ver: &Version) -> Result<Vec<Comparator>, PackageError> {
         op: ComparatorOp::GreaterEq,
         version: ver.clone(),
     };
-    let upper_ver = Version::parse(&format!("{}.{}.0", ver.major, ver.minor + 1)).map_err(|e| {
+    // CTX-0493: checked increment; `u32::MAX` has no representable successor.
+    let next_minor = ver.minor.checked_add(1).ok_or_else(|| {
+        PackageError::manifest(
+            "dependencies.version_req",
+            format!(
+                "tilde upper bound overflow: minor {} has no representable successor",
+                ver.minor
+            ),
+        )
+    })?;
+    let upper_ver = Version::parse(&format!("{}.{next_minor}.0", ver.major)).map_err(|e| {
         PackageError::manifest(
             "dependencies.version_req",
             format!("tilde upper bound overflow: {e}"),
@@ -473,5 +502,74 @@ mod tests {
         assert!(rb.matches(&Version::parse("1.0.0").unwrap()));
         // Four components still rejected fail-closed.
         assert!(VersionReq::parse(">=1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn comparator_shorthand_zero_pads_reported_ranges() {
+        // CTX-0493: the exact in-use plugin spellings resolve as X.Y.0.
+        let r = VersionReq::parse(">=2.30").unwrap();
+        assert_eq!(r.comparators[0].version.to_string(), "2.30.0");
+        assert!(r.matches(&Version::parse("2.30.0").unwrap()));
+        assert!(r.matches(&Version::parse("2.31.5").unwrap()));
+        assert!(!r.matches(&Version::parse("2.29.9").unwrap()));
+
+        let r2 = VersionReq::parse(">=0.5,<1.0").unwrap();
+        assert!(r2.matches(&Version::parse("0.5.0").unwrap()));
+        assert!(r2.matches(&Version::parse("0.9.9").unwrap()));
+        assert!(!r2.matches(&Version::parse("0.4.9").unwrap()));
+        assert!(!r2.matches(&Version::parse("1.0.0").unwrap()));
+    }
+
+    #[test]
+    fn caret_upper_bound_overflow_is_clean_error() {
+        // CTX-0493: `u32::MAX` has no representable successor; never panic.
+        for raw in [
+            "^4294967295",
+            "^4294967295.0.0",
+            "^0.4294967295",
+            "^0.4294967295.0",
+        ] {
+            let error = VersionReq::parse(raw)
+                .expect_err("unrepresentable caret upper bound must be rejected");
+            assert!(error.to_string().contains("overflow"), "{raw}: {error}");
+        }
+    }
+
+    #[test]
+    fn tilde_upper_bound_overflow_is_clean_error() {
+        for raw in ["~1.4294967295", "~0.4294967295", "~4294967295.4294967295"] {
+            let error = VersionReq::parse(raw)
+                .expect_err("unrepresentable tilde upper bound must be rejected");
+            assert!(error.to_string().contains("overflow"), "{raw}: {error}");
+        }
+    }
+
+    #[test]
+    fn caret_tilde_boundary_successors_are_accepted() {
+        // One below `u32::MAX` still expands to the maximal representable bound.
+        let caret = VersionReq::parse("^4294967294").unwrap();
+        assert_eq!(caret.comparators[1].version.to_string(), "4294967295.0.0");
+        assert!(caret.matches(&Version::parse("4294967294.4294967295.4294967295").unwrap()));
+        assert!(!caret.matches(&Version::parse("4294967295.0.0").unwrap()));
+
+        let caret_minor = VersionReq::parse("^0.4294967294").unwrap();
+        assert_eq!(
+            caret_minor.comparators[1].version.to_string(),
+            "0.4294967295.0"
+        );
+        assert!(caret_minor.matches(&Version::parse("0.4294967294.4294967295").unwrap()));
+        assert!(!caret_minor.matches(&Version::parse("0.4294967295.0").unwrap()));
+
+        let tilde = VersionReq::parse("~1.4294967294").unwrap();
+        assert_eq!(tilde.comparators[1].version.to_string(), "1.4294967295.0");
+        assert!(tilde.matches(&Version::parse("1.4294967294.4294967295").unwrap()));
+        assert!(!tilde.matches(&Version::parse("1.4294967295.0").unwrap()));
+
+        // Tilde never increments major, so this stays representable.
+        let tilde_major_max = VersionReq::parse("~4294967295.4294967294").unwrap();
+        assert_eq!(
+            tilde_major_max.comparators[1].version.to_string(),
+            "4294967295.4294967295.0"
+        );
     }
 }

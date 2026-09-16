@@ -51,6 +51,11 @@ jobs:
           bash scripts/check-pkgbuild-source.sh
           bash scripts/check-pkgbuild-bin.sh
 
+      - name: Check terminfo shipping decision (034 item 6)
+        run: |
+          bash scripts/check-terminfo.sh
+          bash scripts/tests/check-terminfo.test.sh
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

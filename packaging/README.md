@@ -99,6 +99,12 @@ Validation: `bash -n packaging/PKGBUILD && (cd packaging && makepkg --printsrcin
 - windows x64 portable ZIP (`bitty-<version>-windows-x86_64.zip`, `windows-zip` job)
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
+- macos Universal 2 (`Bitty-<version>-universal.dmg`, `macos-universal` job)
+
+The Universal 2 DMG fuses the two macOS slices into `Bitty.app` with `lipo`
+inside `scripts/make-macos-dmg.sh`; the job mounts the DMG and launches both
+slices before upload. The app is intentionally unsigned — codesign/notarize is
+deferred (034 item 11) — and the bare triple binaries keep shipping.
 
 The portable ZIP packs `bitty.exe` with `LICENSE`, `README.md` and
 `CHANGELOG.md` at the archive root (assembled by `scripts/make-windows-zip.sh`,

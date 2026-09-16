@@ -13,7 +13,8 @@ status: draft
 
 > Status: **draft design record** (candidate, not accepted). This document
 > reconciles the AI-named Core surface in
-> `crates/bitty-runtime/src/ai_panel.rs` with generic panel, service, and
+> `crates/bitty-panels/src/ai_panel.rs` (moved out of `bitty-runtime` by the
+> CTX-0438 extraction wave) with generic panel, service, and
 > scope capabilities per the BA-6 pressure-test gate. It authorizes no
 > implementation, adds no Core API, removes no Core API, changes no wire
 > name, and weakens no accepted contract. Every verdict below is a proposal;
@@ -49,7 +50,7 @@ architecture). Gap G-5 names the surface this record reviews: `ai_panel.rs`
 declares AI-named Core capabilities (`ai.provider`, `ai.stream`, `ai.model`,
 `agent.context.*`, `panel.provider`) that predate the pressure test.
 
-The read-only inventory (**shipped**, `crates/bitty-runtime/src/ai_panel.rs`,
+The read-only inventory (**shipped**, `crates/bitty-panels/src/ai_panel.rs`,
 about 1180 lines) is:
 
 1. Nine capability constants: `panel.provider`, `panel.create`,
@@ -208,7 +209,7 @@ pinned by the **open** `OQ-066` register entry.
 
 | Claim                                                                                           | Status                | Authority                                                               |
 | ----------------------------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------- |
-| Nine capability constants, gate helpers, bounded helpers, types, commands in `ai_panel.rs`      | Shipped               | `crates/bitty-runtime/src/ai_panel.rs` and its tests                    |
+| Nine capability constants, gate helpers, bounded helpers, types, commands in `ai_panel.rs`      | Shipped               | `crates/bitty-panels/src/ai_panel.rs` and its tests                     |
 | First-party ai-panel manifest capability set                                                    | Shipped               | `crates/bitty-plugin-host/src/bundled.rs`, `ai_panel_manifest`          |
 | Closed capability tables with `:PARAMETER` rules                                                | Shipped               | `capability.rs`, `manifest.rs` closed-set checks and tests              |
 | Sibling panels compose generic families only                                                    | Shipped               | file-manager, git, browser, mail panel tests                            |

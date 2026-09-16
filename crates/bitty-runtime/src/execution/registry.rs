@@ -1123,10 +1123,12 @@ impl JobRecord {
 
     /// Returns a claimed stdin half after the write (or a failed claim).
     fn return_pty_writer(&self, writer: Option<PtyStdinWriter>) {
-        if let Some(writer) = writer
-            && let Ok(mut slot) = self.pty_stdin.lock()
-        {
-            *slot = Some(writer);
+        // MSRV 1.85 has no let-chains (edition-2024 `let` in `&&` position
+        // is 1.88+): nest instead.
+        if let Some(writer) = writer {
+            if let Ok(mut slot) = self.pty_stdin.lock() {
+                *slot = Some(writer);
+            }
         }
     }
 }
@@ -1540,10 +1542,11 @@ impl PtyJob {
             // A racing `write_input_as` may claim the slot while it is still
             // `None` (backend starting): that call fails closed with
             // `Unsupported` and retries after `Running` is observable.
-            if let Ok(writer) = pty.take_writer()
-                && let Ok(mut guard) = slot.lock()
-            {
-                *guard = Some(writer);
+            // MSRV 1.85 has no let-chains: nest instead of `&& let`.
+            if let Ok(writer) = pty.take_writer() {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(writer);
+                }
             }
         }
         Ok(Self { pty, exited: false })

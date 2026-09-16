@@ -123,16 +123,18 @@ const EDITOR_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Temp file name prefix (inside [`std::env::temp_dir`]).
 const TEMP_PREFIX: &str = "bitty-composer-";
 
-/// Editor programs admitted by [`resolve_editor`], matched exactly.
+/// Editor programs admitted by [`resolve_editor`] after surrounding
+/// whitespace is trimmed, then matched exactly.
 ///
 /// `$VISUAL`/`$EDITOR` are attacker-influenced environment inputs: treating
 /// the value as an executable name lets a hostile environment spawn an
 /// arbitrary program on the composer temp file. The allowlist keeps the
 /// execution surface to the known terminal editors this slice supports.
-/// Bare names only: a value containing a path separator, whitespace, a
-/// flag, or any other character is not on the list and is denied before
-/// the temp file exists or a child is spawned. Extending the list is a
-/// deliberate, reviewable change.
+/// Bare names only: surrounding whitespace is trimmed first, and a value
+/// that still contains interior whitespace, a path separator, a flag, or
+/// any other character is not on the list and is denied before the temp
+/// file exists or a child is spawned. Extending the list is a deliberate,
+/// reviewable change.
 pub const EDITOR_ALLOWLIST: &[&str] = &["nvim", "vim", "vi"];
 
 // ---------------------------------------------------------------------------

@@ -88,6 +88,12 @@ jobs:
           cargo build --locked -p bitty-app
           bash scripts/check-runtime-deps.sh --binary target/debug/bitty --packagers deb,rpm,archlinux
 
+      # 034 item 5 / CTX-0450: pin the install-smoke driver's distro leg
+      # (package discovery, install command, --version/doctor/headless smoke)
+      # without starting a container; the release workflow runs the real legs.
+      - name: Check install smoke driver (fixture test)
+        run: bash scripts/tests/install-smoke.test.sh
+
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm

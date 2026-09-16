@@ -404,33 +404,41 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Clean-container install check for the musl .apk (CTX-0447 acceptance: the
-  # package installs on a clean Alpine and `bitty --version` runs). Per-distro
-  # runtime dependencies are 034 item 4, so the font stack the binary links is
-  # installed explicitly before the package.
-  verify-alpine:
-    name: Verify apk installs (clean Alpine)
-    needs: build-alpine
+  # Clean-container install smoke for every package (034 item 5 / CTX-0450):
+  # a package that cannot install and run must not reach a release. The Alpine
+  # leg keeps the CTX-0447 musl-apk check and extends it with the same
+  # --version / doctor / headless smoke as the other distros. Per-distro
+  # runtime dependencies are 034 item 4 (CTX-0449) and ship with the packages;
+  # scripts/install-smoke.sh still installs the font stack explicitly so the
+  # smoke does not depend on how each distro resolves them.
+  verify-install:
+    name: Install smoke (${{ matrix.distro }})
+    needs: [build, build-alpine]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            artifact: bitty-x86_64-unknown-linux-gnu
+          - distro: fedora
+            artifact: bitty-x86_64-unknown-linux-gnu
+          - distro: arch
+            artifact: bitty-x86_64-unknown-linux-gnu
+          - distro: alpine
+            artifact: bitty-x86_64-unknown-linux-musl
     steps:
-      - name: Download musl apk
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download ${{ matrix.artifact }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: bitty-x86_64-unknown-linux-musl
+          name: ${{ matrix.artifact }}
           path: pkg
 
-      - name: Install into a clean Alpine container
-        run: |
-          set -euo pipefail
-          apk_file="$(find pkg -maxdepth 1 -name '*.apk' -print -quit)"
-          test -n "$apk_file"
-          docker run --rm -v "$PWD/pkg:/pkg:ro" -e "APK_FILE=$(basename "$apk_file")" \
-            alpine:3.22 sh -euc '
-              apk add --no-cache fontconfig freetype libgcc
-              apk add --no-cache --allow-untrusted "/pkg/$APK_FILE"
-              bitty --version
-            '
+      - name: Install smoke (${{ matrix.distro }})
+        run: bash scripts/install-smoke.sh --distro "${{ matrix.distro }}" --dir pkg
 
   # macOS Universal 2 DMG (CTX-0454 / 034 item 9): fuse the two macOS slices
   # into one `Bitty.app` inside `Bitty-<version>-universal.dmg` so ordinary
@@ -529,7 +537,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build, build-alpine, verify-alpine, macos-universal]
+    needs: [build, build-alpine, verify-install, macos-universal]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')

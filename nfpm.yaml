@@ -23,8 +23,10 @@ contents:
     dst: /usr/share/doc/bitty/README.md
   - src: ./CHANGELOG.md
     dst: /usr/share/doc/bitty/CHANGELOG.md
-  - src: ./packaging/bitty.desktop
-    dst: /usr/share/applications/bitty.desktop
+  - src: ./packaging/run.bitty.Bitty.desktop
+    dst: /usr/share/applications/run.bitty.Bitty.desktop
+  - src: ./packaging/run.bitty.Bitty.metainfo.xml
+    dst: /usr/share/metainfo/run.bitty.Bitty.metainfo.xml
   - src: ./packaging/icons/hicolor/16x16/apps/bitty.png
     dst: /usr/share/icons/hicolor/16x16/apps/bitty.png
   - src: ./packaging/icons/hicolor/32x32/apps/bitty.png

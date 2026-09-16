@@ -47,6 +47,12 @@ terminfo-check:
 terminfo-test:
     ./scripts/tests/check-terminfo.test.sh
 
+desktop-check:
+    ./scripts/check-desktop-integration.sh
+
+desktop-test:
+    ./scripts/tests/check-desktop-integration.test.sh
+
 install-smoke-test:
     ./scripts/tests/install-smoke.test.sh
 
@@ -83,7 +89,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test install-smoke-test workflow-publish-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test workflow-publish-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 //! Mail panel via Panel Runtime — public API verification (CTX-0112, OQ-011).
 //!
+//! Since the CTX-0438 extraction wave the implementation lives in
+//! `bitty-panels::mail_panel`, outside the `bitty-runtime` microkernel crate;
+//! this suite moved with it and still verifies the identical public paths.
+//!
 //! Verifies `bitty-terminal.mail-panel` (tiled Panel, mcp.invoke:mail.* + network.connect + fs.read:~/mail/**)
 //! as generic Panel Runtime consumer with no private channel, via the public
 //! PluginHost path (`declare → resolve → register → GrantRecord → activate →
@@ -15,17 +19,17 @@
 //! Mirrors file_manager_panel/git_panel/browser_panel/ai_panel but for the mail-panel P3 candidate
 //! with tiled workspace and mcp/network/fs isolation via helper process.
 
+use bitty_panels::mail_panel::{
+    MAIL_PANEL_FS_READ_PATTERN, MAIL_PANEL_FS_WRITE_PATTERN, MAIL_PANEL_MAX_ENTRIES,
+    MAIL_PANEL_MCP_LIST, MAIL_PANEL_MCP_READ, MAIL_PANEL_MCP_SEND, MAIL_PANEL_NETWORK_IMAP,
+    MailEntry, MailFolder, MailIntegration, create_mail_panel, mail_panel_tiled_layout,
+    validate_mail_panel_config,
+};
 use bitty_plugin_host::{
     CapabilityId, DropPolicy, EventKind, GrantRecord, PluginHost, bundled::mail_panel_manifest,
 };
 use bitty_runtime::{
     Runtime, RuntimeConfig,
-    mail_panel::{
-        MAIL_PANEL_FS_READ_PATTERN, MAIL_PANEL_FS_WRITE_PATTERN, MAIL_PANEL_MAX_ENTRIES,
-        MAIL_PANEL_MCP_LIST, MAIL_PANEL_MCP_READ, MAIL_PANEL_MCP_SEND, MAIL_PANEL_NETWORK_IMAP,
-        MailEntry, MailFolder, MailIntegration, create_mail_panel, mail_panel_tiled_layout,
-        validate_mail_panel_config,
-    },
     registry::{BoundedPayload, PanelRegistry, PanelRegistryConfig, WorkspaceId},
 };
 use bitty_term_state::{State, TerminalAction};

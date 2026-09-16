@@ -156,6 +156,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Optional panel experiences extracted from `bitty-runtime` (CTX-0438,
+  024 §17.3):** the first-party `bitty-terminal.ai-panel` and
+  `bitty-terminal.mail-panel` implementations and their state moved out of the
+  microkernel runtime crate into the new in-tree staging crate `bitty-panels`,
+  which consumes only the public Panel Runtime path
+  (`bitty_runtime::registry` + `bitty_ui`) through a private panel-session
+  scaffold. `bitty-runtime` keeps mechanism and no longer carries
+  `ai_panel`/`mail_panel`; the workspace grows to 20 crates. Bundled catalog
+  entries, manifests (`bitty-plugin-host::bundled`), capability strings, wire
+  shapes, and public panel behavior are unchanged; the full plugin splits stay
+  gated on the panel-provider contract (OQ-058) under `CTX-0402`/`CTX-0403`.
+  Panels recorded as Core or already split (`browser-panel`, the
+  `palette`/`statusline` Core helpers, `project`, `shell-integration`,
+  workspace) deliberately stay in `bitty-runtime` in this phase.
 - **Packaging artifacts consolidated under `packaging/` (CTX-0432):** the
   Homebrew formula moved from the duplicated `Formula/` and
   `homebrew/Formula/` copies to `packaging/homebrew/bitty.rb`, the Scoop

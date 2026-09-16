@@ -2,7 +2,12 @@
 //! AI panel via Panel Runtime — tiled Panel + AgentId/AgentWorkspace 32KiB budget, bounded, via Panel(PanelId).
 //!
 //! This module is the first-party `bitty-terminal.ai-panel` implementation
-//! hosted through the generic Panel Runtime (CTX-0102, OQ-011). AI panel is a
+//! hosted through the generic Panel Runtime (CTX-0102, OQ-011). Since the
+//! CTX-0438 extraction wave it lives in the `bitty-panels` staging crate
+//! outside the microkernel runtime and consumes only the public Panel Runtime
+//! path (`bitty_runtime::registry` plus `bitty_ui` primitives); the plugin
+//! split itself stays gated on the panel-provider contract (OQ-058) and the
+//! `bitty-ai` surfaces (owning task CTX-0402). AI panel is a
 //! tiled `Panel(PanelId)` agent surface (`PanelType::Helper`) plus optional
 //! Browser view snapshot for context capture (CTX-0120 Option A) for chat,
 //! tool invocation, memory presentation, and consent surface with four levels
@@ -46,7 +51,7 @@
 
 use bitty_ui::{LayoutNode, SplitAxis, View, ViewId, panel::MAX_OVERLAY_TEXT_LEN};
 
-use crate::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
+use bitty_runtime::registry::{PanelId, PanelRegistry, PanelRegistryConfig, PanelType};
 
 // ---------------------------------------------------------------------------
 // Capability patterns — each a distinct gate, no ambient
@@ -102,9 +107,10 @@ pub const AI_PANEL_CAPABILITY_AI_MODEL: &str = "ai.model";
 // ---------------------------------------------------------------------------
 
 /// Maximum AI panels per workspace — mirrors `MAX_PANELS_PER_WORKSPACE` 32 PR-1.
-pub const AI_PANEL_MAX_PANELS_PER_WORKSPACE: usize = crate::registry::MAX_PANELS_PER_WORKSPACE;
+pub const AI_PANEL_MAX_PANELS_PER_WORKSPACE: usize =
+    bitty_runtime::registry::MAX_PANELS_PER_WORKSPACE;
 /// Maximum AI panels per window — mirrors `MAX_PANELS_PER_WINDOW` 64 PR-2 but BA-7 `4` aggregate for ai type (candidate).
-pub const AI_PANEL_MAX_PANELS_PER_WINDOW: usize = crate::registry::MAX_PANELS_PER_WINDOW;
+pub const AI_PANEL_MAX_PANELS_PER_WINDOW: usize = bitty_runtime::registry::MAX_PANELS_PER_WINDOW;
 /// BA-7 candidate: maximum agents per window (ai panels) — `4` bounded `[1,8]`.
 pub const AI_PANEL_MAX_AGENTS_PER_WINDOW: usize = 4;
 /// Maximum pending MCP navigations? Not used; BA-8 `1` session per panel (strict).
@@ -128,9 +134,9 @@ pub const AI_PANEL_MCP_MAX_IN_FLIGHT_BYTES: usize = 512 * 1024;
 /// MCP max depth — `32` pending tool calls per agent (mirrors `MAX_TOOL_CALLS_PER_TURN*4`).
 pub const AI_PANEL_MCP_MAX_DEPTH: usize = 32;
 /// Panel payload for AI observations is bounded by `BUS_EVENT_MAX_BYTES` `8 KiB` at bus admission.
-pub const AI_PANEL_PAYLOAD_MAX_BYTES: usize = crate::registry::BUS_EVENT_MAX_BYTES;
+pub const AI_PANEL_PAYLOAD_MAX_BYTES: usize = bitty_runtime::registry::BUS_EVENT_MAX_BYTES;
 /// Maximum selection size — bounded `64` mirroring per-subscription bound (PR-7).
-pub const AI_PANEL_MAX_SELECTION: usize = crate::registry::BUS_PER_SUBSCRIPTION_LIMIT;
+pub const AI_PANEL_MAX_SELECTION: usize = bitty_runtime::registry::BUS_PER_SUBSCRIPTION_LIMIT;
 /// Maximum path bytes — mirrors parser `BoundedString::MAX_LEN` `4096` and project path bound.
 pub const AI_PANEL_MAX_PATH_BYTES: usize = 4096;
 /// Maximum chars per title/overlay — `128` (MAX_OVERLAY_TEXT_LEN).
@@ -849,13 +855,10 @@ impl AiPanelIntegration {
 /// is implied and no `~` expansion is performed here.
 pub fn create_ai_panel(
     registry: &mut PanelRegistry,
-    workspace: crate::registry::WorkspaceId,
+    workspace: bitty_runtime::registry::WorkspaceId,
     view: ViewId,
-) -> Result<PanelId, crate::registry::PanelError> {
-    let ty = PanelType::Helper;
-    let handle = registry.create_panel(ty, Some(workspace))?;
-    registry.mount_panel(handle.id, handle.generation, view)?;
-    Ok(handle.id)
+) -> Result<PanelId, bitty_runtime::registry::PanelError> {
+    crate::scaffold::create_mounted_panel(registry, PanelType::Helper, workspace, view)
 }
 
 /// Validates that AI panel creation respects bounded defaults and leaves
@@ -865,8 +868,8 @@ pub fn create_ai_panel(
 /// BA-7 `4` per window for ai type, BA-8 `1` session/panel, BA-9/BA-10 context/memory 32KiB/64KiB.
 pub fn validate_ai_panel_config(
     cfg: &PanelRegistryConfig,
-) -> Result<(), crate::registry::PanelError> {
-    cfg.validate()
+) -> Result<(), bitty_runtime::registry::PanelError> {
+    crate::scaffold::validate_registry_config(cfg)
 }
 
 /// Creates a tiled layout for AI: panel `View` plus optional context `View` via `LayoutNode` primitives.
@@ -888,7 +891,7 @@ pub fn validate_agent_id(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{PanelRegistry, PanelRegistryConfig, WorkspaceId};
+    use bitty_runtime::registry::{PanelRegistry, PanelRegistryConfig, WorkspaceId};
     use bitty_ui::Rect as UiRect;
     use bitty_ui::ViewId;
     use bitty_ui::panel::PanelType;
@@ -1204,14 +1207,15 @@ mod tests {
         for i in 0..80 {
             reg2.publish(
                 &topic,
-                crate::registry::BoundedPayload::try_new(format!("tool result {i}")).unwrap(),
+                bitty_runtime::registry::BoundedPayload::try_new(format!("tool result {i}"))
+                    .unwrap(),
             )
             .unwrap();
         }
         assert!(reg2.bus_events_for_panel(h.id) <= 64);
         assert!(reg2.bus_total_events() <= 8192);
         let large = "a".repeat(9 * 1024);
-        assert!(crate::registry::BoundedPayload::try_new(large).is_err());
+        assert!(bitty_runtime::registry::BoundedPayload::try_new(large).is_err());
         let batch = reg2.drain_batch(h.id, topic.as_str(), 32, 8192);
         assert_eq!(batch.len(), 32);
         assert!(AiPanelIntegration::is_mcp_frame_bounded(&[0u8; 100]));

@@ -24,6 +24,20 @@ nfpm package --config nfpm.yaml --packager apk --target /tmp/bitty.apk
 nfpm package --config nfpm.yaml --packager archlinux --target /tmp/bitty.pkg.tar.zst
 ```
 
+Runtime dependencies are declared per format in the `overrides` block:
+
+| Format    | Runtime dependencies                          |
+| --------- | --------------------------------------------- |
+| deb       | `libfontconfig1`, `libfreetype6`, `libgcc-s1` |
+| rpm       | `fontconfig`, `freetype`, `libgcc`            |
+| apk       | `fontconfig`, `freetype`, `libgcc`            |
+| archlinux | `fontconfig`, `freetype2`, `gcc-libs`         |
+
+`packaging/linux/runtime-deps.toml` maps every linked ELF soname to those
+packages, and `scripts/check-runtime-deps.sh` compares the mapping and the
+declarations against `ldd` + `readelf -d` on the final binary, failing the
+package on divergence. See `packaging/linux/README.md`.
+
 Scripts under `packaging/scripts/` are bounded no-ops (exit 0) to keep package hooks honest.
 
 ## Application icons
@@ -91,6 +105,6 @@ inside `scripts/make-macos-dmg.sh`; the job mounts the DMG and launches both
 slices before upload. The app is intentionally unsigned — codesign/notarize is
 deferred (034 item 11) — and the bare triple binaries keep shipping.
 
-Plus nfpm packaging for linux x64/aarch64 and an Alpine-job apk install check, and optional AUR/Homebrew/Scoop bumps gated on secrets.
+Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, an Alpine-job apk install check, and optional AUR/Homebrew/Scoop bumps gated on secrets.
 
 All packaging keeps bounded contracts: no unbounded file lists, no unsafe, fixed version substitution, scripts are no-ops.

@@ -15,8 +15,12 @@ native musl binary, not repackaged from the glibc build (CTX-0447):
 - The `verify-alpine` job installs the package into a clean Alpine container
   and runs `bitty --version`.
 
-Runtime library dependencies are declared per distribution in a later item
-(034 item 4); the install check installs the font stack explicitly.
+Runtime library dependencies are declared per distribution (034 item 4): the
+apk declares `fontconfig`, `freetype`, and `libgcc` via the `overrides.apk`
+block in `nfpm.yaml`, and `scripts/check-runtime-deps.sh` fails the package
+when those names diverge from the musl binary's `ldd`/`readelf -d` output.
+The install check still installs the font stack explicitly until the smoke
+jobs (034 item 5) resolve the declared dependencies themselves.
 
 The apk can still be produced locally from a musl binary with the single
 `nfpm.yaml` source:

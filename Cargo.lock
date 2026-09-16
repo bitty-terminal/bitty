@@ -229,6 +229,20 @@ name = "bitty-package"
 version = "0.0.20"
 
 [[package]]
+name = "bitty-panels"
+version = "0.0.20"
+dependencies = [
+ "bitty-agent",
+ "bitty-config",
+ "bitty-ipc",
+ "bitty-plugin-host",
+ "bitty-runtime",
+ "bitty-term-state",
+ "bitty-ui",
+ "bitty-vt",
+]
+
+[[package]]
 name = "bitty-perf"
 version = "0.0.20"
 dependencies = [

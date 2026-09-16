@@ -33,6 +33,14 @@ status-drift:
 status-drift-test:
     ./scripts/tests/check-status-drift.test.sh
 
+runtime-deps-test:
+    ./scripts/tests/check-runtime-deps.test.sh
+
+# Compare declared package runtime deps against a binary's ldd/readelf output:
+# `just runtime-deps target/debug/bitty deb,rpm,archlinux`
+runtime-deps binary packagers:
+    ./scripts/check-runtime-deps.sh --binary {{binary}} --packagers {{packagers}}
+
 workflow-publish-test:
     ./scripts/tests/workflow-publish.test.sh
 
@@ -61,7 +69,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test workflow-publish-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test workflow-publish-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

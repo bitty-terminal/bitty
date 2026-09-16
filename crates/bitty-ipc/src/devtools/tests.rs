@@ -327,6 +327,86 @@ fn version_mismatch_is_correlated_error() {
 }
 
 #[test]
+fn dispatcher_test_mode_registers_surface_only_when_enabled() {
+    let default = Dispatcher::with_defaults();
+    assert!(!default.contains(METHOD_TEST_INFO));
+    assert!(!default.contains(METHOD_TEST_EXIT));
+    let test_mode = Dispatcher::with_test_mode();
+    assert!(test_mode.contains(METHOD_TEST_INFO));
+    assert!(test_mode.contains(METHOD_TEST_EXIT));
+    assert_eq!(
+        test_mode.method_count(),
+        default.method_count() + 2,
+        "test mode must add exactly the two test-surface methods"
+    );
+    for method in crate::ctl::all_test_mode_control_methods() {
+        assert!(
+            test_mode.contains(method),
+            "test-mode control method {method} must be registered"
+        );
+    }
+}
+
+#[test]
+fn test_info_is_default_deny_without_test_mode() {
+    // Registration is the gate: a normal instance answers NotFound (not a
+    // scope error, not a fabricated success).
+    let dispatcher = Dispatcher::with_defaults();
+    let outcome = handle_envelope(
+        br#"{"id":7,"method":"bitty.debug/testInfo","version":"1.0"}"#,
+        &dispatcher,
+        &test_context(),
+    );
+    assert!(
+        outcome.was_error,
+        "testInfo must be denied without test mode"
+    );
+    let text = String::from_utf8(outcome.response).unwrap();
+    assert!(
+        text.contains("\"id\":7") && text.contains("UnknownMethod"),
+        "denial must be a correlated UnknownMethod: {text}"
+    );
+}
+
+#[test]
+fn test_info_reports_e2e_surface_in_test_mode() {
+    let dispatcher = Dispatcher::with_test_mode();
+    let outcome = handle_envelope(
+        br#"{"id":8,"method":"bitty.debug/testInfo","version":"1.0"}"#,
+        &dispatcher,
+        &test_context(),
+    );
+    assert!(!outcome.was_error, "testInfo must serve in test mode");
+    let text = String::from_utf8(outcome.response).unwrap();
+    assert!(
+        text.contains("\"test_mode\":true")
+            && text.contains("\"surface\":\"e2e\"")
+            && text.contains("\"protocol\":\"1.0\"")
+            && text.contains("\"instance\":\"test-inst\""),
+        "testInfo must identify the surface and instance: {text}"
+    );
+}
+
+#[test]
+fn test_exit_is_default_deny_without_test_mode() {
+    let dispatcher = Dispatcher::with_defaults();
+    let outcome = handle_envelope(
+        br#"{"id":9,"method":"bitty.debug/testExit","version":"1.0"}"#,
+        &dispatcher,
+        &test_context(),
+    );
+    assert!(
+        outcome.was_error,
+        "testExit must be denied without test mode"
+    );
+    let text = String::from_utf8(outcome.response).unwrap();
+    assert!(
+        text.contains("UnknownMethod"),
+        "normal instances must answer NotFound, never ScopeDenied: {text}"
+    );
+}
+
+#[test]
 fn dispatcher_registers_new_methods_for_follow_up() {
     fn custom(context: &ServeContext, _request: &DevtoolsRequest) -> Result<String, HandlerError> {
         Ok(format!("{{\"uptime_ms\":{}}}", context.uptime_ms))

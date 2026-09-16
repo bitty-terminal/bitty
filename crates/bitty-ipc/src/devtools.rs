@@ -307,6 +307,35 @@ pub const MAX_SYNTH_WHEEL_DELTA: i32 = 64;
 /// Redaction marker replacing sensitive frame lines (P0-AC-026 parity).
 pub const REDACTED_MARKER: &str = "[redacted]";
 
+// ── test-mode E2E surface (CTX-0506, research 043) ──────────────────────────
+//
+// `bitty --test-mode` runs the real Runtime without a display and serves a
+// flag-gated E2E protocol surface for native tests (no VM). The surface
+// reuses the existing `bitty.debug/*` framing, dispatcher, scope, and
+// control-queue architecture; these two methods exist only while test mode
+// is active, so a normal instance answers `NotFound` (default-deny).
+//
+// No new authority:
+// - `testInfo` is read-only surface identity (no terminal content).
+// - `testExit` routes through the existing control queue and requires the
+//   accepted `debug.control` debug scope (elevation via the explicit
+//   `BITTY_CTL_ELEVATE` allowlist, exactly like every other elevated verb).
+//   It does not bypass any scope, bearer, rate, or redaction rule.
+
+/// Wire method for the `--test-mode` E2E handshake (registered only while
+/// test mode is active).
+pub const METHOD_TEST_INFO: &str = "bitty.debug/testInfo";
+
+/// Wire method for deterministic test-mode shutdown (registered only while
+/// test mode is active; requires `debug.control`).
+pub const METHOD_TEST_EXIT: &str = "bitty.debug/testExit";
+
+/// E2E surface name advertised by `testInfo`.
+pub const TEST_SURFACE_NAME: &str = "e2e";
+
+/// E2E surface protocol version advertised by `testInfo`.
+pub const TEST_SURFACE_PROTOCOL: &str = "1.0";
+
 // ── submodules ──────────────────────────────────────────────────────────────
 
 mod automation;

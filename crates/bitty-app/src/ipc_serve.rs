@@ -36,6 +36,11 @@ pub struct ServerDescriptor {
     pub cols: usize,
     /// Grid rows the runtime was configured with.
     pub rows: usize,
+    /// Whether this process serves the `--test-mode` E2E surface (CTX-0506).
+    ///
+    /// Gates registration of `bitty.debug/testInfo` / `bitty.debug/testExit`
+    /// only; it changes no scope, bearer, rate, or redaction rule.
+    pub test_mode: bool,
 }
 
 /// Live servo handle. Holds the accept thread until dropped; dropping
@@ -150,7 +155,13 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
 fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
     match try_listen() {
         Ok(listen) => {
-            let dispatcher = Arc::new(bitty_ipc::devtools::Dispatcher::with_defaults());
+            // CTX-0506: test mode registers the E2E surface (`testInfo`,
+            // `testExit`); normal instances keep the default table.
+            let dispatcher = Arc::new(if descriptor.test_mode {
+                bitty_ipc::devtools::Dispatcher::with_test_mode()
+            } else {
+                bitty_ipc::devtools::Dispatcher::with_defaults()
+            });
             let server = bitty_ipc::devtools::ServerInfo::new(
                 listen.instance,
                 listen.socket_path.clone(),
@@ -446,7 +457,11 @@ mod tests {
 
     #[test]
     fn descriptor_carries_grid_geometry() {
-        let descriptor = ServerDescriptor { cols: 80, rows: 24 };
+        let descriptor = ServerDescriptor {
+            cols: 80,
+            rows: 24,
+            test_mode: false,
+        };
         assert_eq!(descriptor.cols, 80);
         assert_eq!(descriptor.rows, 24);
     }

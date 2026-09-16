@@ -209,6 +209,7 @@ mod plugin;
 mod run;
 mod spawn;
 mod terminal_app;
+mod test_mode;
 
 use cli::{help_text, parse_args, version_text};
 use config_cli::{
@@ -679,6 +680,15 @@ fn main() {
         std::process::exit(code);
     }
 
+    // `bitty --test-mode`: deterministic headless E2E servo (CTX-0506,
+    // research 043). Runs the same Runtime + `BITTY_SOCKET` IPC surface
+    // without a display, event loop, or VM until the elevated
+    // `bitty.debug/testExit` verb applies; grants no new authority.
+    // Takes precedence over `--headless` (the loop is the point).
+    if args.test_mode {
+        std::process::exit(test_mode::run(&mut runtime));
+    }
+
     if args.headless {
         // In headless mode we still fed synthetic bytes via run_headless_smoke, but the live PTY
         // (if any) has been spawned above and will be polled on AboutToWait. For deterministic CI
@@ -714,6 +724,7 @@ fn main() {
     let ipc_serve = ipc_serve::serve_in_background(ipc_serve::ServerDescriptor {
         cols: runtime.config().cols,
         rows: runtime.config().rows,
+        test_mode: false,
     });
     if ipc_serve.is_enabled() {
         logging::info(|| format!("bitty: ipc serving {}", ipc_serve.socket_path()));

@@ -38,6 +38,14 @@
 //! | `workspace focus` | `bitty.debug/focusWorkspace` | `view.manage` |
 //! | `workspace move` | `bitty.debug/moveWorkspace` | `view.manage` |
 //! | `config reload` | `bitty.debug/reloadConfig` | `config.modify` (elevation) |
+//! | (test mode only) | `bitty.debug/testExit` | `debug.control` (elevation) |
+//!
+//! `testExit` is the CTX-0506 deterministic teardown verb for a
+//! `bitty --test-mode` instance: it is registered by
+//! [`crate::devtools::Dispatcher::with_test_mode`] only, so a normal instance
+//! answers `NotFound` (default-deny). It grants no new authority; the scope
+//! is the accepted `debug.control` debug family and elevation follows the
+//! same explicit allowlist as every other elevated verb.
 //!
 //! `terminal.manage`, `config.modify` require explicit elevation per the IPC
 //! RFC (confirmation prompt or pre-granted per-instance allowlist). Without
@@ -140,6 +148,16 @@ pub fn all_control_methods() -> &'static [&'static str] {
     ]
 }
 
+/// Control wire methods registered only while `--test-mode` is active.
+///
+/// Kept separate from [`all_control_methods`] because a normal instance never
+/// registers the test surface: these methods must answer `NotFound` there
+/// (fail-closed default-deny), never `ScopeDenied`/`InvalidMethod`.
+#[must_use]
+pub fn all_test_mode_control_methods() -> &'static [&'static str] {
+    &[crate::devtools::METHOD_TEST_EXIT]
+}
+
 /// Map a control wire method to its required scope.
 ///
 /// Returns `None` for unknown methods (fail-closed `NotFound`, no partial state).
@@ -162,6 +180,12 @@ pub fn required_scope_for_ctl_method(method: &str) -> Option<Scope> {
         }
         METHOD_CLOSE_WORKSPACE => Some(Scope::TerminalManage),
         METHOD_RELOAD_CONFIG => Some(Scope::ConfigModify),
+        // CTX-0506 test-mode surface: `testExit` stops the `--test-mode`
+        // servo loop. It is registered only while test mode is active (see
+        // `Dispatcher::with_test_mode`) and requires the accepted
+        // `debug.control` debug scope, exactly like every other elevated
+        // control verb: no new scope and no bypass.
+        crate::devtools::METHOD_TEST_EXIT => Some(Scope::DebugControl),
         _ => None,
     }
 }
@@ -743,6 +767,25 @@ mod tests {
                 "{method} with empty scopes must be ScopeDenied, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_exit_requires_debug_control_elevation() {
+        let method = crate::devtools::METHOD_TEST_EXIT;
+        assert_eq!(
+            required_scope_for_ctl_method(method),
+            Some(Scope::DebugControl)
+        );
+        // CLI default holds no debug scope: denied fail-closed.
+        let cli = ScopeSet::cli_default();
+        let err = authorize_ctl_method(method, &cli).unwrap_err();
+        assert!(matches!(err, IpcError::ScopeDenied { .. }), "got {err:?}");
+        // Explicit elevation allowlist grants it, exactly like other verbs.
+        let elevated = elevation_from_env(Some("debug.control"));
+        assert!(authorize_ctl_method(method, &elevated).is_ok());
+        // Unknown names grant nothing.
+        let bogus = elevation_from_env(Some("debug-control"));
+        assert!(authorize_ctl_method(method, &bogus).is_err());
     }
 
     #[test]

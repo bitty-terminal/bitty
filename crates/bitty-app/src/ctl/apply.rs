@@ -541,6 +541,14 @@ pub fn apply_control(
             json_escape(&path)
         ));
     }
+    if method == bitty_ipc::devtools::METHOD_TEST_EXIT {
+        // CTX-0506: deterministic teardown for `bitty --test-mode`. The
+        // dispatcher registers this verb only while test mode serves, and
+        // authorization already required the elevated `debug.control`
+        // scope; the loop polls the flag on the main thread and exits 0.
+        crate::test_mode::request_exit();
+        return Ok(String::from("{\"exiting\":true}"));
+    }
     Err((
         "usage",
         "UnknownMethod",

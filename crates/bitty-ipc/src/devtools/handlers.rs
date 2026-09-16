@@ -149,6 +149,30 @@ impl Dispatcher {
         table
     }
 
+    /// Dispatcher with the default table plus the `--test-mode` E2E surface
+    /// (CTX-0506, research 043).
+    ///
+    /// The test surface is registered only by this constructor: a normal
+    /// instance uses [`Dispatcher::with_defaults`] and answers
+    /// `bitty.debug/testInfo` / `bitty.debug/testExit` with `NotFound`
+    /// (fail-closed default-deny). Registration grants no authority —
+    /// `testInfo` is read-only surface identity and `testExit` authorizes the
+    /// accepted `debug.control` scope like every other elevated control verb.
+    #[must_use]
+    pub fn with_test_mode() -> Self {
+        let mut table = Self::with_defaults();
+        let test_surface: &[(&'static str, DevtoolsHandler)] = &[
+            (super::METHOD_TEST_INFO, handle_test_info),
+            (super::METHOD_TEST_EXIT, handle_control),
+        ];
+        for (method, handler) in test_surface {
+            if table.register(method, *handler).is_err() {
+                debug_assert!(false, "statically valid test-mode method rejected");
+            }
+        }
+        table
+    }
+
     /// Register a handler for a `bitty.debug/*` method (CTX-0159 hook).
     ///
     /// # Errors
@@ -210,6 +234,28 @@ fn handle_ping(
     Ok(format!(
         "{{\"version\":\"{DEVTOOLS_PROTOCOL_VERSION}\",\"ok\":true}}"
     ))
+}
+
+/// `bitty.debug/testInfo`: E2E surface handshake (CTX-0506, test-mode only).
+///
+/// Read-only surface identity for an automated harness: it lets a test assert
+/// it is talking to a `--test-mode` instance before driving panel state. The
+/// `instance` field is the validated discovery id (advisory identifier, never
+/// a credential). No terminal content, no authority, no new scope: the only
+/// gate is registration, so a normal instance answers `NotFound`.
+fn handle_test_info(
+    context: &ServeContext,
+    _request: &DevtoolsRequest,
+) -> Result<String, HandlerError> {
+    let mut out = String::with_capacity(160);
+    out.push_str("{\"test_mode\":true,\"surface\":\"");
+    out.push_str(super::TEST_SURFACE_NAME);
+    out.push_str("\",\"protocol\":\"");
+    out.push_str(super::TEST_SURFACE_PROTOCOL);
+    out.push_str("\",\"instance\":\"");
+    json_escape_into(&mut out, &context.server.instance);
+    out.push_str("\"}");
+    Ok(out)
 }
 
 /// Escape a string as a JSON string body (without surrounding quotes).

@@ -33,6 +33,18 @@ repository = "https://github.com/bitty-terminal/bitty"
 keywords = ["terminal", "emulator", "pty", "vt", "bitty"]
 categories = ["command-line-utilities", "emulators"]
 
+# Central version policy for direct dependencies shared by more than one crate
+# (research 042 item 2). Member manifests consume these with
+# `{ workspace = true }` so version drift cannot creep in as the graph grows.
+# Features stay declared at the use site: the entries below carry no extra
+# features, so no feature is enabled workspace-wide by accident.
+[workspace.dependencies]
+# Window/event-loop baseline (ADR-0004: adopted inside bitty-platform, used
+# again by the bitty-perf real-window trials). Lock resolves this to 0.30.13.
+winit = "0.30.13"
+# Minimal one-shot executor for the composition root and perf trials.
+pollster = "1.0"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

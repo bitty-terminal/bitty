@@ -27,7 +27,7 @@ headless = []
 # requires event-loop creation on the OS main thread; see the file header.
 
 [dependencies]
-winit = "0.30"
+winit = { workspace = true }
 # Wayland-first clipboard: `wayland-data-control` enables arboard's
 # wl-clipboard-rs backend, which selects Wayland when `WAYLAND_DISPLAY` is set
 # and falls back to X11 otherwise (see `src/clipboard.rs`). The `wl-clipboard-rs`

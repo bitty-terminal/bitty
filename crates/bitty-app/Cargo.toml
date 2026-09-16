@@ -26,7 +26,7 @@ bitty-plugin-host = { path = "../bitty-plugin-host" }
 bitty-runtime = { path = "../bitty-runtime" }
 bitty-render = { path = "../bitty-render" }
 bitty-term-state = { path = "../bitty-term-state" }
-pollster = "1.0"
+pollster = { workspace = true }
 
 [dev-dependencies]
 bitty-test-support = { path = "../bitty-test-support" }

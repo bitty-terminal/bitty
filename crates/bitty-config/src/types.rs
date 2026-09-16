@@ -1834,6 +1834,14 @@ impl TerminalConfig {
                     format!("must be <= {MAX_SHELL_LEN} bytes"),
                 ));
             }
+            // CTX-0478: NUL is not a legal argv byte and is rejected with a
+            // precise reason before the broader control-character sweep.
+            if t.contains('\0') {
+                return Err(ConfigError::validation(
+                    "terminal.shell",
+                    "must not contain NUL bytes",
+                ));
+            }
             // CTX-0298: process authority must not carry control characters
             // (`init_clean_shell` already rejects them before writing the
             // wizard config; spawn re-checks defensively and fails closed).
@@ -3328,6 +3336,23 @@ mod tests {
         .validate()
         .expect("clean absolute shell is valid");
         TerminalConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn terminal_shell_nul_is_classified_precisely() {
+        // CTX-0478: a NUL in `terminal.shell` is rejected as a NUL byte (not
+        // lumped into the generic control-character error) so the diagnostic
+        // is actionable.
+        let err = TerminalConfig {
+            shell: Some("/bin/z\0sh".into()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("NUL"),
+            "NUL shell must be classified as NUL: {err}"
+        );
     }
 
     #[test]

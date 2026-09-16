@@ -152,6 +152,29 @@ fn bridge_answer_for_unknown_id_returns_false() {
 }
 
 #[test]
+fn bridge_unknown_answer_flood_buffers_nothing() {
+    // Hostile: a peer spraying unknown ids must not exhaust the bounded
+    // inbound response queue; a later legitimate answer still fits.
+    let mut bridge = consented_bridge();
+    for i in 0..64u64 {
+        assert!(
+            !bridge
+                .answer(RequestId(900_000 + i), b"{}".to_vec(), false)
+                .expect("unknown answer fits")
+        );
+    }
+    assert!(bridge.take_response().is_none());
+    let id = bridge
+        .call("terminal.snapshot", b"{}".to_vec(), NOW_MS)
+        .expect("call fits");
+    assert!(
+        bridge
+            .answer(id, b"{}".to_vec(), false)
+            .expect("legitimate answer fits after flood")
+    );
+}
+
+#[test]
 fn bridge_denials_leave_no_partial_state() {
     let mut bridge = consented_bridge();
     let _ = bridge.call("panel.context", b"{}".to_vec(), NOW_MS);

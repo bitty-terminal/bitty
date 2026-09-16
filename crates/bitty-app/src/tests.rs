@@ -182,6 +182,38 @@ fn parse_headless_flag() {
     assert!(p.headless && p.help);
 }
 
+// CTX-0481 fail-loud startup: the opt-in flag and the IPC failure policy.
+#[test]
+fn parse_fail_loud_flag() {
+    assert!(
+        !parse_args(&args_of(&["bitty"])).fail_loud,
+        "default stays fail-soft"
+    );
+    assert!(parse_args(&args_of(&["bitty", "--fail-loud"])).fail_loud);
+    // `--` escape hatch: `--fail-loud` after `--` is a program name.
+    let p = parse_args(&args_of(&["bitty", "--", "--fail-loud"]));
+    assert!(!p.fail_loud);
+    assert_eq!(p.program.as_deref(), Some("--fail-loud"));
+}
+
+#[test]
+fn fail_loud_makes_an_unavailable_ipc_servo_fatal_only_when_opted_in() {
+    // The fail-soft default keeps a serving failure non-fatal; `--fail-loud`
+    // turns the same failure into a startup abort with a non-zero code.
+    let failed = ipc_serve::IpcServeGuard::failed_for_tests("bind /x failed");
+    assert!(ipc_serve_failure_exit(false, &failed).is_none());
+    let (code, message) = ipc_serve_failure_exit(true, &failed).expect("fatal under --fail-loud");
+    assert_eq!(code, EXIT_STARTUP);
+    assert!(
+        message.contains("--fail-loud") && message.contains("bind /x failed"),
+        "diagnostic must name the flag and the reason, got {message:?}"
+    );
+    // A healthy or merely unsupported (disabled, no reason) servo is never
+    // fatal, even with --fail-loud.
+    let disabled = ipc_serve::IpcServeGuard::disabled_for_tests();
+    assert!(ipc_serve_failure_exit(true, &disabled).is_none());
+}
+
 // CTX-0190 quiet-default logging: parsing + level gating.
 #[test]
 fn parse_verbose_flags() {
@@ -553,23 +585,29 @@ fn osc_title_applies_to_window_state_and_is_change_gated() {
         Vec::new(),
         SpawnSpec::default(),
     );
-    assert_eq!(app.last_applied_title, None);
+    assert_eq!(app.window.last_applied_title, None);
     app.runtime.handle_pty_bytes(b"\x1b]2;nvim foo.rs\x07");
     assert!(
         app.drive_tick().is_some(),
         "first tick presents the startup frame"
     );
-    assert_eq!(app.last_applied_title.as_deref(), Some("nvim foo.rs"));
-    assert_eq!(app.title_applies, 1);
+    assert_eq!(
+        app.window.last_applied_title.as_deref(),
+        Some("nvim foo.rs")
+    );
+    assert_eq!(app.window.title_applies, 1);
     // Same title again: the change gate drops it (no titlebar churn).
     app.runtime.handle_pty_bytes(b"\x1b]0;nvim foo.rs\x07");
     let _ = app.drive_tick();
-    assert_eq!(app.title_applies, 1, "identical titles must not re-apply");
+    assert_eq!(
+        app.window.title_applies, 1,
+        "identical titles must not re-apply"
+    );
     // A new title applies exactly once more.
     app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
     let _ = app.drive_tick();
-    assert_eq!(app.last_applied_title.as_deref(), Some("ssh prod"));
-    assert_eq!(app.title_applies, 2);
+    assert_eq!(app.window.last_applied_title.as_deref(), Some("ssh prod"));
+    assert_eq!(app.window.title_applies, 2);
 }
 
 #[test]
@@ -584,13 +622,13 @@ fn osc_title_sanitizes_and_empty_resets_to_static_title() {
     );
     app.runtime.handle_pty_bytes(b"\x1b]2;bad\x01title\x7f\x07");
     app.apply_cold_events();
-    assert_eq!(app.last_applied_title.as_deref(), Some("badtitle"));
+    assert_eq!(app.window.last_applied_title.as_deref(), Some("badtitle"));
     // Empty OSC 0/2 resets to the static theme title, never a blank bar.
     app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
     app.apply_cold_events();
     assert_eq!(
-        app.last_applied_title.as_deref(),
-        Some(app.window_title.as_str())
+        app.window.last_applied_title.as_deref(),
+        Some(app.window.title.as_str())
     );
 }
 
@@ -928,6 +966,138 @@ fn split_ratio_clamped_via_layout_node() {
     } else {
         panic!("expected split");
     }
+}
+
+#[test]
+fn cli_invalid_values_fail_closed_hostile() {
+    // CTX-0480: invalid values record cli_value_error (exit 2 at
+    // dispatch) instead of warn-ignoring to exit 0.
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "nope"]));
+    assert!(p.cli_value_error.is_some(), "bad ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio=nan"]));
+    assert!(p.cli_value_error.is_some(), "NaN ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio=inf"]));
+    assert!(p.cli_value_error.is_some(), "inf ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=bogus"]));
+    assert!(p.cli_value_error.is_some(), "bad split axis must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:nope"]));
+    assert!(p.cli_value_error.is_some(), "bad split ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:"]));
+    assert!(p.cli_value_error.is_some(), "empty split ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=:0.5"]));
+    assert!(p.cli_value_error.is_some(), "axisless split must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split=h:0.5:extra"]));
+    assert!(
+        p.cli_value_error.is_some(),
+        "trailing split junk must error"
+    );
+
+    let p = parse_args(&args_of(&["bitty", "--log-level", "nope"]));
+    assert!(p.cli_value_error.is_some(), "bad log level must error");
+    assert_eq!(p.log_level, None);
+
+    let p = parse_args(&args_of(&["bitty", "--log-level"]));
+    assert!(p.cli_value_error.is_some(), "missing log level must error");
+
+    let p = parse_args(&args_of(&["bitty", "--split-ratio"]));
+    assert!(p.cli_value_error.is_some(), "missing ratio must error");
+
+    let p = parse_args(&args_of(&["bitty", "--layout"]));
+    assert!(p.cli_value_error.is_some(), "missing layout must error");
+
+    let p = parse_args(&args_of(&["bitty", "--focus"]));
+    assert!(p.cli_value_error.is_some(), "missing focus must error");
+
+    // Valid values record no error.
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "0.5"]));
+    assert!(p.cli_value_error.is_none());
+    let p = parse_args(&args_of(&["bitty", "--log-level", "debug"]));
+    assert!(p.cli_value_error.is_none());
+
+    // Negative finite ratios are out-of-range values, not parse errors:
+    // both spellings reach layout build and clamp loudly (CTX-0480).
+    let p = parse_args(&args_of(&["bitty", "--split-ratio", "-5"]));
+    assert!(p.cli_value_error.is_none());
+    assert_eq!(p.split_ratio, Some(-5.0));
+    let p = parse_args(&args_of(&["bitty", "--split=vertical:2.5"]));
+    assert!(p.cli_value_error.is_none());
+    assert_eq!(p.split_ratio, Some(2.5));
+}
+
+#[test]
+fn layout_checked_rejects_hostile_specs() {
+    // CTX-0480: silent normalizations now fail closed via
+    // try_build_layout; finite out-of-range ratios clamp loudly.
+    use crate::layout_cmd::{clamp_ratio_loudly, is_valid_focus_spec, try_build_layout};
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "bogus-spec"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:bogus:0.5"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:nope"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "stack:nope"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3,4,x"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "overlay:1,2,3,4,5"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:nan"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", "split:h:0.5:extra"]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    let args = parse_args(&args_of(&["bitty", "--layout", ""]));
+    assert!(try_build_layout(&args, 80, 24).is_err());
+
+    // Loud clamp: finite extremes clamp to [MIN,MAX], non-finite falls
+    // back to 0.5 with a warning.
+    assert_eq!(
+        clamp_ratio_loudly(5.0),
+        bitty_runtime::LayoutNode::MAX_RATIO
+    );
+    assert_eq!(
+        clamp_ratio_loudly(-1.0),
+        bitty_runtime::LayoutNode::MIN_RATIO
+    );
+    assert_eq!(clamp_ratio_loudly(f32::NAN), 0.5);
+
+    // Out-of-range stack counts clamp loudly; negative space-form ratios
+    // are accepted values and clamp loudly (never read as missing).
+    let args = parse_args(&args_of(&["bitty", "--layout", "stack:99"]));
+    let layout = try_build_layout(&args, 80, 24).expect("stack count clamps");
+    assert_eq!(layout.leaf_count(), 8);
+
+    let args = parse_args(&args_of(&["bitty", "--split", "h", "--split-ratio", "-5"]));
+    let layout = try_build_layout(&args, 80, 24).expect("negative ratio clamps");
+    if let bitty_runtime::LayoutNode::Split { ratio, .. } = layout {
+        assert_eq!(ratio, bitty_runtime::LayoutNode::MIN_RATIO);
+    } else {
+        panic!("expected split");
+    }
+
+    // Focus syntax gating.
+    assert!(is_valid_focus_spec("next"));
+    assert!(is_valid_focus_spec("2"));
+    assert!(!is_valid_focus_spec("bogus"));
+    assert!(!is_valid_focus_spec(""));
 }
 
 #[test]
@@ -2251,7 +2421,7 @@ fn window_opacity_reaches_platform_config() {
         SpawnSpec::default(),
     )
     .with_window_opacity(0.9);
-    assert!((app.window_opacity - 0.9).abs() < f32::EPSILON);
+    assert!((app.window.opacity - 0.9).abs() < f32::EPSILON);
 }
 
 #[test]

@@ -281,6 +281,24 @@ fn conpty_resize_round_trips_on_live_shell() {
 }
 
 #[test]
+fn foreground_observation_is_unavailable_on_conpty() {
+    require_pty!();
+    // CTX-0478: ConPTY exposes no process-group / foreground surface, so both
+    // observations must stay `None`. Callers treat that as "cannot determine"
+    // (never busy) instead of inventing a foreground job; this Windows-gated
+    // test pins the contract on Windows CI.
+    let mut pty = PtyBuilder::new("cmd.exe")
+        .spawn()
+        .expect("spawn interactive cmd");
+    assert!(pty.pid().is_some(), "child pid must be known");
+    assert_eq!(pty.foreground_pgid(), None);
+    assert_eq!(pty.foreground_job(), None);
+
+    let reader = pty.take_reader().expect("reader half");
+    shutdown_and_join(pty, reader, "interactive cmd foreground observation");
+}
+
+#[test]
 fn kill_path_reports_unsuccessful_status() {
     require_pty!();
     let mut pty = PtyBuilder::new("cmd.exe").spawn().expect("spawn cmd");

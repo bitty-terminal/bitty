@@ -47,6 +47,11 @@ pub struct IpcServeGuard {
     enabled: bool,
     /// Socket path served (empty when disabled).
     socket_path: String,
+    /// Why serving was attempted and rejected (CTX-0481): `Some` only for a
+    /// genuine failure on a platform that serves, so `--fail-loud` can turn
+    /// it into a non-zero exit. Platform-unsupported stays `None` (the
+    /// fail-soft warning path is the documented behavior there).
+    failure_reason: Option<String>,
     /// Shutdown flag for the accept loop.
     shutdown: Arc<AtomicBool>,
     /// Accept-loop thread (joined on drop).
@@ -65,6 +70,35 @@ impl IpcServeGuard {
     #[must_use]
     pub fn socket_path(&self) -> &str {
         &self.socket_path
+    }
+
+    /// Why serving was attempted and rejected (CTX-0481); `None` when the
+    /// servo is healthy or the platform does not serve at all.
+    #[must_use]
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+
+    /// Disabled guard without a failure reason (tests: platform-unsupported
+    /// shape).
+    #[cfg(test)]
+    pub(crate) fn disabled_for_tests() -> Self {
+        Self {
+            enabled: false,
+            socket_path: String::new(),
+            failure_reason: None,
+            shutdown: Arc::new(AtomicBool::new(true)),
+            #[cfg(unix)]
+            handle: None,
+        }
+    }
+
+    /// Disabled guard carrying a failure reason (tests).
+    #[cfg(test)]
+    pub(crate) fn failed_for_tests(reason: &str) -> Self {
+        let mut guard = Self::disabled_for_tests();
+        guard.failure_reason = Some(reason.to_string());
+        guard
     }
 }
 
@@ -100,6 +134,10 @@ pub fn serve_in_background(descriptor: ServerDescriptor) -> IpcServeGuard {
         IpcServeGuard {
             enabled: false,
             socket_path: String::new(),
+            // Deliberately no failure reason: a platform that cannot serve
+            // is not a servable-request failure, and `--fail-loud` must
+            // stay usable there (CTX-0481).
+            failure_reason: None,
             shutdown: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -136,6 +174,7 @@ fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
             IpcServeGuard {
                 enabled: true,
                 socket_path: listen.socket_path,
+                failure_reason: None,
                 shutdown,
                 handle: Some(handle),
             }
@@ -145,6 +184,7 @@ fn unix_serve(descriptor: ServerDescriptor) -> IpcServeGuard {
             IpcServeGuard {
                 enabled: false,
                 socket_path: String::new(),
+                failure_reason: Some(reason),
                 shutdown: Arc::new(AtomicBool::new(true)),
                 handle: None,
             }
@@ -373,12 +413,27 @@ mod tests {
         let guard = IpcServeGuard {
             enabled: true,
             socket_path: "/tmp/bitty-test.sock".to_string(),
+            failure_reason: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(unix)]
             handle: None,
         };
         assert!(guard.is_enabled());
         assert_eq!(guard.socket_path(), "/tmp/bitty-test.sock");
+        assert_eq!(guard.failure_reason(), None);
+    }
+
+    #[test]
+    fn failure_reason_is_absent_unless_serving_failed() {
+        // CTX-0481: only a genuine servable-platform failure carries a
+        // reason; the platform-unsupported shape stays `None` so
+        // `--fail-loud` never aborts a platform that cannot serve.
+        assert_eq!(IpcServeGuard::disabled_for_tests().failure_reason(), None);
+        assert_eq!(
+            IpcServeGuard::failed_for_tests("bind failed").failure_reason(),
+            Some("bind failed")
+        );
+        assert!(!IpcServeGuard::failed_for_tests("bind failed").is_enabled());
     }
 
     #[test]

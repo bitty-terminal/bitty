@@ -298,10 +298,19 @@ fn matrix_is_sorted_and_deterministic() {
 fn matrix_no_unsafe_and_generates_bounded_json() {
     let j = generate_matrix_json().expect("json");
     assert!(j.len() < 16 * 1024, "matrix json >16 KiB: {}", j.len());
-    assert!(j.contains("\"ghostty\": \"SKIP\""), "missing ghostty SKIP");
+    // CTX-0484: reference columns are computed from the dumps on disk, never
+    // hardcoded. Every backend column must be present and the report must
+    // disclose whether any reference comparison was actually performed.
+    for backend in REFERENCE_TERMS {
+        assert!(
+            j.contains(&format!("\"{backend}\":")),
+            "missing reference column for {backend}"
+        );
+    }
     assert!(
-        j.contains("\"alacritty\": \"SKIP\""),
-        "missing alacritty SKIP (CTX-0114)"
+        j.contains("\"reference_evidence\": \"present\"")
+            || j.contains("\"reference_evidence\": \"absent\""),
+        "missing reference evidence disclosure"
     );
     // Forbid unsafe is enforced at crate level via #![forbid(unsafe_code)] in src.
     // This test documents the invariant; compile failure is the true gate.

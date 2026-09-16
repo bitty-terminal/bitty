@@ -204,8 +204,8 @@ impl Runtime {
     /// The pane reader starts direct and is promoted into a wakeup
     /// forwarder when a waker is installed (CTX-0230):
     /// [`poll_pty`](Self::poll_pty) drains every pane session on each call,
-    /// and a promoted pane additionally wakes the event loop per chunk so
-    /// pane-only output (e.g. a fresh split shell's `ESC[c`) is answered
+    /// and a promoted pane additionally wakes the event loop per batch (CTX-0476
+    /// waker merge) so pane-only output (e.g. a fresh split shell's `ESC[c`) is answered
     /// promptly. Pane replies flush to the pane's own writer on the same path.
     ///
     /// # Errors
@@ -306,9 +306,9 @@ impl Runtime {
     /// when a waker is installed (CTX-0230). Mirrors
     /// [`promote_pty_reader_to_forwarder`](Self::promote_pty_reader_to_forwarder):
     /// the forwarder blocks in `recv` (zero wakeups when quiet), forwards
-    /// each chunk into a bounded channel
+    /// each batch into a bounded channel
     /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes the shared waker once
-    /// per chunk plus once on EOF. [`pump_pane_sessions`](Self::pump_pane_sessions)
+    /// per batch plus once on EOF (CTX-0476 waker merge). [`pump_pane_sessions`](Self::pump_pane_sessions)
     /// drains the forwarding channel, so the bounded-drain contract holds
     /// end to end. Idempotent: no-op without a session, without a waker, or
     /// when already promoted.
@@ -329,13 +329,26 @@ impl Runtime {
             sess.reader = Some(reader);
             return;
         };
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PTY_FORWARD_CAPACITY_CHUNKS);
-        let handle = std::thread::Builder::new()
-            .name("bitty-pty-wakeup".to_owned())
-            .spawn(move || super::pty::pty_forward_loop(reader, tx, waker))
-            .expect("std thread spawn cannot fail with default builder options");
-        sess.forward_rx = Some(rx);
-        sess.forward_handle = Some(handle);
+        match super::pty::spawn_forwarder_default(reader, waker) {
+            Ok(parts) => {
+                sess.forward_rx = Some(parts.rx);
+                sess.forward_handle = Some(parts.handle);
+            }
+            Err(failure) => {
+                // Fail-closed (CTX-0473): the pane keeps its direct pump.
+                if let Some(reader) = failure.reader {
+                    sess.reader = Some(reader);
+                }
+                self.forwarder_spawn_failures = self.forwarder_spawn_failures.wrapping_add(1);
+                if let Some(suppressed) = self.spawn_log.admit_now() {
+                    eprintln!(
+                        "bitty: pane wakeup forwarder spawn failed for {view:?} ({}): using direct pump{}",
+                        failure.error,
+                        log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+        }
     }
 
     /// Whether one pane's reader is promoted into a wakeup forwarder
@@ -480,11 +493,17 @@ impl Runtime {
         }
         // Collect without holding a borrow across the mutable pump calls.
         // `BTreeMap` iteration is `ViewId`-ordered, so multi-pane wakeups
-        // are deterministic.
+        // are deterministic. CTX-0476: same poll budgets as the primary path
+        // (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
+        // shared across panes, so N panes can never cost N x 1024 chunks.
+        let start = std::time::Instant::now();
+        let mut drained_bytes = 0usize;
         let mut pending: Vec<(ViewId, Vec<u8>)> = Vec::new();
         for (id, sess) in self.pane_sessions.iter() {
-            let mut per_pane = 0usize;
-            while per_pane < 1024 {
+            while pending.len() < POLL_PTY_MAX_CHUNKS && drained_bytes < POLL_PTY_MAX_BYTES {
+                if !pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET {
+                    break;
+                }
                 // Promoted panes drain the forwarder channel; direct panes
                 // drain the pump channel. Either way the bound holds
                 // (`CHANNEL_CAPACITY_CHUNKS` x `READ_CHUNK_SIZE` per stage).
@@ -503,11 +522,17 @@ impl Runtime {
                 match chunk {
                     Some(chunk) => {
                         debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
+                        drained_bytes = drained_bytes.saturating_add(chunk.len());
                         pending.push((*id, chunk));
-                        per_pane += 1;
                     }
                     None => break,
                 }
+            }
+            if pending.len() >= POLL_PTY_MAX_CHUNKS
+                || drained_bytes >= POLL_PTY_MAX_BYTES
+                || (!pending.is_empty() && start.elapsed() >= POLL_PTY_TIME_BUDGET)
+            {
+                break;
             }
         }
         let drained = pending.len();
@@ -575,6 +600,7 @@ impl Runtime {
     /// `tick` (like the primary post-tick flush) so replies queued outside
     /// the pump still reach the pane's shell promptly.
     pub fn write_pane_replies(&mut self, view: ViewId) -> usize {
+        use std::io::Write as _;
         let Some(sess) = self.pane_sessions.get_mut(&view) else {
             return 0;
         };
@@ -582,18 +608,18 @@ impl Runtime {
         if replies.is_empty() {
             return 0;
         }
-        let mut total = 0usize;
-        use std::io::Write as _;
-        for chunk in replies {
-            // Each chunk is bounded; total bounded by the reply cap (4 KiB).
-            // Best-effort, fail-closed: on write error break and drop remainder.
-            if sess.writer.write_all(&chunk).is_ok() {
-                total += chunk.len();
-            } else {
-                break;
-            }
+        // Each chunk is bounded; total bounded by the reply cap (4 KiB).
+        // Best-effort, fail-closed (CTX-0473): the lost remainder is accounted,
+        // never silently swallowed.
+        let (total, dropped) = super::pty::write_chunks(&mut sess.writer, &replies);
+        let flush_failed = sess.writer.flush().is_err();
+        if dropped > 0 {
+            self.reply_write_dropped_bytes =
+                self.reply_write_dropped_bytes.wrapping_add(dropped as u64);
         }
-        let _ = sess.writer.flush();
+        if flush_failed {
+            self.write_flush_failures = self.write_flush_failures.wrapping_add(1);
+        }
         total
     }
 

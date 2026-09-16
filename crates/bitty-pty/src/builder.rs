@@ -246,11 +246,10 @@ impl PtyBuilder {
         nul_free_items.extend(self.args.iter().map(|s| s.as_os_str()));
         for item in nul_free_items.drain(..) {
             if os_contains_nul(item) {
-                // NUL cannot survive execve; reject early with a clear error
-                // instead of an opaque upstream failure.
-                return Err(PtyError::Upstream(
-                    "program and arguments must not contain NUL bytes".to_owned(),
-                ));
+                // NUL cannot survive execve; reject early with a typed
+                // validation error (CTX-0478) instead of an opaque upstream
+                // failure.
+                return Err(PtyError::NulInProgram);
             }
         }
         for (key, value) in &self.env {
@@ -522,7 +521,9 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let bad = OsString::from_vec(vec![b'a', 0, b'b']);
         let err = valid_builder().arg(bad).validate().unwrap_err();
-        assert!(matches!(err, PtyError::Upstream(msg) if msg.contains("NUL")));
+        // CTX-0478: NUL is a typed program/NUL rejection, not an opaque
+        // upstream/backend failure.
+        assert!(matches!(err, PtyError::NulInProgram));
     }
 
     #[cfg(unix)]

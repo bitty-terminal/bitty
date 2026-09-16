@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+use bitty_platform::clipboard::CLIPBOARD_MAX_BYTES;
 use bitty_runtime::Runtime;
 use bitty_ui::CellPos;
 
@@ -322,18 +323,23 @@ fn bracketed_paste_is_defense_in_depth_only_never_bypasses_gate() {
 
 #[test]
 fn truncation_at_char_boundary_before_inspection_deterministic() {
-    // Paste content beyond CLIPBOARD_MAX_BYTES is truncated at a char boundary
-    // before inspection (via Clipboard primitive). Deterministic across runtimes.
+    // CTX-0478: the clipboard primitive rejects over-limit payloads (typed
+    // error, no silent truncation), so oversized paste input is bounded by
+    // the paste gate at a char boundary instead. Deterministic across
+    // runtimes. The end-to-end clipboard seam (an over-limit system read) is
+    // covered by `oversized_system_clipboard_pastes_bounded_prefix_not_noop`.
     let mut a = make_runtime();
     let mut b = make_runtime();
     let long = "a".repeat(9000) + "\u{202E}tail";
     for rt in [&mut a, &mut b] {
-        rt.clipboard_mut().set_text(long.clone()).unwrap();
-        assert_eq!(rt.clipboard().headless_contents().len(), 8192);
+        assert!(
+            rt.clipboard_mut().set_text(long.clone()).is_err(),
+            "over-limit clipboard write must be rejected"
+        );
         rt.drain_pending_input();
-        let insp = rt.paste_from_clipboard().unwrap().unwrap();
-        // Truncated prefix is all 'a' (no suspicious), so clean and delivered immediately
-        // (the BiDi was beyond the truncation point and is dropped).
+        let insp = rt.request_paste(long.clone());
+        // Truncated prefix is all 'a' (no suspicious), so clean and delivered
+        // immediately (the BiDi was beyond the cut and is dropped).
         assert!(!insp, "truncated prefix must be clean");
         assert!(!rt.has_pending_paste());
         assert_eq!(rt.pending_input().len(), 8192);
@@ -342,19 +348,54 @@ fn truncation_at_char_boundary_before_inspection_deterministic() {
 }
 
 #[test]
+fn oversized_system_clipboard_pastes_bounded_prefix_not_noop() {
+    // CTX-0478 review regression: the clipboard read used to reject a system
+    // value over CLIPBOARD_MAX_BYTES with ClipboardPayloadTooLarge, so chord
+    // and right-click paste (`paste_from_clipboard`) delivered nothing. The
+    // paste seam now clips at a char boundary and delivers the bounded
+    // prefix, and a suspicious tail beyond the cut never reaches inspection
+    // (the BiDi below is the suspicious marker).
+    let mut rt = make_runtime();
+    let oversized = "a".repeat(CLIPBOARD_MAX_BYTES + 1000) + "\u{202E}tail";
+    rt.clipboard_mut().simulate_system_text_for_test(oversized);
+    assert!(
+        rt.clipboard_mut().get_text().is_err(),
+        "direct read must reject the simulated over-limit system value \
+         (the regression: this rejection used to propagate out of paste)"
+    );
+    rt.drain_pending_input();
+    let insp = rt
+        .paste_from_clipboard()
+        .expect("over-limit clipboard must not fail the paste")
+        .expect("non-empty clipboard must produce a paste");
+    assert!(!insp, "clean bounded prefix delivers without confirmation");
+    assert!(!rt.has_pending_paste());
+    assert!(rt.last_clipboard_error().is_none());
+    let delivered = rt.drain_pending_input();
+    assert_eq!(delivered.len(), CLIPBOARD_MAX_BYTES);
+    assert!(
+        delivered.iter().all(|byte| *byte == b'a'),
+        "delivered bytes must be the bounded prefix"
+    );
+}
+
+#[test]
 fn embedded_emoji_boundary_truncation_remains_valid_utf8() {
+    // CTX-0478: over-limit clipboard writes are rejected, so the emoji
+    // boundary case is exercised through the paste gate's char-boundary cut.
     let mut rt = make_runtime();
     let emoji = "😀".repeat(3000); // 4 bytes each, 12000 bytes total > 8192
-    rt.clipboard_mut().set_text(emoji).unwrap();
-    let contents = rt.clipboard().headless_contents().to_owned();
-    assert!(contents.len() <= 8192);
-    assert!(contents.len() % 4 == 0 || contents.len() < 8192);
-    // Valid UTF-8 after truncation
-    assert!(String::from_utf8(contents.clone().into_bytes()).is_ok());
+    assert!(
+        rt.clipboard_mut().set_text(emoji.clone()).is_err(),
+        "over-limit clipboard write must be rejected"
+    );
     rt.drain_pending_input();
-    let insp = rt.paste_from_clipboard().unwrap().unwrap();
+    let insp = rt.request_paste(emoji);
     assert!(!insp); // emoji itself is not suspicious
-    assert_eq!(rt.pending_input().len(), contents.len());
+    let delivered = rt.pending_input();
+    assert!(delivered.len() <= 8192);
+    assert!(delivered.len() % 4 == 0, "emoji cut on a char boundary");
+    assert!(std::str::from_utf8(delivered).is_ok());
 }
 
 #[test]

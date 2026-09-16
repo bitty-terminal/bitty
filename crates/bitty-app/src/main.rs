@@ -37,9 +37,10 @@
 //!    builds a headless software surface (`Surface::headless`) and the
 //!    deterministic `GridRenderer` — no display server, window, adapter, or
 //!    font file is contacted.
-//! 4. **Build layout** via [`build_layout`] from the parsed [`crate::cli::Args`] (default
-//!    single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
-//!    `--layout` spec). The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
+//! 4. **Build layout** via [`layout_cmd::try_build_layout`] from the parsed [`crate::cli::Args`]
+//!    (default single leaf, `--split` horizontal/vertical, `--stack`, `--overlay`, or
+//!    `--layout` spec); invalid values fail closed (exit 2) instead of
+//!    silently normalizing. The app constructs a [`LayoutNode`](bitty_runtime::LayoutNode)
 //!    via `bitty-ui` types re-exported through `bitty-runtime` and calls
 //!    [`Runtime::set_layout`](bitty_runtime::Runtime::set_layout). No plugin
 //!    coupling is involved; the layout is derived purely from argv (config
@@ -185,6 +186,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::rc::Rc;
+
 use bitty_platform::{App, PlatformError};
 use bitty_runtime::Runtime;
 
@@ -254,6 +257,40 @@ use config_cli::{
 // Main
 // ---------------------------------------------------------------------------
 
+/// Exit code for a requested startup step that failed under `--fail-loud`
+/// (CTX-0481, issue #762): distinct from the usage (2) and generic
+/// event-loop (1) paths only by intent, but the non-zero code is the
+/// contract headless/CI callers check.
+const EXIT_STARTUP: i32 = 1;
+
+/// Fail-loud policy for one startup step (CTX-0481).
+///
+/// `step_failed` is true when a requested step (primary shell spawn, pane
+/// shells) did not complete. The default fail-soft path returns `None`;
+/// `--fail-loud` turns it into [`EXIT_STARTUP`] so a broken shell can never
+/// read as a green headless run.
+fn fail_loud_exit(fail_loud: bool, step_failed: bool) -> Option<i32> {
+    (fail_loud && step_failed).then_some(EXIT_STARTUP)
+}
+
+/// Fail-loud policy for an attempted-but-unavailable IPC servo (CTX-0481).
+///
+/// `None` when the servo is healthy, or when serving failed but the
+/// operator did not opt into fail-loud. Platform-unsupported (disabled
+/// without a failure reason) is never fatal.
+fn ipc_serve_failure_exit(
+    fail_loud: bool,
+    guard: &ipc_serve::IpcServeGuard,
+) -> Option<(i32, String)> {
+    let reason = guard.failure_reason()?;
+    fail_loud.then(|| {
+        (
+            EXIT_STARTUP,
+            format!("bitty: startup failed (--fail-loud): ipc disabled: {reason}"),
+        )
+    })
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
     let args = parse_args(&raw);
@@ -295,6 +332,14 @@ fn main() {
     // (parsed above into `program`/`program_args`) may name a program.
     if let Some(flag) = args.unknown_flag.as_deref() {
         eprintln!("bitty: unknown flag '{flag}'\n{}", help_text());
+        std::process::exit(2);
+    }
+
+    // CTX-0480: invalid `--split-ratio` / `--split` / `--log-level` /
+    // `--layout` / `--focus` values fail closed (exit 2), never
+    // warn-ignored to exit 0.
+    if let Some(err) = args.cli_value_error.as_deref() {
+        eprintln!("bitty: {err}\n{}", help_text());
         std::process::exit(2);
     }
 
@@ -501,7 +546,14 @@ fn main() {
     if !session_restored {
         let cols = runtime.config().cols;
         let rows = runtime.config().rows;
-        let layout = build_layout(&args, cols, rows);
+        // CTX-0480: invalid `--layout` / non-finite ratio fails closed.
+        let layout = match layout_cmd::try_build_layout(&args, cols, rows) {
+            Ok(node) => node,
+            Err(msg) => {
+                eprintln!("bitty: {msg}\n{}", help_text());
+                std::process::exit(2);
+            }
+        };
         let leaf_ids = layout.leaf_ids();
         let focused_before = runtime.focused_view();
         runtime.set_layout(layout);
@@ -514,6 +566,16 @@ fn main() {
             runtime.container()
         );
         if let Some(focus_spec) = args.focus.as_deref() {
+            // CTX-0480: syntactically unknown focus fails closed; a
+            // well-formed but unresolvable target still warns via
+            // `apply_focus` (returns false, startup continues).
+            if !layout_cmd::is_valid_focus_spec(focus_spec) {
+                eprintln!(
+                    "bitty: unknown --focus spec {focus_spec:?} (want next|prev|up|down|left|right|<id>)\n{}",
+                    help_text()
+                );
+                std::process::exit(2);
+            }
             apply_focus(&mut runtime, focus_spec);
         }
     }
@@ -523,11 +585,18 @@ fn main() {
     // runtime is retained for the process lifetime so its registrations and
     // host-service state outlive startup; command/event delivery from the
     // event loop is a follow-up slice. `--safe` creates no third-party VM.
-    let _plugin_runtime = plugin_runtime::discover_and_activate(
+    // CTX-0481: the shared live-snapshot handle flows to the app tick loop
+    // so `bitty.terminal.snapshot` tracks committed state instead of
+    // freezing at generation 1.
+    let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
         runtime.config().cols,
         runtime.config().rows,
     );
+    let live_snapshot = plugin_session
+        .as_ref()
+        .map(|(_, snapshot)| Rc::clone(snapshot));
+    let _plugin_runtime = plugin_session.map(|(runtime, _)| runtime);
 
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
@@ -562,7 +631,10 @@ fn main() {
     } else {
         spawn_default_shell(&mut runtime, config_shell.as_deref(), shell_env.as_deref())
     };
-    match spawn_result {
+    // CTX-0481 (#762): startup spawn failures stay fail-soft by default but
+    // are never invisible. `--fail-loud` turns the same condition into an
+    // immediate non-zero exit so headless/CI greens only prove a live shell.
+    let startup_spawn_failed = match spawn_result {
         Ok(()) => {
             eprintln!(
                 "bitty: PTY shell spawned (has_pty={} has_reader={})",
@@ -572,14 +644,21 @@ fn main() {
             // CTX-0176: startup multi-leaf layouts (`--split`/`--stack`/
             // `--layout`) give every non-focused leaf its own shell too; the
             // focused leaf keeps the primary session spawned above.
-            // Best-effort with loud warnings (spawn failures stay non-fatal,
-            // startup parity). Skipped when the primary spawn failed: the
-            // same resolution would fail the same way per leaf.
-            spawn_startup_pane_shells(&mut runtime, &spawn_spec);
+            // Best-effort with loud warnings by default. Skipped when the
+            // primary spawn failed: the same resolution would fail the same
+            // way per leaf.
+            spawn_startup_pane_shells(&mut runtime, &spawn_spec) > 0
         }
-        Err(err) => eprintln!(
-            "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
-        ),
+        Err(err) => {
+            eprintln!(
+                "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
+            );
+            true
+        }
+    };
+    if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
+        eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
+        std::process::exit(code);
     }
 
     if args.headless {
@@ -621,6 +700,13 @@ fn main() {
     if ipc_serve.is_enabled() {
         eprintln!("bitty: ipc serving {}", ipc_serve.socket_path());
     }
+    // CTX-0481 (#762): an attempted-but-rejected servo has a reason; under
+    // `--fail-loud` it exits non-zero instead of silently continuing
+    // without IPC.
+    if let Some((code, message)) = ipc_serve_failure_exit(args.fail_loud, &ipc_serve) {
+        eprintln!("{message}");
+        std::process::exit(code);
+    }
     let mut app = TerminalApp::with_theme(
         runtime,
         app_config.theme.name,
@@ -630,7 +716,9 @@ fn main() {
     )
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
-    .with_window_opacity(app_config.effective.window.opacity);
+    .with_window_opacity(app_config.effective.window.opacity)
+    // CTX-0481: commit the live plugin snapshot from the tick loop.
+    .with_live_snapshot(live_snapshot);
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
     if demo_pump_enabled_from_env() {
@@ -712,8 +800,15 @@ fn main() {
             )
             .is_ok()
         };
+        let mut fallback_spawn_failed = !fallback_primary_ok;
         if fallback_primary_ok {
-            spawn_startup_pane_shells(&mut rt, &fallback_spec);
+            fallback_spawn_failed = spawn_startup_pane_shells(&mut rt, &fallback_spec) > 0;
+        }
+        // CTX-0481: the DisplayUnavailable fallback must not turn a
+        // `--fail-loud` shell failure into a green smoke.
+        if let Some(code) = fail_loud_exit(args.fail_loud, fallback_spawn_failed) {
+            eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
+            std::process::exit(code);
         }
         let code = run_headless_smoke(&mut rt);
         std::process::exit(code);

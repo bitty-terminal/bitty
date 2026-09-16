@@ -12,9 +12,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
+
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::{
-    FocusDirection, LayoutNode, SplitAxis, View, ViewCloseRequest, ViewId, WsCloseRequest,
+    FocusDirection, LayoutNode, Runtime, SplitAxis, View, ViewCloseRequest, ViewId, WsCloseRequest,
 };
 
 use crate::spawn::spawn_pane_shell;
@@ -38,6 +40,174 @@ pub(crate) struct AppModifiers {
     alt: bool,
     /// Super held.
     super_held: bool,
+}
+
+/// Chrome-owned key state coalesced out of `TerminalApp` (CTX-0481 state
+/// slimming): the keymap table, the modifier mirror, press-to-release
+/// ownership, and pane zoom move together and share one lifetime.
+pub(crate) struct ChromeState {
+    /// Resolved keymap table (shipped defaults + user overrides).
+    pub(crate) keymaps: Vec<bitty_config::ResolvedKeymap>,
+    /// App-side modifier mirror for chord matching.
+    pub(crate) app_mods: AppModifiers,
+    /// Chrome-owned keys with an unreleased press (CTX-0229 press-to-release
+    /// ownership). A consumed chord owns its key until the physical release:
+    /// repeats/duplicates arriving after modifier decay stay swallowed
+    /// instead of leaking shell bytes (e.g. `Ctrl+Shift+V` paste followed by
+    /// a `V` repeat with `Ctrl` already released must not type `V`).
+    /// Releases and focus transitions clear entries (same staleness bound as
+    /// the CTX-0187 mirror clear); bounded by simultaneously held keys.
+    pub(crate) held: HashSet<bitty_config::KeyName>,
+    /// Pane zoom state (CTX-0481, #762).
+    pub(crate) zoom: ZoomState,
+}
+
+impl ChromeState {
+    pub(crate) fn new(keymaps: Vec<bitty_config::ResolvedKeymap>) -> Self {
+        Self {
+            keymaps,
+            app_mods: AppModifiers::default(),
+            held: HashSet::new(),
+            zoom: ZoomState::new(),
+        }
+    }
+}
+
+/// Pane zoom state (CTX-0481, #762).
+///
+/// The real tiled layout (`backup`) is captured when zoom engages together
+/// with the single-leaf proxy installed in its place (`proxy`). The backup
+/// is only restored while the runtime still holds that exact proxy: a layout
+/// mutation landing meanwhile (e.g. a ctl verb drained between key events)
+/// makes the pair stale, and restoring the older backup would silently drop
+/// the newer panes. A stale backup is discarded with a warning instead.
+#[derive(Debug, Default)]
+pub(crate) struct ZoomState {
+    /// Real tiled layout while zoomed; `None` when not zoomed.
+    backup: Option<LayoutNode>,
+    /// Proxy layout installed at engage time (staleness identity).
+    proxy: Option<LayoutNode>,
+}
+
+impl ZoomState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            backup: None,
+            proxy: None,
+        }
+    }
+
+    /// Whether zoom currently holds a backup.
+    pub(crate) fn is_zoomed(&self) -> bool {
+        self.backup.is_some()
+    }
+
+    /// Leaf count of the real tree while zoomed (diagnostics).
+    pub(crate) fn backup_leaf_count(&self) -> Option<usize> {
+        self.backup.as_ref().map(|layout| layout.leaf_ids().len())
+    }
+
+    /// Engages zoom on `view`: captures the real tree and installs the
+    /// single-leaf proxy. Refuses when zoom is already engaged or the view
+    /// is not a leaf, leaving the layout untouched.
+    pub(crate) fn engage(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
+        if self.backup.is_some() {
+            return false;
+        }
+        let Some(leaf) = runtime.layout().find_leaf(view).cloned() else {
+            return false;
+        };
+        let backup = runtime.layout().clone();
+        let proxy = LayoutNode::leaf(leaf);
+        runtime.set_layout(proxy.clone());
+        self.backup = Some(backup);
+        self.proxy = Some(proxy);
+        true
+    }
+
+    /// Disengages zoom. Restores the real tree only while the runtime still
+    /// holds the recorded proxy; a stale proxy keeps the current layout and
+    /// drops the backup with a warning. Returns whether a restore happened.
+    pub(crate) fn disengage(&mut self, runtime: &mut Runtime) -> bool {
+        let Some(backup) = self.backup.take() else {
+            return false;
+        };
+        let proxy = self.proxy.take();
+        if proxy
+            .as_ref()
+            .is_some_and(|proxy| same_layout_shape(runtime.layout(), proxy))
+        {
+            runtime.set_layout(backup);
+            return true;
+        }
+        eprintln!(
+            "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
+        );
+        false
+    }
+
+    /// Restores zoom before a layout mutation (keymap path and the ctl drain
+    /// hook). Returns whether the real tree was restored.
+    pub(crate) fn restore_for_mutation(&mut self, runtime: &mut Runtime) -> bool {
+        if !self.is_zoomed() {
+            return false;
+        }
+        let restored = self.disengage(runtime);
+        if restored {
+            eprintln!("bitty: zoom restored for layout mutation");
+        }
+        restored
+    }
+}
+
+/// Structural identity of two layout trees, ignoring per-leaf cell
+/// dimensions and allocation origins (CTX-0481).
+///
+/// The runtime reflows every `set_layout` in place, so `View` dimensions and
+/// origins differ from the just-installed proxy; leaf ids and split/stack/
+/// overlay structure are what identify "the runtime still holds the zoom
+/// proxy". Ratios compare by bit pattern (the tree is deterministic).
+fn same_layout_shape(a: &LayoutNode, b: &LayoutNode) -> bool {
+    match (a, b) {
+        (LayoutNode::Leaf(x), LayoutNode::Leaf(y)) => x.id() == y.id(),
+        (
+            LayoutNode::Split {
+                axis: ax,
+                ratio: rx,
+                first: f1,
+                second: s1,
+            },
+            LayoutNode::Split {
+                axis: ay,
+                ratio: ry,
+                first: f2,
+                second: s2,
+            },
+        ) => {
+            ax == ay
+                && rx.to_bits() == ry.to_bits()
+                && same_layout_shape(f1, f2)
+                && same_layout_shape(s1, s2)
+        }
+        (LayoutNode::Stack(xs), LayoutNode::Stack(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_layout_shape(x, y))
+        }
+        (
+            LayoutNode::Overlay {
+                base: b1,
+                overlay: o1,
+                bounds: r1,
+                tier: t1,
+            },
+            LayoutNode::Overlay {
+                base: b2,
+                overlay: o2,
+                bounds: r2,
+                tier: t2,
+            },
+        ) => r1 == r2 && t1 == t2 && same_layout_shape(b1, b2) && same_layout_shape(o1, o2),
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,15 +650,10 @@ fn resolve_priority_for(
 
 impl TerminalApp {
     /// Restore a zoomed layout before a tree-mutating action so the mutation
-    /// applies to the real tree instead of the single-leaf zoom view.
+    /// applies to the real tree instead of the single-leaf zoom view
+    /// (CTX-0481: staleness-checked inside [`ZoomState`]).
     pub(crate) fn restore_zoom(&mut self) -> bool {
-        if let Some(backup) = self.zoom_backup.take() {
-            self.runtime.set_layout(backup);
-            eprintln!("bitty: zoom restored for layout mutation");
-            true
-        } else {
-            false
-        }
+        self.chrome.zoom.restore_for_mutation(&mut self.runtime)
     }
 
     /// Execute one bound chrome action (single owner: the PTY never sees the
@@ -641,10 +806,11 @@ impl TerminalApp {
                 // A zoomed view collapses the live layout to one leaf, so
                 // consult the backup the restore would bring back before
                 // refusing a real multi-pane close.
-                let effective_leaf_count = match self.zoom_backup.as_ref() {
-                    Some(backup) => backup.leaf_ids().len(),
-                    None => self.runtime.leaf_count(),
-                };
+                let effective_leaf_count = self
+                    .chrome
+                    .zoom
+                    .backup_leaf_count()
+                    .unwrap_or_else(|| self.runtime.leaf_count());
                 if effective_leaf_count <= 1 {
                     eprintln!("warning: keymap close_view refused (last pane) — ignoring");
                     return;
@@ -890,13 +1056,14 @@ impl TerminalApp {
                 }
             }
             A::ToggleZoom => {
-                if let Some(backup) = self.zoom_backup.take() {
-                    self.runtime.set_layout(backup);
-                    eprintln!(
-                        "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
-                        self.runtime.leaf_count(),
-                        self.runtime.focused_view()
-                    );
+                if self.chrome.zoom.is_zoomed() {
+                    if self.chrome.zoom.disengage(&mut self.runtime) {
+                        eprintln!(
+                            "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
+                            self.runtime.leaf_count(),
+                            self.runtime.focused_view()
+                        );
+                    }
                 } else {
                     let focused = match self.runtime.focused_view() {
                         Some(id) => id,
@@ -905,18 +1072,10 @@ impl TerminalApp {
                             return;
                         }
                     };
-                    match self.runtime.layout().find_leaf(focused).cloned() {
-                        Some(view) => {
-                            let backup = self.runtime.layout().clone();
-                            self.runtime.set_layout(LayoutNode::leaf(view));
-                            self.zoom_backup = Some(backup);
-                            eprintln!("bitty: keymap toggle_zoom on -> {focused:?}");
-                        }
-                        None => {
-                            eprintln!(
-                                "warning: keymap toggle_zoom found no focused pane — ignoring"
-                            );
-                        }
+                    if self.chrome.zoom.engage(&mut self.runtime, focused) {
+                        eprintln!("bitty: keymap toggle_zoom on -> {focused:?}");
+                    } else {
+                        eprintln!("warning: keymap toggle_zoom found no focused pane — ignoring");
                     }
                 }
             }
@@ -928,7 +1087,7 @@ impl TerminalApp {
                 // copy. Repeating the chord hides it again; `Esc`
                 // dismisses through the runtime key path; the overlay is
                 // present-layer only (never grid truth).
-                let rows = bitty_config::keymap::help_rows_from_keymaps(&self.keymaps);
+                let rows = bitty_config::keymap::help_rows_from_keymaps(&self.chrome.keymaps);
                 let bindings = rows.len();
                 self.runtime.set_help_rows(rows);
                 let visible = self.runtime.toggle_help();
@@ -1047,7 +1206,7 @@ impl TerminalApp {
         } else if had_pending {
             eprintln!("bitty: paste confirmation cancelled (Esc)");
         }
-        if let Some(win) = self.window.as_ref() {
+        if let Some(win) = self.window.handle.as_ref() {
             win.request_redraw();
         }
         true
@@ -1082,33 +1241,33 @@ impl TerminalApp {
     pub(crate) fn intercept_chrome_key(&mut self, kind: &WindowEventKind) -> bool {
         match kind {
             WindowEventKind::KeyboardInput(key) => {
-                track_app_modifiers(&mut self.app_mods, key);
+                track_app_modifiers(&mut self.chrome.app_mods, key);
                 // Release ends press-to-release ownership; the key returns to
                 // normal matching on its next press. Releases always route
                 // (the runtime encodes no bytes for them).
                 if key.state != PressState::Pressed {
-                    if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
-                        self.chrome_held.remove(&keyref.key);
+                    if let Some(keyref) = key_ref_from_event(key, &self.chrome.app_mods) {
+                        self.chrome.held.remove(&keyref.key);
                     }
                     return false;
                 }
                 if is_modifier_key(key) {
                     return false;
                 }
-                if let Some(keyref) = key_ref_from_event(key, &self.app_mods) {
+                if let Some(keyref) = key_ref_from_event(key, &self.chrome.app_mods) {
                     // Still physically held from a consumed chord press: stay
                     // swallowed even when the mirror decayed (release cascade).
                     // No action re-runs; the PTY never sees the key.
                     // (CTX-0229 ownership sits above the modal arm: ownership
                     // is a physical invariant, and with no modal active the
                     // arms below are unreachable — byte-identical.)
-                    if self.chrome_held.contains(&keyref.key) {
-                        if let Some(win) = self.window.as_ref() {
+                    if self.chrome.held.contains(&keyref.key) {
+                        if let Some(win) = self.window.handle.as_ref() {
                             win.request_redraw();
                         }
                         return true;
                     }
-                    let matched = bitty_config::match_keymap(&self.keymaps, keyref);
+                    let matched = bitty_config::match_keymap(&self.chrome.keymaps, keyref);
                     // CTX-0384: copy mode is modal for chrome chords too.
                     // `Esc` routes to the runtime so copy mode exits there
                     // (never the paste/close emergency path while modal);
@@ -1127,7 +1286,7 @@ impl TerminalApp {
                         match matched {
                             Some(CopyModeAction::EnterCopyMode) => {}
                             Some(_) => {
-                                if let Some(win) = self.window.as_ref() {
+                                if let Some(win) = self.window.handle.as_ref() {
                                     win.request_redraw();
                                 }
                                 return true;
@@ -1160,7 +1319,7 @@ impl TerminalApp {
                                 | SearchModeAction::CloseSearch,
                             ) => {}
                             Some(_) => {
-                                if let Some(win) = self.window.as_ref() {
+                                if let Some(win) = self.window.handle.as_ref() {
                                     win.request_redraw();
                                 }
                                 return true;
@@ -1176,7 +1335,7 @@ impl TerminalApp {
                         DispatchPriority::Modal => {
                             // Active modal captures the bound non-confirm
                             // chord: consumed, no action runs, no PTY bytes.
-                            if let Some(win) = self.window.as_ref() {
+                            if let Some(win) = self.window.handle.as_ref() {
                                 win.request_redraw();
                             }
                             return true;
@@ -1189,13 +1348,13 @@ impl TerminalApp {
                                 return false;
                             };
                             // The press is chrome-owned from here until release.
-                            self.chrome_held.insert(keyref.key);
+                            self.chrome.held.insert(keyref.key);
                             // Repeats of a bound chord stay owned by chrome
                             // (no action, no PTY bytes).
                             if !key.repeat {
                                 self.apply_chrome_action(action);
                             }
-                            if let Some(win) = self.window.as_ref() {
+                            if let Some(win) = self.window.handle.as_ref() {
                                 win.request_redraw();
                             }
                             return true;
@@ -1217,7 +1376,7 @@ impl TerminalApp {
                 false
             }
             WindowEventKind::ModifiersChanged(mods) => {
-                self.app_mods = AppModifiers {
+                self.chrome.app_mods = AppModifiers {
                     shift: mods.shift,
                     control: mods.control,
                     alt: mods.alt,
@@ -1231,10 +1390,10 @@ impl TerminalApp {
                 // clear here before delegating to Runtime (which records focus
                 // via set_focused). Fail-closed to shell until the
                 // authoritative ModifiersChanged stream re-latches.
-                clear_app_modifiers_on_focus(&mut self.app_mods, *focused);
+                clear_app_modifiers_on_focus(&mut self.chrome.app_mods, *focused);
                 // CTX-0229: a missed key release while unfocused must not
                 // leave a stale ownership entry swallowing future typing.
-                self.chrome_held.clear();
+                self.chrome.held.clear();
                 false
             }
             _ => false,
@@ -2008,6 +2167,46 @@ mod tests {
         assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
     }
 
+    #[test]
+    fn zoom_backup_never_clobbers_layout_changed_while_zoomed() {
+        // CTX-0481 (#762): the single-slot `zoom_backup` was restored
+        // blindly. A layout mutation landing while zoomed (e.g. a ctl
+        // `view split` drained between key events, CTX-0171) was silently
+        // dropped when zoom toggled off because the backup predated it.
+        // The backup is only valid while the runtime still holds the zoom
+        // proxy; once the layout changed, zoom must not clobber the newer
+        // tree.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "zoom collapses to one leaf");
+        // Out-of-band mutation while zoomed: a three-leaf tree installed by
+        // a path that did not go through the zoom-aware action helpers.
+        let newer = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            two_pane_layout(),
+            LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        );
+        app.runtime.set_layout(newer);
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(
+            app.runtime.leaf_count(),
+            3,
+            "a stale zoom backup must not clobber the newer layout"
+        );
+    }
+
     // CTX-0370 close-confirm app wiring: the close_view chord arms a bounded
     // confirmation for a busy pane, repeat confirms, Esc cancels, and the
     // default `when_busy` mode keeps the pre-0370 single-gesture close for
@@ -2616,7 +2815,7 @@ mod tests {
         assert!(drive_chrome(&mut app, char_press("l", "l", false)));
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
         assert!(app.runtime.drain_pending_input().is_empty());
-        assert!(!app.chrome_held.contains(&bitty_config::KeyName::Char('l')));
+        assert!(!app.chrome.held.contains(&bitty_config::KeyName::Char('l')));
         assert!(!drive_chrome(&mut app, char_release("l")));
         // Workspace close behind the modal is captured too: no arm, no kill.
         assert!(drive_chrome(&mut app, char_press("w", "w", false)));
@@ -2910,8 +3109,9 @@ mod tests {
     #[test]
     fn help_toggle_gestures_drive_intercept_and_esc_dismisses() {
         // End-to-end through the real intercept: Mod+backtick shows,
-        // `Esc` (unbound, routed to `Runtime`) dismisses without PTY
-        // bytes, and the same chord re-arms afterwards.
+        // `Esc` (unbound, routed to `Runtime`) dismisses and still delivers
+        // the Esc to the PTY (the popup is informational, CTX-0475), and the
+        // same chord re-arms afterwards.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let mut app = help_test_app(maps);
@@ -2923,9 +3123,10 @@ mod tests {
         assert!(!drive_chrome(&mut app, no_mods()));
         assert!(!drive_chrome(&mut app, named_press(NamedKey::Escape)));
         assert!(!app.runtime.help_visible(), "Esc dismisses");
-        assert!(
-            app.runtime.drain_pending_input().is_empty(),
-            "dismissal Esc never reaches the PTY"
+        assert_eq!(
+            app.runtime.drain_pending_input(),
+            b"\x1b",
+            "CTX-0475: informational dismissal still delivers Esc to the PTY"
         );
         // Same-chord toggle still works after an Esc dismissal.
         assert!(!drive_chrome(&mut app, alt_mods()));

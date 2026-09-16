@@ -126,16 +126,19 @@ impl Pty {
     /// as its own foreground group, so an idle shell reports `None`; a
     /// foreground pipeline/program (job control moves each job into its own
     /// process group) reports `Some` with a bounded name when the platform
-    /// exposes one. `None` also means "cannot determine" (Windows ConPTY, or
-    /// a dead PTY) — callers must treat it as *not busy*, never invent a
-    /// guess.
+    /// exposes one. `None` also means "cannot determine" (Windows ConPTY,
+    /// where there is no process-group surface at all, or a dead PTY) —
+    /// callers must treat it as *not busy*, never invent a guess.
     pub fn foreground_job(&self) -> Option<ForegroundJob> {
         let child = self.pid()?;
         let fg = foreground_job_pid(Some(child), self.foreground_pgid())?;
-        Some(ForegroundJob {
-            pid: fg,
-            name: process_name(fg),
-        })
+        let name = process_name(fg);
+        // CTX-0478 pid-reuse TOCTOU: the name came from `/proc/<pid>/comm`.
+        // If the foreground group changed between the two observations, that
+        // pid may have exited and been reused by an unrelated process, so the
+        // name can no longer be attributed; re-read and drop it.
+        let name = name_if_still_foreground(fg, name, || self.foreground_pgid());
+        Some(ForegroundJob { pid: fg, name })
     }
 
     /// Takes exclusive ownership of the output side.
@@ -255,8 +258,23 @@ fn foreground_job_pid(child_pid: Option<u32>, fg_pgid: Option<u32>) -> Option<u3
     (fg != child).then_some(fg)
 }
 
-/// Bounded process name for a job pid, when the platform exposes one.
+/// Keeps `name` only when `recheck` still reports `pid` as the foreground
+/// process group (CTX-0478 pid-reuse guard).
 ///
+/// The name is read from `/proc/<pid>/comm`; a pid that exited and was reused
+/// between the foreground observation and the name read must not be attributed
+/// to the observed job. Non-matching or indeterminate re-checks drop the name
+/// while the pid stays reported.
+fn name_if_still_foreground<F: FnOnce() -> Option<u32>>(
+    pid: u32,
+    name: Option<String>,
+    recheck: F,
+) -> Option<String> {
+    let name = name?;
+    (recheck() == Some(pid)).then_some(name)
+}
+
+/// Bounded process name for a job pid, when the platform exposes one.
 /// Linux reads `/proc/<pid>/comm` (a kernel interface; 16-byte name), trims
 /// the trailing newline, strips control characters, and truncates to
 /// [`MAX_JOB_NAME_BYTES`]. Any read failure, non-UTF-8 content, or empty
@@ -300,6 +318,35 @@ mod tests {
             foreground_job_pid(Some(1), Some(2)),
             Some(2),
             "job in front"
+        );
+    }
+
+    #[test]
+    fn pid_reuse_recheck_drops_a_stale_name() {
+        // CTX-0478: the `/proc/<pid>/comm` name is only attributed when the
+        // pid is still the foreground group afterwards.
+        let same = || Some(7);
+        let changed = || Some(8);
+        let gone = || None;
+        assert_eq!(
+            name_if_still_foreground(7, Some("sleep".to_owned()), same),
+            Some("sleep".to_owned()),
+            "matched re-check keeps the name"
+        );
+        assert_eq!(
+            name_if_still_foreground(7, Some("sleep".to_owned()), changed),
+            None,
+            "reused pid drops the name"
+        );
+        assert_eq!(
+            name_if_still_foreground(7, Some("sleep".to_owned()), gone),
+            None,
+            "vanished foreground group drops the name"
+        );
+        assert_eq!(
+            name_if_still_foreground(7, None, same),
+            None,
+            "no name stays none"
         );
     }
 

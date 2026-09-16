@@ -52,21 +52,31 @@ pub const DEFAULT_TRANSPORT_CAPACITY: usize = crate::transport::DEFAULT_TRANSPOR
 /// Headless token-bucket rate limiter for RC-9 (100 req/s, 2x burst).
 ///
 /// The limiter is deterministic via caller-supplied `now_ms`, never wall-clock.
-/// It is bounded (tracks at most `RC9_BURST_PER_SEC` timestamps within the
-/// window) and fail-closed: `check()` returns `RateLimited` when the limit
-/// would be exceeded, without partial state.
+/// Tokens refill at `limit_per_sec` per second up to `burst` capacity; each
+/// admitted request consumes one token. A fresh limiter starts full, so a
+/// short spike of up to `burst` passes, while sustained load is capped at
+/// `limit_per_sec` per second no matter how long the window is observed.
+///
+/// The timestamp deque is observational only (powers `count_in_window`); it
+/// holds at most the admissions inside the trailing 1 s window and never
+/// gates admission by itself. Fail-closed: `check()` returns `RateLimited`
+/// when no token is available, without partial state.
 ///
 /// A malicious peer therefore cannot grow host memory by flooding: the frame
 /// bound caps each allocation, the channel caps bound queue depth, and overflow
 /// is fail-closed and countable (FS-IP4 attribution).
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
-    /// Timestamps (ms) of recent requests within the window, bounded.
+    /// Timestamps (ms) of recent admissions within the window, observational.
     timestamps: std::collections::VecDeque<u64>,
-    /// Sustained limit per second.
+    /// Sustained refill rate (tokens per second).
     limit_per_sec: u32,
-    /// Burst limit.
+    /// Bucket capacity (maximum instantaneous burst).
     burst: u32,
+    /// Available tokens in thousandths (fixed-point, avoids float drift).
+    tokens_milli: u64,
+    /// Last `now_ms` the bucket was refilled at (`None` before first check).
+    last_ms: Option<u64>,
 }
 
 impl RateLimiter {
@@ -83,6 +93,8 @@ impl RateLimiter {
             timestamps: std::collections::VecDeque::with_capacity(burst as usize),
             limit_per_sec,
             burst,
+            tokens_milli: u64::from(burst).saturating_mul(1_000),
+            last_ms: None,
         }
     }
 
@@ -96,30 +108,47 @@ impl RateLimiter {
     ///
     /// # Errors
     ///
-    /// Returns `IpcError::Denied(RateLimited)` when the sustained or burst
-    /// limit would be exceeded. No timestamp is recorded on denial.
+    /// Returns `IpcError::Denied(RateLimited)` when no token is available:
+    /// either the instantaneous `burst` is exhausted or the sustained
+    /// `limit_per_sec` refill has not yet accrued. No timestamp is recorded
+    /// and no token is consumed on denial.
     pub fn check(&mut self, now_ms: u64) -> Result<(), IpcError> {
         self.evict_old(now_ms);
-        // Check burst first: at most `burst` requests per window.
-        if (self.timestamps.len() as u32) >= self.burst {
+        self.refill(now_ms);
+        if self.tokens_milli < 1_000 {
             return Err(IpcError::Denied {
                 code: "RateLimited".into(),
                 reason: format!(
-                    "rate limited: {} requests in {} ms exceeds burst {}",
-                    self.timestamps.len(),
-                    RC9_WINDOW_MS,
-                    self.burst
+                    "rate limited: sustained {} req/s with burst {} exhausted at {} ms",
+                    self.limit_per_sec, self.burst, now_ms
                 ),
             });
         }
-        // Check sustained: also fail if we'd exceed sustained rate averaged?
-        // For headless simplicity we enforce burst as the hard cap; sustained
-        // is same window with lower cap but we treat burst as ceiling.
-        // To enforce both, we also check that count < limit_per_sec when window
-        // is not burst? Simplify: burst is the effective cap.
-        let _ = self.limit_per_sec;
+        self.tokens_milli -= 1_000;
         self.timestamps.push_back(now_ms);
         Ok(())
+    }
+
+    /// Refill tokens accrued since the last check, capped at `burst`.
+    ///
+    /// Backwards clock steps accrue nothing and never move the watermark
+    /// backwards, so skew cannot mint tokens.
+    fn refill(&mut self, now_ms: u64) {
+        let Some(last) = self.last_ms else {
+            self.last_ms = Some(now_ms);
+            return;
+        };
+        let elapsed = now_ms.saturating_sub(last);
+        if elapsed == 0 {
+            return;
+        }
+        self.last_ms = Some(now_ms);
+        let cap_milli = u64::from(self.burst).saturating_mul(1_000);
+        let accrued = (elapsed as u128).saturating_mul(u128::from(self.limit_per_sec));
+        let topped = u128::from(self.tokens_milli)
+            .saturating_add(accrued)
+            .min(u128::from(cap_milli));
+        self.tokens_milli = topped.min(u128::from(u64::MAX)) as u64;
     }
 
     /// Evict timestamps older than `RC9_WINDOW_MS` from `now_ms`.
@@ -210,6 +239,53 @@ mod tests {
         // After window passes, bucket evicts
         assert!(lim.check(1000).is_ok());
         assert_eq!(lim.count_in_window(1000), 1);
+    }
+
+    #[test]
+    fn rate_limiter_enforces_sustained_per_sec_after_burst() {
+        // Hostile: burst 20 at t=0 must not grant a fresh 20 at t=1000;
+        // sustained 10/s refills only 10 per second.
+        let mut lim = RateLimiter::new(10, 20);
+        for _ in 0..20 {
+            assert!(lim.check(0).is_ok());
+        }
+        assert!(lim.check(0).is_err());
+        for _ in 0..10 {
+            assert!(lim.check(1000).is_ok());
+        }
+        assert!(
+            lim.check(1000).is_err(),
+            "sustained per_sec must cap refill, not re-arm full burst"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_partial_refill_and_no_backwards_refill() {
+        let mut lim = RateLimiter::new(10, 10);
+        for _ in 0..10 {
+            assert!(lim.check(0).is_ok());
+        }
+        assert!(lim.check(0).is_err());
+        // 500 ms refills exactly 5.
+        for _ in 0..5 {
+            assert!(lim.check(500).is_ok());
+        }
+        assert!(lim.check(500).is_err());
+        // Clock skew backwards grants nothing.
+        assert!(lim.check(0).is_err());
+    }
+
+    #[test]
+    fn rc9_default_sustains_100_per_sec_after_burst() {
+        let mut lim = RateLimiter::rc9_default();
+        for _ in 0..RC9_BURST_PER_SEC {
+            assert!(lim.check(0).is_ok());
+        }
+        assert!(lim.check(0).is_err());
+        for _ in 0..RC9_REQ_PER_SEC {
+            assert!(lim.check(1000).is_ok());
+        }
+        assert!(lim.check(1000).is_err());
     }
 
     #[test]

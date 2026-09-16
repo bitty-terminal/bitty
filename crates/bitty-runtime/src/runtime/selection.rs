@@ -599,19 +599,21 @@ impl Runtime {
         self.confirm_pending_paste(false)
     }
 
-    /// Consume an `Esc` press while a paste is pending (CTX-0186).
+    /// Scoped `Esc` routing: consume the press only for a real confirmation
+    /// gate (CTX-0186 paste, CTX-0257 workspace close, CTX-0370 view/window
+    /// close).
     ///
-    /// Returns `true` when the event was an `Esc` press with a pending paste:
-    /// the pending paste is dropped without delivery, a redraw is requested so
-    /// any pending indicator clears, and the caller must not forward the key
-    /// to the PTY. Returns `false` otherwise (no pending paste, not `Esc`, or
-    /// not a press), leaving existing key routing untouched.
+    /// Returns `true` when an `Esc` press cancelled at least one pending
+    /// **confirmation gate**: the gate is dropped without delivery, a redraw
+    /// is requested so any pending indicator clears, and the caller must not
+    /// forward the key to the PTY (a dismissal must not also drive shell/vim
+    /// state on the gate it just aborted). Returns `false` otherwise (not
+    /// `Esc`, not a press, or only the informational CTX-0265 help overlay).
     ///
-    /// CTX-0257: the same press also cancels a pending workspace-close arm
-    /// (kill-confirm gate). CTX-0265: the same press also dismisses the
-    /// help popup (informational overlay, not a confirm gate). CTX-0370: the
-    /// same press also cancels a pending view/window close confirmation. Any
-    /// cancellation consumes the `Esc`; all are dropped together when
+    /// CTX-0475 (issue #756): the help popup is informational, not modal, so
+    /// its `Esc` dismissal no longer consumes the press — a fullscreen app
+    /// (vim/less) keeps receiving `Esc` instead of having its mode state
+    /// desynced by the overlay. All pending gates still drop together when
     /// several pend (loud, no partial state).
     pub(super) fn cancel_pending_on_escape(&mut self, event: &KeyEvent) -> bool {
         if event.state != PressState::Pressed {
@@ -623,31 +625,31 @@ impl Runtime {
         ) {
             return false;
         }
-        let mut cancelled = false;
+        let mut gate_cancelled = false;
         // CTX-0370: Esc cancels a pending view/window close confirmation
         // (the close itself is aborted; nothing is torn down).
         if self.pending_close_confirm.is_some() {
             self.snap_focused_to_live();
-            cancelled = self.cancel_pending_close_confirm();
+            gate_cancelled = self.cancel_pending_close_confirm();
         }
         if self.pending_ws_close.is_some() {
             // CTX-0243: Esc-cancel is user intent — snap to live (key handler
             // already snapped; idempotent).
             self.snap_focused_to_live();
-            cancelled = self.cancel_pending_ws_close() || cancelled;
+            gate_cancelled = self.cancel_pending_ws_close() || gate_cancelled;
         }
+        // CTX-0475: the help popup is informational, not a confirmation gate.
+        // Dismiss it, but never consume the `Esc`: the press still routes to
+        // the focused PTY so a fullscreen app's mode state stays in sync.
         if self.help_visible {
-            // CTX-0265: Esc dismisses the help popup (overlay only; the
-            // `Esc` never reaches the PTY so a dismissal cannot drive
-            // shell/vim state).
             self.snap_focused_to_live();
-            cancelled = self.dismiss_help() || cancelled;
+            self.dismiss_help();
         }
         if self.pending_paste.is_none() {
-            return cancelled;
+            return gate_cancelled;
         }
-        // CTX-0243: Esc-cancel is user intent — snap to live (key handler
-        // already snapped; idempotent).
+        // CTX-0186/CTX-0243: the paste gate is a real confirmation gate;
+        // cancelling it consumes the press (the `Esc` is never delivered).
         self.snap_focused_to_live();
         self.pending_paste = None;
         self.pending_paste_since = None;

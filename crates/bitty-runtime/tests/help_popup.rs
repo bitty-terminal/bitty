@@ -3,8 +3,9 @@
 //! Headless proof over the public `Runtime` API (no display server):
 //!
 //! 1. Toggle flips visibility and forces exactly one repaint, then idles.
-//! 2. `Esc` dismisses the popup and is consumed (zero PTY bytes); with no
-//!    popup the same `Esc` encodes normally (no behavior theft).
+//! 2. `Esc` dismisses the popup but is not consumed: the press still encodes
+//!    for the PTY (CTX-0475, issue #756); with no popup the same `Esc`
+//!    encodes normally (no behavior theft).
 //! 3. Overlay-only: while shown, `snapshot().cells` are byte-identical and
 //!    only the presented fills/glyphs grow (never grid truth).
 //! 4. Stored rows are bounded ([`HELP_MAX_ROWS`]).
@@ -59,7 +60,7 @@ fn help_toggle_flips_and_repaints_once() {
 }
 
 #[test]
-fn help_esc_dismisses_and_is_consumed() {
+fn help_esc_dismisses_and_still_reaches_pty() {
     let mut rt = make_runtime();
     let _ = rt.tick();
     rt.set_help_rows(live_help_rows());
@@ -67,13 +68,14 @@ fn help_esc_dismisses_and_is_consumed() {
 
     assert_eq!(
         rt.handle_key_event(esc_press()),
-        None,
-        "dismissal Esc is consumed"
+        Some(vec![27]),
+        "informational dismissal still encodes"
     );
     assert!(!rt.help_visible(), "Esc dismissed the popup");
-    assert!(
-        rt.drain_pending_input().is_empty(),
-        "dismissal Esc never reaches the PTY"
+    assert_eq!(
+        rt.drain_pending_input(),
+        vec![27],
+        "CTX-0475: the dismissal Esc reaches the PTY"
     );
 }
 

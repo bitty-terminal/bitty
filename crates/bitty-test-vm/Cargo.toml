@@ -1,0 +1,18 @@
+[package]
+name = "bitty-test-vm"
+description = "VM test-tier controller: base-image/overlay policy and gated libvirt/QEMU KVM smoke (CTX-0507)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["testing", "qemu", "libvirt", "bitty"]
+categories = ["development-tools"]
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "bitty-vm"
+path = "src/bin/bitty-vm.rs"

@@ -16,6 +16,7 @@ members = [
   "crates/bitty-vt",
   "crates/bitty-term-state",
   "crates/bitty-test-support",
+  "crates/bitty-test-vm",
   "crates/bitty-render",
   "crates/bitty-runtime",
   "crates/bitty-ui",

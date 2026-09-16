@@ -136,9 +136,36 @@ jobs:
           # Ubuntu's main/security archives serve amd64 only; arm64 packages come
           # from ports.ubuntu.com. Restrict the existing sources to amd64 and add
           # the arm64 ports archive (classic .list and deb822 .sources forms).
+          # The rewrite keeps other options (for example signed-by) and replaces
+          # any existing arch= token, so lines that already carry [arch=...] do
+          # not become invalid.
           for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
             [ -f "$f" ] || continue
-            sudo sed -i -E '/^deb(-src)?[[:space:]]/ s/^deb(-src)?[[:space:]]+/deb\1 [arch=amd64] /' "$f"
+            tmp="$(mktemp)"
+            awk '
+              /^deb(-src)?[[:space:]]/ {
+                line = $0
+                match(line, /^deb(-src)?/)
+                head = substr(line, 1, RLENGTH)
+                rest = substr(line, RLENGTH + 1)
+                sub(/^[[:space:]]+/, "", rest)
+                opts = ""
+                if (rest ~ /^\[/) {
+                  match(rest, /^\[[^]]*\]/)
+                  opts = substr(rest, 2, RLENGTH - 2)
+                  rest = substr(rest, RLENGTH + 1)
+                  sub(/^[[:space:]]+/, "", rest)
+                }
+                n = split(opts, o, /[[:space:]]+/)
+                kept = ""
+                for (i = 1; i <= n; i++) if (o[i] != "" && o[i] !~ /^arch=/) kept = kept (kept == "" ? "" : " ") o[i]
+                printf "%s [arch=amd64%s] %s\n", head, (kept == "" ? "" : " " kept), rest
+                next
+              }
+              { print }
+            ' "$f" > "$tmp"
+            sudo cp "$tmp" "$f"
+            rm -f "$tmp"
           done
           for f in /etc/apt/sources.list.d/*.sources; do
             [ -f "$f" ] || continue

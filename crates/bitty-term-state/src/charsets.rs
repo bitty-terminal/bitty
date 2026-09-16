@@ -1,15 +1,16 @@
-//! Charset designation and invocation (SCS, SO/SI, single shifts).
+//! Charset designation and invocation (SCS, SO/SI, LS2/LS3, SS2/SS3).
 //!
-//! The parser delivers fully resolved [`bitty_vt::SelectCharset`] and
-//! [`bitty_vt::InvokeCharset`] actions; terminal state owns the four
-//! G0-G3 slots, the active locking shift, and any armed single shift.
-//! Translation applies to printed scalars only (RFC "Typed Action
-//! interface": parameters arrive resolved; state interprets).
+//! The parser delivers fully resolved [`bitty_vt::SelectCharset`],
+//! [`bitty_vt::InvokeCharset`], and [`bitty_vt::SingleShiftCharset`]
+//! actions; terminal state owns the four G0-G3 slots, the active locking
+//! shift, and any armed single shift. Translation applies to printed
+//! scalars only (RFC "Typed Action interface": parameters arrive resolved;
+//! state interprets).
 //!
-//! Documented invocation rule: designating or invoking `G0`/`G1` selects
-//! the locking shift (`SO`/`SI` semantics); invoking `G2`/`G3` arms a
-//! single shift consumed by exactly one subsequent print (`SS2`/`SS3`
-//! semantics).
+//! Documented invocation rule: `SO`/`SI` (`InvokeCharset` `G1`/`G0`) and
+//! the locking shifts `LS2`/`LS3` (`InvokeCharset` `G2`/`G3`) select GL
+//! persistently; the single shifts `SS2`/`SS3` (`SingleShiftCharset`)
+//! arm a shift consumed by exactly one subsequent print.
 
 use bitty_vt::{CharsetSlot, CharsetTable};
 
@@ -41,12 +42,16 @@ impl Charsets {
         self.slots[slot_index(slot)] = table;
     }
 
-    /// Applies an invocation per the documented rule above.
-    pub fn invoke(&mut self, slot: CharsetSlot) {
-        match slot {
-            CharsetSlot::G0 | CharsetSlot::G1 => self.locking = slot,
-            CharsetSlot::G2 | CharsetSlot::G3 => self.single = Some(slot),
-        }
+    /// Locks `slot` as GL for normal printing (`SO`/`SI`, locking shifts
+    /// `LS2`/`LS3`). The previous locking shift is replaced.
+    pub fn lock(&mut self, slot: CharsetSlot) {
+        self.locking = slot;
+    }
+
+    /// Arms `slot` for exactly the next printed scalar (`SS2`/`SS3`).
+    /// Re-arming before a print replaces the pending single shift.
+    pub fn arm_single(&mut self, slot: CharsetSlot) {
+        self.single = Some(slot);
     }
 
     /// Resolves and consumes the effective table for one printed scalar.
@@ -133,7 +138,7 @@ mod tests {
     fn designation_and_locking_shift() {
         let mut cs = Charsets::default();
         cs.designate(CharsetSlot::G1, CharsetTable::DecSpecialGraphics);
-        cs.invoke(CharsetSlot::G1);
+        cs.lock(CharsetSlot::G1);
         assert_eq!(cs.locking, CharsetSlot::G1);
         assert_eq!(
             cs.consume_translation_table(),
@@ -143,11 +148,28 @@ mod tests {
     }
 
     #[test]
-    fn single_shift_is_consumed_once() {
+    fn locking_shift_g2_locks_gl_persistently() {
+        // LS2 (`ESC n`): G2 becomes GL until another shift changes it.
         let mut cs = Charsets::default();
         cs.designate(CharsetSlot::G2, CharsetTable::UnitedKingdom);
-        cs.invoke(CharsetSlot::G2);
+        cs.lock(CharsetSlot::G2);
+        assert_eq!(cs.locking, CharsetSlot::G2);
+        assert_eq!(cs.single, None);
+        assert_eq!(cs.consume_translation_table(), CharsetTable::UnitedKingdom);
+        assert_eq!(cs.consume_translation_table(), CharsetTable::UnitedKingdom);
+        // SI locks back to G0.
+        cs.lock(CharsetSlot::G0);
+        assert_eq!(cs.consume_translation_table(), CharsetTable::Ascii);
+    }
+
+    #[test]
+    fn single_shift_is_armed_and_consumed_once() {
+        // SS2 (`ESC N`): one-shot, does not touch the locking shift.
+        let mut cs = Charsets::default();
+        cs.designate(CharsetSlot::G2, CharsetTable::UnitedKingdom);
+        cs.arm_single(CharsetSlot::G2);
         assert_eq!(cs.single, Some(CharsetSlot::G2));
+        assert_eq!(cs.locking, CharsetSlot::G0);
         assert_eq!(cs.consume_translation_table(), CharsetTable::UnitedKingdom);
         assert_eq!(cs.single, None);
         assert_eq!(cs.consume_translation_table(), CharsetTable::Ascii);

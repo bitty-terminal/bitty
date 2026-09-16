@@ -260,10 +260,12 @@ pub(crate) fn discover_and_activate(
     for (id, result) in runtime.activate_discovered() {
         match result {
             Ok(report) if report.skipped_safe_mode => {
-                eprintln!(
-                    "bitty: plugin '{id}' skipped (--safe, {} source, no VM)",
-                    report.source_class.as_str()
-                );
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: plugin '{id}' skipped (--safe, {} source, no VM)",
+                        report.source_class.as_str()
+                    )
+                });
             }
             Ok(report) => {
                 let verification = if report.unverified {
@@ -271,14 +273,16 @@ pub(crate) fn discover_and_activate(
                 } else {
                     "verified"
                 };
-                eprintln!(
-                    "bitty: plugin '{id}' active ({} commands, {} events, {} source, {verification})",
-                    report.commands,
-                    report.events,
-                    report.source_class.as_str(),
-                );
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: plugin '{id}' active ({} commands, {} events, {} source, {verification})",
+                        report.commands,
+                        report.events,
+                        report.source_class.as_str(),
+                    )
+                });
             }
-            Err(error) => eprintln!("bitty: plugin '{id}' failed: {error}"),
+            Err(error) => crate::logging::warn(|| format!("bitty: plugin '{id}' failed: {error}")),
         }
     }
     Some((runtime, snapshot))

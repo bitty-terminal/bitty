@@ -287,6 +287,114 @@ fn log_level_from_env_value_accepts_rust_log_filters() {
 }
 
 #[test]
+fn rust_log_filters_parse_directives_not_substrings() {
+    // CTX-0482 (#763): substring scanning let a *target* name that merely
+    // contained a level word flip the gate (`mydebug=warn` -> Debug).
+    // Directives are parsed as `[target=]level`; only the bare global level
+    // and the app's own `bitty*` targets count.
+    assert_eq!(log_level_from_env_value("mydebug=warn"), None);
+    assert_eq!(log_level_from_env_value("mytrace=error"), None);
+    assert_eq!(log_level_from_env_value("wgpu=trace"), None);
+    assert_eq!(log_level_from_env_value("bitty_debug=off"), None);
+    // A target-specific app directive wins over the global level.
+    assert_eq!(
+        log_level_from_env_value("debug,bitty=error"),
+        Some(LogLevel::Error)
+    );
+    assert_eq!(
+        log_level_from_env_value("bitty-app=debug"),
+        Some(LogLevel::Debug)
+    );
+    // A later global directive replaces an earlier one (last wins), and
+    // whitespace around directives/levels is ignored.
+    assert_eq!(log_level_from_env_value("info, warn"), Some(LogLevel::Warn));
+}
+
+#[test]
+fn panel_overlay_modal_bit_feeds_modal_capture() {
+    // CTX-0482 (#763): `modal_capture_active` checked only the three pending
+    // confirmation gates, so panel-overlay modals never captured chrome
+    // dispatch. The runtime bit (fed by `OverlayManager::modal_active` on
+    // the panel path) is the fourth gate.
+    use super::chrome_keys::DispatchPriority;
+    use bitty_config::{ChromeAction, KeyName, KeyRef};
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    assert!(!app.runtime.overlay_modal_active());
+    assert!(!app.modal_capture_active());
+    let chord = KeyRef {
+        key: KeyName::Char('w'),
+        ctrl: false,
+        alt: true,
+        shift: false,
+        super_held: false,
+    };
+    // No modal: the bound chord runs its action.
+    let (priority, action) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
+    assert_eq!(priority, DispatchPriority::User);
+    assert_eq!(action, Some(ChromeAction::CloseView));
+    app.runtime.set_overlay_modal_active(true);
+    assert!(app.modal_capture_active());
+    let (priority, action) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
+    assert_eq!(
+        priority,
+        DispatchPriority::Modal,
+        "bound chords must be captured while a panel modal is active"
+    );
+    assert!(action.is_none());
+    // Esc is the panel modal's own dismissal path: it routes to the runtime
+    // (Terminal), never the paste/close confirm-cancel emergency arm.
+    let esc = KeyRef {
+        key: KeyName::Escape,
+        ..chord
+    };
+    let (priority, _) = app.resolve_dispatch(esc, None);
+    assert_eq!(priority, DispatchPriority::Terminal);
+    app.runtime.set_overlay_modal_active(false);
+    assert!(!app.modal_capture_active());
+    let (priority, _) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
+    assert_eq!(priority, DispatchPriority::User);
+}
+
+#[test]
+fn defense_in_depth_clamps_report_engaged_keys() {
+    // CTX-0482 (#763): `runtime_config_from_effective` clamped some knobs
+    // and failed closed on others with no visible policy. Clamps are
+    // defense-in-depth for already-validated inputs; when one actually
+    // engages it is upstream bound drift and must be named, while semantic
+    // bounds (scrollback) keep failing closed.
+    let cap = bitty_runtime::config::MAX_LAYOUT_GAP_CELLS;
+    let mut effective = bitty_config::EffectiveConfig::default();
+    effective.layout.gaps_in = u32::from(cap) + 5;
+    let (cfg, warnings) =
+        runtime_config_from_effective_with_warnings(&effective).expect("clamps, never fails");
+    assert_eq!(cfg.gaps_in, cap, "the clamp must still bound the value");
+    assert!(
+        warnings.iter().any(|w| w.contains("layout.gaps_in")),
+        "an engaged clamp must be named, warnings={warnings:?}"
+    );
+    // In-range values stay quiet (the normal path emits nothing).
+    let clean = bitty_config::EffectiveConfig::default();
+    let (_, warnings) =
+        runtime_config_from_effective_with_warnings(&clean).expect("defaults build");
+    assert!(warnings.is_empty(), "warnings={warnings:?}");
+    // Semantic bounds stay fail-closed: scrollback above the cap is an
+    // error, never a silent clamp.
+    let mut over = bitty_config::EffectiveConfig::default();
+    over.terminal.scrollback =
+        u32::try_from(bitty_runtime::config::MAX_SCROLLBACK_LINES).expect("fits") + 1;
+    assert!(runtime_config_from_effective_with_warnings(&over).is_err());
+}
+
+#[test]
 fn default_run_emits_no_tick_lines() {
     // Default quiet run: `with_theme` leaves the gate at `Warn`, so the
     // hot path returns `None` without formatting (no stderr tick lines).

@@ -644,10 +644,16 @@ pub enum TerminalAction {
         /// Table being designated.
         table: CharsetTable,
     },
-    /// Invoke a charset slot for the next printed characters (`SO`/`SI`,
-    /// locking shifts `LS2`/`LS3`, single shifts `SS2`/`SS3`).
+    /// Lock a charset slot as GL for normal printing (`SO`/`SI` for
+    /// `G1`/`G0`, locking shifts `LS2`/`LS3` for `G2`/`G3`).
     InvokeCharset {
-        /// Slot to invoke.
+        /// Slot to lock.
+        slot: CharsetSlot,
+    },
+    /// Arm a single shift for exactly the next printed scalar
+    /// (`SS2`/`SS3`; `G2`/`G3` only, the locking shift is untouched).
+    SingleShiftCharset {
+        /// Slot to arm for one printed scalar.
         slot: CharsetSlot,
     },
 

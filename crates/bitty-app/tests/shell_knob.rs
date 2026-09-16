@@ -63,11 +63,16 @@ fn write_config(xdg: &Path, body: &str) {
     std::fs::write(dir.join("init.lua"), body).expect("write init.lua");
 }
 
-/// Runs `bitty --headless` under the isolated root with the injected `$SHELL`
-/// and a hard timeout (spawn + poll + kill by PID, no shell, no pipes).
+/// Runs `bitty --headless --log-level info` under the isolated root with the
+/// injected `$SHELL` and a hard timeout (spawn + poll + kill by PID, no
+/// shell, no pipes).
+///
+/// The info level is required because this test asserts the startup spawn
+/// diagnostics (`CTX-0482` gated them behind `--log-level info`); the
+/// default (`warn`) intentionally stays quiet.
 fn run_headless(root: &Path, shell_env: &Path) -> Output {
     let mut child = Command::new(BITTY_BIN)
-        .args(["--headless"])
+        .args(["--headless", "--log-level", "info"])
         .env("XDG_CONFIG_HOME", root)
         .env("HOME", root)
         .env("SHELL", shell_env)

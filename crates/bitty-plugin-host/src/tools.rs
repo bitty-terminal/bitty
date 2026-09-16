@@ -91,22 +91,87 @@ pub fn is_valid_tool_name(name: &str) -> bool {
     true
 }
 
-/// Environment variables never passed to a Layer-2 spawn (pager hijack).
-pub const DENIED_SPAWN_ENV_VARS: &[&str] = &["PAGER", "GIT_PAGER"];
+/// Environment variables never passed to a Layer-2 spawn.
+///
+/// Three vector classes, all fail-closed:
+///
+/// - **Pager / diff pagination** (CTX-0465): `PAGER`, `GIT_PAGER`.
+/// - **Env-encoded config override** (CTX-0488): `GIT_CONFIG*` names are
+///   read as an implicit `-c <key>=<value>` sequence (`GIT_CONFIG_COUNT` +
+///   `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`, and the
+///   `GIT_CONFIG_PARAMETERS` form git itself exports), re-opening the
+///   override vector closed for argv.
+/// - **External program execution** (CTX-0488): diff drivers, editors, ssh
+///   and askpass helpers, and `GIT_EXEC_PATH` (`git-*` lookup) all execute
+///   attacker-chosen programs. `GIT_DIR`/`GIT_WORK_TREE` are the env form of
+///   the denied repo-escape argv flags.
+pub const DENIED_SPAWN_ENV_VARS: &[&str] = &[
+    // Pager program (CTX-0465).
+    "PAGER",
+    "GIT_PAGER",
+    // Env-encoded config override (CTX-0488).
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    // External program execution (CTX-0488).
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    // Repo-identity escape, env form of the denied `--git-dir`/`--work-tree`.
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+];
+
+/// Denied environment-variable name prefixes (numbered families).
+///
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` are the implicit `-c`
+/// override pairs; any numbered suffix is denied.
+pub const DENIED_SPAWN_ENV_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Whether an environment variable name is denied for a Layer-2 spawn.
+///
+/// ASCII case-insensitive so Windows env lookup (`GetEnvironmentVariable` is
+/// case-insensitive, and git reads through it) cannot bypass with a folded
+/// variant. Near-miss names (`MY_PAGER`, `GIT_TERMINAL_PROMPT`) stay allowed.
+fn env_name_is_denied(name: &str) -> bool {
+    if DENIED_SPAWN_ENV_VARS
+        .iter()
+        .any(|denied| name.eq_ignore_ascii_case(denied))
+    {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    DENIED_SPAWN_ENV_PREFIXES.iter().any(|prefix| {
+        bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    })
+}
 
 /// Whether explicit spawn `env` is safe for a Layer-2 spawn.
 ///
-/// Fail-closed: any entry naming a denied pager variable fails, regardless
-/// of value — even `GIT_PAGER=cat` would legitimize the channel. Exact,
-/// case-sensitive match (`MY_PAGER` and friends stay allowed); the spawn
-/// surface must call this before `env_clear()` + explicit `env()`.
+/// Fail-closed: any entry naming a denied variable fails, regardless of
+/// value — even `GIT_PAGER=cat` or `GIT_CONFIG_COUNT=0` would legitimize the
+/// channel. Matching is ASCII case-insensitive with prefix families for the
+/// numbered `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` names; near-miss names
+/// stay allowed. The spawn surface must call this before `env_clear()` +
+/// explicit `env()`.
 ///
-/// [`DENIED_SPAWN_ENV_VARS`] is the policy list; this predicate is the
-/// enforcement point for the spawn surface (`bitty-runtime` `SpawnRequest`).
+/// [`DENIED_SPAWN_ENV_VARS`] / [`DENIED_SPAWN_ENV_PREFIXES`] are the policy
+/// lists; this predicate is the enforcement point for the spawn surface
+/// (`bitty-runtime` `SpawnRequest`).
 #[must_use]
 pub fn is_safe_spawn_env(env: &[(String, String)]) -> bool {
     for (name, _) in env {
-        if DENIED_SPAWN_ENV_VARS.contains(&name.as_str()) {
+        if env_name_is_denied(name) {
             return false;
         }
     }
@@ -982,6 +1047,72 @@ mod tests {
             "MY_PAGER".to_string(),
             "x".to_string()
         )]));
+    }
+
+    #[test]
+    fn probe_git_config_env_override_denied() {
+        // CTX-0488 hostile probe: env-encoded `-c` override re-opens the
+        // config vector closed for argv (`-c` glued/exact, `--config*`).
+        for name in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+        ] {
+            assert!(
+                !is_safe_spawn_env(&[(name.to_string(), "core.pager=evil".to_string())]),
+                "{name} must be denied"
+            );
+        }
+        // Case-folded variants must not bypass (Windows env lookup folds case).
+        for name in ["git_config_count", "Git_Config_Key_0", "git_config_value_0"] {
+            assert!(
+                !is_safe_spawn_env(&[(name.to_string(), "1".to_string())]),
+                "{name} must be denied case-insensitively"
+            );
+        }
+        // The full env-encoded override triple is denied even when each entry
+        // is individually plausible.
+        assert!(!is_safe_spawn_env(&[
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.pager".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "evil".to_string()),
+        ]));
+    }
+
+    #[test]
+    fn probe_git_external_process_env_denied() {
+        // CTX-0488 hostile probe: external diff/editor/ssh/askpass programs
+        // and `git-*` exec-path lookup re-open process execution.
+        for name in [
+            "GIT_EXTERNAL_DIFF",
+            "GIT_DIFF_OPTS",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_PROXY_COMMAND",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_EXEC_PATH",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+        ] {
+            assert!(
+                !is_safe_spawn_env(&[(name.to_string(), "/tmp/evil".to_string())]),
+                "{name} must be denied"
+            );
+        }
+        // Safe/decorative settings and near-miss names stay allowed.
+        assert!(is_safe_spawn_env(&[
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("MY_PAGER".to_string(), "x".to_string()),
+        ]));
     }
 
     #[test]

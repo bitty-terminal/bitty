@@ -92,6 +92,10 @@ impl State {
             }
             h.str(entry.uri.as_str());
         }
+        // Id-space position: the ids of future links are observable in cells,
+        // so two states differing only here are not behaviorally identical
+        // (CTX-0490 item 4).
+        h.u32(self.next_hyperlink_id);
         h.option_tag(self.current_hyperlink.is_some());
         if let Some(link) = self.current_hyperlink {
             h.u32(link.as_u32());

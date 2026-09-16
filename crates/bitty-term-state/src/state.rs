@@ -64,11 +64,18 @@ pub const ZONE_RECORDS_MAX: usize = 1024;
 /// One retained hyperlink identity: a stable monotonic id plus the OSC 8
 /// `id=` parameter and target URI.
 ///
-/// Ids are never reused within an id space: eviction drops the oldest entry
-/// and live cells holding its id fail closed ([`State::hyperlink_entry`]
-/// returns `None`) instead of ever resolving to a different URI (CTX-0469).
-/// The counter resets only via [`State::full_reset`] or once per 2^32
-/// distinct links (which clears the table first), so reuse is impossible.
+/// While an entry stays resident its id is never reused: eviction drops the
+/// oldest entry and live cells holding its id fail closed
+/// ([`State::hyperlink_entry`] returns `None`) instead of resolving to a
+/// different URI (CTX-0469).
+///
+/// Honest bound (CTX-0490): the id space is a `u32`. When the counter reaches
+/// its wrap point the table is cleared and issuance restarts at zero, so a
+/// cell that still carries a pre-wrap id can resolve against a post-wrap
+/// entry. The window needs 2^32 distinct OSC 8 identities in one session
+/// lifetime and drops every resident entry first, but reuse is not
+/// impossible. [`State::full_reset`] clears the screens before the table, so
+/// no stale cell ids survive it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HyperlinkEntry {
     id: HyperlinkId,
@@ -728,19 +735,31 @@ impl State {
     /// Resolves a [`HyperlinkId`] to its `(id, uri)` pair when present.
     ///
     /// `id` is the optional OSC 8 `id=` parameter; `uri` is the target.
-    /// Evicted or unknown ids fail closed (`None`): an id never resolves
-    /// to a different URI than the one it was issued for (CTX-0469).
+    /// Evicted or unknown ids fail closed (`None`), and no resident id ever
+    /// resolves to a different URI than the one it was issued for while it
+    /// stays resident (CTX-0469).
+    ///
+    /// Issuance is monotonic and the table is a FIFO window, so resident ids
+    /// are contiguous and ascending ([`Self::hyperlink_table`] exposes the
+    /// window); lookup is front-id arithmetic over the deque — O(1) per call
+    /// instead of a scan of up to [`HYPERLINK_TABLE_MAX`] entries (CTX-0490).
+    ///
+    /// Honest bound (CTX-0490): once per 2^32 distinct links the id space
+    /// restarts at zero after clearing the table, so a cell that kept a
+    /// pre-wrap id can resolve to a post-wrap entry (see [`HyperlinkEntry`]).
     #[must_use]
     pub fn hyperlink_entry(&self, id: HyperlinkId) -> Option<(Option<&str>, &str)> {
-        self.hyperlink_table
-            .iter()
-            .find(|entry| entry.id == id)
-            .map(|entry| {
-                (
-                    entry.id_param.as_ref().map(BoundedString::as_str),
-                    entry.uri.as_str(),
-                )
-            })
+        let front_id = self.hyperlink_table.front()?.id.as_u32();
+        let offset = usize::try_from(id.as_u32().checked_sub(front_id)?).ok()?;
+        let entry = self.hyperlink_table.get(offset)?;
+        if entry.id != id {
+            // Defensive: verify the window invariant instead of assuming it.
+            return None;
+        }
+        Some((
+            entry.id_param.as_ref().map(BoundedString::as_str),
+            entry.uri.as_str(),
+        ))
     }
 
     /// Iterates the hyperlink table oldest first; `(HyperlinkId, Option<id>,
@@ -1807,8 +1826,10 @@ impl State {
                     None => {
                         if self.next_hyperlink_id == u32::MAX {
                             // Once per 2^32 distinct links: clear the table
-                            // before resetting the id space so an id can
-                            // never be reissued for a different URI.
+                            // and restart the id space. Cells keep their
+                            // pre-wrap ids, so a stale id can resolve to a
+                            // post-wrap entry — bounded numeric reuse, stated
+                            // honestly in `HyperlinkEntry` (CTX-0490).
                             self.hyperlink_table.clear();
                             self.next_hyperlink_id = 0;
                         }

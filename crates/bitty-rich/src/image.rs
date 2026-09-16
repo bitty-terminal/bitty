@@ -17,6 +17,16 @@
 //! All arithmetic is overflow-checked and saturating where noted. No GPU,
 //! no filesystem, no window system. Deterministic for fixed insertion
 //! order.
+//!
+//! Admission is **backed** (CTX-0487): every record carries the decoded RGBA
+//! frame bytes it describes and a content fingerprint over them
+//! ([`payload_fingerprint`]), so a metadata-only entry with no backing bytes
+//! cannot exist (`NoBackingPayload` / `FrameCountMismatch` /
+//! `FrameLengthMismatch` reject inconsistent admission). Placements must
+//! share the target image's lifecycle generation (`StaleImage`, key-poison
+//! binding), and identifier counters fail closed (`IdExhausted`) instead of
+//! reusing live ids. The store remains headless: it never decodes, allocates
+//! GPU resources, or touches the filesystem.
 
 #![forbid(unsafe_code)]
 
@@ -210,11 +220,16 @@ pub enum AlternateScope {
 // Records
 // ---------------------------------------------------------------------------
 
-/// Decoded image metadata (headless, no pixel allocation).
+/// Decoded image record (headless; retains the decoded RGBA frames).
 ///
 /// `decoded_bytes` is `width * height * 4` for one frame; total animation
 /// bytes is `decoded_bytes * frame_count` and is bounded by
-/// [`IMAGE_STORE_MAX_BYTES`] at admission (IMG-7).
+/// [`IMAGE_STORE_MAX_BYTES`] at admission (IMG-7). `payload` retains exactly
+/// `total_bytes` bytes (all retained frames concatenated) and
+/// `payload_fingerprint` is the [`payload_fingerprint`] digest of those
+/// bytes, so a record's identity can never outlive or disagree with the
+/// backing bytes it was admitted with (metadata-only entries are
+/// unrepresentable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImage {
     /// Stable identifier.
@@ -237,6 +252,41 @@ pub struct DecodedImage {
     pub generation: u64,
     /// Optional compressed payload length (for diagnostics; not stored).
     pub compressed_len: usize,
+    /// Content fingerprint of the retained decoded frames.
+    pub payload_fingerprint: u64,
+    /// Retained decoded RGBA frames, concatenated
+    /// (invariant: `payload.len() == total_bytes`).
+    payload: Box<[u8]>,
+}
+
+impl DecodedImage {
+    /// Backing decoded RGBA bytes for every retained frame, concatenated.
+    ///
+    /// Invariant: `payload().len() == total_bytes`; the store never admits a
+    /// record without these bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// FNV-1a 64-bit content fingerprint (CTX-0487).
+///
+/// Std-only, deterministic, non-cryptographic: used to bind an admitted
+/// [`DecodedImage`] to the exact decoded bytes that were presented at
+/// admission (same key-poison class as the CTX-0467 background content
+/// hash). Callers that still hold payload bytes can recompute this value and
+/// compare it with [`DecodedImage::payload_fingerprint`] before use.
+#[must_use]
+pub fn payload_fingerprint(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Placement record binding one `ImageId` to geometry.
@@ -303,8 +353,29 @@ pub enum ImageStoreError {
     },
     /// Image not found (for placement admission).
     ImageNotFound(ImageId),
-    /// Placement for an evicted image (stale).
+    /// Placement for an evicted image (stale), or a placement whose
+    /// lifecycle generation disagrees with the target image's generation.
     StaleImage(ImageId),
+    /// Admission carried no backing frame bytes (metadata-only entry).
+    NoBackingPayload,
+    /// Backing frame count disagrees with the clamped declared frame count.
+    FrameCountMismatch {
+        /// Declared (clamped) frame count.
+        declared: u16,
+        /// Backing frames presented.
+        backed: usize,
+    },
+    /// A retained frame's byte length disagrees with the declared dimensions
+    /// (`expected = width * height * 4`).
+    FrameLengthMismatch {
+        /// Required bytes for one decoded frame.
+        expected: usize,
+        /// Provided bytes for the offending frame.
+        actual: usize,
+    },
+    /// Identifier space exhausted; admission fails closed instead of
+    /// wrapping to and reusing an id that may still be live.
+    IdExhausted,
 }
 
 impl std::fmt::Display for ImageStoreError {
@@ -325,6 +396,20 @@ impl std::fmt::Display for ImageStoreError {
             }
             Self::ImageNotFound(id) => write!(f, "image not found: {}", id.0),
             Self::StaleImage(id) => write!(f, "stale image: {}", id.0),
+            Self::NoBackingPayload => write!(f, "image admission requires backing frame bytes"),
+            Self::FrameCountMismatch { declared, backed } => {
+                write!(
+                    f,
+                    "frame count mismatch: declared {declared}, backed {backed}"
+                )
+            }
+            Self::FrameLengthMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "frame length mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::IdExhausted => write!(f, "identifier space exhausted"),
         }
     }
 }
@@ -340,7 +425,9 @@ impl std::error::Error for ImageStoreError {}
 /// Deterministic FIFO eviction: oldest images evicted first when at
 /// count cap (256) or byte cap (256 MiB). Same insertion order always
 /// yields same retained set and same `ImageId` sequence. Headless: no
-/// decoder, no GPU allocation, no I/O.
+/// decoder, no GPU allocation, no I/O. Every record retains exactly the
+/// decoded frame bytes it accounts for, so `total_bytes` is resident
+/// payload bytes rather than metadata-only accounting.
 #[derive(Debug, Clone)]
 pub struct ImageStore {
     images: VecDeque<DecodedImage>,
@@ -419,11 +506,21 @@ impl ImageStore {
 
     /// Inserts a decoded image, validating IMG-1..IMG-7 before allocation.
     ///
+    /// Backed admission (CTX-0487): after the cheap metadata checks (IMG-1,
+    /// zero dimensions, IMG-2, IMG-3, clamped frame count IMG-6, IMG-7),
+    /// `frames` must supply the decoded RGBA bytes for exactly the retained
+    /// frames (`width * height * 4` each). An empty slice is rejected
+    /// (`NoBackingPayload`), a wrong frame count (`FrameCountMismatch`), and
+    /// any frame whose length disagrees with the declared dimensions
+    /// (`FrameLengthMismatch`) — all before any eviction, id consumption, or
+    /// copy. Retained bytes are bound to `payload_fingerprint`.
+    ///
     /// `compressed_len` is the wire payload length (IMG-1, 4 MiB).
     /// `width`/`height` are decoded dimensions (IMG-2, 4096 cap).
-    /// `frame_count` is clamped to 64 (IMG-6, excess discarded).
+    /// `frame_count` is clamped to 64 (IMG-6, excess frames discarded).
     /// Returns the assigned [`ImageId`] on success, or a typed error with
-    /// no partial placement emitted.
+    /// no partial record emitted (no eviction, no id consumption).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &mut self,
         source: ImageSource,
@@ -431,6 +528,7 @@ impl ImageStore {
         height: u32,
         compressed_len: usize,
         frame_count: u16,
+        frames: &[&[u8]],
         generation: u64,
     ) -> Result<ImageId, ImageStoreError> {
         if compressed_len > IMAGE_MAX_COMPRESSED_BYTES {
@@ -459,14 +557,39 @@ impl ImageStore {
                 cap: IMAGE_MAX_DECODED_BYTES,
             });
         }
-        let frames = frame_count.clamp(1, IMAGE_MAX_FRAMES);
-        let total = decoded_bytes.saturating_mul(frames as usize);
+        let frames_len = frame_count.clamp(1, IMAGE_MAX_FRAMES);
+        let total = decoded_bytes.saturating_mul(usize::from(frames_len));
         if total > IMAGE_STORE_MAX_BYTES {
             return Err(ImageStoreError::AnimationTooLarge {
                 total,
                 cap: IMAGE_STORE_MAX_BYTES,
             });
         }
+        // Backed admission: every retained frame must be present, and each
+        // frame must match the declared decoded dimensions exactly.
+        if frames.is_empty() {
+            return Err(ImageStoreError::NoBackingPayload);
+        }
+        if frames.len() != usize::from(frames_len) {
+            return Err(ImageStoreError::FrameCountMismatch {
+                declared: frames_len,
+                backed: frames.len(),
+            });
+        }
+        for frame in frames {
+            if frame.len() != decoded_bytes {
+                return Err(ImageStoreError::FrameLengthMismatch {
+                    expected: decoded_bytes,
+                    actual: frame.len(),
+                });
+            }
+        }
+        // Identifier exhaustion fails closed before any eviction or copy:
+        // reusing a live id would poison caches keyed by that id.
+        let next_image_id = self
+            .next_image_id
+            .checked_add(1)
+            .ok_or(ImageStoreError::IdExhausted)?;
 
         // Admit: evict oldest images until both count and byte caps would be satisfied.
         while self.images.len() >= IMAGE_STORE_MAX_COUNT
@@ -483,8 +606,17 @@ impl ImageStore {
             }
         }
 
+        // Retain the exact bytes the record describes (backed admission).
+        let mut payload = Vec::with_capacity(total);
+        for frame in frames {
+            payload.extend_from_slice(frame);
+        }
+        debug_assert_eq!(payload.len(), total);
+        let payload = payload.into_boxed_slice();
+        let fingerprint = payload_fingerprint(&payload);
+
         let id = ImageId(self.next_image_id);
-        self.next_image_id = self.next_image_id.wrapping_add(1).max(1);
+        self.next_image_id = next_image_id;
 
         let image = DecodedImage {
             id,
@@ -493,24 +625,38 @@ impl ImageStore {
             width,
             height,
             decoded_bytes,
-            frame_count: frames,
+            frame_count: frames_len,
             total_bytes: total,
             generation,
             compressed_len,
+            payload_fingerprint: fingerprint,
+            payload,
         };
         self.images.push_back(image);
         self.total_bytes = self.total_bytes.saturating_add(total);
         Ok(id)
     }
 
-    /// Convenience: insert with default source Kitty and generation 0.
+    /// Convenience: insert a single-frame image (source Kitty, generation 0).
+    ///
+    /// `payload` must supply the decoded RGBA bytes for a `width x height`
+    /// frame; admission is backed exactly like [`Self::insert`].
     pub fn insert_simple(
         &mut self,
         width: u32,
         height: u32,
         compressed_len: usize,
+        payload: &[u8],
     ) -> Result<ImageId, ImageStoreError> {
-        self.insert(ImageSource::Kitty, width, height, compressed_len, 1, 0)
+        self.insert(
+            ImageSource::Kitty,
+            width,
+            height,
+            compressed_len,
+            1,
+            &[payload],
+            0,
+        )
     }
 
     /// Looks up an image by id.
@@ -565,7 +711,11 @@ impl ImageStore {
     /// Inserts a placement for an existing image.
     ///
     /// Validates that `image` exists; otherwise returns `ImageNotFound` with
-    /// no placement emitted. Evicts oldest placement when at 128 cap (FIFO).
+    /// no placement emitted. The placement lifecycle `generation` must equal
+    /// the target image's generation; a mismatch is rejected as
+    /// `StaleImage` with no placement emitted (CTX-0487 key-poison binding:
+    /// a placement can never outlive or cross its image's lifecycle).
+    /// Evicts oldest placement when at 128 cap (FIFO).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_placement(
         &mut self,
@@ -578,14 +728,23 @@ impl ImageStore {
         alternate_scope: AlternateScope,
         generation: u64,
     ) -> Result<PlacementId, ImageStoreError> {
-        if self.get(image).is_none() {
-            return Err(ImageStoreError::ImageNotFound(image));
+        let stored = self
+            .get(image)
+            .ok_or(ImageStoreError::ImageNotFound(image))?;
+        if stored.generation != generation {
+            return Err(ImageStoreError::StaleImage(image));
         }
+        // Identifier exhaustion fails closed before eviction or push:
+        // reusing a live id would poison caches keyed by that id.
+        let next_placement_id = self
+            .next_placement_id
+            .checked_add(1)
+            .ok_or(ImageStoreError::IdExhausted)?;
         if self.placements.len() >= IMAGE_MAX_PLACEMENTS {
             self.placements.pop_front();
         }
         let id = PlacementId(self.next_placement_id);
-        self.next_placement_id = self.next_placement_id.wrapping_add(1).max(1);
+        self.next_placement_id = next_placement_id;
         let placement = ImagePlacement {
             id,
             image,
@@ -641,6 +800,26 @@ impl ImageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Zero-filled RGBA bytes for one `width x height` frame (test fixture).
+    fn frame(width: u32, height: u32) -> Vec<u8> {
+        vec![0u8; width as usize * height as usize * 4]
+    }
+
+    /// `count` aliases of one frame: backs a declared animation count
+    /// without materializing every frame's bytes.
+    fn frames(frame: &[u8], count: usize) -> Vec<&[u8]> {
+        vec![frame; count]
+    }
+
+    /// At-cap payload-retaining tests serialize on this lock so the parallel
+    /// test harness does not stack multiple 256 MiB retained stores.
+    static HEAVY: Mutex<()> = Mutex::new(());
+
+    fn heavy_guard() -> MutexGuard<'static, ()> {
+        HEAVY.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn new_is_empty() {
@@ -655,7 +834,7 @@ mod tests {
     #[test]
     fn insert_and_lookup() {
         let mut store = ImageStore::new();
-        let id = store.insert_simple(64, 64, 1024).unwrap();
+        let id = store.insert_simple(64, 64, 1024, &frame(64, 64)).unwrap();
         assert_eq!(store.len(), 1);
         let img = store.get(id).unwrap();
         assert_eq!(img.width, 64);
@@ -674,6 +853,7 @@ mod tests {
                 100,
                 IMAGE_MAX_COMPRESSED_BYTES + 1,
                 1,
+                &frames(&frame(100, 100), 1),
                 0,
             )
             .unwrap_err();
@@ -685,11 +865,27 @@ mod tests {
     fn dimensions_too_large_denied() {
         let mut store = ImageStore::new();
         let err = store
-            .insert(ImageSource::Sixel, 4097, 100, 1024, 1, 0)
+            .insert(
+                ImageSource::Sixel,
+                4097,
+                100,
+                1024,
+                1,
+                &frames(&frame(4097, 100), 1),
+                0,
+            )
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
         let err = store
-            .insert(ImageSource::Sixel, 100, 5000, 1024, 1, 0)
+            .insert(
+                ImageSource::Sixel,
+                100,
+                5000,
+                1024,
+                1,
+                &frames(&frame(100, 5000), 1),
+                0,
+            )
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
     }
@@ -699,7 +895,15 @@ mod tests {
         let mut store = ImageStore::new();
         assert!(matches!(
             store
-                .insert(ImageSource::Kitty, 0, 10, 100, 1, 0)
+                .insert(
+                    ImageSource::Kitty,
+                    0,
+                    10,
+                    100,
+                    1,
+                    &frames(&frame(0, 10), 1),
+                    0
+                )
                 .unwrap_err(),
             ImageStoreError::ZeroDimension
         ));
@@ -707,23 +911,20 @@ mod tests {
 
     #[test]
     fn decoded_too_large_denied() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
-        // 4096x4096x4 = 64 MiB exactly OK; 4096x4096 exceeds? Actually 4096*4096*4 = 67_108_864 = 64 MiB, OK.
-        // Try 4096x4097 would exceed dimension first, so test overflow via large that exceeds decoded cap but not dimension:
-        // 4096x4096 is max, so we need a dimension within cap but decoded exceeds? But 4096x4096*4 is exactly cap.
-        // So we test that OK, and that larger dimension fails earlier. For decoded overflow, we can use 4096x4096 which is OK, then check that any larger would be dimension error.
-        // Instead test that decoded check fires: use 4096x4096 (OK) and then 4096x4096 with frame 64 to test animation too large? Let's test decoded too large with a hypothetical: width=4096 height=4096 is OK, but we can test that the check exists by using 4096x4096 with 4 bytes already cap.
-        // So we verify OK:
+        // 4096x4096x4 = 67_108_864 = 64 MiB exactly at the IMG-3 cap.
+        let frame = frame(4096, 4096);
         assert!(
             store
-                .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+                .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], 0)
                 .is_ok()
         );
         store.clear();
-        // Oversized via overflow-checked: use max u32 dimensions that would overflow? But they exceed dimension cap, so dimension check wins first.
-        // So decoded check is exercised via exact cap boundary.
+        // The decoded cap is exercised at its exact boundary; any larger
+        // dimension is rejected earlier by IMG-2.
         let err = store
-            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], 0)
             .unwrap();
         assert_eq!(
             store.get(err).unwrap().decoded_bytes,
@@ -734,12 +935,16 @@ mod tests {
     #[test]
     fn frame_count_clamped_to_64() {
         let mut store = ImageStore::new();
+        let frame = frame(16, 16);
+        // Declared 100 clamps to 64; exactly 64 backing frames are required.
         let id = store
-            .insert(ImageSource::Kitty, 16, 16, 100, 100, 0)
+            .insert(ImageSource::Kitty, 16, 16, 100, 100, &frames(&frame, 64), 0)
             .unwrap();
         assert_eq!(store.get(id).unwrap().frame_count, 64);
-        // frame 0 clamped to 1
-        let id2 = store.insert(ImageSource::Kitty, 16, 16, 100, 0, 0).unwrap();
+        // Declared 0 clamps to 1; exactly one backing frame is required.
+        let id2 = store
+            .insert(ImageSource::Kitty, 16, 16, 100, 0, &frames(&frame, 1), 0)
+            .unwrap();
         assert_eq!(store.get(id2).unwrap().frame_count, 1);
     }
 
@@ -747,9 +952,10 @@ mod tests {
     fn animation_too_large_denied_even_when_empty() {
         let mut store = ImageStore::new();
         // Use max decoded 64 MiB * 64 frames = 4 GiB > 256 MiB -> should be denied
-        // 4096x4096 is 64 MiB; with 64 frames total 4 GiB > 256 MiB
+        // 4096x4096 is 64 MiB; with 64 frames total 4 GiB > 256 MiB.
+        // IMG-7 fires before backing-frame validation, so no payload is needed.
         let err = store
-            .insert(ImageSource::Kitty, 4096, 4096, 1024, 64, 0)
+            .insert(ImageSource::Kitty, 4096, 4096, 1024, 64, &[], 0)
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::AnimationTooLarge { .. }));
     }
@@ -759,7 +965,7 @@ mod tests {
         let mut store = ImageStore::new();
         let mut ids = Vec::new();
         for _ in 0..IMAGE_STORE_MAX_COUNT + 5 {
-            ids.push(store.insert_simple(1, 1, 10).unwrap());
+            ids.push(store.insert_simple(1, 1, 10, &frame(1, 1)).unwrap());
         }
         assert_eq!(store.len(), IMAGE_STORE_MAX_COUNT);
         for evicted in ids.iter().take(5) {
@@ -772,21 +978,23 @@ mod tests {
 
     #[test]
     fn bounded_evicts_oldest_on_bytes() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // Each image 64x64*4=16KiB; fill until byte cap requires eviction.
         // Use 64 MiB images to exhaust quickly: 256 MiB / 64 MiB = 4 images.
+        let frame = frame(4096, 4096);
         let mut ids = Vec::new();
         for _ in 0..4 {
             ids.push(
                 store
-                    .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+                    .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], 0)
                     .unwrap(),
             );
         }
         assert_eq!(store.total_bytes(), 256 * 1024 * 1024);
         // Fifth should evict oldest
         let fifth = store
-            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], 0)
             .unwrap();
         assert_eq!(store.len(), 4);
         assert!(store.get(ids[0]).is_none());
@@ -797,7 +1005,7 @@ mod tests {
     #[test]
     fn remove_cleans_placements_and_bytes() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         let geom = PlacementGeometry::new(10, 10, 0);
         let pid = store
             .insert_placement(
@@ -823,7 +1031,7 @@ mod tests {
     #[test]
     fn placement_limits_128_evicts_oldest() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         let mut pids = Vec::new();
         for i in 0..IMAGE_MAX_PLACEMENTS + 5 {
             let pid = store
@@ -868,7 +1076,7 @@ mod tests {
     #[test]
     fn alternate_suppression_policy() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         let pid_inline = store
             .insert_placement(
                 img,
@@ -919,19 +1127,19 @@ mod tests {
         let mut a = ImageStore::new();
         let mut b = ImageStore::new();
         assert_eq!(
-            a.insert_simple(10, 10, 100).unwrap(),
-            b.insert_simple(10, 10, 100).unwrap()
+            a.insert_simple(10, 10, 100, &frame(10, 10)).unwrap(),
+            b.insert_simple(10, 10, 100, &frame(10, 10)).unwrap()
         );
         assert_eq!(
-            a.insert_simple(20, 20, 200).unwrap(),
-            b.insert_simple(20, 20, 200).unwrap()
+            a.insert_simple(20, 20, 200, &frame(20, 20)).unwrap(),
+            b.insert_simple(20, 20, 200, &frame(20, 20)).unwrap()
         );
     }
 
     #[test]
     fn clear_empties() {
         let mut store = ImageStore::new();
-        store.insert_simple(10, 10, 100).unwrap();
+        store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         store
             .insert_placement(
                 ImageId(1),
@@ -965,6 +1173,7 @@ mod tests {
                 100,
                 IMAGE_MAX_COMPRESSED_BYTES,
                 1,
+                &frames(&frame(100, 100), 1),
                 0,
             )
             .unwrap();
@@ -979,6 +1188,7 @@ mod tests {
                 100,
                 IMAGE_MAX_COMPRESSED_BYTES + 1,
                 1,
+                &frames(&frame(100, 100), 1),
                 0,
             )
             .unwrap_err();
@@ -990,10 +1200,12 @@ mod tests {
 
     #[test]
     fn dimensions_exact_cap_ok_one_over_denied_no_alloc() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // Exactly 4096 OK
+        let frame = frame(4096, 4096);
         let ok = store
-            .insert(ImageSource::Sixel, 4096, 4096, 1024, 1, 0)
+            .insert(ImageSource::Sixel, 4096, 4096, 1024, 1, &[&frame], 0)
             .unwrap();
         assert_eq!(
             store.get(ok).unwrap().decoded_bytes,
@@ -1001,14 +1213,14 @@ mod tests {
         );
         let len_before = store.len();
         let bytes_before = store.total_bytes();
-        // Width 4097 denied
+        // Width 4097 denied (IMG-2 fires before backing validation).
         let err = store
-            .insert(ImageSource::Sixel, 4097, 4096, 1024, 1, 0)
+            .insert(ImageSource::Sixel, 4097, 4096, 1024, 1, &[], 0)
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
         // Height 4097 denied
         let err2 = store
-            .insert(ImageSource::Sixel, 4096, 4097, 1024, 1, 0)
+            .insert(ImageSource::Sixel, 4096, 4097, 1024, 1, &[], 0)
             .unwrap_err();
         assert!(matches!(err2, ImageStoreError::DimensionsTooLarge { .. }));
         assert_eq!(store.len(), len_before, "no allocation on dimension bomb");
@@ -1017,10 +1229,12 @@ mod tests {
 
     #[test]
     fn decoded_exact_cap_ok_dimension_wins_over_decoded() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // 4096x4096*4 = 64 MiB exactly OK (IMG-3 cap)
+        let frame = frame(4096, 4096);
         let id = store
-            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, 0)
+            .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], 0)
             .unwrap();
         assert_eq!(
             store.get(id).unwrap().decoded_bytes,
@@ -1033,7 +1247,7 @@ mod tests {
         // pre-allocation.
         let len_before = store.len();
         let err = store
-            .insert(ImageSource::Kitty, 4096, 4097, 1024, 1, 0)
+            .insert(ImageSource::Kitty, 4096, 4097, 1024, 1, &[], 0)
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::DimensionsTooLarge { .. }));
         assert_eq!(store.len(), len_before);
@@ -1041,17 +1255,28 @@ mod tests {
 
     #[test]
     fn animation_total_boundary_256mib_ok_one_over_denied() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // 1024x1024*4 = 4 MiB per frame; *64 = 256 MiB exactly OK (IMG-7 cap via IMG-4)
+        let frame = frame(1024, 1024);
         let ok = store
-            .insert(ImageSource::Kitty, 1024, 1024, 1024, 64, 0)
+            .insert(
+                ImageSource::Kitty,
+                1024,
+                1024,
+                1024,
+                64,
+                &frames(&frame, 64),
+                0,
+            )
             .unwrap();
         assert_eq!(store.get(ok).unwrap().total_bytes, IMAGE_STORE_MAX_BYTES);
         store.clear();
         // 1025x1024*4*64 = 268_697_600 > 256 MiB must be rejected as AnimationTooLarge
-        // (dimensions within 4096 cap, so decoded passes, animation fails)
+        // (dimensions within 4096 cap, so decoded passes, animation fails before
+        // backing validation, so no payload is needed).
         let err = store
-            .insert(ImageSource::Kitty, 1025, 1024, 1024, 64, 0)
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 64, &[], 0)
             .unwrap_err();
         assert!(
             matches!(err, ImageStoreError::AnimationTooLarge { .. }),
@@ -1064,15 +1289,17 @@ mod tests {
     #[test]
     fn animation_frame_clamp_64_validates_total_pre_alloc() {
         let mut store = ImageStore::new();
-        // frame_count 100 clamped to 64, so same boundary as 64
+        // frame_count 100 clamped to 64, so same boundary as 64; IMG-7 fires
+        // before backing-frame validation (no payload needed).
         let err = store
-            .insert(ImageSource::Kitty, 1025, 1024, 1024, 100, 0)
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 100, &[], 0)
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::AnimationTooLarge { .. }));
         assert!(store.is_empty());
-        // frame_count 0 clamped to 1, so 1025x1024 with 0 frames = 1 frame = 4_198_400 < 64 MiB OK
+        // frame_count 0 clamped to 1: 1025x1024 with 1 frame = 4_198_400 < 64 MiB OK
+        let frame = frame(1025, 1024);
         let ok = store
-            .insert(ImageSource::Kitty, 1025, 1024, 1024, 0, 0)
+            .insert(ImageSource::Kitty, 1025, 1024, 1024, 0, &[&frame], 0)
             .unwrap();
         assert_eq!(store.get(ok).unwrap().frame_count, 1);
         assert!(store.get(ok).unwrap().total_bytes <= IMAGE_MAX_DECODED_BYTES);
@@ -1081,14 +1308,15 @@ mod tests {
     #[test]
     fn animation_single_image_exceeds_store_cap_even_when_empty_denied() {
         let mut store = ImageStore::new();
-        // 2048x2048*4=16 MiB *64=1 GiB >256 MiB
+        // 2048x2048*4=16 MiB *64=1 GiB >256 MiB; IMG-7 fires before backing
+        // validation (no payload needed).
         let err = store
-            .insert(ImageSource::Kitty, 2048, 2048, 1024, 64, 0)
+            .insert(ImageSource::Kitty, 2048, 2048, 1024, 64, &[], 0)
             .unwrap_err();
         assert!(matches!(err, ImageStoreError::AnimationTooLarge { .. }));
         assert!(store.is_empty());
         // Store remains usable after bomb
-        let ok = store.insert_simple(10, 10, 100).unwrap();
+        let ok = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         assert!(store.get(ok).is_some());
     }
 
@@ -1096,7 +1324,7 @@ mod tests {
     fn decompression_bomb_pre_allocation_no_alloc_peak_under_64mib_per_image() {
         let mut store = ImageStore::new();
         // Seed with one valid image
-        let valid = store.insert_simple(64, 64, 1024).unwrap();
+        let valid = store.insert_simple(64, 64, 1024, &frame(64, 64)).unwrap();
         let len_before = store.len();
         let bytes_before = store.total_bytes();
         // Bomb 1: huge compressed payload (IMG-1)
@@ -1107,18 +1335,21 @@ mod tests {
                 64,
                 IMAGE_MAX_COMPRESSED_BYTES + 1024,
                 1,
+                &frames(&frame(64, 64), 1),
                 0,
             )
             .unwrap_err();
         assert!(matches!(e1, ImageStoreError::CompressedTooLarge { .. }));
-        // Bomb 2: huge dimensions (IMG-2) — small compressed_len but decoded would be huge
+        // Bomb 2: huge dimensions (IMG-2) — small compressed_len but decoded would
+        // be huge; IMG-2 fires before backing validation (no payload needed).
         let e2 = store
-            .insert(ImageSource::Kitty, 8192, 8192, 100, 1, 0)
+            .insert(ImageSource::Kitty, 8192, 8192, 100, 1, &[], 0)
             .unwrap_err();
         assert!(matches!(e2, ImageStoreError::DimensionsTooLarge { .. }));
-        // Bomb 3: animation bomb — dimensions OK but total animation >256 MiB (IMG-7)
+        // Bomb 3: animation bomb — dimensions OK but total animation >256 MiB (IMG-7;
+        // fires before backing validation, so no payload is needed).
         let e3 = store
-            .insert(ImageSource::Kitty, 4096, 4096, 100, 64, 0)
+            .insert(ImageSource::Kitty, 4096, 4096, 100, 64, &[], 0)
             .unwrap_err();
         assert!(matches!(e3, ImageStoreError::AnimationTooLarge { .. }));
         // No allocation occurred for any bomb: len and bytes unchanged, valid still present
@@ -1139,7 +1370,7 @@ mod tests {
         // Insert 500 tiny images (1x1*4=4 B) — exceeds 256 count cap, must FIFO evict
         let mut ids = Vec::new();
         for _ in 0..500 {
-            ids.push(store.insert_simple(1, 1, 10).unwrap());
+            ids.push(store.insert_simple(1, 1, 10, &frame(1, 1)).unwrap());
         }
         assert_eq!(store.len(), IMAGE_STORE_MAX_COUNT);
         assert!(store.len() <= 256);
@@ -1154,18 +1385,20 @@ mod tests {
         // Deterministic: re-inserting same sequence elsewhere would yield same retained set
         let mut other = ImageStore::new();
         for _ in 0..500 {
-            other.insert_simple(1, 1, 10).unwrap();
+            other.insert_simple(1, 1, 10, &frame(1, 1)).unwrap();
         }
         assert_eq!(store.drain_ordered(), other.drain_ordered());
     }
 
     #[test]
     fn sustained_load_bytes_invariant_fifo_256mib() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // Each 4096x4096 is 64 MiB; 4 fills 256 MiB. Repeated inserts must stay within cap via FIFO.
+        let frame = frame(4096, 4096);
         for i in 0..20 {
             store
-                .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, i)
+                .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&frame], i)
                 .unwrap();
             assert!(
                 store.total_bytes() <= IMAGE_STORE_MAX_BYTES,
@@ -1183,16 +1416,18 @@ mod tests {
 
     #[test]
     fn sustained_load_mixed_sizes_byte_and_count_invariants() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // Alternate small and large images to stress both caps
+        let large = frame(4096, 4096);
         for i in 0..300 {
             if i % 10 == 0 {
                 // Large 64 MiB every 10th
                 store
-                    .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, i as u64)
+                    .insert(ImageSource::Kitty, 4096, 4096, 1024, 1, &[&large], i as u64)
                     .unwrap();
             } else {
-                store.insert_simple(64, 64, 1024).unwrap();
+                store.insert_simple(64, 64, 1024, &frame(64, 64)).unwrap();
             }
             assert!(store.total_bytes() <= IMAGE_STORE_MAX_BYTES);
             assert!(store.len() <= IMAGE_STORE_MAX_COUNT);
@@ -1205,8 +1440,8 @@ mod tests {
     #[test]
     fn placement_admission_128_fifo_and_image_eviction_cleans_placements() {
         let mut store = ImageStore::new();
-        let img1 = store.insert_simple(10, 10, 100).unwrap();
-        let img2 = store.insert_simple(10, 10, 100).unwrap();
+        let img1 = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
+        let img2 = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         // Fill placements to 128 for img1
         let mut pids = Vec::new();
         for i in 0..IMAGE_MAX_PLACEMENTS {
@@ -1258,7 +1493,7 @@ mod tests {
         assert!(store.get_placement(pid2).is_some());
         // Flood images to evict img1 and img2 (need 256 images to push them out)
         for _ in 0..IMAGE_STORE_MAX_COUNT {
-            store.insert_simple(1, 1, 10).unwrap();
+            store.insert_simple(1, 1, 10, &frame(1, 1)).unwrap();
         }
         assert!(store.get(img1).is_none());
         assert!(store.get(img2).is_none());
@@ -1300,7 +1535,11 @@ mod tests {
         let mut store = ImageStore::new();
         let mut ids = Vec::new();
         for _ in 0..10 {
-            ids.push(store.insert_simple(100, 100, 1024).unwrap());
+            ids.push(
+                store
+                    .insert_simple(100, 100, 1024, &frame(100, 100))
+                    .unwrap(),
+            );
         }
         let sum: usize = store.iter().map(|img| img.total_bytes).sum();
         assert_eq!(sum, store.total_bytes());
@@ -1321,13 +1560,29 @@ mod tests {
         let mut store = ImageStore::new();
         assert!(matches!(
             store
-                .insert(ImageSource::Kitty, 0, 0, 100, 1, 0)
+                .insert(
+                    ImageSource::Kitty,
+                    0,
+                    0,
+                    100,
+                    1,
+                    &frames(&frame(0, 0), 1),
+                    0
+                )
                 .unwrap_err(),
             ImageStoreError::ZeroDimension
         ));
         assert!(matches!(
             store
-                .insert(ImageSource::Kitty, 10, 0, 100, 1, 0)
+                .insert(
+                    ImageSource::Kitty,
+                    10,
+                    0,
+                    100,
+                    1,
+                    &frames(&frame(10, 0), 1),
+                    0
+                )
                 .unwrap_err(),
             ImageStoreError::ZeroDimension
         ));
@@ -1344,7 +1599,15 @@ mod tests {
             ImageSource::File,
         ] {
             let id = store
-                .insert(source, 10, 10, IMAGE_MAX_COMPRESSED_BYTES, 1, 0)
+                .insert(
+                    source,
+                    10,
+                    10,
+                    IMAGE_MAX_COMPRESSED_BYTES,
+                    1,
+                    &frames(&frame(10, 10), 1),
+                    0,
+                )
                 .unwrap();
             assert_eq!(store.get(id).unwrap().source, source);
             assert_eq!(
@@ -1358,7 +1621,7 @@ mod tests {
     #[test]
     fn placement_anchor_variants_all_ok() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         let anchors = [
             PlacementAnchor::Zone(1),
             PlacementAnchor::Line(2),
@@ -1389,7 +1652,7 @@ mod tests {
     #[test]
     fn scroll_behavior_variants_placement_ok() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         for scroll in [
             ScrollBehavior::Inline,
             ScrollBehavior::PinnedBelow,
@@ -1414,7 +1677,7 @@ mod tests {
     #[test]
     fn alternate_scope_matrix_suppression() {
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         // Suppress vs Allow for each scroll
         let pid_inline_suppress = store
             .insert_placement(
@@ -1497,9 +1760,27 @@ mod tests {
     #[test]
     fn generation_does_not_affect_admission() {
         let mut store = ImageStore::new();
-        let id1 = store.insert(ImageSource::Kitty, 10, 10, 100, 1, 0).unwrap();
+        let id1 = store
+            .insert(
+                ImageSource::Kitty,
+                10,
+                10,
+                100,
+                1,
+                &frames(&frame(10, 10), 1),
+                0,
+            )
+            .unwrap();
         let id2 = store
-            .insert(ImageSource::Kitty, 10, 10, 100, 1, u64::MAX)
+            .insert(
+                ImageSource::Kitty,
+                10,
+                10,
+                100,
+                1,
+                &frames(&frame(10, 10), 1),
+                u64::MAX,
+            )
             .unwrap();
         assert_ne!(id1, id2);
         assert_eq!(store.get(id1).unwrap().generation, 0);
@@ -1510,7 +1791,7 @@ mod tests {
     #[test]
     fn remove_nonexistent_returns_false_no_side_effect() {
         let mut store = ImageStore::new();
-        let id = store.insert_simple(10, 10, 100).unwrap();
+        let id = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         let bytes_before = store.total_bytes();
         assert!(!store.remove(ImageId(999_999)));
         assert!(store.get(id).is_some());
@@ -1523,13 +1804,13 @@ mod tests {
         let mut store = ImageStore::new();
         let mut ids = Vec::new();
         for _ in 0..10 {
-            ids.push(store.insert_simple(1, 1, 10).unwrap());
+            ids.push(store.insert_simple(1, 1, 10, &frame(1, 1)).unwrap());
         }
         let ordered = store.drain_ordered();
         assert_eq!(ordered, ids);
         // Flood to evict oldest 5
         for _ in 0..IMAGE_STORE_MAX_COUNT {
-            store.insert_simple(1, 1, 10).unwrap();
+            store.insert_simple(1, 1, 10, &frame(1, 1)).unwrap();
         }
         assert_eq!(store.len(), IMAGE_STORE_MAX_COUNT);
         let ordered2 = store.drain_ordered();
@@ -1546,7 +1827,9 @@ mod tests {
     fn iter_len_total_bytes_consistent() {
         let mut store = ImageStore::new();
         for _ in 0..5 {
-            store.insert_simple(100, 100, 1024).unwrap();
+            store
+                .insert_simple(100, 100, 1024, &frame(100, 100))
+                .unwrap();
         }
         assert_eq!(store.iter().count(), store.len());
         let sum: usize = store.iter().map(|img| img.total_bytes).sum();
@@ -1574,7 +1857,7 @@ mod tests {
         let mut store = ImageStore::new();
         assert!(store.is_empty());
         assert!(store.placement_is_empty());
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let img = store.insert_simple(10, 10, 100, &frame(10, 10)).unwrap();
         assert!(!store.is_empty());
         assert!(store.placement_is_empty());
         store
@@ -1600,7 +1883,7 @@ mod tests {
         let mut store = ImageStore::new();
         let mut ids = Vec::new();
         for _ in 0..3 {
-            ids.push(store.insert_simple(64, 64, 1024).unwrap());
+            ids.push(store.insert_simple(64, 64, 1024, &frame(64, 64)).unwrap());
         }
         assert!(store.total_bytes() > 0);
         for id in ids {
@@ -1610,7 +1893,7 @@ mod tests {
         assert!(store.is_empty());
         // Re-fill and clear
         for _ in 0..3 {
-            store.insert_simple(64, 64, 1024).unwrap();
+            store.insert_simple(64, 64, 1024, &frame(64, 64)).unwrap();
         }
         store.clear();
         assert_eq!(store.total_bytes(), 0);
@@ -1624,8 +1907,10 @@ mod tests {
             let w = 10 + (i % 10) as u32;
             let h = 10 + (i % 5) as u32;
             assert_eq!(
-                a.insert_simple(w, h, 100 + i as usize).unwrap(),
-                b.insert_simple(w, h, 100 + i as usize).unwrap()
+                a.insert_simple(w, h, 100 + i as usize, &frame(w, h))
+                    .unwrap(),
+                b.insert_simple(w, h, 100 + i as usize, &frame(w, h))
+                    .unwrap()
             );
         }
         // Placement ids also deterministic
@@ -1672,9 +1957,13 @@ mod tests {
         let full = ClipRect::full();
         assert_eq!(full.width, u16::MAX);
         assert_eq!(full.height, u16::MAX);
-        // Insert with custom clip/geom retained
+        // Insert with custom clip/geom retained (image lifecycle generation 7,
+        // matching the placement generation below).
         let mut store = ImageStore::new();
-        let img = store.insert_simple(10, 10, 100).unwrap();
+        let frame = frame(10, 10);
+        let img = store
+            .insert(ImageSource::Kitty, 10, 10, 100, 1, &[&frame], 7)
+            .unwrap();
         let pid = store
             .insert_placement(
                 img,
@@ -1696,13 +1985,208 @@ mod tests {
 
     #[test]
     fn animation_frame_64_boundary_total_at_256mib() {
+        let _heavy = heavy_guard();
         let mut store = ImageStore::new();
         // 1024x1024=4MiB per frame *64=256MiB exactly at cap — should succeed
+        let frame = frame(1024, 1024);
         let id = store
-            .insert(ImageSource::Kitty, 1024, 1024, 1024, 64, 0)
+            .insert(
+                ImageSource::Kitty,
+                1024,
+                1024,
+                1024,
+                64,
+                &frames(&frame, 64),
+                0,
+            )
             .unwrap();
         assert_eq!(store.get(id).unwrap().frame_count, 64);
         assert_eq!(store.get(id).unwrap().total_bytes, 256 * 1024 * 1024);
         assert_eq!(store.total_bytes(), 256 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // CTX-0487 adversarial: metadata-only admission, frame binding, key poison
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_metadata_only_admission_denied() {
+        // Hostile: a 100x100 image declared with zero backing frames. On the
+        // pre-fix base this was admitted as a metadata-only entry (red);
+        // backed admission rejects it with nothing emitted.
+        let mut store = ImageStore::new();
+        let err = store
+            .insert(ImageSource::Kitty, 100, 100, 1024, 1, &[], 0)
+            .unwrap_err();
+        assert_eq!(err, ImageStoreError::NoBackingPayload);
+        assert!(store.is_empty());
+        assert_eq!(store.total_bytes(), 0);
+        // The convenience path cannot be metadata-only either: the frame bytes
+        // are required by type.
+        let payload = frame(100, 100);
+        assert!(store.insert_simple(100, 100, 1024, &payload).is_ok());
+    }
+
+    #[test]
+    fn probe_frame_binding_mismatch_denied() {
+        let mut store = ImageStore::new();
+        let payload = frame(10, 10);
+        // Declared count 2, backed 1.
+        let err = store
+            .insert(ImageSource::Kitty, 10, 10, 1024, 2, &[&payload], 0)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ImageStoreError::FrameCountMismatch {
+                declared: 2,
+                backed: 1
+            }
+        );
+        // Declared count 1, backed 2.
+        let err = store
+            .insert(
+                ImageSource::Kitty,
+                10,
+                10,
+                1024,
+                1,
+                &[&payload, &payload],
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ImageStoreError::FrameCountMismatch {
+                declared: 1,
+                backed: 2
+            }
+        );
+        // Wrong per-frame length (399 and 401 bytes for 10x10x4 = 400).
+        let short = vec![0u8; 399];
+        let err = store
+            .insert(ImageSource::Kitty, 10, 10, 1024, 1, &[&short], 0)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ImageStoreError::FrameLengthMismatch {
+                expected: 400,
+                actual: 399
+            }
+        );
+        let long = vec![0u8; 401];
+        let err = store
+            .insert(ImageSource::Kitty, 10, 10, 1024, 1, &[&long], 0)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ImageStoreError::FrameLengthMismatch {
+                expected: 400,
+                actual: 401
+            }
+        );
+        assert!(store.is_empty(), "no partial record on any mismatch");
+    }
+
+    #[test]
+    fn probe_placement_generation_poison_denied() {
+        let mut store = ImageStore::new();
+        let payload = frame(10, 10);
+        // Image lifecycle generation 0; hostile placement claims 42.
+        let img = store.insert_simple(10, 10, 100, &payload).unwrap();
+        let err = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                42,
+            )
+            .unwrap_err();
+        assert_eq!(err, ImageStoreError::StaleImage(img));
+        assert!(store.placement_is_empty());
+        // Matching generation admits.
+        assert!(
+            store
+                .insert_placement(
+                    img,
+                    PlacementAnchor::Zone(1),
+                    PlacementGeometry::new(1, 1, 0),
+                    ClipRect::full(),
+                    ScrollBehavior::Inline,
+                    true,
+                    AlternateScope::Suppress,
+                    0,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn probe_content_identity_not_metadata_aliased() {
+        let mut store = ImageStore::new();
+        let a = vec![0x11u8; 4 * 4 * 4];
+        let b = vec![0x22u8; 4 * 4 * 4];
+        let ida = store
+            .insert(ImageSource::Kitty, 4, 4, 4, 1, &[&a], 0)
+            .unwrap();
+        let idb = store
+            .insert(ImageSource::Kitty, 4, 4, 4, 1, &[&b], 0)
+            .unwrap();
+        let ra = store.get(ida).unwrap();
+        let rb = store.get(idb).unwrap();
+        // Identical metadata, different bytes: content binding differs.
+        assert_ne!(ra.payload_fingerprint, rb.payload_fingerprint);
+        assert_eq!(ra.payload(), a.as_slice());
+        assert_eq!(rb.payload(), b.as_slice());
+        let ra_fingerprint = ra.payload_fingerprint;
+        assert_eq!(ra_fingerprint, payload_fingerprint(&a));
+        assert_eq!(ra_fingerprint, payload_fingerprint(ra.payload()));
+        // Same bytes produce the same fingerprint (id stays per-insert).
+        let idc = store
+            .insert(ImageSource::Kitty, 4, 4, 4, 1, &[&a], 0)
+            .unwrap();
+        assert_eq!(store.get(idc).unwrap().payload_fingerprint, ra_fingerprint);
+        // Retained payload length always matches the accounted total.
+        for img in store.iter() {
+            assert_eq!(img.payload().len(), img.total_bytes);
+        }
+    }
+
+    #[test]
+    fn probe_id_exhaustion_fails_closed() {
+        let mut store = ImageStore::new();
+        let payload = frame(1, 1);
+        // Simulate wraparound at the counter: never reuse a live id; fail
+        // closed instead (pre-fix `wrapping_add(1).max(1)` reused id 1).
+        store.next_image_id = u64::MAX;
+        let err = store.insert_simple(1, 1, 10, &payload).unwrap_err();
+        assert_eq!(err, ImageStoreError::IdExhausted);
+        assert!(store.is_empty(), "exhaustion emits nothing");
+        assert!(store.get(ImageId(1)).is_none(), "no id-1 reuse");
+
+        store.next_image_id = 1;
+        let img = store.insert_simple(1, 1, 10, &payload).unwrap();
+        store.next_placement_id = u64::MAX;
+        let err = store
+            .insert_placement(
+                img,
+                PlacementAnchor::Zone(1),
+                PlacementGeometry::new(1, 1, 0),
+                ClipRect::full(),
+                ScrollBehavior::Inline,
+                true,
+                AlternateScope::Suppress,
+                0,
+            )
+            .unwrap_err();
+        assert_eq!(err, ImageStoreError::IdExhausted);
+        assert!(store.placement_is_empty());
+        assert!(
+            store.get_placement(PlacementId(1)).is_none(),
+            "no placement id-1 reuse"
+        );
     }
 }

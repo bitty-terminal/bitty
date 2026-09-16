@@ -694,26 +694,16 @@ pub(crate) fn validate_resolved(resolved: &ResolvedSpawn) -> Result<(), IpcError
 pub(crate) fn spawn_process(
     request: &bitty_ipc::execution::ExecutionRequest,
 ) -> Result<bitty_ipc::execution::RawExecutionOutput, IpcError> {
-    use std::process::{Command, Stdio};
-
     use bitty_ipc::execution::{EffectState, ExecutionStatus, RawExecutionOutput};
 
-    let mut command = Command::new(&request.executable);
-    command.args(&request.args);
-    if let Some(cwd) = &request.cwd {
-        command.current_dir(cwd);
-    }
-    // Closed environment: never inherit ambient; explicit vars only.
-    command.env_clear();
-    if let EnvPolicy::Explicit { vars } = &request.env_policy {
-        for var in vars {
-            command.env(&var.name, &var.value);
-        }
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // CTX-0511: argv-only, closed-environment command construction is shared
+    // with the job supervisor so the two execution surfaces cannot drift.
+    let mut command = crate::execution::closed_pipe_command(
+        &request.executable,
+        &request.args,
+        request.cwd.as_deref(),
+        &request.env_policy,
+    );
     let mut child = command.spawn().map_err(|error| IpcError::Unavailable {
         reason: format!(
             "spawn failed for '{}': {}",

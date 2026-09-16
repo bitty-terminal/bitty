@@ -40,6 +40,9 @@ diagram lives in `src/lib.rs`.
   panes, present, plugin, search, selection, and workspace slices.
 - `src/queue.rs` — bounded cold-path event queue.
 - `src/registry.rs` and `src/registry/` — command and panel registries.
+- `src/execution.rs` and `src/execution/` — phase-1 execution supervisor
+  (`CTX-0511`): AI-agnostic async job registry, job model, and lifecycle
+  events above the PTY/process primitives.
 - `src/plugin_runtime/` — plugin runtime wiring and services.
 - `src/config.rs` — runtime-side configuration application.
 - `src/workspace.rs`, `src/tabs.rs` — workspace and tab orchestration.

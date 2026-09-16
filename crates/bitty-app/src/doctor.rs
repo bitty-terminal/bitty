@@ -527,17 +527,18 @@ pub fn check_shell(shell: Option<&str>, exists: bool, executable: bool) -> Docto
     }
 }
 
-/// Image protocols, reported honestly: kitty graphics is a bounded
-/// placeholder stub and sixel is unsupported, so this check is informational
-/// (warn) rather than a pass.
+/// Image protocols, reported honestly: kitty graphics is supported as a
+/// bounded subset (inline images paint; transmit-only and unknown actions
+/// store without painting) and sixel is unsupported, so this check stays an
+/// informational capability report (warn) rather than an installation gate.
 #[must_use]
 pub fn check_image_protocols() -> DoctorCheck {
     DoctorCheck::warn(
         "images",
         "Image protocols",
-        "no action needed: text, braille/block fallbacks, and hyperlinks work; inline images arrive in a later slice"
+        "no action needed: text, braille/block fallbacks, hyperlinks, and bounded kitty inline images work; sixel is unsupported"
             .to_string(),
-        "kitty-graphics: placeholder stub only; sixel: unsupported".to_string(),
+        "kitty-graphics: supported (bounded); sixel: unsupported".to_string(),
     )
 }
 

@@ -225,8 +225,8 @@ const MAX_PENDING_INPUT: usize = 8192;
 
 /// Cross-thread PTY readability callback.
 ///
-/// Invoked exactly once per readability signal (per forwarded chunk plus once
-/// on EOF) from the forwarder thread — never on a timer, never when quiet.
+/// Invoked exactly once per forwarded batch plus once on EOF (CTX-0476 waker
+/// merge) from the forwarder thread — never on a timer, never when quiet.
 /// Production wires this to [`bitty_platform::EventWaker::wake_pty`];
 /// headless tests wire it to a counter/channel. Only `Send` is required:
 /// the forwarder thread owns its clone and is the sole caller.
@@ -286,6 +286,31 @@ pub(super) fn join_forwarder_with_timeout(
     // must stay idempotent and Runtime-independent (see `PtyWaker` docs).
     false
 }
+
+/// Maximum chunks drained per [`Runtime::poll_pty`] call (CTX-0476).
+///
+/// Replaces the prior 1024-chunk collect (8 MiB worst-case stall on the
+/// render thread). 32 × 8 KiB = 256 KiB matches the worst-case total
+/// buffered across both pump stages, so one poll can catch up a full
+/// pipeline without stalling a frame.
+pub const POLL_PTY_MAX_CHUNKS: usize = 32;
+
+/// Maximum bytes drained per [`Runtime::poll_pty`] call (CTX-0476).
+///
+/// Byte budget mirrors the chunk budget at the maximum chunk size
+/// (`POLL_PTY_MAX_CHUNKS` × `READ_CHUNK_SIZE`); a flood of max-size chunks
+/// stops at the same bound as a flood of small ones. The remainder stays
+/// queued under backpressure for the next frame.
+pub const POLL_PTY_MAX_BYTES: usize = POLL_PTY_MAX_CHUNKS * bitty_pty::READ_CHUNK_SIZE;
+
+/// Time budget per [`Runtime::poll_pty`] call (CTX-0476).
+///
+/// Parsing is CPU-bound; without a time bound a hostile child emitting
+/// pathological escape sequences could stall the render thread even within
+/// the byte budget. 10 ms keeps the poll inside a frame budget (mirrors
+/// `SYNC_UPDATE_DEFER_TIMEOUT` order and the 10 ms spawn-poll cadence);
+/// the remainder is picked up on the next poll.
+pub const POLL_PTY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Full compact banner visible duration (CTX-0192).
 ///

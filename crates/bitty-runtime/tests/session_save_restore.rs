@@ -526,3 +526,82 @@ fn workspace_close_respawns_loaded_pending_panes_and_purges_removed() {
         "removed leaves must not linger pending"
     );
 }
+
+/// CTX-0501 (CTX-0461 residual): a close that destroys the leaf owning the
+/// runtime-global primary re-homes the grid onto the loaded slot's focused
+/// leaf. When that leaf still carries a pending restore, the close respawn
+/// hook skips it (it is the live primary owner, not a pending pane), so the
+/// captured history must drain into the primary grid — parity with
+/// `rehydrate_pane`'s owner branch — instead of lingering in the pending map
+/// with no path that could ever spawn it.
+#[test]
+#[cfg(unix)]
+fn workspace_close_rehomes_primary_onto_pending_leaf_and_drains_restore() {
+    bitty_test_support::require_pty!();
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.spawn_shell("/bin/sh")
+        .expect("primary shell records recipe");
+
+    let leaf = |id: u64, history: &str| WorkspaceSnapshot {
+        seq: id,
+        name: format!("ws{id}"),
+        layout: LayoutNode::leaf(View::new(ViewId::new(id), 80, 24)),
+        focus: Some(ViewId::new(id)),
+        panes: vec![PaneSnapshot {
+            view: ViewId::new(id),
+            cwd: None,
+            scrollback: vec![history.to_string()],
+        }],
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![leaf(100, "ws0-history"), leaf(200, "ws1-history")],
+        active: 0,
+        mru: vec![0, 1],
+    };
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(100)),
+        "the active slot's focused leaf owns the primary after restore"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        1,
+        "ws1's history waits pending for its first switch"
+    );
+    assert!(!rt.has_pane_session(&ViewId::new(200)));
+
+    // Closing the primary-owner workspace destroys leaf 100 and loads ws1;
+    // the grid re-homes onto ws1's focused leaf, which is still pending.
+    assert_eq!(rt.workspace_close_at(0).expect("close primary owner"), 0);
+    assert_eq!(
+        rt.primary_view(),
+        Some(ViewId::new(200)),
+        "the grid re-homes onto the loaded focused leaf"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "the re-homed owner's restore must drain, not linger unclaimed"
+    );
+    assert!(
+        !rt.has_pane_session(&ViewId::new(200)),
+        "primary ownership is not a pane spawn"
+    );
+    let history: Vec<String> = rt
+        .state()
+        .scrollback()
+        .map(|line| {
+            line.cells
+                .iter()
+                .filter(|c| !c.spacer)
+                .map(|c| c.glyph)
+                .collect::<String>()
+        })
+        .collect();
+    assert!(
+        history.iter().any(|line| line.contains("ws1-history")),
+        "captured history must hydrate into the primary grid: {history:?}"
+    );
+}

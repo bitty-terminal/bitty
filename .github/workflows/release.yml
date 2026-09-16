@@ -425,9 +425,104 @@ jobs:
               bitty --version
             '
 
+  # macOS Universal 2 DMG (CTX-0454 / 034 item 9): fuse the two macOS slices
+  # into one `Bitty.app` inside `Bitty-<version>-universal.dmg` so ordinary
+  # users never choose a target triple. The app is intentionally unsigned
+  # (codesign/notarize is 034 item 11); the bare triple binaries keep shipping
+  # for Homebrew and direct downloads. Assembly lives in
+  # `scripts/make-macos-dmg.sh` and the step verifies the DMG by mounting it
+  # and launching both slices before anything is published.
+  macos-universal:
+    name: macOS Universal 2 DMG
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download macOS build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bitty-*-apple-darwin
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(bash scripts/check-release-version.sh --print)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+
+      - name: Assemble Bitty.app and create DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="dist/Bitty-${VERSION}-universal.dmg"
+          bash scripts/make-macos-dmg.sh \
+            --version "$VERSION" \
+            --arm64 dist/bitty-aarch64-apple-darwin \
+            --x86_64 dist/bitty-x86_64-apple-darwin \
+            --output "$DMG"
+          shasum -a 256 "$DMG" | tee "$DMG.sha256"
+
+      - name: Verify DMG mount, Universal 2 slices, and both-arch launches
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="dist/Bitty-${VERSION}-universal.dmg"
+          MOUNT_DIR="$(mktemp -d)"
+          trap 'hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1 || true' EXIT
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+          APP_BIN="$MOUNT_DIR/Bitty.app/Contents/MacOS/bitty"
+          if [[ ! -x "$APP_BIN" ]]; then
+            echo "::error::Bitty.app binary missing or not executable"
+            exit 1
+          fi
+          ARCHS="$(lipo -archs "$APP_BIN")"
+          echo "universal slices: $ARCHS"
+          if [[ "$ARCHS" != *arm64* || "$ARCHS" != *x86_64* ]]; then
+            echo "::error::bundled binary is not Universal 2: $ARCHS"
+            exit 1
+          fi
+          OUT="$("$APP_BIN" --version)"
+          echo "arm64 launch: $OUT"
+          if [[ "$OUT" != *"$VERSION"* ]]; then
+            echo "::error::arm64 version mismatch: $OUT"
+            exit 1
+          fi
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          OUT="$(arch -x86_64 "$APP_BIN" --version)"
+          echo "x86_64 (Rosetta) launch: $OUT"
+          if [[ "$OUT" != *"$VERSION"* ]]; then
+            echo "::error::x86_64 version mismatch: $OUT"
+            exit 1
+          fi
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-macos-universal
+          path: dist/*.dmg*
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Create GitHub Release
-    needs: [build, build-alpine, verify-alpine]
+    needs: [build, build-alpine, verify-alpine, macos-universal]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')

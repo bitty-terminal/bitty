@@ -41,10 +41,12 @@ diagram lives in `src/lib.rs`.
 - `src/queue.rs` — bounded cold-path event queue.
 - `src/registry.rs` and `src/registry/` — command and panel registries.
 - `src/execution.rs` and `src/execution/` — execution supervisor
-  (`CTX-0511` foundation + `CTX-0513` delivery): AI-agnostic async job
-  registry, job model, bounded per-job output store with tail/filter reads,
-  and critical/observation event delivery with reconnect replay above the
-  PTY/process primitives.
+  (`CTX-0511` foundation + `CTX-0513` delivery + `CTX-0514` capability-scoped
+  operations): AI-agnostic async job registry, job model, bounded per-job
+  output store with tail/filter reads, critical/observation event delivery
+  with reconnect replay, and per-principal per-operation grants
+  (observe/read_output/write_input/signal/cancel/attach/transfer) enforced
+  in-process with deny-by-default above the PTY/process primitives.
 - `src/plugin_runtime/` — plugin runtime wiring and services.
 - `src/config.rs` — runtime-side configuration application.
 - `src/workspace.rs`, `src/tabs.rs` — workspace and tab orchestration.

@@ -582,6 +582,231 @@ pub enum JobCancel {
     AlreadyStopped(JobStop),
 }
 
+// ── capability-scoped operations (CTX-0514) ───────────────────────────────────
+
+/// Maximum bytes for one job principal name.
+pub const MAX_JOB_PRINCIPAL_BYTES: usize = 64;
+
+/// Maximum bytes accepted in one `write_input` call.
+pub const MAX_WRITE_INPUT_BYTES: usize = 64 * 1024;
+
+/// Maximum `write_input` calls one principal may issue to one job in the
+/// current [`MAX_WRITE_INPUT_WINDOW_MS`] window.
+pub const MAX_WRITES_PER_WINDOW: u64 = 128;
+
+/// Rate-limit window for `write_input`, in milliseconds.
+pub const MAX_WRITE_INPUT_WINDOW_MS: u64 = 1_000;
+
+/// Maximum `signal` calls one principal may issue to one job in the
+/// current [`MAX_SIGNAL_WINDOW_MS`] window.
+///
+/// Signals name kill intents, so the burst budget is tighter than the
+/// `write_input` data path; beyond it the call fails closed with
+/// [`JobError::SignalRateLimited`] and the job is untouched.
+pub const MAX_SIGNALS_PER_WINDOW: u64 = 32;
+
+/// Rate-limit window for `signal`, in milliseconds.
+pub const MAX_SIGNAL_WINDOW_MS: u64 = 1_000;
+
+/// Maximum explicit `(principal, operation)` grants tracked on one job.
+///
+/// Delegation is bounded like every other registry resource: beyond this a
+/// grant fails closed with [`JobError::GrantsFull`] and the owner revokes a
+/// stale grant (or transfers ownership) first. Ownership itself is implicit
+/// and never counts here.
+pub const MAX_GRANTS_PER_JOB: usize = 64;
+
+/// A generic execution principal (research 044 §3, repo layout).
+///
+/// The execution subsystem stays AI-agnostic: this is an opaque caller
+/// identity the host authorizes, never an `AgentId`/`TaskId`/LLM symbol.
+/// Binding a principal to agent/task semantics is `bitty-ai` coordination;
+/// this side only enforces per-principal, per-operation grants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobPrincipal(String);
+
+impl JobPrincipal {
+    /// Wraps an opaque caller identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobError::InvalidPrincipal`] when `name` is empty,
+    /// over-bound, or carries control bytes.
+    pub fn new(name: impl Into<String>) -> Result<Self, JobError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(JobError::InvalidPrincipal {
+                reason: "job principal must not be empty".into(),
+            });
+        }
+        if name.len() > MAX_JOB_PRINCIPAL_BYTES {
+            return Err(JobError::InvalidPrincipal {
+                reason: format!("job principal exceeds {MAX_JOB_PRINCIPAL_BYTES} bytes"),
+            });
+        }
+        if name.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(JobError::InvalidPrincipal {
+                reason: "job principal must not contain control bytes".into(),
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// The opaque identity string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for JobPrincipal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One independently grantable job operation (research 044 §3).
+///
+/// Every operation is its own capability: holding six of the seven grants
+/// never implies the seventh, and no blanket scope exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum JobOperation {
+    /// Observe lifecycle state: `get`, `list`, event replay, acknowledge.
+    Observe,
+    /// Read retained output bytes and the metadata-only output index.
+    ReadOutput,
+    /// Write bytes to an interactive job's stdin.
+    WriteInput,
+    /// Deliver a portable signal request to a live job.
+    Signal,
+    /// Request job termination (direct-child kill, CTX-0511 mechanism).
+    Cancel,
+    /// Subscribe to a live job's event cursor (reconnect-aware tail).
+    Attach,
+    /// Move job ownership (grant delegation plus ownership transfer).
+    Transfer,
+}
+
+impl JobOperation {
+    /// Stable lowercase wire/display name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observe => "observe",
+            Self::ReadOutput => "read_output",
+            Self::WriteInput => "write_input",
+            Self::Signal => "signal",
+            Self::Cancel => "cancel",
+            Self::Attach => "attach",
+            Self::Transfer => "transfer",
+        }
+    }
+
+    /// All seven operations in a deterministic order.
+    #[must_use]
+    pub const fn all() -> &'static [JobOperation] {
+        &[
+            Self::Observe,
+            Self::ReadOutput,
+            Self::WriteInput,
+            Self::Signal,
+            Self::Cancel,
+            Self::Attach,
+            Self::Transfer,
+        ]
+    }
+}
+
+impl fmt::Display for JobOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A delegation of one operation on one job to one principal.
+///
+/// Narrow by construction: exactly one `(principal, operation)` pair. Grants
+/// never widen: a principal can delegate only operations it currently holds,
+/// and holding every operation but one never implies the missing one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobGrant {
+    /// Principal the operation is delegated to.
+    pub principal: JobPrincipal,
+    /// Operation being delegated.
+    pub operation: JobOperation,
+}
+
+impl JobGrant {
+    /// One narrow delegation pair.
+    #[must_use]
+    pub const fn new(principal: JobPrincipal, operation: JobOperation) -> Self {
+        Self {
+            principal,
+            operation,
+        }
+    }
+}
+
+/// A portable signal request (research 044 §4; delivery is CTX-0512).
+///
+/// The vocabulary is the portable intent set: the CTX-0512 typed-signal
+/// mechanism owns delivery (Unix signal numbers, process-group scope,
+/// graceful escalation), so this layer names intents only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobSignal {
+    /// Polite stop request (Unix `SIGINT` intent).
+    Interrupt,
+    /// Graceful termination request (Unix `SIGTERM` intent).
+    Terminate,
+    /// Unconditional kill request (Unix `SIGKILL` intent).
+    Kill,
+}
+
+impl JobSignal {
+    /// Stable lowercase wire/display name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::Terminate => "terminate",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+/// Outcome of an authorized `signal` call.
+///
+/// Phase-1 delivery is CTX-0512's contract, so a live job reports the named
+/// delivery seam instead of an invented outcome. Terminal jobs observe their
+/// stop exactly like [`JobCancel::AlreadyStopped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// The job was already terminal; nothing changed.
+    AlreadyStopped(JobStop),
+    /// Recorded for delivery by the CTX-0512 typed-signal mechanism.
+    Delivered,
+}
+
+/// Receipt of an accepted `attach`: which job, from which event cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachReceipt {
+    /// Job the caller attached to.
+    pub job: JobId,
+    /// Event cursor the attach starts from (validated against the head).
+    pub from_seq: u64,
+}
+
+/// Receipt of an accepted `transfer`: previous and new owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferReceipt {
+    /// Job whose ownership moved.
+    pub job: JobId,
+    /// Owner before the transfer.
+    pub previous_owner: JobPrincipal,
+    /// Owner after the transfer.
+    pub new_owner: JobPrincipal,
+}
+
 // ── errors ──────────────────────────────────────────────────────────────────
 
 /// Job registry and job model failures (owned, no upstream type escapes).
@@ -619,6 +844,47 @@ pub enum JobError {
         /// The requested seq.
         seq: u64,
     },
+    /// The caller is not authorized for this operation on this job.
+    Denied {
+        /// Operation that was refused.
+        operation: String,
+        /// Owned denial reason.
+        reason: String,
+    },
+    /// The principal name failed validation; nothing was authorized.
+    InvalidPrincipal {
+        /// Owned validation reason.
+        reason: String,
+    },
+    /// The `write_input` payload was over-bound; nothing was written.
+    InvalidWrite {
+        /// Owned validation reason.
+        reason: String,
+    },
+    /// The call rate exceeded the per-operation budget; nothing changed.
+    RateLimited {
+        /// Operation that was limited.
+        operation: String,
+        /// Owned limit reason.
+        reason: String,
+    },
+    /// Alias of [`JobError::RateLimited`] kept for the signal path so call
+    /// sites read `signal` intent instead of the generic limiter vocabulary.
+    SignalRateLimited {
+        /// Owned limit reason.
+        reason: String,
+    },
+    /// The operation is not supported for this job's state or backend.
+    Unsupported {
+        /// Owned reason.
+        reason: String,
+    },
+    /// The job's grant table is at capacity; delegate nothing new until the
+    /// owner revokes a stale grant (or transfers ownership).
+    GrantsFull {
+        /// Configured grant capacity per job.
+        limit: usize,
+    },
 }
 
 impl JobError {
@@ -643,6 +909,44 @@ impl JobError {
     pub(crate) fn unknown_event(seq: u64) -> Self {
         Self::UnknownEvent { seq }
     }
+
+    pub(crate) fn denied(operation: JobOperation, reason: impl Into<String>) -> Self {
+        Self::Denied {
+            operation: operation.as_str().into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn invalid_principal(reason: impl Into<String>) -> Self {
+        Self::InvalidPrincipal {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn invalid_write(reason: impl Into<String>) -> Self {
+        Self::InvalidWrite {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn signal_rate_limited(reason: impl Into<String>) -> Self {
+        Self::SignalRateLimited {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn write_rate_limited(reason: impl Into<String>) -> Self {
+        Self::RateLimited {
+            operation: JobOperation::WriteInput.as_str().into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn unsupported(reason: impl Into<String>) -> Self {
+        Self::Unsupported {
+            reason: reason.into(),
+        }
+    }
 }
 
 impl fmt::Display for JobError {
@@ -657,6 +961,21 @@ impl fmt::Display for JobError {
             Self::InvalidRead { reason } => write!(f, "invalid output read: {reason}"),
             Self::InvalidCursor { reason } => write!(f, "invalid event cursor: {reason}"),
             Self::UnknownEvent { seq } => write!(f, "unknown job event {seq}"),
+            Self::Denied { operation, reason } => {
+                write!(f, "denied job {operation}: {reason}")
+            }
+            Self::InvalidPrincipal { reason } => write!(f, "invalid job principal: {reason}"),
+            Self::InvalidWrite { reason } => write!(f, "invalid job write: {reason}"),
+            Self::RateLimited { operation, reason } => {
+                write!(f, "job {operation} rate limited: {reason}")
+            }
+            Self::SignalRateLimited { reason } => {
+                write!(f, "job signal rate limited: {reason}")
+            }
+            Self::Unsupported { reason } => write!(f, "unsupported job operation: {reason}"),
+            Self::GrantsFull { limit } => {
+                write!(f, "job grant table is full (limit {limit})")
+            }
         }
     }
 }
@@ -862,5 +1181,60 @@ mod tests {
             JobError::unknown_event(42).to_string(),
             "unknown job event 42"
         );
+        assert!(
+            JobError::denied(JobOperation::Cancel, "no grant")
+                .to_string()
+                .contains("denied job cancel")
+        );
+        assert!(
+            JobError::invalid_principal("bad")
+                .to_string()
+                .contains("bad"),
+            "principal errors stay owned and stable"
+        );
+        assert!(
+            JobError::invalid_write("bad").to_string().contains("bad"),
+            "write errors stay owned and stable"
+        );
+        assert!(
+            JobError::signal_rate_limited("storm")
+                .to_string()
+                .contains("rate limited"),
+            "signal limiter errors stay owned and stable"
+        );
+        assert!(
+            JobError::unsupported("pipes have closed stdin")
+                .to_string()
+                .contains("unsupported"),
+            "unsupported errors stay owned and stable"
+        );
+        assert_eq!(
+            JobError::GrantsFull { limit: 2 }.to_string(),
+            "job grant table is full (limit 2)"
+        );
+    }
+
+    #[test]
+    fn principal_names_are_bounded_and_control_free() {
+        assert!(JobPrincipal::new("owner-a").is_ok());
+        assert!(matches!(
+            JobPrincipal::new(""),
+            Err(JobError::InvalidPrincipal { .. })
+        ));
+        assert!(matches!(
+            JobPrincipal::new("p".repeat(MAX_JOB_PRINCIPAL_BYTES + 1)),
+            Err(JobError::InvalidPrincipal { .. })
+        ));
+        assert!(matches!(
+            JobPrincipal::new("bad\x01name"),
+            Err(JobError::InvalidPrincipal { .. })
+        ));
+        let owner = JobPrincipal::new("owner-a").expect("valid test principal");
+        assert_eq!(owner.as_str(), "owner-a");
+        assert_eq!(owner.to_string(), "owner-a");
+        assert_eq!(JobOperation::Cancel.as_str(), "cancel");
+        assert_eq!(JobOperation::Cancel.to_string(), "cancel");
+        assert_eq!(JobOperation::all().len(), 7);
+        assert_eq!(JobSignal::Kill.as_str(), "kill");
     }
 }

@@ -704,13 +704,25 @@ pub(crate) fn spawn_process(
         request.cwd.as_deref(),
         &request.env_policy,
     );
-    let mut child = command.spawn().map_err(|error| IpcError::Unavailable {
+    let child = command.spawn().map_err(|error| IpcError::Unavailable {
         reason: format!(
             "spawn failed for '{}': {}",
             request.executable,
             truncate_message(error.to_string(), 128)
         ),
     })?;
+    // CTX-0526: from this point the child is live, so it is owned by a
+    // cleanup guard. Every early `return`/`?` below must pass through the
+    // guard so the child is killed and reaped (bounded) instead of being
+    // dropped unreaped. Steady-state paths disarm the guard once ownership
+    // moves into explicit kill+wait handling; the `Drop` fallback is the
+    // last-resort path for `?` returns (reaper-thread start, `try_wait`).
+    //
+    // Borrow discipline: `guard.child_mut()` borrows end before any
+    // `guard.abandon`/`reaped` call — setup borrows live in their own
+    // statement scopes, and the supervise loop re-borrows per iteration —
+    // so exactly one mutable borrow of the guard is live at a time.
+    let mut guard = PostSpawnChild::new(child);
 
     // Concurrent bounded drain: each stream is drained to EOF but retains at
     // most budget+1 bytes (the spare byte detects overflow so the service
@@ -727,56 +739,83 @@ pub(crate) fn spawn_process(
     let cap = request.effective_stream_budget().saturating_add(1);
     let stdout_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut stdout_thread = match child.stdout.take() {
+    let mut stdout_thread = match guard.child_mut().stdout.take() {
         Some(mut pipe) => {
             let shared = Arc::clone(&stdout_shared);
-            Some(
-                std::thread::Builder::new()
-                    .name("bitty-spawn-stdout".into())
-                    .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
-                    .map_err(|_| IpcError::Internal {
-                        reason: "spawn stdout reaper failed to start".into(),
-                    })?,
-            )
+            let handle = std::thread::Builder::new()
+                .name("bitty-spawn-stdout".into())
+                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                .map_err(|_| IpcError::Internal {
+                    reason: "spawn stdout reaper failed to start".into(),
+                });
+            match handle {
+                // CTX-0526: the guard kills+reaps the live child before the
+                // error propagates, so the reaper-start failure cannot
+                // orphan it.
+                Ok(handle) => Some(handle),
+                Err(error) => return Err(guard.abandon(error)),
+            }
         }
         None => None,
     };
-    let mut stderr_thread = match child.stderr.take() {
+    let mut stderr_thread = match guard.child_mut().stderr.take() {
         Some(mut pipe) => {
             let shared = Arc::clone(&stderr_shared);
-            Some(
-                std::thread::Builder::new()
-                    .name("bitty-spawn-stderr".into())
-                    .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
-                    .map_err(|_| IpcError::Internal {
-                        reason: "spawn stderr reaper failed to start".into(),
-                    })?,
-            )
+            let handle = std::thread::Builder::new()
+                .name("bitty-spawn-stderr".into())
+                .spawn(move || drain_bounded_shared(&mut pipe, cap, &shared))
+                .map_err(|_| IpcError::Internal {
+                    reason: "spawn stderr reaper failed to start".into(),
+                });
+            match handle {
+                // CTX-0526: same guard cleanup as the stdout reaper path.
+                Ok(handle) => Some(handle),
+                Err(error) => return Err(guard.abandon(error)),
+            }
         }
         None => None,
     };
     // Both pipes were requested above; a missing pipe means the stdio handoff
     // failed. Kill and reap so no zombie or wedged child escapes.
+    //
+    // CTX-0526: reachable again — the reaper-start `?` paths above no longer
+    // skip this cleanup, and a missing pipe still kills+reaps exactly once
+    // through the guard.
     if stdout_thread.is_none() || stderr_thread.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(IpcError::Internal {
+        return Err(guard.abandon(IpcError::Internal {
             reason: "spawn stdio pipes were not created".into(),
-        });
+        }));
     }
 
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_millis(request.timeout_ms))
         .unwrap_or_else(std::time::Instant::now);
     loop {
-        match child.try_wait().map_err(|error| IpcError::Internal {
-            reason: format!(
-                "spawn wait failed: {}",
-                truncate_message(error.to_string(), 128)
-            ),
-        })? {
+        // CTX-0526: a `try_wait` error must kill+reap before returning —
+        // `abandon` performs the cleanup explicitly (the guard's `Drop` is
+        // the last-resort path for any `?` that bypasses it).
+        let observed = guard
+            .child_mut()
+            .try_wait()
+            .map_err(|error| IpcError::Internal {
+                reason: format!(
+                    "spawn wait failed: {}",
+                    truncate_message(error.to_string(), 128)
+                ),
+            });
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => return Err(guard.abandon(error)),
+        };
+        match observed {
             Some(status) => {
+                // Steady state: reap explicitly, then disarm the guard so
+                // its `Drop` does not kill+wait a second time. Exactly-once
+                // ownership: from here the child is reaped and the guard
+                // holds no live process.
+                let child = guard.child_mut();
                 let _ = child.wait();
+                guard.reaped();
                 let (stdout, stdout_detached) = stdout_thread
                     .take()
                     .map(|h| join_drain_bounded(h, &stdout_shared))
@@ -815,8 +854,13 @@ pub(crate) fn spawn_process(
                 });
             }
             None if std::time::Instant::now() >= deadline => {
+                // Steady state: kill+reap explicitly, then disarm — the
+                // guard must not repeat the cleanup on scope exit.
+                // Exactly-once: this branch owns the kill+wait pair.
+                let child = guard.child_mut();
                 let _ = child.kill();
                 let _ = child.wait();
+                guard.reaped();
                 let (stdout, stdout_detached) = stdout_thread
                     .take()
                     .map(|h| join_drain_bounded(h, &stdout_shared))
@@ -849,6 +893,147 @@ pub(crate) fn spawn_process(
             }
             None => std::thread::sleep(SPAWN_POLL_INTERVAL),
         }
+    }
+}
+
+/// Owned post-spawn cleanup guard (CTX-0526).
+///
+/// Takes ownership of the live [`std::process::Child`] immediately after
+/// `Command::spawn()` succeeds so every early return kills and reaps the
+/// child (bounded) instead of dropping it unreaped. Steady-state paths call
+/// [`PostSpawnChild::reaped`] after their explicit kill+wait (or `abandon`
+/// on error paths, which performs the cleanup and returns the error), which
+/// disarms the guard; the `Drop` fallback covers `?` returns (reaper-thread
+/// start, `try_wait`) that cannot run explicit cleanup first.
+///
+/// Exactly-once: [`PostSpawnChild::reaped`] and [`PostSpawnChild::abandon`]
+/// are idempotent — whichever runs first performs the single kill+wait pair,
+/// and later calls (including `Drop`) are no-ops.
+#[derive(Debug)]
+struct PostSpawnChild<C: PostSpawnChildOps = std::process::Child> {
+    child: Option<C>,
+}
+
+/// Best-effort kill+reap for one owned child.
+///
+/// `kill` is ignored (the child may already be gone); `wait` reaps the
+/// zombie. Bounded: `wait` blocks only until the killed child exits, which
+/// the OS delivers promptly — this never polls and never touches the
+/// minute-scale drain-join or timeout budgets.
+fn kill_and_reap<C: PostSpawnChildOps>(child: &mut C) {
+    let _ = child.kill_child();
+    let _ = child.wait_child();
+}
+
+/// Minimal kill+wait surface the guard needs.
+///
+/// `std::process::Child` implements this directly; test fakes implement it
+/// with counters so error-path cleanup is observable without spawning a
+/// process tree.
+trait PostSpawnChildOps {
+    /// Best-effort terminate (ignored when the child is already gone).
+    fn kill_child(&mut self) -> std::io::Result<()>;
+    /// Reap the child (blocks only until the killed child exits).
+    fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl PostSpawnChildOps for std::process::Child {
+    fn kill_child(&mut self) -> std::io::Result<()> {
+        self.kill()
+    }
+
+    fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+}
+
+impl<C: PostSpawnChildOps> PostSpawnChild<C> {
+    /// Own the live child immediately after `spawn()` succeeds.
+    fn new(child: C) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Borrow the live child for setup (`stdout.take`, `try_wait`) while
+    /// the guard retains cleanup ownership.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called after [`PostSpawnChild::reaped`] or
+    /// [`PostSpawnChild::abandon`] disarmed the guard; steady-state code
+    /// only touches the child before disarming.
+    fn child_mut(&mut self) -> &mut C {
+        self.child.as_mut().expect("guard holds the live child")
+    }
+
+    /// Disarm after an explicit kill+reap the caller performed.
+    /// Idempotent: safe to call when already disarmed.
+    fn reaped(&mut self) {
+        self.child.take();
+    }
+
+    /// Kill+reap the live child, disarm, and hand the error back.
+    /// Idempotent: the first call performs the single cleanup pair.
+    fn abandon(&mut self, error: IpcError) -> IpcError {
+        if let Some(child) = self.child.as_mut() {
+            kill_and_reap(child);
+        }
+        self.child.take();
+        error
+    }
+}
+
+impl<C: PostSpawnChildOps> Drop for PostSpawnChild<C> {
+    fn drop(&mut self) {
+        // Last-resort path for `?` returns: kill+reap so a live child is
+        // never dropped unreaped. Steady-state paths disarm first, making
+        // this a no-op there.
+        if let Some(child) = self.child.as_mut() {
+            kill_and_reap(child);
+        }
+    }
+}
+
+/// Post-spawn setup faithfully mirroring [`spawn_process`] above, but over a
+/// caller-supplied child (`C`) and injectable reaper-start / wait steps
+/// (CTX-0526).
+///
+/// The production path cannot fail thread-spawn or `try_wait` on demand, so
+/// its error-path cleanup would otherwise be untestable without a process
+/// tree. This seam runs the exact guard discipline — reaper-start failure,
+/// missing-pipe, and wait-error branches all pass through `abandon`, and
+/// steady-state branches disarm via `reaped` — against a fake child, and
+/// returns the `PostSpawnChild` so tests can assert exactly-once kill+wait
+/// ownership with bounded completion.
+#[cfg(test)]
+fn post_spawn_setup<C: PostSpawnChildOps>(
+    mut guard: PostSpawnChild<C>,
+    mut start_stdout_reaper: impl FnMut() -> Result<(), IpcError>,
+    mut start_stderr_reaper: impl FnMut() -> Result<(), IpcError>,
+    pipes_present: bool,
+    mut wait_step: impl FnMut() -> Result<Option<()>, IpcError>,
+) -> Result<PostSpawnChild<C>, IpcError> {
+    if let Err(error) = start_stdout_reaper() {
+        return Err(guard.abandon(error));
+    }
+    if let Err(error) = start_stderr_reaper() {
+        return Err(guard.abandon(error));
+    }
+    if !pipes_present {
+        return Err(guard.abandon(IpcError::Internal {
+            reason: "spawn stdio pipes were not created".into(),
+        }));
+    }
+    match wait_step() {
+        Ok(Some(())) => {
+            // Steady state mirrors `spawn_process`: the caller reaps
+            // explicitly, then disarms so `Drop` stays a no-op.
+            let child = guard.child_mut();
+            let _ = child.wait_child();
+            guard.reaped();
+            Ok(guard)
+        }
+        Ok(None) => Ok(guard),
+        Err(error) => Err(guard.abandon(error)),
     }
 }
 
@@ -2016,5 +2201,358 @@ mod tests {
             retained.len()
         );
         assert!(retained.iter().all(|&b| b == b'q'));
+    }
+
+    // ── CTX-0526 post-spawn cleanup ──────────────────────────────────────
+    //
+    // Fake process backend: a counter child behind the same guard seam the
+    // production path uses, so each post-spawn failure step is observable
+    // without launching a process tree. Every case asserts exactly-once
+    // kill+wait ownership with bounded completion.
+
+    /// Fake live child: counts kill/wait calls instead of touching a
+    /// process. `wait_ok` selects whether `wait_child` reports success;
+    /// counters still advance either way (cleanup was attempted).
+    #[derive(Debug)]
+    struct FakeChild {
+        kills: usize,
+        waits: usize,
+        wait_ok: bool,
+    }
+
+    impl FakeChild {
+        fn live() -> Self {
+            Self {
+                kills: 0,
+                waits: 0,
+                wait_ok: true,
+            }
+        }
+    }
+
+    impl super::PostSpawnChildOps for FakeChild {
+        fn kill_child(&mut self) -> std::io::Result<()> {
+            self.kills = self.kills.saturating_add(1);
+            Ok(())
+        }
+
+        fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.waits = self.waits.saturating_add(1);
+            if self.wait_ok {
+                // Portable fake exit status: command-line tools conventionally
+                // exit 0 on success on every platform, so `success()` agrees
+                // on Unix and Windows without a platform `cfg`. No real
+                // child is spawned; this only satisfies the `ExitStatus`
+                // return type so the fake stays portable (Windows gate).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    return Ok(std::process::ExitStatus::from_raw(0));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::ExitStatusExt as _;
+                    return Ok(std::process::ExitStatus::from_raw(0));
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    return Err(std::io::Error::other("fake wait unsupported"));
+                }
+            }
+            Err(std::io::Error::other("fake wait failed"))
+        }
+    }
+
+    /// Shared wrapper so tests can observe the fake's counters after the
+    /// seam consumes the guard (which disarms it, so `Drop` cannot repeat
+    /// the cleanup). `kill`/`wait` delegate to the shared fake; exactly-once
+    /// is asserted on the shared counters.
+    #[derive(Debug)]
+    struct SharedFake(std::sync::Arc<std::sync::Mutex<FakeChild>>);
+
+    impl super::PostSpawnChildOps for SharedFake {
+        fn kill_child(&mut self) -> std::io::Result<()> {
+            self.0.lock().expect("fake").kill_child()
+        }
+
+        fn wait_child(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            self.0.lock().expect("fake").wait_child()
+        }
+    }
+
+    fn reaper_ok() -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    fn reaper_failed(reason: &str) -> Result<(), IpcError> {
+        Err(IpcError::Internal {
+            reason: reason.into(),
+        })
+    }
+
+    fn wait_exited() -> Result<Option<()>, IpcError> {
+        Ok(Some(()))
+    }
+
+    fn wait_running() -> Result<Option<()>, IpcError> {
+        Ok(None)
+    }
+
+    fn wait_failed() -> Result<Option<()>, IpcError> {
+        Err(IpcError::Internal {
+            reason: "spawn wait failed: fake".into(),
+        })
+    }
+
+    #[test]
+    fn post_spawn_stdout_reaper_failure_kills_and_reaps_exactly_once() {
+        // Mirrors the stdout-reaper `?` path: the reaper fails to start
+        // while the child is live. Cleanup ownership is observable through
+        // a shared fake: the seam's `abandon` must perform exactly one
+        // kill+wait pair before the error propagates, and the consumed
+        // guard cannot repeat it on drop.
+        use std::sync::{Arc, Mutex};
+        let start = std::time::Instant::now();
+        let shared = Arc::new(Mutex::new(FakeChild::live()));
+        let probe = Arc::clone(&shared);
+        let error = super::post_spawn_setup(
+            super::PostSpawnChild::new(SharedFake(probe)),
+            || reaper_failed("spawn stdout reaper failed to start"),
+            reaper_ok,
+            true,
+            wait_exited,
+        )
+        .expect_err("stdout reaper failure must propagate");
+        assert!(
+            matches!(error, IpcError::Internal { ref reason, .. } if reason == "spawn stdout reaper failed to start"),
+            "got {error:?}"
+        );
+        let counts = {
+            let fake = shared.lock().expect("fake");
+            (fake.kills, fake.waits)
+        };
+        assert_eq!(
+            counts,
+            (1, 1),
+            "stdout reaper failure must kill+reap exactly once, got {counts:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cleanup hung: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn post_spawn_reaper_failures_clean_up_with_bounded_completion() {
+        // Each failing setup step (stdout reaper, stderr reaper,
+        // missing-pipe) must kill+reap exactly once and return promptly.
+        // The shared fake records the single kill+wait pair; the seam
+        // consumes the guard so `Drop` cannot repeat it.
+        for (name, stdout_ok, stderr_ok, pipes, reason) in [
+            (
+                "stdout-reaper",
+                false,
+                true,
+                true,
+                "spawn stdout reaper failed to start",
+            ),
+            (
+                "stderr-reaper",
+                true,
+                false,
+                true,
+                "spawn stderr reaper failed to start",
+            ),
+            (
+                "missing-pipe",
+                true,
+                true,
+                false,
+                "spawn stdio pipes were not created",
+            ),
+        ]
+            as [(&str, bool, bool, bool, &str); 3]
+        {
+            let start = std::time::Instant::now();
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+            let probe = std::sync::Arc::clone(&shared);
+            let outcome: Result<super::PostSpawnChild<SharedFake>, IpcError> =
+                super::post_spawn_setup(
+                    super::PostSpawnChild::new(SharedFake(probe)),
+                    || {
+                        if stdout_ok {
+                            reaper_ok()
+                        } else {
+                            reaper_failed(reason)
+                        }
+                    },
+                    || {
+                        if stderr_ok {
+                            reaper_ok()
+                        } else {
+                            reaper_failed(reason)
+                        }
+                    },
+                    // Missing-pipe is reachable with healthy reapers: force
+                    // the pipe branch even when both reapers succeed.
+                    pipes,
+                    wait_exited,
+                );
+            let error = outcome.expect_err("failing setup must propagate");
+            assert!(
+                matches!(error, IpcError::Internal { reason: ref got, .. } if got == reason),
+                "case {name}: got {error:?}, want {reason:?}"
+            );
+            let counts = {
+                let fake = shared.lock().expect("fake");
+                (fake.kills, fake.waits)
+            };
+            assert_eq!(
+                counts,
+                (1, 1),
+                "case {name}: must kill+reap exactly once, got {counts:?}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "case {name} hung: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn post_spawn_wait_error_kills_and_reaps_before_return() {
+        // Mirrors the `try_wait().map_err(?)?` path: a wait error with a
+        // live child must kill+reap exactly once before returning.
+        let start = std::time::Instant::now();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+        let probe = std::sync::Arc::clone(&shared);
+        let error = super::post_spawn_setup(
+            super::PostSpawnChild::new(SharedFake(probe)),
+            reaper_ok,
+            reaper_ok,
+            true,
+            wait_failed,
+        )
+        .expect_err("wait error must propagate");
+        assert!(
+            matches!(error, IpcError::Internal { ref reason, .. } if reason.contains("spawn wait failed")),
+            "got {error:?}"
+        );
+        let counts = {
+            let fake = shared.lock().expect("fake");
+            (fake.kills, fake.waits)
+        };
+        assert_eq!(
+            counts,
+            (1, 1),
+            "wait error must kill+reap exactly once, got {counts:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cleanup hung: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn post_spawn_success_disarms_and_missing_pipe_is_reachable() {
+        // Success (`Ok(Some)`) disarms via `reaped`: the fake already saw
+        // its single wait, and dropping the returned guard performs no
+        // second kill+wait. Missing-pipe (`pipes_present = false` with
+        // healthy reapers) is reachable and fails with its own reason —
+        // the branch the old `?` returns used to skip.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+        let live: super::PostSpawnChild<SharedFake> = super::post_spawn_setup(
+            super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&shared))),
+            reaper_ok,
+            reaper_ok,
+            true,
+            wait_exited,
+        )
+        .expect("success must disarm");
+        drop(live);
+        assert_eq!(
+            {
+                let fake = shared.lock().expect("fake");
+                (fake.kills, fake.waits)
+            },
+            (0, 1),
+            "success path must reap once with no kill and no drop-repeat"
+        );
+        let error = super::post_spawn_setup(
+            super::PostSpawnChild::new(SharedFake(std::sync::Arc::new(std::sync::Mutex::new(
+                FakeChild::live(),
+            )))),
+            reaper_ok,
+            reaper_ok,
+            false,
+            wait_running,
+        )
+        .expect_err("missing pipe must be reachable");
+        assert!(
+            matches!(error, IpcError::Internal { ref reason, .. } if reason == "spawn stdio pipes were not created"),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn post_spawn_cleanup_is_idempotent_and_drop_is_last_resort() {
+        // `abandon` twice performs one kill+wait pair; `reaped` after
+        // `abandon` is a no-op. A guard dropped without disarm still
+        // cleans up via `Drop` (last-resort `?` path); a disarmed guard
+        // drops silently.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+        {
+            let mut guard = super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&shared)));
+            let first = guard.abandon(IpcError::Internal {
+                reason: "first".into(),
+            });
+            assert!(matches!(first, IpcError::Internal { .. }));
+            let second = guard.abandon(IpcError::Internal {
+                reason: "second".into(),
+            });
+            assert!(matches!(second, IpcError::Internal { .. }));
+            guard.reaped();
+        }
+        assert_eq!(
+            {
+                let fake = shared.lock().expect("fake");
+                (fake.kills, fake.waits)
+            },
+            (1, 1),
+            "double abandon must clean up exactly once"
+        );
+
+        // Last-resort `Drop`: an armed guard cleans up on scope exit.
+        let armed = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+        {
+            let _armed = super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&armed)));
+        }
+        assert_eq!(
+            {
+                let fake = armed.lock().expect("fake");
+                (fake.kills, fake.waits)
+            },
+            (1, 1),
+            "armed drop must kill+reap exactly once"
+        );
+
+        // Disarmed guard drops silently.
+        let disarmed = std::sync::Arc::new(std::sync::Mutex::new(FakeChild::live()));
+        {
+            let mut guard =
+                super::PostSpawnChild::new(SharedFake(std::sync::Arc::clone(&disarmed)));
+            guard.reaped();
+        }
+        assert_eq!(
+            {
+                let fake = disarmed.lock().expect("fake");
+                (fake.kills, fake.waits)
+            },
+            (0, 0),
+            "disarmed drop must not touch the child"
+        );
     }
 }

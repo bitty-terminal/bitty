@@ -682,9 +682,15 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
         if view.text.contains("got:") && view.text.contains("hello-bitty-write") {
             break;
         }
+        // Diagnose the ConPTY backend instead of just timing out: report
+        // the child lifecycle state plus how many stdout bytes ever landed.
         assert!(
             Instant::now() < deadline,
-            "PTY child never echoed the written line"
+            "PTY child never echoed the written line (state={:?}, total={} stored={} text_head={:?})",
+            registry.get_as(&spawner, id).map(|snapshot| snapshot.state),
+            view.total_bytes,
+            view.stored_bytes,
+            view.text.chars().take(80).collect::<String>(),
         );
         std::thread::sleep(Duration::from_millis(10));
     }

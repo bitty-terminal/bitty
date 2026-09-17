@@ -39,10 +39,16 @@ to the still-proposed package-lifecycle RFC is a draft seam.
 - `src/lib.rs` — crate docs with status and the RFC section mapping.
 - `src/manifest.rs` — manifest discovery and validation.
 - `src/capability.rs` — closed capability grammar.
+- `src/effective.rs` — effective-capability intersection engine (research
+  045 §8 §12 §13, OQ-057): six-layer intersection, self-grant prohibition,
+  typed denial with reason chain, XDG/`.bitty` policy loading, audit ledger,
+  and the Hard Safety/Policy/Strategy enforcement map.
 - `src/grant.rs` — hash-bound grant records and the grant store.
 - `src/registry.rs` — registry, lifecycle states, and generations.
 - `src/event.rs` — event classes, bounded queues, and delivery policy.
-- `src/host.rs` — host owning registry, grants, pipeline, and side queue.
+- `src/host.rs` — host owning registry, grants, pipeline, side queue, and
+  the effective-capability audit ledger (`authorize_effective` /
+  `delegate_effective` seam on top of the unchanged grant gate).
 - `src/install.rs` — install-path verification seam.
 - `src/tools.rs` — tool surface helpers.
 - `src/bundled.rs` — bundled-plugin declarations.

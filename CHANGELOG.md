@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Host effective-capability intersection engine with self-grant
+  prohibition (CTX-0524, OQ-057, research 045 §8 §12 §13):** every agent,
+  plugin, or Lua request is a request, never a grant.
+  `EffectiveCapability = host ceiling ∩ user policy ∩ project policy ∩
+parent delegation ∩ task grant ∩ agent request` is computed on every
+  privileged request (`agent.spawn`, `execution.run`, `panel.acquire`,
+  `fs.read`/`fs.write`, `network.connect`, plugin lifecycle); lower layers
+  only narrow and a child never exceeds its parent. Wide declarations such
+  as `filesystem = "all"`, `root = true`, or `max_agents = 100` fail closed
+  as self-grant instead of widening. User policy loads from XDG
+  (`$XDG_CONFIG_HOME/bitty/capabilities.conf`) and project policy from
+  `<root>/.bitty/capabilities.conf`, composed with the Configuration Model
+  RFC layer stack (system-policy > user > trusted-local) plus runtime
+  delegation order and non-overridable pins. Refusals are typed denials with
+  a layer-ordered reason chain; grants and denials append to a bounded
+  drop-oldest audit ledger on the host. The Hard Safety/Policy/Strategy
+  classification ships as the enforcement map. No ambient authority is added
+  to existing paths: the `PluginHost::activate` grant gate is unchanged and
+  the engine denies by default on an empty stack.
 - **Host `bitty.process.spawn` surface for Layer-2 system-CLI execution
   (CTX-0445, OQ-013/OQ-053):** a bounded, consent-gated spawn surface that
   executes only allowlisted `[tools.*]` binaries/verbs. Every spawn checks

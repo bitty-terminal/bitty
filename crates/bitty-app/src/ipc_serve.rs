@@ -415,8 +415,10 @@ fn serve_stream(
     let mut context = bitty_ipc::devtools::ServeContext::new(server);
     // CTX-0244: this connection passed peer-credential verification at the
     // Unix-socket accept boundary (P0-AC-021), so per-call local-only
-    // methods (`frameHash`) may serve it.
-    context.attest_local_peer();
+    // methods (`frameHash`) may serve it. CTX-0528/IPC-001: the verified
+    // marker is the proof — the context mark is bound to it, never set on
+    // an unverified stream.
+    context.attest_local_peer(&verified);
     let mut limiter = bitty_ipc::limits::RateLimiter::rc9_default();
     let clock = || {
         SystemTime::now()

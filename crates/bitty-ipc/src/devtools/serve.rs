@@ -286,12 +286,16 @@ pub struct ServeContext {
     /// Opaque debug-session identity for bearer binding (per connection;
     /// the servo must set a distinct id per accepted connection).
     pub session_id: String,
-    /// Local-transport attestation (CTX-0244): true only when the serving
-    /// path verified the peer is local — the Unix-socket accept boundary
-    /// (`transport_attested_peer`, P0-AC-021) or same-process in-process
-    /// dispatch. Fail-closed default `false`: `frameHash` denies without
-    /// it, so a future non-local dispatch path can never serve digests by
-    /// accident (no TCP listener exists today — keep it that way).
+    /// Local-transport attestation (CTX-0244, CTX-0528/IPC-001): true only
+    /// when the serving path verified the peer is local — the Unix-socket
+    /// accept boundary (per-connection `transport_attested_peer`, P0-AC-021)
+    /// whose [`VerifiedPeer`] marker was passed to
+    /// [`attest_local_peer`](ServeContext::attest_local_peer), or
+    /// same-process in-process dispatch (a test-only marker minted via the
+    /// headless UID check, local by construction). Fail-closed default
+    /// `false`: `frameHash` denies without it, so a future non-local
+    /// dispatch path can never serve digests by accident (no TCP listener
+    /// exists today — keep it that way).
     pub local_attested: bool,
 }
 
@@ -317,11 +321,19 @@ impl ServeContext {
     }
 
     /// Mark this context as served over a verified-local transport
-    /// (CTX-0244): call after [`transport_attested_peer`] at the
-    /// Unix-socket accept boundary, or for same-process in-process
-    /// dispatch (the headless verify harness). `frameHash` denies without
-    /// this mark; all other methods ignore it.
-    pub fn attest_local_peer(&mut self) {
+    /// (CTX-0244): call only with the sanitized [`VerifiedPeer`] marker from
+    /// [`transport_attested_peer`] at the Unix-socket accept boundary in
+    /// hand (the marker is the proof — CTX-0528/IPC-001: never call this on
+    /// an unverified stream), or for same-process in-process dispatch (the
+    /// headless verify harness, local by construction). `frameHash` denies
+    /// without this mark; all other methods ignore it.
+    ///
+    /// Takes `&VerifiedPeer` (not `bool`) so the marker type — not a bare
+    /// flag — gates the attestation: call sites must name the proof they
+    /// verified (`let _ = &verified; ctx.attest_local_peer(&verified)`),
+    /// and a future non-local dispatch path cannot set the mark by
+    /// accident.
+    pub fn attest_local_peer(&mut self, _peer: &VerifiedPeer) {
         self.local_attested = true;
     }
 

@@ -599,9 +599,53 @@ mod tests {
         let err = verify_peer_for_connection(foreign, 1000).unwrap_err();
         assert!(matches!(err, IpcError::Unauthenticated { .. }));
         // Attested transport produces a marker without credential bytes.
+        // CTX-0528 (IPC-001): the marker is only mintable after endpoint
+        // verification (see `transport_attested_peer`), never by trusting a
+        // bare UID value — the endpoint check is the gate, not this call.
         let attested = VerifiedPeer::attested(1000);
         let verified = verify_peer_for_connection(good, 1000).unwrap();
         assert_eq!(attested, verified);
+    }
+
+    /// CTX-0528 (IPC-001): the endpoint-proxy marker must be unsatisfiable
+    /// by endpoint ownership alone — a foreign UID fails the headless
+    /// primitive before any byte is minted, mirroring the
+    /// `transport_attested_peer` gate.
+    #[test]
+    fn ipc001_attested_marker_requires_uid_equality() {
+        let foreign = PeerCredentials::new(2000, 2000, 99);
+        let err = verify_peer_for_connection(foreign, 1000).unwrap_err();
+        let reason = match err {
+            IpcError::Unauthenticated { reason } => reason,
+            other => panic!("expected Unauthenticated, got {other:?}"),
+        };
+        // Token-free: the reason carries no credential bytes beyond the
+        // numeric UIDs the serving path already logs (no fd/pid/secret).
+        assert!(
+            reason.contains("does not match"),
+            "foreign UID must fail with a peer-mismatch reason, got: {reason}"
+        );
+        assert!(!reason.contains("secret"), "reason must be token-free");
+    }
+
+    /// CTX-0528 (IPC-001): error reasons on the peer-mismatch path must
+    /// stay token-free (no credential bytes retained or echoed).
+    #[test]
+    fn ipc001_peer_mismatch_reason_is_token_free() {
+        let foreign = PeerCredentials::new(65534, 65534, 9999);
+        let err = verify_peer_uid(foreign, 1000).unwrap_err();
+        let reason = match err {
+            IpcError::Unauthenticated { reason } => reason,
+            other => panic!("expected Unauthenticated, got {other:?}"),
+        };
+        assert!(
+            !reason.contains("9999"),
+            "peer pid must never reach the error reason: {reason}"
+        );
+        assert!(
+            reason.contains("does not match"),
+            "reason must name the mismatch class, got: {reason}"
+        );
     }
 
     #[test]

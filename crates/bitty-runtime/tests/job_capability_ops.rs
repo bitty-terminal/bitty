@@ -656,21 +656,55 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     // banner, and only then read the text — otherwise a quiet store is
     // indistinguishable from a store the drain has not fed yet, and the
     // 20 s deadline burns on a scheduling race instead of child progress.
+    // A console client gates its reads on our cursor replies: answer each
+    // pending DSR with a CPR so a blocked child can proceed (win469d).
     let baseline = registry
         .output_index_as(&spawner, id)
         .expect("owner reads index")
         .stdout_total_bytes;
+    let mut baseline = baseline;
+    let mut answered = 0usize;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        let view = registry
+            .read_output_as(&spawner, id, ReadOutput::new(OutputStream::Stdout))
+            .expect("owner reads");
+        if view.text.contains("got:") && view.text.contains("hello-bitty-write") {
+            break;
+        }
+        // Answer any pending cursor queries before they can stall the child.
+        let requests = view.text.matches("\u{1b}[6n").count();
+        if requests > answered {
+            answered = requests;
+            match registry.write_input_as(&spawner, id, b"\x1b[1;1R") {
+                Ok(_) => {}
+                Err(JobError::RateLimited { .. }) => {}
+                Err(other) => panic!("DSR reply must be accepted, got {other:?}"),
+            }
+            // A reply does not produce marker bytes by itself, so the
+            // settle gate below must not treat the CPR round-trip as child
+            // progress: re-baseline to everything observed so far.
+            baseline = registry
+                .output_index_as(&spawner, id)
+                .expect("owner reads index")
+                .stdout_total_bytes;
+            continue;
+        }
         let index = registry
             .output_index_as(&spawner, id)
             .expect("owner reads index");
         if index.stdout_total_bytes > baseline {
             break;
         }
+        // Diagnose the ConPTY backend instead of just timing out: report
+        // the child lifecycle state plus how many stdout bytes ever landed.
         assert!(
             Instant::now() < deadline,
-            "PTY drain never fed the output store"
+            "PTY child never echoed the written line (state={:?}, total={} stored={} text_head={:?})",
+            registry.get_as(&spawner, id).map(|snapshot| snapshot.state),
+            view.total_bytes,
+            view.stored_bytes,
+            view.text.chars().take(80).collect::<String>(),
         );
         std::thread::sleep(Duration::from_millis(10));
     }

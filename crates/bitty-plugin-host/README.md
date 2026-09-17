@@ -48,7 +48,10 @@ to the still-proposed package-lifecycle RFC is a draft seam.
 - `src/event.rs` — event classes, bounded queues, and delivery policy.
 - `src/host.rs` — host owning registry, grants, pipeline, side queue, the
   effective-capability audit ledger (`authorize_effective` /
-  `delegate_effective` seam on top of the unchanged grant gate), and the
+  `delegate_effective` seam on top of the unchanged grant gate), the
+  filesystem-authorization seam (`authorize_fs` / `grant_fs_consent` /
+  `revoke_fs_consent` / `scrub_fs_content` with `fs_policy` /
+  `fs_audit`), and the
   host secret store (`secrets` field with `resolve_secret_for_spawn` /
   `sanitized_env_view` / `scrub_against_secrets`).
 - `src/secrets.rs` — host secret store and opaque credential handles
@@ -56,6 +59,23 @@ to the still-proposed package-lifecycle RFC is a draft seam.
   per-handle consent and audit ledger, child-env-only resolution,
   fail-closed literal detection (MPC-2), `SanitizedEnvView` agent view,
   P0-AC-026 scrubbing, and the XDG file store with user-only modes.
+- `src/fs_authz.rs` — filesystem authorization: sensitive-path policy plus
+  secret detection (research 045 §4, CTX-0523): `FilesystemScope` (granted
+  path set, deny-by-default, hostile patterns fail closed at construction
+  via the CTX-0465/0489/0495 wave predicate without duplicating it),
+  `SensitivePathPolicy` (default-deny `.env`/`.env.*`, `~/.ssh/**`,
+  `~/.gnupg/**`, `~/.aws/credentials`, token stores, browser credential
+  stores, with explicit per-path user consent as the `secret://`-style
+  escape hatch), content-based secret detection (`content_looks_secret`,
+  fail-closed over-reject consistent with the CTX-0521 heuristics, so
+  renamed secrets are still caught), typed `FsDecision`/`FsError`
+  (path-only diagnostics, never values, per CTX-0521/P0-AC-026), and the
+  bounded `FsAuditLedger`. The host seam
+  (`PluginHost::authorize_fs`/`grant_fs_consent`/`revoke_fs_consent`/
+  `scrub_fs_content`) authorizes through the CTX-0524 six-layer
+  intersection first, then the scope + policy + content layers, auditing
+  every decision; Lua, agent-tool, and execution-request surfaces share
+  this single seam with no bypass.
 - `src/install.rs` — install-path verification seam.
 - `src/tools.rs` — tool surface helpers.
 - `src/bundled.rs` — bundled-plugin declarations.

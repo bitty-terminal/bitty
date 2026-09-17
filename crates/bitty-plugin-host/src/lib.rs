@@ -120,6 +120,7 @@ pub mod capability;
 pub mod effective;
 pub mod error;
 pub mod event;
+pub mod fs_authz;
 pub mod grant;
 pub mod host;
 pub mod install;
@@ -150,6 +151,13 @@ pub use event::{
     PER_PLUGIN_QUEUED_EVENT_LIMIT, PER_SUBSCRIPTION_QUEUE_LIMIT, RC1_INSTRUCTION_BUDGET,
     RC1_WALL_CLOCK_BUDGET_MS, RC1_WARNING_MS, RC2_MEMORY_AGGREGATE_BYTES,
     RC2_MEMORY_PER_PLUGIN_BYTES, RC6_FD_PER_PLUGIN, accumulate_interceptions, should_proceed,
+};
+pub use fs_authz::{
+    FilesystemScope, FsAuditDecision, FsAuditEntry, FsAuditLedger, FsAuthorized, FsConsent,
+    FsDecision, FsDenialKind, FsError, MAX_FS_AUDIT_ENTRIES, MAX_FS_AUDIT_ITEMS, MAX_FS_CONSENTS,
+    MAX_FS_CONTENT_LINE_BYTES, MAX_FS_CONTENT_SCAN_BYTES, MAX_FS_CONTENT_SCAN_LINES,
+    MAX_FS_PATH_BYTES, SensitivePathPolicy, authorize_fs, content_looks_secret,
+    is_literal_scope_pattern,
 };
 pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};

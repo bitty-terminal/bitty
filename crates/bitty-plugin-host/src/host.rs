@@ -174,6 +174,8 @@ pub struct PluginHost {
     safe_mode: bool,
     audit: crate::effective::AuditLedger,
     secrets: crate::secrets::SecretStore,
+    fs_policy: crate::fs_authz::SensitivePathPolicy,
+    fs_audit: crate::fs_authz::FsAuditLedger,
 }
 
 impl PluginHost {
@@ -195,6 +197,8 @@ impl PluginHost {
             safe_mode: false,
             audit: crate::effective::AuditLedger::new(),
             secrets: crate::secrets::SecretStore::new(),
+            fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
+            fs_audit: crate::fs_authz::FsAuditLedger::new(),
         }
     }
 
@@ -212,6 +216,8 @@ impl PluginHost {
             safe_mode: false,
             audit: crate::effective::AuditLedger::new(),
             secrets: crate::secrets::SecretStore::new(),
+            fs_policy: crate::fs_authz::SensitivePathPolicy::default_policy(),
+            fs_audit: crate::fs_authz::FsAuditLedger::new(),
         }
     }
 
@@ -687,6 +693,134 @@ impl PluginHost {
     #[must_use]
     pub fn audit(&self) -> &crate::effective::AuditLedger {
         &self.audit
+    }
+
+    // ── filesystem authorization (research 045 §4; CTX-0523) ─────────────
+
+    /// Access the sensitive-path policy (read-only).
+    ///
+    /// The policy carries the default-deny sensitive set plus explicit
+    /// per-path user consent. Mutate through [`Self::grant_fs_consent`] /
+    /// [`Self::revoke_fs_consent`] so consent changes audit.
+    #[must_use]
+    pub fn fs_policy(&self) -> &crate::fs_authz::SensitivePathPolicy {
+        &self.fs_policy
+    }
+
+    /// FS authorization audit ledger (paths only, never values).
+    #[must_use]
+    pub fn fs_audit(&self) -> &crate::fs_authz::FsAuditLedger {
+        &self.fs_audit
+    }
+
+    /// Grant explicit user consent for exactly one sensitive path.
+    ///
+    /// Consent is keyed by normalized path and audited; it never widens
+    /// the [`crate::fs_authz::FilesystemScope`] — the scope check still
+    /// applies on every request.
+    pub fn grant_fs_consent(
+        &mut self,
+        path: &str,
+        granted_at_ms: u64,
+        expires_at_ms: Option<u64>,
+    ) -> Result<(), PluginError> {
+        self.fs_policy
+            .grant_consent(path, granted_at_ms, expires_at_ms)
+            .map_err(PluginError::from)?;
+        self.fs_audit
+            .push_consent(&[path.to_string()], format!("consent granted for '{path}'"));
+        Ok(())
+    }
+
+    /// Revoke per-path consent (audited; missing grants are a no-op).
+    pub fn revoke_fs_consent(&mut self, path: &str) {
+        self.fs_policy.revoke_consent(path);
+        self.fs_audit
+            .push_consent(&[path.to_string()], format!("consent revoked for '{path}'"));
+    }
+
+    /// Authorize one FS request path through the full FS authorization path.
+    ///
+    /// Composition seam (conforms, never duplicates):
+    ///
+    /// - `stack`/`request` authorize first through the CTX-0524 six-layer
+    ///   intersection ([`Self::authorize_effective`] with `FsRead`/`FsWrite`
+    ///   by `is_write`); only an allowed request reaches the
+    ///   [`crate::fs_authz`] layers (`FilesystemScope` +
+    ///   `SensitivePathPolicy` + content detection).
+    /// - Every outcome (capability denial, scope denial, consent-required,
+    ///   redacted, allow) appends to both the effective ledger (via
+    ///   `authorize_effective`) and the FS audit ledger (paths only).
+    /// - Diagnostics quote the path, never the value.
+    ///
+    /// `scope_patterns` are the capability-shaped grant patterns the
+    /// effective set confers for this request (e.g. the `fs.read:PARAM`
+    /// params); hostile entries fail the whole request closed. `content`
+    /// carries read bytes when available (write requests pass `None`);
+    /// secret-shaped reads authorize as redacted. Lua, agent-tool, and
+    /// execution-request surfaces must all enter here: there is no
+    /// bypass path around this seam.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_fs(
+        &mut self,
+        stack: &crate::effective::EffectiveStack,
+        request: &crate::effective::AgentRequest,
+        project_trusted: bool,
+        scope_patterns: &[String],
+        path: &str,
+        is_write: bool,
+        content: Option<&str>,
+        now_ms: u64,
+    ) -> Result<crate::fs_authz::FsAuthorized, PluginError> {
+        let kind = if is_write {
+            crate::effective::RequestKind::FsWrite
+        } else {
+            crate::effective::RequestKind::FsRead
+        };
+        if let Err(denial) = self.authorize_effective(stack, request, kind, project_trusted) {
+            // Capability denial before the FS layers are contacted: record
+            // a scope-denial marker in the FS ledger (path only) so every
+            // FS decision audits exactly once per ledger.
+            let evaluated = crate::fs_authz::FsAuthorized {
+                decision: crate::fs_authz::FsDecision::Deny {
+                    kind: crate::fs_authz::FsDenialKind::OutsideScope,
+                    path: path.to_string(),
+                },
+                sensitive: self.fs_policy.is_sensitive(path),
+                secret_shaped: false,
+            };
+            let _ = denial;
+            self.fs_audit.push_decision(&evaluated, is_write);
+            return Err(PluginError::registry(format!(
+                "fs denied (outside-scope) '{}'",
+                evaluated.decision.path()
+            )));
+        }
+        let scope = crate::fs_authz::FilesystemScope::from_patterns(scope_patterns)
+            .map_err(PluginError::from)?;
+        let evaluated =
+            crate::fs_authz::authorize_fs(&scope, &self.fs_policy, path, is_write, content, now_ms);
+        self.fs_audit.push_decision(&evaluated, is_write);
+        match &evaluated.decision {
+            crate::fs_authz::FsDecision::Allow { .. }
+            | crate::fs_authz::FsDecision::Redacted { .. } => Ok(evaluated),
+            crate::fs_authz::FsDecision::ConsentRequired { path } => Err(PluginError::registry(
+                format!("fs consent required for '{path}'"),
+            )),
+            crate::fs_authz::FsDecision::Deny { kind, path } => Err(PluginError::registry(
+                format!("fs denied ({kind}) '{path}'"),
+            )),
+        }
+    }
+
+    /// Scrub read bytes against the live secret store (P0-AC-026).
+    ///
+    /// Redacted decisions must serve these bytes — never the raw content —
+    /// before any agent-visible boundary (agent context, Lua logs,
+    /// execution logs, panel history, traces, diagnostics).
+    #[must_use]
+    pub fn scrub_fs_content(&self, content: &str) -> String {
+        crate::secrets::scrub_against_store(content, &self.secrets)
     }
 
     // ── host secret store (research 045 §5; CTX-0521) ────────────────────
@@ -1559,6 +1693,166 @@ mod effective_tests {
                 .is_err()
         );
         assert_eq!(host.audit().len(), 2);
+    }
+
+    #[test]
+    fn host_authorize_fs_denies_sensitive_without_consent() {
+        // 045 §4: the FS authorization path evaluates capability
+        // intersection first, then scope + sensitive policy + content.
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/projects/**"]),
+            user: scope_with("user", &["fs.read:~/projects/**"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/projects/**"]),
+            task: scope_with("task", &["fs.read:~/projects/**"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/projects/**"]),
+            raw_wide: Vec::new(),
+        };
+        let patterns = vec!["~/projects/**".to_string()];
+        // Legit read allows and audits.
+        let allowed = host
+            .authorize_fs(
+                &stack,
+                &request,
+                true,
+                &patterns,
+                "~/projects/notes.md",
+                false,
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(allowed.is_authorized());
+        // Sensitive `.env` read requires consent (typed, path only).
+        let err = host
+            .authorize_fs(
+                &stack,
+                &request,
+                true,
+                &patterns,
+                "~/projects/.env",
+                false,
+                None,
+                0,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("consent required"));
+        // Path-only diagnostic: the normalized key folds case/separators,
+        // so assert the sensitive marker, never a value.
+        assert!(err.to_string().contains("projects"));
+        // Explicit user consent clears exactly that path.
+        host.grant_fs_consent("~/projects/.env", 0, None).unwrap();
+        let consented = host
+            .authorize_fs(
+                &stack,
+                &request,
+                true,
+                &patterns,
+                "~/projects/.env",
+                false,
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(consented.is_authorized());
+        // Secret-shaped content redacts; the scrubbed view leaks nothing.
+        let seed = "ghp_seededFsHostFixtureAAAA1111";
+        let secret_content = format!("token={seed}");
+        let redacted = host
+            .authorize_fs(
+                &stack,
+                &request,
+                true,
+                &patterns,
+                "~/projects/secret.txt",
+                false,
+                Some(&secret_content),
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            redacted.decision,
+            crate::fs_authz::FsDecision::Redacted { .. }
+        ));
+        // Every FS decision audited (allow + consent-required + consent +
+        // allow + redacted).
+        assert_eq!(host.fs_audit().len(), 5);
+        // Capability denial audits too and never reaches the FS layers.
+        let bad = AgentRequest {
+            scope: scope_with("req", &["ui.rich"]),
+            raw_wide: Vec::new(),
+        };
+        let err = host
+            .authorize_fs(
+                &stack,
+                &bad,
+                true,
+                &patterns,
+                "~/projects/a.md",
+                false,
+                None,
+                0,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"));
+        assert_eq!(host.fs_audit().len(), 6);
+    }
+
+    #[test]
+    fn host_authorize_fs_no_bypass_from_plugin_or_agent_request() {
+        // Lua plugins and agent surfaces share this single seam: hostile
+        // spellings and out-of-scope paths deny identically regardless of
+        // which surface supplied the request voice.
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/projects/**"]),
+            user: scope_with("user", &["fs.read:~/projects/**"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/projects/**"]),
+            task: scope_with("task", &["fs.read:~/projects/**"]),
+        };
+        let lua_request = AgentRequest {
+            scope: scope_with("lua", &["fs.read:~/projects/**"]),
+            raw_wide: Vec::new(),
+        };
+        let agent_request = AgentRequest {
+            scope: scope_with("agent", &["fs.read:~/projects/**"]),
+            raw_wide: Vec::new(),
+        };
+        let patterns = vec!["~/projects/**".to_string()];
+        for request in [&lua_request, &agent_request] {
+            for path in [
+                "~/projects/./.env",
+                "~/PROJECTS/.ENV",
+                "~/projects/../../etc/passwd",
+                "/etc/passwd",
+            ] {
+                assert!(
+                    host.authorize_fs(&stack, request, true, &patterns, path, false, None, 0)
+                        .is_err(),
+                    "surface request for {path:?} must not bypass"
+                );
+            }
+            // Backslash/case bypass spellings of the scope itself still
+            // resolve inside the grant (Windows parity) — but the
+            // sensitive layer still fires for `.env`.
+            let err = host
+                .authorize_fs(
+                    &stack,
+                    request,
+                    true,
+                    &patterns,
+                    "~\\PROJECTS\\.env",
+                    false,
+                    None,
+                    0,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("consent required"));
+        }
     }
 }
 

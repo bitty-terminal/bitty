@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Filesystem authorization with sensitive-path policy and secret
+  detection (CTX-0523, research 045 §4):** the FS authorization path
+  (agent tools, plugin capability calls, execution requests) evaluates
+  `FilesystemScope` + `SensitivePathPolicy` + secret detection/redaction
+  through the single host seam `PluginHost::authorize_fs`, which
+  authorizes through the CTX-0524 six-layer intersection
+  (`RequestKind::FsRead`/`FsWrite`) before the scope/policy/content
+  layers and never duplicates their logic. Default-deny covers the task
+  corpus (`.env` and `.env.*` variants, `~/.ssh/**`, `~/.gnupg/**`,
+  `~/.aws/credentials`, token stores, browser credential stores) with an
+  explicit per-path user-consent path (`grant_fs_consent` /
+  `revoke_fs_consent`, audited, consent clears exactly one path, never
+  silent access). Content-based detection (`content_looks_secret`,
+  fail-closed over-reject consistent with the CTX-0521 heuristics) catches
+  renamed secrets (`secret.txt`, `credentials.json`, `prod-config.yaml`);
+  secret-shaped reads authorize as redacted and must be served via
+  `scrub_fs_content` before any agent-visible boundary. Grant-shape
+  attacks reuse the CTX-0465/0489/0495 wave predicate
+  (`is_hostile_fs_pattern`, case-insensitive, either separator, dot/empty
+  normalized) without re-implementing it. Denial and consent diagnostics
+  quote the path and never the value (CTX-0521/P0-AC-026 rule); Lua
+  plugins share the same seam and cannot bypass the check; every decision
+  appends to the bounded drop-oldest `FsAuditLedger` (paths only). The
+  exact default set and heuristics are the reviewable starting set (045
+  open item), not a fixed policy. No new dependencies, no `unsafe`, no
+  hardcoded paths.
 - **Host secret store with opaque credential handles for execution
   (CTX-0521, research 045 §5):** `secret://<name>` references resolve on
   the Rust host side at spawn/request time via

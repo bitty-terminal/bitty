@@ -81,28 +81,6 @@ fn owner(name: &str) -> JobPrincipal {
     JobPrincipal::new(name).expect("valid principal")
 }
 
-/// Whether the harness stdin is a Unix terminal (live-echo probe gate).
-///
-/// PTY children spawned from a piped harness stdin still start, but the
-/// echo round-trip needs a live line discipline on both ends; without a
-/// controlling terminal the child blocks before stdin and the poll would
-/// wait out its deadline instead of proving anything. Windows always skips:
-/// ConPTY has no line-discipline echo for a `lines()` reader the way Unix
-/// does, and this exact poll held Windows CI past its 30-minute timeout.
-#[cfg(unix)]
-fn unix_harness_terminal() -> bool {
-    // `/proc/self/fd/0` resolves to `/dev/pts/N` for terminal-backed stdin
-    // and to `pipe:`/`/dev/null`/a regular path otherwise.
-    std::fs::read_link("/proc/self/fd/0")
-        .map(|target| target.to_string_lossy().contains("/dev/pts/"))
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn unix_harness_terminal() -> bool {
-    false
-}
-
 fn wait_for(
     registry: &JobRegistry,
     principal: &JobPrincipal,
@@ -560,23 +538,17 @@ fn attach_requires_attach_and_a_live_job() {
 }
 
 // ── write_input: PTY delivery proof for the owner, denial for strangers ─────
-///
-/// Live-PTY echo needs a real line discipline on the child side. CI and
-/// sandbox harnesses without a controlling terminal (or with a ConPTY that
-/// does not echo stdin to a `lines()` reader the way Unix does) would block
-/// the child before stdin and the echo poll would wait out its deadline
-/// instead of proving anything — on Windows CI this exact poll held the
-/// whole job past the 30-minute timeout. The enforceable half (denial +
-/// closed-stdin honesty) is covered by the sibling tests above on every
-/// platform; this test performs the live round-trip only where the harness
-/// itself holds a Unix terminal, and skips honestly elsewhere.
+//
+// Live-PTY delivery runs through the same spawned-helper harness the rest
+// of the suite uses (no controlling terminal required): the child is this
+// test binary in `echo-stdin` mode under a real PTY (`JobIo::Pty`), the
+// owner writes one line, and the `got:`-prefixed echo in the bounded output
+// store proves the bytes reached child stdin rather than just looping back
+// as PTY input echo.
+#[cfg(unix)]
 #[test]
 fn write_input_reaches_a_pty_job_for_the_owner_only() {
     require_pty!();
-    if !unix_harness_terminal() {
-        eprintln!("SKIP live-PTY echo: harness holds no Unix terminal");
-        return;
-    }
     let registry = JobRegistry::new();
     let spawner = owner("owner-a");
     let stranger = owner("stranger");
@@ -632,6 +604,138 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     }
 
     assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
+}
+
+// Windows runs the same success-path proof against a platform shell under
+// ConPTY (`more` copies stdin to stdout until EOF): the owner write returns
+// the byte count and the marker bytes then show up in the output store,
+// which the PTY input echo alone could never produce. Bounded polls keep a
+// stuck child loud instead of wedging CI.
+#[cfg(windows)]
+#[test]
+fn write_input_reaches_a_pty_job_for_the_owner_only() {
+    require_pty!();
+    use bitty_ipc::execution::EnvPolicy;
+    let registry = JobRegistry::new();
+    let spawner = owner("owner-a");
+    let stranger = owner("stranger");
+    let spec = JobSpec::new("more".to_owned(), Vec::new())
+        .with_kind(JobKind::Interactive)
+        .with_io(JobIo::Pty)
+        .with_env(EnvPolicy::explicit(Vec::new()).expect("explicit env"));
+    let id = registry.spawn_as(spawner.clone(), spec).expect("tracked");
+    wait_running(&registry, &spawner, id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let written = loop {
+        match registry.write_input_as(&spawner, id, b"hello-bitty-write\r\n") {
+            Ok(n) => break n,
+            Err(JobError::Unsupported { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(other) => panic!("owner writes to PTY stdin, got {other:?}"),
+        }
+    };
+    assert_eq!(written, b"hello-bitty-write\r\n".len());
+
+    let denied = registry.write_input_as(&stranger, id, b"hello-bitty-write\r\n");
+    assert!(
+        is_denied_for(&denied, "write_input"),
+        "stranger write must be denied, got {denied:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = registry
+            .read_output_as(&spawner, id, ReadOutput::new(OutputStream::Stdout))
+            .expect("owner reads");
+        if view.text.contains("hello-bitty-write") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PTY child never echoed the written line"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
+}
+
+// The deadlock regression probe: an authorized write must never wedge the
+// registry for other callers. One thread performs the live-PTY write while
+// the main thread races `cancel_as`/`get_as` against it; both sides finish
+// inside bounded deadlines and the registry stays usable afterwards.
+#[test]
+fn concurrent_write_races_cancel_and_observe_without_wedging_the_registry() {
+    require_pty!();
+    let registry = JobRegistry::new();
+    let spawner = owner("owner-a");
+    #[cfg(unix)]
+    let spec = helper_spec("sleep")
+        .with_kind(JobKind::Interactive)
+        .with_io(JobIo::Pty);
+    #[cfg(windows)]
+    let spec = {
+        use bitty_ipc::execution::EnvPolicy;
+        JobSpec::new("powershell.exe".to_owned(), vec!["-NoExit".to_owned()])
+            .with_kind(JobKind::Interactive)
+            .with_io(JobIo::Pty)
+            .with_env(EnvPolicy::explicit(Vec::new()).expect("explicit env"))
+    };
+    let id = registry.spawn_as(spawner.clone(), spec).expect("tracked");
+    wait_running(&registry, &spawner, id);
+    // Settle the writer-half handoff before the race so the write exercises
+    // the blocking-PTY-write success path (not the starting-gap refusal).
+    let publish_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match registry.write_input_as(&spawner, id, b"probe\n") {
+            Ok(_) => break,
+            Err(JobError::Unsupported { .. }) if Instant::now() < publish_deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(other) => panic!("writer-half handoff never published, got {other:?}"),
+        }
+    }
+    let worker = {
+        let registry = registry.clone();
+        let spawner = spawner.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match registry.write_input_as(&spawner, id, b"stress\n") {
+                    Ok(_) => return true,
+                    Err(JobError::RateLimited { .. }) | Err(JobError::Unsupported { .. })
+                        if Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        })
+    };
+    let race_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let _ = registry.get_as(&spawner, id);
+        if worker.is_finished() {
+            break;
+        }
+        assert!(
+            Instant::now() < race_deadline,
+            "registry wedged: racing get_as never observed the write finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let delivered = worker.join().expect("writer thread joins");
+    assert!(delivered, "authorized concurrent write must succeed");
+    // The registry is still live for the same job after the race.
+    assert!(
+        registry.get_as(&spawner, id).is_ok(),
+        "registry must stay usable after a racing write"
+    );
+    assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
+    let stopped = wait_terminal(&registry, &spawner, id);
+    assert_eq!(stopped.state, JobState::Done(JobStop::Cancelled));
 }
 
 #[test]

@@ -474,11 +474,22 @@ impl JobRegistry {
                 }
             }
         };
+        // The registry guard stays dropped across the blocking PTY write:
+        // re-locking the same non-reentrant mutex while the outer guard is
+        // alive self-deadlocks and wedges every other registry caller, so the
+        // PTY half is released and returned under a fresh guard instead.
+        drop(inner);
         let mut outcome = write_to_pty_stdin(writer, data);
         {
             let inner = lock_inner(&self.shared);
+            // Re-validate under the fresh guard: the job may have finished
+            // while the guard was dropped for PTY I/O. A live record gets
+            // its half back; a terminal or evicted one does not — the half
+            // drops with the outcome instead of lingering in a dead slot.
             if let Some(record) = inner.jobs.get(&id) {
-                record.return_pty_writer(outcome.ok_writer());
+                if !record.state.is_terminal() {
+                    record.return_pty_writer(outcome.ok_writer());
+                }
             }
         }
         outcome.into_result()

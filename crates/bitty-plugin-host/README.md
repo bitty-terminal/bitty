@@ -46,9 +46,16 @@ to the still-proposed package-lifecycle RFC is a draft seam.
 - `src/grant.rs` — hash-bound grant records and the grant store.
 - `src/registry.rs` — registry, lifecycle states, and generations.
 - `src/event.rs` — event classes, bounded queues, and delivery policy.
-- `src/host.rs` — host owning registry, grants, pipeline, side queue, and
-  the effective-capability audit ledger (`authorize_effective` /
-  `delegate_effective` seam on top of the unchanged grant gate).
+- `src/host.rs` — host owning registry, grants, pipeline, side queue, the
+  effective-capability audit ledger (`authorize_effective` /
+  `delegate_effective` seam on top of the unchanged grant gate), and the
+  host secret store (`secrets` field with `resolve_secret_for_spawn` /
+  `sanitized_env_view` / `scrub_against_secrets`).
+- `src/secrets.rs` — host secret store and opaque credential handles
+  (research 045 §5, CTX-0521): `secret://` parsing, `SecretStore` with
+  per-handle consent and audit ledger, child-env-only resolution,
+  fail-closed literal detection (MPC-2), `SanitizedEnvView` agent view,
+  P0-AC-026 scrubbing, and the XDG file store with user-only modes.
 - `src/install.rs` — install-path verification seam.
 - `src/tools.rs` — tool surface helpers.
 - `src/bundled.rs` — bundled-plugin declarations.

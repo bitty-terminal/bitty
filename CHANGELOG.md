@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Host secret store with opaque credential handles for execution
+  (CTX-0521, research 045 §5):** `secret://<name>` references resolve on
+  the Rust host side at spawn/request time via
+  `PluginHost::resolve_secret_for_spawn`, which authorizes through the
+  CTX-0524 six-layer intersection (`RequestKind::ExecutionRun`) before the
+  store is contacted and never duplicates its logic. The store lives outside
+  the repository (`$XDG_DATA_HOME/bitty/secrets.conf`, fallback
+  `$HOME/.local/share`) with user-only file modes (`0600` files, `0700`
+  directories on Unix); values inject only into the child process
+  environment (never argv). Handle values never enter agent context,
+  prompts, Lua logs, execution logs, panel history, traces, diagnostics, or
+  error messages: `Debug`/`Display` impls are redacting by design,
+  `SanitizedEnvView` carries presence plus non-secret values only, and
+  `scrub_against_secrets` redacts stored values to `[redacted]` while
+  preserving `secret://` references. Per-handle consent grants (session or
+  expiring) gate every resolution with audit events; literal secret values
+  in configuration fail closed (MPC-2 reference-not-value) with typed
+  `MissingHandle`/`ConsentRequired`/`LiteralForbidden` errors quoting names
+  only. No ambient authority is added: an empty store resolves nothing, and
+  the `PluginHost::activate` grant gate is unchanged. No new dependencies,
+  no `unsafe`, no hardcoded paths.
 - **Host effective-capability intersection engine with self-grant
   prohibition (CTX-0524, OQ-057, research 045 §8 §12 §13):** every agent,
   plugin, or Lua request is a request, never a grant.

@@ -41,6 +41,22 @@ runtime-deps-test:
 runtime-deps binary packagers:
     ./scripts/check-runtime-deps.sh --binary {{binary}} --packagers {{packagers}}
 
+# Print the Rust channel pinned in rust-toolchain.toml (single source for CI):
+# `just rust-channel`
+rust-channel:
+    ./scripts/rust-channel.sh
+
+rust-channel-test:
+    ./scripts/tests/rust-channel.test.sh
+
+# Assert a built binary carries the expected ELF architecture:
+# `just binary-arch target/release/bitty aarch64`
+binary-arch binary arch:
+    ./scripts/check-binary-arch.sh --binary {{binary}} --arch {{arch}}
+
+binary-arch-test:
+    ./scripts/tests/check-binary-arch.test.sh
+
 terminfo-check:
     ./scripts/check-terminfo.sh
 
@@ -89,7 +105,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test workflow-publish-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

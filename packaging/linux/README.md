@@ -62,8 +62,11 @@ entry: the gate rejects declarations with no link evidence.
 ## Scope
 
 The gate covers the x86_64 glibc packages (`deb`, `rpm`, `archlinux`) and the
-musl apk from `build-alpine`. aarch64 deb/rpm stay on the tolerant MVP path
-from #819 and are gated when 034 item 8 hardens them; the cross build's
-linkage can differ per architecture (the aarch64 binary currently does not
-link `libfreetype.so.6` directly), so per-arch verification lands with that
-item.
+musl apk from `build-alpine`. aarch64 deb/rpm runtime-dependency declarations
+are verified when 034 item 8 hardens them; the cross build's linkage can differ
+per architecture (the aarch64 binary currently does not link
+`libfreetype.so.6` directly), so per-arch verification lands with that item.
+The aarch64 artifact itself is no longer tolerant: the release `build` job
+asserts its ELF machine and interpreter (`scripts/check-binary-arch.sh`,
+`binary-arch-test`), a missing binary fails every target, and every target
+uploads with `if-no-files-found: error` (CTX-0502).

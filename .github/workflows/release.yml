@@ -118,10 +118,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98.1
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
           targets: ${{ matrix.target }}
 
       # Linux ARM64 is cross-compiled on x86_64 with Ubuntu's aarch64 toolchain
@@ -215,10 +221,22 @@ jobs:
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --locked -p bitty-app --target ${{ matrix.target }}
 
+      # CTX-0502: host-cross is verified (#819), so a wrong-architecture
+      # artifact must fail here instead of being renamed, packaged, and
+      # uploaded as ARM64. Mirrors the musl readelf check in `build-alpine`
+      # (CTX-0447 / #824).
+      - name: Assert the binary is aarch64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          scripts/check-binary-arch.sh \
+            --binary "target/${{ matrix.target }}/release/bitty" \
+            --arch aarch64
+
       # 034 item 4 / CTX-0449: fail the package when the declared per-distro
       # runtime deps in nfpm.yaml diverge from the binary's ldd/readelf -d
-      # output (missing, unlinked, or unmapped sonames). aarch64 deb/rpm stay
-      # on the tolerant MVP path (034 item 8) and are not gated yet.
+      # output (missing, unlinked, or unmapped sonames). The runtime-dependency
+      # gate itself still covers x86_64 only; aarch64 declarations land with
+      # 034 item 8 (the arm64 build is otherwise hard-gated by CTX-0502).
       - name: Verify runtime deps (ldd + readelf vs nfpm declarations)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
@@ -236,15 +254,9 @@ jobs:
             BIN="${BIN}.exe"
           fi
           if [[ ! -f "$BIN" ]]; then
-            if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
-              echo "::warning::Binary $BIN not found for aarch64 (cross container fallback, not blocking release)"
-              mkdir -p dist
-              exit 0
-            else
-              echo "::error::Binary $BIN not found"
-              ls -lh "target/${TARGET}/release/" || true
-              exit 1
-            fi
+            echo "::error::Binary $BIN not found"
+            ls -lh "target/${TARGET}/release/" || true
+            exit 1
           fi
           ls -lh "$BIN"
           mkdir -p dist
@@ -265,13 +277,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! -f "target/${{ matrix.target }}/release/bitty" ]]; then
-            if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
-              echo "::warning::skip packaging for aarch64 due to missing binary (cross fallback, not blocking release)"
-              exit 0
-            else
-              echo "::error::missing binary for ${{ matrix.target }}"
-              exit 1
-            fi
+            echo "::error::missing binary for ${{ matrix.target }}"
+            exit 1
           fi
           go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
           GOPATH_BIN="$(go env GOPATH)/bin"
@@ -303,17 +310,7 @@ jobs:
           done
           ls -lh dist/
 
-      - name: Upload artifacts (aarch64, tolerant)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: bitty-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Upload artifacts
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bitty-${{ matrix.target }}
@@ -341,10 +338,16 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.98.1
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
 
       - name: Build bitty binary (native musl, dynamic)
         env:
@@ -657,7 +660,8 @@ jobs:
           cat dist/SHA256SUMS
           COMMIT="$(git rev-parse HEAD)"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "1.98.1",\n  "build_runner": "github-actions"\n}\n' "$COMMIT" "${{ github.ref_name }}" "$DATE" > dist/provenance.json
+          TOOLCHAIN="$(scripts/rust-channel.sh)"
+          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "%s",\n  "build_runner": "github-actions"\n}\n' "$COMMIT" "${{ github.ref_name }}" "$DATE" "$TOOLCHAIN" > dist/provenance.json
           cat dist/provenance.json
       - name: Create Release
         uses: softprops/action-gh-release@v3

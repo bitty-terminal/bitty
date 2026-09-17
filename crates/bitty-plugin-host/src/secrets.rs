@@ -1011,11 +1011,26 @@ impl SecretAuditLedger {
     }
 
     /// Record a successful resolution (names only).
+    ///
+    /// CodeQL models any call to these `push_*` entry points as
+    /// log-tainted on the grounds that the ledger can hold secrets; the
+    /// payload is names-only by construction (see [`Self::push`] and the
+    /// `*_names_never_values` tests), which is the documented barrier the
+    /// analyzer cannot see. Treat new `push_*` call sites as log-tainted
+    /// until they carry the same names-only proof.
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be handle names, never secret values.
     pub fn push_allow(&mut self, handles: &[String], detail: impl Into<String>) {
         self.push(SecretAuditDecision::Allow, handles, None, detail.into());
     }
 
     /// Record a refused resolution (names only).
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be handle names, never secret values.
     pub fn push_deny(
         &mut self,
         handles: &[String],
@@ -1031,6 +1046,10 @@ impl SecretAuditLedger {
     }
 
     /// Record a consent grant or revocation (names only).
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be handle names, never secret values.
     pub fn push_consent(&mut self, handles: &[String], detail: impl Into<String>) {
         self.push(SecretAuditDecision::Consent, handles, None, detail.into());
     }

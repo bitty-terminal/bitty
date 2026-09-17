@@ -651,17 +651,21 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     // bytes reached stdin (not just the ConPTY input echo, which never
     // carries the `got:` prefix). PTY output carries carriage returns from
     // the line discipline, so match the marker plus the payload loosely
-    // rather than byte-exactly. The drain/read plumbing proves delivery:
-    // poll the metadata index until the stdout byte total grows, and only
-    // then read the text — otherwise a quiet store is indistinguishable
-    // from a store the drain has not fed yet, and the 20 s deadline burns
-    // on a scheduling race instead of child progress.
+    // rather than byte-exactly. The drain proves delivery first: poll the
+    // metadata index until the stdout byte total grows past the startup
+    // banner, and only then read the text — otherwise a quiet store is
+    // indistinguishable from a store the drain has not fed yet, and the
+    // 20 s deadline burns on a scheduling race instead of child progress.
+    let baseline = registry
+        .output_index_as(&spawner, id)
+        .expect("owner reads index")
+        .stdout_total_bytes;
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let index = registry
             .output_index_as(&spawner, id)
             .expect("owner reads index");
-        if index.stdout_total_bytes > 0 {
+        if index.stdout_total_bytes > baseline {
             break;
         }
         assert!(

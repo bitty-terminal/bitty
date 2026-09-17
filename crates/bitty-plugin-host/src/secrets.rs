@@ -1068,9 +1068,6 @@ impl SecretAuditLedger {
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        // codeql[rust/cleartext-logging]: false positive — the entry holds
-        // handle names only (bounded_name(detail)); secret values never
-        // reach this sink (see the `*_names_never_values` tests).
         self.entries.push_back(SecretAuditEntry {
             seq,
             decision,

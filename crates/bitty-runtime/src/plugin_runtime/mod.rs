@@ -1069,11 +1069,48 @@ fn invalid_plugin_id() -> PluginId {
 }
 
 /// Validate a registration capture against the manifest, fail closed.
+///
+/// Defense-in-depth complement to the bridge admission caps (`HOST-002`):
+/// the bridge enforces the same count/length/timer bounds before the push,
+/// but a capture built without the bridge (or from a future bridge that
+/// forgets a bound) must still fail closed here — `validate_capture` is the
+/// commit gate before atomic activation. Field-length violations surface as
+/// `Capture` details naming the bound, never echoing untrusted content.
 fn validate_capture(
     id: &PluginId,
     manifest: &PluginManifest,
     capture: &RegistrationCapture,
 ) -> Result<(), PluginRuntimeError> {
+    if capture.commands.len() > bitty_lua::REGISTRATION_MAX_COMMANDS {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "command registration count {} exceeds limit {}",
+                capture.commands.len(),
+                bitty_lua::REGISTRATION_MAX_COMMANDS
+            ),
+        });
+    }
+    if capture.events.len() > bitty_lua::REGISTRATION_MAX_EVENTS {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "event subscription count {} exceeds limit {}",
+                capture.events.len(),
+                bitty_lua::REGISTRATION_MAX_EVENTS
+            ),
+        });
+    }
+    if capture.timers.len() > bitty_lua::REGISTRATION_MAX_TIMERS {
+        return Err(PluginRuntimeError::Capture {
+            plugin: id.to_string(),
+            detail: format!(
+                "timer count {} exceeds limit {}",
+                capture.timers.len(),
+                bitty_lua::REGISTRATION_MAX_TIMERS
+            ),
+        });
+    }
     let declared: BTreeSet<&str> = manifest
         .lazy
         .commands
@@ -1088,6 +1125,33 @@ fn validate_capture(
         .collect();
     let mut seen = BTreeSet::new();
     for command in &capture.commands {
+        if command.id.len() > bitty_lua::REGISTRATION_MAX_ID_BYTES {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "command id exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_ID_BYTES
+                ),
+            });
+        }
+        if command.title.len() > bitty_lua::REGISTRATION_MAX_TITLE_BYTES {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "command title exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_TITLE_BYTES
+                ),
+            });
+        }
+        if command.description.len() > bitty_lua::REGISTRATION_MAX_DESCRIPTION_BYTES {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "command description exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_DESCRIPTION_BYTES
+                ),
+            });
+        }
         let qualified = format!("{}:{}", id.as_str(), command.id);
         if !declared.contains(qualified.as_str()) {
             return Err(PluginRuntimeError::Capture {
@@ -1104,6 +1168,17 @@ fn validate_capture(
     }
     let mut seen_events = BTreeSet::new();
     for subscription in &capture.events {
+        if subscription.kind.is_empty()
+            || subscription.kind.len() > bitty_lua::REGISTRATION_MAX_EVENT_KIND_BYTES
+        {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "event kind exceeds {} bytes",
+                    bitty_lua::REGISTRATION_MAX_EVENT_KIND_BYTES
+                ),
+            });
+        }
         if !declared_events.contains(subscription.kind.as_str()) {
             return Err(PluginRuntimeError::Capture {
                 plugin: id.to_string(),
@@ -1113,7 +1188,31 @@ fn validate_capture(
                 ),
             });
         }
-        seen_events.insert(subscription.kind.clone());
+        if !seen_events.insert(subscription.kind.clone()) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!("duplicate event subscription '{}'", subscription.kind),
+            });
+        }
+    }
+    let mut seen_handles = BTreeSet::new();
+    for timer in &capture.timers {
+        if timer.delay_ms > bitty_lua::REGISTRATION_MAX_TIMER_DELAY_MS {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!(
+                    "timer delay {} ms exceeds limit {} ms",
+                    timer.delay_ms,
+                    bitty_lua::REGISTRATION_MAX_TIMER_DELAY_MS
+                ),
+            });
+        }
+        if !seen_handles.insert(timer.handle) {
+            return Err(PluginRuntimeError::Capture {
+                plugin: id.to_string(),
+                detail: format!("duplicate timer handle {}", timer.handle),
+            });
+        }
     }
     Ok(())
 }

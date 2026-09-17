@@ -431,3 +431,214 @@ fn real_activity_plugin_activates() {
     assert!(matches!(result, LuaValue::String(_)));
     let _ = std::fs::remove_dir_all(&data);
 }
+
+// ── HOST-002 registration-admission validator bounds ─────────────────────
+
+/// Write a plugin package with explicit manifest events plus `init.lua`.
+fn write_plugin_with_events(
+    root: &Path,
+    id: &str,
+    commands: &[&str],
+    events: &[&str],
+    init_src: &str,
+) -> PathBuf {
+    let plugin = root.join(id);
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    let commands_toml = commands
+        .iter()
+        .map(|command| format!("\"{command}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let events_toml = events
+        .iter()
+        .map(|event| format!("\"{event}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "Test"
+version = "0.1.0"
+description = "test"
+
+[compat]
+plugin-api = "^1.0"
+
+[lazy]
+commands = [{commands_toml}]
+events = [{events_toml}]
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
+    plugin
+}
+
+fn activate_once(root: &Path, data: &Path, id: &PluginId) -> Result<(), String> {
+    let mut rt = runtime(
+        Vec::new(),
+        vec![root.to_path_buf()],
+        data.to_path_buf(),
+        false,
+    );
+    rt.discover();
+    rt.activate(id).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[test]
+fn duplicate_event_subscription_fails_closed_and_rolls_back() {
+    let data = temp_dir("dup-event");
+    let root = temp_dir("dup-event-root");
+    let id = PluginId::new("bitty-featured.dupevent").expect("id");
+    write_plugin_with_events(
+        &root,
+        "bitty-featured.dupevent",
+        &["bitty-featured.dupevent:ok"],
+        &["terminal.opened"],
+        r#"
+        bitty.commands.register({ id = "ok", title = "ok", run = function() return "ok" end })
+        bitty.events.subscribe("terminal.opened", function() end)
+        bitty.events.subscribe("terminal.opened", function() end)
+        "#,
+    );
+    let err = activate_once(&root, &data, &id).expect_err("duplicate subscription must fail");
+    assert!(
+        err.contains("duplicate event subscription"),
+        "typed duplicate detail, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn duplicate_command_registration_fails_closed() {
+    let data = temp_dir("dup-command");
+    let root = temp_dir("dup-command-root");
+    let id = PluginId::new("bitty-featured.dupcmd").expect("id");
+    write_plugin_with_events(
+        &root,
+        "bitty-featured.dupcmd",
+        &["bitty-featured.dupcmd:ok"],
+        &[],
+        r#"
+        bitty.commands.register({ id = "ok", title = "a", run = function() return "a" end })
+        bitty.commands.register({ id = "ok", title = "b", run = function() return "b" end })
+        "#,
+    );
+    let err = activate_once(&root, &data, &id).expect_err("duplicate command must fail");
+    assert!(
+        err.contains("duplicate command registration"),
+        "typed duplicate detail, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn oversized_registration_set_fails_closed_at_bridge() {
+    // 129 command registrations against a 128-declaration manifest: the
+    // bridge refuses the 129th with E_DEF_LIMIT (Lua-level pcall error
+    // surfaces as a capture failure), so activation rolls back with bounded
+    // memory instead of capturing an unbounded set.
+    let data = temp_dir("oversized");
+    let root = temp_dir("oversized-root");
+    let id = PluginId::new("bitty-featured.flood").expect("id");
+    let mut commands = Vec::new();
+    let mut body = String::new();
+    for i in 0..128 {
+        commands.push(format!("bitty-featured.flood:c{i}"));
+        body.push_str(&format!(
+            "bitty.commands.register({{ id = \"c{i}\", title = \"T\", run = function() end }})\n"
+        ));
+    }
+    // The 129th registration reuses a declared id (so only the quota, not
+    // the manifest reservation, can reject it).
+    body.push_str(
+        "bitty.commands.register({ id = \"c0\", title = \"T\", run = function() end })\n",
+    );
+    let command_refs: Vec<&str> = commands.iter().map(String::as_str).collect();
+    write_plugin_with_events(&root, "bitty-featured.flood", &command_refs, &[], &body);
+    // The bridge refuses the 129th registration with E_DEF_LIMIT; the raw
+    // Lua error table is opaque at this layer, so assert only fail-closed.
+    activate_once(&root, &data, &id).expect_err("oversized set must fail");
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_count_capped_at_bridge() {
+    // 65 timers: the bridge refuses the 65th with E_DEF_LIMIT, which
+    // surfaces as a Lua runtime error and fails activation closed.
+    let data = temp_dir("timer-flood");
+    let root = temp_dir("timer-flood-root");
+    let id = PluginId::new("bitty-featured.timers").expect("id");
+    let mut body = String::new();
+    for _ in 0..65 {
+        body.push_str("bitty.timers.create(10, function() end)\n");
+    }
+    write_plugin_with_events(
+        &root,
+        "bitty-featured.timers",
+        &["bitty-featured.timers:ok"],
+        &[],
+        &format!(
+            "bitty.commands.register({{ id = \"ok\", title = \"ok\", run = function() return \"ok\" end }})\n{body}"
+        ),
+    );
+    let err = activate_once(&root, &data, &id).expect_err("timer flood must fail");
+    assert!(
+        !err.is_empty(),
+        "timer flood must fail closed with a capture error"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_delay_bound_rejects_absurd_delay() {
+    let data = temp_dir("timer-delay");
+    let root = temp_dir("timer-delay-root");
+    let id = PluginId::new("bitty-featured.delay").expect("id");
+    write_plugin_with_events(
+        &root,
+        "bitty-featured.delay",
+        &["bitty-featured.delay:ok"],
+        &[],
+        r#"
+        bitty.commands.register({ id = "ok", title = "ok", run = function() return "ok" end })
+        bitty.timers.create(86400001, function() end)
+        "#,
+    );
+    let err = activate_once(&root, &data, &id).expect_err("absurd delay must fail");
+    assert!(
+        !err.is_empty(),
+        "absurd delay must fail closed with a capture error"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn legit_manifest_unaffected_by_quotas() {
+    // Boundary: exactly one command + one event + one timer + max-length
+    // title still activates (quotas admit legitimate manifests).
+    let data = temp_dir("legit-quota");
+    let root = temp_dir("legit-quota-root");
+    let id = PluginId::new("bitty-featured.legit").expect("id");
+    let title = "t".repeat(128);
+    write_plugin_with_events(
+        &root,
+        "bitty-featured.legit",
+        &["bitty-featured.legit:ok"],
+        &["terminal.opened"],
+        &format!(
+            "bitty.commands.register({{ id = \"ok\", title = \"{title}\", run = function() return \"ok\" end }})\nbitty.events.subscribe(\"terminal.opened\", function() end)\nbitty.timers.create(86400000, function() end)\n"
+        ),
+    );
+    activate_once(&root, &data, &id).expect("legit manifest must activate");
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}

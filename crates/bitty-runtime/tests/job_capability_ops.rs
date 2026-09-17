@@ -651,7 +651,25 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     // bytes reached stdin (not just the ConPTY input echo, which never
     // carries the `got:` prefix). PTY output carries carriage returns from
     // the line discipline, so match the marker plus the payload loosely
-    // rather than byte-exactly.
+    // rather than byte-exactly. The drain/read plumbing proves delivery:
+    // poll the metadata index until the stdout byte total grows, and only
+    // then read the text — otherwise a quiet store is indistinguishable
+    // from a store the drain has not fed yet, and the 20 s deadline burns
+    // on a scheduling race instead of child progress.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let index = registry
+            .output_index_as(&spawner, id)
+            .expect("owner reads index");
+        if index.stdout_total_bytes > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PTY drain never fed the output store"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let view = registry

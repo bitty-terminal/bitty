@@ -294,6 +294,16 @@ impl DeliveryLog {
         Err(JobError::unknown_event(seq))
     }
 
+    /// Copies the stored event at `seq`, when retained (read-only peek for
+    /// scoped acknowledge authorization; never marks delivery).
+    pub(crate) fn find(&self, seq: u64) -> Option<StoredEvent> {
+        self.critical
+            .iter()
+            .chain(self.observation.iter())
+            .find(|stored| stored.seq == seq)
+            .copied()
+    }
+
     pub(crate) fn dropped(&self) -> u64 {
         self.critical_dropped
             .saturating_add(self.observation_dropped)

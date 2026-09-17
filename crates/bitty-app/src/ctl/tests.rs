@@ -2413,12 +2413,12 @@ fn drain_offers_layout_mutations_to_the_pre_mutation_hook() {
     ipc_ctl::global_control_queue()
         .lock()
         .expect("queue lock")
-        .push_back(ipc_ctl::PendingControl {
-            method: ipc_ctl::METHOD_SPLIT_VIEW.to_string(),
-            params: Some(ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
-            id_raw: String::from("1"),
-            reply: tx,
-        });
+        .push_back(ipc_ctl::PendingControl::new(
+            ipc_ctl::METHOD_SPLIT_VIEW,
+            Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+            "1",
+            tx,
+        ));
     let mut seen: Option<String> = None;
     let drained = drain_global_control_queue_with(
         &mut rt,
@@ -2432,4 +2432,94 @@ fn drain_offers_layout_mutations_to_the_pre_mutation_hook() {
         "the hook must run before the layout-mutating verb applies"
     );
     assert_eq!(rt.leaf_count(), 2, "the split still applied after the hook");
+}
+
+/// CTX-0529 (LIVE-IPC-004): a drain arriving after the caller's deadline must
+/// not apply the effect. The expired `view split` is withdrawn (no hook, no
+/// layout mutation) while the waiter already holds its honest timeout.
+#[cfg(unix)]
+#[test]
+fn drain_withdraws_expired_control_without_effect() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let (tx, rx) = std::sync::mpsc::channel();
+    ipc_ctl::global_control_queue()
+        .lock()
+        .expect("queue lock")
+        .push_back(ipc_ctl::PendingControl::with_deadline(
+            ipc_ctl::METHOD_SPLIT_VIEW,
+            Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+            "1",
+            tx,
+            // Already past: the caller gave up before this drain ran.
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now),
+        ));
+    let mut hook_calls = 0usize;
+    let drained =
+        drain_global_control_queue_with(&mut rt, &bitty_ipc::ScopeSet::cli_default(), |_, _| {
+            hook_calls += 1
+        });
+    assert_eq!(
+        drained, 0,
+        "an expired entry is withdrawn, not counted as drained work"
+    );
+    assert_eq!(hook_calls, 0, "no pre-mutation hook for a withdrawn verb");
+    assert_eq!(
+        rt.leaf_count(),
+        leaves_before,
+        "the timed-out split must never land on the layout"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "withdrawal sends no late success the caller could mistake for applied"
+    );
+    assert!(ipc_ctl::pop_pending_control().is_none());
+}
+
+/// CTX-0529: the full waiter-then-drain sequence stays honest end to end. A
+/// waiter whose entry expires while queued observes `Unavailable`, and the
+/// late drain finds nothing to apply — the client-visible outcome always
+/// matches whether the effect landed.
+#[cfg(unix)]
+#[test]
+fn timed_out_waiter_never_observes_a_post_timeout_effect() {
+    let _guard = hold_wm_lock();
+    let mut rt = headless_runtime();
+    let leaves_before = rt.leaf_count();
+    let granted = bitty_ipc::ScopeSet::cli_default();
+    // Nobody drains while the waiter blocks: force the honest timeout by
+    // enqueueing with a past deadline through the same withdraw path the
+    // 5 s waiter reclaims on timeout.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let seq = {
+        let item = ipc_ctl::PendingControl::with_deadline(
+            ipc_ctl::METHOD_SPLIT_VIEW,
+            Some(&ipc_ctl::params_split(ipc_ctl::SplitDirection::Right)),
+            "1",
+            tx,
+            std::time::Instant::now(),
+        );
+        let seq = item.seq;
+        ipc_ctl::global_control_queue()
+            .lock()
+            .expect("queue lock")
+            .push_back(item);
+        seq
+    };
+    // Waiter side: deadline already reached, entry still queued.
+    assert!(ipc_ctl::withdraw_control_by_seq(seq));
+    drop(rx);
+    // Drain side: nothing left to apply.
+    let drained = drain_global_control_queue_with(&mut rt, &granted, |_, _| {
+        panic!("withdrawn verb must never reach the mutation hook")
+    });
+    assert_eq!(drained, 0);
+    assert_eq!(
+        rt.leaf_count(),
+        leaves_before,
+        "no post-timeout effect may land"
+    );
 }

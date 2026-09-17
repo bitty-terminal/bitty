@@ -33,6 +33,12 @@ pub fn drain_global_control_queue_with(
 ) -> usize {
     let mut count = 0usize;
     loop {
+        // CTX-0529: `pop_pending_control` already withdrew expired entries
+        // (never applied, no `count`, no reply), so every item here is live:
+        // the caller-visible outcome always matches whether the effect
+        // landed. The reply `send` is best-effort — a waiter that timed out
+        // concurrently already reclaimed its entry, and a disconnected
+        // receiver only means nobody reads the answer.
         let Some(item) = ipc_ctl::pop_pending_control() else {
             break;
         };

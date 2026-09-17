@@ -117,6 +117,7 @@
 
 pub mod bundled;
 pub mod capability;
+pub mod effective;
 pub mod error;
 pub mod event;
 pub mod grant;
@@ -128,6 +129,16 @@ pub mod tools;
 
 pub use capability::{
     CapabilityFamily, CapabilityId, effect_statement, validate_closed_capability,
+};
+pub use effective::{
+    AgentRequest, AuditDecision, AuditEntry, AuditLedger, CapabilityScope, DenialKind, DenialStep,
+    EFFECTIVE_AUDIT_BOUND_NOTE, ENFORCEMENT_MAP, EffectiveCapability, EffectiveDenial,
+    EffectiveLayer, EffectiveStack, EnforcementClass, EnforcementEntry, HOST_DEFAULT_MAX_AGENTS,
+    MAX_AUDIT_ENTRIES, MAX_DENIAL_ITEMS, MAX_POLICY_FILE_BYTES, MAX_POLICY_FILE_LINES,
+    MAX_POLICY_LINE_BYTES, MAX_RAW_DECLARATION_BYTES, MAX_RAW_DECLARATIONS, MAX_SCOPE_CAPS,
+    PROJECT_POLICY_DIR_NAME, PROJECT_POLICY_FILE_NAME, PolicyProvenance, RequestKind,
+    USER_POLICY_FILE_NAME, authorize, delegate, enforcement_class_for, parse_policy,
+    project_policy_path, user_policy_path_with_env,
 };
 pub use error::{ErrorClass, PluginError};
 pub use event::{

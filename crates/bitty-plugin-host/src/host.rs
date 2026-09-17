@@ -172,6 +172,7 @@ pub struct PluginHost {
     pipeline: EventPipeline,
     side_queue: SideQueue<HostObservation>,
     safe_mode: bool,
+    audit: crate::effective::AuditLedger,
 }
 
 impl PluginHost {
@@ -191,6 +192,7 @@ impl PluginHost {
             pipeline: EventPipeline::new(DEFAULT_QUEUE_CAPACITY, drop_policy),
             side_queue: SideQueue::new(side_capacity),
             safe_mode: false,
+            audit: crate::effective::AuditLedger::new(),
         }
     }
 
@@ -206,6 +208,7 @@ impl PluginHost {
             pipeline: EventPipeline::new(pipeline_capacity, drop_policy),
             side_queue: SideQueue::new(side_capacity),
             safe_mode: false,
+            audit: crate::effective::AuditLedger::new(),
         }
     }
 
@@ -599,6 +602,88 @@ impl PluginHost {
     /// Insert a grant record (headless helper; persistence is deferred).
     pub fn insert_grant(&mut self, record: GrantRecord) {
         self.grants.insert(record);
+    }
+
+    // ── effective-capability authorization (research 045 §8 §12 §13) ────
+
+    /// Authorize a privileged request through the six-layer intersection.
+    ///
+    /// `stack` carries host/user/project/parent/task voices; `request` is the
+    /// agent/plugin/Lua voice. Wide declarations fail closed as self-grant,
+    /// excess over the intersection denies with a reason chain, and success
+    /// returns exactly what may be exercised. Outcomes are appended to the
+    /// host [`crate::effective::AuditLedger`] (drop-oldest when full). The
+    /// pre-existing [`PluginHost::activate`] grant gate is unchanged: this is
+    /// an additional seam for privileged requests, never a bypass.
+    pub fn authorize_effective(
+        &mut self,
+        stack: &crate::effective::EffectiveStack,
+        request: &crate::effective::AgentRequest,
+        kind: crate::effective::RequestKind,
+        project_trusted: bool,
+    ) -> Result<crate::effective::EffectiveCapability, crate::effective::EffectiveDenial> {
+        let requested: Vec<String> = request
+            .scope
+            .caps
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect();
+        match crate::effective::authorize(stack, request, kind, project_trusted) {
+            Ok(effective) => {
+                let granted: Vec<String> = effective
+                    .caps
+                    .iter()
+                    .map(|cap| cap.as_str().to_string())
+                    .collect();
+                self.audit.push_allow(kind, &requested, &granted);
+                Ok(effective)
+            }
+            Err(denial) => {
+                self.audit.push_deny(kind, &requested, denial.kind);
+                Err(denial)
+            }
+        }
+    }
+
+    /// Attenuate a child request under an already-computed parent set.
+    ///
+    /// Children narrow, never widen: excess denies with
+    /// [`crate::effective::DenialKind::SelfGrant`]. Audited like
+    /// [`PluginHost::authorize_effective`].
+    pub fn delegate_effective(
+        &mut self,
+        parent: &crate::effective::EffectiveCapability,
+        request: &crate::effective::AgentRequest,
+        kind: crate::effective::RequestKind,
+    ) -> Result<crate::effective::EffectiveCapability, crate::effective::EffectiveDenial> {
+        let requested: Vec<String> = request
+            .scope
+            .caps
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect();
+        match crate::effective::delegate(parent, request, kind) {
+            Ok(child) => {
+                debug_assert!(child.is_subset_of(parent));
+                let granted: Vec<String> = child
+                    .caps
+                    .iter()
+                    .map(|cap| cap.as_str().to_string())
+                    .collect();
+                self.audit.push_allow(kind, &requested, &granted);
+                Ok(child)
+            }
+            Err(denial) => {
+                self.audit.push_deny(kind, &requested, denial.kind);
+                Err(denial)
+            }
+        }
+    }
+
+    /// Audit ledger of effective grants and denials (oldest first).
+    #[must_use]
+    pub fn audit(&self) -> &crate::effective::AuditLedger {
+        &self.audit
     }
 
     // ── event pipeline delegation ─────────────────────────────────────
@@ -1317,5 +1402,77 @@ mod tests {
                 .contains("safe mode")
         );
         assert_eq!(host.registry().get(&id).unwrap().generation, 1);
+    }
+}
+
+#[cfg(test)]
+mod effective_tests {
+    use super::*;
+    use crate::effective::{
+        AgentRequest, CapabilityScope, DenialKind, EffectiveStack, RequestKind,
+    };
+
+    fn scope_with(source: &str, caps: &[&str]) -> CapabilityScope {
+        let mut scope = CapabilityScope::unconstrained(source);
+        for raw in caps {
+            scope.caps.insert(CapabilityId::parse(raw).unwrap());
+        }
+        scope
+    }
+
+    #[test]
+    fn host_authorize_effective_audits_allow_and_deny() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["terminal.semantic-read"]),
+            user: scope_with("user", &["terminal.semantic-read"]),
+            project: None,
+            parent: scope_with("parent", &["terminal.semantic-read"]),
+            task: scope_with("task", &["terminal.semantic-read"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        host.authorize_effective(&stack, &request, RequestKind::PluginLifecycle, true)
+            .unwrap();
+        let wide = AgentRequest {
+            scope: CapabilityScope::unconstrained("lua"),
+            raw_wide: vec!["filesystem=all".to_string()],
+        };
+        let denial = host
+            .authorize_effective(&stack, &wide, RequestKind::AgentSpawn, true)
+            .unwrap_err();
+        assert_eq!(denial.kind, DenialKind::SelfGrant);
+        assert_eq!(host.audit().len(), 2);
+    }
+
+    #[test]
+    fn host_delegate_effective_narrows_only() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let parent = crate::effective::EffectiveCapability {
+            caps: [CapabilityId::parse("terminal.semantic-read").unwrap()]
+                .into_iter()
+                .collect(),
+            max_agents: 3,
+            allow_root: false,
+        };
+        let narrow = AgentRequest {
+            scope: scope_with("child", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        let child = host
+            .delegate_effective(&parent, &narrow, RequestKind::PluginLifecycle)
+            .unwrap();
+        assert!(child.is_subset_of(&parent));
+        let wide = AgentRequest {
+            scope: scope_with("child", &["terminal.semantic-read", "ui.rich"]),
+            raw_wide: Vec::new(),
+        };
+        assert!(
+            host.delegate_effective(&parent, &wide, RequestKind::PluginLifecycle)
+                .is_err()
+        );
+        assert_eq!(host.audit().len(), 2);
     }
 }

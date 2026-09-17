@@ -606,25 +606,28 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     assert_eq!(registry.cancel_as(&spawner, id), Ok(JobCancel::Requested));
 }
 
-// Windows runs the same success-path proof against a platform shell under
-// ConPTY (`more` copies stdin to stdout until EOF): the owner write returns
-// the byte count and the marker bytes then show up in the output store,
-// which the PTY input echo alone could never produce. Bounded polls keep a
-// stuck child loud instead of wedging CI.
+// Windows runs the same delivery proof as Unix through the spawned-helper
+// harness: the child is this test binary in `echo-stdin` mode under ConPTY
+// (`JobIo::Pty`), the owner writes one line, and the `got:`-prefixed echo in
+// the bounded output store proves the bytes reached child stdin rather than
+// just looping back as PTY input echo. (`more` cannot serve here: it is a
+// pager that buffers stdin until EOF or a full screen and emits nothing while
+// stdin stays open, so a marker poll against it can never succeed.)
 #[cfg(windows)]
 #[test]
 fn write_input_reaches_a_pty_job_for_the_owner_only() {
     require_pty!();
-    use bitty_ipc::execution::EnvPolicy;
     let registry = JobRegistry::new();
     let spawner = owner("owner-a");
     let stranger = owner("stranger");
-    let spec = JobSpec::new("more".to_owned(), Vec::new())
+    let spec = helper_spec("echo-stdin")
         .with_kind(JobKind::Interactive)
-        .with_io(JobIo::Pty)
-        .with_env(EnvPolicy::explicit(Vec::new()).expect("explicit env"));
+        .with_io(JobIo::Pty);
     let id = registry.spawn_as(spawner.clone(), spec).expect("tracked");
     wait_running(&registry, &spawner, id);
+    // Same writer-half handoff poll as the Unix variant: the supervisor
+    // publishes the PTY writer just after marking `Running`, and a claim
+    // during the gap fails closed with `Unsupported` — never a block.
     let deadline = Instant::now() + Duration::from_secs(10);
     let written = loop {
         match registry.write_input_as(&spawner, id, b"hello-bitty-write\r\n") {
@@ -637,18 +640,24 @@ fn write_input_reaches_a_pty_job_for_the_owner_only() {
     };
     assert_eq!(written, b"hello-bitty-write\r\n".len());
 
+    // Strangers deny even once the writer half is live (auth before gating).
     let denied = registry.write_input_as(&stranger, id, b"hello-bitty-write\r\n");
     assert!(
         is_denied_for(&denied, "write_input"),
         "stranger write must be denied, got {denied:?}"
     );
 
+    // The child echoes the line back with its marker prefix, proving the
+    // bytes reached stdin (not just the ConPTY input echo, which never
+    // carries the `got:` prefix). PTY output carries carriage returns from
+    // the line discipline, so match the marker plus the payload loosely
+    // rather than byte-exactly.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let view = registry
             .read_output_as(&spawner, id, ReadOutput::new(OutputStream::Stdout))
             .expect("owner reads");
-        if view.text.contains("hello-bitty-write") {
+        if view.text.contains("got:") && view.text.contains("hello-bitty-write") {
             break;
         }
         assert!(

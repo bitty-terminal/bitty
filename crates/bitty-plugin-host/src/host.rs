@@ -173,6 +173,7 @@ pub struct PluginHost {
     side_queue: SideQueue<HostObservation>,
     safe_mode: bool,
     audit: crate::effective::AuditLedger,
+    secrets: crate::secrets::SecretStore,
 }
 
 impl PluginHost {
@@ -193,6 +194,7 @@ impl PluginHost {
             side_queue: SideQueue::new(side_capacity),
             safe_mode: false,
             audit: crate::effective::AuditLedger::new(),
+            secrets: crate::secrets::SecretStore::new(),
         }
     }
 
@@ -209,6 +211,7 @@ impl PluginHost {
             side_queue: SideQueue::new(side_capacity),
             safe_mode: false,
             audit: crate::effective::AuditLedger::new(),
+            secrets: crate::secrets::SecretStore::new(),
         }
     }
 
@@ -684,6 +687,88 @@ impl PluginHost {
     #[must_use]
     pub fn audit(&self) -> &crate::effective::AuditLedger {
         &self.audit
+    }
+
+    // ── host secret store (research 045 §5; CTX-0521) ────────────────────
+
+    /// Access the host secret store (read-only).
+    ///
+    /// Values never leave through this reference: use
+    /// [`Self::resolve_secret_for_spawn`] at spawn/request time, or the
+    /// redacting views ([`crate::secrets::SecretDescriptor`],
+    /// [`crate::secrets::SanitizedEnvView`]) for doctor/list surfaces.
+    #[must_use]
+    pub fn secrets(&self) -> &crate::secrets::SecretStore {
+        &self.secrets
+    }
+
+    /// Access the host secret store mutably (provisioning, consent, tests).
+    #[must_use]
+    pub fn secrets_mut(&mut self) -> &mut crate::secrets::SecretStore {
+        &mut self.secrets
+    }
+
+    /// Resolve `(env_name, handle)` bindings into child-env entries.
+    ///
+    /// Composition seam (conforms, never duplicates): `stack`/`request` are
+    /// authorized first through the CTX-0524 six-layer intersection
+    /// ([`Self::authorize_effective`] with `RequestKind::ExecutionRun`); only
+    /// an allowed request reaches the store. Resolution then injects values
+    /// only into the returned child-env pairs (never argv); the values must
+    /// never enter agent context, prompts, Lua logs, execution logs, panel
+    /// history, traces, diagnostics, or error messages.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::effective::EffectiveDenial`] (as `PluginError`) when the
+    ///   capability stack denies the spawn.
+    /// - [`crate::secrets::SecretError::MissingHandle`] /
+    ///   [`crate::secrets::SecretError::ConsentRequired`] (as `PluginError`)
+    ///   when a handle is unknown or lacks active per-handle consent.
+    /// - [`crate::secrets::SecretError`] for malformed/over-bound bindings.
+    pub fn resolve_secret_for_spawn(
+        &mut self,
+        stack: &crate::effective::EffectiveStack,
+        request: &crate::effective::AgentRequest,
+        project_trusted: bool,
+        bindings: &[(String, crate::secrets::SecretHandle)],
+        now_ms: u64,
+    ) -> Result<Vec<(String, String)>, PluginError> {
+        if let Err(denial) = self.authorize_effective(
+            stack,
+            request,
+            crate::effective::RequestKind::ExecutionRun,
+            project_trusted,
+        ) {
+            // Authorization denied before the store is contacted: resolve in
+            // unauthorized mode so failures stay typed but leave no
+            // secret-audit trace (the effective ledger records the denial).
+            let _ = self
+                .secrets
+                .resolve_env_for_spawn_authorized(bindings, now_ms, false);
+            return Err(PluginError::registry(denial.to_string()));
+        }
+        self.secrets
+            .resolve_env_for_spawn(bindings, now_ms)
+            .map_err(PluginError::from)
+    }
+
+    /// Agent-visible sanitized view over explicit env entries.
+    ///
+    /// Presence plus non-secret values only (panel-environment Agent View
+    /// direction): secret values surface as presence markers, never raw.
+    #[must_use]
+    pub fn sanitized_env_view(&self, env: &[(String, String)]) -> crate::secrets::SanitizedEnvView {
+        crate::secrets::SanitizedEnvView::sanitize(env, &self.secrets)
+    }
+
+    /// Scrub text against the live store's values (P0-AC-026).
+    ///
+    /// Handle references survive; every stored value is replaced with
+    /// `[redacted]`. Use before logs, diagnostics, traces, and snapshots.
+    #[must_use]
+    pub fn scrub_against_secrets(&self, input: &str) -> String {
+        crate::secrets::scrub_against_store(input, &self.secrets)
     }
 
     // ── event pipeline delegation ─────────────────────────────────────
@@ -1474,5 +1559,138 @@ mod effective_tests {
                 .is_err()
         );
         assert_eq!(host.audit().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+    use crate::effective::{AgentRequest, CapabilityScope, EffectiveStack};
+    use crate::secrets::{SecretError, SecretHandle};
+
+    const SEED: &str = "ghp_seededSecretFixtureAAAA1111";
+
+    fn scope_with(source: &str, caps: &[&str]) -> CapabilityScope {
+        let mut scope = CapabilityScope::unconstrained(source);
+        for raw in caps {
+            scope.caps.insert(CapabilityId::parse(raw).unwrap());
+        }
+        scope
+    }
+
+    fn authorized_stack() -> (EffectiveStack, AgentRequest) {
+        let stack = EffectiveStack {
+            host: scope_with("host", &["terminal.semantic-read"]),
+            user: scope_with("user", &["terminal.semantic-read"]),
+            project: None,
+            parent: scope_with("parent", &["terminal.semantic-read"]),
+            task: scope_with("task", &["terminal.semantic-read"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["terminal.semantic-read"]),
+            raw_wide: Vec::new(),
+        };
+        (stack, request)
+    }
+
+    fn denied_request() -> AgentRequest {
+        AgentRequest {
+            scope: scope_with("req", &["ui.rich"]),
+            raw_wide: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn secret_spawn_requires_capability_authorization_first() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        host.secrets_mut().insert("github", SEED).unwrap();
+        let secret_audit_before = host.secrets().audit().len();
+        let bindings = vec![(
+            "GITHUB_TOKEN".to_string(),
+            SecretHandle::parse("secret://github").unwrap(),
+        )];
+        // An over-request against the intersection denies before the store
+        // is contacted: no resolution, no new secret audit entry (the
+        // consent grant above is the only entry so far).
+        let denied = host
+            .resolve_secret_for_spawn(
+                &EffectiveStack::unconstrained(),
+                &denied_request(),
+                true,
+                &bindings,
+                10,
+            )
+            .unwrap_err();
+        assert!(denied.to_string().contains("denied"));
+        assert_eq!(host.secrets().audit().len(), secret_audit_before);
+        // Authorized stack resolves into child env only.
+        host.secrets_mut().grant_consent("github", 0, None);
+        let allowed_before = host.secrets().audit().len();
+        let (stack, request) = authorized_stack();
+        let resolved = host
+            .resolve_secret_for_spawn(&stack, &request, true, &bindings, 10)
+            .unwrap();
+        assert_eq!(
+            resolved,
+            vec![("GITHUB_TOKEN".to_string(), SEED.to_string())]
+        );
+        assert_eq!(host.secrets().audit().len(), allowed_before + 1);
+    }
+
+    #[test]
+    fn secret_spawn_surfaces_typed_missing_and_denied() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let (stack, request) = authorized_stack();
+        // Unknown handle: missing (typed, name only).
+        let missing = vec![(
+            "GITHUB_TOKEN".to_string(),
+            SecretHandle::parse("secret://nope").unwrap(),
+        )];
+        let err = host
+            .resolve_secret_for_spawn(&stack, &request, true, &missing, 10)
+            .unwrap_err();
+        assert!(err.to_string().contains("missing secret handle 'nope'"));
+        assert!(!err.to_string().contains(SEED));
+        // Known handle without consent: denied (typed, name only).
+        host.secrets_mut().insert("github", SEED).unwrap();
+        let bindings = vec![(
+            "GITHUB_TOKEN".to_string(),
+            SecretHandle::parse("secret://github").unwrap(),
+        )];
+        let err = host
+            .resolve_secret_for_spawn(&stack, &request, true, &bindings, 10)
+            .unwrap_err();
+        assert!(err.to_string().contains("consent required"));
+        assert!(!err.to_string().contains(SEED));
+    }
+
+    #[test]
+    fn secret_spawn_never_leaks_through_sanitized_or_scrubbed_views() {
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        host.secrets_mut().insert("github", SEED).unwrap();
+        host.secrets_mut().grant_consent("github", 0, None);
+        let (stack, request) = authorized_stack();
+        let resolved = host
+            .resolve_secret_for_spawn(
+                &stack,
+                &request,
+                true,
+                &[(
+                    "GITHUB_TOKEN".to_string(),
+                    SecretHandle::parse("secret://github").unwrap(),
+                )],
+                10,
+            )
+            .unwrap();
+        // Sanitized agent view withholds the value.
+        let view = host.sanitized_env_view(&resolved);
+        assert!(view.is_secret("GITHUB_TOKEN"));
+        assert!(!format!("{view:?}").contains(SEED));
+        // Scrubbing removes the value from mixed text; handles survive.
+        let mixed = format!("out {SEED}\nref secret://github end");
+        let scrubbed = host.scrub_against_secrets(&mixed);
+        assert!(!scrubbed.contains(SEED));
+        assert!(scrubbed.contains("secret://github"));
+        let _ = SecretError::missing_handle("github");
     }
 }

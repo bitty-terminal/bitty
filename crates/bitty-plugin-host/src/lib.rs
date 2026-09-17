@@ -125,6 +125,7 @@ pub mod host;
 pub mod install;
 pub mod manifest;
 pub mod registry;
+pub mod secrets;
 pub mod tools;
 
 pub use capability::{
@@ -160,6 +161,17 @@ pub use manifest::{
     PluginManifest, QualifiedName, ToolDeclaration, is_hostile_fs_pattern,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
+pub use secrets::{
+    FileSecretStore, MAX_HANDLE_NAME_BYTES, MAX_RESOLVED_ENV_VARS, MAX_SECRET_AUDIT_ENTRIES,
+    MAX_SECRET_AUDIT_ITEMS, MAX_SECRET_FILE_BYTES, MAX_SECRET_FILE_LINE_BYTES,
+    MAX_SECRET_FILE_LINES, MAX_SECRET_VALUE_BYTES, MAX_SECRETS, SECRET_REDACTED_MARKER,
+    SECRET_SCHEME_PREFIX, SECRET_STORE_DIR_NAME, SECRET_STORE_FILE_NAME, SanitizedEnvView,
+    SecretAuditDecision, SecretAuditEntry, SecretAuditLedger, SecretConsent, SecretDenialKind,
+    SecretDescriptor, SecretError, SecretHandle, SecretStore, data_home_with_env,
+    is_sensitive_env_name, looks_like_literal_secret, looks_like_secret_token,
+    reject_literal_secret, reject_literal_secrets_in_env, scrub_against_store,
+    scrub_text_with_secrets, secret_store_path, secret_store_path_with_env,
+};
 pub use tools::{
     ACCEPTED_TOOL_GIT, DENIED_SPAWN_ENV_PREFIXES, DENIED_SPAWN_ENV_VARS, GIT_ALLOWED_SUBCOMMANDS,
     MAX_GIT_ARG_BYTES, MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, PAYLOAD_MAX_BYTES, is_accepted_tool,

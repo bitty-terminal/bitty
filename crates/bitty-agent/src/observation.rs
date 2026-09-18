@@ -16,6 +16,9 @@ use crate::error::AgentError;
 /// `256 KiB` IPC framing cap owned by `bitty-ipc` (OQ-018).
 pub const MAX_OBSERVATION_BYTES: usize = 8 * 1024;
 
+/// Marker appended to untrusted terminal output when truncated at the cap.
+pub const TERMINAL_OUTPUT_TRUNCATION_MARKER: &str = "\n[... truncated ...]";
+
 /// Maximum bytes for the whole observation's serialized form (defensive cap
 /// for transport framing checks that will live in `bitty-ipc`).
 pub const MAX_OBSERVATION_FRAME_BYTES: usize = 16 * 1024;
@@ -156,7 +159,14 @@ impl AgentObservation {
     #[must_use]
     pub fn terminal_output_truncated(mut text: String) -> Self {
         if text.len() > MAX_OBSERVATION_BYTES {
-            text.truncate(MAX_OBSERVATION_BYTES);
+            let budget =
+                MAX_OBSERVATION_BYTES.saturating_sub(TERMINAL_OUTPUT_TRUNCATION_MARKER.len());
+            let mut end = budget;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str(TERMINAL_OUTPUT_TRUNCATION_MARKER);
         }
         Self::TerminalOutput { text }
     }
@@ -224,6 +234,126 @@ mod tests {
         let obs = AgentObservation::terminal_output_truncated(big);
         assert_eq!(obs.byte_len(), MAX_OBSERVATION_BYTES);
         obs.validate().expect("truncated fits");
+        match &obs {
+            AgentObservation::TerminalOutput { text } => {
+                assert!(text.ends_with(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn truncation_untruncated_preserves_text_and_no_marker() {
+        // Small text
+        let small = "short terminal output payload".to_string();
+        let obs_small = AgentObservation::terminal_output_truncated(small.clone());
+        assert_eq!(
+            obs_small,
+            AgentObservation::TerminalOutput {
+                text: small.clone()
+            }
+        );
+        match obs_small {
+            AgentObservation::TerminalOutput { text } => {
+                assert_eq!(text, small);
+                assert!(!text.contains(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+            }
+            _ => unreachable!(),
+        }
+
+        // Exact limit text
+        let exact = "x".repeat(MAX_OBSERVATION_BYTES);
+        let obs_exact = AgentObservation::terminal_output_truncated(exact.clone());
+        assert_eq!(
+            obs_exact,
+            AgentObservation::TerminalOutput {
+                text: exact.clone()
+            }
+        );
+        match obs_exact {
+            AgentObservation::TerminalOutput { text } => {
+                assert_eq!(text, exact);
+                assert!(!text.contains(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn truncation_exceeding_max_bytes_budget_and_marker() {
+        let big = "hello terminal world ".repeat(1000);
+        assert!(big.len() > MAX_OBSERVATION_BYTES);
+        let obs = AgentObservation::terminal_output_truncated(big);
+        obs.validate().expect("truncated must be valid");
+        assert!(obs.byte_len() <= MAX_OBSERVATION_BYTES);
+        match obs {
+            AgentObservation::TerminalOutput { text } => {
+                assert!(text.ends_with(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+                assert!(text.len() <= MAX_OBSERVATION_BYTES);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn truncation_multibyte_utf8_char_boundaries() {
+        // Test 2-byte ('é'), 3-byte ('中'), 4-byte ('🦀') characters arranged so
+        // truncation budget hits right in the middle of a multi-byte code point.
+        // None of these should panic and all must yield valid UTF-8 ending with marker.
+
+        // 2-byte character: 'é' is 2 bytes (0xC3 0xA9)
+        for prefix_len in 0..2 {
+            let prefix = "a".repeat(prefix_len);
+            let input = format!("{prefix}{}", "é".repeat(MAX_OBSERVATION_BYTES));
+            let obs = AgentObservation::terminal_output_truncated(input);
+            obs.validate().expect("2-byte UTF-8 valid");
+            assert!(obs.byte_len() <= MAX_OBSERVATION_BYTES);
+            match obs {
+                AgentObservation::TerminalOutput { text } => {
+                    assert!(text.ends_with(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+                    let content = &text[..text.len() - TERMINAL_OUTPUT_TRUNCATION_MARKER.len()];
+                    assert!(content.starts_with(&prefix));
+                    assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // 3-byte character: '中' is 3 bytes (0xE4 0xB8 0xAD)
+        for prefix_len in 0..3 {
+            let prefix = "b".repeat(prefix_len);
+            let input = format!("{prefix}{}", "中".repeat(MAX_OBSERVATION_BYTES));
+            let obs = AgentObservation::terminal_output_truncated(input);
+            obs.validate().expect("3-byte UTF-8 valid");
+            assert!(obs.byte_len() <= MAX_OBSERVATION_BYTES);
+            match obs {
+                AgentObservation::TerminalOutput { text } => {
+                    assert!(text.ends_with(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+                    let content = &text[..text.len() - TERMINAL_OUTPUT_TRUNCATION_MARKER.len()];
+                    assert!(content.starts_with(&prefix));
+                    assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // 4-byte character: '🦀' is 4 bytes (0xF0 0x9F 0xA6 0x80)
+        for prefix_len in 0..4 {
+            let prefix = "c".repeat(prefix_len);
+            let input = format!("{prefix}{}", "🦀".repeat(MAX_OBSERVATION_BYTES));
+            let obs = AgentObservation::terminal_output_truncated(input);
+            obs.validate().expect("4-byte UTF-8 valid");
+            assert!(obs.byte_len() <= MAX_OBSERVATION_BYTES);
+            match obs {
+                AgentObservation::TerminalOutput { text } => {
+                    assert!(text.ends_with(TERMINAL_OUTPUT_TRUNCATION_MARKER));
+                    let content = &text[..text.len() - TERMINAL_OUTPUT_TRUNCATION_MARKER.len()];
+                    assert!(content.starts_with(&prefix));
+                    assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

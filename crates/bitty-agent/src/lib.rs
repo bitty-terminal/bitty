@@ -244,7 +244,10 @@ pub use message::{
     AgentMessage, ContentTrust, MAX_MESSAGE_BYTES, MAX_MESSAGE_FRAME_BYTES,
     MAX_MESSAGES_PER_SESSION, MAX_SESSION_BYTES, Role,
 };
-pub use observation::{AgentObservation, MAX_OBSERVATION_BYTES, MAX_OBSERVATION_FRAME_BYTES};
+pub use observation::{
+    AgentObservation, MAX_OBSERVATION_BYTES, MAX_OBSERVATION_FRAME_BYTES,
+    TERMINAL_OUTPUT_TRUNCATION_MARKER,
+};
 pub use queue::SideQueue;
 pub use session::{AgentSession, DEFAULT_SIDE_QUEUE_CAPACITY, SessionState};
 pub use tool::{

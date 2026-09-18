@@ -276,11 +276,17 @@ impl<T> PanelWorker<T> {
     /// the bounded queue is full the request is shed (a refresh is already
     /// pending) and counted in [`Self::dropped`].
     pub fn request_refresh(&self) {
+        // Reserve accounting before publication so a fast consumer loop cannot
+        // observe a published token and saturating-decrement before the producer
+        // records it, which would drop a decrement and leave stale positive
+        // telemetry (TERM-RUN-011 / CTX-0552).
+        self.queued.fetch_add(1, Ordering::SeqCst);
         if self.tx.try_send(()).is_ok() {
-            self.queued.fetch_add(1, Ordering::Relaxed);
+            // Reserved and successfully published.
         } else {
-            // Full (shed, coalesced) — or disconnected after teardown; only
-            // full-queue sheds count as load shedding.
+            // Full (shed, coalesced) — or disconnected after teardown; roll back
+            // reservation and account for shed load when still alive.
+            dec_saturating(&self.queued);
             if self.is_alive() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -686,5 +692,46 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "Drop must bound slow-probe teardown"
         );
+    }
+
+    /// TERM-RUN-011 / CTX-0552: reserve accounting before publication guarantees
+    /// that consumer processing never outruns producer reservation. A drained
+    /// queue must deterministically report zero pending tokens.
+    #[test]
+    fn worker_pending_accounting_order_drains_to_zero() {
+        let probe_count = Arc::new(AtomicU64::new(0));
+        let probe_counter = Arc::clone(&probe_count);
+        let mut worker = PanelWorker::try_spawn(
+            "accounting-order",
+            None,
+            PANEL_WORKER_DEFAULT_QUEUE_CAP,
+            Duration::from_secs(60),
+            move || {
+                probe_counter.fetch_add(1, Ordering::Relaxed);
+                Some(42_u64)
+            },
+        )
+        .expect("valid worker config");
+
+        // Fire multiple refresh requests rapidly.
+        for _ in 0..20 {
+            worker.request_refresh();
+        }
+
+        // Wait until probe has executed and the queue is completely drained.
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                worker.pending() == 0 && probe_count.load(Ordering::Relaxed) > 0
+            }),
+            "worker must drain queue and pending count must reach zero, got pending={}",
+            worker.pending()
+        );
+
+        assert_eq!(
+            worker.pending(),
+            0,
+            "drained queue must report zero pending"
+        );
+        worker.shutdown();
     }
 }

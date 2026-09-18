@@ -242,7 +242,7 @@ pub fn verify_windows_pipe(peer_sid: u64, runtime_sid: u64) -> Result<(), IpcErr
 /// Tokens are bounded (`<= 64` bytes id, `<= 64` tokens tracked) and expiry
 /// is enforced server-side from caller-supplied `now_ms` (deterministic, never
 /// wall-clock).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChildToken {
     /// Opaque token bytes (bounded, not a credential file).
     pub token: String,
@@ -254,6 +254,18 @@ pub struct ChildToken {
     pub created_at_ms: u64,
     /// Time-to-live in ms (1..=MAX_TOKEN_TTL_MS, default 60s).
     pub ttl_ms: u64,
+}
+
+impl std::fmt::Debug for ChildToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildToken")
+            .field("scope", &self.scope)
+            .field("scoped_id", &self.scoped_id)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("ttl_ms", &self.ttl_ms)
+            .field("token", &"***REDACTED***")
+            .finish()
+    }
 }
 
 impl ChildToken {
@@ -328,9 +340,17 @@ impl ChildToken {
 ///
 /// The runtime verifies every child request against this store; replay after
 /// expiry fails closed, and the store never grows beyond `MAX_CHILD_TOKENS`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ChildTokenStore {
     tokens: std::collections::BTreeMap<String, ChildToken>,
+}
+
+impl std::fmt::Debug for ChildTokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildTokenStore")
+            .field("count", &self.tokens.len())
+            .finish()
+    }
 }
 
 impl ChildTokenStore {
@@ -696,5 +716,41 @@ mod tests {
             "expired-token error must not echo token: {expired_reason}"
         );
         assert_eq!(expired_reason, "child token expired");
+    }
+
+    #[test]
+    fn child_token_and_store_debug_redacts_tokens() {
+        let secret = "super_secret_child_token_value";
+        let token = ChildToken::new(
+            secret.into(),
+            Scope::TerminalInspect,
+            "t:4".into(),
+            100,
+            60_000,
+        )
+        .unwrap();
+
+        let token_debug = format!("{token:?}");
+        assert!(
+            !token_debug.contains(secret),
+            "ChildToken Debug must not contain secret token value, got: {token_debug}"
+        );
+        assert!(
+            token_debug.contains("***REDACTED***"),
+            "ChildToken Debug must contain ***REDACTED***, got: {token_debug}"
+        );
+
+        let mut store = ChildTokenStore::new();
+        store.insert(token).unwrap();
+
+        let store_debug = format!("{store:?}");
+        assert!(
+            !store_debug.contains(secret),
+            "ChildTokenStore Debug must not contain secret token value, got: {store_debug}"
+        );
+        assert!(
+            store_debug.contains("count: 1"),
+            "ChildTokenStore Debug must contain count: 1, got: {store_debug}"
+        );
     }
 }

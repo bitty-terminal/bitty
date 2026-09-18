@@ -216,7 +216,7 @@ use config_cli::{
     config_usage, load_app_config, run_config_subcommand, runtime_config_from_effective,
 };
 use init::run_init_subcommand;
-use layout_cmd::{apply_focus, build_layout, demo_pump_enabled_from_env, run_headless_smoke};
+use layout_cmd::{apply_focus, demo_pump_enabled_from_env, run_headless_smoke};
 use logging::effective_log_level;
 use spawn::{SpawnSpec, resolve_spawn_program, spawn_default_shell, spawn_startup_pane_shells};
 use terminal_app::TerminalApp;
@@ -232,7 +232,9 @@ use spawn::{configured_shell_argv0, looks_like_negative_number, resolve_default_
 use cli::{Args, ConfigCommand};
 
 #[cfg(test)]
-use layout_cmd::{demo_pump_enabled_from_value, run_layout_proof, spawn_demo_pty_pump_with_theme};
+use layout_cmd::{
+    build_layout, demo_pump_enabled_from_value, run_layout_proof, spawn_demo_pty_pump_with_theme,
+};
 
 #[cfg(test)]
 use terminal_app::window_title_for_theme;
@@ -555,42 +557,7 @@ fn main() {
     // A restored session already owns the layout + focus: argv wiring runs
     // only for a fresh start so the two never fight over the tree.
     if !session_restored {
-        let cols = runtime.config().cols;
-        let rows = runtime.config().rows;
-        // CTX-0480: invalid `--layout` / non-finite ratio fails closed.
-        let layout = match layout_cmd::try_build_layout(&args, cols, rows) {
-            Ok(node) => node,
-            Err(msg) => {
-                eprintln!("bitty: {msg}\n{}", help_text());
-                std::process::exit(2);
-            }
-        };
-        let leaf_ids = layout.leaf_ids();
-        let focused_before = runtime.focused_view();
-        runtime.set_layout(layout);
-        logging::info(|| {
-            format!(
-                "bitty: layout installed — leafs={} ids={:?} focused_before={:?} focused_after={:?} container={:?}",
-                runtime.leaf_count(),
-                leaf_ids,
-                focused_before,
-                runtime.focused_view(),
-                runtime.container()
-            )
-        });
-        if let Some(focus_spec) = args.focus.as_deref() {
-            // CTX-0480: syntactically unknown focus fails closed; a
-            // well-formed but unresolvable target still warns via
-            // `apply_focus` (returns false, startup continues).
-            if !layout_cmd::is_valid_focus_spec(focus_spec) {
-                eprintln!(
-                    "bitty: unknown --focus spec {focus_spec:?} (want next|prev|up|down|left|right|<id>)\n{}",
-                    help_text()
-                );
-                std::process::exit(2);
-            }
-            apply_focus(&mut runtime, focus_spec);
-        }
+        apply_startup_layout_and_focus(&mut runtime, &args);
     }
 
     // Gap A startup wiring (RFC plugin-host-runtime-rfc): discover bundled
@@ -628,53 +595,7 @@ fn main() {
         shell_env: shell_env.clone(),
         config_shell: config_shell.clone(),
     };
-    let effective = resolve_spawn_program(&args, config_shell.as_deref(), shell_env.as_deref());
-    logging::info(|| {
-        format!(
-            "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
-            args.program.is_some(),
-            config_shell.is_some()
-        )
-    });
-    let spawn_result = if let Some(program) = args.program.as_deref() {
-        let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
-        if tail.is_empty() {
-            runtime.spawn_shell(program)
-        } else {
-            runtime.spawn_shell_with_args(program, &tail)
-        }
-    } else {
-        spawn_default_shell(&mut runtime, config_shell.as_deref(), shell_env.as_deref())
-    };
-    // CTX-0481 (#762): startup spawn failures stay fail-soft by default but
-    // are never invisible. `--fail-loud` turns the same condition into an
-    // immediate non-zero exit so headless/CI greens only prove a live shell.
-    let startup_spawn_failed = match spawn_result {
-        Ok(()) => {
-            logging::info(|| {
-                format!(
-                    "bitty: PTY shell spawned (has_pty={} has_reader={})",
-                    runtime.has_pty(),
-                    runtime.has_pty_reader()
-                )
-            });
-            // CTX-0176: startup multi-leaf layouts (`--split`/`--stack`/
-            // `--layout`) give every non-focused leaf its own shell too; the
-            // focused leaf keeps the primary session spawned above.
-            // Best-effort with loud warnings by default. Skipped when the
-            // primary spawn failed: the same resolution would fail the same
-            // way per leaf.
-            spawn_startup_pane_shells(&mut runtime, &spawn_spec) > 0
-        }
-        Err(err) => {
-            logging::warn(|| {
-                format!(
-                    "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
-                )
-            });
-            true
-        }
-    };
+    let startup_spawn_failed = spawn_startup_shells(&mut runtime, &args, &spawn_spec);
     if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
         eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
         std::process::exit(code);
@@ -741,7 +662,7 @@ fn main() {
         app_config.theme.name,
         app_config.source,
         keymaps,
-        spawn_spec,
+        spawn_spec.clone(),
     )
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
@@ -796,46 +717,9 @@ fn main() {
             }
         };
         // Re-apply layout and focus in fallback so headless smoke proves the same composition
-        // that real mode would have driven via the window.
-        {
-            let cols = rt.config().cols;
-            let rows = rt.config().rows;
-            let layout = build_layout(&args, cols, rows);
-            rt.set_layout(layout);
-            if let Some(focus_spec) = args.focus.as_deref() {
-                apply_focus(&mut rt, focus_spec);
-            }
-        }
-        // Preserve program spawn attempt in the fallback when it existed, else
-        // resolve the default shell chain (configured `terminal.shell` >
-        // $SHELL > /bin/sh) for completeness.
-        // CTX-0176: startup panes get their own shells here too (same rule as
-        // the primary path above — panes only when the primary spawn worked).
-        let fallback_spec = SpawnSpec {
-            program: args.program.clone(),
-            program_args: args.program_args.clone(),
-            shell_env: std::env::var("SHELL").ok(),
-            config_shell: app_config.effective.terminal.shell.clone(),
-        };
-        let fallback_primary_ok = if let Some(program) = args.program.as_deref() {
-            let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
-            if tail.is_empty() {
-                rt.spawn_shell(program).is_ok()
-            } else {
-                rt.spawn_shell_with_args(program, &tail).is_ok()
-            }
-        } else {
-            spawn_default_shell(
-                &mut rt,
-                fallback_spec.config_shell.as_deref(),
-                fallback_spec.shell_env.as_deref(),
-            )
-            .is_ok()
-        };
-        let mut fallback_spawn_failed = !fallback_primary_ok;
-        if fallback_primary_ok {
-            fallback_spawn_failed = spawn_startup_pane_shells(&mut rt, &fallback_spec) > 0;
-        }
+        // that real mode would have driven via the window (TERM-APP-003 / CTX-0553).
+        apply_startup_layout_and_focus(&mut rt, &args);
+        let fallback_spawn_failed = spawn_startup_shells(&mut rt, &args, &spawn_spec);
         // CTX-0481: the DisplayUnavailable fallback must not turn a
         // `--fail-loud` shell failure into a green smoke.
         if let Some(code) = fail_loud_exit(args.fail_loud, fallback_spawn_failed) {
@@ -844,6 +728,112 @@ fn main() {
         }
         let code = run_headless_smoke(&mut rt);
         std::process::exit(code);
+    }
+}
+
+/// Assembles startup layout and applies focus specifications (TERM-APP-003 / CTX-0553).
+///
+/// Shared between the primary windowed startup path and the `DisplayUnavailable`
+/// headless fallback path, ensuring consistent configuration and ownership without
+/// duplicated assembly logic.
+pub(crate) fn apply_startup_layout_and_focus(runtime: &mut Runtime, args: &cli::Args) {
+    let cols = runtime.config().cols;
+    let rows = runtime.config().rows;
+    // CTX-0480: invalid `--layout` / non-finite ratio fails closed.
+    let layout = match layout_cmd::try_build_layout(args, cols, rows) {
+        Ok(node) => node,
+        Err(msg) => {
+            eprintln!("bitty: {msg}\n{}", help_text());
+            std::process::exit(2);
+        }
+    };
+    let leaf_ids = layout.leaf_ids();
+    let focused_before = runtime.focused_view();
+    runtime.set_layout(layout);
+    logging::info(|| {
+        format!(
+            "bitty: layout installed — leafs={} ids={:?} focused_before={:?} focused_after={:?} container={:?}",
+            runtime.leaf_count(),
+            leaf_ids,
+            focused_before,
+            runtime.focused_view(),
+            runtime.container()
+        )
+    });
+    if let Some(focus_spec) = args.focus.as_deref() {
+        // CTX-0480: syntactically unknown focus fails closed; a
+        // well-formed but unresolvable target still warns via
+        // `apply_focus` (returns false, startup continues).
+        if !layout_cmd::is_valid_focus_spec(focus_spec) {
+            eprintln!(
+                "bitty: unknown --focus spec {focus_spec:?} (want next|prev|up|down|left|right|<id>)\n{}",
+                help_text()
+            );
+            std::process::exit(2);
+        }
+        apply_focus(runtime, focus_spec);
+    }
+}
+
+/// Spawns the primary shell and any layout pane shells (TERM-APP-003 / CTX-0553).
+///
+/// Returns `true` if any startup shell spawn failed (for `--fail-loud` handling).
+pub(crate) fn spawn_startup_shells(
+    runtime: &mut Runtime,
+    args: &cli::Args,
+    spawn_spec: &SpawnSpec,
+) -> bool {
+    let effective = resolve_spawn_program(
+        args,
+        spawn_spec.config_shell.as_deref(),
+        spawn_spec.shell_env.as_deref(),
+    );
+    logging::info(|| {
+        format!(
+            "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
+            args.program.is_some(),
+            spawn_spec.config_shell.is_some()
+        )
+    });
+    let spawn_result = if let Some(program) = args.program.as_deref() {
+        let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
+        if tail.is_empty() {
+            runtime.spawn_shell(program)
+        } else {
+            runtime.spawn_shell_with_args(program, &tail)
+        }
+    } else {
+        spawn_default_shell(
+            runtime,
+            spawn_spec.config_shell.as_deref(),
+            spawn_spec.shell_env.as_deref(),
+        )
+    };
+    match spawn_result {
+        Ok(()) => {
+            logging::info(|| {
+                format!(
+                    "bitty: PTY shell spawned (has_pty={} has_reader={})",
+                    runtime.has_pty(),
+                    runtime.has_pty_reader()
+                )
+            });
+            // CTX-0176: startup multi-leaf layouts (`--split`/`--stack`/
+            // `--layout`) give every non-focused leaf its own shell too; the
+            // focused leaf keeps the primary session spawned above.
+            // Best-effort with loud warnings by default. Skipped when the
+            // primary spawn failed: the same resolution would fail the same
+            // way per leaf.
+            spawn_startup_pane_shells(runtime, spawn_spec) > 0
+        }
+        Err(err) => {
+            logging::warn(|| {
+                format!(
+                    "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
+                )
+            });
+            true
+        }
     }
 }
 

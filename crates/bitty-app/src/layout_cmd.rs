@@ -155,6 +155,7 @@ pub(crate) fn clamp_ratio_loudly(raw: f32) -> f32 {
 /// This is the warn-fallback compatibility form: an unknown `--layout`
 /// spec warns and falls through to the flag precedence. Startup dispatch
 /// must use [`try_build_layout`] to fail closed (exit 2) instead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_layout(args: &Args, cols: usize, rows: usize) -> LayoutNode {
     match try_build_layout(args, cols, rows) {
         Ok(node) => node,

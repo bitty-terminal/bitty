@@ -25,6 +25,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -1714,13 +1715,27 @@ fn resolve_module_source(root: &Path, name: &str) -> Result<String, BridgeError>
             "only source `.lua` modules may be required",
         ));
     }
-    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+    let file = std::fs::File::open(&canonical).map_err(|error| {
+        BridgeError::new(
+            "resolution",
+            "E_REQUIRE_NOT_FOUND",
+            format!("module '{name}' could not be opened: {error}"),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
         BridgeError::new(
             "resolution",
             "E_REQUIRE_NOT_FOUND",
             format!("module '{name}' metadata unavailable: {error}"),
         )
     })?;
+    if !metadata.is_file() {
+        return Err(BridgeError::new(
+            "resolution",
+            "E_REQUIRE_NOT_FOUND",
+            format!("module '{name}' is not a regular file"),
+        ));
+    }
     if metadata.len() as usize > MODULE_FILE_MAX_BYTES {
         return Err(BridgeError::new(
             "budget",
@@ -1728,13 +1743,24 @@ fn resolve_module_source(root: &Path, name: &str) -> Result<String, BridgeError>
             "module source exceeds the per-file byte ceiling",
         ));
     }
-    std::fs::read_to_string(&canonical).map_err(|error| {
-        BridgeError::new(
-            "resolution",
-            "E_REQUIRE_LOAD",
-            format!("module '{name}' is not valid UTF-8 source: {error}"),
-        )
-    })
+    let mut source = String::new();
+    file.take((MODULE_FILE_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut source)
+        .map_err(|error| {
+            BridgeError::new(
+                "resolution",
+                "E_REQUIRE_LOAD",
+                format!("module '{name}' is not valid UTF-8 source: {error}"),
+            )
+        })?;
+    if source.len() > MODULE_FILE_MAX_BYTES {
+        return Err(BridgeError::new(
+            "budget",
+            "E_MODULE_TOO_LARGE",
+            "module source exceeds the per-file byte ceiling",
+        ));
+    }
+    Ok(source)
 }
 
 /// Typed outcome of [`LuaVm::execute_bounded`].
@@ -1766,5 +1792,144 @@ impl LuaVm {
                 Ok(BoundedExecution::RuntimeError(message))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_module_root(tag: &str) -> TempDir {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-lua-host-unit-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let canonical = std::fs::canonicalize(&dir).expect("canonicalize temp dir");
+        TempDir(canonical)
+    }
+
+    #[test]
+    fn resolve_regular_module_direct() {
+        let root = temp_module_root("direct");
+        let code = "local M = {}; M.answer = 42; return M";
+        std::fs::write(root.0.join("my_mod.lua"), code).expect("write module");
+
+        let resolved = resolve_module_source(&root.0, "my_mod").expect("resolve");
+        assert_eq!(resolved, code);
+    }
+
+    #[test]
+    fn resolve_regular_module_init() {
+        let root = temp_module_root("init");
+        let pkg_dir = root.0.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+        let code = "return { name = 'pkg' }";
+        std::fs::write(pkg_dir.join("init.lua"), code).expect("write init.lua");
+
+        let resolved = resolve_module_source(&root.0, "pkg").expect("resolve");
+        assert_eq!(resolved, code);
+    }
+
+    #[test]
+    fn resolve_regular_module_nested() {
+        let root = temp_module_root("nested");
+        let sub_dir = root.0.join("foo").join("bar");
+        std::fs::create_dir_all(&sub_dir).expect("create sub dirs");
+        let code = "return 'nested'";
+        std::fs::write(sub_dir.join("baz.lua"), code).expect("write baz.lua");
+
+        let resolved = resolve_module_source(&root.0, "foo.bar.baz").expect("resolve");
+        assert_eq!(resolved, code);
+    }
+
+    #[test]
+    fn rejects_module_exceeding_byte_ceiling_on_handle_inspection() {
+        let root = temp_module_root("oversized");
+        let path = root.0.join("huge.lua");
+        let file = std::fs::File::create(&path).expect("create file");
+        file.set_len((MODULE_FILE_MAX_BYTES + 1) as u64)
+            .expect("set_len");
+        drop(file);
+
+        let err = resolve_module_source(&root.0, "huge").expect_err("must be rejected");
+        assert_eq!(err.class, "budget");
+        assert_eq!(err.code, "E_MODULE_TOO_LARGE");
+        assert_eq!(
+            err.message,
+            "module source exceeds the per-file byte ceiling"
+        );
+    }
+
+    #[test]
+    fn accepts_module_at_exact_byte_ceiling() {
+        let root = temp_module_root("exact-ceiling");
+        let path = root.0.join("exact.lua");
+        let chunk = vec![b' '; MODULE_FILE_MAX_BYTES];
+        std::fs::write(&path, chunk).expect("write exact bytes");
+
+        let resolved = resolve_module_source(&root.0, "exact").expect("resolve exact size");
+        assert_eq!(resolved.len(), MODULE_FILE_MAX_BYTES);
+    }
+
+    #[test]
+    fn rejects_non_file_target_directory() {
+        let root = temp_module_root("non-file-dir");
+        std::fs::create_dir(root.0.join("somedir.lua")).expect("create dir");
+
+        let err = resolve_module_source(&root.0, "somedir").expect_err("must fail");
+        assert_eq!(err.class, "resolution");
+        assert_eq!(err.code, "E_REQUIRE_NOT_FOUND");
+    }
+
+    #[test]
+    fn rejects_non_existent_module() {
+        let root = temp_module_root("non-existent");
+        let err = resolve_module_source(&root.0, "missing").expect_err("must fail");
+        assert_eq!(err.class, "resolution");
+        assert_eq!(err.code, "E_REQUIRE_NOT_FOUND");
+        assert!(err.message.contains("was not found under the plugin root"));
+    }
+
+    #[test]
+    fn rejects_broken_invalid_utf8_file() {
+        let root = temp_module_root("broken-utf8");
+        std::fs::write(root.0.join("corrupt.lua"), [0xff, 0xfe, 0xfd, 0x00])
+            .expect("write corrupt");
+
+        let err = resolve_module_source(&root.0, "corrupt").expect_err("must fail");
+        assert_eq!(err.class, "resolution");
+        assert_eq!(err.code, "E_REQUIRE_LOAD");
+        assert!(err.message.contains("is not valid UTF-8 source"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_module_root("unreadable");
+        let path = root.0.join("locked.lua");
+        std::fs::write(&path, "return 1").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let err = resolve_module_source(&root.0, "locked").expect_err("must fail");
+        assert_eq!(err.class, "resolution");
+        assert_eq!(err.code, "E_REQUIRE_NOT_FOUND");
+        assert!(err.message.contains("could not be opened"));
+
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
 }

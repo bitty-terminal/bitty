@@ -189,6 +189,8 @@ pub struct Environment {
     pub current: Option<u64>,
     /// Retained generations by id.
     pub generations: BTreeMap<u64, Generation>,
+    /// Registered package manifests by package ID for compatibility checks.
+    pub manifests: std::collections::BTreeMap<String, crate::manifest::PackageManifest>,
     /// Next generation id to allocate.
     next_id: u64,
     /// Retention policy.
@@ -202,6 +204,7 @@ impl Environment {
         Self {
             current: None,
             generations: BTreeMap::new(),
+            manifests: std::collections::BTreeMap::new(),
             next_id: 1,
             policy: RetentionPolicy::default(),
         }
@@ -213,6 +216,7 @@ impl Environment {
         Ok(Self {
             current: None,
             generations: BTreeMap::new(),
+            manifests: std::collections::BTreeMap::new(),
             next_id: 1,
             policy,
         })
@@ -300,6 +304,26 @@ impl Environment {
         self.generations.insert(id, generation);
         Ok(id)
     }
+
+    /// Register a package manifest in this environment for compatibility checks.
+    pub fn register_manifest(&mut self, manifest: crate::manifest::PackageManifest) {
+        self.manifests
+            .insert(manifest.identity.id.to_string(), manifest);
+    }
+
+    /// Stage a new lock resolution as a generation with associated manifests.
+    pub fn stage_with_manifests(
+        &mut self,
+        lock: Lockfile,
+        capability_snapshot: std::collections::BTreeMap<String, Vec<String>>,
+        activated_at: u64,
+        manifests: Vec<crate::manifest::PackageManifest>,
+    ) -> Result<u64, PackageError> {
+        for m in manifests {
+            self.register_manifest(m);
+        }
+        self.stage(lock, capability_snapshot, activated_at)
+    }
 }
 
 impl Default for Environment {
@@ -360,16 +384,21 @@ pub fn activate(
     // Preflight: re-verify digests and compat.
     let preflight = (|| -> Result<(), String> {
         generation.verify_integrity().map_err(|e| e.to_string())?;
-        // Check host compat for each package's manifest? For draft, we check lock validity only.
-        // Additionally check host versions are present if lock has packages with compat? Stub.
         if let Some(sim) = simulate_failure_at {
             if sim == ActivationPhase::Preflight {
                 return Err("simulated preflight failure".to_string());
             }
         }
-        // Simulate host version malformed would be caught via manifest check elsewhere.
-        let _ = host_bitty_version;
-        let _ = host_plugin_api_version;
+        for pkg in &generation.lock.packages {
+            if let Some(manifest) = env.manifests.get(pkg.id.as_str()) {
+                crate::integrity::check_compatibility(
+                    manifest,
+                    host_bitty_version,
+                    host_plugin_api_version,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     })();
     let pre_ok = preflight.is_ok();
@@ -848,5 +877,86 @@ mod tests {
         env.generations.get_mut(&id1).unwrap().root_digest = "b".repeat(64);
         assert!(env.verify_all().is_err());
         assert!(rollback_full(&mut env, id1, None).is_err());
+    }
+
+    fn test_manifest(
+        id: &str,
+        compat_plugin_api: Option<&str>,
+        compat_bitty: Option<&str>,
+    ) -> crate::manifest::PackageManifest {
+        crate::manifest::PackageManifest {
+            identity: crate::manifest::PackageIdentity {
+                id: PackageId::new(id).unwrap(),
+                name: "Test".to_string(),
+                version: "0.1.0".to_string(),
+                description: "desc".to_string(),
+                license: None,
+            },
+            compat: crate::manifest::Compat {
+                bitty: compat_bitty.map(str::to_string),
+                plugin_api: compat_plugin_api.map(str::to_string),
+            },
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            raw_bytes_len: 256,
+            undeclared_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_incompatible_host_plugin_api() {
+        let mut env = Environment::new();
+        let m = test_manifest("xuepoo.a", Some("^2.0.0"), None);
+        let id = env
+            .stage_with_manifests(test_lock(), BTreeMap::new(), 1, vec![m])
+            .unwrap();
+        let report = activate(&mut env, id, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        assert!(!report.succeeded);
+        assert_eq!(env.current, None, "pointer must remain unchanged");
+        assert_eq!(report.phases[0].0, ActivationPhase::Preflight);
+        assert!(
+            report.phases[0].1.is_err(),
+            "preflight must fail on incompat"
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_compatible_host_plugin_api() {
+        let mut env = Environment::new();
+        let m = test_manifest("xuepoo.a", Some("^2.0.0"), None);
+        let id = env
+            .stage_with_manifests(test_lock(), BTreeMap::new(), 1, vec![m])
+            .unwrap();
+        let report = activate(&mut env, id, Some("0.6.0"), Some("2.0.0"), None).unwrap();
+        assert!(report.succeeded);
+        assert_eq!(env.current, Some(id), "pointer must switch to id");
+        assert_eq!(report.phases[0].0, ActivationPhase::Preflight);
+        assert!(report.phases[0].1.is_ok());
+    }
+
+    #[test]
+    fn preflight_incompatible_leaves_prior_pointer_unchanged() {
+        let mut env = Environment::new();
+        let m1 = test_manifest("xuepoo.a", Some("^1.0.0"), None);
+        let id1 = env
+            .stage_with_manifests(test_lock(), BTreeMap::new(), 1, vec![m1])
+            .unwrap();
+        let r1 = activate(&mut env, id1, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        assert!(r1.succeeded);
+        assert_eq!(env.current, Some(id1));
+
+        let m2 = test_manifest("xuepoo.a", Some("^2.0.0"), None);
+        let id2 = env
+            .stage_with_manifests(test_lock(), BTreeMap::new(), 2, vec![m2])
+            .unwrap();
+        let r2 = activate(&mut env, id2, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+        assert!(!r2.succeeded);
+        assert_eq!(
+            env.current,
+            Some(id1),
+            "pointer must stay on prior generation"
+        );
+        assert_eq!(r2.phases[0].0, ActivationPhase::Preflight);
+        assert!(r2.phases[0].1.is_err());
     }
 }

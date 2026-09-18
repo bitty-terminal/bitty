@@ -671,3 +671,48 @@ fn verify_pipeline_each_stage_independently_fails() {
         );
     }
 }
+
+#[test]
+fn activate_preflight_enforces_manifest_host_version_compatibility() {
+    let mut env = Environment::new();
+    let mut m1 = minimal_manifest("xuepoo.a");
+    m1.compat.plugin_api = Some("^1.0.0".to_string());
+    let m1_hex = m1.canonical_digest();
+    let lock1 = test_lock("xuepoo.a", "1.0.0", b"a1", &m1_hex);
+
+    // Initial activation succeeds with host API 1.0.0
+    let id1 = env
+        .stage_with_manifests(lock1, BTreeMap::new(), 1, vec![m1])
+        .unwrap();
+    let report1 = activate(&mut env, id1, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+    assert!(report1.succeeded);
+    assert_eq!(env.current, Some(id1));
+
+    // Staging generation 2 requiring host API 2.x
+    let mut m2 = minimal_manifest("xuepoo.a");
+    m2.compat.plugin_api = Some("^2.0.0".to_string());
+    let m2_hex = m2.canonical_digest();
+    let lock2 = test_lock("xuepoo.a", "2.0.0", b"a2", &m2_hex);
+    let id2 = env
+        .stage_with_manifests(lock2, BTreeMap::new(), 2, vec![m2])
+        .unwrap();
+
+    // Activating generation 2 on host API 1.x fails in preflight before commit
+    let report2 = activate(&mut env, id2, Some("0.6.0"), Some("1.0.0"), None).unwrap();
+    assert!(!report2.succeeded);
+    assert_eq!(
+        env.current,
+        Some(id1),
+        "pointer must remain unchanged at id1"
+    );
+    assert_eq!(report2.phases[0].0, ActivationPhase::Preflight);
+    assert!(
+        report2.phases[0].1.is_err(),
+        "preflight phase must report error"
+    );
+
+    // Activating generation 2 on compatible host API 2.x succeeds and commits
+    let report3 = activate(&mut env, id2, Some("0.6.0"), Some("2.0.0"), None).unwrap();
+    assert!(report3.succeeded);
+    assert_eq!(env.current, Some(id2), "pointer must advance to id2");
+}

@@ -4353,3 +4353,25 @@ fn spawn_default_shell_falls_back_when_configured_shell_missing() {
 }
 
 // `close_last_leaf_helper_refuses` lives in `chrome_keys::tests` (CTX-0233).
+
+#[test]
+fn consolidated_startup_assembly_matches_expected_layout_and_focus() {
+    // TERM-APP-003 / CTX-0553: verify shared startup assembly applies layout
+    // and focus identically without diverging between primary and fallback paths.
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let raw = args_of(&["bitty", "--split=h", "--focus=1"]);
+    let args = parse_args(&raw);
+
+    apply_startup_layout_and_focus(&mut rt, &args);
+
+    assert_eq!(
+        rt.leaf_count(),
+        2,
+        "must assemble split layout into 2 leaves"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId(1)),
+        "focus spec 1 must be focused"
+    );
+}

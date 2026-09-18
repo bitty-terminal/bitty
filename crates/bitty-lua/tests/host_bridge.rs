@@ -844,3 +844,278 @@ fn spawn_timeout_honored() {
         "timed-out spawn result must never be delivered"
     );
 }
+
+// ── HOST-002 registration admission quotas ──────────────────────────────
+
+use bitty_lua::{
+    REGISTRATION_MAX_COMMANDS, REGISTRATION_MAX_DESCRIPTION_BYTES,
+    REGISTRATION_MAX_EVENT_KIND_BYTES, REGISTRATION_MAX_EVENTS, REGISTRATION_MAX_ID_BYTES,
+    REGISTRATION_MAX_TIMER_DELAY_MS, REGISTRATION_MAX_TIMERS, REGISTRATION_MAX_TITLE_BYTES,
+    RegistrationCapture,
+};
+
+fn assert_bridge_code(vm: &mut LuaVm, services: &Rc<FakeServices>, chunk: &str, want: &str) {
+    let outcome = vm.execute_bounded(chunk).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{want}: chunk must complete via pcall: {outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String(want.to_string())),
+        "{want}: typed code"
+    );
+}
+
+fn register_chunk(id: &str) -> String {
+    format!("bitty.commands.register({{ id = \"{id}\", title = \"T\", run = function() end }})")
+}
+
+#[test]
+fn command_registration_count_capped_at_bridge() {
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-commands");
+    install(&mut vm, services.clone());
+    let mut body = String::new();
+    for i in 0..REGISTRATION_MAX_COMMANDS {
+        body.push_str(&register_chunk(&format!("cmd{i}")));
+        body.push('\n');
+    }
+    let outcome = vm.execute_bounded(&body).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "at-cap registration must complete: {outcome:?}"
+    );
+    assert_eq!(
+        vm.take_registrations().commands.len(),
+        REGISTRATION_MAX_COMMANDS
+    );
+
+    // The 129th registration fails closed with E_DEF_LIMIT and no push.
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.commands.register, { id = "one-too-many", title = "T", run = function() end })
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_LIMIT".to_string()))
+    );
+    assert_eq!(
+        vm.take_registrations().commands.len(),
+        REGISTRATION_MAX_COMMANDS,
+        "over-limit registration must not grow the capture"
+    );
+}
+
+#[test]
+fn command_field_lengths_capped_at_bridge() {
+    // Oversized payloads are built host-side: the restricted stdlib has no
+    // `string.rep`, and interpolating keeps the Lua chunk trivially small.
+    let big_id = "i".repeat(REGISTRATION_MAX_ID_BYTES + 1);
+    let big_title = "t".repeat(REGISTRATION_MAX_TITLE_BYTES + 1);
+    let big_description = "d".repeat(REGISTRATION_MAX_DESCRIPTION_BYTES + 1);
+    for (tag, field) in [
+        ("id", format!("id = \"{big_id}\", title = \"T\"")),
+        ("title", format!("id = \"ok\", title = \"{big_title}\"")),
+        (
+            "description",
+            format!("id = \"ok\", title = \"T\", description = \"{big_description}\""),
+        ),
+    ] {
+        let services = Rc::new(FakeServices::default());
+        let mut vm = LuaVm::new(format!("reg-cap-field-{tag}"));
+        install(&mut vm, services.clone());
+        assert_bridge_code(
+            &mut vm,
+            &services,
+            &format!(
+                "local ok, err = pcall(bitty.commands.register, {{ {field}, run = function() end }})\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", err.code) end"
+            ),
+            "E_DEF_INVALID",
+        );
+        assert!(
+            vm.take_registrations().commands.is_empty(),
+            "{tag}: oversized field must not be captured"
+        );
+    }
+
+    // Boundary values (exactly at cap) still register.
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-field-boundary");
+    install(&mut vm, services.clone());
+    let at_id = "i".repeat(REGISTRATION_MAX_ID_BYTES);
+    let at_title = "t".repeat(REGISTRATION_MAX_TITLE_BYTES);
+    let at_description = "d".repeat(REGISTRATION_MAX_DESCRIPTION_BYTES);
+    let outcome = vm
+        .execute_bounded(&format!(
+            "bitty.commands.register({{ id = \"{at_id}\", title = \"{at_title}\", description = \"{at_description}\", run = function() end }})"
+        ))
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(vm.take_registrations().commands.len(), 1);
+}
+
+#[test]
+fn event_subscription_count_and_kind_capped_at_bridge() {
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-events");
+    install(&mut vm, services.clone());
+    let mut body = String::new();
+    for i in 0..REGISTRATION_MAX_EVENTS {
+        body.push_str(&format!(
+            "bitty.events.subscribe(\"kind{i}\", function() end)\n"
+        ));
+    }
+    let outcome = vm.execute_bounded(&body).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "at-cap subscriptions must complete: {outcome:?}"
+    );
+    assert_eq!(
+        vm.take_registrations().events.len(),
+        REGISTRATION_MAX_EVENTS
+    );
+
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.events.subscribe, "one-too-many", function() end)
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        services.store.borrow().get("code"),
+        Some(&LuaValue::String("E_DEF_LIMIT".to_string()))
+    );
+    assert_eq!(
+        vm.take_registrations().events.len(),
+        REGISTRATION_MAX_EVENTS
+    );
+
+    // Oversized kind fails closed with E_DEF_INVALID and no capture.
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-event-kind");
+    install(&mut vm, services.clone());
+    let big_kind = "k".repeat(REGISTRATION_MAX_EVENT_KIND_BYTES + 1);
+    assert_bridge_code(
+        &mut vm,
+        &services,
+        &format!(
+            "local ok, err = pcall(bitty.events.subscribe, \"{big_kind}\", function() end)\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", err.code) end",
+        ),
+        "E_DEF_INVALID",
+    );
+    assert!(vm.take_registrations().events.is_empty());
+}
+
+#[test]
+fn timer_count_delay_and_handle_exhaustion_capped_at_bridge() {
+    // Count cap: the 65th create fails closed with E_DEF_LIMIT.
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-timers");
+    install(&mut vm, services.clone());
+    let mut body = String::new();
+    for _ in 0..REGISTRATION_MAX_TIMERS {
+        body.push_str("bitty.timers.create(10, function() end)\n");
+    }
+    let outcome = vm.execute_bounded(&body).expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "at-cap timers must complete: {outcome:?}"
+    );
+    {
+        let capture = vm.take_registrations();
+        assert_eq!(capture.timers.len(), REGISTRATION_MAX_TIMERS);
+        // Handles are dense from 1 with no aliasing.
+        let mut handles: Vec<i64> = capture.timers.iter().map(|t| t.handle).collect();
+        handles.sort_unstable();
+        assert_eq!(
+            handles,
+            (1..=REGISTRATION_MAX_TIMERS as i64).collect::<Vec<_>>()
+        );
+    }
+    assert_bridge_code(
+        &mut vm,
+        &services,
+        r#"local ok, err = pcall(bitty.timers.create, 10, function() end)
+            if ok then bitty.store.set("code", "NONE") else bitty.store.set("code", err.code) end"#,
+        "E_DEF_LIMIT",
+    );
+    assert_eq!(
+        vm.take_registrations().timers.len(),
+        REGISTRATION_MAX_TIMERS
+    );
+
+    // Delay cap: absurd delays fail closed with E_DEF_INVALID.
+    let services = Rc::new(FakeServices::default());
+    let mut vm = LuaVm::new("reg-cap-timer-delay");
+    install(&mut vm, services.clone());
+    assert_bridge_code(
+        &mut vm,
+        &services,
+        &format!(
+            "local ok, err = pcall(bitty.timers.create, {}, function() end)\nif ok then bitty.store.set(\"code\", \"NONE\") else bitty.store.set(\"code\", err.code) end",
+            REGISTRATION_MAX_TIMER_DELAY_MS + 1
+        ),
+        "E_DEF_INVALID",
+    );
+    assert!(vm.take_registrations().timers.is_empty());
+
+    // Boundary delay (exactly at cap) still creates.
+    let outcome = vm
+        .execute_bounded(&format!(
+            "bitty.timers.create({REGISTRATION_MAX_TIMER_DELAY_MS}, function() end)"
+        ))
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(vm.take_registrations().timers.len(), 1);
+}
+
+#[test]
+fn timer_handle_allocation_is_checked_not_wrapping() {
+    // Unit-level: the handle counter fails closed at exhaustion instead of
+    // wrapping (release-mode `+= 1` would alias handle 1 onto a live timer).
+    // `i64::MAX` is the reserved exhaustion sentinel and is never issued.
+    let mut capture = RegistrationCapture::new();
+    capture.next_timer_handle = i64::MAX - 1;
+    assert_eq!(capture.alloc_timer_handle(), Some(i64::MAX - 1));
+    assert_eq!(capture.next_timer_handle, i64::MAX);
+    assert_eq!(
+        capture.alloc_timer_handle(),
+        None,
+        "exhausted handle space must be signalled, not wrapped"
+    );
+    assert_eq!(capture.next_timer_handle, i64::MAX);
+    assert_eq!(
+        capture.alloc_timer_handle(),
+        None,
+        "exhaustion must be sticky"
+    );
+}

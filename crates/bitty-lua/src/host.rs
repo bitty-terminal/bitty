@@ -79,6 +79,63 @@ pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// Maximum bytes of one source module file accepted by `require`.
 pub const MODULE_FILE_MAX_BYTES: usize = 1024 * 1024;
 
+/// Maximum commands captured from one `init.lua` (HOST-002 admission bound).
+///
+/// Matches the policy-layer manifest ceiling
+/// (`bitty-plugin-host` `MAX_COMMANDS = 128`): a capture can never need more
+/// than the manifest can declare, so the bridge refuses the 129th
+/// registration fail-closed with typed `E_DEF_LIMIT` before any unbounded
+/// growth.
+pub const REGISTRATION_MAX_COMMANDS: usize = 128;
+
+/// Maximum event subscriptions captured from one `init.lua` (HOST-002).
+///
+/// Matches the policy-layer manifest ceiling
+/// (`bitty-plugin-host` `MAX_EVENT_TYPES = 256`).
+pub const REGISTRATION_MAX_EVENTS: usize = 256;
+
+/// Maximum timers captured from one `init.lua` (HOST-002 admission bound).
+///
+/// Timers have no manifest declaration to mirror, so this is the tighter
+/// queue-side precedent (`bitty-plugin-host` `PER_SUBSCRIPTION_QUEUE_LIMIT =
+/// 64`): a generation that needs more concurrent timers than one queue can
+/// drain is hostile or broken, and the bridge refuses the 65th fail-closed
+/// with typed `E_DEF_LIMIT`.
+pub const REGISTRATION_MAX_TIMERS: usize = 64;
+
+/// Maximum bytes of one captured command id (`HOST-002` admission bound).
+///
+/// Matches the policy-layer resource-segment ceiling (manifest qualified-name
+/// resource part, 128 bytes max).
+pub const REGISTRATION_MAX_ID_BYTES: usize = 128;
+
+/// Maximum bytes of one captured command title (`HOST-002`).
+///
+/// Matches the policy-layer display-name ceiling
+/// (`bitty-plugin-host` `MAX_NAME_LEN = 128`); titles are host-rendered
+/// display data, never markup.
+pub const REGISTRATION_MAX_TITLE_BYTES: usize = 128;
+
+/// Maximum bytes of one captured command description (`HOST-002`).
+///
+/// Matches the policy-layer description ceiling
+/// (`bitty-plugin-host` `MAX_DESCRIPTION_LEN = 1024`).
+pub const REGISTRATION_MAX_DESCRIPTION_BYTES: usize = 1024;
+
+/// Maximum bytes of one captured event kind (`HOST-002` admission bound).
+///
+/// Matches the policy-layer lazy-event ceiling (manifest `lazy.events`
+/// entries are `1..128` bytes).
+pub const REGISTRATION_MAX_EVENT_KIND_BYTES: usize = 128;
+
+/// Maximum timer delay in milliseconds (`HOST-002` admission bound).
+///
+/// One day: generous for any legitimate deferred callback, while an
+/// unbounded `u64` delay (millennia) is almost certainly a hostile or broken
+/// computation. Larger delays are refused fail-closed with typed
+/// `E_DEF_INVALID`.
+pub const REGISTRATION_MAX_TIMER_DELAY_MS: u64 = 86_400_000;
+
 /// One bounded, immutable data value crossing the host bridge.
 ///
 /// This is deliberately smaller than the Lua value space: functions, threads,
@@ -571,6 +628,29 @@ impl RegistrationCapture {
         self.timers.retain(|timer| timer.handle != handle);
         self.timers.len() != before
     }
+
+    /// Allocate the next timer handle with checked arithmetic (HOST-002).
+    ///
+    /// Returns the handle to assign, or `None` when the counter is exhausted:
+    /// the caller must fail the `timers.create` call closed with typed
+    /// `E_DEF_LIMIT` instead of wrapping the handle (which would alias a
+    /// live timer in release builds). `i64::MAX` itself is reserved as the
+    /// exhaustion sentinel and never issued, so handles are `1..i64::MAX`;
+    /// losing one value out of 2^63 is immaterial, aliasing is not.
+    pub fn alloc_timer_handle(&mut self) -> Option<i64> {
+        if self.next_timer_handle == i64::MAX {
+            return None;
+        }
+        let handle = self.next_timer_handle;
+        // `handle < i64::MAX` here, so the increment cannot overflow; the
+        // `checked_add` documents the no-wrap invariant rather than handling
+        // a reachable `None`.
+        self.next_timer_handle = self
+            .next_timer_handle
+            .checked_add(1)
+            .expect("handle below i64::MAX increments");
+        Some(handle)
+    }
 }
 
 /// Shared `bitty` bridge state installed into one VM.
@@ -850,16 +930,60 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    state
-                        .capture
-                        .borrow_mut()
-                        .commands
-                        .push(CommandRegistration {
+                    // HOST-002 admission: count + length caps enforced at the
+                    // bridge before the push, so a hostile `init.lua` fails
+                    // closed with bounded memory instead of growing the Vecs
+                    // without limit. Duplicate-id rejection stays in the
+                    // runtime validator, which sees the full capture plus the
+                    // manifest. `E_DEF_LIMIT` marks quota-shaped rejections;
+                    // `E_DEF_INVALID` marks malformed fields.
+                    if id.len() > REGISTRATION_MAX_ID_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!("command id exceeds {REGISTRATION_MAX_ID_BYTES} bytes"),
+                        )
+                        .to_error(ctx));
+                    }
+                    if title.len() > REGISTRATION_MAX_TITLE_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!("command title exceeds {REGISTRATION_MAX_TITLE_BYTES} bytes"),
+                        )
+                        .to_error(ctx));
+                    }
+                    if description.len() > REGISTRATION_MAX_DESCRIPTION_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!(
+                                "command description exceeds \
+                                 {REGISTRATION_MAX_DESCRIPTION_BYTES} bytes"
+                            ),
+                        )
+                        .to_error(ctx));
+                    }
+                    {
+                        let mut capture = state.capture.borrow_mut();
+                        if capture.commands.len() >= REGISTRATION_MAX_COMMANDS {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_LIMIT",
+                                format!(
+                                    "command registration limit \
+                                     ({REGISTRATION_MAX_COMMANDS}) exceeded"
+                                ),
+                            )
+                            .to_error(ctx));
+                        }
+                        capture.commands.push(CommandRegistration {
                             id,
                             title,
                             description,
                             run,
                         });
+                    }
                     stack.replace(ctx, ());
                     Ok(CallbackReturn::Return)
                 }
@@ -897,11 +1021,35 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    state
-                        .capture
-                        .borrow_mut()
-                        .events
-                        .push(EventSubscription { kind, handler });
+                    // HOST-002 admission: kind-length + subscription-count caps at
+                    // the bridge, mirroring the manifest `lazy.events`
+                    // bounds. The runtime validator additionally rejects
+                    // undeclared kinds and duplicate subscriptions.
+                    if kind.is_empty() || kind.len() > REGISTRATION_MAX_EVENT_KIND_BYTES {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!(
+                                "event kind must be 1..={REGISTRATION_MAX_EVENT_KIND_BYTES} bytes"
+                            ),
+                        )
+                        .to_error(ctx));
+                    }
+                    {
+                        let mut capture = state.capture.borrow_mut();
+                        if capture.events.len() >= REGISTRATION_MAX_EVENTS {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_LIMIT",
+                                format!(
+                                    "event subscription limit \
+                                     ({REGISTRATION_MAX_EVENTS}) exceeded"
+                                ),
+                            )
+                            .to_error(ctx));
+                        }
+                        capture.events.push(EventSubscription { kind, handler });
+                    }
                     stack.replace(ctx, ());
                     Ok(CallbackReturn::Return)
                 }
@@ -1123,10 +1271,39 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
+                    // HOST-002 admission: delay + count caps at the bridge,
+                    // checked handle allocation (no wrapping increment). The
+                    // runtime validator re-checks the same bounds so a
+                    // hand-built capture cannot bypass them.
+                    if delay_ms > REGISTRATION_MAX_TIMER_DELAY_MS {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            format!(
+                                "timer delay exceeds \
+                                 {REGISTRATION_MAX_TIMER_DELAY_MS} ms"
+                            ),
+                        )
+                        .to_error(ctx));
+                    }
                     let handle = {
                         let mut capture = state.capture.borrow_mut();
-                        let handle = capture.next_timer_handle;
-                        capture.next_timer_handle += 1;
+                        if capture.timers.len() >= REGISTRATION_MAX_TIMERS {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_LIMIT",
+                                format!("timer limit ({REGISTRATION_MAX_TIMERS}) exceeded"),
+                            )
+                            .to_error(ctx));
+                        }
+                        let Some(handle) = capture.alloc_timer_handle() else {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_LIMIT",
+                                "timer handle space exhausted",
+                            )
+                            .to_error(ctx));
+                        };
                         capture.timers.push(TimerRegistration {
                             handle,
                             delay_ms,

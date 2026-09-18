@@ -72,8 +72,11 @@ pub use config::{
 };
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, CommandRegistration, EventSubscription,
-    HostServices, LuaValue, MarshallingLimits, RegistrationCapture, SNAPSHOT_MAX_BYTES,
-    SPAWN_TIMEOUT_MAX_MS, SPAWN_TIMEOUT_MS, TimerRegistration,
+    HostServices, LuaValue, MarshallingLimits, REGISTRATION_MAX_COMMANDS,
+    REGISTRATION_MAX_DESCRIPTION_BYTES, REGISTRATION_MAX_EVENT_KIND_BYTES, REGISTRATION_MAX_EVENTS,
+    REGISTRATION_MAX_ID_BYTES, REGISTRATION_MAX_TIMER_DELAY_MS, REGISTRATION_MAX_TIMERS,
+    REGISTRATION_MAX_TITLE_BYTES, RegistrationCapture, SNAPSHOT_MAX_BYTES, SPAWN_TIMEOUT_MAX_MS,
+    SPAWN_TIMEOUT_MS, TimerRegistration,
 };
 pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode};
 

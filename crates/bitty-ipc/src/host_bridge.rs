@@ -34,11 +34,12 @@
 //!   `execution::MAX_TRACKED_EXECUTIONS` and
 //!   `rich_fragment::MAX_PENDING_FRAGMENTS`). Duplicate publication
 //!   overwrites (freshest state wins: liveness, not ingestion dedup);
-//!   a new terminal id at capacity is rejected fail-closed (`Ok(false)`,
-//!   no eviction, no silent overwrite of another terminal).
+//!   a new terminal id at capacity evicts the oldest entry so dead terminals
+//!   cannot permanently wedge the store, while terminals can also be
+//!   explicitly retired via [`retire_live_snapshot`].
 //! - Inspect tool result data `<= 16 KiB`
 //!   (`tool_dispatch::MAX_TOOL_RESULT_BYTES`); over-bound live text is cut
-//!   at a char boundary with the truncation flagged in the summary
+//!   at a char boundary at insert and with the truncation flagged in the summary
 //!   (snapshot/execution truncate-and-flag precedent; the flag keeps the
 //!   cut honest, never silent).
 //! - Inspect tool summaries `<= 512` bytes
@@ -71,6 +72,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::auth::{MAX_SCOPED_ID_BYTES, VerifiedPeer};
@@ -95,38 +97,101 @@ pub const INSPECT_TEXT_TOOL: &str = "terminal_text";
 /// Read-only inspect tool serving a bounded live terminal status report.
 pub const INSPECT_STATUS_TOOL: &str = "terminal_status";
 
+/// Internal live snapshot record tracking staleness and insert truncation.
+#[derive(Clone)]
+struct LiveEntry {
+    seq: u64,
+    data: SnapshotData,
+    truncated: bool,
+    original_text_len: usize,
+}
+
+static NEXT_SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Process-global live terminal state, keyed by host terminal id.
 ///
 /// Written by [`publish_live_snapshot`] (Runtime committed state), read by
 /// [`live_snapshot_provider`] and the inspect tool providers below. Bounded
-/// at [`MAX_LIVE_SNAPSHOTS`]; see the module docs for the overwrite/full
+/// at [`MAX_LIVE_SNAPSHOTS`]; see the module docs for the overwrite/eviction
 /// policy.
-fn live_snapshot_store() -> &'static Mutex<BTreeMap<String, SnapshotData>> {
-    static STORE: OnceLock<Mutex<BTreeMap<String, SnapshotData>>> = OnceLock::new();
+fn live_snapshot_store() -> &'static Mutex<BTreeMap<String, LiveEntry>> {
+    static STORE: OnceLock<Mutex<BTreeMap<String, LiveEntry>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-/// Publish committed terminal state into the live store.
-///
-/// Overwrites any entry for the same terminal (freshest wins). A new
-/// terminal id at capacity stores nothing and reports `Ok(false)`
-/// (fail-closed, no eviction).
+/// Retire a live snapshot when a terminal closes.
 ///
 /// # Errors
 ///
-/// Returns `InvalidRequest` when `data.terminal_id` violates the host
+/// Returns `InvalidRequest` when `terminal_id` violates the host
 /// `t:<digits>` grammar, or `Internal` when the store lock is poisoned.
-pub fn publish_live_snapshot(data: SnapshotData) -> Result<bool, IpcError> {
-    crate::ctl::parse_terminal_id(&data.terminal_id).map(|_| ())?;
+pub fn retire_live_snapshot(terminal_id: &str) -> Result<bool, IpcError> {
+    crate::ctl::parse_terminal_id(terminal_id).map(|_| ())?;
     let mut store = live_snapshot_store()
         .lock()
         .map_err(|_| IpcError::Internal {
             reason: "live snapshot store lock is poisoned".into(),
         })?;
-    if !store.contains_key(&data.terminal_id) && store.len() >= MAX_LIVE_SNAPSHOTS {
-        return Ok(false);
+    Ok(store.remove(terminal_id).is_some())
+}
+
+/// Publish committed terminal state into the live store.
+///
+/// Overwrites any entry for the same terminal (freshest wins). If the store
+/// is at capacity ([`MAX_LIVE_SNAPSHOTS`]) and a new terminal is published,
+/// the oldest entry is evicted to ensure dead terminals do not permanently
+/// wedge the store. Terminals can also be explicitly removed when closed via
+/// [`retire_live_snapshot`].
+///
+/// Per-entry text is bounded to [`MAX_TOOL_RESULT_BYTES`]: if `data.text`
+/// exceeds this bound, it is truncated on a UTF-8 character boundary.
+///
+/// # Errors
+///
+/// Returns `InvalidRequest` when `data.terminal_id` violates the host
+/// `t:<digits>` grammar, or `Internal` when the store lock is poisoned.
+pub fn publish_live_snapshot(mut data: SnapshotData) -> Result<bool, IpcError> {
+    crate::ctl::parse_terminal_id(&data.terminal_id).map(|_| ())?;
+    let original_text_len = data.text.len();
+    let truncated = if data.text.len() > MAX_TOOL_RESULT_BYTES {
+        let mut end = MAX_TOOL_RESULT_BYTES;
+        while end > 0 && !data.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        data.text.truncate(end);
+        true
+    } else {
+        false
+    };
+
+    let mut store = live_snapshot_store()
+        .lock()
+        .map_err(|_| IpcError::Internal {
+            reason: "live snapshot store lock is poisoned".into(),
+        })?;
+
+    while !store.contains_key(&data.terminal_id) && store.len() >= MAX_LIVE_SNAPSHOTS {
+        if let Some(oldest_key) = store
+            .iter()
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(k, _)| k.clone())
+        {
+            store.remove(&oldest_key);
+        } else {
+            break;
+        }
     }
-    store.insert(data.terminal_id.clone(), data);
+
+    let seq = NEXT_SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    store.insert(
+        data.terminal_id.clone(),
+        LiveEntry {
+            seq,
+            data,
+            truncated,
+            original_text_len,
+        },
+    );
     Ok(true)
 }
 
@@ -147,7 +212,7 @@ pub fn live_snapshot_provider(request: &SnapshotRequest) -> Result<SnapshotData,
         })?;
     store
         .get(&request.terminal_id)
-        .cloned()
+        .map(|entry| entry.data.clone())
         .ok_or_else(|| IpcError::NotFound {
             reason: format!("no live snapshot published for '{}'", request.terminal_id),
         })
@@ -168,6 +233,7 @@ pub fn clear_live_snapshots_for_tests() {
     if let Ok(mut store) = live_snapshot_store().lock() {
         store.clear();
     }
+    NEXT_SNAPSHOT_SEQ.store(0, Ordering::Relaxed);
 }
 
 // ── read-only inspect tools ─────────────────────────────────────────────────
@@ -220,7 +286,7 @@ pub fn inspect_status_spec() -> Result<ToolSpec, IpcError> {
 }
 
 /// Read one published entry by target (shared provider prologue).
-fn live_entry_for_tool(tool: &str, request: &ToolRequest) -> Result<SnapshotData, IpcError> {
+fn live_entry_for_tool(tool: &str, request: &ToolRequest) -> Result<LiveEntry, IpcError> {
     let target = request
         .target
         .as_deref()
@@ -254,13 +320,14 @@ fn live_entry_for_tool(tool: &str, request: &ToolRequest) -> Result<SnapshotData
 /// - `Internal` when the store lock is poisoned.
 pub fn inspect_text_provider(request: &ToolRequest) -> Result<ToolOutput, IpcError> {
     let entry = live_entry_for_tool(INSPECT_TEXT_TOOL, request)?;
-    let (data_text, truncated) = truncate_to_budget(&entry.text, MAX_TOOL_RESULT_BYTES);
+    let (data_text, tool_truncated) = truncate_to_budget(&entry.data.text, MAX_TOOL_RESULT_BYTES);
+    let truncated = entry.truncated || tool_truncated;
     let summary = format!(
         "{} gen {} {}/{}B{}",
-        entry.terminal_id,
-        entry.generation,
+        entry.data.terminal_id,
+        entry.data.generation,
         data_text.len(),
-        entry.text.len(),
+        entry.original_text_len,
         if truncated { " truncated" } else { "" }
     );
     let output = ToolOutput {
@@ -286,19 +353,19 @@ pub fn inspect_text_provider(request: &ToolRequest) -> Result<ToolOutput, IpcErr
 /// - `Internal` when the store lock is poisoned.
 pub fn inspect_status_provider(request: &ToolRequest) -> Result<ToolOutput, IpcError> {
     let entry = live_entry_for_tool(INSPECT_STATUS_TOOL, request)?;
-    let (cwd, _) = truncate_to_budget(&entry.cwd, crate::snapshot::MAX_SNAPSHOT_CWD_BYTES);
+    let (cwd, _) = truncate_to_budget(&entry.data.cwd, crate::snapshot::MAX_SNAPSHOT_CWD_BYTES);
     let data = format!(
         "generation: {}\ncwd: {}\nzones: {}\ntext_bytes: {}\n",
-        entry.generation,
+        entry.data.generation,
         cwd,
-        entry.semantic_zones.len(),
-        entry.text.len()
+        entry.data.semantic_zones.len(),
+        entry.data.text.len()
     );
     let summary = format!(
         "{} gen {} zones {}",
-        entry.terminal_id,
-        entry.generation,
-        entry.semantic_zones.len()
+        entry.data.terminal_id,
+        entry.data.generation,
+        entry.data.semantic_zones.len()
     );
     let output = ToolOutput {
         target_id: request.target.clone(),
@@ -522,35 +589,154 @@ mod tests {
     }
 
     #[test]
-    fn live_store_cap_is_fail_closed() {
+    fn retire_live_snapshot_drops_count_and_removes_entry() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+        publish_live_snapshot(live_data("t:101", 1, "first")).expect("publish 101");
+        publish_live_snapshot(live_data("t:102", 2, "second")).expect("publish 102");
+        assert_eq!(live_snapshot_count(), 2);
+
+        // Retiring an existing terminal returns Ok(true) and decrements count
+        assert!(retire_live_snapshot("t:101").expect("retire 101"));
+        assert_eq!(live_snapshot_count(), 1);
+
+        // Verification: t:101 is gone from the store
+        let service = SnapshotService::with_defaults(live_snapshot_provider);
+        let error = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:101", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect_err("retired terminal must fail as not found");
+        assert!(matches!(error, IpcError::NotFound { .. }));
+
+        // t:102 is still retained and serves
+        let snapshot = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:102", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("retained terminal serves");
+        assert_eq!(snapshot.text, "second");
+
+        // Retiring already-retired terminal returns Ok(false)
+        assert!(!retire_live_snapshot("t:101").expect("already retired"));
+        assert_eq!(live_snapshot_count(), 1);
+
+        // Retiring with invalid terminal id grammar returns InvalidRequest
+        let err = retire_live_snapshot("invalid").expect_err("bad grammar fails");
+        assert!(matches!(err, IpcError::InvalidRequest { .. }));
+        assert_eq!(live_snapshot_count(), 1);
+
+        // Retire remaining terminal leaves count at 0
+        assert!(retire_live_snapshot("t:102").expect("retire 102"));
+        assert_eq!(live_snapshot_count(), 0);
+        clear_live_snapshots_for_tests();
+    }
+
+    #[test]
+    fn store_at_capacity_evicts_oldest_on_new_publish() {
         let _guard = test_lock();
         clear_live_snapshots_for_tests();
         for index in 0..(MAX_LIVE_SNAPSHOTS as u64) {
             let id = format!("t:{}", 1000 + index);
             assert!(
-                publish_live_snapshot(live_data(&id, index, "x")).expect("capacity"),
+                publish_live_snapshot(live_data(&id, index, "x")).expect("capacity slot"),
                 "slot for {id}"
             );
         }
         assert_eq!(live_snapshot_count(), MAX_LIVE_SNAPSHOTS);
+
+        // 65th publish succeeds by evicting oldest terminal (t:1000), count stays <= MAX_LIVE_SNAPSHOTS
         assert!(
-            !publish_live_snapshot(live_data("t:9999", 1, "x")).expect("full reports"),
-            "new terminal at capacity must report false"
+            publish_live_snapshot(live_data("t:2000", 1, "newest")).expect("65th publish succeeds"),
+            "new terminal at capacity evicts oldest"
         );
-        assert!(
-            publish_live_snapshot(live_data("t:1000", 77, "fresh")).expect("overwrite serves"),
-            "overwrite of a retained terminal still serves"
-        );
+        assert_eq!(live_snapshot_count(), MAX_LIVE_SNAPSHOTS);
+
         let service = SnapshotService::with_defaults(live_snapshot_provider);
-        let snapshot = service
+
+        // t:1000 was evicted
+        let err = service
             .dispatch(
                 SNAPSHOT_METHOD,
                 &SnapshotRequest::new("t:1000", DetailLevel::Standard),
                 &granted_inspect(),
             )
-            .expect("freshest wins");
-        assert_eq!(snapshot.generation, 77);
-        assert_eq!(snapshot.text, "fresh");
+            .expect_err("oldest terminal must be evicted");
+        assert!(matches!(err, IpcError::NotFound { .. }));
+
+        // t:1001 (second oldest) is still retained
+        assert!(
+            service
+                .dispatch(
+                    SNAPSHOT_METHOD,
+                    &SnapshotRequest::new("t:1001", DetailLevel::Standard),
+                    &granted_inspect(),
+                )
+                .is_ok()
+        );
+
+        // t:2000 is present and serves
+        let snap = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:2000", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("newest serves");
+        assert_eq!(snap.text, "newest");
+
+        // Updating an existing terminal refreshes it and keeps count <= MAX_LIVE_SNAPSHOTS
+        assert!(
+            publish_live_snapshot(live_data("t:1001", 99, "fresh")).expect("overwrite serves"),
+            "overwrite of a retained terminal still serves"
+        );
+        assert_eq!(live_snapshot_count(), MAX_LIVE_SNAPSHOTS);
+        clear_live_snapshots_for_tests();
+    }
+
+    #[test]
+    fn publish_truncates_over_budget_text_on_utf8_char_boundary() {
+        let _guard = test_lock();
+        clear_live_snapshots_for_tests();
+
+        // 16382 ASCII bytes ('a') + 3-byte char '語' (0xE8 0xAA 0x9E) = 16385 bytes.
+        // MAX_TOOL_RESULT_BYTES is 16384, which falls inside '語'.
+        // Truncation must stop at byte 16382 to preserve valid UTF-8.
+        let mut over_budget = "a".repeat(MAX_TOOL_RESULT_BYTES - 2);
+        over_budget.push('語');
+        assert_eq!(over_budget.len(), MAX_TOOL_RESULT_BYTES + 1);
+
+        publish_live_snapshot(live_data("t:3000", 1, &over_budget)).expect("publish");
+
+        let service = SnapshotService::with_defaults(live_snapshot_provider);
+        let snapshot = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:3000", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("retrieval serves");
+
+        assert!(snapshot.text.len() <= MAX_TOOL_RESULT_BYTES);
+        assert_eq!(snapshot.text.len(), MAX_TOOL_RESULT_BYTES - 2);
+        assert_eq!(snapshot.text, "a".repeat(MAX_TOOL_RESULT_BYTES - 2));
+
+        // ASCII over-budget text truncates to exactly MAX_TOOL_RESULT_BYTES
+        let ascii_over = "b".repeat(MAX_TOOL_RESULT_BYTES + 100);
+        publish_live_snapshot(live_data("t:3001", 1, &ascii_over)).expect("publish ascii");
+        let snapshot_ascii = service
+            .dispatch(
+                SNAPSHOT_METHOD,
+                &SnapshotRequest::new("t:3001", DetailLevel::Standard),
+                &granted_inspect(),
+            )
+            .expect("retrieval serves");
+        assert_eq!(snapshot_ascii.text.len(), MAX_TOOL_RESULT_BYTES);
+
         clear_live_snapshots_for_tests();
     }
 

@@ -47,7 +47,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -998,7 +998,8 @@ pub struct SecretAuditEntry {
 /// pipeline); `dropped` counts evicted entries for `bitty plugin doctor`.
 #[derive(Debug, Clone, Default)]
 pub struct SecretAuditLedger {
-    entries: VecDeque<SecretAuditEntry>,
+    entries: Vec<SecretAuditEntry>,
+    start: usize,
     dropped: u64,
     next_seq: u64,
 }
@@ -1012,25 +1013,13 @@ impl SecretAuditLedger {
 
     /// Record a successful resolution (names only).
     ///
-    /// CodeQL models any call to these `push_*` entry points as
-    /// log-tainted on the grounds that the ledger can hold secrets; the
-    /// payload is names-only by construction (see [`Self::push`] and the
-    /// `*_names_never_values` tests), which is the documented barrier the
-    /// analyzer cannot see. Treat new `push_*` call sites as log-tainted
-    /// until they carry the same names-only proof.
-    ///
-    /// # Logging
-    ///
-    /// Log-tainted: arguments must be handle names, never secret values.
+    /// The payload is names-only by construction (see [`Self::push`] and the
+    /// `*_names_never_values` tests), ensuring secrets never enter audit logs.
     pub fn push_allow(&mut self, handles: &[String], detail: impl Into<String>) {
         self.push(SecretAuditDecision::Allow, handles, None, detail.into());
     }
 
     /// Record a refused resolution (names only).
-    ///
-    /// # Logging
-    ///
-    /// Log-tainted: arguments must be handle names, never secret values.
     pub fn push_deny(
         &mut self,
         handles: &[String],
@@ -1046,10 +1035,6 @@ impl SecretAuditLedger {
     }
 
     /// Record a consent grant or revocation (names only).
-    ///
-    /// # Logging
-    ///
-    /// Log-tainted: arguments must be handle names, never secret values.
     pub fn push_consent(&mut self, handles: &[String], detail: impl Into<String>) {
         self.push(SecretAuditDecision::Consent, handles, None, detail.into());
     }
@@ -1062,13 +1047,9 @@ impl SecretAuditLedger {
         denial: Option<SecretDenialKind>,
         detail: String,
     ) {
-        if self.entries.len() >= MAX_SECRET_AUDIT_ENTRIES {
-            self.entries.pop_front();
-            self.dropped = self.dropped.wrapping_add(1);
-        }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.entries.push_back(SecretAuditEntry {
+        let entry = SecretAuditEntry {
             seq,
             decision,
             handles: handles
@@ -1078,12 +1059,21 @@ impl SecretAuditLedger {
                 .collect(),
             denial,
             detail: bounded_name(detail),
-        });
+        };
+
+        if self.entries.len() < MAX_SECRET_AUDIT_ENTRIES {
+            self.entries.push(entry);
+        } else {
+            self.entries[self.start] = entry;
+            self.start = (self.start + 1) % MAX_SECRET_AUDIT_ENTRIES;
+            self.dropped = self.dropped.wrapping_add(1);
+        }
     }
 
     /// Retained entries, oldest first.
     pub fn iter(&self) -> impl Iterator<Item = &SecretAuditEntry> + '_ {
-        self.entries.iter()
+        let (head, tail) = self.entries.split_at(self.start);
+        tail.iter().chain(head.iter())
     }
 
     /// Number of retained entries.
@@ -1985,6 +1975,16 @@ mod tests {
         }
         assert_eq!(ledger.len(), MAX_SECRET_AUDIT_ENTRIES);
         assert_eq!(ledger.dropped(), 10);
+        let entries: Vec<_> = ledger.iter().collect();
+        assert_eq!(entries.len(), MAX_SECRET_AUDIT_ENTRIES);
+        assert_eq!(entries[0].detail, "allow 10");
+        assert_eq!(
+            entries[MAX_SECRET_AUDIT_ENTRIES - 1].detail,
+            format!("allow {}", MAX_SECRET_AUDIT_ENTRIES + 9)
+        );
+        for pair in entries.windows(2) {
+            assert!(pair[0].seq < pair[1].seq);
+        }
     }
 
     #[test]

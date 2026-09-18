@@ -76,6 +76,69 @@ pub struct StartupReport {
     pub first_frame_stats: Option<FramePresent>,
 }
 
+/// Distribution metrics across multiple startup measurements (TERM-IPC-015 / CTX-0556).
+///
+/// PB-1 specifies p50 ≤ 100 ms and p99 ≤ 200 ms. A single startup run total
+/// is an observation, not a distribution. `StartupDistribution` aggregates
+/// multiple runs (or fixture samples) into verified p50 and p99 metrics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartupDistribution {
+    pub count: usize,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+}
+
+impl StartupDistribution {
+    /// Computes distribution metrics from a slice of sample totals in milliseconds.
+    #[must_use]
+    pub fn from_samples_ms(mut samples: Vec<f64>) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let count = samples.len();
+        let min_ms = samples[0];
+        let max_ms = samples[count - 1];
+
+        // Standard nearest-rank percentile calculation:
+        let p50_idx = ((count as f64 * 0.50).ceil() as usize)
+            .saturating_sub(1)
+            .min(count - 1);
+        let p99_idx = ((count as f64 * 0.99).ceil() as usize)
+            .saturating_sub(1)
+            .min(count - 1);
+
+        Some(Self {
+            count,
+            p50_ms: samples[p50_idx],
+            p99_ms: samples[p99_idx],
+            min_ms,
+            max_ms,
+        })
+    }
+
+    /// Computes distribution metrics from a slice of [`StartupReport`]s.
+    #[must_use]
+    pub fn from_reports(reports: &[StartupReport]) -> Option<Self> {
+        let samples: Vec<f64> = reports.iter().map(StartupReport::total_ms).collect();
+        Self::from_samples_ms(samples)
+    }
+
+    /// Returns `true` when the p50 startup latency meets PB-1 (100 ms).
+    #[must_use]
+    pub fn meets_p50(&self) -> bool {
+        self.p50_ms <= super::PB1_STARTUP_MS_P50 as f64
+    }
+
+    /// Returns `true` when the p99 startup latency meets PB-1 (200 ms).
+    #[must_use]
+    pub fn meets_p99(&self) -> bool {
+        self.p99_ms <= super::PB1_STARTUP_MS_P99 as f64
+    }
+}
+
 /// Minimal present stats for the first frame (owned, no wgpu type).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramePresent {
@@ -488,20 +551,28 @@ impl StartupReport {
 // Real-window variant (env-gated, Tier 1 box)
 // ---------------------------------------------------------------------------
 
-/// Attempts a real winit window + wgpu surface creation via `bitty-platform`
-/// and `bitty-render` seams, returning a headless fallback report on CI.
+/// Probes winit window configuration and platform reachability via `bitty-platform`,
+/// returning a headless fallback report on CI (TERM-IPC-015 / CTX-0556).
 ///
 /// This function requires `BITTY_PERF_REAL_WINDOW=1` and a display server;
-/// otherwise it delegates to [`measure_headless_startup`] so CI stays green.
-/// When enabled, it creates an `EventLoop`, a `Window`, and a `SurfaceTarget`,
-/// then probes `GpuContext::create_surface` — all bounded and `forbid(unsafe)`.
+/// otherwise it delegates to [`measure_headless_startup`] with a skipped gate.
+/// When enabled, it executes headless startup plus an isolated
+/// [`probe_winit_window_config`] step to measure configuration validation
+/// and event-loop availability.
 ///
-/// Note: this is intentionally not called by default benches; use
-/// `cargo bench --bench startup_real -- --nocapture` with the env var on a
-/// Tier 1 box to obtain real-window numbers for evidence.
+/// Note: This is an isolated configuration and capability probe, not live window presentation.
+/// Live window presentation requires an interactive event loop runner and GPU display.
 #[must_use]
 pub fn measure_real_window_startup() -> StartupReport {
-    if std::env::var("BITTY_PERF_REAL_WINDOW").as_deref() != Ok("1") {
+    measure_real_window_startup_with_gate(
+        std::env::var("BITTY_PERF_REAL_WINDOW").as_deref() == Ok("1"),
+    )
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn measure_real_window_startup_with_gate(gate_enabled: bool) -> StartupReport {
+    if !gate_enabled {
         let mut report = measure_headless_startup();
         report.phases.push(StartupPhase {
             name: "real_window_gate",
@@ -512,18 +583,18 @@ pub fn measure_real_window_startup() -> StartupReport {
         return report;
     }
 
-    // Real path: delegate to headless then attempt window+surface steps with
+    // Real path: delegate to headless then attempt window config probe step with
     // additional timing, so the baseline phases are always comparable.
     let mut report = measure_headless_startup();
     let t_extra = Instant::now();
 
-    // Extra phase: winit window create via bitty-platform App seam.
+    // Extra phase: winit window config probe via bitty-platform (TERM-IPC-015 / CTX-0556).
     // We cannot run App::run without blocking, so we probe via EventLoop builder
     // plus a WindowConfig validation step that proves winit types are reachable.
     let probe_start = Instant::now();
-    let window_status = probe_winit_window_create();
+    let window_status = probe_winit_window_config();
     report.phases.push(StartupPhase {
-        name: "winit_window_create",
+        name: "winit_window_config_probe",
         elapsed: probe_start.elapsed(),
         since_start: report.total + t_extra.elapsed(),
         status: window_status,
@@ -533,7 +604,7 @@ pub fn measure_real_window_startup() -> StartupReport {
     report
 }
 
-fn probe_winit_window_create() -> PhaseStatus {
+fn probe_winit_window_config() -> PhaseStatus {
     // Validate LogicalSize and WindowConfig without touching the display.
     // This proves winit config sizing is instrumented even when display is absent.
     let size = match LogicalSize::new(800.0, 600.0) {
@@ -613,6 +684,76 @@ mod tests {
         assert!(
             matches!(wgpu, PhaseStatus::Success | PhaseStatus::Unavailable(_)),
             "wgpu probe must be Success or Unavailable, got {wgpu:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_timing_fixture_distribution_calculates_accurate_p50_and_p99() {
+        // 100 fixed samples from 1.0 ms to 100.0 ms.
+        let samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let dist = StartupDistribution::from_samples_ms(samples).expect("must calculate");
+        assert_eq!(dist.count, 100);
+        assert_eq!(dist.min_ms, 1.0);
+        assert_eq!(dist.max_ms, 100.0);
+        assert_eq!(dist.p50_ms, 50.0);
+        assert_eq!(dist.p99_ms, 99.0);
+        assert!(dist.meets_p50());
+        assert!(dist.meets_p99());
+
+        // Empty samples test
+        assert!(StartupDistribution::from_samples_ms(vec![]).is_none());
+
+        // Fixed timing reports fixture
+        let reports: Vec<StartupReport> = [50, 80, 120, 150, 250]
+            .into_iter()
+            .map(|ms| StartupReport {
+                phases: Vec::new(),
+                total: Duration::from_millis(ms),
+                headless_fallback: true,
+                is_real_window: false,
+                first_frame_presented: true,
+                first_frame_stats: None,
+            })
+            .collect();
+        let dist_from_reports =
+            StartupDistribution::from_reports(&reports).expect("must calculate");
+        assert_eq!(dist_from_reports.count, 5);
+        assert_eq!(dist_from_reports.min_ms, 50.0);
+        assert_eq!(dist_from_reports.max_ms, 250.0);
+        // p50 for 5 elements: ceil(5 * 0.50) - 1 = 3 - 1 = index 2 -> 120.0
+        assert_eq!(dist_from_reports.p50_ms, 120.0);
+        // p99 for 5 elements: ceil(5 * 0.99) - 1 = 5 - 1 = index 4 -> 250.0
+        assert_eq!(dist_from_reports.p99_ms, 250.0);
+        assert!(!dist_from_reports.meets_p50()); // 120 > 100
+        assert!(!dist_from_reports.meets_p99()); // 250 > 200
+    }
+
+    #[test]
+    fn real_window_probe_naming_and_claims() {
+        // Exercise the gated probe branch directly without unsafe env mutation
+        let report = measure_real_window_startup_with_gate(true);
+
+        // Verify that the phase is named winit_window_config_probe, NOT winit_window_create
+        let probe_phase = report
+            .phases
+            .iter()
+            .find(|p| p.name == "winit_window_config_probe");
+        assert!(
+            probe_phase.is_some(),
+            "winit_window_config_probe must exist when gate is enabled"
+        );
+        assert!(
+            !report
+                .phases
+                .iter()
+                .any(|p| p.name == "winit_window_create"),
+            "old inaccurate name winit_window_create must not exist"
+        );
+
+        // Verify that probe does not claim real presentation without live GPU presentation
+        assert!(
+            !report.is_real_window,
+            "headless test probe must not claim is_real_window = true"
         );
     }
 }

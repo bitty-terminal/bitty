@@ -361,7 +361,7 @@ fn rollback_pruned_target_fails_closed() {
 }
 
 #[test]
-fn rollback_per_plugin_requires_contains_and_full_switch() {
+fn rollback_per_plugin_surgical_scope() {
     let mut env = Environment::new();
     let m_hex = minimal_manifest("xuepoo.a").canonical_digest();
     let mut lock1 = Lockfile::new();
@@ -425,13 +425,13 @@ fn rollback_per_plugin_requires_contains_and_full_switch() {
     lock2
         .insert(LockedPackage {
             id: pid("xuepoo.b"),
-            version: "0.1.0".to_string(),
+            version: "0.2.0".to_string(),
             source: PackageSource::Registry {
                 url: "https://example.com".to_string(),
             },
             digests: PackageDigests {
-                artifact: sha256_hex(b"b"),
-                manifest: sha256_hex(b"mb"),
+                artifact: sha256_hex(b"b2"),
+                manifest: sha256_hex(b"mb2"),
                 content_root: None,
             },
             locked_at: 2,
@@ -439,9 +439,26 @@ fn rollback_per_plugin_requires_contains_and_full_switch() {
         .unwrap();
     let id2 = env.stage(lock2, BTreeMap::new(), 20).unwrap();
     activate(&mut env, id2, Some("0.6.0"), Some("1.0.0"), None).unwrap();
-    // per-plugin rollback to id1 for xuepoo.a
-    rollback_per_plugin(&mut env, id1, "xuepoo.a").unwrap();
-    assert_eq!(env.current, Some(id1));
+
+    let report = rollback_per_plugin(&mut env, id1, "xuepoo.a").unwrap();
+    assert!(report.succeeded);
+
+    let cur = env.current_generation().unwrap();
+    let pkg_a = cur
+        .lock
+        .packages
+        .iter()
+        .find(|p| p.id.as_str() == "xuepoo.a")
+        .unwrap();
+    assert_eq!(pkg_a.version, "0.1.0");
+    let pkg_b = cur
+        .lock
+        .packages
+        .iter()
+        .find(|p| p.id.as_str() == "xuepoo.b")
+        .unwrap();
+    assert_eq!(pkg_b.version, "0.2.0");
+
     // missing plugin in target fails
     assert!(rollback_per_plugin(&mut env, id1, "xuepoo.missing").is_err());
 }

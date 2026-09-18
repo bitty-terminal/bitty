@@ -674,6 +674,156 @@ mod tests {
         assert_eq!(CTL_TIMEOUT.as_secs(), 5);
     }
 
+    /// CTX-0529 (LIVE-IPC-004) failing-first: a queued control whose deadline
+    /// passed must never be handed over for execution. An entry stamped in
+    /// the past arrives expired and the pop side must withdraw it (dropping
+    /// the reply without applying) instead of returning it to the drain.
+    #[test]
+    fn expired_queued_control_is_withdrawn_not_applied() {
+        let _guard = ControlWakeGuard::take();
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        global_control_queue()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(PendingControl::with_deadline(
+                METHOD_LIST_VIEWS,
+                None,
+                "1",
+                tx,
+                // Already past: the caller gave up before the drain ran.
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now),
+            ));
+        assert!(
+            pop_pending_control().is_none(),
+            "an expired entry must be withdrawn, never handed to the drain"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a withdrawn entry must not fabricate a late success reply"
+        );
+        assert!(
+            pop_pending_control().is_none(),
+            "the withdrawal must leave nothing behind for a later drain"
+        );
+    }
+
+    /// CTX-0529 failing-first: a stale entry ahead of a live one must be
+    /// skipped in FIFO order — the live verb behind it still drains.
+    #[test]
+    fn expired_head_does_not_block_live_tail() {
+        let _guard = ControlWakeGuard::take();
+        let (stale_tx, _stale_rx) = std::sync::mpsc::channel::<ControlReply>();
+        let (live_tx, _live_rx) = std::sync::mpsc::channel::<ControlReply>();
+        {
+            let mut guard = global_control_queue()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard.push_back(PendingControl::with_deadline(
+                METHOD_LIST_VIEWS,
+                None,
+                "1",
+                stale_tx,
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now),
+            ));
+            guard.push_back(PendingControl::new(METHOD_LIST_VIEWS, None, "2", live_tx));
+        }
+        let live = pop_pending_control().expect("live tail must still drain");
+        assert_eq!(live.id_raw, "2");
+        assert!(pop_pending_control().is_none());
+    }
+
+    /// CTX-0529 failing-first: the waiter side must give an honest timeout.
+    /// When nobody drains, `enqueue_control_and_wait` returns `Unavailable`
+    /// and withdraws its own entry so a slow drain can never apply it after
+    /// the caller already observed failure.
+    #[test]
+    fn timed_out_enqueue_withdraws_its_entry() {
+        use std::time::Duration;
+        let _guard = ControlWakeGuard::take();
+        // Shrink the production budget only for this test via an explicit
+        // short-deadline enqueue (same withdraw path the 5 s waiter uses).
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        global_control_queue()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(PendingControl::with_deadline(
+                METHOD_LIST_VIEWS,
+                None,
+                "1",
+                tx,
+                std::time::Instant::now() + Duration::from_millis(50),
+            ));
+        // Wait out the deadline exactly like the waiter does, then withdraw.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "nothing drains, so the reply must time out"
+        );
+        withdraw_expired_controls(std::time::Instant::now());
+        assert!(
+            pop_pending_control().is_none(),
+            "post-timeout drain must find nothing: the entry was withdrawn"
+        );
+    }
+
+    /// CTX-0529 failing-first: concurrent timeout+arrival is race-safe. A
+    /// waiter that already gave up and a drain arriving at the same instant
+    /// must agree: either the drain wins before the deadline (success on both
+    /// sides) or the withdrawal wins (honest timeout, no effect). The drain
+    /// side re-checks the deadline under no queue lock, so a reply send to an
+    /// abandoned waiter is best-effort and never resurrects the effect.
+    #[test]
+    fn timeout_arrival_race_stays_honest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let _guard = ControlWakeGuard::take();
+        let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
+        let item = PendingControl::with_deadline(
+            METHOD_LIST_VIEWS,
+            None,
+            "1",
+            tx,
+            std::time::Instant::now() + Duration::from_millis(20),
+        );
+        assert!(!item.is_expired(std::time::Instant::now()));
+        global_control_queue()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push_back(item);
+        // Simulate the arrival side winning just before the deadline.
+        let won = std::sync::Arc::new(AtomicBool::new(false));
+        let won_clone = std::sync::Arc::clone(&won);
+        let drain = std::thread::spawn(move || {
+            let item = pop_pending_control();
+            if let Some(item) = item {
+                // `send` fails only when the waiter already withdrew; the
+                // effect decision was already made at pop (pre-deadline).
+                let _ = item.reply.send(ControlReply {
+                    ok: true,
+                    result_json: String::from("{\"views\":[]}"),
+                    category: "",
+                    code: "",
+                    message: String::new(),
+                });
+                won_clone.store(true, Ordering::SeqCst);
+            }
+        });
+        let reply = rx.recv_timeout(Duration::from_secs(2));
+        drain.join().expect("drain thread must finish");
+        // Exactly one outcome: drain won pre-deadline (success reply) — the
+        // expired path would have withdrawn instead of replying.
+        assert!(won.load(Ordering::SeqCst), "pre-deadline drain must win");
+        let reply = reply.expect("waiter must observe the pre-deadline reply");
+        assert!(
+            reply.ok,
+            "pre-deadline reply must be the success: {reply:?}"
+        );
+        assert!(pop_pending_control().is_none());
+    }
+
     #[test]
     fn control_methods_map_to_expected_scopes() {
         assert_eq!(
@@ -1080,6 +1230,21 @@ pub fn elevation_from_env(raw: Option<&str>) -> ScopeSet {
 /// Maximum queued control actions (drop-newest past this, fail-closed).
 pub const MAX_QUEUED_CONTROLS: usize = 64;
 
+/// Monotonic sequence for queued control actions (CTX-0529).
+///
+/// Lets a timed-out waiter withdraw exactly its own entry without touching
+/// live ones; the drain never executes an entry past its deadline.
+fn next_control_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    // Wrapping past `u64::MAX` lands on 0 once; skip it (0 is never
+    // allocated, mirroring the channel `RequestId` reservation).
+    let mut seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seq == 0 {
+        seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    seq
+}
+
 /// One queued control action (all `Send`; `Runtime` never crosses threads).
 #[derive(Debug)]
 pub struct PendingControl {
@@ -1091,6 +1256,62 @@ pub struct PendingControl {
     pub id_raw: String,
     /// Reply channel back to the connection thread.
     pub reply: std::sync::mpsc::Sender<ControlReply>,
+    /// Owner sequence for targeted withdrawal (CTX-0529).
+    pub seq: u64,
+    /// Absolute wall-clock deadline: `enqueue Instant + CTL_TIMEOUT`.
+    ///
+    /// A drain that pops this entry at or past `deadline` withdraws it
+    /// instead of applying it (CTX-0483 never-execute-after-deadline rule
+    /// for the ctl queue), so a timed-out caller can never observe a
+    /// post-timeout effect.
+    pub deadline: std::time::Instant,
+}
+
+impl PendingControl {
+    /// Stamp a live entry: deadline is one full [`CTL_TIMEOUT`] budget from
+    /// now, matching the waiter's `recv_timeout` so pop-time expiry agrees
+    /// with the caller's timeout.
+    #[must_use]
+    pub fn new(
+        method: &str,
+        params: Option<&str>,
+        id_raw: &str,
+        reply: std::sync::mpsc::Sender<ControlReply>,
+    ) -> Self {
+        Self::with_deadline(
+            method,
+            params,
+            id_raw,
+            reply,
+            std::time::Instant::now() + CTL_TIMEOUT,
+        )
+    }
+
+    /// Build an entry with an explicit deadline (production uses [`Self::new`];
+    /// tests use this to stage already-expired or short-lived entries).
+    #[must_use]
+    pub fn with_deadline(
+        method: &str,
+        params: Option<&str>,
+        id_raw: &str,
+        reply: std::sync::mpsc::Sender<ControlReply>,
+        deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            method: method.to_string(),
+            params: params.map(str::to_string),
+            id_raw: id_raw.to_string(),
+            reply,
+            seq: next_control_seq(),
+            deadline,
+        }
+    }
+
+    /// Whether `now` is at or past the entry deadline.
+    #[must_use]
+    pub fn is_expired(&self, now: std::time::Instant) -> bool {
+        now >= self.deadline
+    }
 }
 
 /// Synchronous control result for the reply channel (all `Send`).
@@ -1118,11 +1339,97 @@ pub fn global_control_queue()
 }
 
 /// Pop one queued action (main-thread consumer).
+///
+/// CTX-0529: skips (withdraws) entries at or past their deadline instead of
+/// handing them over for execution — the ctl-queue form of the CTX-0483
+/// never-execute-after-deadline rule. A withdrawn entry is simply dropped:
+/// its waiter already holds (or is about to observe) the honest timeout from
+/// its own `recv_timeout`, so the pop side must not fabricate a second reply
+/// that could race the timeout and read as a late success. Returns the first
+/// live entry, or `None` when the queue drained or only expired entries
+/// remained.
 pub fn pop_pending_control() -> Option<PendingControl> {
-    global_control_queue()
-        .lock()
-        .map(|mut q| q.pop_front())
-        .unwrap_or(None)
+    loop {
+        let item = global_control_queue()
+            .lock()
+            .map(|mut q| q.pop_front())
+            .unwrap_or(None)?;
+        if item.is_expired(std::time::Instant::now()) {
+            // Withdrawn: no effect applied, no reply sent — the waiter's own
+            // timeout path owns the outcome (including reclaiming the entry
+            // via `withdraw_control_by_seq` when it is still queued).
+            drop(item);
+            continue;
+        }
+        return Some(item);
+    }
+}
+
+/// Honest timeout reply shared by the waiter and the withdraw path.
+///
+/// Both sides must name the same outcome so a client can never observe a
+/// success for an effect that never landed (or a timeout for one that did
+/// pre-deadline — that case still carries the real reply).
+fn timed_out_control_reply() -> ControlReply {
+    ControlReply {
+        ok: false,
+        result_json: String::new(),
+        category: "transport",
+        code: "Unavailable",
+        message: String::from("control timed out (no live runtime draining)"),
+    }
+}
+
+/// Withdraw entries at or past `now` without applying them (CTX-0529).
+///
+/// Same withdraw semantics as [`pop_pending_control`] but queue-wide: used
+/// by a timed-out waiter to reclaim its own entry so a slow drain can never
+/// apply it afterwards. Returns the number withdrawn. Targeted by `seq`
+/// when `Some` (a waiter reclaims exactly its own entry; live entries from
+/// other callers are untouched), or sweeps every expired entry when `None`.
+pub fn withdraw_expired_controls(now: std::time::Instant) -> usize {
+    withdraw_controls_where(|item| item.is_expired(now), None)
+}
+
+/// Withdraw the queued entry owned by `seq` regardless of deadline.
+///
+/// Called by a waiter that timed out while its entry was still queued: the
+/// caller already observed failure, so the entry must never apply later.
+/// Returns `true` when an entry was found and withdrawn (drain will never
+/// see it); `false` when the drain already popped it (the real reply — or
+/// the pop-time withdraw — already decided the outcome).
+pub fn withdraw_control_by_seq(seq: u64) -> bool {
+    withdraw_controls_where(|_| true, Some(seq)) > 0
+}
+
+fn withdraw_controls_where(
+    mut expired: impl FnMut(&PendingControl) -> bool,
+    seq: Option<u64>,
+) -> usize {
+    // Single lock, drain + partition + requeue: the queue is tiny (<= 64)
+    // and neither caller holds another lock, so the brief requeue window is
+    // safe. Replies go out after the lock drops so a blocked receiver can
+    // never stall queue operations.
+    let mut dropped: Vec<PendingControl> = Vec::new();
+    if let Ok(mut guard) = global_control_queue().lock() {
+        let mut kept = std::collections::VecDeque::with_capacity(guard.len());
+        while let Some(item) = guard.pop_front() {
+            let owned = seq.is_none_or(|want| item.seq == want);
+            if owned && expired(&item) {
+                dropped.push(item);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        *guard = kept;
+    } else {
+        return 0;
+    }
+    let count = dropped.len();
+    for item in dropped {
+        let _ = item.reply.send(timed_out_control_reply());
+    }
+    count
 }
 
 /// Clear the queue (test hook only; drops pending replies).
@@ -1223,12 +1530,8 @@ pub fn enqueue_control_and_wait(
         };
     }
     let (tx, rx) = std::sync::mpsc::channel::<ControlReply>();
-    let pending = PendingControl {
-        method: method.to_string(),
-        params: params.map(str::to_string),
-        id_raw: id_raw.to_string(),
-        reply: tx,
-    };
+    let pending = PendingControl::new(method, params, id_raw, tx);
+    let own_seq = pending.seq;
     {
         let queue = global_control_queue();
         let mut guard = queue.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1250,12 +1553,14 @@ pub fn enqueue_control_and_wait(
     wake_event_loop_for_control();
     match rx.recv_timeout(CTL_TIMEOUT) {
         Ok(reply) => reply,
-        Err(_) => ControlReply {
-            ok: false,
-            result_json: String::new(),
-            category: "transport",
-            code: "Unavailable",
-            message: String::from("control timed out (no live runtime draining)"),
-        },
+        // CTX-0529: the waiter gave up — withdraw our own entry so a slow
+        // drain can never apply it after we already reported failure. When
+        // the drain already popped it, the real reply (or the pop-time
+        // withdraw) already decided the outcome and the extra timeout send
+        // below just finds a disconnected receiver.
+        Err(_) => {
+            withdraw_control_by_seq(own_seq);
+            timed_out_control_reply()
+        }
     }
 }

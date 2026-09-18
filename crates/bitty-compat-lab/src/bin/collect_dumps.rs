@@ -102,6 +102,19 @@ fn json_escape(input: &str) -> String {
     out
 }
 
+fn write_snapshot_to_dirs(out_dirs: &[PathBuf], file_name: &str, content: &str) -> usize {
+    let mut successes = 0;
+    for dir in out_dirs {
+        if dir.exists() {
+            let out_path = dir.join(file_name);
+            if fs::write(&out_path, content).is_ok() {
+                successes += 1;
+            }
+        }
+    }
+    successes
+}
+
 fn main() {
     let ws = workspace_root();
     let out_worktree_rec = ws.join("recording/references/bitty");
@@ -219,14 +232,9 @@ fn main() {
                 "snapshot json unexpectedly large {} for {path:?}",
                 json.len()
             );
-            for dir in &out_dirs {
-                if dir.exists() {
-                    let out_path = dir.join(&file_name);
-                    fs::write(&out_path, &json)
-                        .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
-                }
+            if write_snapshot_to_dirs(&out_dirs, &file_name, &json) > 0 {
+                written += 1;
             }
-            written += 1;
             println!(
                 "{} {} bytes={} actions={} hash={:016x} -> {}",
                 category,
@@ -253,4 +261,111 @@ fn main() {
             .join(" and ")
     );
     let _ = PathBuf::from(".");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDirGuard(PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_snapshot_to_dirs_empty_or_nonexistent_dirs_returns_zero() {
+        let mut written = 0usize;
+
+        // Empty out_dirs returns 0
+        let successes = write_snapshot_to_dirs(&[], "test.snapshot.json", "{}");
+        assert_eq!(successes, 0);
+        if successes > 0 {
+            written += 1;
+        }
+        assert_eq!(written, 0);
+
+        // Nonexistent directory returns 0
+        let nonexistent = std::env::temp_dir().join(format!(
+            "bitty-nonexistent-{}-{}",
+            std::process::id(),
+            "ctx0549"
+        ));
+        let _ = fs::remove_dir_all(&nonexistent);
+        assert!(!nonexistent.exists());
+
+        let successes = write_snapshot_to_dirs(&[nonexistent], "test.snapshot.json", "{}");
+        assert_eq!(successes, 0);
+        if successes > 0 {
+            written += 1;
+        }
+        assert_eq!(
+            written, 0,
+            "written count must not increment when no dirs exist"
+        );
+    }
+
+    #[test]
+    fn write_snapshot_to_dirs_valid_directory_writes_file_and_increments() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("bitty-test-ctx0549-valid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let _guard = TempDirGuard(temp_dir.clone());
+
+        let file_name = "test.snapshot.json";
+        let content = "{\"snapshot\": true}\n";
+        let mut written = 0usize;
+
+        let successes = write_snapshot_to_dirs(std::slice::from_ref(&temp_dir), file_name, content);
+        assert_eq!(successes, 1);
+        if successes > 0 {
+            written += 1;
+        }
+        assert_eq!(written, 1, "written count should increment on success");
+
+        let out_path = temp_dir.join(file_name);
+        assert!(out_path.is_file(), "file must be written to disk");
+        let read_content = fs::read_to_string(&out_path).expect("read written file");
+        assert_eq!(read_content, content);
+    }
+
+    #[test]
+    fn write_snapshot_to_dirs_multiple_dirs_counts_each_success() {
+        let temp_dir1 =
+            std::env::temp_dir().join(format!("bitty-test-ctx0549-multi1-{}", std::process::id()));
+        let temp_dir2 =
+            std::env::temp_dir().join(format!("bitty-test-ctx0549-multi2-{}", std::process::id()));
+        let nonexistent = std::env::temp_dir().join(format!(
+            "bitty-test-ctx0549-nonexist-{}",
+            std::process::id()
+        ));
+
+        let _ = fs::remove_dir_all(&temp_dir1);
+        let _ = fs::remove_dir_all(&temp_dir2);
+        let _ = fs::remove_dir_all(&nonexistent);
+
+        fs::create_dir_all(&temp_dir1).expect("create temp dir 1");
+        fs::create_dir_all(&temp_dir2).expect("create temp dir 2");
+        let _guard1 = TempDirGuard(temp_dir1.clone());
+        let _guard2 = TempDirGuard(temp_dir2.clone());
+
+        let file_name = "multi.snapshot.json";
+        let content = "{\"multi\": true}\n";
+
+        let dirs = vec![temp_dir1.clone(), nonexistent, temp_dir2.clone()];
+        let successes = write_snapshot_to_dirs(&dirs, file_name, content);
+        assert_eq!(successes, 2, "both existing directories must succeed");
+
+        assert_eq!(
+            fs::read_to_string(temp_dir1.join(file_name)).unwrap(),
+            content
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir2.join(file_name)).unwrap(),
+            content
+        );
+    }
 }

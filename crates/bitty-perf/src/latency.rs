@@ -156,6 +156,8 @@ pub struct LatencySample {
     pub render_present: Duration,
     /// Whether the sample presented a frame (vs idle no-damage).
     pub presented: bool,
+    /// Whether this sample used synthetic echo injection rather than real PTY output.
+    pub is_synthetic: bool,
 }
 
 impl LatencySample {
@@ -215,6 +217,8 @@ pub struct LatencyReport {
     pub headless: bool,
     /// Number of samples that failed to present (should be 0 for this tracer).
     pub idle_misses: usize,
+    /// Number of samples where synthetic echo bytes were injected.
+    pub synthetic_samples: usize,
 }
 
 fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
@@ -375,6 +379,7 @@ fn measure_latency_with_hook(
             pty_to_state: pty_dur,
             render_present: render_dur,
             presented,
+            is_synthetic: true,
         });
 
         // Keep frame-on-demand invariant: after each present, next tick without
@@ -394,6 +399,7 @@ fn measure_latency_with_hook(
         // unless a real GPU was attached externally.
         rt.is_headless()
     });
+    let synthetic_samples = samples.len();
 
     LatencyReport {
         samples,
@@ -407,6 +413,7 @@ fn measure_latency_with_hook(
         mode: LatencyMode::InjectedEcho,
         headless,
         idle_misses,
+        synthetic_samples,
     }
 }
 
@@ -456,6 +463,7 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
 
     let mut samples = Vec::with_capacity(iterations);
     let mut idle_misses = 0usize;
+    let mut synthetic_samples = 0usize;
 
     for i in 0..iterations {
         let key = keys[i % keys.len()].clone();
@@ -476,7 +484,9 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
         // Bounded drain: poll_pty returns at most 128 KiB (CHANNEL_CAPACITY*READ_CHUNK)
         let _drained = rt.poll_pty();
         // Fallback echo if poll returned 0 (child hasn't echoed yet — inject bounded synthetic)
-        if _drained == 0 {
+        let is_synthetic = _drained == 0;
+        if is_synthetic {
+            synthetic_samples += 1;
             rt.handle_pty_bytes(b"a");
         }
         let pty_dur = t_pty.elapsed();
@@ -495,6 +505,7 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
             pty_to_state: pty_dur,
             render_present: render_dur,
             presented,
+            is_synthetic,
         });
         if presented {
             let _ = rt.tick();
@@ -502,6 +513,12 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
     }
 
     let (presented_ms, presented_work) = presented_series(&samples);
+
+    let mode = if synthetic_samples == samples.len() {
+        LatencyMode::InjectedEcho
+    } else {
+        LatencyMode::RealPtyEcho
+    };
 
     LatencyReport {
         samples,
@@ -512,9 +529,10 @@ pub fn measure_latency_with_pty_echo(iterations: usize) -> LatencyReport {
         p50_work_ms: percentile(&presented_work, 50.0),
         p99_work_ms: percentile(&presented_work, 99.0),
         min_work_ms: presented_work.first().copied().unwrap_or(0.0),
-        mode: LatencyMode::RealPtyEcho,
+        mode,
         headless: rt.is_headless(),
         idle_misses,
+        synthetic_samples,
     }
 }
 
@@ -567,7 +585,7 @@ impl LatencyReport {
         };
         let mut out = String::new();
         out.push_str(&format!(
-            "latency — mode={} p50 {:.3} ms / p99 {:.3} ms / mean {:.3} ms / max {:.3} ms (budget p50 {} ms p99 {} ms) work p50 {:.3} ms / p99 {:.3} ms / min {:.3} ms headless={} idle_misses={} [{verdict}; {work_verdict}]\n",
+            "latency — mode={} p50 {:.3} ms / p99 {:.3} ms / mean {:.3} ms / max {:.3} ms (budget p50 {} ms p99 {} ms) work p50 {:.3} ms / p99 {:.3} ms / min {:.3} ms headless={} idle_misses={} synthetic_samples={} [{verdict}; {work_verdict}]\n",
             self.mode.label(),
             self.p50_ms,
             self.p99_ms,
@@ -579,18 +597,20 @@ impl LatencyReport {
             self.p99_work_ms,
             self.min_work_ms,
             self.headless,
-            self.idle_misses
+            self.idle_misses,
+            self.synthetic_samples
         ));
         // Stage breakdown for first few samples (bounded tracing evidence).
         for (i, s) in self.samples.iter().take(5).enumerate() {
             out.push_str(&format!(
-                "  sample {i}: total {:.3} ms (encode {:.1} µs handle {:.1} µs pty {:.1} µs render {:.1} µs) presented={}\n",
+                "  sample {i}: total {:.3} ms (encode {:.1} µs handle {:.1} µs pty {:.1} µs render {:.1} µs) presented={} synthetic={}\n",
                 s.total_ms(),
                 s.encode.as_secs_f64() * 1_000_000.0,
                 s.handle_key.as_secs_f64() * 1_000_000.0,
                 s.pty_to_state.as_secs_f64() * 1_000_000.0,
                 s.render_present.as_secs_f64() * 1_000_000.0,
-                s.presented
+                s.presented,
+                s.is_synthetic
             ));
         }
         if self.samples.len() > 5 {
@@ -948,9 +968,11 @@ mod tests {
                 pty_to_state: Duration::ZERO,
                 render_present: Duration::from_secs_f64(work_ms / 1000.0),
                 presented: true,
+                is_synthetic: true,
             })
             .collect();
         let (totals, work) = presented_series(&samples);
+        let synthetic_samples = samples.len();
         LatencyReport {
             samples,
             p50_ms: percentile(&totals, 50.0),
@@ -963,6 +985,7 @@ mod tests {
             mode: LatencyMode::InjectedEcho,
             headless: true,
             idle_misses: 0,
+            synthetic_samples,
         }
     }
 
@@ -1080,6 +1103,25 @@ mod tests {
             report.p99_ms,
             p99_limit
         );
+        // CTX-0543: verify synthetic sample tracking and honest mode labeling
+        assert_eq!(
+            report.synthetic_samples,
+            report.samples.iter().filter(|s| s.is_synthetic).count(),
+            "synthetic_samples must match the count of samples marked is_synthetic"
+        );
+        if report.synthetic_samples == report.samples.len() {
+            assert_eq!(
+                report.mode,
+                LatencyMode::InjectedEcho,
+                "when all samples are synthetic, mode must be InjectedEcho"
+            );
+        } else {
+            assert_eq!(
+                report.mode,
+                LatencyMode::RealPtyEcho,
+                "when real PTY echo is received, mode must be RealPtyEcho"
+            );
+        }
     }
 
     #[test]
@@ -1113,7 +1155,13 @@ mod tests {
             summary.contains("work p50"),
             "summary must disclose measured pipeline work: {summary}"
         );
+        assert!(
+            summary.contains("synthetic_samples="),
+            "summary must disclose synthetic_samples: {summary}"
+        );
         assert_eq!(report.mode, LatencyMode::InjectedEcho);
+        assert_eq!(report.synthetic_samples, report.samples.len());
+        assert!(report.samples.iter().all(|s| s.is_synthetic));
         assert_eq!(report.min_work_ms, work.first().copied().unwrap_or(0.0));
 
         // The real-PTY variant must never be mislabeled: whatever path actually
@@ -1130,6 +1178,124 @@ mod tests {
                 "injected-echo",
                 "fallback must be labeled as injected, not as real PTY echo"
             );
+            assert_eq!(
+                pty.synthetic_samples,
+                pty.samples.len(),
+                "all-synthetic fallback must report synthetic_samples == iterations"
+            );
+        } else {
+            assert_eq!(pty.mode, LatencyMode::RealPtyEcho);
+            assert!(
+                pty.synthetic_samples < pty.samples.len(),
+                "real PTY echo report must not have 100% synthetic samples"
+            );
         }
+    }
+
+    #[test]
+    fn synthetic_latency_labeling_and_accounting_contract() {
+        // CTX-0543: verify synthetic sample tracking and honest mode labeling.
+        // 1. measure_latency always marks all samples synthetic and sets InjectedEcho.
+        let report = measure_latency(50);
+        assert_eq!(report.samples.len(), 50);
+        assert_eq!(report.synthetic_samples, 50);
+        assert!(report.samples.iter().all(|s| s.is_synthetic));
+        assert_eq!(report.mode, LatencyMode::InjectedEcho);
+
+        let summary = report.format_summary();
+        assert!(
+            summary.contains("synthetic_samples=50"),
+            "summary must disclose synthetic_samples: {summary}"
+        );
+
+        // 2. measure_latency_with_pty_echo must accurately track synthetic samples.
+        let pty_report = measure_latency_with_pty_echo(50);
+        assert_eq!(pty_report.samples.len(), 50);
+        let counted_synthetic = pty_report.samples.iter().filter(|s| s.is_synthetic).count();
+        assert_eq!(
+            pty_report.synthetic_samples, counted_synthetic,
+            "report.synthetic_samples must equal the number of is_synthetic samples"
+        );
+
+        if pty_report.synthetic_samples == pty_report.samples.len() {
+            assert_eq!(
+                pty_report.mode,
+                LatencyMode::InjectedEcho,
+                "report mode must be InjectedEcho when all samples are synthetic"
+            );
+            assert_ne!(
+                pty_report.mode,
+                LatencyMode::RealPtyEcho,
+                "synthetic fallback must NOT be labeled RealPtyEcho"
+            );
+        } else {
+            assert_eq!(
+                pty_report.mode,
+                LatencyMode::RealPtyEcho,
+                "report mode must be RealPtyEcho when real PTY echo arrived"
+            );
+            assert!(
+                pty_report.synthetic_samples < pty_report.samples.len(),
+                "RealPtyEcho must have at least one non-synthetic sample"
+            );
+        }
+
+        // 3. Verify deterministic mode switching based on synthetic count.
+        let make_report = |synthetic_count: usize, total: usize| -> LatencyReport {
+            let samples: Vec<LatencySample> = (0..total)
+                .map(|i| LatencySample {
+                    total: Duration::from_millis(2),
+                    encode: Duration::from_micros(100),
+                    handle_key: Duration::from_micros(100),
+                    pty_to_state: Duration::from_micros(500),
+                    render_present: Duration::from_millis(1),
+                    presented: true,
+                    is_synthetic: i < synthetic_count,
+                })
+                .collect();
+            let mode = if synthetic_count == total {
+                LatencyMode::InjectedEcho
+            } else {
+                LatencyMode::RealPtyEcho
+            };
+            LatencyReport {
+                samples,
+                p50_ms: 2.0,
+                p99_ms: 2.0,
+                mean_ms: 2.0,
+                max_ms: 2.0,
+                p50_work_ms: 1.7,
+                p99_work_ms: 1.7,
+                min_work_ms: 1.7,
+                mode,
+                headless: true,
+                idle_misses: 0,
+                synthetic_samples: synthetic_count,
+            }
+        };
+
+        // All synthetic -> InjectedEcho
+        let all_synthetic = make_report(50, 50);
+        assert_eq!(all_synthetic.mode, LatencyMode::InjectedEcho);
+        assert_eq!(all_synthetic.synthetic_samples, 50);
+        assert_ne!(all_synthetic.mode, LatencyMode::RealPtyEcho);
+
+        // Partially synthetic -> RealPtyEcho with accurate synthetic_samples count
+        let partial_synthetic = make_report(10, 50);
+        assert_eq!(partial_synthetic.mode, LatencyMode::RealPtyEcho);
+        assert_eq!(partial_synthetic.synthetic_samples, 10);
+
+        // Zero synthetic -> RealPtyEcho with 0 synthetic_samples
+        let zero_synthetic = make_report(0, 50);
+        assert_eq!(zero_synthetic.mode, LatencyMode::RealPtyEcho);
+        assert_eq!(zero_synthetic.synthetic_samples, 0);
+
+        // Existing latency calculations must continue to work without regression
+        assert!(all_synthetic.meets_p50());
+        assert!(all_synthetic.meets_p99());
+        assert!(all_synthetic.meets_work_p50());
+        assert!(all_synthetic.meets_work_p99());
+        assert!(partial_synthetic.meets_p50());
+        assert!(zero_synthetic.meets_p50());
     }
 }

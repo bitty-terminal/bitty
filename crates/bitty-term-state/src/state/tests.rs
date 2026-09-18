@@ -900,3 +900,133 @@ fn ctx_0469_height_only_resize_keeps_wraps_and_content() {
     assert_eq!(&after.cells[..GRID_COLUMNS], &before.cells[..GRID_COLUMNS]);
     assert!(s.check_invariants().is_ok());
 }
+
+/// TERM-ENG-005 / CTX-0555: resize resets scroll region to full screen,
+/// preserves origin mode, and restores saved cursor consistently.
+#[test]
+fn term_eng_005_resize_resets_scroll_region_but_preserves_origin_and_saved_cursor() {
+    let mut s = State::new();
+    s.apply(&TerminalAction::SetScrollRegion {
+        top: Row(5),
+        bottom: Row(15),
+    });
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::Origin,
+        enabled: true,
+    });
+    assert!(s.modes.origin);
+    // Move inside region
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(2),
+        col: Col(4),
+    });
+    let pos_before = s.cursor().position;
+    // Save cursor with origin mode
+    s.apply(&TerminalAction::CursorSave);
+
+    // Resize terminal
+    let new_cols = GRID_COLUMNS + 10;
+    let new_rows = GRID_ROWS + 5;
+    s.resize(new_cols, new_rows);
+
+    // Scroll region reset to full screen
+    assert_eq!(s.scroll_region_top, 0);
+    assert_eq!(s.scroll_region_bottom, (new_rows - 1) as u16);
+    // Origin mode remains enabled
+    assert!(s.modes.origin, "resize must not reset origin mode");
+
+    // Restore cursor
+    s.apply(&TerminalAction::CursorRestore);
+    assert_eq!(s.cursor().position, pos_before);
+    assert!(s.modes.origin, "restore cursor preserves origin mode");
+    assert!(s.check_invariants().is_ok());
+}
+
+/// TERM-ENG-005 / CTX-0555: narrowed scroll region on alternate screen with resize.
+#[test]
+fn term_eng_005_alternate_screen_narrowed_region_and_resize() {
+    let mut s = State::new();
+    prints(&mut s, "primary-content");
+
+    // Enter alternate screen
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    assert!(s.alt_screen_active());
+
+    // Narrow scroll region on alternate screen
+    s.apply(&TerminalAction::SetScrollRegion {
+        top: Row(2),
+        bottom: Row(8),
+    });
+    prints(&mut s, "alt-content");
+
+    // Resize
+    let new_cols = GRID_COLUMNS + 5;
+    let new_rows = GRID_ROWS + 2;
+    s.resize(new_cols, new_rows);
+
+    assert_eq!(s.width(), new_cols);
+    assert_eq!(s.height(), new_rows);
+    assert_eq!(s.scroll_region_top, 0);
+    assert_eq!(s.scroll_region_bottom, (new_rows - 1) as u16);
+    assert!(s.alt_screen_active());
+
+    // Leave alternate screen
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert!(!s.alt_screen_active());
+    assert_eq!(s.width(), new_cols);
+    assert_eq!(s.height(), new_rows);
+    assert!(s.check_invariants().is_ok());
+}
+
+/// ENG-005c / CTX-0555: alternate screen × hyperlink isolation test gap.
+#[test]
+fn term_eng_005c_alternate_screen_hyperlink_isolation() {
+    let mut s = State::new();
+
+    // Primary screen hyperlink
+    s.apply(&TerminalAction::OscHyperlink {
+        link: Some(bitty_vt::Hyperlink {
+            id: Some("id-primary".into()),
+            uri: "https://example.com/primary".into(),
+        }),
+    });
+    prints(&mut s, "P");
+    let primary_link_id = s.current_hyperlink();
+    assert!(primary_link_id.is_some());
+
+    // Switch to alternate screen
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    assert!(s.alt_screen_active());
+
+    // Alternate screen hyperlink
+    s.apply(&TerminalAction::OscHyperlink {
+        link: Some(bitty_vt::Hyperlink {
+            id: Some("id-alt".into()),
+            uri: "https://example.com/alt".into(),
+        }),
+    });
+    prints(&mut s, "A");
+    let alt_link_id = s.current_hyperlink();
+    assert!(alt_link_id.is_some());
+
+    // Return to primary screen
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert!(!s.alt_screen_active());
+
+    // Verify cell on primary screen still holds primary hyperlink
+    let primary_cell = s.screens.main.get(0, 0);
+    assert_eq!(primary_cell.hyperlink, primary_link_id);
+    assert!(s.check_invariants().is_ok());
+}

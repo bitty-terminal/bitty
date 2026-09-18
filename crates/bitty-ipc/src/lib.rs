@@ -163,7 +163,7 @@ pub use host_bridge::{
     HostCaller, INSPECT_STATUS_TOOL, INSPECT_TEXT_TOOL, MAX_LIVE_SNAPSHOTS,
     clear_live_snapshots_for_tests, inspect_status_provider, inspect_status_spec,
     inspect_text_provider, inspect_text_spec, live_snapshot_count, live_snapshot_provider,
-    publish_live_snapshot, register_live_inspect_tools,
+    publish_live_snapshot, register_live_inspect_tools, retire_live_snapshot,
 };
 pub use limits::{
     RC9_BURST_PER_SEC, RC9_MAX_CONNECTIONS, RC9_PAYLOAD_CAP_BYTES, RC9_REQ_PER_SEC, RC9_WINDOW_MS,

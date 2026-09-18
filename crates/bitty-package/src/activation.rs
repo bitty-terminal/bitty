@@ -533,8 +533,8 @@ pub fn rollback_full(
 /// Per-plugin rollback: restore one plugin to its previously retained version.
 ///
 /// Targeted disable remains the surgical path when no prior version exists.
-/// This stub validates that the target generation contains the plugin id;
-/// actual per-plugin merge is deferred to the resolver.
+/// Merges the target package and capability snapshot into the currently active
+/// generation, stages a new generation, and activates it.
 pub fn rollback_per_plugin(
     env: &mut Environment,
     target_id: u64,
@@ -548,18 +548,51 @@ pub fn rollback_per_plugin(
                 id: target_id.to_string(),
             })?;
     target.verify_integrity()?;
-    if !target
+
+    let target_pkg = target
         .lock
         .packages
         .iter()
-        .any(|p| p.id.as_str() == plugin_id)
-    {
-        return Err(PackageError::NotFound {
+        .find(|p| p.id.as_str() == plugin_id)
+        .cloned()
+        .ok_or_else(|| PackageError::NotFound {
             id: format!("plugin {plugin_id} not in generation {target_id}"),
-        });
+        })?;
+
+    let current_id = env
+        .current
+        .ok_or_else(|| PackageError::generation("no active generation for per-plugin rollback"))?;
+    let current_gen =
+        env.generations
+            .get(&current_id)
+            .cloned()
+            .ok_or_else(|| PackageError::NotFound {
+                id: current_id.to_string(),
+            })?;
+
+    let mut new_lock = Lockfile::new();
+    let mut found = false;
+    for p in &current_gen.lock.packages {
+        if p.id.as_str() == plugin_id {
+            new_lock.insert(target_pkg.clone())?;
+            found = true;
+        } else {
+            new_lock.insert(p.clone())?;
+        }
     }
-    // For draft, full switch to target (same as full rollback).
-    activate(env, target_id, Some("0.6.0"), Some("1.0.0"), None)
+    if !found {
+        new_lock.insert(target_pkg.clone())?;
+    }
+
+    let mut new_caps = current_gen.capability_snapshot.clone();
+    if let Some(target_caps) = target.capability_snapshot.get(plugin_id) {
+        new_caps.insert(plugin_id.to_string(), target_caps.clone());
+    } else {
+        new_caps.remove(plugin_id);
+    }
+
+    let new_id = env.stage(new_lock, new_caps, target.activated_at + 1)?;
+    activate(env, new_id, Some("0.6.0"), Some("1.0.0"), None)
 }
 
 #[cfg(test)]

@@ -869,6 +869,144 @@ fn transport_attested_peer_rejects_symlinked_endpoint() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// CTX-0528 (IPC-001): a foreign-owned endpoint fails closed before any
+/// request byte is read — the attestation path cannot be satisfied by
+/// endpoint ownership alone.
+///
+/// Hostile: a socket directory owned by another UID (simulated by asking
+/// for attestation under a different `runtime_uid`) mints no marker, even
+/// though the 0700/0600 shape is well-formed.
+#[cfg(unix)]
+#[test]
+fn ipc001_foreign_uid_endpoint_rejected_before_first_byte() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base =
+        std::env::temp_dir().join(format!("bitty-ctx0528-{}-foreign-uid", std::process::id()));
+    let socket_path = base.join("bitty/a.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_str).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&socket_str).unwrap().uid();
+    let foreign = euid.wrapping_add(1);
+
+    // Marker minting fails closed for the foreign UID: no credential bytes
+    // are read (there is no stream here at all), and no marker exists to
+    // serve with.
+    let err = transport_attested_peer(&socket_str, foreign).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "foreign-uid endpoint must fail closed, got: {err:?}"
+    );
+
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0528 (IPC-001): a symlinked endpoint fails closed at the accept
+/// boundary — no marker is minted for a link, even when its target is a
+/// well-formed 0700/0600 endpoint owned by us.
+#[cfg(unix)]
+#[test]
+fn ipc001_symlink_endpoint_rejected_before_first_byte() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0528-{}-symlink", std::process::id()));
+    let dir_path = base.join("bitty");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let real = dir_path.join("real.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&real).unwrap().uid();
+
+    let link = dir_path.join("link.sock");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let err = transport_attested_peer(link.to_str().unwrap(), euid).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "symlinked endpoint must fail closed, got: {err:?}"
+    );
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0528 (IPC-001): a world-writable directory fails closed at the
+/// accept boundary — group/other permission bits on the leaf directory
+/// reject attestation even for the owning UID.
+#[cfg(unix)]
+#[test]
+fn ipc001_world_writable_dir_rejected_before_first_byte() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0528-{}-wwdir", std::process::id()));
+    let socket_path = base.join("bitty/a.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_str).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&socket_str).unwrap().uid();
+
+    // Hostile: another local user made the leaf world-writable (0777).
+    let leaf = base.join("bitty");
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = transport_attested_peer(&socket_str, euid).unwrap_err();
+    assert!(
+        matches!(err, IpcError::Unauthenticated { .. }),
+        "world-writable dir must fail closed, got: {err:?}"
+    );
+
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// CTX-0528 (IPC-001): no constructor path mints a `VerifiedPeer` marker
+/// without passing the verified endpoint — the marker is unsatisfiable by
+/// endpoint ownership alone. Both failure classes below are fail-closed
+/// (`Unauthenticated`) and carry token-free reasons.
+#[cfg(unix)]
+#[test]
+fn ipc001_marker_not_constructible_without_verified_endpoint() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0528-{}-no-marker", std::process::id()));
+    let socket_path = base.join("bitty/a.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _dir = prepare_socket_dir(&socket_str).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let euid = std::fs::symlink_metadata(&socket_str).unwrap().uid();
+
+    // Missing socket file: nothing to attest, fail closed as Unavailable.
+    let missing = base.join("bitty/missing.sock");
+    let err = transport_attested_peer(missing.to_str().unwrap(), euid).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            IpcError::Unavailable { .. } | IpcError::Unauthenticated { .. }
+        ),
+        "missing endpoint must fail closed, got: {err:?}"
+    );
+
+    // Foreign UID against a well-formed endpoint: fail closed as
+    // Unauthenticated with a peer-mismatch reason (token-free: no fd or
+    // credential bytes echoed).
+    let foreign = euid.wrapping_add(1);
+    let err = transport_attested_peer(&socket_str, foreign).unwrap_err();
+    let reason = match err {
+        IpcError::Unauthenticated { reason } => reason,
+        other => panic!("expected Unauthenticated, got {other:?}"),
+    };
+    assert!(
+        !reason.contains(&socket_str),
+        "failure reason must not echo the socket path bytes: {reason}"
+    );
+
+    drop(listener);
+    std::fs::remove_dir_all(&base).ok();
+}
+
 /// CTX-0463 (issue 744): `resolve_socket_path` is pure advisory resolution;
 /// a non-empty `BITTY_SOCKET` is returned verbatim after shape checks, so
 /// the connect boundary must verify ownership before use.
@@ -1345,9 +1483,16 @@ fn digest_context(
 ) -> ServeContext {
     // Attested like the production accept boundary
     // (`transport_attested_peer` + `attest_local_peer`): same-process
-    // in-process dispatch is local by construction.
+    // in-process dispatch is local by construction. CTX-0528/IPC-001: the
+    // mark is bound to a test-only marker minted via the headless UID
+    // check (same marker type the accept boundary produces).
     let mut ctx = automation_context(server, granted, session, now_ms);
-    ctx.attest_local_peer();
+    let peer = crate::auth::verify_peer_for_connection(
+        crate::auth::PeerCredentials::new(1000, 1000, 1),
+        1000,
+    )
+    .expect("test-only local marker");
+    ctx.attest_local_peer(&peer);
     ctx
 }
 
@@ -1533,7 +1678,14 @@ fn frame_hash_auth_matrix_denies_everything_unauthorized() {
     for (label, scopes, session, term, token, now, attest) in cases {
         let mut ctx = automation_context(&server, scopes, session, now);
         if attest {
-            ctx.attest_local_peer();
+            // CTX-0528/IPC-001: attestation requires the verified marker —
+            // same-process dispatch mints it via the headless UID check.
+            let peer = crate::auth::verify_peer_for_connection(
+                crate::auth::PeerCredentials::new(1000, 1000, 1),
+                1000,
+            )
+            .expect("test-only local marker");
+            ctx.attest_local_peer(&peer);
         }
         let params = if token.is_empty() {
             format!("{{\"terminalId\":\"{term}\"}}")

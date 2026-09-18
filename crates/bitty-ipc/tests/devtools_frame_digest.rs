@@ -147,13 +147,14 @@ fn spawn_digest_server(
             .unwrap();
         let dir = prepare_socket_dir(&socket_path).unwrap();
         let runtime_uid = attest_bound_socket(&socket_path, &dir).unwrap();
-        let _verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
+        let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("digest-proof".to_string(), socket_path.clone(), 80, 24);
         // Production-equivalent: the accept boundary verified a local peer,
         // so the context carries the attestation `frameHash` requires.
+        // CTX-0528/IPC-001: the mark is bound to the verified marker.
         let mut context = ServeContext::with_granted_session(&server, granted, &session);
-        context.attest_local_peer();
+        context.attest_local_peer(&verified);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()
@@ -163,7 +164,7 @@ fn spawn_digest_server(
         };
         let stats = serve_connection(
             &mut stream,
-            _verified,
+            verified,
             &dispatcher,
             &context,
             &mut limiter,

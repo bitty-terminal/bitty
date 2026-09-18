@@ -1,6 +1,7 @@
 //! `bitty ctl` target resolution and IPC round-trip (split from `ctl.rs`, CTX-0307).
 
 use super::CtlTargeting;
+#[cfg(unix)]
 use bitty_ipc::ctl as ipc_ctl;
 
 // ── socket resolution (client) ────────────────────────────────────────────
@@ -112,9 +113,12 @@ fn discovery_base(xdg_runtime_dir: Option<&str>, uid: u32) -> Option<String> {
 
 /// Enumerate live sockets under `<base>/bitty/*.sock`.
 ///
-/// A candidate is live when `connect` succeeds; stale files (refused) are
-/// skipped, never removed here (the servo reclaims on bind). Best-effort:
-/// unreadable directories yield no candidates (ambiguity error downstream).
+/// A candidate is live only when the endpoint first verifies (`0700` dir +
+/// `0600` socket, both owned by `uid`, no symlinks — CTX-0528/IPC-001: a
+/// foreign-owned or world-writable endpoint never reaches `connect`) and
+/// `connect` then succeeds; stale files (refused) are skipped, never
+/// removed here (the servo reclaims on bind). Best-effort: unreadable
+/// directories yield no candidates (ambiguity error downstream).
 #[cfg(unix)]
 fn discover_live_sockets(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<ResolvedTarget> {
     use std::os::unix::net::UnixStream;
@@ -133,6 +137,12 @@ fn discover_live_sockets(xdg_runtime_dir: Option<&str>, uid: u32) -> Vec<Resolve
             }
             let path_str = path.to_string_lossy().into_owned();
             if path_str.len() > bitty_ipc::devtools::MAX_SOCKET_PATH_BYTES {
+                continue;
+            }
+            // CTX-0528 (IPC-001): verify the endpoint before connect — a
+            // forged `BITTY_SOCKET`/planted entry pointing at another
+            // owner's socket fails closed here, never reaching I/O.
+            if bitty_ipc::devtools::verify_socket_endpoint_for_connect(&path_str, uid).is_err() {
                 continue;
             }
             if UnixStream::connect(&path).is_ok() {

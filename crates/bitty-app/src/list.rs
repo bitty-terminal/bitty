@@ -754,13 +754,33 @@ pub fn scan_socket_dir(dir: &Path) -> Result<Vec<InstanceInfo>, InstanceError> {
     ))
 }
 
-/// Probe one socket path with a connect (bounded, no content exchange).
+/// Probe one socket path with endpoint verification plus connect
+/// (bounded, no content exchange).
 ///
-/// Returns `(live, detail)`. `live == true` only when `connect` succeeds;
-/// every other outcome is `live == false` with a short, non-sensitive
-/// detail (error kind only, never OS handles or peer bytes).
+/// Returns `(live, detail)`. `live == true` only when the endpoint first
+/// verifies (`0700` dir + `0600` socket, owned by the probing euid, no
+/// symlinks — CTX-0528/IPC-001: a foreign-owned or tampered endpoint never
+/// reaches `connect`) and `connect` then succeeds; every other outcome is
+/// `live == false` with a short, non-sensitive detail (error kind only,
+/// never OS handles or peer bytes).
 #[cfg(unix)]
 fn probe_socket_live(path: &Path) -> (bool, String) {
+    // CTX-0528 (IPC-001): verify before connect — a planted entry pointing
+    // at another owner's socket fails closed here, never reaching I/O.
+    let euid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").map(|m| m.uid())
+    };
+    if let Ok(uid) = euid {
+        let path_str = path.to_string_lossy();
+        if bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str.as_ref(), uid).is_err()
+        {
+            return (
+                false,
+                "unreachable: endpoint verification failed".to_string(),
+            );
+        }
+    }
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => (true, "live".to_string()),
         Err(err) => {
@@ -1003,6 +1023,20 @@ fn probe_explicit_socket(path_str: &str) -> Result<Vec<InstanceInfo>, InstanceEr
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path_str.to_string());
+            // CTX-0528 (IPC-001): verify the endpoint before connect — a
+            // forged `--socket`/planted entry pointing at another owner's
+            // endpoint fails closed here, never reaching I/O.
+            let uid = std::fs::metadata("/proc/self")
+                .map(|m| m.uid())
+                .unwrap_or(0);
+            if bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str, uid).is_err() {
+                return Ok(vec![InstanceInfo {
+                    instance,
+                    socket: path_str.to_string(),
+                    live: false,
+                    detail: "unreachable: endpoint verification failed".to_string(),
+                }]);
+            }
             match std::os::unix::net::UnixStream::connect(path) {
                 Ok(_) => Ok(vec![InstanceInfo {
                     instance,
@@ -1842,9 +1876,15 @@ mod tests {
         }
         // Stale regular file with .sock suffix (connect fails -> live false).
         std::fs::write(dir.join("stale.sock"), b"not a socket").unwrap();
-        // Live socket.
+        // Live socket (0600 like the servo's attested endpoint, so the
+        // CTX-0528/IPC-001 pre-connect verification passes).
         let live_path = dir.join("live.sock");
         let listener = UnixListener::bind(&live_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&live_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         // Keep listener alive during scan.
         let rows = scan_socket_dir(&dir).unwrap();
         assert_eq!(rows.len(), 2);
@@ -1853,6 +1893,30 @@ mod tests {
         let stale = rows.iter().find(|r| r.instance == "stale").unwrap();
         assert!(!stale.live);
         drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// CTX-0528 (IPC-001): a foreign-owned/tampered endpoint never reports
+    /// live — pre-connect verification fails closed before `connect`, so a
+    /// planted entry cannot be mistaken for a live peer.
+    #[cfg(unix)]
+    #[test]
+    fn ipc001_tampered_endpoint_never_reports_live() {
+        use std::os::unix::fs::PermissionsExt;
+        static TAMPER_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = TAMPER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("blt-tamper-{}-{uniq}", std::process::id()));
+        let dir = base.join("bitty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A world-writable leaf fails the endpoint verification gate even
+        // though a socket inside could accept connections.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let rows = scan_socket_dir(&dir);
+        assert!(
+            rows.is_err(),
+            "world-writable scan dir must fail closed, got: {rows:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

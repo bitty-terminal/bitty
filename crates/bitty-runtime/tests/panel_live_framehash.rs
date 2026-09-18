@@ -426,7 +426,8 @@ fn framehash_socket_roundtrip_matches_runtime_frame() {
         let info = ServerInfo::new("panel-live-proof".to_string(), socket_path.clone(), 80, 24);
         let mut context =
             ServeContext::with_granted_session(&info, server_scopes, "panel-live-proof");
-        context.attest_local_peer();
+        // CTX-0528/IPC-001: the mark is bound to the verified marker.
+        context.attest_local_peer(&verified);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()

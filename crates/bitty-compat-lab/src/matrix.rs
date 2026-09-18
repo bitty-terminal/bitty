@@ -275,7 +275,7 @@ pub fn generate_matrix_json() -> Result<String, String> {
                     any_reference_compared = true;
                     "FAIL"
                 }
-                ReferenceOutcome::Absent => "SKIP",
+                ReferenceOutcome::Absent | ReferenceOutcome::Blocked => "SKIP",
             };
             out.push_str(&format!("\"{backend}\": \"{status}\""));
         }
@@ -377,7 +377,8 @@ mod tests {
                         any_compared = true;
                         "FAIL"
                     }
-                    crate::compare::ReferenceOutcome::Absent => "SKIP",
+                    crate::compare::ReferenceOutcome::Absent
+                    | crate::compare::ReferenceOutcome::Blocked => "SKIP",
                 };
                 let needle = format!("\"{backend}\": \"{expected}\"");
                 assert!(

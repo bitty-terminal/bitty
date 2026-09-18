@@ -70,6 +70,8 @@ pub enum ReferenceOutcome {
     Mismatch,
     /// No dump for this corpus; nothing was compared.
     Absent,
+    /// Reference exists but comparison was blocked (e.g. self-consistency failure).
+    Blocked,
 }
 
 fn bitty_snapshot_dir_candidates() -> Vec<PathBuf> {
@@ -154,6 +156,8 @@ pub struct CompareOutcome {
     pub reference_failures: Vec<String>,
     /// Whether any reference comparison was attempted.
     pub reference_skipped: bool,
+    /// Reference backend comparison count blocked by self-consistency failure.
+    pub reference_blocked: usize,
 }
 
 /// Aggregate report, deterministic and sorted.
@@ -165,6 +169,7 @@ pub struct CompareReport {
     pub reference_compared: usize,
     pub reference_passed: usize,
     pub reference_failed: usize,
+    pub reference_skipped: usize,
     pub outcomes: Vec<CompareOutcome>,
 }
 
@@ -650,9 +655,11 @@ pub fn compare_one(dump: &BittyDump) -> CompareOutcome {
     let self_consistent = self_failure.is_none();
 
     let refs = load_reference_texts_for_corpus(&dump.corpus_rel);
-    let reference_skipped = refs.is_empty();
     let mut reference_failures = Vec::new();
     let mut reference_compared = 0usize;
+    let mut reference_blocked = 0usize;
+    let mut reference_skipped = refs.is_empty();
+
     if self_consistent && !refs.is_empty() {
         // Only compare references when self-consistency already passed, to keep
         // failure attribution clear. Use row-major text equality; backends that
@@ -675,7 +682,9 @@ pub fn compare_one(dump: &BittyDump) -> CompareOutcome {
             }
         }
     } else if !refs.is_empty() {
-        reference_compared = refs.len();
+        // Self-consistency failed; references are blocked from comparison
+        reference_blocked = refs.len();
+        reference_skipped = true;
     }
 
     CompareOutcome {
@@ -685,6 +694,7 @@ pub fn compare_one(dump: &BittyDump) -> CompareOutcome {
         reference_compared,
         reference_failures,
         reference_skipped,
+        reference_blocked,
     }
 }
 
@@ -717,6 +727,7 @@ pub fn compare_all() -> Result<CompareReport, String> {
     let mut self_failed = 0usize;
     let mut ref_compared = 0usize;
     let mut ref_failed = 0usize;
+    let mut ref_skipped = 0usize;
     for dump in &dumps {
         let outcome = compare_one(dump);
         if outcome.self_consistent {
@@ -726,6 +737,7 @@ pub fn compare_all() -> Result<CompareReport, String> {
         }
         ref_compared += outcome.reference_compared;
         ref_failed += outcome.reference_failures.len();
+        ref_skipped += outcome.reference_blocked;
         outcomes.push(outcome);
     }
     // Determinism: outcomes already in file_name order; ensure sorted.
@@ -737,6 +749,7 @@ pub fn compare_all() -> Result<CompareReport, String> {
         reference_compared: ref_compared,
         reference_passed: ref_compared.saturating_sub(ref_failed),
         reference_failed: ref_failed,
+        reference_skipped: ref_skipped,
         outcomes,
     })
 }
@@ -744,17 +757,23 @@ pub fn compare_all() -> Result<CompareReport, String> {
 /// Human-readable one-line summary.
 pub fn format_report(report: &CompareReport) -> String {
     let mut out = String::new();
+    let skipped_suffix = if report.reference_skipped > 0 {
+        format!(" ref_skipped {}", report.reference_skipped)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "compare: total {} self_passed {} self_failed {} ref_compared {} ref_passed {} ref_failed {}\n",
+        "compare: total {} self_passed {} self_failed {} ref_compared {} ref_passed {} ref_failed {}{}\n",
         report.total,
         report.self_passed,
         report.self_failed,
         report.reference_compared,
         report.reference_passed,
-        report.reference_failed
+        report.reference_failed,
+        skipped_suffix
     ));
     for o in &report.outcomes {
-        if o.self_consistent && o.reference_failures.is_empty() {
+        if o.self_consistent && o.reference_failures.is_empty() && o.reference_blocked == 0 {
             continue;
         }
         out.push_str(&format!("  {}: ", o.dump.file_name));
@@ -763,6 +782,9 @@ pub fn format_report(report: &CompareReport) -> String {
         }
         for f in &o.reference_failures {
             out.push_str(&format!("ref_fail: {f}; "));
+        }
+        if o.reference_blocked > 0 {
+            out.push_str(&format!("ref_blocked: {}; ", o.reference_blocked));
         }
         out.push('\n');
     }
@@ -868,6 +890,110 @@ mod tests {
         assert!(
             !dumps.is_empty(),
             "expected >=1 dump from singular recording/ baselines"
+        );
+    }
+
+    #[test]
+    fn blocked_references_not_counted_as_passing_when_self_consistency_fails() {
+        struct TempRefDump {
+            path: PathBuf,
+            dir_created: bool,
+        }
+
+        impl TempRefDump {
+            fn create(backend: &str, file_name: &str, corpus_rel: &str) -> Self {
+                let dir = workspace_root().join(format!("recording/references/{backend}"));
+                let dir_created = !dir.exists();
+                if dir_created {
+                    let _ = fs::create_dir_all(&dir);
+                }
+                let path = dir.join(file_name);
+                let json = format!(
+                    r#"{{"category":"vt","corpus_rel":"{corpus_rel}","bytes_len":10,"actions_len":1,"state_hash":"0123456789abcdef","state_hash_version":{EXPECTED_HASH_VERSION},"width":80,"height":24,"generation":1,"title":"","row":0,"col":0,"visible":true,"text":""}}"#
+                );
+                fs::write(&path, json).expect("write temp reference dump");
+                Self { path, dir_created }
+            }
+        }
+
+        impl Drop for TempRefDump {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.path);
+                if self.dir_created {
+                    if let Some(parent) = self.path.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+            }
+        }
+
+        let corpus_rel = "vt/corpus/01-cursor-addressing.bin";
+        let _temp =
+            TempRefDump::create("ghostty", "ctx0548_blocked_test.snapshot.json", corpus_rel);
+
+        // BittyDump with mismatched bytes_len to trigger self-consistency failure
+        let dump = BittyDump {
+            file_name: "test-blocked-refs.snapshot.json".to_string(),
+            category: "vt".to_string(),
+            corpus_rel: corpus_rel.to_string(),
+            bytes_len: 999_999,
+            actions_len: 0,
+            state_hash: 0,
+            state_hash_version: EXPECTED_HASH_VERSION,
+            width: 80,
+            height: 24,
+            generation: 0,
+            title: String::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            text: String::new(),
+        };
+
+        let outcome = compare_one(&dump);
+        assert!(
+            !outcome.self_consistent,
+            "expected self-consistency failure"
+        );
+        assert_eq!(
+            outcome.reference_compared, 0,
+            "reference_compared must be 0 when blocked"
+        );
+        assert!(
+            outcome.reference_blocked > 0,
+            "reference_blocked must be > 0 when reference dumps exist"
+        );
+        assert!(outcome.reference_skipped, "reference_skipped must be true");
+
+        // Verify that in CompareReport aggregation, reference_passed remains 0
+        let report = CompareReport {
+            total: 1,
+            self_passed: if outcome.self_consistent { 1 } else { 0 },
+            self_failed: if outcome.self_consistent { 0 } else { 1 },
+            reference_compared: outcome.reference_compared,
+            reference_passed: outcome
+                .reference_compared
+                .saturating_sub(outcome.reference_failures.len()),
+            reference_failed: outcome.reference_failures.len(),
+            reference_skipped: outcome.reference_blocked,
+            outcomes: vec![outcome],
+        };
+
+        assert_eq!(
+            report.reference_passed, 0,
+            "reference_passed must remain 0 for blocked reference set"
+        );
+        assert_eq!(report.reference_compared, 0);
+        assert!(report.reference_skipped > 0);
+
+        let rendered = format_report(&report);
+        assert!(
+            rendered.contains("ref_skipped"),
+            "formatted report must include ref_skipped in summary"
+        );
+        assert!(
+            rendered.contains("ref_blocked:"),
+            "formatted report must include ref_blocked in failure details"
         );
     }
 }

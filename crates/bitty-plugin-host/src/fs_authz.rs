@@ -274,7 +274,7 @@ fn validate_scope_pattern(pattern: &str) -> Result<(), FsError> {
         ));
     }
     if is_hostile_fs_pattern(pattern) {
-        return Err(FsError::outside_scope(pattern));
+        return Err(FsError::hostile_pattern(pattern));
     }
     Ok(())
 }
@@ -549,11 +549,11 @@ impl SensitivePathPolicy {
         if is_default_sensitive(&normalized) {
             return true;
         }
-        let segments: Vec<&str> = normalized.split('|').collect();
+        let segments = key_segments(&normalized);
         self.extra_deny.iter().any(|prefix| {
-            let prefix_segments: Vec<&str> = prefix.split('|').collect();
+            let prefix_segments = key_segments(prefix);
             segments.len() >= prefix_segments.len()
-                && segments[..prefix_segments.len()] == prefix_segments
+                && segments[..prefix_segments.len()] == prefix_segments[..]
         })
     }
 }
@@ -584,7 +584,12 @@ impl FsConsent {
     }
 }
 
-/// Normalize a request path to a canonical `|`-joined lowercase segment key.
+/// Normalize a request path to a canonical lowercase segment key.
+///
+/// Segments join on `|` with `\` and `|` backslash-escaped inside each
+/// segment, so the key stays unambiguous even though both bytes are legal
+/// POSIX file name bytes (`~/.npmrc|foo` and `~/.npmrc/foo` never share a
+/// consent or deny key). [`key_segments`] is the exact inverse.
 ///
 /// Returns `None` when the path is unrepresentable (empty, over-bound,
 /// NUL/control-bearing, or normalizing to nothing). Both separators fold
@@ -624,9 +629,55 @@ fn normalize_request_path(path: &str) -> Option<String> {
         key_parts.push(String::new());
     }
     for segment in normalized {
-        key_parts.push(segment.to_ascii_lowercase());
+        key_parts.push(escape_key_segment(&segment.to_ascii_lowercase()));
     }
     Some(key_parts.join("|"))
+}
+
+/// Escape `\` and `|` inside one normalized key segment.
+///
+/// `|` separates key segments and `\` introduces an escape; both are legal
+/// POSIX file name bytes, so a raw join would let `a|b` (one segment) and
+/// `a/b` (two segments) produce the same key. Escaping keeps the joined
+/// form injective over segment vectors.
+fn escape_key_segment(segment: &str) -> String {
+    let mut escaped = String::with_capacity(segment.len());
+    for ch in segment.chars() {
+        if ch == '\\' || ch == '|' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// Split a normalized key back into its segments (inverse of
+/// [`escape_key_segment`] plus the `|` join).
+///
+/// Keys are produced only by [`normalize_request_path`], so escape bytes
+/// always come in pairs; a malformed trailing `\` is kept as a literal so
+/// the parse stays total and fail-closed.
+fn key_segments(key: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in key.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            segments.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    segments.push(current);
+    segments
 }
 
 /// Whether a normalized (`|`-joined lowercase) path is in the default
@@ -644,19 +695,18 @@ fn normalize_request_path(path: &str) -> Option<String> {
 /// credential stores (Chromium `Login Data`/`Cookies`/`Local State`,
 /// Firefox `logins.json`/`key4.db`/`cert9.db`, Safari `Keychains/**`).
 fn is_default_sensitive(normalized: &str) -> bool {
-    let segments: Vec<&str> = normalized.split('|').collect();
-    let lower: Vec<&str> = segments;
+    let lower = key_segments(normalized);
     // Strip the absolute-root marker for file-name checks: `.env` file
     // names are sensitive in any directory, relative or absolute.
-    let file_name = lower.last().copied().unwrap_or("");
+    let file_name = lower.last().map(String::as_str).unwrap_or("");
     if file_name == ".env" || file_name.starts_with(".env.") {
         return true;
     }
     // `~`-rooted credential locations (case already folded, either
     // separator already split).
-    if lower.first() == Some(&"~") {
+    if lower.first().is_some_and(|segment| segment == "~") {
         if lower.len() >= 2 {
-            match lower[1] {
+            match lower[1].as_str() {
                 ".ssh" | ".gnupg" | ".azure" => return true,
                 ".aws" => {
                     // `~/.aws/credentials` and `~/.aws/config` carry
@@ -682,7 +732,7 @@ fn is_default_sensitive(normalized: &str) -> bool {
                 ".netrc" => return true,
                 ".config" => {
                     if lower.len() >= 3 {
-                        match lower[2] {
+                        match lower[2].as_str() {
                             "gh" | "gcloud" => return true,
                             "google-chrome" | "chromium" | "brave-browser" | "microsoft-edge"
                             | "firefox" => return true,
@@ -705,7 +755,7 @@ fn is_default_sensitive(normalized: &str) -> bool {
                     if lower.len() >= 4
                         && lower[2] == "application support"
                         && matches!(
-                            lower[3],
+                            lower[3].as_str(),
                             "google-chrome"
                                 | "chromium"
                                 | "brave-browser"
@@ -726,7 +776,7 @@ fn is_default_sensitive(normalized: &str) -> bool {
         // Token-store file names under `~` regardless of depth.
         if lower.iter().any(|s| {
             matches!(
-                *s,
+                s.as_str(),
                 ".npmrc" | ".pypirc" | ".netrc" | "credentials.toml" | "logins.json" | "key4.db"
             )
         }) {
@@ -1035,6 +1085,12 @@ pub enum FsError {
         /// Path (bounded, never a value).
         path: String,
     },
+    /// A grant pattern is hostile (absolute escape, traversal, overbroad
+    /// home, credential-location grant shape).
+    HostilePattern {
+        /// Pattern (bounded, never a value).
+        pattern: String,
+    },
     /// Malformed request (bad shape, over bounds).
     InvalidRequest {
         /// Bounded reason (names only, never values).
@@ -1068,6 +1124,14 @@ impl FsError {
         }
     }
 
+    /// Hostile grant-pattern error (quotes the pattern only).
+    #[must_use]
+    pub fn hostile_pattern(pattern: impl Into<String>) -> Self {
+        Self::HostilePattern {
+            pattern: bounded_path(pattern.into()),
+        }
+    }
+
     /// Malformed-request error (bounded reason, names only).
     #[must_use]
     pub fn invalid_request(reason: impl Into<String>) -> Self {
@@ -1092,6 +1156,7 @@ impl FsError {
         match self {
             Self::OutsideScope { .. } => FsDenialKind::OutsideScope,
             Self::SensitivePath { .. } => FsDenialKind::SensitivePath,
+            Self::HostilePattern { .. } => FsDenialKind::HostilePattern,
             Self::InvalidRequest { .. } | Self::LimitExceeded { .. } => {
                 FsDenialKind::InvalidRequest
             }
@@ -1114,6 +1179,9 @@ impl fmt::Display for FsError {
             Self::OutsideScope { path } => write!(f, "path '{path}' is outside the granted scope"),
             Self::SensitivePath { path } => {
                 write!(f, "sensitive path '{path}': explicit user consent required")
+            }
+            Self::HostilePattern { pattern } => {
+                write!(f, "hostile fs pattern '{pattern}'")
             }
             Self::InvalidRequest { reason } => write!(f, "invalid fs request: {reason}"),
             Self::LimitExceeded {
@@ -1720,6 +1788,56 @@ mod tests {
         policy.revoke_consent("~/projects/.env");
         let revoked = authorize_fs(&scope, &policy, "~/projects/.env", false, None, 0);
         assert!(!revoked.is_authorized());
+    }
+
+    #[test]
+    fn consent_keys_never_collide_on_pipe_separator_bytes() {
+        // POSIX `|` is a legal file name byte. The normalized key must
+        // keep `~/.npmrc|foo` (one file segment) and `~/.npmrc/foo` (a
+        // nested path) distinct: consent for one never clears the other.
+        let pipe_key = normalize_request_path("~/.npmrc|foo").unwrap();
+        let nested_key = normalize_request_path("~/.npmrc/foo").unwrap();
+        assert_ne!(pipe_key, nested_key);
+        assert_eq!(
+            key_segments(&pipe_key),
+            vec!["~".to_string(), ".npmrc|foo".to_string()]
+        );
+        assert_eq!(
+            key_segments(&nested_key),
+            vec!["~".to_string(), ".npmrc".to_string(), "foo".to_string()]
+        );
+
+        // Granting consent for the pipe-named sibling never clears the
+        // sensitive nested path...
+        let mut policy = test_policy();
+        policy.grant_consent("~/.npmrc|foo", 0, None).unwrap();
+        assert!(policy.consent_active(&pipe_key, 0));
+        assert!(!policy.consent_active(&nested_key, 0));
+        // ...and the reverse direction holds too.
+        let mut reverse = test_policy();
+        reverse.grant_consent("~/.npmrc/foo", 0, None).unwrap();
+        assert!(reverse.consent_active(&nested_key, 0));
+        assert!(!reverse.consent_active(&pipe_key, 0));
+
+        // End-to-end through `authorize_fs`: the nested path stays gated
+        // after consent for the pipe-named sibling, and normal nested
+        // consent still clears exactly its own path.
+        let scope = scope(&["~/.npmrc/**"]);
+        let mut authorized = test_policy();
+        authorized.grant_consent("~/.npmrc|foo", 0, None).unwrap();
+        let nested = authorize_fs(&scope, &authorized, "~/.npmrc/foo", false, None, 0);
+        assert!(matches!(
+            nested.decision,
+            FsDecision::ConsentRequired { .. }
+        ));
+        authorized.grant_consent("~/.npmrc/foo", 0, None).unwrap();
+        let cleared = authorize_fs(&scope, &authorized, "~/.npmrc/foo", false, None, 0);
+        assert!(cleared.is_authorized());
+        let sibling = authorize_fs(&scope, &authorized, "~/.npmrc/bar", false, None, 0);
+        assert!(matches!(
+            sibling.decision,
+            FsDecision::ConsentRequired { .. }
+        ));
     }
 
     #[test]

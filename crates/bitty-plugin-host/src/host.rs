@@ -796,8 +796,25 @@ impl PluginHost {
                 evaluated.decision.path()
             )));
         }
-        let scope = crate::fs_authz::FilesystemScope::from_patterns(scope_patterns)
-            .map_err(PluginError::from)?;
+        let scope = match crate::fs_authz::FilesystemScope::from_patterns(scope_patterns) {
+            Ok(scope) => scope,
+            Err(error) => {
+                // Hostile/invalid grant patterns fail the whole request
+                // closed *and* audit: the construction refusal is itself a
+                // decision, so it cannot return before the FS ledger push
+                // (the "every decision appends" contract).
+                let evaluated = crate::fs_authz::FsAuthorized {
+                    decision: crate::fs_authz::FsDecision::Deny {
+                        kind: error.denial_kind(),
+                        path: path.to_string(),
+                    },
+                    sensitive: true,
+                    secret_shaped: false,
+                };
+                self.fs_audit.push_decision(&evaluated, is_write);
+                return Err(PluginError::from(error));
+            }
+        };
         let evaluated =
             crate::fs_authz::authorize_fs(&scope, &self.fs_policy, path, is_write, content, now_ms);
         self.fs_audit.push_decision(&evaluated, is_write);
@@ -1799,6 +1816,47 @@ mod effective_tests {
             .unwrap_err();
         assert!(err.to_string().contains("denied"));
         assert_eq!(host.fs_audit().len(), 6);
+    }
+
+    #[test]
+    fn host_authorize_fs_audits_hostile_scope_pattern_refusal() {
+        // A hostile grant pattern refuses the request at scope
+        // construction; the refusal must still append to the FS ledger
+        // (every decision audits).
+        let mut host = PluginHost::new(DropPolicy::DropOldest, 8);
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/projects/**"]),
+            user: scope_with("user", &["fs.read:~/projects/**"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/projects/**"]),
+            task: scope_with("task", &["fs.read:~/projects/**"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/projects/**"]),
+            raw_wide: Vec::new(),
+        };
+        let hostile = vec!["~/.ssh/**".to_string()];
+        let before = host.fs_audit().len();
+        let err = host
+            .authorize_fs(
+                &stack,
+                &request,
+                true,
+                &hostile,
+                "~/projects/notes.md",
+                false,
+                None,
+                0,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("hostile"));
+        assert_eq!(host.fs_audit().len(), before + 1);
+        let entry = host.fs_audit().iter().last().expect("audit entry");
+        assert_eq!(entry.decision, crate::fs_authz::FsAuditDecision::Deny);
+        assert_eq!(
+            entry.denial,
+            Some(crate::fs_authz::FsDenialKind::HostilePattern)
+        );
     }
 
     #[test]

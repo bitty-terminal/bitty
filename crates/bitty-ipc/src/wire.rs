@@ -254,15 +254,12 @@ pub fn validate_no_ambient_auth(json: &[u8]) -> Result<(), IpcError> {
             });
         }
     };
-    // For bounded overhead, do a simple check: if the raw string contains
-    // `"auth"` or `"scope"` or `"role"` as a quoted key at top-level depth.
-    // We reuse the depth tracker to only flag when depth == 1.
-    let mut depth = 0usize;
+
+    let mut container_stack: Vec<u8> = Vec::with_capacity(32);
     let mut in_str = false;
     let mut escape = false;
     let mut key_start: Option<usize> = None;
 
-    // We look for pattern `"key":` at depth 1. This is approximate but headless.
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -274,16 +271,27 @@ pub fn validate_no_ambient_auth(json: &[u8]) -> Result<(), IpcError> {
                 escape = true;
             } else if b == b'"' {
                 in_str = false;
-                // If we were tracking a key at depth 1, check it now.
+                // If we were tracking a candidate string at depth 1, inspect it.
                 if let Some(start) = key_start.take() {
-                    // Extract key text between quotes: bytes[start..i]
-                    let key = &s[start..i];
-                    if depth == 1 && (key == "auth" || key == "scope" || key == "role") {
-                        return Err(IpcError::InvalidRequest {
-                            reason: format!(
-                                "forbidden ambient authority field '{key}' in envelope"
-                            ),
-                        });
+                    // Check if enclosing container at depth 1 is an Object `{`.
+                    if container_stack.len() == 1 && container_stack.last() == Some(&b'{') {
+                        // Skip whitespace after closing quote to check if string is a key.
+                        let mut next_idx = i + 1;
+                        while next_idx < bytes.len()
+                            && matches!(bytes[next_idx], b' ' | b'\t' | b'\r' | b'\n')
+                        {
+                            next_idx += 1;
+                        }
+                        if next_idx < bytes.len() && bytes[next_idx] == b':' {
+                            let key = &s[start..i];
+                            if key == "auth" || key == "scope" || key == "role" {
+                                return Err(IpcError::InvalidRequest {
+                                    reason: format!(
+                                        "forbidden ambient authority field '{key}' in envelope"
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -293,16 +301,15 @@ pub fn validate_no_ambient_auth(json: &[u8]) -> Result<(), IpcError> {
         match b {
             b'"' => {
                 in_str = true;
-                // Potential key start if at depth 1 and not already in value.
-                // We treat any string start at depth 1 as candidate key; the
-                // subsequent `:` check is implicit via depth logic but we
-                // conservatively check every depth-1 string.
-                if depth == 1 {
+                if container_stack.len() == 1 {
                     key_start = Some(i + 1);
                 }
             }
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'{' => container_stack.push(b'{'),
+            b'[' => container_stack.push(b'['),
+            b'}' | b']' => {
+                container_stack.pop();
+            }
             _ => {}
         }
         i += 1;
@@ -443,15 +450,32 @@ mod tests {
         assert!(validate_no_ambient_auth(with_scope).is_err());
         let with_auth = br#"{"auth": "token123"}"#;
         assert!(validate_no_ambient_auth(with_auth).is_err());
-        // Params nested scope is okay? The check is top-level only,
-        // but for headless we conservatively reject any depth-1 key named scope.
-        // Nested inside params object would be depth 2, so allowed.
+        // Top-level forbidden keys: scope, auth, role
+        assert!(validate_no_ambient_auth(br#"{"scope":1}"#).is_err());
+        assert!(validate_no_ambient_auth(br#"{"auth":true}"#).is_err());
+        assert!(validate_no_ambient_auth(br#"{"role":"admin"}"#).is_err());
+        // Whitespace before colon must be rejected
+        assert!(validate_no_ambient_auth(br#"{"scope" : 1}"#).is_err());
+        assert!(validate_no_ambient_auth(b"{\"scope\" \t\r\n : 1}").is_err());
+        // Nested scope is allowed (depth > 1)
         let nested_ok = br#"{"params": {"scope": "value"}}"#;
-        // At top level depth 1 keys are "params", not "scope", so ok
         assert!(validate_no_ambient_auth(nested_ok).is_ok());
+        assert!(validate_no_ambient_auth(br#"{"a":{"scope":1}}"#).is_ok());
         // Normal params without auth key passes
         let normal = br#"{"terminal_id": "t:4"}"#;
         assert!(validate_no_ambient_auth(normal).is_ok());
+        // Values matching "scope"/"auth"/"role" must pass (not a key)
+        assert!(validate_no_ambient_auth(br#"{"cmd":"scope"}"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"{"cmd":"auth"}"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"{"cmd":"role"}"#).is_ok());
+        // Array enclosing container must pass (not an object)
+        assert!(validate_no_ambient_auth(br#"["auth"]"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"["scope", "role"]"#).is_ok());
+        // Escaped characters inside string must not falsely match
+        assert!(validate_no_ambient_auth(br#"{"foo\"scope":1}"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"{"cmd":"foo\"scope"}"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"{"foo\\\"scope":1}"#).is_ok());
+        assert!(validate_no_ambient_auth(br#"["foo\"auth"]"#).is_ok());
     }
 
     #[test]

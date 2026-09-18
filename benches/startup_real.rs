@@ -1,11 +1,11 @@
 //! Startup real-window measurement — PB-1 cold startup.
 //!
 //! CTX-0100 upgrade from `cargo run -- --help` proxy to real-window timing.
-//! Covers process start → config → PTY → winit window → wgpu init → font
+//! Covers process start → config → PTY → winit window probe → wgpu init → font
 //! init → first shell bytes → first frame presented, with `Instant` tracing
 //! and bounded phases. Headless CI reports `Unavailable` for display-tied
 //! phases (with attempt duration); a Tier 1 box with `BITTY_PERF_REAL_WINDOW=1`
-//! reports real `Success` and can gate p50 ≤100 ms / p99 ≤200 ms.
+//! runs the configuration and event-loop availability probe (TERM-IPC-015 / CTX-0556).
 //!
 //! Headless, bounded, `forbid(unsafe)`.
 
@@ -14,7 +14,9 @@
 use bitty_perf::startup::{measure_headless_startup, measure_real_window_startup};
 
 fn main() {
-    println!("startup_real — PB-1 cold startup (CTX-0100 real-window, Instant tracing, bounded)");
+    println!(
+        "startup_real — PB-1 cold startup (CTX-0100 / CTX-0556 real-window probe, Instant tracing, bounded)"
+    );
     println!("budget: docs/specifications/performance-budget-rfc.md#pb-1 (p50 100 ms p99 200 ms)");
     println!(
         "pipeline: process_start → args → config → runtime(font+surface) → layout → pty → winit_probe → wgpu_probe → font_probe → first_bytes → first_frame"
@@ -40,12 +42,14 @@ fn main() {
     // Only print detailed real timeline when the gate was active (otherwise it's the same as headless + skipped).
     let gated = std::env::var("BITTY_PERF_REAL_WINDOW").as_deref() == Ok("1");
     if gated {
-        println!("\n--- real-window (BITTY_PERF_REAL_WINDOW=1) ---");
+        println!("\n--- real-window probe (BITTY_PERF_REAL_WINDOW=1) ---");
         println!("{}", real.format_timeline());
         if real.is_real_window {
             println!("real-window: presented via wgpu (is_real_window=true)");
         } else {
-            println!("real-window: still headless (no compositor/GPU) — instrumentation proved");
+            println!(
+                "real-window: configuration & event-loop capability probe (is_real_window=false, display-isolated)"
+            );
         }
     } else {
         println!(

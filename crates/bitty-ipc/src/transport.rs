@@ -192,43 +192,43 @@ impl StdioTransportStub {
         self.outgoing.drain(..).collect()
     }
 
-    /// Try to send raw wire bytes toward the peer and atomically frame them
-    /// on the incoming side of the peer (loopback helper).
+    /// Try to send raw wire bytes toward the peer, decoding length-prefixed
+    /// frames and enqueueing them into the outgoing queue (TERM-IPC-013 / CTX-0554).
     ///
-    /// This helper exists so a single-stub harness can verify framing without
-    /// a second peer: bytes pushed here are split into frames when consumed via
-    /// `recv_incoming`. For multi-stub tests use `drain_outgoing` + `inject_incoming`.
-    pub fn try_send_wire_bytes(&mut self, wire: &[u8]) -> Result<(), IpcError> {
-        // We treat wire as opaque forwarded bytes; the receiver's framer
-        // would split them. For the stub we simply require the caller to have
-        // framed correctly; here we push whole wire as one payload-chunk is not
-        // meaningful so this helper is deliberately minimal and unused by
-        // default. Callers should prefer `try_send_payload` / `try_send_frame`.
-        // Kept for API completeness: validate and signal closed/full.
+    /// This helper allows a harness to push raw wire bytes (one or more length-prefixed
+    /// frames) into the transport. Frames are extracted via [`Framer`](crate::frame::Framer)
+    /// and validated against [`MAX_FRAME_BYTES`] and transport capacity.
+    ///
+    /// # Errors
+    ///
+    /// - [`IpcError::TransportClosed`] when the transport is closed.
+    /// - [`IpcError::TransportFull`] when the resulting frames would exceed capacity.
+    /// - [`IpcError::FrameTooLarge`] when a frame exceeds [`MAX_FRAME_BYTES`].
+    /// - [`IpcError::FrameTruncated`] when wire ends with an incomplete frame.
+    pub fn try_send_wire_bytes(&mut self, wire: &[u8]) -> Result<usize, IpcError> {
         if self.closed {
             return Err(IpcError::TransportClosed {
                 reason: "stdio transport is closed".into(),
             });
         }
-        if self.outgoing.len() >= self.capacity {
+        let mut framer = crate::frame::Framer::new();
+        let frames = framer.push_bytes(wire)?;
+        if !framer.is_empty() {
+            return Err(IpcError::FrameTruncated {
+                expected: 4,
+                actual: framer.buffered_len(),
+            });
+        }
+        if self.outgoing.len() + frames.len() > self.capacity {
             return Err(IpcError::TransportFull {
                 capacity: self.capacity,
             });
         }
-        // Store wire as a dummy frame carrying the raw wire bytes for headless
-        // roundtrip checks; length is validated as frame payload would be.
-        if wire.len() > MAX_FRAME_BYTES + 4 {
-            return Err(IpcError::FrameTooLarge {
-                actual: wire.len(),
-                limit: MAX_FRAME_BYTES + 4,
-            });
+        let count = frames.len();
+        for frame in frames {
+            self.outgoing.push_back(frame);
         }
-        // Wrap wire bytes as a payload for harness visibility (not protocol-faithful
-        // but bounded and testable). Real transport would not store wire; it would
-        // write to a pipe.
-        let frame = Frame::new(wire.to_vec())?;
-        self.outgoing.push_back(frame);
-        Ok(())
+        Ok(count)
     }
 
     /// Inject a frame that has arrived from the peer (incoming direction).
@@ -452,5 +452,56 @@ mod tests {
         let (decoded, consumed) = crate::frame::decode_frame(&wire).unwrap();
         assert_eq!(consumed, wire.len());
         assert_eq!(decoded.payload(), payload);
+    }
+
+    /// TERM-IPC-013 / CTX-0554: pure single and concatenated frame wire fixtures
+    /// must decode into proper frames and agree with the framing contract.
+    #[test]
+    fn try_send_wire_bytes_single_and_concatenated_frames() {
+        let mut t = StdioTransportStub::new(8);
+
+        // Single frame
+        let wire1 = crate::frame::encode_frame(b"frame1").unwrap();
+        let sent = t.try_send_wire_bytes(&wire1).unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(t.outgoing_len(), 1);
+
+        // Concatenated multi-frame
+        let wire2 = crate::frame::encode_frame(b"frame2").unwrap();
+        let wire3 = crate::frame::encode_frame(b"frame3").unwrap();
+        let mut concat = wire2;
+        concat.extend_from_slice(&wire3);
+        let sent = t.try_send_wire_bytes(&concat).unwrap();
+        assert_eq!(sent, 2);
+        assert_eq!(t.outgoing_len(), 3);
+
+        let frames = t.drain_outgoing();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].payload(), b"frame1");
+        assert_eq!(frames[1].payload(), b"frame2");
+        assert_eq!(frames[2].payload(), b"frame3");
+    }
+
+    /// TERM-IPC-013 / CTX-0554: exact cap and truncated framing bounds.
+    #[test]
+    fn try_send_wire_bytes_exact_cap_and_truncated_validation() {
+        let mut t = StdioTransportStub::new(8);
+
+        // Exact MAX_FRAME_BYTES payload
+        let max_payload = vec![42u8; MAX_FRAME_BYTES];
+        let wire_max = crate::frame::encode_frame(&max_payload).unwrap();
+        let sent = t.try_send_wire_bytes(&wire_max).unwrap();
+        assert_eq!(sent, 1);
+        assert_eq!(t.outgoing_len(), 1);
+
+        // Truncated wire bytes
+        let truncated = vec![0, 0, 0, 10, 1, 2, 3]; // declares 10 bytes, has 3
+        let err = t.try_send_wire_bytes(&truncated).unwrap_err();
+        assert!(matches!(err, IpcError::FrameTruncated { .. }));
+
+        // Incomplete header
+        let incomplete_header = vec![0, 0];
+        let err = t.try_send_wire_bytes(&incomplete_header).unwrap_err();
+        assert!(matches!(err, IpcError::FrameTruncated { .. }));
     }
 }

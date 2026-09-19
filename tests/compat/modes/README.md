@@ -51,6 +51,7 @@ modes/
     15-mode-set-sweep.bin        # every M1 mode left set
     16-decscusr.bin              # cursor shape/style
     17-mode-status-reply.bin     # DSR 6 + DA1 emitted reply bytes
+    18-mouse-x10-9-*.bin         # X10 legacy mouse tracking (?9)
 ```
 
 Every `*-on`/`*-off` pair locks the canonical `State::state_hash` of the set

@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 
-use bitty_term_state::{MouseCoordinateEncoding, MouseTrackingMode, State};
+use bitty_term_state::{CursorStyle, MouseCoordinateEncoding, MouseTrackingMode, State};
 use bitty_vt::Parser;
 
 /// Canonical-hash version this golden binds to (`CANONICAL_HASH_VERSION`).
@@ -114,6 +114,8 @@ fn golden_version_is_pinned() {
 #[test]
 fn golden_mouse_tracking_modes_set_and_clear() {
     // Each pair locks the set state and the set-then-cleared state.
+    assert_golden("18-mouse-x10-9-on.bin", 0x4434_3432_dd16_14c7, 9, &[]);
+    assert_golden("18-mouse-x10-9-off.bin", 0x42aa_af5d_5901_16a1, 10, &[]);
     assert_golden("01-mouse-1000-on.bin", 0x1d7f_6da1_49af_58fa, 9, &[]);
     assert_golden("01-mouse-1000-off.bin", 0xd660_51c8_9cec_f61d, 10, &[]);
     assert_golden("02-mouse-1002-on.bin", 0xfe1f_69cc_9f8f_43a6, 9, &[]);
@@ -133,6 +135,16 @@ fn golden_mouse_tracking_modes_set_and_clear() {
     assert_eq!(
         state_of("03-mouse-1003-on.bin").modes().mouse_tracking,
         Some(MouseTrackingMode::Any)
+    );
+    // X10 (`?9`) is the legacy pre-1000 tracking level.
+    assert_eq!(
+        state_of("18-mouse-x10-9-on.bin").modes().mouse_tracking,
+        Some(MouseTrackingMode::X10)
+    );
+    assert_eq!(
+        state_of("18-mouse-x10-9-off.bin").modes().mouse_tracking,
+        None,
+        "DECRST 9 clears X10 tracking"
     );
     for off in [
         "01-mouse-1000-off.bin",
@@ -302,9 +314,18 @@ fn golden_alternate_screen_entry_and_exit() {
     assert!(!state_of("12-alt-screen-47-off.bin").alt_screen_active());
 }
 
+/// DECSCUSR: the fixture ends on a **non-default** shape (`CSI 6 SP q`,
+/// `SteadyBar`), so the golden binds real `CursorStyle` handling — a no-op
+/// would leave the cursor at the power-on `CursorStyle::Default` and change
+/// both the canonical hash and this assertion.
 #[test]
 fn golden_decscusr_cursor_shape() {
-    assert_golden("16-decscusr.bin", 0x3eb5_94f0_41b0_bd17, 21, &[]);
+    assert_golden("16-decscusr.bin", 0x562a_1fd9_66f6_435c, 42, &[]);
+    assert_eq!(
+        state_of("16-decscusr.bin").cursor().cursor_style,
+        CursorStyle::SteadyBar,
+        "the last DECSCUSR shape must reach the live cursor"
+    );
 }
 
 #[test]

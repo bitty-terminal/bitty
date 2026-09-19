@@ -469,6 +469,19 @@ pub fn install_local_dir(
                 "'{plugin_id}' version {version} is already installed with different content"
             )));
         }
+        // PLUG-REG-007: also check manifest identity. A same-version reinstall
+        // with identical Lua but a changed manifest would otherwise write a new
+        // manifest_hash to the index while leaving the on-disk manifest
+        // unchanged, causing resolution to fail closed on hash mismatch.
+        if let Some(ref existing_record) = existing {
+            if existing_record.manifest_hash != manifest_hash {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(PackageOpError::Store(format!(
+                    "'{plugin_id}' version {version} is already installed with a different \
+                     manifest identity; remove the existing install or bump the version"
+                )));
+            }
+        }
         std::fs::remove_dir_all(&staging).map_err(|error| {
             PackageOpError::Store(format!("cannot drop '{}': {error}", staging.display()))
         })?;
@@ -1215,6 +1228,86 @@ mod tests {
         );
         let records = resolution::load_index(&store).expect("index");
         assert_eq!(records[0].version, "2.0.0");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Write a plugin with the same Lua body but a different `compat.bitty` range
+    /// so the manifest hash differs while content_digest is identical.
+    /// (`description` is NOT included in `canonical_bytes`, so it does not change
+    /// the manifest hash; changing `compat.bitty` does.)
+    fn write_plugin_alt_compat(root: &Path, id: &str, version: &str) -> PathBuf {
+        let package = root.join("plugin-alt");
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        // Changed compat range (">=0.0.1,<2.0" vs the standard ">=0.0.1,<1.0")
+        // so manifest_hash differs but Lua body (content_digest) is identical.
+        let manifest = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Fixture\"\nversion = \"{version}\"\n\
+             description = \"fixture\"\n\n[compat]\nbitty = \">=0.0.1,<2.0\"\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\n"
+        );
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("manifest");
+        // Exactly the same Lua body as write_plugin so content_digest is identical.
+        std::fs::write(
+            package.join("lua").join("init.lua"),
+            "bitty.commands.register({ id = \"".to_string()
+                + id
+                + ":greet\", run = function() return \"hi\" end })\n",
+        )
+        .expect("init");
+        package
+    }
+
+    #[test]
+    fn same_version_idempotent_reinstall_preserves_manifest_hash() {
+        // PLUG-REG-007: reinstalling the exact same source (same content_digest
+        // AND same manifest_hash) succeeds with an `updated` report and leaves
+        // the index record consistent.
+        let scratch = scratch("plug-reg-007-ok");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.plug007ok", "1.0.0", None);
+        let first = install(&store, &source);
+        let second = install(&store, &source);
+        assert!(second.updated, "reinstall reports updated");
+        assert_eq!(second.manifest_hash, first.manifest_hash);
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].manifest_hash, first.manifest_hash);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn same_version_manifest_only_change_rejected_before_index_mutation() {
+        // PLUG-REG-007: a reinstall that changes the manifest description (so
+        // the manifest_hash changes) but preserves the Lua body (so
+        // content_digest is identical) must be rejected before any index write.
+        let scratch = scratch("plug-reg-007-reject");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.plug007rej", "1.0.0", None);
+        let first = install(&store, &source);
+        let original_hash = first.manifest_hash.clone();
+
+        // Build an alt version: same Lua body, different compat range -> different manifest_hash.
+        let source_alt = write_plugin_alt_compat(&scratch, "xuepoo.plug007rej", "1.0.0");
+        let err = install_local_dir(
+            &store,
+            &source_alt,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect_err("should reject manifest-only change on same version");
+        let PackageOpError::Store(msg) = &err else {
+            panic!("expected Store error, got {err:?}");
+        };
+        assert!(
+            msg.contains("different manifest identity"),
+            "error should mention manifest identity mismatch, got: {msg}"
+        );
+        // Index must remain unchanged after the rejection.
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(
+            records[0].manifest_hash, original_hash,
+            "index must not be mutated on rejection"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

@@ -14,19 +14,20 @@ content-addressed seed corpora cited by the R-001 evidence.
 
 ## Target crate
 
-| Target           | Surface                                                                 |
-| ---------------- | ----------------------------------------------------------------------- |
-| `vt_parser`      | arbitrary bytes into `bitty_vt::Parser` (whole + byte-wise replay)      |
-| `osc_string`     | OSC payload bodies (`ESC ] ...` BEL / `ST`)                             |
-| `dcs_apc_string` | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and chunked shapes |
+| Target           | Surface                                                                                   |
+| ---------------- | ----------------------------------------------------------------------------------------- |
+| `vt_parser`      | arbitrary bytes into `bitty_vt::Parser` (whole + byte-wise replay)                        |
+| `osc_string`     | OSC payload bodies (`ESC ] ...` BEL / `ST`)                                               |
+| `dcs_apc_string` | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and `m=1`/`m=1`/`m=0` chunked shapes |
 
 Every target feeds bytes through the real public `bitty_vt::Parser::advance`
 API and drives it to completion. Each input asserts two contract invariants:
 a fresh parser is deterministic across identical runs, and a byte-wise feed
-produces the same action sequence as one bulk feed. The string targets also
-replay each envelope with a small kitty ledger cap so the raw-`APC`
-overflow/chunk-growth rejection paths (`KittyApcAssembler`) are reachable from
-a short input without allocating the production 320 MB ledger.
+produces the same action sequence as one bulk feed. Each framed string
+envelope is additionally replayed at a 4 KiB kitty ledger cap
+(`assert_small_ledger_invariants`) so the `KittyApcAssembler`
+overflow/chunk-growth rejection paths are reachable from a short input
+without allocating the production 320 MB ledger.
 
 Bounds (enforced in `fuzz/fuzz_targets/common.rs`, not by the harness):
 
@@ -88,7 +89,7 @@ target crate).
 | ----------------------------- | ---------------- | ----- | ---------------------------------------------- |
 | `fuzz/corpora/vt_parser`      | `vt_parser`      | 30    | byte-identical copy of `fuzz/corpora/vt/*.bin` |
 | `fuzz/corpora/osc_string`     | `osc_string`     | 40    | OSC bodies extracted from `vt/` + hand-curated |
-| `fuzz/corpora/dcs_apc_string` | `dcs_apc_string` | 18    | DCS/APC/SOS/PM bodies + kitty `G` shapes       |
+| `fuzz/corpora/dcs_apc_string` | `dcs_apc_string` | 19    | DCS/APC/SOS/PM bodies + kitty `G` shapes       |
 | `fuzz/corpora/vt`             | (source corpus)  | 30    | R-001 retained corpus (below)                  |
 | `fuzz/corpora/rich`           | (ImageStore)     | 20    | R-002 corpus, own README                       |
 

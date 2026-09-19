@@ -120,8 +120,10 @@ pub fn string_frames(payload: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// Wraps a raw payload as kitty graphics `APC` shapes: a lone single-shot, a
-/// two-chunk `m=1`/`m=0` reassembly, and single-shot packets carrying raw
-/// format claims that reach `validate_raw_claim`.
+/// three-chunk `m=1`/`m=1`/`m=0` reassembly (with a mandatory `f=` on the
+/// opening chunk, and a mid-stream chunk that exercises encoded growth), and
+/// single-shot packets carrying raw format claims that reach
+/// `validate_raw_claim`.
 pub fn kitty_frames(payload: &[u8]) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
 
@@ -131,15 +133,22 @@ pub fn kitty_frames(payload: &[u8]) -> Vec<Vec<u8>> {
     single.extend_from_slice(b"\x1b\\");
     frames.push(single);
 
-    let mut first_chunk = Vec::with_capacity(payload.len() + 12);
-    first_chunk.extend_from_slice(b"\x1b_Gm=1;");
+    // Opening chunk must carry `f=` (`parse_control` rejects a control with
+    // no format), so the stream actually opens; the mid and final chunks are
+    // continuations where only `m=` is read (`more_flag`).
+    let mut first_chunk = Vec::with_capacity(payload.len() + 24);
+    first_chunk.extend_from_slice(b"\x1b_Gf=32,s=1,v=1,m=1;");
     first_chunk.extend_from_slice(payload);
     first_chunk.extend_from_slice(b"\x1b\\");
+    let mut mid_chunk = Vec::with_capacity(payload.len() + 8);
+    mid_chunk.extend_from_slice(b"\x1b_Gm=1;");
+    mid_chunk.extend_from_slice(payload);
+    mid_chunk.extend_from_slice(b"\x1b\\");
     let mut final_chunk = Vec::with_capacity(payload.len() + 7);
     final_chunk.extend_from_slice(b"\x1b_Gm=0;");
     final_chunk.extend_from_slice(payload);
     final_chunk.extend_from_slice(b"\x1b\\");
-    frames.push([first_chunk, final_chunk].concat());
+    frames.push([first_chunk, mid_chunk, final_chunk].concat());
 
     let mut raw_claim = Vec::with_capacity(payload.len() + 16);
     raw_claim.extend_from_slice(b"\x1b_Gf=32,s=4096,v=4096;");

@@ -6,7 +6,7 @@
 # failing on `rustup: command not found`.
 #
 # Build:
-#   docker build -t bitty-act:latest recording/bitty-act
+#   docker build -t bitty-act:latest .github/act
 #
 # Usage (dry-run syntax validation):
 #   act -n -W .github/workflows/ci.yml

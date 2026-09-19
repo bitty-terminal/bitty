@@ -19,8 +19,8 @@ actionlint:
     actionlint -color
 
 # Run the GitHub CI 'Quality gates' job locally through act before pushing a PR.
-# Requires Docker and the bitty-act image (../recording/bitty-act/Dockerfile).
-# Spends remote CI only on work that already passed here.
+# Builds the bitty-act image from .github/act/Dockerfile (one-time).
+# Spends remote CI only on what already passed here.
 #
 # Performance: the repository is bind-mounted (no 38 GB target/ copy), the
 # cargo registry/git caches are persisted under ../.targets/act-cache and
@@ -33,6 +33,9 @@ ci-local *args:
     root="$(git rev-parse --show-toplevel)"
     cache="${BITTY_ACT_CACHE:-$root/../.targets/act-cache}"
     host_cargo="${CARGO_HOME:-$HOME/.cargo}"
+    # Fixed in-image toolchain locations baked into .github/act/Dockerfile.
+    # scratch-paths-exempt: container paths, not host paths.
+    ctr_home=/home/ubuntu ctr_cargo=/usr/local/cargo ctr_rustup=/usr/local/rustup
     # The actionlint CI step runs a dockerized actionlint, so the job user
     # needs the host docker group as a supplementary group (act mounts the
     # docker socket itself; do not mount it again or Docker errors with a
@@ -57,8 +60,8 @@ ci-local *args:
     exec act -W .github/workflows/ci.yml -j quality \
       --pull=false --bind --container-architecture linux/amd64 \
       -P ubuntu-latest=bitty-act:latest \
-      --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:/usr/local/cargo/registry -v $cache/cargo-git:/usr/local/cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
-      --env HOME=/home/ubuntu --env CARGO_HOME=/usr/local/cargo --env RUSTUP_HOME=/usr/local/rustup \
+      --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
+      --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
       --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
       {{args}}
 

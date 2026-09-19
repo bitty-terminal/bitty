@@ -77,13 +77,41 @@ static STORE_MUTEX: Mutex<()> = Mutex::new(());
 /// One local-directory install or update request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInstallOptions {
-    /// Desired load state for the installed record.
+    /// Desired load state for fresh installs when no prior record exists in the store.
+    ///
+    /// For local developer workflows and explicit CLI installs, this defaults to `true`.
+    /// When adhering to the official plugin onboarding contract (rules 4 and 7),
+    /// fresh installs default to staged-and-disabled (`false`).
     pub enable: bool,
+
+    /// Explicit override for load state on update/reinstall.
+    ///
+    /// When `None` (the default), existing records preserve their previous
+    /// `enabled` state across updates, reinstalls, and capability changes
+    /// (PLUG-REG-009). When `Some(state)`, explicitly forces the record's
+    /// `enabled` state to `state`.
+    pub explicit_override: Option<bool>,
 }
 
 impl Default for LocalInstallOptions {
     fn default() -> Self {
-        Self { enable: true }
+        Self {
+            enable: true,
+            explicit_override: None,
+        }
+    }
+}
+
+impl LocalInstallOptions {
+    /// Staged-and-disabled options adhering to the official plugin onboarding
+    /// contract (rules 4 and 7): fresh installs start disabled, updates preserve
+    /// existing desired state.
+    #[must_use]
+    pub fn staged_and_disabled() -> Self {
+        Self {
+            enable: false,
+            explicit_override: None,
+        }
     }
 }
 
@@ -519,6 +547,18 @@ pub fn install_local_dir(
     }
     harden_tree(&target)?;
 
+    let enabled = if let Some(explicit) = options.explicit_override {
+        explicit
+    } else if let Some(ref existing_record) = existing {
+        // PLUG-REG-009: Preserve existing desired state (enabled/disabled)
+        // across updates, unchanged reinstalls, and capability changes,
+        // unless explicitly overridden.
+        existing_record.enabled
+    } else {
+        // Fresh install: apply fresh-install default policy.
+        options.enable
+    };
+
     let root = format!("{PACKAGES_DIR}/{plugin_id}/{version}");
     let mut updated_records = current_records;
     updated_records.retain(|record| record.plugin_id != plugin_id);
@@ -529,7 +569,7 @@ pub fn install_local_dir(
         root: root.clone(),
         manifest_hash: manifest_hash.clone(),
         content_digest: content_digest.clone(),
-        enabled: options.enable,
+        enabled,
         granted: granted.iter().cloned().collect(),
     });
     if let Err(error) = resolution::write_index(store_root, &updated_records) {
@@ -1541,6 +1581,154 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].plugin_id, "xuepoo.conflict");
         assert_eq!(records[0].version, "2.0.0");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn disabled_state_preserved_across_version_update_and_reinstall() {
+        // PLUG-REG-009: preserve existing disabled state across version updates
+        // and unchanged reinstalls unless explicitly overridden.
+        let scratch = scratch("plug-reg-009-preserve");
+        let store = scratch.join("store");
+        let source_v1 = write_plugin(&scratch.join("src_v1"), "xuepoo.persist", "1.0.0", None);
+        let source_v2 = write_plugin(&scratch.join("src_v2"), "xuepoo.persist", "2.0.0", None);
+
+        // 1. Fresh install defaults to enabled.
+        let report_v1 = install(&store, &source_v1);
+        assert_eq!(report_v1.version, "1.0.0");
+        let records = resolution::load_index(&store).expect("index");
+        assert!(records[0].enabled, "fresh install defaults to enabled");
+
+        // 2. Explicitly disable the plugin.
+        assert!(set_enabled(&store, "xuepoo.persist", false).expect("disable"));
+        let records = resolution::load_index(&store).expect("index");
+        assert!(!records[0].enabled, "plugin must be disabled");
+
+        // 3. Unchanged reinstall preserves disabled state.
+        let reinstall = install(&store, &source_v1);
+        assert_eq!(reinstall.version, "1.0.0");
+        let records = resolution::load_index(&store).expect("index");
+        assert!(
+            !records[0].enabled,
+            "unchanged reinstall must preserve disabled state"
+        );
+
+        // 4. Version update preserves disabled state.
+        let update = install(&store, &source_v2);
+        assert_eq!(update.version, "2.0.0");
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].version, "2.0.0");
+        assert!(
+            !records[0].enabled,
+            "version update must preserve disabled state"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn disabled_state_preserved_across_capability_narrowing() {
+        // PLUG-REG-009: capability narrowing preserves disabled state.
+        let scratch = scratch("plug-reg-009-narrow");
+        let store = scratch.join("store");
+        let wider = write_plugin(
+            &scratch.join("src_wide"),
+            "xuepoo.narrow",
+            "1.0.0",
+            Some("platform.notify"),
+        );
+        let narrower = write_plugin(&scratch.join("src_narrow"), "xuepoo.narrow", "1.1.0", None);
+
+        // Fresh install with consent.
+        install_local_dir(&store, &wider, &LocalInstallOptions::default(), &mut |_| {
+            Ok(true)
+        })
+        .expect("install")
+        .expect("approved");
+
+        // Disable plugin.
+        assert!(set_enabled(&store, "xuepoo.narrow", false).expect("disable"));
+        let records = resolution::load_index(&store).expect("index");
+        assert!(!records[0].enabled);
+        assert_eq!(records[0].granted, vec!["platform.notify".to_string()]);
+
+        // Narrow capabilities to none with v1.1.0.
+        install_local_dir(
+            &store,
+            &narrower,
+            &LocalInstallOptions::default(),
+            &mut |_| Ok(true),
+        )
+        .expect("narrowing install")
+        .expect("approved");
+
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].version, "1.1.0");
+        assert!(records[0].granted.is_empty(), "capabilities narrowed");
+        assert!(
+            !records[0].enabled,
+            "disabled state must be preserved across capability narrowing"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn explicit_override_forces_enabled_state_and_staged_disabled_policy() {
+        // PLUG-REG-009: explicit_override overrides existing state;
+        // staged_and_disabled policy installs fresh plugin in disabled state.
+        let scratch = scratch("plug-reg-009-explicit");
+        let store = scratch.join("store");
+        let source_v1 = write_plugin(&scratch.join("src_v1"), "xuepoo.override", "1.0.0", None);
+        let source_v2 = write_plugin(&scratch.join("src_v2"), "xuepoo.override", "2.0.0", None);
+
+        // 1. Fresh install using staged_and_disabled() begins disabled per onboarding rule 7.
+        install_local_dir(
+            &store,
+            &source_v1,
+            &LocalInstallOptions::staged_and_disabled(),
+            &mut |_| Ok(true),
+        )
+        .expect("install")
+        .expect("approved");
+
+        let records = resolution::load_index(&store).expect("index");
+        assert!(
+            !records[0].enabled,
+            "fresh install with staged_and_disabled must be disabled"
+        );
+
+        // 2. Explicit override forces enabled on update.
+        let opts_force_enable = LocalInstallOptions {
+            enable: false,
+            explicit_override: Some(true),
+        };
+        install_local_dir(&store, &source_v2, &opts_force_enable, &mut |_| Ok(true))
+            .expect("update")
+            .expect("approved");
+
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].version, "2.0.0");
+        assert!(
+            records[0].enabled,
+            "explicit_override: Some(true) must force enabled"
+        );
+
+        // 3. Explicit override forces disabled on reinstall.
+        let opts_force_disable = LocalInstallOptions {
+            enable: true,
+            explicit_override: Some(false),
+        };
+        install_local_dir(&store, &source_v2, &opts_force_disable, &mut |_| Ok(true))
+            .expect("reinstall")
+            .expect("approved");
+
+        let records = resolution::load_index(&store).expect("index");
+        assert!(
+            !records[0].enabled,
+            "explicit_override: Some(false) must force disabled"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

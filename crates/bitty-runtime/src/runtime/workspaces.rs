@@ -543,6 +543,13 @@ impl Runtime {
         // an inactive workspace must not reload the active slot from a stale
         // stash (live leaf edits, geometry, focus, and owners would revert).
         self.stash_active_slot();
+        // CTX-0567 (#992): fold every id currently held (live layout plus all
+        // stashed slots, including the slot about to be removed) into the
+        // monotonic high-water *before* the slot is dropped. Retirement is a
+        // boundary: an id installed through the `layout_mut` escape never hit
+        // an allocation funnel, so it must be captured on the way out or the
+        // last-workspace reset below would reissue it.
+        self.raise_view_id_high_water();
         // CTX-0461: leaves destroyed with the workspace can never respawn,
         // so capture them before the removal to drop any pending restores
         // they still hold (stale entries leak and misreport session state).

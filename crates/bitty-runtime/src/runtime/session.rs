@@ -1301,6 +1301,12 @@ impl Runtime {
         snap: &SessionSnapshot,
     ) -> Result<SessionRestoreSummary, SessionError> {
         validate_snapshot(snap)?;
+        // CTX-0567 (#992): fold the outgoing live layout plus every stashed
+        // slot into the monotonic high-water before a restore replaces them.
+        // An id installed through the `layout_mut` escape never hit an
+        // allocation funnel, so a restore whose snapshot carries lower ids
+        // would otherwise let the allocator reissue it.
+        self.raise_view_id_high_water();
         let mut workspaces = Vec::with_capacity(snap.workspaces.len());
         for ws in &snap.workspaces {
             let focus = ws.focus.map_or_else(Focus::new, Focus::with_focus);

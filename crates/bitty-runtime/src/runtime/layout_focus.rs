@@ -724,8 +724,16 @@ impl Runtime {
     /// manual `mark_layout_dirty` call is not required — but prefer
     /// [`Self::set_layout`] (which also re-syncs pane geometry and focus)
     /// for split/close/zoom mutations.
+    ///
+    /// CTX-0567 (#992): this escape can install or drop leaf ids without
+    /// passing an allocation funnel, so folding the ids currently installed
+    /// into the monotonic high-water *before* the borrow is handed out keeps a
+    /// previously escaped id quarantined once a later write retires it
+    /// (WS-INV-4/F-1). Raising the mark is monotonic and never affects the
+    /// geometry-only semantics.
     #[must_use]
     pub fn layout_mut(&mut self) -> &mut LayoutNode {
+        self.raise_view_id_high_water();
         &mut self.layout
     }
 
@@ -785,6 +793,14 @@ impl Runtime {
         // CTX-0334: a structural layout change abandons any pending hover
         // dwell; the candidate may no longer exist or may have moved.
         self.clear_hover_pending();
+        // CTX-0567 (#992): fold the *outgoing* layout into the monotonic
+        // id high-water before it is dropped. The pre-CTX-0567 raise ran only
+        // on the incoming tree, so a leaf installed through the public
+        // `layout_mut` escape (which bypasses every allocation funnel) and
+        // then retired by a replacement could fall below the mark and be
+        // reissued. Retirement is an explicit boundary: capture ids on the
+        // way out, never infer them from the survivor's maximum.
+        self.raise_view_id_high_water();
         // CTX-0359: only an explicit close removes the owner; a layout that
         // merely excludes it (zoom, restore) must never re-home.
         let primary_closed = closed.is_some_and(|closed_view| {

@@ -114,11 +114,16 @@ pub fn load_index(store_root: &Path) -> Result<Vec<PluginRecord>, PluginRuntimeE
     parse_index(&text)
 }
 
+static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Atomically write the `current.json` index (write-temp-then-rename).
 ///
 /// This is the staging side of the contract, used by the package manager and by
 /// tests; runtime loading never calls it. Records are written in deterministic
 /// plugin-id order and the encoded index is bounded before any write.
+///
+/// Each write uses an exclusive transaction temporary pointer to prevent
+/// concurrent writes from interfering with each other (PLUG-REG-011).
 ///
 /// # Errors
 ///
@@ -129,7 +134,11 @@ pub fn write_index(store_root: &Path, records: &[PluginRecord]) -> Result<(), Pl
     std::fs::create_dir_all(store_root)
         .map_err(|error| PluginRuntimeError::Io(format!("plugin store create: {error}")))?;
     let target = store_root.join(CURRENT_POINTER_FILE);
-    let temp = store_root.join("current.json.tmp");
+    let temp = store_root.join(format!(
+        "current.json.tmp-{}-{}",
+        std::process::id(),
+        WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&temp, text.as_bytes())
         .map_err(|error| PluginRuntimeError::Io(format!("plugin index write: {error}")))?;
     match std::fs::rename(&temp, &target) {
@@ -138,8 +147,10 @@ pub fn write_index(store_root: &Path, records: &[PluginRecord]) -> Result<(), Pl
             // Windows cannot rename over an existing file; the fallback still
             // never leaves the temp file as the pointer.
             let _ = std::fs::remove_file(&target);
-            std::fs::rename(&temp, &target)
-                .map_err(|error| PluginRuntimeError::Io(format!("plugin index commit: {error}")))
+            std::fs::rename(&temp, &target).map_err(|error| {
+                let _ = std::fs::remove_file(&temp);
+                PluginRuntimeError::Io(format!("plugin index commit: {error}"))
+            })
         }
     }
 }

@@ -21,6 +21,7 @@
 //! development packages are read-only, re-digested, and visibly unverified.
 //! The numeric bounds below are the RFC's ratified defaults.
 
+pub mod fs;
 pub mod manifest_toml;
 pub mod package;
 pub mod resolution;
@@ -41,9 +42,10 @@ use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{PluginId, PluginManifest};
 
+pub use fs::{FakeFileSystem, FileSystem, NativeFileSystem, write_atomic_durably};
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
-    write_index,
+    load_index_with_fs, write_index, write_index_with_fs,
 };
 pub use services::{
     EmptySettings, Notification, NotificationQueue, PluginServices, SettingsSource, SnapshotSource,

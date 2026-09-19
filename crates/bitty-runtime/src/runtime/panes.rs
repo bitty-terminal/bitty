@@ -298,6 +298,10 @@ impl Runtime {
         if self.pty_waker.is_some() {
             self.promote_pane_reader_to_forwarder(view);
         }
+        // CTX-0532: a fresh session starts with default modes; when it is the
+        // focused leaf, the cached/reader state must read its register, not
+        // a previous pane's. No-op when another pane is focused.
+        self.sync_mode_caches_to_focus();
         self.pending_full_redraw = true;
         Ok(())
     }
@@ -436,6 +440,11 @@ impl Runtime {
         // a later leaf reusing the numeric id can never inherit stale
         // image pixels (origin tokens are `ViewId.0` values).
         self.kitty_images.clear_origin(Some(view.0));
+        // CTX-0532: the focused pane's session may have just vanished (or a
+        // hidden one closed); re-attribute the mode caches. The reader paths
+        // consult `focused_modes` directly and fall back to the primary
+        // register for a now-session-less focused leaf.
+        self.sync_mode_caches_to_focus();
         self.pending_full_redraw = true;
         true
     }
@@ -576,7 +585,10 @@ impl Runtime {
             std::mem::swap(&mut self.state, &mut sess.state);
             std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
         }
-        self.handle_pty_bytes(bytes);
+        // CTX-0532: the inner parse call owns no cache sync, so the swapped
+        // grid can never be cached; the outer sync below runs after the swap
+        // back with the pane's register authoritative again.
+        self.handle_pty_bytes_inner(bytes);
         let Some(sess) = self.pane_sessions.get_mut(&view) else {
             // Unreachable single-threaded (see doc above); keep total rather
             // than debug-panicking on a corrupted swap pair.
@@ -588,6 +600,9 @@ impl Runtime {
         std::mem::swap(&mut self.state, &mut sess.state);
         std::mem::swap(&mut self.query_overlap, &mut sess.query_overlap);
         self.kitty_origin = prev_origin;
+        // CTX-0532: mode changes landed on the pane's register; re-attribute
+        // the input-mode caches to the focused pane.
+        self.sync_mode_caches_to_focus();
     }
 
     /// Flushes one pane's queued terminal replies (DA/DECRQM/XTGETTCAP,
@@ -623,24 +638,36 @@ impl Runtime {
         total
     }
 
-    /// Re-syncs the global Kitty/mouse-capture caches to the focused leaf's
-    /// grid (or the primary grid when focus owns no session). Called after
-    /// pumping panes so a mouse-tracking app in the focused pane still takes
-    /// effect. No-op equivalent when no pane session exists.
-    pub(super) fn sync_mode_caches_to_focus(&mut self) {
-        if self.pane_sessions.is_empty() {
-            return;
-        }
+    /// Mode register of the input-owning context: the focused leaf's private
+    /// session modes when it owns one, otherwise the primary grid's modes.
+    ///
+    /// CTX-0532: every mode-sensitive input reader (mouse capture, Kitty
+    /// encoding, focus reporting, bracketed paste) must attribute to the
+    /// *focused* pane. Reading `self.state` directly attributed them to the
+    /// primary grid even while another pane owned the keyboard; a focus
+    /// transition with no intervening PTY pump then used the previous pane's
+    /// modes. Session-less leaves keep the documented primary fallback,
+    /// matching [`Self::sync_mode_caches_to_focus`].
+    pub(super) fn focused_modes(&self) -> &bitty_term_state::Modes {
         let focused = self.focus.focused();
-        let (kitty, mouse) = match focused.and_then(|id| self.pane_sessions.get(&id)) {
-            Some(sess) => {
-                let modes = sess.state.modes();
-                (modes.kitty_keyboard, modes.mouse_tracking.is_some())
-            }
-            None => {
-                let modes = self.state.modes();
-                (modes.kitty_keyboard, modes.mouse_tracking.is_some())
-            }
+        match focused.and_then(|id| self.pane_sessions.get(&id)) {
+            Some(sess) => sess.state.modes(),
+            None => self.state.modes(),
+        }
+    }
+
+    /// Re-syncs the global Kitty/mouse-capture caches to the focused leaf's
+    /// grid (or the primary grid when focus owns no session).
+    ///
+    /// CTX-0532: called on every focus transition and after any path that
+    /// mutates a mode register (PTY apply, pane pump, spawn/close), so the
+    /// public telemetry caches never lag the focused pane. The mode-sensitive
+    /// reader paths read [`Self::focused_modes`] directly; these caches only
+    /// mirror them for `kitty_flags()` / `mouse_capture_active()` observers.
+    pub(super) fn sync_mode_caches_to_focus(&mut self) {
+        let (kitty, mouse) = {
+            let modes = self.focused_modes();
+            (modes.kitty_keyboard, modes.mouse_tracking.is_some())
         };
         self.kitty_flags = kitty;
         self.mouse_capture_enabled = mouse;

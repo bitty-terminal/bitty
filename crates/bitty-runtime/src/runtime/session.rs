@@ -1316,6 +1316,9 @@ impl Runtime {
         self.workspace_mru = snap.mru.iter().copied().collect::<VecDeque<_>>();
         self.layout = self.workspaces[snap.active].layout.clone();
         self.focus = self.workspaces[snap.active].focus.clone();
+        // CTX-0532: a restore load is a focus transition; attribute the
+        // input-mode caches to the restored focus before any input arrives.
+        self.sync_mode_caches_to_focus();
         let leaves = self.layout.leaf_ids();
         self.primary_view = self
             .focus

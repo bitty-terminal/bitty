@@ -1420,13 +1420,17 @@ impl Runtime {
             alt: self.alt_pressed,
             kitty_flags: self.kitty_flags,
         });
+        // CTX-0532: the focus/mode telemetry mirrors the reader attribution:
+        // bracketed paste and focus reporting come from the focused pane's
+        // own register (primary fallback for session-less leaves).
+        let focus_modes = self.focused_modes();
         crate::inspect::publish_focus(&crate::inspect::FocusSnapshot {
             focused: self.focused,
             focused_view: self.focus.focused().map(|v| v.0),
             mouse_capture: self.mouse_capture_enabled,
             alt_screen: self.state.alt_screen_active(),
-            bracketed_paste: self.state.modes().bracketed_paste,
-            focus_events: self.state.modes().focus_events,
+            bracketed_paste: focus_modes.bracketed_paste,
+            focus_events: focus_modes.focus_events,
         });
     }
 

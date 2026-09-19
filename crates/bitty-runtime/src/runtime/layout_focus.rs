@@ -824,6 +824,9 @@ impl Runtime {
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.
         self.sync_pane_geometry_to(&frames);
+        // CTX-0536 (#923): this is the layout install funnel; raise the
+        // monotonic id high-water so a closed leaf's id is never re-issued.
+        self.raise_view_id_high_water();
         // CTX-0532: focus may have moved to a survivor or the new tree's
         // first leaf; attribute the input-mode caches to it.
         self.sync_mode_caches_to_focus();

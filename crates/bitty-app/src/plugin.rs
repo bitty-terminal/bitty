@@ -1819,7 +1819,7 @@ fn install_source(
         );
         return EXIT_PLUGIN;
     }
-    let options = LocalInstallOptions { enable: true };
+    let options = LocalInstallOptions::default();
     let approve_all = request.yes;
     // Consent is bound to the staged snapshot the installer reviewed: the
     // callback only decides, and the installer commits that same snapshot, so

@@ -587,6 +587,21 @@ impl Runtime {
         if bytes.is_empty() {
             return;
         }
+        self.handle_pty_bytes_inner(bytes);
+        // CTX-0532: mode changes may have landed on the focused pane's own
+        // register, so re-attribute the Kitty/mouse-capture caches once per
+        // drained chunk. Done at the outer boundary (not inside the loop) so
+        // the pane-swap path in `handle_pane_bytes` — which temporarily moves
+        // a pane's grid into `self.state` — can skip the intermediate sync
+        // and re-attribute after swapping back.
+        self.sync_mode_caches_to_focus();
+    }
+
+    /// Parsing/state core of [`Self::handle_pty_bytes`] (CTX-0532 split).
+    ///
+    /// No cache re-attribution here: callers own it at their boundary so the
+    /// pane-swap pair never caches the temporarily swapped-in grid.
+    pub(super) fn handle_pty_bytes_inner(&mut self, bytes: &[u8]) {
         // CTX-0146: pre-scan overlap ++ new bytes for parameterized queries
         // (DECRQM mode numbers, XTGETTCAP payloads, secondary-DA request
         // forms). Bounded scans; matches ending inside the overlap were
@@ -778,9 +793,6 @@ impl Runtime {
                 }
             }
             let damage = self.state.apply(&action);
-            // Keep input-related mode caches in sync (Kitty, mouse capture)
-            self.kitty_flags = self.state.modes().kitty_keyboard;
-            self.mouse_capture_enabled = self.state.modes().mouse_tracking.is_some();
             if !damage.regions.is_empty() {
                 let generation = damage.generation;
                 self.cold_queue.push(ColdEvent::Damage { generation });

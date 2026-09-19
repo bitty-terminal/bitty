@@ -679,7 +679,11 @@ impl Runtime {
     }
 
     pub(super) fn deliver_paste_bytes_bracketed(&mut self, text: &str) {
-        let bracketed = self.state.modes().bracketed_paste;
+        // CTX-0532: bracketed-paste wrapping follows the focused pane's own
+        // mode register (primary fallback for session-less leaves) — the
+        // same context the bytes route to, so a focus change with no pump
+        // between panes can never wrap with the previous pane's mode.
+        let bracketed = self.focused_modes().bracketed_paste;
         let bytes = crate::paste::bracketed_wrap(text, bracketed);
         self.write_input(&bytes);
     }

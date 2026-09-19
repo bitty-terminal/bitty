@@ -112,10 +112,14 @@ impl Runtime {
         }
     }
 
-    /// Encodes with Kitty protocol when `kitty_flags != 0` (opt-in 7727).
-    /// Bounded to 64 bytes per spec; progressive flags are honored with fallback to legacy when flag not set.
+    /// Encodes with Kitty protocol when the focused pane's flags are non-zero
+    /// (opt-in 7727). CTX-0532: the flags come from the focused pane's own
+    /// session (primary fallback for session-less leaves), so a focus
+    /// transition with no pump between panes cannot encode with the previous
+    /// pane's protocol. Bounded to 64 bytes per spec; progressive flags are
+    /// honored with fallback to legacy when flag not set.
     pub(super) fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        if self.kitty_flags == 0 {
+        if self.focused_modes().kitty_keyboard == 0 {
             return bitty_platform::keyboard::encode_key_event_with_modifiers(
                 event,
                 &self.modifier_snapshot(),
@@ -664,9 +668,13 @@ impl Runtime {
         }
         // Shift override always forces selection path.
         let shift_override = self.shift_pressed;
+        // CTX-0532: capture decision reads the focused pane's modes (primary
+        // fallback for session-less leaves) — a focus change with no pump
+        // must never capture with the previous pane's tracking/encoding.
+        let focused_modes = self.focused_modes();
         let capture = !shift_override
-            && self.state.modes().mouse_tracking.is_some()
-            && self.state.modes().mouse_coordinate_encoding
+            && focused_modes.mouse_tracking.is_some()
+            && focused_modes.mouse_coordinate_encoding
                 == Some(bitty_vt::MouseCoordinateEncoding::Sgr)
             && self.should_capture_mouse();
 
@@ -850,11 +858,13 @@ impl Runtime {
     }
 
     pub(super) fn should_capture_mouse(&self) -> bool {
-        // Capture when a mouse mode is enabled; for single-window slice we
-        // capture in any view (not only alternate screen) to prove 1000..1006
-        // end-to-end, but we document that alternate-screen capture is the
-        // normative owner. This keeps headless tests deterministic.
-        self.state.modes().mouse_tracking.is_some()
+        // CTX-0532: capture follows the focused pane's own mode register
+        // (primary fallback for session-less leaves), never the primary grid
+        // while another pane owns the keyboard. Capture happens in any view
+        // (not only alternate screen) to prove 1000..1006 end-to-end, but we
+        // document that alternate-screen capture is the normative owner.
+        // This keeps headless tests deterministic.
+        self.focused_modes().mouse_tracking.is_some()
     }
 
     /// Handles cursor movement for drag selection or mouse-tracking motion.
@@ -896,9 +906,11 @@ impl Runtime {
         // delay arms a timed pending candidate instead of focusing eagerly.
         self.hover_focus_at_at(pos, now);
         // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when capture active.
+        // CTX-0532: motion reads the focused pane's modes (primary fallback).
+        let focused_modes = self.focused_modes();
         let capture = !self.shift_pressed
-            && self.state.modes().mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)
-            && self.state.modes().mouse_coordinate_encoding
+            && focused_modes.mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)
+            && focused_modes.mouse_coordinate_encoding
                 == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
         if capture {
             let cell = self.cursor_to_cell(pos);
@@ -993,11 +1005,13 @@ impl Runtime {
                 // so history remains keyboard/wheel navigable.
                 // CTX-0383: the search overlay behaves the same (modal, no
                 // PTY input; wheel still scrolls the viewport).
+                // CTX-0532: capture follows the focused pane's modes too.
+                let focused_modes = self.focused_modes();
                 let capture_scroll = self.copy_mode.is_none()
                     && !self.search_mode
                     && !self.shift_pressed
-                    && self.state.modes().mouse_tracking.is_some()
-                    && self.state.modes().mouse_coordinate_encoding
+                    && focused_modes.mouse_tracking.is_some()
+                    && focused_modes.mouse_coordinate_encoding
                         == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
                 if capture_scroll {
                     // SGR wheel: buttons 64 (up) / 65 (down), horizontal 66/67
@@ -1130,7 +1144,11 @@ impl Runtime {
         if gained {
             self.pending_full_redraw = true;
         }
-        if self.state.modes().focus_events {
+        // CTX-0532: focus reporting follows the focused pane's own mode
+        // register (primary fallback for session-less leaves), so a window
+        // focus-in while a pane session owns the keyboard reports to the
+        // session that would receive the bytes.
+        if self.focused_modes().focus_events {
             let seq = if focused { "\x1b[I" } else { "\x1b[O" };
             self.push_input_bytes(seq.as_bytes());
         }

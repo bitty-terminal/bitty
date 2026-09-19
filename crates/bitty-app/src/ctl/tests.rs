@@ -1496,6 +1496,93 @@ fn control_elevated_close_reports_not_found_not_denied() {
     assert_eq!(missing.code, "NotFound");
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_RELOAD_CONFIG, None, &all);
     assert!(done.ok, "elevated reload must succeed: {done:?}");
+    // CTX-0537 (APP-001): the verb is probe-only, so the response must
+    // never read as an applied reload.
+    assert!(
+        done.result_json.contains("\"probed\":true") && !done.result_json.contains("\"reloaded\""),
+        "probe-only reload must not claim a reload happened: {}",
+        done.result_json
+    );
+}
+
+#[test]
+fn control_config_reload_reports_probe_not_applied() {
+    // CTX-0537 (APP-001): `core.config.reload` resolves the config path and
+    // performs no application while hot-swap is a follow-up. Field names
+    // must not be readable as "the reload was applied".
+    let mut rt = headless_runtime();
+    let all = bitty_ipc::ScopeSet::all();
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_RELOAD_CONFIG, None, &all);
+    assert!(done.ok, "elevated reload probe must succeed: {done:?}");
+    assert!(
+        !done.result_json.contains("\"reloaded\""),
+        "probe-only verb must not expose a `reloaded` field: {}",
+        done.result_json
+    );
+    assert!(
+        done.result_json.contains("\"probed\":true")
+            && done.result_json.contains("\"applied\":false"),
+        "response must report probed-not-applied: {}",
+        done.result_json
+    );
+}
+
+#[test]
+fn control_config_reload_never_applies_source_mutation() {
+    // CTX-0537 (APP-004) outcome verification: mutate a config source,
+    // invoke the verb, and assert the live config did/did-not change per
+    // the documented probe-only contract. If a future hot-swap flips
+    // `"applied":true` without actually applying, the claiming branch below
+    // fails; while probe-only, the live config must stay byte-identical.
+    use bitty_config::plan::{ConfigSource, LayerKind};
+
+    let dir = {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!("bitty-ctx0537-reload-{}-{n}", std::process::id()))
+    };
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let source_path = dir.join("init.lua");
+    let source_text = "return { font = { family = \"JetBrains Mono\", size = 17.5 } }";
+    std::fs::write(&source_path, source_text).expect("fixture write");
+
+    // The mutated source resolves to a config observably different from the
+    // live defaults; a real hot-swap would have to land this exact value.
+    let src = ConfigSource::new(LayerKind::User, Some(source_path.display().to_string()));
+    let plan = bitty_config::file::parse_lua_config(source_text, &src).expect("fixture parses");
+    let layer = bitty_config::plan::LayeredPlan::new(src, plan);
+    let merged = bitty_config::file::resolve_effective(Some(layer), None).expect("fixture merges");
+    let mutated = crate::config_cli::runtime_config_from_effective(&merged.effective)
+        .expect("fixture runtime config");
+
+    let mut rt = headless_runtime();
+    let before = rt.config().clone();
+    assert_ne!(
+        mutated.font_size, before.font_size,
+        "fixture must differ from the live default to observe an apply"
+    );
+    let all = bitty_ipc::ScopeSet::all();
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_RELOAD_CONFIG, None, &all);
+    assert!(done.ok, "elevated reload probe must succeed: {done:?}");
+    assert!(
+        done.result_json.contains("\"applied\":false"),
+        "probe-only verb must declare that nothing was applied: {}",
+        done.result_json
+    );
+    if done.result_json.contains("\"applied\":true") {
+        assert_eq!(
+            rt.config(),
+            &mutated,
+            "claiming an applied reload requires the live config to carry it"
+        );
+    } else {
+        assert_eq!(
+            rt.config(),
+            &before,
+            "probe-only reload must leave the live config untouched"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

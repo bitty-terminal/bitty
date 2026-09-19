@@ -318,6 +318,9 @@ impl Runtime {
         // sessions in other slots are untouched.
         self.sync_primary_geometry();
         self.sync_pane_geometry();
+        // CTX-0532: the loaded slot's focus is a focus transition; attribute
+        // the input-mode caches to it before any input can arrive.
+        self.sync_mode_caches_to_focus();
     }
 
     /// Front an index in the MRU (each live index exactly once).
@@ -370,6 +373,9 @@ impl Runtime {
         let index = self.workspaces.len() - 1;
         self.active_workspace = index;
         self.mru_front(index);
+        // CTX-0532: a brand-new slot's leaf starts focused; attribute the
+        // input-mode caches to it before any pane spawn/output path runs.
+        self.sync_mode_caches_to_focus();
         // CTX-0359: give the fresh workspace leaf a real shell of its own by
         // replaying the primary attach recipe, so its first typed byte can
         // never reach the previous workspace's shell. Best-effort, startup
@@ -741,6 +747,9 @@ impl Runtime {
                 .ok_or_else(|| String::from("source workspace stranded empty after move"))?;
             self.focus = Focus::with_focus(first);
         }
+        // CTX-0532: the source promotion is a focus transition; attribute
+        // the input-mode caches before presenting again.
+        self.sync_mode_caches_to_focus();
         // Mirror the live source into its slot so stashed copies never hold
         // a duplicate of the moved id (ids stay unique across slots).
         self.stash_active_slot();

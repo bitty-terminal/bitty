@@ -824,6 +824,9 @@ impl Runtime {
         // CTX-0176: leaf boundaries may have moved (split/close/resize),
         // so re-sync every pane session's grid + PTY winsize to its leaf.
         self.sync_pane_geometry_to(&frames);
+        // CTX-0532: focus may have moved to a survivor or the new tree's
+        // first leaf; attribute the input-mode caches to it.
+        self.sync_mode_caches_to_focus();
         self.pending_full_redraw = true;
     }
 
@@ -868,6 +871,10 @@ impl Runtime {
                 self.focus.set(id);
                 self.pending_full_redraw = true;
             }
+            // CTX-0532: every focus transition re-attributes the input-mode
+            // caches to the new pane, so mode-sensitive input with no
+            // intervening PTY pump uses the focused pane's modes.
+            self.sync_mode_caches_to_focus();
             true
         } else {
             false
@@ -893,6 +900,8 @@ impl Runtime {
                 self.focus.set(id);
                 self.pending_full_redraw = true;
             }
+            // CTX-0532: re-attribute the mode caches to the new pane.
+            self.sync_mode_caches_to_focus();
         }
         next
     }

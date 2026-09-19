@@ -25,9 +25,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// This function is pure advisory path resolution only: a non-empty
 /// `BITTY_SOCKET` is returned after NUL/length checks with no ownership or
 /// peer verification. Callers must verify the returned path before bind or
-/// connect via [`verify_socket_endpoint_for_connect`] (client pre-connect)
-/// or the bind-time [`prepare_socket_dir`] + [`attest_bound_socket`] pair
-/// plus per-connection [`transport_attested_peer`] (server accept).
+/// connect via [`verify_socket_endpoint_for_connect`] (client pre-connect,
+/// which returns the endpoint identity) followed by
+/// [`verify_connected_endpoint`] on the live stream (CTX-0539), or the
+/// bind-time [`prepare_socket_dir`] + [`attest_bound_socket`] pair plus
+/// per-connection [`transport_attested_peer`] (server accept). The
+/// pre-connect check alone is defense in depth: a checked-then-swapped
+/// `BITTY_SOCKET` path is caught only by the post-connect binding.
 /// Connecting to or serving an unverified `BITTY_SOCKET` path fails closed
 /// at those boundaries, never here.
 ///
@@ -637,6 +641,28 @@ pub fn attest_bound_socket(socket_path: &str, dir: &DirAttestation) -> Result<u3
     Ok(sock_uid)
 }
 
+/// Identity of an attested socket endpoint (CTX-0539).
+///
+/// Captured from the socket inode by [`verify_socket_endpoint_for_connect`]
+/// so a client can bind a *connected* stream back to the endpoint it vetted
+/// before connect. Device + inode identify the kernel object, not the path
+/// string, so a simple checked-then-swapped path (unlink + rebind at the same
+/// name) is observable even though the pathname is unchanged. See
+/// [`verify_connected_endpoint`] for the residual double-swap race this does
+/// not eliminate.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketEndpointIdentity {
+    /// Device id of the socket inode.
+    pub dev: u64,
+    /// Inode number of the socket inode.
+    pub ino: u64,
+    /// Owner uid (already required to equal `runtime_uid`).
+    pub uid: u32,
+    /// Permission bits (already required to equal [`SOCKET_MODE`]).
+    pub mode: u32,
+}
+
 /// Verify an existing socket endpoint before connect or accept (unix).
 ///
 /// Read-only fail-closed checks for `BITTY_SOCKET` and other resolved paths:
@@ -646,6 +672,12 @@ pub fn attest_bound_socket(socket_path: &str, dir: &DirAttestation) -> Result<u3
 /// fail with `Unavailable` (cannot attest what cannot be stated); mode,
 /// owner, or symlink violations fail with `Unauthenticated` (caller must not
 /// connect or serve).
+///
+/// On success the endpoint's [`SocketEndpointIdentity`] is returned so the
+/// caller can re-bind the connected stream to this exact inode via
+/// [`verify_connected_endpoint`] (CTX-0539). The pre-connect check alone is
+/// defense in depth: it cannot prove which inode a later `connect` reached,
+/// so it must never be the sole gate.
 ///
 /// Server bind uses [`prepare_socket_dir`] + [`attest_bound_socket`] instead
 /// (they create and chmod); this function is for pre-connect verification
@@ -661,7 +693,7 @@ pub fn attest_bound_socket(socket_path: &str, dir: &DirAttestation) -> Result<u3
 pub fn verify_socket_endpoint_for_connect(
     socket_path: &str,
     runtime_uid: u32,
-) -> Result<(), IpcError> {
+) -> Result<SocketEndpointIdentity, IpcError> {
     use std::os::unix::fs::MetadataExt;
 
     if socket_path.is_empty() {
@@ -745,7 +777,115 @@ pub fn verify_socket_endpoint_for_connect(
             ),
         });
     }
+    Ok(SocketEndpointIdentity {
+        dev: sock_meta.dev(),
+        ino: sock_meta.ino(),
+        uid: sock_meta.uid(),
+        mode: sock_mode,
+    })
+}
+
+/// Re-binds a connected client stream to the endpoint vetted before connect
+/// (CTX-0539).
+///
+/// The pre-connect [`verify_socket_endpoint_for_connect`] check and the
+/// `connect` call are not atomic: a path can be unlinked and rebound between
+/// them (checked-then-swapped). This reads the kernel-reported peer address
+/// of the already-connected `stream` (`UnixStream::peer_addr`) and requires
+/// its filesystem identity to equal `expected`, so a stream that reached a
+/// foreign server fails closed before one request byte is written.
+///
+/// This is the strongest post-connect proof available on stable Rust with
+/// `#![forbid(unsafe_code)]`: per-connection `SO_PEERCRED` needs the unstable
+/// `peer_credentials_unix_socket` feature or a reviewed `unsafe` seam, and a
+/// challenge/response needs a pre-shared secret the accepted IPC RFC still
+/// records as an open question (discovery nonce).
+///
+/// **Residual race (honest bound).** `peer_addr` is the path string the
+/// client passed to `connect`, not the connected kernel socket's inode, so
+/// the post-connect `stat` re-reads whatever inode currently occupies that
+/// path. An attacker able to swap the path back to the vetted inode *after*
+/// the connection was accepted would make this check pass while the
+/// established connection still terminates at the foreign listener. This
+/// narrows the checked-then-swapped window to a double-swap race but does not
+/// cryptographically close it; only `SO_PEERCRED` (or a challenge/response)
+/// removes the race entirely. Peer-UID re-checking remains separate hardening.
+///
+/// # Errors
+///
+/// Returns `Unauthenticated` when the connected peer has no pathname address
+/// (an abstract/unnamed socket, which the servo never binds),
+/// `Unavailable` when the peer path cannot be resolved, and
+/// `Unauthenticated` when the post-connect identity differs from `expected`.
+#[cfg(unix)]
+pub fn verify_connected_endpoint(
+    stream: &std::os::unix::net::UnixStream,
+    expected: SocketEndpointIdentity,
+) -> Result<(), IpcError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let peer = stream.peer_addr().map_err(|err| IpcError::Unavailable {
+        reason: format!("cannot read connected peer address: {err}"),
+    })?;
+    let Some(path) = peer.as_pathname() else {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer has no filesystem socket address (refusing to send)".into(),
+        });
+    };
+    if path.as_os_str().is_empty() {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer address is empty (refusing to send)".into(),
+        });
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|err| IpcError::Unavailable {
+        reason: format!("cannot stat connected peer endpoint: {err}"),
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer endpoint is a symlink (refusing to send)".into(),
+        });
+    }
+    let actual = SocketEndpointIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        uid: meta.uid(),
+        mode: meta.mode() & 0o777,
+    };
+    if actual != expected {
+        return Err(IpcError::Unauthenticated {
+            reason: "connected peer endpoint changed after verification (refusing to send)".into(),
+        });
+    }
     Ok(())
+}
+
+/// Non-unix stub: `SocketEndpointIdentity` never exists off unix.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketEndpointIdentity {
+    /// Placeholder device id (never produced on this platform).
+    pub dev: u64,
+    /// Placeholder inode (never produced on this platform).
+    pub ino: u64,
+    /// Placeholder owner uid (never produced on this platform).
+    pub uid: u32,
+    /// Placeholder mode (never produced on this platform).
+    pub mode: u32,
+}
+
+/// Non-unix stub for [`verify_connected_endpoint`](fn.verify_connected_endpoint).
+///
+/// Generic over the stream type because the unix `UnixStream` does not exist
+/// on this platform; no client can reach it (the non-unix `ctl_roundtrip`
+/// returns unavailable first).
+#[cfg(not(unix))]
+pub fn verify_connected_endpoint<T>(
+    _stream: &T,
+    _expected: SocketEndpointIdentity,
+) -> Result<(), IpcError> {
+    Err(IpcError::Unavailable {
+        reason: "unix socket serving requires a unix platform".into(),
+    })
 }
 
 /// Non-unix stub: socket-directory serving requires a unix platform.
@@ -779,7 +919,7 @@ pub fn attest_bound_socket(_socket_path: &str, _dir: &DirAttestation) -> Result<
 pub fn verify_socket_endpoint_for_connect(
     _socket_path: &str,
     _runtime_uid: u32,
-) -> Result<(), IpcError> {
+) -> Result<SocketEndpointIdentity, IpcError> {
     Err(IpcError::Unavailable {
         reason: "unix socket serving requires a unix platform".into(),
     })

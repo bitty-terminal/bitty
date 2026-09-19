@@ -2509,3 +2509,71 @@ fn automation_params_two_tier_envelope_bound() {
     );
     assert!(parse_request(plain_payload.as_bytes()).is_err());
 }
+
+// ── CTX-0539: post-connect endpoint binding ─────────────────────────────
+
+/// The endpoint identity captured before connect must match the connected
+/// stream's kernel-reported peer, and a swapped endpoint must be rejected.
+#[cfg(unix)]
+#[test]
+fn connected_endpoint_binds_to_vetted_inode_and_rejects_swap() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let base = std::env::temp_dir().join(format!("bitty-ctx0539-{}-ipc", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = base.join("s.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let uid = std::fs::symlink_metadata(&base).unwrap().uid();
+
+    // Legitimate endpoint.
+    let legit = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected = verify_socket_endpoint_for_connect(&socket_str, uid).unwrap();
+
+    // Happy path: a client connected to the vetted endpoint verifies.
+    let client = std::os::unix::net::UnixStream::connect(&socket_str).unwrap();
+    let (_accepted, _) = legit.accept().unwrap();
+    assert!(verify_connected_endpoint(&client, expected).is_ok());
+    // Tampering with the expectation is rejected.
+    let mut wrong = expected;
+    wrong.ino = expected.ino.wrapping_add(1);
+    assert!(matches!(
+        verify_connected_endpoint(&client, wrong),
+        Err(IpcError::Unauthenticated { .. })
+    ));
+    drop(client);
+
+    // Checked-then-swapped: replace the endpoint at the same path.
+    drop(legit);
+    std::fs::remove_file(&socket_str).unwrap();
+    let spoof = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let swapped = std::os::unix::net::UnixStream::connect(&socket_str).unwrap();
+    let (_spoof_accepted, _) = spoof.accept().unwrap();
+    assert!(matches!(
+        verify_connected_endpoint(&swapped, expected),
+        Err(IpcError::Unauthenticated { .. })
+    ));
+
+    drop(spoof);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A pair stream has no filesystem peer and must fail closed.
+#[cfg(unix)]
+#[test]
+fn connected_endpoint_rejects_unnamed_peer() {
+    let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let identity = SocketEndpointIdentity {
+        dev: 0,
+        ino: 0,
+        uid: 0,
+        mode: 0o600,
+    };
+    assert!(matches!(
+        verify_connected_endpoint(&client, identity),
+        Err(IpcError::Unauthenticated { .. })
+    ));
+}

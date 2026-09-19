@@ -196,10 +196,14 @@ pub struct CtlIpcOutcome {
 /// Time-bounded (`ipc_ctl::CTL_TIMEOUT` read/write timeouts, shared with
 /// the server-side reply wait) so a dead peer cannot hang the CLI.
 ///
-/// The socket endpoint is verified before connect (`0700` dir + `0600`
-/// socket, both owned by `runtime_uid`, no symlinks): a forged
-/// `BITTY_SOCKET`/`--socket` path pointing at another owner's endpoint
-/// fails closed here, before any request byte is sent.
+/// Server identity is established in two stages (CTX-0539). Before connect
+/// the endpoint is verified (`0700` dir + `0600` socket, both owned by
+/// `runtime_uid`, no symlinks) and its inode identity captured. After connect
+/// the connected stream's kernel-reported peer address is re-bound to that
+/// captured identity: a checked-then-swapped path (unlink + rebind between
+/// the check and the connect), a forged `BITTY_SOCKET`, or any other foreign
+/// endpoint fails closed before one request byte is written. The pre-connect
+/// check is defense in depth, never the sole gate.
 #[cfg(unix)]
 pub fn ctl_roundtrip(
     socket_path: &str,
@@ -208,13 +212,14 @@ pub fn ctl_roundtrip(
     runtime_uid: u32,
 ) -> Result<CtlIpcOutcome, String> {
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
 
-    bitty_ipc::devtools::verify_socket_endpoint_for_connect(socket_path, runtime_uid).map_err(
-        |err| format!("bitty ctl: socket endpoint verification failed for {socket_path:?}: {err}"),
-    )?;
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|err| format!("bitty ctl: cannot connect to {socket_path:?}: {err}"))?;
+    let expected =
+        bitty_ipc::devtools::verify_socket_endpoint_for_connect(socket_path, runtime_uid).map_err(
+            |err| {
+                format!("bitty ctl: socket endpoint verification failed for {socket_path:?}: {err}")
+            },
+        )?;
+    let mut stream = connect_verified_endpoint(socket_path, expected)?;
     stream
         .set_read_timeout(Some(ipc_ctl::CTL_TIMEOUT))
         .map_err(|err| format!("bitty ctl: cannot set read timeout: {err}"))?;
@@ -268,6 +273,29 @@ pub fn ctl_roundtrip(
     Err(String::from(
         "bitty ctl: IPC control requires a unix platform",
     ))
+}
+
+/// Connect to `socket_path` and re-bind the live stream to the endpoint
+/// identity captured by the pre-connect verification (CTX-0539).
+///
+/// Split out from [`ctl_roundtrip`] so the checked-then-swapped fixture can
+/// exercise the real connect + post-connect verification without a race:
+/// the caller captures `expected` from the legitimate endpoint, the path is
+/// then swapped to a spoof, and this function must fail closed before the
+/// caller can write any request byte.
+#[cfg(unix)]
+pub(super) fn connect_verified_endpoint(
+    socket_path: &str,
+    expected: bitty_ipc::devtools::SocketEndpointIdentity,
+) -> Result<std::os::unix::net::UnixStream, String> {
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket_path)
+        .map_err(|err| format!("bitty ctl: cannot connect to {socket_path:?}: {err}"))?;
+    bitty_ipc::devtools::verify_connected_endpoint(&stream, expected).map_err(|err| {
+        format!("bitty ctl: connected server identity check failed for {socket_path:?}: {err}")
+    })?;
+    Ok(stream)
 }
 
 /// Parse a devtools response envelope into an outcome.

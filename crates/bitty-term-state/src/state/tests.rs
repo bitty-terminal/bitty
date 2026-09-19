@@ -383,6 +383,31 @@ fn synchronized_update_mode_is_tracked_and_nested_begins_end_once() {
 }
 
 #[test]
+fn alternate_scroll_mode_is_tracked_and_hashed() {
+    // CTX-0566 (#970): mode 1007 is stored in the mode register and enters
+    // the canonical state hash, so replay determinism covers it.
+    let mut s = State::new();
+    assert!(!s.modes().alternate_scroll, "off at power-on");
+    let base = s.state_hash();
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScroll,
+        enabled: true,
+    });
+    assert!(s.modes().alternate_scroll);
+    assert_ne!(
+        s.state_hash(),
+        base,
+        "alternate scroll must be truth-bearing (hashed)"
+    );
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScroll,
+        enabled: false,
+    });
+    assert!(!s.modes().alternate_scroll);
+    assert_eq!(s.state_hash(), base, "reset restores the pre-set hash");
+}
+
+#[test]
 fn sgr_reset_clears_pen_colors_for_bce_blanks() {
     let mut s = State::new();
     s.apply(&TerminalAction::SetAttributes {

@@ -131,6 +131,7 @@ pub mod kitty_images;
 pub mod layout_focus;
 pub mod log_throttle;
 pub mod mouse_chrome;
+pub mod mouse_encode;
 pub mod panes;
 pub mod plugin;
 pub mod present;

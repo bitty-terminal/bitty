@@ -656,6 +656,20 @@ impl Runtime {
         }
     }
 
+    /// Whether the focused pane's grid is on the alternate screen.
+    ///
+    /// Mirrors [`Self::focused_modes`] attribution (CTX-0532): alternate
+    /// scroll (`?1007`) must read the focused pane's own screen, with the
+    /// primary grid as the session-less fallback. Used by the wheel path to
+    /// decide between cursor-key translation and viewport scrolling.
+    pub(super) fn focused_alt_screen_active(&self) -> bool {
+        let focused = self.focus.focused();
+        match focused.and_then(|id| self.pane_sessions.get(&id)) {
+            Some(sess) => sess.state.alt_screen_active(),
+            None => self.state.alt_screen_active(),
+        }
+    }
+
     /// Re-syncs the global Kitty/mouse-capture caches to the focused leaf's
     /// grid (or the primary grid when focus owns no session).
     ///

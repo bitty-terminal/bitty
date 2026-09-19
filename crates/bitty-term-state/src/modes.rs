@@ -40,6 +40,11 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// Focus reporting (`?1004`).
     pub focus_events: bool,
+    /// Alternate scroll (`?1007`): wheel events in the alternate screen
+    /// translate to cursor up/down keys. Defaults off, matching the xterm
+    /// `alternateScroll` resource (the runtime only enters alternate scroll
+    /// while the alternate screen is active).
+    pub alternate_scroll: bool,
     /// Synchronized updates (`?2026`, CTX-0380): while set, presentation
     /// defers committing frames so an application can redraw atomically.
     /// The runtime bounds the deferral with a timeout so a hung application
@@ -67,6 +72,7 @@ impl Default for Modes {
             cursor_blinking: false,
             bracketed_paste: false,
             focus_events: false,
+            alternate_scroll: false,
             synchronized_update: false,
             kitty_keyboard: 0,
             mouse_tracking: None,

@@ -1747,6 +1747,7 @@ impl State {
             }
             Mode::BracketedPaste => self.modes.bracketed_paste = enabled,
             Mode::FocusEvents => self.modes.focus_events = enabled,
+            Mode::AlternateScroll => self.modes.alternate_scroll = enabled,
             Mode::SynchronizedUpdate => self.modes.synchronized_update = enabled,
             Mode::KittyKeyboard(flags) => {
                 if enabled {
@@ -1763,7 +1764,18 @@ impl State {
                 self.modes.mouse_tracking = enabled.then_some(tracking);
             }
             Mode::MouseCoordinateEncoding(encoding) => {
-                self.modes.mouse_coordinate_encoding = enabled.then_some(encoding);
+                // CTX-0566 (#1127): the coordinate encodings are mutually
+                // exclusive (xterm `charproc.c`: "they are mutually
+                // exclusive. For consistency, a reset is only effective
+                // against the matching mode."). A reset of a mode that is
+                // not active must not clobber a different active encoding,
+                // so an app that resets 1015 cannot break another app's
+                // active 1006.
+                if enabled {
+                    self.modes.mouse_coordinate_encoding = Some(encoding);
+                } else if self.modes.mouse_coordinate_encoding == Some(encoding) {
+                    self.modes.mouse_coordinate_encoding = None;
+                }
             }
         }
     }

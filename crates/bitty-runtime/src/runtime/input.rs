@@ -20,6 +20,22 @@ pub const IME_COMMIT_MAX_CHARS: usize = 256;
 /// Maximum UTF-8 bytes committed from one IME commit (CTX-0367).
 pub const IME_COMMIT_MAX_BYTES: usize = 1024;
 
+/// Protocol button bits for a platform mouse button (CTX-0566).
+///
+/// `0`/`1`/`2` are left/middle/right, `8`/`9` are back/forward; vendor
+/// buttons fold into the low three bits (the wheel codes `64..=67` are added
+/// by the wheel path, never by a physical button).
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::Back => 8,
+        MouseButton::Forward => 9,
+        MouseButton::Other(n) => (n % 8) as u8,
+    }
+}
+
 /// Truncates `text` to at most `max` scalars at a char boundary.
 ///
 /// Pure and allocation-minimal: returns the input unchanged when it already
@@ -671,54 +687,30 @@ impl Runtime {
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
+        // CTX-0566: any tracking mode + any encoding (X10 default, UTF-8
+        // 1005, SGR 1006, urxvt 1015) captures; the encoding only frames
+        // the bytes.
         let focused_modes = self.focused_modes();
         let capture = !shift_override
             && focused_modes.mouse_tracking.is_some()
-            && focused_modes.mouse_coordinate_encoding
-                == Some(bitty_vt::MouseCoordinateEncoding::Sgr)
             && self.should_capture_mouse();
 
         if capture {
             if let Some(pos) = self.last_cursor {
                 let cell = self.cursor_to_cell(pos);
-                // Bounded SGR encoding: ≤32 bytes per event, batch ≤4 KiB (candidate)
-                // Coordinates are 1-based per SGR, clamped to [1,65535] then to grid.
-                let col = (cell.col as u32 + 1).clamp(1, 65535) as u16;
-                let row = (cell.row as u32 + 1).clamp(1, 65535) as u16;
-                let mut code = match event.button {
-                    MouseButton::Left => 0,
-                    MouseButton::Middle => 1,
-                    MouseButton::Right => 2,
-                    MouseButton::Back => 8,
-                    MouseButton::Forward => 9,
-                    MouseButton::Other(n) => (n % 8) as u8,
+                let format = super::mouse_encode::MouseFormat::from_encoding(
+                    focused_modes.mouse_coordinate_encoding,
+                );
+                let report = super::mouse_encode::MouseReport {
+                    button: mouse_button_code(event.button),
+                    modifiers: self.mouse_modifier_bits(),
+                    motion: false,
+                    release: event.state == PressState::Released,
+                    col: cell.col,
+                    row: cell.row,
                 };
-                // Modifier bits: shift 4, alt 8, ctrl 16
-                if self.shift_pressed {
-                    code |= 4;
-                }
-                if self.alt_pressed {
-                    code |= 8;
-                }
-                if self.control_pressed {
-                    code |= 16;
-                }
-                // Drag adds 32 for button-event tracking? For simplicity we map release vs press.
-                let trailer = if event.state == PressState::Pressed {
-                    'M'
-                } else {
-                    'm'
-                };
-                // For SGR, release is still reported with same button code but 'm'
-                // Bounded <32 bytes: format "ESC[<code;col;rowM"
-                let seq = format!("\x1b[<{code};{col};{row}{trailer}");
-                // Enforce bound explicitly (candidate table: mouse encode ≤32 bytes)
-                let bytes = if seq.len() > 32 {
-                    &seq.as_bytes()[..32]
-                } else {
-                    seq.as_bytes()
-                };
-                self.push_input_bytes(bytes);
+                let bytes = super::mouse_encode::encode_mouse(format, report);
+                self.push_input_bytes(bytes.as_slice());
             }
             // Still update last_cursor tracking but do not start selection.
             // CTX-0166: a captured click must still dismiss any stale
@@ -905,37 +897,49 @@ impl Runtime {
         // so Shift+hover selection never steals focus). A positive dwell
         // delay arms a timed pending candidate instead of focusing eagerly.
         self.hover_focus_at_at(pos, now);
-        // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when capture active.
-        // CTX-0532: motion reads the focused pane's modes (primary fallback).
+        // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when
+        // capture active. CTX-0532: motion reads the focused pane's modes
+        // (primary fallback). CTX-0566: any encoding frames the motion; X10
+        // and the other legacy encodings carry no button identity, only the
+        // motion bit.
         let focused_modes = self.focused_modes();
         let capture = !self.shift_pressed
-            && focused_modes.mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)
-            && focused_modes.mouse_coordinate_encoding
-                == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
+            && focused_modes.mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any);
         if capture {
+            let format = super::mouse_encode::MouseFormat::from_encoding(
+                focused_modes.mouse_coordinate_encoding,
+            );
             let cell = self.cursor_to_cell(pos);
-            let col = (cell.col as u32 + 1).clamp(1, 65535) as u16;
-            let row = (cell.row as u32 + 1).clamp(1, 65535) as u16;
-            // Motion button code 32 (no button) plus modifiers, SGR uses 'M' for press/drag
-            let mut code: u8 = 32;
-            if self.shift_pressed {
-                code |= 4;
-            }
-            if self.alt_pressed {
-                code |= 8;
-            }
-            if self.control_pressed {
-                code |= 16;
-            }
-            let seq = format!("\x1b[<{code};{col};{row}M");
-            let bytes = if seq.len() > 32 {
-                &seq.as_bytes()[..32]
-            } else {
-                seq.as_bytes()
+            // Motion reports carry the "no button" code (`3`); the motion
+            // flag adds the `+32` motion bit in every encoding.
+            let report = super::mouse_encode::MouseReport {
+                button: 3,
+                modifiers: self.mouse_modifier_bits(),
+                motion: true,
+                release: false,
+                col: cell.col,
+                row: cell.row,
             };
+            let bytes = super::mouse_encode::encode_mouse(format, report);
             // Bounded: drop if PTY queue full, never block
-            self.push_input_bytes(bytes);
+            self.push_input_bytes(bytes.as_slice());
         }
+    }
+
+    /// Current modifier bits for a mouse report: shift `4`, alt `8`, ctrl
+    /// `16` (xterm `ctlseqs.txt` "Normal tracking mode").
+    fn mouse_modifier_bits(&self) -> u8 {
+        let mut bits = 0;
+        if self.shift_pressed {
+            bits |= 4;
+        }
+        if self.alt_pressed {
+            bits |= 8;
+        }
+        if self.control_pressed {
+            bits |= 16;
+        }
+        bits
     }
 
     /// Handles wheel scroll: accumulates line-notch and pixel deltas and
@@ -999,38 +1003,86 @@ impl Runtime {
                     (self.wheel_line_accum_x + x * lines_per_notch).clamp(-32.0, 32.0);
                 let lines_y = self.wheel_line_accum_y.trunc() as isize;
                 let lines_x = self.wheel_line_accum_x.trunc() as isize;
-                // Shift+wheel or no capture scrolls viewport; otherwise emit mouse wheel SGR when mouse mode active.
-                // CTX-0384: copy mode never forwards wheel SGR to the PTY
-                // (modal, no PTY input); the viewport-scroll path below stays
-                // so history remains keyboard/wheel navigable.
-                // CTX-0383: the search overlay behaves the same (modal, no
-                // PTY input; wheel still scrolls the viewport).
-                // CTX-0532: capture follows the focused pane's modes too.
-                let focused_modes = self.focused_modes();
-                let capture_scroll = self.copy_mode.is_none()
-                    && !self.search_mode
+                // CTX-0566: mode 1007 alternate scroll applies only in the
+                // alternate screen and only when no mouse-tracking mode is
+                // active — xterm and ghostty both give mouse reporting
+                // precedence (`mouse_event == .none` is required for ghostty
+                // alternate scroll), because a full-screen TUI that asked
+                // for mouse events expects wheel reports, not cursor keys.
+                // CTX-0384/CTX-0383: copy mode and the search overlay are
+                // modal — they never forward input to the PTY, so the
+                // viewport-scroll path below stays.
+                // CTX-0532: every mode reads the focused pane (primary
+                // fallback), so a focus change cannot leak the previous
+                // pane's modes.
+                let (alt_scroll_set, mouse_tracking, encoding, app_cursor) = {
+                    let modes = self.focused_modes();
+                    (
+                        modes.alternate_scroll,
+                        modes.mouse_tracking.is_some(),
+                        modes.mouse_coordinate_encoding,
+                        modes.application_cursor_keys,
+                    )
+                };
+                let modal = self.copy_mode.is_some() || self.search_mode;
+                let alt_scroll_active = !modal
                     && !self.shift_pressed
-                    && focused_modes.mouse_tracking.is_some()
-                    && focused_modes.mouse_coordinate_encoding
-                        == Some(bitty_vt::MouseCoordinateEncoding::Sgr);
-                if capture_scroll {
-                    // SGR wheel: buttons 64 (up) / 65 (down), horizontal 66/67
-                    for _ in 0..lines_y.abs().min(32) {
-                        let btn = if lines_y > 0 { 64 } else { 65 };
-                        let seq = if let Some(pos) = self.last_cursor {
+                    && alt_scroll_set
+                    && !mouse_tracking
+                    && self.focused_alt_screen_active();
+                let capture_scroll = !modal && !self.shift_pressed && mouse_tracking;
+                if alt_scroll_active {
+                    // Alternate screen has no scrollback: vertical notches
+                    // become cursor keys (application-cursor aware), and
+                    // horizontal notches are drained with no viewport effect.
+                    // xterm encodes `up` as CSI A (or SS3 A under DECCKM)
+                    // and `down` as CSI B (or SS3 B).
+                    let up: &[u8] = if app_cursor { b"\x1bOA" } else { b"\x1b[A" };
+                    let down: &[u8] = if app_cursor { b"\x1bOB" } else { b"\x1b[B" };
+                    for _ in 0..lines_y.unsigned_abs().min(32) {
+                        let seq = if lines_y > 0 { up } else { down };
+                        self.push_input_bytes(seq);
+                    }
+                    self.wheel_line_accum_y -= lines_y as f32;
+                    self.wheel_line_accum_x = 0.0;
+                } else if capture_scroll {
+                    // Wheel buttons: 64 (up) / 65 (down), horizontal 66/67.
+                    // CTX-0566: framed by the app-selected encoding (X10
+                    // default, UTF-8 1005, SGR 1006, urxvt 1015).
+                    let format = super::mouse_encode::MouseFormat::from_encoding(encoding);
+                    let modifiers = self.mouse_modifier_bits();
+                    let (col, row) = match self.last_cursor {
+                        Some(pos) => {
                             let cell = self.cursor_to_cell(pos);
-                            let col = (cell.col as u32 + 1) as u16;
-                            let row = (cell.row as u32 + 1) as u16;
-                            format!("\x1b[<{btn};{col};{row}M")
-                        } else {
-                            format!("\x1b[<{btn};1;1M")
+                            (cell.col, cell.row)
+                        }
+                        None => (0, 0),
+                    };
+                    for _ in 0..lines_y.unsigned_abs().min(32) {
+                        let btn = if lines_y > 0 { 64 } else { 65 };
+                        let report = super::mouse_encode::MouseReport {
+                            button: btn,
+                            modifiers,
+                            motion: false,
+                            release: false,
+                            col,
+                            row,
                         };
-                        self.push_input_bytes(seq.as_bytes());
+                        let bytes = super::mouse_encode::encode_mouse(format, report);
+                        self.push_input_bytes(bytes.as_slice());
                     }
                     for _ in 0..lines_x.unsigned_abs().min(32) {
                         let btn = if lines_x > 0 { 66 } else { 67 };
-                        let seq = format!("\x1b[<{btn};1;1M");
-                        self.push_input_bytes(seq.as_bytes());
+                        let report = super::mouse_encode::MouseReport {
+                            button: btn,
+                            modifiers,
+                            motion: false,
+                            release: false,
+                            col,
+                            row,
+                        };
+                        let bytes = super::mouse_encode::encode_mouse(format, report);
+                        self.push_input_bytes(bytes.as_slice());
                     }
                     self.wheel_line_accum_y -= lines_y as f32;
                     self.wheel_line_accum_x -= lines_x as f32;

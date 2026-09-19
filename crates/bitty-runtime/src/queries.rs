@@ -221,6 +221,7 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
         1006 => Some(
             state.modes().mouse_coordinate_encoding == Some(bitty_vt::MouseCoordinateEncoding::Sgr),
         ),
+        1007 => Some(state.modes().alternate_scroll),
         1015 => Some(
             state.modes().mouse_coordinate_encoding
                 == Some(bitty_vt::MouseCoordinateEncoding::Urxvt),

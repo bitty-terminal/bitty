@@ -290,6 +290,10 @@ pub enum Mode {
     BracketedPaste,
     /// Focus reporting (`?1004`).
     FocusEvents,
+    /// Alternate scroll (`?1007`): wheel events in the alternate screen
+    /// translate to cursor up/down keys instead of mouse reports or
+    /// viewport scrolling (xterm `alternateScroll`).
+    AlternateScroll,
     /// Synchronized updates (`?2026`, CTX-0380): the application brackets a
     /// redraw between set and reset; presentation defers committing frames
     /// until reset, bounded by the runtime's deferral timeout.

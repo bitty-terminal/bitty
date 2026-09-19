@@ -74,6 +74,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             1003 => Some(Mode::MouseTracking(MouseTrackingMode::Any)),
             1004 => Some(Mode::FocusEvents),
             1005 => Some(Mode::MouseCoordinateEncoding(MouseCoordinateEncoding::Utf8)),
+            1007 => Some(Mode::AlternateScroll),
             1006 => Some(Mode::MouseCoordinateEncoding(MouseCoordinateEncoding::Sgr)),
             1015 => Some(Mode::MouseCoordinateEncoding(
                 MouseCoordinateEncoding::Urxvt,

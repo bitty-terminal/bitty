@@ -2610,3 +2610,116 @@ fn timed_out_waiter_never_observes_a_post_timeout_effect() {
         "no post-timeout effect may land"
     );
 }
+
+// ── CTX-0539: post-connect server-identity binding ─────────────────────
+//
+// Acceptance: a spoofed-socket fixture (checked-then-swapped path) fails
+// closed with no request byte readable by the spoof. The fixture captures
+// the legitimate endpoint identity, swaps the path to an attacker listener,
+// and asserts the real `connect_verified_endpoint` seam refuses the live
+// stream before any write.
+
+/// A checked-then-swapped endpoint must be detected after connect, and the
+/// spoof must read zero request bytes.
+#[test]
+#[cfg(unix)]
+fn spoofed_socket_checked_then_swapped_fails_closed_with_no_bytes() {
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::client::connect_verified_endpoint;
+
+    let dir = std::env::temp_dir().join(format!("bitty-ctx0539-{}-spoof", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = dir.join("s.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&dir).unwrap().uid()
+    };
+
+    // Legitimate server A: bind, chmod 0600, and capture its identity. The
+    // listener stays open for the whole test so A's inode remains allocated.
+    let _legit = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let expected =
+        bitty_ipc::devtools::verify_socket_endpoint_for_connect(&socket_str, uid).unwrap();
+
+    // Checked-then-swapped: attacker moves A's socket file aside (A's inode
+    // stays allocated) and binds a spoof at the original path. The spoof
+    // therefore has a guaranteed distinct inode, and its bind-time address is
+    // the connected path, so `peer_addr` reports `s.sock` and the identity
+    // re-stat sees the spoof's inode. `remove_file` + `bind` is deliberately
+    // not used: the freed inode can be immediately reused, making the fixture
+    // flaky.
+    let moved = dir.join("legit.sock");
+    std::fs::rename(&socket_str, &moved).unwrap();
+    let spoof = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_ne!(
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(&socket_str).unwrap().ino()
+        },
+        expected.ino,
+        "the swapped endpoint must be a different inode"
+    );
+
+    // The seam connects (reaching the spoof) then must reject the identity.
+    let err = connect_verified_endpoint(&socket_str, expected)
+        .expect_err("checked-then-swapped endpoint must fail closed");
+    assert!(
+        err.contains("connected server identity check failed"),
+        "must fail at post-connect verification, got: {err}"
+    );
+
+    // The spoof accepted a TCP-level connection but must read no bytes: the
+    // client never wrote because verification failed first. Nonblocking mode
+    // is portable where `set_read_timeout` is not (macOS may reject a
+    // sub-second `SO_RCVTIMEO` with EINVAL); a `WouldBlock` is exactly "no
+    // request byte is readable by the spoof".
+    let (mut accepted, _) = spoof.accept().unwrap();
+    accepted.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 64];
+    match accepted.read(&mut buf) {
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+        Ok(0) => {}
+        Ok(n) => panic!("spoof read {n} request bytes; failed closed too late"),
+        Err(err) => panic!("unexpected spoof read error: {err}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A foreign `BITTY_SOCKET`-style endpoint owned by nobody verified fails
+/// the pre-connect gate before any connection is attempted.
+#[test]
+#[cfg(unix)]
+fn foreign_socket_endpoint_is_rejected_pre_connect() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("bitty-ctx0539-{}-foreign", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // World-writable directory (0777, not 0700) is never attestable.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let socket_path = dir.join("s.sock");
+    let socket_str = socket_path.to_str().unwrap().to_string();
+    let _listener = std::os::unix::net::UnixListener::bind(&socket_str).unwrap();
+    std::fs::set_permissions(&socket_str, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&dir).unwrap().uid()
+    };
+
+    let err = bitty_ipc::devtools::verify_socket_endpoint_for_connect(&socket_str, uid)
+        .expect_err("0777 directory must fail endpoint attestation");
+    assert!(
+        matches!(err, bitty_ipc::error::IpcError::Unauthenticated { .. }),
+        "directory-mode violation is Unauthenticated, got: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

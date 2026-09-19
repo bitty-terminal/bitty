@@ -1,0 +1,42 @@
+[package]
+name = "bitty-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# `fuzz/` is deliberately not a member of the root workspace (cargo-fuzz
+# convention): the empty `[workspace]` table below makes this an independent
+# workspace root, so `cargo fmt/clippy/test --workspace` in the root and
+# `just check` never build the libFuzzer targets. Keep it that way.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bitty-vt]
+path = "../crates/bitty-vt"
+
+[[bin]]
+name = "vt_parser"
+path = "fuzz_targets/vt_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "osc_string"
+path = "fuzz_targets/osc_string.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcs_apc_string"
+path = "fuzz_targets/dcs_apc_string.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

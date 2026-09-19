@@ -22,7 +22,8 @@ Per-item detail belongs to the issues; completed rows move to git history.
 - Backlog: enumerated read-only from the docs corpora and registers, then
   filed against the ten epics in the GitHub issue tracker.
 - Gates: `just check` is the local gate; CI (`Quality gates`/`MSRV`/
-  `Windows`/`Linux`/`macOS`/`Supply chain`/`CodeQL`) is the merge gate.
+  `Windows`/`Linux`/`macOS`/`M1 matrix`/`Supply chain`/`CodeQL`) is the merge
+  gate.
 
 ## Epic index (issue tracker)
 

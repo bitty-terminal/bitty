@@ -329,10 +329,13 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         }
         CtlRequest::ConfigReload => {
             out.push_str(&format!(
-                "reloaded on {} — result: {result_json}\n",
+                "config probe on {} — result: {result_json}\n",
                 target.instance
             ));
-            out.push_str("(live theme/font hot-swap is a follow-up; the file was validated)\n");
+            out.push_str(
+                "(probe-only: the file was resolved and validated, not applied; \
+                 live theme/font hot-swap is a follow-up)\n",
+            );
         }
         CtlRequest::InstanceList => {
             out.push_str(result_json);

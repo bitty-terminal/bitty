@@ -535,15 +535,18 @@ pub fn apply_control(
         }
     }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
-        // Validate the config file (same probe the startup path uses) and
-        // report its path; live hot-swap is a documented follow-up.
+        // CTX-0537 (APP-001): probe-only until live hot-swap lands. The
+        // response reports exactly what happened — `probed` true and
+        // `applied` false — so a client can never read it as an applied
+        // reload. `path` is the resolved config file (or a defaults marker)
+        // and `hot_swap` names the follow-up.
         let probed = bitty_config::file::probe_config_path(None);
         let path = probed
             .as_ref()
             .map(|p| p.path.display().to_string())
             .unwrap_or_else(|| String::from("(defaults; no file)"));
         return Ok(format!(
-            "{{\"reloaded\":true,\"path\":\"{}\",\"hot_swap\":\"follow-up\"}}",
+            "{{\"probed\":true,\"applied\":false,\"path\":\"{}\",\"hot_swap\":\"follow-up\"}}",
             json_escape(&path)
         ));
     }

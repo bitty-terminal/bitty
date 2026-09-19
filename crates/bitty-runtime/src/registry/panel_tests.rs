@@ -4,8 +4,10 @@
 //! byte-identical logic, only module wiring changed.
 
 use super::{
-    BoundedPayload, EventTopic, Generation, MAX_TOPICS_TOTAL, PanelError, PanelId, PanelRegistry,
-    PanelRegistryConfig, PanelState, PanelType, WorkspaceId,
+    BUS_EVENT_MAX_BYTES, BUS_GLOBAL_BYTES_LIMIT, BUS_GLOBAL_LIMIT, BUS_PER_PANEL_BYTES_LIMIT,
+    BUS_PER_PANEL_LIMIT, BoundedPayload, BusDropPolicy, EventTopic, Generation, MAX_TOPICS_TOTAL,
+    PanelError, PanelEventBus, PanelId, PanelRegistry, PanelRegistryConfig, PanelState, PanelType,
+    WorkspaceId,
 };
 use bitty_ui::{Rect as UiRect, ViewId};
 
@@ -134,6 +136,85 @@ fn mount_already_mounted_errors() {
     assert!(matches!(err, PanelError::PanelAlreadyMounted { .. }));
     let err2 = reg.mount_panel(h2.id, h2.generation, v1).unwrap_err();
     assert!(matches!(err2, PanelError::AlreadyMounted { .. }));
+}
+
+/// CTX-0535 (#922): `unmount_panel` destroys the view attachment. Resuming
+/// such a record must never produce `state == Mounted` with `view == None`;
+/// it stays viewless (`Created`) until `mount_panel` re-attaches a view.
+#[test]
+fn resume_viewless_panel_never_reaches_mounted() {
+    let mut reg = default_panel_registry();
+    let h = reg.create_panel(PanelType::Helper, None).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    let removed = reg.unmount_panel(h.id, h.generation).unwrap();
+    assert_eq!(removed, v1);
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), None);
+    // Resume a viewless record: it must not claim `Mounted`.
+    reg.resume_panel(h.id, h.generation).unwrap();
+    let state = reg.panel_state(h.id, h.generation).unwrap();
+    let view = reg.panel_view(h.id, h.generation).unwrap();
+    assert!(
+        !(state == PanelState::Mounted && view.is_none()),
+        "no reachable Mounted with a missing view (state={state:?}, view={view:?})"
+    );
+    assert_eq!(
+        state,
+        PanelState::Created,
+        "a viewless resume returns to Created, not Mounted"
+    );
+    // The record is still re-mountable: a real mount attaches the view.
+    let v2 = ViewId::new(2);
+    reg.mount_panel(h.id, h.generation, v2).unwrap();
+    assert_eq!(
+        reg.panel_state(h.id, h.generation).unwrap(),
+        PanelState::Mounted
+    );
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v2));
+}
+
+/// CTX-0535 (#922): focus on a viewless panel fails closed. Before the fix
+/// the viewless record could report `Mounted`, letting focus land on a panel
+/// with no view; after the fix the state is `Created` and focus is refused.
+#[test]
+fn focus_viewless_panel_fails_closed() {
+    let mut reg = default_panel_registry();
+    let ws = WorkspaceId::new(11);
+    let h = reg.create_panel(PanelType::Canvas, Some(ws)).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    reg.unmount_panel(h.id, h.generation).unwrap();
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), None);
+    reg.resume_panel(h.id, h.generation).unwrap();
+    let err = reg
+        .focus_panel(h.id, h.generation, ws)
+        .expect_err("focus must refuse a viewless panel");
+    assert!(matches!(err, PanelError::InvalidState { .. }));
+    assert_eq!(reg.focused_panel(ws), None);
+}
+
+/// CTX-0535 (#922): a `Suspended` record that still owns its view (from
+/// `suspend_panel`) resumes to `Mounted` with the same view — the fix must
+/// not regress the visible-suspend/resume path.
+#[test]
+fn resume_with_retained_view_returns_to_mounted() {
+    let mut reg = default_panel_registry();
+    let ws = WorkspaceId::new(12);
+    let h = reg.create_panel(PanelType::Terminal, Some(ws)).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    reg.suspend_panel(h.id, h.generation).unwrap();
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v1));
+    reg.resume_panel(h.id, h.generation).unwrap();
+    assert_eq!(
+        reg.panel_state(h.id, h.generation).unwrap(),
+        PanelState::Mounted
+    );
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v1));
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    assert_eq!(reg.focused_panel(ws), Some(h.id));
 }
 
 #[test]
@@ -301,6 +382,144 @@ fn event_bus_64_per_subscription_drop_oldest() {
     assert_eq!(batch.len(), 32);
     // FIFO DropOldest: first batch should contain msg6..msg37 (oldest 6 dropped)
     assert_eq!(batch[0].payload.as_str(), "msg6");
+}
+
+/// CTX-0534 (#921): a publish that would push a panel's aggregate event count
+/// over `BUS_PER_PANEL_LIMIT` must evict repeatedly until the arrival is
+/// admitted, so `publish` never returns with the panel over budget.
+#[test]
+fn event_bus_per_panel_event_limit_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    // MAX_SUBSCRIPTIONS_PER_PANEL is 32; 32 queues x 64 = 2048 > 1024 cap.
+    let mut topics = Vec::new();
+    for i in 0..32 {
+        let t = bus.declare_topic(&format!("xuepoo.test:admit{i}")).unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..4000 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.queued_events_for_panel(panel) <= BUS_PER_PANEL_LIMIT,
+                "per-panel event count must never exceed {BUS_PER_PANEL_LIMIT} after publish"
+            );
+        }
+    }
+    assert!(bus.queued_events_for_panel(panel) <= BUS_PER_PANEL_LIMIT);
+}
+
+/// CTX-0534 (#921): a publish that would push a panel's aggregate byte count
+/// over `BUS_PER_PANEL_BYTES_LIMIT` must evict repeatedly (across the panel's
+/// queues) until the arrival is admitted or the queues are empty.
+#[test]
+fn event_bus_per_panel_byte_limit_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    let mut topics = Vec::new();
+    for i in 0..8 {
+        let t = bus.declare_topic(&format!("xuepoo.test:bytes{i}")).unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    // 8 queues x 64 events x 4 KiB = 2 MiB of payload, far past the 256 KiB
+    // per-panel byte cap. A single-pass eviction cannot keep up.
+    let blob = "b".repeat(4 * 1024);
+    let payload = BoundedPayload::try_new(blob.clone()).unwrap();
+    for round in 0..2000 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.queued_bytes_for_panel(panel) <= BUS_PER_PANEL_BYTES_LIMIT,
+                "per-panel byte count must never exceed {BUS_PER_PANEL_BYTES_LIMIT} after publish (round {round})"
+            );
+        }
+    }
+}
+
+/// CTX-0534 (#921): the global event/byte caps are held as admission
+/// invariants for every publish, regardless of how many panels/queues exist.
+/// 200 single-subscription panels x 64 = 12800 queued events, past the 8192
+/// global cap while each panel stays well under its own 1024 aggregate.
+#[test]
+fn event_bus_global_limits_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let mut panels = Vec::new();
+    let mut topics = Vec::new();
+    for i in 0..200 {
+        let panel = PanelId::new(i + 1);
+        let t = bus
+            .declare_topic(&format!("xuepoo.test:global{i}"))
+            .unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        panels.push(panel);
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..80 {
+        for (panel, t) in panels.iter().zip(topics.iter()) {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.total_queued_events() <= BUS_GLOBAL_LIMIT,
+                "global event count must never exceed {BUS_GLOBAL_LIMIT} after publish"
+            );
+            assert!(
+                bus.total_queued_bytes() <= BUS_GLOBAL_BYTES_LIMIT,
+                "global byte count must never exceed {BUS_GLOBAL_BYTES_LIMIT} after publish"
+            );
+            assert!(bus.queued_events_for_panel(*panel) <= BUS_PER_PANEL_LIMIT);
+        }
+    }
+}
+
+/// CTX-0534 (#921): with exactly `BUS_PER_PANEL_LIMIT` events queued, one
+/// further publish that targets a *different*, empty subscription must loop
+/// its eviction across the panel's queues (not inspect only the new queue),
+/// admit the arrival, and stay at or below the cap. Under DropOldest the
+/// newest event survives and the drop is counted.
+#[test]
+fn event_bus_overflow_admits_newest_across_panel_queues() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    // 32 queues (the subscription cap) x 32 events = 1024 per-panel events,
+    // exactly `BUS_PER_PANEL_LIMIT`.
+    let mut topics = Vec::new();
+    for i in 0..32 {
+        let t = bus
+            .declare_topic(&format!("xuepoo.test:overflow{i}"))
+            .unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..32 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+        }
+    }
+    assert_eq!(bus.queued_events_for_panel(panel), BUS_PER_PANEL_LIMIT);
+    // Target the last subscription; its queue is full, but the panel
+    // aggregate is also at the cap. Eviction must free exactly one slot.
+    let target = topics.last().expect("at least one subscription");
+    let newest = BoundedPayload::try_new("newest").unwrap();
+    bus.publish(target, newest.clone()).unwrap();
+    assert_eq!(
+        bus.queued_events_for_panel(panel),
+        BUS_PER_PANEL_LIMIT,
+        "overflow publish must evict then admit, keeping the aggregate at the cap"
+    );
+    assert!(
+        bus.total_dropped() > 0,
+        "DropOldest overflow must be counted, never silent"
+    );
+    let drained = bus.drain_batch(panel, target.as_str(), 64, BUS_EVENT_MAX_BYTES);
+    assert_eq!(
+        drained.last().map(|e| e.payload.as_str()),
+        Some(newest.as_str()),
+        "the newest event must survive DropOldest"
+    );
 }
 
 #[test]

@@ -27,6 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_package::requirement::VersionReq;
@@ -70,6 +71,8 @@ const STORE_FILE_MODE: u32 = 0o600;
 const STORE_DIR_MODE: u32 = 0o700;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// In-process mutual exclusion for store mutation transactions (PLUG-REG-011).
+static STORE_MUTEX: Mutex<()> = Mutex::new(());
 
 /// One local-directory install or update request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +454,28 @@ pub fn install_local_dir(
         }
     }
 
+    // PLUG-REG-011: serialize complete store mutation transactions under
+    // mutual exclusion, reload under protection to preserve unrelated updates,
+    // and revalidate baseline around consent to reject concurrent mutations.
+    let _lock = STORE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let current_records = resolution::load_index(store_root)?;
+    let current_existing = current_records
+        .iter()
+        .find(|record| record.plugin_id == plugin_id)
+        .cloned();
+
+    // Revalidate around consent: if this plugin was modified in the store
+    // while consent/staging was in flight, fail closed with a retryable conflict.
+    if current_existing != existing {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(PackageOpError::Store(format!(
+            "concurrent transaction conflict on '{plugin_id}': store record changed during install; retry operation"
+        )));
+    }
+
     let target = package_dir.join(&version);
     let mut created_target = false;
     if target.exists() {
@@ -495,7 +520,7 @@ pub fn install_local_dir(
     harden_tree(&target)?;
 
     let root = format!("{PACKAGES_DIR}/{plugin_id}/{version}");
-    let mut updated_records = records.clone();
+    let mut updated_records = current_records;
     updated_records.retain(|record| record.plugin_id != plugin_id);
     updated_records.push(PluginRecord {
         source_class: SourceClass::LocalPath,
@@ -581,6 +606,9 @@ pub fn set_enabled(
     plugin_id: &str,
     enabled: bool,
 ) -> Result<bool, PackageOpError> {
+    let _lock = STORE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut records = resolution::load_index(store_root)?;
     let record = records
         .iter_mut()
@@ -610,6 +638,9 @@ pub fn set_enabled(
 /// [`PackageOpError::Store`] when the record is unknown or the index cannot be
 /// rewritten.
 pub fn uninstall(store_root: &Path, plugin_id: &str) -> Result<UninstallReport, PackageOpError> {
+    let _lock = STORE_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut records = resolution::load_index(store_root)?;
     let index = records
         .iter()
@@ -1417,6 +1448,99 @@ mod tests {
             store.join("packages/xuepoo.reinstall/2.0.0").is_dir(),
             "retained predecessor v2.0.0 must remain on unchanged reinstall of v3.0.0"
         );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn concurrent_two_writer_unrelated_updates_preserved() {
+        // PLUG-REG-011: deterministic two-writer model where Writer 2 commits an
+        // unrelated plugin while Writer 1 is awaiting consent. When Writer 1
+        // commits, it reloads under protection and preserves Writer 2's plugin.
+        let scratch = scratch("plug-reg-011-unrelated");
+        let store = scratch.join("store");
+
+        // Give source_a a capability so consent() is actually invoked.
+        let source_a = write_plugin(
+            &scratch.join("src_a"),
+            "xuepoo.plugin_a",
+            "1.0.0",
+            Some("platform.notify"),
+        );
+        let source_b = write_plugin(&scratch.join("src_b"), "xuepoo.plugin_b", "1.0.0", None);
+
+        // Writer 1 installs plugin A, but while awaiting consent, Writer 2
+        // commits plugin B into the store.
+        let report_a = install_local_dir(
+            &store,
+            &source_a,
+            &LocalInstallOptions::default(),
+            &mut |_consent_req| {
+                // Interleaved Writer 2 commit:
+                let report_b = install(&store, &source_b);
+                assert_eq!(report_b.plugin_id, "xuepoo.plugin_b");
+                Ok(true)
+            },
+        )
+        .expect("Writer 1 should succeed")
+        .expect("install report");
+
+        assert_eq!(report_a.plugin_id, "xuepoo.plugin_a");
+
+        // Both plugin A and plugin B must be present in current.json.
+        let records = resolution::load_index(&store).expect("index");
+        let ids: Vec<&str> = records.iter().map(|r| r.plugin_id.as_str()).collect();
+        assert!(
+            ids.contains(&"xuepoo.plugin_a") && ids.contains(&"xuepoo.plugin_b"),
+            "both unrelated plugins must be preserved in index, found: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn concurrent_two_writer_same_plugin_conflict_fails_closed() {
+        // PLUG-REG-011: deterministic two-writer model where Writer 2 mutates
+        // the SAME plugin while Writer 1 is awaiting consent. Writer 1 revalidates
+        // baseline under protection and returns a retryable conflict.
+        let scratch = scratch("plug-reg-011-conflict");
+        let store = scratch.join("store");
+
+        // Give source_v1 a capability so consent() is actually invoked.
+        let source_v1 = write_plugin(
+            &scratch.join("src_v1"),
+            "xuepoo.conflict",
+            "1.0.0",
+            Some("platform.notify"),
+        );
+        let source_v2 = write_plugin(&scratch.join("src_v2"), "xuepoo.conflict", "2.0.0", None);
+
+        // Writer 1 begins install of v1.0.0. During consent, Writer 2 commits v2.0.0.
+        let err = install_local_dir(
+            &store,
+            &source_v1,
+            &LocalInstallOptions::default(),
+            &mut |_consent_req| {
+                // Interleaved Writer 2 commits v2.0.0 for the same plugin:
+                let report_v2 = install(&store, &source_v2);
+                assert_eq!(report_v2.version, "2.0.0");
+                Ok(true)
+            },
+        )
+        .expect_err("Writer 1 must detect concurrent conflict on same plugin");
+
+        let PackageOpError::Store(msg) = err else {
+            panic!("expected Store conflict error, got: {err:?}");
+        };
+        assert!(
+            msg.contains("concurrent transaction conflict"),
+            "error should indicate concurrent conflict, got: {msg}"
+        );
+
+        // Store index must retain Writer 2's commit (v2.0.0), not overwritten by Writer 1.
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].plugin_id, "xuepoo.conflict");
+        assert_eq!(records[0].version, "2.0.0");
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

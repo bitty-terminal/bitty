@@ -31,6 +31,11 @@ path = "../../benches/vt_throughput.rs"
 harness = false
 
 [[bench]]
+name = "parser_throughput"
+path = "../../benches/parser_throughput.rs"
+harness = false
+
+[[bench]]
 name = "terminal_state"
 path = "../../benches/terminal_state.rs"
 harness = false

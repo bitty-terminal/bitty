@@ -81,6 +81,13 @@ jobs:
       # job) validates for the new wiring.
       - name: Check M1 matrix driver (fixture test)
         run: bash scripts/tests/m1-matrix.test.sh
+      # M1-11 / CTX-0576: the committed parser-throughput baseline guards the
+      # compatibility-milestone performance requirement (no pathological
+      # regression versus plain-text throughput). The check is bounded
+      # (512 KiB/corpus, 3 rounds), deterministic, and headless; the ratio gate
+      # is deliberately generous so shared runners do not flake.
+      - name: Check parser throughput regression (M1-11 baseline)
+        run: cargo test -p bitty-perf --test parser_throughput_regression --locked
 
       - name: Check status drift gate (OQ/RFC/crate-count/submodule)
         run: |

@@ -1239,18 +1239,32 @@ pub struct AtlasUpload {
 /// Shelf-packed glyph atlas plus its CPU-side coverage texture and upload
 /// queue.
 ///
-/// Eviction policy mirrors [`GlyphCache`]: when a fresh allocation does not
-/// fit, the layout, slot table, texture, and pending queue are reset
-/// wholesale (one counted eviction) and the allocation retries once.
-/// Bitmaps larger than the whole atlas fall back to [`GlyphSource::Inline`]
-/// instead of failing the frame. All outcomes are deterministic functions
-/// of the insertion sequence.
+/// Eviction mirrors [`GlyphCache`] but is **frame consistent** (CTX-0531):
+/// [`GlyphAtlas::ensure`] never resets between two placements of one pass.
+/// When an allocation no longer fits it records exhaustion and returns
+/// [`GlyphSource::Inline`]; the caller rebuilds the whole pass against a
+/// wholesale-reset atlas ([`GlyphAtlas::evict_now`], one counted eviction).
+/// That way a returned [`DrawList`] never mixes slots from two
+/// [`GlyphAtlas::epoch`]s: every emitted atlas slot resolves to the texels
+/// of exactly one generation, and anything that still cannot fit degrades
+/// to a clean inline fallback. Bitmaps larger than the whole atlas always
+/// fall back inline (a reset cannot make them fit). All outcomes are
+/// deterministic functions of the insertion sequence.
 #[derive(Debug)]
 pub struct GlyphAtlas {
     layout: AtlasLayout,
     slots: HashMap<RasterKey, AtlasSlot>,
     texels: Vec<u8>,
     pending: Vec<AtlasUpload>,
+    /// Generation of the current placement set, bumped by every wholesale
+    /// reset (eviction or explicit [`GlyphAtlas::clear`]). Every emitted
+    /// slot belongs to exactly one generation, so a consumer can tell
+    /// placements from different generations apart without trusting slot
+    /// coordinates.
+    epoch: u64,
+    /// Set when a placement pass could not fit a glyph and therefore needs
+    /// the caller to reset and rebuild before the frame is returned.
+    exhausted: bool,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -1280,11 +1294,80 @@ impl GlyphAtlas {
             slots: HashMap::new(),
             texels: vec![0; len],
             pending: Vec::new(),
+            epoch: 0,
+            exhausted: false,
             hits: 0,
             misses: 0,
             evictions: 0,
             inline_fallbacks: 0,
         })
+    }
+
+    /// Generation of the current placement set.
+    ///
+    /// Starts at `0` and increments on every wholesale reset, so an emitted
+    /// slot and the atlas texture it addresses can be compared by generation
+    /// instead of by trusting the slot coordinates alone.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// True when a placement pass could not fit a glyph and needs a reset
+    /// plus a full rebuild before the frame is returned.
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Clears the exhaustion flag so a fresh placement pass starts clean.
+    fn clear_exhausted(&mut self) {
+        self.exhausted = false;
+    }
+
+    /// Captures the cumulative lookup/fallback counters an abandoned
+    /// placement pass must roll back (CTX-0531).
+    fn cost_snapshot(&self) -> (u64, u64, u64) {
+        (self.hits, self.misses, self.inline_fallbacks)
+    }
+
+    /// Restores [`Self::cost_snapshot`] counters after discarding a pass.
+    /// Evictions are deliberately excluded: the wholesale reset did happen.
+    fn restore_cost(&mut self, (hits, misses, inline_fallbacks): (u64, u64, u64)) {
+        self.hits = hits;
+        self.misses = misses;
+        self.inline_fallbacks = inline_fallbacks;
+    }
+
+    /// Resets the atlas wholesale and bumps the placement generation.
+    ///
+    /// Call only at a placement boundary: any slot already handed to a
+    /// [`DrawList`] belongs to the wiped generation and must be discarded
+    /// and rebuilt. Cumulative counters are untouched; the exhaustion reset
+    /// adds its own eviction count in [`Self::evict_now`].
+    fn reset_placements(&mut self) {
+        self.layout.reset();
+        self.slots.clear();
+        self.texels.fill(0);
+        self.pending.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Applies a wholesale exhaustion reset and its counted eviction.
+    ///
+    /// Called by the frame pipeline between passes (CTX-0531), never inside
+    /// one, so no already-emitted slot is invalidated mid-pass.
+    fn evict_now(&mut self) {
+        self.reset_placements();
+        self.exhausted = false;
+        self.evictions = self.evictions.saturating_add(1);
+    }
+
+    /// True when `width` x `height` can never fit this atlas, regardless of
+    /// how full it is (zero span or larger than the atlas itself).
+    fn oversized(&self, width: u16, height: u16) -> bool {
+        let dims = self.layout.dimensions();
+        width == 0 || height == 0 || width > dims.width || height > dims.height
     }
 
     /// Atlas texture dimensions.
@@ -1363,15 +1446,20 @@ impl GlyphAtlas {
     /// counts an eviction), this explicit invalidation leaves the cumulative
     /// counters untouched.
     pub fn clear(&mut self) {
-        self.layout.reset();
-        self.slots.clear();
-        self.texels.fill(0);
-        self.pending.clear();
+        self.reset_placements();
     }
 
     /// Ensures `bitmap` is placed for `key`, queueing an upload when newly
     /// placed. Blank bitmaps are refused by callers before reaching the
     /// atlas.
+    ///
+    /// Never resets mid-pass (CTX-0531): a bitmap that does not currently
+    /// fit degrades to [`GlyphSource::Inline`] and marks the atlas
+    /// [`Self::is_exhausted`] so the caller can reset and rebuild. The
+    /// glyph is deliberately *not* cached in `slots` on that path, so a
+    /// rebuild re-attempts placement against the fresh generation. Bitmaps
+    /// larger than the whole atlas fall back inline without marking
+    /// exhaustion (a reset cannot make them fit).
     pub fn ensure(&mut self, key: RasterKey, bitmap: &GlyphBitmap) -> GlyphSource {
         if let Some(slot) = self.slots.get(&key) {
             self.hits += 1;
@@ -1385,17 +1473,15 @@ impl GlyphAtlas {
             (Ok(w), Ok(h)) => (w, h),
             _ => return self.fallback_inline(bitmap),
         };
+        if self.oversized(width, height) {
+            return self.fallback_inline(bitmap);
+        }
 
-        let slot = match self.layout.allocate(width, height) {
-            Some(slot) => slot,
-            None => {
-                // Wholesale eviction (deterministic), then retry once.
-                self.evict_all();
-                match self.layout.allocate(width, height) {
-                    Some(slot) => slot,
-                    None => return self.fallback_inline(bitmap),
-                }
-            }
+        let Some(slot) = self.layout.allocate(width, height) else {
+            // Exhaustion (not oversize): flag for a caller-driven reset and
+            // rebuild; this pass keeps a clean inline fallback meanwhile.
+            self.exhausted = true;
+            return self.fallback_inline(bitmap);
         };
 
         let coverage = coverage_mask(bitmap);
@@ -1406,14 +1492,6 @@ impl GlyphAtlas {
         });
         self.slots.insert(key, slot);
         GlyphSource::Atlas { slot }
-    }
-
-    fn evict_all(&mut self) {
-        self.layout.reset();
-        self.slots.clear();
-        self.texels.fill(0);
-        self.pending.clear();
-        self.evictions += 1;
     }
 
     fn fallback_inline(&mut self, bitmap: &GlyphBitmap) -> GlyphSource {
@@ -1697,6 +1775,15 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// Errors mean the frame failed outright; partial frames are never
     /// returned.
     ///
+    /// Frame-consistent atlas placement (CTX-0531): a placement pass that
+    /// exhausts the atlas abandons its already-emitted slots, the atlas
+    /// resets wholesale, and a second bounded pass places the same cells
+    /// against the fresh [`GlyphAtlas::epoch`] with further eviction
+    /// disabled. Every glyph in the returned list therefore either samples
+    /// the current texture generation or carries a clean inline fallback;
+    /// none can address a stale slot. At most one eviction reset and two
+    /// passes occur per frame.
+    ///
     /// # Errors
     ///
     /// Propagates rasterizer failures (never cached by [`GlyphCache`]).
@@ -1710,7 +1797,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let descriptor = SnapshotDamage::new(snapshot, damage, self.cell);
         let plan = plan_frame(&descriptor);
 
-        let mut list = DrawList {
+        let list = DrawList {
             generation: snapshot.generation,
             fills: Vec::new(),
             // Rounded decoration is composed by the runtime present path
@@ -1732,12 +1819,59 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
 
         // Coalesced dirty rectangles are pairwise disjoint (frame.rs
         // invariant), so their cell ranges never overlap and each cell is
-        // visited at most once, in row-major order per rectangle.
+        // visited at most once, in row-major order per rectangle. Clone them
+        // so cells can be placed while the list is being built (plan output
+        // is tiny and bounded).
         let cols = snapshot.width;
-        // Clone the plan's rectangles so cells can be placed while the list
-        // is being built (plan output is tiny and bounded).
         let dirty_rects = list.plan.dirty_rects.clone();
-        for dirty in &dirty_rects {
+
+        // Bounded frame-consistent pass (CTX-0531). Pass 1 may observe
+        // exhaustion: its partial list is discarded, the atlas is reset
+        // wholesale (one counted eviction), and pass 2 re-places every cell
+        // against the fresh generation. Pass 2 never resets: whatever still
+        // does not fit keeps its inline fallback, so the returned list has
+        // slots from exactly one generation.
+        let counters_before = self.counters;
+        let atlas_costs_before = self.atlas.cost_snapshot();
+        let mut pass = self.place_pass(snapshot, cols, &dirty_rects, &list.plan);
+        if self.atlas.is_exhausted() {
+            // Discard pass 1: roll back its renderer/atlas cost counters so
+            // the caller sees only the work that produced the returned list.
+            // The eviction counter is intentionally kept (the reset really
+            // happened).
+            self.counters = counters_before;
+            self.atlas.restore_cost(atlas_costs_before);
+            self.atlas.evict_now();
+            pass = self.place_pass(snapshot, cols, &dirty_rects, &list.plan);
+        }
+        Ok(pass)
+    }
+
+    /// Runs one bounded placement pass over `dirty_rects`.
+    ///
+    /// Extracted from [`Self::render`] so a frame-consistent rebuild can
+    /// discard the partial pass and repeat it against a fresh atlas
+    /// generation (CTX-0531). Clears the atlas exhaustion flag on entry so
+    /// the pass reports only its own outcome.
+    fn place_pass(
+        &mut self,
+        snapshot: &Snapshot,
+        cols: usize,
+        dirty_rects: &[RectPx],
+        plan: &FramePlan,
+    ) -> DrawList {
+        self.atlas.clear_exhausted();
+        let mut pass = DrawList {
+            generation: snapshot.generation,
+            fills: Vec::new(),
+            rounded_fills: Vec::new(),
+            backgrounds: Vec::new(),
+            overlay_fills: Vec::new(),
+            glyphs: Vec::new(),
+            images: Vec::new(),
+            plan: plan.clone(),
+        };
+        for dirty in dirty_rects {
             let col_range = pixel_span_to_cells(dirty.x, dirty.width, self.cell.width);
             let row_range = pixel_span_to_cells(dirty.y, dirty.height, self.cell.height);
             for row in row_range {
@@ -1751,11 +1885,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                         // that cannot exist, never corrupt real cells.
                         continue;
                     };
-                    self.place_cell(term_cell, row, col, cols, &mut list, &mut background_run);
+                    self.place_cell(term_cell, row, col, cols, &mut pass, &mut background_run);
                 }
             }
         }
-        Ok(list)
+        pass
     }
 
     /// Emits background, decorations, and (unless suppressed) one glyph for
@@ -2051,6 +2185,43 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         }
         let (origin_x, origin_y) = (i64::from(origin_px.0), i64::from(origin_px.1));
         let baseline = origin_y + self.baseline_offset;
+
+        // Bounded frame-consistent pass (CTX-0531), mirroring `render`: a
+        // pass that exhausts the atlas discards its partial vector, resets
+        // the atlas, and repeats against the fresh generation, so the
+        // returned instances never mix atlas generations.
+        let counters_before = self.counters;
+        let atlas_costs_before = self.atlas.cost_snapshot();
+        let (mut out, exhausted) = self.overlay_line(text, origin_x, baseline, max_cells, color);
+        if exhausted {
+            self.counters = counters_before;
+            self.atlas.restore_cost(atlas_costs_before);
+            self.atlas.evict_now();
+            // The final pass may legitimately re-flag exhaustion (a line whose
+            // glyphs exceed one fresh generation); its inline fallbacks are
+            // the correct terminal outcome, and the next pass clears the flag
+            // on entry.
+            out = self
+                .overlay_line(text, origin_x, baseline, max_cells, color)
+                .0;
+        }
+        out
+    }
+
+    /// Runs one bounded overlay-text placement pass (CTX-0531 extraction).
+    ///
+    /// Returns the instances and whether the atlas reported exhaustion. A
+    /// glyph that could not fit keeps its inline fallback in this pass; the
+    /// caller resets and rebuilds when `exhausted` is true.
+    fn overlay_line(
+        &mut self,
+        text: &str,
+        origin_x: i64,
+        baseline: i64,
+        max_cells: usize,
+        color: Rgba8,
+    ) -> (Vec<GlyphInstance>, bool) {
+        self.atlas.clear_exhausted();
         let mut out = Vec::new();
         let mut col = 0usize;
         for character in text.chars().take(max_cells) {
@@ -2115,7 +2286,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters.glyphs_emitted += 1;
             col += advance;
         }
-        out
+        (out, self.atlas.is_exhausted())
     }
 }
 

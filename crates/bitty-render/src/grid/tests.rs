@@ -698,7 +698,7 @@ fn atlas_miss_then_hit_with_upload_drain() {
 }
 
 #[test]
-fn atlas_eviction_is_wholesale_and_deterministic() {
+fn atlas_eviction_is_frame_consistent_and_deterministic() {
     // 8x8 atlas; fake bitmaps are 6..=8 wide and 6 tall, so each shelf
     // holds at most one placement and only two shelves exist.
     let script: Vec<TerminalAction> = ['a', 'b', 'c'].iter().map(|&c| print(c)).collect();
@@ -706,7 +706,7 @@ fn atlas_eviction_is_wholesale_and_deterministic() {
     let snapshot = state.snapshot();
     let damage = damage_all(&state);
 
-    let render_once = || -> GridRenderer<FakeRasterizer> {
+    let render_once = || -> (GridRenderer<FakeRasterizer>, Vec<GlyphSource>) {
         let mut grid = GridRenderer::with_atlas_dimension(
             FakeRasterizer::new(),
             &font_query(),
@@ -714,24 +714,131 @@ fn atlas_eviction_is_wholesale_and_deterministic() {
             8,
         )
         .unwrap();
-        let _list = grid.render(&snapshot, &damage).unwrap();
-        grid
+        let list = grid.render(&snapshot, &damage).unwrap();
+        let sources = list.glyphs.iter().map(|g| g.source.clone()).collect();
+        (grid, sources)
     };
 
-    let a = render_once();
-    let b = render_once();
+    let (a, a_sources) = render_once();
+    let (b, b_sources) = render_once();
 
-    assert_eq!(a.atlas_stats().3, 0); // nothing oversized
-    assert_eq!(
-        a.atlas_stats().2,
-        2,
-        "'b' and 'c' each force one wholesale reset on the tiny atlas"
-    );
-    assert_eq!(a.atlas_placements(), 1); // post-eviction retry holds only 'c'
+    assert_eq!(a_sources, b_sources);
+    assert_eq!(a_sources.len(), 3, "every cell still emits a glyph");
+
+    // Exactly one wholesale reset (the first exhaustion). The rebuilt pass
+    // runs with eviction disabled, so 'a' keeps an atlas slot while 'b' and
+    // 'c' degrade to clean inline fallbacks — never a stale atlas slot from
+    // the wiped generation (CTX-0531).
+    assert_eq!(a.atlas_stats().2, 1, "one frame-consistent reset");
+    assert_eq!(a.atlas_stats().3, 2, "'b' and 'c' fall back inline");
+    assert_eq!(a.atlas_placements(), 1, "only 'a' fits one generation");
+    assert!(matches!(a_sources[0], GlyphSource::Atlas { .. }));
+    assert!(matches!(a_sources[1], GlyphSource::Inline { .. }));
+    assert!(matches!(a_sources[2], GlyphSource::Inline { .. }));
 
     // Both runs end with byte-identical textures and stats.
     assert_eq!(a.atlas_texels(), b.atlas_texels());
     assert_eq!(a.atlas_stats(), b.atlas_stats());
+}
+
+/// CTX-0531: a mid-frame atlas eviction must never leave a glyph instance
+/// pointing at a slot from the wiped generation. The fixture drives the
+/// real `render` pass on a tiny atlas whose working set (the full grid) is
+/// larger than one generation, so exhaustion is guaranteed mid-pass, then
+/// resolves every emitted atlas UV against the final texture.
+#[test]
+fn mid_frame_eviction_never_leaves_stale_atlas_slots() {
+    // Full 4-cell row: 4 glyphs, each 6..=8 wide x 6 tall on an 8x8 atlas.
+    // At most one 8x8 shelf fits, so the third placement exhausts the atlas
+    // while two slots were already emitted into the same pass.
+    let state = state_from(
+        &['a', 'b', 'c', 'd']
+            .iter()
+            .map(|&c| print(c))
+            .collect::<Vec<_>>(),
+    );
+    let snapshot = state.snapshot();
+    let damage = full_damage(&state);
+
+    let run = || -> (super::DrawList, Vec<u8>, crate::atlas::AtlasDims, usize) {
+        let mut grid = GridRenderer::with_atlas_dimension(
+            FakeRasterizer::new(),
+            &font_query(),
+            cell_metrics(),
+            8,
+        )
+        .unwrap();
+        let list = grid.render(&snapshot, &damage).unwrap();
+        let texels = grid.atlas_texels().to_vec();
+        let dims = grid.atlas_dims();
+        let placements = grid.atlas_placements();
+        (list, texels, dims, placements)
+    };
+
+    // Expected coverage for one fake char, mirroring `coverage_mask`'s RGB
+    // luminance rule. This is the exact texel content the glyph's own bitmap
+    // must resolve to.
+    let expected_coverage = |character: char| -> Vec<u8> {
+        let bitmap = FakeRasterizer::bitmap_for(character);
+        bitmap
+            .data
+            .chunks_exact(3)
+            .map(|px| ((u16::from(px[0]) + u16::from(px[1]) + u16::from(px[2])) / 3) as u8)
+            .collect()
+    };
+
+    // A tiny 8x8 atlas has room for exactly one fake glyph (6..=8 wide, 6
+    // tall) per generation. Whatever cannot fit must be a clean inline
+    // fallback, never a stale atlas UV.
+    for _ in 0..2 {
+        let (list, texels, dims, placements) = run();
+        assert_eq!(list.glyphs.len(), 4, "all four cells still emit a glyph");
+        assert_eq!(
+            placements, 1,
+            "a rebuilt generation holds only the glyphs that fit"
+        );
+
+        // Independent model of the live texture: every emitted atlas glyph
+        // must sample exactly its own post-eviction coverage inside the
+        // atlas bounds. A stale pre-eviction slot would sample zeroed texels
+        // or another glyph's coverage instead.
+        let stride = usize::from(dims.width);
+        let mut atlas_glyphs = 0usize;
+        for (col, glyph) in list.glyphs.iter().enumerate() {
+            let character = ['a', 'b', 'c', 'd'][col];
+            match &glyph.source {
+                GlyphSource::Atlas { slot } => {
+                    atlas_glyphs += 1;
+                    let uv = glyph.uv;
+                    let u0 = (uv[0] * f32::from(dims.width)).round() as usize;
+                    let v0 = (uv[1] * f32::from(dims.height)).round() as usize;
+                    let u1 = (uv[2] * f32::from(dims.width)).round() as usize;
+                    let v1 = (uv[3] * f32::from(dims.height)).round() as usize;
+                    assert_eq!(u0, usize::from(slot.x));
+                    assert_eq!(v0, usize::from(slot.y));
+                    assert!(u1 <= usize::from(dims.width) && v1 <= usize::from(dims.height));
+                    let mut sampled = Vec::with_capacity(u1 - u0);
+                    for row in v0..v1 {
+                        sampled.extend_from_slice(&texels[row * stride + u0..row * stride + u1]);
+                    }
+                    assert_eq!(
+                        sampled,
+                        expected_coverage(character),
+                        "atlas glyph for {character:?} must resolve to its own \
+                         post-eviction texels, not a stale slot"
+                    );
+                }
+                GlyphSource::Inline { mask, .. } => {
+                    assert_eq!(
+                        mask,
+                        &expected_coverage(character),
+                        "inline fallback for {character:?} must carry its own coverage"
+                    );
+                }
+            }
+        }
+        assert_eq!(atlas_glyphs, 1, "exactly one glyph survives on the atlas");
+    }
 }
 
 #[test]

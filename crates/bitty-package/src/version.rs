@@ -245,6 +245,17 @@ fn validate_identifiers(
     Ok(())
 }
 
+fn compare_numeric_identifiers(a: &str, b: &str) -> std::cmp::Ordering {
+    // Strip leading zeros for canonical numeric comparison (even though validated
+    // SemVer numeric identifiers do not have leading zeros except a single '0').
+    let a_trimmed = a.trim_start_matches('0');
+    let b_trimmed = b.trim_start_matches('0');
+    a_trimmed
+        .len()
+        .cmp(&b_trimmed.len())
+        .then_with(|| a_trimmed.cmp(b_trimmed))
+}
+
 fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let a_ids: Vec<&str> = a.split('.').collect();
@@ -253,12 +264,8 @@ fn compare_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
         let a_is_num = ai.bytes().all(|c| c.is_ascii_digit());
         let b_is_num = bi.bytes().all(|c| c.is_ascii_digit());
         let ord = match (a_is_num, b_is_num) {
-            (true, true) => {
-                // Numeric comparison
-                let an: u64 = ai.parse().unwrap_or(u64::MAX);
-                let bn: u64 = bi.parse().unwrap_or(u64::MAX);
-                an.cmp(&bn)
-            }
+            // Numeric comparison without lossy integer conversion (PLUG-REG-013)
+            (true, true) => compare_numeric_identifiers(ai, bi),
             (true, false) => Ordering::Less, // numeric has lower precedence
             (false, true) => Ordering::Greater,
             (false, false) => ai.cmp(bi), // lexical ASCII
@@ -333,5 +340,138 @@ mod tests {
     #[test]
     fn reject_invalid_char() {
         assert!(Version::parse("1.0.0*").is_err());
+    }
+
+    #[test]
+    fn compare_numeric_identifiers_edge_cases() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_numeric_identifiers("0", "0"), Ordering::Equal);
+        assert_eq!(compare_numeric_identifiers("0", "1"), Ordering::Less);
+        assert_eq!(compare_numeric_identifiers("1", "0"), Ordering::Greater);
+        assert_eq!(compare_numeric_identifiers("2", "10"), Ordering::Less);
+        assert_eq!(compare_numeric_identifiers("10", "9"), Ordering::Greater);
+        assert_eq!(compare_numeric_identifiers("123", "124"), Ordering::Less);
+        assert_eq!(compare_numeric_identifiers("124", "123"), Ordering::Greater);
+        // Exceeding u64 range
+        assert_eq!(
+            compare_numeric_identifiers("18446744073709551616", "18446744073709551615"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_numeric_identifiers(
+                "888888888888888888888888888888",
+                "999999999999999999999999999999"
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_numeric_identifiers(
+                "1000000000000000000000000000000",
+                "999999999999999999999999999999"
+            ),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn lossless_numeric_prerelease_ordering_exceeding_u64() {
+        // PLUG-REG-013: numeric prerelease identifiers exceeding u64::MAX must not
+        // collapse to u64::MAX fallback equality.
+        let v_u64_max = Version::parse("1.0.0-18446744073709551615").unwrap();
+        let v_u64_plus_1 = Version::parse("1.0.0-18446744073709551616").unwrap();
+        assert!(v_u64_max < v_u64_plus_1);
+        assert_eq!(
+            v_u64_max.cmp_precedence(&v_u64_plus_1),
+            std::cmp::Ordering::Less
+        );
+
+        let v_large_8 = Version::parse("1.0.0-888888888888888888888888888888").unwrap();
+        let v_large_9 = Version::parse("1.0.0-999999999999999999999999999999").unwrap();
+        assert!(v_large_8 < v_large_9);
+        assert_eq!(
+            v_large_8.cmp_precedence(&v_large_9),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            v_large_9.cmp_precedence(&v_large_8),
+            std::cmp::Ordering::Greater
+        );
+
+        // Different digit counts exceeding u64 range
+        let v_len_30 = Version::parse("1.0.0-999999999999999999999999999999").unwrap();
+        let v_len_31 = Version::parse("1.0.0-1000000000000000000000000000000").unwrap();
+        assert!(v_len_30 < v_len_31);
+    }
+
+    #[test]
+    fn numeric_prerelease_ordering_properties_symmetry_and_transitivity() {
+        use std::cmp::Ordering;
+
+        let raw_versions = [
+            "1.0.0-0",
+            "1.0.0-1",
+            "1.0.0-2",
+            "1.0.0-9",
+            "1.0.0-10",
+            "1.0.0-42",
+            "1.0.0-99",
+            "1.0.0-100",
+            "1.0.0-18446744073709551615", // u64::MAX
+            "1.0.0-18446744073709551616", // u64::MAX + 1
+            "1.0.0-888888888888888888888888888888",
+            "1.0.0-999999999999999999999999999999",
+            "1.0.0-1000000000000000000000000000000",
+            "1.0.0-9999999999999999999999999999999999999999",
+            "1.0.0-9999999999999999999999999999999999999999.1",
+            "1.0.0-alpha",
+            "1.0.0-alpha.0",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.18446744073709551616",
+            "1.0.0-alpha.beta",
+            "1.0.0",
+        ];
+
+        let versions: Vec<Version> = raw_versions
+            .iter()
+            .map(|raw| Version::parse(raw).unwrap())
+            .collect();
+
+        // 1. Reflexivity: v.cmp(v) == Equal
+        for (idx, v) in versions.iter().enumerate() {
+            assert_eq!(
+                v.cmp(v),
+                Ordering::Equal,
+                "reflexivity failed for version index {idx} ({v})"
+            );
+        }
+
+        // 2. Strict total ordering & transitivity: for all i < j, v[i] < v[j]
+        for i in 0..versions.len() {
+            for j in (i + 1)..versions.len() {
+                let vi = &versions[i];
+                let vj = &versions[j];
+                assert_eq!(
+                    vi.cmp(vj),
+                    Ordering::Less,
+                    "expected {vi} < {vj} (index {i} < {j})"
+                );
+                assert!(vi < vj);
+
+                // 3. Symmetry: v[i].cmp(v[j]) == v[j].cmp(v[i]).reverse()
+                assert_eq!(
+                    vi.cmp(vj),
+                    vj.cmp(vi).reverse(),
+                    "symmetry failed between {vi} and {vj}"
+                );
+
+                // 4. Transitivity across triplet (i, j, k)
+                for vk in versions.iter().skip(j + 1) {
+                    assert!(
+                        vi < vk,
+                        "transitivity failed: {vi} < {vj} and {vj} < {vk} but not {vi} < {vk}"
+                    );
+                }
+            }
+        }
     }
 }

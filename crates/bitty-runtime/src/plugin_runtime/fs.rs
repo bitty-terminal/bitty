@@ -52,7 +52,9 @@ impl FileSystem for NativeFileSystem {
     }
 
     fn sync_file(&self, path: &Path) -> io::Result<()> {
-        let file = std::fs::File::open(path)?;
+        // Windows FlushFileBuffers requires GENERIC_WRITE access; opening
+        // with write permissions ensures cross-platform durability flushes.
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
         file.sync_all()
     }
 

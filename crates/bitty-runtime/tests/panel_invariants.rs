@@ -29,6 +29,7 @@
 use bitty_runtime::{
     FocusDirection, LayoutNode, MAX_WORKSPACES, Runtime, SplitAxis, View, ViewId, WsCloseRequest,
 };
+use std::collections::BTreeSet;
 
 /// Deterministic xorshift64 PRNG for reproducible randomized sequences.
 struct Rng(u64);
@@ -606,4 +607,114 @@ fn closing_workspace_rehomes_moved_primary_owner() {
     assert!(rt.is_primary_view(&rehomed));
     assert_eq!(rt.workspace_count(), 1);
     check_invariants(&mut rt, "after owner-workspace close");
+}
+
+/// WS-INV-4 / F-1 (CTX-0567): a `ViewId` that was ever installed in a layout
+/// must never be reissued after retirement. The high-water mark must record
+/// the *outgoing* layout at every replacement, not only the incoming one.
+///
+/// The raw [`Runtime::layout_mut`] escape installs leaf ids without going
+/// through an allocation funnel, so an id can be live without the allocator
+/// having observed it. Retiring that id by replacing the layout with a lower
+/// id must still quarantine it: retirement is tracked explicitly, never
+/// inferred from the survivor's maximum.
+#[test]
+fn retired_view_ids_survive_lower_id_replacement_and_workspace_close() {
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let mut retired: BTreeSet<u64> = BTreeSet::new();
+
+    // ws1: install high ids through the `layout_mut` escape and retire each by
+    // replacing the live layout with a lower id. The escape is the only public
+    // install path that does not itself raise the high-water mark.
+    for raw in [20_u64, 30, 40] {
+        let id = ViewId::new(raw);
+        *rt.layout_mut() = LayoutNode::leaf(View::new(id, 80, 24));
+        assert_eq!(rt.layout().leaf_ids(), vec![id]);
+        retired.insert(raw);
+        rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(4), 80, 24)));
+    }
+
+    // Retire escaped ids across several workspaces by closing each *active*
+    // escaped slot without a prior switch: `remove_workspace` must fold the
+    // outgoing live layout into the high-water before dropping it. The final
+    // close resets the last workspace (single-leaf reallocation).
+    for _ in 0..4 {
+        let index = rt.workspace_new().expect("new workspace below capacity");
+        assert_eq!(index, rt.active_workspace_index(), "new slot is active");
+        // `workspace_new` committed a real allocated id; overwriting the slot
+        // through the escape retires it as well.
+        retired.insert(rt.focused_view().expect("new slot focus").0);
+        let escaped = ViewId::new(100 + index as u64);
+        *rt.layout_mut() = LayoutNode::leaf(View::new(escaped, 80, 24));
+        retired.insert(escaped.0);
+        rt.workspace_close_at(index).expect("close escaped slot");
+        assert!(
+            rt.workspace_count() >= 1,
+            "last close resets, never empties"
+        );
+    }
+
+    // Close the remaining last workspace: its live id is retired too.
+    let last_view = rt.focused_view().expect("sole workspace focus");
+    retired.insert(last_view.0);
+    rt.workspace_close_at(0).expect("close last workspace");
+    assert_eq!(
+        rt.workspace_count(),
+        1,
+        "last close resets to one workspace"
+    );
+    assert_ne!(
+        rt.focused_view(),
+        Some(last_view),
+        "the last-workspace reset allocates a fresh id"
+    );
+
+    // Allocate many new views, committing each (the split/close shape): none
+    // may reuse a retired id, allocation stays strictly monotonic, and every
+    // committed live id is unique.
+    let mut last = 0_u64;
+    for step in 0..128 {
+        let id = rt.next_view_id_global();
+        assert!(
+            !retired.contains(&id.0),
+            "retired ViewId {id:?} was reissued at step {step} (WS-INV-4/F-1)"
+        );
+        assert!(
+            id.0 > last,
+            "allocation must be strictly monotonic: {id:?} after {last}"
+        );
+        last = id.0;
+        rt.set_layout(LayoutNode::leaf(View::new(id, 80, 24)));
+        let live = rt.layout().leaf_ids();
+        let unique: BTreeSet<u64> = live.iter().map(|leaf| leaf.0).collect();
+        assert_eq!(unique.len(), live.len(), "live ViewIds must stay unique");
+    }
+
+    check_invariants(&mut rt, "after retirement stress");
+}
+
+/// WS-INV-4 / F-1 (CTX-0567): two consecutive `layout_mut` writes retire a
+/// high id with no install funnel in between. The escape guard must fold the
+/// id it is about to overwrite even when no `set_layout` follows; otherwise
+/// the retired id is never observed and the allocator reissues it once
+/// allocation climbs past it.
+#[test]
+fn consecutive_layout_mut_writes_quarantine_the_retired_id() {
+    let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let escaped = ViewId::new(9);
+    *rt.layout_mut() = LayoutNode::leaf(View::new(escaped, 80, 24));
+    // Second escape retires `escaped` without any allocator-visible funnel.
+    *rt.layout_mut() = LayoutNode::leaf(View::new(ViewId::new(2), 80, 24));
+    assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(2)]);
+
+    // Allocation climbs toward `escaped`; it must skip the retired id rather
+    // than reissuing it (without the escape guard this loop hits 9).
+    for step in 0..32 {
+        let id = rt.next_view_id_global();
+        assert_ne!(
+            id, escaped,
+            "ViewId retired by a bare layout_mut overwrite was reissued at step {step}"
+        );
+        rt.set_layout(LayoutNode::leaf(View::new(id, 80, 24)));
+    }
 }

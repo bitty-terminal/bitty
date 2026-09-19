@@ -9,8 +9,8 @@ use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
     ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
     EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
-    MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -980,6 +980,126 @@ fn osc_prompt_marks_map_zone_letters() {
             data: BoundedBytes::new(b"Z".to_vec()),
         }]
     );
+}
+
+#[test]
+fn osc9_notification_maps_message_and_stays_bounded() {
+    // M1-16 (#1142): the xterm-style `OSC 9;<message>` form is classified as
+    // a notification with no title. A message containing `;` is rejoined.
+    assert_eq!(
+        parse(b"\x1b]9;build finished\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc9,
+                title: None,
+                body: BoundedString::new("build finished"),
+            }
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]9;a;b;c\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc9,
+                title: None,
+                body: BoundedString::new("a;b;c"),
+            }
+        }]
+    );
+    // Oversized payload truncates at the bounded-string cap, never grows.
+    let oversized = "z".repeat(BoundedString::MAX_LEN + 64);
+    let seq = format!("\x1b]9;{oversized}\x07").into_bytes();
+    let actions = parse(&seq);
+    match actions.as_slice() {
+        [TerminalAction::OscNotification { notification }] => {
+            assert_eq!(notification.body.as_str().len(), BoundedString::MAX_LEN);
+        }
+        other => panic!("oversized OSC 9 must truncate, got {other:?}"),
+    }
+}
+
+#[test]
+fn osc9_empty_message_is_inert() {
+    // An empty notification is not a notification: it stays inert telemetry
+    // so hostile output cannot drive a repeated empty surface.
+    let actions = parse(b"\x1b]9;\x07");
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [TerminalAction::OscUnknown { id: 9, .. }]
+        ),
+        "empty OSC 9 must stay inert, got {actions:?}"
+    );
+}
+
+#[test]
+fn osc777_notify_maps_title_and_body() {
+    // M1-16 (#1142): rxvt-unicode / kitty `OSC 777;notify;<title>;<body>`.
+    assert_eq!(
+        parse(b"\x1b]777;notify;Build;finished\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc777,
+                title: Some(BoundedString::new("Build")),
+                body: BoundedString::new("finished"),
+            }
+        }]
+    );
+    // Body may contain `;`; segments after the title are rejoined.
+    assert_eq!(
+        parse(b"\x1b]777;notify;T;one;two\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc777,
+                title: Some(BoundedString::new("T")),
+                body: BoundedString::new("one;two"),
+            }
+        }]
+    );
+    // An empty title is allowed (title is optional in practice).
+    assert_eq!(
+        parse(b"\x1b]777;notify;;body\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc777,
+                title: Some(BoundedString::new("")),
+                body: BoundedString::new("body"),
+            }
+        }]
+    );
+}
+
+#[test]
+fn osc777_malformed_and_unknown_subcommands_stay_inert() {
+    for sequence in [
+        &b"\x1b]777;notify\x07"[..],       // no title/body
+        &b"\x1b]777;notify;title\x07"[..], // no body
+        &b"\x1b]777;notify;t;\x07"[..],    // empty body
+        &b"\x1b]777;other;t;b\x07"[..],    // unknown sub-command
+        &b"\x1b]777;notify;t;b;c\x07"[..], // still valid (rejoined) — handled below
+    ] {
+        let actions = parse(sequence);
+        if sequence == b"\x1b]777;notify;t;b;c\x07" {
+            assert_eq!(
+                actions,
+                vec![TerminalAction::OscNotification {
+                    notification: Notification {
+                        source: NotificationSource::Osc777,
+                        title: Some(BoundedString::new("t")),
+                        body: BoundedString::new("b;c"),
+                    }
+                }]
+            );
+            continue;
+        }
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [TerminalAction::OscUnknown { id: 777, .. }]
+            ),
+            "malformed OSC 777 must stay inert, got {actions:?} for {sequence:?}"
+        );
+    }
 }
 
 #[test]

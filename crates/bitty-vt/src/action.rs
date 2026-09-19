@@ -413,6 +413,35 @@ pub enum DynamicColorOp {
     Set(Rgb),
 }
 
+/// Terminal-originated notification form (CTX-0577, M1-16).
+///
+/// The VT parser only classifies and bounds the payload; whether a
+/// notification is shown (and how) is a runtime policy decision
+/// (default deny, see `specifications/bell-notification-policy.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotificationSource {
+    /// `OSC 9;<message>`: the xterm-style notification form.
+    Osc9,
+    /// `OSC 777;notify;<title>;<body>`: the rxvt-unicode / kitty form.
+    Osc777,
+}
+
+/// A bounded terminal-originated desktop-notification request (CTX-0577).
+///
+/// Emitted for the recognized notification OSC forms (`OSC 9`, `OSC 777`).
+/// Every field is length-bounded by the parser's OSC collector; the runtime
+/// treats the strings as untrusted display data and never executes or
+/// expands them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Notification {
+    /// Which wire form produced this request.
+    pub source: NotificationSource,
+    /// Optional title; absent for `OSC 9`.
+    pub title: Option<BoundedString>,
+    /// Message body (always present).
+    pub body: BoundedString,
+}
+
 /// Operation carried by one `OSC 4` palette pair (CTX-0392, issue #648).
 ///
 /// The parser only classifies and bounds the payload. Answering queries and
@@ -721,6 +750,15 @@ pub enum TerminalAction {
     OscCwd {
         /// File URL payload, length-bounded.
         url: BoundedString,
+    },
+    /// Terminal-originated notification request (`OSC 9`, `OSC 777`, CTX-0577).
+    ///
+    /// Terminal state treats this as inert; the runtime applies the
+    /// bell/notification policy (default deny) and the capability/consent and
+    /// rate gates before anything is surfaced.
+    OscNotification {
+        /// Recognized notification form and its bounded payload.
+        notification: Notification,
     },
     /// Hyperlink span begin/end (`OSC 8`); `None` ends the current span.
     OscHyperlink {

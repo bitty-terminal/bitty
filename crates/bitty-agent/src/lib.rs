@@ -59,7 +59,8 @@
 //!   bounded message history (`<= 128` / `<= 256 KiB`), and a
 //!   `SideQueue<AgentObservation>` (`DEFAULT_SIDE_QUEUE_CAPACITY = 64`).
 //!   State machine `Created -> Running <-> WaitingToolResult -> Completed/Failed`
-//!   is deterministic and headless-testable.
+//!   is deterministic and headless-testable. A first assistant turn carrying
+//!   tool calls transitions straight to `WaitingToolResult`.
 //! - **Errors:** [`AgentError`] / [`ErrorClass`] — owned, cloneable,
 //!   `std::error::Error`.
 //!

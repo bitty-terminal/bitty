@@ -264,8 +264,14 @@ impl AgentSession {
             });
         }
 
-        // State machine transitions.
+        // State machine transitions. The assistant-with-tool-calls arm is
+        // derived before the broad `Created` arm so a first accepted assistant
+        // turn that requests tools enters `WaitingToolResult`; any other
+        // message from `Created` enters `Running`.
         match (self.state, role, msg.tool_calls.is_empty()) {
+            (SessionState::Created, Role::Assistant, false) => {
+                self.state = SessionState::WaitingToolResult;
+            }
             (SessionState::Created, _, _) => self.state = SessionState::Running,
             (SessionState::Running, Role::Assistant, false) => {
                 self.state = SessionState::WaitingToolResult;
@@ -401,6 +407,48 @@ mod tests {
         s.complete().unwrap();
         assert!(s.is_terminal());
         assert!(s.push_user("after complete").is_err());
+    }
+
+    #[test]
+    fn first_assistant_tool_call_from_created_waits_then_runs() {
+        let mut s = AgentSession::new(agent_id(), 4);
+        assert_eq!(s.state(), SessionState::Created);
+        s.declare_tool(spec("read_file")).unwrap();
+        let call = crate::tool::ToolCall::new("id1", "read_file", "{}").unwrap();
+        s.push_assistant("calling", vec![call.clone()]).unwrap();
+        assert_eq!(s.state(), SessionState::WaitingToolResult);
+        let results = s.stub_dispatch(&[call]).unwrap();
+        s.push_tool_results(results).unwrap();
+        assert_eq!(s.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn first_assistant_without_tool_calls_from_created_runs() {
+        let mut s = AgentSession::new(agent_id(), 4);
+        assert_eq!(s.state(), SessionState::Created);
+        s.push_assistant("no tools", vec![]).unwrap();
+        assert_eq!(s.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn full_tool_loop_from_created_is_consistent() {
+        let mut s = AgentSession::new(agent_id(), 4);
+        s.push_user("hi").unwrap();
+        assert_eq!(s.state(), SessionState::Running);
+        s.declare_tool(spec("read_file")).unwrap();
+        let call = crate::tool::ToolCall::new("id1", "read_file", "{}").unwrap();
+        s.push_assistant("calling", vec![call.clone()]).unwrap();
+        assert_eq!(s.state(), SessionState::WaitingToolResult);
+        let results = s.stub_dispatch(&[call]).unwrap();
+        s.push_tool_results(results).unwrap();
+        assert_eq!(s.state(), SessionState::Running);
+        let call2 = crate::tool::ToolCall::new("id2", "read_file", "{}").unwrap();
+        s.push_assistant("calling again", vec![call2.clone()])
+            .unwrap();
+        assert_eq!(s.state(), SessionState::WaitingToolResult);
+        let results2 = s.stub_dispatch(&[call2]).unwrap();
+        s.push_tool_results(results2).unwrap();
+        assert_eq!(s.state(), SessionState::Running);
     }
 
     #[test]

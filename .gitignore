@@ -1,4 +1,5 @@
 .carryctx/config.local.toml
 .worktrees/
-/target/
+/.trash/
 /recording/
+/target/

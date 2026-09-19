@@ -86,7 +86,12 @@
 
 ### Local gates before push (mandatory)
 
-- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus full `cargo test --workspace --all-targets --locked` and `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets` and validate GitHub workflows with `act -n` (or `act --dry-run`) for `.github/workflows/ci.yml` and `.github/workflows/codeql.yml`. All must pass. `act` only checks workflow syntax, not runtime or performance, so `cargo test` must still pass locally; do not rely on `act` alone. Never push with known local failures to save CI.
+- Before pushing any branch: run repository justfile gates locally and ensure 0 issues: `just check` (fmt-check + clippy -D warnings + test + actionlint + markdownlint) plus full `cargo test --workspace --all-targets --locked` and `cargo check --target x86_64-pc-windows-gnu --workspace --all-targets`. Never push with known local failures to save CI.
+- **Local CI pre-validation is mandatory before opening or updating a PR**: run the remote `Quality gates` job locally with real `act` execution (`just ci-local`) and get a green job before pushing. The recipe owns the working configuration:
+  - the `bitty-act` image (built automatically on first `just ci-local` from the in-repo `.github/act/Dockerfile`) ships the pinned 1.98.1 toolchain plus a non-root `ubuntu` user matching the host uid, because some tests (`chmod 000` unreadable-file checks) fail when run as root;
+  - the repo is bind-mounted, the cargo registry/git caches are persisted and pre-seeded under `../.targets/act-cache`, and the build target dir is shared so repeat runs are incremental; `CARGO_BUILD_JOBS` defaults to `nproc` (override, e.g. `CARGO_BUILD_JOBS=4 just ci-local`, when running two local-CI jobs at once);
+  - the job user joins the host `docker` group so the workflow's dockerized `actionlint` step works (do not also mount the docker socket — act mounts it and a second mount errors with `Duplicate mount point`).
+    A PR may only be pushed once this local run succeeds; the backlog is ~200 issues and remote CI time must not be spent rediscovering failures the local run catches. Report any step that genuinely cannot run locally. `act -n` alone is workflow-syntax-only and not sufficient.
 - Also run `actionlint -color` and `act -n` explicitly when workflows change; install `act` if missing (`which act` else note absence) but do not skip `just check`/`cargo test`/`cargo check`.
 - Verify no `TODO/FIXME` and frontmatter/links valid for docs.
 

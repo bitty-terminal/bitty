@@ -18,6 +18,53 @@ typecheck:
 actionlint:
     actionlint -color
 
+# Run the GitHub CI 'Quality gates' job locally through act before pushing a PR.
+# Builds the bitty-act image from .github/act/Dockerfile (one-time).
+# Spends remote CI only on what already passed here.
+#
+# Performance: the repository is bind-mounted (no 38 GB target/ copy), the
+# cargo registry/git caches are persisted under ../.targets/act-cache and
+# seeded once from the host CARGO_HOME (no re-download of ~800 crates), and
+# the build target dir lives in the same persistent cache so repeat runs are
+# incremental. Cargo uses every local core.
+ci-local *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="$(git rev-parse --show-toplevel)"
+    cache="${BITTY_ACT_CACHE:-$root/../.targets/act-cache}"
+    host_cargo="${CARGO_HOME:-$HOME/.cargo}"
+    # Fixed in-image toolchain locations baked into .github/act/Dockerfile.
+    # scratch-paths-exempt: container paths, not host paths.
+    ctr_home=/home/ubuntu ctr_cargo=/usr/local/cargo ctr_rustup=/usr/local/rustup
+    # The actionlint CI step runs a dockerized actionlint, so the job user
+    # needs the host docker group as a supplementary group (act mounts the
+    # docker socket itself; do not mount it again or Docker errors with a
+    # duplicate mount point).
+    docker_gid="$(getent group docker 2>/dev/null | cut -d: -f3 || true)"
+    group_add=()
+    [ -n "$docker_gid" ] && group_add=(--group-add "$docker_gid")
+    if ! docker image inspect bitty-act:latest >/dev/null 2>&1; then
+      echo "building bitty-act:latest from .github/act/Dockerfile (one-time)" >&2
+      docker build -t bitty-act:latest "$root/.github/act" >&2
+    fi
+    mkdir -p "$cache/cargo-registry" "$cache/cargo-git" "$cache/target"
+    if [ -z "$(ls -A "$cache/cargo-registry" 2>/dev/null)" ] && [ -d "$host_cargo/registry" ]; then
+      cp -a "$host_cargo/registry/." "$cache/cargo-registry/"
+    fi
+    if [ -z "$(ls -A "$cache/cargo-git" 2>/dev/null)" ] && [ -d "$host_cargo/git" ]; then
+      cp -a "$host_cargo/git/." "$cache/cargo-git/"
+    fi
+    # Bind the persistent target dir at both CARGO_TARGET_DIR and the repo's
+    # own target/ so gates that read target/debug/bitty see a container-built
+    # binary instead of the host's (the host glibc is newer than the image's).
+    exec act -W .github/workflows/ci.yml -j quality \
+      --pull=false --bind --container-architecture linux/amd64 \
+      -P ubuntu-latest=bitty-act:latest \
+      --container-options "-u ubuntu ${group_add[*]:-} -v $cache/cargo-registry:$ctr_cargo/registry -v $cache/cargo-git:$ctr_cargo/git -v $cache/target:/cache/target -v $cache/target:$root/target" \
+      --env HOME=$ctr_home --env CARGO_HOME=$ctr_cargo --env RUSTUP_HOME=$ctr_rustup \
+      --env CARGO_TARGET_DIR=/cache/target --env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(nproc)}" \
+      {{args}}
+
 pty-gate:
     ./scripts/check-pty-gated-tests.sh
 

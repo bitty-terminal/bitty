@@ -1,24 +1,102 @@
 <!-- markdownlint-disable MD025 MD060 -->
 
-# Fuzz corpora — VT parser (R-001, P0-AC-001/002)
+# Fuzzing — cargo-fuzz targets and retained corpora
 
-Retained corpus for the bounded VT parser adversarial suite. This directory
-is the content-addressable artifact cited by the risk evidence RFC for
-R-001 (R-001 → P0-AC-001 `adversarial: limit-boundary suite` +
-P0-AC-002 `adversarial: VT/UTF-8/OSC/DCS/APC fuzz`) and by the evidence
-matrix row `R-001 Evidence: P0-AC-001/002 / fuzz/corpora/vt/`.
+`fuzz/` holds the cargo-fuzz target crate for the VT parser family plus the
+content-addressed seed corpora cited by the R-001 evidence.
 
-## Location and hash
+- `fuzz/Cargo.toml` — `bitty-fuzz` package, `cargo-fuzz = true`, three
+  `[[bin]]` targets, path dependency on `crates/bitty-vt`.
+- `fuzz/fuzz_targets/` — target sources (`common.rs` shared helpers).
+- `fuzz/corpora/` — retained seed corpora (this file documents them).
+- `fuzz/corpora/rich/` — separate R-002 `ImageStore` corpus; see
+  `fuzz/corpora/rich/README.md`.
 
-- Root: `fuzz/corpora/vt/` (30 `*.bin` files, ~35 KiB total).
-- Manifest: `fuzz/corpora/vt/SHA256SUMS` — per-file `sha256sum` output,
-  committed alongside the corpora so any drift is diff-visible.
-- Corporate scope: `fuzz/corpora/**` belongs to CTX-0088
-  `ctx-0088/feat-vt-r001-verification` (disjoint from Subagent B's
-  `docs/security/**` audits in the docs submodule). Do not move corpora into
-  `docs/security/**`.
+## Target crate
 
-## Coverage (adversarial dimensions per P0-AC-002)
+| Target           | Surface                                                                 |
+| ---------------- | ----------------------------------------------------------------------- |
+| `vt_parser`      | arbitrary bytes into `bitty_vt::Parser` (whole + byte-wise replay)      |
+| `osc_string`     | OSC payload bodies (`ESC ] ...` BEL / `ST`)                             |
+| `dcs_apc_string` | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and chunked shapes |
+
+Every target feeds bytes through the real public `bitty_vt::Parser::advance`
+API and drives it to completion. Each input asserts two contract invariants:
+a fresh parser is deterministic across identical runs, and a byte-wise feed
+produces the same action sequence as one bulk feed. The string targets also
+replay each envelope with a small kitty ledger cap so the raw-`APC`
+overflow/chunk-growth rejection paths (`KittyApcAssembler`) are reachable from
+a short input without allocating the production 320 MB ledger.
+
+Bounds (enforced in `fuzz/fuzz_targets/common.rs`, not by the harness):
+
+- Input is truncated to `MAX_INPUT_BYTES` (32 KiB); every retained seed is
+  ≤ 8 KiB, so seeds are never truncated.
+- Retained actions are capped at `MAX_ACTIONS` (65536); every byte is still
+  parsed, only the comparison vector stops growing.
+- No wall-clock, sleeps, randomness, filesystem, or network access exists in a
+  target. A hang trips libFuzzer's `-timeout` (25 s in the local smoke); a
+  panic/abort is a crash artifact. Both fail the campaign.
+
+`fuzz/` is intentionally **not** a root workspace member: `fuzz/Cargo.toml`
+carries an empty `[workspace]` table, so `cargo fmt/clippy/test --workspace`
+in the root and `just check` never build libFuzzer targets. Fuzzing requires
+nightly; the stable workspace gate is unaffected.
+
+## How to run
+
+```sh
+# Build all targets (compile-only check)
+cargo +nightly fuzz build
+
+# Run one target; a crash writes under fuzz/artifacts/<target>/
+cargo +nightly fuzz run vt_parser
+cargo +nightly fuzz run osc_string
+cargo +nightly fuzz run dcs_apc_string
+
+# Bounded smoke against the committed seeds
+cargo +nightly fuzz run vt_parser fuzz/corpora/vt_parser -- -runs=20000
+```
+
+cargo-fuzz needs the `nightly` toolchain and `cargo-fuzz`; install it into a
+user directory with `cargo +nightly install cargo-fuzz --locked`. Without
+nightly, a compile-only check is
+`cargo check --manifest-path fuzz/Cargo.toml` (stable can type-check the
+target crate).
+
+## Corpus retention policy on new findings
+
+- A crash/hang is a finding: fix it, then commit the **minimized** artifact
+  (`cargo +nightly fuzz tmin <target> <artifact>`) into
+  `fuzz/corpora/<target>/` with a descriptive name, and add its row to the
+  coverage table below.
+- New coverage discovered by long runs (`fuzz/corpus/<target>/` is
+  gitignored): promote the interesting cases into `fuzz/corpora/<target>/`
+  deliberately — never commit the scratch corpus wholesale. Bound any added
+  seed to the target's `MAX_INPUT_BYTES`.
+- Regenerate the manifest after any edit (from the repo root, so the
+  committed `fuzz/corpora/<target>/` path prefix stays stable):
+  `(cd fuzz/corpora/<target> && sha256sum *.bin | sed 's#  #  fuzz/corpora/<target>/#') > fuzz/corpora/<target>/SHA256SUMS`
+- Verify retention from the repo root:
+  `sha256sum -c fuzz/corpora/<target>/SHA256SUMS`.
+- Corpora are retained evidence: they are never executed as part of the
+  stable workspace build and are not imported as dependencies.
+
+## Retained corpora
+
+| Directory                     | Target           | Seeds | Source                                         |
+| ----------------------------- | ---------------- | ----- | ---------------------------------------------- |
+| `fuzz/corpora/vt_parser`      | `vt_parser`      | 30    | byte-identical copy of `fuzz/corpora/vt/*.bin` |
+| `fuzz/corpora/osc_string`     | `osc_string`     | 40    | OSC bodies extracted from `vt/` + hand-curated |
+| `fuzz/corpora/dcs_apc_string` | `dcs_apc_string` | 18    | DCS/APC/SOS/PM bodies + kitty `G` shapes       |
+| `fuzz/corpora/vt`             | (source corpus)  | 30    | R-001 retained corpus (below)                  |
+| `fuzz/corpora/rich`           | (ImageStore)     | 20    | R-002 corpus, own README                       |
+
+The `vt_parser` seeds are byte-identical copies of the R-001 corpus, so the
+fuzz target and the in-repo evidence share one corpus. The derived target
+corpora are additive; the `vt/` corpus remains the canonical R-001 artifact.
+
+## Coverage (adversarial dimensions per P0-AC-002, R-001)
 
 | File                                     | Dimension                                       | P0-AC   | Limit exercised                              |
 | ---------------------------------------- | ----------------------------------------------- | ------- | -------------------------------------------- |
@@ -61,6 +139,9 @@ matrix row `R-001 Evidence: P0-AC-001/002 / fuzz/corpora/vt/`.
   replays every `seeds/*.bin` panic-free and deterministic (≥10 seeds, actually
   14); `crates/bitty-vt/tests/harness.rs::vt_corpus_bounded_and_deterministic_for_bitty_vt`
   replays every `tests/compat/*/corpus/*.bin` (≥16 corpora).
+- The `fuzz/` target crate is compile-checked with `cargo +nightly fuzz build`
+  (or `cargo check --manifest-path fuzz/Cargo.toml`); it is outside the stable
+  workspace and does not affect `just check`.
 - `fuzz/corpora/vt/` retention itself satisfies P0-AC-002
   `corpus retained in-repo`; the SHA256 manifest satisfies the risk-evidence
   RFC artifact `corpus hash` requirement.

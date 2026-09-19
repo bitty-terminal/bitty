@@ -1,0 +1,6 @@
+area: osc-color
+provenance: spec|xterm patch #411 ctlseqs.txt "OSC Ps ; Pt ST": Ps=10 RGB set
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+action: osc_dynamic_color fg set 17 34 51

@@ -1,0 +1,7 @@
+area: osc-title
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps=2 Change Window Title to Pt"; OSC 2 ST-terminated
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+title: oracle
+action: osc_title oracle

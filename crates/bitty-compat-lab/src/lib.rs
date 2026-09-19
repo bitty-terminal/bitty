@@ -59,6 +59,7 @@ pub use harness::{
 
 pub mod compare;
 pub mod matrix;
+pub mod oracle;
 pub mod report;
 
 #[cfg(test)]

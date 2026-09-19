@@ -1,0 +1,8 @@
+area: cursor-style
+provenance: spec|xterm patch #411 ctlseqs.txt "CSI Ps SP q Set cursor style (DECSCUSR)": Ps=0 default
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+cursor_style: default
+action: cursor_style steady_block
+action: cursor_style default

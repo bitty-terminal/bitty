@@ -1,0 +1,6 @@
+area: cursor-keys
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1 -> Application Cursor Keys (DECCKM), VT100"
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: application_cursor_keys = on

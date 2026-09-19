@@ -1,0 +1,6 @@
+area: alternate-scroll
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1007 -> Disable Alternate Scroll Mode"
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: alternate_scroll = off

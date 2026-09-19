@@ -1,0 +1,6 @@
+area: mouse-tracking
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1003 -> Use All Motion Mouse Tracking" (Any-event)
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: mouse_tracking = any

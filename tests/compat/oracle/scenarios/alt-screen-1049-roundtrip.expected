@@ -1,0 +1,7 @@
+area: alternate-screen
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps=1049 Save cursor ... switch to Alternate Screen Buffer, clearing it first"; 1049l "Use Normal Screen Buffer and restore cursor"
+grid: 80x24
+grid_text: unchecked
+row 0: AC
+cursor: 0 2 visible
+mode: alt_screen = off

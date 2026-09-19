@@ -1,0 +1,6 @@
+area: synchronized-update
+provenance: spec|M1 RFC "Synchronized updates DECSET 2026"; xterm patch #411 ctlseqs.txt; ghostty synchronized_output=2026
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: synchronized_update = off

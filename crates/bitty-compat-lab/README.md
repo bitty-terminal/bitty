@@ -33,7 +33,20 @@ binaries for collecting dumps and rendering reports.
 - `src/matrix.rs` — release compatibility matrix over surfaces and terminals.
 - `src/compare.rs` — differential comparison helpers.
 - `src/report.rs` — report rendering helpers.
+- `src/oracle.rs` — M1 differential oracle corpus (CTX-0573): scenario
+  discovery, externally derived expectations, runner, and summary JSON.
 - `src/bin/collect_dumps.rs` — dump-collection binary.
 - `src/bin/compat_report.rs` — report binary.
+- `src/bin/oracle_runner.rs` — M1 differential oracle runner (CTX-0573).
 - `tests/` — lab integration tests (`compat_matrix`, `compare`, `report`,
-  `harness`, `live_compat`, `dogfooding_corpus`).
+  `harness`, `oracle`, `live_compat`, `dogfooding_corpus`).
+
+## Differential oracle (CTX-0573)
+
+`src/oracle.rs` plus `src/bin/oracle_runner.rs` implement the M1 differential
+oracle corpus: each scenario under `tests/compat/oracle/scenarios/` carries an
+expectation derived from the xterm control-sequence specification (patch #411)
+or a pinned reference capture, never from Bitty's own output. Run
+`cargo test -p bitty-compat-lab --test oracle --locked` or
+`cargo run -p bitty-compat-lab --bin oracle_runner --locked`; see
+`tests/compat/oracle/README.md` for layout, provenance, and how to extend.

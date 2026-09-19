@@ -1,0 +1,6 @@
+area: device-status
+provenance: spec|xterm patch #411 ctlseqs.txt "CSI Ps n Device Status Report": Ps=6 -> CSI r ; c R (1-based)
+grid: 80x24
+grid_text: blank
+cursor: 4 6 visible
+reply: \e[5;7R

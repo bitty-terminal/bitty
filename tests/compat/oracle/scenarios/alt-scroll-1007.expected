@@ -1,0 +1,6 @@
+area: alternate-scroll
+provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1007 -> Enable Alternate Scroll Mode"; M1 RFC 1007 = Alternate Scroll
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: alternate_scroll = on

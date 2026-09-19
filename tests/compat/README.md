@@ -6,7 +6,7 @@ Headless, bounded, `forbid(unsafe)` compatibility scaffolding for M1 Hardening P
 
 ## Scope
 
-Lab root for `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui,scrollback,graphics}/`. Each category holds placeholder corpora (`corpus/*.bin`, `*.txt`) and a `README.md` describing capture method, bounds, and differential harness. No window, no GPU, no network — `Parser -> TerminalAction -> State` only.
+Lab root for `tests/compat/{vt,osc,keyboard,mouse,resize,unicode,shell,tui,scrollback,graphics,modes}/`. Each category holds bounded corpora (`corpus/*.bin`, `*.txt`) and a `README.md` describing capture method, bounds, and differential harness. No window, no GPU, no network — `Parser -> TerminalAction -> State` only.
 
 ## Invariants
 
@@ -47,7 +47,16 @@ tests/compat/
   tui/corpus/* + README.md           # nvim/tmux/htop/fzf traces
   scrollback/corpus/* + README.md    # scrollback retention, 1049h/1049l restore
   graphics/corpus/* + README.md      # kitty APC G single/chunked admission
+  modes/corpus/* + README.md         # M1 private modes / input goldens (CTX-0571)
 ```
+
+## M1 golden snapshots
+
+`crates/bitty-compat-lab/tests/m1_mode_golden.rs` pins each `modes/` fixture
+to its canonical `State::state_hash`, semantic mode register, and emitted
+reply bytes (Terminal-state RFC replay guarantee 2). Re-record a golden only
+with an explicit behavior-change task, never to match a snapshot that
+disagrees with the accepted `compatibility-milestone-rfc.md`.
 
 ## No window/GPU leak
 

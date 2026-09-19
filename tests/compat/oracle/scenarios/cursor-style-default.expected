@@ -1,0 +1,9 @@
+area: cursor-style
+authority: text-rendering-rfc
+cite: maps `0` to the configured default style
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+cursor_style: default
+action: cursor_style steady_block
+action: cursor_style default

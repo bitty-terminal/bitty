@@ -1,0 +1,8 @@
+area: cursor-style
+authority: xterm-ctlseqs
+cite: Ps = 2  -> steady block.
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+cursor_style: steady_block
+action: cursor_style steady_block

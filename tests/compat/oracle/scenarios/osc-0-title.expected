@@ -1,0 +1,8 @@
+area: osc-title
+authority: xterm-ctlseqs
+cite: Ps = 0  -> Change Icon Name and Window Title to Pt.
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+title: bitty-oracle
+action: osc_title bitty-oracle

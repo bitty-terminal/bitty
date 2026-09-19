@@ -1,0 +1,7 @@
+area: osc-color
+authority: xterm-ctlseqs
+cite: Ps = 1 0  -> Change VT100 text foreground color to Pt.
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+action: osc_dynamic_color fg set 17 34 51

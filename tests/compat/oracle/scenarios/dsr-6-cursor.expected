@@ -1,0 +1,7 @@
+area: device-status
+authority: xterm-ctlseqs
+cite: Ps = 6  -> Report Cursor Position (CPR) [row;column].
+grid: 80x24
+grid_text: blank
+cursor: 4 6 visible
+reply: \e[5;7R

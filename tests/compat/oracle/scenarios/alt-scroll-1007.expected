@@ -1,0 +1,7 @@
+area: alternate-scroll
+authority: xterm-ctlseqs
+cite: Ps = 1 0 0 7  -> Enable Alternate Scroll Mode, xterm.  This
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: alternate_scroll = on

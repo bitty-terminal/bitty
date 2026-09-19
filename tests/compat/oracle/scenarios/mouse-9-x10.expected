@@ -1,0 +1,7 @@
+area: mouse-tracking
+authority: xterm-ctlseqs
+cite: Ps = 9  -> Send Mouse X & Y on button press.  See the
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: mouse_tracking = x10

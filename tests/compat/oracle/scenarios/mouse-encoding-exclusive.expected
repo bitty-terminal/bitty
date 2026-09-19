@@ -1,0 +1,7 @@
+area: mouse-encoding
+authority: xterm-charproc
+cite: they are mutually exclusive.  For consistency, a reset is
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: mouse_encoding = sgr

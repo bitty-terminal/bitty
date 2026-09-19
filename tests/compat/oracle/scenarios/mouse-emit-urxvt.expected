@@ -1,0 +1,10 @@
+area: mouse-encoding
+authority: xterm-ctlseqs
+cite: CSI followed by semicolon-separated
+engine: runtime
+stimulus: mouse-left-press
+at_cell: 0,0
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+emit: \e[32;1;1M

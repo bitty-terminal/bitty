@@ -1,0 +1,8 @@
+area: alternate-screen
+authority: xterm-ctlseqs
+cite: Ps = 4 7  -> Use Alternate Screen Buffer, xterm.  This
+grid: 80x24
+grid_text: unchecked
+row 0: B   A
+cursor: 0 1 visible
+mode: alt_screen = on

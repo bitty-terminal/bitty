@@ -1,0 +1,9 @@
+area: osc-color
+authority: kitty-window
+cite: rgb:{c.red:02x}/{c.green:02x}/{c.blue:02x}
+engine: runtime
+stimulus: allow-osc-color-set
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+reply: \e]10;rgb:1111/2222/3333\e\\\e]11;rgb:4444/5555/6666\e\\

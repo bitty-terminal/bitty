@@ -1,0 +1,7 @@
+area: osc-color
+authority: xterm-ctlseqs
+cite: If a "?" is given rather than a name or RGB specification,
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+action: osc_dynamic_color fg query

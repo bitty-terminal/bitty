@@ -1,0 +1,7 @@
+area: device-status
+authority: xterm-ctlseqs
+cite: -> CSI ? 6 c  ("VT102")
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+reply: \e[?6c

@@ -1,0 +1,7 @@
+area: synchronized-update
+authority: ghostty-modes
+cite: .{ .name = "synchronized_output", .value = 2026, .default_configurable = false },
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+mode: synchronized_update = off

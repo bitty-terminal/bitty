@@ -1,0 +1,10 @@
+area: mouse-encoding
+authority: xterm-ctlseqs
+cite: On button press, xterm sends CSI M
+engine: runtime
+stimulus: mouse-left-press
+at_cell: 0,0
+grid: 80x24
+grid_text: blank
+cursor: 0 0 visible
+emit: \e[M\x20\x21\x21

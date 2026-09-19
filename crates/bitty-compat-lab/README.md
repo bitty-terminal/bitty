@@ -33,7 +33,25 @@ binaries for collecting dumps and rendering reports.
 - `src/matrix.rs` — release compatibility matrix over surfaces and terminals.
 - `src/compare.rs` — differential comparison helpers.
 - `src/report.rs` — report rendering helpers.
+- `src/oracle.rs` — M1 differential oracle corpus (CTX-0573): scenario
+  discovery, externally derived expectations, runner, and summary JSON.
 - `src/bin/collect_dumps.rs` — dump-collection binary.
 - `src/bin/compat_report.rs` — report binary.
+- `src/bin/oracle_runner.rs` — M1 differential oracle runner (CTX-0573).
 - `tests/` — lab integration tests (`compat_matrix`, `compare`, `report`,
-  `harness`, `live_compat`, `dogfooding_corpus`).
+  `harness`, `oracle`, `live_compat`, `dogfooding_corpus`).
+
+## Differential oracle (CTX-0573)
+
+`src/oracle.rs` plus `src/bin/oracle_runner.rs` implement the M1 differential
+oracle corpus: each scenario under `tests/compat/oracle/scenarios/` carries
+structured provenance — an `authority` from the closed `AUTHORITIES` set and a
+verbatim `cite` token from that exact source (xterm `ctlseqs.txt` and
+`charproc.c`, the ghostty/kitty reference trees, and the accepted RFCs) — never
+Bitty's own output. The committed `tests/compat/oracle/authority-cites.txt`
+index plus `oracle_citations_are_backed_by_their_authority` reject a
+mis-citation. A `state` engine replays bytes through `bitty-vt`/`bitty-term-state`;
+a `runtime` engine drives `bitty-runtime` for OSC 10/11 query replies and mouse
+coordinate emission. Run `cargo test -p bitty-compat-lab --test oracle --locked`
+or `cargo run -p bitty-compat-lab --bin oracle_runner --locked`; see
+`tests/compat/oracle/README.md` for layout, provenance, and how to extend.

@@ -473,6 +473,24 @@ fn mouse_tracking_modes_are_distinct() {
 }
 
 #[test]
+fn decset_1007_maps_to_alternate_scroll_mode() {
+    // CTX-0566 (#970): `?1007` is alternate scroll, not a focus mode.
+    assert_eq!(
+        parse(b"\x1b[?1007h\x1b[?1007l"),
+        vec![
+            TerminalAction::SetMode {
+                mode: Mode::AlternateScroll,
+                enabled: true,
+            },
+            TerminalAction::SetMode {
+                mode: Mode::AlternateScroll,
+                enabled: false,
+            },
+        ]
+    );
+}
+
+#[test]
 fn ansi_sm_rm_map_insert_and_linefeed_modes() {
     assert_eq!(
         parse(b"\x1b[4h\x1b[20h\x1b[4l\x1b[33l"),

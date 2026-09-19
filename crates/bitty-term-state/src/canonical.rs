@@ -32,7 +32,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v6 adds the hyperlink id-space position (`CTX-0490`): prior versions
 /// omitted `next_hyperlink_id`, so states differing only in the ids their
 /// next links would receive collided.
-pub const CANONICAL_HASH_VERSION: u32 = 6;
+/// v7 adds the alternate-scroll mode (`CTX-0566` `DECSET 1007`): prior
+/// versions omitted it, so states differing only in the wheel-to-cursor-key
+/// translation flag collided.
+pub const CANONICAL_HASH_VERSION: u32 = 7;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -196,6 +199,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 6);
+        assert_eq!(CANONICAL_HASH_VERSION, 7);
     }
 }

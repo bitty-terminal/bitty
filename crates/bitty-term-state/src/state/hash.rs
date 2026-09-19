@@ -43,6 +43,7 @@ impl State {
         h.boolean(self.modes.cursor_blinking);
         h.boolean(self.modes.bracketed_paste);
         h.boolean(self.modes.focus_events);
+        h.boolean(self.modes.alternate_scroll);
         h.boolean(self.modes.synchronized_update);
         h.u32(self.modes.kitty_keyboard);
         h.option_tag(self.modes.mouse_tracking.is_some());
@@ -261,5 +262,6 @@ fn write_modes(out: &mut CanonicalHasher, modes: &Modes) {
     out.boolean(modes.cursor_blinking);
     out.boolean(modes.bracketed_paste);
     out.boolean(modes.focus_events);
+    out.boolean(modes.alternate_scroll);
     out.boolean(modes.synchronized_update);
 }

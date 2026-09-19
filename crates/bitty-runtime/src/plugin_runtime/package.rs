@@ -516,6 +516,25 @@ pub fn install_local_dir(
     harden_index(store_root)?;
 
     let previous_version = existing.as_ref().map(|record| record.version.clone());
+    // PLUG-REG-008: Keep predecessor/history metadata independently so that an
+    // unchanged reinstall does not advance retention and prune the genuinely
+    // retained predecessor.
+    let retained_predecessor = if let Some(ref existing_record) = existing {
+        if existing_record.version != version {
+            // Version updated: record the superseded version as the new predecessor.
+            save_predecessor(&package_dir, &existing_record.version)?;
+            Some(existing_record.version.clone())
+        } else {
+            // Unchanged reinstall: do not advance retention; keep the previously
+            // retained predecessor if its tree is still present.
+            load_predecessor(&package_dir)
+                .filter(|prev| prev != &version && package_dir.join(prev).is_dir())
+        }
+    } else {
+        // Fresh install: no predecessor.
+        None
+    };
+
     // CTX-0417: prune runs after the current.json commit, so the update is
     // already active here. A prune failure must not masquerade as a failed
     // install: report it as a typed warning and let the leftover dirs be
@@ -524,7 +543,7 @@ pub fn install_local_dir(
         store_root,
         &plugin_id,
         &version,
-        previous_version.as_deref(),
+        retained_predecessor.as_deref(),
     ) {
         Ok(()) => gc_warning,
         Err(error) => {
@@ -906,6 +925,32 @@ fn copy_tree(
     Ok(())
 }
 
+const PREDECESSOR_FILE: &str = ".predecessor";
+
+fn load_predecessor(package_dir: &Path) -> Option<String> {
+    let path = package_dir.join(PREDECESSOR_FILE);
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn save_predecessor(package_dir: &Path, version: &str) -> Result<(), PackageOpError> {
+    let path = package_dir.join(PREDECESSOR_FILE);
+    std::fs::write(&path, version.as_bytes()).map_err(|error| {
+        PackageOpError::Store(format!("cannot record predecessor version: {error}"))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(STORE_FILE_MODE));
+    }
+    Ok(())
+}
+
 /// Remove staged versions other than the current and the immediately previous
 /// one (RFC retained-generation recommendation: current plus previous).
 fn prune_retained_versions(
@@ -920,7 +965,11 @@ fn prune_retained_versions(
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(STAGING_PREFIX) || name == current || Some(name.as_str()) == previous {
+        if name.starts_with(STAGING_PREFIX)
+            || name.starts_with('.')
+            || name == current
+            || Some(name.as_str()) == previous
+        {
             continue;
         }
         let path = entry.path();
@@ -1308,6 +1357,67 @@ mod tests {
             records[0].manifest_hash, original_hash,
             "index must not be mutated on rejection"
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn unchanged_reinstall_preserves_retained_predecessor() {
+        // PLUG-REG-008: installing v1, upgrading to v2, then reinstalling v2
+        // must NOT advance retention and must NOT prune the retained v1 tree.
+        let scratch = scratch("plug-reg-008");
+        let store = scratch.join("store");
+
+        // 1. Initial install of v1.0.0
+        let source_v1 = write_plugin(&scratch, "xuepoo.reinstall", "1.0.0", None);
+        install(&store, &source_v1);
+        assert!(store.join("packages/xuepoo.reinstall/1.0.0").is_dir());
+
+        // 2. Upgrade to v2.0.0: v1.0.0 is retained as predecessor.
+        let source_v2 = write_plugin(&scratch, "xuepoo.reinstall", "2.0.0", None);
+        let update = install(&store, &source_v2);
+        assert!(update.updated);
+        assert_eq!(update.previous_version.as_deref(), Some("1.0.0"));
+        assert!(store.join("packages/xuepoo.reinstall/2.0.0").is_dir());
+        assert!(
+            store.join("packages/xuepoo.reinstall/1.0.0").is_dir(),
+            "v1.0.0 must be retained as predecessor after update to v2.0.0"
+        );
+
+        // 3. Unchanged reinstall of v2.0.0: must NOT prune v1.0.0.
+        let reinstall = install(&store, &source_v2);
+        assert!(reinstall.updated);
+        assert!(
+            store.join("packages/xuepoo.reinstall/2.0.0").is_dir(),
+            "current v2.0.0 tree must remain"
+        );
+        assert!(
+            store.join("packages/xuepoo.reinstall/1.0.0").is_dir(),
+            "retained predecessor v1.0.0 must remain on unchanged reinstall"
+        );
+
+        // 4. Further upgrade to v3.0.0: v2.0.0 is retained as predecessor, v1.0.0 is pruned.
+        let source_v3 = write_plugin(&scratch, "xuepoo.reinstall", "3.0.0", None);
+        let update3 = install(&store, &source_v3);
+        assert!(update3.updated);
+        assert!(store.join("packages/xuepoo.reinstall/3.0.0").is_dir());
+        assert!(
+            store.join("packages/xuepoo.reinstall/2.0.0").is_dir(),
+            "v2.0.0 must be retained as predecessor after update to v3.0.0"
+        );
+        assert!(
+            !store.join("packages/xuepoo.reinstall/1.0.0").exists(),
+            "older v1.0.0 must be pruned after advancing to v3.0.0"
+        );
+
+        // 5. Unchanged reinstall of v3.0.0: preserves retained v2.0.0.
+        let reinstall3 = install(&store, &source_v3);
+        assert!(reinstall3.updated);
+        assert!(store.join("packages/xuepoo.reinstall/3.0.0").is_dir());
+        assert!(
+            store.join("packages/xuepoo.reinstall/2.0.0").is_dir(),
+            "retained predecessor v2.0.0 must remain on unchanged reinstall of v3.0.0"
+        );
+
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

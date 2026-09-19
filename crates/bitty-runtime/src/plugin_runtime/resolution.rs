@@ -97,19 +97,38 @@ pub struct PluginRecord {
 /// [`PluginRuntimeError::Integrity`] for an over-limit or malformed index;
 /// [`PluginRuntimeError::Io`] for a read failure.
 pub fn load_index(store_root: &Path) -> Result<Vec<PluginRecord>, PluginRuntimeError> {
+    load_index_with_fs(store_root, &super::fs::NativeFileSystem)
+}
+
+/// Load and validate the `current.json` index using the specified filesystem adapter.
+///
+/// An absent index is an empty store (no installed packages). A present index
+/// that is over the byte ceiling, malformed, or carries invalid records is a
+/// fail-closed integrity error.
+///
+/// # Errors
+///
+/// [`PluginRuntimeError::Integrity`] for an over-limit or malformed index;
+/// [`PluginRuntimeError::Io`] for a read failure.
+pub fn load_index_with_fs(
+    store_root: &Path,
+    fs: &dyn super::fs::FileSystem,
+) -> Result<Vec<PluginRecord>, PluginRuntimeError> {
     let path = store_root.join(CURRENT_POINTER_FILE);
-    if !path.exists() {
+    if !fs.exists(&path) {
         return Ok(Vec::new());
     }
-    let metadata = std::fs::metadata(&path)
+    let len = fs
+        .metadata_len(&path)
         .map_err(|error| PluginRuntimeError::Io(format!("plugin index metadata: {error}")))?;
-    if metadata.len() as usize > PLUGIN_INDEX_MAX_BYTES {
+    if len as usize > PLUGIN_INDEX_MAX_BYTES {
         return Err(integrity(
             "current.json",
             "plugin index exceeds the byte ceiling",
         ));
     }
-    let text = std::fs::read_to_string(&path)
+    let text = fs
+        .read_to_string(&path)
         .map_err(|error| PluginRuntimeError::Io(format!("plugin index read: {error}")))?;
     parse_index(&text)
 }
@@ -130,29 +149,28 @@ static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// [`PluginRuntimeError::Integrity`] when the encoded index exceeds
 /// [`PLUGIN_INDEX_MAX_BYTES`]; [`PluginRuntimeError::Io`] on a write failure.
 pub fn write_index(store_root: &Path, records: &[PluginRecord]) -> Result<(), PluginRuntimeError> {
+    write_index_with_fs(store_root, records, &super::fs::NativeFileSystem)
+}
+
+/// Atomically write the `current.json` index using the specified filesystem adapter.
+///
+/// On failure, temporary staging files are cleaned up and the previous committed
+/// index is preserved intact (TERM-RUN-003, PLUG-REG-010).
+pub fn write_index_with_fs(
+    store_root: &Path,
+    records: &[PluginRecord],
+    fs: &dyn super::fs::FileSystem,
+) -> Result<(), PluginRuntimeError> {
     let text = encode_index(records)?;
-    std::fs::create_dir_all(store_root)
-        .map_err(|error| PluginRuntimeError::Io(format!("plugin store create: {error}")))?;
     let target = store_root.join(CURRENT_POINTER_FILE);
     let temp = store_root.join(format!(
         "current.json.tmp-{}-{}",
         std::process::id(),
         WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::write(&temp, text.as_bytes())
-        .map_err(|error| PluginRuntimeError::Io(format!("plugin index write: {error}")))?;
-    match std::fs::rename(&temp, &target) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Windows cannot rename over an existing file; the fallback still
-            // never leaves the temp file as the pointer.
-            let _ = std::fs::remove_file(&target);
-            std::fs::rename(&temp, &target).map_err(|error| {
-                let _ = std::fs::remove_file(&temp);
-                PluginRuntimeError::Io(format!("plugin index commit: {error}"))
-            })
-        }
-    }
+    super::fs::write_atomic_durably(fs, &target, text.as_bytes(), &temp)
+        .map_err(|error| PluginRuntimeError::Io(format!("plugin index commit: {error}")))?;
+    Ok(())
 }
 
 /// Resolve one record into a verified [`PluginPackage`], fail closed.
@@ -1027,5 +1045,54 @@ mod tests {
             crate::plugin_runtime::PluginRuntimeError::Incompatible { .. }
         ));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_index_preserves_committed_index_on_failed_replacement() {
+        use crate::plugin_runtime::fs::FakeFileSystem;
+        let fake_fs = FakeFileSystem::new();
+        let store = PathBuf::from("/plugins-store");
+
+        let record_a = PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "test.plugina".to_string(),
+            version: "1.0.0".to_string(),
+            root: "packages/test.plugina/1.0.0".to_string(),
+            manifest_hash: "a".repeat(64),
+            content_digest: "a".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        };
+
+        // Initial write succeeds
+        write_index_with_fs(&store, std::slice::from_ref(&record_a), &fake_fs)
+            .expect("initial write succeeds");
+        let loaded = load_index_with_fs(&store, &fake_fs).expect("loaded");
+        assert_eq!(loaded, vec![record_a.clone()]);
+
+        // Inject rename/replacement failure
+        fake_fs.set_fail_renames(true);
+
+        let record_b = PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "test.pluginb".to_string(),
+            version: "2.0.0".to_string(),
+            root: "packages/test.pluginb/2.0.0".to_string(),
+            manifest_hash: "b".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: false,
+            granted: Vec::new(),
+        };
+
+        let err = write_index_with_fs(&store, std::slice::from_ref(&record_b), &fake_fs);
+        assert!(err.is_err(), "replacement failure must fail closed");
+
+        // Destination current.json was NOT deleted and still returns record_a!
+        let reloaded = load_index_with_fs(&store, &fake_fs).expect("reloaded index");
+        assert_eq!(reloaded, vec![record_a]);
+
+        // Destination target exists
+        let target = store.join(CURRENT_POINTER_FILE);
+        assert!(fake_fs.exists(&target));
     }
 }

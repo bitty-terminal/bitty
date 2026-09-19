@@ -9,8 +9,14 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_lua::{BridgeError, LuaValue};
+
+use super::fs::{FileSystem, NativeFileSystem, write_atomic_durably};
+
+static STORE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum stored value bytes per entry.
 pub const STORE_MAX_VALUE_BYTES: usize = 8 * 1024;
@@ -29,6 +35,7 @@ pub const STORE_FILE_MAX_BYTES: usize =
 pub struct PluginStore {
     path: Option<PathBuf>,
     entries: BTreeMap<String, LuaValue>,
+    fs: Arc<dyn FileSystem>,
 }
 
 impl PluginStore {
@@ -38,6 +45,17 @@ impl PluginStore {
         Self {
             path: None,
             entries: BTreeMap::new(),
+            fs: Arc::new(NativeFileSystem),
+        }
+    }
+
+    /// Create an empty store configured with an explicit path and filesystem adapter.
+    #[must_use]
+    pub fn with_filesystem(path: Option<PathBuf>, fs: Arc<dyn FileSystem>) -> Self {
+        Self {
+            path,
+            entries: BTreeMap::new(),
+            fs,
         }
     }
 
@@ -48,17 +66,32 @@ impl PluginStore {
     /// Returns a bounded message when the file exists but is unreadable,
     /// over the file ceiling, or not the JSON subset this module writes.
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        if !path.exists() {
+        Self::load_with_fs(path, Arc::new(NativeFileSystem))
+    }
+
+    /// Load a store from `path` using the specified filesystem adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded message when the file exists but is unreadable,
+    /// over the file ceiling, or not the JSON subset this module writes.
+    pub fn load_with_fs(path: PathBuf, fs: Arc<dyn FileSystem>) -> Result<Self, String> {
+        if !fs.exists(&path) {
             return Ok(Self {
                 path: Some(path),
                 entries: BTreeMap::new(),
+                fs,
             });
         }
-        let metadata = std::fs::metadata(&path).map_err(|e| format!("store metadata: {e}"))?;
-        if metadata.len() as usize > STORE_FILE_MAX_BYTES {
+        let len = fs
+            .metadata_len(&path)
+            .map_err(|e| format!("store metadata: {e}"))?;
+        if len as usize > STORE_FILE_MAX_BYTES {
             return Err("plugin store exceeds the file ceiling".to_string());
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("store read: {e}"))?;
+        let text = fs
+            .read_to_string(&path)
+            .map_err(|e| format!("store read: {e}"))?;
         let value = parse_json(&text).map_err(|e| format!("store parse: {e}"))?;
         let mut entries = BTreeMap::new();
         if let LuaValue::Table(pairs) = value {
@@ -74,6 +107,7 @@ impl PluginStore {
         Ok(Self {
             path: Some(path),
             entries,
+            fs,
         })
     }
 
@@ -89,11 +123,18 @@ impl PluginStore {
     ///
     /// Fails closed with a typed `E_STORE_*`/`E_TIMEOUT` style error before
     /// any mutation when the key, value, or quota is invalid.
+    ///
+    /// Candidate entries are persisted before publishing to in-memory state;
+    /// on persistence failure, in-memory state and the previous committed
+    /// file remain untouched (TERM-RUN-003).
     pub fn set(&mut self, key: &str, value: LuaValue) -> Result<(), BridgeError> {
         validate_key(key)?;
         if matches!(value, LuaValue::Nil) {
-            self.entries.remove(key);
-            return self.persist();
+            let mut candidate = self.entries.clone();
+            candidate.remove(key);
+            self.persist_entries(&candidate)?;
+            self.entries = candidate;
+            return Ok(());
         }
         let encoded = encode_json(&value);
         if encoded.len() > STORE_MAX_VALUE_BYTES {
@@ -118,8 +159,9 @@ impl PluginStore {
                 "plugin store quota exceeded",
             ));
         }
+        self.persist_entries(&candidate)?;
         self.entries = candidate;
-        self.persist()
+        Ok(())
     }
 
     /// Number of entries.
@@ -140,21 +182,19 @@ impl PluginStore {
         self.path.as_deref()
     }
 
-    fn persist(&self) -> Result<(), BridgeError> {
+    fn persist_entries(&self, candidate: &BTreeMap<String, LuaValue>) -> Result<(), BridgeError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|_| {
-                BridgeError::new(
-                    "runtime",
-                    "E_STORE_IO",
-                    "could not create the plugin state directory",
-                )
-            })?;
-        }
+        let Some(parent) = path.parent() else {
+            return Err(BridgeError::new(
+                "runtime",
+                "E_STORE_IO",
+                "invalid plugin state path",
+            ));
+        };
         let mut buffer = String::from("{");
-        for (index, (key, value)) in self.entries.iter().enumerate() {
+        for (index, (key, value)) in candidate.iter().enumerate() {
             if index > 0 {
                 buffer.push(',');
             }
@@ -163,29 +203,23 @@ impl PluginStore {
             buffer.push_str(&encode_json(value));
         }
         buffer.push('}');
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, buffer.as_bytes()).map_err(|_| {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("store.json");
+        let temp = parent.join(format!(
+            "{}.tmp-{}-{}",
+            file_name,
+            std::process::id(),
+            STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_atomic_durably(&*self.fs, path, buffer.as_bytes(), &temp).map_err(|_| {
             BridgeError::new(
                 "runtime",
                 "E_STORE_IO",
-                "could not write the plugin state file",
+                "could not commit the plugin state file",
             )
-        })?;
-        match std::fs::rename(&temp, path) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // Windows cannot rename over an existing file; the fallback is
-                // still bounded and never leaves the temp file as the store.
-                let _ = std::fs::remove_file(path);
-                std::fs::rename(&temp, path).map_err(|_| {
-                    BridgeError::new(
-                        "runtime",
-                        "E_STORE_IO",
-                        "could not commit the plugin state file",
-                    )
-                })
-            }
-        }
+        })
     }
 }
 
@@ -550,5 +584,189 @@ fn utf8_width(first: u8) -> usize {
         3
     } else {
         4
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin_runtime::fs::FakeFileSystem;
+
+    #[test]
+    fn in_memory_store_operations() {
+        let mut store = PluginStore::in_memory();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.path(), None);
+
+        store
+            .set("alpha", LuaValue::String("val1".to_string()))
+            .expect("set alpha");
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.get("alpha"),
+            Some(LuaValue::String("val1".to_string()))
+        );
+
+        // Deletion via Nil
+        store.set("alpha", LuaValue::Nil).expect("delete alpha");
+        assert!(store.is_empty());
+        assert_eq!(store.get("alpha"), None);
+    }
+
+    #[test]
+    fn candidate_persisted_before_in_memory_publish_on_rejected_write() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        // First write succeeds
+        store
+            .set("theme", LuaValue::String("light".to_string()))
+            .expect("first write succeeds");
+        assert_eq!(
+            store.get("theme"),
+            Some(LuaValue::String("light".to_string()))
+        );
+
+        // Inject write failure
+        fake_fs.set_fail_writes(true);
+        let err = store.set("theme", LuaValue::String("dark".to_string()));
+        assert!(err.is_err());
+
+        // In-memory state remains intact with previous value (not candidate "dark")
+        assert_eq!(
+            store.get("theme"),
+            Some(LuaValue::String("light".to_string()))
+        );
+
+        // Persisted state in fake fs remains "light"
+        let persisted = fake_fs.read_to_string(&path).expect("read store");
+        assert!(persisted.contains("light"));
+        assert!(!persisted.contains("dark"));
+    }
+
+    #[test]
+    fn store_preserves_committed_settings_on_rejected_replacement() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        store
+            .set("setting.a", LuaValue::Integer(42))
+            .expect("initial commit");
+        assert_eq!(store.get("setting.a"), Some(LuaValue::Integer(42)));
+
+        // Inject rename/replacement failure
+        fake_fs.set_fail_renames(true);
+
+        let err = store.set("setting.a", LuaValue::Integer(100));
+        assert!(err.is_err(), "replacement failure must fail closed");
+
+        // In-memory state was NOT mutated to candidate
+        assert_eq!(store.get("setting.a"), Some(LuaValue::Integer(42)));
+
+        // Destination was NOT deleted and still contains prior setting
+        assert!(fake_fs.exists(&path));
+        let disk_text = fake_fs.read_to_string(&path).expect("read store");
+        assert!(disk_text.contains("42"));
+        assert!(!disk_text.contains("100"));
+
+        // Temporary file was cleaned up
+        let temp_exists = fake_fs
+            .get_file("/plugins-state/my-plugin/store.json.tmp")
+            .is_some();
+        assert!(!temp_exists);
+    }
+
+    #[test]
+    fn store_preserves_committed_settings_on_rejected_deletion_transaction() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        store
+            .set("key1", LuaValue::String("preserved".to_string()))
+            .expect("initial set");
+        assert_eq!(
+            store.get("key1"),
+            Some(LuaValue::String("preserved".to_string()))
+        );
+
+        // Fail replacement during deletion
+        fake_fs.set_fail_renames(true);
+        let err = store.set("key1", LuaValue::Nil);
+        assert!(err.is_err());
+
+        // In-memory key must NOT be deleted
+        assert_eq!(
+            store.get("key1"),
+            Some(LuaValue::String("preserved".to_string()))
+        );
+
+        // On-disk file must still contain the key
+        let text = fake_fs.read_to_string(&path).expect("read store");
+        assert!(text.contains("preserved"));
+
+        // Unblock and retry deletion
+        fake_fs.set_fail_renames(false);
+        store.set("key1", LuaValue::Nil).expect("deletion succeeds");
+        assert_eq!(store.get("key1"), None);
+        let updated = fake_fs.read_to_string(&path).expect("read store");
+        assert!(!updated.contains("preserved"));
+    }
+
+    #[test]
+    fn distinguish_atomicity_from_durability() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        // Inject durability (sync) failure
+        fake_fs.set_fail_syncs(true);
+        let err = store.set("alpha", LuaValue::Integer(1));
+        assert!(err.is_err());
+
+        // Atomicity preserved: destination not created, in-memory empty
+        assert!(!fake_fs.exists(&path));
+        assert!(store.is_empty());
+
+        // Restore durability and check order
+        fake_fs.set_fail_syncs(false);
+        store
+            .set("alpha", LuaValue::Integer(1))
+            .expect("sync and rename succeed");
+        assert!(fake_fs.exists(&path));
+        assert_eq!(store.get("alpha"), Some(LuaValue::Integer(1)));
+    }
+
+    #[test]
+    fn native_fs_atomic_store_replacement_and_reload() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-test-native-store-{}-{}",
+            std::process::id(),
+            STORE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("store.json");
+
+        let mut store = PluginStore::load(path.clone()).expect("load empty");
+        assert!(store.is_empty());
+
+        store
+            .set("session.id", LuaValue::String("s-123".to_string()))
+            .expect("first set");
+        store
+            .set("session.count", LuaValue::Integer(7))
+            .expect("second set");
+
+        // Reload from disk in a fresh store instance
+        let reloaded = PluginStore::load(path.clone()).expect("reload from disk");
+        assert_eq!(
+            reloaded.get("session.id"),
+            Some(LuaValue::String("s-123".to_string()))
+        );
+        assert_eq!(reloaded.get("session.count"), Some(LuaValue::Integer(7)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,28 @@
 //! byte-identical logic, only module wiring changed.
 use super::*;
 
+/// OS hand-off boundary for a runtime-authorized URL activation (CTX-0577).
+///
+/// The production implementation spawns the native URL handler through
+/// [`Runtime::spawn_validated_url`]; the runtime never spawns directly from
+/// the click path, so tests can install a recording double that captures the
+/// exact URL sequence the live consumer would open — without launching a
+/// browser. This is the same seam pattern as the app's `OsTitleSink`.
+pub trait UrlOpener {
+    /// Opens `activation`, which already passed the gesture + scheme gate.
+    fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError>;
+}
+
+/// Production [`UrlOpener`]: spawns the native handler (no shell).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemUrlOpener;
+
+impl UrlOpener for SystemUrlOpener {
+    fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError> {
+        Runtime::spawn_validated_url(activation.uri())
+    }
+}
+
 /// Map a [`ColdEvent`] to a [`HostObservation`] where semantics overlap.
 ///
 /// Only post-state, bounded observations cross the queue; hot-path payloads
@@ -419,6 +441,85 @@ impl Runtime {
     /// Terminal output and synthetic API calls never mint this proof.
     pub fn take_activation_gesture(&self) -> Option<ActivationGesture> {
         self.pending_activation_gesture.clone()
+    }
+
+    /// Installs the OS hand-off used by the live OSC 8 click-to-open consumer
+    /// (CTX-0577). Production keeps the default [`SystemUrlOpener`]; tests
+    /// install a recording double so the exact URL sequence is assertable
+    /// without launching a browser.
+    pub fn set_url_opener(&mut self, opener: Box<dyn UrlOpener>) {
+        self.url_opener = opener;
+    }
+
+    /// Count of URL activations handed to the opener.
+    #[must_use]
+    pub const fn url_activations(&self) -> u64 {
+        self.url_activations
+    }
+
+    /// Count of URL activations refused by the gesture/scheme gate.
+    #[must_use]
+    pub const fn url_activation_refusals(&self) -> u64 {
+        self.url_activation_refusals
+    }
+
+    /// Whether a hyperlink activation gesture awaits consumption (CTX-0577).
+    ///
+    /// The app's live consumer reads this after a mouse event and calls
+    /// [`Self::activate_pending_hyperlink`] exactly when it is `true`.
+    #[must_use]
+    pub fn has_pending_hyperlink_activation(&self) -> bool {
+        self.pending_activation_gesture.is_some()
+    }
+
+    /// Live OSC 8 click-to-open consumer (CTX-0577, M1-17 / issue #1143).
+    ///
+    /// Consumes the single-use [`ActivationGesture`] *and the exact URI bound
+    /// to it* at mint time. The caller cannot supply a substitute URI, so
+    /// this path cannot be used as a confused deputy. The URI was validated
+    /// by the platform scheme allowlist when the gesture was minted
+    /// (`http`/`https`/`mailto`; `file:` is a separate, distinct capability)
+    /// and is re-validated by [`Self::authorize_url_activation`] before the
+    /// opener is called.
+    ///
+    /// Fail-closed: no pending gesture, a plugin veto, or a timeout leaves
+    /// nothing opened and counts a refusal. Returns the URI opened on
+    /// success.
+    pub fn activate_pending_hyperlink(
+        &mut self,
+        decisions: &[InterceptionDecision],
+        timed_out: bool,
+    ) -> Result<String, bitty_platform::PlatformError> {
+        let (Some(gesture), Some(uri)) = (
+            self.pending_activation_gesture.clone(),
+            self.pending_activation_uri.clone(),
+        ) else {
+            self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+            return Err(bitty_platform::PlatformError::UrlActivationDenied);
+        };
+        let activation = match self.authorize_url_activation(&uri, gesture, decisions, timed_out) {
+            Ok(activation) => activation,
+            Err(err) => {
+                // A refusal must still consume the binding so a replayed
+                // click cannot retry against a stale URI.
+                self.pending_activation_gesture = None;
+                self.pending_activation_uri = None;
+                self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                return Err(err);
+            }
+        };
+        self.pending_activation_uri = None;
+        let opened = activation.uri().to_owned();
+        match self.url_opener.open_url(activation) {
+            Ok(()) => {
+                self.url_activations = self.url_activations.saturating_add(1);
+                Ok(opened)
+            }
+            Err(err) => {
+                self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                Err(err)
+            }
+        }
     }
 
     /// Opens a URL using only a runtime-issued, URI-bound authorization.

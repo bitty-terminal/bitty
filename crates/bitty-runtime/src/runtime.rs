@@ -649,7 +649,23 @@ pub struct Runtime {
     /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
     spawn_log: log_throttle::LogThrottle,
     pending_activation_gesture: Option<ActivationGesture>,
+    /// Exact URI bound to [`Self::pending_activation_gesture`] at mint time
+    /// (CTX-0577); consumed together with it so the live consumer never
+    /// accepts a substitute target.
+    pending_activation_uri: Option<String>,
     next_activation_gesture: u64,
+    /// OS hand-off for a runtime-authorized URL activation (CTX-0577).
+    ///
+    /// The click path never spawns a handler directly; it goes through this
+    /// seam so tests can record the exact URL sequence. Defaults to
+    /// [`SystemUrlOpener`] (the production native handler).
+    url_opener: Box<dyn plugin::UrlOpener>,
+    /// Count of hyperlink activations that passed the gate and were handed
+    /// to the opener (CTX-0577 diagnostics).
+    url_activations: u64,
+    /// Count of hyperlink activations refused by the gate (no gesture, stale
+    /// gesture, veto, or a URI outside the scheme allowlist).
+    url_activation_refusals: u64,
     /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
     ///
     /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
@@ -769,6 +785,14 @@ pub struct ActivationGesture(u64);
 #[derive(Debug, PartialEq, Eq)]
 pub struct UrlActivation {
     uri: String,
+}
+
+impl UrlActivation {
+    /// The validated URI this authorization binds to.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
 }
 
 /// Runtime-issued authorization for a local-file URL activation.
@@ -1126,7 +1150,11 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_BURST,
             ),
             pending_activation_gesture: None,
+            pending_activation_uri: None,
             next_activation_gesture: 1,
+            url_opener: Box::new(plugin::SystemUrlOpener),
+            url_activations: 0,
+            url_activation_refusals: 0,
             bell_mode: bell::BellMode::default(),
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
@@ -1299,7 +1327,11 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_BURST,
             ),
             pending_activation_gesture: None,
+            pending_activation_uri: None,
             next_activation_gesture: 1,
+            url_opener: Box::new(plugin::SystemUrlOpener),
+            url_activations: 0,
+            url_activation_refusals: 0,
             bell_mode: bell::BellMode::default(),
             osc_notification_allowed: false,
             bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),

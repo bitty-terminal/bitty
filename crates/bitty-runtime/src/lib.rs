@@ -228,6 +228,7 @@ pub use runtime::bell::{
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
 pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::PresentFrame;
+pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{
     MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_GRID_DIM, MAX_SESSION_LAYOUT_DEPTH,
     MAX_SESSION_LINE_BYTES, MAX_SESSION_LINE_TEXT_BYTES, MAX_SESSION_NAME_CHARS,

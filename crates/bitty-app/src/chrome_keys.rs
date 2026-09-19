@@ -73,7 +73,7 @@ impl ChromeState {
     }
 }
 
-/// Pane zoom state (CTX-0481, #762).
+/// Pane zoom state (CTX-0481, #762; per-workspace CTX-0538).
 ///
 /// The real tiled layout (`backup`) is captured when zoom engages together
 /// with the single-leaf proxy installed in its place (`proxy`). The backup
@@ -81,37 +81,62 @@ impl ChromeState {
 /// mutation landing meanwhile (e.g. a ctl verb drained between key events)
 /// makes the pair stale, and restoring the older backup would silently drop
 /// the newer panes. A stale backup is discarded with a warning instead.
+///
+/// CTX-0538 (LIVE-APP-002): entries are keyed by the workspace's stable
+/// sequence (`ws{seq}` identity, CTX-0322), never a single slot. Workspace
+/// switches therefore never compare one workspace's backup against another
+/// workspace's live layout: zoom engaged in A survives a trip through B and
+/// restores A exactly, while a disengage in B is a clean no-op.
 #[derive(Debug, Default)]
 pub(crate) struct ZoomState {
-    /// Real tiled layout while zoomed; `None` when not zoomed.
-    backup: Option<LayoutNode>,
+    /// Per-workspace entries keyed by stable workspace sequence.
+    entries: std::collections::BTreeMap<u64, ZoomEntry>,
+}
+
+/// One workspace's zoom pair (CTX-0538).
+#[derive(Debug)]
+struct ZoomEntry {
+    /// Real tiled layout while zoomed.
+    backup: LayoutNode,
     /// Proxy layout installed at engage time (staleness identity).
-    proxy: Option<LayoutNode>,
+    proxy: LayoutNode,
+}
+
+/// Stable sequence of the active workspace, if one exists (CTX-0538).
+fn active_workspace_seq(runtime: &Runtime) -> Option<u64> {
+    runtime.workspace_seq_at(runtime.active_workspace_index())
 }
 
 impl ZoomState {
     pub(crate) const fn new() -> Self {
         Self {
-            backup: None,
-            proxy: None,
+            entries: std::collections::BTreeMap::new(),
         }
     }
 
-    /// Whether zoom currently holds a backup.
-    pub(crate) fn is_zoomed(&self) -> bool {
-        self.backup.is_some()
+    /// Whether the active workspace currently holds a zoom backup.
+    pub(crate) fn is_zoomed(&self, runtime: &Runtime) -> bool {
+        active_workspace_seq(runtime).is_some_and(|seq| self.entries.contains_key(&seq))
     }
 
-    /// Leaf count of the real tree while zoomed (diagnostics).
-    pub(crate) fn backup_leaf_count(&self) -> Option<usize> {
-        self.backup.as_ref().map(|layout| layout.leaf_ids().len())
+    /// Leaf count of the active workspace's real tree while zoomed
+    /// (diagnostics).
+    pub(crate) fn backup_leaf_count(&self, runtime: &Runtime) -> Option<usize> {
+        let seq = active_workspace_seq(runtime)?;
+        self.entries
+            .get(&seq)
+            .map(|entry| entry.backup.leaf_ids().len())
     }
 
     /// Engages zoom on `view`: captures the real tree and installs the
-    /// single-leaf proxy. Refuses when zoom is already engaged or the view
-    /// is not a leaf, leaving the layout untouched.
+    /// single-leaf proxy. Refuses when the active workspace is already
+    /// zoomed or the view is not a leaf, leaving the layout untouched.
     pub(crate) fn engage(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
-        if self.backup.is_some() {
+        self.prune(runtime);
+        let Some(seq) = active_workspace_seq(runtime) else {
+            return false;
+        };
+        if self.entries.contains_key(&seq) {
             return false;
         }
         let Some(leaf) = runtime.layout().find_leaf(view).cloned() else {
@@ -120,24 +145,23 @@ impl ZoomState {
         let backup = runtime.layout().clone();
         let proxy = LayoutNode::leaf(leaf);
         runtime.set_layout(proxy.clone());
-        self.backup = Some(backup);
-        self.proxy = Some(proxy);
+        self.entries.insert(seq, ZoomEntry { backup, proxy });
         true
     }
 
-    /// Disengages zoom. Restores the real tree only while the runtime still
-    /// holds the recorded proxy; a stale proxy keeps the current layout and
-    /// drops the backup with a warning. Returns whether a restore happened.
+    /// Disengages zoom in the active workspace. Restores the real tree only
+    /// while the runtime still holds that workspace's recorded proxy; a
+    /// stale proxy keeps the current layout and drops the entry with a
+    /// warning. Returns whether a restore happened.
     pub(crate) fn disengage(&mut self, runtime: &mut Runtime) -> bool {
-        let Some(backup) = self.backup.take() else {
+        let Some(seq) = active_workspace_seq(runtime) else {
             return false;
         };
-        let proxy = self.proxy.take();
-        if proxy
-            .as_ref()
-            .is_some_and(|proxy| same_layout_shape(runtime.layout(), proxy))
-        {
-            runtime.set_layout(backup);
+        let Some(entry) = self.entries.remove(&seq) else {
+            return false;
+        };
+        if same_layout_shape(runtime.layout(), &entry.proxy) {
+            runtime.set_layout(entry.backup);
             return true;
         }
         eprintln!(
@@ -149,7 +173,8 @@ impl ZoomState {
     /// Restores zoom before a layout mutation (keymap path and the ctl drain
     /// hook). Returns whether the real tree was restored.
     pub(crate) fn restore_for_mutation(&mut self, runtime: &mut Runtime) -> bool {
-        if !self.is_zoomed() {
+        self.prune(runtime);
+        if !self.is_zoomed(runtime) {
             return false;
         }
         let restored = self.disengage(runtime);
@@ -157,6 +182,14 @@ impl ZoomState {
             eprintln!("bitty: zoom restored for layout mutation");
         }
         restored
+    }
+
+    /// Drops entries whose workspace no longer exists (closed, or replaced
+    /// by a session restore), so the map stays bounded by the live
+    /// workspace count instead of the session's close history.
+    pub(crate) fn prune(&mut self, runtime: &Runtime) {
+        self.entries
+            .retain(|seq, _| runtime.workspace_index_by_seq(*seq).is_some());
     }
 }
 
@@ -823,7 +856,7 @@ impl TerminalApp {
                 let effective_leaf_count = self
                     .chrome
                     .zoom
-                    .backup_leaf_count()
+                    .backup_leaf_count(&self.runtime)
                     .unwrap_or_else(|| self.runtime.leaf_count());
                 if effective_leaf_count <= 1 {
                     eprintln!("warning: keymap close_view refused (last pane) — ignoring");
@@ -1070,7 +1103,11 @@ impl TerminalApp {
                 }
             }
             A::ToggleZoom => {
-                if self.chrome.zoom.is_zoomed() {
+                // CTX-0538: zoom is scoped to the active workspace, so a
+                // toggle here engages/disengages only this workspace's
+                // entry (closes/restores prune the dead keys).
+                self.chrome.zoom.prune(&self.runtime);
+                if self.chrome.zoom.is_zoomed(&self.runtime) {
                     if self.chrome.zoom.disengage(&mut self.runtime) {
                         eprintln!(
                             "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
@@ -2228,6 +2265,97 @@ mod tests {
             app.runtime.leaf_count(),
             3,
             "a stale zoom backup must not clobber the newer layout"
+        );
+    }
+
+    /// CTX-0538 zoom test app: two-workspace runtime where workspace 1 holds
+    /// the two-pane tree under test and workspace 2 is a fresh single leaf.
+    fn workspace_zoom_test_app() -> TerminalApp {
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime.workspace_new().expect("second workspace");
+        assert_eq!(app.runtime.active_workspace_index(), 1);
+        // Back to workspace 1 and lay the split tree into it again (the new
+        // workspace switch stashed the fresh leaf, so re-install the split).
+        assert!(app.runtime.workspace_switch(0));
+        app.runtime.set_layout(two_pane_layout());
+        app
+    }
+
+    #[test]
+    fn zoom_round_trip_is_scoped_to_its_workspace() {
+        // CTX-0538 (LIVE-APP-002): zoom is per-workspace. Engage in A,
+        // switch to B and back, then disengage: A's exact tree returns and
+        // B never sees A's backup.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_zoom_test_app();
+        assert_eq!(app.runtime.leaf_count(), 2);
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "A zoom collapses to one leaf");
+
+        // Switch to B: the live layout is B's own (single leaf), and the
+        // zoom state must not leak into it. Disengaging in B is a clean
+        // no-op (B holds no zoom), never a comparison against A's backup.
+        assert!(app.runtime.workspace_switch(1));
+        assert_eq!(
+            app.runtime.leaf_count(),
+            1,
+            "B keeps its own single-leaf layout"
+        );
+        assert!(!app.chrome.zoom.restore_for_mutation(&mut app.runtime));
+        assert_eq!(
+            app.runtime.leaf_count(),
+            1,
+            "restore in B must not touch B's layout"
+        );
+
+        // Back to A: the zoom is still engaged there and disengaging
+        // restores A's exact tree.
+        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.leaf_count(), 1, "A is still zoomed");
+        assert!(app.chrome.zoom.restore_for_mutation(&mut app.runtime));
+        assert_eq!(
+            app.runtime.leaf_count(),
+            2,
+            "disengaging in A restores A's exact two-leaf tree"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn zoom_toggle_in_another_workspace_never_consumes_a_backup() {
+        // CTX-0538: a toggle in workspace B must engage B's zoom, never
+        // disengage A's leftover entry (the pre-fix single slot).
+        use bitty_config::ChromeAction;
+        let mut app = workspace_zoom_test_app();
+        // Zoom A onto v:2 (one-leaf proxy on v:2).
+        app.apply_chrome_action(ChromeAction::FocusId(2));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1);
+        // Switch to B and toggle: B engages its own zoom (single leaf is
+        // idempotently zoomed), and A's entry is untouched.
+        assert!(app.runtime.workspace_switch(1));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "B toggles its own zoom");
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.runtime.leaf_count(), 1, "B disengages its own zoom");
+        // Back in A the zoom is still live and restores the real tree.
+        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.leaf_count(), 1, "A is still zoomed");
+        assert!(app.chrome.zoom.restore_for_mutation(&mut app.runtime));
+        assert_eq!(
+            app.runtime.leaf_count(),
+            2,
+            "A's backup must survive B's toggles"
         );
     }
 

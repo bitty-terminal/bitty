@@ -50,6 +50,25 @@ pub(crate) fn sanitize_window_title(raw: &str) -> String {
 // App handler
 // ---------------------------------------------------------------------------
 
+/// OS-window title handoff boundary (CTX-0570).
+///
+/// `WindowHandle::set_title` needs a live winit window, so the OS titlebar
+/// itself cannot be asserted headlessly. Routing every title through this one
+/// seam means the call sequence a test double records is exactly the
+/// production call sequence: production installs the [`WindowHandle`] wrapper
+/// (done when the window is created), and tests install a recording double
+/// instead. There is no separate test-only branch in `apply_window_title`.
+pub(crate) trait OsTitleSink {
+    /// Hands a sanitized, bounded title to the OS window.
+    fn set_os_title(&self, title: &str);
+}
+
+impl OsTitleSink for WindowHandle {
+    fn set_os_title(&self, title: &str) {
+        WindowHandle::set_title(self, title);
+    }
+}
+
 /// OS-window bookkeeping coalesced out of `TerminalApp` (CTX-0481 state
 /// slimming): the handle, its identity, the resolved static title, opacity,
 /// and the IME/title synchronization counters all move together and share
@@ -79,6 +98,11 @@ pub(crate) struct WindowState {
     /// Count of sanitized title applications (CTX-0382 diagnostics): stays
     /// at one per distinct title, proving no per-frame churn.
     pub(crate) title_applies: u64,
+    /// Title-handoff boundary (CTX-0570). `None` headlessly (no window), in
+    /// which case application still records state but performs no OS call;
+    /// production sets this when the window handle is created, and tests
+    /// install a recording double through `TerminalApp::set_os_title_sink`.
+    pub(crate) os_title_sink: Option<Box<dyn OsTitleSink>>,
 }
 
 impl WindowState {
@@ -91,6 +115,7 @@ impl WindowState {
             ime_cursor_area: None,
             last_applied_title: None,
             title_applies: 0,
+            os_title_sink: None,
         }
     }
 }
@@ -489,13 +514,17 @@ impl TerminalApp {
         }
     }
 
-    /// Applies a sanitized, change-gated title to the OS window (CTX-0382).
+    /// Applies a sanitized, change-gated title to the OS window (CTX-0382,
+    /// handoff seam CTX-0570).
     ///
     /// An empty sanitized title resets to the static theme title (matching
     /// xterm's reset-to-default behavior). Identical titles are dropped so
     /// the titlebar never churns per frame; `title_applies` counts real
-    /// applications. No-op without a window (headless CI), but the applied
-    /// title is still recorded so tests can observe the path end to end.
+    /// applications. The OS handoff goes through
+    /// [`WindowState::os_title_sink`]: production installs the
+    /// [`WindowHandle`] wrapper at window creation, so this method has one
+    /// production code path that a recording test double observes exactly.
+    /// Headlessly (no sink) state is still recorded but no OS call is made.
     pub(crate) fn apply_window_title(&mut self, raw: &str) {
         let sanitized = sanitize_window_title(raw);
         let title = if sanitized.is_empty() {
@@ -508,9 +537,21 @@ impl TerminalApp {
         }
         self.window.last_applied_title = Some(title.clone());
         self.window.title_applies += 1;
-        if let Some(window) = self.window.handle.as_ref() {
-            window.set_title(&title);
+        if let Some(sink) = self.window.os_title_sink.as_ref() {
+            sink.set_os_title(&title);
         }
+    }
+
+    /// Installs a title-handoff sink, replacing any previous one (CTX-0570).
+    ///
+    /// Production calls this once at window creation with the live
+    /// [`WindowHandle`]; tests call it with a recording double so the exact
+    /// call sequence applied to the OS can be asserted without a window
+    /// system. Replacing is intentional: a re-created window must not leave a
+    /// stale sink behind.
+    #[cfg(test)]
+    pub(crate) fn set_os_title_sink(&mut self, sink: Box<dyn OsTitleSink>) {
+        self.window.os_title_sink = Some(sink);
     }
 
     /// Attempts to attach a real GPU surface after window creation (single-window slice).
@@ -748,6 +789,11 @@ impl AppHandler for TerminalApp {
                             handle.set_ime_allowed(true);
                             // Clone handle before moving into try_attach_gpu (which borrows self mutably)
                             let handle_for_gpu = handle.clone();
+                            // CTX-0570: install the title-handoff sink here
+                            // (the one production site), so OSC 0/2 title
+                            // application flows through the same seam tests
+                            // observe with a recording double.
+                            self.window.os_title_sink = Some(Box::new(handle.clone()));
                             self.window.handle = Some(handle);
                             // Single-window vertical slice: try real GPU attach with crossfont atlas.
                             // On headless CI this fails with NoCompatibleAdapter and we stay headless

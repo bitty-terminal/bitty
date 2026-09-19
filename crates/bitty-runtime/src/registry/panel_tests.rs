@@ -4,8 +4,10 @@
 //! byte-identical logic, only module wiring changed.
 
 use super::{
-    BoundedPayload, EventTopic, Generation, MAX_TOPICS_TOTAL, PanelError, PanelId, PanelRegistry,
-    PanelRegistryConfig, PanelState, PanelType, WorkspaceId,
+    BUS_EVENT_MAX_BYTES, BUS_GLOBAL_BYTES_LIMIT, BUS_GLOBAL_LIMIT, BUS_PER_PANEL_BYTES_LIMIT,
+    BUS_PER_PANEL_LIMIT, BoundedPayload, BusDropPolicy, EventTopic, Generation, MAX_TOPICS_TOTAL,
+    PanelError, PanelEventBus, PanelId, PanelRegistry, PanelRegistryConfig, PanelState, PanelType,
+    WorkspaceId,
 };
 use bitty_ui::{Rect as UiRect, ViewId};
 
@@ -301,6 +303,144 @@ fn event_bus_64_per_subscription_drop_oldest() {
     assert_eq!(batch.len(), 32);
     // FIFO DropOldest: first batch should contain msg6..msg37 (oldest 6 dropped)
     assert_eq!(batch[0].payload.as_str(), "msg6");
+}
+
+/// CTX-0534 (#921): a publish that would push a panel's aggregate event count
+/// over `BUS_PER_PANEL_LIMIT` must evict repeatedly until the arrival is
+/// admitted, so `publish` never returns with the panel over budget.
+#[test]
+fn event_bus_per_panel_event_limit_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    // MAX_SUBSCRIPTIONS_PER_PANEL is 32; 32 queues x 64 = 2048 > 1024 cap.
+    let mut topics = Vec::new();
+    for i in 0..32 {
+        let t = bus.declare_topic(&format!("xuepoo.test:admit{i}")).unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..4000 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.queued_events_for_panel(panel) <= BUS_PER_PANEL_LIMIT,
+                "per-panel event count must never exceed {BUS_PER_PANEL_LIMIT} after publish"
+            );
+        }
+    }
+    assert!(bus.queued_events_for_panel(panel) <= BUS_PER_PANEL_LIMIT);
+}
+
+/// CTX-0534 (#921): a publish that would push a panel's aggregate byte count
+/// over `BUS_PER_PANEL_BYTES_LIMIT` must evict repeatedly (across the panel's
+/// queues) until the arrival is admitted or the queues are empty.
+#[test]
+fn event_bus_per_panel_byte_limit_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    let mut topics = Vec::new();
+    for i in 0..8 {
+        let t = bus.declare_topic(&format!("xuepoo.test:bytes{i}")).unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    // 8 queues x 64 events x 4 KiB = 2 MiB of payload, far past the 256 KiB
+    // per-panel byte cap. A single-pass eviction cannot keep up.
+    let blob = "b".repeat(4 * 1024);
+    let payload = BoundedPayload::try_new(blob.clone()).unwrap();
+    for round in 0..2000 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.queued_bytes_for_panel(panel) <= BUS_PER_PANEL_BYTES_LIMIT,
+                "per-panel byte count must never exceed {BUS_PER_PANEL_BYTES_LIMIT} after publish (round {round})"
+            );
+        }
+    }
+}
+
+/// CTX-0534 (#921): the global event/byte caps are held as admission
+/// invariants for every publish, regardless of how many panels/queues exist.
+/// 200 single-subscription panels x 64 = 12800 queued events, past the 8192
+/// global cap while each panel stays well under its own 1024 aggregate.
+#[test]
+fn event_bus_global_limits_held_as_admission_invariant() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let mut panels = Vec::new();
+    let mut topics = Vec::new();
+    for i in 0..200 {
+        let panel = PanelId::new(i + 1);
+        let t = bus
+            .declare_topic(&format!("xuepoo.test:global{i}"))
+            .unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        panels.push(panel);
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..80 {
+        for (panel, t) in panels.iter().zip(topics.iter()) {
+            bus.publish(t, payload.clone()).unwrap();
+            assert!(
+                bus.total_queued_events() <= BUS_GLOBAL_LIMIT,
+                "global event count must never exceed {BUS_GLOBAL_LIMIT} after publish"
+            );
+            assert!(
+                bus.total_queued_bytes() <= BUS_GLOBAL_BYTES_LIMIT,
+                "global byte count must never exceed {BUS_GLOBAL_BYTES_LIMIT} after publish"
+            );
+            assert!(bus.queued_events_for_panel(*panel) <= BUS_PER_PANEL_LIMIT);
+        }
+    }
+}
+
+/// CTX-0534 (#921): with exactly `BUS_PER_PANEL_LIMIT` events queued, one
+/// further publish that targets a *different*, empty subscription must loop
+/// its eviction across the panel's queues (not inspect only the new queue),
+/// admit the arrival, and stay at or below the cap. Under DropOldest the
+/// newest event survives and the drop is counted.
+#[test]
+fn event_bus_overflow_admits_newest_across_panel_queues() {
+    let mut bus = PanelEventBus::new(BusDropPolicy::DropOldest);
+    let panel = PanelId::new(1);
+    // 32 queues (the subscription cap) x 32 events = 1024 per-panel events,
+    // exactly `BUS_PER_PANEL_LIMIT`.
+    let mut topics = Vec::new();
+    for i in 0..32 {
+        let t = bus
+            .declare_topic(&format!("xuepoo.test:overflow{i}"))
+            .unwrap();
+        bus.subscribe(panel, &t).unwrap();
+        topics.push(t);
+    }
+    let payload = BoundedPayload::try_new("x").unwrap();
+    for _ in 0..32 {
+        for t in &topics {
+            bus.publish(t, payload.clone()).unwrap();
+        }
+    }
+    assert_eq!(bus.queued_events_for_panel(panel), BUS_PER_PANEL_LIMIT);
+    // Target the last subscription; its queue is full, but the panel
+    // aggregate is also at the cap. Eviction must free exactly one slot.
+    let target = topics.last().expect("at least one subscription");
+    let newest = BoundedPayload::try_new("newest").unwrap();
+    bus.publish(target, newest.clone()).unwrap();
+    assert_eq!(
+        bus.queued_events_for_panel(panel),
+        BUS_PER_PANEL_LIMIT,
+        "overflow publish must evict then admit, keeping the aggregate at the cap"
+    );
+    assert!(
+        bus.total_dropped() > 0,
+        "DropOldest overflow must be counted, never silent"
+    );
+    let drained = bus.drain_batch(panel, target.as_str(), 64, BUS_EVENT_MAX_BYTES);
+    assert_eq!(
+        drained.last().map(|e| e.payload.as_str()),
+        Some(newest.as_str()),
+        "the newest event must survive DropOldest"
+    );
 }
 
 #[test]

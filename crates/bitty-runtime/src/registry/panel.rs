@@ -414,6 +414,9 @@ pub struct BusEvent {
     pub topic: EventTopic,
     pub payload: BoundedPayload,
     pub generation: Generation,
+    /// Monotonic publish sequence (CTX-0534): aggregate eviction must victimize
+    /// the genuinely oldest queued event, not the first queue in map order.
+    pub sequence: u64,
 }
 
 /// Drop policy for bus queues; v1 default is `DropOldest`.
@@ -512,13 +515,11 @@ impl BusQueue {
 #[derive(Debug)]
 pub struct PanelEventBus {
     queues: HashMap<(PanelId, String), BusQueue>,
-    per_panel_events: HashMap<PanelId, usize>,
-    per_panel_bytes: HashMap<PanelId, usize>,
-    global_events: usize,
-    global_bytes: usize,
     total_dropped: u64,
     drop_policy: BusDropPolicy,
     topics: HashSet<String>,
+    /// Monotonic publish sequence handed to each queued event (CTX-0534).
+    next_publish_seq: u64,
 }
 
 impl PanelEventBus {
@@ -526,13 +527,10 @@ impl PanelEventBus {
     pub fn new(drop_policy: BusDropPolicy) -> Self {
         Self {
             queues: HashMap::new(),
-            per_panel_events: HashMap::new(),
-            per_panel_bytes: HashMap::new(),
-            global_events: 0,
-            global_bytes: 0,
             total_dropped: 0,
             drop_policy,
             topics: HashSet::new(),
+            next_publish_seq: 0,
         }
     }
 
@@ -574,7 +572,11 @@ impl PanelEventBus {
     }
 
     /// Publish a payload to all subscribers of `topic`. Enforces per-panel
-    /// 1024/256KiB and global 8192/2MiB with DropOldest via queue eviction.
+    /// 1024/256KiB and global 8192/2MiB as admission invariants: under
+    /// `DropOldest` eviction loops (oldest event first, across every queue)
+    /// until the arrival fits or the queues are empty; under `DropNewest` the
+    /// arrival is refused when it would exceed. `publish` never returns with
+    /// any aggregate over its cap (CTX-0534).
     pub fn publish(
         &mut self,
         topic: &EventTopic,
@@ -597,122 +599,159 @@ impl PanelEventBus {
             return Ok(());
         }
         for (panel_id, topic_str) in subscribers {
-            let generation = Generation::INITIAL; // placeholder; real generation tracked per panel elsewhere
+            let key = (panel_id, topic_str);
+            if !self.queues.contains_key(&key) {
+                continue;
+            }
+            let payload_len = payload.len();
+            match self.drop_policy {
+                BusDropPolicy::DropNewest => {
+                    if self.admission_exceeds(panel_id, payload_len) {
+                        self.record_aggregate_drop(&key);
+                        continue;
+                    }
+                }
+                BusDropPolicy::DropOldest => {
+                    // Loop until the arrival is admissible or nothing remains
+                    // to evict. Global first so the host-wide ceiling wins,
+                    // then the panel aggregate. The attempt bound is the total
+                    // capacity across both scopes; the progress guard covers
+                    // intrinsic over-budget payloads (which cannot fit even
+                    // with empty queues).
+                    let mut attempts = 0usize;
+                    while self.admission_exceeds(panel_id, payload_len) {
+                        let before = self.global_totals();
+                        if self.global_exceeds(payload_len) {
+                            self.evict_oldest_globally();
+                        } else if self.panel_exceeds(panel_id, payload_len) {
+                            self.evict_oldest_for_panel(panel_id);
+                        } else {
+                            break;
+                        }
+                        if self.global_totals() == before {
+                            break;
+                        }
+                        attempts += 1;
+                        if attempts > BUS_GLOBAL_LIMIT + BUS_PER_PANEL_LIMIT {
+                            break;
+                        }
+                    }
+                    if self.admission_exceeds(panel_id, payload_len) {
+                        // Queues empty but the payload still cannot fit: apply
+                        // the documented drop-newest fallback and count it on
+                        // the target queue.
+                        self.record_aggregate_drop(&key);
+                        continue;
+                    }
+                }
+            }
             let event = BusEvent {
                 topic: topic.clone(),
                 payload: payload.clone(),
-                generation,
+                generation: Generation::INITIAL, // placeholder; real generation tracked per panel elsewhere
+                sequence: self.next_publish_seq,
             };
-            // Enforce per-panel aggregate before push: if would exceed, evict oldest across panel's queues (DropOldest)
-            let per_panel_events = self.per_panel_events.get(&panel_id).copied().unwrap_or(0);
-            let per_panel_bytes = self.per_panel_bytes.get(&panel_id).copied().unwrap_or(0);
-            if per_panel_events >= BUS_PER_PANEL_LIMIT
-                || per_panel_bytes + payload.len() > BUS_PER_PANEL_BYTES_LIMIT
-            {
-                match self.drop_policy {
-                    BusDropPolicy::DropOldest => {
-                        // Evict oldest across panel's queues
-                        self.evict_oldest_for_panel(panel_id);
-                    }
-                    BusDropPolicy::DropNewest => {
-                        // Drop new arrival for this subscriber
-                        if let Some(q) = self.queues.get_mut(&(panel_id, topic_str.clone())) {
-                            q.dropped = q.dropped.wrapping_add(1);
-                            self.total_dropped = self.total_dropped.wrapping_add(1);
-                        }
-                        continue;
-                    }
-                }
-            }
-            // Enforce global before push
-            if self.global_events >= BUS_GLOBAL_LIMIT
-                || self.global_bytes + payload.len() > BUS_GLOBAL_BYTES_LIMIT
-            {
-                match self.drop_policy {
-                    BusDropPolicy::DropOldest => {
-                        self.evict_oldest_globally();
-                    }
-                    BusDropPolicy::DropNewest => {
-                        if let Some(q) = self.queues.get_mut(&(panel_id, topic_str.clone())) {
-                            q.dropped = q.dropped.wrapping_add(1);
-                            self.total_dropped = self.total_dropped.wrapping_add(1);
-                        }
-                        continue;
-                    }
-                }
-            }
-            // Push to per-subscription queue
-            let key = (panel_id, topic_str);
+            self.next_publish_seq = self.next_publish_seq.wrapping_add(1);
             if let Some(queue) = self.queues.get_mut(&key) {
-                let before_len = queue.len();
-                let before_bytes = queue.bytes();
-                let pushed = queue.push(event);
-                if pushed {
-                    // Update aggregates
-                    let delta_events = queue.len() as isize - before_len as isize;
-                    let delta_bytes = queue.bytes() as isize - before_bytes as isize;
-                    *self.per_panel_events.entry(panel_id).or_insert(0) =
-                        (*self.per_panel_events.get(&panel_id).unwrap_or(&0) as isize
-                            + delta_events) as usize;
-                    *self.per_panel_bytes.entry(panel_id).or_insert(0) =
-                        (*self.per_panel_bytes.get(&panel_id).unwrap_or(&0) as isize + delta_bytes)
-                            as usize;
-                    self.global_events = (self.global_events as isize + delta_events) as usize;
-                    self.global_bytes = (self.global_bytes as isize + delta_bytes) as usize;
-                    if queue.dropped > 0 && delta_events <= 0 {
-                        // DropOldest evicted one, count total dropped already in queue.dropped
-                        // Recompute total_dropped as sum of all queue dropped?
-                        self.total_dropped = self.queues.values().map(|q| q.dropped).sum();
-                    }
-                } else {
-                    self.total_dropped = self.queues.values().map(|q| q.dropped).sum();
-                }
+                let before_dropped = queue.dropped;
+                let _pushed = queue.push(event);
+                // A full per-subscription queue applies the same policy and
+                // counts its own drop; fold that into the global counter.
+                let newly_dropped = queue.dropped.wrapping_sub(before_dropped);
+                self.total_dropped = self.total_dropped.wrapping_add(newly_dropped);
             }
         }
         Ok(())
     }
 
-    fn evict_oldest_for_panel(&mut self, panel_id: PanelId) {
-        // Find oldest queue entry for panel_id (first queue with earliest front)
-        let mut oldest_key: Option<(PanelId, String)> = None;
-        for key in self.queues.keys() {
-            if key.0 == panel_id {
-                oldest_key = Some(key.clone());
-                break;
-            }
-        }
-        if let Some(key) = oldest_key {
-            if let Some(q) = self.queues.get_mut(&key) {
-                if let Some(ev) = q.inner.pop_front() {
-                    q.dropped = q.dropped.wrapping_add(1);
-                    let bytes = ev.payload.len();
-                    *self.per_panel_events.entry(panel_id).or_insert(1) -= 1;
-                    *self.per_panel_bytes.entry(panel_id).or_insert(bytes) -= bytes;
-                    self.global_events = self.global_events.saturating_sub(1);
-                    self.global_bytes = self.global_bytes.saturating_sub(bytes);
-                    self.total_dropped = self.total_dropped.wrapping_add(1);
-                }
-            }
+    /// Whether admitting `payload_len` more bytes for `panel_id` would breach
+    /// any per-panel or global event/byte cap.
+    fn admission_exceeds(&self, panel_id: PanelId, payload_len: usize) -> bool {
+        self.panel_exceeds(panel_id, payload_len) || self.global_exceeds(payload_len)
+    }
+
+    /// Whether the per-panel event/byte aggregate would breach its cap.
+    fn panel_exceeds(&self, panel_id: PanelId, payload_len: usize) -> bool {
+        let (panel_events, panel_bytes) = self.panel_totals(panel_id);
+        panel_events + 1 > BUS_PER_PANEL_LIMIT
+            || panel_bytes + payload_len > BUS_PER_PANEL_BYTES_LIMIT
+    }
+
+    /// Whether the global event/byte aggregate would breach its cap.
+    fn global_exceeds(&self, payload_len: usize) -> bool {
+        let (global_events, global_bytes) = self.global_totals();
+        global_events + 1 > BUS_GLOBAL_LIMIT || global_bytes + payload_len > BUS_GLOBAL_BYTES_LIMIT
+    }
+
+    /// Live queued (events, bytes) aggregate for one panel, computed from the
+    /// queues so it can never drift from the stored state.
+    fn panel_totals(&self, panel_id: PanelId) -> (usize, usize) {
+        self.queues
+            .iter()
+            .filter(|((pid, _), _)| *pid == panel_id)
+            .fold((0usize, 0usize), |(events, bytes), (_, q)| {
+                (events + q.len(), bytes + q.bytes())
+            })
+    }
+
+    /// Live queued (events, bytes) aggregate across every queue.
+    fn global_totals(&self) -> (usize, usize) {
+        self.queues
+            .values()
+            .fold((0usize, 0usize), |(events, bytes), q| {
+                (events + q.len(), bytes + q.bytes())
+            })
+    }
+
+    /// Count one refused/dropped arrival against `key` and the total.
+    fn record_aggregate_drop(&mut self, key: &(PanelId, String)) {
+        if let Some(q) = self.queues.get_mut(key) {
+            q.dropped = q.dropped.wrapping_add(1);
+            self.total_dropped = self.total_dropped.wrapping_add(1);
         }
     }
 
-    fn evict_oldest_globally(&mut self) {
-        // Evict one event from any queue (first found)
-        let key_opt = self.queues.keys().next().cloned();
-        if let Some(key) = key_opt {
-            if let Some(q) = self.queues.get_mut(&key) {
-                if let Some(ev) = q.inner.pop_front() {
-                    let bytes = ev.payload.len();
-                    let pid = key.0;
-                    *self.per_panel_events.entry(pid).or_insert(1) -= 1;
-                    *self.per_panel_bytes.entry(pid).or_insert(bytes) -= bytes;
-                    q.dropped = q.dropped.wrapping_add(1);
-                    self.global_events = self.global_events.saturating_sub(1);
-                    self.global_bytes = self.global_bytes.saturating_sub(bytes);
-                    self.total_dropped = self.total_dropped.wrapping_add(1);
-                }
+    /// Evict the genuinely oldest queued event across `panel_id`'s queues.
+    /// Returns `false` when the panel has nothing queued.
+    fn evict_oldest_for_panel(&mut self, panel_id: PanelId) -> bool {
+        let victim = self
+            .queues
+            .iter()
+            .filter(|((pid, _), _)| *pid == panel_id)
+            .filter_map(|(key, q)| q.inner.front().map(|ev| (key.clone(), ev.sequence)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(key, _)| key);
+        let Some(key) = victim else {
+            return false;
+        };
+        self.pop_oldest(&key)
+    }
+
+    /// Evict the genuinely oldest queued event across every queue.
+    /// Returns `false` when nothing is queued anywhere.
+    fn evict_oldest_globally(&mut self) -> bool {
+        let victim = self
+            .queues
+            .iter()
+            .filter_map(|(key, q)| q.inner.front().map(|ev| (key.clone(), ev.sequence)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(key, _)| key);
+        let Some(key) = victim else {
+            return false;
+        };
+        self.pop_oldest(&key)
+    }
+
+    /// Pop the front of `key`, counting the drop exactly once.
+    fn pop_oldest(&mut self, key: &(PanelId, String)) -> bool {
+        if let Some(q) = self.queues.get_mut(key) {
+            if q.inner.pop_front().is_some() {
+                q.dropped = q.dropped.wrapping_add(1);
+                self.total_dropped = self.total_dropped.wrapping_add(1);
+                return true;
             }
         }
+        false
     }
 
     pub fn drain_batch(
@@ -723,44 +762,31 @@ impl PanelEventBus {
         max_bytes: usize,
     ) -> Vec<BusEvent> {
         let key = (panel_id, topic.to_string());
-        let (events, delta_bytes, delta_events, dropped) =
-            if let Some(q) = self.queues.get_mut(&key) {
-                let batch = q.drain_batch(max_events, max_bytes);
-                let bytes: usize = batch.iter().map(|e| e.payload.len()).sum();
-                let ev_cnt = batch.len();
-                let dropped = q.dropped;
-                (batch, bytes, ev_cnt, dropped)
-            } else {
-                return Vec::new();
-            };
-        // Update aggregates
-        if delta_events > 0 {
-            if let Some(cnt) = self.per_panel_events.get_mut(&panel_id) {
-                *cnt = cnt.saturating_sub(delta_events);
-            }
-            if let Some(cnt) = self.per_panel_bytes.get_mut(&panel_id) {
-                *cnt = cnt.saturating_sub(delta_bytes);
-            }
-            self.global_events = self.global_events.saturating_sub(delta_events);
-            self.global_bytes = self.global_bytes.saturating_sub(delta_bytes);
+        if let Some(q) = self.queues.get_mut(&key) {
+            q.drain_batch(max_events, max_bytes)
+        } else {
+            Vec::new()
         }
-        let _ = dropped;
-        events
     }
 
     #[must_use]
     pub fn total_queued_events(&self) -> usize {
-        self.global_events
+        self.queues.values().map(BusQueue::len).sum()
     }
 
     #[must_use]
     pub fn total_queued_bytes(&self) -> usize {
-        self.global_bytes
+        self.queues.values().map(BusQueue::bytes).sum()
     }
 
     #[must_use]
     pub fn queued_events_for_panel(&self, panel_id: PanelId) -> usize {
-        self.per_panel_events.get(&panel_id).copied().unwrap_or(0)
+        self.panel_totals(panel_id).0
+    }
+
+    #[must_use]
+    pub fn queued_bytes_for_panel(&self, panel_id: PanelId) -> usize {
+        self.panel_totals(panel_id).1
     }
 
     #[must_use]
@@ -769,21 +795,9 @@ impl PanelEventBus {
     }
 
     pub fn clear_panel(&mut self, panel_id: PanelId) {
-        let keys: Vec<(PanelId, String)> = self
-            .queues
-            .keys()
-            .filter(|(pid, _)| *pid == panel_id)
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(q) = self.queues.remove(&key) {
-                self.global_events = self.global_events.saturating_sub(q.len());
-                self.global_bytes = self.global_bytes.saturating_sub(q.bytes());
-                self.total_dropped = self.total_dropped.wrapping_add(q.dropped);
-            }
-        }
-        self.per_panel_events.remove(&panel_id);
-        self.per_panel_bytes.remove(&panel_id);
+        // `total_dropped` is maintained at drop time (pop/record/push), so
+        // removing the queues here must not re-add their per-queue counters.
+        self.queues.retain(|(pid, _), _| *pid != panel_id);
     }
 
     pub fn topics_len(&self) -> usize {

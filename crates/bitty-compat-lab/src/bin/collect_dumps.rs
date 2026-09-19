@@ -36,6 +36,8 @@ const CATEGORIES: &[&str] = &[
     "tui",
     "scrollback",
     "graphics",
+    "modes",
+    "color",
 ];
 
 fn corpus_dir(category: &str) -> PathBuf {

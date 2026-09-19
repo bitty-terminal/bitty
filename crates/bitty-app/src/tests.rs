@@ -755,6 +755,83 @@ fn osc_title_sanitizes_and_empty_resets_to_static_title() {
     );
 }
 
+/// Recording double for the OS title handoff (CTX-0570).
+///
+/// `WindowHandle::set_title` needs a live winit window, so the OS titlebar
+/// cannot be read back headlessly. This double records every title handed
+/// across [`crate::terminal_app::OsTitleSink`] in call order, which is the
+/// exact production call sequence (the trait impl for `WindowHandle` just
+/// forwards to winit). The `Mutex` keeps the double usable behind a shared
+/// handle while `TerminalApp` owns it as a boxed trait object.
+struct RecordingTitleSink {
+    titles: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::terminal_app::OsTitleSink for RecordingTitleSink {
+    fn set_os_title(&self, title: &str) {
+        self.titles
+            .lock()
+            .expect("poison-free")
+            .push(title.to_owned());
+    }
+}
+
+#[test]
+fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
+    // M1-05 evidence (#1131): the exact sequence of OS-title applications is
+    // asserted with a test double. The OS titlebar itself is not readable
+    // headlessly, so this proves the platform-handoff call sequence
+    // (sanitize -> change gate -> sink) rather than the painted titlebar.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_os_title_sink(Box::new(RecordingTitleSink {
+        titles: std::sync::Arc::clone(&recorded),
+    }));
+
+    // A fresh title crosses the seam exactly once, sanitized.
+    app.runtime
+        .handle_pty_bytes(b"\x1b]2;nvim \x01src/\x7fmain.rs\x07");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        ["nvim src/main.rs"],
+        "sanitized title handed to the OS sink"
+    );
+
+    // A repeat of the same title is dropped by the change gate: no second
+    // call, so the titlebar never churns.
+    app.runtime.handle_pty_bytes(b"\x1b]0;nvim src/main.rs\x07");
+    app.drive_tick();
+    assert_eq!(recorded.lock().expect("poison-free").len(), 1);
+
+    // OSC 2 then OSC 0 with a new title applies once more, in order.
+    app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
+    app.runtime.handle_pty_bytes(b"\x1b]0;build log\x07");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").as_slice(),
+        ["nvim src/main.rs", "ssh prod", "build log"],
+        "one call per distinct title, in arrival order"
+    );
+
+    // An empty title resets to the static theme title (never a blank bar),
+    // which is a distinct value and so crosses the seam again.
+    app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
+    app.drive_tick();
+    assert_eq!(
+        recorded.lock().expect("poison-free").last().unwrap(),
+        &app.window.title,
+        "empty reset targets the static theme title"
+    );
+}
+
 #[test]
 fn default_startup_carries_no_demo_line() {
     // CTX-0167 / #269: real sessions show only the shell — the default

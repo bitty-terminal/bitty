@@ -29,6 +29,8 @@ pub const STORE_MAX_KEY_BYTES: usize = 128;
 /// Maximum store file bytes accepted on load.
 pub const STORE_FILE_MAX_BYTES: usize =
     STORE_MAX_TOTAL_BYTES + STORE_MAX_ENTRIES * STORE_MAX_KEY_BYTES + 4096;
+/// Maximum JSON recursion depth accepted by parser and value validation.
+pub const JSON_MAX_DEPTH: usize = 16;
 
 /// One plugin's bounded key/value store.
 #[derive(Debug)]
@@ -99,11 +101,16 @@ impl PluginStore {
                 let LuaValue::String(key) = key else {
                     return Err("store keys must be strings".to_string());
                 };
+                validate_entry(&key, &entry).map_err(|err| {
+                    format!("store entry '{key}' violates invariants: {}", err.message)
+                })?;
                 entries.insert(key, entry);
             }
         } else {
             return Err("store root must be an object".to_string());
         }
+        validate_store_quota(&entries)
+            .map_err(|err| format!("store quota violated: {}", err.message))?;
         Ok(Self {
             path: Some(path),
             entries,
@@ -136,29 +143,11 @@ impl PluginStore {
             self.entries = candidate;
             return Ok(());
         }
-        let encoded = encode_json(&value);
-        if encoded.len() > STORE_MAX_VALUE_BYTES {
-            return Err(BridgeError::new(
-                "validation",
-                "E_STORE_VALUE_INVALID",
-                "store value exceeds the 8 KiB ceiling",
-            ));
-        }
-        validate_json_value(&value)?;
+        validate_entry(key, &value)?;
 
         let mut candidate = self.entries.clone();
         candidate.insert(key.to_string(), value);
-        let total: usize = candidate
-            .iter()
-            .map(|(k, v)| k.len() + encode_json(v).len())
-            .sum();
-        if candidate.len() > STORE_MAX_ENTRIES || total > STORE_MAX_TOTAL_BYTES {
-            return Err(BridgeError::new(
-                "budget",
-                "E_STORE_QUOTA",
-                "plugin store quota exceeded",
-            ));
-        }
+        validate_store_quota(&candidate)?;
         self.persist_entries(&candidate)?;
         self.entries = candidate;
         Ok(())
@@ -223,6 +212,48 @@ impl PluginStore {
     }
 }
 
+/// Validate an individual key and entry value against store invariants.
+///
+/// Ensures valid key format, value byte size within [`STORE_MAX_VALUE_BYTES`],
+/// and semantic value structure (finite numbers, valid UTF-8 strings, valid table
+/// keys, and nesting depth within [`JSON_MAX_DEPTH`]).
+pub fn validate_entry(key: &str, value: &LuaValue) -> Result<(), BridgeError> {
+    validate_key(key)?;
+    let encoded = encode_json(value);
+    if encoded.len() > STORE_MAX_VALUE_BYTES {
+        return Err(BridgeError::new(
+            "validation",
+            "E_STORE_VALUE_INVALID",
+            "store value exceeds the 8 KiB ceiling",
+        ));
+    }
+    validate_json_value(value, 2)?;
+    Ok(())
+}
+
+/// Validate the aggregate quota (entry count and total encoded bytes) of the store.
+pub fn validate_store_quota(entries: &BTreeMap<String, LuaValue>) -> Result<(), BridgeError> {
+    if entries.len() > STORE_MAX_ENTRIES {
+        return Err(BridgeError::new(
+            "budget",
+            "E_STORE_QUOTA",
+            "plugin store entry count exceeds limit",
+        ));
+    }
+    let total: usize = entries
+        .iter()
+        .map(|(k, v)| k.len() + encode_json(v).len())
+        .sum();
+    if total > STORE_MAX_TOTAL_BYTES {
+        return Err(BridgeError::new(
+            "budget",
+            "E_STORE_QUOTA",
+            "plugin store quota exceeded",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_key(key: &str) -> Result<(), BridgeError> {
     if key.is_empty() || key.len() > STORE_MAX_KEY_BYTES {
         return Err(BridgeError::new(
@@ -262,7 +293,14 @@ fn validate_key(key: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
-fn validate_json_value(value: &LuaValue) -> Result<(), BridgeError> {
+fn validate_json_value(value: &LuaValue, depth: usize) -> Result<(), BridgeError> {
+    if depth > JSON_MAX_DEPTH {
+        return Err(BridgeError::new(
+            "validation",
+            "E_STORE_VALUE_INVALID",
+            "store value nesting exceeds depth ceiling",
+        ));
+    }
     match value {
         LuaValue::Nil | LuaValue::Bool(_) | LuaValue::Integer(_) => Ok(()),
         LuaValue::Number(n) if n.is_finite() => Ok(()),
@@ -289,7 +327,7 @@ fn validate_json_value(value: &LuaValue) -> Result<(), BridgeError> {
                         ));
                     }
                 }
-                validate_json_value(child)?;
+                validate_json_value(child, depth + 1)?;
             }
             Ok(())
         }
@@ -388,8 +426,6 @@ struct JsonParser<'a> {
     pos: usize,
     depth: usize,
 }
-
-const JSON_MAX_DEPTH: usize = 16;
 
 impl JsonParser<'_> {
     fn parse_value(&mut self) -> Result<LuaValue, String> {
@@ -768,5 +804,158 @@ mod tests {
         assert_eq!(reloaded.get("session.count"), Some(LuaValue::Integer(7)));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_invalid_keys() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+
+        // Key starting with invalid char
+        fake_fs.set_file(path.clone(), b"{\"_bad\": 1}".to_vec());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("violates invariants"));
+
+        // Key with uppercase
+        fake_fs.set_file(path.clone(), b"{\"BadKey\": 1}".to_vec());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("violates invariants"));
+
+        // Key with empty dot segments
+        fake_fs.set_file(path.clone(), b"{\"a..b\": 1}".to_vec());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("violates invariants"));
+
+        // Oversized key (> 128 bytes)
+        let long_key = "a".repeat(129);
+        fake_fs.set_file(path.clone(), format!("{{\"{long_key}\": 1}}").into_bytes());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("violates invariants"));
+    }
+
+    #[test]
+    fn load_rejects_oversized_value() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+
+        let big_str = "x".repeat(STORE_MAX_VALUE_BYTES + 1);
+        fake_fs.set_file(
+            path.clone(),
+            format!("{{\"k\": \"{big_str}\"}}").into_bytes(),
+        );
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("violates invariants"));
+    }
+
+    #[test]
+    fn load_rejects_non_finite_and_invalid_values() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+
+        // Non-object root (string)
+        fake_fs.set_file(path.clone(), b"\"just a string\"".to_vec());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("store root must be an object"));
+
+        // Non-object root (array)
+        fake_fs.set_file(path.clone(), b"[1, 2, 3]".to_vec());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("store keys must be strings"));
+    }
+
+    #[test]
+    fn load_rejects_quota_violations() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+
+        // Too many entries (> STORE_MAX_ENTRIES)
+        let mut text = String::from("{");
+        for i in 0..=STORE_MAX_ENTRIES {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("\"k{i}\": {i}"));
+        }
+        text.push('}');
+        fake_fs.set_file(path.clone(), text.into_bytes());
+        let err = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("store quota violated"));
+    }
+
+    #[test]
+    fn nesting_depth_enforced_across_set_and_load() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        // Construct 13 levels of nested tables with leaf scalar (leaf depth = 2 + 13 + 1 = 16 <= 16, passes)
+        let mut ok_val = LuaValue::Table(vec![(
+            LuaValue::String("leaf".to_string()),
+            LuaValue::Integer(42),
+        )]);
+        for i in 0..13 {
+            ok_val = LuaValue::Table(vec![(LuaValue::String(format!("lvl{i}")), ok_val)]);
+        }
+        store
+            .set("nested.ok", ok_val)
+            .expect("depth 16 must succeed");
+
+        // Construct 14 levels of nested tables with leaf scalar (leaf depth = 2 + 14 + 1 = 17 > 16, fails)
+        let mut deep_val = LuaValue::Table(vec![(
+            LuaValue::String("leaf".to_string()),
+            LuaValue::Integer(42),
+        )]);
+        for i in 0..14 {
+            deep_val = LuaValue::Table(vec![(LuaValue::String(format!("lvl{i}")), deep_val)]);
+        }
+        let err = store.set("nested.deep", deep_val);
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, "E_STORE_VALUE_INVALID");
+
+        // Loading the valid store must succeed
+        let loaded =
+            PluginStore::load_with_fs(path.clone(), fake_fs.clone()).expect("valid store loads");
+        assert!(loaded.get("nested.ok").is_some());
+    }
+
+    #[test]
+    fn load_failure_preserves_last_good_state() {
+        let fake_fs = Arc::new(FakeFileSystem::new());
+        let path = PathBuf::from("/plugins-state/my-plugin/store.json");
+        let mut store = PluginStore::with_filesystem(Some(path.clone()), fake_fs.clone());
+
+        store
+            .set("good.key", LuaValue::String("good.val".to_string()))
+            .expect("initial set");
+        assert_eq!(
+            store.get("good.key"),
+            Some(LuaValue::String("good.val".to_string()))
+        );
+
+        // Verify valid load
+        let loaded = PluginStore::load_with_fs(path.clone(), fake_fs.clone()).expect("load valid");
+        assert_eq!(
+            loaded.get("good.key"),
+            Some(LuaValue::String("good.val".to_string()))
+        );
+
+        // Corrupt on disk with invalid key
+        fake_fs.set_file(path.clone(), b"{\"INVALID_KEY\": 123}".to_vec());
+        let failed_load = PluginStore::load_with_fs(path.clone(), fake_fs.clone());
+        assert!(failed_load.is_err());
+
+        // In-memory `store` was unaffected and still holds good state
+        assert_eq!(
+            store.get("good.key"),
+            Some(LuaValue::String("good.val".to_string()))
+        );
     }
 }

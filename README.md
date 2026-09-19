@@ -24,8 +24,8 @@ repository. Anything not marked shipped is not a compatibility promise.
 | Terminal core: PTY, VT parser, grid/scrollback, damage tracking                   | Shipped                      |
 | Windowed rendering (`wgpu`) with headless/software fallback                       | Shipped                      |
 | Layouts: splits, stack, overlay, workspaces, focus, resize                        | Shipped                      |
-| Scrollback search and selection                                                   | Shipped                      |
-| 30 built-in theme presets with aliases, `bitty list themes`                       | Shipped                      |
+| Scrollback search and selection                                                   | Partial                      |
+| 30 built-in theme presets (aliases for many), `bitty list themes`                 | Shipped                      |
 | `bitty init` guided setup wizard                                                  | Shipped                      |
 | Lua `init.lua` config, XDG paths, named profiles                                  | Shipped                      |
 | Appearance overrides: CLI flags and per-view `views.*`                            | Shipped                      |
@@ -41,6 +41,19 @@ repository. Anything not marked shipped is not a compatibility promise.
 | Third-party plugin ecosystem and SDK                                              | Early                        |
 | Stable public Rust API (1.0)                                                      | Not yet                      |
 | Remote UI and a `bittyd` daemon                                                   | Not yet (post-1.0 candidate) |
+
+"Partial" means the mechanism exists and is tested but is not yet fully
+reachable end-to-end: scrollback search is keyboard-driven (`Ctrl+Shift+F` opens
+the modal query, `Enter`/`Shift+Enter` navigate matches, `Esc` exits) over the
+bounded state search (`crates/bitty-term-state/src/search.rs`,
+`crates/bitty-runtime/src/runtime/search.rs`), but no frame paints the query or
+scrollback match highlights yet (the current match paints only while it is in
+the live grid, through the selection highlight) and the search status label is
+stderr-only. Selection is likewise live-grid only: mouse selection and keyboard
+copy mode (`Ctrl+Shift+Space`) both clamp to the live grid, and
+`crates/bitty-runtime/src/runtime/present.rs` skips the highlight while the
+focused view is scrolled into history. The remaining overlay and
+scrollback-selection work is tracked in issue #1140.
 
 "Early" means the mechanism exists and is tested, but its external contract is
 still changing; do not depend on it yet. The design corpus for text/Unicode and
@@ -120,7 +133,8 @@ bitty init --yes --theme tokyo-night --font-family "JetBrainsMono Nerd Font"
 ### Themes
 
 Bitty ships 30 built-in presets (Tokyo Night, Catppuccin, Gruvbox, Solarized,
-Dracula, Nord, Rose Pine, Everforest, and more), each with aliases:
+Dracula, Nord, Rose Pine, Everforest, and more); many carry short aliases such
+as `catppuccin` and `gruvbox`:
 
 ```sh
 bitty list themes
@@ -143,8 +157,10 @@ bitty --help                     # full flag and subcommand reference
 
 Default chrome chords use Alt as the modifier (configurable with `mod_key`):
 `Alt+h/j/k/l` and `Ctrl+Alt+arrows` move focus, `Shift+Alt+h/j/k/l` splits,
-`Shift+Ctrl+h/j/k/l` resizes, `Alt+1..9` jumps to a view, `Alt+z/m/f` toggles
-zoom/maximize/fullscreen, `Alt+w` closes, and `Ctrl+Shift+C/V` copy and paste.
+`Shift+Ctrl+h/j/k/l` resizes, `Alt+1..9` jumps to a workspace, `Alt+z/m/f`
+toggles pane zoom, `Alt+w` closes the workspace, `Ctrl+Shift+C/V` copy and
+paste, and `Ctrl+Shift+F` opens scrollback search. See the Status table for the
+known scrollback-search limitations.
 
 ## Configuration
 

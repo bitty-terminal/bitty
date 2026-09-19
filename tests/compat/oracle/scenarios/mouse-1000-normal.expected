@@ -1,5 +1,6 @@
 area: mouse-tracking
-provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1000 -> Send Mouse X & Y on button press and release"
+authority: xterm-ctlseqs
+cite: Ps = 1 0 0 0  -> Send Mouse X & Y on button press and
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

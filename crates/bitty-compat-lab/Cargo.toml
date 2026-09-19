@@ -16,6 +16,14 @@ workspace = true
 [dependencies]
 bitty-vt = { version = "0.0.20", path = "../bitty-vt" }
 bitty-term-state = { version = "0.0.20", path = "../bitty-term-state" }
+# CTX-0573 review F6: the `runtime` oracle engine drives the real app path so
+# OSC 10/11 query replies and mouse coordinate emission — deliberately inert in
+# terminal state — are diffed against the corpus. `bitty-runtime` does not
+# depend on this crate, so the edge is acyclic; this crate is `publish = false`
+# devtooling, so no external dependency enters the workspace that the runtime
+# does not already build.
+bitty-runtime = { version = "0.0.20", path = "../bitty-runtime" }
+bitty-platform = { version = "0.0.20", path = "../bitty-platform" }
 
 [dev-dependencies]
 bitty-pty = { version = "0.0.20", path = "../bitty-pty" }

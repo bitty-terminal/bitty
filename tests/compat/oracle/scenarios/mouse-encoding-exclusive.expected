@@ -1,5 +1,6 @@
 area: mouse-encoding
-provenance: spec|xterm patch #411 ctlseqs.txt: encodings mutually exclusive, a reset is only effective against the matching mode
+authority: xterm-charproc
+cite: they are mutually exclusive.  For consistency, a reset is
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

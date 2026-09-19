@@ -12,9 +12,10 @@
 //! ## Layout
 //!
 //! ```text
-//! tests/compat/oracle/README.md              # layout, provenance, how to extend
-//! tests/compat/oracle/scenarios/<id>.bin     # raw VT bytes for one scenario
-//! tests/compat/oracle/scenarios/<id>.expected# expectation (spec/capture derived)
+//! tests/compat/oracle/README.md               # layout, provenance, how to extend
+//! tests/compat/oracle/authority-cites.txt     # authority<TAB>cite index
+//! tests/compat/oracle/scenarios/<id>.bin      # raw VT bytes for one scenario
+//! tests/compat/oracle/scenarios/<id>.expected # expectation (authority derived)
 //! ```
 //!
 //! Discovery is `CARGO_MANIFEST_DIR`-anchored through
@@ -26,16 +27,30 @@
 //! The scenario set covers the M1 protocol matrix
 //! (`docs/specifications/compatibility-milestone-rfc.md`): synchronized
 //! updates (DECSET 2026), OSC 10/11 color query/set, OSC 0/2 title, mouse
-//! tracking 1000/1002/1003 and encodings X10/SGR/UTF-8/urxvt, mode 1007
-//! alternate scroll, DECSCUSR cursor style, alternate screen 1049/47, and
-//! DECCKM cursor keys.
+//! tracking 1000/1002/1003 and encodings X10/SGR/UTF-8/urxvt (register plus
+//! emitted bytes), mode 1007 alternate scroll, DECSCUSR cursor style,
+//! alternate screen 1049/47, DECCKM cursor keys, and DSR/DA1 replies.
 //!
 //! ## Provenance
 //!
-//! Each `.expected` file carries a `provenance:` line naming either the
-//! authoritative specification section (`spec|<citation>`) or the captured
-//! reference terminal and revision (`capture|<terminal> <version> <rev>`).
-//! See `tests/compat/oracle/README.md` for the corpus-wide provenance table.
+//! Each `.expected` file carries structured provenance: an `authority:` line
+//! naming one of the [`AUTHORITIES`] (the exact external source that defines
+//! the exercised behavior) and a `cite:` line holding a **verbatim token** from
+//! that source. The `oracle_citations_are_backed_by_their_authority` guard
+//! requires every `authority`/`cite` pair to appear in the committed
+//! `tests/compat/oracle/authority-cites.txt` index, which is derived from — and
+//! re-verified against — the read-only reference snapshots and the canonical
+//! specs. A free-form citation cannot enter the index, so a mis-citation (for
+//! example citing `ctlseqs` for the `2026` synchronized-update mode, which
+//! ctlseqs does not define) fails the guard instead of being rubber-stamped.
+//! When a source is resolvable on the host, the guard additionally asserts the
+//! token appears verbatim in it. See `tests/compat/oracle/README.md` for the
+//! corpus-wide provenance table.
+//!
+//! Two engines execute scenarios: `state` (default) replays bytes through the
+//! headless parser/state path; `runtime` drives `bitty-runtime` (OSC 10/11
+//! query replies and mouse coordinate emission) and is executed by the
+//! `bitty-runtime` oracle test, which reuses this crate's parser.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -55,8 +70,8 @@ pub const MAX_SCENARIOS: usize = 64;
 /// Maximum expected-file bytes accepted.
 pub const MAX_EXPECTED_BYTES: usize = 16 * 1024;
 
-/// Summary schema version.
-pub const SUMMARY_VERSION: u32 = 1;
+/// Summary schema version (bumped for structured engine/citation fields).
+pub const SUMMARY_VERSION: u32 = 2;
 
 /// Scope label recorded in the summary.
 pub const SUMMARY_SCOPE: &str = "M1 VT differential oracle corpus (CTX-0573)";
@@ -78,9 +93,9 @@ pub const AREAS: &[&str] = &[
 /// Where a scenario's expectation came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceKind {
-    /// Authoritative control-sequence specification citation.
+    /// Authoritative specification citation.
     Spec,
-    /// Captured reference terminal, pinned by version and revision.
+    /// Reference implementation source (a captured/pinned upstream tree).
     Capture,
 }
 
@@ -95,14 +110,162 @@ impl ProvenanceKind {
     }
 }
 
-/// One expectation's provenance.
+/// Where an authority source lives relative to the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorityRoot {
+    /// `$BITTY_WORKSPACE/recording/references/<path>` (read-only snapshot).
+    UmbrellaReferences,
+    /// `<repo>/<path>` (canonical docs submodule).
+    RepoDocs,
+}
+
+/// One externally authoritative source the oracle may cite.
+///
+/// The `id` is the structured `authority:` value; `path` locates the source so
+/// the citation guard can re-verify the `cite:` token verbatim when the source
+/// is resolvable on the host.
+#[derive(Debug, Clone, Copy)]
+pub struct Authority {
+    /// Stable authority id used in `.expected` files.
+    pub id: &'static str,
+    /// Spec or reference-implementation kind.
+    pub kind: ProvenanceKind,
+    /// Source path relative to [`Authority::root`].
+    pub path: &'static str,
+    /// Where the source lives.
+    pub root: AuthorityRoot,
+    /// Human-readable label recorded in the summary.
+    pub label: &'static str,
+}
+
+/// The closed set of authorities the oracle may cite.
+///
+/// One entry per exact source file, so a `cite:` token can be re-found
+/// verbatim (never a whole tree, which would make the check vacuous). The set
+/// is deliberately minimal: `xterm-ctlseqs` (the control-sequence reference),
+/// its source `xterm-charproc` (semantics ctlseqs states only loosely), the
+/// ghostty and kitty reference sources, and the two accepted RFCs. A source
+/// absent here cannot be cited, so a mis-citation is a load error, not a
+/// silent pass.
+pub const AUTHORITIES: &[Authority] = &[
+    Authority {
+        id: "xterm-ctlseqs",
+        kind: ProvenanceKind::Spec,
+        path: "xterm/ctlseqs.txt",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "xterm patch #411 ctlseqs.txt (2026/08/23)",
+    },
+    Authority {
+        id: "xterm-charproc",
+        kind: ProvenanceKind::Capture,
+        path: "xterm/charproc.c",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "xterm patch #411 charproc.c",
+    },
+    Authority {
+        id: "ghostty-modes",
+        kind: ProvenanceKind::Capture,
+        path: "ghostty/src/terminal/modes.zig",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "ghostty src/terminal/modes.zig",
+    },
+    Authority {
+        id: "ghostty-stream",
+        kind: ProvenanceKind::Capture,
+        path: "ghostty/src/terminal/stream.zig",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "ghostty src/terminal/stream.zig",
+    },
+    Authority {
+        id: "ghostty-terminal",
+        kind: ProvenanceKind::Capture,
+        path: "ghostty/src/terminal/Terminal.zig",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "ghostty src/terminal/Terminal.zig",
+    },
+    Authority {
+        id: "kitty-window",
+        kind: ProvenanceKind::Capture,
+        path: "kitty/kitty/window.py",
+        root: AuthorityRoot::UmbrellaReferences,
+        label: "kitty kitty/window.py",
+    },
+    Authority {
+        id: "m1-rfc",
+        kind: ProvenanceKind::Spec,
+        path: "docs/specifications/compatibility-milestone-rfc.md",
+        root: AuthorityRoot::RepoDocs,
+        label: "M1 compatibility milestone RFC",
+    },
+    Authority {
+        id: "text-rendering-rfc",
+        kind: ProvenanceKind::Spec,
+        path: "docs/specifications/text-rendering-rfc.md",
+        root: AuthorityRoot::RepoDocs,
+        label: "text rendering RFC",
+    },
+];
+
+/// Look up an authority id.
+#[must_use]
+pub fn authority(id: &str) -> Option<&'static Authority> {
+    AUTHORITIES.iter().find(|a| a.id == id)
+}
+
+/// One expectation's provenance: a structured authority plus the verbatim
+/// token from that authority which supports the exercised behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
-    /// Spec or terminal capture.
+    /// Spec or reference-implementation kind.
     pub kind: ProvenanceKind,
-    /// Citation text after the `|`, e.g. `xterm patch #411 ctlseqs.txt` or
-    /// `xterm 411 (2026/08/23)`. Free-form but recorded verbatim.
+    /// Authority id (key into [`AUTHORITIES`]).
+    pub authority: String,
+    /// Human-readable authority label.
     pub source: String,
+    /// Verbatim token from the authority that defines the behavior.
+    pub cite: String,
+}
+
+/// Which execution engine runs a scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// Headless `bitty-vt` parser -> `bitty-term-state` (default).
+    State,
+    /// `bitty-runtime` end-to-end (OSC query replies, mouse encoding).
+    Runtime,
+}
+
+impl Engine {
+    /// Lowercase wire form used in the summary JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Engine::State => "state",
+            Engine::Runtime => "runtime",
+        }
+    }
+}
+
+/// One deterministic stimulus applied before a runtime scenario's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stimulus {
+    /// Grant the `OSC 10`/`OSC 11` set gate (default deny).
+    AllowOscColorSet,
+    /// Move the pointer to the scenario's `at_cell` (0-based) and press left.
+    MouseLeftPress,
+    /// Move the pointer to the scenario's `at_cell` and release left.
+    MouseLeftRelease,
+}
+
+impl Stimulus {
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "allow-osc-color-set" => Some(Stimulus::AllowOscColorSet),
+            "mouse-left-press" => Some(Stimulus::MouseLeftPress),
+            "mouse-left-release" => Some(Stimulus::MouseLeftRelease),
+            _ => None,
+        }
+    }
 }
 
 /// Expected state for one scenario.
@@ -134,8 +297,11 @@ pub struct Expected {
     pub title: Option<String>,
     /// Expected exact canonical action list, or `None` when unchecked.
     pub actions: Option<Vec<String>>,
-    /// Expected concatenated reply bytes, or `None` when unchecked.
+    /// Expected concatenated query-reply bytes, or `None` when unchecked.
     pub reply: Option<Vec<u8>>,
+    /// Expected terminal-to-host input bytes (`emit:`), or `None` when
+    /// unchecked. Runtime-engine only (mouse report emission).
+    pub emit: Option<Vec<u8>>,
 }
 
 /// One oracle scenario: bytes plus the externally derived expectation.
@@ -147,6 +313,12 @@ pub struct Scenario {
     pub area: String,
     /// Provenance of the expectation.
     pub provenance: Provenance,
+    /// Which engine executes the scenario.
+    pub engine: Engine,
+    /// Deterministic stimuli applied before the bytes (runtime engine).
+    pub stimuli: Vec<Stimulus>,
+    /// Pointer cell `(row, col)` for mouse stimuli, 0-based.
+    pub at_cell: Option<(u16, u16)>,
     /// Raw VT bytes.
     pub corpus: Vec<u8>,
     /// Expected state.
@@ -193,6 +365,8 @@ pub struct ScenarioOutcome {
     pub id: String,
     /// Area.
     pub area: String,
+    /// Execution engine.
+    pub engine: Engine,
     /// Provenance.
     pub provenance: Provenance,
     /// Overall status.
@@ -289,19 +463,35 @@ pub fn load_scenario_file(bin: &Path) -> Result<Scenario, String> {
         return Err(format!("{id}: expected file exceeds MAX_EXPECTED_BYTES"));
     }
     let text = std::str::from_utf8(&raw).map_err(|e| format!("{id}: expected utf8: {e}"))?;
-    let (area, provenance, expected) = parse_expected(&id, text)?;
+    let parsed = parse_expected(&id, text)?;
     Ok(Scenario {
         id,
-        area,
-        provenance,
+        area: parsed.area,
+        provenance: parsed.provenance,
+        engine: parsed.engine,
+        stimuli: parsed.stimuli,
+        at_cell: parsed.at_cell,
         corpus,
-        expected,
+        expected: parsed.expected,
     })
 }
 
-fn parse_expected(id: &str, text: &str) -> Result<(String, Provenance, Expected), String> {
+/// Parsed `.expected` file, minus the raw corpus.
+struct ParsedExpected {
+    area: String,
+    provenance: Provenance,
+    engine: Engine,
+    stimuli: Vec<Stimulus>,
+    at_cell: Option<(u16, u16)>,
+    expected: Expected,
+}
+
+fn parse_expected(id: &str, text: &str) -> Result<ParsedExpected, String> {
     let mut area: Option<String> = None;
     let mut provenance: Option<Provenance> = None;
+    let mut engine = Engine::State;
+    let mut stimuli: Vec<Stimulus> = Vec::new();
+    let mut at_cell: Option<(u16, u16)> = None;
     let mut expected = Expected {
         grid: (bitty_term_state::GRID_COLUMNS, bitty_term_state::GRID_ROWS),
         ..Expected::default()
@@ -324,24 +514,52 @@ fn parse_expected(id: &str, text: &str) -> Result<(String, Provenance, Expected)
                 }
                 area = Some(value.to_string());
             }
-            "provenance" => {
-                let (kind, source) = value.split_once('|').ok_or_else(|| {
-                    format!("{id}:{}: provenance needs `kind|citation`", lineno + 1)
-                })?;
-                let kind = match kind.trim() {
-                    "spec" => ProvenanceKind::Spec,
-                    "capture" => ProvenanceKind::Capture,
+            "authority" => {
+                let found = authority(value)
+                    .ok_or_else(|| format!("{id}:{}: unknown authority {value:?}", lineno + 1))?;
+                provenance = Some(Provenance {
+                    kind: found.kind,
+                    authority: found.id.to_string(),
+                    source: found.label.to_string(),
+                    cite: String::new(),
+                });
+            }
+            "cite" => {
+                let p = provenance
+                    .as_mut()
+                    .ok_or_else(|| format!("{id}:{}: cite before authority", lineno + 1))?;
+                p.cite = value.to_string();
+            }
+            "engine" => {
+                engine = match value {
+                    "state" => Engine::State,
+                    "runtime" => Engine::Runtime,
                     other => {
                         return Err(format!(
-                            "{id}:{}: unknown provenance kind {other:?}",
+                            "{id}:{}: engine expects state|runtime, got {other:?}",
                             lineno + 1
                         ));
                     }
                 };
-                provenance = Some(Provenance {
-                    kind,
-                    source: source.trim().to_string(),
-                });
+            }
+            "stimulus" => {
+                let parsed = Stimulus::parse(value)
+                    .ok_or_else(|| format!("{id}:{}: unknown stimulus {value:?}", lineno + 1))?;
+                stimuli.push(parsed);
+            }
+            "at_cell" => {
+                let (r, c) = value
+                    .split_once(',')
+                    .ok_or_else(|| format!("{id}:{}: at_cell needs `ROW,COL`", lineno + 1))?;
+                let r: u16 = r
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("{id}:{}: bad at_cell row", lineno + 1))?;
+                let c: u16 = c
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("{id}:{}: bad at_cell col", lineno + 1))?;
+                at_cell = Some((r, c));
             }
             "grid" => {
                 let (w, h) = value
@@ -413,6 +631,7 @@ fn parse_expected(id: &str, text: &str) -> Result<(String, Provenance, Expected)
                 .get_or_insert_with(Vec::new)
                 .push(value.to_string()),
             "reply" => expected.reply = Some(unescape_bytes(value)),
+            "emit" => expected.emit = Some(unescape_bytes(value)),
             other => return Err(format!("{id}:{}: unknown key {other:?}", lineno + 1)),
         }
     }
@@ -423,13 +642,42 @@ fn parse_expected(id: &str, text: &str) -> Result<(String, Provenance, Expected)
         return Err(format!("{id}: grid dimensions must be non-zero"));
     }
     let area = area.ok_or_else(|| format!("{id}: missing `area:` line"))?;
-    let provenance = provenance.ok_or_else(|| format!("{id}: missing `provenance:` line"))?;
-    Ok((area, provenance, expected))
+    let provenance = provenance.ok_or_else(|| format!("{id}: missing `authority:` line"))?;
+    if provenance.cite.trim().is_empty() {
+        return Err(format!("{id}: missing `cite:` line"));
+    }
+    if engine == Engine::Runtime {
+        let uses_stimulus = stimuli
+            .iter()
+            .any(|s| matches!(s, Stimulus::MouseLeftPress | Stimulus::MouseLeftRelease));
+        if uses_stimulus && at_cell.is_none() {
+            return Err(format!(
+                "{id}: mouse stimulus requires an `at_cell: ROW,COL` line"
+            ));
+        }
+    } else if !stimuli.is_empty() || at_cell.is_some() {
+        return Err(format!(
+            "{id}: stimuli and at_cell are runtime-engine only (add `engine: runtime`)"
+        ));
+    }
+    Ok(ParsedExpected {
+        area,
+        provenance,
+        engine,
+        stimuli,
+        at_cell,
+        expected,
+    })
 }
 
 /// Run the full oracle corpus, sorted and bounded.
+///
+/// Citations are verified first (against the committed index and, when
+/// resolvable, the authority sources) so a mis-citation fails the run rather
+/// than passing as a green scenario.
 pub fn run_oracle() -> Result<OracleReport, String> {
     let scenarios = load_scenarios()?;
+    verify_citations(&scenarios)?;
     let mut outcomes = Vec::with_capacity(scenarios.len());
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -450,44 +698,40 @@ pub fn run_oracle() -> Result<OracleReport, String> {
     })
 }
 
+/// Observed values one engine extracts for the shared checks.
+struct Observation {
+    snapshot: Snapshot,
+    actions: Vec<TerminalAction>,
+    alt_screen: bool,
+    /// Query replies emitted by the engine (concatenated).
+    reply: Vec<u8>,
+    /// Input bytes the terminal emitted toward the host (mouse reports).
+    emit: Vec<u8>,
+}
+
 /// Execute one scenario against the Bitty build and diff against its oracle.
 #[must_use]
 pub fn run_scenario(scenario: &Scenario) -> ScenarioOutcome {
     let mut checks: Vec<CheckResult> = Vec::new();
 
-    // Bounded, deterministic parse through the shared compat-lab harness.
-    let actions = std::panic::catch_unwind(|| crate::parse_bounded(&scenario.corpus))
-        .expect("parse_bounded must not panic on a bounded corpus");
-    let snapshot = crate::actions_to_snapshot(&actions);
+    let observation = match scenario.engine {
+        Engine::State => observe_state_engine(scenario),
+        Engine::Runtime => observe_runtime_engine(scenario),
+    };
 
-    let mut state = bitty_term_state::State::new();
-    for action in &actions {
-        state.apply(action);
-    }
-    let replies = state.take_replies();
-    let reply_bytes: Vec<u8> = replies.iter().flat_map(|r| r.iter().copied()).collect();
-
-    if let Err(err) = state.check_invariants() {
-        checks.push(CheckResult {
-            name: "invariants".to_string(),
-            passed: false,
-            expected: "clean".to_string(),
-            actual: format!("{err:?}"),
-        });
-    }
-
-    check_grid(&scenario.expected, &snapshot, &mut checks);
-    check_cursor(&scenario.expected, &snapshot, &mut checks);
+    check_grid(&scenario.expected, &observation.snapshot, &mut checks);
+    check_cursor(&scenario.expected, &observation.snapshot, &mut checks);
     check_modes(
         &scenario.expected,
-        &snapshot.modes,
-        state.alt_screen_active(),
+        &observation.snapshot.modes,
+        observation.alt_screen,
         &mut checks,
     );
-    check_cursor_style(&scenario.expected, &snapshot, &mut checks);
-    check_title(&scenario.expected, &snapshot, &mut checks);
-    check_actions(&scenario.expected, &actions, &mut checks);
-    check_reply(&scenario.expected, &reply_bytes, &mut checks);
+    check_cursor_style(&scenario.expected, &observation.snapshot, &mut checks);
+    check_title(&scenario.expected, &observation.snapshot, &mut checks);
+    check_actions(&scenario.expected, &observation.actions, &mut checks);
+    check_reply(&scenario.expected, &observation.reply, &mut checks);
+    check_emit(&scenario.expected, &observation.emit, &mut checks);
 
     let status = if checks.iter().all(|c| c.passed) {
         Status::Pass
@@ -497,9 +741,167 @@ pub fn run_scenario(scenario: &Scenario) -> ScenarioOutcome {
     ScenarioOutcome {
         id: scenario.id.clone(),
         area: scenario.area.clone(),
+        engine: scenario.engine,
         provenance: scenario.provenance.clone(),
         status,
         checks,
+    }
+}
+
+/// Headless `bitty-vt` parser -> `bitty-term-state` observation (bounded).
+fn observe_state_engine(scenario: &Scenario) -> Observation {
+    let actions = std::panic::catch_unwind(|| crate::parse_bounded(&scenario.corpus))
+        .expect("parse_bounded must not panic on a bounded corpus");
+    let snapshot = crate::actions_to_snapshot(&actions);
+
+    let mut state = bitty_term_state::State::new();
+    for action in &actions {
+        state.apply(action);
+    }
+    let reply: Vec<u8> = state
+        .take_replies()
+        .iter()
+        .flat_map(|r| r.iter().copied())
+        .collect();
+    debug_assert!(
+        state.check_invariants().is_ok(),
+        "state engine left the terminal invariant set dirty"
+    );
+    Observation {
+        snapshot,
+        actions,
+        alt_screen: state.alt_screen_active(),
+        reply,
+        emit: Vec::new(),
+    }
+}
+
+/// `bitty-runtime` engine: real app path for replies and mouse emission.
+///
+/// Deterministic and headless: no PTY, network, clock, or display; the
+/// runtime's `Instant::now` seam is only used for click counting, which the
+/// stimuli do not exercise.
+fn observe_runtime_engine(scenario: &Scenario) -> Observation {
+    use bitty_runtime::Runtime;
+
+    let config = bitty_runtime::RuntimeConfig {
+        theme_resolved: true,
+        ..bitty_runtime::RuntimeConfig::default()
+    };
+    let mut rt = Runtime::new(config).expect("headless runtime must build");
+
+    // Phase 1 — stimuli that gate later bytes (must precede the corpus).
+    for stimulus in &scenario.stimuli {
+        if *stimulus == Stimulus::AllowOscColorSet {
+            rt.set_osc_color_set_allowed(true);
+        }
+    }
+
+    rt.handle_pty_bytes(&scenario.corpus);
+
+    // Phase 2 — input stimuli, applied after the corpus so the tracking and
+    // encoding modes are live when the pointer event is encoded. One captured
+    // base instant feeds the virtual-clock seam for every event, so the
+    // click-tracking timestamp is fixed for the scenario and the emitted bytes
+    // cannot depend on wall time.
+    let base = std::time::Instant::now();
+    for stimulus in &scenario.stimuli {
+        match stimulus {
+            Stimulus::AllowOscColorSet => {}
+            Stimulus::MouseLeftPress | Stimulus::MouseLeftRelease => {
+                let (row, col) = scenario
+                    .at_cell
+                    .expect("runtime mouse stimulus requires at_cell");
+                let pos = runtime_cell_center(&rt, row, col);
+                rt.handle_cursor_moved(pos);
+                rt.drain_pending_input();
+                let state = if *stimulus == Stimulus::MouseLeftPress {
+                    bitty_platform::PressState::Pressed
+                } else {
+                    bitty_platform::PressState::Released
+                };
+                rt.handle_mouse_input_at(
+                    bitty_platform::MouseEvent::new(bitty_platform::MouseButton::Left, state),
+                    base,
+                );
+            }
+        }
+    }
+    let reply: Vec<u8> = rt
+        .take_replies()
+        .iter()
+        .flat_map(|r| r.iter().copied())
+        .collect();
+    let emit = rt.pending_input().to_vec();
+    let snapshot = rt.snapshot();
+    let alt_screen = rt.state().alt_screen_active();
+    let actions = crate::parse_bounded(&scenario.corpus);
+    Observation {
+        snapshot,
+        actions,
+        alt_screen,
+        reply,
+        emit,
+    }
+}
+
+/// A physical pointer position whose `Runtime::cursor_to_cell` maps to
+/// `(row, col)`.
+///
+/// Inverts the runtime's own public cell mapping by a bounded 1px scan rather
+/// than re-deriving decoration/DPI/gap math here, so the stimulus stays
+/// correct if layout constants change. The scan range is derived from the
+/// configured grid and decoration — no clock or randomness.
+fn runtime_cell_center(
+    rt: &bitty_runtime::Runtime,
+    row: u16,
+    col: u16,
+) -> bitty_platform::CursorPosition {
+    let cfg = rt.config();
+    let cell_w = f64::from(cfg.cell_width.max(1));
+    let cell_h = f64::from(cfg.cell_height.max(1));
+    let max_x = (cfg.cols as f64 + 4.0) * cell_w + 256.0;
+    let max_y = (cfg.rows as f64 + 4.0) * cell_h + 256.0;
+    let x = probe_axis(
+        |x| {
+            rt.cursor_to_cell(bitty_platform::CursorPosition { x, y: 0.0 })
+                .col
+        },
+        col,
+        max_x,
+    );
+    let y = probe_axis(
+        |y| {
+            rt.cursor_to_cell(bitty_platform::CursorPosition { x: 0.0, y })
+                .row
+        },
+        row,
+        max_y,
+    );
+    bitty_platform::CursorPosition { x, y }
+}
+
+/// Midpoint of the first pixel band on one axis whose cell mapping equals
+/// `target` (bounded scan up to `max`).
+fn probe_axis(mut map: impl FnMut(f64) -> u16, target: u16, max: f64) -> f64 {
+    let mut start = None;
+    let mut end = max;
+    let mut x = 0.0f64;
+    while x <= max {
+        let cell = map(x);
+        if cell == target {
+            if start.is_none() {
+                start = Some(x);
+            }
+        } else if start.is_some() {
+            end = x;
+            break;
+        }
+        x += 1.0;
+    }
+    match start {
+        Some(lo) => (lo + end) / 2.0,
+        None => max / 2.0,
     }
 }
 
@@ -735,6 +1137,18 @@ fn check_reply(expected: &Expected, reply: &[u8], checks: &mut Vec<CheckResult>)
     }
 }
 
+fn check_emit(expected: &Expected, emit: &[u8], checks: &mut Vec<CheckResult>) {
+    if let Some(want) = &expected.emit {
+        push_check(
+            checks,
+            "emit",
+            emit == want.as_slice(),
+            escape_bytes(want),
+            escape_bytes(emit),
+        );
+    }
+}
+
 /// Canonical, stable textual form of the parser actions the oracle asserts.
 ///
 /// Only the families named by `action:` expectation lines are canonicalized;
@@ -916,9 +1330,15 @@ pub fn generate_summary_json(report: &OracleReport) -> Result<String, String> {
             json_escape(&outcome.area)
         ));
         out.push_str(&format!(
-            "      \"provenance\": {{\"kind\": \"{}\", \"source\": \"{}\"}},\n",
+            "      \"engine\": \"{}\",\n",
+            outcome.engine.as_str()
+        ));
+        out.push_str(&format!(
+            "      \"provenance\": {{\"kind\": \"{}\", \"authority\": \"{}\", \"source\": \"{}\", \"cite\": \"{}\"}},\n",
             outcome.provenance.kind.as_str(),
-            json_escape(&outcome.provenance.source)
+            json_escape(&outcome.provenance.authority),
+            json_escape(&outcome.provenance.source),
+            json_escape(&outcome.provenance.cite)
         ));
         out.push_str(&format!(
             "      \"status\": \"{}\",\n",
@@ -969,4 +1389,131 @@ fn json_escape(input: &str) -> String {
         }
     }
     out
+}
+
+/// Repo-relative path of the committed citation index.
+pub const CITATION_INDEX_REL: &str = "tests/compat/oracle/authority-cites.txt";
+
+/// One index entry: the claimed `authority` + verbatim `cite` pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiteEntry {
+    /// Authority id.
+    pub authority: String,
+    /// Verbatim token from the authority source.
+    pub cite: String,
+}
+
+/// Load and validate the citation index.
+///
+/// Format: one `authority<TAB>cite` pair per non-comment, non-blank line. A
+/// malformed line, an unknown authority, a duplicate pair, or an empty field
+/// is an error, so the index cannot silently drift.
+pub fn load_citation_index() -> Result<Vec<CiteEntry>, String> {
+    let path = crate::workspace_root().join(CITATION_INDEX_REL);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read citation index {}: {e}", path.display()))?;
+    let mut out: Vec<CiteEntry> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (authority, cite) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("citation index:{}: needs `authority<TAB>cite`", lineno + 1))?;
+        let authority = authority.trim();
+        let cite = cite.trim();
+        if authority.is_empty() || cite.is_empty() {
+            return Err(format!(
+                "citation index:{}: empty authority or cite field",
+                lineno + 1
+            ));
+        }
+        if self::authority(authority).is_none() {
+            return Err(format!(
+                "citation index:{}: unknown authority {authority:?}",
+                lineno + 1
+            ));
+        }
+        let key = (authority.to_string(), cite.to_string());
+        if !seen.insert(key.clone()) {
+            return Err(format!(
+                "citation index:{}: duplicate pair {authority:?} / {cite:?}",
+                lineno + 1
+            ));
+        }
+        out.push(CiteEntry {
+            authority: key.0,
+            cite: key.1,
+        });
+    }
+    if out.is_empty() {
+        return Err("citation index is empty".to_string());
+    }
+    Ok(out)
+}
+
+/// Resolve an authority's source file on this host, if present.
+///
+/// Returns `None` when the read-only snapshot / docs submodule is absent (for
+/// example a bare CI checkout without the submodule); the caller then relies on
+/// the committed index alone.
+#[must_use]
+pub fn resolve_authority_source(authority: &Authority) -> Option<PathBuf> {
+    match authority.root {
+        AuthorityRoot::UmbrellaReferences => crate::umbrella_root()
+            .map(|root| root.join("recording/references").join(authority.path)),
+        AuthorityRoot::RepoDocs => Some(crate::workspace_root().join(authority.path)),
+    }
+    .filter(|p| p.exists())
+}
+
+/// Verify one `authority`/`cite` pair against the committed index and, when
+/// resolvable, the authority source file.
+///
+/// # Errors
+///
+/// Returns a message when the pair is absent from the index, or when the
+/// authority source is resolvable and does not contain the token verbatim
+/// (a mis-citation: the cited sentence does not support the behavior).
+pub fn verify_citation(index: &[CiteEntry], authority_id: &str, cite: &str) -> Result<(), String> {
+    let entry_ok = index
+        .iter()
+        .any(|e| e.authority == authority_id && e.cite == cite);
+    if !entry_ok {
+        return Err(format!(
+            "citation not in {CITATION_INDEX_REL}: authority {authority_id:?} / cite {cite:?}"
+        ));
+    }
+    let Some(auth) = authority(authority_id) else {
+        return Err(format!("unknown authority {authority_id:?}"));
+    };
+    if let Some(path) = resolve_authority_source(auth) {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read authority source {}: {e}", path.display()))?;
+        if !text.contains(cite) {
+            return Err(format!(
+                "cite {cite:?} is not present verbatim in {} ({}): the cited source does not \
+                 support the exercised behavior",
+                auth.label,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify every scenario's structured provenance against the index/sources.
+pub fn verify_citations(scenarios: &[Scenario]) -> Result<(), String> {
+    let index = load_citation_index()?;
+    for scenario in scenarios {
+        verify_citation(
+            &index,
+            &scenario.provenance.authority,
+            &scenario.provenance.cite,
+        )
+        .map_err(|e| format!("{}: {e}", scenario.id))?;
+    }
+    Ok(())
 }

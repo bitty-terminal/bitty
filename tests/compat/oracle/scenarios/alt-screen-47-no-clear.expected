@@ -1,5 +1,6 @@
 area: alternate-screen
-provenance: spec|xterm patch #411 ctlseqs.txt "Ps=47 Use Alternate Screen Buffer" (no clear on entry, unlike 1049); ghostty SwitchScreenMode .@"47" "The screen is not erased"
+authority: xterm-ctlseqs
+cite: Ps = 4 7  -> Use Alternate Screen Buffer, xterm.  This
 grid: 80x24
 grid_text: unchecked
 row 0: B   A

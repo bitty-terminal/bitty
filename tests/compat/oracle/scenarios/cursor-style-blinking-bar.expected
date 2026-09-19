@@ -1,5 +1,6 @@
 area: cursor-style
-provenance: spec|xterm patch #411 ctlseqs.txt "CSI Ps SP q Set cursor style (DECSCUSR)": Ps=5 blinking bar
+authority: xterm-ctlseqs
+cite: Ps = 5  -> blinking bar, xterm.
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

@@ -3,10 +3,13 @@
 # Historical Bitty defect (pre-CTX-0175): mode 1007 was misclassified as a
 # focus-event mode instead of Alternate Scroll. This expectation records the
 # WRONG reading (focus_events) so the divergence guard proves the runner fails
-# when the build returns alternate_scroll, i.e. the runner detects a real
-# classification divergence rather than rubber-stamping Bitty.
+# when the build returns alternate_scroll — i.e. the runner detects a real
+# classification divergence rather than rubber-stamping Bitty. The citation is
+# the correct one for the mode (ctlseqs 1007 = Alternate Scroll); only the
+# asserted mode value is deliberately wrong.
 area: alternate-scroll
-provenance: capture|deliberate-divergence fixture, not a spec or reference capture
+authority: xterm-ctlseqs
+cite: Ps = 1 0 0 7  -> Enable Alternate Scroll Mode, xterm.  This
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

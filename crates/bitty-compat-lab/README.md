@@ -44,9 +44,14 @@ binaries for collecting dumps and rendering reports.
 ## Differential oracle (CTX-0573)
 
 `src/oracle.rs` plus `src/bin/oracle_runner.rs` implement the M1 differential
-oracle corpus: each scenario under `tests/compat/oracle/scenarios/` carries an
-expectation derived from the xterm control-sequence specification (patch #411)
-or a pinned reference capture, never from Bitty's own output. Run
-`cargo test -p bitty-compat-lab --test oracle --locked` or
-`cargo run -p bitty-compat-lab --bin oracle_runner --locked`; see
+oracle corpus: each scenario under `tests/compat/oracle/scenarios/` carries
+structured provenance — an `authority` from the closed `AUTHORITIES` set and a
+verbatim `cite` token from that exact source (xterm `ctlseqs.txt` and
+`charproc.c`, the ghostty/kitty reference trees, and the accepted RFCs) — never
+Bitty's own output. The committed `tests/compat/oracle/authority-cites.txt`
+index plus `oracle_citations_are_backed_by_their_authority` reject a
+mis-citation. A `state` engine replays bytes through `bitty-vt`/`bitty-term-state`;
+a `runtime` engine drives `bitty-runtime` for OSC 10/11 query replies and mouse
+coordinate emission. Run `cargo test -p bitty-compat-lab --test oracle --locked`
+or `cargo run -p bitty-compat-lab --bin oracle_runner --locked`; see
 `tests/compat/oracle/README.md` for layout, provenance, and how to extend.

@@ -197,7 +197,9 @@ dependencies = [
 name = "bitty-compat-lab"
 version = "0.0.20"
 dependencies = [
+ "bitty-platform",
  "bitty-pty",
+ "bitty-runtime",
  "bitty-term-state",
  "bitty-vt",
 ]

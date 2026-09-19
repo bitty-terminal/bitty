@@ -1,5 +1,6 @@
 area: device-status
-provenance: spec|xterm patch #411 ctlseqs.txt "CSI Ps n Device Status Report": Ps=5 -> CSI 0 n
+authority: xterm-ctlseqs
+cite: Ps = 5  -> Status Report.
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

@@ -1,5 +1,6 @@
 area: osc-color
-provenance: spec|xterm patch #411 ctlseqs.txt "OSC Ps ; Pt ST": Ps=10 foreground, "?" queries
+authority: xterm-ctlseqs
+cite: If a "?" is given rather than a name or RGB specification,
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

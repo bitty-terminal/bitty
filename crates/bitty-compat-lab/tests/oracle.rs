@@ -11,8 +11,8 @@
 use std::path::PathBuf;
 
 use bitty_compat_lab::oracle::{
-    AREAS, MAX_SCENARIOS, ProvenanceKind, Status, generate_summary_json, load_scenario_file,
-    run_oracle, run_scenario,
+    AREAS, Engine, MAX_SCENARIOS, Status, generate_summary_json, load_citation_index,
+    load_scenario_file, resolve_authority_source, run_oracle, run_scenario, verify_citations,
 };
 
 fn divergence_dir() -> PathBuf {
@@ -55,49 +55,168 @@ fn oracle_corpus_is_green_against_the_bitty_build() {
 
 #[test]
 fn oracle_expectations_are_externally_derived_not_self_golden() {
-    // Every expectation names a spec citation or a captured reference
-    // terminal. A scenario with neither would be a self-golden (Bitty's own
-    // output recorded as the oracle) and is rejected.
+    // Every expectation names a structured authority and a verbatim citation.
+    // A scenario with neither would be a self-golden (Bitty's own output
+    // recorded as the oracle) and is rejected.
     let report = run_oracle().expect("run oracle");
     for outcome in &report.outcomes {
         assert!(
+            !outcome.provenance.authority.trim().is_empty(),
+            "{} has an empty authority id",
+            outcome.id
+        );
+        assert!(
             !outcome.provenance.source.trim().is_empty(),
-            "{} has an empty provenance source",
+            "{} has an empty authority label",
+            outcome.id
+        );
+        assert!(
+            !outcome.provenance.cite.trim().is_empty(),
+            "{} has an empty citation token",
             outcome.id
         );
         assert!(
             matches!(
                 outcome.provenance.kind,
-                ProvenanceKind::Spec | ProvenanceKind::Capture
+                bitty_compat_lab::oracle::ProvenanceKind::Spec
+                    | bitty_compat_lab::oracle::ProvenanceKind::Capture
             ),
             "{} has an unsupported provenance kind",
             outcome.id
         );
-        // Spec citations must name the authoritative control-sequence source;
-        // capture citations must name a terminal.
-        let source = outcome.provenance.source.to_lowercase();
-        match outcome.provenance.kind {
-            ProvenanceKind::Spec => assert!(
-                source.contains("ctlseqs")
-                    || source.contains("spec")
-                    || source.contains("m1 rfc")
-                    || source.contains("ecma"),
-                "{} spec provenance does not cite an authoritative source: {}",
-                outcome.id,
-                outcome.provenance.source
-            ),
-            ProvenanceKind::Capture => assert!(
-                source.contains("xterm")
-                    || source.contains("ghostty")
-                    || source.contains("kitty")
-                    || source.contains("wezterm")
-                    || source.contains("alacritty"),
-                "{} capture provenance does not name a reference terminal: {}",
-                outcome.id,
-                outcome.provenance.source
-            ),
-        }
     }
+}
+
+#[test]
+fn oracle_citations_are_backed_by_their_authority() {
+    // F4: the provenance string no longer rubber-stamps a mis-citation. Every
+    // scenario's `authority`/`cite` pair must be in the committed index AND,
+    // when the authority source is resolvable on this host, the token must
+    // appear in that exact source verbatim. This rejects e.g. a ctlseqs
+    // citation for DECSET 2026 (which ctlseqs does not define).
+    let scenarios = bitty_compat_lab::oracle::load_scenarios().expect("load scenarios");
+    assert!(!scenarios.is_empty(), "no scenarios to verify");
+    verify_citations(&scenarios).expect("citations must be backed by their authority");
+
+    // The index itself is non-trivial and every entry names a real authority,
+    // so a free-form citation cannot enter it.
+    let index = load_citation_index().expect("citation index");
+    assert!(index.len() >= 20, "citation index suspiciously small");
+    for entry in &index {
+        bitty_compat_lab::oracle::authority(&entry.authority)
+            .unwrap_or_else(|| panic!("index authority {:?} is unknown", entry.authority));
+    }
+}
+
+#[test]
+fn oracle_citation_sources_are_verified_when_present() {
+    // Source-verbatim re-verification. The read-only reference snapshot
+    // (`recording/references/`) and the `docs/` submodule are absent from a
+    // bare CI checkout (the container mounts only the repository, and CI does
+    // not init the submodule), so this degrades to an explicit skip there. On a
+    // developer/commander checkout it runs and fails on any token the source
+    // does not contain. `scripts/gen-oracle-scenarios.sh` additionally greps
+    // every token from its source at generation time, so the committed index
+    // cannot hold a token that was never in the source.
+    let index = load_citation_index().expect("citation index");
+    let resolvable: Vec<_> = index
+        .iter()
+        .filter_map(|entry| {
+            let auth = bitty_compat_lab::oracle::authority(&entry.authority)
+                .expect("validated index authority");
+            resolve_authority_source(auth).map(|path| (entry, path))
+        })
+        .collect();
+    if resolvable.is_empty() {
+        eprintln!(
+            "SKIP oracle_citation_sources_are_verified_when_present: no authority source \
+             present (bare CI checkout); index-membership check still ran"
+        );
+        return;
+    }
+    for (entry, path) in &resolvable {
+        let text = std::fs::read_to_string(path).expect("read authority source");
+        assert!(
+            text.contains(&entry.cite),
+            "index entry {}/{:?} is not present verbatim in {}",
+            entry.authority,
+            entry.cite,
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn oracle_rejects_a_mis_citation() {
+    // Direct proof the guard is not vacuous: a fabricated ctlseqs token that
+    // does not exist in ctlseqs.txt must fail verification.
+    use bitty_compat_lab::oracle::{CiteEntry, verify_citation};
+    let index = load_citation_index().expect("citation index");
+    let bogus = CiteEntry {
+        authority: "xterm-ctlseqs".to_string(),
+        cite: "DECSET 2026 -> Enable Synchronized Updates".to_string(),
+    };
+    assert!(
+        !index.contains(&bogus),
+        "fabricated citation must not be in the index"
+    );
+    assert!(
+        verify_citation(&index, &bogus.authority, &bogus.cite).is_err(),
+        "guard accepted a citation that is not indexed"
+    );
+    // And a real authority with a token not present in its source fails too.
+    if resolve_authority_source(
+        bitty_compat_lab::oracle::authority("xterm-ctlseqs").expect("authority"),
+    )
+    .is_some()
+    {
+        assert!(
+            verify_citation(
+                &index,
+                "xterm-ctlseqs",
+                "Ps = 2 0 2 6  -> Enable Synchronized Updates."
+            )
+            .is_err(),
+            "guard accepted a token absent from ctlseqs.txt"
+        );
+    }
+}
+
+#[test]
+fn oracle_covers_both_engines() {
+    // The corpus must exercise the runtime engine (F6): OSC 10/11 query
+    // response round trip and mouse emitted bytes, not only the parse action.
+    let report = run_oracle().expect("run oracle");
+    let runtime: Vec<&str> = report
+        .outcomes
+        .iter()
+        .filter(|o| o.engine == Engine::Runtime)
+        .map(|o| o.id.as_str())
+        .collect();
+    assert!(
+        runtime.contains(&"osc-10-11-roundtrip"),
+        "missing OSC 10/11 runtime round-trip; runtime scenarios: {runtime:?}"
+    );
+    for id in ["mouse-emit-x10", "mouse-emit-sgr", "mouse-emit-urxvt"] {
+        assert!(
+            runtime.contains(&id),
+            "missing emitted-bytes scenario {id}; runtime scenarios: {runtime:?}"
+        );
+    }
+    // The round-trip asserts a non-empty reply, and the mouse scenarios a
+    // non-empty emit, so the runtime path is genuinely observed.
+    let round_trip = report
+        .outcomes
+        .iter()
+        .find(|o| o.id == "osc-10-11-roundtrip")
+        .expect("round trip");
+    assert!(
+        round_trip
+            .checks
+            .iter()
+            .any(|c| c.name == "reply" && c.passed),
+        "round trip did not pass its reply check"
+    );
 }
 
 #[test]
@@ -108,8 +227,10 @@ fn oracle_summary_is_deterministic_and_bounded() {
     let b = generate_summary_json(&second).expect("summary second");
     assert_eq!(a, b, "oracle summary must be deterministic");
     assert!(a.len() < 256 * 1024, "summary {} bytes", a.len());
-    assert!(a.contains("\"schema_version\": 1"), "missing schema");
+    assert!(a.contains("\"schema_version\": 2"), "missing schema");
     assert!(a.contains("\"summary\":"), "missing summary");
+    assert!(a.contains("\"engine\":"), "summary must record the engine");
+    assert!(a.contains("\"cite\":"), "summary must record the citation");
     assert!(
         !a.contains("winit") && !a.contains("wgpu"),
         "summary must not reference window/GPU backends"

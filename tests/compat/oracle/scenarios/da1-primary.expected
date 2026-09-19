@@ -1,5 +1,6 @@
 area: device-status
-provenance: spec|xterm patch #411 ctlseqs.txt "CSI Ps c Send Device Attributes (Primary DA)": VT102 -> CSI ? 6 c
+authority: xterm-ctlseqs
+cite: -> CSI ? 6 c  ("VT102")
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

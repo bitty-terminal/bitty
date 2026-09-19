@@ -1,5 +1,6 @@
 area: osc-title
-provenance: spec|xterm patch #411 ctlseqs.txt "Ps=0 Change Icon Name and Window Title to Pt"; OSC 0 BEL-terminated
+authority: xterm-ctlseqs
+cite: Ps = 0  -> Change Icon Name and Window Title to Pt.
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

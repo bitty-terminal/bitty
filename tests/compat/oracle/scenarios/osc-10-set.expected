@@ -1,5 +1,6 @@
 area: osc-color
-provenance: spec|xterm patch #411 ctlseqs.txt "OSC Ps ; Pt ST": Ps=10 RGB set
+authority: xterm-ctlseqs
+cite: Ps = 1 0  -> Change VT100 text foreground color to Pt.
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

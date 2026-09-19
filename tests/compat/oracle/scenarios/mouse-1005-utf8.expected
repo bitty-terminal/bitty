@@ -1,5 +1,6 @@
 area: mouse-encoding
-provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1005 -> Enable UTF-8 Mouse Mode"
+authority: xterm-ctlseqs
+cite: Ps = 1 0 0 5  -> Enable UTF-8 Mouse Mode, xterm.
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

@@ -1,5 +1,6 @@
 area: alternate-scroll
-provenance: spec|xterm patch #411 ctlseqs.txt "Ps = 1007 -> Enable Alternate Scroll Mode"; M1 RFC 1007 = Alternate Scroll
+authority: xterm-ctlseqs
+cite: Ps = 1 0 0 7  -> Enable Alternate Scroll Mode, xterm.  This
 grid: 80x24
 grid_text: blank
 cursor: 0 0 visible

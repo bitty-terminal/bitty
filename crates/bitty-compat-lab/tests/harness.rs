@@ -67,8 +67,8 @@ fn list_corpus_manifest(category: &str) -> Vec<PathBuf> {
 }
 
 /// Canonical categories from the Phase C scaffold plus the CTX-0404
-/// M1/M2 additions (`scrollback`, `graphics`) and the CTX-0571 M1 mode
-/// golden corpus (`modes`).
+/// M1/M2 additions (`scrollback`, `graphics`) and the CTX-0571 M1 mode and
+/// color golden corpora (`modes`, `color`).
 const CATEGORIES: &[&str] = &[
     "vt",
     "osc",
@@ -81,6 +81,7 @@ const CATEGORIES: &[&str] = &[
     "scrollback",
     "graphics",
     "modes",
+    "color",
 ];
 
 #[test]

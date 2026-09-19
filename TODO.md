@@ -12,12 +12,15 @@ Per-item detail belongs to the issues; completed rows move to git history.
 
 ## Program state
 
-- Phase: **Core pivot active** (2026-09-19). `fix`-label backlog cleared;
-  docs corpora synchronized; research 044-059 captured.
+- Phase: **Core pivot active** (2026-09-19). The `fix`-label backlog was
+  cleared at the pivot; new P0 issues filed since (for example #1070,
+  #1115) are tracked by the epics. Docs corpora were reconciled at the
+  pivot; stale-row refresh and status reconciliation remain open (#978).
+  The execution-supervisor and UI-runtime captures are recorded.
 - Baseline: `bitty` `main` with a 21-member workspace; docs submodule pinned
   to `bitty-terminal-docs` (`docs/`, pin trails `main` by design).
-- Backlog: enumerated read-only from the docs corpora and registers
-  (~212 rows; ~127 net-new Core items) and filed as GitHub issues.
+- Backlog: enumerated read-only from the docs corpora and registers, then
+  filed against the ten epics in the GitHub issue tracker.
 - Gates: `just check` is the local gate; CI (`Quality gates`/`MSRV`/
   `Windows`/`Linux`/`macOS`/`Supply chain`/`CodeQL`) is the merge gate.
 
@@ -44,7 +47,7 @@ Per-item detail belongs to the issues; completed rows move to git history.
    a CarryCtx task; the issue carries labels (`feat`/`fix`/`docs`/`chore` +
    `P0`/`P1`/`P2` + `area:*`) and milestone `v0.1.0`.
 3. **Docs stay synchronized.** A change that alters behavior, contracts, or
-   status updates the owning document in the same wave (epic 9); the docs
+   status updates the owning document in the same wave (#978); the docs
    corpora stay self-contained (no research references).
 4. **Evidence, not claims.** Behavior is `Implemented` until independent
    verification lands; only then may a document say `Verified`.
@@ -66,11 +69,23 @@ Per-item detail belongs to the issues; completed rows move to git history.
 
 ## Blocked / open
 
-- Epic items blocked on owner decisions: `OQ-050` (anchor identity),
-  `OQ-051` (panel content path), `OQ-052` (window forms/Mod),
-  `OQ-056` (capability API), `OQ-058` (panel provider), `OQ-083` (write
-  lease), `OQ-084` (identity ontology), `OQ-085` (trust levels),
-  `OQ-086` (sensitive input), `RFC-OQ-3/8/9` (panel placement/budget/
-  save-restore).
+All named questions are still Open in the `bitty-docs` open-questions
+register; blocked work does not start before its decision lands.
+
+- Panel, compositor, and input: `OQ-050` (anchor identity), `OQ-051`
+  (panel content path), `OQ-052` (window forms/Mod), `OQ-088` (leader
+  default), `OQ-089` (Beacon engine). `RFC-OQ-3/8/9` (panel placement/
+  budget/save-restore) remain open in the accepted Panel Runtime RFC.
+- Runtime and security: `OQ-083` (write lease), `OQ-084` (identity
+  ontology), `OQ-085` (trust levels), `OQ-086` (sensitive input),
+  `OQ-087` (command-risk classification, named in epic #973).
+- AI and plugin contracts: `OQ-054` (credential refs), `OQ-056`
+  (capability API), `OQ-057` (role contract), `OQ-058` (panel provider),
+  `OQ-068` (`.wheel/` project directory).
+- Text and terminal features: `OQ-073`-`OQ-078` (ligatures, search, copy
+  mode, bell, Kitty extensions, accessibility), `OQ-090`/`OQ-091` (width
+  tables, bidi scope), `OQ-100` (perf harness gates).
+- Blocked work item: #981 (hint overlay + dispatch) awaits `OQ-088`/
+  `OQ-089`.
 - Plugin-lane issue #767 (V-C signature scheme) remains open and is out of
   this phase's scope.

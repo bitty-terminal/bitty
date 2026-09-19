@@ -174,6 +174,9 @@ impl Runtime {
         self.workspace_mru = VecDeque::from([0]);
         self.pending_ws_close = None;
         self.next_workspace_seq = 2;
+        // CTX-0536 (#923): seed the monotonic id high-water from the initial
+        // leaf so the very first allocation can never reuse id 1.
+        self.raise_view_id_high_water();
     }
 
     /// Number of workspaces (`>= 1` by invariant).
@@ -267,22 +270,34 @@ impl Runtime {
     #[must_use]
     pub fn next_view_id_global(&self) -> ViewId {
         let live = self.live_view_raws();
-        let max = live.iter().copied().max().unwrap_or(0);
-        let id = match max.checked_add(1) {
+        let live_max = live.iter().copied().max().unwrap_or(0);
+        // CTX-0536 (#923): allocate above the monotonic high-water mark, not
+        // just above the live maximum, so an id retired by a leaf or
+        // workspace close is never re-handed to a fresh owner. `u64`
+        // exhaustion is out of scope (the issue states it explicitly); the
+        // allocator saturates at `u64::MAX` rather than wrapping or reusing.
+        let floor = self.view_id_high_water.max(live_max);
+        let id = match floor.checked_add(1) {
             Some(next) => ViewId::new(next),
-            None => {
-                let mut raw = 1u64;
-                while live.contains(&raw) {
-                    raw += 1;
-                }
-                ViewId::new(raw)
-            }
+            None => ViewId::new(u64::MAX),
         };
         debug_assert!(
             !live.contains(&id.0),
             "view id allocator must never hand out a live id"
         );
         id
+    }
+
+    /// Raise the monotonic view-id high-water mark to cover every id currently
+    /// installed in the live layout or any stashed slot (CTX-0536, #923).
+    ///
+    /// Called at every layout install/removal funnel so a retired id stays
+    /// below the mark and can never be re-issued. Bounded and cheap: it scans
+    /// the same live set [`Self::live_view_raws`] already scans.
+    pub(super) fn raise_view_id_high_water(&mut self) {
+        if let Some(max) = self.live_view_raws().into_iter().max() {
+            self.view_id_high_water = self.view_id_high_water.max(max);
+        }
     }
 
     /// Raw ids of every live leaf: the live layout plus all stashed slots.
@@ -311,6 +326,9 @@ impl Runtime {
             self.layout = slot.layout.clone();
             self.focus = slot.focus.clone();
         }
+        // CTX-0536 (#923): loading a slot is a layout install; cover ids that
+        // entered through the workspace-new / empty-reset paths.
+        self.raise_view_id_high_water();
         // CTX-0405: a slot swap is a layout install that bypasses
         // `replace_layout`; the loaded slot's leaf boundaries may have been
         // stashed before a window resize or reflow, so re-sync the primary
@@ -373,6 +391,9 @@ impl Runtime {
         let index = self.workspaces.len() - 1;
         self.active_workspace = index;
         self.mru_front(index);
+        // CTX-0536 (#923): record the fresh id so its later retirement can
+        // never fall back below the monotonic high-water mark.
+        self.raise_view_id_high_water();
         // CTX-0532: a brand-new slot's leaf starts focused; attribute the
         // input-mode caches to it before any pane spawn/output path runs.
         self.sync_mode_caches_to_focus();
@@ -733,6 +754,9 @@ impl Runtime {
             let fresh = View::new(fresh_id, self.cols, self.rows);
             self.layout = LayoutNode::leaf(fresh);
             self.focus = Focus::with_focus(fresh_id);
+            // CTX-0536 (#923): the fresh source leaf is a new id; raise the
+            // high-water before the moved leaf's old id can be recycled.
+            self.raise_view_id_high_water();
         } else {
             let mut source = self.layout.clone();
             let removed = remove_leaf_view(&mut source, focused)
@@ -948,6 +972,78 @@ mod tests {
         assert_eq!(rt.next_view_id_global(), ViewId::new(2));
         assert_eq!(rt.next_view_id_global(), ViewId::new(2));
         assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1)]);
+    }
+
+    /// CTX-0536 (#923): a closed leaf's id must never be re-handed while a
+    /// stale handle (session, snapshot, focus MRU, ctl reply) could still
+    /// resolve it. A `max + 1` over *live* ids reuses the id of the highest
+    /// leaf as soon as that leaf closes, aliasing the retired owner.
+    #[test]
+    fn retired_max_view_id_is_not_reissued() {
+        let mut rt = fresh();
+        // Install views 2 then 3 through the global allocator, splitting the
+        // previous leaf each time (the keymap/ctl shape).
+        let v2 = rt.next_view_id_global();
+        assert_eq!(v2, ViewId::new(2));
+        let mut layout = rt.layout().clone();
+        let old = layout.find_leaf(ViewId::new(1)).cloned().expect("leaf 1");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(v2, 80, 24)),
+        );
+        rt.set_layout(layout);
+
+        let v3 = rt.next_view_id_global();
+        assert_eq!(v3, ViewId::new(3));
+        let mut layout = rt.layout().clone();
+        let old = layout.find_leaf(v2).cloned().expect("leaf 2");
+        layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(old),
+            LayoutNode::leaf(View::new(v3, 80, 24)),
+        );
+        rt.set_layout(layout);
+        assert!(rt.layout().leaf_ids().contains(&v3));
+
+        // Close v3 (the current max): the live max drops to 2, so a `max + 1`
+        // allocator would hand out the retired id 3 again.
+        let mut layout = rt.layout().clone();
+        let removed = remove_leaf_view(&mut layout, v3).expect("v3 must be closable");
+        assert_eq!(removed.id(), v3);
+        rt.set_layout_closing(layout, v3);
+        assert!(!rt.layout().leaf_ids().contains(&v3));
+
+        let next = rt.next_view_id_global();
+        assert_ne!(
+            next, v3,
+            "a retired view id must never be re-issued to a fresh owner"
+        );
+        assert_eq!(next, ViewId::new(4));
+    }
+
+    /// CTX-0536 (#923): closing an entire workspace retires its ids; a later
+    /// allocation must not reuse them even though they are no longer live.
+    #[test]
+    fn retired_view_ids_across_workspaces_are_not_reissued() {
+        let mut rt = fresh();
+        rt.workspace_new().expect("ws2");
+        let ws2_id = rt.focused_view().expect("ws2 focus");
+        assert_eq!(ws2_id, ViewId::new(2));
+        // ws2 is idle (no pane session): closing is immediate.
+        assert_eq!(
+            rt.workspace_close_request(),
+            WsCloseRequest::Closed { killed: 0 }
+        );
+        assert!(!rt.layout().leaf_ids().contains(&ws2_id));
+        let next = rt.next_view_id_global();
+        assert_ne!(
+            next, ws2_id,
+            "an id retired by a workspace close must never be re-issued"
+        );
+        assert_eq!(next, ViewId::new(3));
     }
 
     #[test]

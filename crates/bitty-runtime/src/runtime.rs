@@ -423,6 +423,15 @@ pub struct Runtime {
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     workspace_mru: std::collections::VecDeque<usize>,
+    /// Monotonic high-water mark of every [`ViewId`] ever installed in a
+    /// layout (CTX-0536, issue #923).
+    ///
+    /// `next_view_id_global` allocates above this mark rather than above the
+    /// live maximum, so an id retired by a leaf/workspace close is never
+    /// re-handed while a stale handle (session, snapshot, focus MRU, ctl
+    /// reply) could still resolve it. Raised at every layout install; never
+    /// lowered. Starts at the default leaf id `1`.
+    view_id_high_water: u64,
     /// Pending per-pane session restores (CTX-0393): scrollback + cwd for
     /// session-less leaves, drained into the fresh grid by the next
     /// successful spawn of each leaf. Keyed by [`ViewId`]; bounded by the
@@ -1125,6 +1134,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             pending_ws_close: None,
             help_visible: false,
@@ -1289,6 +1299,7 @@ impl Runtime {
             workspaces: Vec::new(),
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
+            view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             pending_ws_close: None,
             help_visible: false,

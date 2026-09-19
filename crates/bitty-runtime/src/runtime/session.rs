@@ -1316,6 +1316,9 @@ impl Runtime {
         self.workspace_mru = snap.mru.iter().copied().collect::<VecDeque<_>>();
         self.layout = self.workspaces[snap.active].layout.clone();
         self.focus = self.workspaces[snap.active].focus.clone();
+        // CTX-0536 (#923): a restored snapshot installs ids directly; raise
+        // the monotonic high-water so a later allocation never reuses one.
+        self.raise_view_id_high_water();
         // CTX-0532: a restore load is a focus transition; attribute the
         // input-mode caches to the restored focus before any input arrives.
         self.sync_mode_caches_to_focus();

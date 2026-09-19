@@ -39,7 +39,7 @@
 //! | [`HYPERLINK_TABLE_MAX`](state::HYPERLINK_TABLE_MAX) | 1024 | Bounded link table (threat T-01) |
 //! | [`MAX_ZEROWIDTH_CHARS`](cell::MAX_ZEROWIDTH_CHARS) | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
 //! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 6 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers, v4 adds soft-wrap continuation flags for CTX-0266 reflow, v5 adds synchronized-update mode for CTX-0380, v6 adds the hyperlink id-space position for CTX-0490) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 7 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds alt-screen saved cursor style/visibility, v3 adds per-cell combining buffers, v4 adds soft-wrap continuation flags for CTX-0266 reflow, v5 adds synchronized-update mode for CTX-0380, v6 adds the hyperlink id-space position for CTX-0490, v7 adds the alternate-scroll mode for CTX-0566) |
 //!
 //! # Determinism
 //!

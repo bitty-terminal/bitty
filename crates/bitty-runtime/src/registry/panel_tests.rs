@@ -138,6 +138,85 @@ fn mount_already_mounted_errors() {
     assert!(matches!(err2, PanelError::AlreadyMounted { .. }));
 }
 
+/// CTX-0535 (#922): `unmount_panel` destroys the view attachment. Resuming
+/// such a record must never produce `state == Mounted` with `view == None`;
+/// it stays viewless (`Created`) until `mount_panel` re-attaches a view.
+#[test]
+fn resume_viewless_panel_never_reaches_mounted() {
+    let mut reg = default_panel_registry();
+    let h = reg.create_panel(PanelType::Helper, None).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    let removed = reg.unmount_panel(h.id, h.generation).unwrap();
+    assert_eq!(removed, v1);
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), None);
+    // Resume a viewless record: it must not claim `Mounted`.
+    reg.resume_panel(h.id, h.generation).unwrap();
+    let state = reg.panel_state(h.id, h.generation).unwrap();
+    let view = reg.panel_view(h.id, h.generation).unwrap();
+    assert!(
+        !(state == PanelState::Mounted && view.is_none()),
+        "no reachable Mounted with a missing view (state={state:?}, view={view:?})"
+    );
+    assert_eq!(
+        state,
+        PanelState::Created,
+        "a viewless resume returns to Created, not Mounted"
+    );
+    // The record is still re-mountable: a real mount attaches the view.
+    let v2 = ViewId::new(2);
+    reg.mount_panel(h.id, h.generation, v2).unwrap();
+    assert_eq!(
+        reg.panel_state(h.id, h.generation).unwrap(),
+        PanelState::Mounted
+    );
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v2));
+}
+
+/// CTX-0535 (#922): focus on a viewless panel fails closed. Before the fix
+/// the viewless record could report `Mounted`, letting focus land on a panel
+/// with no view; after the fix the state is `Created` and focus is refused.
+#[test]
+fn focus_viewless_panel_fails_closed() {
+    let mut reg = default_panel_registry();
+    let ws = WorkspaceId::new(11);
+    let h = reg.create_panel(PanelType::Canvas, Some(ws)).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    reg.unmount_panel(h.id, h.generation).unwrap();
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), None);
+    reg.resume_panel(h.id, h.generation).unwrap();
+    let err = reg
+        .focus_panel(h.id, h.generation, ws)
+        .expect_err("focus must refuse a viewless panel");
+    assert!(matches!(err, PanelError::InvalidState { .. }));
+    assert_eq!(reg.focused_panel(ws), None);
+}
+
+/// CTX-0535 (#922): a `Suspended` record that still owns its view (from
+/// `suspend_panel`) resumes to `Mounted` with the same view — the fix must
+/// not regress the visible-suspend/resume path.
+#[test]
+fn resume_with_retained_view_returns_to_mounted() {
+    let mut reg = default_panel_registry();
+    let ws = WorkspaceId::new(12);
+    let h = reg.create_panel(PanelType::Terminal, Some(ws)).unwrap();
+    let v1 = ViewId::new(1);
+    reg.mount_panel(h.id, h.generation, v1).unwrap();
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    reg.suspend_panel(h.id, h.generation).unwrap();
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v1));
+    reg.resume_panel(h.id, h.generation).unwrap();
+    assert_eq!(
+        reg.panel_state(h.id, h.generation).unwrap(),
+        PanelState::Mounted
+    );
+    assert_eq!(reg.panel_view(h.id, h.generation).unwrap(), Some(v1));
+    reg.focus_panel(h.id, h.generation, ws).unwrap();
+    assert_eq!(reg.focused_panel(ws), Some(h.id));
+}
+
 #[test]
 fn moving_panel_between_views_preserves_id() {
     let mut reg = default_panel_registry();

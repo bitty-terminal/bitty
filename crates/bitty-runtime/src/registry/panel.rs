@@ -1043,6 +1043,17 @@ impl PanelRegistry {
         Ok(self.get_panel(id, generation)?.state)
     }
 
+    /// Returns the view currently attached to a panel, if any. `Mounted`/
+    /// `Focused` records always carry `Some`; `Created`/`Suspended` records
+    /// are viewless (CTX-0535).
+    pub fn panel_view(
+        &self,
+        id: PanelId,
+        generation: Generation,
+    ) -> Result<Option<ViewId>, PanelError> {
+        Ok(self.get_panel(id, generation)?.view)
+    }
+
     /// Mounts `panel` to an empty `ViewId`. Validates handles, single-owner
     /// mapping, and transitions `Created -> Mounted`.
     ///
@@ -1137,10 +1148,14 @@ impl PanelRegistry {
     ) -> Result<(), PanelError> {
         self.ensure_not_disposed()?;
         let rec = self.get_panel(panel_id, generation)?;
-        if rec.state != UiPanelState::Mounted && rec.state != UiPanelState::Focused {
+        // CTX-0535 (#922): a panel with no view attachment can never be
+        // focused, even if a corrupted/legacy record claims `Mounted`.
+        if rec.view.is_none()
+            || (rec.state != UiPanelState::Mounted && rec.state != UiPanelState::Focused)
+        {
             return Err(PanelError::InvalidState {
                 current: rec.state,
-                expected: "Mounted or Focused",
+                expected: "Mounted or Focused with an attached view",
             });
         }
         if rec.workspace != Some(workspace) && rec.workspace.is_some() {
@@ -1183,7 +1198,13 @@ impl PanelRegistry {
         Ok(())
     }
 
-    /// Resumes a suspended panel back to mounted.
+    /// Resumes a suspended panel back to the appropriate state.
+    ///
+    /// A panel suspended with its view attachment retained (`suspend_panel`)
+    /// returns to `Mounted`. A viewless record (`unmount_panel` destroyed the
+    /// attachment) returns to `Created` and must pass through `mount_panel`
+    /// to re-attach a view, so `Mounted` never coexists with `view == None`
+    /// (CTX-0535, issue #922).
     pub fn resume_panel(
         &mut self,
         panel_id: PanelId,
@@ -1197,8 +1218,13 @@ impl PanelRegistry {
                 expected: "Suspended",
             });
         }
+        let has_view = rec.view.is_some();
         let rec_mut = self.get_panel_mut(panel_id, generation)?;
-        rec_mut.state = UiPanelState::Mounted;
+        rec_mut.state = if has_view {
+            UiPanelState::Mounted
+        } else {
+            UiPanelState::Created
+        };
         Ok(())
     }
 

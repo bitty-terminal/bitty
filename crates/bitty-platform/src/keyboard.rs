@@ -28,8 +28,8 @@
 //!   to `text` when available, otherwise nothing.
 //! - Kitty keyboard protocol is M1 opt-in, not M1-required
 //!   (`compatibility-milestone-rfc`): this module owns the legacy baseline
-//!   and the Kitty code tables ([`kitty_functional_key`],
-//!   [`kitty_modifier_key`]); the runtime's `encode_key_with_kitty` composes
+//!   and the Kitty code tables ([`ext_functional_key`],
+//!   [`ext_modifier_key`]); the runtime's `encode_key_enhanced` composes
 //!   them under the negotiated flags. The legacy path here is the
 //!   byte-identical fallback when the protocol is off.
 //!
@@ -346,8 +346,8 @@ pub fn encode_named_key(named: NamedKey) -> Option<&'static [u8]> {
 ///
 /// Returns `None` for keys with no defined Kitty code (the caller keeps the
 /// legacy path). Modifier keys carry an explicit side, so they are handled by
-/// [`kitty_modifier_key`] instead.
-pub fn kitty_functional_key(named: NamedKey) -> Option<(u32, u8)> {
+/// [`ext_modifier_key`] instead.
+pub fn ext_functional_key(named: NamedKey) -> Option<(u32, u8)> {
     let pair = match named {
         NamedKey::Escape => (27, b'u'),
         NamedKey::Enter => (13, b'u'),
@@ -415,7 +415,7 @@ pub fn kitty_functional_key(named: NamedKey) -> Option<(u32, u8)> {
 /// The spec reports `shift`/`ctrl`/`alt`/`super`/`hyper`/`meta` keys as
 /// dedicated codes (57441..=57452); `Location::Standard` defaults to the left
 /// variant. `AltGraph` folds to `alt`, matching the legacy modifier model.
-pub const fn kitty_modifier_key(named: NamedKey, location: KeyLocation) -> Option<u32> {
+pub const fn ext_modifier_key(named: NamedKey, location: KeyLocation) -> Option<u32> {
     let right = matches!(location, KeyLocation::Right);
     let code = match named {
         NamedKey::Shift => {
@@ -947,53 +947,53 @@ mod tests {
     }
 
     #[test]
-    fn kitty_functional_table_matches_the_spec() {
+    fn ext_functional_table_matches_the_spec() {
         // Spot-check the authoritative "Functional key definitions" rows.
-        assert_eq!(kitty_functional_key(NamedKey::Escape), Some((27, b'u')));
-        assert_eq!(kitty_functional_key(NamedKey::Enter), Some((13, b'u')));
-        assert_eq!(kitty_functional_key(NamedKey::Tab), Some((9, b'u')));
-        assert_eq!(kitty_functional_key(NamedKey::Backspace), Some((127, b'u')));
-        assert_eq!(kitty_functional_key(NamedKey::Insert), Some((2, b'~')));
-        assert_eq!(kitty_functional_key(NamedKey::Delete), Some((3, b'~')));
-        assert_eq!(kitty_functional_key(NamedKey::ArrowUp), Some((1, b'A')));
-        assert_eq!(kitty_functional_key(NamedKey::Home), Some((1, b'H')));
-        assert_eq!(kitty_functional_key(NamedKey::End), Some((1, b'F')));
-        assert_eq!(kitty_functional_key(NamedKey::F1), Some((1, b'P')));
-        assert_eq!(kitty_functional_key(NamedKey::F3), Some((13, b'~')));
-        assert_eq!(kitty_functional_key(NamedKey::F12), Some((24, b'~')));
-        assert_eq!(kitty_functional_key(NamedKey::F13), Some((57376, b'u')));
-        assert_eq!(kitty_functional_key(NamedKey::Space), None);
+        assert_eq!(ext_functional_key(NamedKey::Escape), Some((27, b'u')));
+        assert_eq!(ext_functional_key(NamedKey::Enter), Some((13, b'u')));
+        assert_eq!(ext_functional_key(NamedKey::Tab), Some((9, b'u')));
+        assert_eq!(ext_functional_key(NamedKey::Backspace), Some((127, b'u')));
+        assert_eq!(ext_functional_key(NamedKey::Insert), Some((2, b'~')));
+        assert_eq!(ext_functional_key(NamedKey::Delete), Some((3, b'~')));
+        assert_eq!(ext_functional_key(NamedKey::ArrowUp), Some((1, b'A')));
+        assert_eq!(ext_functional_key(NamedKey::Home), Some((1, b'H')));
+        assert_eq!(ext_functional_key(NamedKey::End), Some((1, b'F')));
+        assert_eq!(ext_functional_key(NamedKey::F1), Some((1, b'P')));
+        assert_eq!(ext_functional_key(NamedKey::F3), Some((13, b'~')));
+        assert_eq!(ext_functional_key(NamedKey::F12), Some((24, b'~')));
+        assert_eq!(ext_functional_key(NamedKey::F13), Some((57376, b'u')));
+        assert_eq!(ext_functional_key(NamedKey::Space), None);
     }
 
     #[test]
-    fn kitty_modifier_table_covers_left_and_right() {
+    fn ext_modifier_table_covers_left_and_right() {
         assert_eq!(
-            kitty_modifier_key(NamedKey::Shift, KeyLocation::Standard),
+            ext_modifier_key(NamedKey::Shift, KeyLocation::Standard),
             Some(57441)
         );
         assert_eq!(
-            kitty_modifier_key(NamedKey::Shift, KeyLocation::Right),
+            ext_modifier_key(NamedKey::Shift, KeyLocation::Right),
             Some(57447)
         );
         assert_eq!(
-            kitty_modifier_key(NamedKey::Control, KeyLocation::Left),
+            ext_modifier_key(NamedKey::Control, KeyLocation::Left),
             Some(57442)
         );
         assert_eq!(
-            kitty_modifier_key(NamedKey::Control, KeyLocation::Right),
+            ext_modifier_key(NamedKey::Control, KeyLocation::Right),
             Some(57448)
         );
         // AltGraph folds to the alt variant.
         assert_eq!(
-            kitty_modifier_key(NamedKey::AltGraph, KeyLocation::Left),
+            ext_modifier_key(NamedKey::AltGraph, KeyLocation::Left),
             Some(57443)
         );
         assert_eq!(
-            kitty_modifier_key(NamedKey::Meta, KeyLocation::Right),
+            ext_modifier_key(NamedKey::Meta, KeyLocation::Right),
             Some(57452)
         );
         assert_eq!(
-            kitty_modifier_key(NamedKey::Enter, KeyLocation::Standard),
+            ext_modifier_key(NamedKey::Enter, KeyLocation::Standard),
             None
         );
     }

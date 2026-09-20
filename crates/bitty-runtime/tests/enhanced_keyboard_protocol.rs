@@ -87,7 +87,7 @@ fn set_assign_all_replaces_the_whole_flag_register() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=3u"); // 0b11
     send(&mut rt, b"\x1b[=1u"); // assign: only disambiguate remains
-    assert_eq!(rt.kitty_flags(), 1);
+    assert_eq!(rt.enhanced_keyboard_flags(), 1);
     send(&mut rt, b"\x1b[?u");
     assert_eq!(replies(&mut rt), vec![b"\x1b[?1u".to_vec()]);
 }
@@ -97,19 +97,19 @@ fn set_mode_two_ors_and_mode_three_clears_specified_flags() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=1u"); // assign disambiguate
     send(&mut rt, b"\x1b[=4;2u"); // mode 2: set specified (alternates)
-    assert_eq!(rt.kitty_flags(), 5);
+    assert_eq!(rt.enhanced_keyboard_flags(), 5);
     send(&mut rt, b"\x1b[=1;3u"); // mode 3: reset specified (disambiguate)
-    assert_eq!(rt.kitty_flags(), 4);
+    assert_eq!(rt.enhanced_keyboard_flags(), 4);
     // Unknown mode fails closed without touching the register.
     send(&mut rt, b"\x1b[=31;9u");
-    assert_eq!(rt.kitty_flags(), 4);
+    assert_eq!(rt.enhanced_keyboard_flags(), 4);
 }
 
 #[test]
 fn flags_are_bounded_to_the_five_defined_bits() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=4294967295u"); // all bits set on the wire
-    assert_eq!(rt.kitty_flags(), 0x1F);
+    assert_eq!(rt.enhanced_keyboard_flags(), 0x1F);
     send(&mut rt, b"\x1b[?u");
     assert_eq!(replies(&mut rt), vec![b"\x1b[?31u".to_vec()]);
 }
@@ -119,9 +119,9 @@ fn push_and_pop_restore_the_previous_flags() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=1u"); // current = 1
     send(&mut rt, b"\x1b[>5u"); // push 1, current = 5
-    assert_eq!(rt.kitty_flags(), 5);
+    assert_eq!(rt.enhanced_keyboard_flags(), 5);
     send(&mut rt, b"\x1b[<u"); // pop one -> restore 1
-    assert_eq!(rt.kitty_flags(), 1);
+    assert_eq!(rt.enhanced_keyboard_flags(), 1);
     send(&mut rt, b"\x1b[?u");
     assert_eq!(replies(&mut rt), vec![b"\x1b[?1u".to_vec()]);
 }
@@ -131,9 +131,9 @@ fn push_defaults_to_zero_and_pop_defaults_to_one() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=7u");
     send(&mut rt, b"\x1b[>u"); // push, flags omitted -> zero
-    assert_eq!(rt.kitty_flags(), 0);
+    assert_eq!(rt.enhanced_keyboard_flags(), 0);
     send(&mut rt, b"\x1b[<u"); // pop one, count omitted
-    assert_eq!(rt.kitty_flags(), 7);
+    assert_eq!(rt.enhanced_keyboard_flags(), 7);
 }
 
 #[test]
@@ -143,14 +143,14 @@ fn popping_past_the_stack_empties_it_and_resets_all_flags() {
     send(&mut rt, b"\x1b[>2u");
     send(&mut rt, b"\x1b[>4u");
     send(&mut rt, b"\x1b[<9u"); // pop more entries than exist
-    assert_eq!(rt.kitty_flags(), 0);
+    assert_eq!(rt.enhanced_keyboard_flags(), 0);
     // A later pop is a no-op, never an underflow.
     send(&mut rt, b"\x1b[<u");
-    assert_eq!(rt.kitty_flags(), 0);
+    assert_eq!(rt.enhanced_keyboard_flags(), 0);
 }
 
 #[test]
-fn kitty_keyboard_state_is_independent_per_alternate_screen() {
+fn enhanced_keyboard_state_is_independent_per_alternate_screen() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=1u");
     send(&mut rt, b"\x1b[>4u"); // main: push 1, current 4
@@ -159,7 +159,7 @@ fn kitty_keyboard_state_is_independent_per_alternate_screen() {
     send(&mut rt, b"\x1b[<u"); // pop inside alt
     send(&mut rt, b"\x1b[?1049l"); // leave alt screen
     assert_eq!(
-        rt.kitty_flags(),
+        rt.enhanced_keyboard_flags(),
         4,
         "main-screen flags must survive an alt-screen push/pop cycle"
     );
@@ -203,7 +203,7 @@ fn legacy_7727_alias_still_negotiates_flags() {
     // the authoritative `CSI = u` form is the primary path.
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[?7727h");
-    assert_eq!(rt.kitty_flags(), 1);
+    assert_eq!(rt.enhanced_keyboard_flags(), 1);
     send(&mut rt, b"\x1b[?7727$p");
     assert_eq!(replies(&mut rt), vec![b"\x1b[?7727;1$y".to_vec()]);
 }
@@ -477,10 +477,10 @@ fn default_off_is_byte_identical_to_legacy_for_every_covered_key() {
         named_key(NamedKey::F5, PressState::Pressed),
     ];
     for event in &events {
-        let kitty = rt.handle_key_event_ref(event);
+        let enhanced = rt.handle_key_event_ref(event);
         let legacy = bitty_platform::keyboard::encode_key_event_with_modifiers(event, &ctrl_mods());
         assert_eq!(
-            kitty, legacy,
+            enhanced, legacy,
             "flags 0 must match the legacy encoder for {event:?}"
         );
     }

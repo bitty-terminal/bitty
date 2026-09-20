@@ -125,7 +125,7 @@ fn decrqm_ansi_reports_insert_and_lnm() {
 }
 
 #[test]
-fn decrqm_kitty_flags_follow_negotiation() {
+fn decrqm_enhanced_keyboard_flags_follow_negotiation() {
     let mut rt = Runtime::with_defaults().expect("build");
     rt.handle_pty_bytes(b"\x1b[?7727$p");
     assert_eq!(replies_text(&mut rt), vec![b"\x1b[?7727;2$y".to_vec()]);

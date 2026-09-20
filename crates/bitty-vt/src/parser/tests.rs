@@ -491,33 +491,33 @@ fn decset_1007_maps_to_alternate_scroll_mode() {
 }
 
 #[test]
-fn kitty_keyboard_negotiation_sequences_classify() {
-    use crate::action::{KittyKeyboardOp, KittyKeyboardSetMode};
+fn enhanced_keyboard_negotiation_sequences_classify() {
+    use crate::action::{EnhancedKeyboardOp, EnhancedKeyboardSetMode};
     assert_eq!(
         parse(b"\x1b[?u"),
-        vec![TerminalAction::KittyKeyboard {
-            op: KittyKeyboardOp::Query
+        vec![TerminalAction::EnhancedKeyboard {
+            op: EnhancedKeyboardOp::Query
         }]
     );
     assert_eq!(
         parse(b"\x1b[=3u\x1b[=4;2u\x1b[=1;3u"),
         vec![
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Set {
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Set {
                     flags: 3,
-                    mode: KittyKeyboardSetMode::Assign,
+                    mode: EnhancedKeyboardSetMode::Assign,
                 },
             },
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Set {
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Set {
                     flags: 4,
-                    mode: KittyKeyboardSetMode::Set,
+                    mode: EnhancedKeyboardSetMode::Set,
                 },
             },
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Set {
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Set {
                     flags: 1,
-                    mode: KittyKeyboardSetMode::Reset,
+                    mode: EnhancedKeyboardSetMode::Reset,
                 },
             },
         ]
@@ -525,17 +525,17 @@ fn kitty_keyboard_negotiation_sequences_classify() {
     assert_eq!(
         parse(b"\x1b[>5u\x1b[>u\x1b[<u\x1b[<3u"),
         vec![
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Push { flags: 5 },
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Push { flags: 5 },
             },
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Push { flags: 0 },
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Push { flags: 0 },
             },
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Pop { n: 1 },
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Pop { n: 1 },
             },
-            TerminalAction::KittyKeyboard {
-                op: KittyKeyboardOp::Pop { n: 3 },
+            TerminalAction::EnhancedKeyboard {
+                op: EnhancedKeyboardOp::Pop { n: 3 },
             },
         ]
     );

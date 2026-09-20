@@ -697,13 +697,16 @@ impl Runtime {
     /// mutates a mode register (PTY apply, pane pump, spawn/close), so the
     /// public telemetry caches never lag the focused pane. The mode-sensitive
     /// reader paths read [`Self::focused_modes`] directly; these caches only
-    /// mirror them for `kitty_flags()` / `mouse_capture_active()` observers.
+    /// mirror them for `enhanced_keyboard_flags()` / `mouse_capture_active()` observers.
     pub(super) fn sync_mode_caches_to_focus(&mut self) {
-        let (kitty, mouse) = {
+        let (enhanced_flags, mouse) = {
             let modes = self.focused_modes();
-            (modes.kitty_keyboard.flags(), modes.mouse_tracking.is_some())
+            (
+                modes.enhanced_keyboard.flags(),
+                modes.mouse_tracking.is_some(),
+            )
         };
-        self.kitty_flags = kitty;
+        self.enhanced_keyboard_flags = enhanced_flags;
         self.mouse_capture_enabled = mouse;
     }
 }

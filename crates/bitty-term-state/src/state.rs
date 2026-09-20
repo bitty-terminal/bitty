@@ -25,7 +25,7 @@ use crate::damage::{
 };
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
-use crate::modes::{AltScreen, KittyKeyboardState, Modes};
+use crate::modes::{AltScreen, EnhancedKeyboardState, Modes};
 use crate::replies::Replies;
 use crate::scrollback::{ClearedRange, SCROLLBACK_DEFAULT_LINES, Scrollback, ScrollbackLine};
 use crate::tabs::TabStops;
@@ -167,10 +167,10 @@ pub struct State {
     /// alternate screens (`main_key_encoding_flags` / `alt_key_encoding_flags`
     /// in the reference), so a `CSI = u` inside an alt screen that never
     /// negotiated must report zero, and main's register must survive
-    /// untouched. [`Self::modes`]`.kitty_keyboard` is the live (active screen)
+    /// untouched. [`Self::modes`]`.enhanced_keyboard` is the live (active screen)
     /// register; this field holds the other screen's register and is swapped
     /// on each alt-screen transition (`CTX-0575` F3).
-    kitty_keyboard_stash: KittyKeyboardState,
+    enhanced_keyboard_stash: EnhancedKeyboardState,
     saved_cursors: [Option<SavedCursor>; 2],
     cursor: Cursor,
     modes: Modes,
@@ -222,7 +222,7 @@ impl State {
             screens: ScreenPair::new(GRID_ROWS, GRID_COLUMNS),
             alt_screen: AltScreen::Off,
             primary_save: None,
-            kitty_keyboard_stash: KittyKeyboardState::default(),
+            enhanced_keyboard_stash: EnhancedKeyboardState::default(),
             saved_cursors: [None, None],
             cursor: Cursor::default(),
             modes: Modes::default(),
@@ -1090,7 +1090,7 @@ impl State {
             // Kitty keyboard progressive-enhancement negotiation (CTX-0575).
             // The bounded register and push/pop stack live in the mode
             // register; a `Query` synthesizes the spec reply `CSI ? flags u`.
-            TerminalAction::KittyKeyboard { op } => self.apply_kitty_keyboard(*op),
+            TerminalAction::EnhancedKeyboard { op } => self.apply_enhanced_keyboard(*op),
 
             TerminalAction::Unknown(report) => match report.kind {
                 SequenceKind::Csi => self.telemetry.unknown_csi += 1,
@@ -1774,15 +1774,15 @@ impl State {
                 if enabled {
                     // Legacy `?7727 h/l` alias: OR in bounded bits.
                     self.modes
-                        .kitty_keyboard
-                        .set(flags, bitty_vt::KittyKeyboardSetMode::Set);
+                        .enhanced_keyboard
+                        .set(flags, bitty_vt::EnhancedKeyboardSetMode::Set);
                 } else if flags == 0 {
                     // `CSI ? 7727 l` without flags disables all.
-                    self.modes.kitty_keyboard.pop(u32::MAX);
+                    self.modes.enhanced_keyboard.pop(u32::MAX);
                 } else {
                     self.modes
-                        .kitty_keyboard
-                        .set(flags, bitty_vt::KittyKeyboardSetMode::Reset);
+                        .enhanced_keyboard
+                        .set(flags, bitty_vt::EnhancedKeyboardSetMode::Reset);
                 }
             }
             Mode::MouseTracking(tracking) => {
@@ -1825,8 +1825,8 @@ impl State {
             // (main) register with the inactive-screen stash so the alt screen
             // starts from its own negotiated flags, not main's (F3).
             std::mem::swap(
-                &mut self.modes.kitty_keyboard,
-                &mut self.kitty_keyboard_stash,
+                &mut self.modes.enhanced_keyboard,
+                &mut self.enhanced_keyboard_stash,
             );
             self.alt_screen = variant;
             if variant == AltScreen::Via1049 {
@@ -1862,7 +1862,7 @@ impl State {
                 self.alt_screen == AltScreen::Via1049 && variant == AltScreen::Via1049;
             // Preserve the alt screen's own register for the next alt session
             // while main's is restored from the entry snapshot.
-            let alt_kitty = std::mem::take(&mut self.modes.kitty_keyboard);
+            let alt_enhanced = std::mem::take(&mut self.modes.enhanced_keyboard);
             if let Some(save) = self.primary_save.take() {
                 if restore_cursor {
                     self.cursor.position = save.cursor_position;
@@ -1874,7 +1874,7 @@ impl State {
                 self.charsets = save.charsets;
                 self.modes = save.modes;
             }
-            self.kitty_keyboard_stash = alt_kitty;
+            self.enhanced_keyboard_stash = alt_enhanced;
             self.alt_screen = AltScreen::Off;
             self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         }
@@ -1949,16 +1949,16 @@ impl State {
     ///
     /// `Query` queues the spec reply `CSI ? flags u`; the register never
     /// emits bytes on its own (RFC: replies are queued, not written).
-    fn apply_kitty_keyboard(&mut self, op: bitty_vt::KittyKeyboardOp) {
-        use bitty_vt::KittyKeyboardOp;
+    fn apply_enhanced_keyboard(&mut self, op: bitty_vt::EnhancedKeyboardOp) {
+        use bitty_vt::EnhancedKeyboardOp;
         match op {
-            KittyKeyboardOp::Set { flags, mode } => {
-                self.modes.kitty_keyboard.set(flags, mode);
+            EnhancedKeyboardOp::Set { flags, mode } => {
+                self.modes.enhanced_keyboard.set(flags, mode);
             }
-            KittyKeyboardOp::Push { flags } => self.modes.kitty_keyboard.push(flags),
-            KittyKeyboardOp::Pop { n } => self.modes.kitty_keyboard.pop(u32::from(n)),
-            KittyKeyboardOp::Query => {
-                let payload = format!("\x1b[?{}u", self.modes.kitty_keyboard.flags())
+            EnhancedKeyboardOp::Push { flags } => self.modes.enhanced_keyboard.push(flags),
+            EnhancedKeyboardOp::Pop { n } => self.modes.enhanced_keyboard.pop(u32::from(n)),
+            EnhancedKeyboardOp::Query => {
+                let payload = format!("\x1b[?{}u", self.modes.enhanced_keyboard.flags())
                     .into_bytes()
                     .into_boxed_slice();
                 self.replies.queue(payload);
@@ -2018,7 +2018,7 @@ impl State {
         self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         self.alt_screen = AltScreen::Off;
         self.primary_save = None;
-        self.kitty_keyboard_stash = KittyKeyboardState::default();
+        self.enhanced_keyboard_stash = EnhancedKeyboardState::default();
         self.saved_cursors = [None, None];
         self.cursor = Cursor::default();
         self.modes = Modes::default();

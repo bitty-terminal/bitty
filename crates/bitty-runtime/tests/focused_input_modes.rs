@@ -71,7 +71,7 @@ fn primary_text(rt: &Runtime) -> String {
 }
 
 #[test]
-fn focus_transition_reattributes_capture_and_kitty_without_pump() {
+fn focus_transition_reattributes_capture_and_enhanced_keyboard_without_pump() {
     bitty_test_support::require_pty!();
     let mut rt = two_pane_runtime();
     // Primary pane is the "app": mouse tracking (1000 + SGR 1006) and
@@ -84,7 +84,11 @@ fn focus_transition_reattributes_capture_and_kitty_without_pump() {
     // Focus the app pane: app modes are active.
     assert!(rt.set_focus(ViewId::new(1)));
     assert!(rt.mouse_capture_active(), "app pane must capture the mouse");
-    assert_ne!(rt.kitty_flags(), 0, "app pane must enable Kitty flags");
+    assert_ne!(
+        rt.enhanced_keyboard_flags(),
+        0,
+        "app pane must enable Kitty flags"
+    );
 
     // Switch to the plain pane with NO PTY pump in between: the plain
     // pane's modes must win, never the previous pane's.
@@ -94,7 +98,7 @@ fn focus_transition_reattributes_capture_and_kitty_without_pump() {
         "plain pane inherited the app pane's mouse capture"
     );
     assert_eq!(
-        rt.kitty_flags(),
+        rt.enhanced_keyboard_flags(),
         0,
         "plain pane inherited the app pane's Kitty flags"
     );

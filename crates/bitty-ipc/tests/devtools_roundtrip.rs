@@ -80,7 +80,11 @@ fn spawn_server(socket_path: String, min_requests: u64) -> std::thread::JoinHand
         let verified = transport_attested_peer(&socket_path, runtime_uid).unwrap();
         let dispatcher = Dispatcher::with_defaults();
         let server = ServerInfo::new("e2e".to_string(), socket_path.clone(), 80, 24);
-        let context = ServeContext::new(&server);
+        // A live read session: the peer has been granted `debug.inspect`
+        // (connection alone grants no debug scope, P0-AC-025).
+        let mut granted = bitty_ipc::scope::ScopeSet::cli_default();
+        granted.insert(bitty_ipc::scope::Scope::DebugInspect);
+        let context = ServeContext::with_granted(&server, granted);
         let mut limiter = RateLimiter::rc9_default();
         let clock = || {
             SystemTime::now()

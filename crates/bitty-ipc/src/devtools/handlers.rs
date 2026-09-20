@@ -258,6 +258,32 @@ fn handle_test_info(
     Ok(out)
 }
 
+/// Require a debug scope for a read-only debug method (fail-closed).
+///
+/// The accepted scope hierarchy is `debug.control ⊃ debug.trace ⊃
+/// debug.inspect` ([`crate::scope::Scope`]: `trace` and `control` are
+/// "inspect plus ..."), so a caller holding any debug scope may read.
+/// Connection alone grants none of them, so a peer with no debug scope is
+/// denied with `scope`/`ScopeDenied` and zero partial state. This is the
+/// read-surface half of P0-AC-025 (DevTools scopes distinct and ungranted by
+/// connection); the write surface (automation) additionally intersects a
+/// capability scope and a bearer.
+fn require_debug_read_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
+    use crate::scope::Scope;
+    let granted = &context.granted;
+    if granted.contains(Scope::DebugInspect)
+        || granted.contains(Scope::DebugTrace)
+        || granted.contains(Scope::DebugControl)
+    {
+        return Ok(());
+    }
+    Err(HandlerError::new(
+        "scope",
+        "ScopeDenied",
+        format!("permission denied: scope 'debug.inspect' denied for {method} (needs elevation)"),
+    ))
+}
+
 /// Escape a string as a JSON string body (without surrounding quotes).
 pub(super) fn json_escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
@@ -285,6 +311,7 @@ fn handle_get_snapshot(
     context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
+    require_debug_read_scope(context, "bitty.debug/getSnapshot")?;
     let server = &context.server;
     let mut out = String::with_capacity(256);
     out.push_str("{\"version\":\"");
@@ -736,9 +763,10 @@ pub(super) fn parse_optional_uint_param(
 /// `"rows","generation"}`. Empty store (never published) yields empty lines
 /// with generation `0` rather than an error.
 fn handle_get_grid_text(
-    _context: &ServeContext,
+    context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
+    require_debug_read_scope(context, "bitty.debug/getGridText")?;
     let rows = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "rows",
@@ -813,9 +841,10 @@ fn handle_get_grid_text(
 /// button,col,row,pressed}],"dropped_notice":false}`. Empty store yields an
 /// empty array rather than an error.
 fn handle_get_input_ring(
-    _context: &ServeContext,
+    context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
+    require_debug_read_scope(context, "bitty.debug/getInputRing")?;
     let limit = parse_optional_uint_param(
         request.params_raw.as_deref(),
         "limit",
@@ -894,9 +923,10 @@ fn handle_get_input_ring(
 
 /// `bitty.debug/getModifiers`: modifier/latch state (no params).
 fn handle_get_modifiers(
-    _context: &ServeContext,
+    context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
+    require_debug_read_scope(context, "bitty.debug/getModifiers")?;
     let guard = live_modifiers_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -921,9 +951,10 @@ fn handle_get_modifiers(
 
 /// `bitty.debug/getFocus`: focus/window state (no params).
 fn handle_get_focus(
-    _context: &ServeContext,
+    context: &ServeContext,
     _request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
+    require_debug_read_scope(context, "bitty.debug/getFocus")?;
     let guard = live_focus_store().lock().map_err(|_| {
         HandlerError::new(
             "transport",
@@ -991,7 +1022,28 @@ fn handle_control(
     if reply.ok {
         Ok(reply.result_json)
     } else {
-        Err(HandlerError::new(reply.category, reply.code, reply.message))
+        Err(HandlerError::new(
+            debug_error_category(reply.category),
+            reply.code,
+            reply.message,
+        ))
+    }
+}
+
+/// Map a control-reply category onto the accepted debug-protocol taxonomy.
+///
+/// The devtools-rfc fixes the wire category set to `usage`, `capability`,
+/// `scope`, `budget`, `generation`, and `transport`. The internal
+/// [`crate::ctl::ControlReply`] uses `auth` as a CLI exit-code class
+/// (`bitty ctl` maps it to exit 7); `auth` is not a debug-protocol category,
+/// so a permission failure is reported as `scope` on the wire. The stable
+/// `code` (`ScopeDenied` / `Denied` / `Unauthenticated`) still distinguishes
+/// the exact denial. Every other control category (`usage`, `budget`,
+/// `transport`) is already on the accepted taxonomy and passes through.
+fn debug_error_category(category: &'static str) -> &'static str {
+    match category {
+        "auth" => "scope",
+        other => other,
     }
 }
 

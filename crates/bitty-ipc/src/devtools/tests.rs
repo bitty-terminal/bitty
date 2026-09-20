@@ -19,7 +19,11 @@ fn test_server_info() -> ServerInfo {
 }
 
 fn test_context() -> ServeContext {
-    ServeContext::new(&test_server_info())
+    // Connection alone grants no debug scope (P0-AC-025); the read-surface
+    // tests model a peer that has been granted `debug.inspect`.
+    let mut granted = crate::scope::ScopeSet::cli_default();
+    granted.insert(crate::scope::Scope::DebugInspect);
+    ServeContext::with_granted(&test_server_info(), granted)
 }
 
 // ── socket path ─────────────────────────────────────────────────────
@@ -1409,6 +1413,210 @@ fn introspection_publish_is_bounded() {
     assert!(!outcome.was_error);
     let text = String::from_utf8(outcome.response).unwrap();
     assert!(text.len() <= MAX_INSPECT_JSON_BYTES + 512);
+    clear_introspection_for_tests();
+}
+
+// ── debug-protocol v1 verification (CTX-0589, issue #1097) ──────────────
+//
+// Contract-level evidence for the devtools-rfc plugin-runtime verification
+// plan that is reachable on today's server surface:
+// - P0-AC-025 zero-scope matrix: connection (an empty granted set) grants
+//   none of `debug.inspect`/`debug.trace`/`debug.control`; every read method
+//   fails closed with a typed `scope`/`ScopeDenied`, zero partial state.
+// - Typed-error taxonomy: every server failure carries a category drawn from
+//   the accepted set (`usage`|`capability`|`scope`|`budget`|`generation`|
+//   `transport`), never an off-taxonomy class. Pins the control-denial
+//   mapping (`auth` -> `scope`).
+// The RFC's plugin-runtime methods (`listPlugins`, `getPlugin`,
+// `getBudgets`, `disposeGeneration`, ...) are not registered on this server
+// slice, so their generation-ownership acceptance items stay open; the
+// generation invariant that IS reachable (grid `generation` is output-only,
+// with no caller-supplied stale-generation parameter) is pinned below.
+
+/// Accepted error categories per devtools-rfc (L331-333): every failure must
+/// carry one of these on the wire.
+const ACCEPTED_DEBUG_CATEGORIES: &[&str] = &[
+    "usage",
+    "capability",
+    "scope",
+    "budget",
+    "generation",
+    "transport",
+];
+
+/// Extract the `error.category` value from a rendered error response.
+fn error_category(response: &str) -> Option<String> {
+    let at = response.find("\"category\":\"")? + "\"category\":\"".len();
+    let rest = &response[at..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[test]
+fn debug_read_surface_connection_alone_grants_nothing() {
+    // P0-AC-025 read half: a peer that has merely connected (empty granted
+    // set) must be denied every read method with the shared typed shape and
+    // zero partial state.
+    let _introspection_guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(vec!["SECRET-GRID".to_string()], 0, 0, true, 5, 80, 24);
+    let dispatcher = Dispatcher::with_defaults();
+    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    for method in [
+        "bitty.debug/getSnapshot",
+        "bitty.debug/getGridText",
+        "bitty.debug/getInputRing",
+        "bitty.debug/getModifiers",
+        "bitty.debug/getFocus",
+    ] {
+        let envelope =
+            format!("{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\"}}").into_bytes();
+        let outcome = handle_envelope(&envelope, &dispatcher, &ctx);
+        assert!(
+            outcome.was_error,
+            "{method} must be denied with zero scopes"
+        );
+        let text = response_text(&outcome);
+        assert_eq!(
+            error_category(&text).as_deref(),
+            Some("scope"),
+            "{method} denial must be typed scope: {text}"
+        );
+        assert!(
+            text.contains("\"code\":\"ScopeDenied\""),
+            "{method} denial must be ScopeDenied: {text}"
+        );
+        assert!(
+            !text.contains("SECRET-GRID"),
+            "{method} must not leak content on a denial: {text}"
+        );
+    }
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn debug_read_surface_any_debug_scope_reads_but_others_do_not() {
+    // The accepted hierarchy is debug.control > debug.trace > debug.inspect
+    // (RFC scopes table), so any one debug scope reads the surface; a peer
+    // holding only a non-debug scope does not.
+    let _introspection_guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(vec!["readable".to_string()], 0, 0, true, 5, 80, 24);
+    let dispatcher = Dispatcher::with_defaults();
+    for scope in [
+        crate::scope::Scope::DebugInspect,
+        crate::scope::Scope::DebugTrace,
+        crate::scope::Scope::DebugControl,
+    ] {
+        let mut granted = crate::scope::ScopeSet::new();
+        granted.insert(scope);
+        let ctx = ServeContext::with_granted(&test_server_info(), granted);
+        let outcome = handle_envelope(
+            br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
+            &dispatcher,
+            &ctx,
+        );
+        assert!(!outcome.was_error, "{scope:?} must read the grid surface");
+        assert!(response_text(&outcome).contains("readable"));
+    }
+    let mut non_debug = crate::scope::ScopeSet::new();
+    non_debug.insert(crate::scope::Scope::TerminalInspect);
+    let ctx = ServeContext::with_granted(&test_server_info(), non_debug);
+    let outcome = handle_envelope(
+        br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
+        &dispatcher,
+        &ctx,
+    );
+    assert!(
+        outcome.was_error,
+        "terminal.inspect must not read debug surface"
+    );
+    assert!(response_text(&outcome).contains("ScopeDenied"));
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn debug_control_denial_category_is_on_taxonomy() {
+    // Regression: the control path's internal `auth` CLI class must not leak
+    // onto the debug wire; a scope denial is typed `scope` (RFC taxonomy).
+    let dispatcher = Dispatcher::with_defaults();
+    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    let outcome = handle_envelope(
+        br#"{"id":1,"method":"bitty.debug/spawnTerminal","version":"1.0","params":{"cwd":null}}"#,
+        &dispatcher,
+        &ctx,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert_eq!(
+        error_category(&text).as_deref(),
+        Some("scope"),
+        "control denial must map auth -> scope: {text}"
+    );
+    assert!(
+        text.contains("\"code\":\"ScopeDenied\""),
+        "control denial must keep ScopeDenied: {text}"
+    );
+}
+
+#[test]
+fn debug_error_categories_stay_on_taxonomy() {
+    // Typed-error sweep: every reachable server failure category is in the
+    // accepted set. Drives the same dispatcher through parse faults, scope
+    // denials, unknown methods, and version faults.
+    let dispatcher = Dispatcher::with_defaults();
+    let ctx = ServeContext::with_granted(&test_server_info(), crate::scope::ScopeSet::new());
+    let probes: &[&[u8]] = &[
+        br#"{"id":1,"method":"bitty.debug/nope","version":"1.0"}"#,
+        br#"{"id":2,"method":"bitty.debug/ping","version":"9.9"}"#,
+        br#"{"id":3,"method":"bitty.debug/ping","version":"1.0","scope":"admin"}"#,
+        br#"{"id":4,"method":"bitty.debug/spawnTerminal","version":"1.0","params":{"cwd":null}}"#,
+        br#"{"id":5,"method":"bitty.debug/getGridText","version":"1.0"}"#,
+        br#"{"id":6,"method":"bitty.debug/getGridText","version":"1.0","params":{"rows":999}}"#,
+    ];
+    for payload in probes {
+        let outcome = handle_envelope(payload, &dispatcher, &ctx);
+        assert!(
+            outcome.was_error,
+            "probe must fail: {:?}",
+            response_text(&outcome)
+        );
+        let text = response_text(&outcome);
+        let category = error_category(&text).expect("error must carry a category");
+        assert!(
+            ACCEPTED_DEBUG_CATEGORIES.contains(&category.as_str()),
+            "off-taxonomy category {category:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn grid_generation_is_output_only_no_caller_generation_param() {
+    // Generation ownership at the reachable debug boundary: the grid
+    // `generation` is a damage-generation output. There is no caller-supplied
+    // generation parameter that could address another generation's data, so a
+    // stale-generation request cannot leak a sibling scope's content. A
+    // caller-supplied `generation` is ignored (not an address).
+    let _introspection_guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    publish_grid_text(vec!["gen-seven".to_string()], 0, 0, true, 7, 80, 24);
+    let dispatcher = Dispatcher::with_defaults();
+    let context = test_context();
+    let outcome = handle_envelope(
+        br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0","params":{"generation":3}}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(!outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(
+        text.contains("\"generation\":7"),
+        "served generation must be the live store's, not the caller's: {text}"
+    );
+    assert!(
+        !text.contains("\"generation\":3"),
+        "a caller-supplied generation must not be echoed as authority: {text}"
+    );
     clear_introspection_for_tests();
 }
 

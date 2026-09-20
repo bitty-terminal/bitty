@@ -25,7 +25,7 @@ use crate::damage::{
 };
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
-use crate::modes::{AltScreen, Modes};
+use crate::modes::{AltScreen, KittyKeyboardState, Modes};
 use crate::replies::Replies;
 use crate::scrollback::{ClearedRange, SCROLLBACK_DEFAULT_LINES, Scrollback, ScrollbackLine};
 use crate::tabs::TabStops;
@@ -161,6 +161,16 @@ pub struct State {
     screens: ScreenPair,
     alt_screen: AltScreen,
     primary_save: Option<ScreenSave>,
+    /// Kitty keyboard flag register of the currently **inactive** screen.
+    ///
+    /// The kitty protocol keeps separate flag stacks for the main and
+    /// alternate screens (`main_key_encoding_flags` / `alt_key_encoding_flags`
+    /// in the reference), so a `CSI = u` inside an alt screen that never
+    /// negotiated must report zero, and main's register must survive
+    /// untouched. [`Self::modes`]`.kitty_keyboard` is the live (active screen)
+    /// register; this field holds the other screen's register and is swapped
+    /// on each alt-screen transition (`CTX-0575` F3).
+    kitty_keyboard_stash: KittyKeyboardState,
     saved_cursors: [Option<SavedCursor>; 2],
     cursor: Cursor,
     modes: Modes,
@@ -212,6 +222,7 @@ impl State {
             screens: ScreenPair::new(GRID_ROWS, GRID_COLUMNS),
             alt_screen: AltScreen::Off,
             primary_save: None,
+            kitty_keyboard_stash: KittyKeyboardState::default(),
             saved_cursors: [None, None],
             cursor: Cursor::default(),
             modes: Modes::default(),
@@ -1076,6 +1087,11 @@ impl State {
             // `kitty_display_image`; state stays inert by design.
             TerminalAction::KittyGraphics { .. } => {}
 
+            // Kitty keyboard progressive-enhancement negotiation (CTX-0575).
+            // The bounded register and push/pop stack live in the mode
+            // register; a `Query` synthesizes the spec reply `CSI ? flags u`.
+            TerminalAction::KittyKeyboard { op } => self.apply_kitty_keyboard(*op),
+
             TerminalAction::Unknown(report) => match report.kind {
                 SequenceKind::Csi => self.telemetry.unknown_csi += 1,
                 SequenceKind::Esc => self.telemetry.unknown_esc += 1,
@@ -1756,13 +1772,17 @@ impl State {
             Mode::SynchronizedUpdate => self.modes.synchronized_update = enabled,
             Mode::KittyKeyboard(flags) => {
                 if enabled {
-                    // Progressive flags: OR in bounded bits (candidate spec: u32, unknown bits ignored)
-                    self.modes.kitty_keyboard |= flags & 0x1F;
+                    // Legacy `?7727 h/l` alias: OR in bounded bits.
+                    self.modes
+                        .kitty_keyboard
+                        .set(flags, bitty_vt::KittyKeyboardSetMode::Set);
                 } else if flags == 0 {
-                    // CSI ? 7727 l without flags disables all
-                    self.modes.kitty_keyboard = 0;
+                    // `CSI ? 7727 l` without flags disables all.
+                    self.modes.kitty_keyboard.pop(u32::MAX);
                 } else {
-                    self.modes.kitty_keyboard &= !(flags & 0x1F);
+                    self.modes
+                        .kitty_keyboard
+                        .set(flags, bitty_vt::KittyKeyboardSetMode::Reset);
                 }
             }
             Mode::MouseTracking(tracking) => {
@@ -1801,6 +1821,13 @@ impl State {
                 charsets: self.charsets.clone(),
                 modes: self.modes.clone(),
             });
+            // Kitty keeps a separate flag register per screen: swap the live
+            // (main) register with the inactive-screen stash so the alt screen
+            // starts from its own negotiated flags, not main's (F3).
+            std::mem::swap(
+                &mut self.modes.kitty_keyboard,
+                &mut self.kitty_keyboard_stash,
+            );
             self.alt_screen = variant;
             if variant == AltScreen::Via1049 {
                 // ?1049 clears the alternate screen on entry; ?47 keeps
@@ -1813,6 +1840,9 @@ impl State {
             if self.alt_screen == AltScreen::Off {
                 return;
             }
+            // Preserve the alt screen's own register for the next alt session
+            // while main's is restored from the entry snapshot.
+            let alt_kitty = std::mem::take(&mut self.modes.kitty_keyboard);
             if let Some(save) = self.primary_save.take() {
                 self.cursor.position = save.cursor_position;
                 self.cursor.pending_wrap = save.pending_wrap;
@@ -1822,6 +1852,7 @@ impl State {
                 self.charsets = save.charsets;
                 self.modes = save.modes;
             }
+            self.kitty_keyboard_stash = alt_kitty;
             self.alt_screen = AltScreen::Off;
             self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         }
@@ -1892,6 +1923,27 @@ impl State {
     // Replies (queued, never written anywhere)
     // ------------------------------------------------------------------
 
+    /// Applies one Kitty keyboard-protocol operation (CTX-0575).
+    ///
+    /// `Query` queues the spec reply `CSI ? flags u`; the register never
+    /// emits bytes on its own (RFC: replies are queued, not written).
+    fn apply_kitty_keyboard(&mut self, op: bitty_vt::KittyKeyboardOp) {
+        use bitty_vt::KittyKeyboardOp;
+        match op {
+            KittyKeyboardOp::Set { flags, mode } => {
+                self.modes.kitty_keyboard.set(flags, mode);
+            }
+            KittyKeyboardOp::Push { flags } => self.modes.kitty_keyboard.push(flags),
+            KittyKeyboardOp::Pop { n } => self.modes.kitty_keyboard.pop(u32::from(n)),
+            KittyKeyboardOp::Query => {
+                let payload = format!("\x1b[?{}u", self.modes.kitty_keyboard.flags())
+                    .into_bytes()
+                    .into_boxed_slice();
+                self.replies.queue(payload);
+            }
+        }
+    }
+
     fn request_device_status(&mut self, kind: StatusKind) {
         let payload: Box<[u8]> = match kind {
             StatusKind::OperatingStatus => b"\x1b[0n".to_vec().into_boxed_slice(),
@@ -1944,6 +1996,7 @@ impl State {
         self.damage_grid_rect(0, 0, self.height as u16 - 1, self.width as u16 - 1);
         self.alt_screen = AltScreen::Off;
         self.primary_save = None;
+        self.kitty_keyboard_stash = KittyKeyboardState::default();
         self.saved_cursors = [None, None];
         self.cursor = Cursor::default();
         self.modes = Modes::default();

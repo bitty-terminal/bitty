@@ -45,7 +45,17 @@ impl State {
         h.boolean(self.modes.focus_events);
         h.boolean(self.modes.alternate_scroll);
         h.boolean(self.modes.synchronized_update);
-        h.u32(self.modes.kitty_keyboard);
+        h.u8(self.modes.kitty_keyboard.depth() as u8);
+        for entry in self.modes.kitty_keyboard.entries() {
+            h.u8(*entry);
+        }
+        // The inactive screen's kitty flag register (per-screen independence):
+        // truth-bearing because re-entering the alternate screen resumes its
+        // prior register (CTX-0575 F3).
+        h.u8(self.kitty_keyboard_stash.depth() as u8);
+        for entry in self.kitty_keyboard_stash.entries() {
+            h.u8(*entry);
+        }
         h.option_tag(self.modes.mouse_tracking.is_some());
         if let Some(mode) = self.modes.mouse_tracking {
             h.u8(mouse_tracking_discriminant(mode));
@@ -264,4 +274,8 @@ fn write_modes(out: &mut CanonicalHasher, modes: &Modes) {
     out.boolean(modes.focus_events);
     out.boolean(modes.alternate_scroll);
     out.boolean(modes.synchronized_update);
+    out.u8(modes.kitty_keyboard.depth() as u8);
+    for entry in modes.kitty_keyboard.entries() {
+        out.u8(*entry);
+    }
 }

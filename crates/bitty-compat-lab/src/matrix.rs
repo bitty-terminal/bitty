@@ -98,7 +98,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         surface: "Kitty",
         category: "keyboard",
         corpus_rel: "keyboard/corpus/03-dogfooding-kitty-keyboard-bracketed.bin",
-        description: "Kitty keyboard progressive 7727 plus CSI u and bracketed paste",
+        description: "Kitty keyboard progressive enhancement (CSI =/>/< /? u; 7727 alias) plus CSI u and bracketed paste",
     },
     MatrixEntry {
         surface: "IME",

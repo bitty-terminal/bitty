@@ -306,6 +306,54 @@ pub enum Mode {
     MouseCoordinateEncoding(MouseCoordinateEncoding),
 }
 
+/// How a `CSI = flags ; mode u` assignment combines with the live flags.
+///
+/// Mirrors the Kitty keyboard-protocol `mode` parameter
+/// (`sw.kovidgoyal.net/kitty/keyboard-protocol`): `1` assigns (all set bits
+/// set, all unset bits reset), `2` sets only the named bits, `3` resets only
+/// the named bits. Unknown modes fail closed (no state change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KittyKeyboardSetMode {
+    /// `mode 1`: replace the whole flag register with `flags`.
+    Assign,
+    /// `mode 2`: OR `flags` into the register.
+    Set,
+    /// `mode 3`: clear `flags` from the register.
+    Reset,
+}
+
+/// One Kitty keyboard progressive-enhancement operation (CTX-0575).
+///
+/// The authoritative negotiation is `CSI = flags ; mode u` (set),
+/// `CSI > flags u` (push), `CSI < n u` (pop) and `CSI ? u` (query); the
+/// historical `CSI ? 7727 h/l` alias stays supported separately. The parser
+/// only classifies the wire form — the bounded flag register and push/pop
+/// stack live in terminal state (RFC invariant 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KittyKeyboardOp {
+    /// `CSI = flags ; mode u`: combine `flags` into the register by `mode`.
+    Set {
+        /// Enhancement bits named by the sequence (masked to the five
+        /// defined bits by terminal state).
+        flags: u32,
+        /// How the bits combine with the live register.
+        mode: KittyKeyboardSetMode,
+    },
+    /// `CSI > flags u`: push the current flags and set `flags` (default 0).
+    Push {
+        /// Enhancement bits for the new top of the stack.
+        flags: u32,
+    },
+    /// `CSI < n u`: pop `n` entries (default 1); popping past the bottom
+    /// resets all flags.
+    Pop {
+        /// Number of entries to pop (bounded by terminal state).
+        n: u16,
+    },
+    /// `CSI ? u`: report the live flags as `CSI ? flags u`.
+    Query,
+}
+
 /// XTerm mouse-tracking protocol level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseTrackingMode {
@@ -690,6 +738,18 @@ pub enum TerminalAction {
     SingleShiftCharset {
         /// Slot to arm for one printed scalar.
         slot: CharsetSlot,
+    },
+
+    // Keyboard protocol
+    /// Kitty keyboard progressive-enhancement negotiation (CTX-0575).
+    ///
+    /// Emitted for `CSI = flags ; mode u`, `CSI > flags u`, `CSI < n u`, and
+    /// `CSI ? u`. Terminal state owns the bounded flag register and the
+    /// per-screen push/pop stack and synthesizes the `CSI ? flags u` reply
+    /// for [`KittyKeyboardOp::Query`].
+    KittyKeyboard {
+        /// Classified wire operation.
+        op: KittyKeyboardOp,
     },
 
     // Device status and replies

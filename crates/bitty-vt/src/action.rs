@@ -420,9 +420,11 @@ pub enum DynamicColorOp {
 /// (default deny, see `specifications/bell-notification-policy.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationSource {
-    /// `OSC 9;<message>`: the xterm-style notification form.
+    /// `OSC 9;<message>`: the xterm-style notification form (bare text; the
+    /// ConEmu `OSC 9;<n>` sub-commands are not notifications).
     Osc9,
-    /// `OSC 777;notify;<title>;<body>`: the rxvt-unicode / kitty form.
+    /// `OSC 777;notify;<title>;<body>`: the rxvt-unicode notification form
+    /// (kitty's documented notification protocol is `OSC 99`, unparsed here).
     Osc777,
 }
 

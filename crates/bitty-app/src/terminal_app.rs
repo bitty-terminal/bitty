@@ -929,14 +929,14 @@ impl AppHandler for TerminalApp {
                 // bounded wake at its next frame; when the last animation
                 // ends the deadline is `None` and the loop returns to wait
                 // (zero periodic wakeups, PB-7).
+                // CTX-0577 (review PX-3067): the bounded bell flash and
+                // notification banner also expire on a timer, so arm a wake
+                // at their deadline too; otherwise a quiet window would keep
+                // the surface until unrelated activity forced a frame.
                 let hover = self.runtime.hover_activation_deadline();
                 let animation = self.runtime.animation_deadline();
-                let wake = match (hover, animation) {
-                    (Some(h), Some(a)) => Some(h.min(a)),
-                    (Some(h), None) => Some(h),
-                    (None, Some(a)) => Some(a),
-                    (None, None) => None,
-                };
+                let bell = self.runtime.bell_notification_deadline();
+                let wake = [hover, animation, bell].into_iter().flatten().min();
                 match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),

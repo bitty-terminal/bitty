@@ -1800,6 +1800,47 @@ impl Runtime {
         expired
     }
 
+    /// Clears the visual bell flash once its bounded window has elapsed and
+    /// returns whether this call performed the expiration (CTX-0577 review
+    /// PX-3067).
+    ///
+    /// Without this the flash only stopped painting lazily when some other
+    /// event happened to present a frame; on a quiet window it persisted
+    /// indefinitely, contradicting the bounded-surface contract.
+    pub(super) fn expire_bell_flash(&mut self, now: std::time::Instant) -> bool {
+        let expired = self
+            .bell_flash_at
+            .is_some_and(|since| now.saturating_duration_since(since) >= bell::BELL_FLASH_DURATION);
+        if expired {
+            self.bell_flash_at = None;
+        }
+        expired
+    }
+
+    /// Earliest instant either bounded bell/notification surface needs to
+    /// change, if any (CTX-0577 review PX-3067).
+    ///
+    /// The app event loop arms a timed wake at this instant
+    /// (`EventContext::set_wait_until`) so expiry happens on time even when
+    /// no PTY bytes or layout change arrive. `None` when neither surface is
+    /// live, so an idle window keeps zero periodic wakeups (PB-7).
+    #[must_use]
+    pub fn bell_notification_deadline(&self) -> Option<std::time::Instant> {
+        let flash = self
+            .bell_flash_at
+            .map(|since| since + bell::BELL_FLASH_DURATION);
+        let banner = self
+            .notification_banner
+            .as_ref()
+            .map(|(_, since)| *since + bell::NOTIFICATION_BANNER_DURATION);
+        match (flash, banner) {
+            (Some(f), Some(b)) => Some(f.min(b)),
+            (Some(f), None) => Some(f),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     // ------------------------------------------------------------------
     // M1 protocol state (CTX-0380 synchronized updates, CTX-0381 dynamic colors)
     // ------------------------------------------------------------------

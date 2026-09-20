@@ -241,25 +241,26 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-/// Parses an `OSC 4` payload segment list (CTX-0392).
-///
-/// Accepted shape: even-count `;<index>;<spec>` pairs (`index` decimal
-/// `0..=255`, `spec` `?` query or the same color grammar as OSC 10/11:
-/// `#RGB`, `#RRGGBB`, `rgb:R/G/B` 1-4 hex digits per component). At least
-/// one pair and at most [`MAX_OSC4_OPS`] pairs; the whole sequence fails
-/// closed (`None`) on an odd segment count, empty payload, non-decimal or
-/// out-of-range index, malformed color, or pair-count overflow, so the
-/// caller records it as inert and live palette state never corrupts.
-/// The input is already length-bounded by the parser's OSC collector.
 /// Parses an `OSC 9` notification (CTX-0577).
 ///
-/// Wire form: `OSC 9 ; message`. The message may itself contain `;`, so the
-/// remaining segments are rejoined. An empty message is not a notification
-/// and returns `None` so the caller records it as inert (fail-closed).
+/// Wire form is bare `OSC 9 ; <text>`: the message may itself contain `;`,
+/// so the remaining segments are rejoined. The ConEmu `OSC 9;<n>[;...]`
+/// sub-commands (`1` sleep, `2` message box, `3` tab title, `4` progress,
+/// `5`..=`9`) use the same OSC code, so a single-digit `1`..=`9` first
+/// segment is treated as a ConEmu command and returns `None` (the caller
+/// records it as inert). An empty message is likewise not a notification.
 fn parse_osc9_notification(rest: &[&[u8]]) -> Option<Notification> {
     let body = join_segments(rest);
     if body.is_empty() {
         return None;
+    }
+    // ConEmu sub-command space: `OSC 9;<single digit 1..=9>` (optionally
+    // followed by `;params`). Restricting to the bare text form keeps the
+    // notification surface from reinterpreting another protocol's commands.
+    if let Some(first) = rest.first() {
+        if first.len() == 1 && matches!(first[0], b'1'..=b'9') {
+            return None;
+        }
     }
     Some(Notification {
         source: NotificationSource::Osc9,
@@ -271,7 +272,8 @@ fn parse_osc9_notification(rest: &[&[u8]]) -> Option<Notification> {
 /// Parses an `OSC 777` notification (CTX-0577).
 ///
 /// Accepted wire form is exactly `OSC 777 ; notify ; title ; body` (the
-/// rxvt-unicode / kitty notification form). The body may contain `;` and is
+/// rxvt-unicode notification form; kitty's documented protocol is `OSC 99`,
+/// which this parser does not handle). The body may contain `;` and is
 /// rejoined; any other sub-command or a malformed segment list returns
 /// `None` so the caller records it as inert. `OSC 777` also carries other
 /// sub-commands (`notify` is the only one defined here), so unknown
@@ -294,6 +296,16 @@ fn parse_osc777_notification(rest: &[&[u8]]) -> Option<Notification> {
     })
 }
 
+/// Parses an `OSC 4` payload segment list (CTX-0392).
+///
+/// Accepted shape: even-count `;<index>;<spec>` pairs (`index` decimal
+/// `0..=255`, `spec` `?` query or the same color grammar as OSC 10/11:
+/// `#RGB`, `#RRGGBB`, `rgb:R/G/B` 1-4 hex digits per component). At least
+/// one pair and at most [`MAX_OSC4_OPS`] pairs; the whole sequence fails
+/// closed (`None`) on an odd segment count, empty payload, non-decimal or
+/// out-of-range index, malformed color, or pair-count overflow, so the
+/// caller records it as inert and live palette state never corrupts.
+/// The input is already length-bounded by the parser's OSC collector.
 fn parse_osc4(rest: &[&[u8]]) -> Option<Vec<PaletteOp>> {
     if rest.is_empty() || rest.len() % 2 != 0 {
         return None;

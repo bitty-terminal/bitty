@@ -1019,6 +1019,41 @@ fn osc9_notification_maps_message_and_stays_bounded() {
 }
 
 #[test]
+fn osc9_conemu_subcommands_stay_inert() {
+    // Review PX-3067: ConEmu `OSC 9;<n>[;...]` (1 sleep, 2 message box,
+    // 3 tab title, 4 progress, 5..9 reserved) share the code with the
+    // notification form; only bare text is a notification.
+    for sequence in [
+        &b"\x1b]9;1\x07"[..],
+        &b"\x1b]9;2;hi\x07"[..],
+        &b"\x1b]9;3;title\x07"[..],
+        &b"\x1b]9;4;1;50\x07"[..],
+        &b"\x1b]9;5\x07"[..],
+        &b"\x1b]9;9\x07"[..],
+    ] {
+        let actions = parse(sequence);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [TerminalAction::OscUnknown { id: 9, .. }]
+            ),
+            "ConEmu OSC 9 must stay inert, got {actions:?} for {sequence:?}"
+        );
+    }
+    // A multi-digit or textual message is not a ConEmu command.
+    assert_eq!(
+        parse(b"\x1b]9;10\x07"),
+        vec![TerminalAction::OscNotification {
+            notification: Notification {
+                source: NotificationSource::Osc9,
+                title: None,
+                body: BoundedString::new("10"),
+            }
+        }]
+    );
+}
+
+#[test]
 fn osc9_empty_message_is_inert() {
     // An empty notification is not a notification: it stays inert telemetry
     // so hostile output cannot drive a repeated empty surface.

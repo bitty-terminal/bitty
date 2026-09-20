@@ -711,6 +711,22 @@ impl Runtime {
     fn tick_time_gates(&mut self, now: std::time::Instant) -> bool {
         // fires even when the pointer stopped moving.
         self.apply_hover_deadline(now);
+        // CTX-0577 (review PX-3067): the bounded bell flash and notification
+        // banner are time-expiring presentation surfaces. Expire them here —
+        // before the idle short-circuit in `collect_tick_basis` — and force
+        // the frame so a quiet window (no PTY bytes, no layout change) still
+        // clears them on time instead of painting them indefinitely. Advancing
+        // the queued notification here keeps the one-banner-at-a-time rule
+        // independent of unrelated activity.
+        if self.expire_bell_flash(now) {
+            self.pending_full_redraw = true;
+        }
+        if self.expire_notification_banner(now) {
+            self.pending_full_redraw = true;
+        }
+        if self.advance_notification_banner_at(now) {
+            self.pending_full_redraw = true;
+        }
         // CTX-0192 transient: collapse the full banner to the flash once its
         // duration expires. Force exactly one repaint for the transition so
         // the retained frame keeps a visible (smaller) signal while pending.
@@ -1326,16 +1342,8 @@ impl Runtime {
         now: std::time::Instant,
         layers: &mut FrameLayers,
     ) {
-        // Expire stale surfaces so the frame is repainted without them.
-        let banner_expired = self.expire_notification_banner(now);
-        if banner_expired {
-            layers.any_needs_draw = true;
-        }
-        // Present the next queued notification once the previous banner has
-        // expired, so at most one notification is visible at a time.
-        if self.advance_notification_banner_at(now) {
-            layers.any_needs_draw = true;
-        }
+        // Expiry and queue advancement already ran in `tick_time_gates` (so
+        // they fire on a quiet window too); read the resolved surface here.
         let flash_active = self.visual_bell_active_at(now);
         let banner = self.notification_banner_at(now);
         let Some(frame) = self

@@ -154,6 +154,89 @@ fn notification_banner_is_never_silent_and_self_expires() {
 }
 
 #[test]
+fn bell_flash_expires_on_a_quiet_window_without_pty_or_layout_change() {
+    // Review PX-3067: the bounded flash must self-expire on time (forcing a
+    // frame) rather than persisting until unrelated activity happens to tick.
+    let mut rt = runtime();
+    rt.handle_pty_bytes(b"\x07");
+    let now = std::time::Instant::now();
+    assert!(rt.visual_bell_active_at(now));
+    // Present the admitted flash, consuming the admission's redraw request.
+    assert!(rt.tick_at(now).is_some(), "admitted flash must present");
+    assert!(rt.visual_bell_active_at(now));
+    // No PTY bytes and no layout/geometry change before the deadline.
+    let later = now + BELL_FLASH_DURATION;
+    let stats = rt.tick_at(later);
+    assert!(
+        stats.is_some(),
+        "flash expiry must force a frame on a quiet window"
+    );
+    assert!(
+        !rt.visual_bell_active_at(later),
+        "flash must be cleared by the expiry tick"
+    );
+}
+
+#[test]
+fn notification_banner_expires_on_a_quiet_window_without_pty_or_layout_change() {
+    let mut rt = runtime();
+    rt.set_osc_notification_allowed(true);
+    rt.handle_pty_bytes(b"\x1b]9;quiet\x07");
+    let now = std::time::Instant::now();
+    assert_eq!(rt.notification_banner_at(now).as_deref(), Some("quiet"));
+    assert!(rt.tick_at(now).is_some(), "banner must present");
+    let later = now + NOTIFICATION_BANNER_DURATION;
+    let stats = rt.tick_at(later);
+    assert!(
+        stats.is_some(),
+        "banner expiry must force a frame on a quiet window"
+    );
+    assert!(
+        rt.notification_banner_at(later).is_none(),
+        "banner must be cleared by the expiry tick"
+    );
+}
+
+#[test]
+fn bell_notification_deadline_tracks_live_surfaces() {
+    // The app wake computation reads this deadline; it must be `Some` only
+    // while a bounded surface is live, so an idle window keeps zero wakes.
+    let mut rt = runtime();
+    assert!(rt.bell_notification_deadline().is_none());
+    rt.handle_pty_bytes(b"\x07");
+    let deadline = rt.bell_notification_deadline().expect("flash arms a wake");
+    assert!(deadline >= std::time::Instant::now());
+    // Past the flash window the deadline clears once a tick expires it.
+    let _ = rt.tick_at(std::time::Instant::now() + BELL_FLASH_DURATION);
+    assert!(rt.bell_notification_deadline().is_none());
+}
+
+#[test]
+fn osc9_conemu_subcommands_are_not_notifications() {
+    // Review PX-3067: ConEmu's `OSC 9;<n>` commands share the code with the
+    // notification form, so they must not surface a banner even with consent.
+    let mut rt = runtime();
+    rt.set_osc_notification_allowed(true);
+    for seq in [
+        &b"\x1b]9;1\x07"[..],    // sleep
+        &b"\x1b]9;2;hi\x07"[..], // message box
+        &b"\x1b]9;3;title\x07"[..],
+        &b"\x1b]9;4;1;50\x07"[..], // progress
+        &b"\x1b]9;9\x07"[..],
+    ] {
+        rt.handle_pty_bytes(seq);
+    }
+    assert_eq!(rt.pending_notification_count(), 0);
+    assert!(rt.notification_banner().is_none());
+    // The bare text form still surfaces.
+    rt.handle_pty_bytes(b"\x1b]9;real notification\x07");
+    assert_eq!(
+        rt.notification_banner().as_deref(),
+        Some("real notification")
+    );
+}
+
+#[test]
 fn malformed_notification_forms_stay_inert() {
     let mut rt = runtime();
     rt.set_osc_notification_allowed(true);

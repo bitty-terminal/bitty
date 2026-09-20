@@ -22,6 +22,10 @@ slice implements exactly that budget and a default-deny surface.
 
 - `BEL` (C0 `0x07`) user-visible handling.
 - `OSC 9;<message>` and `OSC 777;notify;<title>;<body>` notifications.
+  The ConEmu `OSC 9;<n>[;...]` sub-commands (`1` sleep, `2` message box,
+  `3` tab title, `4` progress, `5`..=`9`) share the OSC 9 code but are not
+  notifications and stay inert. Kitty's documented notification protocol is
+  `OSC 99`, which is not parsed.
 - Capability/consent gating, rate limiting, and the bounded presentation
   surface for both.
 
@@ -44,9 +48,12 @@ Rules:
    (`bell_rate_dropped`); nothing queues without bound. A backwards clock
    cannot re-open a window early.
 3. **Bounded presentation.** The visual flash is a short, self-expiring
-   accent strip; the notification banner shows one notification at a time
-   and self-expires after `NOTIFICATION_BANNER_DURATION` (4 s). Neither
-   mutates grid truth or the layout.
+   accent strip (`BELL_FLASH_DURATION`, 120 ms); the notification banner
+   shows one notification at a time and self-expires after
+   `NOTIFICATION_BANNER_DURATION` (4 s). Expiry runs in the tick's time
+   gates and the app arms a wake at `bell_notification_deadline()`, so both
+   clear on time even on a quiet window with no PTY output or layout change.
+   Neither mutates grid truth or the layout.
 4. **No ambient authority.** Notification payloads are untrusted observation
    data: control characters are stripped, the text is length-bounded, and it
    is never expanded, executed, or interpreted as a path or command.
@@ -72,8 +79,9 @@ Rules:
 ## Implemented code and evidence
 
 - Parser classification: `crates/bitty-vt/src/parser/dispatch.rs`
-  (`parse_osc9_notification`, `parse_osc777_notification`) plus
-  `TerminalAction::OscNotification` in `crates/bitty-vt/src/action.rs`.
+  (`parse_osc9_notification` — bare text only, ConEmu `OSC 9;<n>` denied;
+  `parse_osc777_notification`) plus `TerminalAction::OscNotification` in
+  `crates/bitty-vt/src/action.rs`.
 - Policy and bounds: `crates/bitty-runtime/src/runtime/bell.rs`.
 - Wiring: `crates/bitty-runtime/src/runtime/pty.rs` (admission) and
   `crates/bitty-runtime/src/runtime/present.rs` (bounded overlays).

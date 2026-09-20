@@ -68,6 +68,15 @@ ci-local *args:
 pty-gate:
     ./scripts/check-pty-gated-tests.sh
 
+# Run the four M1 evidence suites on this host and print the per-platform
+# table: `just m1-matrix`. The aggregated Tier 1 view lives in CI
+# (`.github/workflows/ci.yml` job `m1-matrix`); see scripts/m1-matrix.sh.
+m1-matrix *args:
+    ./scripts/m1-matrix.sh run --platform local {{args}}
+
+m1-matrix-test:
+    ./scripts/tests/m1-matrix.test.sh
+
 scratch-paths:
     ./scripts/check-scratch-paths.sh
 
@@ -152,7 +161,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test actionlint markdownlint
+check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

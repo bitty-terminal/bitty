@@ -73,6 +73,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      # M1-10 / CTX-0574: pin the M1 matrix driver's reporting logic (suite
+      # floors, ignored-test rejection, aggregate failure modes, step summary)
+      # without running the real suites here; the four Tier 1 platform legs and
+      # the `m1-matrix` aggregate job below run the suites themselves. This is
+      # also what the mandatory local `just ci-local` run (which targets this
+      # job) validates for the new wiring.
+      - name: Check M1 matrix driver (fixture test)
+        run: bash scripts/tests/m1-matrix.test.sh
+
       - name: Check status drift gate (OQ/RFC/crate-count/submodule)
         run: |
           bash scripts/check-status-drift.sh
@@ -151,6 +160,23 @@ jobs:
       - name: Run tests under xvfb (X11)
         run: xvfb-run -a cargo test --workspace --all-targets --locked
 
+      # M1-10 / CTX-0574: run the four M1 evidence suites by name so a
+      # per-platform regression is a distinct, reported result instead of
+      # being buried in the blanket test run above. The suites are headless
+      # (Parser -> State, plus the deterministic headless rasterizer) and need
+      # no display, so this step does not use xvfb.
+      - name: Run M1 compatibility matrix
+        run: ./scripts/m1-matrix.sh run --platform linux-x11 --out m1-results/linux-x11.tsv
+
+      - name: Upload M1 matrix result (linux-x11)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: m1-results-linux-x11
+          path: m1-results/linux-x11.tsv
+          if-no-files-found: error
+          retention-days: 7
+
   linux-wayland:
     name: Linux Wayland
     runs-on: ubuntu-latest
@@ -177,6 +203,21 @@ jobs:
       - name: Run tests with Wayland env
         run: cargo test --workspace --all-targets --locked
 
+      # M1-10 / CTX-0574: Wayland leg of the M1 compatibility matrix. The M1
+      # suites are display-independent; the Wayland env above only proves the
+      # workspace still builds and tests on the Wayland path.
+      - name: Run M1 compatibility matrix
+        run: ./scripts/m1-matrix.sh run --platform linux-wayland --out m1-results/linux-wayland.tsv
+
+      - name: Upload M1 matrix result (linux-wayland)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: m1-results-linux-wayland
+          path: m1-results/linux-wayland.tsv
+          if-no-files-found: error
+          retention-days: 7
+
   macos:
     name: macOS ARM64 check and test
     runs-on: macos-14
@@ -196,6 +237,21 @@ jobs:
 
       - name: Run tests (macOS ARM64)
         run: cargo test --workspace --all-targets --locked
+
+      # M1-10 / CTX-0574: macOS ARM64 leg of the M1 compatibility matrix. The
+      # suites are headless and free of window/font/GPU dependencies, so the
+      # macOS path is exercised without a display.
+      - name: Run M1 compatibility matrix
+        run: ./scripts/m1-matrix.sh run --platform macos --out m1-results/macos.tsv
+
+      - name: Upload M1 matrix result (macos)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: m1-results-macos
+          path: m1-results/macos.tsv
+          if-no-files-found: error
+          retention-days: 7
 
   supply-chain:
     name: Supply chain (deny/audit)
@@ -253,3 +309,60 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+      # M1-10 / CTX-0574: Windows x86_64 (ConPTY) leg of the M1 compatibility
+      # matrix, the third ADR-0002 Tier 1 platform. `shell: bash` selects the
+      # Git Bash on windows-latest; the suites are headless and the rasterizer
+      # used by the color/title golden is the deterministic headless one, so no
+      # window or GPU is required.
+      - name: Run M1 compatibility matrix
+        shell: bash
+        run: ./scripts/m1-matrix.sh run --platform windows --out m1-results/windows.tsv
+
+      - name: Upload M1 matrix result (windows)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: m1-results-windows
+          path: m1-results/windows.tsv
+          if-no-files-found: error
+          retention-days: 7
+
+  # M1-10 / CTX-0574: aggregate the four ADR-0002 Tier 1 platform legs into a
+  # single pass/fail view. Each platform job runs the M1 evidence suites by
+  # name and uploads a `m1-results-<platform>` artifact; this job stitches them
+  # into one table on the run summary and fails if any platform is missing a
+  # suite, reported a fail, or had a failed job result. That makes a regression
+  # on one Tier 1 platform a single visible check instead of four scattered
+  # job logs.
+  #
+  # MSRV is intentionally not a leg: it is a compile-floor gate
+  # (`cargo +1.85 check`), not a Tier 1 platform run. The four suites are
+  # exercised on Linux X11, Linux Wayland, macOS ARM64, and Windows x86_64
+  # above, which is the full Tier 1 platform set.
+  m1-matrix:
+    name: M1 matrix (Tier 1 aggregate)
+    if: always()
+    needs: [linux-x11, linux-wayland, macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      M1_JOB_LINUX_X11: ${{ needs['linux-x11'].result }}
+      M1_JOB_LINUX_WAYLAND: ${{ needs['linux-wayland'].result }}
+      M1_JOB_MACOS: ${{ needs.macos.result }}
+      M1_JOB_WINDOWS: ${{ needs.windows.result }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download per-platform M1 results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: m1-results-*
+          path: m1-results
+          merge-multiple: true
+
+      - name: Aggregate M1 matrix
+        run: |
+          ls -l m1-results || true
+          ./scripts/m1-matrix.sh aggregate --dir m1-results --summary "$GITHUB_STEP_SUMMARY"

@@ -259,3 +259,60 @@ fn clean_frame_composites_nothing() {
     bitty_render::grid::composite_frame(&grid, &list, &mut surface).unwrap();
     assert_eq!(surface.as_bytes(), &before[..]);
 }
+
+#[test]
+fn underline_styles_composite_to_distinct_rgba() {
+    // CTX-0583 (#1145): the end-to-end claim is pixel-level, not just
+    // DrawList-level. Each style is rendered onto its own surface and the
+    // four byte images are pairwise distinct; Single keeps the pre-CTX-0583
+    // full-width bottom strip.
+    use bitty_term_state::{Attribute, AttributeChange, AttributeDiff, UnderlineStyle};
+
+    let render_style = |style: UnderlineStyle| {
+        let mut state = State::new();
+        state.apply(&TerminalAction::SetAttributes {
+            attrs: AttributeDiff {
+                changes: [AttributeChange::Enable(Attribute::Underline(style))]
+                    .into_iter()
+                    .collect(),
+            },
+        });
+        // One underlined blank cell; the surface is clipped to one row so
+        // the byte image stays small and deterministic.
+        state.apply(&print(' '));
+        let mut grid = renderer();
+        let surface = bitty_render::grid::render_snapshot_to_surface(
+            &mut grid,
+            &state.snapshot(),
+            &whole_history(&state),
+            bitty_render::grid::DEFAULT_BG,
+        )
+        .unwrap();
+        surface.as_bytes().to_vec()
+    };
+
+    let single = render_style(UnderlineStyle::Single);
+    let dotted = render_style(UnderlineStyle::Dotted);
+    let dashed = render_style(UnderlineStyle::Dashed);
+    let curly = render_style(UnderlineStyle::Curly);
+    for (a_name, a) in [
+        ("single", &single),
+        ("dotted", &dotted),
+        ("dashed", &dashed),
+        ("curly", &curly),
+    ] {
+        for (b_name, b) in [
+            ("single", &single),
+            ("dotted", &dotted),
+            ("dashed", &dashed),
+            ("curly", &curly),
+        ] {
+            if a_name != b_name {
+                assert_ne!(
+                    a, b,
+                    "{a_name} and {b_name} must composite to distinct RGBA"
+                );
+            }
+        }
+    }
+}

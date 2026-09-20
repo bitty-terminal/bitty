@@ -649,6 +649,265 @@ fn underlined_blank_still_counts_as_drawn() {
     assert_eq!(grid.counters().blank_cells_skipped, 0);
 }
 
+/// Renders `text` underlined in `style` on the default 8x16 grid and
+/// returns the emitted fills (background run first, decorations after).
+fn render_underlined(style: UnderlineStyle, text: &str) -> Vec<super::FillRect> {
+    let mut script = vec![sgr(&[AttributeChange::Enable(Attribute::Underline(style))])];
+    script.extend(text.chars().map(print));
+    let state = state_from(&script);
+    let damage = damage_all(&state);
+    let mut grid = renderer();
+    grid.render(&state.snapshot(), &damage).unwrap().fills
+}
+
+/// Decoration geometry `(x, y, width, height)` for one underlined blank
+/// cell: the merged background fill is skipped.
+fn decoration_rects(style: UnderlineStyle) -> Vec<(i32, i32, u32, u32)> {
+    render_underlined(style, " ")
+        .iter()
+        .skip(1)
+        .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+        .collect()
+}
+
+#[test]
+fn underline_styles_paint_distinct_geometry() {
+    // CTX-0583 / M1-19 (#1145): Single/Curly/Dotted/Dashed must be
+    // distinguishable paint, not one shared strip. 8x16 cell, thickness 2,
+    // baseline strip top row y = 12.
+    let single = decoration_rects(UnderlineStyle::Single);
+    let dotted = decoration_rects(UnderlineStyle::Dotted);
+    let dashed = decoration_rects(UnderlineStyle::Dashed);
+    let curly = decoration_rects(UnderlineStyle::Curly);
+
+    // Single stays the honest full-width strip.
+    assert_eq!(single, vec![(0, 12, 8, 2)], "single underline geometry");
+    // Dotted: thickness-sized dots on the baseline strip (pitch 2*thickness).
+    assert_eq!(
+        dotted,
+        vec![(0, 12, 2, 2), (4, 12, 2, 2)],
+        "dotted underline geometry"
+    );
+    // Dashed: alternating longer dashes on the baseline strip.
+    assert_eq!(
+        dashed,
+        vec![(0, 12, 3, 2), (6, 12, 2, 2)],
+        "dashed underline geometry"
+    );
+    // Curly: a stepped wave raised up to two thicknesses above the strip.
+    assert_eq!(
+        curly,
+        vec![(0, 12, 2, 2), (2, 10, 2, 2), (4, 8, 2, 2), (6, 10, 2, 2),],
+        "curly underline geometry"
+    );
+
+    // Pairwise distinctness is the actual acceptance criterion.
+    for (a_name, a) in [
+        ("single", &single),
+        ("dotted", &dotted),
+        ("dashed", &dashed),
+        ("curly", &curly),
+    ] {
+        for (b_name, b) in [
+            ("single", &single),
+            ("dotted", &dotted),
+            ("dashed", &dashed),
+            ("curly", &curly),
+        ] {
+            if a_name != b_name {
+                assert_ne!(a, b, "{a_name} and {b_name} must paint differently");
+            }
+        }
+    }
+}
+
+#[test]
+fn underline_style_paint_is_deterministic() {
+    for style in [
+        UnderlineStyle::Single,
+        UnderlineStyle::Double,
+        UnderlineStyle::Curly,
+        UnderlineStyle::Dotted,
+        UnderlineStyle::Dashed,
+    ] {
+        let first = render_underlined(style, " ");
+        let second = render_underlined(style, " ");
+        assert_eq!(first, second, "style {style:?} must be deterministic");
+    }
+}
+
+#[test]
+fn curly_and_dotted_patterns_continue_across_adjacent_cells() {
+    // Two underlined blank cells in one row: the background merges into one
+    // fill, and the decoration phase is anchored in absolute pixels, so the
+    // wave/dot pattern reads as one continuous run.
+    let fills = render_underlined(UnderlineStyle::Curly, "  ");
+    let rects: Vec<_> = fills
+        .iter()
+        .skip(1)
+        .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![
+            (0, 12, 2, 2),
+            (2, 10, 2, 2),
+            (4, 8, 2, 2),
+            (6, 10, 2, 2),
+            (8, 12, 2, 2),
+            (10, 10, 2, 2),
+            (12, 8, 2, 2),
+            (14, 10, 2, 2),
+        ],
+        "curly wave must continue into the next cell"
+    );
+
+    let fills = render_underlined(UnderlineStyle::Dotted, "  ");
+    let rects: Vec<_> = fills
+        .iter()
+        .skip(1)
+        .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+        .collect();
+    assert_eq!(
+        rects,
+        vec![(0, 12, 2, 2), (4, 12, 2, 2), (8, 12, 2, 2), (12, 12, 2, 2)],
+        "dot pitch must continue across the cell boundary"
+    );
+}
+
+#[test]
+fn patterned_underline_rects_stay_bounded_and_inside_the_cell() {
+    // Detail is capped so hostile cell widths cannot explode the fill list
+    // (one cell emits at most MAX_DECORATION_RECTS_PER_CELL decoration
+    // rectangles).
+    for width in [1u32, 7, 8, 16, 64, 1024, 4096] {
+        for style in [
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ] {
+            let cell = CellMetrics::new(width, 16).unwrap();
+            let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), cell).unwrap();
+            let state = state_from(&[
+                sgr(&[AttributeChange::Enable(Attribute::Underline(style))]),
+                print(' '),
+            ]);
+            let damage = damage_all(&state);
+            let list = grid.render(&state.snapshot(), &damage).unwrap();
+            let decorations: Vec<_> = list.fills.iter().skip(1).collect();
+            assert!(
+                decorations.len() <= super::MAX_DECORATION_RECTS_PER_CELL as usize,
+                "width {width} style {style:?}: {} decoration rects exceed the cap",
+                decorations.len()
+            );
+            for fill in decorations {
+                assert!(
+                    fill.rect.x >= 0,
+                    "width {width} style {style:?}: negative x"
+                );
+                assert!(
+                    fill.rect.x + i32::try_from(fill.rect.width).unwrap()
+                        <= i32::try_from(width).unwrap(),
+                    "width {width} style {style:?}: fill spans past the cell"
+                );
+                assert!(
+                    fill.rect.y >= 0
+                        && fill.rect.y + i32::try_from(fill.rect.height).unwrap()
+                            <= i32::try_from(cell.height).unwrap(),
+                    "width {width} style {style:?}: fill leaves the cell vertically"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn underline_styles_stay_distinct_across_normal_cell_widths() {
+    // The 8x16 cell is the representative case (distinctness test above),
+    // but any span at least one pattern cycle wide keeps the styles apart.
+    // Below that (a 1..=3 px "cell") there is physically no room for a
+    // pattern, so the styles degrade to partial bars; such spans must still
+    // stay bounded and inside the cell (next test).
+    for width in [4u32, 5, 6, 7, 8, 9, 16, 32, 80] {
+        let geometry = |style| {
+            let cell = CellMetrics::new(width, 16).unwrap();
+            let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), cell).unwrap();
+            let state = state_from(&[
+                sgr(&[AttributeChange::Enable(Attribute::Underline(style))]),
+                print(' '),
+            ]);
+            let damage = damage_all(&state);
+            let list = grid.render(&state.snapshot(), &damage).unwrap();
+            let rects: Vec<_> = list
+                .fills
+                .iter()
+                .skip(1)
+                .map(|fill| (fill.rect.x, fill.rect.y, fill.rect.width, fill.rect.height))
+                .collect();
+            rects
+        };
+        let single = geometry(UnderlineStyle::Single);
+        let dotted = geometry(UnderlineStyle::Dotted);
+        let dashed = geometry(UnderlineStyle::Dashed);
+        let curly = geometry(UnderlineStyle::Curly);
+        assert_ne!(single, dotted, "width {width}: single vs dotted");
+        assert_ne!(single, dashed, "width {width}: single vs dashed");
+        assert_ne!(single, curly, "width {width}: single vs curly");
+        assert_ne!(dotted, dashed, "width {width}: dotted vs dashed");
+        assert_ne!(dotted, curly, "width {width}: dotted vs curly");
+        assert_ne!(dashed, curly, "width {width}: dashed vs curly");
+    }
+}
+
+#[test]
+fn patterned_underline_survives_tiny_cell_heights() {
+    // Tiny cells saturate to zero-height bands instead of underflowing; no
+    // rect may leave the cell and no path may panic.
+    for height in [1u32, 2, 3, 4, 5] {
+        let cell = CellMetrics::new(8, height).unwrap();
+        for style in [
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ] {
+            let mut grid = GridRenderer::new(FakeRasterizer::new(), &font_query(), cell).unwrap();
+            let state = state_from(&[
+                sgr(&[AttributeChange::Enable(Attribute::Underline(style))]),
+                print(' '),
+            ]);
+            let damage = damage_all(&state);
+            let list = grid.render(&state.snapshot(), &damage).unwrap();
+            for fill in list.fills.iter().skip(1) {
+                assert!(
+                    fill.rect.y >= 0
+                        && fill.rect.y + i32::try_from(fill.rect.height).unwrap()
+                            <= i32::try_from(height).unwrap(),
+                    "height {height} style {style:?}: decoration leaves the cell"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_underline_paints_no_decoration() {
+    let state = state_from(&[
+        sgr(&[AttributeChange::Enable(Attribute::Underline(
+            UnderlineStyle::None,
+        ))]),
+        print(' '),
+    ]);
+    let damage = damage_all(&state);
+    let mut grid = renderer();
+    let list = grid.render(&state.snapshot(), &damage).unwrap();
+
+    // Background only.
+    assert_eq!(list.fills.len(), 1);
+    assert_eq!(grid.counters().decorations_emitted, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Atlas behavior
 // ---------------------------------------------------------------------------

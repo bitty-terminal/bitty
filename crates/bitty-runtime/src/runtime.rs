@@ -1489,6 +1489,17 @@ impl Runtime {
         self.inspect_ring.len()
     }
 
+    /// Events evicted at the bounded input-ring cap (CTX-0591).
+    ///
+    /// Counted attribution for the input-observability lane: the ring drops
+    /// the oldest event when full, and this counter makes that loss visible
+    /// to doctor surfaces instead of silent (devtools-rfc instrumentation
+    /// "queue accounting"; P0-AC-014 parity with `cold_queue_dropped`).
+    #[must_use]
+    pub const fn inspect_input_dropped(&self) -> u64 {
+        self.inspect_ring.dropped()
+    }
+
     /// Publish bounded read-only introspection snapshots to the `BITTY_SOCKET`
     /// live store (CTX-0159, Issue #258).
     ///

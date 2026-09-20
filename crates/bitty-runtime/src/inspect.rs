@@ -188,14 +188,18 @@ fn truncate_chars(s: &str, max: usize) -> String {
 ///
 /// Owned by [`crate::Runtime`]; pushes are `O(1)` and never grow past
 /// [`INSPECT_MAX_RING`]. When full the oldest event is dropped (no blocking,
-/// no error). Snapshots are cloned most-recent-first-capped reads for the
-/// live store.
+/// no error) and [`InputRing::dropped`] increments, so the observability
+/// lane reports counted attribution instead of silent loss (devtools-rfc
+/// instrumentation "queue accounting"; P0-AC-014). Snapshots are cloned
+/// most-recent-first-capped reads for the live store.
 #[derive(Debug, Clone)]
 pub struct InputRing {
     /// Retained events, oldest first.
     events: VecDeque<InputEvent>,
     /// Next sequence number.
     next_seq: u64,
+    /// Events evicted at [`INSPECT_MAX_RING`] since creation or `clear`.
+    dropped: u64,
 }
 
 impl InputRing {
@@ -205,6 +209,7 @@ impl InputRing {
         Self {
             events: VecDeque::new(),
             next_seq: 1,
+            dropped: 0,
         }
     }
 
@@ -226,9 +231,17 @@ impl InputRing {
         self.next_seq
     }
 
-    /// Clear all retained events (test helper).
+    /// Events dropped at the ring bound since creation or the last
+    /// [`InputRing::clear`] (counted attribution, never silent loss).
+    #[must_use]
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Clear all retained events and reset the drop counter (test helper).
     pub fn clear(&mut self) {
         self.events.clear();
+        self.dropped = 0;
     }
 
     /// Push one event, dropping the oldest when full.
@@ -237,6 +250,7 @@ impl InputRing {
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
         if self.events.len() >= INSPECT_MAX_RING {
             self.events.pop_front();
+            self.dropped = self.dropped.wrapping_add(1);
         }
         self.events.push_back(event);
     }
@@ -606,12 +620,19 @@ mod tests {
         assert_eq!(all.len(), INSPECT_MAX_RING);
         // Oldest dropped: first retained seq is 11 (1-based, 10 dropped).
         assert_eq!(all[0].seq, 11);
+        // Counted attribution: the 10 evictions are visible, never silent
+        // (devtools-rfc "queue accounting"; P0-AC-014).
+        assert_eq!(ring.dropped(), 10);
         // Snapshot limit honors the request bound.
         let few = ring.snapshot(3);
         assert_eq!(few.len(), 3);
         assert_eq!(few[2].seq, all[all.len() - 1].seq);
         // Zero limit fails closed.
         assert!(ring.snapshot(0).is_empty());
+        // Explicit clear resets both the ring and its drop counter.
+        ring.clear();
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.dropped(), 0);
     }
 
     #[test]

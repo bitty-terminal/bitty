@@ -40,8 +40,6 @@ tests/compat/oracle/
   divergences/
     mouse-1007-misclassified.bin         # deliberate-divergence fixture
     mouse-1007-misclassified.expected    # the pre-CTX-0175 WRONG reading
-    alt-screen-47-cursor-restore.bin     # real Bitty ?47 cursor divergence
-    alt-screen-47-cursor-restore.expected# reference expectation Bitty misses
 ```
 
 The module lives at `crates/bitty-compat-lab/src/oracle.rs`; the runner binary
@@ -104,6 +102,7 @@ token verbatim in it, so a mis-citation fails instead of being rubber-stamped.
 | cursor-style        | `cursor-style-steady-block`, `cursor-style-blinking-bar`                  | xterm-ctlseqs Ps 2 / Ps 5                                                                          |
 | cursor-style        | `cursor-style-default`                                                    | text-rendering-rfc "maps `0` to the configured default style" (ctlseqs says Ps 0 = blinking block) |
 | alternate-screen    | `alt-screen-1049-roundtrip`, `alt-screen-47-no-clear`                     | xterm-ctlseqs Ps 1049 / Ps 47                                                                      |
+| alternate-screen    | `alt-screen-47-cursor-restore`                                            | ghostty-terminal "only copies the cursor" (?47 does not save/restore)                              |
 | cursor-keys         | `cursor-keys-decckm`, `cursor-keys-decckm-reset`                          | xterm-ctlseqs Ps 1 application/normal cursor keys                                                  |
 | device-status       | `dsr-5-status`, `dsr-6-cursor`, `da1-primary`                             | xterm-ctlseqs DSR 5/6, Primary DA `CSI ? 6 c`                                                      |
 
@@ -161,17 +160,11 @@ proves the runner fails on a real divergence in both directions:
 `oracle_rejects_a_mis_citation` additionally proves the citation guard is not
 vacuous: a fabricated ctlseqs citation fails verification.
 
-### Open divergence found by this corpus
-
-`divergences/alt-screen-47-cursor-restore.expected` is a **real** Bitty
+The `alt-screen-47-cursor-restore` scenario was originally a real Bitty
 divergence surfaced while building the oracle (kept out of the green corpus
-until fixed): xterm (`charproc.c` `srm_ALTBUF`) and ghostty
-(`SwitchScreenMode .@"47"`, "only copies the cursor") keep the cursor global
-across a `?47` alternate-buffer switch — they do not save/restore it the way
-`?1049` does. Bitty's `switch_alt_screen` saves and restores the cursor for
-`Via47` as well as `Via1049`, so `X ?47h Y ?47l Z` leaves the cursor after `X`
-(column 1) instead of after `Z`. The runner detects it (`FAIL`) and it is
-tracked as a follow-up issue (see the PR) rather than silenced.
+until fixed); CTX-0582 (#1173) fixed `switch_alt_screen` so `?47` no longer
+saves/restores the cursor and promoted the fixture into `scenarios/`, where it
+now runs green.
 
 ## Follow-ups
 
@@ -179,4 +172,3 @@ tracked as a follow-up issue (see the PR) rather than silenced.
   of the M1 RFC evidence requirement) are not in this corpus; the
   `capture|`/reference-dump path in `crates/bitty-compat-lab/src/compare.rs`
   is the intended home.
-- The `?47` cursor save/restore divergence above is a tracked fix.

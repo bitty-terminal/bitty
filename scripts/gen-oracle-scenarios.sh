@@ -454,6 +454,22 @@ row 0: B   A
 cursor: 0 1 visible
 mode: alt_screen = on'
 
+# ?47 must NOT save/restore the cursor: xterm `srm_ALTBUF` has no
+# CursorSave/CursorRestore (unlike `srm_OPT_ALTBUF_CURSOR` for ?1049) and
+# ghostty `.@"47"` "only copies the cursor", so the cursor stays where the
+# alt session left it. "X ?47h Y ?47l Z" places Z at column 2 -> row "X Z"
+# with the cursor at column 3. Promoted from the divergence set by CTX-0582
+# (#1173) once the build matched the reference.
+write_bin "alt-screen-47-cursor-restore" 'X\x1b[?47hY\x1b[?47lZ'
+write_expected "alt-screen-47-cursor-restore" 'area: alternate-screen
+authority: ghostty-terminal
+cite: /// Legacy alternate screen mode. This goes to the alternate
+grid: 80x24
+grid_text: unchecked
+row 0: X Z
+cursor: 0 3 visible
+mode: alt_screen = off'
+
 # --- cursor-keys ---------------------------------------------------------
 # DECCKM ?1 application cursor keys.
 write_bin "cursor-keys-decckm" '\x1b[?1h'

@@ -273,7 +273,10 @@ fn oracle_runner_catches_every_deliberate_divergence() {
     // Differential-power proof. Each fixture under `divergences/` carries an
     // oracle whose expectation disagrees with the build. If the runner ever
     // rubber-stamped Bitty's output, these oracles would pass and this test
-    // would fail.
+    // would fail. The former `alt-screen-47-cursor-restore` fixture was
+    // promoted into `scenarios/` by CTX-0582 once the build was fixed, so one
+    // committed divergence fixture remains (oracle wrong, Bitty right); the
+    // in-test mutation below still proves the opposite direction.
     let dir = divergence_dir();
     let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read divergence dir")
@@ -283,8 +286,8 @@ fn oracle_runner_catches_every_deliberate_divergence() {
         .collect();
     fixtures.sort();
     assert!(
-        fixtures.len() >= 2,
-        "need at least two divergence fixtures (oracle-wrong and bitty-wrong): {fixtures:?}"
+        !fixtures.is_empty(),
+        "need at least one divergence fixture (oracle-wrong): {fixtures:?}"
     );
     for bin in &fixtures {
         let scenario = load_scenario_file(bin).expect("load divergence fixture");

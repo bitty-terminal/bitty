@@ -1,0 +1,8 @@
+area: alternate-screen
+authority: ghostty-terminal
+cite: /// Legacy alternate screen mode. This goes to the alternate
+grid: 80x24
+grid_text: unchecked
+row 0: X Z
+cursor: 0 3 visible
+mode: alt_screen = off

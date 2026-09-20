@@ -635,6 +635,79 @@ fn alt_screen_exit_restores_saved_cursor_style() {
 }
 
 #[test]
+fn alt_screen_47_does_not_save_or_restore_the_cursor() {
+    // Issue #1173 / CTX-0582. Mode ?47 is the legacy alternate-buffer switch:
+    // xterm `srm_ALTBUF` performs no CursorSave/CursorRestore and ghostty
+    // `.@"47"` "only copies the cursor", so a ?47 round trip leaves the cursor
+    // wherever the alt screen left it. Bitty previously snapshotted the cursor
+    // for Via47 as well, so "X ?47h Y ?47l Z" restored the cursor onto X and
+    // produced "XZ" instead of the reference "X Z".
+    let mut s = State::new();
+    prints(&mut s, "X");
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreen,
+        enabled: true,
+    });
+    assert_eq!(
+        s.cursor().position.col,
+        1,
+        "?47 entry must leave the cursor in place"
+    );
+    prints(&mut s, "Y");
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreen,
+        enabled: false,
+    });
+    assert_eq!(
+        s.cursor().position.col,
+        2,
+        "?47 exit must leave the alt cursor in place"
+    );
+    prints(&mut s, "Z");
+    let snap = s.snapshot();
+    assert_eq!(
+        &snap.cells[..3].iter().map(|c| c.glyph).collect::<String>(),
+        "X Z",
+        "reference xterm/ghostty place Z after X on the primary row"
+    );
+    assert_eq!(s.cursor().position.col, 3);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn alt_screen_1049_still_saves_and_restores_the_cursor() {
+    // The ?1049 counterpart of the test above: xterm
+    // `srm_OPT_ALTBUF_CURSOR` saves the cursor as in DECSC on entry and
+    // restores it on exit, so the same byte stream returns to the pre-entry
+    // column and "X ?1049h Y ?1049l Z" yields "XZ" (issue #1173 acceptance:
+    // ?1049 behavior is unchanged).
+    let mut s = State::new();
+    prints(&mut s, "X");
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    prints(&mut s, "Y");
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert_eq!(
+        s.cursor().position.col,
+        1,
+        "?1049 exit must restore the pre-entry cursor"
+    );
+    prints(&mut s, "Z");
+    let snap = s.snapshot();
+    assert_eq!(
+        &snap.cells[..2].iter().map(|c| c.glyph).collect::<String>(),
+        "XZ"
+    );
+    assert_eq!(s.cursor().position.col, 2);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn ctx_0182_large_altscreen_fullscreen_stays_blue() {
     // nmtui live pattern at 200x62 (CTX-0182, issue #282): alt-screen
     // entry, ED All with black BCE, then blue EL fills for every row.

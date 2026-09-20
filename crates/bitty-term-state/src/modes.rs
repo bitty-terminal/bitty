@@ -195,8 +195,10 @@ impl Default for Modes {
 
 /// Which alternate-screen entry variant is active, if any.
 ///
-/// RFC invariant 5: entry saves and exit restores the full primary-screen
-/// cursor/style/mode set. The variant is recorded so exit handling stays
+/// RFC invariant 5: entry saves and exit restores the primary-screen
+/// mode/charset set. The cursor is only saved/restored by the `?1049` pair
+/// (`srm_OPT_ALTBUF_CURSOR`); the legacy `?47` (`srm_ALTBUF`) leaves the
+/// cursor in place. The variant is recorded so exit handling stays
 /// deterministic regardless of which disable sequence arrives first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum AltScreen {

@@ -163,6 +163,23 @@ commit-check message:
 
 check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test actionlint markdownlint
 
+# Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
+# headless parser benchmark over the committed VT/escape corpora and verifies
+# the ratio gate against crates/bitty-perf/baselines/parser-throughput.json.
+# The release `bench` profile is used (optimized); the same gate runs bounded
+# in CI via `cargo test -p bitty-perf --test parser_throughput_regression`.
+perf-parser:
+    cargo bench -p bitty-perf --bench parser_throughput -- --nocapture
+
+# Re-capture the committed parser-throughput baseline artifact. Provenance is
+# taken from the environment so no host path or username enters the file:
+#   BITTY_PERF_DATE, BITTY_PERF_REVISION, BITTY_PERF_TOOLCHAIN, BITTY_PERF_OS,
+#   BITTY_PERF_MACHINE_CLASS (see benches/parser_throughput.rs).
+# Defaults leave the artifact placeholders intact, so fill every variable
+# before committing a regenerated baseline.
+perf-parser-baseline out="crates/bitty-perf/baselines/parser-throughput.json":
+    cargo bench -p bitty-perf --bench parser_throughput -- --nocapture --write-baseline {{out}}
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref

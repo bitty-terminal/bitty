@@ -34,3 +34,23 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
 - `src/startup.rs` — cold-path phase instrumentation.
 - `src/latency.rs` — input-latency stage breakdown.
 - `src/idle.rs` — frame-on-demand idle gating.
+- `src/parser_throughput.rs` — parser-throughput baseline measurement and
+  ratio gate (CTX-0576, M1-11); corpora loading, median-of-rounds
+  measurement, baseline parsing, and the regression check.
+- `baselines/parser-throughput.json` — committed baseline artifact (numbers
+  plus provenance); `baselines/README.md` records the runbook, exact command,
+  environment, and limitations.
+- `tests/parser_throughput_regression.rs` — bounded CI regression gate run by
+  plain `cargo test` (also on the optimized `bench` profile via
+  `just perf-parser`).
+
+## Parser throughput baseline (CTX-0576, M1-11)
+
+`src/parser_throughput.rs` measures `bitty_vt::Parser::advance` in isolation
+over reused deterministic corpora (`bitty-vt` seeds, `tests/compat/*/corpus`,
+a synthetic escape storm) and compares the escape/plain throughput ratios
+against `baselines/parser-throughput.json`. The gate is generous
+(4× ratio collapse) so shared runners and debug `cargo test` builds do not
+flake; it catches pathological regressions only. Run `just perf-parser` for
+the optimized verdict and `just perf-parser-baseline` to regenerate the
+artifact after a recorded environment change.

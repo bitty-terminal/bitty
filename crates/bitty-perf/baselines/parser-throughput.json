@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0576",
+  "issue": 1137,
+  "milestone_item": "M1-11",
+  "captured_at": "2026-09-20",
+  "revision": "6ed5362651e923285912caf9aade45ebac8d87af",
+  "command": "just perf-parser-baseline (cargo bench -p bitty-perf --bench parser_throughput -- --write-baseline; release bench profile, sample_bytes=4194304 rounds=5)",
+  "profile": "bench (release)",
+  "toolchain": "rustc 1.98.1 (rust-toolchain.toml)",
+  "os": "CachyOS Linux (Arch derivative), kernel 7.2.3-1-cachyos, x86_64",
+  "machine_class": "desktop x86_64 24-core hybrid P/E (Intel i7-14650HX class), 31 GiB RAM, NVMe",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-6-throughput-floor",
+  "bounds": {
+    "MAX_CHUNK_BYTES": 8192,
+    "MAX_SEGMENT_BYTES": 65536,
+    "MAX_ACTIONS": 4096,
+    "sample_bytes": 4194304,
+    "rounds": 5
+  },
+  "regression_factor": 4,
+  "absolute_floor_mb_s": 10,
+  "corpora": [
+    {
+      "id": "plain_text",
+      "description": "plain ASCII reference stream (bitty-vt seed 01), low escape density",
+      "bytes": 4194304,
+      "actions": 4194304,
+      "mb_s": 108.84,
+      "ratio_vs_plain": 1.0000
+    },
+    {
+      "id": "mixed_seeds",
+      "description": "all bitty-vt seed families (SGR, cursor, DECSET, OSC, DCS, malformed)",
+      "bytes": 4194304,
+      "actions": 706784,
+      "mb_s": 176.58,
+      "ratio_vs_plain": 1.6223
+    },
+    {
+      "id": "compat_corpus",
+      "description": "tests/compat/*/corpus M1 surface corpora (modes, color, osc, mouse, tui)",
+      "bytes": 4194304,
+      "actions": 1679872,
+      "mb_s": 120.62,
+      "ratio_vs_plain": 1.1082
+    },
+    {
+      "id": "escape_storm",
+      "description": "synthetic heavy escape density (SGR/DECSET/OSC/DCS/cursor) worst case",
+      "bytes": 4194304,
+      "actions": 1206016,
+      "mb_s": 125.00,
+      "ratio_vs_plain": 1.1484
+    }
+  ]
+}

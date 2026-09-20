@@ -491,6 +491,65 @@ fn decset_1007_maps_to_alternate_scroll_mode() {
 }
 
 #[test]
+fn kitty_keyboard_negotiation_sequences_classify() {
+    use crate::action::{KittyKeyboardOp, KittyKeyboardSetMode};
+    assert_eq!(
+        parse(b"\x1b[?u"),
+        vec![TerminalAction::KittyKeyboard {
+            op: KittyKeyboardOp::Query
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b[=3u\x1b[=4;2u\x1b[=1;3u"),
+        vec![
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Set {
+                    flags: 3,
+                    mode: KittyKeyboardSetMode::Assign,
+                },
+            },
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Set {
+                    flags: 4,
+                    mode: KittyKeyboardSetMode::Set,
+                },
+            },
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Set {
+                    flags: 1,
+                    mode: KittyKeyboardSetMode::Reset,
+                },
+            },
+        ]
+    );
+    assert_eq!(
+        parse(b"\x1b[>5u\x1b[>u\x1b[<u\x1b[<3u"),
+        vec![
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Push { flags: 5 },
+            },
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Push { flags: 0 },
+            },
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Pop { n: 1 },
+            },
+            TerminalAction::KittyKeyboard {
+                op: KittyKeyboardOp::Pop { n: 3 },
+            },
+        ]
+    );
+    // Unknown set mode and parameterized query stay inert telemetry.
+    assert_eq!(
+        parse(b"\x1b[=1;9u\x1b[?2u"),
+        vec![
+            unknown(SequenceKind::Csi, b'u', [b'=', 0]),
+            unknown(SequenceKind::Csi, b'u', [b'?', 0]),
+        ]
+    );
+}
+
+#[test]
 fn ansi_sm_rm_map_insert_and_linefeed_modes() {
     assert_eq!(
         parse(b"\x1b[4h\x1b[20h\x1b[4l\x1b[33l"),

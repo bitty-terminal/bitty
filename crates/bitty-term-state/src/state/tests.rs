@@ -328,6 +328,78 @@ fn reply_synthesis_is_origin_aware_and_bounded() {
 }
 
 #[test]
+fn kitty_keyboard_stack_set_push_pop_and_query_reply() {
+    use bitty_vt::{KittyKeyboardOp, KittyKeyboardSetMode};
+    let mut s = State::new();
+    let op = |op| TerminalAction::KittyKeyboard { op };
+    s.apply(&op(KittyKeyboardOp::Set {
+        flags: 3,
+        mode: KittyKeyboardSetMode::Assign,
+    }));
+    assert_eq!(s.modes.kitty_keyboard.flags(), 3);
+    s.apply(&op(KittyKeyboardOp::Push { flags: 8 }));
+    assert_eq!(s.modes.kitty_keyboard.flags(), 8);
+    assert_eq!(s.modes.kitty_keyboard.depth(), 2);
+    s.apply(&op(KittyKeyboardOp::Pop { n: 1 }));
+    assert_eq!(s.modes.kitty_keyboard.flags(), 3);
+    // Bounded: an oversized pop empties the stack and resets the flags.
+    s.apply(&op(KittyKeyboardOp::Pop { n: u16::MAX }));
+    assert_eq!(s.modes.kitty_keyboard.flags(), 0);
+    assert_eq!(s.modes.kitty_keyboard.depth(), 0);
+    // Query replies with the live flags without touching state.
+    s.apply(&op(KittyKeyboardOp::Set {
+        flags: 31,
+        mode: KittyKeyboardSetMode::Assign,
+    }));
+    s.apply(&op(KittyKeyboardOp::Query));
+    let replies = s.take_replies();
+    assert_eq!(&replies[0][..], b"\x1b[?31u");
+}
+
+#[test]
+fn kitty_keyboard_stack_is_bounded_and_evicts_oldest() {
+    let mut s = State::new();
+    for flags in 0..12u32 {
+        s.apply(&TerminalAction::KittyKeyboard {
+            op: bitty_vt::KittyKeyboardOp::Push { flags },
+        });
+    }
+    assert_eq!(
+        s.modes.kitty_keyboard.depth(),
+        crate::modes::KITTY_KEYBOARD_STACK_MAX
+    );
+    // Oldest entries were evicted: the top is the last pushed value.
+    assert_eq!(s.modes.kitty_keyboard.flags(), 11);
+}
+
+#[test]
+fn kitty_keyboard_stack_participates_in_the_state_hash() {
+    let mut pushed = State::new();
+    pushed.apply(&TerminalAction::KittyKeyboard {
+        op: bitty_vt::KittyKeyboardOp::Set {
+            flags: 1,
+            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+        },
+    });
+    pushed.apply(&TerminalAction::KittyKeyboard {
+        op: bitty_vt::KittyKeyboardOp::Push { flags: 1 },
+    });
+    // Same live flags, different stack depth: hashes must differ (v8).
+    let mut flat = State::new();
+    flat.apply(&TerminalAction::KittyKeyboard {
+        op: bitty_vt::KittyKeyboardOp::Set {
+            flags: 1,
+            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+        },
+    });
+    assert_eq!(
+        pushed.modes.kitty_keyboard.flags(),
+        flat.modes.kitty_keyboard.flags()
+    );
+    assert_ne!(pushed.state_hash(), flat.state_hash());
+}
+
+#[test]
 fn decstr_resets_defined_subset_only() {
     let mut s = State::new();
     s.apply(&TerminalAction::SetAttributes {

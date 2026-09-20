@@ -26,9 +26,12 @@
 //!   `"\x1b[A"`, `F1` → `"\x1bOP"`, etc.). Modifier-only names (`Shift`,
 //!   `Control`, `Alt`, …) produce no bytes; `Other`/`Unidentified` fall back
 //!   to `text` when available, otherwise nothing.
-//! - Kitty keyboard protocol is explicitly deferred (M1 opt-in, progressive
-//!   enhancement per `compatibility-milestone-rfc`). Only the legacy baseline
-//!   is encoded here so headless CI and real winit keyboards agree.
+//! - Kitty keyboard protocol is M1 opt-in, not M1-required
+//!   (`compatibility-milestone-rfc`): this module owns the legacy baseline
+//!   and the Kitty code tables ([`kitty_functional_key`],
+//!   [`kitty_modifier_key`]); the runtime's `encode_key_with_kitty` composes
+//!   them under the negotiated flags. The legacy path here is the
+//!   byte-identical fallback when the protocol is off.
 //!
 //! The table mirrors xterm's legacy encoding sufficient for shells, editors,
 //! and TUIs; application-cursor / keypad nuances (`DECCKM` etc.) are deferred
@@ -36,7 +39,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::event::{KeyEvent, LogicalKey, ModifiersState, NamedKey, PressState};
+use crate::event::{KeyEvent, KeyLocation, LogicalKey, ModifiersState, NamedKey, PressState};
 
 /// Maximum bytes a single key may produce (Fn keys and CSI sequences are tiny).
 const MAX_ENCODED_LEN: usize = 8;
@@ -329,6 +332,137 @@ pub fn encode_named_key(named: NamedKey) -> Option<&'static [u8]> {
 
         NamedKey::Other => None,
     }
+}
+
+/// Maps an explicitly modeled [`NamedKey`] to its Kitty keyboard-protocol
+/// functional key code and CSI trailer (CTX-0575).
+///
+/// The pair is `(unicode-key-code, final-byte)` from the authoritative
+/// "Functional key definitions" table
+/// (`sw.kovidgoyal.net/kitty/keyboard-protocol`); the code is a Unicode
+/// Private Use Area value (`57344..=63743`) except the handful of C0
+/// compatibility keys (Escape/Enter/Tab/Backspace) and the number keys
+/// whose trailer is `~`/`A`/`B`/`C`/`D`/`H`/`F`/`P`/`Q`/`S`.
+///
+/// Returns `None` for keys with no defined Kitty code (the caller keeps the
+/// legacy path). Modifier keys carry an explicit side, so they are handled by
+/// [`kitty_modifier_key`] instead.
+pub fn kitty_functional_key(named: NamedKey) -> Option<(u32, u8)> {
+    let pair = match named {
+        NamedKey::Escape => (27, b'u'),
+        NamedKey::Enter => (13, b'u'),
+        NamedKey::Tab => (9, b'u'),
+        NamedKey::Backspace => (127, b'u'),
+        NamedKey::Insert => (2, b'~'),
+        NamedKey::Delete => (3, b'~'),
+        NamedKey::ArrowLeft => (1, b'D'),
+        NamedKey::ArrowRight => (1, b'C'),
+        NamedKey::ArrowUp => (1, b'A'),
+        NamedKey::ArrowDown => (1, b'B'),
+        NamedKey::PageUp => (5, b'~'),
+        NamedKey::PageDown => (6, b'~'),
+        NamedKey::Home => (1, b'H'),
+        NamedKey::End => (1, b'F'),
+        NamedKey::CapsLock => (57358, b'u'),
+        NamedKey::ScrollLock => (57359, b'u'),
+        NamedKey::NumLock => (57360, b'u'),
+        NamedKey::PrintScreen => (57361, b'u'),
+        NamedKey::Pause => (57362, b'u'),
+        NamedKey::ContextMenu => (57363, b'u'),
+        NamedKey::F1 => (1, b'P'),
+        NamedKey::F2 => (1, b'Q'),
+        NamedKey::F3 => (13, b'~'),
+        NamedKey::F4 => (1, b'S'),
+        NamedKey::F5 => (15, b'~'),
+        NamedKey::F6 => (17, b'~'),
+        NamedKey::F7 => (18, b'~'),
+        NamedKey::F8 => (19, b'~'),
+        NamedKey::F9 => (20, b'~'),
+        NamedKey::F10 => (21, b'~'),
+        NamedKey::F11 => (23, b'~'),
+        NamedKey::F12 => (24, b'~'),
+        NamedKey::F13 => (57376, b'u'),
+        NamedKey::F14 => (57377, b'u'),
+        NamedKey::F15 => (57378, b'u'),
+        NamedKey::F16 => (57379, b'u'),
+        NamedKey::F17 => (57380, b'u'),
+        NamedKey::F18 => (57381, b'u'),
+        NamedKey::F19 => (57382, b'u'),
+        NamedKey::F20 => (57383, b'u'),
+        NamedKey::F21 => (57384, b'u'),
+        NamedKey::F22 => (57385, b'u'),
+        NamedKey::F23 => (57386, b'u'),
+        NamedKey::F24 => (57387, b'u'),
+        NamedKey::F25 => (57388, b'u'),
+        NamedKey::F26 => (57389, b'u'),
+        NamedKey::F27 => (57390, b'u'),
+        NamedKey::F28 => (57391, b'u'),
+        NamedKey::F29 => (57392, b'u'),
+        NamedKey::F30 => (57393, b'u'),
+        NamedKey::F31 => (57394, b'u'),
+        NamedKey::F32 => (57395, b'u'),
+        NamedKey::F33 => (57396, b'u'),
+        NamedKey::F34 => (57397, b'u'),
+        NamedKey::F35 => (57398, b'u'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Maps a modifier [`NamedKey`] plus its physical [`KeyLocation`] to the
+/// Kitty keyboard-protocol left/right key code (CTX-0575).
+///
+/// The spec reports `shift`/`ctrl`/`alt`/`super`/`hyper`/`meta` keys as
+/// dedicated codes (57441..=57452); `Location::Standard` defaults to the left
+/// variant. `AltGraph` folds to `alt`, matching the legacy modifier model.
+pub const fn kitty_modifier_key(named: NamedKey, location: KeyLocation) -> Option<u32> {
+    let right = matches!(location, KeyLocation::Right);
+    let code = match named {
+        NamedKey::Shift => {
+            if right {
+                57447
+            } else {
+                57441
+            }
+        }
+        NamedKey::Control => {
+            if right {
+                57448
+            } else {
+                57442
+            }
+        }
+        NamedKey::Alt | NamedKey::AltGraph => {
+            if right {
+                57449
+            } else {
+                57443
+            }
+        }
+        NamedKey::Super => {
+            if right {
+                57450
+            } else {
+                57444
+            }
+        }
+        NamedKey::Hyper => {
+            if right {
+                57451
+            } else {
+                57445
+            }
+        }
+        NamedKey::Meta => {
+            if right {
+                57452
+            } else {
+                57446
+            }
+        }
+        _ => return None,
+    };
+    Some(code)
 }
 
 #[allow(dead_code)]
@@ -810,5 +944,57 @@ mod tests {
         let mut ev = make_char("a", Some("a"), PressState::Pressed, false);
         ev.repeat = true;
         assert_eq!(encode_key_event(&ev), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn kitty_functional_table_matches_the_spec() {
+        // Spot-check the authoritative "Functional key definitions" rows.
+        assert_eq!(kitty_functional_key(NamedKey::Escape), Some((27, b'u')));
+        assert_eq!(kitty_functional_key(NamedKey::Enter), Some((13, b'u')));
+        assert_eq!(kitty_functional_key(NamedKey::Tab), Some((9, b'u')));
+        assert_eq!(kitty_functional_key(NamedKey::Backspace), Some((127, b'u')));
+        assert_eq!(kitty_functional_key(NamedKey::Insert), Some((2, b'~')));
+        assert_eq!(kitty_functional_key(NamedKey::Delete), Some((3, b'~')));
+        assert_eq!(kitty_functional_key(NamedKey::ArrowUp), Some((1, b'A')));
+        assert_eq!(kitty_functional_key(NamedKey::Home), Some((1, b'H')));
+        assert_eq!(kitty_functional_key(NamedKey::End), Some((1, b'F')));
+        assert_eq!(kitty_functional_key(NamedKey::F1), Some((1, b'P')));
+        assert_eq!(kitty_functional_key(NamedKey::F3), Some((13, b'~')));
+        assert_eq!(kitty_functional_key(NamedKey::F12), Some((24, b'~')));
+        assert_eq!(kitty_functional_key(NamedKey::F13), Some((57376, b'u')));
+        assert_eq!(kitty_functional_key(NamedKey::Space), None);
+    }
+
+    #[test]
+    fn kitty_modifier_table_covers_left_and_right() {
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Shift, KeyLocation::Standard),
+            Some(57441)
+        );
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Shift, KeyLocation::Right),
+            Some(57447)
+        );
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Control, KeyLocation::Left),
+            Some(57442)
+        );
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Control, KeyLocation::Right),
+            Some(57448)
+        );
+        // AltGraph folds to the alt variant.
+        assert_eq!(
+            kitty_modifier_key(NamedKey::AltGraph, KeyLocation::Left),
+            Some(57443)
+        );
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Meta, KeyLocation::Right),
+            Some(57452)
+        );
+        assert_eq!(
+            kitty_modifier_key(NamedKey::Enter, KeyLocation::Standard),
+            None
+        );
     }
 }

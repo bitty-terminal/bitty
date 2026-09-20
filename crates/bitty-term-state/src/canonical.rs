@@ -35,7 +35,11 @@ use crate::cell::{Attributes, Cell, Style};
 /// v7 adds the alternate-scroll mode (`CTX-0566` `DECSET 1007`): prior
 /// versions omitted it, so states differing only in the wheel-to-cursor-key
 /// translation flag collided.
-pub const CANONICAL_HASH_VERSION: u32 = 7;
+/// v8 adds the Kitty keyboard-protocol flag register as a bounded push/pop
+/// stack (`CTX-0575`): prior versions stored only the flattened bitmask, so
+/// states with identical live flags but different stack contents collided and
+/// a pop could not be replayed.
+pub const CANONICAL_HASH_VERSION: u32 = 8;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -199,6 +203,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 7);
+        assert_eq!(CANONICAL_HASH_VERSION, 8);
     }
 }

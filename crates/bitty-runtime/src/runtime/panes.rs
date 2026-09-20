@@ -681,7 +681,7 @@ impl Runtime {
     pub(super) fn sync_mode_caches_to_focus(&mut self) {
         let (kitty, mouse) = {
             let modes = self.focused_modes();
-            (modes.kitty_keyboard, modes.mouse_tracking.is_some())
+            (modes.kitty_keyboard.flags(), modes.mouse_tracking.is_some())
         };
         self.kitty_flags = kitty;
         self.mouse_capture_enabled = mouse;

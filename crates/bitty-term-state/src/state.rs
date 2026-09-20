@@ -1076,6 +1076,11 @@ impl State {
             // `kitty_display_image`; state stays inert by design.
             TerminalAction::KittyGraphics { .. } => {}
 
+            // Kitty keyboard progressive-enhancement negotiation (CTX-0575).
+            // The bounded register and push/pop stack live in the mode
+            // register; a `Query` synthesizes the spec reply `CSI ? flags u`.
+            TerminalAction::KittyKeyboard { op } => self.apply_kitty_keyboard(*op),
+
             TerminalAction::Unknown(report) => match report.kind {
                 SequenceKind::Csi => self.telemetry.unknown_csi += 1,
                 SequenceKind::Esc => self.telemetry.unknown_esc += 1,
@@ -1756,13 +1761,17 @@ impl State {
             Mode::SynchronizedUpdate => self.modes.synchronized_update = enabled,
             Mode::KittyKeyboard(flags) => {
                 if enabled {
-                    // Progressive flags: OR in bounded bits (candidate spec: u32, unknown bits ignored)
-                    self.modes.kitty_keyboard |= flags & 0x1F;
+                    // Legacy `?7727 h/l` alias: OR in bounded bits.
+                    self.modes
+                        .kitty_keyboard
+                        .set(flags, bitty_vt::KittyKeyboardSetMode::Set);
                 } else if flags == 0 {
-                    // CSI ? 7727 l without flags disables all
-                    self.modes.kitty_keyboard = 0;
+                    // `CSI ? 7727 l` without flags disables all.
+                    self.modes.kitty_keyboard.pop(u32::MAX);
                 } else {
-                    self.modes.kitty_keyboard &= !(flags & 0x1F);
+                    self.modes
+                        .kitty_keyboard
+                        .set(flags, bitty_vt::KittyKeyboardSetMode::Reset);
                 }
             }
             Mode::MouseTracking(tracking) => {
@@ -1891,6 +1900,27 @@ impl State {
     // ------------------------------------------------------------------
     // Replies (queued, never written anywhere)
     // ------------------------------------------------------------------
+
+    /// Applies one Kitty keyboard-protocol operation (CTX-0575).
+    ///
+    /// `Query` queues the spec reply `CSI ? flags u`; the register never
+    /// emits bytes on its own (RFC: replies are queued, not written).
+    fn apply_kitty_keyboard(&mut self, op: bitty_vt::KittyKeyboardOp) {
+        use bitty_vt::KittyKeyboardOp;
+        match op {
+            KittyKeyboardOp::Set { flags, mode } => {
+                self.modes.kitty_keyboard.set(flags, mode);
+            }
+            KittyKeyboardOp::Push { flags } => self.modes.kitty_keyboard.push(flags),
+            KittyKeyboardOp::Pop { n } => self.modes.kitty_keyboard.pop(u32::from(n)),
+            KittyKeyboardOp::Query => {
+                let payload = format!("\x1b[?{}u", self.modes.kitty_keyboard.flags())
+                    .into_bytes()
+                    .into_boxed_slice();
+                self.replies.queue(payload);
+            }
+        }
+    }
 
     fn request_device_status(&mut self, kind: StatusKind) {
         let payload: Box<[u8]> = match kind {

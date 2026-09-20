@@ -11,6 +11,88 @@ use super::*;
 /// pane width, so no composition can overdraw or grow the frame.
 pub const IME_PREEDIT_MAX_CHARS: usize = 128;
 
+/// Maximum bytes a single Kitty keyboard-protocol frame may produce
+/// (CTX-0575). Matches the `input-pointer-rfc.md` Kitty bound: one key yields
+/// at most 64 bytes of `CSI u`; an over-bound frame falls back to legacy
+/// rather than truncating a sequence.
+pub const MAX_KITTY_FRAME_BYTES: usize = 64;
+
+/// Kitty keyboard flag: disambiguate `Esc`/`ctrl`/`alt` ASCII keys (bit 1).
+pub const KITTY_FLAG_DISAMBIGUATE: u32 = 1 << 0;
+/// Kitty keyboard flag: report repeat/release event types (bit 2).
+pub const KITTY_FLAG_REPORT_EVENTS: u32 = 1 << 1;
+/// Kitty keyboard flag: report shifted/alternate keys (bit 4).
+pub const KITTY_FLAG_REPORT_ALTERNATES: u32 = 1 << 2;
+/// Kitty keyboard flag: report text-producing keys as escape codes (bit 8).
+pub const KITTY_FLAG_REPORT_ALL_KEYS: u32 = 1 << 3;
+/// Kitty keyboard flag: embed associated text codepoints (bit 16).
+pub const KITTY_FLAG_REPORT_TEXT: u32 = 1 << 4;
+
+/// Builds one Kitty `CSI` key frame per the spec's `serialize` algorithm.
+///
+/// `mods` is the raw modifier bitmask (shift `1`, alt `2`, ctrl `4`); the
+/// wire encodes it as `mods + 1`. `event_type` (`:2`/`:3`) is omitted for a
+/// press. `shifted` adds the alternate shifted-key sub-field and `embed`
+/// appends the associated-text codepoint field when present. `trailer` is
+/// `u` for `CSI u` keys and `~`/`A`/`B`/`C`/`D`/`H`/`F`/`P`/`Q`/`S` for the
+/// functional-key table.
+///
+/// The result is hard-bounded to [`MAX_KITTY_FRAME_BYTES`]: associated text
+/// is truncated to the codepoints that still fit, so a long IME/layout text
+/// can never grow the frame or leak past the per-key bound. The caller still
+/// checks the bound before emitting.
+fn kitty_frame(
+    code: u32,
+    shifted: Option<u32>,
+    mods: u32,
+    event_type: Option<u32>,
+    embed: Option<&str>,
+    trailer: u8,
+) -> Vec<u8> {
+    // Worst case per codepoint field is 1 separator + 10 decimal digits.
+    const EMBED_CODEPOINT_MAX: usize = 11;
+    let mut out = String::with_capacity(MAX_KITTY_FRAME_BYTES);
+    out.push_str("\x1b[");
+    let second = mods != 0 || event_type.is_some();
+    let third = embed.is_some();
+    if code != 1 || shifted.is_some() || second || third {
+        out.push_str(&code.to_string());
+    }
+    if let Some(shifted) = shifted {
+        out.push(':');
+        out.push_str(&shifted.to_string());
+    }
+    if second || third {
+        out.push(';');
+        if second {
+            out.push_str(&(mods + 1).to_string());
+            if let Some(event_type) = event_type {
+                out.push(':');
+                out.push_str(&event_type.to_string());
+            }
+        }
+    }
+    if let Some(text) = embed {
+        let mut first = true;
+        for ch in text.chars() {
+            let value = ch as u32;
+            // Associated text must not contain control codes (spec).
+            if value < 0x20 || (0x7f..=0x9f).contains(&value) {
+                continue;
+            }
+            // Reserve one byte for the trailer; stop before it would overflow.
+            if out.len() + EMBED_CODEPOINT_MAX + 1 > MAX_KITTY_FRAME_BYTES {
+                break;
+            }
+            out.push(if first { ';' } else { ':' });
+            out.push_str(&value.to_string());
+            first = false;
+        }
+    }
+    out.push(char::from(trailer));
+    out.into_bytes()
+}
+
 /// Maximum characters committed from one IME commit (CTX-0367).
 ///
 /// Matches `text-rendering-rfc.md` TXT-11 and the platform seam truncation
@@ -100,8 +182,9 @@ impl Runtime {
     ///
     /// Pure, headless, and deterministic: delegates to
     /// [`bitty_platform::encode_key_event`] which owns the xterm legacy table
-    /// (M1 required baseline; Kitty protocol is deferred). Returns `None` for
-    /// release/synthetic/modifier-only/unmapped inputs. This entry point
+    /// (M1 required baseline; the opt-in Kitty protocol is composed in
+    /// [`encode_key_with_kitty`](Self::encode_key_with_kitty)). Returns `None`
+    /// for release/synthetic/modifier-only/unmapped inputs. This entry point
     /// assumes no modifiers are held; the live input path
     /// ([`Self::handle_key_event`]) applies the tracked modifier snapshot via
     /// [`encode_key_with_kitty`](Self::encode_key_with_kitty) instead, so
@@ -128,56 +211,169 @@ impl Runtime {
         }
     }
 
-    /// Encodes with Kitty protocol when the focused pane's flags are non-zero
-    /// (opt-in 7727). CTX-0532: the flags come from the focused pane's own
-    /// session (primary fallback for session-less leaves), so a focus
-    /// transition with no pump between panes cannot encode with the previous
-    /// pane's protocol. Bounded to 64 bytes per spec; progressive flags are
-    /// honored with fallback to legacy when flag not set.
+    /// Encodes with the Kitty keyboard protocol when the focused pane's flags
+    /// are non-zero (opt-in).
+    ///
+    /// CTX-0532: the flags come from the focused pane's own session (primary
+    /// fallback for session-less leaves), so a focus transition with no pump
+    /// between panes cannot encode with the previous pane's protocol.
+    /// CTX-0575 completes the M1-13 subset with the authoritative flag
+    /// semantics (`sw.kovidgoyal.net/kitty/keyboard-protocol`):
+    ///
+    /// - `disambiguate` (bit 1) reports `Esc`/`ctrl`/`alt` ASCII keys and
+    ///   functional keys as `CSI u`, with bare `Enter`/`Tab`/`Backspace`
+    ///   kept legacy (spec exception so a crashed program can still `reset`);
+    /// - `report_events` (bit 2) adds the `:2`/`:3` event-type sub-field for
+    ///   repeat/release; releases are dropped without it;
+    /// - `report_alternates` (bit 4) adds the shifted key sub-field;
+    /// - `report_all_keys` (bit 8) reports text-producing keys as escape
+    ///   codes instead of raw UTF-8;
+    /// - `report_associated_text` (bit 16) embeds the text codepoints as the
+    ///   trailing field (undefined without `report_all_keys`, so bitty fails
+    ///   closed to the legacy text path).
+    ///
+    /// Every emitted frame is bounded to [`MAX_KITTY_FRAME_BYTES`]; an
+    /// over-bound frame falls back to the legacy encoder rather than
+    /// truncating a sequence. With flags `0` this delegates straight to the
+    /// legacy encoder, so the opt-in default-off behavior stays
+    /// byte-identical (differential proof).
     pub(super) fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        if self.focused_modes().kitty_keyboard == 0 {
-            return bitty_platform::keyboard::encode_key_event_with_modifiers(
-                event,
-                &self.modifier_snapshot(),
-            );
+        let flags = self.focused_modes().kitty_keyboard.flags();
+        if flags == 0 {
+            return self.kitty_fallback(event);
         }
-        // Kitty active: produce CSI u for disambiguated keys, else legacy with fallback.
-        // For vertical slice, handle Tab vs Ctrl-I disambiguation and Enter vs Ctrl-M.
-        // When event is Tab with Ctrl modifier (text is \t but logical is Tab), encode Kitty distinct.
-        // Simplistic: if logical is Named(Tab) and control_pressed, encode Kitty 9;1:1 etc.
-        // General: encode any character key as CSI <codepoint> ; mods u
-        // Bounded: single key ≤64 bytes, checked.
-        let mods: u8 = (if self.shift_pressed { 1 } else { 0 })
-            | (if self.alt_pressed { 2 } else { 0 })
-            | (if self.control_pressed { 4 } else { 0 });
-        // For named keys with CSI u equivalents, use codepoint of logical char if available
-        let codepoint_opt = match &event.logical_key {
-            bitty_platform::LogicalKey::Character(s) => s.chars().next().map(|c| c as u32),
-            bitty_platform::LogicalKey::Named(named) => match named {
-                bitty_platform::NamedKey::Enter => Some(13),
-                bitty_platform::NamedKey::Tab => Some(9),
-                bitty_platform::NamedKey::Backspace => Some(127),
-                bitty_platform::NamedKey::Escape => Some(27),
-                _ => None,
-            },
-            _ => None,
+        if event.is_synthetic {
+            return None;
+        }
+        let report_events = flags & KITTY_FLAG_REPORT_EVENTS != 0;
+        let disambiguate = flags & KITTY_FLAG_DISAMBIGUATE != 0;
+        let report_all = flags & KITTY_FLAG_REPORT_ALL_KEYS != 0;
+        let report_alternates = flags & KITTY_FLAG_REPORT_ALTERNATES != 0;
+        let report_text = flags & KITTY_FLAG_REPORT_TEXT != 0;
+
+        let pressed = event.state == PressState::Pressed;
+        if !pressed && !report_events {
+            return None;
+        }
+        // Spec legacy mode: text passes through untouched unless disambiguate,
+        // report-events, or report-all-keys is active.
+        let legacy_mode = !disambiguate && !report_events && !report_all;
+
+        let mods: u32 = u32::from(self.shift_pressed)
+            | (u32::from(self.alt_pressed) << 1)
+            | (u32::from(self.control_pressed) << 2);
+        // Repeat (2) and release (3) carry `:n`; press (1) is the default.
+        let event_type = if !report_events {
+            None
+        } else if event.repeat {
+            Some(2)
+        } else if pressed {
+            None
+        } else {
+            Some(3)
         };
-        if let Some(cp) = codepoint_opt {
-            // Kitty CSI u: ESC [ <codepoint> ; <mods+1> u  (mods+1 per Kitty spec where 1 = no mods)
-            // Event type 1 = press, 2 = repeat, 3 = release (only when requested flag bit 1 set)
-            let event_type = if event.repeat { 2 } else { 1 };
-            // Only emit Kitty when flag for disambiguation wants it; for slice, always when Kitty active and mods non-zero or named.
-            let is_named = matches!(&event.logical_key, bitty_platform::LogicalKey::Named(_));
-            if mods != 0 || is_named {
-                let seq = format!("\x1b[{cp};{}:{}u", mods + 1, event_type);
-                if seq.len() <= 64 {
-                    return Some(seq.into_bytes());
+
+        // Text-producing character keys.
+        if let bitty_platform::LogicalKey::Character(chars) = &event.logical_key {
+            let Some(base) = chars.chars().next() else {
+                return self.kitty_fallback(event);
+            };
+            // The protocol key code is always the un-shifted codepoint.
+            let code = u32::from(base.to_lowercase().next().unwrap_or(base));
+            let shifted = if report_alternates && self.shift_pressed {
+                base.to_uppercase()
+                    .next()
+                    .map(u32::from)
+                    .filter(|value| *value != code)
+            } else {
+                None
+            };
+            // Mirrors the reference `simple_encoding_ok` gate: an escape
+            // frame is required once event types, alternates, or associated
+            // text participate, or when disambiguate turns a modified key
+            // into `CSI u`, or report-all-keys requests every key. Anything
+            // else keeps the legacy bytes (raw UTF-8 / C0), so the default-off
+            // and disambiguate-off behavior stays byte-identical.
+            let add_actions = event_type.is_some();
+            let add_alternates = shifted.is_some();
+            let embed = if report_text && report_all {
+                event.text.as_deref().filter(|text| !text.is_empty())
+            } else {
+                None
+            };
+            let simple_encoding_ok = !add_actions && !add_alternates && embed.is_none();
+            if simple_encoding_ok && !report_all && !(disambiguate && mods != 0) {
+                return self.kitty_fallback(event);
+            }
+            let frame = kitty_frame(code, shifted, mods, event_type, embed, b'u');
+            return self.kitty_or_fallback(frame);
+        }
+
+        // Named keys.
+        if let bitty_platform::LogicalKey::Named(named) = &event.logical_key {
+            // Space is a text-producing key (code 32) rather than a
+            // functional key, but winit models it as named. It only leaves the
+            // legacy path when report-all-keys asks for escape codes.
+            if *named == bitty_platform::NamedKey::Space {
+                if !report_all {
+                    return self.kitty_fallback(event);
                 }
+                let embed = if report_text {
+                    event.text.as_deref().filter(|text| !text.is_empty())
+                } else {
+                    None
+                };
+                let frame = kitty_frame(32, None, mods, event_type, embed, b'u');
+                return self.kitty_or_fallback(frame);
+            }
+            if let Some(code) = bitty_platform::kitty_modifier_key(*named, event.location) {
+                if !report_all {
+                    return self.kitty_fallback(event);
+                }
+                let frame = kitty_frame(code, None, mods, event_type, None, b'u');
+                return self.kitty_or_fallback(frame);
+            }
+            if let Some((code, trailer)) = bitty_platform::kitty_functional_key(*named) {
+                if legacy_mode {
+                    return self.kitty_fallback(event);
+                }
+                // Escape keeps `0x1b` unless disambiguate/report-all asks for
+                // the escape-coded form (spec: Esc-vs-sequence disambiguation).
+                if *named == bitty_platform::NamedKey::Escape && !disambiguate && !report_all {
+                    return self.kitty_fallback(event);
+                }
+                // Bare Enter/Tab/Backspace keep their legacy bytes under
+                // disambiguate/report-events; report-all-keys encodes them.
+                let legacy_exception = matches!(
+                    named,
+                    bitty_platform::NamedKey::Enter
+                        | bitty_platform::NamedKey::Tab
+                        | bitty_platform::NamedKey::Backspace
+                );
+                if legacy_exception && !report_all && mods == 0 {
+                    return self.kitty_fallback(event);
+                }
+                let frame = kitty_frame(code, None, mods, event_type, None, trailer);
+                return self.kitty_or_fallback(frame);
             }
         }
-        // Fallback to legacy for keys not disambiguated, still honoring the
-        // tracked modifier snapshot (CTX-0154: Ctrl+letter synthesis).
+        self.kitty_fallback(event)
+    }
+
+    /// Legacy encoder fallback for keys without a Kitty encoding.
+    fn kitty_fallback(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
+    }
+
+    /// Returns `frame` when it fits the per-key byte bound, else falls back to
+    /// the legacy encoder instead of truncating the sequence.
+    fn kitty_or_fallback(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
+        if frame.len() <= MAX_KITTY_FRAME_BYTES {
+            Some(frame)
+        } else {
+            // Bounded inputs make this unreachable; stay conservative anyway.
+            None
+        }
     }
 
     /// Handles a decoded keyboard event: encodes to bytes and routes to the PTY.
@@ -306,14 +502,20 @@ impl Runtime {
         // CTX-0159: retain a bounded input trace for screenshots-free probes.
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
-            // Modifier-only keys produce no PTY input but still update state.
+            // Modifier-only keys produce no PTY input by default but still
+            // update state. Under report-all-keys the kitty protocol reports
+            // modifier press/release as dedicated CSI u codes (CTX-0575).
             self.inspect_ring.push_modifiers(
                 self.shift_pressed,
                 self.control_pressed,
                 self.alt_pressed,
             );
             self.publish_inspect_snapshot();
-            return None;
+            let bytes = self.encode_key_with_kitty(&event);
+            if let Some(bytes) = &bytes {
+                self.push_input_bytes(bytes);
+            }
+            return bytes;
         }
         self.inspect_ring.push_key(
             &key_inspect_label(&event),
@@ -423,7 +625,11 @@ impl Runtime {
                 self.alt_pressed,
             );
             self.publish_inspect_snapshot();
-            return None;
+            let bytes = self.encode_key_with_kitty(event);
+            if let Some(bytes) = &bytes {
+                self.push_input_bytes(bytes);
+            }
+            return bytes;
         }
         self.inspect_ring.push_key(
             &key_inspect_label(event),

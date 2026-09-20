@@ -31,7 +31,9 @@
 //!   (line-feed/new-line) plus every private mode `bitty-vt` maps
 //!   (cursor keys, 132-column request flag, reverse video, origin, autowrap,
 //!   mouse levels/encodings, cursor visibility/blink, alt-screen, bracketed
-//!   paste, focus events, Kitty `7727`). Anything else — including action-only
+//!   paste, focus events, Kitty `7727`; CTX-0575 reports the live register,
+//!   which the `CSI = u` / `CSI > u` / `CSI < u` forms and the historical
+//!   `?7727` alias all update). Anything else — including action-only
 //!   pseudo-modes such as `1048` — reports `0` (not recognized).
 //! - Tertiary DA (`CSI = c`) stays silent on purpose: the reference
 //!   (`alacritty::identify_terminal`) answers primary/secondary only, and a
@@ -228,7 +230,7 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
         ),
         2004 => Some(state.modes().bracketed_paste),
         2026 => Some(state.modes().synchronized_update),
-        7727 => Some(state.modes().kitty_keyboard != 0),
+        7727 => Some(state.modes().kitty_keyboard.flags() != 0),
         _ => None,
     };
     match set {

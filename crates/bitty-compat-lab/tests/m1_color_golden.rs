@@ -22,7 +22,7 @@ use bitty_term_state::{Color, Rgb, State};
 use bitty_vt::Parser;
 
 /// Canonical-hash version this golden binds to (`CANONICAL_HASH_VERSION`).
-const HASH_VERSION: u32 = 7;
+const HASH_VERSION: u32 = 8;
 
 fn corpus_dir() -> PathBuf {
     bitty_compat_lab::workspace_root().join("tests/compat/color/corpus")
@@ -70,7 +70,7 @@ fn golden_version_is_pinned() {
 /// `100–107` backgrounds.
 #[test]
 fn golden_sgr_16_color_fg_and_bg_cells() {
-    assert_golden("01-sgr-16-fg-bg.bin", 0xfd9a_3598_faf1_794d, 67, "");
+    assert_golden("01-sgr-16-fg-bg.bin", 0x26f5_2b49_c9f5_ce06, 67, "");
     let state = state_of("01-sgr-16-fg-bg.bin");
     let cells = state.snapshot().cells;
     for i in 0..16u8 {
@@ -107,7 +107,7 @@ fn golden_sgr_16_color_fg_and_bg_cells() {
 /// (`232–255`) resolve to the same indexed attribute for fg and bg.
 #[test]
 fn golden_sgr_256_indexed_cells() {
-    assert_golden("02-sgr-256-indexed.bin", 0xb58e_cd8e_a9a5_6d23, 32, "");
+    assert_golden("02-sgr-256-indexed.bin", 0x1348_cdc8_98a6_620c, 32, "");
     let state = state_of("02-sgr-256-indexed.bin");
     let cells = state.snapshot().cells;
     let samples: [u8; 10] = [16, 21, 52, 88, 196, 201, 231, 232, 240, 255];
@@ -122,7 +122,7 @@ fn golden_sgr_256_indexed_cells() {
 /// Truecolor foreground and background resolve to exact `Color::Rgb` values.
 #[test]
 fn golden_sgr_truecolor_cells() {
-    assert_golden("03-sgr-truecolor.bin", 0x9bfa_76c8_f36d_7dc8, 10, "");
+    assert_golden("03-sgr-truecolor.bin", 0x1762_034c_270e_20af, 10, "");
     let state = state_of("03-sgr-truecolor.bin");
     let cells = state.snapshot().cells;
     assert_eq!(
@@ -169,7 +169,7 @@ fn golden_sgr_truecolor_cells() {
 fn golden_osc_title_set() {
     assert_golden(
         "04-osc-title.bin",
-        0x7884_cf55_7474_1525,
+        0x383f_e35b_1537_c976,
         2,
         "bitty-title-2",
     );
@@ -179,8 +179,8 @@ fn golden_osc_title_set() {
 /// change, so the canonical hash matches a bare state.
 #[test]
 fn golden_osc_color_queries_are_grid_inert() {
-    assert_golden("05-osc-color-query.bin", 0x5121_1c42_017d_eb98, 2, "");
-    assert_golden("06-osc-color-set-query.bin", 0x5121_1c42_017d_eb98, 4, "");
+    assert_golden("05-osc-color-query.bin", 0x03e5_7926_279d_dbd9, 2, "");
+    assert_golden("06-osc-color-set-query.bin", 0x03e5_7926_279d_dbd9, 4, "");
     assert_eq!(
         state_of("05-osc-color-query.bin").state_hash(),
         State::new().state_hash(),
@@ -197,7 +197,7 @@ fn golden_osc_color_queries_are_grid_inert() {
 /// resets the title to the empty string; the styled cells survive.
 #[test]
 fn golden_osc_title_reset_leaves_styled_text() {
-    assert_golden("07-osc-title-reset.bin", 0x517e_40b3_06d6_afcb, 11, "");
+    assert_golden("07-osc-title-reset.bin", 0x1c23_382c_53bc_82fc, 11, "");
     let state = state_of("07-osc-title-reset.bin");
     let cells = state.snapshot().cells;
     let text: String = cells[..6].iter().map(|c| c.glyph).collect();

@@ -9,9 +9,9 @@ use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
-    MAX_OSC4_OPS, Mode, MouseCoordinateEncoding, MouseTrackingMode, Notification,
-    NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    TerminalAction, UnrecognizedSequence, ZoneKind,
+    KittyKeyboardOp, KittyKeyboardSetMode, MAX_OSC4_OPS, Mode, MouseCoordinateEncoding,
+    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -55,6 +55,53 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             }
         }
         if flags == 0 { 1 } else { flags & 0x1F }
+    }
+
+    /// Classifies a Kitty keyboard-protocol control sequence (CTX-0575).
+    ///
+    /// Shapes (authoritative spec, `keyboard-protocol` progressive
+    /// enhancement): `CSI = flags ; mode u`, `CSI > flags u`, `CSI < n u`,
+    /// `CSI ? u`. Any other intermediate/parameter shape returns `None` so the
+    /// caller records it as inert unknown telemetry. Flags are not masked
+    /// here; the state layer owns the five-bit bound.
+    fn kitty_keyboard_op(
+        intermediates: &[u8],
+        params: &Params,
+        final_byte: u8,
+    ) -> Option<KittyKeyboardOp> {
+        if final_byte != b'u' {
+            return None;
+        }
+        match intermediates {
+            b"=" => {
+                let flags = u32::from(mode_value(params, 0));
+                let mode = match lead_value(sub_params(params, 1)) {
+                    None | Some(1) => KittyKeyboardSetMode::Assign,
+                    Some(2) => KittyKeyboardSetMode::Set,
+                    Some(3) => KittyKeyboardSetMode::Reset,
+                    Some(_) => return None,
+                };
+                Some(KittyKeyboardOp::Set { flags, mode })
+            }
+            b">" => Some(KittyKeyboardOp::Push {
+                flags: u32::from(mode_value(params, 0)),
+            }),
+            b"<" => Some(KittyKeyboardOp::Pop {
+                n: resolved_count(params, 0).0,
+            }),
+            b"?" => {
+                // `vte` always delivers one parameter (the implicit `0`), so
+                // the bare `CSI ? u` query arrives as a single zero param.
+                // Any other parameter form is not part of the protocol and
+                // stays unknown telemetry.
+                if params.len() <= 1 && mode_value(params, 0) == 0 {
+                    Some(KittyKeyboardOp::Query)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn dispatch_mode(&mut self, params: &Params, index: usize, enabled: bool) {
@@ -392,6 +439,18 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
 
         if intermediates == *b"!" && final_byte == b'p' {
             self.emit(TerminalAction::SoftReset);
+            return;
+        }
+
+        // Kitty keyboard progressive-enhancement negotiation (CTX-0575):
+        // `CSI = flags ; mode u`, `CSI > flags u`, `CSI < n u`, `CSI ? u`.
+        // Classified before the generic intermediate guard below so these
+        // shapes never collapse to inert telemetry.
+        if final_byte == b'u' && matches!(intermediates, b"=" | b">" | b"<" | b"?") {
+            match Self::kitty_keyboard_op(intermediates, params, final_byte) {
+                Some(op) => self.emit(TerminalAction::KittyKeyboard { op }),
+                None => self.unknown_csi(intermediates, final_byte),
+            }
             return;
         }
 

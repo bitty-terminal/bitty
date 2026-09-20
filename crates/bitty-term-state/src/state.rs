@@ -1061,6 +1061,11 @@ impl State {
                 // bitty-docs security corpus remain authoritative.
             }
             TerminalAction::OscCwd { url } => self.cwd_report = Some(url.clone()),
+            // OSC 9 / OSC 777 notifications (CTX-0577): grid truth is
+            // untouched. The runtime owns the bell/notification policy
+            // (default deny) and the capability/consent and rate gates;
+            // terminal state stays inert by contract.
+            TerminalAction::OscNotification { .. } => {}
             TerminalAction::OscHyperlink { link } => self.osc_hyperlink(link.as_ref()),
             TerminalAction::OscPromptMark { kind, exit_code } => {
                 self.record_zone(*kind, *exit_code);

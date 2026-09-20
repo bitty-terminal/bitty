@@ -122,6 +122,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+pub mod bell;
 pub mod click;
 pub mod close_confirm;
 pub mod copy_mode;
@@ -648,7 +649,43 @@ pub struct Runtime {
     /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
     spawn_log: log_throttle::LogThrottle,
     pending_activation_gesture: Option<ActivationGesture>,
+    /// Exact URI bound to [`Self::pending_activation_gesture`] at mint time
+    /// (CTX-0577); consumed together with it so the live consumer never
+    /// accepts a substitute target.
+    pending_activation_uri: Option<String>,
     next_activation_gesture: u64,
+    /// OS hand-off for a runtime-authorized URL activation (CTX-0577).
+    ///
+    /// The click path never spawns a handler directly; it goes through this
+    /// seam so tests can record the exact URL sequence. Defaults to
+    /// [`SystemUrlOpener`] (the production native handler).
+    url_opener: Box<dyn plugin::UrlOpener>,
+    /// Count of hyperlink activations that passed the gate and were handed
+    /// to the opener (CTX-0577 diagnostics).
+    url_activations: u64,
+    /// Count of hyperlink activations refused by the gate (no gesture, stale
+    /// gesture, veto, or a URI outside the scheme allowlist).
+    url_activation_refusals: u64,
+    /// User-visible bell behavior (CTX-0577, `OQ-076` policy input).
+    ///
+    /// Defaults to [`bell::BellMode::Visual`]: `BEL` paints a bounded,
+    /// self-expiring flash. Audible/off are embedder choices.
+    bell_mode: bell::BellMode,
+    /// Whether terminal-originated notifications (`OSC 9` / `OSC 777`) are
+    /// allowed (CTX-0577). Default `false`: no consent means no surface.
+    osc_notification_allowed: bool,
+    /// `RC-8` rate limiter shared by the bell and notification surfaces.
+    bell_limiter: bell::Rc8Limiter,
+    /// Bounded queue of admitted notifications awaiting presentation.
+    notifications: bell::TerminalNotificationQueue,
+    /// Instant the visual bell flash was last admitted (bounded display).
+    bell_flash_at: Option<std::time::Instant>,
+    /// Current notification banner text and when it was first shown.
+    notification_banner: Option<(String, std::time::Instant)>,
+    /// Count of OSC notification requests dropped because consent is absent.
+    notifications_denied: u64,
+    /// Count of bell/notification events dropped by the `RC-8` limiter.
+    bell_rate_dropped: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     kitty_flags: u32,
     shift_pressed: bool,
@@ -748,6 +785,14 @@ pub struct ActivationGesture(u64);
 #[derive(Debug, PartialEq, Eq)]
 pub struct UrlActivation {
     uri: String,
+}
+
+impl UrlActivation {
+    /// The validated URI this authorization binds to.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
 }
 
 /// Runtime-issued authorization for a local-file URL activation.
@@ -1105,7 +1150,19 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_BURST,
             ),
             pending_activation_gesture: None,
+            pending_activation_uri: None,
             next_activation_gesture: 1,
+            url_opener: Box::new(plugin::SystemUrlOpener),
+            url_activations: 0,
+            url_activation_refusals: 0,
+            bell_mode: bell::BellMode::default(),
+            osc_notification_allowed: false,
+            bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
+            notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
+            bell_flash_at: None,
+            notification_banner: None,
+            notifications_denied: 0,
+            bell_rate_dropped: 0,
             kitty_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1270,7 +1327,19 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_BURST,
             ),
             pending_activation_gesture: None,
+            pending_activation_uri: None,
             next_activation_gesture: 1,
+            url_opener: Box::new(plugin::SystemUrlOpener),
+            url_activations: 0,
+            url_activation_refusals: 0,
+            bell_mode: bell::BellMode::default(),
+            osc_notification_allowed: false,
+            bell_limiter: bell::Rc8Limiter::new(bell::RC8_WINDOW, bell::RC8_EVENTS_PER_WINDOW),
+            notifications: bell::TerminalNotificationQueue::new(bell::NOTIFICATION_QUEUE_CAPACITY),
+            bell_flash_at: None,
+            notification_banner: None,
+            notifications_denied: 0,
+            bell_rate_dropped: 0,
             kitty_flags: 0,
             shift_pressed: false,
             control_pressed: false,
@@ -1546,6 +1615,230 @@ impl Runtime {
     /// Drains all queued cold-path events in FIFO order.
     pub fn drain_cold_events(&mut self) -> Vec<ColdEvent> {
         self.cold_queue.drain()
+    }
+
+    // ------------------------------------------------------------------
+    // Bell / notification policy (CTX-0577, M1-16 / issue #1142)
+    // ------------------------------------------------------------------
+
+    /// Sets the user-visible bell behavior (CTX-0577, `OQ-076` policy input).
+    ///
+    /// Defaults to [`bell::BellMode::Visual`]. Audible is an owner-pending
+    /// surface: no OS primitive is wired yet, so [`bell::BellMode::Audible`]
+    /// only counts requests for a future sink.
+    pub fn set_bell_mode(&mut self, mode: bell::BellMode) {
+        self.bell_mode = mode;
+    }
+
+    /// Current user-visible bell behavior.
+    #[must_use]
+    pub const fn bell_mode(&self) -> bell::BellMode {
+        self.bell_mode
+    }
+
+    /// Allows or denies terminal-originated notifications (`OSC 9` /
+    /// `OSC 777`, CTX-0577).
+    ///
+    /// Default-deny: untrusted PTY output can never surface a desktop
+    /// notification unless an embedder grants this explicitly. Denied
+    /// requests are counted in [`Self::notifications_denied`], never queued.
+    pub fn set_osc_notification_allowed(&mut self, allowed: bool) {
+        self.osc_notification_allowed = allowed;
+    }
+
+    /// Whether terminal-originated notifications are currently allowed.
+    #[must_use]
+    pub const fn osc_notification_allowed(&self) -> bool {
+        self.osc_notification_allowed
+    }
+
+    /// Count of notification requests denied because consent is absent.
+    #[must_use]
+    pub const fn notifications_denied(&self) -> u64 {
+        self.notifications_denied
+    }
+
+    /// Count of bell/notification events dropped by the `RC-8` limiter.
+    #[must_use]
+    pub const fn bell_rate_dropped(&self) -> u64 {
+        self.bell_rate_dropped
+    }
+
+    /// Notifications dropped to queue overflow.
+    #[must_use]
+    pub const fn notifications_queue_dropped(&self) -> u64 {
+        self.notifications.dropped()
+    }
+
+    /// Number of admitted notifications awaiting presentation.
+    #[must_use]
+    pub fn pending_notification_count(&self) -> usize {
+        self.notifications.len()
+    }
+
+    /// Whether the visual bell flash is currently active at `now`.
+    #[must_use]
+    pub fn visual_bell_active_at(&self, now: std::time::Instant) -> bool {
+        self.bell_mode.visual()
+            && self.bell_flash_at.is_some_and(|since| {
+                now.saturating_duration_since(since) < bell::BELL_FLASH_DURATION
+            })
+    }
+
+    /// Whether the visual bell flash is currently active (wall clock).
+    #[must_use]
+    pub fn visual_bell_active(&self) -> bool {
+        self.visual_bell_active_at(std::time::Instant::now())
+    }
+
+    /// Applies the bell/notification policy to one `BEL` (CTX-0577).
+    ///
+    /// The event itself already crossed to the bounded cold queue (the
+    /// plugin-visible observation is unchanged); this only decides the
+    /// user-visible surface. Rate-limited under `RC-8`; audible is a counted
+    /// request only (no OS primitive). Returns `true` when the visual flash
+    /// was (re)armed.
+    pub(super) fn apply_bell_policy(&mut self, now: std::time::Instant) -> bool {
+        if self.bell_mode == bell::BellMode::Off {
+            return false;
+        }
+        if !self.bell_limiter.admit_at(now) {
+            self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
+            return false;
+        }
+        if self.bell_mode.visual() {
+            self.bell_flash_at = Some(now);
+            self.pending_full_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Applies the bell/notification policy to one `OSC 9` / `OSC 777`
+    /// request (CTX-0577). Returns `true` when the notification was admitted
+    /// into the bounded queue.
+    pub(super) fn apply_notification_policy(
+        &mut self,
+        notification: &bitty_vt::Notification,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.osc_notification_allowed {
+            self.notifications_denied = self.notifications_denied.saturating_add(1);
+            return false;
+        }
+        if !self.bell_limiter.admit_at(now) {
+            self.bell_rate_dropped = self.bell_rate_dropped.saturating_add(1);
+            return false;
+        }
+        // Show immediately when no banner is live, so an admitted
+        // notification is never silently parked until a frame arrives; queue
+        // it otherwise (the present path advances the queue on expiry).
+        if self.notification_banner_at(now).is_none() {
+            self.show_notification_banner(notification, now).is_some()
+        } else {
+            self.notifications.push(notification.clone())
+        }
+    }
+
+    /// Promotes the next queued notification to the visible banner once the
+    /// current banner has expired (CTX-0577).
+    ///
+    /// Deterministic virtual-clock seam: the present path calls it with the
+    /// frame instant, and tests drive banner rotation without sleeping.
+    pub fn advance_notification_banner_at(&mut self, now: std::time::Instant) -> bool {
+        if self.notification_banner_at(now).is_some() {
+            return false;
+        }
+        let Some(notification) = self.notifications.pop_front() else {
+            return false;
+        };
+        self.show_notification_banner(&notification, now).is_some()
+    }
+
+    /// Shows one notification as the banner, replacing any current banner.
+    pub(super) fn show_notification_banner(
+        &mut self,
+        notification: &bitty_vt::Notification,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        let text = bell::notification_banner_text(notification);
+        if text.is_empty() {
+            return None;
+        }
+        self.notification_banner = Some((text.clone(), now));
+        self.pending_full_redraw = true;
+        Some(text)
+    }
+
+    /// Visible notification banner text at `now`, expiring after
+    /// [`bell::NOTIFICATION_BANNER_DURATION`]. Never-silent while a banner is
+    /// live, and never a persistent surface.
+    #[must_use]
+    pub fn notification_banner_at(&self, now: std::time::Instant) -> Option<String> {
+        let (text, since) = self.notification_banner.as_ref()?;
+        if now.saturating_duration_since(*since) >= bell::NOTIFICATION_BANNER_DURATION {
+            return None;
+        }
+        Some(text.clone())
+    }
+
+    /// Visible notification banner text now (wall clock).
+    #[must_use]
+    pub fn notification_banner(&self) -> Option<String> {
+        self.notification_banner_at(std::time::Instant::now())
+    }
+
+    /// Clears an expired notification banner and returns whether it did.
+    pub(super) fn expire_notification_banner(&mut self, now: std::time::Instant) -> bool {
+        let expired = self.notification_banner.as_ref().is_some_and(|(_, since)| {
+            now.saturating_duration_since(*since) >= bell::NOTIFICATION_BANNER_DURATION
+        });
+        if expired {
+            self.notification_banner = None;
+        }
+        expired
+    }
+
+    /// Clears the visual bell flash once its bounded window has elapsed and
+    /// returns whether this call performed the expiration (CTX-0577 review
+    /// PX-3067).
+    ///
+    /// Without this the flash only stopped painting lazily when some other
+    /// event happened to present a frame; on a quiet window it persisted
+    /// indefinitely, contradicting the bounded-surface contract.
+    pub(super) fn expire_bell_flash(&mut self, now: std::time::Instant) -> bool {
+        let expired = self
+            .bell_flash_at
+            .is_some_and(|since| now.saturating_duration_since(since) >= bell::BELL_FLASH_DURATION);
+        if expired {
+            self.bell_flash_at = None;
+        }
+        expired
+    }
+
+    /// Earliest instant either bounded bell/notification surface needs to
+    /// change, if any (CTX-0577 review PX-3067).
+    ///
+    /// The app event loop arms a timed wake at this instant
+    /// (`EventContext::set_wait_until`) so expiry happens on time even when
+    /// no PTY bytes or layout change arrive. `None` when neither surface is
+    /// live, so an idle window keeps zero periodic wakeups (PB-7).
+    #[must_use]
+    pub fn bell_notification_deadline(&self) -> Option<std::time::Instant> {
+        let flash = self
+            .bell_flash_at
+            .map(|since| since + bell::BELL_FLASH_DURATION);
+        let banner = self
+            .notification_banner
+            .as_ref()
+            .map(|(_, since)| *since + bell::NOTIFICATION_BANNER_DURATION);
+        match (flash, banner) {
+            (Some(f), Some(b)) => Some(f.min(b)),
+            (Some(f), None) => Some(f),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     // ------------------------------------------------------------------

@@ -207,6 +207,11 @@ pub(super) struct ImeCaret {
 /// a pathological atlas from spinning the frame loop.
 const ATLAS_REBUILD_LIMIT: u8 = 2;
 
+/// Visual bell flash accent (CTX-0577): translucent amber, painted as a
+/// one-cell-high strip on the focused view's top edge. Deliberately subtle so
+/// the flash signals without obscuring content.
+const BELL_FLASH_BG: bitty_render::grid::Rgba8 = [0x5A, 0x4A, 0x00, 0xB0];
+
 /// One leaf's retained present primitives (CTX-0386).
 ///
 /// The software and GPU present paths clear the surface every frame and
@@ -706,6 +711,22 @@ impl Runtime {
     fn tick_time_gates(&mut self, now: std::time::Instant) -> bool {
         // fires even when the pointer stopped moving.
         self.apply_hover_deadline(now);
+        // CTX-0577 (review PX-3067): the bounded bell flash and notification
+        // banner are time-expiring presentation surfaces. Expire them here —
+        // before the idle short-circuit in `collect_tick_basis` — and force
+        // the frame so a quiet window (no PTY bytes, no layout change) still
+        // clears them on time instead of painting them indefinitely. Advancing
+        // the queued notification here keeps the one-banner-at-a-time rule
+        // independent of unrelated activity.
+        if self.expire_bell_flash(now) {
+            self.pending_full_redraw = true;
+        }
+        if self.expire_notification_banner(now) {
+            self.pending_full_redraw = true;
+        }
+        if self.advance_notification_banner_at(now) {
+            self.pending_full_redraw = true;
+        }
         // CTX-0192 transient: collapse the full banner to the flash once its
         // duration expires. Force exactly one repaint for the transition so
         // the retained frame keeps a visible (smaller) signal while pending.
@@ -1301,7 +1322,59 @@ impl Runtime {
             layers,
         );
         self.paint_help_overlay(&basis.allocations, &basis.view_map, basis.pad_px, layers);
+        self.paint_bell_and_notification(&basis.allocations, basis.pad_px, now, layers);
         self.paint_scrollbar_overlay(layers);
+    }
+
+    /// CTX-0577 (M1-16): the bounded visual bell flash and the single
+    /// notification banner.
+    ///
+    /// Both are presentation-only overlays: the flash is a short, self-
+    /// expiring border tint (never stacked), and at most one notification
+    /// banner is shown at a time (bounded text). Neither mutates grid truth
+    /// or the layout, and both are driven by the rate-limited policy state
+    /// (`runtime::bell`), so hostile PTY output cannot paint an unbounded
+    /// surface.
+    fn paint_bell_and_notification(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        now: std::time::Instant,
+        layers: &mut FrameLayers,
+    ) {
+        // Expiry and queue advancement already ran in `tick_time_gates` (so
+        // they fire on a quiet window too); read the resolved surface here.
+        let flash_active = self.visual_bell_active_at(now);
+        let banner = self.notification_banner_at(now);
+        let Some(frame) = self
+            .focused_view()
+            .or_else(|| allocations.first().map(|f| f.view))
+            .and_then(|view| allocations.iter().find(|f| f.view == view))
+        else {
+            return;
+        };
+        let live = self.live_cell_metrics();
+        // Visual bell: a one-cell-high accent strip along the top edge of the
+        // focused view, repainted only while the bounded flash window is
+        // open.
+        if flash_active && frame.cols > 0 && frame.content.width > 0 {
+            let width = px_span(frame.cols, live.width);
+            layers.combined_overlay.push(bitty_render::grid::FillRect {
+                rect: bitty_render::geometry::RectPx::new(
+                    px_add(pad_px, frame.content.x),
+                    px_add(pad_px, frame.content.y),
+                    width,
+                    live.height,
+                ),
+                color: BELL_FLASH_BG,
+            });
+            layers.any_needs_draw = true;
+        }
+        // Notification banner: right-aligned bottom pill, identical in shape
+        // to the pending-confirmation banners (one per frame, never stacked).
+        if let Some(text) = banner {
+            self.paint_banner_pill(allocations, Some(frame.view), &text, pad_px, layers);
+        }
     }
 
     /// RFC-0002 close transition: fade the retained rings of Views closed

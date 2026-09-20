@@ -554,6 +554,25 @@ impl TerminalApp {
         self.window.os_title_sink = Some(sink);
     }
 
+    /// Live OSC 8 click-to-open consumer (CTX-0577, M1-17 / issue #1143).
+    ///
+    /// Called after a mouse event when the runtime has armed a hyperlink
+    /// activation; consumes the single-use gesture and opens the bound URI
+    /// through the runtime opener seam. No plugin interceptors exist on this
+    /// path today (an empty decision list means proceed); failures are
+    /// reported loudly, never silently swallowed, because a refused click is
+    /// user-visible intent.
+    pub(crate) fn activate_pending_hyperlink_now(&mut self) {
+        match self.runtime.activate_pending_hyperlink(&[], false) {
+            Ok(uri) => {
+                crate::logging::info(|| format!("bitty: opened hyperlink {uri}"));
+            }
+            Err(err) => {
+                eprintln!("bitty: hyperlink activation refused ({err})");
+            }
+        }
+    }
+
     /// Attempts to attach a real GPU surface after window creation (single-window slice).
     pub(crate) fn try_attach_gpu(&mut self, handle: &WindowHandle) {
         // Do not re-attach if already has GPU
@@ -719,6 +738,15 @@ impl AppHandler for TerminalApp {
             self.save_session_best_effort("exit");
             ctx.exit();
             return;
+        }
+        // CTX-0577 (M1-17): the live OSC 8 click-to-open consumer. A primary
+        // mouse release over a safe hyperlink cell mints a single-use
+        // gesture; consume it here through the runtime opener seam so the
+        // authorized URI is actually opened (not parse-only). Fail-closed:
+        // anything without a gesture, or outside the scheme allowlist, is
+        // refused and counted inside the runtime.
+        if self.runtime.has_pending_hyperlink_activation() {
+            self.activate_pending_hyperlink_now();
         }
         // CTX-0370: a window-close request that did not exit armed a bounded
         // confirmation (or was superseded by one); report it loudly so the
@@ -901,14 +929,14 @@ impl AppHandler for TerminalApp {
                 // bounded wake at its next frame; when the last animation
                 // ends the deadline is `None` and the loop returns to wait
                 // (zero periodic wakeups, PB-7).
+                // CTX-0577 (review PX-3067): the bounded bell flash and
+                // notification banner also expire on a timer, so arm a wake
+                // at their deadline too; otherwise a quiet window would keep
+                // the surface until unrelated activity forced a frame.
                 let hover = self.runtime.hover_activation_deadline();
                 let animation = self.runtime.animation_deadline();
-                let wake = match (hover, animation) {
-                    (Some(h), Some(a)) => Some(h.min(a)),
-                    (Some(h), None) => Some(h),
-                    (None, Some(a)) => Some(a),
-                    (None, None) => None,
-                };
+                let bell = self.runtime.bell_notification_deadline();
+                let wake = [hover, animation, bell].into_iter().flatten().min();
                 match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),

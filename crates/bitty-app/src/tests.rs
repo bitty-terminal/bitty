@@ -4,6 +4,7 @@
 
 use super::chrome_keys::two_pane_layout;
 use super::*;
+use bitty_platform::{PlatformEvent, WindowEventKind};
 // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
 // without the gate the import is unused on Windows.
 #[cfg(unix)]
@@ -830,6 +831,101 @@ fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
         &app.window.title,
         "empty reset targets the static theme title"
     );
+}
+
+/// Recording double for the OSC 8 click-to-open live consumer (CTX-0577).
+struct RecordingUrlOpener {
+    opened: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl bitty_runtime::UrlOpener for RecordingUrlOpener {
+    fn open_url(
+        &self,
+        activation: bitty_runtime::UrlActivation,
+    ) -> Result<(), bitty_platform::PlatformError> {
+        self.opened
+            .lock()
+            .expect("poison-free")
+            .push(activation.uri().to_owned());
+        Ok(())
+    }
+}
+
+#[test]
+fn osc8_click_path_reaches_the_live_url_consumer() {
+    // M1-17 evidence (#1143): the app's click path must consume the runtime
+    // gesture and hand the authorized URI to the opener seam — not stop at
+    // parse-only. The recording double captures the exact URL sequence.
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+
+    app.runtime
+        .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        )),
+    });
+    assert!(app.runtime.has_pending_hyperlink_activation());
+    app.activate_pending_hyperlink_now();
+    assert_eq!(
+        opened.lock().expect("poison-free").as_slice(),
+        ["https://example.test"],
+        "the live consumer must open the authorized URI exactly once"
+    );
+    assert!(!app.runtime.has_pending_hyperlink_activation());
+}
+
+#[test]
+fn osc8_click_path_never_opens_a_hostile_scheme() {
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec::default(),
+    );
+    let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
+        opened: std::sync::Arc::clone(&opened),
+    }));
+
+    app.runtime
+        .handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
+    let window_id = bitty_platform::WindowId::from_raw_public(1);
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+    });
+    app.runtime.handle_platform_event(PlatformEvent::Window {
+        window_id,
+        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        )),
+    });
+    // No gesture was minted, so the app path has nothing to consume.
+    assert!(!app.runtime.has_pending_hyperlink_activation());
+    app.activate_pending_hyperlink_now();
+    assert!(opened.lock().expect("poison-free").is_empty());
 }
 
 #[test]

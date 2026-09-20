@@ -61,8 +61,9 @@ pub use action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
     ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
     EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
-    MouseCoordinateEncoding, MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb, Row, SequenceKind,
-    StatusKind, TabTargets, TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    MouseCoordinateEncoding, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
+    PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction, UnderlineStyle,
+    UnrecognizedSequence, ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
 pub use kitty_apc::{

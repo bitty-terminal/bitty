@@ -9,8 +9,9 @@ use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
-    MAX_OSC4_OPS, Mode, MouseCoordinateEncoding, MouseTrackingMode, PaletteColorOp, PaletteOp, Rgb,
-    Row, SequenceKind, StatusKind, TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
+    MAX_OSC4_OPS, Mode, MouseCoordinateEncoding, MouseTrackingMode, Notification,
+    NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
+    TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -238,6 +239,61 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Parses an `OSC 9` notification (CTX-0577).
+///
+/// Wire form is bare `OSC 9 ; <text>`: the message may itself contain `;`,
+/// so the remaining segments are rejoined. The ConEmu `OSC 9;<n>[;...]`
+/// sub-commands (`1` sleep, `2` message box, `3` tab title, `4` progress,
+/// `5`..=`9`) use the same OSC code, so a single-digit `1`..=`9` first
+/// segment is treated as a ConEmu command and returns `None` (the caller
+/// records it as inert). An empty message is likewise not a notification.
+fn parse_osc9_notification(rest: &[&[u8]]) -> Option<Notification> {
+    let body = join_segments(rest);
+    if body.is_empty() {
+        return None;
+    }
+    // ConEmu sub-command space: `OSC 9;<single digit 1..=9>` (optionally
+    // followed by `;params`). Restricting to the bare text form keeps the
+    // notification surface from reinterpreting another protocol's commands.
+    if let Some(first) = rest.first() {
+        if first.len() == 1 && matches!(first[0], b'1'..=b'9') {
+            return None;
+        }
+    }
+    Some(Notification {
+        source: NotificationSource::Osc9,
+        title: None,
+        body: BoundedString::new(String::from_utf8_lossy(&body)),
+    })
+}
+
+/// Parses an `OSC 777` notification (CTX-0577).
+///
+/// Accepted wire form is exactly `OSC 777 ; notify ; title ; body` (the
+/// rxvt-unicode notification form; kitty's documented protocol is `OSC 99`,
+/// which this parser does not handle). The body may contain `;` and is
+/// rejoined; any other sub-command or a malformed segment list returns
+/// `None` so the caller records it as inert. `OSC 777` also carries other
+/// sub-commands (`notify` is the only one defined here), so unknown
+/// sub-commands must not produce a notification.
+fn parse_osc777_notification(rest: &[&[u8]]) -> Option<Notification> {
+    let [sub_command, title, body @ ..] = rest else {
+        return None;
+    };
+    if *sub_command != b"notify" || body.is_empty() {
+        return None;
+    }
+    let body = join_segments(body);
+    if body.is_empty() {
+        return None;
+    }
+    Some(Notification {
+        source: NotificationSource::Osc777,
+        title: Some(BoundedString::new(String::from_utf8_lossy(title))),
+        body: BoundedString::new(String::from_utf8_lossy(&body)),
+    })
 }
 
 /// Parses an `OSC 4` payload segment list (CTX-0392).
@@ -739,6 +795,30 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     data: BoundedBytes::new(data.to_vec()),
                 });
             }
+            // OSC 9 / OSC 777 notifications (CTX-0577, M1-16). Bounded and
+            // classified only; the runtime owns the show/silence policy and
+            // the capability/consent and rate gates. Malformed forms fall
+            // through to the inert `OscUnknown` record instead of guessing.
+            9 => match parse_osc9_notification(rest) {
+                Some(notification) => self.emit(TerminalAction::OscNotification { notification }),
+                None => {
+                    let data = join_segments(rest);
+                    self.emit(TerminalAction::OscUnknown {
+                        id,
+                        data: BoundedBytes::new(data),
+                    });
+                }
+            },
+            777 => match parse_osc777_notification(rest) {
+                Some(notification) => self.emit(TerminalAction::OscNotification { notification }),
+                None => {
+                    let data = join_segments(rest);
+                    self.emit(TerminalAction::OscUnknown {
+                        id,
+                        data: BoundedBytes::new(data),
+                    });
+                }
+            },
             133 => {
                 let kind = match rest.first().and_then(|segment| segment.first()) {
                     Some(b'A') => ZoneKind::PromptStart,

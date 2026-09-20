@@ -639,9 +639,21 @@ impl Runtime {
                     Some(ColdEvent::UnknownSequence(SequenceKind::Csi))
                 }
                 TerminalAction::PrintControl(ctrl) if ctrl.0 == 0x07 => Some(ColdEvent::Bell),
+                TerminalAction::OscNotification { notification } => {
+                    // CTX-0577: the policy decides the user-visible surface;
+                    // the action itself is not a cold event (notifications
+                    // are not plugin observations today).
+                    self.apply_notification_policy(notification, std::time::Instant::now());
+                    None
+                }
                 _ => None,
             };
             if let Some(ev) = pre_event {
+                // CTX-0577: the bell policy decides the user-visible surface
+                // (bounded visual flash by default, rate-limited under RC-8).
+                if matches!(ev, ColdEvent::Bell) {
+                    let _ = self.apply_bell_policy(std::time::Instant::now());
+                }
                 // Cold queue: bounded, drop-oldest, never blocks.
                 self.cold_queue.push(ev.clone());
                 // Side queue bridging: bounded, same non-blocking guarantee (ADR-0003 rule 4).

@@ -568,6 +568,10 @@ impl Runtime {
                                         self.next_activation_gesture =
                                             self.next_activation_gesture.wrapping_add(1).max(1);
                                         self.pending_activation_gesture = Some(token);
+                                        // CTX-0577: bind the exact URI to the
+                                        // gesture so the live consumer cannot
+                                        // be handed a substitute target.
+                                        self.pending_activation_uri = Some(uri.to_owned());
                                     }
                                 }
                             }

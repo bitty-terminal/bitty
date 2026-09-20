@@ -37,12 +37,21 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
 - `src/parser_throughput.rs` — parser-throughput baseline measurement and
   ratio gate (CTX-0576, M1-11); corpora loading, median-of-rounds
   measurement, baseline parsing, and the regression check.
+- `src/real_window.rs` — real-window PB-1 startup (launch-to-first-frame
+  p50/p99) and PB-2 idle-RSS measurement (CTX-0592); opt-in, bounded,
+  `Unavailable` without `BITTY_PERF_REAL_WINDOW=1`.
 - `baselines/parser-throughput.json` — committed baseline artifact (numbers
   plus provenance); `baselines/README.md` records the runbook, exact command,
   environment, and limitations.
+- `baselines/pb-real-window.json` — committed real-window evidence artifact
+  (PB-1/PB-2 numbers plus host context and provenance);
+  `baselines/real-window-evidence.md` records the runbook and limitations.
 - `tests/parser_throughput_regression.rs` — bounded CI regression gate run by
   plain `cargo test` (also on the optimized `bench` profile via
   `just perf-parser`).
+- `tests/real_window_evidence.rs` — bounded CI contract test for the
+  real-window harness (asserts `Unavailable` without opt-in and baseline
+  provenance).
 
 ## Parser throughput baseline (CTX-0576, M1-11)
 
@@ -54,3 +63,14 @@ against `baselines/parser-throughput.json`. The gate is generous
 flake; it catches pathological regressions only. Run `just perf-parser` for
 the optimized verdict and `just perf-parser-baseline` to regenerate the
 artifact after a recorded environment change.
+
+## Real-window PB-1/PB-2 evidence (CTX-0592)
+
+`src/real_window.rs` launches the real `bitty` binary and measures the accepted
+budgets end-to-end: PB-1 cold startup (process launch to the first presented
+frame, p50/p99) and PB-2 idle RSS (one window, bounded idle interval). It is
+opt-in — `BITTY_PERF_REAL_WINDOW=1` plus a built binary — and reports
+`Unavailable` with a reason otherwise, so headless CI never fabricates numbers.
+Run `just perf-real-window` on a Tier 1 host and `just
+perf-real-window-baseline` to regenerate the artifact; see
+`baselines/real-window-evidence.md` for the runbook and limitations.

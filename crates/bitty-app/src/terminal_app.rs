@@ -464,6 +464,20 @@ impl TerminalApp {
         self.sync_ime_cursor_area();
         if let Some(present) = stats {
             self.presented_frames += 1;
+            // CTX-0592: emit the real-window first-frame marker exactly once
+            // when the opt-in perf harness asked for it. The harness starts
+            // its timer before spawning this process and reads the elapsed
+            // time to this line as PB-1 launch-to-first-frame. Gated on the
+            // env flag so normal sessions and CI emit nothing, and on
+            // `!present.headless` so the headless fallback path (no window or
+            // no GPU) never fabricates a real-window first frame.
+            if self.presented_frames == 1
+                && !present.headless
+                && std::env::var_os("BITTY_PERF_STARTUP_MARKER").is_some()
+            {
+                println!("bitty perf: first-frame");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
             if let Some(line) = self.maybe_format_tick(&present) {
                 eprintln!("{line}");
             }

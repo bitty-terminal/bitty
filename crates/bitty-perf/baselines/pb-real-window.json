@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0592",
+  "issues": [1056, 1057],
+  "captured_at": "2026-09-20",
+  "revision": "6fd9d4d1f399565cc07ea228e5f43335d0cb52f5",
+  "command": "just perf-real-window-baseline",
+  "profile": "bench (release)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-1-cold-startup-time and #pb-2-idle-memory",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "bounds": {
+    "startup_samples": 10,
+    "idle_secs": 60,
+    "idle_rss_samples": 3
+  },
+  "regression_factor": 3,
+  "pb1_startup": {
+    "status": "measured",
+    "marker_seen": true,
+    "count": 10,
+    "p50_ms": 227.813,
+    "p99_ms": 257.041,
+    "min_ms": 209.196,
+    "max_ms": 257.041,
+    "budget_p50_ms": 100,
+    "budget_p99_ms": 200
+  },
+  "pb2_idle_rss": {
+    "status": "measured",
+    "rss_mb": 426.266,
+    "samples_mb": [426.266, 426.266, 426.266],
+    "budget_mb": 80
+  }
+}

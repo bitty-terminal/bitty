@@ -167,7 +167,7 @@ jobs:
       - name: Run tests under xvfb (X11)
         run: xvfb-run -a cargo test --workspace --all-targets --locked
 
-      # M1-10 / CTX-0574: run the four M1 evidence suites by name so a
+      # M1-10 / CTX-0574: run the M1 evidence suites by name so a
       # per-platform regression is a distinct, reported result instead of
       # being buried in the blanket test run above. The suites are headless
       # (Parser -> State, plus the deterministic headless rasterizer) and need
@@ -344,7 +344,7 @@ jobs:
   # job logs.
   #
   # MSRV is intentionally not a leg: it is a compile-floor gate
-  # (`cargo +1.85 check`), not a Tier 1 platform run. The four suites are
+  # (`cargo +1.85 check`), not a Tier 1 platform run. The M1 suites are
   # exercised on Linux X11, Linux Wayland, macOS ARM64, and Windows x86_64
   # above, which is the full Tier 1 platform set.
   m1-matrix:

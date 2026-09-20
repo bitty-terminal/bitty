@@ -56,7 +56,7 @@ M1_SUITES=(
   "m1_color_golden|bitty-compat-lab|7"
   "m1_mode_input|bitty-runtime|2"
   "m1_color_title|bitty-runtime|3"
-  "m1_shell_coverage|bitty-runtime|15"
+  "m1_shell_coverage|bitty-runtime|16"
 )
 
 # ADR-0002 Tier 1 platform legs as wired in .github/workflows/ci.yml.

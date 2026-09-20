@@ -35,7 +35,7 @@ if [[ "$platforms" != "$want_platforms" ]]; then
 fi
 
 suites="$("$SCRIPT" suites)"
-want_suites=$'m1_mode_golden\tbitty-compat-lab\t10\nm1_color_golden\tbitty-compat-lab\t7\nm1_mode_input\tbitty-runtime\t2\nm1_color_title\tbitty-runtime\t3\nm1_shell_coverage\tbitty-runtime\t15'
+want_suites=$'m1_mode_golden\tbitty-compat-lab\t10\nm1_color_golden\tbitty-compat-lab\t7\nm1_mode_input\tbitty-runtime\t2\nm1_color_title\tbitty-runtime\t3\nm1_shell_coverage\tbitty-runtime\t16'
 if [[ "$suites" != "$want_suites" ]]; then
   echo "FAIL: suites: unexpected table" >&2
   printf '%s\n' "$suites" >&2
@@ -67,7 +67,7 @@ case "$suite" in
 m1_mode_golden) echo "test result: ok. 10 passed; 0 failed; 0 ignored" ;;
 m1_color_golden) echo "test result: ok. 7 passed; 0 failed; 0 ignored" ;;
 m1_mode_input) echo "test result: ok. 2 passed; 0 failed; 0 ignored" ;;
-m1_shell_coverage) echo "test result: ok. 15 passed; 0 failed; 0 ignored" ;;
+m1_shell_coverage) echo "test result: ok. 16 passed; 0 failed; 0 ignored" ;;
 m1_color_title)
 	if [[ "${FAKE_M1_FAIL:-}" == "color-title" ]]; then
 		echo "test result: FAILED. 2 passed; 1 failed; 0 ignored"

@@ -92,13 +92,16 @@ impl Kind {
 
     /// Script dumping the raw bytes of `path` to stdout.
     ///
-    /// POSIX shells emit raw bytes inline (`printf`) and never reach this
-    /// helper; the other families read the staged file so no control byte
-    /// travels through a Windows command line.
+    /// POSIX shells and `cmd.exe` emit the injected stream inline and never
+    /// call this helper; PowerShell and nushell read a staged file.
     fn raw_file(self, path: &Path) -> String {
         match self {
             Kind::Posix => format!("printf '%s' \"$(cat '{0}')\"", path.display()),
-            Kind::Cmd => format!("type \"{}\"", path.display()),
+            // Unreachable: `cmd.exe` re-quotes any argument containing a
+            // space, and its parser does not understand MSVC backslash-escaped
+            // quotes, so a quoted file path cannot survive the Windows command
+            // line. `injection_argv` echoes the cmd payload inline instead.
+            Kind::Cmd => format!("type {}", path.display()),
             Kind::PowerShell => format!(
                 "[Console]::Out.Write([System.IO.File]::ReadAllText('{}'))",
                 path.display()
@@ -323,14 +326,22 @@ fn stage_payload_file(name: &str, bytes: &str) -> PathBuf {
 
 /// Builds the injected `OSC 7`/`OSC 133` argv for `spec`.
 ///
-/// Raw control bytes are passed inline only for the POSIX `printf` family;
-/// every other shell reads them from a staged temp file. Returns
-/// `(argv, temp_file)`; the caller removes `temp_file` when present.
+/// The POSIX family and `cmd.exe` pass the raw bytes inline (POSIX via
+/// `printf`, cmd via `echo`); PowerShell and nushell read them from a staged
+/// temp file. Returns `(argv, temp_file)`; the caller removes `temp_file`
+/// when present.
 fn injection_argv(spec: &ShellSpec, name: &str) -> (Vec<String>, Option<PathBuf>) {
     let bytes = injected_bytes(name);
     match spec.kind {
         Kind::Posix => (argv_with(spec, &format!("printf '%s' '{bytes}'")), None),
-        Kind::Cmd | Kind::PowerShell | Kind::Nushell => {
+        // `cmd.exe` re-quotes any argument containing a space, and its parser
+        // does not understand MSVC backslash-escaped inner quotes, so a quoted
+        // temp-file path cannot survive the Windows command line. The injected
+        // stream carries no cmd metacharacter, so `echo` is byte-faithful
+        // here; `cmd_payload_is_echoed_inline_never_via_a_quoted_file_path`
+        // pins that invariant.
+        Kind::Cmd => (argv_with(spec, &format!("echo {bytes}")), None),
+        Kind::PowerShell | Kind::Nushell => {
             let path = stage_payload_file(name, &bytes);
             let script = spec.kind.raw_file(&path);
             (argv_with(spec, &script), Some(path))
@@ -516,6 +527,34 @@ fn resolver_prefers_earlier_candidates_and_reports_absence() {
         find_program(&["missing", "absent"], &lookup),
         None,
         "absent programs must resolve to None (explicit skip reason)"
+    );
+}
+
+#[test]
+fn cmd_payload_is_echoed_inline_never_via_a_quoted_file_path() {
+    // Windows regression (CI run 35521362359): portable-pty re-quotes any
+    // argv element containing a space, and `cmd.exe`'s parser does not accept
+    // the MSVC backslash-escaped inner quotes, so `type "<tmp path>"` failed
+    // with "The filename, directory name, or volume label syntax is
+    // incorrect". The bytes therefore travel inline (`echo`), which is safe
+    // here: the injected stream contains no cmd metacharacters.
+    let spec = spec_named("cmd");
+    let (args, temp) = injection_argv(spec, "cmd");
+    assert!(temp.is_none(), "cmd must not stage a temp payload file");
+    let script = args.last().expect("script arg");
+    assert!(
+        script.starts_with("echo "),
+        "cmd injection must echo the payload inline, got {script:?}"
+    );
+    for meta in ['"', '^', '&', '|', '<', '>', '(', ')', '%'] {
+        assert!(
+            !script.contains(meta),
+            "inline cmd payload must be metacharacter-free, found {meta:?} in {script:?}"
+        );
+    }
+    assert!(
+        script.contains("\u{1b}]7;") && script.contains("\u{1b}]133;D;0"),
+        "inline cmd payload must carry the injected OSC 7/133 stream"
     );
 }
 

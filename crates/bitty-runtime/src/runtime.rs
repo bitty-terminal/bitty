@@ -439,6 +439,12 @@ pub struct Runtime {
     /// successful spawn of each leaf. Keyed by [`ViewId`]; bounded by the
     /// session decode caps. Never logged (may hold sensitive text).
     session_pending: BTreeMap<ViewId, session::PendingPaneRestore>,
+    /// Captured `OSC 7` cwd for the restored primary owner, if the leaf was
+    /// session-less at apply time (CTX-0585, M1-25): the split path seeds the
+    /// spawn cwd from `session_pending`, but the primary restart path spawns
+    /// through `spawn_shell_with_args`, which must consult this slot too.
+    /// Keyed and cleared exactly like `session_pending`; never logged.
+    session_primary_cwd: Option<(ViewId, String)>,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
     /// Whether the help popup (CTX-0265) is currently shown.
@@ -832,6 +838,7 @@ impl std::fmt::Debug for Runtime {
             .field("workspace_count", &self.workspaces.len())
             .field("active_workspace", &self.active_workspace)
             .field("session_pending", &self.session_pending.len())
+            .field("session_primary_cwd", &self.session_primary_cwd.is_some())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
@@ -1194,6 +1201,7 @@ impl Runtime {
             workspace_mru: std::collections::VecDeque::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
+            session_primary_cwd: None,
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),
@@ -1371,6 +1379,7 @@ impl Runtime {
             workspace_mru: std::collections::VecDeque::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
+            session_primary_cwd: None,
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),

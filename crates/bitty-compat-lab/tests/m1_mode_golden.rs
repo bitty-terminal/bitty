@@ -306,7 +306,12 @@ fn golden_alternate_screen_entry_and_exit() {
     assert_golden("11-alt-screen-1049-on.bin", 0x065b_cf3f_a961_9f48, 9, &[]);
     assert_golden("11-alt-screen-1049-off.bin", 0x9048_977b_ae0b_7018, 10, &[]);
     assert_golden("12-alt-screen-47-on.bin", 0x5cb0_451f_ea49_254e, 9, &[]);
-    assert_golden("12-alt-screen-47-off.bin", 0x3259_f3f0_0010_723b, 10, &[]);
+    // `12-alt-screen-47-off` was re-recorded by CTX-0582 (#1173): `?47` no
+    // longer restores the cursor on exit, so the final cursor stays at row 1
+    // col 7 (the alt screen's `mode-12` text followed by LF) instead of
+    // jumping back to the pre-entry origin, matching xterm `srm_ALTBUF` and
+    // ghostty `.@"47"`. The `-on` hash is unchanged.
+    assert_golden("12-alt-screen-47-off.bin", 0x5ff5_e3b8_264c_1035, 10, &[]);
 
     assert!(state_of("11-alt-screen-1049-on.bin").alt_screen_active());
     assert!(!state_of("11-alt-screen-1049-off.bin").alt_screen_active());

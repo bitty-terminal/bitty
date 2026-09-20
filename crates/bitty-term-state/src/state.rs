@@ -1840,15 +1840,37 @@ impl State {
             if self.alt_screen == AltScreen::Off {
                 return;
             }
+            // The cursor is saved/restored only by the `?1049` pair. xterm's
+            // `srm_ALTBUF` (the `?47` DECSET/DECRST arm) performs neither
+            // `CursorSave` nor `CursorRestore`, and ghostty's `.@"47"` "only
+            // copies the cursor" (the screen is not saved); only
+            // `srm_OPT_ALTBUF_CURSOR` (`?1049`) saves on entry and restores on
+            // exit (issue #1173 / CTX-0582). Because Bitty keeps one shared
+            // cursor rather than per-screen cursors, "copies the cursor" is a
+            // no-op and the live cursor simply stays where the alt screen left
+            // it. Restore the saved cursor only when the alt screen was both
+            // entered and exited through `?1049`, so an entry/exit through
+            // `?47` never restores a cursor it did not save; this also covers
+            // a mixed `?47h`/`?1049l` pair without resurrecting a pre-entry
+            // position the reference would not have saved. The primary
+            // `modes`/`charsets` snapshot is still taken and restored for
+            // every variant: it backs the single-register model required by
+            // terminal-state invariant 5 (alternate-screen entry saves and
+            // exit restores the primary mode/charset set), and `?1049` keeps
+            // its full restore unchanged.
+            let restore_cursor =
+                self.alt_screen == AltScreen::Via1049 && variant == AltScreen::Via1049;
             // Preserve the alt screen's own register for the next alt session
             // while main's is restored from the entry snapshot.
             let alt_kitty = std::mem::take(&mut self.modes.kitty_keyboard);
             if let Some(save) = self.primary_save.take() {
-                self.cursor.position = save.cursor_position;
-                self.cursor.pending_wrap = save.pending_wrap;
-                self.cursor.style = save.style;
-                self.cursor.cursor_style = save.cursor_style;
-                self.cursor.visible = save.cursor_visible;
+                if restore_cursor {
+                    self.cursor.position = save.cursor_position;
+                    self.cursor.pending_wrap = save.pending_wrap;
+                    self.cursor.style = save.style;
+                    self.cursor.cursor_style = save.cursor_style;
+                    self.cursor.visible = save.cursor_visible;
+                }
                 self.charsets = save.charsets;
                 self.modes = save.modes;
             }

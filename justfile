@@ -180,6 +180,24 @@ perf-parser:
 perf-parser-baseline out="crates/bitty-perf/baselines/parser-throughput.json":
     cargo bench -p bitty-perf --bench parser_throughput -- --nocapture --write-baseline {{out}}
 
+# Real-window PB-1 startup + PB-2 idle-memory evidence (CTX-0592). Opt-in: a
+# run requires BITTY_PERF_REAL_WINDOW=1 and a built `bitty` binary (release
+# preferred). On headless CI the bench reports UNMEASURED and exits 0, so it
+# never fabricates numbers. Bounds: BITTY_PERF_STARTUP_SAMPLES (<=50),
+# BITTY_PERF_IDLE_SECS (<=300), BITTY_PERF_STARTUP_TIMEOUT_SECS (<=120),
+# BITTY_PERF_BIN (explicit binary path). Runbook:
+# crates/bitty-perf/baselines/real-window-evidence.md.
+perf-real-window:
+    BITTY_PERF_REAL_WINDOW=1 cargo bench -p bitty-perf --bench real_window -- --nocapture
+
+# Regenerate the committed real-window evidence artifact. Provenance comes
+# from the environment so no host path or username enters the file:
+#   BITTY_PERF_DATE, BITTY_PERF_REVISION, BITTY_PERF_TOOLCHAIN,
+#   BITTY_PERF_COMMAND, BITTY_PERF_PROFILE (see benches/real_window.rs).
+# Both PB-1 and PB-2 must be measured or the bench refuses to write (exit 2).
+perf-real-window-baseline out="crates/bitty-perf/baselines/pb-real-window.json":
+    BITTY_PERF_REAL_WINDOW=1 cargo bench -p bitty-perf --bench real_window -- --nocapture --write-baseline {{out}}
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref

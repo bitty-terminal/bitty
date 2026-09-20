@@ -28,6 +28,7 @@
 pub mod idle;
 pub mod latency;
 pub mod parser_throughput;
+pub mod real_window;
 pub mod startup;
 
 /// PB-1 cold startup budget — p50 / p99 (ms).

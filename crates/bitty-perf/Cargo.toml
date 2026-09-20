@@ -69,3 +69,8 @@ harness = false
 name = "idle_real"
 path = "../../benches/idle_real.rs"
 harness = false
+
+[[bench]]
+name = "real_window"
+path = "../../benches/real_window.rs"
+harness = false

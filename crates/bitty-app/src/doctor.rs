@@ -1543,13 +1543,32 @@ mod tests {
 
     #[test]
     fn run_bounded_captures_fast_command() {
-        let out = run_bounded("true", &[], 3);
-        assert!(out.is_some());
-        assert!(out.expect("output").status.success());
+        // `true` is a POSIX utility with no Windows counterpart, so the test
+        // previously failed there (spawn failed -> `None`). Windows uses the
+        // native one-shot runner `cmd /C exit 0` (the same convention as the
+        // ConPTY `spawn_windows` and `cli_run` tests); Unix keeps `true`. The
+        // fast child must be captured with a successful status, not killed at
+        // the deadline.
+        #[cfg(windows)]
+        let (prog, args): (&str, &[&str]) = ("cmd", &["/C", "exit", "0"]);
+        #[cfg(not(windows))]
+        let (prog, args): (&str, &[&str]) = ("true", &[]);
+        // 10s matches the proven one-shot bound in the ConPTY `spawn_windows`
+        // tests: a healthy child exits in milliseconds, but a loaded Windows CI
+        // runner can stall first launch, and this assert is about capture, not
+        // latency.
+        let out = run_bounded(prog, args, 10).expect("fast command must be captured");
+        assert!(
+            out.status.success(),
+            "fast command must exit 0, got {:?}",
+            out.status
+        );
     }
 
     #[test]
     fn run_bounded_rejects_bad_input() {
+        // Empty and unresolvable program names fail at spawn on every platform
+        // (no shell fallback, so no PATH magic can rescue them).
         assert_eq!(run_bounded("", &[], 1), None);
         assert_eq!(
             run_bounded("definitely-not-a-bitty-binary-xyz", &[], 1),
@@ -1559,10 +1578,18 @@ mod tests {
 
     #[test]
     fn run_bounded_kills_hung_command() {
-        // `sleep 30` must die at the 1s deadline, not run to completion.
+        // `sleep` does not exist on Windows, where the old test passed
+        // vacuously because the spawn failed before the deadline ever applied.
+        // `ping -n 31 127.0.0.1` is the native Windows blocking probe (~30s,
+        // present in `System32`); Unix keeps `sleep 30`. The kill-at-deadline
+        // path is therefore genuinely exercised on both platforms.
+        #[cfg(windows)]
+        let (prog, args): (&str, &[&str]) = ("ping", &["-n", "31", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (prog, args): (&str, &[&str]) = ("sleep", &["30"]);
         let start = Instant::now();
-        let out = run_bounded("sleep", &["30"], 1);
-        assert_eq!(out, None);
+        let out = run_bounded(prog, args, 1);
+        assert_eq!(out, None, "hung child must be killed at the deadline");
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "kill took too long: {:?}",

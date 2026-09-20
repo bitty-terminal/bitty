@@ -9,6 +9,7 @@ Shell integration corpus — `OSC 133` prompt marks (`A/B/C/D`), `OSC 7` cwd, hy
 - Shell marks: `OSC 133 ; A` (prompt start), `133 ; B` (input start), `133 ; C` (output start), `133 ; D` (output end), plus `1337` / `1339` (WezTerm / Ghostty extensions). Captured from `zsh`/`bash`/`fish` with shell integration (`script` logs of `cargo build`, `nvim` TUI, `fzf`).
 - Ghostty / kitty / WezTerm differential — compare `ZoneRecord` log (`bitty-term-state::zone_len`, `zones()`) to reference terminal's shell-integration dump (Ghostty `shell-integration` zone JSON, kitty `marks` API). Zones are bounded `ZONE_RECORDS_MAX = 1024`, oldest dropped first.
 - Existing baseline — `replay.rs::fixture_shell_session_replay` (full `133;A`/`133;B`/`133;C`/`133;D;0` flow with hyperlink, bracketed paste, alt-screen), `seeds/09-osc-hyperlink-prompt.bin`.
+- Live five-shell smoke — `crates/bitty-runtime/tests/m1_shell_coverage.rs` (CTX-0588, M1-27) spawns each installed M1 roster shell (bash/zsh/fish/PowerShell/cmd/nushell) through the real PTY with zero integration and injects `OSC 7`/`OSC 133` through the shell itself; this corpus directory remains the byte-replay side of the same acceptance.
 
 ## Bounds
 

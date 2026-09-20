@@ -2,12 +2,12 @@
 # m1-matrix.sh — CTX-0574 M1 compatibility matrix runner and Tier 1 aggregator.
 #
 # The accepted compatibility-milestone-rfc.md requires every M1 Required item
-# verified on each ADR-0002 Tier 1 platform in CI. The four M1 evidence suites
-# were only implicit members of the blanket `cargo test --workspace`
-# invocation, so a per-platform regression was invisible in the job pile and a
-# renamed or emptied suite could stop running without failing anything. This
-# driver runs each suite by name on every platform leg, asserts it actually
-# executed tests, and aggregates the legs into one pass/fail gate.
+# verified on each ADR-0002 Tier 1 platform in CI. The M1 evidence suites were
+# only implicit members of the blanket `cargo test --workspace` invocation, so
+# a per-platform regression was invisible in the job pile and a renamed or
+# emptied suite could stop running without failing anything. This driver runs
+# each suite by name on every platform leg, asserts it actually executed
+# tests, and aggregates the legs into one pass/fail gate.
 #
 # Headless / no platform-conditional normalization:
 #   - m1_mode_golden / m1_color_golden drive `Parser -> State` and pin
@@ -15,6 +15,11 @@
 #   - m1_mode_input drives runtime input encoding only (no frame).
 #   - m1_color_title uses `Surface::headless` plus the deterministic headless
 #     rasterizer, whose frames are byte-identical on Linux/macOS/Windows.
+#   - m1_shell_coverage spawns each installed M1 roster shell (bash/zsh/fish/
+#     PowerShell/cmd/nushell) through the real PTY with zero integration and
+#     injects OSC 7/133; a shell absent from a leg skips with a recorded
+#     reason (the suite still executes every test, so the floor holds), and
+#     the suite fails a leg whose runner resolves no roster shell at all.
 #   No Tier 1 platform therefore skips a suite and there is deliberately no
 #   skip list. If a future suite genuinely cannot run somewhere it fails here
 #   and needs an explicit, reviewed exemption instead of a silent omission.
@@ -51,6 +56,7 @@ M1_SUITES=(
   "m1_color_golden|bitty-compat-lab|7"
   "m1_mode_input|bitty-runtime|2"
   "m1_color_title|bitty-runtime|3"
+  "m1_shell_coverage|bitty-runtime|16"
 )
 
 # ADR-0002 Tier 1 platform legs as wired in .github/workflows/ci.yml.
@@ -62,7 +68,7 @@ usage: m1-matrix.sh <command> [options]
 
 commands:
   run --platform <id> [--out <file>] [--summary <file>]
-      Run the four M1 evidence suites for one platform and write a TSV.
+      Run the five M1 evidence suites for one platform and write a TSV.
       `--summary` (default: $GITHUB_STEP_SUMMARY) additionally appends the
       per-platform table to that file.
   aggregate [--dir <dir>] [--summary <file>]
@@ -177,7 +183,7 @@ cmd_run() {
 }
 
 # aggregate: stitch every platform TSV into one table and fail unless each
-# Tier 1 leg ran all four suites and passed.
+# Tier 1 leg ran all suites and passed.
 cmd_aggregate() {
   local dir="m1-results" summary="${M1_SUMMARY:-${GITHUB_STEP_SUMMARY:-}}"
   while (($# > 0)); do

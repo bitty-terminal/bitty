@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Five-shell coverage evidence (CTX-0588, M1-27, Issue #1153):**
+  `crates/bitty-runtime/tests/m1_shell_coverage.rs` drives the real PTY with
+  ZERO shell integration active (default config, no plugin, rc files
+  disabled) for every M1 roster shell installed on the runner
+  (bash/zsh/fish/PowerShell/cmd/nushell) and asserts the shell's own output
+  never fabricates `OSC 7`/`OSC 133` state. Each available shell then emits
+  injected `OSC 7` (cwd) and `OSC 133` A/B/C/D (`D;0`) sequences through the
+  shell itself, and the suite asserts the parser/state records exactly the
+  one cwd report and the ordered four-zone cycle with exit code 0. A
+  prompt-text purity test proves no prompt heuristic can synthesize cwd or
+  zones. Uninstalled shells skip with an explicit documented reason printed
+  as `SHELL-COVERAGE shell=<name> status=skipped reason=…`; an anti-vacuity
+  test fails a leg whose runner resolves no roster shell. The suite is a
+  member of `scripts/m1-matrix.sh` (floor 15) so it runs by name on every
+  ADR-0002 Tier 1 CI leg.
 - **Filesystem authorization with sensitive-path policy and secret
   detection (CTX-0523, research 045 §4):** the FS authorization path
   (agent tools, plugin capability calls, execution requests) evaluates

@@ -23,15 +23,22 @@ actionlint:
 # Spends remote CI only on what already passed here.
 #
 # Performance: the repository is bind-mounted (no 38 GB target/ copy), the
-# cargo registry/git caches are persisted under ../.targets/act-cache and
-# seeded once from the host CARGO_HOME (no re-download of ~800 crates), and
-# the build target dir lives in the same persistent cache so repeat runs are
-# incremental. Cargo uses every local core.
+# cargo registry/git caches are persisted under a per-branch
+# ../.targets/act-cache-<branch> dir (override with BITTY_ACT_CACHE for
+# explicit sharing) and seeded once from the host CARGO_HOME (no
+# re-download of ~800 crates), and the build target dir lives in the same
+# persistent cache so repeat runs are incremental. The per-branch default
+# keeps concurrent ci-local runs on different branches/tasks isolated:
+# sharing one act cache caused exit-137 SIGKILL plus cross-task path
+# contamination. Cargo uses every local core.
 ci-local *args:
     #!/usr/bin/env bash
     set -euo pipefail
     root="$(git rev-parse --show-toplevel)"
-    cache="${BITTY_ACT_CACHE:-$root/../.targets/act-cache}"
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)"
+    [ "$branch" = "HEAD" ] && branch="detached-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    tag="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-64)"
+    cache="${BITTY_ACT_CACHE:-$root/../.targets/act-cache-$tag}"
     host_cargo="${CARGO_HOME:-$HOME/.cargo}"
     # Fixed in-image toolchain locations baked into .github/act/Dockerfile.
     # scratch-paths-exempt: container paths, not host paths.

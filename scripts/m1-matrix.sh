@@ -30,7 +30,7 @@
 #
 # Usage:
 #   m1-matrix.sh run --platform <id> [--out <file>] [--summary <file>]
-#       Run the four M1 suites, write the TSV, print the per-platform table,
+#       Run the five M1 suites, write the TSV, print the per-platform table,
 #       and append it to <summary>.
 #   m1-matrix.sh aggregate [--dir <dir>] [--summary <file>]
 #       Require the complete Tier 1 matrix; print and (optionally) append the

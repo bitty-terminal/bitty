@@ -39,7 +39,11 @@ use crate::cell::{Attributes, Cell, Style};
 /// stack (`CTX-0575`): prior versions stored only the flattened bitmask, so
 /// states with identical live flags but different stack contents collided and
 /// a pop could not be replayed.
-pub const CANONICAL_HASH_VERSION: u32 = 8;
+/// v9 adds the inactive screen's Kitty flag register (`CTX-0575` F3): the
+/// protocol keeps separate main/alt registers, and re-entering the alternate
+/// screen resumes its prior register, so two states differing only in the
+/// stashed (inactive-screen) stack are not behaviorally identical.
+pub const CANONICAL_HASH_VERSION: u32 = 9;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -203,6 +207,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 8);
+        assert_eq!(CANONICAL_HASH_VERSION, 9);
     }
 }

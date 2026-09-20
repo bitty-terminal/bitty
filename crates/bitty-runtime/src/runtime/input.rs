@@ -220,9 +220,12 @@ impl Runtime {
     /// CTX-0575 completes the M1-13 subset with the authoritative flag
     /// semantics (`sw.kovidgoyal.net/kitty/keyboard-protocol`):
     ///
-    /// - `disambiguate` (bit 1) reports `Esc`/`ctrl`/`alt` ASCII keys and
-    ///   functional keys as `CSI u`, with bare `Enter`/`Tab`/`Backspace`
-    ///   kept legacy (spec exception so a crashed program can still `reset`);
+    /// - `disambiguate` (bit 1) reports `Esc`/`alt`/`ctrl`/`ctrl+alt`/
+    ///   `shift+alt` ASCII keys and functional keys as `CSI u`, with bare
+    ///   `Enter`/`Tab`/`Backspace` kept legacy (spec exception so a crashed
+    ///   program can still `reset`). A shift-only text key is *not*
+    ///   disambiguated — the shifted glyph is already the text — so it stays
+    ///   on the text path unless `report_all_keys` requests every key;
     /// - `report_events` (bit 2) adds the `:2`/`:3` event-type sub-field for
     ///   repeat/release; releases are dropped without it;
     /// - `report_alternates` (bit 4) adds the shifted key sub-field;
@@ -233,8 +236,9 @@ impl Runtime {
     ///   closed to the legacy text path).
     ///
     /// Every emitted frame is bounded to [`MAX_KITTY_FRAME_BYTES`]; an
-    /// over-bound frame falls back to the legacy encoder rather than
-    /// truncating a sequence. With flags `0` this delegates straight to the
+    /// over-bound frame is **dropped** (RFC `input-pointer-rfc` Kitty bounds:
+    /// "Every Kitty frame has a legacy equivalent or is dropped") rather
+    /// than truncated. With flags `0` this delegates straight to the
     /// legacy encoder, so the opt-in default-off behavior stays
     /// byte-identical (differential proof).
     pub(super) fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
@@ -294,6 +298,11 @@ impl Runtime {
             // into `CSI u`, or report-all-keys requests every key. Anything
             // else keeps the legacy bytes (raw UTF-8 / C0), so the default-off
             // and disambiguate-off behavior stays byte-identical.
+            //
+            // A shift-only text key is *not* disambiguated (the shifted glyph
+            // is already the text, and kitty treats it as a text key); only
+            // `alt`/`ctrl`/`ctrl+alt`/`shift+alt` combinations are, matching
+            // the spec's Disambiguate escape codes list.
             let add_actions = event_type.is_some();
             let add_alternates = shifted.is_some();
             let embed = if report_text && report_all {
@@ -302,7 +311,10 @@ impl Runtime {
                 None
             };
             let simple_encoding_ok = !add_actions && !add_alternates && embed.is_none();
-            if simple_encoding_ok && !report_all && !(disambiguate && mods != 0) {
+            // Disambiguation applies to alt/ctrl/ctrl+alt/shift+alt — i.e. any
+            // chord with alt or ctrl — but never shift alone.
+            let disambiguated_chord = self.alt_pressed || self.control_pressed;
+            if simple_encoding_ok && !report_all && !(disambiguate && disambiguated_chord) {
                 return self.kitty_fallback(event);
             }
             let frame = kitty_frame(code, shifted, mods, event_type, embed, b'u');
@@ -312,13 +324,17 @@ impl Runtime {
         // Named keys.
         if let bitty_platform::LogicalKey::Named(named) = &event.logical_key {
             // Space is a text-producing key (code 32) rather than a
-            // functional key, but winit models it as named. It only leaves the
-            // legacy path when report-all-keys asks for escape codes.
+            // functional key, but winit models it as named. It leaves the
+            // legacy path when report-all-keys asks for escape codes, or when
+            // disambiguate must report a `ctrl`/`alt` chord (e.g.
+            // `ctrl+Space` -> `CSI 32;5u` instead of the legacy NUL). A bare
+            // or shift-only Space stays text.
             if *named == bitty_platform::NamedKey::Space {
-                if !report_all {
+                let disambiguated_chord = self.alt_pressed || self.control_pressed;
+                if !report_all && !(disambiguate && disambiguated_chord) {
                     return self.kitty_fallback(event);
                 }
-                let embed = if report_text {
+                let embed = if report_text && report_all {
                     event.text.as_deref().filter(|text| !text.is_empty())
                 } else {
                     None
@@ -365,8 +381,12 @@ impl Runtime {
         bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
     }
 
-    /// Returns `frame` when it fits the per-key byte bound, else falls back to
-    /// the legacy encoder instead of truncating the sequence.
+    /// Returns `frame` when it fits the per-key byte bound, else drops it.
+    ///
+    /// RFC `input-pointer-rfc` Kitty bounds: "Every Kitty frame has a legacy
+    /// equivalent or is dropped with a bounded counter, never silently
+    /// misrouted." An over-bound frame therefore yields `None` (drop), never
+    /// a legacy fallback and never a truncated sequence.
     fn kitty_or_fallback(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
         if frame.len() <= MAX_KITTY_FRAME_BYTES {
             Some(frame)

@@ -166,6 +166,38 @@ fn kitty_keyboard_state_is_independent_per_alternate_screen() {
 }
 
 #[test]
+fn never_negotiated_alt_screen_reports_zero_flags() {
+    // F3 (review PX-3072): the alt screen must hold an independent register.
+    // Main negotiated 4; entering a fresh alt screen must report 0, and main
+    // must be restored untouched on exit.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=4u");
+    send(&mut rt, b"\x1b[?1049h");
+    send(&mut rt, b"\x1b[?u");
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b[?0u".to_vec()],
+        "alt screen that never negotiated reports flags 0, not main's 4"
+    );
+    send(&mut rt, b"\x1b[?1049l");
+    send(&mut rt, b"\x1b[?u");
+    assert_eq!(replies(&mut rt), vec![b"\x1b[?4u".to_vec()]);
+}
+
+#[test]
+fn alt_screen_reentrant_register_survives() {
+    // F3: the alt screen's own register is retained across alt sessions.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[?1049h");
+    send(&mut rt, b"\x1b[=2u"); // alt negotiates 2
+    send(&mut rt, b"\x1b[?1049l");
+    send(&mut rt, b"\x1b[?1049h"); // re-enter
+    send(&mut rt, b"\x1b[?u");
+    assert_eq!(replies(&mut rt), vec![b"\x1b[?2u".to_vec()]);
+    send(&mut rt, b"\x1b[?1049l");
+}
+
+#[test]
 fn legacy_7727_alias_still_negotiates_flags() {
     // Regression: the historical `?7727` alias keeps its old semantics while
     // the authoritative `CSI = u` form is the primary path.
@@ -207,6 +239,67 @@ fn disambiguate_encodes_ctrl_letter_as_csi_u() {
         "Ctrl+A under disambiguate is CSI 97;5u"
     );
     release_ctrl(&mut rt);
+}
+
+#[test]
+fn disambiguate_does_not_report_shift_only_text_keys() {
+    // F1 (review PX-3072): the Disambiguate flag covers Esc/alt/ctrl/ctrl+alt/
+    // shift+alt — never shift alone. A shifted text key keeps its text
+    // (report-all-keys is off), matching kitty's SEND_TEXT_TO_CHILD path.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u"); // disambiguate only
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", Some("A"), PressState::Pressed, false)),
+        Some(b"A".to_vec()),
+        "shift+A stays on the text path under CSI = 1u"
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("1", Some("!"), PressState::Pressed, false)),
+        Some(b"!".to_vec()),
+        "shift+1 stays on the text path under CSI = 1u"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn disambiguate_reports_shift_alt_but_not_shift_only() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Pressed));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("a", None, PressState::Pressed, false)),
+        Some(b"\x1b[97;4u".to_vec()),
+        "shift+alt+A is in the disambiguated set"
+    );
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn disambiguate_reports_ctrl_space_as_csi_u() {
+    // F2 (review PX-3072): ctrl+Space is a disambiguated chord and must be
+    // `CSI 32;5u`, not the legacy NUL byte.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    press_ctrl(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Space, PressState::Pressed)),
+        Some(b"\x1b[32;5u".to_vec()),
+        "ctrl+Space under disambiguate is CSI 32;5u"
+    );
+    release_ctrl(&mut rt);
+}
+
+#[test]
+fn bare_space_stays_text_under_disambiguate() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=1u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Space, PressState::Pressed)),
+        Some(b" ".to_vec())
+    );
 }
 
 #[test]

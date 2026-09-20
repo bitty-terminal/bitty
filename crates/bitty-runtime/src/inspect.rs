@@ -680,7 +680,11 @@ mod tests {
             80,
             24,
         );
-        let context = bitty_ipc::devtools::ServeContext::new(&server);
+        // The read surface requires a debug scope (P0-AC-025): model a peer
+        // that has been granted `debug.inspect`.
+        let mut granted = bitty_ipc::scope::ScopeSet::cli_default();
+        granted.insert(bitty_ipc::scope::Scope::DebugInspect);
+        let context = bitty_ipc::devtools::ServeContext::with_granted(&server, granted);
         let outcome = bitty_ipc::devtools::handle_envelope(
             br#"{"id":1,"method":"bitty.debug/getGridText","version":"1.0"}"#,
             &dispatcher,

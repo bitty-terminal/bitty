@@ -47,8 +47,11 @@
 //! buttons with coordinates), `bitty.debug/getModifiers` (modifier/latch
 //! state), and `bitty.debug/getFocus` (focus/window state). The live store is
 //! published by `bitty-runtime/src/inspect.rs` (`&self` only, never mutating
-//! terminal truth); every query is read-only. The
-//! [`Dispatcher`] remains an extensible method table: new `bitty.debug/*`
+//! terminal truth); every query is read-only. Per P0-AC-025, connection alone
+//! grants no debug scope: `getSnapshot` and the four introspection methods
+//! require a granted debug scope (`debug.inspect`, or the wider `debug.trace`
+//! / `debug.control`) and deny an ungranted peer with `scope`/`ScopeDenied`.
+//! The [`Dispatcher`] remains an extensible method table: new `bitty.debug/*`
 //! handlers register via [`Dispatcher::register`] without reworking framing,
 //! parsing, or the connection loop. CTX-0188 adds test automation
 //! (`synthesizeInput` + `captureFrame`, bearer-scoped per Amendment A1):

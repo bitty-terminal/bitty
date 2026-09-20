@@ -172,7 +172,11 @@ fn spawn_verify_server(socket_path: String, granted: ScopeSet) -> std::thread::J
 fn serve_with_cli_default(tag: &str) -> (String, std::thread::JoinHandle<()>) {
     let socket_path = temp_socket_path(tag);
     prepare_socket_dir(&socket_path).unwrap();
-    let server = spawn_verify_server(socket_path.clone(), ScopeSet::cli_default());
+    // The read surface needs a debug scope (P0-AC-025): the harness models a
+    // session granted `debug.inspect` (CLI default plus that one scope).
+    let mut granted = ScopeSet::cli_default();
+    granted.insert(bitty_ipc::scope::Scope::DebugInspect);
+    let server = spawn_verify_server(socket_path.clone(), granted);
     // Give the listener a moment to bind (bounded, local-only).
     std::thread::sleep(Duration::from_millis(100));
     (socket_path, server)
@@ -349,6 +353,57 @@ fn verify_modifiers_and_input_ring_observability() {
         ring.contains(r#""count":2"#),
         "unexpected ring count: {ring}"
     );
+
+    drop(client);
+    server.join().unwrap();
+    clear_introspection_for_tests();
+    std::fs::remove_file(&socket_path).ok();
+}
+
+#[test]
+fn verify_unscoped_read_surface_denied_machine_checkably() {
+    // P0-AC-025 (read half) over a real socket: a peer with an empty granted
+    // set (connection alone) must be denied every read method with a typed
+    // `scope`/`ScopeDenied` and must not receive terminal content.
+    let _guard = hold_verify_lock();
+    clear_introspection_for_tests();
+    publish_grid_text(
+        vec!["SECRET-GRID-MUST-NOT-LEAK".to_string()],
+        0,
+        0,
+        true,
+        5,
+        80,
+        24,
+    );
+
+    let socket_path = temp_socket_path("vr");
+    prepare_socket_dir(&socket_path).unwrap();
+    let server = spawn_verify_server(socket_path.clone(), ScopeSet::new());
+    std::thread::sleep(Duration::from_millis(100));
+    let mut client = VerifyClient::connect(&socket_path);
+
+    for method in [
+        "bitty.debug/getSnapshot",
+        "bitty.debug/getGridText",
+        "bitty.debug/getInputRing",
+        "bitty.debug/getModifiers",
+        "bitty.debug/getFocus",
+    ] {
+        let denied = client.call(method, None);
+        assert!(
+            denied.contains("\"error\"") && denied.contains("ScopeDenied"),
+            "{method} on a connection-only peer must be ScopeDenied: {denied}"
+        );
+        assert!(
+            denied.contains("\"category\":\"scope\""),
+            "{method} denial must be typed scope on the wire: {denied}"
+        );
+        assert!(
+            !denied.contains("SECRET-GRID-MUST-NOT-LEAK"),
+            "{method} must not leak content on a denial: {denied}"
+        );
+    }
 
     drop(client);
     server.join().unwrap();

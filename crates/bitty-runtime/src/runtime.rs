@@ -693,7 +693,7 @@ pub struct Runtime {
     /// Count of bell/notification events dropped by the `RC-8` limiter.
     bell_rate_dropped: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
-    kitty_flags: u32,
+    enhanced_keyboard_flags: u32,
     shift_pressed: bool,
     control_pressed: bool,
     alt_pressed: bool,
@@ -1170,7 +1170,7 @@ impl Runtime {
             notification_banner: None,
             notifications_denied: 0,
             bell_rate_dropped: 0,
-            kitty_flags: 0,
+            enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,
@@ -1348,7 +1348,7 @@ impl Runtime {
             notification_banner: None,
             notifications_denied: 0,
             bell_rate_dropped: 0,
-            kitty_flags: 0,
+            enhanced_keyboard_flags: 0,
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,
@@ -1443,8 +1443,8 @@ impl Runtime {
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.
     #[must_use]
-    pub fn kitty_flags(&self) -> u32 {
-        self.kitty_flags
+    pub fn enhanced_keyboard_flags(&self) -> u32 {
+        self.enhanced_keyboard_flags
     }
 
     /// Whether Shift is currently latched (CTX-0159 read-only accessor).
@@ -1508,7 +1508,7 @@ impl Runtime {
             shift: self.shift_pressed,
             control: self.control_pressed,
             alt: self.alt_pressed,
-            kitty_flags: self.kitty_flags,
+            enhanced_keyboard_flags: self.enhanced_keyboard_flags,
         });
         // CTX-0532: the focus/mode telemetry mirrors the reader attribution:
         // bracketed paste and focus reporting come from the focused pane's

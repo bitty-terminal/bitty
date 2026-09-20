@@ -448,7 +448,7 @@ pub struct ModifierSnapshot {
     /// Whether Alt is currently latched.
     pub alt: bool,
     /// Live Kitty keyboard flags (`0` means legacy).
-    pub kitty_flags: u32,
+    pub enhanced_keyboard_flags: u32,
 }
 
 /// Bounded focus/window snapshot (owned, `Send`).
@@ -518,7 +518,7 @@ pub fn publish_modifiers(snapshot: &ModifierSnapshot) {
         shift: snapshot.shift,
         control: snapshot.control,
         alt: snapshot.alt,
-        kitty_flags: snapshot.kitty_flags,
+        enhanced_keyboard_flags: snapshot.enhanced_keyboard_flags,
     });
 }
 
@@ -660,7 +660,7 @@ mod tests {
             shift: false,
             control: true,
             alt: false,
-            kitty_flags: 0,
+            enhanced_keyboard_flags: 0,
         });
         publish_focus(&FocusSnapshot {
             focused: true,

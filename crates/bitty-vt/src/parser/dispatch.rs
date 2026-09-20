@@ -8,10 +8,11 @@ use super::sgr::parse_sgr;
 use super::{Bridge, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
-    DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
-    KittyKeyboardOp, KittyKeyboardSetMode, MAX_OSC4_OPS, Mode, MouseCoordinateEncoding,
-    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, Rgb, Row,
-    SequenceKind, StatusKind, TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
+    DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, MAX_OSC4_OPS, Mode,
+    MouseCoordinateEncoding, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
+    PaletteOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
+    UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use vte::{Params, Perform};
@@ -33,7 +34,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
         }));
     }
 
-    fn kitty_flags_from_sub(sub: &[u16]) -> u32 {
+    fn enhanced_keyboard_flags_from_sub(sub: &[u16]) -> u32 {
         // Progressive Kitty flags: sub[0] == 7727, remaining entries are colon-
         // separated flag identifiers. Each identifier is either a 1-indexed flag
         // number (1..5 -> bit 0..4) or a direct bitmask fragment. We handle both:
@@ -64,11 +65,11 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
     /// `CSI ? u`. Any other intermediate/parameter shape returns `None` so the
     /// caller records it as inert unknown telemetry. Flags are not masked
     /// here; the state layer owns the five-bit bound.
-    fn kitty_keyboard_op(
+    fn enhanced_keyboard_op(
         intermediates: &[u8],
         params: &Params,
         final_byte: u8,
-    ) -> Option<KittyKeyboardOp> {
+    ) -> Option<EnhancedKeyboardOp> {
         if final_byte != b'u' {
             return None;
         }
@@ -76,17 +77,17 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             b"=" => {
                 let flags = u32::from(mode_value(params, 0));
                 let mode = match lead_value(sub_params(params, 1)) {
-                    None | Some(1) => KittyKeyboardSetMode::Assign,
-                    Some(2) => KittyKeyboardSetMode::Set,
-                    Some(3) => KittyKeyboardSetMode::Reset,
+                    None | Some(1) => EnhancedKeyboardSetMode::Assign,
+                    Some(2) => EnhancedKeyboardSetMode::Set,
+                    Some(3) => EnhancedKeyboardSetMode::Reset,
                     Some(_) => return None,
                 };
-                Some(KittyKeyboardOp::Set { flags, mode })
+                Some(EnhancedKeyboardOp::Set { flags, mode })
             }
-            b">" => Some(KittyKeyboardOp::Push {
+            b">" => Some(EnhancedKeyboardOp::Push {
                 flags: u32::from(mode_value(params, 0)),
             }),
-            b"<" => Some(KittyKeyboardOp::Pop {
+            b"<" => Some(EnhancedKeyboardOp::Pop {
                 n: resolved_count(params, 0).0,
             }),
             b"?" => {
@@ -95,7 +96,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
                 // Any other parameter form is not part of the protocol and
                 // stays unknown telemetry.
                 if params.len() <= 1 && mode_value(params, 0) == 0 {
-                    Some(KittyKeyboardOp::Query)
+                    Some(EnhancedKeyboardOp::Query)
                 } else {
                     None
                 }
@@ -131,7 +132,7 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
             2026 => Some(Mode::SynchronizedUpdate),
             7727 => {
                 let flags = if enabled {
-                    Self::kitty_flags_from_sub(sub)
+                    Self::enhanced_keyboard_flags_from_sub(sub)
                 } else if sub.len() > 1 {
                     // Progressive disable: extract flags to clear; if none, 0 means all
                     let mut f: u32 = 0;
@@ -447,8 +448,8 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         // Classified before the generic intermediate guard below so these
         // shapes never collapse to inert telemetry.
         if final_byte == b'u' && matches!(intermediates, b"=" | b">" | b"<" | b"?") {
-            match Self::kitty_keyboard_op(intermediates, params, final_byte) {
-                Some(op) => self.emit(TerminalAction::KittyKeyboard { op }),
+            match Self::enhanced_keyboard_op(intermediates, params, final_byte) {
+                Some(op) => self.emit(TerminalAction::EnhancedKeyboard { op }),
                 None => self.unknown_csi(intermediates, final_byte),
             }
             return;
@@ -485,7 +486,7 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                     // Progressive Kitty flags: colon subparams inside same entry plus
                     // semicolon-separated flag masks immediately following this entry.
                     let mut flags = if enabled {
-                        Self::kitty_flags_from_sub(sub)
+                        Self::enhanced_keyboard_flags_from_sub(sub)
                     } else if sub.len() > 1 {
                         let mut f: u32 = 0;
                         for &v in &sub[1..] {

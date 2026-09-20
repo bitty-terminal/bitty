@@ -313,7 +313,7 @@ pub enum Mode {
 /// set, all unset bits reset), `2` sets only the named bits, `3` resets only
 /// the named bits. Unknown modes fail closed (no state change).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KittyKeyboardSetMode {
+pub enum EnhancedKeyboardSetMode {
     /// `mode 1`: replace the whole flag register with `flags`.
     Assign,
     /// `mode 2`: OR `flags` into the register.
@@ -330,14 +330,14 @@ pub enum KittyKeyboardSetMode {
 /// only classifies the wire form — the bounded flag register and push/pop
 /// stack live in terminal state (RFC invariant 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KittyKeyboardOp {
+pub enum EnhancedKeyboardOp {
     /// `CSI = flags ; mode u`: combine `flags` into the register by `mode`.
     Set {
         /// Enhancement bits named by the sequence (masked to the five
         /// defined bits by terminal state).
         flags: u32,
         /// How the bits combine with the live register.
-        mode: KittyKeyboardSetMode,
+        mode: EnhancedKeyboardSetMode,
     },
     /// `CSI > flags u`: push the current flags and set `flags` (default 0).
     Push {
@@ -746,10 +746,10 @@ pub enum TerminalAction {
     /// Emitted for `CSI = flags ; mode u`, `CSI > flags u`, `CSI < n u`, and
     /// `CSI ? u`. Terminal state owns the bounded flag register and the
     /// per-screen push/pop stack and synthesizes the `CSI ? flags u` reply
-    /// for [`KittyKeyboardOp::Query`].
-    KittyKeyboard {
+    /// for [`EnhancedKeyboardOp::Query`].
+    EnhancedKeyboard {
         /// Classified wire operation.
-        op: KittyKeyboardOp,
+        op: EnhancedKeyboardOp,
     },
 
     // Device status and replies

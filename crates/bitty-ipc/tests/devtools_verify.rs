@@ -302,7 +302,7 @@ fn verify_modifiers_and_input_ring_observability() {
         shift: false,
         control: true,
         alt: false,
-        kitty_flags: 0,
+        enhanced_keyboard_flags: 0,
     });
     publish_input_ring(vec![
         InputEventPublish {

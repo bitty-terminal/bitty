@@ -328,87 +328,87 @@ fn reply_synthesis_is_origin_aware_and_bounded() {
 }
 
 #[test]
-fn kitty_keyboard_stack_set_push_pop_and_query_reply() {
-    use bitty_vt::{KittyKeyboardOp, KittyKeyboardSetMode};
+fn enhanced_keyboard_stack_set_push_pop_and_query_reply() {
+    use bitty_vt::{EnhancedKeyboardOp, EnhancedKeyboardSetMode};
     let mut s = State::new();
-    let op = |op| TerminalAction::KittyKeyboard { op };
-    s.apply(&op(KittyKeyboardOp::Set {
+    let op = |op| TerminalAction::EnhancedKeyboard { op };
+    s.apply(&op(EnhancedKeyboardOp::Set {
         flags: 3,
-        mode: KittyKeyboardSetMode::Assign,
+        mode: EnhancedKeyboardSetMode::Assign,
     }));
-    assert_eq!(s.modes.kitty_keyboard.flags(), 3);
-    s.apply(&op(KittyKeyboardOp::Push { flags: 8 }));
-    assert_eq!(s.modes.kitty_keyboard.flags(), 8);
-    assert_eq!(s.modes.kitty_keyboard.depth(), 2);
-    s.apply(&op(KittyKeyboardOp::Pop { n: 1 }));
-    assert_eq!(s.modes.kitty_keyboard.flags(), 3);
+    assert_eq!(s.modes.enhanced_keyboard.flags(), 3);
+    s.apply(&op(EnhancedKeyboardOp::Push { flags: 8 }));
+    assert_eq!(s.modes.enhanced_keyboard.flags(), 8);
+    assert_eq!(s.modes.enhanced_keyboard.depth(), 2);
+    s.apply(&op(EnhancedKeyboardOp::Pop { n: 1 }));
+    assert_eq!(s.modes.enhanced_keyboard.flags(), 3);
     // Bounded: an oversized pop empties the stack and resets the flags.
-    s.apply(&op(KittyKeyboardOp::Pop { n: u16::MAX }));
-    assert_eq!(s.modes.kitty_keyboard.flags(), 0);
-    assert_eq!(s.modes.kitty_keyboard.depth(), 0);
+    s.apply(&op(EnhancedKeyboardOp::Pop { n: u16::MAX }));
+    assert_eq!(s.modes.enhanced_keyboard.flags(), 0);
+    assert_eq!(s.modes.enhanced_keyboard.depth(), 0);
     // Query replies with the live flags without touching state.
-    s.apply(&op(KittyKeyboardOp::Set {
+    s.apply(&op(EnhancedKeyboardOp::Set {
         flags: 31,
-        mode: KittyKeyboardSetMode::Assign,
+        mode: EnhancedKeyboardSetMode::Assign,
     }));
-    s.apply(&op(KittyKeyboardOp::Query));
+    s.apply(&op(EnhancedKeyboardOp::Query));
     let replies = s.take_replies();
     assert_eq!(&replies[0][..], b"\x1b[?31u");
 }
 
 #[test]
-fn kitty_keyboard_stack_is_bounded_and_evicts_oldest() {
+fn enhanced_keyboard_stack_is_bounded_and_evicts_oldest() {
     let mut s = State::new();
     for flags in 0..12u32 {
-        s.apply(&TerminalAction::KittyKeyboard {
-            op: bitty_vt::KittyKeyboardOp::Push { flags },
+        s.apply(&TerminalAction::EnhancedKeyboard {
+            op: bitty_vt::EnhancedKeyboardOp::Push { flags },
         });
     }
     assert_eq!(
-        s.modes.kitty_keyboard.depth(),
-        crate::modes::KITTY_KEYBOARD_STACK_MAX
+        s.modes.enhanced_keyboard.depth(),
+        crate::modes::ENHANCED_KEYBOARD_STACK_MAX
     );
     // Oldest entries were evicted: the top is the last pushed value.
-    assert_eq!(s.modes.kitty_keyboard.flags(), 11);
+    assert_eq!(s.modes.enhanced_keyboard.flags(), 11);
 }
 
 #[test]
-fn kitty_keyboard_stack_participates_in_the_state_hash() {
+fn enhanced_keyboard_stack_participates_in_the_state_hash() {
     let mut pushed = State::new();
-    pushed.apply(&TerminalAction::KittyKeyboard {
-        op: bitty_vt::KittyKeyboardOp::Set {
+    pushed.apply(&TerminalAction::EnhancedKeyboard {
+        op: bitty_vt::EnhancedKeyboardOp::Set {
             flags: 1,
-            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+            mode: bitty_vt::EnhancedKeyboardSetMode::Assign,
         },
     });
-    pushed.apply(&TerminalAction::KittyKeyboard {
-        op: bitty_vt::KittyKeyboardOp::Push { flags: 1 },
+    pushed.apply(&TerminalAction::EnhancedKeyboard {
+        op: bitty_vt::EnhancedKeyboardOp::Push { flags: 1 },
     });
     // Same live flags, different stack depth: hashes must differ (v8).
     let mut flat = State::new();
-    flat.apply(&TerminalAction::KittyKeyboard {
-        op: bitty_vt::KittyKeyboardOp::Set {
+    flat.apply(&TerminalAction::EnhancedKeyboard {
+        op: bitty_vt::EnhancedKeyboardOp::Set {
             flags: 1,
-            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+            mode: bitty_vt::EnhancedKeyboardSetMode::Assign,
         },
     });
     assert_eq!(
-        pushed.modes.kitty_keyboard.flags(),
-        flat.modes.kitty_keyboard.flags()
+        pushed.modes.enhanced_keyboard.flags(),
+        flat.modes.enhanced_keyboard.flags()
     );
     assert_ne!(pushed.state_hash(), flat.state_hash());
 }
 
 #[test]
-fn kitty_keyboard_register_is_per_screen() {
+fn enhanced_keyboard_register_is_per_screen() {
     // F3 (review PX-3072): entering the alternate screen switches to a fresh
     // independent register; main's register is restored on exit and the alt
     // register survives re-entry.
     let mut s = State::new();
-    s.apply(&TerminalAction::KittyKeyboard {
-        op: bitty_vt::KittyKeyboardOp::Set {
+    s.apply(&TerminalAction::EnhancedKeyboard {
+        op: bitty_vt::EnhancedKeyboardOp::Set {
             flags: 4,
-            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+            mode: bitty_vt::EnhancedKeyboardSetMode::Assign,
         },
     });
     s.apply(&TerminalAction::SetMode {
@@ -416,34 +416,38 @@ fn kitty_keyboard_register_is_per_screen() {
         enabled: true,
     });
     assert_eq!(
-        s.modes.kitty_keyboard.flags(),
+        s.modes.enhanced_keyboard.flags(),
         0,
         "already-negotiated main flags must not leak into a fresh alt screen"
     );
-    s.apply(&TerminalAction::KittyKeyboard {
-        op: bitty_vt::KittyKeyboardOp::Set {
+    s.apply(&TerminalAction::EnhancedKeyboard {
+        op: bitty_vt::EnhancedKeyboardOp::Set {
             flags: 2,
-            mode: bitty_vt::KittyKeyboardSetMode::Assign,
+            mode: bitty_vt::EnhancedKeyboardSetMode::Assign,
         },
     });
     s.apply(&TerminalAction::SetMode {
         mode: Mode::AlternateScreenClearAndRestore,
         enabled: false,
     });
-    assert_eq!(s.modes.kitty_keyboard.flags(), 4, "main register restored");
+    assert_eq!(
+        s.modes.enhanced_keyboard.flags(),
+        4,
+        "main register restored"
+    );
     s.apply(&TerminalAction::SetMode {
         mode: Mode::AlternateScreenClearAndRestore,
         enabled: true,
     });
     assert_eq!(
-        s.modes.kitty_keyboard.flags(),
+        s.modes.enhanced_keyboard.flags(),
         2,
         "alt register survives a re-entry"
     );
 }
 
 #[test]
-fn kitty_keyboard_stash_participates_in_the_state_hash() {
+fn enhanced_keyboard_stash_participates_in_the_state_hash() {
     // Two states with identical live flags but different inactive-screen
     // registers are not behaviorally identical (v9).
     let negotiate_and_leave = |alt_flags: Option<u32>| {
@@ -453,10 +457,10 @@ fn kitty_keyboard_stash_participates_in_the_state_hash() {
                 mode: Mode::AlternateScreenClearAndRestore,
                 enabled: true,
             });
-            s.apply(&TerminalAction::KittyKeyboard {
-                op: bitty_vt::KittyKeyboardOp::Set {
+            s.apply(&TerminalAction::EnhancedKeyboard {
+                op: bitty_vt::EnhancedKeyboardOp::Set {
                     flags,
-                    mode: bitty_vt::KittyKeyboardSetMode::Assign,
+                    mode: bitty_vt::EnhancedKeyboardSetMode::Assign,
                 },
             });
             s.apply(&TerminalAction::SetMode {
@@ -468,8 +472,8 @@ fn kitty_keyboard_stash_participates_in_the_state_hash() {
     };
     let with_stash = negotiate_and_leave(Some(2));
     let without_stash = negotiate_and_leave(None);
-    assert_eq!(with_stash.modes.kitty_keyboard.flags(), 0);
-    assert_eq!(without_stash.modes.kitty_keyboard.flags(), 0);
+    assert_eq!(with_stash.modes.enhanced_keyboard.flags(), 0);
+    assert_eq!(without_stash.modes.enhanced_keyboard.flags(), 0);
     assert_ne!(with_stash.state_hash(), without_stash.state_hash());
 }
 

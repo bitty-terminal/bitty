@@ -12,26 +12,26 @@
 //!   parser's closed `Mode` enum has no explicit "off" variant; disabling
 //!   clears the option.
 
-use bitty_vt::{KittyKeyboardSetMode, MouseCoordinateEncoding, MouseTrackingMode};
+use bitty_vt::{EnhancedKeyboardSetMode, MouseCoordinateEncoding, MouseTrackingMode};
 
 /// Maximum depth of the Kitty keyboard-protocol push/pop stack (CTX-0575).
 ///
 /// The spec requires terminals to bound the stack against denial-of-service;
 /// eight entries matches the reference implementations (kitty, ghostty) and
 /// the RFC "bounded parser" rule.
-pub const KITTY_KEYBOARD_STACK_MAX: usize = 8;
+pub const ENHANCED_KEYBOARD_STACK_MAX: usize = 8;
 
 /// Mask of the five defined Kitty keyboard progressive-enhancement bits:
 /// disambiguate, report events, report alternates, report all keys, report
 /// associated text. Unknown wire bits are ignored.
-pub const KITTY_KEYBOARD_FLAG_MASK: u32 = 0x1F;
+pub const ENHANCED_KEYBOARD_FLAG_MASK: u32 = 0x1F;
 
 /// Live Kitty keyboard-protocol flag register plus its bounded push/pop stack
 /// (CTX-0575).
 ///
 /// `entries` is a stack whose top is the current flag register. `len == 0`
 /// means no register exists yet and the live flags are zero, matching
-/// [`KittyKeyboardSetMode`] assignment semantics: a pop that empties the
+/// [`EnhancedKeyboardSetMode`] assignment semantics: a pop that empties the
 /// stack resets all flags (spec "progressive enhancement"), and a later set
 /// re-creates the base entry.
 ///
@@ -42,28 +42,28 @@ pub const KITTY_KEYBOARD_FLAG_MASK: u32 = 0x1F;
 /// alt-screen negotiation never mutates the main register and exit restores
 /// it. This matches how every other mode in this register is handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KittyKeyboardState {
-    entries: [u8; KITTY_KEYBOARD_STACK_MAX],
+pub struct EnhancedKeyboardState {
+    entries: [u8; ENHANCED_KEYBOARD_STACK_MAX],
     len: u8,
 }
 
-impl Default for KittyKeyboardState {
+impl Default for EnhancedKeyboardState {
     fn default() -> Self {
         Self {
-            entries: [0; KITTY_KEYBOARD_STACK_MAX],
+            entries: [0; ENHANCED_KEYBOARD_STACK_MAX],
             len: 0,
         }
     }
 }
 
-impl KittyKeyboardState {
+impl EnhancedKeyboardState {
     /// Current active flags (`0` when no register exists).
     #[must_use]
     pub fn flags(&self) -> u32 {
         if self.len == 0 {
             0
         } else {
-            u32::from(self.entries[self.len as usize - 1]) & KITTY_KEYBOARD_FLAG_MASK
+            u32::from(self.entries[self.len as usize - 1]) & ENHANCED_KEYBOARD_FLAG_MASK
         }
     }
 
@@ -80,8 +80,8 @@ impl KittyKeyboardState {
     }
 
     /// Applies one `CSI = flags ; mode u` assignment (five-bit bounded).
-    pub fn set(&mut self, flags: u32, mode: KittyKeyboardSetMode) {
-        let flags = (flags & KITTY_KEYBOARD_FLAG_MASK) as u8;
+    pub fn set(&mut self, flags: u32, mode: EnhancedKeyboardSetMode) {
+        let flags = (flags & ENHANCED_KEYBOARD_FLAG_MASK) as u8;
         if self.len == 0 {
             // Re-create the base entry (post-pop or initial assignment).
             self.entries[0] = 0;
@@ -89,20 +89,20 @@ impl KittyKeyboardState {
         }
         let top = self.len as usize - 1;
         match mode {
-            KittyKeyboardSetMode::Assign => self.entries[top] = flags,
-            KittyKeyboardSetMode::Set => self.entries[top] |= flags,
-            KittyKeyboardSetMode::Reset => self.entries[top] &= !flags,
+            EnhancedKeyboardSetMode::Assign => self.entries[top] = flags,
+            EnhancedKeyboardSetMode::Set => self.entries[top] |= flags,
+            EnhancedKeyboardSetMode::Reset => self.entries[top] &= !flags,
         }
     }
 
     /// Pushes `flags` as the new current register; when full, the oldest entry
-    /// is evicted (spec), never growing past [`KITTY_KEYBOARD_STACK_MAX`].
+    /// is evicted (spec), never growing past [`ENHANCED_KEYBOARD_STACK_MAX`].
     pub fn push(&mut self, flags: u32) {
-        if self.len as usize == KITTY_KEYBOARD_STACK_MAX {
-            self.entries.copy_within(1..KITTY_KEYBOARD_STACK_MAX, 0);
+        if self.len as usize == ENHANCED_KEYBOARD_STACK_MAX {
+            self.entries.copy_within(1..ENHANCED_KEYBOARD_STACK_MAX, 0);
             self.len -= 1;
         }
-        self.entries[self.len as usize] = (flags & KITTY_KEYBOARD_FLAG_MASK) as u8;
+        self.entries[self.len as usize] = (flags & ENHANCED_KEYBOARD_FLAG_MASK) as u8;
         self.len += 1;
     }
 
@@ -114,7 +114,7 @@ impl KittyKeyboardState {
     pub fn pop(&mut self, n: u32) {
         let n = n as usize;
         if n >= self.len as usize {
-            self.entries = [0; KITTY_KEYBOARD_STACK_MAX];
+            self.entries = [0; ENHANCED_KEYBOARD_STACK_MAX];
             self.len = 0;
             return;
         }
@@ -162,8 +162,8 @@ pub struct Modes {
     /// cannot stall presentation indefinitely.
     pub synchronized_update: bool,
     /// Kitty keyboard progressive flag register and bounded push/pop stack
-    /// (CTX-0575). The live bitmask is [`KittyKeyboardState::flags`].
-    pub kitty_keyboard: KittyKeyboardState,
+    /// (CTX-0575). The live bitmask is [`EnhancedKeyboardState::flags`].
+    pub enhanced_keyboard: EnhancedKeyboardState,
     /// Active mouse-tracking protocol level (`None`: off).
     pub mouse_tracking: Option<MouseTrackingMode>,
     /// Extended mouse coordinate encoding (`None`: legacy default).
@@ -186,7 +186,7 @@ impl Default for Modes {
             focus_events: false,
             alternate_scroll: false,
             synchronized_update: false,
-            kitty_keyboard: KittyKeyboardState::default(),
+            enhanced_keyboard: EnhancedKeyboardState::default(),
             mouse_tracking: None,
             mouse_coordinate_encoding: None,
         }

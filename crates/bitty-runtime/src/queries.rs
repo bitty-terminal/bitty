@@ -230,7 +230,7 @@ pub(crate) fn decrqm_value(state: &State, private: bool, mode: u16) -> u8 {
         ),
         2004 => Some(state.modes().bracketed_paste),
         2026 => Some(state.modes().synchronized_update),
-        7727 => Some(state.modes().kitty_keyboard.flags() != 0),
+        7727 => Some(state.modes().enhanced_keyboard.flags() != 0),
         _ => None,
     };
     match set {

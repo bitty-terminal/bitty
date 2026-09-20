@@ -399,7 +399,7 @@ pub struct ModifiersPublish {
     /// Whether Alt is latched.
     pub alt: bool,
     /// Live Kitty keyboard flags (`0` means legacy).
-    pub kitty_flags: u32,
+    pub enhanced_keyboard_flags: u32,
 }
 
 /// Focus/window state published by the runtime.
@@ -448,7 +448,7 @@ struct StoredModifiers {
     /// Alt latch.
     alt: bool,
     /// Kitty flags.
-    kitty_flags: u32,
+    enhanced_keyboard_flags: u32,
 }
 
 /// Stored focus snapshot.
@@ -571,7 +571,7 @@ pub fn publish_modifiers(snapshot: ModifiersPublish) {
             shift: snapshot.shift,
             control: snapshot.control,
             alt: snapshot.alt,
-            kitty_flags: snapshot.kitty_flags,
+            enhanced_keyboard_flags: snapshot.enhanced_keyboard_flags,
         };
     }
 }
@@ -944,7 +944,7 @@ fn handle_get_modifiers(
     out.push_str(",\"alt\":");
     out.push_str(if guard.alt { "true" } else { "false" });
     out.push_str(",\"kitty_flags\":");
-    out.push_str(&guard.kitty_flags.to_string());
+    out.push_str(&guard.enhanced_keyboard_flags.to_string());
     out.push('}');
     Ok(out)
 }

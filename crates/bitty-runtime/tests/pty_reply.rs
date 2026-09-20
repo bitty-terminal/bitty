@@ -14,7 +14,7 @@ use bitty_runtime::Runtime;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
-fn kitty_progressive_flags_via_parser() {
+fn enhanced_keyboard_progressive_flags_via_parser() {
     // Headless parser → state path for Kitty progressive flags.
     // This test proves the parser fix: 7727 with colon subparams `1:2:5` etc
     // must produce a bitmask 19 (1|2|16) not just 1, and must survive via state.
@@ -22,14 +22,14 @@ fn kitty_progressive_flags_via_parser() {
     // Enable with progressive flags 1:2:5 (bits 0,1,4 => 1|2|16=19)
     rt.handle_pty_bytes(b"\x1b[?7727:1:2:5h");
     assert_eq!(
-        rt.kitty_flags() & 0x1F,
+        rt.enhanced_keyboard_flags() & 0x1F,
         19,
         "progressive 1:2:5 must map to 19 (1|2|16)"
     );
     // Disable flag 2 via `1:2`
     rt.handle_pty_bytes(b"\x1b[?7727:2l");
     assert_eq!(
-        rt.kitty_flags() & 0x1F,
+        rt.enhanced_keyboard_flags() & 0x1F,
         17,
         "after disabling flag 2, 19 & !2 == 17"
     );
@@ -38,17 +38,17 @@ fn kitty_progressive_flags_via_parser() {
     rt2.handle_pty_bytes(b"\x1b[?7727;3h");
     // Our progressive semicolon handling ORs following masks; 7727 alone defaults 1, ;3 replaces to 3
     assert_eq!(
-        rt2.kitty_flags() & 0x1F,
+        rt2.enhanced_keyboard_flags() & 0x1F,
         3,
         "semicolon mask 3 must be parsed"
     );
     // Simple enable without flags defaults to 1
     let mut rt3 = Runtime::with_defaults().expect("build");
     rt3.handle_pty_bytes(b"\x1b[?7727h");
-    assert_eq!(rt3.kitty_flags() & 0x1F, 1);
+    assert_eq!(rt3.enhanced_keyboard_flags() & 0x1F, 1);
     // Disable all
     rt3.handle_pty_bytes(b"\x1b[?7727l");
-    assert_eq!(rt3.kitty_flags() & 0x1F, 0);
+    assert_eq!(rt3.enhanced_keyboard_flags() & 0x1F, 0);
 }
 
 #[test]

@@ -1254,7 +1254,7 @@ fn introspection_round_trip_all_methods_sequential() {
         shift: true,
         control: false,
         alt: false,
-        kitty_flags: 0,
+        enhanced_keyboard_flags: 0,
     });
     publish_focus(FocusPublish {
         focused: true,

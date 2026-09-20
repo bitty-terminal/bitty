@@ -15,18 +15,18 @@ pub const IME_PREEDIT_MAX_CHARS: usize = 128;
 /// (CTX-0575). Matches the `input-pointer-rfc.md` Kitty bound: one key yields
 /// at most 64 bytes of `CSI u`; an over-bound frame falls back to legacy
 /// rather than truncating a sequence.
-pub const MAX_KITTY_FRAME_BYTES: usize = 64;
+pub const MAX_EXT_KEY_FRAME_BYTES: usize = 64;
 
 /// Kitty keyboard flag: disambiguate `Esc`/`ctrl`/`alt` ASCII keys (bit 1).
-pub const KITTY_FLAG_DISAMBIGUATE: u32 = 1 << 0;
+pub const EXT_KEY_FLAG_DISAMBIGUATE: u32 = 1 << 0;
 /// Kitty keyboard flag: report repeat/release event types (bit 2).
-pub const KITTY_FLAG_REPORT_EVENTS: u32 = 1 << 1;
+pub const EXT_KEY_FLAG_REPORT_EVENTS: u32 = 1 << 1;
 /// Kitty keyboard flag: report shifted/alternate keys (bit 4).
-pub const KITTY_FLAG_REPORT_ALTERNATES: u32 = 1 << 2;
+pub const EXT_KEY_FLAG_REPORT_ALTERNATES: u32 = 1 << 2;
 /// Kitty keyboard flag: report text-producing keys as escape codes (bit 8).
-pub const KITTY_FLAG_REPORT_ALL_KEYS: u32 = 1 << 3;
+pub const EXT_KEY_FLAG_REPORT_ALL_KEYS: u32 = 1 << 3;
 /// Kitty keyboard flag: embed associated text codepoints (bit 16).
-pub const KITTY_FLAG_REPORT_TEXT: u32 = 1 << 4;
+pub const EXT_KEY_FLAG_REPORT_TEXT: u32 = 1 << 4;
 
 /// Builds one Kitty `CSI` key frame per the spec's `serialize` algorithm.
 ///
@@ -37,11 +37,11 @@ pub const KITTY_FLAG_REPORT_TEXT: u32 = 1 << 4;
 /// `u` for `CSI u` keys and `~`/`A`/`B`/`C`/`D`/`H`/`F`/`P`/`Q`/`S` for the
 /// functional-key table.
 ///
-/// The result is hard-bounded to [`MAX_KITTY_FRAME_BYTES`]: associated text
+/// The result is hard-bounded to [`MAX_EXT_KEY_FRAME_BYTES`]: associated text
 /// is truncated to the codepoints that still fit, so a long IME/layout text
 /// can never grow the frame or leak past the per-key bound. The caller still
 /// checks the bound before emitting.
-fn kitty_frame(
+fn ext_key_frame(
     code: u32,
     shifted: Option<u32>,
     mods: u32,
@@ -51,7 +51,7 @@ fn kitty_frame(
 ) -> Vec<u8> {
     // Worst case per codepoint field is 1 separator + 10 decimal digits.
     const EMBED_CODEPOINT_MAX: usize = 11;
-    let mut out = String::with_capacity(MAX_KITTY_FRAME_BYTES);
+    let mut out = String::with_capacity(MAX_EXT_KEY_FRAME_BYTES);
     out.push_str("\x1b[");
     let second = mods != 0 || event_type.is_some();
     let third = embed.is_some();
@@ -81,7 +81,7 @@ fn kitty_frame(
                 continue;
             }
             // Reserve one byte for the trailer; stop before it would overflow.
-            if out.len() + EMBED_CODEPOINT_MAX + 1 > MAX_KITTY_FRAME_BYTES {
+            if out.len() + EMBED_CODEPOINT_MAX + 1 > MAX_EXT_KEY_FRAME_BYTES {
                 break;
             }
             out.push(if first { ';' } else { ':' });
@@ -183,11 +183,11 @@ impl Runtime {
     /// Pure, headless, and deterministic: delegates to
     /// [`bitty_platform::encode_key_event`] which owns the xterm legacy table
     /// (M1 required baseline; the opt-in Kitty protocol is composed in
-    /// [`encode_key_with_kitty`](Self::encode_key_with_kitty)). Returns `None`
+    /// [`encode_key_enhanced`](Self::encode_key_enhanced)). Returns `None`
     /// for release/synthetic/modifier-only/unmapped inputs. This entry point
     /// assumes no modifiers are held; the live input path
     /// ([`Self::handle_key_event`]) applies the tracked modifier snapshot via
-    /// [`encode_key_with_kitty`](Self::encode_key_with_kitty) instead, so
+    /// [`encode_key_enhanced`](Self::encode_key_enhanced) instead, so
     /// `Ctrl+letter` synthesizes C0 bytes on Wayland where winit reports
     /// `text=None` (CTX-0154).
     #[must_use]
@@ -235,25 +235,25 @@ impl Runtime {
     ///   trailing field (undefined without `report_all_keys`, so bitty fails
     ///   closed to the legacy text path).
     ///
-    /// Every emitted frame is bounded to [`MAX_KITTY_FRAME_BYTES`]; an
+    /// Every emitted frame is bounded to [`MAX_EXT_KEY_FRAME_BYTES`]; an
     /// over-bound frame is **dropped** (RFC `input-pointer-rfc` Kitty bounds:
     /// "Every Kitty frame has a legacy equivalent or is dropped") rather
     /// than truncated. With flags `0` this delegates straight to the
     /// legacy encoder, so the opt-in default-off behavior stays
     /// byte-identical (differential proof).
-    pub(super) fn encode_key_with_kitty(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        let flags = self.focused_modes().kitty_keyboard.flags();
+    pub(super) fn encode_key_enhanced(&self, event: &KeyEvent) -> Option<Vec<u8>> {
+        let flags = self.focused_modes().enhanced_keyboard.flags();
         if flags == 0 {
-            return self.kitty_fallback(event);
+            return self.ext_key_fallback(event);
         }
         if event.is_synthetic {
             return None;
         }
-        let report_events = flags & KITTY_FLAG_REPORT_EVENTS != 0;
-        let disambiguate = flags & KITTY_FLAG_DISAMBIGUATE != 0;
-        let report_all = flags & KITTY_FLAG_REPORT_ALL_KEYS != 0;
-        let report_alternates = flags & KITTY_FLAG_REPORT_ALTERNATES != 0;
-        let report_text = flags & KITTY_FLAG_REPORT_TEXT != 0;
+        let report_events = flags & EXT_KEY_FLAG_REPORT_EVENTS != 0;
+        let disambiguate = flags & EXT_KEY_FLAG_DISAMBIGUATE != 0;
+        let report_all = flags & EXT_KEY_FLAG_REPORT_ALL_KEYS != 0;
+        let report_alternates = flags & EXT_KEY_FLAG_REPORT_ALTERNATES != 0;
+        let report_text = flags & EXT_KEY_FLAG_REPORT_TEXT != 0;
 
         let pressed = event.state == PressState::Pressed;
         if !pressed && !report_events {
@@ -280,7 +280,7 @@ impl Runtime {
         // Text-producing character keys.
         if let bitty_platform::LogicalKey::Character(chars) = &event.logical_key {
             let Some(base) = chars.chars().next() else {
-                return self.kitty_fallback(event);
+                return self.ext_key_fallback(event);
             };
             // The protocol key code is always the un-shifted codepoint.
             let code = u32::from(base.to_lowercase().next().unwrap_or(base));
@@ -315,10 +315,10 @@ impl Runtime {
             // chord with alt or ctrl — but never shift alone.
             let disambiguated_chord = self.alt_pressed || self.control_pressed;
             if simple_encoding_ok && !report_all && !(disambiguate && disambiguated_chord) {
-                return self.kitty_fallback(event);
+                return self.ext_key_fallback(event);
             }
-            let frame = kitty_frame(code, shifted, mods, event_type, embed, b'u');
-            return self.kitty_or_fallback(frame);
+            let frame = ext_key_frame(code, shifted, mods, event_type, embed, b'u');
+            return self.ext_key_or_fallback(frame);
         }
 
         // Named keys.
@@ -332,31 +332,31 @@ impl Runtime {
             if *named == bitty_platform::NamedKey::Space {
                 let disambiguated_chord = self.alt_pressed || self.control_pressed;
                 if !report_all && !(disambiguate && disambiguated_chord) {
-                    return self.kitty_fallback(event);
+                    return self.ext_key_fallback(event);
                 }
                 let embed = if report_text && report_all {
                     event.text.as_deref().filter(|text| !text.is_empty())
                 } else {
                     None
                 };
-                let frame = kitty_frame(32, None, mods, event_type, embed, b'u');
-                return self.kitty_or_fallback(frame);
+                let frame = ext_key_frame(32, None, mods, event_type, embed, b'u');
+                return self.ext_key_or_fallback(frame);
             }
-            if let Some(code) = bitty_platform::kitty_modifier_key(*named, event.location) {
+            if let Some(code) = bitty_platform::ext_modifier_key(*named, event.location) {
                 if !report_all {
-                    return self.kitty_fallback(event);
+                    return self.ext_key_fallback(event);
                 }
-                let frame = kitty_frame(code, None, mods, event_type, None, b'u');
-                return self.kitty_or_fallback(frame);
+                let frame = ext_key_frame(code, None, mods, event_type, None, b'u');
+                return self.ext_key_or_fallback(frame);
             }
-            if let Some((code, trailer)) = bitty_platform::kitty_functional_key(*named) {
+            if let Some((code, trailer)) = bitty_platform::ext_functional_key(*named) {
                 if legacy_mode {
-                    return self.kitty_fallback(event);
+                    return self.ext_key_fallback(event);
                 }
                 // Escape keeps `0x1b` unless disambiguate/report-all asks for
                 // the escape-coded form (spec: Esc-vs-sequence disambiguation).
                 if *named == bitty_platform::NamedKey::Escape && !disambiguate && !report_all {
-                    return self.kitty_fallback(event);
+                    return self.ext_key_fallback(event);
                 }
                 // Bare Enter/Tab/Backspace keep their legacy bytes under
                 // disambiguate/report-events; report-all-keys encodes them.
@@ -367,17 +367,17 @@ impl Runtime {
                         | bitty_platform::NamedKey::Backspace
                 );
                 if legacy_exception && !report_all && mods == 0 {
-                    return self.kitty_fallback(event);
+                    return self.ext_key_fallback(event);
                 }
-                let frame = kitty_frame(code, None, mods, event_type, None, trailer);
-                return self.kitty_or_fallback(frame);
+                let frame = ext_key_frame(code, None, mods, event_type, None, trailer);
+                return self.ext_key_or_fallback(frame);
             }
         }
-        self.kitty_fallback(event)
+        self.ext_key_fallback(event)
     }
 
     /// Legacy encoder fallback for keys without a Kitty encoding.
-    fn kitty_fallback(&self, event: &KeyEvent) -> Option<Vec<u8>> {
+    fn ext_key_fallback(&self, event: &KeyEvent) -> Option<Vec<u8>> {
         bitty_platform::keyboard::encode_key_event_with_modifiers(event, &self.modifier_snapshot())
     }
 
@@ -387,8 +387,8 @@ impl Runtime {
     /// equivalent or is dropped with a bounded counter, never silently
     /// misrouted." An over-bound frame therefore yields `None` (drop), never
     /// a legacy fallback and never a truncated sequence.
-    fn kitty_or_fallback(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
-        if frame.len() <= MAX_KITTY_FRAME_BYTES {
+    fn ext_key_or_fallback(&self, frame: Vec<u8>) -> Option<Vec<u8>> {
+        if frame.len() <= MAX_EXT_KEY_FRAME_BYTES {
             Some(frame)
         } else {
             // Bounded inputs make this unreachable; stay conservative anyway.
@@ -531,7 +531,7 @@ impl Runtime {
                 self.alt_pressed,
             );
             self.publish_inspect_snapshot();
-            let bytes = self.encode_key_with_kitty(&event);
+            let bytes = self.encode_key_enhanced(&event);
             if let Some(bytes) = &bytes {
                 self.push_input_bytes(bytes);
             }
@@ -544,7 +544,7 @@ impl Runtime {
             self.alt_pressed,
             pressed,
         );
-        let bytes = self.encode_key_with_kitty(&event)?;
+        let bytes = self.encode_key_enhanced(&event)?;
         // Bounded encoding already ≤64; push respects MAX_PENDING_INPUT.
         self.push_input_bytes(&bytes);
         self.publish_inspect_snapshot();
@@ -645,7 +645,7 @@ impl Runtime {
                 self.alt_pressed,
             );
             self.publish_inspect_snapshot();
-            let bytes = self.encode_key_with_kitty(event);
+            let bytes = self.encode_key_enhanced(event);
             if let Some(bytes) = &bytes {
                 self.push_input_bytes(bytes);
             }
@@ -658,7 +658,7 @@ impl Runtime {
             self.alt_pressed,
             pressed,
         );
-        let bytes = self.encode_key_with_kitty(event)?;
+        let bytes = self.encode_key_enhanced(event)?;
         self.push_input_bytes(&bytes);
         self.publish_inspect_snapshot();
         Some(bytes)

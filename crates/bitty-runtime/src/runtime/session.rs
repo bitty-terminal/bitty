@@ -1336,6 +1336,7 @@ impl Runtime {
             .or_else(|| leaves.first().copied());
         self.pending_ws_close = None;
         self.session_pending.clear();
+        self.session_primary_cwd = None;
 
         let mut panes = 0usize;
         let mut scrollback_lines = 0usize;
@@ -1363,6 +1364,11 @@ impl Runtime {
             return session.state.restore_scrollback_text(&lines);
         }
         if self.primary_view == Some(pane.view) {
+            // CTX-0585: the primary owner has no shell yet (its history goes
+            // straight into the grid), but the real restart attach spawns
+            // through `spawn_shell_with_args`, which cannot see the pending
+            // map. Stash the captured cwd so that path can seed the spawn cwd.
+            self.session_primary_cwd = pane.cwd.clone().map(|cwd| (pane.view, cwd));
             return self.state.restore_scrollback_text(&lines);
         }
         self.session_pending.insert(
@@ -1403,9 +1409,20 @@ impl Runtime {
     /// Validated spawn directory from a pending restore: the captured
     /// `OSC 7` URL decoded to a local path that must still exist.
     /// Fail-open (`None`) on any doubt — the caller keeps its default.
+    ///
+    /// CTX-0585: the primary owner has no pending-map entry (its history went
+    /// straight into the grid), so its captured cwd is read from
+    /// `session_primary_cwd` — keyed to the owner so a later pane is never
+    /// seeded from a foreign leaf's report.
     #[must_use]
     pub fn session_pending_cwd(&self, view: &ViewId) -> Option<PathBuf> {
-        let report = self.session_pending.get(view)?.cwd.as_deref()?;
+        let report = match self.session_pending.get(view) {
+            Some(pending) => pending.cwd.as_deref()?,
+            None => match &self.session_primary_cwd {
+                Some((owner, report)) if owner == view => report.as_str(),
+                _ => return None,
+            },
+        };
         let path = osc7_cwd_path(report)?;
         path.is_dir().then_some(path)
     }

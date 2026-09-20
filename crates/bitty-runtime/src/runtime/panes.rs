@@ -83,6 +83,15 @@ impl Runtime {
         let cols = self.cols.min(u16::MAX as usize) as u16;
         let rows = self.rows.min(u16::MAX as usize) as u16;
         let mut builder = PtyBuilder::new(program).size(cols, rows);
+        // CTX-0585 (M1-25): the primary restart attach must seed its cwd from
+        // the captured `OSC 7` report, exactly like a split spawn. The leaf
+        // focused at attach time becomes the owner below, so resolve against
+        // it; `session_pending_cwd` fails open when there is no capture.
+        if let Some(owner) = self.focus.focused() {
+            if let Some(cwd) = self.session_pending_cwd(&owner) {
+                builder = builder.cwd(cwd);
+            }
+        }
         for arg in args {
             builder = builder.arg(*arg);
         }
@@ -125,6 +134,11 @@ impl Runtime {
         // this spawn fulfils a restored session (no-op otherwise).
         if let Some(owner) = self.primary_view {
             let _ = self.hydrate_session_pending_for(owner);
+            // CTX-0585: the captured primary cwd is consumed exactly once by
+            // this attach (split panes drain through the pending map).
+            if self.session_primary_cwd.as_ref().map(|(o, _)| *o) == Some(owner) {
+                self.session_primary_cwd = None;
+            }
         }
         Ok(())
     }
@@ -293,6 +307,12 @@ impl Runtime {
         // captured scrollback (immutable history; the shell itself is new).
         // No-op without a pending restore for this leaf.
         let _ = self.hydrate_session_pending_for(view);
+        // CTX-0585: a split spawned for the restored primary owner consumes
+        // the captured cwd exactly once. `inherited_cwd_for` read it above;
+        // clear only after the successful publish so a failed spawn keeps it.
+        if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(view) {
+            self.session_primary_cwd = None;
+        }
         // If a waker is already installed (split after `set_pty_waker`),
         // promote immediately so the new pane wakes the loop too (CTX-0230).
         if self.pty_waker.is_some() {

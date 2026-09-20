@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bitty_runtime::runtime::session::{
     MAX_SESSION_CWD_BYTES, MAX_SESSION_FILE_BYTES, MAX_SESSION_SCROLLBACK_LINES_PER_PANE,
@@ -33,6 +34,26 @@ fn scratch_dir(tag: &str) -> PathBuf {
 fn feed_lines(rt: &mut Runtime, lines: usize) {
     for i in 0..lines {
         rt.handle_pty_bytes(format!("line {i:03}\r\n").as_bytes());
+    }
+}
+
+/// One-leaf workspace snapshot carrying a captured cwd (hermetic, no PTY).
+fn single_leaf_snapshot(id: u64, cwd: Option<String>, history: &str) -> SessionSnapshot {
+    SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: id,
+            name: format!("ws{id}"),
+            layout: LayoutNode::leaf(View::new(ViewId::new(id), 80, 24)),
+            focus: Some(ViewId::new(id)),
+            panes: vec![PaneSnapshot {
+                view: ViewId::new(id),
+                cwd,
+                scrollback: vec![history.to_string()],
+            }],
+        }],
+        active: 0,
+        mru: vec![0],
     }
 }
 
@@ -604,4 +625,275 @@ fn workspace_close_rehomes_primary_onto_pending_leaf_and_drains_restore() {
         history.iter().any(|line| line.contains("ws1-history")),
         "captured history must hydrate into the primary grid: {history:?}"
     );
+}
+
+/// M1-25 (#1151): restore must seed the primary shell's spawn cwd from the
+/// captured `OSC 7` report — the real app restart path calls
+/// `Runtime::spawn_shell_with_args` for the primary pane, not
+/// `spawn_shell_for_view`, so the pending cwd must apply on that path too.
+/// Split panes already consult the pending cwd; the primary attach must not
+/// silently drop it.
+#[test]
+#[cfg(unix)]
+fn primary_restore_spawns_with_captured_cwd() {
+    bitty_test_support::require_pty!();
+    let dir = scratch_dir("primary-cwd");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let report = format!("file://{}", dir.display());
+    let snap = single_leaf_snapshot(100, Some(report), "primary-history");
+
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    // The lone leaf becomes the primary owner: its history hydrates straight
+    // into the grid, so it has no pending-map entry — but the captured cwd
+    // must still be staged for the primary attach.
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "primary history hydrates immediately, not via the pending map"
+    );
+    assert_eq!(
+        rt.session_pending_cwd(&ViewId::new(100)),
+        Some(dir.clone()),
+        "captured primary cwd must be staged for the attach"
+    );
+
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "pwd -P; exec sleep 30"])
+        .expect("primary shell spawn");
+    assert!(
+        wait_for_primary_text(&mut rt, "bitty-session-primary-cwd"),
+        "primary shell must start in the captured cwd; grid={:?}",
+        primary_text(&rt)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1-25 (#1151): a captured cwd whose directory no longer exists must
+/// fail open — the primary still spawns in the default cwd and the captured
+/// history is still hydrated. A stale report must never error or blank the
+/// restore.
+#[test]
+#[cfg(unix)]
+fn primary_restore_stale_cwd_falls_back_and_still_hydrates() {
+    bitty_test_support::require_pty!();
+    let dir = scratch_dir("primary-stale");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let report = format!("file://{}", dir.display());
+    std::fs::remove_dir_all(&dir).expect("delete scratch dir");
+    let snap = single_leaf_snapshot(100, Some(report), "stale-history");
+
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    rt.apply_session_snapshot(&snap).expect("apply valid");
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "pwd -P; exec sleep 30"])
+        .expect("primary shell spawn");
+    let cwd = default_cwd();
+    assert!(
+        wait_for_primary_text(&mut rt, &cwd),
+        "stale capture must fall back to the default cwd without error; grid={:?}",
+        primary_text(&rt)
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "primary attach must drain the pending restore even on cwd fallback"
+    );
+}
+
+/// M1-25 (#1151): format-v1 header versioning fails closed — a structurally
+/// valid file claiming a future version is rejected whole, never applied
+/// partially, and the runtime is left untouched. Pins the version gate that
+/// the round-trip test only proves for v1.
+#[test]
+fn version_mismatch_is_rejected_before_any_mutation() {
+    let raw = concat!(
+        "bitty-session v2\n",
+        "workspaces 1 active 0 mru 0\n",
+        "workspace 1 7\n",
+        "name ws1\n",
+        "layout (leaf 7 80 24)\n",
+        "pane 7 80 24 0 0\n",
+        "end-pane\n",
+        "end-workspace\n",
+        "end-session\n",
+    );
+    let err = decode_session(raw.as_bytes()).expect_err("v2 must be rejected");
+    assert_eq!(err, SessionError::UnsupportedVersion(2));
+
+    let dir = scratch_dir("version");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("session");
+    std::fs::write(&path, raw).expect("write v2 file");
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let before = rt.layout().clone();
+    let err = rt
+        .load_session_from_path(&path)
+        .expect_err("v2 load must fail closed");
+    assert_eq!(err, SessionError::UnsupportedVersion(2));
+    assert_eq!(
+        rt.layout(),
+        &before,
+        "rejected file must not mutate runtime"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1-25 (#1151): a partially written temp sibling from a crashed saver must
+/// never be read, and a *failed* save must not clobber the last-good file.
+/// Drives the real `save_session_to_path` against a file path that cannot be
+/// renamed onto (a directory), proving the previous complete session stays
+/// authoritative through the failure.
+#[test]
+fn failed_save_never_clobbers_last_good_session() {
+    let dir = scratch_dir("last-good");
+    let good = dir.join("good-session");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    feed_lines(&mut rt, 12);
+    rt.save_session_to_path(&good).expect("first save works");
+    let first = std::fs::read(&good).expect("read good session");
+    let snap_first = decode_session(&first).expect("good session decodes");
+
+    // A path whose rename target is an existing directory fails the atomic
+    // rename after the temp write; the save must report the error and leave
+    // no partial file claiming to be a session.
+    let blocked = dir.join("blocked");
+    std::fs::create_dir_all(&blocked).expect("blocking dir");
+    let err = rt
+        .save_session_to_path(&blocked)
+        .expect_err("rename onto a directory must fail");
+    assert!(
+        !format!("{err}").contains("line"),
+        "errors must never echo session contents"
+    );
+
+    // Last-good is untouched and still decodes to the same snapshot.
+    let after = std::fs::read(&good).expect("good session still present");
+    assert_eq!(
+        first, after,
+        "failed save must not touch the last-good file"
+    );
+    assert_eq!(
+        decode_session(&after).expect("still decodes"),
+        snap_first,
+        "last-good snapshot must survive a failed save"
+    );
+
+    // No temp litter survives the failed save for the blocked path.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "failed save must clean its temp sibling: {leftovers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1-25 (#1151): a corrupt file present at startup must yield a
+/// `FreshWithWarning` outcome (counts/kinds only, no contents) and leave the
+/// runtime on a clean start — the startup-level counterpart to the
+/// path-level `corrupt_file_falls_back_to_clean_start` test.
+#[test]
+fn corrupt_store_at_startup_warns_and_starts_clean() {
+    let dir = scratch_dir("startup-corrupt");
+    let dir_str = dir.to_string_lossy().into_owned();
+    let path = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("session dir");
+    }
+    std::fs::write(&path, b"\x00\x01not a session").expect("write garbage");
+
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let before = rt.layout().clone();
+    let outcome = rt.restore_session_on_startup_with_env(false, Some(dir_str.as_str()), None);
+    match &outcome {
+        bitty_runtime::runtime::session::SessionStartupOutcome::FreshWithWarning(err) => {
+            assert!(
+                !format!("{err}").contains("not a session"),
+                "warning must never echo file contents"
+            );
+        }
+        other => panic!("corrupt store must warn, got {other:?}"),
+    }
+    assert_eq!(
+        rt.layout(),
+        &before,
+        "corrupt store must leave a clean start"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M1-25 (#1151): safe mode must not read the session store, so a *valid*
+/// store present at startup is left completely unapplied even though it
+/// would otherwise restore. Complements `safe_mode_never_reads_session_state`
+/// (which uses an unreadable file) with a readable, would-restore file.
+#[test]
+fn safe_mode_does_not_apply_a_valid_store() {
+    let dir = scratch_dir("safe-valid");
+    let dir_str = dir.to_string_lossy().into_owned();
+    let path = session_file_for(Some(dir_str.as_str()), None).expect("path resolves");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("session dir");
+    }
+    let snap = single_leaf_snapshot(4242, None, "must-not-restore");
+    std::fs::write(&path, encode_session(&snap).expect("encode")).expect("write valid store");
+
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let before_layout = rt.layout().leaf_ids();
+    let outcome = rt.restore_session_on_startup_with_env(true, Some(dir_str.as_str()), None);
+    assert!(
+        matches!(
+            outcome,
+            bitty_runtime::runtime::session::SessionStartupOutcome::SkippedSafeMode
+        ),
+        "safe mode must short-circuit, got {outcome:?}"
+    );
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        before_layout,
+        "safe mode must not apply a valid store"
+    );
+    assert_eq!(
+        rt.session_pending_len(),
+        0,
+        "no pending restore in safe mode"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Physical default cwd a child gets when nothing is inherited: the PTY
+/// layer falls back to `$HOME`, else the process cwd (mirrors
+/// `cwd_inherit.rs::default_cwd`).
+fn default_cwd() -> String {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    let cwd = home
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .expect("home or process cwd");
+    std::fs::canonicalize(&cwd)
+        .unwrap_or(cwd)
+        .display()
+        .to_string()
+}
+
+fn primary_text(rt: &Runtime) -> String {
+    rt.snapshot().cells.iter().map(|c| c.glyph).collect()
+}
+
+/// Polls and ticks until the primary grid shows `needle` or times out.
+fn wait_for_primary_text(rt: &mut Runtime, needle: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let _ = rt.poll_pty();
+        rt.tick();
+        if primary_text(rt).contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }

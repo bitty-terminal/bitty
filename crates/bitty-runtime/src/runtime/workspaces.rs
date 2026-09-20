@@ -557,6 +557,11 @@ impl Runtime {
         self.workspaces.remove(index);
         for view in removed_leaves {
             self.session_pending.remove(&view);
+            // CTX-0585: a destroyed primary owner can never respawn; drop its
+            // captured cwd so the slot does not outlive the leaf.
+            if self.session_primary_cwd.as_ref().map(|(owner, _)| *owner) == Some(view) {
+                self.session_primary_cwd = None;
+            }
         }
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();

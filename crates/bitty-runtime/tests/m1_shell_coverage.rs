@@ -1,4 +1,4 @@
-//! M1-27 (CTX-0588, Issue #1153): five-shell coverage evidence with ZERO
+//! M1-27 (CTX-0588, Issue #1153): six-shell coverage evidence with ZERO
 //! shell integration active, plus injected `OSC 7` / `OSC 133` tests.
 //!
 //! Acceptance source: `compatibility-milestone-rfc.md` "Shell integration"

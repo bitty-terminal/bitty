@@ -256,7 +256,7 @@ pub use runtime::{
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{
     DecoratedView, Decoration, DecorationError, Focus, FocusDirection, Gaps, LayoutNode,
-    ScrollbarMode, SplitAxis, View, ViewId,
+    OverlayLayer, OverlayTier, ScrollbarMode, SplitAxis, View, ViewId,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

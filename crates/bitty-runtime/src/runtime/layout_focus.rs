@@ -41,6 +41,15 @@ pub struct PresentFrame {
     pub border: u16,
     /// Corner radius in physical px (carried; painted by the present ring).
     pub radius: u16,
+    /// Paint tier of the leaf (`None` = base content, CW-12).
+    ///
+    /// Frames are stable-sorted on this key (base first, then
+    /// `Editor < Float < Popup < Messages`) so the present path paints
+    /// tiered overlays in tier order regardless of tree construction
+    /// order. A float nested inside a higher-tier float carries the
+    /// higher tier, so the sort never splits one overlay composition
+    /// apart.
+    pub tier: Option<OverlayTier>,
 }
 
 /// Mutable borrow of the owned layout tree (CTX-0603, #1165).
@@ -568,6 +577,13 @@ impl Runtime {
     /// remainder stays background,
     /// which is what makes the composition fractional-cell. Pure and
     /// deterministic; total for hostile containers/decoration.
+    ///
+    /// CW-12: frames are stable-sorted by overlay tier (base content first,
+    /// then `Editor < Float < Popup < Messages`), so the present path
+    /// composites stacked overlays in tier order regardless of tree
+    /// construction order. Same-tier frames keep solver order. Hit-testing
+    /// ([`Self::cursor_to_present_cell`]) still scans this order, matching
+    /// the `overlay_stack` depth-first convention.
     #[must_use]
     pub fn present_frames(&self) -> Vec<PresentFrame> {
         let live = self.live_cell_metrics();
@@ -587,7 +603,13 @@ impl Runtime {
             u16::try_from(ch).unwrap_or(u16::MAX),
         );
         let max_dim = u32::try_from(bitty_term_state::MAX_GRID_DIM).unwrap_or(u32::MAX);
-        self.layout
+        // CW-12: per-leaf paint tiers from the tiered overlay primitives.
+        // Keyed by `ViewId` (not zipped) so the tier map cannot drift from
+        // the decorated solver when either walk changes.
+        let tiers: std::collections::HashMap<ViewId, Option<OverlayTier>> =
+            self.layout.leaf_overlay_tiers().into_iter().collect();
+        let mut frames: Vec<PresentFrame> = self
+            .layout
             .layout_with_decoration_scaled(
                 area,
                 self.config.decoration,
@@ -614,8 +636,14 @@ impl Runtime {
                 rows: (u32::from(dv.content.height) / ch).clamp(1, max_dim) as u16,
                 border: dv.border,
                 radius: dv.radius,
+                tier: tiers.get(&view).copied().flatten(),
             })
-            .collect()
+            .collect();
+        // CW-12: paint base content first, then tiers lowest-first.
+        // Stable: same-tier frames keep solver order (the `OverlayTier`
+        // same-tier conflict rule). `None < Some`, so base always leads.
+        frames.sort_by_key(|frame| frame.tier);
+        frames
     }
 
     /// Reflows leaf `View`s to the decorated content frames (CTX-0294).

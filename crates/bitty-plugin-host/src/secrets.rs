@@ -1591,7 +1591,8 @@ impl FileSecretStore {
     /// Load the store file at `path` (fail-closed on missing/mode/content).
     ///
     /// Missing files yield an empty store (first-run provisioning); existing
-    /// files must pass the user-only mode gate before any byte is parsed.
+    /// files must pass the symlink/regular-file gate and the user-only mode
+    /// gate before any byte is parsed.
     pub fn load(path: PathBuf) -> Result<Self, SecretError> {
         if !path.exists() {
             return Ok(Self {
@@ -1599,6 +1600,7 @@ impl FileSecretStore {
                 store: SecretStore::new(),
             });
         }
+        assert_store_file_identity(&path)?;
         assert_store_file_modes(&path)?;
         let text = std::fs::read_to_string(&path).map_err(|err| {
             SecretError::invalid_request(format!("cannot read secret store: {err}"))
@@ -1640,6 +1642,32 @@ impl FileSecretStore {
         restrict_file_modes(&self.path)?;
         Ok(())
     }
+}
+
+/// Assert the store path is a regular file, not a symlink or special file
+/// (CTX-0625, R-003/P0-AC-005: fail-closed loader identity gate).
+///
+/// Symlinks — even to mode-conforming targets — are refused: `metadata`
+/// follows links, so a link swap between the mode check and the read could
+/// redirect the load, and a link to a device or fifo would block or leak
+/// kernel bytes. Non-regular files (directories, fifos, sockets, devices)
+/// are refused because `read_to_string` on a fifo blocks and on a device
+/// exposes non-store bytes. Uses `symlink_metadata` so the link itself is
+/// inspected, never the target.
+fn assert_store_file_identity(path: &std::path::Path) -> Result<(), SecretError> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|err| SecretError::invalid_request(format!("cannot stat secret store: {err}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(SecretError::invalid_request(
+            "secret store must not be a symlink (refusing to load)",
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(SecretError::invalid_request(
+            "secret store must be a regular file (refusing to load)",
+        ));
+    }
+    Ok(())
 }
 
 /// Assert user-only modes on an existing store file (fail-closed).
@@ -2054,6 +2082,38 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         let err = FileSecretStore::load(path).unwrap_err();
         assert!(err.to_string().contains("600"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_store_refuses_symlink_and_non_regular() {
+        // CTX-0625 (R-003/P0-AC-005 negative class matrix): the secret-store
+        // loader refuses symlinks (even to mode-conforming targets) and
+        // non-regular files (directories here; fifos/sockets/devices share
+        // the same gate) before parsing any byte.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-secrets-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.conf");
+        std::fs::write(&target, "secret github value-one\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = FileSecretStore::load(link).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "symlink store must be refused, got: {err}"
+        );
+        let err = FileSecretStore::load(dir.clone()).unwrap_err();
+        assert!(
+            err.to_string().contains("regular file"),
+            "directory store must be refused, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

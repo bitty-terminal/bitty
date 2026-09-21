@@ -369,6 +369,38 @@ fn is_literal_fs_segment(segment: &str) -> bool {
     !segment.is_empty() && segment != "." && !segment.contains(['*', '?', '[', ']', '{', '}'])
 }
 
+/// Windows reserved device names (CTX-0625, R-003/P0-AC-005).
+///
+/// `NUL`, `CON`, `PRN`, `AUX`, `COM<digits>`, `LPT<digits>` name devices
+/// from any directory on Windows, case-insensitively and with any extension
+/// (`NUL.txt` still opens the device). A grant pattern naming one as a path
+/// segment would authorize device access on Windows while looking like an
+/// ordinary relative path, so such patterns fail closed. Matching is ASCII
+/// case-insensitive on the segment base (up to the first `.` or `:`);
+/// longer names (`nullable`, `console`) still pass.
+fn is_windows_device_segment(segment: &str) -> bool {
+    let base = segment.split(['.', ':']).next().unwrap_or(segment);
+    if base.eq_ignore_ascii_case("nul")
+        || base.eq_ignore_ascii_case("con")
+        || base.eq_ignore_ascii_case("prn")
+        || base.eq_ignore_ascii_case("aux")
+    {
+        return true;
+    }
+    // `COM1`-`COM99…` / `LPT1`-`LPT99…`: prefix plus a non-empty all-digit
+    // suffix. Longer non-numeric names (`comms`, `compile`) still pass.
+    if base.len() > 3 {
+        let (head, tail) = base.split_at(3);
+        if (head.eq_ignore_ascii_case("com") || head.eq_ignore_ascii_case("lpt"))
+            && !tail.is_empty()
+            && tail.bytes().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a filesystem glob `pattern` escapes its sandbox or names secrets.
 ///
 /// Denies (fail-closed):
@@ -380,6 +412,9 @@ fn is_literal_fs_segment(segment: &str) -> bool {
 ///   `~/.`, `~/./**`) — these match unknown home children, sensitive
 ///   dot-directories included;
 /// - `..` segments on either separator (`../`, `..\\`, embedded, trailing);
+/// - Windows reserved device names as any segment, case-insensitively with
+///   any extension (`NUL`, `con.txt`, `COM1`, `notes/AUX` — CTX-0625,
+///   R-003/P0-AC-005: these name devices from any directory on Windows);
 /// - sensitive credential locations, case-insensitively and on either
 ///   separator (`~/.ssh/...`, `~\.SSH\...`, any `.ssh`/`.gnupg`/`.aws`/
 ///   `.azure`/`.kube`/`.docker` segment, `~/.config/gh|gcloud/...`), with
@@ -408,6 +443,18 @@ pub fn is_hostile_fs_pattern(pattern: &str) -> bool {
         return true;
     }
     if segments.contains(&"..") {
+        return true;
+    }
+    // Windows reserved device names (`NUL`, `CON`, `COM1`, …) address
+    // devices from any directory on Windows, so a pattern naming one as a
+    // segment fails closed even when it looks like an ordinary relative
+    // path. Runs on the raw segments (no normalization needed: `.`/empty
+    // spellings do not hide a device segment, and normalization preserves
+    // every real segment).
+    if segments
+        .iter()
+        .any(|segment| !segment.is_empty() && *segment != "." && is_windows_device_segment(segment))
+    {
         return true;
     }
     // `.` and empty segments are no-ops on the target filesystem, so the
@@ -501,7 +548,7 @@ impl FilesystemRequest {
                 return Err(PluginError::manifest(
                     "capabilities.filesystem.paths",
                     format!(
-                        "path pattern '{p}' is hostile (absolute path, '..' traversal, foreign/overbroad home, or sensitive credential location)"
+                        "path pattern '{p}' is hostile (absolute path, '..' traversal, foreign/overbroad home, Windows device name, or sensitive credential location)"
                     ),
                 ));
             }
@@ -1305,6 +1352,71 @@ mod tests {
             assert!(
                 req.validate().is_ok(),
                 "legit fs pattern {path:?} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_filesystem_rejects_device_paths_and_windows_reserved_names() {
+        // CTX-0625 (R-003/P0-AC-005 negative class matrix): device nodes,
+        // procfs/sysfs/devfs entries, and Windows reserved device names
+        // must fail closed at manifest validation. Absolute device paths
+        // deny via the absolute rule; reserved names deny as segments even
+        // when they look like ordinary relative paths.
+        for path in [
+            "/dev/null",
+            "/dev/kvm",
+            "/dev/**",
+            "/proc/self/mem",
+            "/proc/self/environ",
+            "/sys/kernel/debug/foo",
+            "/dev/tty",
+            "NUL",
+            "nul",
+            "CON",
+            "con.txt",
+            "PRN",
+            "AUX",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "notes/AUX",
+            "notes/COM1",
+            "~/projects/CON",
+            "~/projects/nul.txt",
+            "~/.config/COM1",
+            "docs/../NUL",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_err(),
+                "device/hostile fs pattern {path:?} must be denied"
+            );
+            assert!(
+                is_hostile_fs_pattern(path),
+                "device/hostile fs pattern {path:?} must classify hostile"
+            );
+        }
+        // Longer names that merely start with a reserved word stay allowed.
+        for path in [
+            "notes/nullable.md",
+            "notes/console.log",
+            "notes/printer.md",
+            "notes/auxiliary/data.md",
+            "notes/comms.md",
+            "~/projects/nullability.txt",
+        ] {
+            let req = FilesystemRequest {
+                access: FsAccess::Read,
+                paths: vec![path.to_string()],
+            };
+            assert!(
+                req.validate().is_ok(),
+                "lookalike fs pattern {path:?} must stay allowed"
             );
         }
     }

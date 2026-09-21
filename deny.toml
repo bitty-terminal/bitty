@@ -9,6 +9,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # ttf-parser (winit/metal paths) and paste are unmaintained upstream; the
 # advisories are tracked here and ignored until the replacement lands, matching
 # the cargo-audit step in CI (ADR-0004 maintenance policy).
+# Time bound (CTX-0634, P0-AC-034 exception policy): re-check both upstream
+# replacements no later than 2027-03-31 and drop each ignore when its
+# replacement lands; any extension needs a dated ADR-0004 revision.
 ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436"]
 
 [bans]
@@ -45,6 +48,8 @@ confidence-threshold = 0.8
 # The single MPL-2.0 node is dwrote (crossfont's Windows DirectWrite binding),
 # which has no permissive alternative today; scope it per crate instead of a
 # global allowance and revisit when crossfont drops dwrote (CTX-0505).
+# Time bound (CTX-0634, P0-AC-034 exception policy): re-check no later than
+# 2027-03-31; any further copyleft node needs a dated ADR-0004 revision.
 exceptions = [{ allow = ["MPL-2.0"], crate = "dwrote" }]
 
 [licenses.private]
@@ -59,6 +64,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
 # for the Lua GC), not bitty's choice — kept visible here rather than hidden
 # behind a wildcard so any new git source still fails loudly.
+# Time bound (CTX-0634, P0-AC-034 exception policy): re-audit both pins
+# (rev freshness, source trust) no later than 2027-03-31; any new git source
+# needs a dated ADR-0004/ADR-0012 revision, never a silent allowlist edit.
 allow-git = [
     "https://github.com/bitty-terminal/phodopus",
     "https://github.com/kyren/gc-arena",

@@ -806,14 +806,6 @@ impl State {
         &self.images
     }
 
-    /// Mutable image store (bounded placeholder). Restricted to tests and
-    /// the future image protocol; not used by the parser path in this
-    /// milestone.
-    pub fn image_store_mut(&mut self) -> &mut ImageStore {
-        &mut self.images
-    }
-
-    /// Inert-sequence telemetry counters (outside the state hash).
     #[must_use]
     pub fn telemetry(&self) -> TelemetryCounters {
         self.telemetry

@@ -1,0 +1,15 @@
+# scenario: leaf-text-exact
+# scope: leaf
+# tolerance: exact
+# generator: crates/bitty-ui/tests/ux_invariant_guards.rs
+view ViewId(7) origin Point { x: 0, y: 0 } size 40x10
+row 00: 'ux-41 leaf scenario'
+row 01: 'tab-A identity stable'
+row 02: 'wide あ'
+row 03: '0123456789'
+row 04: ''
+row 05: ''
+row 06: ''
+row 07: ''
+row 08: ''
+row 09: ''

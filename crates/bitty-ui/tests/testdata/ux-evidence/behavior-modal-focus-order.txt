@@ -1,0 +1,10 @@
+# scenario: modal-focus-order
+# scope: window
+# tolerance: exact
+# generator: crates/bitty-ui/tests/ux_invariant_guards.rs
+event 00: layout committed leaves=3
+event 01: focus first=Some(ViewId(61))
+event 02: focus next=Some(ViewId(62))
+event 03: overlay created=Ok(1)
+event 04: overlay refused=Err(OverlayBusy)
+event 05: budget refused=Err(TooManyOverlays { max: 4, current: 4 })

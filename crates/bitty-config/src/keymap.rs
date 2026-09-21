@@ -727,6 +727,21 @@ pub enum ChromeAction {
     /// this action lets users bind an explicit closer. Fail-closed no-op
     /// when search is inactive.
     CloseSearch,
+    /// Toggle the command palette overlay (`toggle_palette`, CTX-0647 issue #1003).
+    ///
+    /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
+    /// fresh config keeps Normal Mode byte-identical and the palette stays
+    /// bundled-disabled (OQ-053: palette is the independent first-party
+    /// package `bitty-terminal/palette`, no PanelRegistry host in the app
+    /// yet). The user opts in with
+    /// `{ chord = "ctrl+shift+p", action = "toggle_palette" }` (suggested
+    /// chord; `ctrl+shift+p` is free in the shipped map); the
+    /// single-character schema rule already forces a modifier, so the open
+    /// chord can never shadow bare shell typing. Until the panel host
+    /// lands the app consumes a bound chord as inert with a loud warning
+    /// (no overlay, no routing change) — the bundled-disabled decision is
+    /// kept, and the entry exists as forward-compat wiring.
+    TogglePalette,
 }
 
 impl ChromeAction {
@@ -867,6 +882,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::CloseSearch)
             }
+            "toggle_palette" | "open_palette" | "palette_toggle" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TogglePalette)
+            }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
                 format!("unknown action '{trimmed}'; {KNOWN_ACTIONS_HINT}"),
@@ -907,12 +926,13 @@ impl ChromeAction {
             Self::SearchNext => "search_next".to_string(),
             Self::SearchPrev => "search_prev".to_string(),
             Self::CloseSearch => "close_search".to_string(),
+            Self::TogglePalette => "toggle_palette".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -1816,6 +1836,41 @@ mod tests {
         assert!(Chord::parse("e").is_err());
         let open = Chord::parse("alt+e").expect("alt+e parses");
         assert_eq!(open.canonical(), "alt+e");
+    }
+
+    #[test]
+    fn toggle_palette_parses_but_is_never_a_default() {
+        // CTX-0647 / #1003: palette user entry exists as forward-compat
+        // wiring while the palette stays bundled-disabled (OQ-053: the
+        // palette is the independent first-party package, no panel host in
+        // the app yet). `toggle_palette` only exists when the user binds
+        // it explicitly (suggested chord `ctrl+shift+p`, free in the
+        // shipped map).
+        for raw in ["toggle_palette", "open_palette", "palette_toggle"] {
+            assert_eq!(
+                ChromeAction::parse(raw).expect("parses"),
+                ChromeAction::TogglePalette,
+                "alias {raw:?} must parse"
+            );
+        }
+        assert_eq!(ChromeAction::TogglePalette.canonical(), "toggle_palette");
+        // Panel command grammar stays rejected here: `palette:toggle` is a
+        // PanelRegistry command, not a chrome action.
+        assert!(ChromeAction::parse("palette:toggle").is_err());
+        assert!(ChromeAction::parse("toggle_palette:1").is_err());
+        let maps = default_keymaps().expect("defaults valid");
+        assert!(
+            !maps.iter().any(|m| m.action == ChromeAction::TogglePalette),
+            "defaults must not bind toggle_palette so Ctrl+Shift+P stays shell input"
+        );
+        // Bare `p` can never be a chord (schema rule), so the open key
+        // cannot shadow shell typing even when bound.
+        assert!(Chord::parse("p").is_err());
+        let open = Chord::parse("ctrl+shift+p").expect("ctrl+shift+p parses");
+        assert_eq!(open.canonical(), "ctrl+shift+p");
+        // Unknown head still lists the vocabulary including the new action.
+        let err = ChromeAction::parse("explode:now").unwrap_err();
+        assert!(err.to_string().contains("toggle_palette"));
     }
 
     #[test]

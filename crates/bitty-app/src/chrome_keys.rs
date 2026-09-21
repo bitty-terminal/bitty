@@ -773,6 +773,21 @@ impl TerminalApp {
                     "warning: keymap open_composer is not yet shipped (see #647); chord ignored, no editor launched"
                 );
             }
+            A::TogglePalette => {
+                // CTX-0647 / GitHub #1003 (palette user entry): the palette
+                // panel exists via the public Panel Runtime path
+                // (`bitty_runtime::palette`) but the app hosts no
+                // PanelRegistry yet, so there is no overlay to toggle and
+                // the palette stays bundled-disabled (OQ-053). Until the
+                // panel host lands, `toggle_palette` parses for forward
+                // compat but is never in defaults: unbound Ctrl+Shift+P
+                // reaches the shell, and an explicitly bound chord is
+                // consumed here as inert with a loud warning (no overlay,
+                // no routing change, Normal Mode stays byte-identical).
+                eprintln!(
+                    "warning: keymap toggle_palette is not yet shipped (see #1003); chord ignored, no palette opened"
+                );
+            }
             A::NewSplit(dir) => {
                 self.restore_zoom();
                 let focused = match self.runtime.focused_view() {
@@ -3315,6 +3330,44 @@ mod tests {
         let focused = app.runtime.focused_view();
         let help = app.runtime.help_visible();
         app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
+        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
+        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        assert_eq!(app.runtime.help_visible(), help, "help unchanged");
+    }
+
+    #[test]
+    fn toggle_palette_is_inert_and_unbound_by_default() {
+        // CTX-0647 / #1003 palette entry: the panel exists via the public
+        // Panel Runtime path but the app hosts no PanelRegistry yet, so the
+        // palette stays bundled-disabled (OQ-053). Until the panel host
+        // lands, defaults stay unbound so Ctrl+Shift+P reaches the shell,
+        // and an explicitly bound chord is inert with a warning.
+        use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
+        let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+        assert!(
+            !maps.iter().any(|m| m.action == ChromeAction::TogglePalette),
+            "defaults must not bind toggle_palette so Ctrl+Shift+P stays shell input"
+        );
+        let ctrl_shift_p = KeyRef {
+            key: KeyName::Char('p'),
+            ctrl: true,
+            alt: false,
+            shift: true,
+            super_held: false,
+        };
+        assert_eq!(
+            match_keymap(&maps, ctrl_shift_p),
+            None,
+            "unbound Ctrl+Shift+P must fall through to the PTY"
+        );
+        // Bound-but-inert: no runtime mutation, no overlay, no routing change.
+        let mut app = help_test_app(maps);
+        let leafs = app.runtime.leaf_count();
+        let leaves = app.runtime.layout().leaf_ids();
+        let focused = app.runtime.focused_view();
+        let help = app.runtime.help_visible();
+        app.apply_chrome_action(ChromeAction::TogglePalette);
         assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
         assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
         assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");

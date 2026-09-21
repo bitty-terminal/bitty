@@ -112,7 +112,9 @@ pub use theme::{
     DEFAULT_THEME_NAME, Theme, ThemeCategory, ThemeResolution, default_theme, list_presets,
     normalize_theme_name, resolve_theme, resolve_theme_with_status,
 };
-pub use trust::{TrustDecision, TrustRecord, TrustStore, check_trust, validate_project_plan};
+pub use trust::{
+    TrustDecision, TrustRecord, TrustStore, admit_project_layer, check_trust, validate_project_plan,
+};
 pub use types::{
     AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition, AnimationsConfig,
     AppearanceConfig, BackgroundFit, CloseConfirm, DecorationConfig, EffectiveConfig, FontConfig,

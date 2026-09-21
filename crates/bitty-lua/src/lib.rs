@@ -61,6 +61,8 @@ use std::time::{Duration, Instant};
 use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
 
 pub mod config;
+pub mod error;
+pub mod gate;
 pub mod host;
 mod stdlib;
 pub mod ui;

@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::geometry::{Gaps, Rect, SplitAxis};
+use crate::geometry::{Gaps, Point, Rect, SplitAxis};
 use crate::view::{View, ViewId};
 
 /// Z-index tier for floating overlays (CTX-0217, FIND-0002).
@@ -588,6 +588,386 @@ impl LayoutNode {
     #[must_use]
     pub fn is_leaf(&self) -> bool {
         matches!(self, Self::Leaf(_))
+    }
+
+    /// Removes the leaf with `id` from the tree (CW-09 drag re-parenting).
+    ///
+    /// Returns the detached [`View`] when found. Interior nodes collapse
+    /// deterministically: a `Split` with one surviving child is replaced by
+    /// that child (so ratios never dangle), an empty `Stack` stays an empty
+    /// `Stack`, and an `Overlay` whose base was removed keeps the overlay
+    /// subtree (and vice versa). Returns `None` with the tree untouched when
+    /// `id` is absent. Total and deterministic.
+    pub fn remove_leaf(&mut self, id: ViewId) -> Option<View> {
+        // A bare-leaf tree: removing its only leaf yields `Some` and leaves
+        // an empty `Stack` (same tombstone path as nested removal).
+        if let Self::Leaf(v) = self {
+            if v.id() != id {
+                return None;
+            }
+            let taken = std::mem::replace(&mut *self, Self::Stack(Vec::new()));
+            let Self::Leaf(view) = taken else {
+                unreachable!("just matched Leaf")
+            };
+            return Some(view);
+        }
+        match self {
+            Self::Leaf(_) => None, // Unreachable: bare leaves return above.
+            Self::Split { first, second, .. } => {
+                if let leaf @ Some(_) = first.remove_leaf_result(id) {
+                    if first.is_gone() {
+                        *self = std::mem::replace(second.as_mut(), Self::Stack(Vec::new()));
+                    }
+                    return leaf;
+                }
+                if let leaf @ Some(_) = second.remove_leaf_result(id) {
+                    if second.is_gone() {
+                        *self = std::mem::replace(first.as_mut(), Self::Stack(Vec::new()));
+                    }
+                    return leaf;
+                }
+                None
+            }
+            Self::Stack(children) => {
+                let pos = children.iter().position(|c| c.contains_leaf(id))?;
+                let mut child = children.remove(pos);
+                let leaf = child.remove_leaf_result(id);
+                if !child.is_gone() {
+                    children.insert(pos.min(children.len()), child);
+                }
+                leaf
+            }
+            Self::Overlay { base, overlay, .. } => {
+                if let leaf @ Some(_) = base.remove_leaf_result(id) {
+                    if base.is_gone() {
+                        *self = std::mem::replace(overlay.as_mut(), Self::Stack(Vec::new()));
+                    }
+                    return leaf;
+                }
+                if let leaf @ Some(_) = overlay.remove_leaf_result(id) {
+                    if overlay.is_gone() {
+                        *self = std::mem::replace(base.as_mut(), Self::Stack(Vec::new()));
+                    }
+                    return leaf;
+                }
+                None
+            }
+        }
+    }
+
+    /// Helper: like [`Self::remove_leaf`] but also succeeds when `self` IS
+    /// the target leaf. `is_gone` (below) reports whether the node must be
+    /// dropped by its parent.
+    fn remove_leaf_result(&mut self, id: ViewId) -> Option<View> {
+        if let Self::Leaf(v) = self {
+            if v.id() == id {
+                // Leave an empty-stack tombstone; the caller collapses it.
+                let Self::Leaf(v) = std::mem::replace(self, Self::Stack(Vec::new())) else {
+                    unreachable!()
+                };
+                return Some(v);
+            }
+            return None;
+        }
+        self.remove_leaf(id)
+    }
+
+    /// True when this node is the empty-stack tombstone left by
+    /// [`Self::remove_leaf_result`] (to be collapsed by the parent).
+    fn is_gone(&self) -> bool {
+        matches!(self, Self::Stack(children) if children.is_empty())
+    }
+
+    /// Re-parents leaf `id` under the sibling split at `sibling` (CW-09
+    /// pointer drag re-parenting).
+    ///
+    /// Detaches the dragged leaf, then inserts it beside `sibling` via
+    /// [`Self::insert_beside`]. Returns `false` with the tree untouched when
+    /// either id is absent or `id == sibling` (self-drops are no-ops).
+    pub fn reparent_leaf(
+        &mut self,
+        id: ViewId,
+        sibling: ViewId,
+        axis: SplitAxis,
+        ratio: f32,
+        after: bool,
+    ) -> bool {
+        if id == sibling || !self.contains_leaf(id) || !self.contains_leaf(sibling) {
+            return false;
+        }
+        let Some(view) = self.remove_leaf(id) else {
+            return false;
+        };
+        let placed = self.insert_beside(sibling, &view, axis, ratio, after);
+        debug_assert!(placed);
+        placed
+    }
+
+    /// Inserts `dragged` beside the node holding `sibling` (CW-09).
+    ///
+    /// Splits the node holding `sibling` into `Split { axis, ratio, ... }`
+    /// with the dragged leaf and the sibling subtree as children (`second`
+    /// when `after` is true, `first` otherwise). `ratio` is clamped to
+    /// `[MIN_RATIO, MAX_RATIO]` via [`clamp_ratio`]. Returns `false` with
+    /// the tree untouched when `sibling` is absent. Shared by
+    /// [`Self::reparent_leaf`] (drag re-parenting) and scratchpad restore.
+    pub fn insert_beside(
+        &mut self,
+        sibling: ViewId,
+        dragged: &View,
+        axis: SplitAxis,
+        ratio: f32,
+        after: bool,
+    ) -> bool {
+        match self {
+            Self::Leaf(v) if v.id() == sibling => {
+                let existing = std::mem::replace(&mut *self, Self::Stack(Vec::new()));
+                let split = if after {
+                    Self::split(axis, ratio, existing, Self::leaf(dragged.clone()))
+                } else {
+                    Self::split(axis, ratio, Self::leaf(dragged.clone()), existing)
+                };
+                *self = split;
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.insert_beside(sibling, dragged, axis, ratio, after)
+                    || second.insert_beside(sibling, dragged, axis, ratio, after)
+            }
+            Self::Stack(children) => {
+                for child in children.iter_mut() {
+                    if child.insert_beside(sibling, dragged, axis, ratio, after) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Self::Overlay { base, overlay, .. } => {
+                base.insert_beside(sibling, dragged, axis, ratio, after)
+                    || overlay.insert_beside(sibling, dragged, axis, ratio, after)
+            }
+        }
+    }
+
+    /// Adjusts the split ratio at `path` from a split-handle drag (CW-09
+    /// split-handle resize).
+    ///
+    /// Converts handle offset `delta_cells` (signed cells along the split
+    /// axis, positive toward `second`) on a `total_cells` container into a
+    /// ratio delta, adds it to the current ratio, and clamps the result to
+    /// `[MIN_RATIO, MAX_RATIO]` via [`Self::set_split_ratio_at`]. Returns
+    /// `false` with the tree untouched when `total_cells == 0` or `path`
+    /// addresses no split. Deterministic and total.
+    pub fn resize_split_by_drag(
+        &mut self,
+        path: &[usize],
+        delta_cells: i32,
+        total_cells: u16,
+    ) -> bool {
+        if total_cells == 0 {
+            return false;
+        }
+        let Some(current) = self.split_ratio_at(path) else {
+            return false;
+        };
+        let next = current + (f32::from(delta_cells as i16) / f32::from(total_cells));
+        self.set_split_ratio_at(path, next)
+    }
+
+    /// Reads the split ratio at `path` (`[]` = this node), or `None` when
+    /// `path` addresses no split.
+    #[must_use]
+    pub fn split_ratio_at(&self, path: &[usize]) -> Option<f32> {
+        if path.is_empty() {
+            if let Self::Split { ratio, .. } = self {
+                return Some(*ratio);
+            }
+            return None;
+        }
+        let idx = path[0];
+        let rest = &path[1..];
+        match self {
+            Self::Split { first, second, .. } => match idx {
+                0 => first.split_ratio_at(rest),
+                1 => second.split_ratio_at(rest),
+                _ => None,
+            },
+            Self::Stack(children) => children.get(idx)?.split_ratio_at(rest),
+            Self::Overlay { base, overlay, .. } => match idx {
+                0 => base.split_ratio_at(rest),
+                1 => overlay.split_ratio_at(rest),
+                _ => None,
+            },
+            Self::Leaf(_) => None,
+        }
+    }
+
+    /// Hit-tests `point` against the current allocations (CW-09).
+    ///
+    /// Returns the leaf id whose allocation contains the point, or `None`
+    /// when the point lands on background (gap band, overlay margin) or in
+    /// an empty container. Allocations come from
+    /// [`Self::layout_with_gaps`]; ties are impossible (allocations never
+    /// overlap) so the first hit wins. Total and deterministic.
+    #[must_use]
+    pub fn hit_test_leaf(&self, bounds: Rect, gaps: Gaps, point: Point) -> Option<ViewId> {
+        self.layout_with_gaps(bounds, gaps)
+            .into_iter()
+            .find(|(_, rect)| rect.contains_point(point))
+            .map(|(id, _)| id)
+    }
+
+    /// Hit-tests `point` against the split-handle bands (CW-09).
+    ///
+    /// A split handle is the `gaps.inner`-wide band between the two
+    /// children of a `Split` (Hyprland-like `gaps_in`); with zero inner
+    /// gaps the divider is the one-cell boundary line between the children.
+    /// Returns the path of the split whose handle contains the point
+    /// (outermost first on nesting), or `None`. Paths use the same
+    /// indexing as [`Self::set_split_ratio_at`]. Total and deterministic.
+    #[must_use]
+    pub fn hit_test_split_handle(
+        &self,
+        bounds: Rect,
+        gaps: Gaps,
+        point: Point,
+    ) -> Option<Vec<usize>> {
+        let inner = gaps.inset_outer(bounds);
+        self.hit_test_handle_inner(inner, gaps.inner, point, Vec::new())
+    }
+
+    /// Recursion for [`Self::hit_test_split_handle`]: `bounds` is the
+    /// gap-inset region owned by `self`; `prefix` is the path to `self`.
+    fn hit_test_handle_inner(
+        &self,
+        bounds: Rect,
+        gap_in: u16,
+        point: Point,
+        prefix: Vec<usize>,
+    ) -> Option<Vec<usize>> {
+        match self {
+            Self::Leaf(_) => None,
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
+                let handle = handle_band_between(a, b, *axis, gap_in);
+                if let Some(rect) = handle {
+                    if rect.contains_point(point) {
+                        return Some(prefix.clone());
+                    }
+                } else if on_child_boundary(a, b, *axis, point) {
+                    return Some(prefix.clone());
+                }
+                // Recurse: first child keeps the prefix, second appends.
+                let mut first_prefix = prefix.clone();
+                first_prefix.push(0);
+                if let Some(hit) = first.hit_test_handle_inner(a, gap_in, point, first_prefix) {
+                    return Some(hit);
+                }
+                let mut second_prefix = prefix;
+                second_prefix.push(1);
+                second.hit_test_handle_inner(b, gap_in, point, second_prefix)
+            }
+            Self::Stack(children) => {
+                for (i, child) in children.iter().enumerate() {
+                    let mut child_prefix = prefix.clone();
+                    child_prefix.push(i);
+                    if let Some(hit) =
+                        child.hit_test_handle_inner(bounds, gap_in, point, child_prefix)
+                    {
+                        return Some(hit);
+                    }
+                }
+                None
+            }
+            Self::Overlay {
+                base,
+                overlay,
+                bounds: overlay_bounds,
+                ..
+            } => {
+                let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
+                let mut base_prefix = prefix.clone();
+                base_prefix.push(0);
+                if let Some(hit) = base.hit_test_handle_inner(bounds, gap_in, point, base_prefix) {
+                    return Some(hit);
+                }
+                let mut overlay_prefix = prefix;
+                overlay_prefix.push(1);
+                overlay.hit_test_handle_inner(clipped, gap_in, point, overlay_prefix)
+            }
+        }
+    }
+}
+
+/// Handle band between two gap-split siblings (CW-09 helper for
+/// [`LayoutNode::hit_test_split_handle`]).
+///
+/// Returns `Some(band)` when `gap_in > 0` and a positive-width band fits
+/// between the children along `axis`; `None` with zero gaps (the caller
+/// falls back to the one-cell boundary line) or when the children abut
+/// exactly.
+fn handle_band_between(first: Rect, second: Rect, axis: SplitAxis, gap_in: u16) -> Option<Rect> {
+    if gap_in == 0 {
+        return None;
+    }
+    match axis {
+        SplitAxis::Horizontal => {
+            let start = first.right();
+            let end = second.x as u32;
+            (end > start).then(|| {
+                Rect::new(
+                    start.min(u32::from(u16::MAX)) as u16,
+                    first.y.min(second.y),
+                    (end - start).min(u32::from(u16::MAX)) as u16,
+                    first.height.max(second.height),
+                )
+            })
+        }
+        SplitAxis::Vertical => {
+            let start = first.bottom();
+            let end = second.y as u32;
+            (end > start).then(|| {
+                Rect::new(
+                    first.x.min(second.x),
+                    start.min(u32::from(u16::MAX)) as u16,
+                    first.width.max(second.width),
+                    (end - start).min(u32::from(u16::MAX)) as u16,
+                )
+            })
+        }
+    }
+}
+
+/// True when `point` sits on the one-cell boundary between two gapless
+/// siblings (CW-09 helper for zero-gap handle hit testing).
+fn on_child_boundary(first: Rect, second: Rect, axis: SplitAxis, point: Point) -> bool {
+    match axis {
+        SplitAxis::Horizontal => {
+            // Divider is the last column of `first` / first column of
+            // `second` when they abut exactly.
+            second.x == first.x.saturating_add(first.width)
+                && (point.x as u32 == first.right().saturating_sub(1)
+                    || point.x as u32 == second.x as u32)
+                && (point.y as u32) >= first.y as u32
+                && (point.y as u32) < first.bottom()
+                && (point.y as u32) >= second.y as u32
+                && (point.y as u32) < second.bottom()
+        }
+        SplitAxis::Vertical => {
+            second.y == first.y.saturating_add(first.height)
+                && (point.y as u32 == first.bottom().saturating_sub(1)
+                    || point.y as u32 == second.y as u32)
+                && (point.x as u32) >= first.x as u32
+                && (point.x as u32) < first.right()
+                && (point.x as u32) >= second.x as u32
+                && (point.x as u32) < second.right()
+        }
     }
 }
 
@@ -1466,5 +1846,247 @@ mod tests {
             _ => panic!("must stay an overlay"),
         };
         assert_eq!(bounds, Rect::new(10, 5, 10, 5));
+    }
+
+    #[test]
+    fn remove_leaf_collapses_split_and_stack() {
+        // CW-09: removing one side of a split leaves the surviving child;
+        // removing a stacked tab keeps the other tabs in order.
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert_eq!(tree.remove_leaf(ViewId::new(1)), Some(view(1, 40, 24)));
+        assert_eq!(tree, LayoutNode::leaf(view(2, 40, 24)));
+        assert_eq!(tree.remove_leaf(ViewId::new(99)), None);
+
+        let mut stack = LayoutNode::stack(vec![
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 80, 24)),
+            LayoutNode::leaf(view(3, 80, 24)),
+        ]);
+        assert_eq!(stack.remove_leaf(ViewId::new(2)), Some(view(2, 80, 24)));
+        assert_eq!(stack.leaf_ids(), vec![ViewId::new(1), ViewId::new(3)]);
+        assert_eq!(stack.remove_leaf(ViewId::new(1)), Some(view(1, 80, 24)));
+        assert_eq!(stack.remove_leaf(ViewId::new(3)), Some(view(3, 80, 24)));
+        assert_eq!(stack, LayoutNode::stack(Vec::new()));
+    }
+
+    #[test]
+    fn reparent_leaf_splits_beside_sibling() {
+        // CW-09: drag leaf 3 onto leaf 1 -> leaf 1's position becomes a
+        // split with the dragged leaf after the sibling; leaf count and
+        // sibling allocation cover the container exactly.
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::leaf(view(3, 40, 12)),
+            ),
+        );
+        assert!(tree.reparent_leaf(
+            ViewId::new(3),
+            ViewId::new(1),
+            SplitAxis::Horizontal,
+            0.5,
+            true
+        ));
+        assert_eq!(tree.leaf_count(), 3);
+        // Self-drops and unknown ids are fail-soft no-ops.
+        let before = tree.clone();
+        assert!(!tree.reparent_leaf(
+            ViewId::new(1),
+            ViewId::new(1),
+            SplitAxis::Horizontal,
+            0.5,
+            true
+        ));
+        assert!(!tree.reparent_leaf(
+            ViewId::new(404),
+            ViewId::new(1),
+            SplitAxis::Horizontal,
+            0.5,
+            true
+        ));
+        assert!(!tree.reparent_leaf(
+            ViewId::new(1),
+            ViewId::new(404),
+            SplitAxis::Horizontal,
+            0.5,
+            true
+        ));
+        assert_eq!(tree, before);
+        // Ratio clamps to [MIN_RATIO, MAX_RATIO] and layout stays exact.
+        let mut tree2 = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert!(tree2.reparent_leaf(
+            ViewId::new(2),
+            ViewId::new(1),
+            SplitAxis::Vertical,
+            0.01,
+            false
+        ));
+        // Ratio clamped at the new inner split; the dragged leaf lands
+        // before the sibling.
+        let inner_ratio = match &tree2 {
+            LayoutNode::Split { ratio, .. } => *ratio,
+            _ => panic!("root still a split"),
+        };
+        assert!(
+            (inner_ratio - LayoutNode::MIN_RATIO).abs() < 1e-6,
+            "clamped drag ratio {inner_ratio}"
+        );
+        let alloc = tree2.layout(Rect::new(0, 0, 80, 24));
+        assert_eq!(alloc.len(), 2);
+        assert_eq!(alloc[0].1.height as u32 + alloc[1].1.height as u32, 24);
+        assert_eq!(alloc[0].0, ViewId::new(2));
+        assert_eq!(alloc[1].0, ViewId::new(1));
+    }
+
+    #[test]
+    fn resize_split_by_drag_validates_range_and_path() {
+        // CW-09: handle drags convert cells to ratio delta, clamped to
+        // [0.10, 0.90]; bad paths and zero totals are no-ops.
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert!(tree.resize_split_by_drag(&[], 8, 80));
+        assert!((tree.split_ratio_at(&[]).expect("root split") - 0.6).abs() < 1e-6);
+        // Overshoot clamps at MAX_RATIO, undershoot at MIN_RATIO.
+        assert!(tree.resize_split_by_drag(&[], 800, 80));
+        assert!((tree.split_ratio_at(&[]).expect("root split") - 0.9).abs() < 1e-6);
+        assert!(tree.resize_split_by_drag(&[], -800, 80));
+        assert!((tree.split_ratio_at(&[]).expect("root split") - 0.1).abs() < 1e-6);
+        // Non-finite outcomes clamp via clamp_ratio (total path stays total).
+        let before = tree.clone();
+        assert!(
+            !tree.resize_split_by_drag(&[0], 4, 80),
+            "leaf path: no split"
+        );
+        assert!(!tree.resize_split_by_drag(&[], 4, 0), "zero total: no-op");
+        assert_eq!(tree, before);
+        let bounds = Rect::new(0, 0, 80, 24);
+        let alloc = tree.layout(bounds);
+        assert_eq!(alloc.len(), 2);
+        assert_eq!(alloc[0].1.width as u32 + alloc[1].1.width as u32, 80);
+    }
+
+    #[test]
+    fn hit_test_leaf_resolves_allocations_and_gaps() {
+        use crate::geometry::{Gaps, Point};
+        // CW-09: points inside allocations resolve to the owning leaf;
+        // gap bands and outside points resolve to None.
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        let bounds = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            tree.hit_test_leaf(bounds, Gaps::ZERO, Point::new(5, 5)),
+            Some(ViewId::new(1))
+        );
+        assert_eq!(
+            tree.hit_test_leaf(bounds, Gaps::ZERO, Point::new(60, 5)),
+            Some(ViewId::new(2))
+        );
+        assert_eq!(
+            tree.hit_test_leaf(bounds, Gaps::ZERO, Point::new(200, 200)),
+            None
+        );
+        // With inner gaps the band between panes is background, not a leaf.
+        let gaps = Gaps::new(2, 0);
+        let alloc = tree.layout_with_gaps(bounds, gaps);
+        let band_x = alloc[0].1.x.saturating_add(alloc[0].1.width);
+        assert_eq!(
+            tree.hit_test_leaf(bounds, gaps, Point::new(band_x, 5)),
+            None,
+            "gap band is background"
+        );
+    }
+
+    #[test]
+    fn hit_test_split_handle_finds_divider_paths() {
+        use crate::geometry::{Gaps, Point};
+        // CW-09: gapless divider hits the root split; gap bands hit the
+        // split too; leaf interiors hit nothing.
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        let bounds = Rect::new(0, 0, 80, 24);
+        let alloc = tree.layout(bounds);
+        let divider_x = alloc[0].1.x.saturating_add(alloc[0].1.width);
+        assert_eq!(
+            tree.hit_test_split_handle(bounds, Gaps::ZERO, Point::new(divider_x, 5)),
+            Some(Vec::new()),
+            "gapless divider resolves to the root split path"
+        );
+        assert_eq!(
+            tree.hit_test_split_handle(
+                bounds,
+                Gaps::ZERO,
+                Point::new(divider_x.wrapping_sub(1), 5)
+            ),
+            Some(Vec::new()),
+            "last column of first pane is the boundary"
+        );
+        assert_eq!(
+            tree.hit_test_split_handle(bounds, Gaps::ZERO, Point::new(5, 5)),
+            None,
+            "leaf interior is no handle"
+        );
+        // Gapped: the inner band resolves to the root split path.
+        let gaps = Gaps::new(2, 0);
+        let gapped = tree.layout_with_gaps(bounds, gaps);
+        let band_x = gapped[0].1.x.saturating_add(gapped[0].1.width);
+        assert_eq!(
+            tree.hit_test_split_handle(bounds, gaps, Point::new(band_x, 5)),
+            Some(Vec::new())
+        );
+        // Nested splits resolve to the inner path.
+        let nested = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::leaf(view(3, 40, 12)),
+            ),
+        );
+        let alloc = nested.layout(bounds);
+        // Leaf 2 occupies the top-right; its bottom edge is the inner
+        // vertical divider.
+        let leaf2 = alloc
+            .iter()
+            .find(|(id, _)| *id == ViewId::new(2))
+            .expect("leaf 2");
+        let divider_y = leaf2.1.y.saturating_add(leaf2.1.height);
+        // Mid-width of the inner split: on the inner vertical divider but
+        // clear of the root divider at the region's left edge.
+        let mid_x = leaf2.1.x.saturating_add(leaf2.1.width / 2);
+        assert_eq!(
+            nested.hit_test_split_handle(bounds, Gaps::ZERO, Point::new(mid_x, divider_y)),
+            Some(vec![1]),
+            "nested vertical divider resolves to path [1]"
+        );
     }
 }

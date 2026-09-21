@@ -320,6 +320,95 @@ pub fn is_staging_allowed(report: &VerificationReport) -> bool {
     report.is_passed()
 }
 
+// ── native-artifact file-name guard (R-017 / P0-AC-018) ────────────────────
+
+/// Native artifact extensions rejected at install (`R-017`, `P0-AC-018`).
+///
+/// Lowercase comparison basis; matching is ASCII case-insensitive so
+/// `EVIL.SO` / `Hook.DLL` / `lib.DYLIB` cannot bypass with a folded variant.
+pub const NATIVE_ARTIFACT_EXTENSIONS: &[&str] = &["so", "dll", "dylib"];
+
+/// Whether `name` names a native artifact file (risk `R-017`, `P0-AC-018`).
+///
+/// Pure file-name screen, no I/O: trims surrounding whitespace, screens only
+/// the base segment after the last `/` or `\`, and compares ASCII
+/// case-insensitively. Rejects:
+/// - base extensions `.so` / `.dll` / `.dylib` (trailing dots ignored, so
+///   `evil.so.` is still rejected),
+/// - versioned Linux shared objects containing `.so.` (`libfoo.so.1`,
+///   `libfoo.so.1.2`).
+///
+/// An empty or extension-less name is not native (other validation owns
+/// emptiness); benign names (`init.lua`, `README.md`, `icon.png`) pass.
+/// Fail-closed direction: unknown spellings of the three covered extensions
+/// are rejected, never passed.
+#[must_use]
+pub fn is_native_artifact_file_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
+    if base.is_empty() {
+        return false;
+    }
+    let lower = base.to_ascii_lowercase();
+    let stripped = lower.trim_end_matches('.');
+    if stripped.is_empty() {
+        return false;
+    }
+    // Versioned `.so`: `libfoo.so.1`, `libfoo.so.1.2`.
+    if stripped.contains(".so.") {
+        return true;
+    }
+    let ext = stripped.rsplit('.').next().unwrap_or(stripped);
+    NATIVE_ARTIFACT_EXTENSIONS.contains(&ext)
+}
+
+/// Reject native artifact file names before install staging (fail-closed).
+///
+/// Every name in `names` is screened with [`is_native_artifact_file_name`];
+/// the first native name aborts with an owned [`PackageError::integrity`]
+/// (`stage = "native_reject"`, so `bitty plugin doctor` groups it via
+/// [`DoctorIssue::from_package_error`]). An empty list passes: there is
+/// nothing to screen, not an exemption.
+///
+/// This is the `P0-AC-018` install gate for artifact file listings. The
+/// staging caller must pass the package's file names here; content bytes
+/// alone cannot carry the extension signal.
+pub fn reject_native_artifact_files<I, S>(names: I) -> Result<(), PackageError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for name in names {
+        let name = name.as_ref();
+        if is_native_artifact_file_name(name) {
+            return Err(PackageError::integrity(
+                "native_reject",
+                format!(
+                    "native artifact '{name}' rejected (R-017: .so/.dll/.dylib payloads are forbidden)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify the full install pipeline with a native-artifact file screen.
+///
+/// Runs [`reject_native_artifact_files`] over `artifact_file_names` first —
+/// a native name blocks before any of the 7 pipeline stages run — then
+/// delegates to [`verify_install`]. Fail-closed with owned errors; no
+/// staging is performed here.
+pub fn verify_install_with_files(
+    inputs: &InstallInputs<'_>,
+    artifact_file_names: &[String],
+) -> Result<VerificationReport, PackageError> {
+    reject_native_artifact_files(artifact_file_names)?;
+    verify_install(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1108,103 @@ mod tests {
         let err = PackageError::generation("tampered");
         let issue = DoctorIssue::from_package_error("xuepoo.doc", &err);
         assert_eq!(issue.error_class, "generation");
+    }
+
+    // ── R-017 / P0-AC-018: native-artifact file-name guard ───────────────
+
+    #[test]
+    fn native_predicate_rejects_each_artifact_type() {
+        // Each P0-AC-018 artifact type, plain and nested.
+        for name in [
+            "evil.so",
+            "evil.dll",
+            "evil.dylib",
+            "lib/evil.so",
+            "lib\\evil.dll",
+            "plugins/evil.dylib",
+        ] {
+            assert!(is_native_artifact_file_name(name), "{name} must be native");
+        }
+    }
+
+    #[test]
+    fn native_predicate_rejects_evasion_spellings() {
+        for name in [
+            "EVIL.SO",            // case fold
+            "Hook.DLL",           // case fold
+            "lib.DYLIB",          // case fold
+            "libfoo.so.1",        // versioned .so
+            "libfoo.so.1.2",      // versioned .so
+            " evil.so ",          // padding
+            "evil.so.",           // trailing dot
+            "a.b.so",             // dotted stem
+            "C:\\mods\\evil.dll", // windows path
+        ] {
+            assert!(is_native_artifact_file_name(name), "{name} must be native");
+        }
+    }
+
+    #[test]
+    fn native_predicate_passes_benign_names() {
+        for name in [
+            "",
+            "init.lua",
+            "main.lua",
+            "README.md",
+            "icon.png",
+            "plugin.wasm",
+            "solitary",   // no extension
+            "so.txt",     // native token as stem only
+            "foo.sox",    // near-miss extension
+            "foo.dl",     // near-miss extension
+            "foo.dylibx", // near-miss extension
+            "...",
+            "/",
+        ] {
+            assert!(!is_native_artifact_file_name(name), "{name} must pass");
+        }
+    }
+
+    #[test]
+    fn reject_native_files_fails_closed_on_first_native_name() {
+        let err = reject_native_artifact_files(["init.lua", "evil.dll", "payload.so"])
+            .expect_err("native name must block");
+        assert!(err.to_string().contains("evil.dll"));
+        let issue = DoctorIssue::from_package_error("xuepoo.native", &err);
+        assert_eq!(issue.stage, "native_reject");
+
+        assert!(reject_native_artifact_files(["init.lua", "README.md"]).is_ok());
+        assert!(reject_native_artifact_files(Vec::<String>::new()).is_ok());
+    }
+
+    #[test]
+    fn install_with_files_blocks_native_before_pipeline() {
+        let manifest = minimal_package_manifest("xuepoo.good");
+        let manifest_digest = manifest.canonical_digest();
+        let artifact = b"package artifact bytes v1";
+        let artifact_digest = sha256_hex(artifact);
+        let inputs = default_inputs(
+            artifact,
+            &artifact_digest,
+            &manifest,
+            &manifest_digest,
+            &[],
+            &[],
+            false,
+        );
+
+        // Benign file list: full pipeline passes.
+        let benign = vec!["init.lua".to_string(), "README.md".to_string()];
+        let report = verify_install_with_files(&inputs, &benign).unwrap();
+        assert!(report.is_passed());
+
+        // Native name blocks even when every pipeline input is valid.
+        for native in ["payload.so", "payload.dll", "payload.dylib"] {
+            let names = vec![native.to_string()];
+            let err = verify_install_with_files(&inputs, &names)
+                .expect_err("native artifact must block install");
+            let issue = DoctorIssue::from_package_error("xuepoo.good", &err);
+            assert_eq!(issue.stage, "native_reject", "{native}");
+        }
     }
 }

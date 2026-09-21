@@ -164,7 +164,10 @@ pub use fs_authz::{
 };
 pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};
-pub use install::{DoctorIssue, InstallInputs, is_staging_allowed, verify_install};
+pub use install::{
+    DoctorIssue, InstallInputs, NATIVE_ARTIFACT_EXTENSIONS, is_native_artifact_file_name,
+    is_staging_allowed, reject_native_artifact_files, verify_install, verify_install_with_files,
+};
 pub use lifecycle::{
     BudgetDimension, Clock, ESCALATION_WINDOW_SECS, ESCALATIONS_TO_SUSPEND, EnforcementAction,
     EnforcementRecord, LifecycleEnforcer, MAX_ENFORCEMENT_RECORDS, MAX_TRACKED_OWNERS, ManualClock,

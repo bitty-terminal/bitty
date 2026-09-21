@@ -1205,6 +1205,139 @@ mod tests {
         assert!(rt.workspace_close_index(99).is_err(), "unknown index");
     }
 
+    /// WS-INV-6 (follow-up F-4): a workspace slot keeps its stable creation
+    /// sequence (`WorkspaceSlot::seq`) across index shifts, and the workspace
+    /// MRU holds each live index exactly once with the active index fronted.
+    ///
+    /// Headless and session-free: every workspace here is idle, so closes
+    /// are immediate and only slot/`seq`/MRU movement is pinned.
+    #[test]
+    fn workspace_seq_stable_across_index_shifts() {
+        fn seqs(rt: &Runtime) -> Vec<u64> {
+            (0..rt.workspace_count())
+                .map(|i| rt.workspace_seq_at(i).expect("every slot carries a seq"))
+                .collect()
+        }
+        fn assert_mru_valid(rt: &Runtime) {
+            let n = rt.workspace_count();
+            let mru: Vec<usize> = rt.workspace_mru.iter().copied().collect();
+            assert_eq!(mru.len(), n, "MRU holds each live index exactly once");
+            let mut seen = vec![false; n];
+            for &i in &mru {
+                assert!(i < n, "MRU index {i} is in range");
+                assert!(!seen[i], "MRU index {i} appears exactly once");
+                seen[i] = true;
+            }
+            assert_eq!(
+                mru.first(),
+                Some(&rt.active_workspace_index()),
+                "MRU head is the active workspace"
+            );
+        }
+        fn assert_seq_addrs(rt: &Runtime) {
+            for (index, seq) in seqs(rt).iter().enumerate() {
+                assert_eq!(rt.workspace_index_by_seq(*seq), Some(index));
+                assert_eq!(
+                    rt.workspace_names()[index],
+                    format!("ws{seq}"),
+                    "name tracks the stable seq, never the positional index"
+                );
+            }
+            assert_eq!(rt.workspace_seq_at(rt.workspace_count()), None);
+            assert_eq!(rt.workspace_index_by_seq(u64::MAX), None);
+        }
+
+        let mut rt = fresh();
+        assert_eq!(seqs(&rt), vec![1]);
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Grow to four slots: seqs allocate monotonically from 1.
+        assert_eq!(rt.workspace_new().expect("ws2"), 1);
+        assert_eq!(rt.workspace_new().expect("ws3"), 2);
+        assert_eq!(rt.workspace_new().expect("ws4"), 3);
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_eq!(rt.active_workspace_index(), 3);
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Switches (direct, prev/next, MRU-last) never mutate seqs.
+        assert!(rt.workspace_switch(0));
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_mru_valid(&rt);
+        assert_eq!(rt.workspace_next(), 1);
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_mru_valid(&rt);
+        assert_eq!(rt.workspace_prev(), 0);
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_mru_valid(&rt);
+        assert_eq!(rt.workspace_last(), 1);
+        assert_eq!(seqs(&rt), vec![1, 2, 3, 4]);
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Close an inactive slot above the active one: survivors keep their
+        // seqs, higher slots shift down, the retired seq resolves nowhere.
+        assert!(rt.workspace_switch(0));
+        assert_eq!(rt.workspace_close_at(2).expect("close inactive ws3"), 0);
+        assert_eq!(seqs(&rt), vec![1, 2, 4]);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_index_by_seq(3), None);
+        assert_eq!(rt.workspace_index_by_seq(4), Some(2));
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Close an inactive slot below the active one: the active index
+        // shifts down with its slot while every surviving seq is untouched.
+        assert!(rt.workspace_switch(2));
+        assert_eq!(rt.active_workspace_index(), 2);
+        assert_eq!(rt.workspace_close_at(1).expect("close inactive ws2"), 0);
+        assert_eq!(seqs(&rt), vec![1, 4]);
+        assert_eq!(rt.active_workspace_index(), 1);
+        assert_eq!(rt.workspace_index_by_seq(2), None);
+        assert_eq!(rt.workspace_index_by_seq(4), Some(1));
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Close the active slot itself: the neighbor loads and surviving
+        // seqs are preserved verbatim.
+        assert_eq!(rt.workspace_close_at(1).expect("close active ws4"), 0);
+        assert_eq!(seqs(&rt), vec![1]);
+        assert_eq!(rt.active_workspace_index(), 0);
+        assert_eq!(rt.workspace_index_by_seq(4), None);
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // A fresh workspace after closes takes a new monotonic seq; retired
+        // seqs (2, 3, 4) are never reissued.
+        let index = rt.workspace_new().expect("ws5");
+        assert_eq!(index, 1);
+        assert_eq!(seqs(&rt), vec![1, 5]);
+        assert_eq!(rt.workspace_index_by_seq(5), Some(1));
+        for retired in [2, 3, 4] {
+            assert_eq!(rt.workspace_index_by_seq(retired), None);
+        }
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+
+        // Draining to the last workspace resets it with a fresh monotonic
+        // seq rather than reusing a retired one.
+        assert_eq!(rt.workspace_close_at(0).expect("close ws1"), 0);
+        assert_eq!(seqs(&rt), vec![5]);
+        assert_eq!(rt.workspace_close_at(0).expect("reset last ws5"), 0);
+        assert_eq!(rt.workspace_count(), 1);
+        let reset = seqs(&rt);
+        assert_eq!(reset.len(), 1);
+        assert!(
+            reset[0] > 5,
+            "reset seq {} must advance past every retired seq",
+            reset[0]
+        );
+        assert_eq!(rt.workspace_names(), vec![format!("ws{}", reset[0])]);
+        assert_mru_valid(&rt);
+        assert_seq_addrs(&rt);
+    }
+
     #[test]
     fn move_multi_leaf_preserves_focus_and_tabline() {
         // CTX-0259: two workspaces, ws1 split into two leaves; moving the

@@ -7,7 +7,7 @@ rule set.
 
 ## Why
 
-Research note 024 §4 found code-doc status contradictions accumulating:
+Code-doc status contradictions accumulate:
 `bitty-agent` claimed OQ-018 open while `bitty-ipc` recorded the accepted
 IPC-Agent RFC closing it, and `bitty-runtime` described the Plugin Platform
 RFC as Proposed/Draft after acceptance. This gate makes those contradictions
@@ -28,9 +28,10 @@ landed`, `not landed`, `not yet implemented`, `will be decided when`,
    `README.md` / `CONTRIBUTING.md` / `AGENTS.md` must not claim later-phase
    wiring.
 4. **RFC status spot-checks** — in-repo Proposed/Draft claims about the
-   Plugin Platform, Isolation Resource, and IPC-Agent RFCs fail when the
-   owning frontmatter (sibling checkout when present, else the vendored
-   `accepted` value) is `accepted`.
+   Plugin Platform, Isolation Resource, IPC-Agent, Rich Presentation,
+   Terminal State, Governance, Risk Evidence, and Package Follow-up RFCs
+   fail when the owning frontmatter (sibling checkout when present, else
+   the vendored `accepted` value) is `accepted`.
 
 ## Expectations table and sources
 
@@ -43,9 +44,20 @@ landed`, `not landed`, `not yet implemented`, `will be decided when`,
 | OQ-014 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted isolation-resource-rfc (closed 2026-08-28); owning `bitty-plugins-docs/specifications/isolation-resource-rfc.md` frontmatter `status: accepted` |
 | OQ-018 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted ipc-agent-rfc (closed 2026-08-29); owning `bitty-ai-docs/specifications/ipc-agent-rfc.md` frontmatter `status: accepted`                        |
 | OQ-053 | accepted/closed | bitty-docs `decisions/open-questions.md`: Accepted Bundled-Plugin Split Decision (closed 2026-09-14)                                                                                               |
+| OQ-007 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted terminal-state-rfc; owning `bitty-terminal-docs/specifications/terminal-state-rfc.md` frontmatter `status: accepted`                                        |
+| OQ-009 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted lua-runtime-rfc (closed OQ-009 on 2026-08-27); owning `bitty-plugins-docs/runtime/lua-runtime-rfc.md` frontmatter `status: accepted`                   |
+| OQ-021 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-lifecycle-rfc; owning `bitty-plugins-docs/packaging/package-lifecycle-rfc.md` frontmatter `status: accepted`                                      |
+| OQ-022 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-followup-rfc (closed OQ-022 on 2026-08-28); owning `bitty-plugins-docs/packaging/package-followup-rfc.md` frontmatter `status: accepted`         |
+| OQ-023 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted website-delivery-rfc (closed OQ-023 on 2026-08-29); owning `bitty-terminal-docs/specifications/website-delivery-rfc.md` frontmatter `status: accepted` |
+| OQ-024 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted governance-rfc (closed OQ-024 on 2026-08-29); owning `bitty-terminal-docs/specifications/governance-rfc.md` frontmatter `status: accepted`             |
+| OQ-025 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted risk-evidence-rfc (closed OQ-025 on 2026-08-29); owning `bitty-terminal-docs/specifications/risk-evidence-rfc.md` frontmatter `status: accepted`       |
+| OQ-026 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-026 on 2026-08-28)                                                                                                                                          |
+| OQ-027 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-027 on 2026-08-28)                                                                                                                                          |
+| OQ-028 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-028 on 2026-08-28)                                                                                                                                          |
 
 Owning RFC statuses are re-read at gate time from
-`../bitty-plugins-docs/...` / `../bitty-ai-docs/...` / `docs/...` when
+`../bitty-plugins-docs/...` / `../bitty-ai-docs/...` /
+`../bitty-terminal-docs/...` / `docs/...` when
 those checkouts exist; otherwise the vendored `accepted` value applies
 (CI checks out only this repository).
 

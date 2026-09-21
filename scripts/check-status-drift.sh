@@ -29,6 +29,36 @@
 #     bitty-ai-docs/specifications/ipc-agent-rfc.md `status: accepted`.
 #   OQ-053 = accepted/closed — bitty-docs open-questions: Accepted
 #     Bundled-Plugin Split Decision (closed OQ-053 on 2026-09-14).
+#   REL-10 additions (vendored, verified read-only against the canonical
+#   register plus owning `status: accepted` frontmatter before encoding):
+#   OQ-007 = accepted — bitty-docs open-questions: Accepted terminal-state-rfc;
+#     owning frontmatter
+#     bitty-terminal-docs/specifications/terminal-state-rfc.md `status: accepted`.
+#   OQ-009 = accepted — bitty-docs open-questions: Accepted lua-runtime-rfc
+#     (closed OQ-009 on 2026-08-27); owning frontmatter
+#     bitty-plugins-docs/runtime/lua-runtime-rfc.md `status: accepted`.
+#     (OQ-030, OQ-031, OQ-032 are separate follow-ups outside this row.)
+#   OQ-021 = accepted — bitty-docs open-questions: Accepted package-lifecycle-rfc;
+#     owning frontmatter
+#     bitty-plugins-docs/packaging/package-lifecycle-rfc.md `status: accepted`.
+#   OQ-022 = accepted — bitty-docs open-questions: Accepted package-followup-rfc
+#     (closed OQ-022 on 2026-08-28); owning frontmatter
+#     bitty-plugins-docs/packaging/package-followup-rfc.md `status: accepted`.
+#   OQ-023 = accepted — bitty-docs open-questions: Accepted website-delivery-rfc
+#     (closed OQ-023 on 2026-08-29); owning frontmatter
+#     bitty-terminal-docs/specifications/website-delivery-rfc.md `status: accepted`.
+#   OQ-024 = accepted — bitty-docs open-questions: Accepted governance-rfc
+#     (closed OQ-024 on 2026-08-29); owning frontmatter
+#     bitty-terminal-docs/specifications/governance-rfc.md `status: accepted`.
+#   OQ-025 = accepted — bitty-docs open-questions: Accepted risk-evidence-rfc
+#     (closed OQ-025 on 2026-08-29); owning frontmatter
+#     bitty-terminal-docs/specifications/risk-evidence-rfc.md `status: accepted`.
+#   OQ-026 = accepted — same register + owning RFC as OQ-022
+#     (closed OQ-026 on 2026-08-28).
+#   OQ-027 = accepted — same register + owning RFC as OQ-022
+#     (closed OQ-027 on 2026-08-28).
+#   OQ-028 = accepted — same register + owning RFC as OQ-022
+#     (closed OQ-028 on 2026-08-28).
 #
 # Rule 1 — OQ status claims (stale open language for an accepted/closed OQ):
 #   Scan `*.rs` + in-repo `*.md` for lines mentioning a tabled OQ together
@@ -56,7 +86,9 @@
 #
 # Rule 4 — canonical RFC status spot-checks:
 #   EXPECTED (frontmatter when a sibling checkout exists, else vendored
-#   `accepted`): plugin-platform, isolation-resource, ipc-agent.
+#   `accepted`): plugin-platform, isolation-resource, ipc-agent,
+#   rich-presentation, terminal-state, governance, risk-evidence,
+#   package-followup (REL-10 expansion).
 #   Owning candidates (read-only, first hit wins):
 #     plugin-platform: ../bitty-plugins-docs/specifications/plugin-platform-rfc.md,
 #       docs/specifications/plugin-platform-rfc.md
@@ -64,9 +96,28 @@
 #       docs/specifications/isolation-resource-rfc.md
 #     ipc-agent: ../bitty-ai-docs/specifications/ipc-agent-rfc.md,
 #       docs/specifications/ipc-agent-rfc.md
+#     rich-presentation: ../bitty-terminal-docs/specifications/rich-presentation-rfc.md,
+#       docs/specifications/rich-presentation-rfc.md
+#     terminal-state: ../bitty-terminal-docs/specifications/terminal-state-rfc.md,
+#       docs/specifications/terminal-state-rfc.md
+#     governance: ../bitty-terminal-docs/specifications/governance-rfc.md,
+#       docs/specifications/governance-rfc.md
+#     risk-evidence: ../bitty-terminal-docs/specifications/risk-evidence-rfc.md,
+#       docs/specifications/risk-evidence-rfc.md
+#     package-followup: ../bitty-plugins-docs/packaging/package-followup-rfc.md,
+#       docs/packaging/package-followup-rfc.md
+#   Deliberately not yet covered (in-repo `Proposed`/`draft` claims still
+#   present; encoding them as `accepted`-expected would flip the gate red —
+#   reconcile the claims in their owning scopes first): package-lifecycle
+#   (`crates/bitty-package`, `crates/bitty-plugin-host` install seam),
+#   lua-runtime (`crates/bitty-plugin-host` Lua dependency note),
+#   configuration-model (`crates/bitty-config` status sections).
 #   Any in-repo `*.rs` file mentioning the RFC identifier
 #   (`plugin-platform-rfc`, `Plugin Platform RFC`, `isolation-resource-rfc`,
-#   `Isolation*Resource RFC`, `ipc-agent-rfc`, `IPC*Agent RFC`) while claiming
+#   `Isolation*Resource RFC`, `ipc-agent-rfc`, `IPC*Agent RFC`,
+#   `rich-presentation-rfc`, `terminal-state-rfc`, `governance-rfc`,
+#   `risk-evidence-rfc`, `package-followup-rfc`, or the matching spaced
+#   `X RFC` / `X Resource RFC` form) while claiming
 #   `Proposed` / `draft` / `Draft` for that RFC fails when EXPECTED is
 #   `accepted`, unless the file also carries an RFC-specific acceptance
 #   phrase (`<rfc>.*accepted` / `accepted.*<rfc>`, case-insensitive).
@@ -192,7 +243,7 @@ list_scan_files() {
 }
 
 # --- Rule 1: OQ status claims ---
-OQS=(OQ-008 OQ-011 OQ-012 OQ-013 OQ-014 OQ-018 OQ-053)
+OQS=(OQ-008 OQ-011 OQ-012 OQ-013 OQ-014 OQ-018 OQ-053 OQ-007 OQ-009 OQ-021 OQ-022 OQ-023 OQ-024 OQ-025 OQ-026 OQ-027 OQ-028)
 STALE_RE='remains?[^[:alnum:]]*open|unresolved|has not landed|have not landed|not landed|not yet implemented|will be decided when|future'
 
 mapfile -d '' RULE1_FILES < <(list_scan_files rs_md || true)
@@ -363,7 +414,67 @@ rfc_expected() {
 		done
 		printf 'accepted'
 		;;
-	esac
+	rich-presentation)
+		for candidate in ../bitty-terminal-docs/specifications/rich-presentation-rfc.md docs/specifications/rich-presentation-rfc.md; do
+			if [[ -f "$candidate" ]]; then
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
+				if [[ -n "$status" ]]; then
+					printf '%s' "$status"
+					return 0
+				fi
+			fi
+		done
+		printf 'accepted'
+		;;
+	terminal-state)
+		for candidate in ../bitty-terminal-docs/specifications/terminal-state-rfc.md docs/specifications/terminal-state-rfc.md; do
+			if [[ -f "$candidate" ]]; then
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
+				if [[ -n "$status" ]]; then
+					printf '%s' "$status"
+					return 0
+				fi
+			fi
+		done
+		printf 'accepted'
+		;;
+	governance)
+		for candidate in ../bitty-terminal-docs/specifications/governance-rfc.md docs/specifications/governance-rfc.md; do
+			if [[ -f "$candidate" ]]; then
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
+				if [[ -n "$status" ]]; then
+					printf '%s' "$status"
+					return 0
+				fi
+			fi
+		done
+		printf 'accepted'
+		;;
+	risk-evidence)
+		for candidate in ../bitty-terminal-docs/specifications/risk-evidence-rfc.md docs/specifications/risk-evidence-rfc.md; do
+			if [[ -f "$candidate" ]]; then
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
+				if [[ -n "$status" ]]; then
+					printf '%s' "$status"
+					return 0
+				fi
+			fi
+		done
+		printf 'accepted'
+		;;
+	package-followup)
+		for candidate in ../bitty-plugins-docs/packaging/package-followup-rfc.md docs/packaging/package-followup-rfc.md; do
+			if [[ -f "$candidate" ]]; then
+				status="$(grep -i -m1 -E -e '^status:[[:space:]]*[^[:space:]]+' "$candidate" 2>/dev/null | sed -E -e 's/^[^:]*:[[:space:]]*([^[:space:]]+).*/\1/' | tr '[:upper:]' '[:lower:]' || true)"
+				if [[ -n "$status" ]]; then
+					printf '%s' "$status"
+					return 0
+				fi
+			fi
+		done
+		printf 'accepted'
+		;;
+esac
 }
 
 check_rfc() {
@@ -411,6 +522,11 @@ check_rfc() {
 check_rfc plugin-platform 'plugin-platform|plugin platform' 'plugin-platform.*accepted|accepted.*plugin-platform|plugin platform.*accepted|accepted.*plugin platform'
 check_rfc isolation-resource 'isolation-resource|isolation resource|isolation/resource' 'isolation-resource.*accepted|accepted.*isolation-resource|isolation resource.*accepted|accepted.*isolation resource|isolation/resource.*accepted|accepted.*isolation/resource'
 check_rfc ipc-agent 'ipc-agent|ipc[^[:alnum:]]+agent rfc|ipc and agent' 'ipc-agent.*accepted|accepted.*ipc-agent|ipc[^[:alnum:]]+agent.*accepted|accepted.*ipc[^[:alnum:]]+agent'
+check_rfc rich-presentation 'rich-presentation|rich presentation' 'rich-presentation.*accepted|accepted.*rich-presentation|rich presentation.*accepted|accepted.*rich presentation'
+check_rfc terminal-state 'terminal-state|terminal state' 'terminal-state.*accepted|accepted.*terminal-state|terminal state.*accepted|accepted.*terminal state'
+check_rfc governance 'governance-rfc|governance rfc' 'governance-rfc.*accepted|accepted.*governance-rfc|governance rfc.*accepted|accepted.*governance rfc'
+check_rfc risk-evidence 'risk-evidence|risk evidence' 'risk-evidence.*accepted|accepted.*risk-evidence|risk evidence.*accepted|accepted.*risk evidence'
+check_rfc package-followup 'package-followup|package followup|package follow-up' 'package-followup.*accepted|accepted.*package-followup|package followup.*accepted|accepted.*package followup|package follow-up.*accepted|accepted.*package follow-up'
 
 if ((FAIL)); then
 	echo "status-drift: FAIL — code-doc status contradictions; fix claims to match the canonical register or extend the explicit expectations table with a reason" >&2

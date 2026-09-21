@@ -35,25 +35,25 @@ landed`, `not landed`, `not yet implemented`, `will be decided when`,
 
 ## Expectations table and sources
 
-| OQ     | Vendored        | Canonical source (read-only, verified before encoding)                                                                                                                                             |
-| ------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OQ-008 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted rich-presentation-rfc (closed 2026-08-28)                                                                                                       |
-| OQ-011 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted plugin-platform-rfc; owning `bitty-plugins-docs/specifications/plugin-platform-rfc.md` frontmatter `status: accepted`                           |
-| OQ-012 | accepted        | Same register + owning RFC as OQ-011                                                                                                                                                               |
-| OQ-013 | accepted        | Same register + owning RFC as OQ-011 (DropOldest v1 default closed)                                                                                                                                |
-| OQ-014 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted isolation-resource-rfc (closed 2026-08-28); owning `bitty-plugins-docs/specifications/isolation-resource-rfc.md` frontmatter `status: accepted` |
-| OQ-018 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted ipc-agent-rfc (closed 2026-08-29); owning `bitty-ai-docs/specifications/ipc-agent-rfc.md` frontmatter `status: accepted`                        |
-| OQ-053 | accepted/closed | bitty-docs `decisions/open-questions.md`: Accepted Bundled-Plugin Split Decision (closed 2026-09-14)                                                                                               |
-| OQ-007 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted terminal-state-rfc; owning `bitty-terminal-docs/specifications/terminal-state-rfc.md` frontmatter `status: accepted`                                        |
+| OQ     | Vendored        | Canonical source (read-only, verified before encoding)                                                                                                                                                    |
+| ------ | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OQ-008 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted rich-presentation-rfc (closed 2026-08-28)                                                                                                              |
+| OQ-011 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted plugin-platform-rfc; owning `bitty-plugins-docs/specifications/plugin-platform-rfc.md` frontmatter `status: accepted`                                  |
+| OQ-012 | accepted        | Same register + owning RFC as OQ-011                                                                                                                                                                      |
+| OQ-013 | accepted        | Same register + owning RFC as OQ-011 (DropOldest v1 default closed)                                                                                                                                       |
+| OQ-014 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted isolation-resource-rfc (closed 2026-08-28); owning `bitty-plugins-docs/specifications/isolation-resource-rfc.md` frontmatter `status: accepted`        |
+| OQ-018 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted ipc-agent-rfc (closed 2026-08-29); owning `bitty-ai-docs/specifications/ipc-agent-rfc.md` frontmatter `status: accepted`                               |
+| OQ-053 | accepted/closed | bitty-docs `decisions/open-questions.md`: Accepted Bundled-Plugin Split Decision (closed 2026-09-14)                                                                                                      |
+| OQ-007 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted terminal-state-rfc; owning `bitty-terminal-docs/specifications/terminal-state-rfc.md` frontmatter `status: accepted`                                   |
 | OQ-009 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted lua-runtime-rfc (closed OQ-009 on 2026-08-27); owning `bitty-plugins-docs/runtime/lua-runtime-rfc.md` frontmatter `status: accepted`                   |
-| OQ-021 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-lifecycle-rfc; owning `bitty-plugins-docs/packaging/package-lifecycle-rfc.md` frontmatter `status: accepted`                                      |
-| OQ-022 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-followup-rfc (closed OQ-022 on 2026-08-28); owning `bitty-plugins-docs/packaging/package-followup-rfc.md` frontmatter `status: accepted`         |
+| OQ-021 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-lifecycle-rfc; owning `bitty-plugins-docs/packaging/package-lifecycle-rfc.md` frontmatter `status: accepted`                                   |
+| OQ-022 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted package-followup-rfc (closed OQ-022 on 2026-08-28); owning `bitty-plugins-docs/packaging/package-followup-rfc.md` frontmatter `status: accepted`       |
 | OQ-023 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted website-delivery-rfc (closed OQ-023 on 2026-08-29); owning `bitty-terminal-docs/specifications/website-delivery-rfc.md` frontmatter `status: accepted` |
 | OQ-024 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted governance-rfc (closed OQ-024 on 2026-08-29); owning `bitty-terminal-docs/specifications/governance-rfc.md` frontmatter `status: accepted`             |
 | OQ-025 | accepted        | bitty-docs `decisions/open-questions.md`: Accepted risk-evidence-rfc (closed OQ-025 on 2026-08-29); owning `bitty-terminal-docs/specifications/risk-evidence-rfc.md` frontmatter `status: accepted`       |
-| OQ-026 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-026 on 2026-08-28)                                                                                                                                          |
-| OQ-027 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-027 on 2026-08-28)                                                                                                                                          |
-| OQ-028 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-028 on 2026-08-28)                                                                                                                                          |
+| OQ-026 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-026 on 2026-08-28)                                                                                                                                        |
+| OQ-027 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-027 on 2026-08-28)                                                                                                                                        |
+| OQ-028 | accepted        | Same register + owning RFC as OQ-022 (closed OQ-028 on 2026-08-28)                                                                                                                                        |
 
 Owning RFC statuses are re-read at gate time from
 `../bitty-plugins-docs/...` / `../bitty-ai-docs/...` /

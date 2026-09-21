@@ -104,8 +104,8 @@ use bitty_render::{
 use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_ui::{
-    CellPos, Focus, FocusDirection, Gaps, LayoutNode, PersistentSelection, Rect as UiRect,
-    SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
+    CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
+    Rect as UiRect, SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
 };
 use bitty_vt::{
     ClipboardOp, DynamicColorOp, DynamicColorTarget, PaletteColorOp, Parser, SequenceKind,

@@ -256,6 +256,54 @@ impl LayoutNode {
         }
     }
 
+    /// Innermost paint tier per leaf, in solver order (CW-12).
+    ///
+    /// Mirrors the [`Self::layout`] recursion (`Split`/`Stack` fan-out,
+    /// `Overlay` base-then-overlay): base leaves carry the enclosing floor
+    /// (`None` at the top, so base content paints below every tier) while
+    /// overlay leaves carry the higher of the node's tier and the enclosing
+    /// floor. The `max` keeps nested floats together: a float nested inside
+    /// a higher-tier float paints with (never below) its parent, so the
+    /// flat tier sort can never split one overlay composition apart. The
+    /// present path stable-sorts on this key so stacked overlays paint
+    /// `Editor < Float < Popup < Messages` regardless of tree construction
+    /// order; same-tier leaves keep solver order (the [`OverlayTier`]
+    /// same-tier conflict rule).
+    #[must_use]
+    pub fn leaf_overlay_tiers(&self) -> Vec<(ViewId, Option<OverlayTier>)> {
+        let mut out = Vec::with_capacity(self.leaf_count());
+        self.collect_overlay_tiers(None, &mut out);
+        out
+    }
+
+    fn collect_overlay_tiers(
+        &self,
+        enclosing: Option<OverlayTier>,
+        out: &mut Vec<(ViewId, Option<OverlayTier>)>,
+    ) {
+        match self {
+            Self::Leaf(v) => out.push((v.id(), enclosing)),
+            Self::Split { first, second, .. } => {
+                first.collect_overlay_tiers(enclosing, out);
+                second.collect_overlay_tiers(enclosing, out);
+            }
+            Self::Stack(children) => {
+                for child in children {
+                    child.collect_overlay_tiers(enclosing, out);
+                }
+            }
+            Self::Overlay {
+                base,
+                overlay,
+                tier,
+                ..
+            } => {
+                base.collect_overlay_tiers(enclosing, out);
+                overlay.collect_overlay_tiers(enclosing.max(Some(*tier)), out);
+            }
+        }
+    }
+
     /// Moves the floating overlay containing leaf `id` by (`dx`, `dy`) cells.
     ///
     /// CTX-0260 (Alt+drag): only [`LayoutNode::Overlay`] bounds move; tiled
@@ -1406,6 +1454,76 @@ mod tests {
         assert_eq!(
             rev_ids,
             vec![ViewId::new(1), ViewId::new(3), ViewId::new(2)]
+        );
+    }
+
+    #[test]
+    fn leaf_overlay_tiers_stacked_and_nested() {
+        // CW-12: per-leaf paint tiers for the present path. Base content
+        // carries `None`; stacked layers carry their tier in solver order
+        // even when insertion was scrambled; a hand-nested overlay resolves
+        // to its innermost enclosing tier.
+        let layer = |tier, id: u64| {
+            OverlayLayer::new(
+                tier,
+                LayoutNode::leaf(view(id, 1, 1)),
+                Rect::new(0, 0, 10, 5),
+            )
+        };
+        let stacked = LayoutNode::overlay_stack(
+            LayoutNode::leaf(view(1, 1, 1)),
+            vec![
+                layer(OverlayTier::Messages, 40),
+                layer(OverlayTier::Editor, 10),
+                layer(OverlayTier::Popup, 30),
+                layer(OverlayTier::Float, 20),
+            ],
+        );
+        assert_eq!(
+            stacked.leaf_overlay_tiers(),
+            vec![
+                (ViewId::new(1), None),
+                (ViewId::new(10), Some(OverlayTier::Editor)),
+                (ViewId::new(20), Some(OverlayTier::Float)),
+                (ViewId::new(30), Some(OverlayTier::Popup)),
+                (ViewId::new(40), Some(OverlayTier::Messages)),
+            ]
+        );
+
+        // Nested overlays: the Editor float nested inside the Messages float
+        // paints with (never below) its parent, so the flat tier sort keeps
+        // the inner composition (7 before 2) together.
+        let inner = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(7, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            Rect::new(0, 0, 10, 5),
+            OverlayTier::Editor,
+        );
+        let nested = LayoutNode::overlay_tiered(
+            LayoutNode::leaf(view(1, 1, 1)),
+            inner,
+            Rect::new(0, 0, 10, 5),
+            OverlayTier::Messages,
+        );
+        assert_eq!(
+            nested.leaf_overlay_tiers(),
+            vec![
+                (ViewId::new(1), None),
+                (ViewId::new(7), Some(OverlayTier::Messages)),
+                (ViewId::new(2), Some(OverlayTier::Messages)),
+            ]
+        );
+
+        // Untiered trees stay tier-free (solver order preserved as-is).
+        let plain = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        assert_eq!(
+            plain.leaf_overlay_tiers(),
+            vec![(ViewId::new(1), None), (ViewId::new(2), None)]
         );
     }
 

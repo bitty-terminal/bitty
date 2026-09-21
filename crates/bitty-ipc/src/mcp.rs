@@ -469,7 +469,16 @@ impl McpClientStub {
     }
 
     /// Inject a server notification / unsolicited message.
+    ///
+    /// Fail-closed like [`Self::inject_response`]: a closed client accepts
+    /// no further inbound bytes, so a compromised peer cannot smuggle an
+    /// instruction-bearing notification past shutdown (R-013).
     pub fn inject_notification(&mut self, notification: McpNotification) -> Result<(), IpcError> {
+        if self.is_closed() {
+            return Err(IpcError::TransportClosed {
+                reason: "mcp client is closed".into(),
+            });
+        }
         let payload = mcp_notification_wire_payload(&notification);
         let frame = Frame::new(payload)?;
         self.transport.inject_incoming(frame)
@@ -729,6 +738,21 @@ mod tests {
         assert!(client.is_closed());
         let err = client.send_request("x".into(), vec![], 0).unwrap_err();
         assert!(matches!(err, IpcError::TransportClosed { .. }));
+        // Inbound injection closes too: no notification smuggling past shutdown.
+        let notif = McpNotification::new("event".into(), b"data".to_vec()).unwrap();
+        assert!(matches!(
+            client.send_notification(notif.clone()).unwrap_err(),
+            IpcError::TransportClosed { .. }
+        ));
+        let resp = McpResponse::success(RequestId(1), b"hi".to_vec()).unwrap();
+        assert!(matches!(
+            client.inject_response(resp).unwrap_err(),
+            IpcError::TransportClosed { .. }
+        ));
+        assert!(matches!(
+            client.inject_notification(notif).unwrap_err(),
+            IpcError::TransportClosed { .. }
+        ));
     }
 
     #[test]

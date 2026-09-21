@@ -23,6 +23,11 @@
 //! - WS-INV-18/19: focus is always a live member of its layout; focusing a
 //!   non-member fails closed without mutating focus.
 //!
+//! CW-27 (F-6): the randomized sequences interleave inactive-workspace
+//! closes (`workspace_close_at` on a non-active slot) alongside active
+//! closes, so active-layout/focus preservation is pinned in property
+//! coverage, not only in the dedicated regression test.
+//!
 //! The PRNG is a deterministic xorshift64 (no new dependency): a failing seed
 //! reproduces exactly across machines.
 
@@ -378,7 +383,55 @@ fn random_op(
             }
         }
         97..=99 => {
-            if rt.workspace_count() >= 2 {
+            if rt.workspace_count() >= 2 && rng.next() & 1 == 0 {
+                // CW-27 (F-6): close an inactive slot. The active workspace
+                // must survive with identical live layout, focus, and
+                // frames; the primary owner is preserved unless it lived in
+                // the removed slot, in which case it re-homes to the focused
+                // survivor (WS-INV-7/19).
+                let active = rt.active_workspace_index();
+                let layout_before = rt.layout().clone();
+                let focus_before = rt.focused_view();
+                let primary_before = rt.primary_view();
+                let frames_before = rt.present_frames();
+                let mut target = rng.below(rt.workspace_count() - 1);
+                if target >= active {
+                    target += 1;
+                }
+                let removed = all_slots(rt)[target].leaves.clone();
+                let killed = rt
+                    .workspace_close_at(target)
+                    .expect("inactive workspace must close");
+                assert_eq!(killed, 0, "headless runtimes own no sessions");
+                assert_eq!(
+                    rt.layout(),
+                    &layout_before,
+                    "inactive close keeps the live layout"
+                );
+                assert_eq!(
+                    rt.focused_view(),
+                    focus_before,
+                    "inactive close keeps focus"
+                );
+                assert_eq!(
+                    rt.present_frames(),
+                    frames_before,
+                    "inactive close keeps frames"
+                );
+                match primary_before {
+                    Some(owner) if removed.contains(&owner) => assert_eq!(
+                        rt.primary_view(),
+                        rt.focused_view(),
+                        "destroyed owner re-homes to the focused survivor"
+                    ),
+                    _ => assert_eq!(
+                        rt.primary_view(),
+                        primary_before,
+                        "inactive close keeps the primary owner"
+                    ),
+                }
+                format!("workspace_close_inactive {target}")
+            } else if rt.workspace_count() >= 2 {
                 let closed = match rt.workspace_close_request() {
                     WsCloseRequest::Closed { killed } => {
                         assert_eq!(killed, 0, "headless runtimes own no sessions");

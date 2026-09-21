@@ -356,6 +356,18 @@ fn inspect_protocol_supported_state() {
             && text.contains("\"status\":\"supported\""),
         "json must name support state, got {text:?}"
     );
+    // DT-12: the wire detail must carry the live bounded subset (decode
+    // formats plus the deferred-animation bound), never stub wording.
+    for marker in ["f=100", "f=24", "f=32", "animation"] {
+        assert!(
+            text.contains(marker),
+            "protocol detail must name {marker:?}, got {text:?}"
+        );
+    }
+    assert!(
+        !text.contains("stub") && !text.contains("later slice"),
+        "protocol detail must not repeat stub wording, got {text:?}"
+    );
 }
 
 #[test]

@@ -144,6 +144,27 @@ fn jsonl_matches_json_single_line_shape() {
 }
 
 #[test]
+fn images_row_reports_bounded_kitty_support() {
+    // DT-12 (CTX-0509 follow-up): the live doctor images row must report
+    // the shipped bounded kitty subset as an informational warn, never
+    // the pre-present-path stub.
+    let output = spawn_doctor(&["doctor", "--format", "json"], &[]);
+    let stdout = stdout_text(&output);
+    assert!(
+        stdout.contains("\"id\":\"images\"") && stdout.contains("\"status\":\"warn\""),
+        "images row must stay informational-warn, got {stdout}"
+    );
+    assert!(
+        stdout.contains("bounded") && stdout.contains("sixel"),
+        "images row must name bounded kitty support and sixel, got {stdout}"
+    );
+    assert!(
+        !stdout.contains("stub") && !stdout.contains("later slice"),
+        "images row must not repeat stub wording, got {stdout}"
+    );
+}
+
+#[test]
 fn unknown_format_fails_closed_with_usage() {
     let output = spawn_doctor(&["doctor", "--format", "yaml"], &[]);
     assert_eq!(output.status.code(), Some(2), "want exit 2");

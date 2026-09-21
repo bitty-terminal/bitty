@@ -141,7 +141,8 @@ pub mod wire;
 pub use auth::{
     CHILD_TOKEN_TTL_MS, ChildToken, ChildTokenStore, DIR_MODE, MAX_CHILD_TOKENS,
     MAX_SCOPED_ID_BYTES, MAX_TOKEN_TTL_MS, PeerCredentials, SOCKET_MODE, VerifiedPeer,
-    verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint, verify_windows_pipe,
+    is_child_eligible_scope, verify_peer_for_connection, verify_peer_uid, verify_unix_endpoint,
+    verify_windows_pipe,
 };
 pub use bridge::{BridgeClient, MAX_BRIDGE_CLIENT_ID_BYTES, MAX_BRIDGE_PARAMS_BYTES};
 pub use channel::{

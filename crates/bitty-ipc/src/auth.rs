@@ -273,9 +273,13 @@ impl ChildToken {
     ///
     /// # Errors
     ///
+    /// - `ScopeDenied` when `scope` is not child-eligible (only
+    ///   `terminal.inspect` may be minted on a child token; anything wider
+    ///   would be a runtime administrator token, R-012),
     /// - `InvalidRequest` when `token` empty or >128 bytes,
     /// - `PayloadTooLarge` when `scoped_id` > 64 bytes,
-    /// - `InvalidRequest` when `ttl_ms` zero or > `MAX_TOKEN_TTL_MS`.
+    /// - `InvalidRequest` when `ttl_ms` zero or > `MAX_TOKEN_TTL_MS`,
+    /// - `InvalidRequest` when `token`/`scoped_id` carries control bytes.
     pub fn new(
         token: String,
         scope: Scope,
@@ -283,6 +287,12 @@ impl ChildToken {
         created_at_ms: u64,
         ttl_ms: u64,
     ) -> Result<Self, IpcError> {
+        if !is_child_eligible_scope(scope) {
+            return Err(IpcError::ScopeDenied {
+                scope: scope.as_str().into(),
+                action: "child token mint".into(),
+            });
+        }
         if token.is_empty() || token.len() > 128 {
             return Err(IpcError::InvalidRequest {
                 reason: format!("child token must be 1..=128 bytes, got {}", token.len()),
@@ -300,10 +310,12 @@ impl ChildToken {
                 reason: format!("ttl_ms must be 1..={MAX_TOKEN_TTL_MS}, got {ttl_ms}"),
             });
         }
-        // Tokens must not carry control bytes (would confuse PTY fd framing).
-        if token.bytes().any(|b| b < 0x20 || b == 0x7F)
-            || scoped_id.bytes().any(|b| b < 0x20 || b == 0x7F)
-        {
+        // Tokens travel over the PTY-side fd: reject C0, DEL, and C1 controls.
+        // C1 (U+0080..=U+009F) arrives as multi-byte UTF-8 and passes a
+        // raw-byte scan, so check `char::is_control` (C0 + DEL + C1), which
+        // also keeps tokens single-line (no CR/LF/ESC that could smuggle
+        // `SendEnv`/`AcceptEnv` lines or PTY framing).
+        if token.chars().any(|c| c.is_control()) || scoped_id.chars().any(|c| c.is_control()) {
             return Err(IpcError::InvalidRequest {
                 reason: "token/scoped_id must not contain control bytes".into(),
             });
@@ -334,6 +346,20 @@ impl ChildToken {
     pub fn authorizes(&self, scope: Scope, scoped_id: &str, now_ms: u64) -> bool {
         !self.is_expired(now_ms) && self.scope == scope && self.scoped_id == scoped_id
     }
+}
+
+/// Whether `scope` may be minted on a child scope token (R-012, P0-AC-023).
+///
+/// A child holds only a short-lived current-terminal scope, never a runtime
+/// administrator token: only `terminal.inspect` (read-only text/list scoped
+/// to one terminal id) is eligible. Every other scope fails closed at mint
+/// time — including the sibling read-only inspects (`view`/`config`/`plugin`/
+/// `debug`), which expose wider runtime state than the child's own terminal,
+/// and all effectful scopes (`terminal.input/manage`, `config.modify`,
+/// `plugin.manage`, `process.spawn`, `debug.trace/control`).
+#[must_use]
+pub fn is_child_eligible_scope(scope: Scope) -> bool {
+    matches!(scope, Scope::TerminalInspect)
 }
 
 /// Bounded in-memory store for child tokens (server-side).

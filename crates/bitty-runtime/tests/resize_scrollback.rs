@@ -94,7 +94,11 @@ fn runtime_view_scroll_offset_survives_resize_headlessly() {
     // View id 1 is default leaf.
     let view_id = ViewId::new(1);
     {
-        let view = rt.layout_mut().find_leaf_mut(view_id).expect("view 1");
+        // CTX-0603: `layout_mut` returns a guard by value, so bind it
+        // before borrowing a leaf through it (a chained temporary would
+        // drop while `view` is still borrowed).
+        let mut borrowed = rt.layout_mut();
+        let view = borrowed.find_leaf_mut(view_id).expect("view 1");
         view.set_scroll_offset(5, sb_len);
         assert_eq!(view.scroll_offset(), 5);
     }

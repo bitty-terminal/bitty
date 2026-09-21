@@ -205,6 +205,24 @@ perf-real-window:
 perf-real-window-baseline out="crates/bitty-perf/baselines/pb-real-window.json":
     BITTY_PERF_REAL_WINDOW=1 cargo bench -p bitty-perf --bench real_window -- --nocapture --write-baseline {{out}}
 
+# PB-7 idle CPU/wakeup evidence (CTX-0636, PERF-08). Fast path: the
+# frame-on-demand invariant plus cost means (no extended window). Extended
+# path: `--idle-window` parks a proven-idle Runtime child and samples its
+# /proc CPU and wakeup counters (Linux-only; Unmeasured elsewhere).
+# Runbook: crates/bitty-perf/baselines/idle-evidence.md.
+perf-idle:
+    cargo bench -p bitty-perf --bench idle_real -- --nocapture
+
+# Regenerate the committed PB-7 idle evidence artifact. Provenance comes
+# from the environment so no host path or username enters the file:
+#   BITTY_PERF_TASK, BITTY_PERF_DATE, BITTY_PERF_REVISION,
+#   BITTY_PERF_TOOLCHAIN, BITTY_PERF_COMMAND, BITTY_PERF_PROFILE
+# (see benches/idle_real.rs). The window comes from BITTY_PERF_IDLE_SECS
+# (default 60, max 300); frame-on-demand must pass and the window must be
+# measured or the bench refuses to write (exit 2).
+perf-idle-baseline out="crates/bitty-perf/baselines/pb-idle.json":
+    cargo bench -p bitty-perf --bench idle_real -- --nocapture --write-baseline {{out}}
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref

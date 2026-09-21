@@ -236,6 +236,14 @@ impl FilesystemScope {
         if path.chars().any(|c| c.is_control()) {
             return false;
         }
+        // CTX-0625 (R-003/P0-AC-005): absolute paths are never covered.
+        // No validated scope pattern is absolute (the manifest predicate
+        // denies them), so an absolute request can never be legitimately
+        // granted. This keeps `allows` fail-closed even for callers that
+        // bypass `authorize_fs` (which denies hostile shapes first).
+        if is_absolute_path(path) {
+            return false;
+        }
         let segments = split_segments(path);
         if segments.contains(&"..") {
             return false;
@@ -1650,6 +1658,65 @@ mod tests {
                 "hostile path {path:?} must deny as hostile/invalid"
             );
         }
+    }
+
+    #[test]
+    fn device_proc_sys_devfs_requests_deny_by_default() {
+        // CTX-0625 (R-003/P0-AC-005 negative class matrix): devices,
+        // procfs/sysfs/devfs entries, and Windows device paths deny even
+        // under a broad legit scope. Absolute shapes deny as hostile
+        // before scope matching; reserved names deny as hostile too.
+        let scope = scope(&["~/projects/**", "~/.config/**"]);
+        let policy = test_policy();
+        for path in [
+            "/dev/null",
+            "/dev/kvm",
+            "/dev/tty",
+            "/proc/self/environ",
+            "/proc/self/mem",
+            "/sys/kernel/debug/foo",
+            "/dev/disk0",
+            "C:/Windows/System32/drivers/etc/hosts",
+            "NUL",
+            "notes/COM1",
+            "~/projects/CON",
+        ] {
+            let evaluated = authorize_fs(&scope, &policy, path, false, None, 0);
+            assert!(
+                matches!(
+                    evaluated.decision,
+                    FsDecision::Deny {
+                        kind: FsDenialKind::HostilePattern | FsDenialKind::InvalidRequest,
+                        ..
+                    }
+                ),
+                "device/hostile path {path:?} must deny as hostile/invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_paths_never_covered_even_by_broad_scope() {
+        // CTX-0625 defense in depth: `allows` itself refuses absolute
+        // paths, so even the broadest relative scope (`**`) cannot cover
+        // them for callers that bypass `authorize_fs`.
+        let scope = FilesystemScope::from_patterns(&["**".to_string()])
+            .expect("broad relative scope must validate");
+        for path in [
+            "/etc/passwd",
+            "/dev/null",
+            "/proc/self/environ",
+            "C:/Windows/System32/drivers/etc/hosts",
+        ] {
+            assert!(
+                !scope.allows(path),
+                "absolute path {path:?} must never be covered"
+            );
+        }
+        assert!(
+            scope.allows("notes/local.md"),
+            "broad scope must still cover relative paths"
+        );
     }
 
     #[test]

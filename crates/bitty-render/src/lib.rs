@@ -106,11 +106,11 @@
 //! [`bitty_platform::SurfaceTarget::with_raw_handles`]. That call bridges raw
 //! handles into a `wgpu::Surface`; it requires `unsafe` to borrow the raw
 //! `DisplayHandle`/`WindowHandle` (see `GPU Surface Seam` in [`gpu`]). The
-//! `unsafe` is confined to `gpu::Surface` construction (a single `unsafe`
-//! block with a safety comment) and does not leak. `crossfont` still requires
+//! `unsafe` is confined to `gpu::Surface` construction (two `unsafe`
+//! blocks, each with a safety comment) and does not leak. `crossfont` still requires
 //! no caller unsafe. `bytemuck` is intentionally not introduced: vertex bytes
 //! are serialized with explicit little-endian `to_le_bytes` calls, so no
-//! `Pod` bit-casting (and no second `unsafe` scope) is required.
+//! `Pod` bit-casting (and no further `unsafe`) is required.
 //!
 //! # Example
 //!

@@ -87,9 +87,11 @@
 //!
 //! # `unsafe` scope
 //!
-//! The single `unsafe` block in this file is the `DisplayHandle::borrow_raw` /
+//! The two `unsafe` blocks in this file are the `DisplayHandle::borrow_raw` /
 //! `WindowHandle::borrow_raw` construction for the `raw-window-handle` bridge
-//! that `wgpu::Instance::create_surface` consumes. The raw handles are
+//! that `wgpu::Instance::create_surface` consumes, plus the lifetime
+//! extension of the created surface to `'static` (justified by the owned
+//! `SurfaceTarget` clone below). The raw handles are
 //! obtained from `SurfaceTarget::with_raw_handles`, which guarantees they
 //! originate from a live window that the `Surface` then keeps alive via a
 //! cloned `SurfaceTarget`. No other `unsafe` exists in this crate.

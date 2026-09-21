@@ -21,6 +21,12 @@
 //! for any value (including empty). It exists so the skip path is exercisable
 //! everywhere: `BITTY_TEST_FORCE_NO_PTY=1 cargo test ...`.
 //!
+//! `#![forbid(unsafe_code)]`: this crate is safe-`std` only; the workspace
+//! `deny` already applies via `[lints] workspace = true`, and the crate-level
+//! `forbid` pins it so no inner `allow` can reopen `unsafe` here.
+
+#![forbid(unsafe_code)]
+
 use std::ffi::OsStr;
 
 /// Environment variable that forces [`pty_supported`] to `false`.

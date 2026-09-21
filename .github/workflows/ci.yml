@@ -28,18 +28,52 @@ jobs:
 
       # bitty-render wraps crossfont (ADR-0004), which links the platform
       # font stack on Linux (FreeType + fontconfig) via pkg-config.
+      # HK-07: cache downloaded .deb archives across runs (key = OS + the
+      # package lists in this file). Install steps below still run
+      # unconditionally; a cold archive just refetches.
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: Install font stack development libraries
         run: >-
           sudo apt-get update
           && sudo apt-get install -y --no-install-recommends
           libfontconfig1-dev libfreetype6-dev
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
-          --component rustfmt
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: rustfmt, clippy
+
+      # HK-07: compilation cache on the managed Cache backend. Scoped to
+      # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
+      # action) with prefix fallback on restore. Raw target/ stays out of
+      # actions/cache; nothing here keys on sources, and no install step is
+      # gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -126,6 +160,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # HK-07: cache downloaded .deb archives across runs (key = OS + the
+      # package lists in this file). Install steps below still run
+      # unconditionally; a cold archive just refetches.
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: Install font stack development libraries
         run: >-
           sudo apt-get update
@@ -133,10 +181,21 @@ jobs:
           libfontconfig1-dev libfreetype6-dev
 
       - name: Install MSRV toolchain 1.85
-        run: >-
-          rustup toolchain install 1.85
-          --profile minimal
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          # MSRV floor; must match the rust-version in Cargo.toml.
+          toolchain: 1.85
+          components: clippy
+
+      # HK-07: compilation cache on the managed Cache backend. The toolchain
+      # is part of the key, so MSRV 1.85 never shares target cache with the
+      # pinned channel (the action also appends job, Cargo.lock, and rustc
+      # hashes, with prefix fallback on restore). Nothing here keys on
+      # sources, and no install step is gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-1.85
 
       - name: Check MSRV compilation
         run: cargo +1.85 check --workspace --all-targets --locked
@@ -151,6 +210,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # HK-07: cache downloaded .deb archives across runs (key = OS + the
+      # package lists in this file). Install steps below still run
+      # unconditionally; a cold archive just refetches.
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: Install font stack and xvfb
         run: >-
           sudo apt-get update
@@ -158,11 +231,32 @@ jobs:
           libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-0
           libxkbcommon-dev xvfb
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      # HK-07: compilation cache on the managed Cache backend. Scoped to
+      # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
+      # action) with prefix fallback on restore. Raw target/ stays out of
+      # actions/cache; nothing here keys on sources, and no install step is
+      # gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
       - name: Run tests under xvfb (X11)
         run: xvfb-run -a cargo test --workspace --all-targets --locked
@@ -195,17 +289,52 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # HK-07: cache downloaded .deb archives across runs (key = OS + the
+      # package lists in this file). Install steps below still run
+      # unconditionally; a cold archive just refetches.
+      - name: Prepare apt archive directory (cache ownership)
+        run: sudo mkdir -p /var/cache/apt/archives && sudo chown -R "$(id -u):$(id -g)" /var/cache/apt/archives
+
+      - name: Cache apt archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: Install font stack and Wayland libraries
         run: >-
           sudo apt-get update
           && sudo apt-get install -y --no-install-recommends
           libfontconfig1-dev libfreetype6-dev libwayland-dev
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      # HK-07: compilation cache on the managed Cache backend. Scoped to
+      # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
+      # action) with prefix fallback on restore. Raw target/ stays out of
+      # actions/cache; nothing here keys on sources, and no install step is
+      # gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
       - name: Run tests with Wayland env
         run: cargo test --workspace --all-targets --locked
@@ -233,11 +362,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      # HK-07: compilation cache on the managed Cache backend. Scoped to
+      # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
+      # action) with prefix fallback on restore. Raw target/ stays out of
+      # actions/cache; nothing here keys on sources, and no install step is
+      # gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
       - name: Check workspace compilation (macOS ARM64)
         run: cargo check --workspace --all-targets --locked
@@ -268,10 +418,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version 0.20.2
@@ -305,11 +466,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the workflow tracks the file.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
+
       - name: Install pinned Rust toolchain
-        run: >-
-          rustup toolchain install 1.98.1
-          --profile minimal
-          --component clippy
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          components: clippy
+
+      # HK-07: compilation cache on the managed Cache backend. Scoped to
+      # OS + toolchain (+ job, Cargo.lock, and rustc hashes appended by the
+      # action) with prefix fallback on restore. Raw target/ stays out of
+      # actions/cache; nothing here keys on sources, and no install step is
+      # gated on cache-hit.
+      - name: Cache Rust compilation artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
       - name: Check workspace compilation
         run: cargo check --workspace --all-targets --locked

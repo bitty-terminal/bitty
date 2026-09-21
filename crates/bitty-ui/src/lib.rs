@@ -58,6 +58,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod a11y;
 pub mod decoration;
 pub mod focus;
 pub mod geometry;

@@ -1,0 +1,215 @@
+//! Accessibility baseline integration tests (UX-42, CTX-0614).
+//!
+//! Pins the candidate baseline implemented in `bitty_ui::a11y` against the
+//! candidate record
+//! (`bitty-terminal-docs/specifications/accessibility-baseline-candidate.md`,
+//! Draft): role mapping per scene kind with fail-closed unmapped kinds,
+//! terminal text runs plus cursor with the fidelity boundary, and chrome
+//! read-only exposure excluded from the tab order. Headless, deterministic,
+//! bounded: no window, no GPU, no PTY, no filesystem.
+
+#![forbid(unsafe_code)]
+
+use bitty_term_state::{State, TerminalAction};
+use bitty_ui::a11y::{
+    A11yError, A11yRole, ChromeKind, ChromeNode, FIDELITY_BOUNDARY, InteractiveNode, SceneKind,
+    chrome_tab_order, expose_terminal, interactive_role, role_of, terminal_text_runs,
+    validate_scene,
+};
+use bitty_vt::{ControlChar, GraphemeCell};
+
+fn prints(state: &mut State, text: &str) {
+    for c in text.chars() {
+        state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+    }
+}
+
+fn feed_line(state: &mut State, text: &str) {
+    prints(state, text);
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+}
+
+// ---------------------------------------------------------------------------
+// Role mapping: every mapped kind resolves, unmapped kinds fail closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_mapped_scene_kind_has_a_role() {
+    let expected: &[(SceneKind, A11yRole)] = &[
+        (SceneKind::Text, A11yRole::Text),
+        (SceneKind::Row, A11yRole::Group),
+        (SceneKind::Column, A11yRole::Group),
+        (SceneKind::Block, A11yRole::Group),
+        (SceneKind::Image, A11yRole::Image),
+        (SceneKind::CodeBlock, A11yRole::Code),
+        (SceneKind::Table, A11yRole::Table),
+        (SceneKind::List, A11yRole::List),
+        (SceneKind::Rule, A11yRole::Separator),
+    ];
+    assert_eq!(SceneKind::mapped().len(), expected.len());
+    for (kind, role) in expected {
+        assert_eq!(role_of(*kind), Ok(*role), "kind {kind:?} must map");
+    }
+    // The mapped set is exactly the full set minus the fallback.
+    assert_eq!(SceneKind::all().len(), SceneKind::mapped().len() + 1);
+}
+
+#[test]
+fn unknown_scene_kind_fails_closed() {
+    assert_eq!(
+        role_of(SceneKind::Unknown),
+        Err(A11yError::UnmappedSceneKind)
+    );
+}
+
+#[test]
+fn validate_scene_accepts_mapped_and_rejects_unmapped() {
+    assert!(validate_scene(SceneKind::mapped()).is_ok());
+    assert!(validate_scene(&[]).is_ok());
+    assert_eq!(
+        validate_scene(&[SceneKind::Text, SceneKind::Unknown, SceneKind::List]),
+        Err(A11yError::UnmappedSceneKind)
+    );
+}
+
+#[test]
+fn interactive_roles_resolve_from_declared_purpose() {
+    assert_eq!(interactive_role("button"), Ok(A11yRole::Button));
+    assert_eq!(interactive_role("input"), Ok(A11yRole::Input));
+}
+
+#[test]
+fn undeclared_interactive_purpose_fails_closed() {
+    assert_eq!(
+        interactive_role("switch"),
+        Err(A11yError::UnmappedSceneKind)
+    );
+    assert_eq!(interactive_role(""), Err(A11yError::UnmappedSceneKind));
+}
+
+#[test]
+fn interactive_node_exposes_name_state_and_activation() {
+    let button = InteractiveNode::new("button", "Send", true).unwrap();
+    assert_eq!(button.role(), A11yRole::Button);
+    assert_eq!(button.name(), "Send");
+    assert!(button.is_enabled());
+    assert_eq!(button.activation_label(), Some("activate"));
+
+    let disabled = InteractiveNode::new("input", "Search", false).unwrap();
+    assert_eq!(disabled.role(), A11yRole::Input);
+    assert!(!disabled.is_enabled());
+    // Disabled controls expose state with no activation.
+    assert_eq!(disabled.activation_label(), None);
+}
+
+#[test]
+fn interactive_node_rejects_undeclared_purpose_and_overlong_name() {
+    assert_eq!(
+        InteractiveNode::new("menu", "Open", true),
+        Err(A11yError::UnmappedSceneKind)
+    );
+    let long = "n".repeat(257);
+    assert!(matches!(
+        InteractiveNode::new("button", &long, true),
+        Err(A11yError::NameTooLong { .. })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Terminal exposure: text runs plus cursor, read-only, stated boundary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terminal_runs_expose_readable_text_and_cursor() {
+    let mut state = State::new();
+    feed_line(&mut state, "hello");
+    prints(&mut state, "world");
+    let snapshot = state.snapshot();
+
+    let runs = terminal_text_runs(&snapshot);
+    assert!(runs.len() >= 2);
+    assert_eq!(runs[0].row, 0);
+    assert_eq!(runs[0].text, "hello");
+    assert_eq!(runs[1].row, 1);
+    // LF preserves the column, so the second line starts at column 5.
+    assert_eq!(runs[1].text.trim(), "world");
+
+    let exposure = expose_terminal(&snapshot);
+    assert_eq!(exposure.cursor, snapshot.cursor.position);
+    assert_eq!(exposure.cursor_visible, snapshot.cursor.visible);
+    // Cursor tracks the live position: one fed line plus five more cells.
+    assert_eq!(exposure.cursor.row, 1);
+    assert_eq!(exposure.cursor.col, 10);
+}
+
+#[test]
+fn terminal_blank_rows_produce_no_runs() {
+    let state = State::new();
+    let snapshot = state.snapshot();
+    assert!(terminal_text_runs(&snapshot).is_empty());
+}
+
+#[test]
+fn terminal_exposure_is_named_by_title_and_read_only() {
+    let mut state = State::new();
+    prints(&mut state, "data");
+    state.apply(&TerminalAction::OscTitle {
+        text: "editor".into(),
+    });
+    let before = state.snapshot();
+    let exposure = expose_terminal(&before);
+    assert_eq!(exposure.title, "editor");
+    // The projection derives from the snapshot and mutates nothing.
+    assert_eq!(state.snapshot(), before);
+    assert_eq!(exposure.runs.len(), 1);
+    assert_eq!(exposure.runs[0].text, "data");
+}
+
+#[test]
+fn fidelity_boundary_is_stated_not_implied() {
+    for token in ["cursor", "SGR", "graphics", "images"] {
+        assert!(
+            FIDELITY_BOUNDARY.contains(token),
+            "boundary must name {token}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome exposure: read-only state, excluded from the tab order
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chrome_is_excluded_from_tab_order_while_state_is_exposed() {
+    let bar = ChromeNode::new(ChromeKind::Bar, "status bar", Some("main.rs")).unwrap();
+    let tabs = ChromeNode::new(ChromeKind::TabStrip, "tabs", Some("editor")).unwrap();
+    let note = ChromeNode::new(ChromeKind::Notification, "notices", None).unwrap();
+    let nodes = [bar, tabs, note];
+
+    for node in &nodes {
+        assert!(!node.is_tab_stop(), "{node:?} must never be a focus target");
+    }
+    assert!(chrome_tab_order(&nodes).is_empty());
+    assert!(chrome_tab_order(&[]).is_empty());
+
+    // State stays exposed read-only: names and active items are readable.
+    assert_eq!(nodes[0].accessible_name(), "status bar");
+    assert_eq!(nodes[0].active_item(), Some("main.rs"));
+    assert_eq!(nodes[1].kind(), ChromeKind::TabStrip);
+    assert_eq!(nodes[1].active_item(), Some("editor"));
+    assert_eq!(nodes[2].accessible_name(), "notices");
+    assert_eq!(nodes[2].active_item(), None);
+}
+
+#[test]
+fn chrome_rejects_overlong_names() {
+    let long = "x".repeat(300);
+    assert!(matches!(
+        ChromeNode::new(ChromeKind::Rail, &long, None),
+        Err(A11yError::NameTooLong { .. })
+    ));
+    assert!(matches!(
+        ChromeNode::new(ChromeKind::Rail, "rail", Some(&long)),
+        Err(A11yError::NameTooLong { .. })
+    ));
+}

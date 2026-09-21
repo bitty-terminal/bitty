@@ -39,8 +39,8 @@ to the still-proposed package-lifecycle RFC is a draft seam.
 - `src/lib.rs` — crate docs with status and the RFC section mapping.
 - `src/manifest.rs` — manifest discovery and validation.
 - `src/capability.rs` — closed capability grammar.
-- `src/effective.rs` — effective-capability intersection engine (research
-  045 §8 §12 §13, OQ-057): six-layer intersection, self-grant prohibition,
+- `src/effective.rs` — effective-capability intersection engine (CTX-0524,
+  OQ-057): six-layer intersection, self-grant prohibition,
   typed denial with reason chain, XDG/`.bitty` policy loading, audit ledger,
   and the Hard Safety/Policy/Strategy enforcement map.
 - `src/grant.rs` — hash-bound grant records and the grant store.
@@ -58,12 +58,12 @@ to the still-proposed package-lifecycle RFC is a draft seam.
   host secret store (`secrets` field with `resolve_secret_for_spawn` /
   `sanitized_env_view` / `scrub_against_secrets`).
 - `src/secrets.rs` — host secret store and opaque credential handles
-  (research 045 §5, CTX-0521): `secret://` parsing, `SecretStore` with
+  (CTX-0521): `secret://` parsing, `SecretStore` with
   per-handle consent and audit ledger, child-env-only resolution,
   fail-closed literal detection (MPC-2), `SanitizedEnvView` agent view,
   P0-AC-026 scrubbing, and the XDG file store with user-only modes.
 - `src/fs_authz.rs` — filesystem authorization: sensitive-path policy plus
-  secret detection (research 045 §4, CTX-0523): `FilesystemScope` (granted
+  secret detection (CTX-0523): `FilesystemScope` (granted
   path set, deny-by-default, hostile patterns fail closed at construction
   via the CTX-0465/0489/0495 wave predicate without duplicating it),
   `SensitivePathPolicy` (default-deny `.env`/`.env.*`, `~/.ssh/**`,

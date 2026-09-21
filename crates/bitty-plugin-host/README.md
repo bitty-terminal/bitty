@@ -45,6 +45,9 @@ to the still-proposed package-lifecycle RFC is a draft seam.
   and the Hard Safety/Policy/Strategy enforcement map.
 - `src/grant.rs` — hash-bound grant records and the grant store.
 - `src/registry.rs` — registry, lifecycle states, and generations.
+- `src/lifecycle.rs` — host-owned lifecycle enforcement (FS-2 degradation
+  ladder, FS-4 enforcement records, FS-6 reload ordering; pinned by
+  `tests/lifecycle.rs`).
 - `src/event.rs` — event classes, bounded queues, and delivery policy.
 - `src/host.rs` — host owning registry, grants, pipeline, side queue, the
   effective-capability audit ledger (`authorize_effective` /

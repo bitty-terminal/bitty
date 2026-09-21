@@ -65,6 +65,8 @@ the determinism contract are documented in `src/lib.rs`.
 - `src/config.rs` — configuration-chunk evaluation and table extraction.
 - `src/stdlib.rs` — restricted standard-library construction.
 - `src/gate.rs` — fail-closed plugin-VM build gate and safe-mode policy.
+- `src/store.rs` — host-owned RC-11 persistent-store quota backend
+  (`bitty.store`; pinned by `tests/store_quota.rs`).
 - `src/error.rs` — stable `E_*` bridge codes for VM budget failures.
 - `tests/` — headless budget and isolation tests, including the
   `readiness_mirror.rs` gate mirror.

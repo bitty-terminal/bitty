@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Plugin persistent store quota backend (CTX-0596, RUN-25):**
+  `crates/bitty-lua/src/store.rs` owns the host-side `bitty.store` backend
+  behind `HostServices`: one `PluginStore` per plugin identity with RC-11
+  ceilings (256 KiB persisted total, 8 KiB per value, depth 8, 1024 nodes),
+  refused fail-closed with typed `E_STORE_QUOTA` (class `budget`) leaving the
+  previous persisted state intact and with no eviction path. Byte, node, and
+  depth accounting is exact and deterministic, and the bridge re-validates the
+  limits defence-in-depth under the default marshalling bounds. Pinned by
+  `crates/bitty-lua/tests/store_quota.rs` (11 new tests).
+- **Host-owned plugin lifecycle enforcement (CTX-0597, RUN-26):**
+  `crates/bitty-plugin-host/src/lifecycle.rs` adds the FS-2 degradation
+  ladder (`LifecycleEnforcer`: refuse, terminate callback, suspend
+  generation, disable plugin; three escalations inside the 60 s window
+  suspend the generation and only an explicit `reactivate` resumes it),
+  FS-4 structured `EnforcementRecord`s (bounded, drop-oldest), and FS-6
+  `reload_generation` ordering (generation `N` is disposed before `N+1`
+  activates; a failed activation restores `N`, and a double failure disables
+  the plugin cleanly). Pure data plus bounded counters: no VM coupling, no
+  file I/O, no `unsafe`. Pinned by
+  `crates/bitty-plugin-host/tests/lifecycle.rs` (9 new tests).
+- **Fail-closed plugin-VM load gate and stable budget codes (CTX-0598,
+  RUN-27):** `crates/bitty-lua/src/gate.rs` seals plugin construction behind
+  `PluginVmBuilder`/`build_plugin_vm`, which require explicit RC-1/RC-2
+  `VmBudgets` (FS-7) and refuse missing or zero budgets fail-closed, while
+  `LoadPolicy` models `--safe` admission on identities only (FS-8: no
+  third-party candidate is admitted). `crates/bitty-lua/src/error.rs`
+  stabilizes the budget code surface (`E_TIMEOUT`,
+  `E_BUDGET_INSTRUCTIONS`, `E_BUDGET_MEMORY`, class `budget`). Pinned by
+  `crates/bitty-lua/tests/load_gate.rs` (15 new tests) with safe-mode
+  coverage in `tests/safe_mode.rs`.
 - **Six-shell coverage evidence (CTX-0588, M1-27, Issue #1153):**
   `crates/bitty-runtime/tests/m1_shell_coverage.rs` drives the real PTY with
   ZERO shell integration active (default config, no plugin, rc files
@@ -382,6 +412,26 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   registered future auto-cancel fail-closed through Lua `pcall`. Post-swap
   behavior is pinned by `crates/bitty-lua/tests/readiness_mirror.rs`
   (CTX-0600, RUN-29).
+- **Plugin-host event docs follow the Phodopus swap (CTX-0601):**
+  `crates/bitty-plugin-host/src/event.rs` crate docs now name the `phodopus`
+  VM for RC-1/RC-2 enforcement and state that config chunks run on the same
+  gate-built `phodopus` VM per ADR-0004; the stale `piccolo` references and
+  the `mlua` config-VM claim are retired (no `mlua` remains in manifests or
+  the lockfile). Docs-only, no behavior change.
+- **CI shares compilation and apt caches (CTX-0602):**
+  `.github/workflows/ci.yml` adds `Swatinem/rust-cache` on all six Rust jobs
+  (OS-plus-toolchain keys, MSRV 1.85 isolated), installs the toolchain from
+  `rust-toolchain.toml`, and adds an apt archive cache; no suite, timeout,
+  or job-name changes. CI-only, no product behavior change.
+- **Crate READMEs cover the pivot-wave modules (CTX-0605):**
+  `crates/bitty-lua/README.md` maps `src/store.rs` (RC-11 `bitty.store`
+  backend) and `crates/bitty-plugin-host/README.md` maps `src/lifecycle.rs`
+  (FS-2/FS-4/FS-6 enforcement); verification found zero `piccolo` residue
+  and accurate swap claims. Docs-only.
+- **Scratch-path hygiene gate covers `/var/tmp` (CTX-0604):**
+  `scripts/check-scratch-paths.sh` extends the temp-dir pattern past the
+  `/tmp/` lookbehind exclusion so the alternate system temp dir is caught;
+  the gate and its fixture suite pass. CI-only.
 
 ### Fixed
 
@@ -454,6 +504,13 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   (`>=0.5,<1.0`, `>=2.30`) remains accepted (zero-padded to `>=0.5.0,<1.0.0`
   and `>=2.30.0` by CTX-0466) and is now regression-pinned across
   `bitty-package`, `bitty-runtime`, and `bitty-plugin-host`.
+- **Whole-tree layout writes cannot retire a ViewId unobserved (CTX-0603,
+  issue #1165):** `layout_mut` now returns a `LayoutMutGuard` that folds the
+  overwritten tree into the ViewId high-water on every `DerefMut` access and
+  on `Drop`, so consecutive whole-tree writes inside one borrow keep
+  WS-INV-4/F-1. A single-borrow double-write regression test pins it, and a
+  mutation probe with the `DerefMut` raise removed fails, proving the test
+  is non-tautological.
 
 ### Security
 

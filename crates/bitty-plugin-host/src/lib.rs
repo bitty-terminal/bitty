@@ -66,6 +66,7 @@
 //! | Plugin host (ADRs) | `host` | [`host::PluginHost`] owns registry + grant store + event pipeline + [`host::SideQueue`] bounded side queue; no window/GPU/PTY coupling; headless testable |
 //! | Package install verification (proposed, draft) | `install` | [`install::verify_install`] calls `bitty_package::verify_pipeline` (7 stages) before staging; `V-A`/`V-B`/`V-C` trust, capability-diff `P0-AC-030`, generation integrity `verify_all`; fail-closed owned errors + [`install::DoctorIssue`] for `bitty plugin doctor`; headless tamper/capability tests |
 //! | Security alignment | all | No bypass, no ambient authority, presentation never rewrites terminal truth, high-risk identifiers distinct, `bitty --safe` skips third-party plugins |
+//! | Unknown-origin restrictive policy (R-020, P0-AC-032) | `origin` | [`origin::DetectedOrigin`] advisory classification (fail-closed to `Unknown` on absent/conflicting signals), [`origin::OriginPolicy`] `Unknown`/`Remote` restrictive, relaxation only via explicit [`origin::OriginOverride::RelaxToStandard`] |
 //! | Verification remaining under closed OQ-011..OQ-014 | docs + `event::DropPolicy` | `DropOldest` accepted v1 default; exact queue depths/timeouts per accepted `OQ-014` budgets; remaining work is implementation verification, not open RFC points |
 //!
 //! # Drop policy — DropOldest accepted default for v1 (OQ-013 closed decision point)
@@ -126,6 +127,7 @@ pub mod host;
 pub mod install;
 pub mod lifecycle;
 pub mod manifest;
+pub mod origin;
 pub mod registry;
 pub mod secrets;
 pub mod tools;
@@ -174,6 +176,10 @@ pub use manifest::{
     MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,
     MAX_PATTERN_TEXT_BYTES, MAX_PROVIDED_SERVICES, MAX_TOOLS, PluginId, PluginIdentity,
     PluginManifest, QualifiedName, ToolDeclaration, is_hostile_fs_pattern,
+};
+pub use origin::{
+    DetectedOrigin, OriginOverride, OriginPolicy, OriginSignals, classify_origin,
+    resolve_origin_policy,
 };
 pub use registry::{Generation, PluginState, Registry, RegistryEntry};
 pub use secrets::{

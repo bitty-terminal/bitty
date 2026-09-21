@@ -123,9 +123,12 @@ jobs:
         run: |
           channel="$(scripts/rust-channel.sh)"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
           targets: ${{ matrix.target }}
@@ -343,9 +346,12 @@ jobs:
         run: |
           channel="$(scripts/rust-channel.sh)"
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        # Windows runners default to PowerShell: force bash (git-bash) so the
+        # command substitution above parses. No-op on Linux/macOS.
+        shell: bash
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
 

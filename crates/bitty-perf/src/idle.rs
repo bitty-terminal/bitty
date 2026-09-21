@@ -428,6 +428,459 @@ impl IdleReport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PB-7 bounded idle-CPU/wakeup evidence (CTX-0636, PERF-08)
+// ---------------------------------------------------------------------------
+
+/// Schema version of the committed `pb-idle.json` artifact.
+pub const IDLE_BASELINE_SCHEMA_VERSION: u32 = 1;
+/// Committed PB-7 evidence artifact, relative to the repository root.
+pub const IDLE_BASELINE_REL_PATH: &str = "crates/bitty-perf/baselines/pb-idle.json";
+/// Hidden bench argument: re-exec the bench binary as the idle subject.
+///
+/// The child constructs a default `Runtime`, proves it is idle
+/// (`tick == None`), then blocks like `ControlFlow::Wait` for the window.
+/// The parent samples the child's CPU and wakeup counters across the window.
+pub const IDLE_CHILD_ARG: &str = "--idle-child";
+/// Environment knob for the extended idle window in seconds.
+pub const IDLE_WINDOW_ENV: &str = "BITTY_PERF_IDLE_SECS";
+/// Default extended idle window in seconds.
+///
+/// A bounded proxy: the accepted budget averages over 10 minutes, and the
+/// real 10-minute measurement is gated on the Tier 1 reference machine
+/// (PERF-01, blocked on OQ-100). A parked child shows its steady-state rate
+/// within a minute; the window stays configurable up to the maximum.
+pub const DEFAULT_IDLE_WINDOW_SECS: u64 = 60;
+/// Maximum extended idle window in seconds (mirrors the PB-2 idle clamp).
+pub const MAX_IDLE_WINDOW_SECS: u64 = 300;
+
+/// Idle-CPU/wakeup evidence for one parked-`Runtime` window.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IdleCpuEvidence {
+    /// Idle window actually observed, in seconds.
+    pub window_secs: u64,
+    /// Mean CPU over the window as percent of one core (`None` when unmeasured).
+    pub avg_cpu_pct: Option<f64>,
+    /// Delta of `utime + stime` across the window, in clock ticks.
+    pub cpu_ticks: Option<u64>,
+    /// `CLK_TCK` used for the tick conversion.
+    pub clock_tick_hz: Option<u64>,
+    /// Delta of voluntary + involuntary context switches across the window.
+    ///
+    /// Spawn/exit edge effects account for a small single-digit count; a
+    /// parked child shows no steady-state periodic wakeups.
+    pub wakeups: Option<u64>,
+    /// Voluntary context-switch delta, when readable.
+    pub voluntary_ctxt: Option<u64>,
+    /// Involuntary context-switch delta, when readable.
+    pub involuntary_ctxt: Option<u64>,
+    /// Why the measurement is unavailable (`None` when measured).
+    pub reason: Option<String>,
+}
+
+impl IdleCpuEvidence {
+    /// `true` when no CPU sample was collected.
+    #[must_use]
+    pub fn is_unavailable(&self) -> bool {
+        self.avg_cpu_pct.is_none()
+    }
+
+    /// `true` only when a CPU sample exists and is within the PB-7 budget.
+    /// An unmeasured window is reported as not met, never as passing.
+    #[must_use]
+    pub fn meets_budget(&self) -> bool {
+        self.avg_cpu_pct
+            .is_some_and(|pct| pct <= super::PB7_IDLE_CPU_PCT as f64)
+    }
+
+    /// One-line human summary for bench output and evidence docs.
+    #[must_use]
+    pub fn format_summary(&self) -> String {
+        match (self.avg_cpu_pct, self.wakeups) {
+            (Some(pct), Some(w)) => format!(
+                "idle-cpu — {} window {}s avg_cpu {:.3}% (ticks {} @ {} Hz) wakeups {} (vol {} invol {}) vs PB-7 budget {}% avg over 10 min, zero periodic wakeups when idle",
+                if self.meets_budget() {
+                    "PASS"
+                } else {
+                    "ABOVE_BUDGET"
+                },
+                self.window_secs,
+                pct,
+                self.cpu_ticks.unwrap_or(0),
+                self.clock_tick_hz.unwrap_or(0),
+                w,
+                self.voluntary_ctxt.unwrap_or(0),
+                self.involuntary_ctxt.unwrap_or(0),
+                super::PB7_IDLE_CPU_PCT,
+            ),
+            _ => format!(
+                "idle-cpu — UNMEASURED window {}s ({})",
+                self.window_secs,
+                self.reason.as_deref().unwrap_or("no sample")
+            ),
+        }
+    }
+}
+
+/// Provenance metadata supplied to [`baseline_json`].
+#[derive(Debug, Clone, Default)]
+pub struct IdleBaselineMeta {
+    /// Owning CarryCtx task.
+    pub task: String,
+    /// Owning GitHub issues.
+    pub issues: Vec<u64>,
+    /// Capture date (`YYYY-MM-DD`).
+    pub captured_at: String,
+    /// Git revision the baseline was captured at.
+    pub revision: String,
+    /// Exact measurement command.
+    pub command: String,
+    /// Cargo profile used.
+    pub profile: String,
+}
+
+/// Clamp the extended idle window from `BITTY_PERF_IDLE_SECS`.
+#[must_use]
+pub fn idle_window_secs() -> u64 {
+    let parsed = std::env::var(IDLE_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_IDLE_WINDOW_SECS);
+    clamp_window(parsed)
+}
+
+/// Clamp a raw idle-window value into `1..=MAX_IDLE_WINDOW_SECS`.
+#[must_use]
+pub const fn clamp_window(window_secs: u64) -> u64 {
+    if window_secs < 1 {
+        1
+    } else if window_secs > MAX_IDLE_WINDOW_SECS {
+        MAX_IDLE_WINDOW_SECS
+    } else {
+        window_secs
+    }
+}
+
+/// Idle-subject entry point for the re-execed bench child. Never returns.
+///
+/// Proves the fresh `Runtime` is idle, parks on a condvar with a deadline
+/// (the headless equivalent of the platform `ControlFlow::Wait` loop), then
+/// re-verifies no internal timer produced damage while parked. Exits nonzero
+/// when the runtime never reaches idle or wakes with pending damage.
+pub fn run_idle_child(window_secs: u64) -> ! {
+    use std::sync::{Arc, Condvar, Mutex};
+    let window_secs = window_secs.clamp(1, MAX_IDLE_WINDOW_SECS);
+    let mut rt = Runtime::with_defaults().expect("idle child runtime");
+    let _ = rt.tick();
+    assert!(
+        rt.tick().is_none(),
+        "idle child must reach idle before parking"
+    );
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let (lock, cvar) = &*pair;
+    let deadline = Instant::now() + Duration::from_secs(window_secs);
+    let mut guard = lock.lock().expect("idle child condvar lock");
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (g, _) = cvar
+            .wait_timeout(guard, remaining)
+            .expect("idle child condvar wait");
+        guard = g;
+    }
+    drop(guard);
+    if rt.tick().is_some() {
+        std::process::exit(3);
+    }
+    std::process::exit(0);
+}
+
+/// Measure the idle CPU/wakeup of a parked `Runtime` child over
+/// [`idle_window_secs`].
+///
+/// Linux-only (`/proc` counters); every other platform returns `Unavailable`
+/// with a reason. The child is killed and reaped on every path.
+#[must_use]
+pub fn measure_idle_cpu() -> IdleCpuEvidence {
+    measure_idle_cpu_with(idle_window_secs())
+}
+
+/// Measurement variant with an explicit window in seconds (used by the bench).
+#[must_use]
+pub fn measure_idle_cpu_with(window_secs: u64) -> IdleCpuEvidence {
+    let window_secs = window_secs.clamp(1, MAX_IDLE_WINDOW_SECS);
+    let unavailable = |reason: &str| IdleCpuEvidence {
+        window_secs,
+        reason: Some(reason.to_string()),
+        ..IdleCpuEvidence::default()
+    };
+    if !cfg!(target_os = "linux") {
+        return unavailable("non-Linux host: no /proc counters for wakeup evidence");
+    }
+    let Some(hz) = clock_tick_hz() else {
+        return unavailable("CLK_TCK undiscoverable (getconf failed)");
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return unavailable("bench executable path undiscoverable"),
+    };
+    let child = match std::process::Command::new(exe)
+        .arg(IDLE_CHILD_ARG)
+        .arg(window_secs.to_string())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return unavailable("idle child spawn failed"),
+    };
+    let pid = child.id();
+    // Settle: let the child prove idle and reach its park before t0.
+    std::thread::sleep(Duration::from_millis(500));
+    let t0 = Instant::now();
+    let Some((ticks0, vol0, invol0)) = read_child_counters(pid) else {
+        reap(child);
+        return unavailable("t0 /proc counters unreadable (child exited early?)");
+    };
+    std::thread::sleep(Duration::from_secs(window_secs));
+    let wall_secs = t0.elapsed().as_secs_f64().max(1e-9);
+    let result = match read_child_counters(pid) {
+        Some((ticks1, vol1, invol1)) => {
+            let dticks = ticks1.saturating_sub(ticks0);
+            let pct = 100.0 * dticks as f64 / (hz as f64 * wall_secs);
+            IdleCpuEvidence {
+                window_secs,
+                avg_cpu_pct: Some(pct),
+                cpu_ticks: Some(dticks),
+                clock_tick_hz: Some(hz),
+                wakeups: Some(vol1.saturating_sub(vol0) + invol1.saturating_sub(invol0)),
+                voluntary_ctxt: Some(vol1.saturating_sub(vol0)),
+                involuntary_ctxt: Some(invol1.saturating_sub(invol0)),
+                reason: None,
+            }
+        }
+        None => unavailable("t1 /proc counters unreadable"),
+    };
+    reap(child);
+    result
+}
+
+fn reap(mut child: std::process::Child) {
+    // The child exits on its own when its park deadline passes; allow a
+    // bounded grace, then kill. Every path reaps via `wait`.
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn clock_tick_hz() -> Option<u64> {
+    let out = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|hz| *hz > 0)
+}
+
+/// CPU ticks plus wakeup counters for one pid via `/proc`.
+fn read_child_counters(pid: u32) -> Option<(u64, u64, u64)> {
+    let (utime, stime) =
+        parse_stat_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+    let (vol, invol) =
+        parse_status_ctxt(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)?;
+    Some((utime + stime, vol, invol))
+}
+
+/// Parse `utime`/`stime` (fields 14/15) from `/proc/<pid>/stat` contents.
+///
+/// The comm field may contain spaces and parentheses, so fields are split
+/// after the last `)`.
+fn parse_stat_ticks(stat: &str) -> Option<(u64, u64)> {
+    let after_comm = stat.rsplit(')').next()?;
+    let mut fields = after_comm.split_whitespace();
+    // After `pid (comm)`: state is field 3, utime field 14, stime field 15.
+    let utime = fields.nth(11)?.parse::<u64>().ok()?;
+    let stime = fields.next()?.parse::<u64>().ok()?;
+    Some((utime, stime))
+}
+
+/// Parse voluntary/involuntary context switches from `/proc/<pid>/status`.
+fn parse_status_ctxt(status: &str) -> Option<(u64, u64)> {
+    let mut vol = None;
+    let mut invol = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+            vol = rest.trim().parse::<u64>().ok();
+        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+            invol = rest.trim().parse::<u64>().ok();
+        }
+    }
+    Some((vol?, invol?))
+}
+
+fn escape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Serialize a PB-7 report plus provenance into the committed shape.
+///
+/// Provenance comes from the caller (environment-derived); host context is
+/// captured from the environment. No checkout path, username, or hostname is
+/// embedded.
+#[must_use]
+pub fn baseline_json(
+    report: &IdleReport,
+    cpu: &IdleCpuEvidence,
+    meta: &IdleBaselineMeta,
+) -> String {
+    let host = crate::real_window::HostContext::capture();
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!(
+        "  \"schema_version\": {IDLE_BASELINE_SCHEMA_VERSION},\n"
+    ));
+    out.push_str(&format!("  \"task\": \"{}\",\n", escape_json(&meta.task)));
+    let issues: Vec<String> = meta.issues.iter().map(u64::to_string).collect();
+    out.push_str(&format!("  \"issues\": [{}],\n", issues.join(", ")));
+    out.push_str(&format!(
+        "  \"captured_at\": \"{}\",\n",
+        escape_json(&meta.captured_at)
+    ));
+    out.push_str(&format!(
+        "  \"revision\": \"{}\",\n",
+        escape_json(&meta.revision)
+    ));
+    out.push_str(&format!(
+        "  \"command\": \"{}\",\n",
+        escape_json(&meta.command)
+    ));
+    out.push_str(&format!(
+        "  \"profile\": \"{}\",\n",
+        escape_json(&meta.profile)
+    ));
+    out.push_str(
+        "  \"budget_ref\": \"docs/specifications/performance-budget-rfc.md#pb-7-idle-resource-usage\",\n",
+    );
+    out.push_str("  \"host_context\": {\n");
+    out.push_str(&format!("    \"os\": \"{}\",\n", escape_json(&host.os)));
+    out.push_str(&format!("    \"arch\": \"{}\",\n", escape_json(&host.arch)));
+    out.push_str(&format!(
+        "    \"toolchain\": \"{}\",\n",
+        escape_json(&host.toolchain)
+    ));
+    out.push_str(&format!("    \"cpus\": {},\n", host.cpus));
+    match host.total_memory_mb {
+        Some(mb) => out.push_str(&format!("    \"total_memory_mb\": {mb}\n")),
+        None => out.push_str("    \"total_memory_mb\": null\n"),
+    }
+    out.push_str("  },\n");
+    out.push_str("  \"bounds\": {\n");
+    out.push_str(&format!("    \"idle_window_secs\": {},\n", cpu.window_secs));
+    out.push_str("    \"idle_tick_samples\": 3000,\n");
+    out.push_str("    \"clean_render_samples\": 2000\n");
+    out.push_str("  },\n");
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| c.name)
+        .collect();
+    out.push_str("  \"frame_on_demand\": {\n");
+    out.push_str(&format!(
+        "    \"status\": \"{}\",\n",
+        if report.all_passed() { "pass" } else { "fail" }
+    ));
+    out.push_str(&format!("    \"checks_run\": {},\n", report.checks.len()));
+    out.push_str(&format!(
+        "    \"checks_failed\": [{}],\n",
+        failed
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    out.push_str(&format!(
+        "    \"idle_tick_mean_us\": {:.3},\n",
+        report.idle_tick_mean_us
+    ));
+    out.push_str(&format!(
+        "    \"clean_render_mean_us\": {:.3},\n",
+        report.clean_render_mean_us
+    ));
+    out.push_str(&format!(
+        "    \"clean_is_clean\": {}\n",
+        report.clean_is_clean
+    ));
+    out.push_str("  },\n");
+    out.push_str("  \"pb7_idle_cpu\": {\n");
+    out.push_str(&format!(
+        "    \"status\": \"{}\",\n",
+        if cpu.is_unavailable() {
+            "unavailable"
+        } else {
+            "measured"
+        }
+    ));
+    out.push_str(&format!("    \"window_secs\": {},\n", cpu.window_secs));
+    match cpu.avg_cpu_pct {
+        Some(pct) => out.push_str(&format!("    \"avg_cpu_pct\": {pct:.4},\n")),
+        None => out.push_str("    \"avg_cpu_pct\": null,\n"),
+    }
+    match cpu.cpu_ticks {
+        Some(t) => out.push_str(&format!("    \"cpu_ticks\": {t},\n")),
+        None => out.push_str("    \"cpu_ticks\": null,\n"),
+    }
+    match cpu.clock_tick_hz {
+        Some(hz) => out.push_str(&format!("    \"clock_tick_hz\": {hz},\n")),
+        None => out.push_str("    \"clock_tick_hz\": null,\n"),
+    }
+    match cpu.wakeups {
+        Some(w) => out.push_str(&format!("    \"wakeups\": {w},\n")),
+        None => out.push_str("    \"wakeups\": null,\n"),
+    }
+    match cpu.voluntary_ctxt {
+        Some(v) => out.push_str(&format!("    \"voluntary_ctxt\": {v},\n")),
+        None => out.push_str("    \"voluntary_ctxt\": null,\n"),
+    }
+    match cpu.involuntary_ctxt {
+        Some(v) => out.push_str(&format!("    \"involuntary_ctxt\": {v},\n")),
+        None => out.push_str("    \"involuntary_ctxt\": null,\n"),
+    }
+    out.push_str(&format!(
+        "    \"budget_cpu_pct\": {},\n",
+        super::PB7_IDLE_CPU_PCT
+    ));
+    out.push_str(&format!(
+        "    \"meets_cpu_budget\": {}\n",
+        cpu.meets_budget()
+    ));
+    out.push_str("  }\n");
+    out.push_str("}\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +969,109 @@ mod tests {
             CpuBudgetVerdict::Unmeasured
         );
         assert!(!unmeasured.meets_cpu_budget());
+    }
+
+    #[test]
+    fn stat_ticks_parse_handles_paren_comm() {
+        // pid (comm with spaces and (parens)) state ppid ... utime stime.
+        let stat = "12345 (idle_real (test)) S 1 2 3 4 5 6 7 8 9 10 42 7 0 0 0";
+        assert_eq!(parse_stat_ticks(stat), Some((42, 7)));
+    }
+
+    #[test]
+    fn stat_ticks_parse_rejects_truncated() {
+        assert_eq!(parse_stat_ticks("1 (x) S"), None);
+        assert_eq!(parse_stat_ticks("no parens here"), None);
+    }
+
+    #[test]
+    fn status_ctxt_parse_reads_both_counters() {
+        let status = "Name:\tidle_real\nState:\tS (sleeping)\nvoluntary_ctxt_switches:\t12\nnonvoluntary_ctxt_switches:\t3\n";
+        assert_eq!(parse_status_ctxt(status), Some((12, 3)));
+    }
+
+    #[test]
+    fn status_ctxt_parse_requires_both() {
+        assert_eq!(parse_status_ctxt("voluntary_ctxt_switches:\t1\n"), None);
+        assert_eq!(parse_status_ctxt(""), None);
+    }
+
+    #[test]
+    fn idle_cpu_meets_budget_is_fail_closed() {
+        let met = IdleCpuEvidence {
+            window_secs: 60,
+            avg_cpu_pct: Some(0.05),
+            ..IdleCpuEvidence::default()
+        };
+        assert!(!met.is_unavailable());
+        assert!(met.meets_budget());
+
+        let over = IdleCpuEvidence {
+            avg_cpu_pct: Some(super::super::PB7_IDLE_CPU_PCT as f64 + 0.1),
+            ..IdleCpuEvidence::default()
+        };
+        assert!(!over.meets_budget());
+
+        let unmeasured = IdleCpuEvidence::default();
+        assert!(unmeasured.is_unavailable());
+        assert!(!unmeasured.meets_budget());
+    }
+
+    #[test]
+    fn baseline_json_carries_schema_budget_and_numbers() {
+        let report = IdleReport {
+            checks: vec![IdleCheck {
+                name: "second_tick_is_idle_no_damage",
+                passed: true,
+                detail: "ok".to_string(),
+            }],
+            idle_tick_mean_us: 0.5,
+            clean_render_mean_us: 0.3,
+            clean_is_clean: true,
+            sampled_cpu_pct: Some(0.0),
+            elapsed: Duration::ZERO,
+        };
+        let cpu = IdleCpuEvidence {
+            window_secs: 60,
+            avg_cpu_pct: Some(0.02),
+            cpu_ticks: Some(1),
+            clock_tick_hz: Some(100),
+            wakeups: Some(4),
+            voluntary_ctxt: Some(3),
+            involuntary_ctxt: Some(1),
+            reason: None,
+        };
+        let meta = IdleBaselineMeta {
+            task: "CTX-0636".to_string(),
+            issues: vec![1062],
+            captured_at: "2026-09-22".to_string(),
+            revision: "test-revision".to_string(),
+            command: "test command".to_string(),
+            profile: "test".to_string(),
+        };
+        let json = baseline_json(&report, &cpu, &meta);
+        for needle in [
+            "\"schema_version\": 1",
+            "\"task\": \"CTX-0636\"",
+            "\"issues\": [1062]",
+            "pb-7-idle-resource-usage",
+            "\"avg_cpu_pct\": 0.0200",
+            "\"budget_cpu_pct\": 1",
+            "\"meets_cpu_budget\": true",
+            "\"checks_failed\": []",
+        ] {
+            assert!(json.contains(needle), "baseline must contain {needle}");
+        }
+    }
+
+    #[test]
+    fn idle_window_clamp_bounds_the_window() {
+        assert_eq!(super::clamp_window(0), 1);
+        assert_eq!(super::clamp_window(60), 60);
+        assert_eq!(super::clamp_window(u64::MAX), super::MAX_IDLE_WINDOW_SECS);
+        assert_eq!(
+            super::idle_window_secs().clamp(1, super::MAX_IDLE_WINDOW_SECS),
+            super::idle_window_secs()
+        );
     }
 }

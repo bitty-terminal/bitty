@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0636",
+  "issues": [1062],
+  "captured_at": "2026-09-21",
+  "revision": "b0b1155aec54b127503d049a5df61f84cd24d9b8",
+  "command": "cargo bench -p bitty-perf --bench idle_real -- --nocapture --write-baseline crates/bitty-perf/baselines/pb-idle.json",
+  "profile": "bench (release)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-7-idle-resource-usage",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "bounds": {
+    "idle_window_secs": 60,
+    "idle_tick_samples": 3000,
+    "clean_render_samples": 2000
+  },
+  "frame_on_demand": {
+    "status": "pass",
+    "checks_run": 9,
+    "checks_failed": [],
+    "idle_tick_mean_us": 1.864,
+    "clean_render_mean_us": 0.020,
+    "clean_is_clean": true
+  },
+  "pb7_idle_cpu": {
+    "status": "measured",
+    "window_secs": 60,
+    "avg_cpu_pct": 0.0000,
+    "cpu_ticks": 0,
+    "clock_tick_hz": 100,
+    "wakeups": 2,
+    "voluntary_ctxt": 1,
+    "involuntary_ctxt": 1,
+    "budget_cpu_pct": 1,
+    "meets_cpu_budget": true
+  }
+}

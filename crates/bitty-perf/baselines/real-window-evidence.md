@@ -124,11 +124,13 @@ Environment for this capture (host context is recorded inside the artifact):
 | PB-1 p99          | 257.0 ms | ≤ 200 ms | `ABOVE_BUDGET` |
 | PB-2 idle RSS p50 | 426.3 MB | ≤ 80 MB  | `ABOVE_BUDGET` |
 
-A second 10-launch run on the same host (recorded under
-`recording/ctx-0592/evidence-capture.md`) measured p50 254.2 ms / p99
+A second 10-launch run on the same host measured p50 254.2 ms / p99
 410.7 ms and RSS p50 431.3 MB, consistent with the committed artifact; the
 spread (`~210-410 ms`) shows why the opt-in regression factor is deliberately
-loose on this shared workstation.
+loose on this shared workstation. Candidate cross-check only: its run log
+lived in gitignored local scratch
+(`recording/ctx-0592/evidence-capture.md`, not committed and not present in
+the repository), so these numbers are not verifiable from the repo.
 
 Interpretation, stated honestly:
 

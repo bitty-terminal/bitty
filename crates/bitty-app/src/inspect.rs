@@ -1541,6 +1541,53 @@ mod tests {
     }
 
     #[test]
+    fn protocol_catalog_reflects_live_kitty_state() {
+        // DT-12 (CTX-0509 follow-up): the kitty entry must describe the
+        // shipped bounded subset, never the pre-present-path stub. Live
+        // bounds: intake (`bitty-rich` kitty), decode (`f=100` PNG,
+        // `f=24` RGB, `f=32` RGBA), cursor-anchored placement, present
+        // blit; transmit-only and unknown `a=` actions store without
+        // painting; animation deferred.
+        let kitty = inspect_protocol("kitty-graphics").expect("kitty");
+        assert_eq!(kitty.status, "supported");
+        for marker in ["f=100", "f=24", "f=32", "Transmit-only", "animation"] {
+            assert!(
+                kitty.detail.contains(marker),
+                "kitty detail must name {marker:?}, got {:?}",
+                kitty.detail
+            );
+        }
+        let lowered = kitty.detail.to_ascii_lowercase();
+        for stale in ["stub", "no raster", "later slice"] {
+            assert!(
+                !lowered.contains(stale),
+                "kitty detail must not repeat the pre-present-path stub wording ({stale:?}), got {:?}",
+                kitty.detail
+            );
+        }
+        // The rest of the catalog stays honest too: sixel sequences are
+        // ignored (no VT mapping), OSC 8 / OSC 133 record via bitty-rich,
+        // and OSC 52 stays behind the clipboard policy gate.
+        let sixel = inspect_protocol("sixel").expect("sixel");
+        assert_eq!(sixel.status, "unsupported");
+        assert!(sixel.detail.contains("ignored"));
+        assert_eq!(
+            inspect_protocol("hyperlink").expect("hyperlink").status,
+            "supported"
+        );
+        assert_eq!(
+            inspect_protocol("shell-integration")
+                .expect("shell-integration")
+                .status,
+            "supported"
+        );
+        assert_eq!(
+            inspect_protocol("clipboard").expect("clipboard").status,
+            "policy-gated"
+        );
+    }
+
+    #[test]
     fn envelopes_are_machine_readable() {
         let req = InspectRequest::validate(
             Some("command"),

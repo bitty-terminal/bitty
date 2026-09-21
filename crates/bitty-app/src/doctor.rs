@@ -1303,6 +1303,29 @@ mod tests {
     }
 
     #[test]
+    fn image_protocols_report_bounded_kitty_not_stub() {
+        // DT-12 (CTX-0509 follow-up): the images row must describe the
+        // shipped bounded kitty subset, never the pre-present-path stub.
+        let check = check_image_protocols();
+        assert_eq!(check.id, "images");
+        assert_eq!(check.status, DoctorStatus::Warn);
+        let text = format!("{} {}", check.hint, check.detail);
+        for marker in ["bounded", "sixel", "unsupported"] {
+            assert!(
+                text.contains(marker),
+                "images row must name {marker:?}, got {text:?}"
+            );
+        }
+        let lowered = text.to_ascii_lowercase();
+        for stale in ["stub", "later slice", "no raster"] {
+            assert!(
+                !lowered.contains(stale),
+                "images row must not repeat the pre-present-path stub wording ({stale:?}), got {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn generic_failure_yields_exit_one() {
         let mut inputs = healthy_inputs();
         inputs.pty_available = false;

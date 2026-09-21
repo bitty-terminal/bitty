@@ -368,6 +368,20 @@ layout.gap_cells * cell_axis`; with the default `layout` cell gaps of `0`
   measurement `mode` (injected echo vs real PTY echo) and adds work
   p50/p99/min; and the compat-lab matrix derives reference outcomes from the
   on-disk dumps instead of hardcoding `SKIP`.
+- **Lua VM swap from piccolo 0.3.3 to Phodopus (CTX-0599, RUN-28):**
+  `bitty-lua` builds every VM through `phodopus` at exact git revision
+  `1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0` (builder-constructed: 32 MiB
+  hard quota, no `fuel_limit`, the `SLICE_FUEL = 1024` stepping loop stays
+  the authoritative RC-1 instruction policy). Plugin construction is
+  gate-sealed (`gate::PluginVmBuilder`/`build_plugin_vm` require explicit
+  RC-1/RC-2 budgets fail-closed; the raw constructors are deprecated to the
+  single internal gate path). Stdlib baseline: in-core `utf8` and
+  `string.format` with proportional fuel charging (the bitty duplicates are
+  retired), retained bounded `string.byte`/`char`, `table.concat`/`sort`,
+  and restricted `os.time`/`clock`/`date`. Parked host operations with no
+  registered future auto-cancel fail-closed through Lua `pcall`. Post-swap
+  behavior is pinned by `crates/bitty-lua/tests/readiness_mirror.rs`
+  (CTX-0600, RUN-29).
 
 ### Fixed
 

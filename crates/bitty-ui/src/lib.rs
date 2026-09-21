@@ -67,6 +67,7 @@ pub mod presentation;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
+pub mod theme;
 pub mod view;
 
 // Re-exports for ergonomic root access.

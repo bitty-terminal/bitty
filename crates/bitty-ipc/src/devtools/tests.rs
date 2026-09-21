@@ -541,7 +541,7 @@ fn serve_path_takes_verified_marker_only() {
 
     // Endpoint attestation on a properly owned 0700/0600 socket mints the
     // same marker type (unit euid owns the temp endpoint it just created).
-    let attested = {
+    let (attested, euid) = {
         use std::os::unix::fs::PermissionsExt;
         let base =
             std::env::temp_dir().join(format!("bitty-ctx0463-{}-marker", std::process::id()));
@@ -558,9 +558,15 @@ fn serve_path_takes_verified_marker_only() {
         let marker = transport_attested_peer(&socket_str, euid).unwrap();
         drop(listener);
         std::fs::remove_dir_all(&base).ok();
-        marker
+        (marker, euid)
     };
-    assert_eq!(verified, attested);
+    // CTX-0656: the attested marker binds the endpoint UID — it equals the
+    // headless-verified marker for the same UID (no hardcoded UID assumed)
+    // and carries that UID for downstream comparison.
+    assert_eq!(attested.peer_uid(), euid);
+    let headless_same =
+        verify_peer_for_connection(PeerCredentials::new(euid, euid, 1), euid).unwrap();
+    assert_eq!(headless_same, attested);
 
     // Foreign UID cannot produce a marker: rejected before any byte read.
     let foreign = PeerCredentials::new(2000, 2000, 99);

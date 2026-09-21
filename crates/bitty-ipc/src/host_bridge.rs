@@ -911,7 +911,11 @@ mod tests {
 
     #[test]
     fn host_caller_binds_shape_and_server_authority() {
-        let peer = VerifiedPeer::attested(1000);
+        use crate::auth::{PeerCredentials, verify_peer_for_connection};
+        // CTX-0656: the marker is only mintable through verification — the
+        // same-process harness proves locality via the headless UID check.
+        let peer = verify_peer_for_connection(PeerCredentials::new(1000, 1000, 1), 1000)
+            .expect("test-only local marker");
         let granted = granted_inspect();
         let caller = HostCaller::bind(&peer, "bridge-tests", granted.clone(), 1_000)
             .expect("valid label binds");

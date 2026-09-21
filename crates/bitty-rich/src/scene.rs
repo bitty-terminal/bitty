@@ -175,11 +175,23 @@ pub enum SceneNode {
 
 impl SceneNode {
     /// Counts nodes in subtree (including self).
+    ///
+    /// Structural elements count, not just enum nesting: every table row
+    /// and cell and every list item is a separately allocated `Vec`/`String`
+    /// slot, so a table of empty strings still presses against SCN-1.
+    /// (SEC-18/R-021: without structural counting, a table with hundreds of
+    /// thousands of empty rows measured 1 node and 0 text bytes and sailed
+    /// through admission.) `CodeBlock` stays 1: its content is a single
+    /// `String` already budgeted by [`Self::text_bytes`].
     #[must_use]
     pub fn count_nodes(&self) -> usize {
         match self {
             Self::Text(_) | Self::Image(_) | Self::Rule | Self::Unknown(_) => 1,
-            Self::CodeBlock(_) | Self::Table(_) | Self::List(_) => 1,
+            Self::CodeBlock(_) => 1,
+            Self::Table(model) => {
+                1 + model.rows.len() + model.rows.iter().map(Vec::len).sum::<usize>()
+            }
+            Self::List(model) => 1 + model.items.len(),
             Self::Row(children) | Self::Column(children) => {
                 1 + children.iter().map(Self::count_nodes).sum::<usize>()
             }
@@ -205,6 +217,10 @@ impl SceneNode {
     }
 
     /// Text bytes in subtree (sum of all string payloads).
+    ///
+    /// Includes the `Block` border color: it is a producer-supplied `String`
+    /// with no other budget, so excluding it would let an unbounded payload
+    /// bypass SCN-3 (SEC-18/R-021).
     #[must_use]
     pub fn text_bytes(&self) -> usize {
         match self {
@@ -218,7 +234,9 @@ impl SceneNode {
             Self::Row(children) | Self::Column(children) => {
                 children.iter().map(Self::text_bytes).sum()
             }
-            Self::Block { child, .. } => child.text_bytes(),
+            Self::Block { border, child } => {
+                child.text_bytes() + border.as_ref().map_or(0, |b| b.color.len())
+            }
             Self::Image(_) | Self::Rule => 0,
         }
     }
@@ -1173,5 +1191,167 @@ mod tests {
         scene.insert(block).unwrap();
         assert_eq!(scene.len(), 1);
         assert_eq!(scene.get(BlockId(1)).unwrap().text_bytes(), 5);
+    }
+
+    /// SEC-18/R-021: a table of empty strings must press against SCN-1.
+    /// Structural rows/cells count as nodes; string bytes alone (here: 0)
+    /// would admit an arbitrarily large allocation.
+    #[test]
+    fn sec18_table_structure_counts_against_scn1() {
+        let small = SceneNode::Table(TableModel {
+            rows: vec![
+                vec!["a".to_string(), "b".to_string()],
+                vec!["c".to_string()],
+            ],
+        });
+        // 1 (table) + 2 (rows) + 3 (cells).
+        assert_eq!(small.count_nodes(), 6);
+        assert_eq!(small.text_bytes(), 3);
+
+        let rows = SCENE_MAX_NODES_PER_BLOCK + 1;
+        let big = SceneNode::Table(TableModel {
+            rows: (0..rows).map(|_| vec![String::new()]).collect(),
+        });
+        assert_eq!(big.text_bytes(), 0);
+        assert!(big.count_nodes() > SCENE_MAX_NODES_PER_BLOCK);
+        let err = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            big,
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SceneError::NodesTooMany { .. }));
+    }
+
+    /// SEC-18/R-021: list items count as nodes against SCN-1.
+    #[test]
+    fn sec18_list_items_count_against_scn1() {
+        let small = SceneNode::List(ListModel {
+            items: vec!["a".to_string(), "b".to_string()],
+            ordered: false,
+        });
+        assert_eq!(small.count_nodes(), 3);
+        assert_eq!(small.text_bytes(), 2);
+
+        let big = SceneNode::List(ListModel {
+            items: vec![String::new(); SCENE_MAX_NODES_PER_BLOCK + 1],
+            ordered: true,
+        });
+        assert_eq!(big.text_bytes(), 0);
+        let err = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            big,
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SceneError::NodesTooMany { .. }));
+    }
+
+    /// SEC-18/R-021: the border color string is producer-supplied and has
+    /// no other budget, so it counts against SCN-3.
+    #[test]
+    fn sec18_border_color_counts_against_scn3() {
+        let bordered = SceneNode::Block {
+            border: Some(Border {
+                width: 1,
+                color: "#ff0000".to_string(),
+            }),
+            child: Box::new(tiny_text("hi")),
+        };
+        // 2 (child text) + 7 (color).
+        assert_eq!(bordered.text_bytes(), 9);
+
+        let oversized = SceneNode::Block {
+            border: Some(Border {
+                width: 1,
+                color: "c".repeat(SCENE_MAX_TEXT_BYTES_PER_BLOCK + 1),
+            }),
+            child: Box::new(tiny_text("")),
+        };
+        let err = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            oversized,
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SceneError::TextTooLarge { .. }));
+    }
+
+    /// SEC-18/R-021 pin: the constrained AST admits no script, executable,
+    /// or resource-loading variant. This exhaustive match forces the test
+    /// (and the audit) to change when a variant is added.
+    #[test]
+    fn sec18_constrained_variant_set_is_pinned() {
+        fn kind(node: &SceneNode) -> &'static str {
+            match node {
+                SceneNode::Text(_) => "text",
+                SceneNode::Row(_) => "row",
+                SceneNode::Column(_) => "column",
+                SceneNode::Block { .. } => "block",
+                SceneNode::Image(_) => "image",
+                SceneNode::CodeBlock(_) => "codeblock",
+                SceneNode::Table(_) => "table",
+                SceneNode::List(_) => "list",
+                SceneNode::Rule => "rule",
+                SceneNode::Unknown(_) => "unknown",
+            }
+        }
+        let span = StyledSpan {
+            text: String::new(),
+            bold: false,
+            italic: false,
+        };
+        let cases: Vec<(SceneNode, &str)> = vec![
+            (SceneNode::Text(span.clone()), "text"),
+            (SceneNode::Row(vec![]), "row"),
+            (SceneNode::Column(vec![]), "column"),
+            (
+                SceneNode::Block {
+                    border: None,
+                    child: Box::new(SceneNode::Rule),
+                },
+                "block",
+            ),
+            (SceneNode::Image(PlacementId(0)), "image"),
+            (
+                SceneNode::CodeBlock(CodeBlockModel {
+                    lang: None,
+                    content: String::new(),
+                }),
+                "codeblock",
+            ),
+            (SceneNode::Table(TableModel { rows: vec![] }), "table"),
+            (
+                SceneNode::List(ListModel {
+                    items: vec![],
+                    ordered: false,
+                }),
+                "list",
+            ),
+            (SceneNode::Rule, "rule"),
+            (SceneNode::Unknown(String::new()), "unknown"),
+        ];
+        assert_eq!(cases.len(), 10);
+        for (node, expected) in &cases {
+            assert_eq!(kind(node), *expected);
+            // Every variant is measurable and bounded; leaves sit at depth
+            // 1, a block wrapping one child at depth 2 with 2 nodes.
+            let (expected_depth, expected_nodes) =
+                if *expected == "block" { (2, 2) } else { (1, 1) };
+            assert_eq!(node.depth(), expected_depth);
+            assert_eq!(node.count_nodes(), expected_nodes);
+        }
     }
 }

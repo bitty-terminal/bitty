@@ -1386,17 +1386,32 @@ pub fn run_editor(editor: &str, path: &Path, timeout: Duration) -> Result<(), Ed
 
 /// Reads the edited temp file back, bounded at [`COMPOSER_MAX_BYTES`].
 ///
+/// The allocation is capped at `cap + 1` via [`std::io::Read::take`]:
+/// a hostile or runaway editor could otherwise grow the temp file without
+/// bound and OOM this process through one [`std::fs::read`] before the
+/// size check runs (SEC-18/R-021). `cap + 1` distinguishes "exactly at
+/// cap" (accepted) from "over cap" ([`EditorError::TooLarge`]) with a
+/// single bounded read; the reported size comes from metadata so the
+/// diagnostic stays accurate without allocating the excess.
+///
 /// # Errors
 /// [`EditorError::ReadFailed`] on I/O failure;
 /// [`EditorError::TooLarge`] past the cap;
 /// [`EditorError::InvalidUtf8`] when the file is not valid UTF-8.
 pub fn read_composer_back(path: &Path) -> Result<String, EditorError> {
-    let bytes =
-        std::fs::read(path).map_err(|e| EditorError::ReadFailed(truncate_err(e.to_string())))?;
+    use std::io::Read as _;
+    let limit = (COMPOSER_MAX_BYTES as u64).saturating_add(1);
+    let file = std::fs::File::open(path)
+        .map_err(|e| EditorError::ReadFailed(truncate_err(e.to_string())))?;
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|e| EditorError::ReadFailed(truncate_err(e.to_string())))?;
     if bytes.len() > COMPOSER_MAX_BYTES {
-        return Err(EditorError::TooLarge {
-            wanted: bytes.len(),
-        });
+        let wanted = std::fs::metadata(path)
+            .map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX))
+            .unwrap_or(bytes.len());
+        return Err(EditorError::TooLarge { wanted });
     }
     String::from_utf8(bytes).map_err(|_| EditorError::InvalidUtf8)
 }
@@ -2085,5 +2100,53 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(TEMP_PREFIX))
             .collect();
         assert!(leftovers.is_empty(), "temp file cleaned up on timeout");
+    }
+
+    // -- SEC-18/R-021 read-back bound + spawn-literal pins ---------------------
+
+    #[test]
+    fn read_back_exactly_at_cap_is_accepted() {
+        let dir = workdir();
+        let path = dir.join("at-cap");
+        std::fs::write(&path, "e".repeat(COMPOSER_MAX_BYTES)).expect("write at-cap file");
+        let content = read_composer_back(&path).expect("exactly at cap reads back");
+        assert_eq!(content.len(), COMPOSER_MAX_BYTES);
+    }
+
+    #[test]
+    fn read_back_over_cap_fails_closed_with_bounded_allocation() {
+        let dir = workdir();
+        let path = dir.join("over-cap");
+        // One byte past the cap: the bounded read must refuse without
+        // allocating the whole file.
+        let actual = COMPOSER_MAX_BYTES + 1024;
+        std::fs::write(&path, "o".repeat(actual)).expect("write over-cap file");
+        let err = read_composer_back(&path).expect_err("over cap must fail");
+        assert!(
+            matches!(err, EditorError::TooLarge { wanted } if wanted == actual),
+            "diagnostic must report the on-disk size, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_back_missing_file_is_read_failed() {
+        let dir = workdir();
+        let err = read_composer_back(&dir.join("does-not-exist")).expect_err("missing must fail");
+        assert!(matches!(err, EditorError::ReadFailed(_)));
+    }
+
+    #[test]
+    fn run_editor_takes_program_literally_never_a_shell() {
+        // A flag string is one program name, not a program plus flags:
+        // `Command::new` receives it unsplit, so the spawn fails instead of
+        // executing anything (no shell splitting, no flag injection).
+        let dir = workdir();
+        let err = run_editor("vim --clean", &dir, Duration::from_secs(5)).expect_err("must fail");
+        assert!(
+            matches!(err, EditorError::SpawnFailed(_)),
+            "flag string must fail spawn, not execute: {err:?}"
+        );
+        let err = run_editor("  ", &dir, Duration::from_secs(5)).expect_err("blank must fail");
+        assert_eq!(err, EditorError::NoEditor);
     }
 }

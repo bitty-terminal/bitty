@@ -13,7 +13,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{BoundedExecution, HostServices, LuaValue, LuaVm, MarshallingLimits};
+
+/// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
+fn gate_vm(id: impl Into<String>) -> LuaVm {
+    build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
+}
 use bitty_runtime::plugin_runtime::services::{
     EmptySettings, NotificationQueue, PluginServices, UnavailableSnapshot,
 };
@@ -63,7 +69,7 @@ fn stored(services: &PluginServices, key: &str) -> Option<LuaValue> {
 #[test]
 fn git_panel_call_shape_serves_output() {
     let services = services_with(true, true);
-    let mut vm = LuaVm::new("git-panel-shape");
+    let mut vm = gate_vm("git-panel-shape");
     install(&mut vm, services.clone());
     // Exact consumer shape: array argv, `.output` read.
     let outcome = vm
@@ -90,7 +96,7 @@ fn git_panel_call_shape_serves_output() {
 #[test]
 fn spawn_without_grant_is_capability_denied() {
     let services = services_with(false, true);
-    let mut vm = LuaVm::new("git-panel-nogrant");
+    let mut vm = gate_vm("git-panel-nogrant");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -117,7 +123,7 @@ fn spawn_without_grant_is_capability_denied() {
 #[test]
 fn granted_plugin_without_backend_is_unavailable() {
     let services = services_with(true, false);
-    let mut vm = LuaVm::new("git-panel-nobackend");
+    let mut vm = gate_vm("git-panel-nobackend");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -157,7 +163,7 @@ fn production_backend_denies_unallowlisted_verbs_without_spawning() {
     ));
     services.set_spawn_git(true);
     services.set_spawn_backend(Some(git_spawn_backend("bitty-terminal.git-panel")));
-    let mut vm = LuaVm::new("git-panel-production");
+    let mut vm = gate_vm("git-panel-production");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(

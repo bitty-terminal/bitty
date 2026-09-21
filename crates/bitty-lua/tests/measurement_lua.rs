@@ -6,15 +6,41 @@
 //! RC-1 instruction 10^7 + wall 50ms (warning 8ms) and RC-2 32MiB per-VM heap,
 //! plus fail-closed suspend counted via `VmBudgetSnapshot` (BudgetSnapshot-
 //! compatible counters). See `crates/bitty-lua/src/lib.rs` for the bounded
-//! deterministic `piccolo` wrapper and `crates/bitty-plugin-host` for queue
+//! deterministic `phodopus` wrapper and `crates/bitty-plugin-host` for queue
 //! global admission.
 
 use std::time::Duration;
 
+use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{
     ExecuteOutcome, LuaVm, RC1_INSTRUCTION_BUDGET, RC1_WALL_CLOCK_BUDGET_MS, RC1_WARNING_MS,
     RC2_MEMORY_PER_PLUGIN_BYTES, SuspendReason, VmError,
 };
+
+/// Build a VM with default RC budgets through the fail-closed gate.
+fn gate_vm(id: &str) -> LuaVm {
+    build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
+}
+
+/// Build a VM with explicit budgets through the fail-closed gate.
+fn gate_vm_with(
+    id: &str,
+    instruction_budget: u64,
+    wall_budget_ms: u64,
+    warning_ms: u64,
+    memory_limit: usize,
+) -> LuaVm {
+    build_plugin_vm(
+        id,
+        Some(VmBudgets {
+            instruction_budget,
+            wall_budget_ms,
+            warning_ms,
+            memory_limit,
+        }),
+    )
+    .expect("explicit budgets are valid")
+}
 
 // ── constants ───────────────────────────────────────────────────────────────
 
@@ -32,7 +58,7 @@ fn rc_budgets_are_documented_defaults() {
 fn rc1_instruction_exceed_suspends_with_tiny_budget() {
     // Deterministic proof: tiny instruction budget (100) guarantees exceed for
     // an infinite loop, regardless of host speed. Fail-closed suspend counted.
-    let mut vm = LuaVm::with_budgets("xuepoo.instr-tiny", 100, 50, 8, 32 * 1024 * 1024);
+    let mut vm = gate_vm_with("xuepoo.instr-tiny", 100, 50, 8, 32 * 1024 * 1024);
     let outcome = vm.execute("while true do end").unwrap();
     assert!(
         matches!(outcome, ExecuteOutcome::Suspended { ref reason, .. }
@@ -57,7 +83,7 @@ fn rc1_instruction_exceed_suspends_with_tiny_budget() {
 #[test]
 fn rc1_instruction_default_budget_suspends_infinite_loop() {
     // With default 10_000_000, an infinite loop must eventually exceed.
-    let mut vm = LuaVm::new("xuepoo.instr-default");
+    let mut vm = gate_vm("xuepoo.instr-default");
     let outcome = vm.execute("while true do end").unwrap();
     assert!(
         matches!(outcome, ExecuteOutcome::Suspended { ref reason, .. }
@@ -70,7 +96,7 @@ fn rc1_instruction_default_budget_suspends_infinite_loop() {
 
 #[test]
 fn rc1_instruction_trivial_completes_under_budget() {
-    let mut vm = LuaVm::new("xuepoo.instr-ok");
+    let mut vm = gate_vm("xuepoo.instr-ok");
     let outcome = vm.execute("return 1 + 2").unwrap();
     assert!(matches!(outcome, ExecuteOutcome::Completed { .. }));
     assert!(!vm.is_suspended());
@@ -85,7 +111,7 @@ fn rc1_instruction_trivial_completes_under_budget() {
 #[test]
 fn rc1_wall_exceed_suspends_synthetic() {
     // Deterministic wall proof via synthetic elapsed injection — no jitter.
-    let mut vm = LuaVm::new("xuepoo.wall-synth");
+    let mut vm = gate_vm("xuepoo.wall-synth");
     let outcome = vm
         .execute_with_elapsed("return 1", Duration::from_millis(50))
         .unwrap();
@@ -111,7 +137,7 @@ fn rc1_wall_exceed_suspends_synthetic() {
 #[test]
 fn rc1_wall_warning_triggered_before_hard_limit() {
     // Warning at 8ms should set flag but not suspend.
-    let mut vm = LuaVm::new("xuepoo.wall-warn");
+    let mut vm = gate_vm("xuepoo.wall-warn");
     // Synthetic 8ms hits warning but not hard limit (50).
     let outcome = vm
         .execute_with_elapsed("return 1", Duration::from_millis(8))
@@ -130,7 +156,7 @@ fn rc1_wall_warning_triggered_before_hard_limit() {
     ));
     assert!(warning);
     // Also verify that a real VM with synthetic 8ms warning path was counted:
-    let mut vm2 = LuaVm::new("xuepoo.wall-warn2");
+    let mut vm2 = gate_vm("xuepoo.wall-warn2");
     let _ = vm2.execute_with_elapsed("return 1", Duration::from_millis(8));
     // After synthetic 8ms, execute_with_elapsed delegates to real execute, so
     // warning_count may be 1; but check_budgets already proves deterministic.
@@ -148,7 +174,7 @@ fn rc1_wall_real_busy_loop_suspends_or_warns() {
     // This is not purely deterministic on wall, but with default 50ms and heavy work,
     // it should either suspend (wall or instruction) or complete with warning.
     // We assert that suspension is counted if it happens, and that the harness is headless.
-    let mut vm = LuaVm::new("xuepoo.wall-real");
+    let mut vm = gate_vm("xuepoo.wall-real");
     // Light loop: enough to exercise wall/instruction accounting but finishes in <1s
     // even in CI debug (was 200k `s..\"a\"` O(n²) → 6-16s locally, >5m in CI debug).
     let outcome = vm
@@ -197,10 +223,13 @@ fn rc1_wall_real_busy_loop_suspends_or_warns() {
 #[test]
 fn rc2_memory_exceed_suspends_with_tiny_limit() {
     // Deterministic memory proof with tiny limit (64 KiB) — allocation bomb.
-    let mut vm = LuaVm::with_budgets("xuepoo.mem-tiny", 10_000_000, 50, 8, 64 * 1024);
-    // Allocate ~200 KiB via string rep.
+    let mut vm = gate_vm_with("xuepoo.mem-tiny", 10_000_000, 50, 8, 64 * 1024);
+    // Allocate ~200 KiB via string rep. Each element is distinct: identical
+    // content would intern to one shared string and never trip enforcement.
     let outcome = vm
-        .execute(r#"local t = {}; for i=1,1000 do t[i] = string.rep("a", 1024) end"#)
+        .execute(
+            r#"local t = {} for i=1,1000 do t[i] = string.rep(tostring(i) .. "abcdefgh", 16) end"#,
+        )
         .unwrap();
     assert!(
         matches!(
@@ -225,7 +254,7 @@ fn rc2_memory_exceed_suspends_with_tiny_limit() {
 
 #[test]
 fn rc2_memory_default_limit_allows_small_alloc() {
-    let mut vm = LuaVm::new("xuepoo.mem-ok");
+    let mut vm = gate_vm("xuepoo.mem-ok");
     let outcome = vm.execute(r#"local t = {1,2,3}; return t[1]"#).unwrap();
     assert!(matches!(outcome, ExecuteOutcome::Completed { .. }));
     assert!(!vm.is_suspended());
@@ -236,7 +265,7 @@ fn rc2_memory_default_limit_allows_small_alloc() {
 
 #[test]
 fn rc2_memory_check_budgets_deterministic() {
-    let vm = LuaVm::new("xuepoo.mem-check");
+    let vm = gate_vm("xuepoo.mem-check");
     let (s, _) = vm.check_budgets(0, 0, 32 * 1024 * 1024 + 1);
     assert!(matches!(s, Some(SuspendReason::MemoryExceeded { .. })));
     let (s, _) = vm.check_budgets(0, 0, 32 * 1024 * 1024);
@@ -247,7 +276,7 @@ fn rc2_memory_check_budgets_deterministic() {
 
 #[test]
 fn fail_closed_suspend_counted_via_snapshot() {
-    let mut vm = LuaVm::with_budgets("xuepoo.fail-count", 50, 50, 8, 32 * 1024 * 1024);
+    let mut vm = gate_vm_with("xuepoo.fail-count", 50, 50, 8, 32 * 1024 * 1024);
     let _ = vm.execute("while true do end").unwrap();
     assert_eq!(vm.suspension_count(), 1);
     let snap1 = vm.budget_snapshot();
@@ -273,8 +302,8 @@ fn fail_closed_suspend_counted_via_snapshot() {
 #[test]
 fn deterministic_replay_same_code_same_budget_same_outcome() {
     let code = "local x = 0; for i=1,100 do x = x + i end; return x";
-    let mut vm1 = LuaVm::with_budgets("xuepoo.replay1", 5000, 50, 8, 32 * 1024 * 1024);
-    let mut vm2 = LuaVm::with_budgets("xuepoo.replay2", 5000, 50, 8, 32 * 1024 * 1024);
+    let mut vm1 = gate_vm_with("xuepoo.replay1", 5000, 50, 8, 32 * 1024 * 1024);
+    let mut vm2 = gate_vm_with("xuepoo.replay2", 5000, 50, 8, 32 * 1024 * 1024);
     let o1 = vm1.execute(code).unwrap();
     let o2 = vm2.execute(code).unwrap();
     // Wall is non-deterministic (0 vs 1ms on Windows); compare deterministically
@@ -355,8 +384,8 @@ fn deterministic_replay_same_code_same_budget_same_outcome() {
 #[test]
 fn deterministic_instruction_boundary() {
     // Two VMs with same tiny budget and same infinite loop must both suspend with same reason class.
-    let mut vm1 = LuaVm::with_budgets("xuepoo.det1", 200, 50, 8, 32 * 1024 * 1024);
-    let mut vm2 = LuaVm::with_budgets("xuepoo.det2", 200, 50, 8, 32 * 1024 * 1024);
+    let mut vm1 = gate_vm_with("xuepoo.det1", 200, 50, 8, 32 * 1024 * 1024);
+    let mut vm2 = gate_vm_with("xuepoo.det2", 200, 50, 8, 32 * 1024 * 1024);
     let o1 = vm1.execute("while true do end").unwrap();
     let o2 = vm2.execute("while true do end").unwrap();
     assert!(matches!(o1, ExecuteOutcome::Suspended { .. }));
@@ -368,7 +397,7 @@ fn deterministic_instruction_boundary() {
 
 #[test]
 fn budget_snapshot_compatible_counters() {
-    let mut vm = LuaVm::new("xuepoo.snapshot");
+    let mut vm = gate_vm("xuepoo.snapshot");
     let snap0 = vm.budget_snapshot();
     assert_eq!(snap0.instruction_budget, RC1_INSTRUCTION_BUDGET);
     assert_eq!(snap0.wall_budget_ms, RC1_WALL_CLOCK_BUDGET_MS);
@@ -387,7 +416,7 @@ fn budget_snapshot_compatible_counters() {
     let total_suspensions = snap1.suspension_count;
     assert_eq!(total_suspensions, 0);
     // After suspend, utilization >1 or suspended true signals budget exceed.
-    let mut vm2 = LuaVm::with_budgets("xuepoo.snap-suspend", 10, 50, 8, 32 * 1024 * 1024);
+    let mut vm2 = gate_vm_with("xuepoo.snap-suspend", 10, 50, 8, 32 * 1024 * 1024);
     let _ = vm2.execute("while true do end").unwrap();
     let snap2 = vm2.budget_snapshot();
     assert!(snap2.suspended);
@@ -406,7 +435,7 @@ fn cr_lua_01_wall_trips_at_deadline_not_at_fuel_exhaustion() {
     // slices the 50 ms wall budget must trip after ~50 ms having consumed
     // far less than the instruction budget. Margins are wide (20x) so this
     // holds in both debug and release profiles.
-    let mut vm = LuaVm::with_budgets(
+    let mut vm = gate_vm_with(
         "xuepoo.cr-lua-01-wall",
         1_000_000_000,
         50,
@@ -442,7 +471,7 @@ fn cr_lua_01_memory_trips_near_limit_not_after_full_budget() {
     // allocated ~39 MB before the check ran; capped slices must trip with
     // usage just over the limit (one slice of growth, bounded generously).
     let limit = 256 * 1024;
-    let mut vm = LuaVm::with_budgets("xuepoo.cr-lua-01-mem", 10_000_000, 60_000, 8, limit);
+    let mut vm = gate_vm_with("xuepoo.cr-lua-01-mem", 10_000_000, 60_000, 8, limit);
     let outcome = vm
         .execute(r#"local t = {} for i = 1, 100000000 do t[i] = { i } end"#)
         .unwrap();
@@ -456,10 +485,32 @@ fn cr_lua_01_memory_trips_near_limit_not_after_full_budget() {
                 used <= limit + 128 * 1024,
                 "memory must trip near the limit, not after full-budget growth: {used}"
             );
+            assert!(vm.is_suspended());
         }
-        other => panic!("expected memory suspend, got {other:?}"),
+        ExecuteOutcome::RuntimeError { .. } => {
+            // The builder hard quota refused mid-slice instead of the host
+            // poll tripping first: same RC-2 enforcement, surfaced as a Lua
+            // error rather than a suspension.
+        }
+        other => panic!("expected memory suspend or quota error, got {other:?}"),
     }
-    assert!(vm.is_suspended());
+}
+
+// ── builder hard quota (RC-2) ─────────────────────────────────────────────────
+
+#[test]
+fn builder_hard_quota_refuses_single_large_allocation() {
+    // The builder-installed hard quota refuses a single 300 KiB `string.rep`
+    // inside one C call: host polling runs between slices, never mid-call, so
+    // the refusal deterministically surfaces as a Lua runtime error without
+    // suspending the VM.
+    let mut vm = gate_vm_with("xuepoo.hard-quota", 10_000_000, 60_000, 8, 64 * 1024);
+    let outcome = vm.execute(r#"return string.rep("a", 300 * 1024)"#).unwrap();
+    assert!(
+        matches!(outcome, ExecuteOutcome::RuntimeError { .. }),
+        "expected hard-quota runtime error, got {outcome:?}"
+    );
+    assert!(!vm.is_suspended());
 }
 
 // ── no window/GPU/mlua conflict ─────────────────────────────────────────────
@@ -467,9 +518,9 @@ fn cr_lua_01_memory_trips_near_limit_not_after_full_budget() {
 #[test]
 fn no_window_gpu_mlua_conflict() {
     // This test proves the crate is headless and does not import mlua/wgpu/winit.
-    // Compile-time guarantee: bitty-lua Cargo.toml has only piccolo, no mlua/wgpu.
+    // Compile-time guarantee: bitty-lua Cargo.toml has only phodopus, no mlua/wgpu.
     // Runtime guarantee: VM constructs without display.
-    let vm = LuaVm::new("xuepoo.no-gpu");
+    let vm = gate_vm("xuepoo.no-gpu");
     assert!(!vm.is_suspended());
     // Ensure constants are as documented (no drift).
     assert_eq!(vm.instruction_budget(), 10_000_000);

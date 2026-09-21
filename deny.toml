@@ -55,4 +55,11 @@ registries = []
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Exact-rev git pins only. phodopus is the direct swap target (RUN-28);
+# kyren/gc-arena is phodopus's own rev-pinned transitive dep (arena backing
+# for the Lua GC), not bitty's choice — kept visible here rather than hidden
+# behind a wildcard so any new git source still fails loudly.
+allow-git = [
+    "https://github.com/bitty-terminal/phodopus",
+    "https://github.com/kyren/gc-arena",
+]

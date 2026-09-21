@@ -110,6 +110,11 @@ impl PluginVmBuilder {
     ///
     /// [`VmError::Budget`](crate::VmError) when budgets were never supplied
     /// or fail validation. No VM is constructed on this path.
+    ///
+    /// The `with_budgets` call below is the single legitimate internal use of
+    /// the deprecated raw constructor: the gate is the only path that may
+    /// invoke it, so the deprecation lint is silenced here and nowhere else.
+    #[allow(deprecated)]
     pub fn build(self) -> Result<LuaVm, VmError> {
         let budgets = self.budgets.ok_or_else(|| {
             VmError::Budget(

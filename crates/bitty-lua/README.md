@@ -7,7 +7,9 @@
 
 ## Purpose
 
-`bitty-lua` wraps the pure-Rust `piccolo` VM to give Bitty deterministic,
+`bitty-lua` wraps the pure-Rust `phodopus` VM (a `piccolo` fork with
+sandboxing: hard memory quotas, fuel policy, text-only `load`, and
+preload-only `require`) to give Bitty deterministic,
 bounded Lua execution for per-plugin isolation and, per DEC-0011, user
 configuration evaluation. Each VM instance gets isolated globals with a
 restricted standard library, host work happens only through
@@ -17,10 +19,12 @@ are documented in `src/lib.rs`.
 
 ## Boundaries
 
-- Sole third-party dependency, per `Cargo.toml`: `piccolo`; no
-  network-facing dependency is declared.
-- Standard library only, with no `unsafe` and no ambient `io`, `os`, or
-  `debug` authority (see `src/stdlib.rs`).
+- Sole third-party dependency, per `Cargo.toml`: `phodopus` (pinned by
+  exact git revision); no network-facing dependency is declared.
+- Standard library only, with no `unsafe` and no ambient `io` authority;
+  `os` is narrowed by the host, `debug` is traceback-only, `load` is
+  text-only, and `package.path` is empty with no native loader
+  (see `src/stdlib.rs`).
 - Configuration chunks run under the same budgets as plugins and must return
   plain-data tables; the typed schema in `bitty-config` stays the validation
   authority (see `src/config.rs`).
@@ -28,7 +32,7 @@ are documented in `src/lib.rs`.
 
 ## Layout
 
-- `Cargo.toml` — package metadata and the `piccolo` dependency.
+- `Cargo.toml` — package metadata and the `phodopus` dependency.
 - `src/lib.rs` — crate docs with the role, budgets, and determinism sections.
 - `src/host.rs` — VM lifecycle, budget enforcement, and host calls.
 - `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /

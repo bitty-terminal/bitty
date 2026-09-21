@@ -84,17 +84,34 @@ fn safe_config_vm_starts_with_zero_third_party_surface() {
         "safe VM must have no bitty surface: {outcome:?}"
     );
 
-    // No ambient authority: io/package/debug absent, os narrowed.
+    // No ambient authority: `io` is never loaded (core without `load_io`),
+    // there are no file loaders, and `os` stays narrowed by the host.
     let outcome = vm
         .execute(
-            "assert(io == nil and package == nil and debug == nil \
-             and load == nil and loadfile == nil and dofile == nil \
+            "assert(io == nil and loadfile == nil and dofile == nil \
              and os.execute == nil and os.getenv == nil and os.remove == nil)",
         )
         .expect("execute");
     assert!(
         matches!(outcome, ExecuteOutcome::Completed { .. }),
         "safe VM must have no ambient surface: {outcome:?}"
+    );
+
+    // In-core sandbox baseline (Phodopus core, post-RUN-28): `package`,
+    // `debug`, and `load` exist but narrowed — empty `package.path` with no
+    // native loader, traceback-only `debug`, text-only `load` — so an
+    // unmounted module still resolves to nothing.
+    let outcome = vm
+        .execute(
+            "assert(package ~= nil and package.path == \"\" and package.loadlib == nil) \
+             assert(debug ~= nil and type(debug.traceback) == \"function\") \
+             assert(load ~= nil and load(\"return 40 + 2\", \"probe\", \"t\")() == 42) \
+             assert(pcall(require, \"no.such.module\") == false)",
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, ExecuteOutcome::Completed { .. }),
+        "safe VM must keep the narrowed in-core baseline: {outcome:?}"
     );
 }
 

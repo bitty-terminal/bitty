@@ -31,7 +31,7 @@
 //! subset of the terminal-wide budget. The terminal-wide aggregation across
 //! generations is owned by the host composer and is not part of this slice.
 
-use piccolo::Value;
+use phodopus::Value;
 
 use crate::host::{BridgeError, LuaValue, MarshallingLimits};
 

@@ -1,11 +1,11 @@
-//! `bitty-lua`: deterministic, bounded piccolo VM for plugin isolation (RC-1/RC-2).
+//! `bitty-lua`: deterministic, bounded phodopus VM for plugin isolation (RC-1/RC-2).
 //!
 //! # Role in Bitty (no mlua conflict)
 //!
-//! This crate wraps the pure-Rust [`piccolo`] VM for **per-plugin isolation**
+//! This crate wraps the pure-Rust [`phodopus`] VM for **per-plugin isolation**
 //! and, per DEC-0011, **user configuration evaluation**.
 //!
-//! - **Plugin VMs:** `piccolo` 0.3.x stackless VM, one instance per
+//! - **Plugin VMs:** `phodopus` 0.3.x stackless VM, one instance per
 //!   `(PluginId, generation)`, isolated globals/registry/module trees, restricted
 //!   stdlib construction (no `io`/`os`/`debug` ambient authority, no raw
 //!   metatable access to host objects, no dynamic native loading). Host
@@ -17,7 +17,7 @@
 //!   chunk must return a plain-data table (wezterm-style `return {...}`) that
 //!   maps 1:1 to `bitty-config` plan fields; extraction is bounded and the
 //!   typed schema remains the validation authority. There is no `mlua`
-//!   dependency anywhere, so no `mlua::Lua` / `piccolo::Lua` type conflict.
+//!   dependency anywhere, so no `mlua::Lua` / `phodopus::Lua` type conflict.
 //!
 //! The crate is `std`-only, `#![forbid(unsafe_code)]`, `MSRV 1.85`,
 //! `edition = "2024"`, `publish = false` (workspace), headless and
@@ -30,7 +30,7 @@
 //! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
 //! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | `Instant` deadline checked at next instruction boundary; exceed => suspend |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
-//! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | `Lua::total_memory()` / `gc_metrics().total_allocation()` checked before/after each slice; exceed => suspend |
+//! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
 //! `Suspended` and further `execute` calls are refused with
@@ -44,8 +44,8 @@
 //!
 //! Execution is deterministic given identical source and identical budgets: the
 //! VM uses a single `Fuel` container initialised to `RC1_INSTRUCTION_BUDGET`
-//! and never refills it within one `execute` call, `Lua::core()` stdlib with
-//! no I/O (`Lua::empty` + `load_core` without `load_io`), and no wall/GPU
+//! and never refills it within one `execute` call, builder-loaded core stdlib
+//! with no I/O (core without `load_io`), and no wall/GPU
 //! timing in the replay path. Wall-clock is measured externally for the
 //! enforcement, but the harness also exposes `check_budgets` /
 //! `with_budgets` for deterministic synthetic-wall tests that do not depend on
@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
+use phodopus::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
 
 pub mod config;
 pub mod error;
@@ -113,7 +113,7 @@ pub const RC6_FD_PER_PLUGIN: usize = 16;
 
 /// Max fuel granted to a single `Executor::step` slice (CR-LUA-01 fix).
 ///
-/// Piccolo's `Executor::step` loops internally (up to 64 VM instructions per
+/// Phodopus's `Executor::step` loops internally (up to 64 VM instructions per
 /// `run_vm` batch) until its fuel is exhausted, so passing the whole
 /// instruction budget at once lets one slice burn the entire budget before
 /// the outer loop re-checks wall-clock and memory. Capping each slice to
@@ -123,14 +123,14 @@ pub const RC6_FD_PER_PLUGIN: usize = 16;
 ///   50 ms budget);
 /// - memory growth per slice: what ~1k instructions can allocate;
 /// - instruction overrun past exhaustion: one trailing `run_vm` batch
-///   (<= 64) plus piccolo per-step constants.
+///   (<= 64) plus phodopus per-step constants.
 ///
 /// Between slices the loop re-checks wall/memory/instruction budgets and
 /// tops fuel back up (never above the remaining budget), which is exactly
-/// the `step` / re-grant pattern piccolo's [`Fuel`] documents (`refill`
+/// the `step` / re-grant pattern phodopus's [`Fuel`] documents (`refill`
 /// exists for re-using one container across ticks). Fuel is only ever
 /// mutated between `step` calls, never during one, so the VM contract is
-/// preserved. `1024` is 16x piccolo's internal 64-instruction batch: large
+/// preserved. `1024` is 16x phodopus's internal 64-instruction batch: large
 /// enough to keep per-slice `Instant`/`total_memory` overhead negligible
 /// (~10k checks for a full-budget run), small enough to keep check latency
 /// tight.
@@ -328,10 +328,11 @@ pub(crate) enum DriveOutcome {
 
 // ── VM ───────────────────────────────────────────────────────────────────────
 
-/// Deterministic, bounded piccolo VM for one plugin identity+generation.
+/// Deterministic, bounded phodopus VM for one plugin identity+generation.
 ///
 /// One instance per `(PluginId, generation)`, isolated globals/registry. Host
-/// constructs the restricted stdlib via `Lua::core()` (no I/O). Budgets are
+/// constructs the restricted stdlib via the runtime builder (core without I/O,
+/// plus the hard RC-2 quota). Budgets are
 /// enforced at instruction, wall, and memory dimensions; exceed => fail-closed
 /// suspend, counted. No window/GPU coupling.
 pub struct LuaVm {
@@ -379,7 +380,7 @@ enum VmStatus {
 /// never more than the remaining instruction budget.
 ///
 /// Always >= 1 when `used < budget` (callers check exhaustion first), so
-/// every slice makes piccolo's guaranteed minimal positive progress and the
+/// every slice makes phodopus's guaranteed minimal positive progress and the
 /// stepping loop terminates at the budget. Grants are `i32`-safe by
 /// construction (`SLICE_FUEL` fits with wide margin).
 fn initial_grant(budget: u64, used: u64) -> i32 {
@@ -388,6 +389,14 @@ fn initial_grant(budget: u64, used: u64) -> i32 {
 
 impl LuaVm {
     /// Create a new VM for `id` with default RC budgets.
+    ///
+    /// Deprecated: prefer [`gate::PluginVmBuilder`] or [`gate::build_plugin_vm`],
+    /// which require explicit RC-1/RC-2 budgets and refuse fail-closed without
+    /// them. Every build path installs the same builder hard quota.
+    #[deprecated(
+        note = "use gate::PluginVmBuilder or gate::build_plugin_vm so RC-1/RC-2 budgets stay mandatory on every build"
+    )]
+    #[allow(deprecated)]
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self::with_budgets(
@@ -400,6 +409,14 @@ impl LuaVm {
     }
 
     /// Create with explicit budgets (for tests / tuning).
+    ///
+    /// Deprecated: prefer [`gate::PluginVmBuilder`] or [`gate::build_plugin_vm`].
+    /// The hard RC-2 quota is installed through the runtime builder, so host-side
+    /// polling stays the attribution source while the builder refuses over-quota
+    /// allocation fail-closed.
+    #[deprecated(
+        note = "use gate::PluginVmBuilder or gate::build_plugin_vm so RC-1/RC-2 budgets stay mandatory on every build"
+    )]
     pub fn with_budgets(
         id: impl Into<String>,
         instruction_budget: u64,
@@ -410,12 +427,15 @@ impl LuaVm {
         assert!(instruction_budget > 0, "instruction budget must be > 0");
         assert!(wall_budget_ms > 0, "wall budget must be > 0");
         assert!(memory_limit > 0, "memory limit must be > 0");
-        // Lua::core() loads base, coroutine, math, string, table — no I/O.
-        // This matches the restricted stdlib baseline per lua-runtime-rfc:
-        // pure computation base only, no `io`/`os.execute`/`debug` ambient authority.
-        // The accepted baseline also retains `utf8`; piccolo omits it, so the
-        // bounded, I/O-free `utf8` functions are installed explicitly.
-        let mut lua = Lua::core();
+        // The builder loads the restricted core baseline (base, coroutine,
+        // math, string, table, utf8, preload-only `require`, no I/O) and then
+        // installs the hard RC-2 quota. The fixed core footprint is trusted
+        // and not charged against the quota; `fuel_limit` stays unset so the
+        // host `SLICE_FUEL` stepping loop remains the authoritative RC-1
+        // instruction policy.
+        let mut builder = Lua::builder();
+        builder.memory_limit(memory_limit);
+        let mut lua = builder.build();
         stdlib::install_retained_stdlib(&mut lua);
         Self {
             id: id.into(),
@@ -581,6 +601,11 @@ impl LuaVm {
         self.wall_budget_ms = wall_budget_ms;
         self.warning_ms = warning_ms;
         self.memory_limit = memory_limit;
+        // The builder-installed hard quota is shared by reference, so tuning
+        // updates it live; host-side polling keeps using the same value.
+        self.lua.enter(|ctx| {
+            ctx.memory_limit().set_max_bytes(Some(memory_limit));
+        });
     }
 
     /// Deterministic budget check helper — headless, no wall/GPU, no Lua.
@@ -755,6 +780,49 @@ impl LuaVm {
         self.drive_stashed(stashed, start)
     }
 
+    /// Host-async trampoline: resolve one parked host operation fail-closed.
+    ///
+    /// Returns `Ok(true)` when the executor was parked on a host operation and
+    /// the park was cancelled, so the caller must keep stepping: the
+    /// cancellation unwinds through Lua `pcall` on the next slice. Returns
+    /// `Ok(false)` when the executor is not parked. Bitty registers no host
+    /// futures, so every park is unexpected and cancelled with a typed message;
+    /// an unresolvable park is a [`VmError::Runtime`], never a silent completion.
+    pub(crate) fn pump_host_suspended(
+        &mut self,
+        stashed: &StashedExecutor,
+    ) -> Result<bool, VmError> {
+        let parked = self.lua.enter(|ctx| {
+            let exec = ctx.fetch(stashed);
+            (
+                exec.mode() == ExecutorMode::HostSuspended,
+                exec.pending_host_op(ctx),
+            )
+        });
+        match parked {
+            (false, _) => Ok(false),
+            (true, Some(handle)) => {
+                let outcome = self.lua.enter(|ctx| {
+                    let exec = ctx.fetch(stashed);
+                    exec.cancel_host_op(
+                        ctx,
+                        handle,
+                        "host operation parked without a registered host future",
+                    )
+                });
+                match outcome {
+                    Ok(()) => Ok(true),
+                    Err(error) => Err(VmError::Runtime(format!(
+                        "host operation unresolvable: {error}"
+                    ))),
+                }
+            }
+            (true, None) => Err(VmError::Runtime(
+                "executor reports HostSuspended with no pending host operation".to_string(),
+            )),
+        }
+    }
+
     /// Shared budget-enforced stepping loop over an already-loaded executor.
     ///
     /// Used by [`LuaVm::drive_chunk`] and by host-bridge invocation
@@ -783,7 +851,7 @@ impl LuaVm {
         // `SLICE_FUEL` so wall/memory/instruction checks run every ~1k
         // instructions instead of once per whole budget. `total_used` tracks
         // the true cumulative consumption across slices; fuel is only topped
-        // up between `step` calls (never during), per piccolo's contract.
+        // up between `step` calls (never during), per phodopus's contract.
         let mut total_used: u64 = 0;
         let mut fuel = Fuel::with(initial_grant(self.instruction_budget, total_used));
 
@@ -895,25 +963,40 @@ impl LuaVm {
             // Top up the slice grant (capped at the remaining budget). The
             // previous slice always exhausts its grant before `step` reports
             // more work, so this only fires on slice boundaries; the guard
-            // keeps any leftover when piccolo returns early with fuel spare.
+            // keeps any leftover when phodopus returns early with fuel spare.
             if fuel.remaining() <= 0 {
                 fuel.set_remaining(initial_grant(self.instruction_budget, total_used));
             }
 
-            // Step one capped slice. Piccolo runs at most ~`SLICE_FUEL` worth
+            // Step one capped slice. Phodopus runs at most ~`SLICE_FUEL` worth
             // (64-instruction `run_vm` batches) before returning, so wall and
             // memory are re-checked promptly after this returns.
             let fuel_before = fuel.remaining();
-            let done = self.lua.enter(|ctx| {
+            let step_done = self.lua.enter(|ctx| {
                 let exec = ctx.fetch(&stashed);
                 exec.step(ctx, &mut fuel)
             });
+            let done = match step_done {
+                Ok(done) => done,
+                Err(error) => {
+                    return Err(VmError::Runtime(format!(
+                        "executor step refused: {error:?}"
+                    )));
+                }
+            };
             let consumed = (fuel_before as i64 - fuel.remaining() as i64).max(0) as u64;
             total_used = total_used.saturating_add(consumed);
 
             // If done, break to mode inspection by the caller (`execute` vs
             // `eval_config`); the strict final checks below still apply.
             if done {
+                // A parked host operation reports done without being
+                // finished: route it through the host trampoline and keep
+                // stepping instead of completing. Wall-clock policy stays
+                // host-side — the loop-top checks still bound the resume.
+                if self.pump_host_suspended(&stashed)? {
+                    continue;
+                }
                 // Step reports the executor finished (Result/Stopped/yielded).
                 // Mode inspection and result extraction belong to the caller
                 // (`execute` vs `eval_config`), which run after the shared
@@ -922,7 +1005,7 @@ impl LuaVm {
             }
 
             // Each non-done slice makes minimal positive progress per
-            // piccolo's contract and strictly grows `total_used`, so the
+            // phodopus's contract and strictly grows `total_used`, so the
             // instruction pre-check above guarantees termination. The net
             // below only guards pathological fuel handling.
 
@@ -1047,6 +1130,15 @@ impl LuaVm {
                         return Ok(ExecuteOutcome::RuntimeError { message: msg });
                     }
                 }
+                // Defensive: the drive loop resolves every park through the
+                // trampoline before returning `Ready`, so a parked mode here
+                // means the trampoline was bypassed — refuse fail-closed
+                // rather than reporting completion.
+                if mode == ExecutorMode::HostSuspended {
+                    return Ok(ExecuteOutcome::RuntimeError {
+                        message: "executor parked on a host operation after drive".to_string(),
+                    });
+                }
                 Ok(ExecuteOutcome::Completed {
                     instructions_used: self.instructions_used,
                     wall_elapsed_ms: self.wall_elapsed_ms,
@@ -1114,17 +1206,19 @@ impl LuaVm {
 impl LuaVm {
     /// Read a numeric/boolean global for unit tests (no marshalling surface).
     pub(crate) fn test_global(&mut self, name: &str) -> Option<f64> {
-        self.lua
-            .enter(|ctx| match ctx.get_global(name.to_string()) {
-                piccolo::Value::Integer(i) => Some(i as f64),
-                piccolo::Value::Number(n) => Some(n),
-                piccolo::Value::Boolean(b) => Some(if b { 1.0 } else { 0.0 }),
+        self.lua.enter(
+            |ctx| match ctx.globals().get_value(ctx, ctx.intern(name.as_bytes())) {
+                phodopus::Value::Integer(i) => Some(i as f64),
+                phodopus::Value::Number(n) => Some(n),
+                phodopus::Value::Boolean(b) => Some(if b { 1.0 } else { 0.0 }),
                 _ => None,
-            })
+            },
+        )
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod vm_unit_tests {
     use super::*;
 
@@ -1175,11 +1269,17 @@ mod vm_unit_tests {
     fn restricted_stdlib_denies_ambient_io_and_dynamic_loading() {
         let mut vm = LuaVm::new("xuepoo.sandbox");
         // The accepted Lua Runtime RFC retains `os.time`/`os.clock`/`os.date`
-        // but removes process/env/filesystem primitives; `io`, `package`,
-        // `debug`, and dynamic loading stay absent.
+        // but removes process/env/filesystem primitives; `io` and file-based
+        // loading stay absent, while `debug` is traceback-only, `load` is
+        // text-only, and `package`/`require` are the preload-only module
+        // system (empty path, no `cpath`, no native loader).
         let outcome = vm
             .execute(
-                "assert(io == nil and package == nil and debug == nil and load == nil and loadfile == nil and dofile == nil \
+                "assert(io == nil and loadfile == nil and dofile == nil \
+                 and type(load) == 'function' \
+                 and type(package) == 'table' and package.path == '' and package.cpath == nil \
+                 and type(require) == 'function' \
+                 and type(debug) == 'table' and type(debug.traceback) == 'function' \
                  and type(os) == 'table' and type(os.time) == 'function' and type(os.clock) == 'function' \
                  and os.execute == nil and os.getenv == nil and os.remove == nil and os.tmpname == nil)",
             )
@@ -1203,7 +1303,7 @@ mod vm_unit_tests {
         // CR-LUA-01: fuel was handed to `step` whole, so one slice could
         // burn the entire budget before any check ran. Slices are now
         // capped at `SLICE_FUEL`, so the overrun past exhaustion is at most
-        // one trailing `run_vm` batch (<= 64) plus piccolo per-step
+        // one trailing `run_vm` batch (<= 64) plus phodopus per-step
         // constants. Fuel accounting is exact (no timing), so this bound
         // is deterministic across profiles.
         let budget = 1000;
@@ -1268,13 +1368,15 @@ mod vm_unit_tests {
 
     #[test]
     fn slow_compile_times_out_without_effects() {
-        // CTX-0464 gap 2: wall-clock started after Closure::load, so compile
-        // work hid outside the RC-1 budget. With the clock starting before
-        // load, a near-cap comment (~1016 KiB, execution is one assignment) with
-        // a 1 ms wall budget must suspend with WallClockExceeded before
-        // executing (no global set, no completion). Payload stays under the
-        // cap but is large enough that parsing alone exceeds 1 ms even on
-        // fast hosts (512 KiB parses in 0 ms on some hosts — flaky).
+        // CTX-0464 gap 2: the wall clock starts before Closure::load so compile
+        // work cannot hide outside the RC-1 budget. Real 1 ms timing cannot
+        // prove this deterministically — a near-cap parse often completes
+        // inside one timer tick while the budget floor is also 1 ms, so the
+        // old real-clock form failed roughly every second run under parallel
+        // load. The enforcement half is proved with the synthetic wall hook:
+        // elapsed already past the budget suspends WallClockExceeded before
+        // executing (no global set, suspension recorded). The clock-before-load
+        // placement itself is structural in `execute` (reviewed, not timed).
         let mut vm = LuaVm::with_budgets(
             "xuepoo.slow-compile",
             RC1_INSTRUCTION_BUDGET,
@@ -1288,7 +1390,9 @@ mod vm_unit_tests {
             code.len() <= MAX_CHUNK_BYTES,
             "test chunk must stay under the cap"
         );
-        let outcome = vm.execute(&code).unwrap();
+        let outcome = vm
+            .execute_with_elapsed(&code, Duration::from_millis(5))
+            .unwrap();
         assert!(
             matches!(
                 outcome,
@@ -1297,9 +1401,56 @@ mod vm_unit_tests {
                     ..
                 }
             ),
-            "expected wall suspend including compile time, got {outcome:?}"
+            "expected wall suspend before executing, got {outcome:?}"
         );
         assert!(vm.is_suspended());
+        assert_eq!(vm.suspension_count(), 1);
         assert_eq!(vm.test_global("result"), None);
+    }
+
+    #[test]
+    fn host_suspended_park_cancels_fail_closed() {
+        // A parked host operation with no registered host future is
+        // unexpected: the drive-loop trampoline cancels it fail-closed and the
+        // cancellation unwinds through Lua `pcall` as a runtime error without
+        // suspending the VM. Wall-clock policy stays host-side (the loop-top
+        // checks still bound the resume slices).
+        let mut vm = LuaVm::new("xuepoo.trampoline");
+        vm.lua.enter(|ctx| {
+            let park = phodopus::Callback::from_fn(&ctx, |ctx, _, _| {
+                let sequence = phodopus::async_sequence(&ctx, |_, mut seq| async move {
+                    // Propagate the cancellation: swallowing it here would let
+                    // the sequence return normally after the trampoline
+                    // cancels the park, hiding the parked call from `pcall`.
+                    seq.suspend(phodopus::HostOpHandle::from_raw(1)).await?;
+                    Ok(phodopus::SequenceReturn::Return)
+                });
+                Ok(phodopus::CallbackReturn::Sequence(sequence))
+            });
+            ctx.set_global("park_once", park);
+        });
+        let outcome = vm
+            .execute("local ok, err = pcall(park_once) assert(ok == false) assert(err ~= nil)")
+            .unwrap();
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "cancelled park must unwind through pcall, got {outcome:?}"
+        );
+        assert!(!vm.is_suspended());
+        assert_eq!(vm.suspension_count(), 0);
+    }
+
+    #[test]
+    fn pump_host_suspended_reports_not_parked() {
+        // The trampoline query path on a plain completed executor: no park,
+        // no cancellation, no error.
+        let mut vm = LuaVm::new("xuepoo.no-park");
+        let stashed = vm.lua.enter(|ctx| {
+            let closure =
+                phodopus::Closure::load(ctx, None, b"return 1").expect("trivial chunk loads");
+            ctx.stash(phodopus::Executor::start(ctx, closure.into(), ()))
+        });
+        assert!(!vm.pump_host_suspended(&stashed).expect("query works"));
+        assert!(!vm.is_suspended());
     }
 }

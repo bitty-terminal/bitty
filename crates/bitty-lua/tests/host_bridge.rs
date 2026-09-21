@@ -5,7 +5,13 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::{BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits};
+
+/// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
+fn gate_vm(id: impl Into<String>) -> LuaVm {
+    build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
+}
 
 #[derive(Default)]
 struct FakeServices {
@@ -79,7 +85,7 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 
 #[test]
 fn bitty_namespace_is_read_only() {
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     install(&mut vm, Rc::new(FakeServices::default()));
     let outcome = vm.execute_bounded("bitty.settings = {}").expect("execute");
     assert!(
@@ -87,7 +93,7 @@ fn bitty_namespace_is_read_only() {
         "assignment must fail: {outcome:?}"
     );
 
-    let mut vm = LuaVm::new("t2");
+    let mut vm = gate_vm("t2");
     install(&mut vm, Rc::new(FakeServices::default()));
     let outcome = vm
         .execute_bounded("bitty.commands.register = 1")
@@ -105,7 +111,7 @@ fn store_and_settings_round_trip() {
         .settings
         .borrow_mut()
         .insert("retention_days".to_string(), LuaValue::Integer(7));
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -133,7 +139,7 @@ fn require_resolves_rooted_source_only() {
     std::fs::write(dir.join("agg.lua"), "local M = {}; M.v = 42; return M").expect("write module");
 
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     vm.with_module_root(dir.clone());
     install(&mut vm, services.clone());
     let outcome = vm
@@ -156,7 +162,7 @@ fn require_rejects_traversal() {
     std::fs::write(parent.join("outside.lua"), "return 1").expect("write escape");
     let root = parent.join("root");
     std::fs::create_dir_all(&root).expect("root");
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     vm.with_module_root(root.clone());
     install(&mut vm, Rc::new(FakeServices::default()));
     let outcome = vm
@@ -171,7 +177,7 @@ fn require_rejects_traversal() {
 
 #[test]
 fn registrations_are_captured() {
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     install(&mut vm, Rc::new(FakeServices::default()));
     let outcome = vm
         .execute_bounded(
@@ -195,7 +201,7 @@ fn registrations_are_captured() {
 
 #[test]
 fn captured_command_is_callable() {
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     install(&mut vm, Rc::new(FakeServices::default()));
     vm.execute_bounded(
         r#"bitty.commands.register({ id = "echo", title = "E", run = function(args) return args.who .. "!" end })"#,
@@ -210,7 +216,7 @@ fn captured_command_is_callable() {
 #[test]
 fn capability_absent_fails_closed() {
     let services = Rc::new(FakeServices::default()); // terminal_read = false
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     install(&mut vm, services);
     let outcome = vm
         .execute_bounded(r#"local ok = pcall(bitty.terminal.snapshot, { scope = "semantic" }); bitty.store.set("denied", not ok)"#)
@@ -227,7 +233,7 @@ fn host_call_deadline_returns_typed_timeout() {
         settings_delay_ms: 30,
         ..FakeServices::default()
     });
-    let mut vm = LuaVm::new("t");
+    let mut vm = gate_vm("t");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -307,7 +313,7 @@ fn process_spawn_unavailable_by_default() {
     // FakeServices does not override process_spawn: the default fails closed
     // with E_SPAWN_UNAVAILABLE (the CTX-0400 git-panel gap).
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("spawn-unavailable");
+    let mut vm = gate_vm("spawn-unavailable");
     install(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -338,7 +344,7 @@ fn process_spawn_serves_bounded_table() {
         calls: RefCell::new(Vec::new()),
         deny: false,
     });
-    let mut vm = LuaVm::new("spawn-ok");
+    let mut vm = gate_vm("spawn-ok");
     install_spawn(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -374,7 +380,7 @@ fn process_spawn_denied_stays_typed() {
         calls: RefCell::new(Vec::new()),
         deny: true,
     });
-    let mut vm = LuaVm::new("spawn-denied");
+    let mut vm = gate_vm("spawn-denied");
     install_spawn(&mut vm, services.clone());
     let outcome = vm
         .execute_bounded(
@@ -424,7 +430,7 @@ fn process_spawn_rejects_malformed_argv() {
             calls: RefCell::new(Vec::new()),
             deny: false,
         });
-        let mut vm = LuaVm::new(format!("spawn-bad-{tag}"));
+        let mut vm = gate_vm(format!("spawn-bad-{tag}"));
         install_spawn(&mut vm, services.clone());
         let outcome = vm
             .execute_bounded(&format!(
@@ -460,7 +466,7 @@ fn process_spawn_rejects_malformed_argv() {
 
 #[test]
 fn process_namespace_is_read_only() {
-    let mut vm = LuaVm::new("spawn-readonly");
+    let mut vm = gate_vm("spawn-readonly");
     install(&mut vm, Rc::new(FakeServices::default()));
     let outcome = vm
         .execute_bounded("bitty.process.spawn = 1")
@@ -527,7 +533,7 @@ fn slow_spawn_is_delivered_not_timed_out() {
         store: RefCell::new(BTreeMap::new()),
         delay_ms: 30,
     });
-    let mut vm = LuaVm::new("spawn-slow");
+    let mut vm = gate_vm("spawn-slow");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -624,7 +630,7 @@ fn post_deadline_effects_never_commit() {
     let services = Rc::new(SlowStoreServices {
         store: RefCell::new(BTreeMap::new()),
     });
-    let mut vm = LuaVm::new("pre-commit");
+    let mut vm = gate_vm("pre-commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -715,7 +721,7 @@ fn committed_mutation_is_not_reported_as_timeout() {
     let services = Rc::new(SlowCommitServices {
         store: RefCell::new(BTreeMap::new()),
     });
-    let mut vm = LuaVm::new("commit");
+    let mut vm = gate_vm("commit");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 1)
         .expect("install");
@@ -813,7 +819,7 @@ fn spawn_timeout_honored() {
         store: RefCell::new(BTreeMap::new()),
         delay_ms: 50,
     });
-    let mut vm = LuaVm::new("spawn-timeout");
+    let mut vm = gate_vm("spawn-timeout");
     let services_dyn: Rc<dyn HostServices> = services.clone();
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
         .expect("install");
@@ -874,7 +880,7 @@ fn register_chunk(id: &str) -> String {
 #[test]
 fn command_registration_count_capped_at_bridge() {
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-commands");
+    let mut vm = gate_vm("reg-cap-commands");
     install(&mut vm, services.clone());
     let mut body = String::new();
     for i in 0..REGISTRATION_MAX_COMMANDS {
@@ -935,7 +941,7 @@ fn command_field_lengths_capped_at_bridge() {
         ),
     ] {
         let services = Rc::new(FakeServices::default());
-        let mut vm = LuaVm::new(format!("reg-cap-field-{tag}"));
+        let mut vm = gate_vm(format!("reg-cap-field-{tag}"));
         install(&mut vm, services.clone());
         assert_bridge_code(
             &mut vm,
@@ -953,7 +959,7 @@ fn command_field_lengths_capped_at_bridge() {
 
     // Boundary values (exactly at cap) still register.
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-field-boundary");
+    let mut vm = gate_vm("reg-cap-field-boundary");
     install(&mut vm, services.clone());
     let at_id = "i".repeat(REGISTRATION_MAX_ID_BYTES);
     let at_title = "t".repeat(REGISTRATION_MAX_TITLE_BYTES);
@@ -973,7 +979,7 @@ fn command_field_lengths_capped_at_bridge() {
 #[test]
 fn event_subscription_count_and_kind_capped_at_bridge() {
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-events");
+    let mut vm = gate_vm("reg-cap-events");
     install(&mut vm, services.clone());
     let mut body = String::new();
     for i in 0..REGISTRATION_MAX_EVENTS {
@@ -1018,7 +1024,7 @@ fn event_subscription_count_and_kind_capped_at_bridge() {
 
     // Oversized kind fails closed with E_DEF_INVALID and no capture.
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-event-kind");
+    let mut vm = gate_vm("reg-cap-event-kind");
     install(&mut vm, services.clone());
     let big_kind = "k".repeat(REGISTRATION_MAX_EVENT_KIND_BYTES + 1);
     assert_bridge_code(
@@ -1036,7 +1042,7 @@ fn event_subscription_count_and_kind_capped_at_bridge() {
 fn timer_count_delay_and_handle_exhaustion_capped_at_bridge() {
     // Count cap: the 65th create fails closed with E_DEF_LIMIT.
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-timers");
+    let mut vm = gate_vm("reg-cap-timers");
     install(&mut vm, services.clone());
     let mut body = String::new();
     for _ in 0..REGISTRATION_MAX_TIMERS {
@@ -1072,7 +1078,7 @@ fn timer_count_delay_and_handle_exhaustion_capped_at_bridge() {
 
     // Delay cap: absurd delays fail closed with E_DEF_INVALID.
     let services = Rc::new(FakeServices::default());
-    let mut vm = LuaVm::new("reg-cap-timer-delay");
+    let mut vm = gate_vm("reg-cap-timer-delay");
     install(&mut vm, services.clone());
     assert_bridge_code(
         &mut vm,

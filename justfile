@@ -104,6 +104,14 @@ runtime-deps-test:
 runtime-deps binary packagers:
     ./scripts/check-runtime-deps.sh --binary {{binary}} --packagers {{packagers}}
 
+# Local supply-chain gate mirroring the CI `Supply chain (deny/audit)` job
+# (CTX-0634, SEC-16 / R-019): `just supply-chain`
+supply-chain:
+    ./scripts/check-supply-chain.sh
+
+supply-chain-test:
+    ./scripts/tests/check-supply-chain.test.sh
+
 # Print the Rust channel pinned in rust-toolchain.toml (single source for CI):
 # `just rust-channel`
 rust-channel:
@@ -168,7 +176,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

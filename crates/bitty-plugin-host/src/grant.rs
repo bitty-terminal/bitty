@@ -86,6 +86,23 @@ impl GrantRecord {
     }
 }
 
+/// Outcome of a granted plugin update ([`GrantStore::apply_update`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    /// Plugin id the update applied to.
+    pub plugin_id: PluginId,
+    /// Manifest hash the update moved away from.
+    pub old_hash: String,
+    /// Manifest hash the update moved to.
+    pub new_hash: String,
+    /// Capabilities in the new set absent from the prior grant (sorted).
+    /// Empty when the update narrowed or kept the set.
+    pub added: Vec<CapabilityId>,
+    /// True when no capability was added: the grant carried forward silently
+    /// (narrowed, equal, or idempotent same-hash re-apply).
+    pub carried_forward: bool,
+}
+
 /// In-memory grant store (stub for the state-directory persistence).
 ///
 /// Invariants enforced:
@@ -194,6 +211,144 @@ impl GrantStore {
         self.get(plugin_id)
             .map(|r| r.manifest_hash != candidate_hash)
             .unwrap_or(false)
+    }
+
+    /// Apply a plugin update to the stored grant (R-016 / P0-AC-030).
+    ///
+    /// The install pipeline (`install::verify_install`) blocks artifact-level
+    /// updates; this is the grant-lifecycle counterpart: it binds the new
+    /// capability set to the new manifest hash so a silently broadened update
+    /// can never take effect through a bare `insert`.
+    ///
+    /// - Unknown plugin fails closed (`NotFound`): first installs go through
+    ///   consent, never through update.
+    /// - `old_hash` must equal the stored hash: stale or confused updates
+    ///   (including downgrade/rollback confusion) fail closed with no state change.
+    /// - Added capabilities (`new_caps - granted`) without `approved` fail
+    ///   closed with no state change: the update blocks pending an explicit
+    ///   permission diff and approval.
+    /// - Narrowed or equal sets carry forward silently (`CarriedForward`);
+    ///   this is the downgrade path. Rollback to a broader set is possible
+    ///   but requires `approved`, exactly like any other expansion.
+    /// - A denied plugin is never revived by an update, even an approved one:
+    ///   explicit re-grant is required.
+    /// - Per-capability denials (CTX-0465) survive updates: even an approved
+    ///   expansion cannot resurrect a revoked capability without explicit
+    ///   [`GrantStore::clear_cap_denial`].
+    /// - Same-hash grant changes are not updates: `new_hash == old_hash`
+    ///   requires `new_caps == granted` (idempotent no-op success), otherwise
+    ///   fails closed.
+    pub fn apply_update(
+        &mut self,
+        plugin_id: &PluginId,
+        old_hash: &str,
+        new_hash: &str,
+        new_caps: &BTreeSet<CapabilityId>,
+        approved: bool,
+        decided_at: u64,
+    ) -> Result<UpdateOutcome, PluginError> {
+        let key = plugin_id.as_str().to_string();
+        // Denied plugins are never revived by an update, even an approved one:
+        // explicit re-grant is required. Checked first because a full revoke
+        // removes the record while the denial marker persists.
+        if self.denials.contains(&key) {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' is denied; explicit re-grant required (update cannot revive a denial)",
+                plugin_id.as_str()
+            )));
+        }
+        let current = self
+            .records
+            .get(&key)
+            .ok_or_else(|| PluginError::NotFound {
+                id: plugin_id.to_string(),
+            })?;
+        if current.denied {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' is denied; explicit re-grant required (update cannot revive a denial)",
+                plugin_id.as_str()
+            )));
+        }
+        if current.manifest_hash != old_hash {
+            return Err(PluginError::grant(format!(
+                "stale update for '{}': expected current hash '{}', got '{}'",
+                plugin_id.as_str(),
+                current.manifest_hash,
+                old_hash
+            )));
+        }
+        if current.denied || self.denials.contains(&key) {
+            return Err(PluginError::grant(format!(
+                "plugin '{}' is denied; explicit re-grant required (update cannot revive a denial)",
+                plugin_id.as_str()
+            )));
+        }
+        if new_hash == old_hash {
+            if *new_caps != current.granted {
+                return Err(PluginError::grant(format!(
+                    "same-manifest grant change for '{}' is not an update (hash '{}')",
+                    plugin_id.as_str(),
+                    old_hash
+                )));
+            }
+            return Ok(UpdateOutcome {
+                plugin_id: plugin_id.clone(),
+                old_hash: old_hash.to_string(),
+                new_hash: new_hash.to_string(),
+                added: Vec::new(),
+                carried_forward: true,
+            });
+        }
+        let added: Vec<CapabilityId> = new_caps.difference(&current.granted).cloned().collect();
+        if !added.is_empty() && !approved {
+            let names: Vec<&str> = added.iter().map(CapabilityId::as_str).collect();
+            return Err(PluginError::grant(format!(
+                "update for '{}' adds {} capabilit{} ({}); blocked pending explicit diff approval",
+                plugin_id.as_str(),
+                added.len(),
+                if added.len() == 1 { "y" } else { "ies" },
+                names.join(", ")
+            )));
+        }
+        if let Some(denied_set) = self.denied_caps.get(&key) {
+            let resurrected: Vec<&str> = new_caps
+                .iter()
+                .filter(|cap| denied_set.contains(*cap))
+                .map(CapabilityId::as_str)
+                .collect();
+            if !resurrected.is_empty() {
+                return Err(PluginError::grant(format!(
+                    "update for '{}' resurrects explicitly denied capabilit{} ({}); explicit re-grant required",
+                    plugin_id.as_str(),
+                    if resurrected.len() == 1 { "y" } else { "ies" },
+                    resurrected.join(", ")
+                )));
+            }
+        }
+        let carried_forward = added.is_empty();
+        let origin = if carried_forward {
+            GrantOrigin::CarriedForward
+        } else {
+            GrantOrigin::ConsentUi
+        };
+        self.records.insert(
+            key,
+            GrantRecord {
+                plugin_id: plugin_id.clone(),
+                manifest_hash: new_hash.to_string(),
+                granted: new_caps.clone(),
+                decided_at,
+                origin,
+                denied: false,
+            },
+        );
+        Ok(UpdateOutcome {
+            plugin_id: plugin_id.clone(),
+            old_hash: old_hash.to_string(),
+            new_hash: new_hash.to_string(),
+            added,
+            carried_forward,
+        })
     }
 
     /// Revoke grants for `plugin_id`.
@@ -515,5 +670,217 @@ mod tests {
         // Empty narrowing succeeds (fully narrowed).
         let empty = BTreeSet::new();
         assert!(store.apply_workspace_narrowing(&pid, &empty).is_ok());
+    }
+
+    fn update_store() -> (GrantStore, PluginId) {
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("terminal.semantic-read"));
+        granted.insert(cap("ui.rich"));
+        store.insert(GrantRecord::granted(pid.clone(), "h1", granted, 1));
+        (store, pid)
+    }
+
+    fn declared(caps: &[&str]) -> CapabilityRequests {
+        CapabilityRequests {
+            ids: caps.iter().map(|s| cap(s)).collect(),
+            ..CapabilityRequests::default()
+        }
+    }
+
+    #[test]
+    fn update_blocked_on_added_capability_without_approval() {
+        // P0-AC-030: a silently broadened update blocks with no state change.
+        let (mut store, pid) = update_store();
+        let broadened: BTreeSet<_> = [
+            cap("terminal.semantic-read"),
+            cap("ui.rich"),
+            cap("clipboard.read"),
+        ]
+        .into_iter()
+        .collect();
+        let err = store
+            .apply_update(&pid, "h1", "h2", &broadened, false, 2)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("blocked pending explicit diff approval")
+        );
+        assert!(err.to_string().contains("clipboard.read"));
+        // No state change: old record intact, new hash grants nothing.
+        let rec = store.get(&pid).unwrap();
+        assert_eq!(rec.manifest_hash, "h1");
+        assert_eq!(rec.origin, GrantOrigin::ConsentUi);
+        assert!(!store.is_granted(
+            &pid,
+            "h2",
+            &cap("clipboard.read"),
+            &declared(&["terminal.semantic-read", "ui.rich", "clipboard.read"])
+        ));
+    }
+
+    #[test]
+    fn update_approved_expansion_regrants() {
+        let (mut store, pid) = update_store();
+        let broadened: BTreeSet<_> = [
+            cap("terminal.semantic-read"),
+            cap("ui.rich"),
+            cap("clipboard.read"),
+        ]
+        .into_iter()
+        .collect();
+        let outcome = store
+            .apply_update(&pid, "h1", "h2", &broadened, true, 2)
+            .unwrap();
+        assert_eq!(outcome.added, vec![cap("clipboard.read")]);
+        assert!(!outcome.carried_forward);
+        let rec = store.get(&pid).unwrap();
+        assert_eq!(rec.manifest_hash, "h2");
+        assert_eq!(rec.origin, GrantOrigin::ConsentUi);
+        assert!(!rec.denied);
+        let new_declared = declared(&["terminal.semantic-read", "ui.rich", "clipboard.read"]);
+        assert!(store.is_granted(&pid, "h2", &cap("clipboard.read"), &new_declared));
+        // Old hash no longer grants.
+        assert!(!store.is_granted(&pid, "h1", &cap("ui.rich"), &new_declared));
+    }
+
+    #[test]
+    fn update_narrowing_carries_forward_silently() {
+        // Downgrade path: fewer capabilities carry forward without approval.
+        let (mut store, pid) = update_store();
+        let narrowed: BTreeSet<_> = [cap("terminal.semantic-read")].into_iter().collect();
+        let outcome = store
+            .apply_update(&pid, "h1", "h2", &narrowed, false, 2)
+            .unwrap();
+        assert!(outcome.added.is_empty());
+        assert!(outcome.carried_forward);
+        let rec = store.get(&pid).unwrap();
+        assert_eq!(rec.manifest_hash, "h2");
+        assert_eq!(rec.origin, GrantOrigin::CarriedForward);
+        let new_declared = declared(&["terminal.semantic-read"]);
+        assert!(store.is_granted(&pid, "h2", &cap("terminal.semantic-read"), &new_declared));
+        assert!(!store.is_granted(&pid, "h2", &cap("ui.rich"), &new_declared));
+    }
+
+    #[test]
+    fn update_equal_set_carries_forward() {
+        let (mut store, pid) = update_store();
+        let same: BTreeSet<_> = [cap("terminal.semantic-read"), cap("ui.rich")]
+            .into_iter()
+            .collect();
+        let outcome = store
+            .apply_update(&pid, "h1", "h2", &same, false, 2)
+            .unwrap();
+        assert!(outcome.carried_forward);
+        assert_eq!(store.get(&pid).unwrap().origin, GrantOrigin::CarriedForward);
+    }
+
+    #[test]
+    fn update_stale_hash_fails_closed() {
+        let (mut store, pid) = update_store();
+        let narrowed: BTreeSet<_> = [cap("terminal.semantic-read")].into_iter().collect();
+        let err = store
+            .apply_update(&pid, "stale", "h2", &narrowed, true, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("stale update"));
+        assert_eq!(store.get(&pid).unwrap().manifest_hash, "h1");
+    }
+
+    #[test]
+    fn update_unknown_plugin_fails_closed() {
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.ghost").unwrap();
+        let caps: BTreeSet<_> = [cap("ui.rich")].into_iter().collect();
+        let err = store
+            .apply_update(&pid, "h0", "h1", &caps, true, 1)
+            .unwrap_err();
+        assert!(matches!(err, PluginError::NotFound { .. }));
+    }
+
+    #[test]
+    fn update_denied_plugin_requires_regrant() {
+        // Even an approved update must not revive a denied plugin.
+        let (mut store, pid) = update_store();
+        store.revoke_all(&pid).unwrap();
+        assert!(store.is_denied(&pid));
+        let narrowed: BTreeSet<_> = [cap("terminal.semantic-read")].into_iter().collect();
+        let err = store
+            .apply_update(&pid, "h1", "h2", &narrowed, true, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("explicit re-grant required"));
+        assert!(store.is_denied(&pid));
+        assert!(store.get(&pid).is_none());
+    }
+
+    #[test]
+    fn update_cannot_resurrect_cap_denial() {
+        // CTX-0465 denials survive updates until explicitly cleared.
+        let (mut store, pid) = update_store();
+        store.revoke(&pid, Some(&cap("ui.rich"))).unwrap();
+        assert!(store.is_cap_denied(&pid, &cap("ui.rich")));
+        let with_revoked: BTreeSet<_> = [cap("terminal.semantic-read"), cap("ui.rich")]
+            .into_iter()
+            .collect();
+        // Same-hash re-apply is not an update, and the hash moved anyway:
+        // approved expansion carrying the revoked cap still fails.
+        let err = store
+            .apply_update(&pid, "h1", "h2", &with_revoked, true, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("explicit re-grant required"));
+        // After explicit clearance the same approved update succeeds.
+        assert!(store.clear_cap_denial(&pid, &cap("ui.rich")));
+        let outcome = store
+            .apply_update(&pid, "h1", "h2", &with_revoked, true, 3)
+            .unwrap();
+        assert!(!outcome.carried_forward);
+        assert_eq!(outcome.added, vec![cap("ui.rich")]);
+    }
+
+    #[test]
+    fn update_same_hash_requires_same_caps() {
+        let (mut store, pid) = update_store();
+        let same: BTreeSet<_> = [cap("terminal.semantic-read"), cap("ui.rich")]
+            .into_iter()
+            .collect();
+        // Idempotent re-apply succeeds without rewriting the record.
+        let outcome = store
+            .apply_update(&pid, "h1", "h1", &same, false, 9)
+            .unwrap();
+        assert!(outcome.carried_forward);
+        assert_eq!(store.get(&pid).unwrap().decided_at, 1);
+        // Same-hash grant change is caller confusion: fail closed.
+        let changed: BTreeSet<_> = [cap("terminal.semantic-read")].into_iter().collect();
+        let err = store
+            .apply_update(&pid, "h1", "h1", &changed, true, 9)
+            .unwrap_err();
+        assert!(err.to_string().contains("not an update"));
+    }
+
+    #[test]
+    fn update_rollback_to_broader_set_requires_approval() {
+        // Rollback is always possible, but a broader-than-current set is an
+        // expansion no matter its history: it needs explicit approval.
+        let (mut store, pid) = update_store();
+        let narrowed: BTreeSet<_> = [cap("terminal.semantic-read")].into_iter().collect();
+        store
+            .apply_update(&pid, "h1", "h2", &narrowed, false, 2)
+            .unwrap();
+        let back: BTreeSet<_> = [cap("terminal.semantic-read"), cap("ui.rich")]
+            .into_iter()
+            .collect();
+        // Unapproved rollback to the broader set blocks.
+        assert!(
+            store
+                .apply_update(&pid, "h2", "h3", &back, false, 3)
+                .is_err()
+        );
+        // Approved rollback restores.
+        let outcome = store
+            .apply_update(&pid, "h2", "h3", &back, true, 3)
+            .unwrap();
+        assert_eq!(outcome.added, vec![cap("ui.rich")]);
+        let rollback_declared = declared(&["terminal.semantic-read", "ui.rich"]);
+        assert!(store.is_granted(&pid, "h3", &cap("ui.rich"), &rollback_declared));
     }
 }

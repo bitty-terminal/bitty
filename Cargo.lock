@@ -352,6 +352,7 @@ version = "0.0.20"
 name = "bitty-ui"
 version = "0.0.20"
 dependencies = [
+ "bitty-rich",
  "bitty-term-state",
  "bitty-vt",
 ]

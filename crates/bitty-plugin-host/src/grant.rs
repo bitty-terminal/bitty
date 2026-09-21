@@ -103,11 +103,38 @@ pub struct UpdateOutcome {
     pub carried_forward: bool,
 }
 
+/// Explicit consent evidence for [`GrantStore::insert_with_consent`].
+///
+/// A value of this type is the call-site's attestation that the grant record
+/// passed through an explicit user decision (host consent UX for first
+/// installs, explicit re-grant action afterwards). It is deliberately not
+/// `Default`: callers must write `GrantConsent::explicit(..)`, so no implicit
+/// or ambient insert compiles without acknowledging consent. The attested
+/// `decided_at` must match the record's `decided_at`; mismatched evidence is
+/// rejected fail-closed so one consent cannot be replayed onto another record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantConsent {
+    decided_at: u64,
+}
+
+impl GrantConsent {
+    /// Attest an explicit user decision made at `decided_at` (monotonic host
+    /// time, same clock as [`GrantRecord::decided_at`]).
+    #[must_use]
+    pub fn explicit(decided_at: u64) -> Self {
+        Self { decided_at }
+    }
+}
+
 /// In-memory grant store (stub for the state-directory persistence).
 ///
 /// Invariants enforced:
 /// - Undeclared authority cannot be exercised even if a stale grant record exists
 ///   (callers must intersect requested capabilities with grants; see [`GrantStore::is_granted`]).
+/// - Direct [`GrantStore::insert`] is the explicit-consent path (first installs
+///   and explicit re-grants only): production callers present [`GrantConsent`]
+///   via [`GrantStore::insert_with_consent`], and updates go through
+///   [`GrantStore::apply_update`], never a bare `insert`.
 /// - Workspace configuration may narrow grants but may never add any.
 /// - Revocation takes effect at the next dispatch boundary (host detaches handlers).
 #[derive(Debug, Default, Clone)]
@@ -145,7 +172,16 @@ impl GrantStore {
         self.records.is_empty()
     }
 
-    /// Insert or replace a grant record.
+    /// Insert or replace a grant record (explicit-consent path).
+    ///
+    /// Scope: first installs and explicit re-grants only — the caller attests
+    /// the record passed through the host consent UX. Updates to an existing
+    /// grant must go through [`GrantStore::apply_update`] (which fails closed
+    /// on unapproved additions), never a bare `insert`; production callers
+    /// should prefer [`GrantStore::insert_with_consent`], which rejects
+    /// missing consent evidence with a typed error. A bare `insert` never
+    /// clears per-capability denials for enforcement: [`GrantStore::is_granted`]
+    /// still fails closed until explicit [`GrantStore::clear_cap_denial`].
     pub fn insert(&mut self, record: GrantRecord) {
         let key = record.plugin_id.as_str().to_string();
         if record.denied {
@@ -154,6 +190,35 @@ impl GrantStore {
             self.denials.remove(&key);
         }
         self.records.insert(key, record);
+    }
+
+    /// Insert or replace a grant record with explicit consent evidence.
+    ///
+    /// Consent-only fail-closed entry point: `None` (missing evidence) or
+    /// evidence whose `decided_at` does not match the record is rejected with
+    /// a typed [`PluginError::Grant`] and changes no state. On success this
+    /// stores exactly what [`GrantStore::insert`] would store.
+    pub fn insert_with_consent(
+        &mut self,
+        record: GrantRecord,
+        consent: Option<GrantConsent>,
+    ) -> Result<(), PluginError> {
+        let Some(evidence) = consent else {
+            return Err(PluginError::grant(format!(
+                "explicit consent required to grant '{}'; ambient inserts are rejected",
+                record.plugin_id.as_str()
+            )));
+        };
+        if evidence.decided_at != record.decided_at {
+            return Err(PluginError::grant(format!(
+                "consent evidence mismatch for '{}': consent decided_at {} != record decided_at {}",
+                record.plugin_id.as_str(),
+                evidence.decided_at,
+                record.decided_at
+            )));
+        }
+        self.insert(record);
+        Ok(())
     }
 
     /// Retrieve a record for `plugin_id`.
@@ -218,7 +283,10 @@ impl GrantStore {
     /// The install pipeline (`install::verify_install`) blocks artifact-level
     /// updates; this is the grant-lifecycle counterpart: it binds the new
     /// capability set to the new manifest hash so a silently broadened update
-    /// can never take effect through a bare `insert`.
+    /// can never take effect through [`GrantStore::apply_update`] without
+    /// explicit diff approval. A bare [`GrantStore::insert`] is the
+    /// explicit-consent path for first installs and re-grants and must never
+    /// carry an update.
     ///
     /// - Unknown plugin fails closed (`NotFound`): first installs go through
     ///   consent, never through update.
@@ -277,12 +345,8 @@ impl GrantStore {
                 old_hash
             )));
         }
-        if current.denied || self.denials.contains(&key) {
-            return Err(PluginError::grant(format!(
-                "plugin '{}' is denied; explicit re-grant required (update cannot revive a denial)",
-                plugin_id.as_str()
-            )));
-        }
+        // (Denied plugins were already rejected above: `denials` before the
+        // fetch, `current.denied` right after. No second check needed.)
         if new_hash == old_hash {
             if *new_caps != current.granted {
                 return Err(PluginError::grant(format!(
@@ -882,5 +946,75 @@ mod tests {
         assert_eq!(outcome.added, vec![cap("ui.rich")]);
         let rollback_declared = declared(&["terminal.semantic-read", "ui.rich"]);
         assert!(store.is_granted(&pid, "h3", &cap("ui.rich"), &rollback_declared));
+    }
+
+    #[test]
+    fn insert_without_consent_is_rejected() {
+        // CTX-0657: the consent-gated path fails closed without evidence.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("ui.rich"));
+        let err = store
+            .insert_with_consent(GrantRecord::granted(pid.clone(), "h", granted, 1), None)
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Grant { .. }));
+        assert!(err.to_string().contains("explicit consent required"));
+        assert!(store.get(&pid).is_none());
+    }
+
+    #[test]
+    fn insert_with_consent_stores_grant() {
+        // CTX-0657: matching evidence is the working consent path.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("ui.rich"));
+        store
+            .insert_with_consent(
+                GrantRecord::granted(pid.clone(), "h", granted.clone(), 7),
+                Some(GrantConsent::explicit(7)),
+            )
+            .unwrap();
+        let declared = CapabilityRequests {
+            ids: granted,
+            ..CapabilityRequests::default()
+        };
+        assert!(store.is_granted(&pid, "h", &cap("ui.rich"), &declared));
+    }
+
+    #[test]
+    fn insert_with_mismatched_consent_is_rejected() {
+        // Evidence is bound to the record: one consent cannot be replayed
+        // onto a different record.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("ui.rich"));
+        let err = store
+            .insert_with_consent(
+                GrantRecord::granted(pid.clone(), "h", granted, 1),
+                Some(GrantConsent::explicit(2)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, PluginError::Grant { .. }));
+        assert!(err.to_string().contains("mismatch"));
+        assert!(store.get(&pid).is_none());
+    }
+
+    #[test]
+    fn bare_insert_remains_first_install_consent_path() {
+        // CTX-0657 review constraint: `insert` stays pub because first-install
+        // consent needs it; updates still go through `apply_update`.
+        let mut store = GrantStore::new();
+        let pid = PluginId::new("xuepoo.test").unwrap();
+        let mut granted = BTreeSet::new();
+        granted.insert(cap("ui.rich"));
+        store.insert(GrantRecord::granted(pid.clone(), "h1", granted.clone(), 1));
+        let declared = CapabilityRequests {
+            ids: granted,
+            ..CapabilityRequests::default()
+        };
+        assert!(store.is_granted(&pid, "h1", &cap("ui.rich"), &declared));
     }
 }

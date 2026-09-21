@@ -162,7 +162,7 @@ pub use fs_authz::{
     MAX_FS_PATH_BYTES, SensitivePathPolicy, authorize_fs, content_looks_secret,
     is_literal_scope_pattern,
 };
-pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
+pub use grant::{GrantConsent, GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};
 pub use install::{
     DoctorIssue, InstallInputs, NATIVE_ARTIFACT_EXTENSIONS, is_native_artifact_file_name,

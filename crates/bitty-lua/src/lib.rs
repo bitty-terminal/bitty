@@ -65,6 +65,7 @@ pub mod error;
 pub mod gate;
 pub mod host;
 mod stdlib;
+pub mod store;
 pub mod ui;
 
 pub use config::{

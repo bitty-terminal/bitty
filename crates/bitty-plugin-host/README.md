@@ -80,6 +80,10 @@ to the still-proposed package-lifecycle RFC is a draft seam.
   every decision; Lua, agent-tool, and execution-request surfaces share
   this single seam with no bypass.
 - `src/install.rs` — install-path verification seam.
+- `src/origin.rs` — unknown-origin restrictive policy (R-020, P0-AC-032):
+  advisory origin classification fail-closed to `Unknown`, restrictive
+  policy for `Unknown`/`Remote`, relaxation only via explicit user
+  override.
 - `src/tools.rs` — tool surface helpers.
 - `src/bundled.rs` — bundled-plugin declarations.
 - `src/error.rs` — owned error types.

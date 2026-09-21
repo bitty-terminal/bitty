@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member of `scripts/m1-matrix.sh` (floor 16) so it runs by name on every
   ADR-0002 Tier 1 CI leg.
 - **Filesystem authorization with sensitive-path policy and secret
-  detection (CTX-0523, research 045 §4):** the FS authorization path
+  detection (CTX-0523):** the FS authorization path
   (agent tools, plugin capability calls, execution requests) evaluates
   `FilesystemScope` + `SensitivePathPolicy` + secret detection/redaction
   through the single host seam `PluginHost::authorize_fs`, which
@@ -77,11 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quote the path and never the value (CTX-0521/P0-AC-026 rule); Lua
   plugins share the same seam and cannot bypass the check; every decision
   appends to the bounded drop-oldest `FsAuditLedger` (paths only). The
-  exact default set and heuristics are the reviewable starting set (045
-  open item), not a fixed policy. No new dependencies, no `unsafe`, no
+  exact default set and heuristics are the reviewable starting set (open
+  item), not a fixed policy. No new dependencies, no `unsafe`, no
   hardcoded paths.
 - **Host secret store with opaque credential handles for execution
-  (CTX-0521, research 045 §5):** `secret://<name>` references resolve on
+  (CTX-0521):** `secret://<name>` references resolve on
   the Rust host side at spawn/request time via
   `PluginHost::resolve_secret_for_spawn`, which authorizes through the
   CTX-0524 six-layer intersection (`RequestKind::ExecutionRun`) before the
@@ -102,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `PluginHost::activate` grant gate is unchanged. No new dependencies,
   no `unsafe`, no hardcoded paths.
 - **Host effective-capability intersection engine with self-grant
-  prohibition (CTX-0524, OQ-057, research 045 §8 §12 §13):** every agent,
+  prohibition (CTX-0524, OQ-057):** every agent,
   plugin, or Lua request is a request, never a grant.
   `EffectiveCapability = host ceiling ∩ user policy ∩ project policy ∩
 parent delegation ∩ task grant ∩ agent request` is computed on every

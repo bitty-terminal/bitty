@@ -83,18 +83,18 @@
 //! Per-event payloads are separately bounded by [`EVENT_MAX_BYTES`] (8 KiB) via
 //! [`BoundedText`] / [`EventPayload::try_text`] — see the payload section.
 //!
-//! # RC-1 / RC-2 and memory ceilings — enforced via `bitty-lua` (piccolo)
+//! # RC-1 / RC-2 and memory ceilings — enforced via `bitty-lua` (phodopus)
 //!
 //! The isolation/resource RFC proposes `RC-1` (callback CPU/instruction
 //! budget: `10^7` VM instructions or `50 ms` wall clock, warning `8 ms`) and
 //! `RC-2` (memory per plugin `32 MiB`, aggregate `512 MiB`, `RC-6` fd caps).
 //! These dimensions are enforced by the `bitty-lua` crate which wraps the
-//! `piccolo` stackless VM deterministically (one VM per `(PluginId, generation)`,
+//! `phodopus` stackless VM deterministically (one VM per `(PluginId, generation)`,
 //! isolated globals/registry, `Fuel`-bounded instruction counter + wall-clock
 //! deadline + allocator-accounted `32 MiB` heap, fail-closed suspend,
-//! `BudgetSnapshot`-compatible counters). Config VM remains `mlua` per
-//! `ADR-0004`; plugin VM is `piccolo` per isolation RFC watch-list (documented
-//! clearly in `bitty-lua`). See `crates/bitty-lua` for the bounded,
+//! `BudgetSnapshot`-compatible counters). Config chunks run on the same
+//! `phodopus` VM per `ADR-0004`; plugin VM is `phodopus` per isolation RFC
+//! watch-list (documented clearly in `bitty-lua`). See `crates/bitty-lua` for the bounded,
 //! headless, deterministic implementation and `tests/measurement_lua.rs` for
 //! harness proof.
 //!
@@ -601,7 +601,7 @@ pub const DEFAULT_BATCH_BYTES: usize = 8 * 1024;
 /// RC-1 instruction budget candidate (Open, no VM yet): `10^7` VM instructions.
 ///
 /// Documented for harness parameterization; not enforced until the Lua VM
-/// (`OQ-009` piccolo) exists. Do not describe as normative.
+/// (`OQ-009` phodopus) exists. Do not describe as normative.
 pub const RC1_INSTRUCTION_BUDGET: u64 = 10_000_000;
 
 /// RC-1 wall-clock budget candidate (Open): `50 ms` per callback.

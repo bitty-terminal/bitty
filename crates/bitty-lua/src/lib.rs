@@ -63,6 +63,7 @@ use piccolo::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor};
 pub mod config;
 pub mod host;
 mod stdlib;
+pub mod store;
 pub mod ui;
 
 pub use config::{

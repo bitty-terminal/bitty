@@ -213,3 +213,83 @@ fn chrome_rejects_overlong_names() {
         Err(A11yError::NameTooLong { .. })
     ));
 }
+
+/// Drift coupling: every `bitty-rich` `SceneNode` variant must map to a
+/// `SceneKind` with a resolved role (or fail closed for `Unknown`).
+/// Deliberately exhaustive — gains a compile error if `bitty-rich` adds a
+/// variant, so the mirror in `bitty_ui::a11y` cannot drift silently.
+#[test]
+fn scene_kind_mirror_tracks_bitty_rich() {
+    use bitty_rich::scene::{Border, CodeBlockModel, ListModel, SceneNode, StyledSpan, TableModel};
+
+    let span = StyledSpan {
+        text: String::from("t"),
+        bold: false,
+        italic: false,
+    };
+    let leaf = SceneNode::Text(span.clone());
+    let cases: Vec<(SceneNode, SceneKind)> = vec![
+        (leaf.clone(), SceneKind::Text),
+        (SceneNode::Row(vec![leaf.clone()]), SceneKind::Row),
+        (SceneNode::Column(vec![leaf.clone()]), SceneKind::Column),
+        (
+            SceneNode::Block {
+                border: Some(Border {
+                    width: 1,
+                    color: String::from("#fff"),
+                }),
+                child: Box::new(leaf.clone()),
+            },
+            SceneKind::Block,
+        ),
+        (
+            SceneNode::Image(bitty_rich::image::PlacementId(1)),
+            SceneKind::Image,
+        ),
+        (
+            SceneNode::CodeBlock(CodeBlockModel {
+                lang: None,
+                content: String::from("x"),
+            }),
+            SceneKind::CodeBlock,
+        ),
+        (
+            SceneNode::Table(TableModel {
+                rows: vec![vec![String::from("c")]],
+            }),
+            SceneKind::Table,
+        ),
+        (
+            SceneNode::List(ListModel {
+                items: vec![String::from("i")],
+                ordered: false,
+            }),
+            SceneKind::List,
+        ),
+        (SceneNode::Rule, SceneKind::Rule),
+    ];
+    for (node, kind) in &cases {
+        let mapped = match node {
+            SceneNode::Text(_) => SceneKind::Text,
+            SceneNode::Row(_) => SceneKind::Row,
+            SceneNode::Column(_) => SceneKind::Column,
+            SceneNode::Block { .. } => SceneKind::Block,
+            SceneNode::Image(_) => SceneKind::Image,
+            SceneNode::CodeBlock(_) => SceneKind::CodeBlock,
+            SceneNode::Table(_) => SceneKind::Table,
+            SceneNode::List(_) => SceneKind::List,
+            SceneNode::Rule => SceneKind::Rule,
+            SceneNode::Unknown(_) => SceneKind::Unknown,
+        };
+        assert_eq!(mapped, *kind);
+        assert!(role_of(*kind).is_ok(), "{kind:?} must resolve a role");
+    }
+    assert!(matches!(
+        role_of(SceneKind::Unknown),
+        Err(A11yError::UnmappedSceneKind)
+    ));
+    assert!(matches!(
+        validate_scene(&[SceneKind::Unknown]),
+        Err(A11yError::UnmappedSceneKind)
+    ));
+}

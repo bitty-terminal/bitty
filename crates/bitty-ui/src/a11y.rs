@@ -90,10 +90,13 @@ impl std::error::Error for A11yError {}
 /// Mirrors the `SceneNode` variants of `bitty-rich` v1 (`Text`, `Row`,
 /// `Column`, `Block`, `Image`, `CodeBlock`, `Table`, `List`, `Rule`) plus
 /// the forward-compatible fallback (`SceneNode::Unknown`, mirrored here as
-/// [`SceneKind::Unknown`]). This crate does not depend on `bitty-rich`, so
-/// the kinds are mirrored rather than imported; if `bitty-rich` gains a
-/// variant, a matching [`SceneKind`] plus a [`role_of`] mapping must land
-/// here first, otherwise validation fails closed.
+/// [`SceneKind::Unknown`]). The kinds are mirrored rather than imported so
+/// the projection stays decoupled from the producer at runtime; the mirror
+/// cannot drift silently — `scene_kind_mirror_tracks_bitty_rich` (integration
+/// test, `bitty-rich` dev-dependency) maps every `SceneNode` variant and
+/// fails to compile if `bitty-rich` gains one. If it does, a matching
+/// [`SceneKind`] plus a [`role_of`] mapping must land here first, otherwise
+/// validation fails closed.
 ///
 /// `bitty-rich` v1 carries no interactive node variant. The candidate
 /// requires interactive nodes to expose a role from their declared purpose

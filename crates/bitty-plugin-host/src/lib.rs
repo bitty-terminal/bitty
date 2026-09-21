@@ -124,6 +124,7 @@ pub mod fs_authz;
 pub mod grant;
 pub mod host;
 pub mod install;
+pub mod lifecycle;
 pub mod manifest;
 pub mod registry;
 pub mod secrets;
@@ -162,6 +163,12 @@ pub use fs_authz::{
 pub use grant::{GrantOrigin, GrantRecord, GrantStore, RevokeReport};
 pub use host::{HostObservation, PluginHost, SideQueue};
 pub use install::{DoctorIssue, InstallInputs, is_staging_allowed, verify_install};
+pub use lifecycle::{
+    BudgetDimension, Clock, ESCALATION_WINDOW_SECS, ESCALATIONS_TO_SUSPEND, EnforcementAction,
+    EnforcementRecord, LifecycleEnforcer, MAX_ENFORCEMENT_RECORDS, MAX_TRACKED_OWNERS, ManualClock,
+    PluginLifecycleStatus, ReloadOutcome, ReloadReport, ReloadResources, SystemClock,
+    reload_generation,
+};
 pub use manifest::{
     CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyTriggers, MANIFEST_MAX_BYTES,
     MAX_COMMANDS, MAX_DEPENDENCIES, MAX_EVENT_TYPES, MAX_FS_PATTERNS_PER_KIND,

@@ -4,6 +4,7 @@
 //! byte-identical logic, only module wiring changed.
 use super::*;
 use crate::config::decoration_runtime_error;
+use core::ops::{Deref, DerefMut};
 
 pub(super) fn default_layout(cols: usize, rows: usize) -> LayoutNode {
     let view = View::new(ViewId::new(1), cols, rows);
@@ -40,6 +41,41 @@ pub struct PresentFrame {
     pub border: u16,
     /// Corner radius in physical px (carried; painted by the present ring).
     pub radius: u16,
+}
+
+/// Mutable borrow of the owned layout tree (CTX-0603, #1165).
+///
+/// Returned by [`Runtime::layout_mut`]: dereferences to the live
+/// [`LayoutNode`] like the pre-CTX-0603 `&mut` escape, but folds the
+/// currently installed leaf ids into the monotonic ViewId high-water on
+/// every [`DerefMut`] access and on [`Drop`]. Each whole-tree write inside
+/// one borrow therefore quarantines the tree it overwrites, so an
+/// intermediate id retired mid-borrow is never reissued (WS-INV-4/F-1).
+/// Raising is monotonic and preserves the geometry-only semantics.
+#[must_use]
+pub struct LayoutMutGuard<'a> {
+    runtime: &'a mut Runtime,
+}
+
+impl Deref for LayoutMutGuard<'_> {
+    type Target = LayoutNode;
+
+    fn deref(&self) -> &LayoutNode {
+        &self.runtime.layout
+    }
+}
+
+impl DerefMut for LayoutMutGuard<'_> {
+    fn deref_mut(&mut self) -> &mut LayoutNode {
+        self.runtime.raise_view_id_high_water();
+        &mut self.runtime.layout
+    }
+}
+
+impl Drop for LayoutMutGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.raise_view_id_high_water();
+    }
 }
 
 impl Runtime {
@@ -731,10 +767,14 @@ impl Runtime {
     /// previously escaped id quarantined once a later write retires it
     /// (WS-INV-4/F-1). Raising the mark is monotonic and never affects the
     /// geometry-only semantics.
-    #[must_use]
-    pub fn layout_mut(&mut self) -> &mut LayoutNode {
+    ///
+    /// CTX-0603 (#1165): the guard raises on every `DerefMut` access and on
+    /// `Drop`, so consecutive whole-tree writes inside one borrow each fold
+    /// the tree they overwrite — an intermediate id retired mid-borrow can
+    /// never slip past the mark unobserved.
+    pub fn layout_mut(&mut self) -> LayoutMutGuard<'_> {
         self.raise_view_id_high_water();
-        &mut self.layout
+        LayoutMutGuard { runtime: self }
     }
 
     /// Forces a full redraw on the next `tick` (CTX-0228).
@@ -973,5 +1013,35 @@ impl Runtime {
         self.layout.reflow_with_gaps(self.container, gaps);
         self.pending_full_redraw = true;
         self.layout.layout_with_gaps(self.container, gaps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(id: u64) -> LayoutNode {
+        LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
+    }
+
+    /// CTX-0603 (#1165): two whole-tree writes inside one `layout_mut`
+    /// borrow must quarantine the intermediate id. The pre-CTX-0603 escape
+    /// raised only when the borrow was taken, so the second write retired
+    /// id 50 without the allocator ever observing it and a later
+    /// allocation reissued it.
+    #[test]
+    fn layout_mut_single_borrow_double_write_quarantines_intermediate_id() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        {
+            let mut borrowed = rt.layout_mut();
+            *borrowed = leaf(50);
+            *borrowed = leaf(2);
+        }
+        assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(
+            rt.next_view_id_global(),
+            ViewId::new(51),
+            "intermediate id 50 retired inside one layout_mut borrow must stay quarantined"
+        );
     }
 }

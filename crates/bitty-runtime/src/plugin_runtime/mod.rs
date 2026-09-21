@@ -4,7 +4,7 @@
 //! `plugin-host-runtime-rfc` Gap A plus the minimal Gap C host services. Policy
 //! stays in `bitty-plugin-host` (manifest validation, capability grammar,
 //! grants, registry, event pipeline); the VM seam stays in `bitty-lua`; this
-//! module orchestrates one `!Send` piccolo VM per `(PluginId, generation)` on a
+//! module orchestrates one `!Send` Phodopus VM per `(PluginId, generation)` on a
 //! single owning thread.
 //!
 //! Lifecycle: `Unloaded -> Loading -> Activating -> Active -> Suspended ->
@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use bitty_lua::gate::{VmBudgets, build_plugin_vm};
 use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::{HostServices, LuaVm, MarshallingLimits, RegistrationCapture};
 use bitty_plugin_host::DropPolicy;
@@ -356,7 +357,7 @@ struct PluginEntry {
 
 /// Orchestrates discovery, activation, and dispatch for plugin VMs.
 ///
-/// The struct is `!Send` because it owns piccolo VMs; callers use it on the
+/// The struct is `!Send` because it owns Phodopus VMs; callers use it on the
 /// single owning thread (the application's cold path).
 pub struct PluginRuntime {
     safe_mode: bool,
@@ -697,7 +698,16 @@ impl PluginRuntime {
             plugin_services.set_spawn_git(true);
             plugin_services.set_spawn_backend(Some(spawn::git_spawn_backend(id.as_str())));
         }
-        let mut vm = LuaVm::new(id.as_str());
+        // RC-1/RC-2 enter through the fail-closed gate: no VM exists without
+        // explicit budgets (the deprecated `LuaVm::new` default path is sealed).
+        let mut vm = match build_plugin_vm(id.as_str(), Some(VmBudgets::default())) {
+            Ok(vm) => vm,
+            Err(error) => {
+                let error = PluginRuntimeError::Vm(error.to_string());
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        };
         vm.with_module_root(module_root.clone());
         {
             let entry = self.entries.get_mut(id).expect("entry exists");

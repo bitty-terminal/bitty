@@ -11,11 +11,16 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
-    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits,
-    RC1_INSTRUCTION_BUDGET, RC1_WARNING_MS, RC2_MEMORY_PER_PLUGIN_BYTES, UiNode,
+    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, UiNode,
 };
+
+/// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
+fn gate_vm(id: impl Into<String>) -> LuaVm {
+    build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
+}
 
 #[derive(Default)]
 struct UiServices {
@@ -114,13 +119,13 @@ const OVERSIZE_PROBE_WALL_BUDGET_MS: u64 = 250;
 /// Probe VM carrying [`OVERSIZE_PROBE_WALL_BUDGET_MS`] and otherwise default
 /// RC budgets.
 fn oversized_probe_vm(id: &str) -> LuaVm {
-    LuaVm::with_budgets(
-        id,
-        RC1_INSTRUCTION_BUDGET,
-        OVERSIZE_PROBE_WALL_BUDGET_MS,
-        RC1_WARNING_MS,
-        RC2_MEMORY_PER_PLUGIN_BYTES,
-    )
+    PluginVmBuilder::new(id)
+        .budgets(VmBudgets {
+            wall_budget_ms: OVERSIZE_PROBE_WALL_BUDGET_MS,
+            ..VmBudgets::default()
+        })
+        .build()
+        .expect("padded wall budget is valid")
 }
 
 fn run(vm: &mut LuaVm, source: &str) {
@@ -140,7 +145,7 @@ fn stored(services: &UiServices, key: &str) -> Option<LuaValue> {
 #[test]
 fn probe_bitty_ui_namespace_is_present() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("probe");
+    let mut vm = gate_vm("probe");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -167,7 +172,7 @@ fn probe_bitty_ui_namespace_is_present() {
 #[test]
 fn mount_and_update_round_trip_validated_scene() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("round-trip");
+    let mut vm = gate_vm("round-trip");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -203,7 +208,7 @@ fn mount_and_update_round_trip_validated_scene() {
 #[test]
 fn ui_namespace_is_read_only() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("readonly");
+    let mut vm = gate_vm("readonly");
     install(&mut vm, services, 50);
     let outcome = vm
         .execute_bounded("bitty.ui.mount = function() end")
@@ -222,7 +227,7 @@ fn ui_namespace_is_read_only() {
 #[test]
 fn unknown_slot_is_typed_component_error() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("slot");
+    let mut vm = gate_vm("slot");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -243,7 +248,7 @@ fn unknown_slot_is_typed_component_error() {
 #[test]
 fn excluded_unknown_and_malformed_components_rejected() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("shapes");
+    let mut vm = gate_vm("shapes");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -281,7 +286,7 @@ fn excluded_unknown_and_malformed_components_rejected() {
 #[test]
 fn depth_sixteen_accepted_seventeen_rejected() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("depth");
+    let mut vm = gate_vm("depth");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -375,7 +380,7 @@ fn oversized_text_and_node_count_rejected() {
 #[test]
 fn oversized_update_rejected_before_commit() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("update-budget");
+    let mut vm = gate_vm("update-budget");
     install(&mut vm, services.clone(), 200);
     run(
         &mut vm,
@@ -412,7 +417,7 @@ fn oversized_update_rejected_before_commit() {
 #[test]
 fn cyclic_component_fails_closed() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("cyclic");
+    let mut vm = gate_vm("cyclic");
     install(&mut vm, services.clone(), 200);
     run(
         &mut vm,
@@ -435,7 +440,7 @@ fn cyclic_component_fails_closed() {
 #[test]
 fn update_rejects_non_integer_handle() {
     let services = Rc::new(UiServices::default());
-    let mut vm = LuaVm::new("handle");
+    let mut vm = gate_vm("handle");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -478,7 +483,7 @@ fn host_without_ui_surface_fails_closed() {
 
     let services = Rc::new(Bare::default());
     let services_dyn: Rc<dyn HostServices> = services.clone();
-    let mut vm = LuaVm::new("bare");
+    let mut vm = gate_vm("bare");
     vm.install_host_module(services_dyn, MarshallingLimits::default(), 50)
         .expect("install");
     run(
@@ -500,7 +505,7 @@ fn capability_denial_propagates_typed() {
         deny: Some("ui.rich"),
         ..UiServices::default()
     });
-    let mut vm = LuaVm::new("denied");
+    let mut vm = gate_vm("denied");
     install(&mut vm, services.clone(), 50);
     run(
         &mut vm,
@@ -529,7 +534,7 @@ fn expired_mount_returns_timeout_without_commit() {
         slow_ms: 30,
         ..UiServices::default()
     });
-    let mut vm = LuaVm::new("expired");
+    let mut vm = gate_vm("expired");
     install(&mut vm, services.clone(), 5);
     run(
         &mut vm,

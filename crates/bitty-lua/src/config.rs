@@ -10,7 +10,7 @@
 //!
 //! # What the chunk can touch
 //!
-//! The sandbox builds [`piccolo::Lua::core`]: pure-computation base library
+//! The sandbox builds [`phodopus::Lua::core`]: pure-computation base library
 //! (`type`, `tostring`, `pairs`, `ipairs`, `error`, `assert`, `select`,
 //! `pcall`, `next`, `rawget`/`rawset`, `setmetatable`/`getmetatable`, …),
 //! `coroutine`, `math`, `string`, and `table` (inventory verified
@@ -59,10 +59,10 @@
 //!   `bitty-config` validation.
 //! - Metatables are ignored: extraction reads raw table contents only, so
 //!   `__index` tricks cannot smuggle values past validation.
-//! - Error messages carry key names and piccolo line info only — never file
+//! - Error messages carry key names and phodopus line info only — never file
 //!   contents beyond the offending line.
 
-use piccolo::{Context, ExecutorMode, Table, Value, Variadic};
+use phodopus::{Context, ExecutorMode, Table, Value, Variadic};
 
 use crate::{DriveOutcome, LuaVm, SuspendReason, VmError};
 
@@ -465,7 +465,7 @@ pub enum ConfigOutcome {
         memory_used: usize,
     },
     /// Chunk failed to load/compile or errored at runtime. Message carries
-    /// piccolo diagnostics (including line info) but never file contents.
+    /// phodopus diagnostics (including line info) but never file contents.
     LuaError {
         /// Diagnostic message.
         message: String,
@@ -614,8 +614,8 @@ impl ValueSnapshot {
             },
             Value::Table(t) => Self::capture_table(ctx, t, 0),
             Value::Function(f) => Self::Opaque(match f {
-                piccolo::Function::Closure(_) => "function",
-                piccolo::Function::Callback(_) => "function",
+                phodopus::Function::Closure(_) => "function",
+                phodopus::Function::Callback(_) => "function",
             }),
             Value::Thread(_) => Self::Opaque("thread"),
             Value::UserData(_) => Self::Opaque("userdata"),
@@ -682,7 +682,7 @@ impl ValueSnapshot {
             let len = table.length().max(0) as usize;
             let want = len.min(MAX_CONFIG_KEYMAPS + 1);
             for i in 1..=(want as i64) {
-                let v = table.get(ctx, i);
+                let v = table.get_value(ctx, i);
                 if matches!(v, Value::Nil) {
                     break;
                 }
@@ -798,8 +798,8 @@ impl ValueSnapshot {
                         Err(_) => Self::Binary,
                     },
                     Value::Function(f) => Self::Opaque(match f {
-                        piccolo::Function::Closure(_) => "function",
-                        piccolo::Function::Callback(_) => "function",
+                        phodopus::Function::Closure(_) => "function",
+                        phodopus::Function::Callback(_) => "function",
                     }),
                     Value::Thread(_) => Self::Opaque("thread"),
                     Value::UserData(_) => Self::Opaque("userdata"),
@@ -1607,6 +1607,7 @@ fn extract_keymaps(val: &ValueSnapshot) -> Result<Vec<KeymapData>, String> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::LuaVm;

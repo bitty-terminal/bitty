@@ -1,31 +1,28 @@
-//! Retained restricted-stdlib additions piccolo does not ship.
+//! Retained restricted-stdlib additions the in-core baseline does not ship.
 //!
 //! The accepted [Lua Runtime RFC] baseline keeps a pure-computation base
-//! (`string`, `table`, `math`, `utf8`, basic functions) for every VM. Piccolo's
-//! `Lua::core()` ships a much smaller subset (for example `string.len/sub/upper/
-//! lower/reverse` and `table.pack/unpack`), so this module installs the
-//! missing, I/O-free functions the accepted baseline requires: `utf8.len/char/
-//! codepoint`, `string.byte/char/format`, `table.concat`, and `table.sort`.
-//! Nothing here grants ambient authority; every function only inspects or
-//! builds bounded in-VM strings/tables, and `string.format` refuses unknown
-//! conversions and caps its output.
+//! (`string`, `table`, `math`, `utf8`, basic functions) for every VM.
+//! Phodopus's core ships `utf8` and `string.format` in-core with proportional
+//! fuel charging, so the former bitty `utf8` and `string.format` duplicates
+//! are retired; the old boundary tests now exercise the in-core
+//! implementations as parity. This module keeps the bounded bitty variants it
+//! still owns (`string.byte/char`, `table.concat`, `table.sort`) plus the
+//! restricted `os.time/clock/date` core does not ship. Nothing here grants
+//! ambient authority; every function only inspects or builds bounded in-VM
+//! strings/tables.
 //!
 //! [Lua Runtime RFC]: https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/specifications/lua-runtime-rfc.md
 
-use piccolo::{
-    Callback, CallbackReturn, Closure, Context, Error, Executor, IntoValue, Lua, Table, Value,
-    Variadic,
+use phodopus::{
+    Callback, CallbackReturn, Closure, Context, Executor, IntoValue, Lua, Table, Value, Variadic,
 };
 
-/// Maximum bytes produced by one `string.format` call.
-pub const STRING_FORMAT_MAX_BYTES: usize = 64 * 1024;
-/// Maximum width/precision accepted by `string.format`.
-const FORMAT_MAX_WIDTH: usize = 4096;
+/// Maximum bytes produced by one `table.concat` call.
+const TABLE_CONCAT_MAX_BYTES: usize = 64 * 1024;
 
 /// Install the retained stdlib functions into `lua`.
 pub(crate) fn install_retained_stdlib(lua: &mut Lua) {
     lua.enter(|ctx| {
-        install_utf8(ctx);
         install_string(ctx);
         install_table(ctx);
         install_os(ctx);
@@ -101,7 +98,7 @@ fn install_os<'gc>(ctx: Context<'gc>) {
         }),
     )
     .expect("os accepts 'date'");
-    ctx.set_global("os", os).expect("globals accept 'os'");
+    ctx.set_global("os", os);
 }
 
 struct DateFields {
@@ -183,91 +180,9 @@ fn format_date(format: &str, fields: &DateFields) -> String {
     out
 }
 
-fn install_utf8<'gc>(ctx: Context<'gc>) {
-    let utf8 = Table::new(&ctx);
-    utf8.set(
-        ctx,
-        "len",
-        Callback::from_fn(&ctx, |ctx, _, mut stack| {
-            let Value::String(text) = stack.get(0) else {
-                return Err("bad argument #1 to 'len' (string expected)"
-                    .into_value(ctx)
-                    .into());
-            };
-            if !stack.get(1).is_nil() || !stack.get(2).is_nil() {
-                return Err("utf8.len i/j bounds are not supported"
-                    .into_value(ctx)
-                    .into());
-            }
-            match std::str::from_utf8(text.as_bytes()) {
-                Ok(decoded) => {
-                    stack.replace(ctx, Value::Integer(decoded.chars().count() as i64));
-                }
-                Err(error) => {
-                    stack.replace(
-                        ctx,
-                        Variadic(vec![
-                            Value::Nil,
-                            Value::Integer(error.valid_up_to() as i64 + 1),
-                        ]),
-                    );
-                }
-            }
-            Ok(CallbackReturn::Return)
-        }),
-    )
-    .expect("utf8 accepts 'len'");
-    utf8.set(
-        ctx,
-        "char",
-        Callback::from_fn(&ctx, |ctx, _, mut stack| {
-            let mut out = String::new();
-            for index in 0..stack.len() {
-                let Some(scalar) = stack.get(index).to_integer() else {
-                    return Err("bad argument to 'char' (number expected)"
-                        .into_value(ctx)
-                        .into());
-                };
-                let Ok(scalar) = u32::try_from(scalar) else {
-                    return Err("value out of range for 'char'".into_value(ctx).into());
-                };
-                let Some(ch) = char::from_u32(scalar) else {
-                    return Err("value out of range for 'char'".into_value(ctx).into());
-                };
-                out.push(ch);
-            }
-            stack.replace(ctx, ctx.intern(out.as_bytes()));
-            Ok(CallbackReturn::Return)
-        }),
-    )
-    .expect("utf8 accepts 'char'");
-    utf8.set(
-        ctx,
-        "codepoint",
-        Callback::from_fn(&ctx, |ctx, _, mut stack| {
-            let Value::String(text) = stack.get(0) else {
-                return Err("bad argument #1 to 'codepoint' (string expected)"
-                    .into_value(ctx)
-                    .into());
-            };
-            let Ok(decoded) = std::str::from_utf8(text.as_bytes()) else {
-                return Err("invalid UTF-8 code".into_value(ctx).into());
-            };
-            let values: Vec<Value> = decoded
-                .chars()
-                .map(|ch| Value::Integer(ch as i64))
-                .collect();
-            stack.replace(ctx, Variadic(values));
-            Ok(CallbackReturn::Return)
-        }),
-    )
-    .expect("utf8 accepts 'codepoint'");
-    ctx.set_global("utf8", utf8).expect("globals accept 'utf8'");
-}
-
 fn install_string<'gc>(ctx: Context<'gc>) {
     let string = match ctx.get_global("string") {
-        Value::Table(table) => table,
+        Ok(Value::Table(table)) => table,
         _ => Table::new(&ctx),
     };
     string
@@ -329,36 +244,13 @@ fn install_string<'gc>(ctx: Context<'gc>) {
             }),
         )
         .expect("string accepts 'char'");
-    string
-        .set(
-            ctx,
-            "format",
-            Callback::from_fn(&ctx, |ctx, _, mut stack| {
-                let Value::String(format) = stack.get(0) else {
-                    return Err("bad argument #1 to 'format' (string expected)"
-                        .into_value(ctx)
-                        .into());
-                };
-                let format = String::from_utf8_lossy(format.as_bytes()).into_owned();
-                let rendered = match format_string(&format, &stack) {
-                    Ok(rendered) => rendered,
-                    Err(message) => {
-                        let value: Value = message.into_value(ctx);
-                        return Err(Error::from(value));
-                    }
-                };
-                stack.replace(ctx, ctx.intern(rendered.as_bytes()));
-                Ok(CallbackReturn::Return)
-            }),
-        )
-        .expect("string accepts 'format'");
-    ctx.set_global("string", string)
-        .expect("globals accept 'string'");
+
+    ctx.set_global("string", string);
 }
 
 fn install_table<'gc>(ctx: Context<'gc>) {
     let table = match ctx.get_global("table") {
-        Value::Table(table) => table,
+        Ok(Value::Table(table)) => table,
         _ => Table::new(&ctx),
     };
     table
@@ -390,13 +282,13 @@ fn install_table<'gc>(ctx: Context<'gc>) {
                         out.push_str(&separator);
                     }
                     first = false;
-                    match list.get(ctx, index) {
+                    match list.get_value(ctx, index) {
                         Value::String(s) => out.push_str(&String::from_utf8_lossy(s.as_bytes())),
                         Value::Integer(i) => out.push_str(&i.to_string()),
                         Value::Number(n) => out.push_str(&n.to_string()),
                         _ => return Err("invalid value in 'concat' list".into_value(ctx).into()),
                     }
-                    if out.len() > STRING_FORMAT_MAX_BYTES {
+                    if out.len() > TABLE_CONCAT_MAX_BYTES {
                         return Err("concat result exceeds the byte ceiling"
                             .into_value(ctx)
                             .into());
@@ -407,8 +299,7 @@ fn install_table<'gc>(ctx: Context<'gc>) {
             }),
         )
         .expect("table accepts 'concat'");
-    ctx.set_global("table", table)
-        .expect("globals accept 'table'");
+    ctx.set_global("table", table);
 }
 
 /// Inject `table.sort` as trusted Lua so a Lua comparator can be invoked
@@ -436,141 +327,16 @@ end
             .expect("trusted stdlib chunk compiles");
         ctx.stash(Executor::start(ctx, closure.into(), ()))
     });
-    lua.finish(&stashed);
-}
-
-fn format_string<'gc>(
-    format: &str,
-    stack: &piccolo::Stack<'gc, '_>,
-) -> Result<String, &'static str> {
-    let mut out = String::new();
-    let mut chars = format.chars().peekable();
-    let mut argument = 1usize;
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('%') => out.push('%'),
-            Some(conversion) if conversion.is_ascii_alphabetic() => {
-                let mut flags = String::new();
-                while let Some(&flag) = chars.peek() {
-                    if matches!(flag, '-' | '+' | ' ' | '#' | '0') {
-                        flags.push(flag);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let mut width = String::new();
-                while let Some(&digit) = chars.peek() {
-                    if digit.is_ascii_digit() && width.len() < 6 {
-                        width.push(digit);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let mut precision: Option<usize> = None;
-                if chars.peek() == Some(&'.') {
-                    chars.next();
-                    let mut digits = String::new();
-                    while let Some(&digit) = chars.peek() {
-                        if digit.is_ascii_digit() && digits.len() < 6 {
-                            digits.push(digit);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    precision = digits.parse::<usize>().ok();
-                }
-                let value = stack.get(argument);
-                argument += 1;
-                let rendered = render_conversion(conversion, &flags, precision, value)
-                    .ok_or("unsupported format conversion or argument")?;
-                let width = width.parse::<usize>().unwrap_or(0).min(FORMAT_MAX_WIDTH);
-                out.push_str(&pad(&rendered, width, flags.contains('-')));
-            }
-            _ => return Err("invalid format string"),
-        }
-        if out.len() > STRING_FORMAT_MAX_BYTES {
-            return Err("format result exceeds the byte ceiling");
-        }
-    }
-    Ok(out)
-}
-
-fn render_conversion(
-    conversion: char,
-    _flags: &str,
-    precision: Option<usize>,
-    value: Value<'_>,
-) -> Option<String> {
-    match conversion {
-        'd' | 'i' | 'u' => Some(value.to_integer()?.to_string()),
-        'o' => Some(format!("{:o}", value.to_integer()?)),
-        'x' => Some(format!("{:x}", value.to_integer()?)),
-        'X' => Some(format!("{:X}", value.to_integer()?)),
-        'f' | 'F' => {
-            let number = numeric(value)?;
-            let precision = precision.unwrap_or(6);
-            Some(format!("{number:.precision$}"))
-        }
-        'e' => Some(format!("{:e}", numeric(value)?)),
-        'E' => Some(format!("{:E}", numeric(value)?)),
-        'g' | 'G' => Some(format!("{}", numeric(value)?)),
-        'c' => {
-            let byte = value.to_integer()?;
-            if !(0..=255).contains(&byte) {
-                return None;
-            }
-            Some((byte as u8 as char).to_string())
-        }
-        's' => {
-            let text = match value {
-                Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
-                Value::Integer(i) => i.to_string(),
-                Value::Number(n) => n.to_string(),
-                Value::Boolean(b) => b.to_string(),
-                Value::Nil => "nil".to_string(),
-                _ => return None,
-            };
-            let text = match precision {
-                Some(limit) => text.chars().take(limit).collect(),
-                None => text,
-            };
-            Some(text)
-        }
-        _ => None,
-    }
-}
-
-fn numeric(value: Value<'_>) -> Option<f64> {
-    match value {
-        Value::Integer(i) => Some(i as f64),
-        Value::Number(n) => Some(n),
-        Value::String(s) => String::from_utf8_lossy(s.as_bytes()).parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-fn pad(rendered: &str, width: usize, left_align: bool) -> String {
-    let length = rendered.chars().count();
-    if length >= width {
-        return rendered.to_string();
-    }
-    let padding: String = std::iter::repeat_n(' ', width - length).collect();
-    if left_align {
-        format!("{rendered}{padding}")
-    } else {
-        format!("{padding}{rendered}")
-    }
+    // The sort chunk runs once on a fresh single-owner executor, so a step
+    // refusal is unreachable; a trusted-chunk failure panics like the compile
+    // immediately above rather than shipping a half-installed stdlib.
+    lua.finish(&stashed)
+        .expect("trusted stdlib sort chunk finishes");
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use crate::{ExecuteOutcome, LuaVm};
 
     #[test]
@@ -599,7 +365,7 @@ mod tests {
             .execute(
                 r#"
                 local text = utf8.char(0x61, 0x1F600)
-                local values = { utf8.codepoint(text) }
+                local values = { utf8.codepoint(text, 1, #text) }
                 round_trip = (#text == 5) and (values[2] == 0x1F600)
             "#,
             )

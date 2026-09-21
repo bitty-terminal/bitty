@@ -977,7 +977,13 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
     }
 
     let src_desc = source.describe();
-    let mut vm = bitty_lua::LuaVm::new("bitty-config");
+    let mut vm = bitty_lua::gate::build_plugin_vm(
+        "bitty-config",
+        Some(bitty_lua::gate::VmBudgets::default()),
+    )
+    .map_err(|e| ConfigError::InvalidInput {
+        message: format!("config evaluation refused: {e}"),
+    })?;
     let data = match vm
         .eval_config(content)
         .map_err(|e| ConfigError::InvalidInput {

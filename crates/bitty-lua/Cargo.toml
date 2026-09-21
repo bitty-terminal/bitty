@@ -1,12 +1,12 @@
 [package]
 name = "bitty-lua"
-description = "Deterministic piccolo Lua VM budgets for Bitty plugins"
+description = "Deterministic phodopus Lua VM budgets for Bitty plugins"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitty-terminal/bitty"
-keywords = ["lua", "vm", "piccolo", "bitty"]
+keywords = ["lua", "vm", "phodopus", "bitty"]
 categories = ["embedded", "development-tools"]
 publish = true
 
@@ -14,4 +14,4 @@ publish = true
 workspace = true
 
 [dependencies]
-piccolo = "0.3.3"
+phodopus = { git = "https://github.com/bitty-terminal/phodopus", rev = "1653c51f7fbda5e93fa99aefb0e5be58dfacfeb0" }

@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use piccolo::{
-    Callback, CallbackReturn, Closure, Context, Error, Function, StashedFunction, Table, Value,
+use phodopus::{
+    Callback, CallbackReturn, Closure, Context, Error, ExecutorMode, Function, StashedFunction,
+    Table, Value,
 };
 
 use crate::ui::{UiNode, component_invalid, is_ui_slot, read_component};
@@ -206,7 +207,7 @@ impl LuaValue {
             Self::Table(pairs) => {
                 let table = Table::new(&ctx);
                 for (key, value) in pairs {
-                    let _ = table.set_value(&ctx, key.to_lua(ctx), value.to_lua(ctx));
+                    let _ = table.set_raw(ctx, key.to_lua(ctx), value.to_lua(ctx));
                 }
                 Value::Table(table)
             }
@@ -832,8 +833,7 @@ impl LuaVm {
 
         self.lua.enter(|ctx| {
             let root = build_bitty_root(ctx, &state);
-            ctx.set_global("bitty", root)
-                .expect("globals accept 'bitty'");
+            ctx.set_global("bitty", root);
         });
 
         if self.module_root.is_some() {
@@ -873,13 +873,25 @@ impl LuaVm {
         let stashed = self.lua.enter(|ctx| {
             let func: Function = ctx.fetch(function);
             let argv: Vec<Value> = args.iter().map(|v| v.to_lua(ctx)).collect();
-            ctx.stash(piccolo::Executor::start(ctx, func, piccolo::Variadic(argv)))
+            ctx.stash(phodopus::Executor::start(
+                ctx,
+                func,
+                phodopus::Variadic(argv),
+            ))
         });
 
         match self.drive_stashed(stashed, Instant::now())? {
             crate::DriveOutcome::Suspended { reason, .. } => Err(VmError::Suspended { reason }),
             crate::DriveOutcome::Failed { message } => Err(VmError::Load(message)),
             crate::DriveOutcome::Ready { stashed } => {
+                let parked = self
+                    .lua
+                    .enter(|ctx| ctx.fetch(&stashed).mode() == ExecutorMode::HostSuspended);
+                if parked {
+                    return Err(VmError::Runtime(
+                        "executor parked on a host operation after drive".to_string(),
+                    ));
+                }
                 let outcome = self.lua.enter(|ctx| {
                     let exec = ctx.fetch(&stashed);
                     match exec.take_result::<Value>(ctx) {
@@ -920,7 +932,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let id = required_string(ctx, def, "id")?;
                     let title = required_string(ctx, def, "title")?;
                     let description = optional_string(ctx, def, "description").unwrap_or_default();
-                    let run = match def.get(ctx, "run") {
+                    let run = match def.get_value(ctx, "run") {
                         Value::Function(function) => ctx.stash(function),
                         _ => {
                             return Err(BridgeError::new(
@@ -1164,7 +1176,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                 move |ctx, _exec, mut stack| {
                     let opts = stack.get(0);
                     let scope = match opts {
-                        Value::Table(table) => match table.get(ctx, "scope".to_string()) {
+                        Value::Table(table) => match table.get_value(ctx, "scope".to_string()) {
                             Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
                             _ => {
                                 return Err(BridgeError::new(
@@ -1436,6 +1448,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
 
 impl LuaVm {
     /// Install the rooted, source-only `require` over the configured module root.
+    ///
+    /// The module root acts as the single VFS-style capability root: resolution
+    /// canonicalizes under it and rejects traversal, non-`.lua` artifacts, and
+    /// cross-tree fallback. The runtime builder installs core with an empty
+    /// module configuration, so this injection is the only searcher — a VM
+    /// without a module root keeps the preload-only `require`, which resolves
+    /// nothing.
     fn install_require(&mut self) -> Result<(), VmError> {
         let Some(root) = self.directory_root() else {
             return Err(VmError::Load("module root not configured".into()));
@@ -1467,7 +1486,7 @@ impl LuaVm {
                         };
                         validate_module_name(&name).map_err(|e| e.to_error(ctx))?;
                         let loaded: Table = ctx.fetch(&cache);
-                        let cached = loaded.get(ctx, name.clone());
+                        let cached = loaded.get_value(ctx, name.clone());
                         if !cached.is_nil() {
                             stack.replace(ctx, cached);
                             return Ok(CallbackReturn::Return);
@@ -1515,8 +1534,7 @@ impl LuaVm {
                         })
                     }
                 }),
-            )
-            .expect("globals accept 'require'");
+            );
         });
         Ok(())
     }
@@ -1644,7 +1662,7 @@ fn required_string<'gc>(
 }
 
 fn optional_string<'gc>(ctx: Context<'gc>, table: Table<'gc>, field: &str) -> Option<String> {
-    match table.get(ctx, field.to_string()) {
+    match table.get_value(ctx, field.to_string()) {
         Value::String(s) => Some(String::from_utf8_lossy(s.as_bytes()).into_owned()),
         _ => None,
     }
@@ -1931,5 +1949,38 @@ mod tests {
         assert!(err.message.contains("could not be opened"));
 
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    #[test]
+    fn installed_require_mounts_on_single_vfs_root() {
+        // The host `require` injection mounts on the configured module root as
+        // its only VFS-style capability root: modules resolve inside it, and
+        // traversal outside it fails closed as a Lua error. The VM itself is
+        // built through the fail-closed gate with the builder hard quota.
+        let root = temp_module_root("mounted");
+        std::fs::write(root.0.join("agg.lua"), "return { v = 7 }").expect("write module");
+        let mut vm = crate::gate::build_plugin_vm(
+            "require-mounted",
+            Some(crate::gate::VmBudgets::default()),
+        )
+        .expect("gate build");
+        vm.with_module_root(root.0.clone());
+        vm.install_require().expect("install require");
+        let outcome = vm
+            .execute("agg_value = require(\"agg\").v")
+            .expect("execute");
+        assert!(
+            matches!(outcome, crate::ExecuteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.test_global("agg_value"), Some(7.0));
+        // Escape past the root is denied fail-closed as a Lua error, and the
+        // VM stays usable (no suspension from a refused resolution).
+        let outcome = vm.execute("require(\"../outside\")").expect("execute");
+        assert!(
+            matches!(outcome, crate::ExecuteOutcome::RuntimeError { .. }),
+            "{outcome:?}"
+        );
+        assert!(!vm.is_suspended());
     }
 }

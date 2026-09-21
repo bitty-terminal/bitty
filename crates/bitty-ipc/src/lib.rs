@@ -178,8 +178,8 @@ pub use rich_fragment::{
     RichFragment,
 };
 pub use scope::{
-    ConsentGrant, ConsentLedger, Scope, ScopeSet, authorize_method, required_scope_for_method,
-    validate_method_name,
+    ConsentGrant, ConsentLedger, Scope, ScopeSet, all_known_methods, authorize_method,
+    required_scope_for_method, validate_method_name,
 };
 pub use snapshot::{
     DetailLevel, MAX_SNAPSHOT_CWD_BYTES, MAX_SNAPSHOT_FULL_BYTES, MAX_SNAPSHOT_MINIMAL_BYTES,

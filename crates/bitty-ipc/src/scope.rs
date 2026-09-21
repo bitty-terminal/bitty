@@ -404,10 +404,66 @@ pub fn required_scope_for_method(method: &str) -> Option<Scope> {
         "process.spawn" => Some(Scope::ProcessSpawn),
         // debug
         "debug.snapshot" | "debug.inspect" | "debug.get" => Some(Scope::DebugInspect),
-        "debug.start_trace" | "debug.trace" | "debug.start-trace" => Some(Scope::DebugTrace),
+        "debug.start_trace" | "debug.trace" => Some(Scope::DebugTrace),
         "debug.break" | "debug.control" | "debug.pause" => Some(Scope::DebugControl),
         _ => None,
     }
+}
+
+/// All methods in the generic IPC registry (38, wire-stable).
+///
+/// This is the single countable list backing [`required_scope_for_method`]:
+/// every entry maps to `Some`, and every `Some` mapping has its method here.
+/// Tests assert the two stay in sync so the scope×action matrix cannot
+/// silently drift from the registry (R-011 closure).
+#[must_use]
+pub fn all_known_methods() -> &'static [&'static str] {
+    &[
+        // terminal (11)
+        "terminal.list",
+        "terminal.text",
+        "terminal.get_text",
+        "terminal.snapshot",
+        "terminal.send",
+        "terminal.input",
+        "terminal.write",
+        "terminal.close",
+        "terminal.spawn",
+        "terminal.kill",
+        "terminal.manage",
+        // view (6)
+        "view.list",
+        "view.split",
+        "view.focus",
+        "view.close",
+        "view.create",
+        "view.manage",
+        // config (6)
+        "config.show",
+        "config.get",
+        "config.inspect",
+        "config.reload",
+        "config.set",
+        "config.modify",
+        // plugin (6)
+        "plugin.list",
+        "plugin.get",
+        "plugin.install",
+        "plugin.disable",
+        "plugin.enable",
+        "plugin.remove",
+        // process (1)
+        "process.spawn",
+        // debug (8)
+        "debug.snapshot",
+        "debug.inspect",
+        "debug.get",
+        "debug.start_trace",
+        "debug.trace",
+        "debug.break",
+        "debug.control",
+        "debug.pause",
+    ]
 }
 
 /// Check authorization server-side.

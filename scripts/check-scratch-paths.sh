@@ -21,7 +21,8 @@
 #       artifact as it existed then (the artifact itself is generated into
 #       the git-ignored workspace `recording/` since CTX-0379).
 #
-# Rule 2 — no NEW hardcoded `/tmp/` evidence writes (code + scripts only):
+# Rule 2 — no NEW hardcoded `/tmp/` or `/var/tmp/` evidence writes
+# (code + scripts only):
 #   Scope is `crates/*/src/**.rs`, `scripts/*`, `tools/**`. Integration
 #   tests (`crates/*/tests/**`), fixtures, and docs examples are out of scope
 #   (reviewed-legit: socket dirs, `temp_dir()` fixtures, manual commands).
@@ -31,7 +32,9 @@
 #   `scratch-paths-exempt: <reason>`, or the line mentions `temp_dir`,
 #   `mktemp`, or `sock` (socket paths), or — for `.rs` files — the hit sits
 #   at/after the file's first `#[cfg(test)]` line (unit-test-only region).
-#   The `/tmp/` match requires the slash NOT to follow `[A-Za-z0-9_/-]`.
+#   The rule covers `/var/tmp/` too (the alternate system temp dir; the
+#   inner `/tmp/` of `/var/tmp/` is lookbehind-excluded, so it needs its
+#   own alternative). The match requires the leading slash NOT to follow `[A-Za-z0-9_/-]`.
 #
 # Rule 3 — no NEW host-absolute path literals in production code (CTX-0296):
 #   Same file scope and exemptions as Rule 2. Fails on `/mnt/`,
@@ -183,7 +186,7 @@ for file in "${SRC_FILES[@]}"; do
 		echo "scratch-paths[tmp-write]: $file:$hit"
 		FAIL=1
 	done < <(
-		rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])/tmp/' "$file" 2>/dev/null || true
+		rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/tmp/|/var/tmp/)' "$file" 2>/dev/null || true
 	)
 done
 

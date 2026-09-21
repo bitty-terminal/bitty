@@ -1139,7 +1139,7 @@ pub fn transport_attested_peer(
             })?
     };
     verify_peer_uid(PeerCredentials::new(sock_uid, sock_gid, 0), runtime_uid)?;
-    Ok(VerifiedPeer::attested(runtime_uid))
+    VerifiedPeer::attested(PeerCredentials::new(sock_uid, sock_gid, 0), runtime_uid)
 }
 
 /// Non-unix stub for [`transport_attested_peer`](fn.transport_attested_peer).

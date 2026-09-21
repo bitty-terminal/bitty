@@ -35,9 +35,11 @@ impl std::fmt::Display for ViewId {
 /// scrollback history. Horizontal offset is retained for completeness but
 /// terminal grids rarely use it; it is clamped similarly.
 ///
-/// Each leaf also carries a [`PresentationMode`] (CTX-0276): the requested
-/// per-leaf display mode (`Tiled` live; `Floating`/`Fullscreen`/`Scratchpad`
-/// parseable but transition-gated). The layout solver ignores the field, so
+/// Each leaf also carries a [`PresentationMode`] (CTX-0276, CW-08): the
+/// requested per-leaf display mode. Every transition routes through the
+/// [`PresentationMode::can_transition`] gate (currently permit-all) via
+/// `request_transition` or the workspace presentation commands. The layout
+/// solver ignores the field, so
 /// stamping a mode never moves allocations. This is deliberately distinct
 /// from `Visibility` (computed display state in the `bitty-runtime`
 /// registry) — the two are never flattened into one enum.
@@ -91,8 +93,8 @@ impl View {
     }
 
     /// Creates a new view with an explicit [`PresentationMode`] (CTX-0276).
-    /// Non-`Tiled` modes are stored verbatim; entering them at runtime stays
-    /// gated by [`PresentationMode::can_transition`] (follow-up).
+    /// Non-`Tiled` modes are stored verbatim; runtime entry routes through
+    /// [`PresentationMode::can_transition`] (CW-08: currently permit-all).
     #[must_use]
     pub fn with_presentation(id: ViewId, cols: usize, rows: usize, mode: PresentationMode) -> Self {
         let mut view = Self::new(id, cols, rows);
@@ -144,9 +146,9 @@ impl View {
     }
 
     /// Stamps a [`PresentationMode`] on this leaf. Stored verbatim and
-    /// ignored by the layout solver (allocations byte-identical); runtime
-    /// entry into non-`Tiled` modes stays gated by
-    /// [`PresentationMode::can_transition`].
+    /// ignored by the layout solver (allocations byte-identical). Prefer
+    /// [`PresentationMode::request_transition`] for runtime changes so the
+    /// [`PresentationMode::can_transition`] gate is enforced.
     pub fn set_presentation(&mut self, mode: PresentationMode) {
         self.presentation = mode;
     }

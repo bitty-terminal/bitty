@@ -35,10 +35,16 @@
 //!   view-aware highlight mapping, `PersistentSelection` conversion, and
 //!   scroll-to-current for the viewport.
 //! - [`geometry`] — integer `Rect`, `Point`, `Size`, `SplitAxis`.
+//! - [`scratchpad::ScratchpadSlot`] — single hidden per-window scratchpad
+//!   slot with anchor-preserving hide/show/toggle (CW-10), routed as
+//!   `bitty.workspace:scratchpad-toggle`.
+//! - [`drag::DragHistory`] — bounded (`32`, `DropOldest`) undo history for
+//!   drag/resize sessions (CW-09).
 //! - [`presentation::PresentationMode`] — per-leaf display mode unifying the
-//!   zoom/overlay/visibility special-cases toward one mode field (CTX-0276):
-//!   `Tiled` live, `Floating`/`Fullscreen`/`Scratchpad` parseable but
-//!   transition-gated; deliberately distinct from `Visibility` (computed
+//!   zoom/overlay/visibility special-cases toward one mode field (CTX-0276,
+//!   CW-08): `can_transition` is the single gate for all transitions and
+//!   `apply_presentation_command` routes mode changes through the workspace
+//!   command registry; deliberately distinct from `Visibility` (computed
 //!   display state in `bitty-runtime`).
 //!
 //! # Determinism
@@ -60,11 +66,13 @@
 
 pub mod a11y;
 pub mod decoration;
+pub mod drag;
 pub mod focus;
 pub mod geometry;
 pub mod layout;
 pub mod panel;
 pub mod presentation;
+pub mod scratchpad;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
@@ -77,6 +85,7 @@ pub use decoration::{
     DEFAULT_RADIUS_PX, DecoratedView, Decoration, DecorationError, MAX_BORDER_PX,
     MAX_CONTENT_INSET_PX, MAX_GAP_PX, MAX_RADIUS_PX,
 };
+pub use drag::{DRAG_HISTORY_CAP, DragHistory};
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
 pub use layout::{
@@ -89,7 +98,14 @@ pub use panel::{
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
 };
-pub use presentation::PresentationMode;
+pub use presentation::{
+    PRESENTATION_CMD_FLOATING, PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD,
+    PRESENTATION_CMD_TILED, PresentationCommandError, PresentationMode, apply_presentation_command,
+    presentation_command_for_mode, presentation_mode_for_command,
+};
+pub use scratchpad::{
+    HiddenEntry, SCRATCHPAD_CMD_TOGGLE, ScratchpadError, ScratchpadSlot, apply_scratchpad_toggle,
+};
 pub use scrollbar::{
     MIN_THUMB_HEIGHT_PX, SCROLLBAR_PROXIMITY_PX, ScrollbarHit, ScrollbarMode, ThumbSpan, TrackRect,
     TrackSpec, hit_test, is_visible, offset_for_thumb_y, thumb_geometry, track_rect,

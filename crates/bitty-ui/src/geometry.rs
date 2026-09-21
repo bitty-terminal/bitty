@@ -153,6 +153,20 @@ impl Rect {
     pub fn clip_to(self, bounds: Rect) -> Option<Rect> {
         self.intersection(bounds)
     }
+
+    /// True when `p` lies inside `self` (left/top inclusive, right/bottom
+    /// exclusive). Empty rects contain nothing. Used by split-handle and
+    /// leaf hit testing (CW-09).
+    #[must_use]
+    pub fn contains_point(self, p: Point) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        p.x >= self.x
+            && p.y >= self.y
+            && (p.x as u32) < self.right()
+            && (p.y as u32) < self.bottom()
+    }
 }
 
 /// Split axis for `LayoutNode::Split`.
@@ -283,5 +297,21 @@ mod tests {
         assert!(inset.is_empty());
         assert_eq!(inset.width, 0);
         assert_eq!(inset.height, 0);
+    }
+
+    #[test]
+    fn contains_point_edges_and_empty() {
+        // CW-09: left/top inclusive, right/bottom exclusive; empty rects
+        // contain nothing.
+        let r = Rect::new(10, 5, 20, 10);
+        assert!(r.contains_point(Point::new(10, 5)));
+        assert!(r.contains_point(Point::new(29, 14)));
+        assert!(!r.contains_point(Point::new(30, 5)), "right edge exclusive");
+        assert!(
+            !r.contains_point(Point::new(10, 15)),
+            "bottom edge exclusive"
+        );
+        assert!(!r.contains_point(Point::new(9, 5)));
+        assert!(!Rect::new(0, 0, 0, 5).contains_point(Point::new(0, 0)));
     }
 }

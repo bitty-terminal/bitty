@@ -13,10 +13,12 @@
 //!    always-on-entry, or deny, with deny as the default when origin detection
 //!    is not positively local (R-020's restrictive `Unknown` rule).
 //!
-//! Open mechanics left to review (DB location/format, invalidation on
-//! rename/move, expiry, prompt UX) are not fixed here; this module exposes
-//! the smallest headless-testable surface that captures the hash binding
-//! without claiming a final storage location.
+//! Open mechanics left to review (trust DB install location, invalidation
+//! on rename/move, grant expiry, prompt UX, single-use consumption of
+//! `TrustOnce`) are not fixed here; [`admit_project_layer`] is the single
+//! enforcement point callers must route project plans through, and the
+//! store exposes the smallest headless-testable surface that captures the
+//! hash binding without claiming a final storage location.
 //!
 //! # Drift note
 //!
@@ -27,7 +29,7 @@
 use std::collections::HashMap;
 
 use crate::error::ConfigError;
-use crate::plan::ConfigPlan;
+use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 
 /// Consent lifecycle for a single project's declarative config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -281,8 +283,9 @@ impl TrustStore {
     }
 
     /// Parse the durable line form produced by [`Self::serialize`].
-    /// Unknown decisions, malformed lines, and oversized inputs fail
-    /// closed. Later lines win on duplicate normalized paths.
+    /// Unknown decisions, malformed lines, empty paths/hashes, and
+    /// oversized inputs fail closed. Later lines win on duplicate
+    /// normalized paths.
     ///
     /// # Errors
     ///
@@ -326,6 +329,17 @@ impl TrustStore {
                     format!("must contain <= {MAX_TRUST_RECORDS} records"),
                 ));
             }
+            // CTX-0628: a grant for an empty path or hash can never match
+            // (fail-closed at lookup), so persisting one is either corrupt
+            // or hostile — reject it at parse time instead of storing junk.
+            if TrustRecord::normalize_path(parts[0]).is_empty()
+                || TrustRecord::normalize_hash(parts[1]).is_empty()
+            {
+                return Err(ConfigError::validation(
+                    "trust",
+                    format!("trust record on line {} has empty path or hash", idx + 1),
+                ));
+            }
             store.insert(TrustRecord::new(
                 parts[0].to_string(),
                 parts[1].to_string(),
@@ -362,6 +376,18 @@ impl TrustStore {
     /// Returns [`ConfigError`] on I/O (other than missing file) or parse
     /// failure.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self, ConfigError> {
+        // CTX-0628: pre-check size via metadata so a hostile oversized file
+        // fails closed without allocating the read buffer first. The
+        // post-read check in `deserialize` stays as the binding limit
+        // (metadata is advisory under symlink races).
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_TRUST_FILE_BYTES as u64 {
+                return Err(ConfigError::validation(
+                    "trust",
+                    format!("trust file must be <= {MAX_TRUST_FILE_BYTES} bytes"),
+                ));
+            }
+        }
         match std::fs::read_to_string(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(e) => Err(ConfigError::InvalidInput {
@@ -378,14 +404,18 @@ impl TrustStore {
 /// - `terminal.shell` (process authority),
 /// - `plugins`, `keymaps` that could claim privileged actions,
 /// - `extends` chains (to avoid confused-deputy profile loading),
+/// - `profile_name` (would spoof the active profile identity at merge),
 /// - undeclared fields.
 ///
-/// The allowed subset in this draft: `font`, `window`,
+/// The allowed subset in this draft: `font`, `window`, `layout`,
 /// `terminal.scrollback`, `terminal.scroll_lines_per_notch`,
-/// `terminal.scroll_pixels_per_notch`, `selection.auto_copy`, `layout`,
+/// `terminal.scroll_pixels_per_notch`, `selection.auto_copy`,
 /// `decoration` (geometry and the CTX-0340 outline colors), `scrollbar`,
 /// `mouse`, `appearance`, `views` (CTX-0343 per-View appearance; like
 /// `decoration`, presentation-only chrome, still grammar/bounds checked).
+/// Every allowed section is bounds-validated here — including `layout`
+/// (CTX-0628: previously documented as allowed but never checked, so
+/// out-of-range gaps passed the project gate).
 /// Expanding this without review would weaken T-08 mitigation.
 pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     if plan.terminal.as_ref().is_some_and(|t| t.shell.is_some()) {
@@ -423,6 +453,15 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare extends".into(),
         });
     }
+    // CTX-0628: a project layer's `profile_name` overwrites
+    // `effective.profile` at merge (ScalarReplace), so an untrusted clone
+    // could spoof the active profile identity and its attribution. Like
+    // `extends`, it stays out of project layers.
+    if plan.profile_name.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare profile_name".into(),
+        });
+    }
     if !plan.undeclared_fields.is_empty() {
         return Err(ConfigError::UndeclaredField {
             field: plan.undeclared_fields[0].clone(),
@@ -437,6 +476,14 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
     }
     if let Some(w) = &plan.window {
         w.validate().map_err(|e| ConfigError::TrustViolation {
+            message: e.to_string(),
+        })?;
+    }
+    if let Some(l) = &plan.layout {
+        // CTX-0628: `layout` gaps are presentation-only geometry with no
+        // process authority (like `window` radius), so project layers may
+        // set them — but the bounds still fail closed at the project gate.
+        l.validate().map_err(|e| ConfigError::TrustViolation {
             message: e.to_string(),
         })?;
     }
@@ -492,6 +539,43 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Admit a project plan as a [`LayerKind::TrustedLocal`] layer.
+///
+/// This is the single enforcement point for R-010 project-config trust:
+/// consent first, schema second, layer construction last. A plan from an
+/// untrusted clone reaches the merge stack only when **both** hold:
+/// 1. [`check_trust`] passes — an explicit Once/Always grant binds this
+///    canonical path to this content hash (missing grants and stale hashes
+///    fail closed here, before any content is inspected);
+/// 2. [`validate_project_plan`] passes — the content is declarative-only
+///    with no process/network/fs-write/runtime-admin authority.
+///
+/// The returned layer carries [`LayerKind::TrustedLocal`] precedence
+/// (above `User`, below `Cli`) with source attribution pointing at the
+/// project root, so `config show --source` traces project fields back to
+/// the consented directory.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::TrustViolation`] when consent is missing/stale
+/// or the plan declares out-of-allowlist content.
+///
+/// [R-010]: https://github.com/bitty-terminal/bitty-docs (risk-register.md)
+#[must_use = "an unadmitted project plan must not reach the merge stack"]
+pub fn admit_project_layer(
+    plan: ConfigPlan,
+    store: &TrustStore,
+    canonical_path: &str,
+    content_hash: &str,
+) -> Result<LayeredPlan, ConfigError> {
+    check_trust(store, canonical_path, content_hash)?;
+    validate_project_plan(&plan)?;
+    Ok(LayeredPlan::new(
+        ConfigSource::new(LayerKind::TrustedLocal, Some(canonical_path)),
+        plan,
+    ))
 }
 
 /// Evaluate trust for a project path+hash against a store.
@@ -796,5 +880,185 @@ mod tests {
         assert!(TrustStore::deserialize("no-tabs-here").is_err());
         assert!(TrustStore::deserialize("/a\th1\tgrant-forever").is_err());
         assert!(TrustStore::deserialize("").expect("empty ok").is_empty());
+    }
+
+    #[test]
+    fn admit_project_layer_grants_trusted_valid_plan() {
+        // CTX-0628 (R-010 closure): the gate admits a consented,
+        // declarative-only plan as a `TrustedLocal` layer with attribution
+        // pointing back at the project root.
+        use crate::types::FontConfig;
+        let plan = ConfigPlan {
+            font: Some(FontConfig {
+                family: "Mono".into(),
+                size: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut store = TrustStore::new();
+        store.insert(TrustRecord::new("/proj", "hash1", TrustDecision::TrustOnce));
+        let layer = admit_project_layer(plan, &store, "/proj", "hash1").expect("admitted");
+        assert_eq!(layer.source.layer, LayerKind::TrustedLocal);
+        assert!(
+            layer.source.describe().contains("/proj"),
+            "attribution traces to project: {}",
+            layer.source.describe()
+        );
+    }
+
+    #[test]
+    fn admit_project_layer_rejects_untrusted_clone() {
+        // CTX-0628: no grant, no layer — an untrusted clone never reaches
+        // the merge stack, even with perfectly valid content.
+        use crate::types::FontConfig;
+        let plan = ConfigPlan {
+            font: Some(FontConfig {
+                family: "Mono".into(),
+                size: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let store = TrustStore::new();
+        let err = admit_project_layer(plan, &store, "/clone", "hash1").unwrap_err();
+        assert!(matches!(err, ConfigError::TrustViolation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn admit_project_layer_rejects_stale_hash() {
+        // CTX-0628: consent binds path PLUS hash — edited content
+        // invalidates the grant and re-prompts instead of merging.
+        use crate::types::FontConfig;
+        let plan = ConfigPlan {
+            font: Some(FontConfig {
+                family: "Mono".into(),
+                size: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut store = TrustStore::new();
+        store.insert(TrustRecord::new(
+            "/proj",
+            "hash1",
+            TrustDecision::TrustAlways,
+        ));
+        let err = admit_project_layer(plan, &store, "/proj", "hash2").unwrap_err();
+        assert!(err.to_string().contains("stale"), "{err:?}");
+    }
+
+    #[test]
+    fn admit_project_layer_rejects_hostile_content_despite_grant() {
+        // CTX-0628: consent does not launder authority — a granted path
+        // serving `terminal.shell` is still denied at the schema gate.
+        let plan = ConfigPlan {
+            terminal: Some(TerminalConfig {
+                scrollback: 5000,
+                shell: Some("/bin/sh".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut store = TrustStore::new();
+        store.insert(TrustRecord::new(
+            "/proj",
+            "hash1",
+            TrustDecision::TrustAlways,
+        ));
+        let err = admit_project_layer(plan, &store, "/proj", "hash1").unwrap_err();
+        assert!(matches!(err, ConfigError::TrustViolation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn admit_project_layer_rejects_deny() {
+        // CTX-0628: an explicit Reject (Deny) grant is never admitted.
+        use crate::types::FontConfig;
+        let plan = ConfigPlan {
+            font: Some(FontConfig {
+                family: "Mono".into(),
+                size: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut store = TrustStore::new();
+        store.insert(TrustRecord::new("/proj", "hash1", TrustDecision::Deny));
+        let err = admit_project_layer(plan, &store, "/proj", "hash1").unwrap_err();
+        assert!(matches!(err, ConfigError::TrustViolation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn project_plan_rejects_profile_name() {
+        // CTX-0628: a project layer's `profile_name` overwrites
+        // `effective.profile` at merge, so it stays out like `extends`.
+        let plan = ConfigPlan {
+            profile_name: Some("work".into()),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).unwrap_err();
+        assert!(err.to_string().contains("profile_name"), "{err:?}");
+    }
+
+    #[test]
+    fn project_plan_layout_bounds_fail_closed() {
+        // CTX-0628: `layout` was documented as allowed but never checked —
+        // out-of-range gaps passed the project gate. Bounds now fail
+        // closed here, not just downstream.
+        use crate::types::{LayoutConfig, MAX_LAYOUT_GAP_CELLS};
+        let plan = ConfigPlan {
+            layout: Some(LayoutConfig {
+                gaps_in: 2,
+                gaps_out: 2,
+            }),
+            ..Default::default()
+        };
+        validate_project_plan(&plan).expect("in-range layout allowed in project");
+        let bad = ConfigPlan {
+            layout: Some(LayoutConfig {
+                gaps_in: MAX_LAYOUT_GAP_CELLS + 1,
+                gaps_out: 0,
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&bad).unwrap_err();
+        assert!(matches!(err, ConfigError::TrustViolation { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn trust_deserialize_rejects_empty_path_or_hash() {
+        // CTX-0628: a grant for an empty path or hash can never match at
+        // lookup, so persisting one is corrupt/hostile — fail closed here.
+        assert!(TrustStore::deserialize("/proj\t\ttrust-always").is_err());
+        assert!(TrustStore::deserialize("/proj\t   \tdeny").is_err());
+        assert!(TrustStore::deserialize("\th1\tdeny").is_err());
+        assert!(TrustStore::deserialize("   \th1\tdeny").is_err());
+    }
+
+    #[test]
+    fn trust_fs_roundtrip_and_oversized_fail_closed() {
+        // CTX-0628: the store survives a save/load cycle through the
+        // filesystem; missing files grant nothing; oversized files fail
+        // closed before granting anything.
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-trust-ctx0628-{}-roundtrip",
+            std::process::id()
+        ));
+        let path = dir.join("trust.db");
+        let mut s = TrustStore::new();
+        s.insert(TrustRecord::new(
+            "/proj",
+            "abc123",
+            TrustDecision::TrustAlways,
+        ));
+        s.save_to_path(&path).expect("save");
+        let back = TrustStore::load_from_path(&path).expect("load");
+        assert!(back.is_trusted("/proj", "abc123"));
+        let missing = TrustStore::load_from_path(&dir.join("absent.db")).expect("missing ok");
+        assert!(missing.is_empty());
+        let big_path = dir.join("big.db");
+        std::fs::write(&big_path, vec![b'x'; MAX_TRUST_FILE_BYTES + 1]).expect("write big");
+        assert!(TrustStore::load_from_path(&big_path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

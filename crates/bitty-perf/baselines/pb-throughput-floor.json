@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0676",
+  "issues": [1061],
+  "captured_at": "2026-09-22",
+  "revision": "c70b9f2b00facc4d848ce3f38df1f47a95a423fe",
+  "command": "cargo bench -p bitty-perf --bench throughput_floor -- --nocapture (sample_bytes=1048576 rounds=3)",
+  "profile": "bench (release)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-6-throughput-floor",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1 (rust-toolchain.toml)",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "bounds": {
+    "chunk_bytes": 8192,
+    "segment_bytes": 65536,
+    "sample_bytes": 1048576,
+    "rounds": 3
+  },
+  "throughput": {
+    "status": "measured",
+    "median_mb_s": 6.06,
+    "round_mb_s": [5.94, 6.06, 6.20],
+    "actions_final_round": 748800,
+    "renders_final_round": 128,
+    "floor_mb_s": 40,
+    "meets_floor": false
+  }
+}

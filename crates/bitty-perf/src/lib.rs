@@ -32,6 +32,8 @@ pub mod parser_throughput;
 pub mod real_soak;
 pub mod real_window;
 pub mod startup;
+pub mod throughput_floor;
+pub mod typical_session;
 
 /// PB-1 cold startup budget — p50 / p99 (ms).
 pub const PB1_STARTUP_MS_P50: u64 = 100;

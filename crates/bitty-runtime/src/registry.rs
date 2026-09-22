@@ -563,12 +563,18 @@ pub struct ViewHandle {
 // Submodules (CTX-0308 split) — facade re-exports preserve `registry::*`
 // ---------------------------------------------------------------------------
 
+mod event_bus_v1;
+mod host;
 mod panel;
 #[cfg(test)]
 mod panel_tests;
+mod provider;
 mod terminal;
 #[cfg(test)]
 mod tests;
 
+pub use event_bus_v1::*;
+pub use host::*;
 pub use panel::*;
+pub use provider::*;
 pub use terminal::*;

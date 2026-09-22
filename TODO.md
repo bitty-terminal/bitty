@@ -16,6 +16,12 @@ Per-item detail belongs to the issues; completed rows move to git history.
   cleared at the pivot; new P0 issues filed since (for example #1070,
   #1115) are tracked by the epics. Docs corpora were reconciled at the
   pivot; stale-row refresh and status reconciliation remain open (#978).
+  CTX-0658 verified the DOC batch at HEAD: DOC-09 narrowed (all five panel
+  candidates are `status: draft` with no implementation claims; promotion
+  needs a `bitty-terminal-docs` owner review, no `bitty`-side change),
+  DOC-08 kept (Status System is draft; the promotion path waits on open
+  UX-05 #1011 / UX-18 #1024), DOC-05 closed `bitty`-side (no OQ citations
+  in repo-owned files; the status-drift gate enforces the sync rule).
   The execution-supervisor and UI-runtime captures are recorded.
 - Baseline: `bitty` `main` with a 21-member workspace; docs submodule pinned
   to `bitty-terminal-docs` (`docs/`, pin trails `main` by design).

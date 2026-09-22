@@ -961,6 +961,24 @@ fn control_elevated_ops_deny_without_elevation() {
 }
 
 #[test]
+fn test_exit_denied_at_drain_apply_without_elevation() {
+    // Amendment A3 admission (defense in depth): the drain-side apply
+    // re-authorizes `testExit` against the drain-time scopes, so an
+    // unelevated drain denies with `ScopeDenied` and never arms teardown.
+    // (The elevated success path is covered by the `--test-mode` E2E;
+    // asserting it here would arm the process-global exit flag.)
+    let mut rt = headless_runtime();
+    let empty = bitty_ipc::ScopeSet::new();
+    let reply =
+        apply_control_envelope(&mut rt, bitty_ipc::devtools::METHOD_TEST_EXIT, None, &empty);
+    assert!(!reply.ok, "testExit without elevation must fail");
+    assert_eq!(
+        reply.code, "ScopeDenied",
+        "testExit denial must be ScopeDenied, got {reply:?}"
+    );
+}
+
+#[test]
 fn control_unscoped_callers_rejected_for_every_op() {
     let mut rt = headless_runtime();
     let empty = bitty_ipc::ScopeSet::new();

@@ -43,7 +43,11 @@ use crate::cell::{Attributes, Cell, Style};
 /// protocol keeps separate main/alt registers, and re-entering the alternate
 /// screen resumes its prior register, so two states differing only in the
 /// stashed (inactive-screen) stack are not behaviorally identical.
-pub const CANONICAL_HASH_VERSION: u32 = 9;
+/// v10 adds the M1-18 zone anchors (`CTX-0665`): `buffer_row`,
+/// `evicted_at_mark`, `epoch_at_mark` per zone record plus the global
+/// `buffer_epoch`. Anchors are observable jump targets, so states differing
+/// only in them are not behaviorally identical.
+pub const CANONICAL_HASH_VERSION: u32 = 10;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -207,6 +211,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 9);
+        assert_eq!(CANONICAL_HASH_VERSION, 10);
     }
 }

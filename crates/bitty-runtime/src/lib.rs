@@ -182,6 +182,7 @@
 
 pub mod browser_panel;
 pub mod config;
+pub mod cw_present;
 pub mod error;
 pub mod execution;
 pub mod host_bridge;

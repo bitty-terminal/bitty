@@ -1004,6 +1004,18 @@ impl TerminalApp {
                     eprintln!("warning: keymap close_search with no search open — ignoring");
                 }
             }
+            A::SearchToggleCase => {
+                // M1-14 (CTX-0665): flip overlay case sensitivity with
+                // reveal. No-op when the overlay is closed (fail-closed).
+                if self.runtime.is_search_mode() {
+                    self.runtime.search_toggle_case();
+                    if let Some(label) = self.runtime.search_mode_label() {
+                        eprintln!("bitty: keymap search_toggle_case -> {label}");
+                    }
+                } else {
+                    eprintln!("warning: keymap search_toggle_case with no search open — ignoring");
+                }
+            }
             A::PasteFromClipboard => {
                 // CTX-0161: explicit single-owner paste chord (ctrl+shift+v).
                 // Before this binding the chord fell through to the PTY as

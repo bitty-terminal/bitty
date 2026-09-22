@@ -88,6 +88,13 @@ struct HyperlinkEntry {
 pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// One recorded semantic prompt/command zone boundary.
+///
+/// In addition to the ordinal log position, each record carries a stable
+/// buffer anchor (M1-18, CTX-0665): the combined scrollback + live buffer
+/// row of the cursor line when the marker arrived, plus the prune/epoch
+/// generation needed to resolve it later. [`State::zone_buffer_row`]
+/// validates the anchor against the current buffer and returns `None`
+/// when the marked line was pruned, cleared, reset, or reflowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneRecord {
     /// Monotonic sequence number assigned when the marker arrived.
@@ -97,6 +104,21 @@ pub struct ZoneRecord {
     /// Exit status for `OutputEnd` (`D`), `None` otherwise or on parse failure.
     /// Bounded: validated as signed 32-bit integer; malformed yields `None`.
     pub exit_code: Option<i32>,
+    /// Combined buffer row of the cursor line at mark time (`0` = oldest
+    /// retained scrollback, `scrollback_len + cursor_row` for live rows).
+    pub buffer_row: usize,
+    /// Scrollback eviction total (`total_written - retained`) at mark time.
+    /// Resolution subtracts the evictions since the mark (oldest-first
+    /// pruning shifts every retained row down by exactly the evicted count).
+    pub evicted_at_mark: u64,
+    /// Buffer epoch at mark time (bumped on scrollback clear, full reset,
+    /// and resize reflow). A mismatch fails resolution: the marked content
+    /// is gone even when the arithmetic still lands in range.
+    pub epoch_at_mark: u64,
+    /// Whether the alternate screen was active at mark time. Resolution
+    /// requires the same screen: alt-screen marks never resolve against
+    /// the primary buffer and vice versa.
+    pub on_alt_screen: bool,
 }
 
 /// Versioned read-only view of terminal state for renderers and plugins.
@@ -187,6 +209,14 @@ pub struct State {
     current_hyperlink: Option<HyperlinkId>,
     zones: VecDeque<ZoneRecord>,
     zone_counter: u64,
+    /// Buffer epoch for zone-anchor validation (M1-18, CTX-0665). Bumped
+    /// on every operation that wholesale invalidates buffer-row identity:
+    /// scrollback clear (`ED 3`) and resize reflow (which reassigns
+    /// scrollback ids). Full reset returns it to zero alongside dropping
+    /// the zone log, so a reset state matches a fresh one. Push-prune
+    /// needs no bump: oldest-first eviction shifts rows arithmetically
+    /// (see `evicted_at_mark`).
+    buffer_epoch: u64,
     generation: u64,
     damage_history: VecDeque<Damage>,
     batch_rects: Vec<DamageRect>,
@@ -239,6 +269,7 @@ impl State {
             current_hyperlink: None,
             zones: VecDeque::new(),
             zone_counter: 0,
+            buffer_epoch: 0,
             generation: 0,
             damage_history: VecDeque::new(),
             batch_rects: Vec::new(),
@@ -307,6 +338,10 @@ impl State {
             };
         }
         let erase = self.bce_style();
+        // M1-18: any geometry change reassigns scrollback ids (width
+        // reflow) or drops grid rows (height shrink), so every zone
+        // buffer anchor from before this call is invalid.
+        self.buffer_epoch += 1;
         let old_cols = self.width;
         let old_rows = self.height;
         let alt_active = self.alt_screen != AltScreen::Off;
@@ -795,6 +830,84 @@ impl State {
     #[must_use]
     pub fn zone_len(&self) -> usize {
         self.zones.len()
+    }
+
+    /// Current buffer epoch for zone-anchor validation (M1-18, CTX-0665).
+    #[must_use]
+    pub fn buffer_epoch(&self) -> u64 {
+        self.buffer_epoch
+    }
+
+    /// Total scrollback lines evicted so far (pushed minus retained).
+    ///
+    /// `Scrollback::clear` keeps `total_written` while dropping retained
+    /// lines, so the count jumps there too — but every clear also bumps
+    /// [`Self::buffer_epoch`], and resolution checks the epoch first, so
+    /// a cleared anchor fails closed instead of landing on new content.
+    #[must_use]
+    pub fn scrollback_evicted_total(&self) -> u64 {
+        self.scrollback
+            .total_written()
+            .saturating_sub(self.scrollback.len() as u64)
+    }
+
+    /// Resolves a zone record's buffer anchor to its current combined
+    /// buffer row (`0` = oldest retained scrollback).
+    ///
+    /// Headless, deterministic, total: returns `None` when the marked
+    /// line is gone — pruned past the retained window (eviction drift
+    /// exceeds the mark row), cleared/reset/reflowed (epoch mismatch),
+    /// recorded on the other screen, or out of the current buffer — and
+    /// `Some(row)` otherwise. Live content that scrolled into history
+    /// keeps resolving: full-screen scrolls preserve `buffer_row`
+    /// exactly, and prune shifts are subtracted arithmetically.
+    #[must_use]
+    pub fn zone_buffer_row(&self, record: &ZoneRecord) -> Option<usize> {
+        if record.epoch_at_mark != self.buffer_epoch {
+            return None;
+        }
+        if record.on_alt_screen != self.alt_screen_active() {
+            return None;
+        }
+        let drift = self
+            .scrollback_evicted_total()
+            .checked_sub(record.evicted_at_mark)? as usize;
+        let row = record.buffer_row.checked_sub(drift)?;
+        if row < self.scrollback.len() + self.height {
+            Some(row)
+        } else {
+            None
+        }
+    }
+
+    /// Buffer row of the nearest `PromptStart` (`OSC 133;A`) marker
+    /// strictly before `from`, if it still resolves.
+    ///
+    /// Prompt-jump primitive (M1-18): view layers scroll to the returned
+    /// row to move to the previous command block. Unresolvable (pruned,
+    /// cleared, other screen) prompts are skipped, never returned.
+    #[must_use]
+    pub fn prev_prompt_buffer_row(&self, from: usize) -> Option<usize> {
+        self.zones
+            .iter()
+            .filter(|r| r.kind == ZoneKind::PromptStart)
+            .filter_map(|r| self.zone_buffer_row(r))
+            .filter(|row| *row < from)
+            .max()
+    }
+
+    /// Buffer row of the nearest `PromptStart` (`OSC 133;A`) marker
+    /// strictly after `from`, if it still resolves.
+    ///
+    /// Mirror of [`Self::prev_prompt_buffer_row`] for forward prompt-jump.
+    #[must_use]
+    pub fn next_prompt_buffer_row(&self, from: usize) -> Option<usize> {
+        self.zones
+            .iter()
+            .filter(|r| r.kind == ZoneKind::PromptStart)
+            .filter_map(|r| self.zone_buffer_row(r))
+            .filter(|row| *row > from)
+            .min()
     }
 
     /// The image store; see `crate::image` for the OQ-008 status.
@@ -1546,6 +1659,8 @@ impl State {
             EraseDisplayMode::Scrollback => {
                 let cleared = self.scrollback.clear();
                 self.push_scroll_damage(cleared);
+                // M1-18: wholesale buffer-identity invalidation for anchors.
+                self.buffer_epoch += 1;
             }
         }
     }
@@ -1923,10 +2038,19 @@ impl State {
         } else {
             None
         };
+        // M1-18 anchor: the marked content sits at the cursor's live row,
+        // whose combined buffer row is `scrollback_len + cursor_row`. The
+        // cursor is clamped defensively (this runs before
+        // `enforce_cursor_invariants`).
+        let cursor_row = (self.cursor.position.row as usize).min(self.height.saturating_sub(1));
         self.zones.push_back(ZoneRecord {
             ordinal: self.zone_counter,
             kind,
             exit_code: code,
+            buffer_row: self.scrollback.len() + cursor_row,
+            evicted_at_mark: self.scrollback_evicted_total(),
+            epoch_at_mark: self.buffer_epoch,
+            on_alt_screen: self.alt_screen_active(),
         });
         while self.zones.len() > ZONE_RECORDS_MAX {
             self.zones.pop_front();
@@ -2020,6 +2144,10 @@ impl State {
         self.charsets = Charsets::default();
         let cleared = self.scrollback.clear();
         self.push_scroll_damage(cleared);
+        // M1-18: zones are dropped below, so no anchor outlives the reset;
+        // the epoch returns to its initial value so a reset state hashes
+        // (and resolves) exactly like a fresh one.
+        self.buffer_epoch = 0;
         self.replies.clear();
         self.title = BoundedString::new("");
         self.cwd_report = None;

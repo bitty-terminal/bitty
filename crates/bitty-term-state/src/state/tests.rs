@@ -1278,3 +1278,230 @@ fn term_eng_005c_alternate_screen_hyperlink_isolation() {
     assert_eq!(primary_cell.hyperlink, primary_link_id);
     assert!(s.check_invariants().is_ok());
 }
+
+// ------------------------------------------------------------------
+// M1-18 shell-integration anchors (CTX-0665): zone buffer anchoring,
+// prune/clear/reset/reflow invalidation, and prompt-jump primitives.
+// ------------------------------------------------------------------
+
+fn feed_anchor_line(state: &mut State, text: &str) {
+    prints(state, text);
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+}
+
+fn mark_prompt(state: &mut State) {
+    state.apply(&TerminalAction::OscPromptMark {
+        kind: ZoneKind::PromptStart,
+        exit_code: None,
+    });
+}
+
+fn history_line_text(state: &State, row: usize) -> String {
+    let line = state.scrollback_line(row).expect("history line");
+    line.cells
+        .iter()
+        .filter(|c| !c.spacer)
+        .map(|c| c.glyph)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+#[test]
+fn zone_anchor_resolves_live_cursor_row() {
+    let mut s = State::new();
+    prints(&mut s, "prompt$ ");
+    mark_prompt(&mut s);
+    assert_eq!(s.zone_len(), 1);
+    let rec = s.zones().next().copied().expect("record");
+    let expect = s.scrollback_len() + s.cursor().position.row as usize;
+    assert_eq!(s.zone_buffer_row(&rec), Some(expect));
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_tracks_line_into_scrollback() {
+    let mut s = State::new();
+    // A shell emits `OSC 133;A` with the cursor at the prompt row, then
+    // prints the prompt: mark first, then print on the same row.
+    mark_prompt(&mut s);
+    prints(&mut s, "first-prompt$");
+    let rec = s.zones().next().copied().expect("record");
+    let h = s.height();
+    feed_anchor_line(&mut s, "");
+    for i in 0..(h + 3) {
+        feed_anchor_line(&mut s, &format!("filler{i:02}"));
+    }
+    assert!(s.scrollback_len() > 0, "marked row must have scrolled");
+    let row = s.zone_buffer_row(&rec).expect("anchor survives scroll");
+    assert!(row < s.scrollback_len(), "marked row is now history");
+    assert_eq!(history_line_text(&s, row), "first-prompt$");
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_prune_invalidates_and_jump_skips() {
+    let mut s = State::with_scrollback_lines(4);
+    prints(&mut s, "doomed-prompt$");
+    mark_prompt(&mut s);
+    let rec = s.zones().next().copied().expect("record");
+    assert!(s.zone_buffer_row(&rec).is_some());
+    // Churn past both the grid height (so lines actually scroll) and the
+    // tiny retention cap (so the marked line is pruned).
+    let h = s.height();
+    for i in 0..(h + 16) {
+        feed_anchor_line(&mut s, &format!("churn{i:02}"));
+    }
+    // The record is retained (zone cap is 1024) but its line is pruned.
+    assert_eq!(s.zone_len(), 1);
+    assert_eq!(
+        s.zone_buffer_row(&rec),
+        None,
+        "pruned anchor must fail closed"
+    );
+    let total = s.scrollback_len() + s.height();
+    assert_eq!(s.prev_prompt_buffer_row(total), None);
+    assert_eq!(s.next_prompt_buffer_row(0), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_clear_invalidates_but_keeps_record() {
+    let mut s = State::new();
+    prints(&mut s, "prompt$");
+    mark_prompt(&mut s);
+    let rec = s.zones().next().copied().expect("record");
+    assert!(s.zone_buffer_row(&rec).is_some());
+    let epoch_before = s.buffer_epoch();
+    s.apply(&TerminalAction::EraseInDisplay {
+        mode: EraseDisplayMode::Scrollback,
+    });
+    assert!(s.buffer_epoch() > epoch_before, "clear bumps the epoch");
+    // The record survives (unlike FullReset) but no longer resolves:
+    // without the epoch check it could land on unrelated new content.
+    assert_eq!(s.zone_len(), 1);
+    assert_eq!(s.zone_buffer_row(&rec), None);
+    // New marks after the clear resolve again.
+    prints(&mut s, "fresh$");
+    mark_prompt(&mut s);
+    let fresh = s.zones().copied().last().expect("record");
+    assert!(s.zone_buffer_row(&fresh).is_some());
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_full_reset_drops_zones() {
+    let mut s = State::new();
+    prints(&mut s, "prompt$");
+    mark_prompt(&mut s);
+    assert_eq!(s.zone_len(), 1);
+    s.apply(&TerminalAction::FullReset);
+    assert_eq!(s.zone_len(), 0);
+}
+
+#[test]
+fn zone_anchor_resize_invalidates_but_noop_keeps() {
+    let mut s = State::new();
+    prints(&mut s, "prompt$");
+    mark_prompt(&mut s);
+    let rec = s.zones().next().copied().expect("record");
+    let (w, h) = (s.width(), s.height());
+    s.resize(w, h);
+    assert!(
+        s.zone_buffer_row(&rec).is_some(),
+        "no-op resize keeps anchors"
+    );
+    s.resize(w, h + 2);
+    assert_eq!(
+        s.zone_buffer_row(&rec),
+        None,
+        "geometry change reassigns rows"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_alt_screen_mismatch_fails_closed() {
+    let mut s = State::new();
+    prints(&mut s, "main-prompt$");
+    mark_prompt(&mut s);
+    let main_rec = s.zones().next().copied().expect("record");
+    assert!(s.zone_buffer_row(&main_rec).is_some());
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    assert!(s.alt_screen_active());
+    assert_eq!(
+        s.zone_buffer_row(&main_rec),
+        None,
+        "main-screen mark must not resolve on alt"
+    );
+    prints(&mut s, "alt-prompt$");
+    mark_prompt(&mut s);
+    let alt_rec = s.zones().copied().last().expect("record");
+    assert!(s.zone_buffer_row(&alt_rec).is_some());
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert!(!s.alt_screen_active());
+    assert!(s.zone_buffer_row(&main_rec).is_some());
+    assert_eq!(
+        s.zone_buffer_row(&alt_rec),
+        None,
+        "alt-screen mark must not resolve on main"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn prompt_jump_prev_next_strict_and_ordered() {
+    let mut s = State::new();
+    prints(&mut s, "cmd-one$");
+    mark_prompt(&mut s);
+    feed_anchor_line(&mut s, "output one");
+    prints(&mut s, "cmd-two$");
+    mark_prompt(&mut s);
+    feed_anchor_line(&mut s, "output two");
+    prints(&mut s, "cmd-three$");
+    mark_prompt(&mut s);
+    let rows: Vec<usize> = s
+        .zones()
+        .copied()
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|r| s.zone_buffer_row(r).expect("all live"))
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0] < rows[1] && rows[1] < rows[2]);
+    let total = s.scrollback_len() + s.height();
+    assert_eq!(s.prev_prompt_buffer_row(total), Some(rows[2]));
+    assert_eq!(s.prev_prompt_buffer_row(rows[2]), Some(rows[1]));
+    // Strictly before: exactly on a prompt skips it.
+    assert_eq!(s.prev_prompt_buffer_row(rows[1]), Some(rows[0]));
+    assert_eq!(s.prev_prompt_buffer_row(rows[0]), None);
+    // `from` is strict: a prompt exactly at `from` is skipped.
+    assert_eq!(s.next_prompt_buffer_row(0), Some(rows[1]));
+    assert_eq!(s.next_prompt_buffer_row(rows[0]), Some(rows[1]));
+    assert_eq!(s.next_prompt_buffer_row(rows[1]), Some(rows[2]));
+    assert_eq!(s.next_prompt_buffer_row(rows[2]), None);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn zone_anchor_hash_deterministic_across_identical_states() {
+    let mut a = State::new();
+    let mut b = State::new();
+    for st in [&mut a, &mut b] {
+        prints(st, "prompt$");
+        mark_prompt(st);
+        feed_anchor_line(st, "output");
+    }
+    assert_eq!(a.state_hash(), b.state_hash());
+    // A scrolled state diverges from a fresh one with the same zone kinds.
+    let mut c = State::new();
+    prints(&mut c, "prompt$");
+    mark_prompt(&mut c);
+    assert_ne!(a.state_hash(), c.state_hash());
+}

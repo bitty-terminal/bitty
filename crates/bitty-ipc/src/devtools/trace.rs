@@ -219,10 +219,10 @@ pub fn set_trace_spool_dir_for_tests(dir: &str) {
 
 /// Resolve the spool directory.
 fn spool_dir() -> String {
-    if let Ok(slot) = spool_dir_override().lock()
-        && let Some(dir) = slot.as_deref()
-    {
-        return dir.to_string();
+    if let Ok(slot) = spool_dir_override().lock() {
+        if let Some(dir) = slot.as_deref() {
+            return dir.to_string();
+        }
     }
     std::env::temp_dir()
         .join("bitty-traces")
@@ -601,22 +601,22 @@ pub(super) fn handle_start_trace(
 fn write_spool_file(path: &str, bytes: &[u8]) -> Result<(), String> {
     use std::path::Path;
     let spool = Path::new(path);
-    if let Some(parent) = spool.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder
-                .create(parent)
-                .map_err(|err| format!("trace spool dir failed: {err}"))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("trace spool dir failed: {err}"))?;
+    if let Some(parent) = spool.parent() {
+        if !parent.as_os_str().is_empty() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(parent)
+                    .map_err(|err| format!("trace spool dir failed: {err}"))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| format!("trace spool dir failed: {err}"))?;
+            }
         }
     }
     #[cfg(unix)]

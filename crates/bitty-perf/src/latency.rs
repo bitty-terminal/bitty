@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
 use bitty_runtime::Runtime;
 
+use super::real_window::{BaselineMeta, HostContext};
+
 // ---------------------------------------------------------------------------
 // Bounded helpers
 // ---------------------------------------------------------------------------
@@ -618,6 +620,126 @@ impl LatencyReport {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Committed baseline artifact (CTX-0686, PERF-05)
+// ---------------------------------------------------------------------------
+
+/// Schema version of the committed `pb-latency.json` artifact.
+pub const LATENCY_SCHEMA_VERSION: u32 = 1;
+/// Committed PB-4 evidence artifact, relative to the repository root.
+pub const LATENCY_BASELINE_REL_PATH: &str = "crates/bitty-perf/baselines/pb-latency.json";
+/// Samples in the committed headless capture (the `benches/latency_real.rs` primary).
+pub const LATENCY_BASELINE_SAMPLES: usize = 1_000;
+
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The committed evidence artifact, embedded at compile time.
+#[must_use]
+pub const fn committed_latency_json() -> &'static str {
+    include_str!("../baselines/pb-latency.json")
+}
+
+/// Serialize a measured report plus provenance into the committed shape.
+///
+/// Returns `Err` when no sample presented — the bench refuses to write
+/// fabricated numbers. Wall-clock verdicts are recorded as measured, never
+/// normalized: on a shared runner they include scheduler gaps, which is why
+/// the committed artifact carries the work percentiles alongside.
+pub fn baseline_json(report: &LatencyReport, meta: &BaselineMeta) -> Result<String, String> {
+    let presented = report.samples.iter().filter(|s| s.presented).count();
+    if presented == 0 {
+        return Err(
+            "refusing to serialize a latency report with zero presented samples".to_string(),
+        );
+    }
+    let host = HostContext::capture();
+    let issues: Vec<String> = meta.issues.iter().map(u64::to_string).collect();
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!(
+        "  \"schema_version\": {LATENCY_SCHEMA_VERSION},\n"
+    ));
+    out.push_str(&format!("  \"task\": \"{}\",\n", escape(&meta.task)));
+    out.push_str(&format!("  \"issues\": [{}],\n", issues.join(", ")));
+    out.push_str(&format!(
+        "  \"captured_at\": \"{}\",\n",
+        escape(&meta.captured_at)
+    ));
+    out.push_str(&format!(
+        "  \"revision\": \"{}\",\n",
+        escape(&meta.revision)
+    ));
+    out.push_str(&format!("  \"command\": \"{}\",\n", escape(&meta.command)));
+    out.push_str(&format!("  \"profile\": \"{}\",\n", escape(&meta.profile)));
+    out.push_str(
+        "  \"budget_ref\": \"docs/specifications/performance-budget-rfc.md#pb-4-input-latency\",\n",
+    );
+    out.push_str("  \"host_context\": {\n");
+    out.push_str(&format!("    \"os\": \"{}\",\n", escape(&host.os)));
+    out.push_str(&format!("    \"arch\": \"{}\",\n", escape(&host.arch)));
+    out.push_str(&format!(
+        "    \"toolchain\": \"{}\",\n",
+        escape(&host.toolchain)
+    ));
+    out.push_str(&format!("    \"cpus\": {},\n", host.cpus));
+    match host.total_memory_mb {
+        Some(mb) => out.push_str(&format!("    \"total_memory_mb\": {mb}\n")),
+        None => out.push_str("    \"total_memory_mb\": null\n"),
+    }
+    out.push_str("  },\n");
+    out.push_str("  \"bounds\": {\n");
+    out.push_str(&format!("    \"samples\": {},\n", report.samples.len()));
+    out.push_str(&format!("    \"presented\": {presented},\n"));
+    out.push_str(&format!("    \"idle_misses\": {},\n", report.idle_misses));
+    out.push_str(&format!(
+        "    \"synthetic_samples\": {}\n",
+        report.synthetic_samples
+    ));
+    out.push_str("  },\n");
+    out.push_str("  \"latency\": {\n");
+    out.push_str("    \"status\": \"measured\",\n");
+    out.push_str(&format!("    \"mode\": \"{}\",\n", report.mode.label()));
+    out.push_str(&format!("    \"headless\": {},\n", report.headless));
+    out.push_str(&format!("    \"wall_p50_ms\": {:.3},\n", report.p50_ms));
+    out.push_str(&format!("    \"wall_p99_ms\": {:.3},\n", report.p99_ms));
+    out.push_str(&format!("    \"wall_mean_ms\": {:.3},\n", report.mean_ms));
+    out.push_str(&format!("    \"wall_max_ms\": {:.3},\n", report.max_ms));
+    out.push_str(&format!(
+        "    \"work_p50_ms\": {:.3},\n",
+        report.p50_work_ms
+    ));
+    out.push_str(&format!(
+        "    \"work_p99_ms\": {:.3},\n",
+        report.p99_work_ms
+    ));
+    out.push_str(&format!(
+        "    \"work_min_ms\": {:.3},\n",
+        report.min_work_ms
+    ));
+    out.push_str(&format!(
+        "    \"budget_p50_ms\": {},\n",
+        super::PB4_LATENCY_MS_P50
+    ));
+    out.push_str(&format!(
+        "    \"budget_p99_ms\": {},\n",
+        super::PB4_LATENCY_MS_P99
+    ));
+    out.push_str(&format!("    \"meets_p50\": {},\n", report.meets_p50()));
+    out.push_str(&format!("    \"meets_p99\": {},\n", report.meets_p99()));
+    out.push_str(&format!(
+        "    \"meets_work_p50\": {},\n",
+        report.meets_work_p50()
+    ));
+    out.push_str(&format!(
+        "    \"meets_work_p99\": {}\n",
+        report.meets_work_p99()
+    ));
+    out.push_str("  }\n}\n");
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0686",
+  "issues": [1059],
+  "captured_at": "2026-09-23",
+  "revision": "13d555649b47e07bf56a0d467ffb5332b3f86396",
+  "command": "cargo bench -p bitty-perf --bench latency_real -- --nocapture --write-baseline crates/bitty-perf/baselines/pb-latency.json",
+  "profile": "bench (release)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-4-input-latency",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1 (rust-toolchain.toml)",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "bounds": {
+    "samples": 1000,
+    "presented": 1000,
+    "idle_misses": 0,
+    "synthetic_samples": 1000
+  },
+  "latency": {
+    "status": "measured",
+    "mode": "injected-echo",
+    "headless": true,
+    "wall_p50_ms": 1.654,
+    "wall_p99_ms": 3.833,
+    "wall_mean_ms": 1.657,
+    "wall_max_ms": 9.845,
+    "work_p50_ms": 1.653,
+    "work_p99_ms": 3.833,
+    "work_min_ms": 0.414,
+    "budget_p50_ms": 8,
+    "budget_p99_ms": 15,
+    "meets_p50": true,
+    "meets_p99": true,
+    "meets_work_p50": true,
+    "meets_work_p99": true
+  }
+}

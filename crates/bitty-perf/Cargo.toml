@@ -79,3 +79,8 @@ harness = false
 name = "real_soak"
 path = "../../benches/real_soak.rs"
 harness = false
+
+[[bench]]
+name = "dogfood_session"
+path = "../../benches/dogfood_session.rs"
+harness = false

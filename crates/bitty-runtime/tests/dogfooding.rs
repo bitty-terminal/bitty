@@ -397,3 +397,104 @@ fn dogfood_real_pty_graceful_smoke() {
     print_findings("real PTY graceful (Unix, 5 s per app, bounded)", &findings);
     assert_eq!(findings.len(), 6);
 }
+
+// Continuous daily-driver session (CTX-0643, PERF-10): the headless proof
+// behind scripts/dogfood-session.sh. All six app surfaces rotate through
+// ONE runtime for SESSION_CYCLES full cycles — the shape a daily driver
+// actually produces — with per-cycle bounds, frame-on-demand idleness
+// between cycles, and a byte-exact deterministic replay of the whole
+// session on a second runtime.
+const SESSION_CYCLES: usize = 6;
+
+#[test]
+fn dogfood_daily_driver_session_continuous_bounded() {
+    let start = Instant::now();
+    let apps: &[(&str, &[u8])] = &[
+        ("shell", corpus_shell()),
+        ("cargo", corpus_cargo()),
+        ("git", corpus_git()),
+        ("nvim", corpus_nvim()),
+        ("tmux", corpus_tmux()),
+        ("ssh", corpus_ssh()),
+    ];
+    let mut rt = make_runtime();
+    // Prime one full redraw so later ticks are damage-driven (mirrors soak).
+    let _ = rt.tick();
+    // Byte stream of the whole session for the deterministic replay.
+    let mut stream: Vec<u8> = Vec::new();
+    let mut findings = Vec::new();
+    let mut prev_gen = rt.state().generation();
+    for cycle in 0..SESSION_CYCLES {
+        let t0 = Instant::now();
+        let mut corpus_bytes = 0usize;
+        for (_, corpus) in apps {
+            rt.handle_pty_bytes(corpus);
+            stream.extend_from_slice(corpus);
+            corpus_bytes += corpus.len();
+        }
+        let mut ticks = 0usize;
+        if rt.tick().is_some() {
+            ticks += 1;
+        }
+        let generation = rt.state().generation();
+        assert!(
+            generation > prev_gen,
+            "cycle {cycle}: generation must advance"
+        );
+        // Bounded queues every cycle (cold cap 256, plugin side cap 128).
+        assert!(
+            rt.cold_queue_len() <= rt.cold_queue_capacity(),
+            "cycle {cycle}: cold queue overflow"
+        );
+        assert!(
+            rt.plugin_side_len() <= rt.plugin_side_capacity(),
+            "cycle {cycle}: side queue overflow"
+        );
+        let rgba_len = rt.headless_rgba().map_or(0, |v| v.len());
+        assert!(rgba_len > 0, "cycle {cycle}: rgba must be non-empty");
+        findings.push(Finding {
+            app: "session",
+            method: "continuous",
+            corpus_bytes,
+            ticks,
+            gen_delta: generation - prev_gen,
+            cold_len: rt.cold_queue_len(),
+            side_len: rt.plugin_side_len(),
+            rgba_len,
+            elapsed_ms: t0.elapsed().as_millis(),
+        });
+        prev_gen = generation;
+        // Frame-on-demand between cycles: no damage, no present.
+        assert_eq!(rt.tick(), None, "cycle {cycle}: idle must be None");
+    }
+    // Deterministic replay of the entire session on a second runtime.
+    let mut replay = make_runtime();
+    let _ = replay.tick();
+    for b in stream.chunks(1) {
+        replay.handle_pty_bytes(b);
+    }
+    let _ = replay.tick();
+    assert_eq!(
+        rt.snapshot().generation,
+        replay.snapshot().generation,
+        "session generation must be deterministic"
+    );
+    for row in 0..2 {
+        assert_eq!(
+            snapshot_row_text(&rt, row),
+            snapshot_row_text(&replay, row),
+            "session row {row} must be deterministic"
+        );
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < WALL_BUDGET,
+        "dogfooding session took {elapsed:?} exceeds {WALL_BUDGET:?}"
+    );
+    print_findings("continuous session (6 apps x 6 cycles, bounded)", &findings);
+    assert_eq!(findings.len(), SESSION_CYCLES);
+    assert_eq!(
+        MAX_BUFFERED_BYTES,
+        READ_CHUNK_SIZE * CHANNEL_CAPACITY_CHUNKS
+    );
+}

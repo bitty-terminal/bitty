@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dogfood_session;
 pub mod idle;
 pub mod latency;
 pub mod parser_throughput;

@@ -96,6 +96,17 @@
 //!   preference above plugin content theme above framework default) with
 //!   per-key attribution (UX-20, CTX-0669, candidate).
 
+//! - [`canvas`] — bounded `Canvas` display lists retained for compositor
+//!   replay at refresh, revision-gated like [`uitree`] (UX-25, CTX-0671,
+//!   candidate).
+//! - [`budget`] — UI/GPU resource budget tiers (node count, texture
+//!   memory, blur area, draw calls) with refuse-vs-degrade admission
+//!   (UX-24, CTX-0671, candidate).
+//! - [`motion`] — Core-owned motion hierarchy (`motion.default` ->
+//!   `panel` -> `panel.open/move/close`): Lua sets targets, Rust
+//!   interpolates, reduced motion is mandatory, zero wakeups at rest
+//!   (UX-23, CTX-0671, candidate).
+
 //!
 //! # Determinism
 //!
@@ -119,12 +130,15 @@ pub mod beacon_dispatch;
 pub mod beacon_label;
 pub mod beacon_layer;
 pub mod beacon_target;
+pub mod budget;
+pub mod canvas;
 pub mod decoration;
 pub mod drag;
 pub mod focus;
 pub mod geometry;
 pub mod gesture;
 pub mod layout;
+pub mod motion;
 pub mod panel;
 pub mod panel_rules;
 pub mod presentation;
@@ -156,6 +170,15 @@ pub use beacon_target::{
     CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
     TargetRef, TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
 };
+pub use budget::{
+    Admission, BudgetDimension, BudgetTier, ESSENTIAL_TEXTURE_BYTES, Overrun, RICH_TEXTURE_BYTES,
+    ResourceBudget, ResourceUsage, STANDARD_TEXTURE_BYTES, tree_nodes,
+};
+pub use canvas::{
+    CanvasCommand, CanvasDisplayList, CanvasError, CanvasLayer, CanvasSubmitReport,
+    MAX_CANVAS_COMMANDS, MAX_CANVAS_COORD, MAX_CANVAS_RADIUS, MAX_CANVAS_SURFACES,
+    MAX_CANVAS_TEXT_LEN,
+};
 pub use decoration::{
     DEFAULT_BORDER_PX, DEFAULT_CONTENT_INSET_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX,
     DEFAULT_RADIUS_PX, DecoratedView, Decoration, DecorationError, MAX_BORDER_PX,
@@ -177,6 +200,10 @@ pub use gesture::{
 pub use layout::{
     LayoutNode, OverlayLayer, OverlayTier, clamp_ratio, smart_split_axis, split_rect,
     split_rect_with_gap,
+};
+pub use motion::{
+    MAX_MOTION_DURATION_MS, MotionConfig, MotionCurve, MotionError, MotionScope, MotionSpec,
+    MotionValue,
 };
 pub use panel::{
     BrowserSurfaceId, CommandError, CommandRegistry, InputTarget, MAX_COMMANDS_PER_PANEL_TYPE,
@@ -223,9 +250,9 @@ pub use uitree::{
 };
 pub use view::{View, ViewId};
 pub use widget_mech::{
-    CanvasMech, MAX_CANVAS_COMMANDS, MAX_CANVAS_DIM_PX, MAX_ITEM_HEIGHT_PX, MAX_SCROLL_CONTENT_PX,
-    MAX_VIEWPORT_PX, MAX_VIRTUAL_ITEMS, ScrollMech, TextInputMech, VirtualListMech,
-    WidgetMechError,
+    CanvasMech, MAX_ITEM_HEIGHT_PX, MAX_MECH_CANVAS_COMMANDS, MAX_MECH_CANVAS_DIM_PX,
+    MAX_SCROLL_CONTENT_PX, MAX_VIEWPORT_PX, MAX_VIRTUAL_ITEMS, ScrollMech, TextInputMech,
+    VirtualListMech, WidgetMechError,
 };
 pub use window_chrome::{
     ChromeError, ChromeNotification, ChromeSurface, MAX_NOTIFICATION_TEXT_LEN, MAX_NOTIFICATIONS,

@@ -137,7 +137,10 @@ fn scroll_and_canvas_budgets_hold_end_to_end() {
     canvas.push_commands(100).expect("queue");
     assert_eq!(canvas.commands(), 100);
     canvas.clear();
-    assert_eq!(canvas.budget_remaining(), bitty_ui::MAX_CANVAS_COMMANDS);
+    assert_eq!(
+        canvas.budget_remaining(),
+        bitty_ui::MAX_MECH_CANVAS_COMMANDS
+    );
 }
 
 // ---------------------------------------------------------------------------

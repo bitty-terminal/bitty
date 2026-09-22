@@ -62,13 +62,13 @@ pub const MAX_VIEWPORT_PX: u32 = 16_384;
 pub const MAX_SCROLL_CONTENT_PX: u64 = 1_048_576;
 
 /// Hard cap in pixels on one canvas dimension.
-pub const MAX_CANVAS_DIM_PX: u32 = 16_384;
+pub const MAX_MECH_CANVAS_DIM_PX: u32 = 16_384;
 
 /// Hard cap on queued canvas display-list commands per node.
 ///
 /// Rejected with [`WidgetMechError::CommandBudgetExceeded`]: an unbounded
 /// display list is an unbounded paint budget.
-pub const MAX_CANVAS_COMMANDS: u32 = 65_536;
+pub const MAX_MECH_CANVAS_COMMANDS: u32 = 65_536;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -101,14 +101,14 @@ pub enum WidgetMechError {
         /// The cap that was exceeded.
         cap: u64,
     },
-    /// A canvas dimension is zero or exceeds [`MAX_CANVAS_DIM_PX`].
+    /// A canvas dimension is zero or exceeds [`MAX_MECH_CANVAS_DIM_PX`].
     BadCanvasSize {
         /// Width requested in pixels.
         width: u32,
         /// Height requested in pixels.
         height: u32,
     },
-    /// Queued canvas commands would exceed [`MAX_CANVAS_COMMANDS`].
+    /// Queued canvas commands would exceed [`MAX_MECH_CANVAS_COMMANDS`].
     CommandBudgetExceeded {
         /// Commands that would be queued.
         requested: u64,
@@ -569,7 +569,7 @@ impl ScrollMech {
 
 /// Rust-owned paint budget for one `Canvas` node.
 ///
-/// Counts queued display-list commands against [`MAX_CANVAS_COMMANDS`].
+/// Counts queued display-list commands against [`MAX_MECH_CANVAS_COMMANDS`].
 /// Decode, rasterization, and pixels live outside this crate's UI role;
 /// Lua defines what each command draws, Rust bounds how many may queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -586,12 +586,12 @@ impl CanvasMech {
     /// # Errors
     ///
     /// Returns [`WidgetMechError::BadCanvasSize`] when a dimension is zero
-    /// or exceeds [`MAX_CANVAS_DIM_PX`].
+    /// or exceeds [`MAX_MECH_CANVAS_DIM_PX`].
     pub fn new(node: UiNodeId, width_px: u32, height_px: u32) -> Result<Self, WidgetMechError> {
         if width_px == 0
             || height_px == 0
-            || width_px > MAX_CANVAS_DIM_PX
-            || height_px > MAX_CANVAS_DIM_PX
+            || width_px > MAX_MECH_CANVAS_DIM_PX
+            || height_px > MAX_MECH_CANVAS_DIM_PX
         {
             return Err(WidgetMechError::BadCanvasSize {
                 width: width_px,
@@ -633,7 +633,7 @@ impl CanvasMech {
     /// Commands still queueable before the budget closes.
     #[must_use]
     pub fn budget_remaining(&self) -> u32 {
-        MAX_CANVAS_COMMANDS.saturating_sub(self.commands)
+        MAX_MECH_CANVAS_COMMANDS.saturating_sub(self.commands)
     }
 
     /// Queues `count` commands against the budget.
@@ -641,13 +641,13 @@ impl CanvasMech {
     /// # Errors
     ///
     /// Returns [`WidgetMechError::CommandBudgetExceeded`] without mutating
-    /// when the queue would exceed [`MAX_CANVAS_COMMANDS`].
+    /// when the queue would exceed [`MAX_MECH_CANVAS_COMMANDS`].
     pub fn push_commands(&mut self, count: u32) -> Result<(), WidgetMechError> {
         let next = u64::from(self.commands).saturating_add(u64::from(count));
-        if next > u64::from(MAX_CANVAS_COMMANDS) {
+        if next > u64::from(MAX_MECH_CANVAS_COMMANDS) {
             return Err(WidgetMechError::CommandBudgetExceeded {
                 requested: next,
-                cap: u64::from(MAX_CANVAS_COMMANDS),
+                cap: u64::from(MAX_MECH_CANVAS_COMMANDS),
             });
         }
         self.commands = next as u32;
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn canvas_budget_fails_closed_then_clears() {
         let mut mech = CanvasMech::new(id(4), 800, 600).expect("valid mech");
-        mech.push_commands(MAX_CANVAS_COMMANDS)
+        mech.push_commands(MAX_MECH_CANVAS_COMMANDS)
             .expect("exact budget");
         assert_eq!(mech.budget_remaining(), 0);
         let err = mech
@@ -794,13 +794,13 @@ mod tests {
         assert_eq!(
             err,
             WidgetMechError::CommandBudgetExceeded {
-                requested: u64::from(MAX_CANVAS_COMMANDS) + 1,
-                cap: u64::from(MAX_CANVAS_COMMANDS),
+                requested: u64::from(MAX_MECH_CANVAS_COMMANDS) + 1,
+                cap: u64::from(MAX_MECH_CANVAS_COMMANDS),
             }
         );
-        assert_eq!(mech.commands(), MAX_CANVAS_COMMANDS);
+        assert_eq!(mech.commands(), MAX_MECH_CANVAS_COMMANDS);
         mech.clear();
-        assert_eq!(mech.budget_remaining(), MAX_CANVAS_COMMANDS);
+        assert_eq!(mech.budget_remaining(), MAX_MECH_CANVAS_COMMANDS);
     }
 
     #[test]

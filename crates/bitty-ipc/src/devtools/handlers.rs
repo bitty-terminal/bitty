@@ -6,6 +6,7 @@ use super::profiling::{
     handle_get_frame_stats, handle_get_process_stats, handle_stream_frame_stats,
     handle_stream_process_stats,
 };
+use super::trace::{handle_fetch_trace_chunk, handle_start_trace, handle_stop_trace};
 
 use crate::error::IpcError;
 use std::collections::BTreeMap;
@@ -63,7 +64,9 @@ impl Dispatcher {
     /// `createWorkspace`, `closeWorkspace`, `focusWorkspace`) plus CTX-0259
     /// workspace move (`moveWorkspace`) plus CTX-0188
     /// test automation (`synthesizeInput`,
-    /// `captureFrame`, bearer-scoped per Amendment A1) plus CTX-0189 live
+    /// `captureFrame`, bearer-scoped per Amendment A1) plus DT-03 trace
+    /// lifecycle (`startTrace`, `stopTrace`, `fetchTraceChunk`, requiring
+    /// `debug.trace`) plus CTX-0189 live
     /// profiling (`getProcessStats`, `getFrameStats`, `streamProcessStats`,
     /// `streamFrameStats`; sampling-only, scope-gated per Amendment A1).
     ///
@@ -131,6 +134,18 @@ impl Dispatcher {
         for (method, handler) in automation {
             if table.register(method, *handler).is_err() {
                 debug_assert!(false, "statically valid automation method rejected");
+            }
+        }
+        // DT-03 trace lifecycle (opt-in, bounded, 256 KiB pages, 0600
+        // spool; requires `debug.trace`, never `debug.inspect` alone).
+        let traces: &[(&'static str, DevtoolsHandler)] = &[
+            (METHOD_START_TRACE, handle_start_trace),
+            (METHOD_STOP_TRACE, handle_stop_trace),
+            (METHOD_FETCH_TRACE_CHUNK, handle_fetch_trace_chunk),
+        ];
+        for (method, handler) in traces {
+            if table.register(method, *handler).is_err() {
+                debug_assert!(false, "statically valid trace method rejected");
             }
         }
         // CTX-0189 live profiling (sampling-only, bounded, redacted;

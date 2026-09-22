@@ -97,7 +97,7 @@ fn dev_help_exits_zero_and_names_verbs() {
         stderr_text(&output)
     );
     let text = stdout_text(&output);
-    for token in ["trace", "capture", "dump", "overlay"] {
+    for token in ["trace", "capture", "synthesize", "dump", "overlay"] {
         assert!(text.contains(token), "help must name {token}: {text:?}");
     }
 }
@@ -134,7 +134,7 @@ fn unknown_verb_names_valid_set() {
     let stderr = stderr_text(&output);
     assert!(stderr.contains("unknown verb"), "stderr={stderr:?}");
     assert!(
-        stderr.contains("trace|capture|dump|overlay"),
+        stderr.contains("trace|capture|synthesize|dump|overlay"),
         "stderr={stderr:?}"
     );
     assert!(output.stdout.is_empty());
@@ -265,6 +265,52 @@ fn capture_bad_layout_fails_closed() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr_text(&output).contains("unknown --layout"));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn synthesize_table_reports_receipt_and_held_paste_gate() {
+    let output = spawn_dev(&["dev", "synthesize"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "synthesize must exit 0, stderr={:?}",
+        stderr_text(&output)
+    );
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("accepted=8"), "receipt: {stdout:?}");
+    assert!(stdout.contains("rejected=0"), "receipt: {stdout:?}");
+    assert!(
+        stdout.contains("paste gate: confirmation-required"),
+        "T-04 gate: {stdout:?}"
+    );
+}
+
+#[test]
+fn synthesize_json_envelope_and_fail_closed_args() {
+    let output = spawn_dev(&["dev", "synthesize", "--format", "json"], &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = stdout_text(&output);
+    assert_dev_envelope(&stdout, "synthesize");
+    assert!(stdout.contains("\"accepted\":8"), "receipt: {stdout:?}");
+    assert!(
+        stdout.contains("\"paste_gate\":\"confirmation-required\""),
+        "gate: {stdout:?}"
+    );
+    for args in [
+        vec!["dev", "synthesize", "extra"],
+        vec!["dev", "synthesize", "--iterations", "5"],
+        vec!["dev", "synthesize", "--layout", "split"],
+        vec!["dev", "synthesize", "--socket", "/tmp/a.sock"],
+    ] {
+        let output = spawn_dev(&args, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "want exit 2 for {args:?}, stderr={:?}",
+            stderr_text(&output)
+        );
+        assert!(output.stdout.is_empty(), "no stdout on usage error");
+    }
 }
 
 #[test]

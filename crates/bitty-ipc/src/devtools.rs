@@ -223,6 +223,15 @@ pub const METHOD_CAPTURE_FRAME: &str = "bitty.debug/captureFrame";
 /// `headless_rgba` + geometry header; 32-byte digest, zero pixel bytes).
 pub const METHOD_FRAME_HASH: &str = "bitty.debug/frameHash";
 
+/// Wire method for `startTrace` (DT-03, #1099: opt-in bounded trace).
+pub const METHOD_START_TRACE: &str = "bitty.debug/startTrace";
+
+/// Wire method for `stopTrace` (DT-03, #1099: export + delete).
+pub const METHOD_STOP_TRACE: &str = "bitty.debug/stopTrace";
+
+/// Wire method for `fetchTraceChunk` (DT-03, #1099: 256 KiB pages).
+pub const METHOD_FETCH_TRACE_CHUNK: &str = "bitty.debug/fetchTraceChunk";
+
 /// Maximum synthetic events per `synthesizeInput` call (Amendment A1).
 pub const MAX_SYNTH_EVENTS_PER_CALL: usize = 64;
 
@@ -346,7 +355,9 @@ mod automation_ops;
 mod handlers;
 mod json;
 mod profiling;
+mod record;
 mod serve;
+mod trace;
 
 #[cfg(test)]
 mod tests;
@@ -367,10 +378,23 @@ pub use profiling::{
     FrameStatsPublish, ProcessStatsPublish, clear_profiling_for_tests, publish_frame_stats,
     publish_process_stats,
 };
+pub use record::{
+    MAX_ACTIVE_RECORDINGS, MAX_RECORD_BYTES, MAX_RECORD_DETAIL_BYTES, MAX_RECORD_ENTRIES,
+    RECORD_REDACTED_MARKER, RecordEntry, RecordError, RecordKind, Recording, ReplayReport,
+    ReplayVerdict, clear_recordings_for_tests, is_recording_opt_in, record_action,
+    record_config_diagnostic, record_input_marker, record_lifecycle, record_parser_input,
+    recording_count_for_tests, replay_recording, set_recording_opt_in, start_recording,
+    stop_recording,
+};
 pub use serve::{
     ConnectionStats, DirAttestation, HandleOutcome, ServeContext, ServerInfo,
     SocketEndpointIdentity, SocketEnv, attest_bound_socket, encode_error, encode_success,
     handle_envelope, id_zero_error, max_connections, prepare_socket_dir, resolve_socket_path,
     resolve_socket_path_from_env, serve_connection, transport_attested_peer,
     verify_connected_endpoint, verify_socket_endpoint_for_connect,
+};
+pub use trace::{
+    MAX_ACTIVE_TRACES, MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, TRACE_CHUNK_BYTES,
+    TRACE_PREVIEW_BYTES, TraceAppendError, append_trace_event, clear_traces_for_tests,
+    redact_trace_preview, set_trace_spool_dir_for_tests, trace_count_for_tests,
 };

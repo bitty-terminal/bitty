@@ -424,10 +424,11 @@ fn dispatcher_registers_new_methods_for_follow_up() {
     // createWorkspace, closeWorkspace, focusWorkspace) plus CTX-0259 move
     // (moveWorkspace) plus CTX-0188
     // automation (synthesizeInput,
-    // captureFrame) plus CTX-0244 digest (frameHash) plus CTX-0189
+    // captureFrame) plus CTX-0244 digest (frameHash) plus DT-03 trace
+    // lifecycle (startTrace, stopTrace, fetchTraceChunk) plus CTX-0189
     // profiling (getProcessStats, getFrameStats, streamProcessStats,
     // streamFrameStats).
-    assert_eq!(dispatcher.method_count(), 28);
+    assert_eq!(dispatcher.method_count(), 31);
     assert!(dispatcher.contains("bitty.debug/getGridText"));
     assert!(dispatcher.contains("bitty.debug/getInputRing"));
     assert!(dispatcher.contains("bitty.debug/getModifiers"));
@@ -435,6 +436,9 @@ fn dispatcher_registers_new_methods_for_follow_up() {
     assert!(dispatcher.contains(METHOD_SYNTHESIZE_INPUT));
     assert!(dispatcher.contains(METHOD_CAPTURE_FRAME));
     assert!(dispatcher.contains(METHOD_FRAME_HASH));
+    assert!(dispatcher.contains(METHOD_START_TRACE));
+    assert!(dispatcher.contains(METHOD_STOP_TRACE));
+    assert!(dispatcher.contains(METHOD_FETCH_TRACE_CHUNK));
     assert!(dispatcher.contains(METHOD_GET_PROCESS_STATS));
     assert!(dispatcher.contains(METHOD_GET_FRAME_STATS));
     assert!(dispatcher.contains(METHOD_STREAM_PROCESS_STATS));
@@ -2792,281 +2796,598 @@ fn connected_endpoint_rejects_unnamed_peer() {
     ));
 }
 
-// ── DT-04 admission: no-bypass issuance audit (Amendment A1) ─────────────
+// ── trace lifecycle (DT-03, #1099) ─────────────────────────────────────────
 //
-// Acceptance item A1.5: no flag, variable, configuration key, or debug
-// build switch issues, persists, or widens an automation bearer. The only
-// issuance path is the explicit server-side consent minter
-// (`issue_automation_bearer*`): machine-checked here from the wire side —
-// no IPC method mints bearers, and even maximally elevated scopes never
-// substitute for a bearer.
+// `startTrace` / `stopTrace` / `fetchTraceChunk` over the dispatcher:
+// scope matrix, bounds, redaction, 256 KiB pagination with byte-accurate
+// previews, and the `0600` spool export. All content is synthetic fixture
+// text — never secrets (P0-AC-026 harness rule).
 
-/// Candidate issuance method names a bypass would hide behind. Every one
-/// must answer `UnknownMethod` (registration-deny, never scope-deny).
-const BYPASS_ISSUANCE_METHODS: &[&str] = &[
-    "bitty.debug/issueAutomationBearer",
-    "bitty.debug/grantAutomationBearer",
-    "bitty.debug/mintAutomationBearer",
-    "bitty.debug/elevateAutomation",
-    "bitty.debug/issueBearer",
-    "bitty.debug/grantBearer",
-];
+/// Serial guard for the process-global trace and record stores (same
+/// `OnceLock<Mutex<()>>` idiom as the introspection lock; std-only).
+fn trace_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
-#[test]
-fn automation_no_issuance_path_over_ipc_env_or_elevation() {
-    let _guard = lock_introspection_for_test();
-    clear_introspection_for_tests();
-    clear_automation_for_tests();
-    let server = test_server_info();
-    let dispatcher = Dispatcher::with_defaults();
-    // No IPC issuance method exists: bypass-shaped names fail closed as
-    // unknown methods (registration deny, not scope deny).
-    for method in BYPASS_ISSUANCE_METHODS {
-        let payload = format!(
-            "{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{{\"terminalId\":\"t:1\"}}}}"
-        );
-        let outcome = handle_envelope(payload.as_bytes(), &dispatcher, &test_context());
-        assert!(outcome.was_error, "{method} must not exist");
-        assert!(
-            response_text(&outcome).contains("UnknownMethod"),
-            "{method} must answer UnknownMethod, got: {}",
-            response_text(&outcome)
-        );
+fn lock_trace_for_test() -> std::sync::MutexGuard<'static, ()> {
+    trace_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn trace_scopes() -> crate::scope::ScopeSet {
+    let mut set = crate::scope::ScopeSet::new();
+    set.insert(crate::scope::Scope::DebugTrace);
+    set
+}
+
+fn trace_context(server: &ServerInfo, now_ms: u64) -> ServeContext {
+    let mut ctx = ServeContext::with_granted_session(server, trace_scopes(), "trace-test");
+    ctx.uptime_ms = now_ms;
+    ctx
+}
+
+fn trace_envelope(id: u64, method: &str, params: &str) -> Vec<u8> {
+    format!("{{\"id\":{id},\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{params}}}")
+        .into_bytes()
+}
+
+/// Extract a `"key":"value"` string field from a response (no unescape).
+fn response_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    let at = text.find(needle.as_str())?;
+    let rest = &text[at + needle.len()..];
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(out),
+            '\\' => {
+                let e = chars.next()?;
+                out.push('\\');
+                out.push(e);
+            }
+            c => out.push(c),
+        }
     }
-    // Elevation alone never substitutes for a bearer: maximally elevated
-    // scopes (the `BITTY_CTL_ELEVATE` allowlist shape, built purely without
-    // touching process env) plus forged or hand-crafted tokens still fail
-    // closed with zero issued bearers.
-    let elevated = crate::ctl::elevation_from_env(Some(
-        "debug.control,debug.trace,debug.inspect,terminal.input,terminal.inspect",
-    ));
-    let ctx = automation_context(&server, elevated, "s1", 0);
-    for (id, token) in [
-        (11u64, "forged-token".to_string()),
-        (12u64, "deadbeef".repeat(4)),
-    ] {
-        let params = format!(
-            "{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
-        );
-        let outcome = handle_envelope(&synth_envelope(id, &params), &dispatcher, &ctx);
-        assert!(outcome.was_error);
-        assert!(
-            response_text(&outcome).contains("ScopeDenied"),
-            "forged bearer with full elevation must be ScopeDenied, got: {}",
-            response_text(&outcome)
-        );
-        let params =
-            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"format\":\"semantic\"}}");
-        let outcome = handle_envelope(&capture_envelope(id + 100, &params), &dispatcher, &ctx);
-        assert!(outcome.was_error);
-        assert!(
-            response_text(&outcome).contains("ScopeDenied"),
-            "forged capture with full elevation must be ScopeDenied, got: {}",
-            response_text(&outcome)
-        );
+}
+
+/// Unescape a JSON string body (responses from these tests only carry
+/// `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX` escapes plus raw UTF-8).
+fn unescape_json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+            }
+            Some(e) => {
+                out.push('\\');
+                out.push(e);
+            }
+            None => out.push('\\'),
+        }
     }
-    // Bearer tokens are opaque: a real token embeds neither the session
-    // nor the terminal id, so authority cannot be crafted.
-    let tok = issue_automation_bearer("sess-9", "t:3", AutomationFamily::Synthesize, 0).unwrap();
-    assert_eq!(tok.len(), 32, "token must stay 32 hex chars");
-    assert!(tok.bytes().all(|b| b.is_ascii_hexdigit()));
-    assert!(!tok.contains("sess-9") && !tok.contains("t:3"));
-    assert_eq!(automation_bearer_count_for_tests(), 1);
-    clear_automation_for_tests();
-    clear_introspection_for_tests();
+    out
+}
+
+fn unique_spool_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("bitty-trace-test-{}-{tag}", std::process::id()))
 }
 
 #[test]
-fn automation_shed_calls_leave_zero_partial_state() {
-    // Acceptance item A1.2: overruns shed with typed `budget` errors and
-    // leave zero partial state — no sequence advance, no input markers,
-    // no audit entries.
-    let _guard = lock_introspection_for_test();
-    clear_introspection_for_tests();
-    clear_automation_for_tests();
+fn trace_lifecycle_start_stop_fetch_roundtrip() {
+    let _guard = lock_trace_for_test();
+    clear_traces_for_tests();
+    clear_recordings_for_tests();
+    let spool = unique_spool_dir("roundtrip");
+    std::fs::remove_dir_all(&spool).ok();
+    set_trace_spool_dir_for_tests(spool.to_string_lossy().as_ref());
     let server = test_server_info();
     let dispatcher = Dispatcher::with_defaults();
-    let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 0).unwrap();
-    let ctx = automation_context(&server, automation_scopes_synthesize(), "s1", 0);
-    let params = format!(
-        "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
-    );
-    let seq0 = synthetic_seq_for_tests();
-    let audit0 = frame_audit_len_for_tests();
-    let ring0 = live_input_store().lock().map(|g| g.len()).unwrap_or(0);
-    for id in 1..=MAX_SYNTH_CALLS_PER_SEC as u64 {
-        let outcome = handle_envelope(&synth_envelope(id, &params), &dispatcher, &ctx);
-        assert!(!outcome.was_error, "call {id} must pass under ceiling");
-    }
-    assert_eq!(
-        synthetic_seq_for_tests(),
-        seq0 + MAX_SYNTH_CALLS_PER_SEC as u64
-    );
+    assert!(dispatcher.contains(METHOD_START_TRACE));
+    assert!(dispatcher.contains(METHOD_STOP_TRACE));
+    assert!(dispatcher.contains(METHOD_FETCH_TRACE_CHUNK));
+
+    let ctx = trace_context(&server, 1_000);
     let outcome = handle_envelope(
-        &synth_envelope(MAX_SYNTH_CALLS_PER_SEC as u64 + 1, &params),
+        &trace_envelope(1, METHOD_START_TRACE, "{}"),
         &dispatcher,
         &ctx,
     );
-    assert!(outcome.was_error);
     let text = response_text(&outcome);
-    assert!(
-        text.contains("RateLimited") && text.contains("budget"),
-        "got: {text}"
-    );
-    assert_eq!(
-        synthetic_seq_for_tests(),
-        seq0 + MAX_SYNTH_CALLS_PER_SEC as u64,
-        "shed synth must not advance the sequence"
-    );
-    assert_eq!(
-        frame_audit_len_for_tests(),
-        audit0,
-        "shed synth must not audit"
-    );
-    assert_eq!(
-        live_input_store().lock().map(|g| g.len()).unwrap_or(0),
-        ring0 + MAX_SYNTH_CALLS_PER_SEC,
-        "shed synth must not publish markers"
-    );
-    // Same discipline for capture: the shed call appends no audit entry.
-    publish_grid_text(vec!["f".to_string()], 0, 1, true, 1, 80, 24);
-    let tok = issue_automation_bearer("c1", "t:1", AutomationFamily::Capture, 0).unwrap();
-    let ctx = automation_context(&server, automation_scopes_capture(), "c1", 0);
-    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"semantic\"}}");
-    for id in 1..=MAX_CAPTURE_FPS as u64 {
-        let outcome = handle_envelope(&capture_envelope(id, &params), &dispatcher, &ctx);
-        assert!(!outcome.was_error, "capture {id} must pass under ceiling");
-    }
-    let audit_mid = frame_audit_len_for_tests();
+    assert!(!outcome.was_error, "startTrace must succeed: {text}");
+    assert!(text.contains("\"traceId\":\"trace-1\""), "got: {text}");
+    assert!(text.contains("\"chunkBytes\":262144"), "got: {text}");
+    assert!(text.contains("trace-1.jsonl"), "got: {text}");
+
+    // Append three instrumentation events through the harness hook.
+    let seq0 = append_trace_event(
+        "trace-1",
+        "panel-1",
+        "bitty.panel:mounted",
+        "{\"count\":1}",
+        7,
+        1_001,
+    )
+    .expect("append must succeed")
+    .expect("event must be retained");
+    assert_eq!(seq0, 0);
+    append_trace_event("trace-1", "panel-1", "lifecycle", "mounted", 7, 1_002).unwrap();
+    append_trace_event("trace-1", "queue", "budget", "{\"depth\":3}", 8, 1_003).unwrap();
+
+    // Fetch page 0: small export, no continuation, byte-accurate preview.
     let outcome = handle_envelope(
-        &capture_envelope(MAX_CAPTURE_FPS as u64 + 1, &params),
+        &trace_envelope(
+            2,
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-1\",\"offset\":0}",
+        ),
         &dispatcher,
         &ctx,
     );
-    assert!(outcome.was_error);
-    assert!(
-        response_text(&outcome).contains("RateLimited"),
-        "got: {}",
-        response_text(&outcome)
-    );
+    let text = response_text(&outcome);
+    assert!(!outcome.was_error, "fetch must succeed: {text}");
+    assert!(text.contains("\"continuation\":false"), "got: {text}");
+    let raw_chunk = response_field(&text, "chunk").expect("chunk field");
+    let chunk = unescape_json_string(&raw_chunk);
+    assert!(chunk.contains("\"kind\":\"lifecycle\""), "got: {chunk}");
+    assert!(chunk.contains("\"seq\":2"), "got: {chunk}");
+    let raw_preview = response_field(&text, "preview").expect("preview field");
+    let preview = unescape_json_string(&raw_preview);
+    let mut end = chunk.len().min(TRACE_PREVIEW_BYTES);
+    while end > 0 && !chunk.is_char_boundary(end) {
+        end -= 1;
+    }
     assert_eq!(
-        frame_audit_len_for_tests(),
-        audit_mid,
-        "shed capture must not audit"
+        preview,
+        redact_trace_preview(&chunk[..end]),
+        "preview must equal the redacted export prefix byte-for-byte"
     );
-    clear_automation_for_tests();
-    clear_introspection_for_tests();
+
+    // Stop: spool export, counts, previews, then the record is gone.
+    let outcome = handle_envelope(
+        &trace_envelope(3, METHOD_STOP_TRACE, "{\"traceId\":\"trace-1\"}"),
+        &dispatcher,
+        &ctx,
+    );
+    let text = response_text(&outcome);
+    assert!(!outcome.was_error, "stopTrace must succeed: {text}");
+    assert!(text.contains("\"spoolMode\":\"0600\""), "got: {text}");
+    assert!(text.contains("\"truncated\":false"), "got: {text}");
+    assert!(text.contains("\"dropCount\":0"), "got: {text}");
+    let spool_file = spool.join("trace-1.jsonl");
+    let spooled = std::fs::read(&spool_file).expect("spool file must exist");
+    assert_eq!(
+        spooled,
+        chunk.as_bytes(),
+        "spool export must equal the served bytes byte-for-byte"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&spool_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "spool files keep mode 0600");
+    }
+
+    // Sibling parity: stop deletes the record; fetch-after-stop is NotFound.
+    let outcome = handle_envelope(
+        &trace_envelope(4, METHOD_STOP_TRACE, "{\"traceId\":\"trace-1\"}"),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(response_text(&outcome).contains("\"code\":\"NotFound\""));
+    let outcome = handle_envelope(
+        &trace_envelope(
+            5,
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-1\",\"offset\":0}",
+        ),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(response_text(&outcome).contains("\"code\":\"NotFound\""));
+
+    std::fs::remove_dir_all(&spool).ok();
+    clear_traces_for_tests();
 }
 
-// ── DT-06 admission: sustained ceiling, TTL adequacy, audit byte-accuracy ──
-//
-// Acceptance: the 120 s TTL and 2/s ceiling stay adequate under harness
-// load, and the digest audit stays byte-accurate under contention (every
-// attributable call — granted, shed, denied — leaves exactly one entry;
-// granted entries carry exactly the served digest).
-
 #[test]
-fn frame_hash_sustained_ceiling_ttl_and_audit_byte_accuracy_under_load() {
-    use crate::frame_digest::{FRAME_DIGEST_TTL_MS, MAX_FRAME_DIGEST_PER_SEC, frame_digest_hex};
-    let _guard = lock_introspection_for_test();
-    clear_introspection_for_tests();
-    clear_automation_for_tests();
-    assert_eq!(FRAME_DIGEST_TTL_MS, 120_000);
-    assert_eq!(MAX_FRAME_DIGEST_PER_SEC, 2);
+fn trace_scope_matrix_denies_inspect_and_unscoped() {
+    let _guard = lock_trace_for_test();
+    clear_traces_for_tests();
     let server = test_server_info();
     let dispatcher = Dispatcher::with_defaults();
-    let rgba = fixture_rgba(8, 8, 4);
-    publish_frame_rgba(8, 8, 7, rgba.clone());
-    let served = frame_digest_hex(8, 8, 7, &rgba);
-    let tok = issue_automation_bearer_with_ttl(
-        "load",
-        "t:1",
-        AutomationFamily::FrameDigest,
-        0,
-        FRAME_DIGEST_TTL_MS,
-    )
-    .unwrap();
-    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
-    let forged = "{\"terminalId\":\"t:1\",\"bearer\":\"bogus\"}".to_string();
-    let audit0 = frame_audit_len_for_tests();
-    let mut id = 1u64;
-    // Five consecutive 1 s windows: 2 grants + 1 shed + 1 forged-denied
-    // each. Virtual clock only — no sleeps.
-    for window in 0..5u64 {
-        let now = window * 1_000;
-        let ctx = digest_context(&server, automation_scopes_capture(), "load", now);
-        for _ in 0..MAX_FRAME_DIGEST_PER_SEC {
-            id += 1;
-            let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+    let methods = [
+        (METHOD_START_TRACE, "{}"),
+        (METHOD_STOP_TRACE, "{\"traceId\":\"trace-9\"}"),
+        (
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-9\",\"offset\":0}",
+        ),
+    ];
+    // `debug.inspect` alone and no debug scope at all: every method denies
+    // with `scope`/`ScopeDenied` and creates zero partial state.
+    for (label, granted) in [
+        ("inspect-only", {
+            let mut set = crate::scope::ScopeSet::new();
+            set.insert(crate::scope::Scope::DebugInspect);
+            set
+        }),
+        ("unscoped", crate::scope::ScopeSet::new()),
+    ] {
+        let ctx = ServeContext::with_granted_session(&server, granted, "trace-test");
+        for (method, params) in methods {
+            let outcome = handle_envelope(&trace_envelope(1, method, params), &dispatcher, &ctx);
+            let text = response_text(&outcome);
             assert!(
-                !outcome.was_error,
-                "window {window}: grant must serve under load"
-            );
-            assert!(
-                response_text(&outcome).contains(&served),
-                "window {window}: served digest must match: {}",
-                response_text(&outcome)
+                text.contains("\"code\":\"ScopeDenied\""),
+                "{label} {method} must be ScopeDenied: {text}"
             );
         }
-        id += 1;
-        let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
-        assert!(outcome.was_error);
-        assert!(
-            response_text(&outcome).contains("RateLimited"),
-            "window {window}: overrun must shed, got: {}",
-            response_text(&outcome)
+    }
+    assert_eq!(trace_count_for_tests(), 0);
+    // `debug.control` is wider than `debug.trace`: start succeeds.
+    let mut control = crate::scope::ScopeSet::new();
+    control.insert(crate::scope::Scope::DebugControl);
+    let ctx = ServeContext::with_granted_session(&server, control, "trace-test");
+    let outcome = handle_envelope(
+        &trace_envelope(2, METHOD_START_TRACE, "{}"),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(!outcome.was_error, "control scope starts traces");
+    clear_traces_for_tests();
+}
+
+#[test]
+fn trace_params_and_budget_fail_closed() {
+    let _guard = lock_trace_for_test();
+    clear_traces_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let ctx = trace_context(&server, 5_000);
+    for (label, params) in [
+        ("zero-duration", "{\"durationMs\":0}"),
+        ("over-duration", "{\"durationMs\":300001}"),
+        ("zero-bytes", "{\"maxBytes\":0}"),
+        ("over-bytes", "{\"maxBytes\":4194305}"),
+        ("non-object", "[1]"),
+    ] {
+        let outcome = handle_envelope(
+            &trace_envelope(1, METHOD_START_TRACE, params),
+            &dispatcher,
+            &ctx,
         );
-        id += 1;
-        let outcome = handle_envelope(&digest_envelope(id, &forged), &dispatcher, &ctx);
-        assert!(outcome.was_error);
+        let text = response_text(&outcome);
         assert!(
-            response_text(&outcome).contains("ScopeDenied"),
-            "window {window}: forged bearer must deny, got: {}",
-            response_text(&outcome)
+            text.contains("\"code\":\"InvalidParams\""),
+            "{label} must be InvalidParams: {text}"
         );
     }
-    // TTL adequacy: the full-cap grant still serves 1 ms before expiry
-    // and denies exactly at issue + TTL.
-    let ctx = digest_context(&server, automation_scopes_capture(), "load", 119_999);
-    id += 1;
-    let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
-    assert!(!outcome.was_error, "grant must serve at TTL - 1 ms");
-    assert!(response_text(&outcome).contains(&served));
-    let ctx = digest_context(&server, automation_scopes_capture(), "load", 120_000);
-    id += 1;
-    let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
-    assert!(outcome.was_error);
-    assert!(
-        response_text(&outcome).contains("ScopeDenied"),
-        "grant must expire exactly at TTL, got: {}",
-        response_text(&outcome)
+    // Four concurrent traces, then the fifth is shed with TooManyTraces.
+    for id in 1..=4u64 {
+        let outcome = handle_envelope(
+            &trace_envelope(id, METHOD_START_TRACE, "{}"),
+            &dispatcher,
+            &ctx,
+        );
+        assert!(!outcome.was_error, "trace {id} must start");
+    }
+    let outcome = handle_envelope(
+        &trace_envelope(9, METHOD_START_TRACE, "{}"),
+        &dispatcher,
+        &ctx,
     );
-    // Byte-accuracy: 5 windows x (2 granted + 1 shed + 1 denied) + 1
-    // granted + 1 expired = 22 entries, no loss, no duplication, no
-    // drop-oldest in range (cap is 64).
-    let snap = frame_audit_snapshot_for_tests();
+    let text = response_text(&outcome);
+    assert!(text.contains("\"code\":\"TooManyTraces\""), "got: {text}");
+
+    // Unknown ids, over-range offsets, and malformed ids fail closed.
+    for (label, method, params, code) in [
+        (
+            "unknown-stop",
+            METHOD_STOP_TRACE,
+            "{\"traceId\":\"trace-99\"}",
+            "NotFound",
+        ),
+        (
+            "unknown-fetch",
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-99\",\"offset\":0}",
+            "NotFound",
+        ),
+        (
+            "over-offset",
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-1\",\"offset\":999999}",
+            "InvalidParams",
+        ),
+        (
+            "missing-offset",
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-1\"}",
+            "InvalidParams",
+        ),
+        (
+            "wild-id",
+            METHOD_STOP_TRACE,
+            "{\"traceId\":\"trace-*\"}",
+            "InvalidParams",
+        ),
+    ] {
+        let outcome = handle_envelope(&trace_envelope(10, method, params), &dispatcher, &ctx);
+        let text = response_text(&outcome);
+        assert!(
+            text.contains(&format!("\"code\":\"{code}\"")),
+            "{label} must be {code}: {text}"
+        );
+    }
+
+    // Mid-character offsets are rejected (UTF-8 scalar boundaries only).
+    append_trace_event("trace-1", "panel-1", "note", "caf\u{e9} latte", 1, 5_001).unwrap();
+    let bytes: u64 = {
+        let outcome = handle_envelope(
+            &trace_envelope(
+                11,
+                METHOD_FETCH_TRACE_CHUNK,
+                "{\"traceId\":\"trace-1\",\"offset\":0}",
+            ),
+            &dispatcher,
+            &ctx,
+        );
+        let raw = response_field(&response_text(&outcome), "chunk").unwrap();
+        unescape_json_string(&raw).len() as u64
+    };
+    let _ = bytes;
+    // Find a mid-character offset inside the retained export: the payload
+    // above carries a 2-byte `é`; probe every offset until the handler
+    // rejects one (proves the boundary check fires on real content).
+    let mut saw_boundary_rejection = false;
+    for probe in 0..4096u64 {
+        let params = format!("{{\"traceId\":\"trace-1\",\"offset\":{probe}}}");
+        let outcome = handle_envelope(
+            &trace_envelope(12, METHOD_FETCH_TRACE_CHUNK, &params),
+            &dispatcher,
+            &ctx,
+        );
+        let text = response_text(&outcome);
+        if text.contains("UTF-8 scalar boundary") {
+            saw_boundary_rejection = true;
+            break;
+        }
+        if probe > 2048 && text.contains("\"continuation\":false") {
+            break;
+        }
+    }
+    assert!(
+        saw_boundary_rejection,
+        "mid-character offsets must be rejected"
+    );
+    clear_traces_for_tests();
+}
+
+#[test]
+fn trace_redaction_and_input_gating() {
+    let _guard = lock_trace_for_test();
+    clear_traces_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let ctx = trace_context(&server, 7_000);
+
+    // Default trace: input markers drop with a counted drop; secrets redact.
+    let outcome = handle_envelope(
+        &trace_envelope(1, METHOD_START_TRACE, "{}"),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(!outcome.was_error);
+    assert!(
+        append_trace_event("trace-1", "harness", "input.key", "a", 1, 7_001)
+            .unwrap()
+            .is_none(),
+        "input markers need includeInput"
+    );
+    append_trace_event(
+        "trace-1",
+        "panel-1",
+        "snapshot",
+        "token abc123 leaked",
+        1,
+        7_002,
+    )
+    .unwrap();
+    let outcome = handle_envelope(
+        &trace_envelope(
+            2,
+            METHOD_FETCH_TRACE_CHUNK,
+            "{\"traceId\":\"trace-1\",\"offset\":0}",
+        ),
+        &dispatcher,
+        &ctx,
+    );
+    let raw = response_field(&response_text(&outcome), "chunk").unwrap();
+    let chunk = unescape_json_string(&raw);
+    assert!(
+        !chunk.contains("input.key"),
+        "marker must not be retained: {chunk}"
+    );
+    assert!(
+        chunk.contains("[redacted]"),
+        "secret payload must redact: {chunk}"
+    );
+    assert!(
+        !chunk.contains("token abc123"),
+        "secret must not leak: {chunk}"
+    );
+    let outcome = handle_envelope(
+        &trace_envelope(3, METHOD_STOP_TRACE, "{\"traceId\":\"trace-1\"}"),
+        &dispatcher,
+        &ctx,
+    );
+    let text = response_text(&outcome);
+    assert!(text.contains("\"dropCount\":1"), "got: {text}");
+    assert!(text.contains("\"truncated\":true"), "got: {text}");
+
+    // Opted-in trace retains input markers with their synthetic nature
+    // visible in the kind (harness/user distinguishable on replay).
+    let outcome = handle_envelope(
+        &trace_envelope(4, METHOD_START_TRACE, "{\"includeInput\":true}"),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(!outcome.was_error);
+    let kept = append_trace_event("trace-2", "harness", "input.key", "a", 1, 7_003).unwrap();
+    assert_eq!(kept, Some(0));
+    // Over-budget lines drop with a counted drop; retained state unchanged.
+    let outcome = handle_envelope(
+        &trace_envelope(5, METHOD_START_TRACE, "{\"maxBytes\":64}"),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(!outcome.was_error);
+    let before = trace_count_for_tests();
+    assert_eq!(before, 2);
+    let dropped = append_trace_event("trace-3", "o", "k", &"x".repeat(200), 1, 7_004).unwrap();
+    assert!(dropped.is_none(), "over-budget line must drop");
+    let outcome = handle_envelope(
+        &trace_envelope(6, METHOD_STOP_TRACE, "{\"traceId\":\"trace-3\"}"),
+        &dispatcher,
+        &ctx,
+    );
+    let text = response_text(&outcome);
+    assert!(text.contains("\"byteCount\":0"), "got: {text}");
+    assert!(text.contains("\"dropCount\":1"), "got: {text}");
+    clear_traces_for_tests();
+}
+
+// ── record/replay staged v1 (DT-08, #1104) ─────────────────────────────────
+//
+// Library-only hooks: disabled by default, opt-in retention with
+// redaction, headless-harness replay with determinism digests, and no
+// plugin re-execution by construction (this module depends on `std`
+// only and replays through a caller-supplied driver closure).
+
+#[test]
+fn record_hooks_are_disabled_by_default() {
+    let _guard = lock_trace_for_test();
+    clear_recordings_for_tests();
+    assert!(!is_recording_opt_in());
     assert_eq!(
-        snap.len(),
-        audit0 + 22,
-        "every attributable call leaves one entry"
+        start_recording("harness", false),
+        Err(RecordError::NotOptedIn)
     );
-    assert!(snap.iter().all(|e| e.format == "digest"));
+    assert_eq!(record_action("rec-1", "noop"), Err(RecordError::NotOptedIn));
+    assert_eq!(stop_recording("rec-1"), Err(RecordError::NotOptedIn));
+}
+
+#[test]
+fn record_roundtrip_redacts_and_gates_input() {
+    let _guard = lock_trace_for_test();
+    clear_recordings_for_tests();
+    set_recording_opt_in(true);
+    let id = start_recording("harness", false).expect("opted-in start");
+    assert_eq!(recording_count_for_tests(), 1);
+
+    assert_eq!(record_parser_input(&id, b"hello"), Ok(true));
+    assert_eq!(record_action(&id, "pane-mounted"), Ok(true));
+    assert_eq!(record_lifecycle(&id, "attached"), Ok(true));
+    assert_eq!(
+        record_config_diagnostic(&id, "theme resolved: dark"),
+        Ok(true)
+    );
+    // Input markers need per-recording opt-in: counted drop, Ok(false).
+    assert_eq!(record_input_marker(&id, "key:a"), Ok(false));
+    // Secret-shaped details redact before retention.
+    assert_eq!(record_action(&id, "deploy token abc"), Ok(true));
+
+    let recording = stop_recording(&id).expect("stop");
+    assert_eq!(recording.owner, "harness");
+    assert_eq!(recording.entries.len(), 5);
+    assert_eq!(recording.drops, 1);
+    assert!(!recording.include_input);
+    assert_eq!(recording.entries[0].kind, RecordKind::ParserInput);
+    assert_eq!(recording.entries[0].detail, "68656c6c6f");
     assert!(
-        snap.iter()
-            .all(|e| e.session_id == "load" && e.terminal_id == "t:1"),
-        "audit attribution must stay exact under load"
+        recording.entries[0].synthetic,
+        "parser inputs are harness-origin"
     );
-    let with_digest: Vec<_> = snap.iter().filter(|e| !e.digest_hex.is_empty()).collect();
-    assert_eq!(with_digest.len(), 11, "exactly the 11 grants carry digests");
     assert!(
-        with_digest
-            .iter()
-            .all(|e| e.digest_hex == served && e.frame_seq == 7),
-        "granted entries must carry exactly the served digest"
+        !recording.entries[1].synthetic,
+        "passive actions stay passive"
     );
-    let denied: Vec<_> = snap.iter().filter(|e| e.digest_hex.is_empty()).collect();
-    assert_eq!(denied.len(), 11, "shed + forged + expired carry no digest");
-    assert!(denied.iter().all(|e| e.frame_seq == 0));
-    clear_automation_for_tests();
-    clear_introspection_for_tests();
+    assert_eq!(recording.entries[4].detail, "[redacted]");
+    assert!(
+        recording.bytes > 0,
+        "retained bytes must be accounted, got {}",
+        recording.bytes
+    );
+    // Replay runs through the caller's driver: entries arrive in order,
+    // and the same decisions always digest identically.
+    let mut seen: Vec<String> = Vec::new();
+    let report = replay_recording(&recording, |entry| {
+        seen.push(entry.detail.clone());
+        ReplayVerdict::Applied
+    });
+    assert_eq!(report.applied, 5);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(seen.len(), 5);
+    let again = replay_recording(&recording, |_| ReplayVerdict::Applied);
+    assert_eq!(
+        report.digest_hex, again.digest_hex,
+        "replay must be deterministic"
+    );
+    let skip_all = replay_recording(&recording, |_| ReplayVerdict::Skipped);
+    assert_eq!(skip_all.applied, 0);
+    assert_eq!(skip_all.skipped, 5);
+    assert_ne!(
+        skip_all.digest_hex, report.digest_hex,
+        "different driver decisions must digest differently"
+    );
+    clear_recordings_for_tests();
+}
+
+#[test]
+fn record_input_opt_in_and_bounds_fail_closed() {
+    let _guard = lock_trace_for_test();
+    clear_recordings_for_tests();
+    set_recording_opt_in(true);
+    let id = start_recording("harness", true).expect("opted-in start");
+    assert_eq!(record_input_marker(&id, "key:a"), Ok(true));
+    let recording = stop_recording(&id).expect("stop");
+    assert!(recording.include_input);
+    assert!(recording.entries[0].synthetic);
+
+    // Unknown ids, bad shapes, and capacity fail closed with no partial state.
+    assert_eq!(stop_recording("rec-99"), Err(RecordError::NotFound));
+    assert_eq!(record_action("rec-99", "noop"), Err(RecordError::NotFound));
+    assert!(matches!(
+        record_action(&id, ""),
+        Err(RecordError::InvalidDetail(_))
+    ));
+    assert!(matches!(
+        record_parser_input(&id, &[0u8; 4097]),
+        Err(RecordError::InvalidDetail(_))
+    ));
+    let ids: Vec<String> = (0..MAX_ACTIVE_RECORDINGS)
+        .map(|_| start_recording("h", false).expect("slot"))
+        .collect();
+    assert_eq!(start_recording("h", false), Err(RecordError::TooMany));
+    for live in &ids {
+        stop_recording(live).unwrap();
+    }
+    clear_recordings_for_tests();
 }

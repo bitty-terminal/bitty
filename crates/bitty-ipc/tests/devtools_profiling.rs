@@ -32,7 +32,8 @@ use std::sync::{Mutex, OnceLock};
 
 use bitty_ipc::devtools::{
     Dispatcher, FrameStatsPublish, ProcessStatsPublish, ServeContext, ServerInfo,
-    clear_profiling_for_tests, handle_envelope, publish_frame_stats, publish_process_stats,
+    clear_profiling_for_tests, handle_envelope, publish_frame_stats, publish_grid_text,
+    publish_process_stats,
 };
 use bitty_ipc::scope::{Scope, ScopeSet};
 
@@ -700,4 +701,136 @@ mod socket {
         clear_profiling_for_tests();
         std::fs::remove_file(&socket_path).ok();
     }
+}
+
+// ── DT-05 admission: aggregates-only posture + zero terminal bytes ──────────
+//
+// Acceptance item A1.4 (Amendment A1 live-profiling scope): profiling
+// records carry zero terminal bytes — getters and streams serve numeric
+// aggregates plus a bounded renderer label only, never per-frame traces,
+// PTY output, clipboard, or environment bytes. The dispatch path itself
+// never samples: serving unrelated methods leaves the profiling store
+// empty (cold-path-only posture, PB-4/PB-7 neutrality shape).
+
+/// Raw-trace keys that must never appear in a profiling response. The
+/// stream envelope legitimately uses `"samples"` (aggregate objects), so
+/// that key is asserted structurally elsewhere, not here.
+const FORBIDDEN_TRACE_KEYS: &[&str] = &[
+    "\"events\"",
+    "\"spans\"",
+    "\"trace\"",
+    "\"pty\"",
+    "\"lines\"",
+    "\"grid\"",
+    "\"text\"",
+    "\"clipboard\"",
+    "\"env\"",
+];
+
+#[test]
+fn profiling_responses_carry_aggregates_only_and_zero_terminal_bytes() {
+    let _guard = hold_profiling_lock();
+    clear_profiling_for_tests();
+    // Seed terminal content carrying secrets, clipboard, and environment
+    // bytes: no profiling response may echo any of it.
+    publish_grid_text(
+        vec![
+            "$ echo hello".to_string(),
+            "DB_PASSWORD=hunter2-profiling".to_string(),
+            "clipboard bytes profiling-probe".to_string(),
+            "AWS_SECRET=hunter2-env-probe".to_string(),
+        ],
+        1,
+        5,
+        true,
+        21,
+        80,
+        24,
+    );
+    publish_process_stats(1000, process_sample(2048));
+    publish_frame_stats(1000, frame_sample("wgpu-vulkan"));
+
+    let (err, process) = call(inspect_scopes(), "bitty.debug/getProcessStats", None);
+    assert!(!err, "getProcessStats must serve: {process}");
+    let (err, frame) = call(inspect_scopes(), "bitty.debug/getFrameStats", None);
+    assert!(!err, "getFrameStats must serve: {frame}");
+    let (err, process_stream) = call(
+        trace_scopes(),
+        "bitty.debug/streamProcessStats",
+        Some("{\"afterSeq\":0}"),
+    );
+    assert!(!err, "streamProcessStats must serve: {process_stream}");
+    let (err, frame_stream) = call(
+        trace_scopes(),
+        "bitty.debug/streamFrameStats",
+        Some("{\"afterSeq\":0}"),
+    );
+    assert!(!err, "streamFrameStats must serve: {frame_stream}");
+
+    // Aggregate contract: numeric fields plus the bounded renderer label.
+    assert!(process.contains("\"rssBytes\":2048"), "got: {process}");
+    assert!(frame.contains("\"frameP50Us\":3000"), "got: {frame}");
+    assert!(
+        frame.contains("\"backend\":\"wgpu-vulkan\""),
+        "got: {frame}"
+    );
+    assert!(
+        frame.contains("\"trust\":\"untrusted-observation\""),
+        "got: {frame}"
+    );
+    assert!(
+        process_stream.contains("\"family\":\"process-stats\""),
+        "got: {process_stream}"
+    );
+    assert!(
+        frame_stream.contains("\"family\":\"frame-stats\""),
+        "got: {frame_stream}"
+    );
+    for body in [&process, &frame, &process_stream, &frame_stream] {
+        for secret in [
+            "hunter2-profiling",
+            "profiling-probe",
+            "hunter2-env-probe",
+            "hello",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "terminal bytes reached profiling output: {body}"
+            );
+        }
+        for key in FORBIDDEN_TRACE_KEYS {
+            assert!(
+                !body.contains(key),
+                "raw-trace key {key} in profiling output: {body}"
+            );
+        }
+    }
+    clear_profiling_for_tests();
+}
+
+#[test]
+fn profiling_dispatch_path_never_samples() {
+    // Cold-path-only posture: serving unrelated debug methods must not
+    // publish profiling samples as a side effect (no hot-path callback
+    // registration — sampling happens only through the explicit publish
+    // path at a sampled cadence).
+    let _guard = hold_profiling_lock();
+    clear_profiling_for_tests();
+    for _ in 0..16 {
+        let (err, _) = call(inspect_scopes(), "bitty.debug/ping", None);
+        assert!(!err);
+    }
+    let (err, process) = call(inspect_scopes(), "bitty.debug/getProcessStats", None);
+    assert!(!err);
+    assert!(
+        process.contains("\"sample\":\"none\""),
+        "dispatch must not sample: {process}"
+    );
+    let (err, frame) = call(inspect_scopes(), "bitty.debug/getFrameStats", None);
+    assert!(!err);
+    assert!(
+        frame.contains("\"sample\":\"none\""),
+        "dispatch must not sample: {frame}"
+    );
+    clear_profiling_for_tests();
 }

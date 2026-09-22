@@ -76,12 +76,20 @@ struct TestInstance {
 impl TestInstance {
     fn spawn_test_mode(tag: &str, elevate_debug_control: bool) -> Self {
         let dir = TestDir::new(tag);
-        let socket_path = dir.path().join("s.sock");
-        let socket = socket_path.to_string_lossy().into_owned();
+        let socket = dir.path().join("s.sock").to_string_lossy().into_owned();
         assert!(
             socket.len() < 100,
             "socket path must fit macOS SUN_LEN: {socket}"
         );
+        Self::spawn_test_mode_with_socket(tag, elevate_debug_control, dir, socket)
+    }
+
+    fn spawn_test_mode_with_socket(
+        tag: &str,
+        elevate_debug_control: bool,
+        dir: TestDir,
+        socket: String,
+    ) -> Self {
         let stderr_path = dir.path().join("stderr.log");
         let stderr = std::fs::File::create(&stderr_path).expect("stderr log");
         let mut cmd = Command::new(BITTY_BIN);
@@ -340,5 +348,26 @@ fn test_mode_exit_is_not_ambient_authority() {
     assert!(
         info.contains("\"test_mode\":true"),
         "instance must keep serving after a denied testExit: {info}"
+    );
+}
+
+#[test]
+fn test_mode_unservable_socket_exits_nonzero_fail_closed() {
+    // Amendment A3 admission: a test-mode process that cannot serve its
+    // socket exits non-zero instead of running a harness against no
+    // surface. `/proc` is never writable, so this socket can never bind
+    // (fail-soft serve guard → `run()` returns 1).
+    let dir = TestDir::new("nosock");
+    let socket = "/proc/bitty-test-mode-unservable/s.sock".to_string();
+    let mut instance = TestInstance::spawn_test_mode_with_socket("nosock", true, dir, socket);
+    let status = instance.wait_exit(Duration::from_secs(30));
+    assert!(
+        !status.success(),
+        "test-mode with an unservable socket must exit non-zero, got {status}"
+    );
+    assert!(
+        instance.stderr_tail().contains("servable IPC socket"),
+        "stderr must name the missing surface:\\n{}",
+        instance.stderr_tail()
     );
 }

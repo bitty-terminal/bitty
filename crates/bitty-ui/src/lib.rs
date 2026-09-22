@@ -78,6 +78,11 @@
 //!   by the canonical [`uitree::UiNodeId`]; appearance stays Lua-side.
 //!   Headless only: no render, exec, or plugin coupling (beacon-style
 //!   plugin migration recorded as a follow-up in the module docs).
+//! - [`gesture::GestureTransaction`] — U-5 gesture transaction
+//!   (lift/preview/commit/Esc-rollback, interactive drop targets, atomic
+//!   registry commit) and [`gesture::CommandOrigin`] ontological
+//!   equivalence (gesture/keyboard/palette/CLI/IPC/agent through one
+//!   registry, UX-21/UX-22).
 //!
 //! # Determinism
 //!
@@ -105,6 +110,7 @@ pub mod decoration;
 pub mod drag;
 pub mod focus;
 pub mod geometry;
+pub mod gesture;
 pub mod layout;
 pub mod panel;
 pub mod presentation;
@@ -147,6 +153,10 @@ pub use drag::{
 };
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
+pub use gesture::{
+    CommandInvocation, CommandOrigin, DropTarget, EquivalenceError, GestureError, GestureOutcome,
+    GesturePhase, GestureTransaction, resolve_invocation, verify_origin_equivalence,
+};
 pub use layout::{
     LayoutNode, OverlayLayer, OverlayTier, clamp_ratio, smart_split_axis, split_rect,
     split_rect_with_gap,

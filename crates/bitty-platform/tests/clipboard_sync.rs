@@ -99,3 +99,46 @@ fn backend_hint_matches_wayland_env_signal() {
 fn new_never_panics_without_display() {
     let _ = Clipboard::new();
 }
+
+#[test]
+fn bounded_reads_report_whether_they_clipped() {
+    // R-004 truncated-paste telemetry: the paste seam attributes a
+    // platform-layer clip exactly once, so the bounded reads must report
+    // whether they cut. A simulated over-limit system value stands in for
+    // a hostile native clipboard without a display server.
+    let mut cb = Clipboard::new_headless();
+    assert!(
+        !cb.last_bounded_read_truncated(),
+        "flag starts clear after construction"
+    );
+    cb.simulate_system_text_for_test("y".repeat(CLIPBOARD_MAX_BYTES + 32));
+    let text = cb.get_text_bounded().expect("bounded read clips");
+    assert_eq!(text.len(), CLIPBOARD_MAX_BYTES);
+    assert!(
+        cb.last_bounded_read_truncated(),
+        "over-limit bounded read must report the clip"
+    );
+    // An in-cap value clears the flag again on the next bounded read.
+    cb.simulate_system_text_for_test(String::from("small"));
+    assert_eq!(cb.get_text_bounded().expect("in-cap read"), "small");
+    assert!(
+        !cb.last_bounded_read_truncated(),
+        "in-cap bounded read must clear the flag"
+    );
+    // The direct rejecting read never touches the flag.
+    cb.simulate_system_text_for_test("z".repeat(CLIPBOARD_MAX_BYTES + 1));
+    assert!(cb.get_text().is_err(), "direct read rejects over-limit");
+    assert!(
+        !cb.last_bounded_read_truncated(),
+        "direct read must leave the flag untouched"
+    );
+    // The primary bounded read shares the same flag.
+    let primary = cb
+        .get_primary_bounded()
+        .expect("bounded primary read clips");
+    assert_eq!(primary.len(), CLIPBOARD_MAX_BYTES);
+    assert!(
+        cb.last_bounded_read_truncated(),
+        "over-limit primary read must report the clip"
+    );
+}

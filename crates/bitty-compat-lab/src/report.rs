@@ -11,9 +11,12 @@
 //!   deterministic, and invariant-checked here, or by a named test that is
 //!   verified present in its source file ([`Method::Test`]).
 //! - [`Status::Local`] — environment-dependent check that only runs when the
-//!   local tool exists and the operator opts in with `BITTY_COMPAT_LIVE=1`
-//!   ([`Method::LocalPty`], implemented by `tests/live_compat.rs`). CI never
-//!   runs these and must not claim them.
+//!   local tool or display exists and the operator opts in
+//!   ([`Method::LocalPty`] with `BITTY_COMPAT_LIVE=1`, implemented by
+//!   `tests/live_compat.rs`; [`Method::LiveDisplay`] with the `gui-tests`
+//!   feature plus a live display, implemented by
+//!   `crates/bitty-platform/tests/clipboard_live.rs`). CI never runs these
+//!   and must not claim them.
 //! - [`Status::Partial`] — bounded parser/admission evidence exists, but the
 //!   full behavior (e.g. a protocol extension) is not implemented.
 //! - [`Status::Gap`] — not covered; the row names the reason.
@@ -106,6 +109,14 @@ pub enum Method {
     /// Env-gated PTY scenario in `tests/live_compat.rs` (`BITTY_COMPAT_LIVE=1`).
     LocalPty {
         /// Scenario name; must match a live scenario test.
+        scenario: &'static str,
+    },
+    /// Env-gated live-display scenario in
+    /// `crates/bitty-platform/tests/clipboard_live.rs` (default-off
+    /// `gui-tests` feature plus a reachable display; R-004, CTX-0641).
+    LiveDisplay {
+        /// Scenario prefix; every test named `live_{scenario}_*` in
+        /// `clipboard_live.rs` belongs to it.
         scenario: &'static str,
     },
     /// No automated evidence; `reason` records why.
@@ -368,11 +379,11 @@ pub const ROWS: &[Row] = &[
     Row {
         area: "clipboard",
         scenario: "OS-level clipboard roundtrip on a live display",
-        status: Status::Gap,
-        method: Method::Uncovered {
-            reason: "needs a live display/clipboard backend; R-004 remains Open",
+        status: Status::Local,
+        method: Method::LiveDisplay {
+            scenario: "clipboard",
         },
-        note: "security audit residual; tracked in the clipboard audit",
+        note: "operator-run per Tier-1 display (X11/Wayland/macOS/Windows) with gui-tests; never claimed in CI",
     },
     // graphics-protocols
     Row {
@@ -598,6 +609,7 @@ fn method_name(method: Method) -> &'static str {
         Method::Corpus { .. } => "corpus",
         Method::Test { .. } => "test",
         Method::LocalPty { .. } => "local-pty",
+        Method::LiveDisplay { .. } => "live-display",
         Method::Uncovered { .. } => "none",
     }
 }
@@ -621,7 +633,7 @@ pub fn generate_report_json() -> Result<String, String> {
         }
         match (row.status, row.method) {
             (Status::Ci, Method::Corpus { .. } | Method::Test { .. }) => {}
-            (Status::Local, Method::LocalPty { .. }) => {}
+            (Status::Local, Method::LocalPty { .. } | Method::LiveDisplay { .. }) => {}
             (Status::Partial, Method::Corpus { .. }) => {}
             (Status::Gap, Method::Uncovered { .. }) => {}
             (status, method) => {
@@ -711,6 +723,13 @@ pub fn generate_report_json() -> Result<String, String> {
                     json_escape(scenario)
                 );
                 ("local-pty", evidence, "env-gated-BITTY_COMPAT_LIVE")
+            }
+            Method::LiveDisplay { scenario } => {
+                let evidence = format!(
+                    "{{\"kind\": \"live-display\", \"scenario\": \"{}\", \"check\": \"env-gated-gui-tests\"}}",
+                    json_escape(scenario)
+                );
+                ("live-display", evidence, "env-gated-gui-tests")
             }
             Method::Uncovered { reason } => {
                 let evidence = format!(

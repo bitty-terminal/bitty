@@ -31,6 +31,16 @@
 //!   `bitty-ui`; Panel Scene producers and platform adapters consume it
 //!   read-only. Structure, names, and state only; actions and live events
 //!   are post-1.0.
+//! - Announcements ([`AnnouncementQueue`]) — one bounded announcement per
+//!   focus transition and per async state transition, coalesced and
+//!   rate-limited; never on render, never on a repeating cadence.
+//! - Settings composition ([`A11ySettings`]) — `reduced_motion` collapses
+//!   animation to the final committed state, high contrast selects the
+//!   compliant outline pair; both are core-owned and never
+//!   plugin-overridable.
+//! - Hot path ([`A11ySource`], [`needs_a11y_refresh`]) — projection
+//!   updates are invalidation-driven, create no periodic timer, and
+//!   execute no plugin code per keystroke.
 //!
 //! The projection is derived and read-only: every constructor takes shared
 //! references and returns owned data. It never mutates terminal state, is
@@ -39,7 +49,11 @@
 #![forbid(unsafe_code)]
 
 use bitty_term_state::{CursorPosition, Snapshot};
+use std::collections::VecDeque;
 use std::fmt;
+
+use crate::motion::MotionSpec;
+use crate::theme::{SAFE_BORDER_FOCUSED, SAFE_BORDER_IDLE, TokenColor};
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -928,4 +942,297 @@ pub fn build_a11y_tree(
         builder.push(root, A11yNodeKind::Scene(*kind), role.as_str(), None)?;
     }
     Ok(builder.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Announcements: one bounded notice per transition, never on render
+// ---------------------------------------------------------------------------
+//
+// Ownership: the queue is owned by `bitty-ui` and drained by the platform
+// adapter. Callers push exactly once per focus transition
+// ([`AnnouncementQueue::push_focus`]) and once per async state transition
+// ([`AnnouncementQueue::push_state`]); render, paint, and damage paths
+// never push, and no repeating cadence exists — the queue holds no timer,
+// takes no clock, and advances only on explicit push/drain calls.
+
+/// Hard cap in characters for one announcement text.
+///
+/// Longer input is rejected with [`A11yError::NameTooLong`], never
+/// silently truncated: truncation would misreport the transition to
+/// assistive technology.
+pub const MAX_ANNOUNCEMENT_TEXT_LEN: usize = 256;
+
+/// Hard cap on queued announcements.
+///
+/// Rate limiting is `DropOldest`: when full, the oldest pending notice is
+/// discarded so the newest state always wins and memory stays bounded.
+/// Coalescing (see [`AnnouncementQueue::push`]) drops consecutive
+/// duplicates before the cap is even consulted.
+pub const MAX_PENDING_ANNOUNCEMENTS: usize = 8;
+
+/// What transition an announcement reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AnnouncementKind {
+    /// A keyboard/pointer focus transition (one per transition).
+    Focus,
+    /// An async state transition (completion, notice arrival, guard
+    /// resolution — one per transition).
+    AsyncState,
+}
+
+impl AnnouncementKind {
+    /// Candidate vocabulary spelling for this kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Focus => "focus",
+            Self::AsyncState => "state",
+        }
+    }
+}
+
+impl fmt::Display for AnnouncementKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One queued accessibility announcement: its transition kind plus the
+/// bounded text the adapter speaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Announcement {
+    kind: AnnouncementKind,
+    text: String,
+}
+
+impl Announcement {
+    /// The transition this notice reports.
+    #[must_use]
+    pub const fn kind(&self) -> AnnouncementKind {
+        self.kind
+    }
+
+    /// The bounded text the adapter speaks.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+fn check_announcement_len(text: &str) -> Result<(), A11yError> {
+    let len = text.chars().count();
+    if len > MAX_ANNOUNCEMENT_TEXT_LEN {
+        return Err(A11yError::NameTooLong {
+            len,
+            cap: MAX_ANNOUNCEMENT_TEXT_LEN,
+        });
+    }
+    Ok(())
+}
+
+/// Bounded, coalesced announcement queue.
+///
+/// Push exactly once per focus transition and once per async state
+/// transition; drain from the platform adapter. Consecutive duplicates
+/// (same kind and text as the tail) coalesce to a single notice, and a
+/// full queue drops the oldest notice so the newest state always wins.
+/// Nothing here touches render, paint, timers, or plugin code.
+#[derive(Clone, Debug, Default)]
+pub struct AnnouncementQueue {
+    pending: VecDeque<Announcement>,
+}
+
+impl AnnouncementQueue {
+    /// Starts an empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Queues one notice for `kind` with `text`.
+    ///
+    /// Returns `Ok(true)` when queued, `Ok(false)` when coalesced with an
+    /// identical tail notice (no duplicate is stored).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A11yError::NameTooLong`] when `text` exceeds
+    /// [`MAX_ANNOUNCEMENT_TEXT_LEN`] characters.
+    pub fn push(&mut self, kind: AnnouncementKind, text: &str) -> Result<bool, A11yError> {
+        check_announcement_len(text)?;
+        if let Some(tail) = self.pending.back() {
+            if tail.kind == kind && tail.text == text {
+                return Ok(false);
+            }
+        }
+        if self.pending.len() >= MAX_PENDING_ANNOUNCEMENTS {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(Announcement {
+            kind,
+            text: text.to_string(),
+        });
+        Ok(true)
+    }
+
+    /// Queues one notice for a focus transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A11yError::NameTooLong`] when `text` exceeds
+    /// [`MAX_ANNOUNCEMENT_TEXT_LEN`] characters.
+    pub fn push_focus(&mut self, text: &str) -> Result<bool, A11yError> {
+        self.push(AnnouncementKind::Focus, text)
+    }
+
+    /// Queues one notice for an async state transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`A11yError::NameTooLong`] when `text` exceeds
+    /// [`MAX_ANNOUNCEMENT_TEXT_LEN`] characters.
+    pub fn push_state(&mut self, text: &str) -> Result<bool, A11yError> {
+        self.push(AnnouncementKind::AsyncState, text)
+    }
+
+    /// Pending notice count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether no notice is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Drains every pending notice in push order, leaving the queue empty.
+    #[must_use]
+    pub fn drain(&mut self) -> Vec<Announcement> {
+        self.pending.drain(..).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings composition: core-owned, never plugin-overridable
+// ---------------------------------------------------------------------------
+//
+// Both flags are constructed from core configuration only
+// (`appearance.animations.reduced_motion`, the high-contrast theme switch):
+// no constructor takes a plugin handle, plugin layer, or plugin token, so
+// a plugin cannot override either flag by construction.
+
+/// Accessibility settings composing core motion and theme choices.
+///
+/// `reduced_motion` collapses every animation to its final committed
+/// state (see [`A11ySettings::resolve_motion`]); `high_contrast` selects
+/// the compliant outline pair (see
+/// [`A11ySettings::high_contrast_outlines`]). Both default off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct A11ySettings {
+    reduced_motion: bool,
+    high_contrast: bool,
+}
+
+impl A11ySettings {
+    /// Starts with both flags off (animations resolve as authored, theme
+    /// tokens resolve through the normal cascade).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            reduced_motion: false,
+            high_contrast: false,
+        }
+    }
+
+    /// Sets the core `reduced_motion` flag (builder).
+    #[must_use]
+    pub const fn with_reduced_motion(mut self, reduced: bool) -> Self {
+        self.reduced_motion = reduced;
+        self
+    }
+
+    /// Sets the core high-contrast flag (builder).
+    #[must_use]
+    pub const fn with_high_contrast(mut self, high: bool) -> Self {
+        self.high_contrast = high;
+        self
+    }
+
+    /// Whether animation must collapse to its final committed state.
+    #[must_use]
+    pub const fn reduced_motion(self) -> bool {
+        self.reduced_motion
+    }
+
+    /// Whether the compliant outline pair is selected.
+    #[must_use]
+    pub const fn high_contrast(self) -> bool {
+        self.high_contrast
+    }
+
+    /// Resolves `spec` under the reduced-motion flag: when set, the
+    /// animation collapses to [`MotionSpec::INSTANT`] (the final committed
+    /// state, no interpolation); otherwise `spec` passes through
+    /// untouched. Mirrors the [`MotionConfig`](crate::motion::MotionConfig)
+    /// short-circuit without taking any plugin input.
+    #[must_use]
+    pub const fn resolve_motion(self, spec: MotionSpec) -> MotionSpec {
+        if self.reduced_motion {
+            return MotionSpec::INSTANT;
+        }
+        spec
+    }
+
+    /// The compliant outline pair while high contrast is set: the accepted
+    /// `--safe` forced pair (focused white, idle gray), which satisfies
+    /// the enforced contrast floors. Returns `None` when high contrast is
+    /// off so the caller keeps the normal theme cascade instead.
+    #[must_use]
+    pub const fn high_contrast_outlines(self) -> Option<(TokenColor, TokenColor)> {
+        if self.high_contrast {
+            return Some((SAFE_BORDER_FOCUSED, SAFE_BORDER_IDLE));
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hot path: invalidation-driven refresh, no timer, no plugin code
+// ---------------------------------------------------------------------------
+//
+// The projection rebuilds only when the caller names an invalidation
+// source. The signature takes no clock, duration, or timer handle (no
+// periodic refresh can be expressed) and no plugin handle or callback
+// (no plugin code can run per keystroke): inputs are snapshots, nodes,
+// and settings only.
+
+/// What changed that may require rebuilding the accessibility
+/// projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum A11ySource {
+    /// Keyboard/pointer focus moved (pairs with one queued announcement).
+    FocusChange,
+    /// An async state transition completed (pairs with one queued
+    /// announcement).
+    AsyncStateChange,
+    /// Scene-backed content changed.
+    SceneUpdate,
+    /// Terminal grid, title, or cursor changed.
+    TerminalUpdate,
+    /// Chrome surface name or active item changed.
+    ChromeUpdate,
+}
+
+/// Whether the accessibility projection must rebuild for `source`.
+///
+/// `None` (nothing invalidated) never rebuilds; any named source does.
+/// Render, paint, and damage ticks pass `None` unless one of them also
+/// carries a real content change.
+#[must_use]
+pub const fn needs_a11y_refresh(source: Option<A11ySource>) -> bool {
+    source.is_some()
 }

@@ -3,6 +3,11 @@
 //! ADR-0003 role: `bitty-ui` depends only on `bitty-term-state`; views are
 //! pure data. Rendering is deferred to runtime composition. The viewport
 //! algebra is deterministic and headless-testable.
+//!
+//! Decision F-3 (CW-17, `[BLOCKED: OQ-058]`): no distinct `SessionId`
+//! newtype is introduced here. Views stay keyed by [`ViewId`] until the
+//! owner resolves `OQ-058`; a session type, if the RFC wants one, lands
+//! as a separate decision, never as a rename of this key.
 
 #![forbid(unsafe_code)]
 

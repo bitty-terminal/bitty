@@ -42,6 +42,13 @@
 //!   charset policy; [`beacon_layer::BeaconAnnotationLayer`] single batched
 //!   layer; [`beacon_dispatch::BeaconDispatcher`] label-to-typed-command
 //!   bridge that executes nothing.
+//! - [`beacon_provider`] — U-8 provider tiers (UX-33, CTX-0675,
+//!   candidate): [`beacon_provider::CommandBlockProvider`] exposes the
+//!   semantic terminal as the single Core-tier target source behind the
+//!   capability-gated [`beacon_provider::ProviderMediator`], and
+//!   [`beacon_provider::TargetSnapshot`] freezes one cold-path collection
+//!   per hint-session entry (UX-29) with fail-closed epoch revalidation
+//!   and no per-frame polling.
 //! - [`scratchpad::ScratchpadSlot`] — single hidden per-window scratchpad
 //!   slot with anchor-preserving hide/show/toggle (CW-10), routed as
 //!   `bitty.workspace:scratchpad-toggle`.
@@ -129,6 +136,7 @@ pub mod a11y;
 pub mod beacon_dispatch;
 pub mod beacon_label;
 pub mod beacon_layer;
+pub mod beacon_provider;
 pub mod beacon_target;
 pub mod budget;
 pub mod canvas;
@@ -165,6 +173,12 @@ pub use beacon_label::{
 };
 pub use beacon_layer::{
     AnnotationLayerError, BeaconAnnotation, BeaconAnnotationLayer, MAX_BEACON_ANNOTATIONS,
+};
+pub use beacon_provider::{
+    CORE_TERMINAL_PROVIDER_NAME, CommandBlockProvider, DerivedProvider, MAX_SNAPSHOT_TARGETS,
+    MAX_TARGET_PROVIDER_NAME_LEN, MAX_TARGET_PROVIDERS, ProviderError, ProviderMediator,
+    ProviderTarget, ProviderTier, SnapshotEntry, TARGET_PROVIDER_CAPABILITY, TargetKind,
+    TargetProvider, TargetSnapshot, validate_provider_name,
 };
 pub use beacon_target::{
     CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,

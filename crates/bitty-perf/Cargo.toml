@@ -84,3 +84,13 @@ harness = false
 name = "dogfood_session"
 path = "../../benches/dogfood_session.rs"
 harness = false
+
+[[bench]]
+name = "typical_session"
+path = "../../benches/typical_session.rs"
+harness = false
+
+[[bench]]
+name = "throughput_floor"
+path = "../../benches/throughput_floor.rs"
+harness = false

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0676",
+  "issues": [1058],
+  "captured_at": "2026-09-22",
+  "revision": "c70b9f2b00facc4d848ce3f38df1f47a95a423fe",
+  "command": "cargo bench -p bitty-perf --bench typical_session -- --nocapture --write-baseline crates/bitty-perf/baselines/pb-typical-session.json",
+  "profile": "bench (release)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-3-typical-session-memory",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1 (rust-toolchain.toml)",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "bounds": {
+    "tabs": 8,
+    "tabs_after_close": 1,
+    "bytes_per_tab": 65536,
+    "total_bytes": 524288,
+    "chunk_bytes": 8192
+  },
+  "session": {
+    "status": "measured",
+    "rss_before_mb": 2.754,
+    "rss_open_mb": 69.039,
+    "rss_close_mb": 54.184,
+    "growth_mb": 66.285,
+    "growth_pct": 2406.950,
+    "reclaim_within_pct": 1867.518,
+    "budget_mb": 250,
+    "reclaim_budget_pct": 15,
+    "meets_open_budget": true,
+    "meets_reclaim": false
+  }
+}

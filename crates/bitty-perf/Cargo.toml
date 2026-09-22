@@ -74,3 +74,8 @@ harness = false
 name = "real_window"
 path = "../../benches/real_window.rs"
 harness = false
+
+[[bench]]
+name = "real_soak"
+path = "../../benches/real_soak.rs"
+harness = false

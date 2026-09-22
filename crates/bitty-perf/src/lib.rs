@@ -28,6 +28,7 @@
 pub mod idle;
 pub mod latency;
 pub mod parser_throughput;
+pub mod real_soak;
 pub mod real_window;
 pub mod startup;
 

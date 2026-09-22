@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0642",
+  "issues": [1063],
+  "captured_at": "2026-09-22",
+  "revision": "b0b1155aec54b127503d049a5df61f84cd24d9b8",
+  "command": "bash scripts/real-render-soak.sh --out-dir recording/real-soak --duration-secs 14400 --interval-secs 300",
+  "profile": "dev (debug)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-3-typical-session-memory and #pb-7-idle-cpu",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "soak": {
+    "status": "unavailable",
+    "duration_secs": 14400,
+    "interval_secs": 300,
+    "interval_effective_secs": 300,
+    "workspace": "4",
+    "workload": "mixed",
+    "completed_captures": 0,
+    "rss_first_mb": null,
+    "rss_last_mb": null,
+    "budget_mb": 250,
+    "reason": "CTX-0642 landed the automation; no Tier 1 long-duration capture has completed on this branch yet"
+  }
+}

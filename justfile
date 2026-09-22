@@ -179,7 +179,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test real-render-soak-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies
@@ -233,6 +233,24 @@ perf-idle:
 # measured or the bench refuses to write (exit 2).
 perf-idle-baseline out="crates/bitty-perf/baselines/pb-idle.json":
     cargo bench -p bitty-perf --bench idle_real -- --nocapture --write-baseline {{out}}
+# Long-duration real-render soak planner (CTX-0642, PERF-09). Headless-safe:
+# loads the clamped soak config, prints the bounded capture plan and the
+# hyprctl+grim leg status, and reports UNMEASURED without
+# BITTY_PERF_REAL_SOAK=1. Bounds: BITTY_PERF_SOAK_DURATION_SECS (60..86400),
+# BITTY_PERF_SOAK_INTERVAL_SECS (30..3600), BITTY_PERF_SOAK_WORKSPACE (1..10),
+# BITTY_PERF_SOAK_WORKLOAD (idle|mixed|input-spam). Runbook:
+# crates/bitty-perf/baselines/real-soak-evidence.md.
+perf-real-soak *args:
+    cargo bench -p bitty-perf --bench real_soak -- --nocapture {{args}}
+
+# Full automated soak chain (Tier 1: Hyprland + hyprctl/grim/jq required).
+# Evidence lands in timestamped run dirs under {{out}} (gitignored scratch):
+# `BITTY_PERF_REAL_SOAK=1 just perf-real-soak-run recording/real-soak`.
+perf-real-soak-run out *args:
+    BITTY_PERF_REAL_SOAK=1 bash scripts/real-render-soak.sh --out-dir {{out}} {{args}}
+
+real-render-soak-test:
+    bash scripts/tests/real-render-soak.test.sh
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

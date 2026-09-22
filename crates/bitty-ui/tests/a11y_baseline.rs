@@ -12,9 +12,9 @@
 
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::a11y::{
-    A11yError, A11yRole, ChromeKind, ChromeNode, FIDELITY_BOUNDARY, InteractiveNode, SceneKind,
-    chrome_tab_order, expose_terminal, interactive_role, role_of, terminal_text_runs,
-    validate_scene,
+    A11yError, A11yNodeKind, A11yRole, A11yTreeBuilder, ChromeKind, ChromeNode, FIDELITY_BOUNDARY,
+    InteractiveNode, MAX_A11Y_TREE_NODES, SceneKind, build_a11y_tree, chrome_tab_order,
+    expose_terminal, interactive_role, role_of, terminal_text_runs, validate_scene,
 };
 use bitty_vt::{ControlChar, GraphemeCell};
 
@@ -292,4 +292,173 @@ fn scene_kind_mirror_tracks_bitty_rich() {
         validate_scene(&[SceneKind::Unknown]),
         Err(A11yError::UnmappedSceneKind)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Accessibility tree: stable shape, fail-closed bounds, read-only build
+// ---------------------------------------------------------------------------
+
+fn tree_snapshot() -> bitty_term_state::Snapshot {
+    let mut state = State::new();
+    feed_line(&mut state, "hello");
+    prints(&mut state, "world");
+    state.apply(&TerminalAction::OscTitle {
+        text: "editor".into(),
+    });
+    state.snapshot()
+}
+
+#[test]
+fn tree_shape_is_root_terminal_chrome_scene_in_order() {
+    let snapshot = tree_snapshot();
+    let chrome = [
+        ChromeNode::new(ChromeKind::Bar, "status bar", Some("main.rs")).unwrap(),
+        ChromeNode::new(ChromeKind::Notification, "notices", None).unwrap(),
+    ];
+    let scene = [SceneKind::Text, SceneKind::Table];
+    let before = snapshot.clone();
+    let tree = build_a11y_tree(&snapshot, &chrome, &scene).unwrap();
+    // The build borrows everything and mutates nothing.
+    assert_eq!(snapshot, before);
+
+    // 1 root + 1 terminal + 2 rows + 2 chrome + 2 scene.
+    assert_eq!(tree.len(), 8);
+    assert!(!tree.is_empty());
+
+    let root = tree.get(tree.root()).unwrap();
+    assert_eq!(root.kind(), A11yNodeKind::Root);
+    assert_eq!(root.name(), "editor");
+    assert_eq!(root.role(), Some(A11yRole::Group));
+    assert_eq!(root.children().len(), 5);
+
+    let order: Vec<(A11yNodeKind, &str)> = tree
+        .preorder()
+        .map(|node| (node.kind(), node.name()))
+        .collect();
+    assert_eq!(order[0], (A11yNodeKind::Root, "editor"));
+    assert_eq!(order[1], (A11yNodeKind::Terminal, "editor"));
+    assert_eq!(order[2].0, A11yNodeKind::TerminalRow);
+    assert_eq!(order[2].1, "hello");
+    assert_eq!(order[3].0, A11yNodeKind::TerminalRow);
+    assert!(order[3].1.contains("world"));
+    assert_eq!(
+        order[4],
+        (A11yNodeKind::Chrome(ChromeKind::Bar), "status bar")
+    );
+    assert_eq!(
+        order[5],
+        (A11yNodeKind::Chrome(ChromeKind::Notification), "notices")
+    );
+    assert_eq!(order[6], (A11yNodeKind::Scene(SceneKind::Text), "text"));
+    // Scene roles attach last in caller order; preorder ends with the table.
+    let names: Vec<&str> = tree.preorder().map(|node| node.name()).collect();
+    assert_eq!(names.last(), Some(&"table"));
+
+    // Terminal leaf states the live cursor; rows read as text.
+    let terminal = tree
+        .preorder()
+        .find(|node| node.kind() == A11yNodeKind::Terminal)
+        .unwrap();
+    let visibility = if snapshot.cursor.visible {
+        "visible"
+    } else {
+        "hidden"
+    };
+    assert_eq!(
+        terminal.state(),
+        Some(format!("cursor 1,10 {visibility}").as_str())
+    );
+    assert_eq!(terminal.role(), Some(A11yRole::Text));
+
+    // Chrome keeps its identity and stays out of the role vocabulary.
+    let bar = tree.preorder().nth(4).unwrap();
+    assert_eq!(bar.role(), None);
+    assert_eq!(bar.state(), Some("main.rs"));
+}
+
+#[test]
+fn tree_fails_closed_on_unmapped_scene_kind() {
+    let snapshot = tree_snapshot();
+    assert_eq!(
+        build_a11y_tree(&snapshot, &[], &[SceneKind::Text, SceneKind::Unknown]),
+        Err(A11yError::UnmappedSceneKind)
+    );
+}
+
+#[test]
+fn tree_fails_closed_on_overlong_title_and_chrome_label() {
+    let snapshot = tree_snapshot();
+    let long = "n".repeat(300);
+    let chrome = [ChromeNode::new(ChromeKind::Rail, "rail", None).unwrap()];
+    // Overlong titles fail the root; overlong chrome labels fail at
+    // construction (pinned below), so the tree build itself stays total.
+    let builder = A11yTreeBuilder::new(&long);
+    assert!(matches!(builder, Err(A11yError::NameTooLong { .. })));
+    let bad_state = ChromeNode::new(ChromeKind::Rail, "rail", Some(&long));
+    assert!(matches!(bad_state, Err(A11yError::NameTooLong { .. })));
+    let tree = build_a11y_tree(&snapshot, &chrome, &[]);
+    assert!(tree.is_ok());
+}
+
+#[test]
+fn tree_builder_enforces_cap_foreign_handles_and_row_content_rule() {
+    let mut builder = A11yTreeBuilder::new("window").unwrap();
+    assert_eq!(builder.len(), 1);
+    assert!(!builder.is_empty());
+    let root = builder.root();
+    assert_eq!(root.as_u32(), 0);
+
+    // Row content bypasses the name cap; plain names do not.
+    let long = "x".repeat(300);
+    assert!(builder.push_row_text(root, &long).is_ok());
+    assert!(matches!(
+        builder.push(root, A11yNodeKind::TerminalRow, &long, None),
+        Err(A11yError::NameTooLong { .. })
+    ));
+
+    // Interactive controls attach with their declared role (the rejected
+    // overlong push above allocated nothing, so this is id 2).
+    let button = builder
+        .push(
+            root,
+            A11yNodeKind::Interactive(A11yRole::Button),
+            "Send",
+            Some("enabled"),
+        )
+        .unwrap();
+    assert_eq!(button.as_usize(), 2);
+
+    // A handle from a taller builder is out of range here.
+    let mut other = A11yTreeBuilder::new("other").unwrap();
+    let _ = other
+        .push(other.root(), A11yNodeKind::Terminal, "t", None)
+        .unwrap();
+    let _ = other
+        .push(other.root(), A11yNodeKind::Terminal, "t", None)
+        .unwrap();
+    let foreign = other
+        .push(other.root(), A11yNodeKind::Terminal, "t", None)
+        .unwrap();
+    assert!(other.len() > builder.len());
+    assert!(foreign.as_usize() >= builder.len());
+    assert_eq!(
+        builder.push(foreign, A11yNodeKind::Terminal, "t", None),
+        Err(A11yError::UnknownParent)
+    );
+
+    // The node cap fails closed with an exact count.
+    let mut full = A11yTreeBuilder::new("full").unwrap();
+    let full_root = full.root();
+    for _ in 1..MAX_A11Y_TREE_NODES {
+        full.push(full_root, A11yNodeKind::TerminalRow, "r", None)
+            .unwrap();
+    }
+    assert_eq!(
+        full.push(full_root, A11yNodeKind::TerminalRow, "r", None),
+        Err(A11yError::TooManyNodes {
+            count: MAX_A11Y_TREE_NODES + 1,
+            cap: MAX_A11Y_TREE_NODES,
+        })
+    );
+    assert_eq!(full.finish().len(), MAX_A11Y_TREE_NODES);
 }

@@ -66,6 +66,7 @@ mod cell;
 mod charsets;
 mod cursor;
 pub mod damage;
+pub mod grapheme;
 mod grid;
 pub mod image;
 pub mod modes;
@@ -90,10 +91,15 @@ pub use bitty_vt::{
     TerminalAction, UnderlineStyle, ZoneKind,
 };
 pub use cell::{
-    Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, Zerowidth, char_cell_width,
+    AmbiguousWidth, Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, Zerowidth,
+    char_cell_width, char_cell_width_in,
 };
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};
+pub use grapheme::{
+    Graphemes, cluster_cell_width, is_extended_pictographic, is_grapheme_extend,
+    is_regional_indicator, split_clusters,
+};
 pub use image::{
     IMAGE_STORE_MAX_ENTRIES, IMAGE_STORE_MAX_PAYLOAD_BYTES, ImageId, ImagePlaceholder, ImageStore,
 };

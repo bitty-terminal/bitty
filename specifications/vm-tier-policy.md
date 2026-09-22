@@ -116,5 +116,14 @@ pattern.
   nothing in this policy is scheduled in CI.
 - Guest boot, SSH execution, artifact collection, and libvirt domain
   definition are unimplemented follow-up work.
+- Full in-guest suite candidacy is recorded plan, not scheduled work: the
+  code-reviewed target is `policy::GUEST_SUITE_CANDIDATES`. Functional
+  suites (`compat-matrix`, `parser-corpus`, `pty-integration`) are candidates
+  on every guest including emulated (TCG) ones; timing suites
+  (`startup-bench`, `latency-bench`, `idle-bench`) are KVM-only candidates
+  because emulated timing is host-scheduler noise, never a budget signal.
+- The declared PERF-14 dependency names no filed issue in the tracker, so
+  this slice carries no backlog dependency; a real PERF-14 must be filed and
+  linked before it can order this work.
 - virtio-gpu/virgl coverage, benchmark VMs, Windows guests, and physical
   GPU runners remain outside this slice, consistent with research 043.

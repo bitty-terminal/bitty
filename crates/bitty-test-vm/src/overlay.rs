@@ -131,6 +131,70 @@ pub fn render_command(program: &str, args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{Cadence, RunPlan, guest};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique scratch root per hermetic test (parallel-safe); removed on drop.
+    struct HermeticRoot(std::path::PathBuf);
+
+    impl HermeticRoot {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "bitty-test-vm-hermetic-{tag}-{}-{n}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for HermeticRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A qemu-img path that cannot exist, proving the guard under test fires
+    /// before any subprocess is spawned.
+    fn missing_qemu_img(root: &HermeticRoot) -> std::path::PathBuf {
+        root.0.join("no-such-qemu-img")
+    }
+
+    fn hermetic_plan(root: &HermeticRoot, run_id: &str) -> RunPlan {
+        let guest = guest("arch").expect("arch guest exists");
+        RunPlan::new(guest, Cadence::Pr, run_id, &root.0).expect("plan builds")
+    }
+
+    #[test]
+    fn refuses_reused_run_id_before_touching_qemu_img() {
+        // Exactly-once proof in the fast tier: run ids are single-use and the
+        // refusal must not depend on qemu-img being installed. The pre-existing
+        // overlay plus a nonexistent binary isolates the guard itself.
+        let root = HermeticRoot::new("reuse");
+        let plan = hermetic_plan(&root, "reuse-1");
+        let base = plan.base_image();
+        std::fs::create_dir_all(base.parent().expect("base dir")).expect("base dir");
+        std::fs::write(&base, []).expect("fixture base marker");
+        let overlay = plan.overlay_image();
+        std::fs::create_dir_all(overlay.parent().expect("run dir")).expect("run dir");
+        std::fs::write(&overlay, []).expect("pre-existing overlay marker");
+
+        let error = create_overlay(&missing_qemu_img(&root), &plan)
+            .expect_err("reused run id must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+    }
+
+    #[test]
+    fn refuses_missing_base_before_touching_qemu_img() {
+        // Same isolation for the missing-base guard: NotFound without ever
+        // spawning a subprocess.
+        let root = HermeticRoot::new("missing");
+        let plan = hermetic_plan(&root, "missing-1");
+
+        let error = create_overlay(&missing_qemu_img(&root), &plan)
+            .expect_err("missing base must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
 
     #[test]
     fn parses_backing_filename_from_qemu_json() {

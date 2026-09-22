@@ -81,8 +81,24 @@
 //!   CTX-0512). A job's own network failure is recorded as the observed stop
 //!   plus retained stderr facts; no separate `network_error` classification
 //!   is invented.
+//!
+//! # Candidate signals (CTX-0678, RUN-20..RUN-23 analysis batch)
+//!
+//! - Panel lease kernel ([`PanelLease`]): idle/occupied transitions with
+//!   acquire/release/handoff events for OQ-083; lease vocabulary stays a UX
+//!   metaphor and owns no bus, clock, or agent ontology.
+//! - Sensitive-input gate ([`automated_input_allowed`]): the observed PTY
+//!   echo state is the only signal for OQ-086; no-echo denies automated
+//!   input with a typed denial and excludes capture.
+//! - Command-risk kernel ([`classify_argv`]): structural argv tiers and
+//!   hard-deny classes for OQ-087; shell-AST resolution stays open work.
+//! - Detached-supervisor trust boundary: analysis only
+//!   (`specifications/run-20-detached-supervisor-trust-boundary.md`); no
+//!   daemon code, per the accepted headless/daemon decision.
 
+mod command_risk;
 mod delivery;
+mod lease;
 mod model;
 mod oom;
 mod output;
@@ -90,15 +106,21 @@ mod persistence;
 mod process_tree;
 mod registry;
 mod retention;
+mod sensitive_input;
 mod supervisor;
 
 use std::process::{Command, Stdio};
 
 use bitty_ipc::execution::EnvPolicy;
 
+pub use command_risk::{HardDeny, OperationIntent, RiskTier, RiskVerdict, classify_argv};
 pub use delivery::{
     DeliveryState, EventClass, EventReplay, MAX_EVENT_REPLAY, MAX_STORED_CRITICAL_EVENTS,
     MAX_STORED_OBSERVATION_EVENTS, StoredEvent,
+};
+pub use lease::{
+    LeaseError, LeaseEvent, LeaseHolder, LeaseState, MAX_PANEL_DESCRIPTION_CHARS,
+    MAX_PANEL_TITLE_CHARS, PanelLease, validate_description, validate_title,
 };
 pub use model::{
     AttachReceipt, DEFAULT_RETENTION_TTL, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo,
@@ -123,6 +145,9 @@ pub use persistence::{
 pub use process_tree::{KillScope, ProcessTreeBackend};
 pub use registry::{DEFAULT_MAX_JOBS, JobRegistry, MAX_STORED_JOB_EVENTS};
 pub use retention::{MAX_RETENTION_TTL, RetentionError, RetentionPolicy, RetentionTier};
+pub use sensitive_input::{
+    EchoState, InteractionClass, SecureInputDenial, automated_input_allowed, may_capture,
+};
 pub use supervisor::{
     AdoptedJob, AdoptionKind, DaemonError, HandoffOffer, ScheduleDecision, SchedulePolicy,
     SupervisorDaemon, adoption_plan, clear_handoff, read_handoff, write_handoff,

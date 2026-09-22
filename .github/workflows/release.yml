@@ -637,6 +637,135 @@ jobs:
             throw "version mismatch: archive $version, binary $output"
           }
 
+  # Versioned Linux binary bundles (REL-07 / #1110):
+  # `bitty-<version>-<target>.tar.zst` carrying `bin/bitty`, `share/`
+  # (desktop entry, icons, metainfo), LICENSE, README.md, and CHANGELOG.md —
+  # the primary long-term artifact per the binary-compression section of
+  # release-distribution.md. Bare target-triple binaries keep shipping for
+  # now. Assembly lives in `scripts/make-unix-bundle.sh`; the version comes
+  # from repo metadata (tag > workflow input > Cargo workspace version),
+  # never hardcoded, and the target comes from the matrix.
+  unix-bundle:
+    name: Unix bundle (${{ matrix.target }})
+    needs: [build, build-alpine]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download ${{ matrix.target }} binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bitty-${{ matrix.target }}
+          path: dist
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          fi
+          if [[ -z "$version" ]]; then
+            version="$(bash scripts/check-release-version.sh --print)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release version: $version"
+
+      - name: Assemble versioned bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE="dist/bitty-${VERSION}-${{ matrix.target }}.tar.zst"
+          bash scripts/make-unix-bundle.sh \
+            --version "$VERSION" \
+            --target "${{ matrix.target }}" \
+            --binary "dist/bitty-${{ matrix.target }}" \
+            --output "$BUNDLE"
+          sha256sum "$BUNDLE" | tee "$BUNDLE.sha256"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bitty-${{ matrix.target }}-bundle
+          path: dist/bitty-*.tar.zst*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Clean-runner acceptance for the versioned bundles (REL-07 / #1110): a
+  # fresh Ubuntu runner expands each published archive and runs
+  # `bin/bitty --version`, asserting the archive name, the single top-level
+  # directory, the fixed member roots, and the version match.
+  verify-unix-bundle:
+    name: Verify Unix bundle
+    needs: unix-bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bitty-*-bundle
+          path: pkg
+          merge-multiple: true
+
+      - name: Expand archives and run bitty
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+          shopt -s nullglob
+          bundles=(pkg/bitty-*.tar.zst)
+          if [[ "${#bundles[@]}" -eq 0 ]]; then
+            echo "::error::no versioned bundle artifacts found"
+            exit 1
+          fi
+          for bundle in "${bundles[@]}"; do
+            base="$(basename "$bundle" .tar.zst)"
+            if [[ ! "$base" =~ ^bitty-([0-9]+\.[0-9]+\.[0-9]+)-(.+)$ ]]; then
+              echo "::error::unexpected bundle name: $base"
+              exit 1
+            fi
+            version="${BASH_REMATCH[1]}"
+            echo "bundle: $base (version=$version)"
+            if [[ "$(tar -tf "$bundle" | cut -d/ -f1 | sort -u)" != "$base" ]]; then
+              echo "::error::$base extracts outside its top-level directory" >&2
+              exit 1
+            fi
+            expected="$(printf '%s\n' CHANGELOG.md LICENSE README.md bin share)"
+            actual="$(tar -tf "$bundle" | cut -d/ -f2 | LC_ALL=C sort -u)"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::$base member roots mismatch (actual: $actual)" >&2
+              exit 1
+            fi
+            dest="$(mktemp -d)"
+            tar -xf "$bundle" -C "$dest"
+            exe="$dest/$base/bin/bitty"
+            if [[ ! -x "$exe" ]]; then
+              echo "::error::$base bin/bitty missing or not executable" >&2
+              exit 1
+            fi
+            output="$("$exe" --version)"
+            echo "bitty --version => $output"
+            if [[ "$output" != *"$version"* ]]; then
+              echo "::error::version mismatch: bundle $version, binary $output" >&2
+              exit 1
+            fi
+            rm -rf "$dest"
+          done
+
   release:
     name: Create GitHub Release
     needs:
@@ -647,6 +776,8 @@ jobs:
         macos-universal,
         windows-zip,
         verify-windows-zip,
+        unix-bundle,
+        verify-unix-bundle,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 10

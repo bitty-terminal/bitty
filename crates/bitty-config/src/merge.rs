@@ -75,6 +75,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "selection.auto_copy"
         | "layout.gaps_in"
         | "layout.gaps_out"
+        | "workspace.layout"
         | "decoration.gaps_in"
         | "decoration.gaps_out"
         | "decoration.border"
@@ -115,6 +116,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal"
         | "selection"
         | "layout"
+        | "workspace"
         | "decoration"
         | "views"
         | "scrollbar"
@@ -543,6 +545,8 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "layout.gaps_in",
     "layout.gaps_out",
     "layout",
+    "workspace.layout",
+    "workspace",
     "decoration.gaps_in",
     "decoration.gaps_out",
     "decoration.border",
@@ -937,6 +941,49 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
                 }
             }
             attribution.insert("layout".to_string(), src.clone());
+        }
+
+        // CW-07: `workspace.layout` is scalar-replace like
+        // `selection.auto_copy`; absent table means "says nothing".
+        if let Some(ws) = &plan.workspace {
+            let field = "workspace.layout";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.workspace.layout.clone_from(&ws.layout);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.workspace.layout.clone_from(&ws.layout);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("workspace".to_string(), src.clone());
         }
 
         // CTX-0292: Core-owned workspace decoration (`decoration.gaps_in`,
@@ -1883,6 +1930,49 @@ fn merge_layers_allow_policy_violations(
                 }
             }
             attribution.insert("layout".to_string(), src.clone());
+        }
+        // CW-07: `workspace.layout` is scalar-replace like
+        // `selection.auto_copy`; absent table means "says nothing".
+        // (Second merge path: allow-policy-violations variant for diagnostics.)
+        if let Some(ws) = &plan.workspace {
+            let field = "workspace.layout";
+            if is_policy {
+                policy_fields.insert(field.to_string(), src.clone());
+                effective.workspace.layout.clone_from(&ws.layout);
+                let prev = attribution.get(field).cloned();
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            } else if let Some(policy_src) = policy_fields.get(field) {
+                policy_violations.push(ConfigError::NonOverridable {
+                    field: field.to_string(),
+                    policy_source: policy_src.describe(),
+                    attempted_source: src.describe(),
+                });
+                conflicts.push(MergeConflict {
+                    field: field.to_string(),
+                    previous_source: policy_src.clone(),
+                    new_source: src.clone(),
+                    merge_class: MergeClass::ScalarReplace,
+                });
+            } else {
+                let prev = attribution.get(field).cloned();
+                effective.workspace.layout.clone_from(&ws.layout);
+                record_attribution(
+                    &mut attribution,
+                    &mut conflicts,
+                    field,
+                    prev,
+                    src,
+                    MergeClass::ScalarReplace,
+                );
+            }
+            attribution.insert("workspace".to_string(), src.clone());
         }
         // CTX-0292: Core-owned workspace decoration is scalar-replace like
         // `layout.gaps_in`; absent table means "says nothing".
@@ -3282,6 +3372,71 @@ mod tests {
         assert_eq!(merged3.effective.layout.gaps_out, 0);
         assert_eq!(
             merged3.source_of("layout.gaps_in").unwrap().layer,
+            LayerKind::CoreDefaults
+        );
+    }
+
+    #[test]
+    fn workspace_layout_merges_scalar_replace_with_attribution() {
+        // CW-07: user provider lands in effective with user attribution;
+        // CLI wins over file; absent layers keep the preserve default.
+        use crate::types::WorkspaceConfig;
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("dwindle".to_string()),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged = merge_layers(vec![user]).expect("merge");
+        assert_eq!(
+            merged.effective.workspace.layout.as_deref(),
+            Some("dwindle")
+        );
+        assert_eq!(
+            merged.source_of("workspace.layout").unwrap().layer,
+            LayerKind::User
+        );
+        let cli = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Cli, Some("cli")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("grid".to_string()),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user2 = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("user.lua")),
+            ConfigPlan {
+                workspace: Some(WorkspaceConfig {
+                    layout: Some("dwindle".to_string()),
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let merged2 = merge_layers(vec![user2, cli]).expect("merge");
+        assert_eq!(merged2.effective.workspace.layout.as_deref(), Some("grid"));
+        assert_eq!(
+            merged2.source_of("workspace.layout").unwrap().layer,
+            LayerKind::Cli
+        );
+        assert!(
+            merged2
+                .conflicts
+                .iter()
+                .any(|c| c.field == "workspace.layout")
+        );
+        // Empty stack preserves with core-defaults attribution.
+        let merged3 = merge_layers(vec![]).expect("empty layers merge");
+        assert!(merged3.effective.workspace.layout.is_none());
+        assert_eq!(
+            merged3.source_of("workspace.layout").unwrap().layer,
             LayerKind::CoreDefaults
         );
     }

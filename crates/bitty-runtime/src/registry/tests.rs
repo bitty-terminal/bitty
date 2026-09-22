@@ -594,3 +594,185 @@ fn headless_composition_rects_equivalence() {
         .unwrap();
     assert_eq!(allocs, allocs2);
 }
+
+// ---------------------------------------------------------------------------
+// LayoutProvider plugin path (CW-07, issue #986)
+// ---------------------------------------------------------------------------
+
+use bitty_ui::provider::{
+    LayoutError as UiLayoutError, LayoutProvider as UiLayoutProvider, ProviderId as UiProviderId,
+    ProviderName as UiProviderName, WorkspaceSnapshot as UiWorkspaceSnapshot,
+};
+
+/// Third-party provider that drops every view but the first (invalid).
+#[derive(Debug)]
+struct ForgetfulProvider {
+    name: UiProviderName,
+}
+
+impl UiLayoutProvider for ForgetfulProvider {
+    fn id(&self) -> UiProviderId {
+        UiProviderId::new(900)
+    }
+
+    fn name(&self) -> &UiProviderName {
+        &self.name
+    }
+
+    fn propose(
+        &self,
+        workspace: &UiWorkspaceSnapshot,
+        views: &[ViewId],
+        _area: bitty_ui::provider::LogicalRect,
+    ) -> Result<LayoutNode, UiLayoutError> {
+        if views.is_empty() {
+            return Err(UiLayoutError::EmptyViewSet);
+        }
+        let first = views[0];
+        Ok(match workspace.current.find_leaf(first) {
+            Some(view) => LayoutNode::leaf(view.clone()),
+            None => LayoutNode::leaf(View::new(first, 1, 1)),
+        })
+    }
+}
+
+#[test]
+fn canonical_providers_preregistered_and_default_stamped() {
+    let mut reg = default_registry();
+    // Well-formed but unregistered names fail closed.
+    assert!(matches!(
+        reg.set_default_layout_provider("acme.tiling:ghost"),
+        Err(RegistryError::UnknownLayoutProvider { .. })
+    ));
+    // Malformed names fail closed.
+    assert!(matches!(
+        reg.set_default_layout_provider("Bad Name"),
+        Err(RegistryError::LayoutProposalRejected { .. })
+    ));
+    reg.set_default_layout_provider("dwindle").unwrap();
+    assert_eq!(reg.default_layout_provider(), Some("dwindle"));
+    let wid = reg.create_workspace().unwrap();
+    assert_eq!(reg.workspace_provider(wid).unwrap(), Some("dwindle"));
+    reg.clear_default_layout_provider();
+    assert_eq!(reg.default_layout_provider(), None);
+    let wid2 = reg.create_workspace().unwrap();
+    assert_eq!(reg.workspace_provider(wid2).unwrap(), None);
+}
+
+#[test]
+fn per_workspace_selection_is_independent() {
+    let mut reg = default_registry();
+    let wid1 = reg.create_workspace().unwrap();
+    let wid2 = reg.create_workspace().unwrap();
+    reg.set_workspace_provider(wid1, "dwindle").unwrap();
+    reg.set_workspace_provider(wid2, "grid").unwrap();
+    assert_eq!(reg.workspace_provider(wid1).unwrap(), Some("dwindle"));
+    assert_eq!(reg.workspace_provider(wid2).unwrap(), Some("grid"));
+    // Unknown workspace and unknown provider fail closed.
+    assert!(matches!(
+        reg.set_workspace_provider(WorkspaceId::new(999), "dwindle"),
+        Err(RegistryError::NotFound { .. })
+    ));
+    assert!(matches!(
+        reg.set_workspace_provider(wid1, "acme.tiling:ghost"),
+        Err(RegistryError::UnknownLayoutProvider { .. })
+    ));
+    // Failed selection leaves the previous choice untouched.
+    assert_eq!(reg.workspace_provider(wid1).unwrap(), Some("dwindle"));
+}
+
+#[test]
+fn recompose_without_selection_or_views_is_noop() {
+    let mut reg = default_registry();
+    let wid = reg.create_workspace().unwrap();
+    let before = reg.workspace_layout(wid).unwrap().clone();
+    assert_eq!(
+        reg.recompose_workspace(wid, UiRect::new(0, 0, 80, 24)),
+        Ok(false)
+    );
+    assert_eq!(reg.workspace_layout(wid).unwrap(), &before);
+    // A selection with no views is also a no-op (fresh workspace).
+    reg.set_workspace_provider(wid, "grid").unwrap();
+    assert_eq!(
+        reg.recompose_workspace(wid, UiRect::new(0, 0, 80, 24)),
+        Ok(false)
+    );
+}
+
+#[test]
+fn recompose_applies_provider_and_stays_deterministic() {
+    let mut reg = default_registry();
+    let wid = reg.create_workspace().unwrap();
+    let vh1 = reg.create_view(wid).unwrap();
+    let vh2 = reg.create_view(wid).unwrap();
+    let vh3 = reg.create_view(wid).unwrap();
+    reg.set_workspace_provider(wid, "dwindle").unwrap();
+    let container = UiRect::new(0, 0, 120, 40);
+    assert!(reg.recompose_workspace(wid, container).unwrap());
+    let first = reg.workspace_layout(wid).unwrap().clone();
+    // All views survive with no inventions, in deterministic order.
+    assert_eq!(first.leaf_ids(), vec![vh1.id, vh2.id, vh3.id]);
+    assert!(matches!(first, LayoutNode::Split { .. }));
+    // Recomposing the composed tree is a fixpoint (deterministic).
+    assert!(reg.recompose_workspace(wid, container).unwrap());
+    assert_eq!(reg.workspace_layout(wid).unwrap(), &first);
+    // View content bindings survive the recompose.
+    let allocs = reg.reflow_workspace(wid, container).unwrap();
+    assert_eq!(allocs.len(), 3);
+}
+
+#[test]
+fn recompose_with_master_and_grid() {
+    let mut reg = default_registry();
+    let wid = reg.create_workspace().unwrap();
+    for _ in 0..5 {
+        reg.create_view(wid).unwrap();
+    }
+    let container = UiRect::new(0, 0, 120, 40);
+    reg.set_workspace_provider(wid, "master").unwrap();
+    assert!(reg.recompose_workspace(wid, container).unwrap());
+    let master = reg.workspace_layout(wid).unwrap().clone();
+    assert_eq!(master.leaf_count(), 5);
+    reg.set_workspace_provider(wid, "grid").unwrap();
+    assert!(reg.recompose_workspace(wid, container).unwrap());
+    let grid = reg.workspace_layout(wid).unwrap().clone();
+    assert_eq!(grid.leaf_count(), 5);
+    assert_ne!(master, grid);
+}
+
+#[test]
+fn invalid_proposal_is_rejected_and_tree_retained() {
+    let mut reg = default_registry();
+    let wid = reg.create_workspace().unwrap();
+    reg.create_view(wid).unwrap();
+    reg.create_view(wid).unwrap();
+    let before = reg.workspace_layout(wid).unwrap().clone();
+    // Registration without the capability grant is denied.
+    assert!(matches!(
+        reg.register_layout_provider(
+            Box::new(ForgetfulProvider {
+                name: UiProviderName::parse("acme.tiling:forgetful").unwrap()
+            }),
+            false
+        ),
+        Err(RegistryError::LayoutCapabilityDenied { .. })
+    ));
+    reg.register_layout_provider(
+        Box::new(ForgetfulProvider {
+            name: UiProviderName::parse("acme.tiling:forgetful").unwrap(),
+        }),
+        true,
+    )
+    .unwrap();
+    reg.set_workspace_provider(wid, "acme.tiling:forgetful")
+        .unwrap();
+    let err = reg
+        .recompose_workspace(wid, UiRect::new(0, 0, 80, 24))
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::LayoutProposalRejected { .. }),
+        "unexpected error: {err}"
+    );
+    // Previous tree retained, state untouched.
+    assert_eq!(reg.workspace_layout(wid).unwrap(), &before);
+}

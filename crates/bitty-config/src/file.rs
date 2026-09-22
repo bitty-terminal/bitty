@@ -1752,6 +1752,16 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         })?),
     };
 
+    // CW-07: `workspace` is a fully-optional table with the same
+    // absent-means-silent contract. When present, `layout` carries the
+    // raw provider name; spelling is validated fail-closed via
+    // `WorkspaceConfig::validate` (called by `plan.validate()` below),
+    // and unknown provider names fail at apply time in `bitty-runtime`.
+    let workspace = match data.workspace {
+        None => None,
+        Some(w) => Some(crate::types::WorkspaceConfig { layout: w.layout }),
+    };
+
     let plan = ConfigPlan {
         schema_version: None,
         font,
@@ -1760,6 +1770,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         selection,
         close_confirm,
         layout,
+        workspace,
         decoration,
         views,
         scrollbar,
@@ -2155,6 +2166,58 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("layout"),
+                "must name the field: {bad} -> {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_workspace_layout_parse_and_validate() {
+        // CW-07: `workspace = { layout = "dwindle" }` parses to the plan;
+        // absent table means "says nothing" (plan.workspace None so merge
+        // keeps lower); present-but-partial keeps layout None; malformed
+        // names, wrong types, and unknown sub-keys fail closed naming the
+        // field (never echoing the value).
+        let plan = parse_lua_config(
+            r#"return { workspace = { layout = "dwindle" } }"#,
+            &test_source(),
+        )
+        .expect("workspace layout parses");
+        assert_eq!(
+            plan.workspace.expect("workspace present").layout.as_deref(),
+            Some("dwindle")
+        );
+        let plan = parse_lua_config(
+            r#"return { workspace = { layout = "acme.tiling:spiral" } }"#,
+            &test_source(),
+        )
+        .expect("qualified provider parses");
+        assert_eq!(
+            plan.workspace.expect("workspace present").layout.as_deref(),
+            Some("acme.tiling:spiral")
+        );
+        let plan = parse_lua_config(r#"return { workspace = {} }"#, &test_source())
+            .expect("empty workspace parses");
+        let ws = plan.workspace.expect("workspace present");
+        assert!(ws.layout.is_none());
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("no workspace table");
+        assert!(plan.workspace.is_none());
+        for bad in [
+            r#"return { workspace = { layout = "Dwindle" } }"#,
+            r#"return { workspace = { layout = "has space" } }"#,
+            r#"return { workspace = { layout = "" } }"#,
+            r#"return { workspace = { layout = 3 } }"#,
+            r#"return { workspace = "dwindle" }"#,
+            r#"return { workspace = { layout = "dwindle", bogus = 1 } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("workspace"),
                 "must name the field: {bad} -> {msg}"
             );
         }

@@ -116,6 +116,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `close_confirm`           | RestartRequired    |
 /// | `layout.gaps_in`          | RestartRequired    |
 /// | `layout.gaps_out`         | RestartRequired    |
+/// | `workspace.layout`        | RestartRequired    |
 /// | `scrollbar.mode`          | RestartRequired    |
 /// | `scrollbar.width`         | RestartRequired    |
 /// | `mouse.focus_follows_mouse` | RestartRequired  |
@@ -182,6 +183,8 @@ pub fn classify_field(field: &str) -> ReloadClass {
         | "layout.gaps_in"
         | "layout.gaps_out"
         | "layout"
+        | "workspace.layout"
+        | "workspace"
         | "scrollbar.mode"
         | "scrollbar.width"
         | "scrollbar"
@@ -419,6 +422,14 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "layout.gaps_out",
         old.layout.gaps_out.to_string(),
         new.layout.gaps_out.to_string(),
+    );
+    // CW-07: the default provider is stamped on workspace creation, so
+    // changes apply at startup, not live. (Per-workspace live switches go
+    // through the runtime provider API, not config reload.)
+    push_if_changed(
+        "workspace.layout",
+        old.workspace.layout.clone().unwrap_or_default(),
+        new.workspace.layout.clone().unwrap_or_default(),
     );
     // CTX-0181: scrollbar chrome is adopted at startup (RuntimeConfig is
     // built once from the effective config), so changes are
@@ -830,6 +841,13 @@ mod tests {
             ReloadClass::RestartRequired
         );
         assert_eq!(classify_field("layout"), ReloadClass::RestartRequired);
+        // CW-07: the default provider is stamped at workspace creation, so
+        // changes apply at startup, not live.
+        assert_eq!(
+            classify_field("workspace.layout"),
+            ReloadClass::RestartRequired
+        );
+        assert_eq!(classify_field("workspace"), ReloadClass::RestartRequired);
         // CTX-0223: padding/opacity are Live — the running instance adopts
         // them without restart (`Runtime::set_window_padding` re-derives the
         // grid in place; `WindowHandle::set_opacity` retoggles the winit

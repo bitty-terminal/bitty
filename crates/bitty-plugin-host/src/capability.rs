@@ -25,6 +25,8 @@ pub enum CapabilityFamily {
     Panel,
     /// Browser embed/navigation/storage for WebView surface (CTX-0110, BA-1..BA-3).
     Browser,
+    /// Layout algorithm proposals for the workspace compositor (CW-07).
+    Layout,
     /// Agent context, memory and workspace (CTX-0111, ai-panel).
     Agent,
     /// MCP tool invocation per-tool (CTX-0111, ai-panel).
@@ -49,6 +51,7 @@ impl CapabilityFamily {
             "protocol" => Some(Self::Protocol),
             "panel" => Some(Self::Panel),
             "browser" => Some(Self::Browser),
+            "layout" => Some(Self::Layout),
             "agent" => Some(Self::Agent),
             "mcp" => Some(Self::Mcp),
             "ai" => Some(Self::Ai),
@@ -72,6 +75,7 @@ impl CapabilityFamily {
             Self::Protocol => "protocol",
             Self::Panel => "panel",
             Self::Browser => "browser",
+            Self::Layout => "layout",
             Self::Agent => "agent",
             Self::Mcp => "mcp",
             Self::Ai => "ai",
@@ -127,6 +131,7 @@ impl CapabilityFamily {
                 "browser.file-url",
                 "browser.storage",
             ],
+            Self::Layout => &["layout.provider"],
             Self::Agent => &[
                 "agent.context.terminal",
                 "agent.context.workspace",
@@ -344,6 +349,7 @@ pub fn effect_statement(id: &CapabilityId) -> &'static str {
         "browser.navigation" => "Navigate browser surface to allowlisted URLs",
         "browser.file-url" => "Allow file:// navigation validated against project scope",
         "browser.storage" => "Persist browser cookies/cache with bounded quota",
+        "layout.provider" => "Provide layout algorithms for the workspace",
         "agent.context.terminal" => "Observe terminal context for this agent (bounded 32KiB)",
         "agent.context.workspace" => "Observe workspace context for this agent (bounded 32KiB)",
         "agent.memory" => "Persist agent conversational memory (opt-in, 0600, <=7 days)",
@@ -423,6 +429,7 @@ mod tests {
             "debug.trace",
             "platform.notify",
             "protocol.register",
+            "layout.provider",
         ] {
             assert!(CapabilityId::parse(id).is_ok(), "should parse {id}");
         }
@@ -448,6 +455,7 @@ mod tests {
             CapabilityFamily::Debug,
             CapabilityFamily::Panel,
             CapabilityFamily::Browser,
+            CapabilityFamily::Layout,
             CapabilityFamily::Agent,
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,
@@ -562,6 +570,7 @@ mod tests {
             CapabilityFamily::Protocol,
             CapabilityFamily::Panel,
             CapabilityFamily::Browser,
+            CapabilityFamily::Layout,
             CapabilityFamily::Agent,
             CapabilityFamily::Mcp,
             CapabilityFamily::Ai,

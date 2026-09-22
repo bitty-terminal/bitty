@@ -72,6 +72,7 @@ pub mod geometry;
 pub mod layout;
 pub mod panel;
 pub mod presentation;
+pub mod provider;
 pub mod scratchpad;
 pub mod scrollbar;
 pub mod search;
@@ -102,6 +103,13 @@ pub use presentation::{
     PRESENTATION_CMD_FLOATING, PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD,
     PRESENTATION_CMD_TILED, PresentationCommandError, PresentationMode, apply_presentation_command,
     presentation_command_for_mode, presentation_mode_for_command,
+};
+pub use provider::{
+    DEFAULT_PROVIDER_RATIO, DWINDLE_PROVIDER_ID, DwindleProvider, GRID_PROVIDER_ID, GridProvider,
+    LAYOUT_PROVIDER_CAPABILITY, LayoutError, LayoutProvider, LogicalRect as ProviderRect,
+    MASTER_PROVIDER_ID, MAX_PROVIDER_NAME_LEN, MasterProvider, NOOP_PROVIDER_ID,
+    NOOP_PROVIDER_NAME, NoopTiler, ProviderId, ProviderName, ProviderRegistry,
+    RESERVED_PROVIDER_NAMES, WorkspaceSnapshot, validate_proposal,
 };
 pub use scratchpad::{
     HiddenEntry, SCRATCHPAD_CMD_TOGGLE, ScratchpadError, ScratchpadSlot, apply_scratchpad_toggle,

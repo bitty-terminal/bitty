@@ -26,6 +26,11 @@ use bitty_ui::{
         CommandRegistry as UiCommandRegistry, OverlayKind as UiOverlayKind,
         OverlayManager as UiOverlayManager, PanelState as UiPanelState, PanelType as UiPanelType,
     },
+    provider::{
+        LayoutError as UiLayoutError, LayoutProvider as UiLayoutProvider,
+        ProviderRegistry as UiProviderRegistry, WorkspaceSnapshot as UiWorkspaceSnapshot,
+        validate_proposal as validate_layout_proposal,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -327,6 +332,19 @@ pub enum RegistryError {
         kind: &'static str,
         id_raw: u64,
     },
+    /// No provider is registered under this name.
+    UnknownLayoutProvider {
+        name: String,
+    },
+    /// Provider registration without the `layout.provider` grant.
+    LayoutCapabilityDenied {
+        name: String,
+    },
+    /// A provider proposal failed validation or `propose` itself failed;
+    /// the previous tree is retained.
+    LayoutProposalRejected {
+        reason: String,
+    },
     DetachedTerminalHasNoView {
         view_id: ViewId,
     },
@@ -395,6 +413,18 @@ impl std::fmt::Display for RegistryError {
             Self::ResourceExhausted { reason } => write!(f, "resource exhausted: {reason}"),
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
             Self::NotFound { kind, id_raw } => write!(f, "{kind} {id_raw} not found"),
+            Self::UnknownLayoutProvider { name } => {
+                write!(f, "unknown layout provider '{name}'")
+            }
+            Self::LayoutCapabilityDenied { name } => {
+                write!(
+                    f,
+                    "registering layout provider '{name}' requires the 'layout.provider' capability"
+                )
+            }
+            Self::LayoutProposalRejected { reason } => {
+                write!(f, "layout proposal rejected: {reason}")
+            }
             Self::DetachedTerminalHasNoView { view_id } => {
                 write!(f, "view {view_id} is not attached")
             }
@@ -403,6 +433,24 @@ impl std::fmt::Display for RegistryError {
 }
 
 impl std::error::Error for RegistryError {}
+
+/// Maps provider-path failures to registry errors.
+///
+/// Unknown names and denied grants keep their own variants; every other
+/// proposal failure (malformed names, invalid trees, duplicate ids) is an
+/// attributed [`RegistryError::LayoutProposalRejected`] — the previous
+/// tree is always retained.
+impl From<UiLayoutError> for RegistryError {
+    fn from(error: UiLayoutError) -> Self {
+        match error {
+            UiLayoutError::UnknownProvider { name } => Self::UnknownLayoutProvider { name },
+            UiLayoutError::CapabilityDenied { name } => Self::LayoutCapabilityDenied { name },
+            other => Self::LayoutProposalRejected {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config validated before registry creation
@@ -487,6 +535,11 @@ struct Workspace {
     view_gens: HashMap<ViewId, Generation>,
     view_visibility: HashMap<ViewId, Visibility>,
     active: bool,
+    /// Active layout provider name for this workspace (CW-07
+    /// `workspace.layout`). `None` preserves the current tree (no-op).
+    /// Stamped from the registry default at creation; each workspace may
+    /// select a different provider afterwards.
+    provider: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

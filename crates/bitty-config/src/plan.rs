@@ -17,7 +17,7 @@ use crate::keymap::ModKey;
 use crate::types::{
     AppearanceConfig, CloseConfirm, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
     MouseConfig, PluginSpec, ScrollbarConfig, SelectionConfig, TerminalConfig, ViewOverride,
-    WindowConfig,
+    WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -45,6 +45,9 @@ pub struct ConfigPlan {
     pub close_confirm: Option<CloseConfirm>,
     /// Layout configuration (CTX-0177 `layout.gaps_in`/`layout.gaps_out`).
     pub layout: Option<LayoutConfig>,
+    /// Default layout provider for new workspaces (CW-07
+    /// `workspace.layout`; `None` means "this layer says nothing").
+    pub workspace: Option<WorkspaceConfig>,
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
     /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
     pub decoration: Option<DecorationConfig>,
@@ -203,6 +206,9 @@ impl ConfigPlan {
         }
         if let Some(l) = &self.layout {
             l.validate()?;
+        }
+        if let Some(w) = &self.workspace {
+            w.validate()?;
         }
         if let Some(d) = &self.decoration {
             d.validate()?;

@@ -10,23 +10,67 @@
 //! workspace arrives with layout plus pending history and respawns its
 //! shells lazily on the first switch to it (bounded, best-effort).
 //!
-//! # Format (v1, hand-rolled, no new dependencies)
+//! # Format (v2, hand-rolled, no new dependencies)
 //!
-//! A UTF-8 text file, `\n`-separated, magic first line `bitty-session v1`:
+//! A UTF-8 text file, `\n`-separated, magic first line `bitty-session v2`:
 //!
 //! ```text
-//! bitty-session v1
+//! bitty-session v2
 //! workspaces <n> active <a> mru <m0,m1,...>
 //! workspace <seq> <focus-id|none>
 //! name <escaped workspace name>
 //! layout <s-expr: (leaf id cols rows) | (split h|v ratio-bits first second) | (stack children...)>
-//! pane <view-id> <cols> <rows> <k> <cwd:0|1>
+//! pane <view-id> <cols> <rows> <k> <cwd:0|1> <attach> <route> <mode>
 //! <escaped cwd, iff cwd == 1>
 //! <k escaped scrollback lines, oldest first>
 //! end-pane
 //! end-workspace
 //! end-session
 //! ```
+//!
+//! The v2 pane header appends three fixed tokens: `<attach>` is the live
+//! attachment map (`primary` = owned the primary grid, `session` = owned a
+//! private pane session, `detached` = session-less leaf with no state);
+//! `<route>` is the content route (only `terminal` is live — the reserved
+//! extension point for panel/rich activities); `<mode>` is the requested
+//! per-leaf [`PresentationMode`](bitty_ui::PresentationMode)
+//! (`tiled`/`floating`/`fullscreen`/`scratchpad`). The layout S-expression
+//! still carries identity plus geometry only; the mode token stamps the
+//! restored leaf at decode so the live tree keeps it.
+//!
+//! # Versioning and migration (CW-16)
+//!
+//! | File version | Decoder behavior |
+//! |---|----------------------------------------------------------------------------|
+//! | v1 | Migrated in memory (unspecified attachment, terminal route, tiled mode); re-encoding writes v2 (one-way on disk). |
+//! | v2 | Native: all three pane tokens parsed and validated. |
+//! | anything else | [`SessionError::UnsupportedVersion`]: whole file rejected before any other parsing, runtime untouched. |
+//!
+//! Migration normalizes at decode: downstream (validation, apply,
+//! re-encode) only ever sees [`SESSION_FORMAT_VERSION`] snapshots.
+//! Unknown `<attach>`/`<route>`/`<mode>` tokens in a v2 file are
+//! [`SessionError::Corrupt`], never defaulted — a future activity route or
+//! mode must arrive with its own format version, not smuggled into v2.
+//! At most one pane per file may claim `primary`; a `detached` pane
+//! carrying a cwd or scrollback is corrupt (capture never emits it).
+//!
+//! # Rehydration rules (CW-15, under the accepted WS-INV-25/26 contract)
+//!
+//! * Fresh identities: a restore never resurrects a live PTY or
+//!   `RuntimeId`. Every restored shell spawns fresh; rehydrated scrollback
+//!   is immutable history in that fresh grid, never live PTY state.
+//! * One live session per view: a snapshot view colliding with a live pane
+//!   session is rejected fail-closed before any mutation (the
+//!   runtime-level counterpart of the registry's `PersistentIdInUse`).
+//! * Primary routing follows the startup recipe: the primary shell
+//!   re-attaches at the focused leaf on every launch, so the derived
+//!   startup owner (active workspace focus, else first leaf) hydrates the
+//!   primary grid — a recorded `primary` on any other leaf is downgraded
+//!   to a pending respawn carrying its own history and cwd, never mixed
+//!   into the shared grid.
+//! * Detached leaves restore empty: no grid write, no pending entry, no
+//!   respawn on switch or startup. Only attached (`session`) leaves earn
+//!   fresh shells.
 //!
 //! Field escaping is backslash-only (`\\` → `\`, `\n` → LF, `\r` → CR);
 //! whole-line fields (name, cwd, scrollback) may contain spaces. Transient
@@ -105,14 +149,27 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use bitty_ui::{Focus, LayoutNode, SplitAxis, View, ViewId};
+use bitty_ui::{Focus, LayoutNode, PresentationMode, SplitAxis, View, ViewId};
 
 use super::panes::osc7_cwd_path;
 use super::workspaces::WorkspaceSlot;
 use super::*;
 
 /// Session file format version written by this slice.
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+///
+/// v2 extends the v1 pane record with the live attachment map
+/// ([`PaneAttachment`]), the content route ([`PaneRoute`]), and the
+/// per-leaf presentation mode. See the module docs for the v1/v2 record
+/// shapes and the migration rules.
+pub const SESSION_FORMAT_VERSION: u32 = 2;
+
+/// Earliest format version the decoder still migrates. v1 files carry the
+/// short pane record (`pane <id> <cols> <rows> <k> <cwd:0|1>`); migration
+/// leaves the attachment unspecified (resolved through
+/// [`derive_startup_owner`] exactly like the pre-v2 restore), defaults the
+/// route to [`PaneRoute::Terminal`], and defaults the mode to
+/// [`PresentationMode::Tiled`].
+pub const SESSION_MIN_DECODE_VERSION: u32 = 1;
 
 /// Maximum session file bytes read or written (issue: bounded size).
 pub const MAX_SESSION_FILE_BYTES: usize = 1_048_576;
@@ -206,6 +263,101 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// One pane's live attachment at capture: which binding backed the leaf.
+///
+/// CW-15 (F-2): the runtime half of the accepted attach/visibility
+/// contract (at most one live session per view; rehydration mints fresh
+/// PTYs under the same identity, never a second live terminal). It records
+/// which leaf owned the primary grid, which owned private pane sessions
+/// (live PTYs), and which were session-less.
+///
+/// `None` in memory marks a v1-legacy pane whose attachment was never
+/// recorded. Apply and encode resolve it through [`derive_startup_owner`]
+/// (the active workspace's focused leaf, else its first leaf),
+/// reproducing the pre-v2 restore exactly: the derived owner hydrates the
+/// primary grid, every other pane waits pending for its respawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneAttachment {
+    /// The leaf owned the primary grid at capture.
+    Primary,
+    /// The leaf owned a private pane session (live PTY) at capture.
+    Session,
+    /// Session-less leaf: no grid, no PTY; persists no history and earns
+    /// no respawn (stays empty until the user spawns into it).
+    Detached,
+}
+
+impl PaneAttachment {
+    /// Canonical file token (`"primary" | "session" | "detached"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Session => "session",
+            Self::Detached => "detached",
+        }
+    }
+
+    /// Parses a file token; `None` on anything else (fail-closed, never a
+    /// silent alias).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "primary" => Some(Self::Primary),
+            "session" => Some(Self::Session),
+            "detached" => Some(Self::Detached),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PaneAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Content route serving a leaf: which activity backend the pane restores
+/// against.
+///
+/// CW-16: only [`Self::Terminal`] is live — every runtime leaf is
+/// terminal-backed (primary grid or pane session). The token reserves the
+/// extension point the candidate Panel/Activity direction names (rich,
+/// browser, panel activities hosted by a panel): a future version adds
+/// variants here, and this version's decoder rejects them fail-closed
+/// rather than misrouting a pane onto the wrong backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneRoute {
+    /// Terminal-backed leaf (primary grid or pane session).
+    Terminal,
+}
+
+impl PaneRoute {
+    /// Canonical file token (`"terminal"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Parses a file token; `None` on anything else (fail-closed: a future
+    /// activity route in a v2 file is rejected, never defaulted).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "terminal" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PaneRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One pane's persisted state: cwd report plus scrollback history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaneSnapshot {
@@ -215,6 +367,13 @@ pub struct PaneSnapshot {
     pub cwd: Option<String>,
     /// Scrollback lines oldest-first, trimmed, bounded per pane.
     pub scrollback: Vec<String>,
+    /// Live attachment at capture; `None` for v1-legacy panes (resolved
+    /// through [`derive_startup_owner`] on apply and encode).
+    pub attach: Option<PaneAttachment>,
+    /// Content route serving the leaf (always [`PaneRoute::Terminal`]).
+    pub route: PaneRoute,
+    /// Requested per-leaf display mode at capture.
+    pub mode: PresentationMode,
 }
 
 /// One workspace's persisted state: identity plus layout, focus, and panes.
@@ -693,6 +852,14 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
                         return Err(SessionError::Corrupt("scrollback line bound"));
                     }
                 }
+                // CW-16: a session-less leaf persists no state by
+                // construction (capture emits no cwd and no history for
+                // it), so a file claiming otherwise is corrupt.
+                if pane.attach == Some(PaneAttachment::Detached)
+                    && (pane.cwd.is_some() || !pane.scrollback.is_empty())
+                {
+                    return Err(SessionError::Corrupt("detached pane state"));
+                }
             }
         }
         total_panes += ws.panes.len();
@@ -700,7 +867,57 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
             return Err(SessionError::Corrupt("too many panes"));
         }
     }
+    // CW-16: the primary grid is single — at most one leaf may claim it
+    // across the whole file. (Whether the recorded owner actually hydrates
+    // the grid is decided at apply: the startup recipe re-pins the primary
+    // shell at the focused leaf on every launch, so a recorded owner
+    // elsewhere is downgraded to a pending respawn with its own history.)
+    let primaries = snap
+        .workspaces
+        .iter()
+        .flat_map(|ws| ws.panes.iter())
+        .filter(|pane| pane.attach == Some(PaneAttachment::Primary))
+        .count();
+    if primaries > 1 {
+        return Err(SessionError::Corrupt("duplicate primary"));
+    }
     Ok(())
+}
+
+/// Startup-owner derivation shared by v1 migration and legacy (`None`)
+/// attachments: the active workspace's focused leaf, else its first leaf.
+///
+/// Total on validated snapshots (every workspace carries at least one
+/// leaf; `active` indexes a live workspace; focus is a leaf or absent).
+/// This is the leaf the startup recipe binds the primary shell to, so it
+/// is the only leaf whose history hydrates straight into the primary
+/// grid; every other pane waits pending for its own fresh shell.
+fn derive_startup_owner(snap: &SessionSnapshot) -> ViewId {
+    let ws = &snap.workspaces[snap.active];
+    ws.focus
+        .filter(|focus| ws.layout.leaf_ids().contains(focus))
+        .unwrap_or_else(|| ws.layout.leaf_ids()[0])
+}
+
+/// Resolves one pane's recorded attachment for encode.
+///
+/// Unspecified (`None`, v1-legacy) attachments resolve through
+/// [`derive_startup_owner`]: the derived owner records as
+/// [`PaneAttachment::Primary`], every other pane as
+/// [`PaneAttachment::Session`]. Recorded attachments always write
+/// faithfully — the stale-owner downgrade is an apply-time routing rule
+/// (see [`Runtime::apply_session_snapshot`]), never an encode rewrite, so
+/// capture/encode/decode round-trips byte-identically.
+fn resolve_attachment(
+    attach: Option<PaneAttachment>,
+    view: ViewId,
+    owner: ViewId,
+) -> PaneAttachment {
+    attach.unwrap_or(if view == owner {
+        PaneAttachment::Primary
+    } else {
+        PaneAttachment::Session
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +927,10 @@ fn validate_snapshot(snap: &SessionSnapshot) -> Result<(), SessionError> {
 /// Encodes a validated snapshot to file bytes (fails closed before I/O).
 pub fn encode_session(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
     validate_snapshot(snap)?;
+    // Unspecified (v1-legacy) attachments resolve through the same
+    // startup-owner derivation apply uses, so hand-built snapshots encode
+    // to the v2 record apply would have restored them through.
+    let owner = derive_startup_owner(snap);
     let mut out = String::new();
     out.push_str(SESSION_MAGIC);
     out.push_str(&SESSION_FORMAT_VERSION.to_string());
@@ -738,12 +959,18 @@ pub fn encode_session(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
                 .find_leaf(pane.view)
                 .ok_or(SessionError::Corrupt("pane coverage"))?;
             let cwd_flag = u8::from(pane.cwd.is_some());
+            // CW-16 v2 record: attachment map, content route, and
+            // presentation mode ride the pane header. Fixed tokens, still
+            // one line per pane, still covered by the line-bytes cap below.
+            let attach = resolve_attachment(pane.attach, pane.view, owner);
             out.push_str(&format!(
-                "pane {} {} {} {} {cwd_flag}\n",
+                "pane {} {} {} {} {cwd_flag} {attach} {} {}\n",
                 pane.view.0,
                 leaf.cols(),
                 leaf.rows(),
-                pane.scrollback.len()
+                pane.scrollback.len(),
+                pane.route,
+                pane.mode,
             ));
             if let Some(cwd) = &pane.cwd {
                 out.push_str(&escape_field(cwd));
@@ -808,6 +1035,14 @@ impl<'a> SessionParser<'a> {
 }
 
 /// Decodes file bytes to a snapshot; any violation rejects the whole file.
+///
+/// Versioning (CW-16): v1 files migrate in memory — pane records gain an
+/// unspecified attachment (resolved through [`derive_startup_owner`] like
+/// the pre-v2 restore), [`PaneRoute::Terminal`], and
+/// [`PresentationMode::Tiled`]. The returned snapshot always carries
+/// [`SESSION_FORMAT_VERSION`]; anything outside
+/// `SESSION_MIN_DECODE_VERSION..=SESSION_FORMAT_VERSION` is
+/// [`SessionError::UnsupportedVersion`] before any other parsing.
 pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
     if bytes.len() > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge {
@@ -836,7 +1071,7 @@ pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
         .strip_prefix(SESSION_MAGIC)
         .and_then(|v| v.parse().ok())
         .ok_or(SessionError::Corrupt("magic"))?;
-    if version != SESSION_FORMAT_VERSION {
+    if !(SESSION_MIN_DECODE_VERSION..=SESSION_FORMAT_VERSION).contains(&version) {
         return Err(SessionError::UnsupportedVersion(version));
     }
     let header = parser.next()?;
@@ -847,15 +1082,17 @@ pub fn decode_session(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
     let mut workspaces = Vec::with_capacity(count);
     let mut total_panes = 0usize;
     for _ in 0..count {
-        let ws = parse_workspace(&mut parser, &mut total_panes)?;
+        let ws = parse_workspace(&mut parser, &mut total_panes, version)?;
         workspaces.push(ws);
     }
     parser.expect("end-session")?;
     if parser.pos != parser.lines.len() {
         return Err(SessionError::Corrupt("trailing"));
     }
+    // Migration normalizes here: downstream (validate, apply, re-encode)
+    // only ever sees the current model version.
     let snap = SessionSnapshot {
-        version,
+        version: SESSION_FORMAT_VERSION,
         workspaces,
         active,
         mru,
@@ -898,6 +1135,7 @@ fn parse_workspaces_header(line: &str) -> Result<(usize, usize, Vec<usize>), Ses
 fn parse_workspace(
     parser: &mut SessionParser<'_>,
     total_panes: &mut usize,
+    version: u32,
 ) -> Result<WorkspaceSnapshot, SessionError> {
     let head = parser.next()?;
     let head = head
@@ -922,7 +1160,7 @@ fn parse_workspace(
             .ok_or(SessionError::Corrupt("name"))?,
     )?;
     let layout_line = parser.next()?;
-    let layout = decode_layout(
+    let mut layout = decode_layout(
         layout_line
             .strip_prefix("layout ")
             .ok_or(SessionError::Corrupt("layout"))?,
@@ -934,7 +1172,14 @@ fn parse_workspace(
         if line == "end-workspace" {
             break;
         }
-        let pane = parse_pane(parser, line, &layout)?;
+        let pane = parse_pane(parser, line, &layout, version)?;
+        // CW-16: the layout S-expression carries identity plus geometry
+        // only; the v2 mode token stamps the restored leaf so the live
+        // tree keeps the requested display mode (the solver ignores it,
+        // transitions stay gated by `can_transition`).
+        if let Some(leaf) = layout.find_leaf_mut(pane.view) {
+            leaf.set_presentation(pane.mode);
+        }
         panes.push(pane);
         *total_panes += 1;
         if *total_panes > MAX_SESSION_PANES_TOTAL {
@@ -954,17 +1199,63 @@ fn parse_workspace(
 }
 
 /// Parses one `pane ... end-pane` block; `head` is the already-read header.
+///
+/// v1 headers carry five fields (`pane <id> <cols> <rows> <k> <cwd:0|1>`)
+/// and migrate with an unspecified attachment, the terminal route, and a
+/// tiled mode. v2 headers append `<attach> <route> <mode>`; the token
+/// count is exact per version so a v2 record can never hide inside a v1
+/// file (or vice versa).
 fn parse_pane(
     parser: &mut SessionParser<'_>,
     head: &str,
     layout: &LayoutNode,
+    version: u32,
 ) -> Result<PaneSnapshot, SessionError> {
     let head = head
         .strip_prefix("pane ")
         .ok_or(SessionError::Corrupt("pane"))?;
     let parts: Vec<&str> = head.split(' ').collect();
-    let [id_raw, cols_raw, rows_raw, count_raw, cwd_raw] = parts.as_slice() else {
-        return Err(SessionError::Corrupt("pane"));
+    let (id_raw, cols_raw, rows_raw, count_raw, cwd_raw, attach, route, mode) = match version {
+        1 => {
+            let [id_raw, cols_raw, rows_raw, count_raw, cwd_raw] = parts.as_slice() else {
+                return Err(SessionError::Corrupt("pane"));
+            };
+            (
+                *id_raw,
+                *cols_raw,
+                *rows_raw,
+                *count_raw,
+                *cwd_raw,
+                None,
+                PaneRoute::Terminal,
+                PresentationMode::Tiled,
+            )
+        }
+        _ => {
+            let [
+                id_raw,
+                cols_raw,
+                rows_raw,
+                count_raw,
+                cwd_raw,
+                attach_raw,
+                route_raw,
+                mode_raw,
+            ] = parts.as_slice()
+            else {
+                return Err(SessionError::Corrupt("pane"));
+            };
+            (
+                *id_raw,
+                *cols_raw,
+                *rows_raw,
+                *count_raw,
+                *cwd_raw,
+                Some(PaneAttachment::parse(attach_raw).ok_or(SessionError::Corrupt("attach"))?),
+                PaneRoute::parse(route_raw).ok_or(SessionError::Corrupt("route"))?,
+                PresentationMode::parse(mode_raw).ok_or(SessionError::Corrupt("mode"))?,
+            )
+        }
     };
     let id: u64 = id_raw
         .parse()
@@ -991,7 +1282,7 @@ fn parse_pane(
     if count > MAX_SESSION_SCROLLBACK_LINES_PER_PANE {
         return Err(SessionError::Corrupt("scrollback bound"));
     }
-    let cwd = match *cwd_raw {
+    let cwd = match cwd_raw {
         "0" => None,
         "1" => {
             let raw = parser.next()?;
@@ -1017,6 +1308,9 @@ fn parse_pane(
         view,
         cwd,
         scrollback,
+        attach,
+        route,
+        mode,
     })
 }
 
@@ -1053,14 +1347,17 @@ fn scrollback_tail_text(state: &State, max_lines: usize) -> Vec<String> {
 
 /// Normalizes a layout tree for persistence: transient overlays strip to
 /// their base (never session truth), and leaves rebuild to identity plus
-/// geometry only. Origin, scroll offset, and presentation mode are
-/// presentation-only solver output and must not affect round-trip equality.
+/// geometry plus the requested presentation mode. Origin and scroll offset
+/// are presentation-only solver output and must not affect round-trip
+/// equality; the mode is session truth (CW-16 persists it per pane) and
+/// survives the strip.
 fn strip_overlays(node: &LayoutNode) -> LayoutNode {
     match node {
-        LayoutNode::Leaf(view) => LayoutNode::leaf(View::new(
+        LayoutNode::Leaf(view) => LayoutNode::leaf(View::with_presentation(
             view.id(),
             usize::from(view.cols()),
             usize::from(view.rows()),
+            view.presentation(),
         )),
         LayoutNode::Split {
             axis,
@@ -1254,10 +1551,27 @@ impl Runtime {
                     ),
                     None => (None, Vec::new()),
                 };
+                // CW-15/16: record the live attachment map (primary owner,
+                // pane session, or session-less), the content route, and
+                // the requested presentation mode for every leaf.
+                let attach = if self.primary_view == Some(*view) {
+                    PaneAttachment::Primary
+                } else if self.pane_sessions.contains_key(view) {
+                    PaneAttachment::Session
+                } else {
+                    PaneAttachment::Detached
+                };
+                let mode = layout
+                    .find_leaf(*view)
+                    .map(|leaf| leaf.presentation())
+                    .unwrap_or_default();
                 panes.push(PaneSnapshot {
                     view: *view,
                     cwd,
                     scrollback,
+                    attach: Some(attach),
+                    route: PaneRoute::Terminal,
+                    mode,
                 });
             }
             workspaces.push(WorkspaceSnapshot {
@@ -1301,6 +1615,19 @@ impl Runtime {
         snap: &SessionSnapshot,
     ) -> Result<SessionRestoreSummary, SessionError> {
         validate_snapshot(snap)?;
+        // CW-15 (F-2, WS-INV-26): a snapshot view colliding with a live
+        // pane session fails closed before any mutation. Rehydration mints
+        // fresh PTYs for restored leaves; merging snapshot history into a
+        // live grid would alias two histories onto one session, the exact
+        // second-live-terminal hazard the registry rejects with
+        // `PersistentIdInUse`. The runtime is left untouched.
+        for ws in &snap.workspaces {
+            for pane in &ws.panes {
+                if self.pane_sessions.contains_key(&pane.view) {
+                    return Err(SessionError::Corrupt("attachment in use"));
+                }
+            }
+        }
         // CTX-0567 (#992): fold the outgoing live layout plus every stashed
         // slot into the monotonic high-water before a restore replaces them.
         // An id installed through the `layout_mut` escape never hit an
@@ -1328,22 +1655,43 @@ impl Runtime {
         // CTX-0532: a restore load is a focus transition; attribute the
         // input-mode caches to the restored focus before any input arrives.
         self.sync_mode_caches_to_focus();
-        let leaves = self.layout.leaf_ids();
-        self.primary_view = self
-            .focus
-            .focused()
-            .filter(|focus| leaves.contains(focus))
-            .or_else(|| leaves.first().copied());
+        // CW-15/16: the startup recipe binds the primary shell at the
+        // focused leaf on every launch, so the primary owner is always the
+        // derived startup owner (a recorded owner elsewhere is downgraded
+        // to a pending respawn by `resolve_attachment` below).
+        let owner = derive_startup_owner(snap);
+        self.primary_view = Some(owner);
         self.pending_ws_close = None;
         self.session_pending.clear();
         self.session_primary_cwd = None;
+        // CW-15: marks the world restored so startup pane spawn respawns
+        // only attached leaves (pending restores). Session-less
+        // (`Detached`) leaves stay empty by design instead of gaining
+        // shells they never had.
+        self.session_restored = true;
 
         let mut panes = 0usize;
         let mut scrollback_lines = 0usize;
         for ws in &snap.workspaces {
             for pane in &ws.panes {
                 panes += 1;
-                scrollback_lines += self.rehydrate_pane(pane);
+                // A recorded `Primary` away from the derived owner is
+                // downgraded to a pending respawn: the startup recipe
+                // re-pins the primary shell at the focused leaf on every
+                // launch, so honoring a stale owner would mix two histories
+                // into the one global grid. The downgraded pane keeps its
+                // own history and cwd — contents preserved, bindings fresh.
+                match resolve_attachment(pane.attach, pane.view, owner) {
+                    PaneAttachment::Primary if pane.view == owner => {
+                        scrollback_lines += self.rehydrate_primary(pane);
+                    }
+                    PaneAttachment::Primary | PaneAttachment::Session => {
+                        self.stage_pending_restore(pane);
+                    }
+                    // Detached: no grid, no pending entry, no respawn.
+                    // The leaf restores as an empty pane.
+                    PaneAttachment::Detached => {}
+                }
             }
         }
         let pending = self.session_pending.len();
@@ -1356,21 +1704,26 @@ impl Runtime {
         })
     }
 
-    /// Rehydrates one pane: into its live grid when one exists, else into
-    /// the pending map. Returns the rehydrated line count.
-    fn rehydrate_pane(&mut self, pane: &PaneSnapshot) -> usize {
+    /// Rehydrates the startup owner's pane straight into the primary grid
+    /// (which has no shell yet) and stages its captured cwd for the real
+    /// restart attach. Returns the rehydrated line count.
+    ///
+    /// The collision guard in [`Runtime::apply_session_snapshot`] guarantees
+    /// no live pane session backs this view, so the grid write always lands
+    /// on a fresh grid — never merged into a live PTY (WS-INV-26).
+    fn rehydrate_primary(&mut self, pane: &PaneSnapshot) -> usize {
         let lines: Vec<&str> = pane.scrollback.iter().map(String::as_str).collect();
-        if let Some(session) = self.pane_sessions.get_mut(&pane.view) {
-            return session.state.restore_scrollback_text(&lines);
-        }
-        if self.primary_view == Some(pane.view) {
-            // CTX-0585: the primary owner has no shell yet (its history goes
-            // straight into the grid), but the real restart attach spawns
-            // through `spawn_shell_with_args`, which cannot see the pending
-            // map. Stash the captured cwd so that path can seed the spawn cwd.
-            self.session_primary_cwd = pane.cwd.clone().map(|cwd| (pane.view, cwd));
-            return self.state.restore_scrollback_text(&lines);
-        }
+        // CTX-0585: the primary owner has no shell yet (its history goes
+        // straight into the grid), but the real restart attach spawns
+        // through `spawn_shell_with_args`, which cannot see the pending
+        // map. Stash the captured cwd so that path can seed the spawn cwd.
+        self.session_primary_cwd = pane.cwd.clone().map(|cwd| (pane.view, cwd));
+        self.state.restore_scrollback_text(&lines)
+    }
+
+    /// Stages one pane's captured history and cwd in the pending map for
+    /// the next successful spawn of its leaf.
+    fn stage_pending_restore(&mut self, pane: &PaneSnapshot) {
         self.session_pending.insert(
             pane.view,
             PendingPaneRestore {
@@ -1378,7 +1731,6 @@ impl Runtime {
                 scrollback: pane.scrollback.clone(),
             },
         );
-        0
     }
 
     /// Drains the pending restore for `view` into its fresh grid after a
@@ -1404,6 +1756,27 @@ impl Runtime {
     #[must_use]
     pub fn session_pending_len(&self) -> usize {
         self.session_pending.len()
+    }
+
+    /// Whether `view` has a pending restore awaiting its shell spawn.
+    ///
+    /// CW-15: startup pane spawn consults this so a restored session
+    /// respawns only attached leaves; session-less (`Detached`) leaves
+    /// carry no entry and stay empty by design.
+    #[must_use]
+    pub fn session_pending_contains(&self, view: &ViewId) -> bool {
+        self.session_pending.contains_key(view)
+    }
+
+    /// Whether a session restore populated this runtime (set by a
+    /// successful [`Runtime::apply_session_snapshot`]).
+    ///
+    /// CW-15: distinguishes "fresh start, every leaf needs a shell" from
+    /// "restored world, only pending leaves need one" for the startup
+    /// spawn path. Never logged beyond the bit itself.
+    #[must_use]
+    pub fn session_restored(&self) -> bool {
+        self.session_restored
     }
 
     /// Validated spawn directory from a pending restore: the captured
@@ -1599,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_capture_strips_overlays_and_presentation_state() {
+    fn layout_capture_strips_overlays_but_keeps_modes() {
         let base = LayoutNode::split(SplitAxis::Horizontal, 0.5, leaf(1), leaf(2));
         let over = LayoutNode::overlay(base.clone(), leaf(9), bitty_ui::Rect::new(5, 5, 20, 10));
         let stripped = strip_overlays(&over);
@@ -1611,6 +1984,18 @@ mod tests {
             panic!("leaf must stay a leaf");
         };
         assert_eq!(view, View::new(ViewId::new(7), 80, 24));
+        // CW-16: the requested presentation mode is session truth and
+        // survives the strip (origin/scroll do not).
+        let floating = LayoutNode::leaf(View::with_presentation(
+            ViewId::new(8),
+            80,
+            24,
+            PresentationMode::Floating,
+        ));
+        let LayoutNode::Leaf(kept) = strip_overlays(&floating) else {
+            panic!("leaf must stay a leaf");
+        };
+        assert_eq!(kept.presentation(), PresentationMode::Floating);
     }
 
     #[test]
@@ -1661,6 +2046,9 @@ mod tests {
                 view: ViewId::new(1),
                 cwd: None,
                 scrollback: Vec::new(),
+                attach: None,
+                route: PaneRoute::Terminal,
+                mode: PresentationMode::Tiled,
             }],
         };
         let snap = SessionSnapshot {
@@ -1681,6 +2069,9 @@ mod tests {
                     view: ViewId::new(1),
                     cwd: None,
                     scrollback: Vec::new(),
+                    attach: None,
+                    route: PaneRoute::Terminal,
+                    mode: PresentationMode::Tiled,
                 }],
             }],
             active: 0,
@@ -1725,5 +2116,216 @@ mod tests {
         assert!(glyphs.contains(&'\u{FFFD}'));
         assert!(glyphs.contains(&'中'));
         assert!(state.check_invariants().is_ok());
+    }
+
+    fn v2_pane(id: u64, attach: Option<PaneAttachment>) -> PaneSnapshot {
+        PaneSnapshot {
+            view: ViewId::new(id),
+            cwd: None,
+            scrollback: Vec::new(),
+            attach,
+            route: PaneRoute::Terminal,
+            mode: PresentationMode::Tiled,
+        }
+    }
+
+    fn two_pane_snapshot(attach_a: Option<PaneAttachment>) -> SessionSnapshot {
+        SessionSnapshot {
+            version: SESSION_FORMAT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                seq: 1,
+                name: "ws1".to_string(),
+                layout: LayoutNode::split(
+                    SplitAxis::Horizontal,
+                    0.5,
+                    LayoutNode::leaf(View::with_presentation(
+                        ViewId::new(1),
+                        80,
+                        24,
+                        PresentationMode::Floating,
+                    )),
+                    leaf(2),
+                ),
+                focus: Some(ViewId::new(1)),
+                panes: vec![
+                    PaneSnapshot {
+                        mode: PresentationMode::Floating,
+                        ..v2_pane(1, attach_a)
+                    },
+                    v2_pane(2, Some(PaneAttachment::Session)),
+                ],
+            }],
+            active: 0,
+            mru: vec![0],
+        }
+    }
+
+    #[test]
+    fn attach_route_mode_tokens_round_trip() {
+        assert_eq!(
+            PaneAttachment::parse("primary"),
+            Some(PaneAttachment::Primary)
+        );
+        assert_eq!(
+            PaneAttachment::parse("session"),
+            Some(PaneAttachment::Session)
+        );
+        assert_eq!(
+            PaneAttachment::parse("detached"),
+            Some(PaneAttachment::Detached)
+        );
+        assert_eq!(PaneAttachment::parse("Primary"), None);
+        assert_eq!(PaneAttachment::parse(""), None);
+        assert_eq!(PaneRoute::parse("terminal"), Some(PaneRoute::Terminal));
+        assert_eq!(PaneRoute::parse("panel"), None);
+        assert_eq!(PaneRoute::parse(""), None);
+    }
+
+    #[test]
+    fn v2_encode_decode_preserves_attach_route_mode() {
+        let snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        let bytes = encode_session(&snap).expect("v2 snapshot encodes");
+        assert!(
+            bytes.starts_with(b"bitty-session v2\n"),
+            "encoder writes the v2 magic"
+        );
+        let back = decode_session(&bytes).expect("decode own v2 encoding");
+        assert_eq!(snap, back, "v2 round trip must preserve everything");
+        assert_eq!(
+            back.workspaces[0].layout.leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)]
+        );
+        let mode = back.workspaces[0]
+            .layout
+            .find_leaf(ViewId::new(1))
+            .expect("leaf present")
+            .presentation();
+        assert_eq!(mode, PresentationMode::Floating);
+    }
+
+    #[test]
+    fn v1_file_migrates_with_legacy_defaults() {
+        let raw = concat!(
+            "bitty-session v1\n",
+            "workspaces 1 active 0 mru 0\n",
+            "workspace 1 7\n",
+            "name ws1\n",
+            "layout (leaf 7 80 24)\n",
+            "pane 7 80 24 1 0\n",
+            "migrated line\n",
+            "end-pane\n",
+            "end-workspace\n",
+            "end-session\n",
+        );
+        let snap = decode_session(raw.as_bytes()).expect("v1 must migrate");
+        assert_eq!(snap.version, SESSION_FORMAT_VERSION);
+        let pane = &snap.workspaces[0].panes[0];
+        assert_eq!(pane.attach, None, "v1 carries no attachment record");
+        assert_eq!(pane.route, PaneRoute::Terminal);
+        assert_eq!(pane.mode, PresentationMode::Tiled);
+        assert_eq!(pane.scrollback, vec!["migrated line".to_string()]);
+        // The migrated snapshot re-encodes as v2 and decodes back.
+        let bytes = encode_session(&snap).expect("migrated snapshot encodes");
+        assert!(bytes.starts_with(b"bitty-session v2\n"));
+        let back = decode_session(&bytes).expect("v2 re-decode works");
+        assert_eq!(
+            back.workspaces[0].panes[0].attach,
+            Some(PaneAttachment::Primary),
+            "unspecified attachment resolves through the startup-owner derivation"
+        );
+    }
+
+    #[test]
+    fn v1_record_cannot_hide_v2_tokens() {
+        // An 8-token pane header in a v1 file is corrupt (exact token
+        // count per version), not a silent upgrade.
+        let raw = concat!(
+            "bitty-session v1\n",
+            "workspaces 1 active 0 mru 0\n",
+            "workspace 1 7\n",
+            "name ws1\n",
+            "layout (leaf 7 80 24)\n",
+            "pane 7 80 24 0 0 primary terminal tiled\n",
+            "end-pane\n",
+            "end-workspace\n",
+            "end-session\n",
+        );
+        assert!(decode_session(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn v2_rejects_unknown_attach_route_mode() {
+        let pane_with = |header: &str| {
+            format!(
+                "bitty-session v2\nworkspaces 1 active 0 mru 0\nworkspace 1 7\nname ws1\nlayout (leaf 7 80 24)\n{header}\nend-pane\nend-workspace\nend-session\n"
+            )
+        };
+        for (label, header) in [
+            ("attach", "pane 7 80 24 0 0 floating terminal tiled"),
+            ("route", "pane 7 80 24 0 0 session panel tiled"),
+            ("mode", "pane 7 80 24 0 0 session terminal zoomed"),
+            ("short", "pane 7 80 24 0 0"),
+        ] {
+            let err = decode_session(pane_with(header).as_bytes())
+                .expect_err(&format!("bad {label} must fail"));
+            assert!(
+                !format!("{err}").contains("ws1"),
+                "errors must never echo session contents"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_double_primary_and_stateful_detached() {
+        let mut snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        snap.workspaces[0].panes[1].attach = Some(PaneAttachment::Primary);
+        let err = validate_snapshot(&snap).expect_err("two primaries must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (duplicate primary)");
+
+        let mut snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        snap.workspaces[0].panes[1].attach = Some(PaneAttachment::Detached);
+        snap.workspaces[0].panes[1].scrollback = vec!["stowaway".to_string()];
+        let err = validate_snapshot(&snap).expect_err("stateful detached must fail");
+        assert_eq!(
+            format!("{err}"),
+            "session file corrupt (detached pane state)"
+        );
+    }
+
+    #[test]
+    fn startup_owner_derivation_prefers_focus_else_first_leaf() {
+        let snap = two_pane_snapshot(None);
+        assert_eq!(derive_startup_owner(&snap), ViewId::new(1));
+        let mut unfocused = snap.clone();
+        unfocused.workspaces[0].focus = None;
+        assert_eq!(derive_startup_owner(&unfocused), ViewId::new(1));
+
+        assert_eq!(
+            resolve_attachment(None, ViewId::new(1), ViewId::new(1)),
+            PaneAttachment::Primary
+        );
+        assert_eq!(
+            resolve_attachment(None, ViewId::new(2), ViewId::new(1)),
+            PaneAttachment::Session
+        );
+        // Recorded attachments resolve faithfully at encode/decode; the
+        // stale-owner downgrade is an apply-time routing rule (pinned by
+        // `recorded_primary_elsewhere_downgrades_to_pending`).
+        assert_eq!(
+            resolve_attachment(
+                Some(PaneAttachment::Primary),
+                ViewId::new(2),
+                ViewId::new(1)
+            ),
+            PaneAttachment::Primary
+        );
+        assert_eq!(
+            resolve_attachment(
+                Some(PaneAttachment::Detached),
+                ViewId::new(2),
+                ViewId::new(1)
+            ),
+            PaneAttachment::Detached
+        );
     }
 }

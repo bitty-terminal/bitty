@@ -207,6 +207,72 @@ pub fn guest(id: &str) -> Option<&'static Guest> {
     GUESTS.iter().find(|guest| guest.id == id)
 }
 
+/// One test suite that is a candidate for full in-guest execution once the
+/// deferred guest-boot stage lands (PERF-15 open item; research 043).
+///
+/// This is recorded plan, not scheduled work: nothing here runs in CI until
+/// KVM-capable runners and prepared base images exist. The table fixes the
+/// candidacy decision so the next slice has a reviewed target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestSuite {
+    /// Stable identifier (e.g. `compat-matrix`).
+    pub id: &'static str,
+    /// What the suite proves in the guest.
+    pub description: &'static str,
+    /// `true` when the suite measures wall-clock time. Timing suites are
+    /// candidates for KVM guests only: on emulated (TCG) guests the timing
+    /// is host-scheduler noise, so they are excluded there.
+    pub requires_kvm: bool,
+}
+
+/// Candidate suites for full in-guest runs. Functional suites run everywhere,
+/// including emulated guests; timing suites are KVM-only.
+pub const GUEST_SUITE_CANDIDATES: &[GuestSuite] = &[
+    GuestSuite {
+        id: "compat-matrix",
+        description: "compat-lab corpus replay over the 14 release surfaces (functional, deterministic)",
+        requires_kvm: false,
+    },
+    GuestSuite {
+        id: "parser-corpus",
+        description: "VT parser corpus replay (functional; the throughput floor stays a KVM-side gate)",
+        requires_kvm: false,
+    },
+    GuestSuite {
+        id: "pty-integration",
+        description: "PTY spawn, resize, and signal integration per guest OS",
+        requires_kvm: false,
+    },
+    GuestSuite {
+        id: "startup-bench",
+        description: "PB-1 cold-startup phase timeline (timing; KVM only)",
+        requires_kvm: true,
+    },
+    GuestSuite {
+        id: "latency-bench",
+        description: "PB-4 input-latency distribution (timing; KVM only)",
+        requires_kvm: true,
+    },
+    GuestSuite {
+        id: "idle-bench",
+        description: "PB-7 idle CPU and wakeup sampling (timing; KVM only)",
+        requires_kvm: true,
+    },
+];
+
+/// Look up a candidate suite by its stable identifier.
+pub fn guest_suite(id: &str) -> Option<&'static GuestSuite> {
+    GUEST_SUITE_CANDIDATES.iter().find(|suite| suite.id == id)
+}
+
+/// Candidate suites for one guest: every suite on KVM guests; only the
+/// non-timing suites on emulated (TCG) guests.
+pub fn guest_suites(guest: &Guest) -> impl Iterator<Item = &'static GuestSuite> {
+    GUEST_SUITE_CANDIDATES
+        .iter()
+        .filter(move |suite| !suite.requires_kvm || guest.accel == Accel::Kvm)
+}
+
 /// Run identifiers become directory names: lowercase ASCII letters, digits,
 /// and `-`, starting with an alphanumeric, at most 64 characters.
 pub fn run_id_is_safe(run_id: &str) -> bool {
@@ -800,5 +866,38 @@ mod tests {
         let run_id = default_run_id("arch", 1_700_000_000);
         assert_eq!(run_id, "arch-1700000000");
         assert!(run_id_is_safe(&run_id));
+    }
+
+    #[test]
+    fn guest_suite_candidates_isolate_timing_from_emulated_guests() {
+        // Suite ids are unique and every id resolves through the lookup.
+        let mut ids: Vec<&str> = GUEST_SUITE_CANDIDATES.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), GUEST_SUITE_CANDIDATES.len());
+        for suite in GUEST_SUITE_CANDIDATES {
+            assert_eq!(guest_suite(suite.id), Some(suite));
+        }
+        assert_eq!(guest_suite("no-such-suite"), None);
+
+        // KVM guests are candidates for every suite, including timing ones.
+        let kvm = guest("arch").expect("arch exists");
+        let kvm_ids: Vec<_> = guest_suites(kvm).map(|s| s.id).collect();
+        assert_eq!(kvm_ids.len(), GUEST_SUITE_CANDIDATES.len());
+        for timing in ["startup-bench", "latency-bench", "idle-bench"] {
+            assert!(kvm_ids.contains(&timing), "{kvm_ids:?}");
+        }
+
+        // Emulated (TCG) guests get the functional suites only: emulated
+        // timing is host-scheduler noise, never a budget signal.
+        let tcg = guest("arch-arm64").expect("arm guest exists");
+        let tcg_ids: Vec<_> = guest_suites(tcg).map(|s| s.id).collect();
+        assert_eq!(
+            tcg_ids,
+            ["compat-matrix", "parser-corpus", "pty-integration"]
+        );
+        for suite in guest_suites(tcg) {
+            assert!(!suite.requires_kvm, "{suite:?}");
+        }
     }
 }

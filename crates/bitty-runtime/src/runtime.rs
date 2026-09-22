@@ -445,6 +445,10 @@ pub struct Runtime {
     /// through `spawn_shell_with_args`, which must consult this slot too.
     /// Keyed and cleared exactly like `session_pending`; never logged.
     session_primary_cwd: Option<(ViewId, String)>,
+    /// Whether a session restore populated this runtime (CW-15): set by a
+    /// successful `apply_session_snapshot`, read by startup pane spawn to
+    /// respawn only attached leaves. Count-only in logs.
+    session_restored: bool,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
     /// Whether the help popup (CTX-0265) is currently shown.
@@ -839,6 +843,7 @@ impl std::fmt::Debug for Runtime {
             .field("active_workspace", &self.active_workspace)
             .field("session_pending", &self.session_pending.len())
             .field("session_primary_cwd", &self.session_primary_cwd.is_some())
+            .field("session_restored", &self.session_restored)
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("help_visible", &self.help_visible)
             .field("help_rows", &self.help_rows.len())
@@ -1202,6 +1207,7 @@ impl Runtime {
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
+            session_restored: false,
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),
@@ -1380,6 +1386,7 @@ impl Runtime {
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
+            session_restored: false,
             pending_ws_close: None,
             help_visible: false,
             help_rows: Vec::new(),

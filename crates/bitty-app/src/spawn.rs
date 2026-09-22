@@ -205,6 +205,13 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
         if Some(*id) == primary {
             continue;
         }
+        // CW-15: a restored session respawns only attached leaves (pending
+        // restores). Session-less (`Detached`) leaves carry no pending
+        // entry and stay empty by design instead of gaining shells they
+        // never had. Fresh starts still spawn every leaf.
+        if runtime.session_restored() && !runtime.session_pending_contains(id) {
+            continue;
+        }
         if let Err(err) =
             spawn_pane_shell(runtime, spec, *id, rect.width.max(1), rect.height.max(1))
         {

@@ -73,9 +73,24 @@ impl Capture {
 /// Spawn `program` under an 80x24 PTY, apply `stages`, read until exit or the
 /// scenario deadline, and always reap the child.
 fn capture(program: &Path, args: &[&str], stages: &[Stage]) -> Capture {
-    let mut pty = PtyBuilder::new(program.as_os_str())
+    capture_with_env(program, args, stages, &[])
+}
+
+/// [`capture`] with extra child environment entries (e.g. a tool-specific
+/// config path). The session environment is otherwise inherited.
+fn capture_with_env(
+    program: &Path,
+    args: &[&str],
+    stages: &[Stage],
+    envs: &[(&str, &str)],
+) -> Capture {
+    let mut builder = PtyBuilder::new(program.as_os_str())
         .args(args.iter().map(|arg| arg.to_string()))
-        .size(80, 24)
+        .size(80, 24);
+    for (key, value) in envs {
+        builder = builder.env(key, value);
+    }
+    let mut pty = builder
         .spawn()
         .unwrap_or_else(|err| panic!("spawn {}: {err}", program.display()));
     let mut writer = pty.take_writer().expect("pty writer half");
@@ -378,6 +393,45 @@ fn live_htop_probe() {
         capture.bytes.len()
     );
     emit_verified("htop", &htop, &capture, "\"scope\": \"render-capture\"");
+}
+
+/// Literal marker rendered by the minimal starship config below.
+const STARSHIP_MARKER: &str = "bitty-starship-ok";
+
+#[test]
+fn live_starship_probe() {
+    if !live_enabled() {
+        return emit_skip("starship", "BITTY_COMPAT_LIVE is not 1");
+    }
+    let Some(starship) = tool_path("starship") else {
+        return emit_skip("starship", "starship not found on PATH");
+    };
+    // Minimal config: literal marker plus the success character only, so the
+    // prompt stays deterministic (no cwd/git/time modules).
+    let config =
+        std::env::temp_dir().join(format!("bitty-compat-starship-{}.toml", std::process::id()));
+    std::fs::write(&config, "format = \"bitty-starship-ok$character\"\n")
+        .expect("write temp starship config");
+    let config_arg = config.to_string_lossy().into_owned();
+    let capture = capture_with_env(
+        &starship,
+        &["prompt", "--status", "0"],
+        &[],
+        &[("STARSHIP_CONFIG", config_arg.as_str())],
+    );
+    let _ = std::fs::remove_file(&config);
+    let text = capture.text();
+    assert!(
+        text.contains(STARSHIP_MARKER),
+        "starship capture missing marker ({} bytes)",
+        capture.bytes.len()
+    );
+    emit_verified(
+        "starship",
+        &starship,
+        &capture,
+        "\"scope\": \"prompt-render\"",
+    );
 }
 
 /// 2x2 RGBA PNG (red/green/blue/yellow) used as the chafa input.

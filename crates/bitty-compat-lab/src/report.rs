@@ -60,7 +60,8 @@ pub const AREAS: &[&str] = &[
 ///
 /// Sorted alphabetically; the report mirrors this order.
 pub const PROBED_TOOLS: &[&str] = &[
-    "bash", "chafa", "fish", "fzf", "htop", "nvim", "sh", "ssh", "tmux", "zsh",
+    "bash", "chafa", "fish", "fzf", "htop", "lazygit", "nvim", "sh", "ssh", "starship", "tmux",
+    "zsh",
 ];
 
 /// Evidence status for one matrix row.
@@ -157,6 +158,15 @@ pub const ROWS: &[Row] = &[
         status: Status::Local,
         method: Method::LocalPty { scenario: "shell" },
         note: "bash --noprofile --norc -i; env-gated, never claimed in CI",
+    },
+    Row {
+        area: "shell-startup-exit",
+        scenario: "real starship prompt render capture over a PTY",
+        status: Status::Local,
+        method: Method::LocalPty {
+            scenario: "starship",
+        },
+        note: "minimal STARSHIP_CONFIG with a literal marker; env-gated, never claimed in CI",
     },
     Row {
         area: "shell-startup-exit",
@@ -270,6 +280,15 @@ pub const ROWS: &[Row] = &[
         status: Status::Local,
         method: Method::LocalPty { scenario: "htop" },
         note: "q to quit; bounded capture and replay",
+    },
+    Row {
+        area: "general-tui",
+        scenario: "real lazygit render capture over a PTY",
+        status: Status::Gap,
+        method: Method::Uncovered {
+            reason: "lazygit 0.65.0 stalls after its capability-query burst waiting for terminal replies the bounded harness never answers (no render within 26 s even with DECRQM/XTWINOPS/DA answered externally); needs a query-answering PTY leg in a follow-up task",
+        },
+        note: "env probe records lazygit presence; no render evidence claimed",
     },
     // unicode-cjk-ime
     Row {

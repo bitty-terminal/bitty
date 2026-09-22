@@ -84,6 +84,16 @@ m1-matrix *args:
 m1-matrix-test:
     ./scripts/tests/m1-matrix.test.sh
 
+# Run the 14 surfaces x 4 terminals release-matrix suites on this host and
+# print the per-platform table: `just compat-matrix`. The aggregated Tier 1
+# view lives in CI (`.github/workflows/ci.yml` job `compat-matrix`); see
+# scripts/compat-matrix.sh. PERF-11 (#1065), CTX-0692.
+compat-matrix *args:
+    ./scripts/compat-matrix.sh run --platform local {{args}}
+
+compat-matrix-test:
+    ./scripts/tests/compat-matrix.test.sh
+
 scratch-paths:
     ./scripts/check-scratch-paths.sh
 
@@ -179,7 +189,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test compat-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

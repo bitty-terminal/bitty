@@ -207,6 +207,7 @@ dependencies = [
  "bitty-pty",
  "bitty-runtime",
  "bitty-term-state",
+ "bitty-ui",
  "bitty-vt",
 ]
 

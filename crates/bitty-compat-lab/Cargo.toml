@@ -27,3 +27,7 @@ bitty-platform = { version = "0.0.20", path = "../bitty-platform" }
 
 [dev-dependencies]
 bitty-pty = { version = "0.0.20", path = "../bitty-pty" }
+# M1-29 (CTX-0689): A5 selection gates assert the presentation-layer contract
+# in `bitty-ui`; dev-only edge, no product graph change (`bitty-ui` depends
+# solely on `bitty-term-state`, so this edge is acyclic).
+bitty-ui = { version = "0.0.20", path = "../bitty-ui" }

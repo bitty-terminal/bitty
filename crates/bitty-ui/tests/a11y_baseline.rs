@@ -12,9 +12,11 @@
 
 use bitty_term_state::{State, TerminalAction};
 use bitty_ui::a11y::{
-    A11yError, A11yNodeKind, A11yRole, A11yTreeBuilder, ChromeKind, ChromeNode, FIDELITY_BOUNDARY,
-    InteractiveNode, MAX_A11Y_TREE_NODES, SceneKind, build_a11y_tree, chrome_tab_order,
-    expose_terminal, interactive_role, role_of, terminal_text_runs, validate_scene,
+    A11yError, A11yNodeKind, A11yRole, A11ySettings, A11ySource, A11yTreeBuilder, AnnouncementKind,
+    AnnouncementQueue, ChromeKind, ChromeNode, FIDELITY_BOUNDARY, InteractiveNode,
+    MAX_A11Y_TREE_NODES, MAX_ANNOUNCEMENT_TEXT_LEN, MAX_PENDING_ANNOUNCEMENTS, SceneKind,
+    build_a11y_tree, chrome_tab_order, expose_terminal, interactive_role, needs_a11y_refresh,
+    role_of, terminal_text_runs, validate_scene,
 };
 use bitty_vt::{ControlChar, GraphemeCell};
 
@@ -461,4 +463,158 @@ fn tree_builder_enforces_cap_foreign_handles_and_row_content_rule() {
         })
     );
     assert_eq!(full.finish().len(), MAX_A11Y_TREE_NODES);
+}
+
+// ---------------------------------------------------------------------------
+// Announcements: one bounded notice per transition, coalesced + rate-limited
+// ---------------------------------------------------------------------------
+
+#[test]
+fn announcements_coalesce_consecutive_duplicates() {
+    let mut queue = AnnouncementQueue::new();
+    assert!(queue.is_empty());
+    assert_eq!(queue.len(), 0);
+    assert_eq!(queue.push_focus("editor"), Ok(true));
+    // Same kind and text as the tail coalesces: no duplicate is stored.
+    assert_eq!(queue.push_focus("editor"), Ok(false));
+    assert_eq!(queue.len(), 1);
+    let drained = queue.drain();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].kind(), AnnouncementKind::Focus);
+    assert_eq!(drained[0].text(), "editor");
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn announcements_keep_kinds_distinct() {
+    let mut queue = AnnouncementQueue::new();
+    assert_eq!(queue.push_focus("ready"), Ok(true));
+    // Same text under the other kind is a different notice.
+    assert_eq!(queue.push_state("ready"), Ok(true));
+    assert_eq!(queue.len(), 2);
+    let drained = queue.drain();
+    assert_eq!(drained[0].kind(), AnnouncementKind::Focus);
+    assert_eq!(drained[1].kind(), AnnouncementKind::AsyncState);
+    assert_eq!(drained[1].text(), "ready");
+}
+
+#[test]
+fn announcements_rate_limit_drops_oldest() {
+    let mut queue = AnnouncementQueue::new();
+    for i in 0..(MAX_PENDING_ANNOUNCEMENTS + 3) {
+        let text = format!("state {i}");
+        assert_eq!(queue.push_state(&text), Ok(true));
+    }
+    assert_eq!(queue.len(), MAX_PENDING_ANNOUNCEMENTS);
+    let drained = queue.drain();
+    // Newest state wins: the first three notices were dropped.
+    assert_eq!(drained.len(), MAX_PENDING_ANNOUNCEMENTS);
+    assert_eq!(drained[0].text(), "state 3");
+    let last = format!("state {}", MAX_PENDING_ANNOUNCEMENTS + 2);
+    assert_eq!(drained.last().expect("nonempty").text(), last.as_str());
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn announcements_reject_overlong_text_at_the_boundary() {
+    let mut queue = AnnouncementQueue::new();
+    let long = "n".repeat(MAX_ANNOUNCEMENT_TEXT_LEN + 1);
+    assert!(matches!(
+        queue.push_focus(&long),
+        Err(A11yError::NameTooLong { .. })
+    ));
+    assert!(queue.is_empty());
+    // Boundary length is accepted.
+    let at_cap = "n".repeat(MAX_ANNOUNCEMENT_TEXT_LEN);
+    assert_eq!(queue.push_state(&at_cap), Ok(true));
+    assert_eq!(queue.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Settings composition: core-owned reduced motion + high contrast
+// ---------------------------------------------------------------------------
+
+#[test]
+fn settings_reduced_motion_collapses_to_final_state() {
+    use bitty_ui::MotionSpec;
+    let authored = MotionSpec::default();
+    assert!(!authored.is_instant());
+    let reduced = A11ySettings::new().with_reduced_motion(true);
+    assert!(reduced.reduced_motion());
+    let collapsed = reduced.resolve_motion(authored);
+    assert_eq!(collapsed, MotionSpec::INSTANT);
+    assert!(collapsed.is_instant());
+}
+
+#[test]
+fn settings_defaults_leave_motion_and_tokens_untouched() {
+    use bitty_ui::MotionSpec;
+    let settings = A11ySettings::default();
+    assert_eq!(settings, A11ySettings::new());
+    assert!(!settings.reduced_motion());
+    assert!(!settings.high_contrast());
+    let authored = MotionSpec::default();
+    assert_eq!(settings.resolve_motion(authored), authored);
+    assert_eq!(settings.high_contrast_outlines(), None);
+}
+
+#[test]
+fn settings_high_contrast_selects_compliant_outlines() {
+    use bitty_ui::theme::{SAFE_BORDER_FOCUSED, SAFE_BORDER_IDLE};
+    let settings = A11ySettings::new().with_high_contrast(true);
+    assert!(settings.high_contrast());
+    let (focused, idle) = settings
+        .high_contrast_outlines()
+        .expect("pair while high contrast");
+    assert_eq!(focused, SAFE_BORDER_FOCUSED);
+    assert_eq!(idle, SAFE_BORDER_IDLE);
+}
+
+// ---------------------------------------------------------------------------
+// Hot path: invalidation-driven refresh, no timer, no plugin code
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hot_path_refresh_is_invalidation_driven() {
+    // Render/paint/damage ticks with no content change pass `None` and
+    // never rebuild.
+    assert!(!needs_a11y_refresh(None));
+    for source in [
+        A11ySource::FocusChange,
+        A11ySource::AsyncStateChange,
+        A11ySource::SceneUpdate,
+        A11ySource::TerminalUpdate,
+        A11ySource::ChromeUpdate,
+    ] {
+        assert!(
+            needs_a11y_refresh(Some(source)),
+            "source {source:?} must refresh"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionId decision (F-3, CW-17): ViewId keying retained, no new type
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_f3_keeps_viewid_keying() {
+    // Decision F-3 (`[BLOCKED: OQ-058]`): no `SessionId` newtype exists;
+    // scenes stay keyed by `ViewId` until the owner resolves `OQ-058`.
+    use bitty_ui::{
+        LayoutNode, PanelId, TerminalBinding, View, ViewId, WorkspaceScene, WorkspaceSceneId,
+    };
+    let tiled = LayoutNode::leaf(View::new(ViewId::new(11), 80, 24));
+    let mut scene = WorkspaceScene::new(WorkspaceSceneId::new(1), tiled);
+    let panel = PanelId::new(7);
+    scene
+        .bind(panel, ViewId::new(11), TerminalBinding::new(77))
+        .expect("bind by ViewId");
+    // View-keyed lookup resolves in its own lane: the panel lane never
+    // converts into the view lane.
+    assert_eq!(scene.view_of(panel), Some(ViewId::new(11)));
+    assert_eq!(
+        scene.attachment_of(panel).expect("attached").view,
+        ViewId::new(11)
+    );
 }

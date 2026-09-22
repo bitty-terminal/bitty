@@ -83,8 +83,14 @@ use arboard::{ClearExtLinux, GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
 /// Maximum bytes allowed for a clipboard payload (mirrors
 /// `BoundedBytes::MAX_LEN` / `CLIPBOARD_MAX_PAYLOAD_BYTES` = 4096 plus a
-/// small slack for paste verification). Enforced before `arboard` calls so
-/// unbounded paste data cannot grow the heap without limit (T-01).
+/// small slack for paste verification). Writes are rejected before any
+/// `arboard` call, so an over-limit write never reaches the OS.
+///
+/// Scope (R-004 residual): this is a post-acquisition retained/inspection
+/// bound, not a strict peak-memory bound. A native read materializes the
+/// OS-provided `String` first and the bounded accessors clip afterwards, so
+/// only retained/inspected/pasted/answered bytes are capped. See the
+/// [`Clipboard`] type docs.
 pub const CLIPBOARD_MAX_BYTES: usize = 8192;
 
 /// Whether a Wayland display is advertised via `WAYLAND_DISPLAY`.
@@ -127,6 +133,14 @@ pub fn display_backend_hint() -> &'static str {
 /// The primary selection (middle-click / `wl-paste --primary`) is tracked in
 /// a second buffer and synced best-effort on Linux. See the module docs for
 /// the exact sync and error contract.
+///
+/// Bound scope (R-004 residual): [`CLIPBOARD_MAX_BYTES`] is a
+/// post-acquisition retained/inspection bound, not a strict peak-memory
+/// bound. Native reads materialize the OS-provided `String` before the
+/// bounded accessors clip it, so a hostile clipboard can transiently exceed
+/// the cap in memory; what is retained, inspected, pasted, or answered is
+/// always within the cap. Whether the last bounded read clipped is
+/// observable via [`Self::last_bounded_read_truncated`].
 pub struct Clipboard {
     inner: Option<arboard::Clipboard>,
     headless_buf: String,
@@ -141,6 +155,13 @@ pub struct Clipboard {
     /// every regular/primary read. `None` in production; set by
     /// [`Clipboard::simulate_system_text_for_test`].
     simulated_read: Option<String>,
+    /// Whether the most recent bounded read ([`Self::get_text_bounded`] /
+    /// [`Self::get_primary_bounded`]) clipped an over-limit value.
+    ///
+    /// Set on every bounded read, untouched by the direct reads, so the
+    /// paste seam can attribute a truncation to the platform layer exactly
+    /// once (R-004 truncated-paste telemetry).
+    bounded_read_truncated: bool,
 }
 
 impl std::fmt::Debug for Clipboard {
@@ -176,6 +197,7 @@ impl Clipboard {
                 headless_only: false,
                 init_error: None,
                 simulated_read: None,
+                bounded_read_truncated: false,
             },
             Err(err) => Self {
                 inner: None,
@@ -184,6 +206,7 @@ impl Clipboard {
                 headless_only: false,
                 init_error: Some(err.to_string()),
                 simulated_read: None,
+                bounded_read_truncated: false,
             },
         }
     }
@@ -201,6 +224,7 @@ impl Clipboard {
                 headless_only: false,
                 init_error: None,
                 simulated_read: None,
+                bounded_read_truncated: false,
             }),
             Err(err) => Err(PlatformError::ClipboardUnavailable(err.to_string())),
         }
@@ -217,6 +241,7 @@ impl Clipboard {
             headless_only: true,
             init_error: None,
             simulated_read: None,
+            bounded_read_truncated: false,
         }
     }
 
@@ -261,6 +286,19 @@ impl Clipboard {
     #[must_use]
     pub fn primary_contents(&self) -> &str {
         &self.primary_buf
+    }
+
+    /// Whether the most recent bounded read clipped an over-limit value.
+    ///
+    /// Set by [`Self::get_text_bounded`] / [`Self::get_primary_bounded`] on
+    /// every call (`true` only when the system value exceeded
+    /// [`CLIPBOARD_MAX_BYTES`] and was cut at a UTF-8 char boundary);
+    /// `false` after construction and untouched by the direct rejecting
+    /// reads. The paste seam merges this into its truncation telemetry so a
+    /// platform-layer clip is attributed exactly once (R-004).
+    #[must_use]
+    pub fn last_bounded_read_truncated(&self) -> bool {
+        self.bounded_read_truncated
     }
 
     /// Writes `text` to the regular clipboard and syncs the primary selection.
@@ -422,11 +460,16 @@ impl Clipboard {
     ///
     /// When a system clipboard is present and the read fails, returns
     /// `PlatformError::ClipboardOperation`.
+    ///
+    /// Records whether the value was clipped in
+    /// [`Self::last_bounded_read_truncated`].
     pub fn get_text_bounded(&mut self) -> Result<String, PlatformError> {
         let text = self
             .read_text_raw()
             .map_err(PlatformError::ClipboardOperation)?;
+        let truncated = text.len() > CLIPBOARD_MAX_BYTES;
         let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        self.bounded_read_truncated = truncated;
         self.headless_buf = text.clone();
         Ok(text)
     }
@@ -442,11 +485,16 @@ impl Clipboard {
     ///
     /// When a system clipboard is present and the read fails, returns
     /// `PlatformError::ClipboardOperation`.
+    ///
+    /// Records whether the value was clipped in
+    /// [`Self::last_bounded_read_truncated`].
     pub fn get_primary_bounded(&mut self) -> Result<String, PlatformError> {
         let text = self
             .read_primary_raw()
             .map_err(PlatformError::ClipboardOperation)?;
+        let truncated = text.len() > CLIPBOARD_MAX_BYTES;
         let text = truncate_to_bytes(text, CLIPBOARD_MAX_BYTES);
+        self.bounded_read_truncated = truncated;
         self.primary_buf = text.clone();
         Ok(text)
     }
@@ -956,6 +1004,7 @@ mod tests {
             headless_only: false,
             init_error: Some(String::from("display unavailable")),
             simulated_read: None,
+            bounded_read_truncated: false,
         };
         assert_eq!(cb.headless_reason(), Some("display unavailable"));
         assert!(cb.is_headless());

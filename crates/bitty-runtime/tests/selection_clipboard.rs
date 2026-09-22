@@ -660,3 +660,82 @@ fn selection_text_uses_snapshot_wide_snap() {
     rt.set_selection(sel_spacer);
     assert_eq!(rt.selection_text().as_deref(), Some("\u{4e2d}"));
 }
+
+#[test]
+fn truncated_paste_telemetry_counts_gate_clips_exactly_once() {
+    // R-004 truncated-paste telemetry (CTX-0641): string seams reach the
+    // inspection gate unclipped, so each over-cap string paste increments
+    // the counter once; in-cap pastes, confirm, and cancel never change it.
+    let mut rt = make_runtime();
+    assert_eq!(rt.paste_truncated_pastes(), 0);
+    // Clean oversized paste delivers its bounded prefix immediately.
+    let over = "a".repeat(CLIPBOARD_MAX_BYTES + 64);
+    assert!(!rt.paste_text_via_gate(over), "clean paste delivers");
+    assert_eq!(rt.paste_truncated_pastes(), 1);
+    assert_eq!(rt.pending_input().len(), CLIPBOARD_MAX_BYTES);
+    // In-cap paste does not count.
+    rt.drain_pending_input();
+    assert!(!rt.paste_text_via_gate(String::from("small")));
+    assert_eq!(rt.paste_truncated_pastes(), 1);
+    // Suspicious oversized paste gates, then confirm/cancel leave the count.
+    // (The trigger sits at the front so the truncation keeps it.)
+    let over_suspicious = format!("\n{}", "b".repeat(CLIPBOARD_MAX_BYTES + 64));
+    assert!(
+        rt.paste_text_via_gate(over_suspicious),
+        "multi-line paste must gate"
+    );
+    assert_eq!(rt.paste_truncated_pastes(), 2);
+    assert!(rt.confirm_pending_paste(true), "confirm delivers");
+    assert_eq!(rt.paste_truncated_pastes(), 2);
+    let over_cancel = format!("\x1b{}", "c".repeat(CLIPBOARD_MAX_BYTES + 1));
+    assert!(rt.paste_text_via_gate(over_cancel), "esc paste must gate");
+    assert_eq!(rt.paste_truncated_pastes(), 3);
+    assert!(rt.cancel_pending_paste(), "cancel drops");
+    assert_eq!(rt.paste_truncated_pastes(), 3);
+}
+
+#[test]
+fn truncated_paste_telemetry_counts_platform_clip_once_not_twice() {
+    // An over-limit OS clipboard is clipped by the platform bounded read;
+    // the paste seam must attribute that truncation exactly once even
+    // though `request_paste` re-applies the same bound downstream.
+    let mut rt = make_runtime();
+    rt.clipboard_mut()
+        .simulate_system_text_for_test("d".repeat(CLIPBOARD_MAX_BYTES + 900));
+    let delivered = rt.paste_from_clipboard().expect("bounded read succeeds");
+    assert_eq!(delivered, Some(false), "clean prefix delivers immediately");
+    assert_eq!(rt.paste_truncated_pastes(), 1);
+    assert_eq!(rt.pending_input().len(), CLIPBOARD_MAX_BYTES);
+    // The primary seam shares the exactly-once attribution.
+    let mut rt_primary = make_runtime();
+    rt_primary
+        .clipboard_mut()
+        .simulate_system_text_for_test("e".repeat(CLIPBOARD_MAX_BYTES + 900));
+    assert_eq!(rt_primary.paste_from_primary(), Some(false));
+    assert_eq!(rt_primary.paste_truncated_pastes(), 1);
+    // In-cap clipboard pastes never count.
+    let mut rt_small = make_runtime();
+    rt_small
+        .clipboard_mut()
+        .set_text(String::from("tiny"))
+        .expect("seed");
+    assert_eq!(rt_small.paste_from_clipboard().expect("paste"), Some(false));
+    assert_eq!(rt_small.paste_truncated_pastes(), 0);
+}
+
+#[test]
+fn truncated_paste_telemetry_clips_multibyte_on_char_boundary() {
+    // Oversized multibyte input through the gate stays valid UTF-8 within
+    // the cap and counts once.
+    let mut rt = make_runtime();
+    let over = "😀".repeat(CLIPBOARD_MAX_BYTES / 4 + 10);
+    assert!(!rt.paste_text_via_gate(over), "clean emoji delivers");
+    assert_eq!(rt.paste_truncated_pastes(), 1);
+    let delivered = rt.pending_input();
+    assert!(delivered.len() <= CLIPBOARD_MAX_BYTES);
+    assert_eq!(delivered.len() % 4, 0, "emoji cut on a char boundary");
+    assert!(
+        std::str::from_utf8(delivered).is_ok(),
+        "delivered prefix must be valid UTF-8"
+    );
+}

@@ -50,7 +50,7 @@ fn report_statuses_declare_consistent_methods() {
     for row in ROWS {
         match (row.status, row.method) {
             (Status::Ci, Method::Corpus { .. } | Method::Test { .. }) => {}
-            (Status::Local, Method::LocalPty { .. }) => {}
+            (Status::Local, Method::LocalPty { .. } | Method::LiveDisplay { .. }) => {}
             (Status::Partial, Method::Corpus { .. }) => {}
             (Status::Gap, Method::Uncovered { .. }) => {}
             (status, method) => panic!(
@@ -117,12 +117,27 @@ fn report_local_rows_map_to_live_scenario_tests() {
         bitty_compat_lab::workspace_root().join("crates/bitty-compat-lab/tests/live_compat.rs"),
     )
     .expect("read live_compat.rs");
+    let clipboard_live = std::fs::read_to_string(
+        bitty_compat_lab::workspace_root().join("crates/bitty-platform/tests/clipboard_live.rs"),
+    )
+    .expect("read clipboard_live.rs");
     for row in ROWS {
         if let Method::LocalPty { scenario } = row.method {
             let needle = format!("fn live_{scenario}_probe(");
             assert!(
                 live.contains(&needle),
                 "live scenario {scenario:?} for {:?}/{:?} has no {needle}",
+                row.area,
+                row.scenario
+            );
+        }
+        if let Method::LiveDisplay { scenario } = row.method {
+            // Every live-display scenario owns at least one
+            // `live_{scenario}_*` test in `clipboard_live.rs`.
+            let needle = format!("fn live_{scenario}_");
+            assert!(
+                clipboard_live.contains(&needle),
+                "live-display scenario {scenario:?} for {:?}/{:?} has no {needle} test",
                 row.area,
                 row.scenario
             );

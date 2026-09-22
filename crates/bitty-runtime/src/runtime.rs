@@ -634,6 +634,15 @@ pub struct Runtime {
     /// (wrapping) lets headless tests and the embedder observe the event
     /// without touching the real clipboard.
     osc52_rejected_writes: u64,
+    /// Count of pastes clipped to `CLIPBOARD_MAX_BYTES` (R-004, CTX-0641).
+    ///
+    /// Truncated-paste telemetry: incremented exactly once per paste whose
+    /// payload exceeded the 8192-byte post-acquisition bound, whether the
+    /// clip happened in the platform bounded read (`paste_from_clipboard` /
+    /// `paste_from_primary`) or at the inspection gate (`request_paste`
+    /// for string seams). Monotonic (wrapping); the delivered paste is the
+    /// bounded prefix either way, and confirm/cancel never change it.
+    paste_truncated_pastes: u64,
     /// Input bytes dropped because the focused writer failed mid-write
     /// (CTX-0473). Wrapping telemetry: bytes that never reached the shell.
     input_write_dropped_bytes: u64,
@@ -1127,6 +1136,7 @@ impl Runtime {
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,
+            paste_truncated_pastes: 0,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,
@@ -1305,6 +1315,7 @@ impl Runtime {
             closing_frames: Vec::new(),
             last_presented_workspace: 0,
             last_clipboard_error: None,
+            paste_truncated_pastes: 0,
             last_cursor: None,
             search_state: SearchState::new(),
             pending_paste: None,

@@ -380,6 +380,10 @@ impl Runtime {
         let text = match self.clipboard.get_primary_bounded() {
             Ok(text) => {
                 self.clear_clipboard_error();
+                if self.clipboard.last_bounded_read_truncated() {
+                    // Same exactly-once attribution as `paste_from_clipboard`.
+                    self.paste_truncated_pastes = self.paste_truncated_pastes.wrapping_add(1);
+                }
                 text
             }
             Err(err) => {
@@ -504,6 +508,12 @@ impl Runtime {
     /// char-boundary bound via `truncate_paste_text`.
     pub fn paste_from_clipboard(&mut self) -> Result<Option<bool>, bitty_platform::PlatformError> {
         let text = self.clipboard.get_text_bounded()?;
+        if self.clipboard.last_bounded_read_truncated() {
+            // The platform layer clipped an over-limit system value: attribute
+            // the truncation here (`request_paste` sees an in-cap string and
+            // must not count again).
+            self.paste_truncated_pastes = self.paste_truncated_pastes.wrapping_add(1);
+        }
         if text.is_empty() {
             return Ok(None);
         }
@@ -553,7 +563,15 @@ impl Runtime {
         // `write_input` also snaps; explicit here for the pending-confirm path
         // with no bytes yet).
         self.snap_focused_to_live();
+        // R-004 truncated-paste telemetry (CTX-0641): string seams reach the
+        // gate unclipped, so a clip here is the paste's truncation. Clipboard
+        // seams arrive pre-clipped from the bounded read (already counted by
+        // the caller), so this stays exactly-once per paste.
+        let original_len = text.len();
         let text = truncate_paste_text(text);
+        if text.len() < original_len {
+            self.paste_truncated_pastes = self.paste_truncated_pastes.wrapping_add(1);
+        }
         // Explicit confirmation: identical re-paste while pending delivers.
         if let Some(pending) = self.pending_paste.as_ref() {
             if pending.text == text {
@@ -759,5 +777,17 @@ impl Runtime {
     #[must_use]
     pub fn osc52_rejected_writes(&self) -> u64 {
         self.osc52_rejected_writes
+    }
+
+    /// Count of pastes clipped to `CLIPBOARD_MAX_BYTES` (R-004, CTX-0641).
+    ///
+    /// Truncated-paste telemetry: exactly one increment per paste whose
+    /// payload exceeded the 8192-byte post-acquisition bound — counted at
+    /// the platform bounded read for clipboard seams and at the inspection
+    /// gate for string seams. Monotonic (wrapping); confirm/cancel never
+    /// change it.
+    #[must_use]
+    pub fn paste_truncated_pastes(&self) -> u64 {
+        self.paste_truncated_pastes
     }
 }

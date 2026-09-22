@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "task": "CTX-0643",
+  "issues": [1064],
+  "captured_at": "2026-09-22",
+  "revision": "d599640dc7b5d27c47759240ff6da6b08dae81fb",
+  "command": "bash scripts/dogfood-session.sh --out-dir recording/dogfood-session --duration-secs 14400 --cycle-secs 600",
+  "profile": "dev (debug)",
+  "budget_ref": "docs/specifications/performance-budget-rfc.md#pb-3-typical-session-memory and #pb-7-idle-cpu",
+  "host_context": {
+    "os": "linux",
+    "arch": "x86_64",
+    "toolchain": "rustc 1.98.1",
+    "cpus": 24,
+    "total_memory_mb": 31818
+  },
+  "session": {
+    "status": "unavailable",
+    "duration_secs": 14400,
+    "cycle_secs": 600,
+    "cycle_effective_secs": 600,
+    "workspace": "4",
+    "apps": ["shell", "cargo", "git", "nvim", "tmux", "ssh"],
+    "completed_cycles": 0,
+    "rss_first_mb": null,
+    "rss_last_mb": null,
+    "rss_max_mb": null,
+    "budget_mb": 250,
+    "reason": "CTX-0643 landed the automation; no Tier 1 daily-driver session has completed on this branch yet"
+  }
+}

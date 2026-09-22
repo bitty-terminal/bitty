@@ -80,6 +80,19 @@ else
 fi
 echo ""
 
+# Continuous daily-driver session proof (CTX-0643, PERF-10): all six app
+# surfaces rotate through one runtime for six full cycles, bounded and
+# deterministic (headless, CI).
+echo "=== continuous daily-driver session (cargo test --test dogfooding) ==="
+# shellcheck disable=SC2086
+if cargo test -p bitty-runtime --test dogfooding dogfood_daily_driver_session_continuous_bounded $EXTRA 2>&1 | tail -n 40; then
+	echo "continuous session: PASS"
+else
+	echo "continuous session: FAIL" >&2
+	exit 1
+fi
+echo ""
+
 # Headless app smoke proof (no display/GPU)
 echo "=== bitty --headless smoke (software present) ==="
 if have cargo; then

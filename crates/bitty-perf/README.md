@@ -44,6 +44,12 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
   PERF-09): clamped soak config, bounded capture plan, `hyprctl` + `grim`
   leg probing, RSS trend helpers, and schedule/evidence JSON builders;
   opt-in, bounded, `Unavailable` without `BITTY_PERF_REAL_SOAK=1`.
+- `src/dogfood_session.rs` — continuous daily-driver session automation
+  (CTX-0643, PERF-10): clamped session config, bounded cycle plan over the
+  six app surfaces (shell, cargo, git, nvim, tmux, ssh), per-cycle
+  evidence rows, and schedule/evidence JSON builders; opt-in, bounded,
+  `Unavailable` without `BITTY_PERF_DOGFOOD_SESSION=1`. The pixel leg and
+  RSS helpers are shared with the soak chain.
 - `baselines/parser-throughput.json` — committed baseline artifact (numbers
   plus provenance); `baselines/README.md` records the runbook, exact command,
   environment, and limitations.
@@ -55,6 +61,11 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
   the first Tier 1 run is promoted);
   `baselines/real-soak-evidence.md` records the automation runbook,
   scheduling, and limitations.
+- `baselines/pb-dogfood-session.json` — committed daily-driver session
+  artifact (PB-3/PB-7 numbers plus host context and provenance,
+  `unavailable` until the first Tier 1 session is promoted);
+  `baselines/dogfood-session-evidence.md` records the automation runbook,
+  scheduling, and limitations.
 - `tests/parser_throughput_regression.rs` — bounded CI regression gate run by
   plain `cargo test` (also on the optimized `bench` profile via
   `just perf-parser`).
@@ -65,6 +76,11 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
   planner (asserts gate/leg discipline, plan math, and artifact
   provenance); the script chain is covered headlessly by
   `scripts/tests/real-render-soak.test.sh` (`just real-render-soak-test`).
+- `tests/dogfood_session_evidence.rs` — bounded CI contract test for the
+  session planner (asserts gate/leg discipline, cycle plan math, app
+  selection validation, and artifact provenance); the script chain is
+  covered headlessly by `scripts/tests/dogfood-session.test.sh`
+  (`just dogfood-session-test`).
 
 ## Parser throughput baseline (CTX-0576, M1-11)
 
@@ -99,3 +115,22 @@ sample for the PB-3 anchor. Planning (`just perf-real-soak`,
 and a Hyprland session, otherwise they report `Unavailable` and exit 2.
 See `baselines/real-soak-evidence.md` for the runbook, scheduling, and
 the committed `baselines/pb-real-soak.json` shape.
+
+## Continuous daily-driver dogfood session (CTX-0643, PERF-10)
+
+`src/dogfood_session.rs` plus `scripts/dogfood-session.sh` build on the
+soak chain: instead of one synthetic workload, each cycle drives every
+selected daily-driver app once through `bitty ctl terminal send` (shell,
+cargo, git, nvim, tmux, ssh — a subset is selectable via
+`BITTY_PERF_SESSION_APPS`), then records the same per-cycle triple the
+soak uses (pixel capture, grid-text snapshot, RSS sample). Planning
+(`just perf-dogfood-session`, `--dry-run`) is headless-safe; live runs
+need `BITTY_PERF_DOGFOOD_SESSION=1` and a Hyprland session, otherwise
+they report `Unavailable` and exit 2. The headless continuity proof —
+all six surfaces rotating through one runtime with per-cycle bounds and
+deterministic replay — is
+`cargo test -p bitty-runtime --test dogfooding
+dogfood_daily_driver_session_continuous_bounded`
+(also wired into `scripts/dogfood.sh`). See
+`baselines/dogfood-session-evidence.md` for the runbook, scheduling, and
+the committed `baselines/pb-dogfood-session.json` shape.

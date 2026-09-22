@@ -179,7 +179,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test real-render-soak-test actionlint markdownlint
+check: fmt-check clippy test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate status-drift status-drift-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test unix-bundle-test rust-channel-test binary-arch-test workflow-publish-test m1-matrix-test real-render-soak-test dogfood-session-test actionlint markdownlint
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies
@@ -251,6 +251,26 @@ perf-real-soak-run out *args:
 
 real-render-soak-test:
     bash scripts/tests/real-render-soak.test.sh
+
+# Daily-driver dogfood session planner (CTX-0643, PERF-10). Headless-safe:
+# loads the clamped session config, prints the bounded cycle plan and the
+# hyprctl+grim leg status, and reports UNMEASURED without
+# BITTY_PERF_DOGFOOD_SESSION=1. Bounds: BITTY_PERF_SESSION_DURATION_SECS
+# (60..86400), BITTY_PERF_SESSION_CYCLE_SECS (60..3600),
+# BITTY_PERF_SESSION_WORKSPACE (1..10), BITTY_PERF_SESSION_APPS
+# (csv subset of shell,cargo,git,nvim,tmux,ssh). Runbook:
+# crates/bitty-perf/baselines/dogfood-session-evidence.md.
+perf-dogfood-session *args:
+    cargo bench -p bitty-perf --bench dogfood_session -- --nocapture {{args}}
+
+# Full dogfood session chain (Tier 1: Hyprland + hyprctl/grim/jq required).
+# Evidence lands in timestamped run dirs under {{out}} (gitignored scratch):
+# `BITTY_PERF_DOGFOOD_SESSION=1 just perf-dogfood-session-run recording/dogfood-session`.
+perf-dogfood-session-run out *args:
+    BITTY_PERF_DOGFOOD_SESSION=1 bash scripts/dogfood-session.sh --out-dir {{out}} {{args}}
+
+dogfood-session-test:
+    bash scripts/tests/dogfood-session.test.sh
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

@@ -126,6 +126,7 @@ pub mod ctl;
 pub mod devtools;
 pub mod error;
 pub mod execution;
+pub mod execution_verbs;
 pub mod frame;
 pub mod frame_digest;
 pub mod host_bridge;
@@ -158,6 +159,13 @@ pub use execution::{
     MAX_EXEC_EVIDENCE_REF_BYTES, MAX_EXEC_EVIDENCE_REFS, MAX_EXEC_OUTPUT_BUDGET_BYTES,
     MAX_EXEC_STREAM_BYTES, MAX_EXEC_TARGET_BYTES, MAX_EXEC_TIMEOUT_MS, MAX_EXECUTABLE_BYTES,
     MAX_TRACKED_EXECUTIONS, RawExecutionOutput,
+};
+pub use execution_verbs::{
+    EXECUTION_ACKNOWLEDGE_VERB, EXECUTION_ATTACH_VERB, EXECUTION_CANCEL_VERB,
+    EXECUTION_EVENTS_VERB, EXECUTION_GET_VERB, EXECUTION_LIST_VERB, EXECUTION_OUTPUT_INDEX_VERB,
+    EXECUTION_READ_OUTPUT_VERB, EXECUTION_SIGNAL_VERB, EXECUTION_SPAWN_VERB, EXECUTION_VERBS,
+    EXECUTION_WRITE_INPUT_VERB, is_execution_verb, required_scope_for_verb,
+    validate_execution_verb,
 };
 pub use frame::{Frame, Framer, MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, decode_frame, encode_frame};
 pub use host_bridge::{

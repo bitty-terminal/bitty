@@ -84,9 +84,12 @@
 
 mod delivery;
 mod model;
+mod oom;
 mod output;
 mod persistence;
+mod process_tree;
 mod registry;
+mod retention;
 mod supervisor;
 
 use std::process::{Command, Stdio};
@@ -104,6 +107,7 @@ pub use model::{
     MAX_JOB_PRINCIPAL_BYTES, MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_WRITE_INPUT_BYTES,
     MAX_WRITE_INPUT_WINDOW_MS, MAX_WRITES_PER_WINDOW, SignalOutcome, TransferReceipt,
 };
+pub use oom::{MAX_MEMORY_EVENTS_BYTES, OomVerdict, classify_oom, parse_oom_kill_count};
 pub use output::{
     MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES, MAX_READ_LINES, OutputFilter, OutputIndex,
     OutputStream, OutputView, ReadOutput,
@@ -116,7 +120,9 @@ pub use persistence::{
     LOGS_DIR_NAME, MANIFEST_FILE_NAME, MAX_LOG_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_PERSISTED_JOBS,
     PERSIST_FORMAT_VERSION,
 };
+pub use process_tree::{KillScope, ProcessTreeBackend};
 pub use registry::{DEFAULT_MAX_JOBS, JobRegistry, MAX_STORED_JOB_EVENTS};
+pub use retention::{MAX_RETENTION_TTL, RetentionError, RetentionPolicy, RetentionTier};
 pub use supervisor::{
     AdoptedJob, AdoptionKind, DaemonError, HandoffOffer, ScheduleDecision, SchedulePolicy,
     SupervisorDaemon, adoption_plan, clear_handoff, read_handoff, write_handoff,

@@ -83,6 +83,19 @@
 //!   registry commit) and [`gesture::CommandOrigin`] ontological
 //!   equivalence (gesture/keyboard/palette/CLI/IPC/agent through one
 //!   registry, UX-21/UX-22).
+
+//! - [`window_chrome`] — headless per-window chrome runtime over the five
+//!   named surfaces (`WorkspaceRail`, `StatusBar`, `OverlayRoot`,
+//!   `NotificationArea`, `CommandSurface`) with a bounded notice queue and
+//!   a single command session (UX-18, CTX-0669, candidate).
+//! - [`panel_rules`] — typed panel rules (placement, presentation, minimum
+//!   size, accent) with origin rank, selector specificity, and fail-closed
+//!   conflict diagnostics (UX-19, CTX-0669, candidate).
+//! - [`resolved_style`] — seven-layer `ResolvedStyle` cascade (safety above
+//!   user rule above workspace rule above user theme above plugin
+//!   preference above plugin content theme above framework default) with
+//!   per-key attribution (UX-20, CTX-0669, candidate).
+
 //!
 //! # Determinism
 //!
@@ -113,8 +126,10 @@ pub mod geometry;
 pub mod gesture;
 pub mod layout;
 pub mod panel;
+pub mod panel_rules;
 pub mod presentation;
 pub mod provider;
+pub mod resolved_style;
 pub mod scratchpad;
 pub mod scrollbar;
 pub mod search;
@@ -124,6 +139,8 @@ pub mod ui_levels;
 pub mod uitree;
 pub mod view;
 pub mod widget_mech;
+pub mod window_chrome;
+
 pub mod workspace_scene;
 
 // Re-exports for ergonomic root access.
@@ -167,6 +184,10 @@ pub use panel::{
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
 };
+pub use panel_rules::{
+    EffectKind, MAX_PANEL_RULES, PanelRule, PanelRuleSet, RuleDiagnostic, RuleEffect, RuleError,
+    RuleId, RuleOrigin, RuleSelector,
+};
 pub use presentation::{
     FLOATING_CMD_TOGGLE, FloatingToggleError, PRESENTATION_CMD_FLOATING,
     PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD, PRESENTATION_CMD_TILED,
@@ -180,6 +201,7 @@ pub use provider::{
     NOOP_PROVIDER_NAME, NoopTiler, ProviderId, ProviderName, ProviderRegistry,
     RESERVED_PROVIDER_NAMES, WorkspaceSnapshot, validate_proposal,
 };
+pub use resolved_style::{ResolvedStyle, StyleCascade, StyleError, StyleOrigin};
 pub use scratchpad::{
     HiddenEntry, SCRATCHPAD_CMD_TOGGLE, ScratchpadError, ScratchpadSlot, apply_scratchpad_toggle,
 };
@@ -204,6 +226,10 @@ pub use widget_mech::{
     CanvasMech, MAX_CANVAS_COMMANDS, MAX_CANVAS_DIM_PX, MAX_ITEM_HEIGHT_PX, MAX_SCROLL_CONTENT_PX,
     MAX_VIEWPORT_PX, MAX_VIRTUAL_ITEMS, ScrollMech, TextInputMech, VirtualListMech,
     WidgetMechError,
+};
+pub use window_chrome::{
+    ChromeError, ChromeNotification, ChromeSurface, MAX_NOTIFICATION_TEXT_LEN, MAX_NOTIFICATIONS,
+    MAX_OVERLAY_NODES, NotificationId, NotificationSeverity, WindowChromeRuntime,
 };
 pub use workspace_scene::{
     ActivityId, ActivityStack, LayerEntry, PanelAttachment, SceneError, SceneLayer,

@@ -6,17 +6,21 @@
 //! - `ok`: the stage ran and passed.
 //! - `dry-run`: the stage would run; `--execute`/`BITTY_VM_LIVE` is absent.
 //! - `gated`: the stage cannot run here (missing `/dev/kvm`, QEMU binary,
-//!   or a prepared base image; `BITTY_VM_FORCE_SKIP` set).
-//! - `deferred`: the stage is future work outside this first slice.
+//!   a prepared base image, `virsh`/`ssh`, or `BITTY_VM_FORCE_SKIP` set).
+//! - `deferred`: the stage is future work outside these slices.
 //! - `failed`: the stage ran and failed.
 //!
-//! Guest boot and SSH test execution are `deferred` in this slice: the plan
-//! renders the exact commands and domain XML, but no domain is started. A
-//! gated stage does not fail the command unless `--require` is passed.
+//! The guest lifecycle (`boot`, `ssh`, `artifacts`, `teardown` in
+//! [`crate::guest`]) executes only with live execution enabled and every
+//! prerequisite present; otherwise it reports `dry-run` or `gated`. A
+//! gated stage does not fail the command unless `--require` is passed
+//! (which implies `--execute`, so dry-run stages are never silently
+//! accepted as satisfied).
 
 use std::time::Duration;
 
 use crate::capability::Capabilities;
+use crate::guest;
 use crate::kvm::{self, ProbeStatus};
 use crate::overlay;
 use crate::policy::RunPlan;
@@ -27,8 +31,6 @@ pub const STAGE_POLICY: &str = "policy";
 pub const STAGE_ACCEL: &str = "accel";
 /// Stage name: qcow2 overlay creation.
 pub const STAGE_OVERLAY: &str = "overlay";
-/// Stage name: guest boot and SSH execution (deferred).
-pub const STAGE_GUEST: &str = "guest-boot";
 
 /// State of one smoke stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,11 +173,12 @@ impl SmokeReport {
     }
 }
 
-/// Run the smoke stages for one plan. Only the accelerator probe and
-/// overlay creation can execute; both require `execute` and their
-/// prerequisites, and both report `gated` honestly otherwise.
+/// Run the smoke stages for one plan. The accelerator probe, overlay
+/// creation, and the guest lifecycle (`boot`, `ssh`, `artifacts`,
+/// `teardown`) can execute; each requires `execute` and its prerequisites,
+/// and each reports `gated` or `dry-run` honestly otherwise.
 pub fn run_smoke(plan: RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> SmokeReport {
-    let stages = vec![
+    let mut stages = vec![
         StageReport {
             stage: STAGE_POLICY,
             state: policy_stage(&plan),
@@ -188,16 +191,31 @@ pub fn run_smoke(plan: RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> Smo
             stage: STAGE_OVERLAY,
             state: overlay_stage(&plan, caps, opts),
         },
-        StageReport {
-            stage: STAGE_GUEST,
-            state: StageState::Deferred(
-                "guest boot + SSH execution is follow-up work outside this slice; the plan renders \
-                 the qemu-img/libvirt commands and domain XML"
-                    .to_string(),
-            ),
-        },
     ];
+    stages.extend(guest_stages(&plan, caps, opts));
     SmokeReport { plan, stages }
+}
+
+/// Guest-lifecycle stages for one plan: forced skip gates everything,
+/// a non-live run renders the exact commands as dry-run, a live run
+/// without every prerequisite reports the missing piece as gated, and a
+/// live run with all prerequisites present executes the real lifecycle.
+fn guest_stages(plan: &RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> Vec<StageReport> {
+    if opts.force_skip {
+        return guest::gated_stages(&format!(
+            "forced skip: {} is set",
+            crate::config::FORCE_SKIP_ENV
+        ));
+    }
+    if !opts.execute {
+        return guest::dry_run_stages(plan);
+    }
+    match guest::guest_prereqs(plan, caps) {
+        Ok(tools) => {
+            guest::run_guest_lifecycle(plan, &tools, &guest::GuestOptions::default()).stages
+        }
+        Err(reason) => guest::gated_stages(&reason),
+    }
 }
 
 fn policy_stage(plan: &RunPlan) -> StageState {
@@ -296,9 +314,10 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_reports_deferred_guest_and_no_execution() {
+    fn dry_run_reports_guest_lifecycle_without_executing() {
         let opts = SmokeOptions::default();
-        let report = run_smoke(plan("arch"), &caps(true, true, true), &opts);
+        let plan = plan("arch");
+        let report = run_smoke(plan.clone(), &caps(true, true, true), &opts);
         let states: Vec<_> = report
             .stages
             .iter()
@@ -310,11 +329,50 @@ mod tests {
                 ("policy", "ok"),
                 ("accel", "dry-run"),
                 ("overlay", "gated"),
-                ("guest-boot", "deferred"),
+                ("boot", "dry-run"),
+                ("ssh", "dry-run"),
+                ("artifacts", "dry-run"),
+                ("teardown", "dry-run"),
             ]
         );
         assert_eq!(report.outcome(false), SmokeOutcome::Ok);
         assert!(!report.failed());
+        assert!(
+            !plan.run_dir().exists(),
+            "dry run must not create the run directory"
+        );
+    }
+
+    #[test]
+    fn live_run_without_a_base_image_gates_the_lifecycle() {
+        // Live execution with every tool present but no prepared base image
+        // must report the lifecycle gated (never failed, never executed).
+        // No QEMU binary either, so the accelerator stage gates instead of
+        // attempting a real probe.
+        let opts = SmokeOptions {
+            execute: true,
+            ..SmokeOptions::default()
+        };
+        let plan = plan("arch");
+        let report = run_smoke(plan.clone(), &caps(true, false, false), &opts);
+        let lifecycle: Vec<_> = report
+            .stages
+            .iter()
+            .filter(|s| matches!(s.stage, "boot" | "ssh" | "artifacts" | "teardown"))
+            .collect();
+        assert_eq!(lifecycle.len(), 4);
+        for stage in &lifecycle {
+            assert!(
+                matches!(&stage.state, StageState::Gated(reason) if reason.contains("base image not prepared")),
+                "{stage:?}"
+            );
+        }
+        assert_eq!(report.outcome(true), SmokeOutcome::Gated);
+        assert_eq!(report.outcome(false), SmokeOutcome::Ok);
+        assert!(
+            !plan.run_dir().exists(),
+            "gated lifecycle must not create the run directory"
+        );
     }
 
     #[test]
@@ -355,7 +413,8 @@ mod tests {
         assert_eq!(report.outcome(true), SmokeOutcome::Gated);
         let render = report.render(true);
         assert!(render.contains("forced skip"));
-        assert!(render.contains("guest-boot deferred"));
+        assert!(render.contains("boot       gated"));
+        assert!(render.contains("teardown   gated"));
     }
 
     #[test]

@@ -1,11 +1,12 @@
-# VM test-tier policy (first slice, CTX-0507)
+# VM test-tier policy (second slice, CTX-0510; first slice CTX-0507)
 
 > Status: **implemented only for what the controller and tests can prove**;
 > everything else in this document is recorded plan and is marked as such.
 > Owning code: `crates/bitty-test-vm` (`cargo run -p bitty-test-vm --bin
-bitty-vm -- <command>`). Research record 043 and the testing-infrastructure
+> bitty-vm -- <command>`). Research record 043 and the testing-infrastructure
 > capture in `bitty-docs` define the wider three-tier test architecture
-> (native, VM, physical); this document fixes the first slice of its VM tier.
+> (native, VM, physical); this document fixes the first two slices of its VM
+> tier.
 
 ## Why
 
@@ -61,17 +62,21 @@ checkout, home directory, or hostname:
 
 ## Staged cadence
 
-| Cadence | Guests                                       | CI status                                  |
-| ------- | -------------------------------------------- | ------------------------------------------ |
-| PR      | Arch Linux x86_64 (KVM)                      | encoded; not wired (no KVM CI runner)      |
-| main    | adds Ubuntu LTS, Fedora, Alpine x86_64 (KVM) | encoded; not wired                         |
-| nightly | adds Arch Linux ARM64 under QEMU TCG         | encoded; not wired (no ARM base image yet) |
+| Cadence | Guests                                           | CI status                                                         |
+| ------- | ------------------------------------------------ | ----------------------------------------------------------------- |
+| PR      | Arch Linux x86_64 (KVM), Windows 11 x86_64 (KVM) | wired (gated dry-run on hosted runners; live KVM pending runners) |
+| main    | adds Ubuntu LTS, Fedora, Alpine x86_64 (KVM)     | wired (gated dry-run on hosted runners; live KVM pending runners) |
+| nightly | adds Arch Linux ARM64 under QEMU TCG             | wired (gated dry-run on hosted runners; no ARM base image yet)    |
 
 The matrix is encoded in `policy::GUESTS` and enforced by `--cadence`
-cross-checks; scheduling belongs to a later slice that owns KVM-capable
-runners. Windows 11 is part of research 043's PR row and stays deferred
-here: it needs image provisioning, OpenSSH/WinRM wiring, and licensing that
-this slice does not own.
+cross-checks; `.github/workflows/vm-tier.yml` runs the controller per
+cadence (PR job on pull requests, main job on pushes to `main`, nightly
+job on schedule). Hosted runners have no `/dev/kvm` and no prepared base
+images, so those jobs execute the policy stage for real and report the
+live stages `gated`/`dry-run` (exit 0); live KVM execution stays pending
+on KVM-capable runners and prepared base images. Windows 11 joins the PR
+row per research 043; its base image additionally needs a provisioned
+OpenSSH `bitty` account, the QEMU guest agent, and a licensing story.
 
 ## Base-image creation (manual, far future)
 
@@ -87,11 +92,13 @@ only ever touch overlays.
 
 `bitty-vm` commands: `guests` (matrix), `doctor` (capabilities and
 configuration), `plan` (dry-run; executes nothing, renders the `qemu-img`
-and libvirt commands plus domain XML), `smoke` (gated stages: `policy`,
-`accel`, `overlay`, `guest-boot`). Stage states are `ok`, `dry-run`,
+and libvirt commands, domain XML path, artifact paths, and in-guest suite
+candidates), `smoke` (gated stages: `policy`, `accel`, `overlay`, `boot`,
+`ssh`, `artifacts`, `teardown`). Stage states are `ok`, `dry-run`,
 `gated`, `deferred`, and `failed`; a gated stage is reported with its exact
 missing prerequisite and does not fail the command unless `--require` is
-passed (exit 3).
+passed (exit 3). `--require` implies `--execute`, so a dry-run stage never
+counts as satisfied under `--require`.
 
 What this slice actually executes:
 
@@ -102,20 +109,28 @@ What this slice actually executes:
   it spawned.
 - **Overlay creation** (implemented): real `qemu-img` overlay over a
   prepared base image, with single-use enforcement.
-- **Guest boot and SSH test execution** (deferred): the plan renders the
-  intended domain XML and commands; starting domains, waiting for SSH,
-  uploading artifacts, and collecting logs are follow-up work.
+- **Guest lifecycle** (implemented behind `BITTY_VM_LIVE` / `smoke
+  --execute`): `virsh define` of the domain XML staged at the real path
+  `<run-dir>/domain.xml` (never a rendered string), `virsh start`, SSH
+  readiness wait plus a remote execution probe over per-run known-hosts,
+  artifact collection (`virsh dumpxml` required, `virsh screenshot`
+  best-effort), then `virsh destroy` + `undefine`. The per-run directory
+  (overlay, staged XML, artifacts) is removed when the run ends; removal
+  is enforced by the `teardown` stage verifying it and by a drop guard if
+  anything escapes that path.
 
-Live integration tests (`tests/live_kvm.rs`, `tests/live_overlay.rs`) are
-skipped unless `BITTY_VM_LIVE` is set, mirroring the compat-lab live-test
-pattern.
+Live integration tests (`tests/live_kvm.rs`, `tests/live_overlay.rs`,
+`tests/live_guest.rs`) are skipped unless `BITTY_VM_LIVE` is set,
+mirroring the compat-lab live-test pattern.
 
 ## Open items
 
 - KVM-capable CI runners, image storage, and refresh cadence are undecided;
-  nothing in this policy is scheduled in CI.
-- Guest boot, SSH execution, artifact collection, and libvirt domain
-  definition are unimplemented follow-up work.
+  the `vm-tier.yml` cadence jobs run gated dry-runs until those exist, and
+  live KVM execution stays pending on them.
+- Full in-guest suite execution (`policy::GUEST_SUITE_CANDIDATES` runners),
+  Windows UEFI/OVMF and Hyper-V enlightenment tuning, and Windows image
+  licensing remain follow-up work.
 - Full in-guest suite candidacy is recorded plan, not scheduled work: the
   code-reviewed target is `policy::GUEST_SUITE_CANDIDATES`. Functional
   suites (`compat-matrix`, `parser-corpus`, `pty-integration`) are candidates
@@ -125,5 +140,5 @@ pattern.
 - The declared PERF-14 dependency names no filed issue in the tracker, so
   this slice carries no backlog dependency; a real PERF-14 must be filed and
   linked before it can order this work.
-- virtio-gpu/virgl coverage, benchmark VMs, Windows guests, and physical
-  GPU runners remain outside this slice, consistent with research 043.
+- virtio-gpu/virgl coverage, benchmark VMs, and physical GPU runners remain
+  outside this slice, consistent with research 043.

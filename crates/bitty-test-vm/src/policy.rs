@@ -153,16 +153,24 @@ pub struct Guest {
     pub ssh_user: &'static str,
 }
 
-/// The staged Linux guest matrix of this slice.
-///
-/// Windows 11 is part of research 043's PR row but deliberately absent here:
-/// it needs image provisioning, OpenSSH/WinRM wiring, and a licensing story
-/// that this first slice does not own. It stays a documented plan, not a
-/// fake row; see `specifications/vm-tier-policy.md`.
+/// The staged guest matrix: Linux guests plus Windows 11 (research 043's PR
+/// row). Windows runs under KVM like the other x86_64 guests; its base image
+/// additionally provisions the OpenSSH server and the QEMU guest agent under
+/// a `bitty` account (manual image-prep step; licensing stays an open item
+/// in `specifications/vm-tier-policy.md`). UEFI/OVMF and Hyper-V
+/// enlightenment tuning are follow-up work, recorded in the same document.
 pub const GUESTS: &[Guest] = &[
     Guest {
         id: "arch",
         display: "Arch Linux x86_64",
+        arch: GuestArch::X86_64,
+        accel: Accel::Kvm,
+        first_cadence: Cadence::Pr,
+        ssh_user: "bitty",
+    },
+    Guest {
+        id: "windows11",
+        display: "Windows 11 x86_64",
         arch: GuestArch::X86_64,
         accel: Accel::Kvm,
         first_cadence: Cadence::Pr,
@@ -208,7 +216,8 @@ pub fn guest(id: &str) -> Option<&'static Guest> {
 }
 
 /// One test suite that is a candidate for full in-guest execution once the
-/// deferred guest-boot stage lands (PERF-15 open item; research 043).
+/// live guest lifecycle (CTX-0510) grows suite runners (PERF-15 open item;
+/// research 043).
 ///
 /// This is recorded plan, not scheduled work: nothing here runs in CI until
 /// KVM-capable runners and prepared base images exist. The table fixes the
@@ -673,21 +682,40 @@ mod tests {
     #[test]
     fn cadence_matrix_is_staged_by_cost() {
         let pr: Vec<_> = Cadence::Pr.guests().map(|g| g.id).collect();
-        assert_eq!(pr, ["arch"]);
+        assert_eq!(pr, ["arch", "windows11"]);
 
         let main: Vec<_> = Cadence::Main.guests().map(|g| g.id).collect();
-        assert_eq!(main, ["arch", "ubuntu", "fedora", "alpine"]);
+        assert_eq!(main, ["arch", "windows11", "ubuntu", "fedora", "alpine"]);
 
         let nightly: Vec<_> = Cadence::Nightly.guests().map(|g| g.id).collect();
         assert_eq!(
             nightly,
-            ["arch", "ubuntu", "fedora", "alpine", "arch-arm64"]
+            [
+                "arch",
+                "windows11",
+                "ubuntu",
+                "fedora",
+                "alpine",
+                "arch-arm64"
+            ]
         );
 
         let arm = guest("arch-arm64").expect("arm guest exists");
         assert_eq!(arm.accel, Accel::Tcg);
         assert_eq!(arm.arch, GuestArch::Aarch64);
         assert_eq!(arm.first_cadence, Cadence::Nightly);
+    }
+
+    #[test]
+    fn windows_guest_rides_the_kvm_pr_row() {
+        let windows = guest("windows11").expect("windows guest exists");
+        assert_eq!(windows.arch, GuestArch::X86_64);
+        assert_eq!(windows.accel, Accel::Kvm);
+        assert_eq!(windows.first_cadence, Cadence::Pr);
+        assert_eq!(windows.ssh_user, "bitty");
+        // Timing suites stay KVM-eligible on Windows like on Linux KVM.
+        let ids: Vec<_> = guest_suites(windows).map(|s| s.id).collect();
+        assert_eq!(ids.len(), GUEST_SUITE_CANDIDATES.len());
     }
 
     #[test]

@@ -1,0 +1,112 @@
+name: VM tier
+
+# CTX-0510: per-cadence VM-tier controller runs (PR / main / nightly).
+#
+# Hosted runners have no /dev/kvm and no prepared base images, so these jobs
+# execute the policy stage for real and report the live stages gated/dry-run
+# (exit 0 without --require). They pin the cadence -> guest mapping in CI;
+# live KVM execution stays pending on KVM-capable runners and prepared base
+# images (see specifications/vm-tier-policy.md).
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # Nightly ARM64 (TCG) leg, 03:17 UTC.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vm-tier-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vm-pr:
+    name: VM tier (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+
+      # PR cadence: Arch + Windows 11 (policy::GUESTS with first_cadence Pr).
+      # Hosted runners have no VM root: pass an ephemeral --root (under
+      # RUNNER_TEMP) so the controller reports gated/dry-run and exits 0.
+      - name: Smoke PR guests (gated dry-run)
+        run: |
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest arch --cadence pr --run-id "ci-pr-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest windows11 --cadence pr --run-id "ci-pr-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+
+  vm-main:
+    name: VM tier (main)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+
+      # Main cadence additions: Ubuntu LTS, Fedora, Alpine (gated dry-run).
+      - name: Smoke main guests (gated dry-run)
+        run: |
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest ubuntu --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest fedora --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest alpine --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+
+  vm-nightly:
+    name: VM tier (nightly ARM64)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+
+      # Nightly cadence addition: Arch ARM64 under TCG (gated dry-run; no
+      # ARM base image exists yet).
+      - name: Smoke nightly guest (gated dry-run)
+        run: >
+          cargo run --locked -p bitty-test-vm --bin bitty-vm --
+          smoke --guest arch-arm64 --cadence nightly --run-id "ci-nightly-${{ github.run_id }}"
+          --root "${{ runner.temp }}/bitty-vm"

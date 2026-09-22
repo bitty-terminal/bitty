@@ -53,6 +53,13 @@
 //!   `apply_presentation_command` routes mode changes through the workspace
 //!   command registry; deliberately distinct from `Visibility` (computed
 //!   display state in `bitty-runtime`).
+//! - [`uitree`] — retained declarative `UiTree` with Level-1 primitives,
+//!   stable `UiNodeId` diffing identities, revision-gated paint scheduling,
+//!   and the `A11yRole` mapping (UX-13/UX-14, CTX-0662, candidate).
+//! - [`workspace_scene`] — four-layer `WorkspaceScene` -> `View` ->
+//!   `Panel` -> `Activity` spatial/identity model with the
+//!   `PanelId != ViewId != TerminalId` inequality by construction
+//!   (UX-15, CTX-0662, candidate).
 //!
 //! # Determinism
 //!
@@ -89,7 +96,9 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod theme;
+pub mod uitree;
 pub mod view;
+pub mod workspace_scene;
 
 // Re-exports for ergonomic root access.
 pub use beacon_dispatch::{BeaconDispatcher, DispatchError, MAX_BEACON_BINDINGS};
@@ -146,4 +155,12 @@ pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
 };
+pub use uitree::{
+    ApplyReport, UiChange, UiChangeKind, UiNode, UiNodeId, UiNodeKind, UiTree, UiTreeError,
+    a11y_role_of, diff_trees,
+};
 pub use view::{View, ViewId};
+pub use workspace_scene::{
+    ActivityId, ActivityStack, LayerEntry, PanelAttachment, SceneError, SceneLayer,
+    TerminalBinding, WorkspaceScene, WorkspaceSceneId,
+};

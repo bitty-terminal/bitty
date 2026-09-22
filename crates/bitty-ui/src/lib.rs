@@ -140,7 +140,9 @@ pub mod gesture;
 pub mod layout;
 pub mod motion;
 pub mod panel;
+pub mod panel_rehydrate;
 pub mod panel_rules;
+pub mod panel_state;
 pub mod presentation;
 pub mod provider;
 pub mod resolved_style;
@@ -211,9 +213,18 @@ pub use panel::{
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
 };
+pub use panel_rehydrate::{
+    MAX_RECORD_LEN, MAX_SNAPSHOT_PANELS, PanelRecord, RehydrateError, RehydrateReport,
+    SNAPSHOT_VERSION, encode_snapshot, rehydrate_snapshot,
+};
 pub use panel_rules::{
     EffectKind, MAX_PANEL_RULES, PanelRule, PanelRuleSet, RuleDiagnostic, RuleEffect, RuleError,
     RuleId, RuleOrigin, RuleSelector,
+};
+pub use panel_state::{
+    CloseOutcome, MAX_BADGE_COUNT, MAX_BADGE_TEXT_LEN, MAX_PANELS_WITH_STATE, PanelActivity,
+    PanelAttention, PanelFocusState, PanelInteraction, PanelLifecycle, PanelStateError,
+    PanelVisibility, SevenPanelState,
 };
 pub use presentation::{
     FLOATING_CMD_TOGGLE, FloatingToggleError, PRESENTATION_CMD_FLOATING,

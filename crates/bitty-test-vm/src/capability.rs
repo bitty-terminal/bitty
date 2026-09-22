@@ -24,9 +24,9 @@ pub struct Capabilities {
     pub qemu_system: Option<PathBuf>,
     /// `qemu-img`, used to create and inspect qcow2 overlays.
     pub qemu_img: Option<PathBuf>,
-    /// libvirt `virsh`; needed by the deferred guest-boot stage only.
+    /// libvirt `virsh`; needed by the live guest lifecycle only.
     pub virsh: Option<PathBuf>,
-    /// OpenSSH client; needed by the deferred guest-access stage only.
+    /// OpenSSH client; needed by the live guest lifecycle only.
     pub ssh: Option<PathBuf>,
 }
 
@@ -78,6 +78,19 @@ impl Capabilities {
         let mut missing = Vec::new();
         if self.qemu_img.is_none() {
             missing.push("qemu-img");
+        }
+        missing
+    }
+
+    /// Labels of the prerequisites for the live guest lifecycle
+    /// (base-image presence is checked against the plan separately).
+    pub fn missing_for_guest(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.virsh.is_none() {
+            missing.push("virsh");
+        }
+        if self.ssh.is_none() {
+            missing.push("ssh");
         }
         missing
     }

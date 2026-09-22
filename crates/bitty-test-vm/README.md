@@ -7,11 +7,13 @@
 
 ## Purpose
 
-`bitty-test-vm` is the first slice of the VM test tier from research 043: it
-encodes the **base-image + qcow2 overlay policy** (a run never installs or
-boots from an ISO), the staged guest cadence (PR: Arch; main adds Ubuntu,
-Fedora, Alpine; nightly adds Linux ARM64 under TCG), and a small gated
-controller, `bitty-vm`.
+`bitty-test-vm` is the VM test tier from research 043 (first slice CTX-0507,
+second slice CTX-0510): it encodes the **base-image + qcow2 overlay policy**
+(a run never installs or boots from an ISO), the staged guest cadence (PR:
+Arch and Windows 11; main adds Ubuntu, Fedora, Alpine; nightly adds Linux
+ARM64 under TCG), the guest lifecycle (libvirt boot, SSH readiness and
+execution, artifact collection, teardown with enforced run-directory
+removal), and a small gated controller, `bitty-vm`.
 
 ## Boundaries
 
@@ -21,10 +23,12 @@ controller, `bitty-vm`.
 - No host paths are hardcoded. The VM root comes from `BITTY_VM_ROOT` or
   `--root`; `$ISO_PATH` is documentation-only input for the manual,
   far-future base-image creation step and is never read to run a VM.
-- `plan` executes nothing. `smoke` executes only the bounded QEMU
-  accelerator probe and qcow2 overlay creation, and only with `--execute` /
-  `BITTY_VM_LIVE`; every other stage is reported `gated` or `deferred` with
-  a reason. Guest boot and SSH test execution are follow-up work.
+- `plan` executes nothing. `smoke` executes the bounded QEMU accelerator
+  probe, qcow2 overlay creation, and the guest lifecycle (`boot`, `ssh`,
+  `artifacts`, `teardown`), and only with `--execute` / `BITTY_VM_LIVE`;
+  every other stage is reported `gated`, `dry-run`, or `deferred` with a
+  reason. `--require` implies `--execute`. Full in-guest suite execution
+  stays recorded plan (`policy::GUEST_SUITE_CANDIDATES`).
 - Overlay creation is refused unless the plan passes policy validation, the
   prepared base image exists, and no overlay with the same run id exists.
 
@@ -46,7 +50,7 @@ Enabled live integration tests (skipped by default, like the compat-lab
 pattern):
 
 ```text
-BITTY_VM_LIVE=1 cargo test -p bitty-test-vm --test live_kvm --test live_overlay
+BITTY_VM_LIVE=1 cargo test -p bitty-test-vm --test live_kvm --test live_overlay --test live_guest
 ```
 
 ## Layout
@@ -59,7 +63,10 @@ BITTY_VM_LIVE=1 cargo test -p bitty-test-vm --test live_kvm --test live_overlay
 - `src/overlay.rs` — `qemu-img` overlay creation, backing-file readback,
   shell-safe command rendering.
 - `src/kvm.rs` — bounded QEMU accelerator probe (QMP handshake + quit).
+- `src/guest.rs` — guest lifecycle (libvirt boot, SSH readiness and
+  execution, artifact collection, teardown, enforced run-directory removal).
 - `src/smoke.rs` — gated stage orchestration and stable report rendering.
 - `src/cli.rs` — argument parsing and command dispatch.
 - `src/bin/bitty-vm.rs` — thin entry point.
-- `tests/live_kvm.rs`, `tests/live_overlay.rs` — env-gated live checks.
+- `tests/live_kvm.rs`, `tests/live_overlay.rs`, `tests/live_guest.rs` —
+  env-gated live checks.

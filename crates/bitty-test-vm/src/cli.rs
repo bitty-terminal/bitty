@@ -48,9 +48,10 @@ pub fn usage() -> String {
          \x20 --root <dir>    VM root (default ${root_env})\n\
          \x20 --xml           also print the libvirt domain XML\n\
          \n\
-         smoke options: plan options plus\n\
-         \x20 --execute       allow live stages (probe, overlay creation); ${live_env} opts in\n\
-         \x20 --require       exit 3 when a stage is gated and could not run here\n\
+         smoke options: plan options plus\
+         \x20 --execute       allow live stages (probe, overlay creation, guest lifecycle); ${live_env} opts in\
+         \x20 --require       exit 3 when a stage is gated and could not run here (implies --execute,\
+         so dry-run stages never count as satisfied)
          \n\
          environment: {root_env} (VM root), {live_env} (live opt-in), \
          {force_env} (force all live stages gated), {iso_env} (manual base-image creation only; \
@@ -263,6 +264,14 @@ fn dispatch(command: Command) -> ExitCode {
     }
 }
 
+/// Whether live stages may run: `--execute`, `BITTY_VM_LIVE`, or
+/// `--require` (demanding live coverage while refusing to execute would
+/// accept every dry-run stage as satisfied, so `--require` implies
+/// `--execute`).
+pub fn effective_execute(execute: bool, require_live: bool) -> bool {
+    execute || require_live
+}
+
 /// Resolve and cross-check the guest against the requested cadence.
 pub fn resolve_guest(id: &str, cadence: Cadence) -> Result<&'static Guest, String> {
     let guest =
@@ -382,7 +391,9 @@ fn print_doctor() {
         );
     }
     println!(
-        "  guest boot / SSH exec: deferred to a later slice (needs a prepared base image and libvirt)"
+        "  guest boot / SSH exec / artifacts: implemented behind --execute/{live} \
+         (gated without a prepared base image, virsh, or ssh)",
+        live = crate::config::LIVE_ENV,
     );
 }
 
@@ -433,6 +444,19 @@ fn run_plan(args: PlanArgs) -> ExitCode {
     println!("overlay:  {}", plan.overlay_image().display());
     println!("domain:   {}", plan.domain_name());
     println!("ssh:      {}", plan.ssh_target());
+    println!(
+        "xml path: {} (staged here by the live lifecycle for `virsh define`)",
+        crate::guest::artifact_paths(&plan).domain_xml.display()
+    );
+    println!(
+        "artifacts: {} (dumpxml + screenshot; removed with the run dir)",
+        crate::guest::artifact_paths(&plan).dir.display()
+    );
+    let suites: Vec<_> = policy::guest_suites(plan.guest).map(|s| s.id).collect();
+    println!(
+        "suites:   {} (in-guest candidates; recorded plan, not scheduled work)",
+        suites.join(", ")
+    );
     println!("commands (dry run; nothing executed):");
     println!(
         "  {}",
@@ -462,7 +486,7 @@ fn run_smoke(args: SmokeArgs) -> ExitCode {
     };
     let config = VmConfig::from_env()
         .with_root_override(args.root.clone())
-        .with_execute(args.execute);
+        .with_execute(effective_execute(args.execute, args.require_live));
     let root = match resolve_root(&config) {
         Ok(root) => root,
         Err(message) => {
@@ -606,6 +630,14 @@ mod tests {
         ] {
             assert!(parse_args(&args(&bad)).is_err(), "{bad:?} must not parse");
         }
+    }
+
+    #[test]
+    fn require_implies_execute() {
+        assert!(!effective_execute(false, false));
+        assert!(effective_execute(true, false));
+        assert!(effective_execute(false, true));
+        assert!(effective_execute(true, true));
     }
 
     #[test]

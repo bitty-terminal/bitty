@@ -72,30 +72,10 @@ impl std::fmt::Display for CommandBlockId {
     }
 }
 
-/// Stable handle for a chrome/UI-tree node. Distinct newtype; no `From`
-/// bridge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct UiNodeId(pub u64);
-
-impl UiNodeId {
-    /// Creates a UI-node id from a raw value.
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for UiNodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "UiNodeId({})", self.0)
-    }
-}
+/// Stable handle for a chrome/UI-tree node: the canonical
+/// [`crate::uitree::UiNodeId`], re-exported here for beacon call sites.
+/// Distinct newtype; no `From` bridge.
+pub use crate::uitree::UiNodeId;
 
 /// Stable handle for a link (OSC-8 hyperlink or chrome link). Distinct
 /// newtype; no `From` bridge.

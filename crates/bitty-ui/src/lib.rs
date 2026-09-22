@@ -46,7 +46,12 @@
 //!   slot with anchor-preserving hide/show/toggle (CW-10), routed as
 //!   `bitty.workspace:scratchpad-toggle`.
 //! - [`drag::DragHistory`] — bounded (`32`, `DropOldest`) undo history for
-//!   drag/resize sessions (CW-09).
+//!   drag/resize sessions (CW-09). The PW drag family builds on it (CTX-0663):
+//!   [`drag::DragMoveSession`] (UX-01 Mod+drag move, `bitty.workspace:drag-move`),
+//!   [`drag::apply_tiled_resize`] / [`drag::resize_floating_rect`] /
+//!   [`drag::detect_resize_edge`] (UX-02 edge/corner resize,
+//!   `bitty.workspace:drag-resize`), and [`drag::move_leaf_to_workspace`]
+//!   (UX-09 drag-across-workspace, `bitty.workspace:drop`).
 //! - [`presentation::PresentationMode`] — per-leaf display mode unifying the
 //!   zoom/overlay/visibility special-cases toward one mode field (CTX-0276,
 //!   CW-08): `can_transition` is the single gate for all transitions and
@@ -60,6 +65,9 @@
 //!   `Panel` -> `Activity` spatial/identity model with the
 //!   `PanelId != ViewId != TerminalId` inequality by construction
 //!   (UX-15, CTX-0662, candidate).
+//! - [`presentation::toggle_floating`] /
+//!   [`presentation::apply_floating_toggle`] toggle one leaf Tiled ⇄ Floating
+//!   (UX-03, `bitty.workspace:floating-toggle`).
 //!
 //! # Determinism
 //!
@@ -111,14 +119,20 @@ pub use beacon_layer::{
 };
 pub use beacon_target::{
     CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
-    TargetRef, TargetRegistry, UiNodeId, UiNodeRef, WorkspaceId, WorkspaceRef,
+    TargetRef, TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
 };
 pub use decoration::{
     DEFAULT_BORDER_PX, DEFAULT_CONTENT_INSET_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX,
     DEFAULT_RADIUS_PX, DecoratedView, Decoration, DecorationError, MAX_BORDER_PX,
     MAX_CONTENT_INSET_PX, MAX_GAP_PX, MAX_RADIUS_PX,
 };
-pub use drag::{DRAG_HISTORY_CAP, DragHistory};
+pub use drag::{
+    CrossWorkspaceDrop, CrossWorkspaceError, DRAG_HISTORY_CAP, DRAG_MOVE_CMD, DRAG_RESIZE_CMD,
+    DragHistory, DragMoveError, DragMoveSession, DragResizeError, DropSpec,
+    MAX_VIEWS_PER_WORKSPACE_TREE, RESIZE_HANDLE_CELLS, ResizeEdge, WORKSPACE_DROP_CMD,
+    apply_tiled_resize, detect_resize_edge, move_leaf_to_workspace, resize_floating_rect,
+    workspace_drop_target,
+};
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
 pub use layout::{
@@ -132,8 +146,9 @@ pub use panel::{
     ViewContent, route_input, validate_panel_bounds,
 };
 pub use presentation::{
-    PRESENTATION_CMD_FLOATING, PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD,
-    PRESENTATION_CMD_TILED, PresentationCommandError, PresentationMode, apply_presentation_command,
+    FLOATING_CMD_TOGGLE, FloatingToggleError, PRESENTATION_CMD_FLOATING,
+    PRESENTATION_CMD_FULLSCREEN, PRESENTATION_CMD_SCRATCHPAD, PRESENTATION_CMD_TILED,
+    PresentationCommandError, PresentationMode, apply_floating_toggle, apply_presentation_command,
     presentation_command_for_mode, presentation_mode_for_command,
 };
 pub use provider::{

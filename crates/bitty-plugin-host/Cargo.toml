@@ -17,3 +17,7 @@ workspace = true
 bitty-term-state = { path = "../bitty-term-state" }
 bitty-config = { path = "../bitty-config" }
 bitty-package = { path = "../bitty-package" }
+
+[dev-dependencies]
+# V-C install tests mint real Ed25519 signatures (bitty#767).
+ed25519-dalek.workspace = true

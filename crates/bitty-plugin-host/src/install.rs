@@ -40,11 +40,10 @@
 //! - `V-B` (`TrustMode::TrustOnFirstUse`) — TOFU pin per publisher identity/source; pin change is a loud
 //!   security event requiring explicit re-approval (PL-AC-003). Bind strongest
 //!   available identity: publisher key where present, otherwise `url@rev`.
-//! - `V-C` (`TrustMode::Signed`) — publisher signatures over manifest + artifact digests.
-//!   UNAVAILABLE: no signature scheme is implemented (bitty#743), so `verify_signature`
-//!   rejects every record fail-closed and `Signed` installs cannot proceed (PL-AC-004).
-//!   The key-store / pin-check plumbing below is preserved for the follow-up `OQ-029`
-//!   scheme and stays ordered signature-first so nothing can skip ahead of it.
+//! - `V-C` (`TrustMode::Signed`) — publisher Ed25519 signatures over manifest + artifact digests
+//!   (bitty#767, OQ-029). `verify_signature` checks the record against the enrolled key directory
+//!   fail-closed, then the `V-B` pin check still applies when a trust store is present (signature-first
+//!   ordering, CR-PKG-02). Unsigned, unknown-key, tampered, and revoked records cannot proceed (PL-AC-004).
 //!
 //! The caller selects a `TrustMode` per package source. All modes still pass the full
 //! 7-stage chain; there is no trusted-source fast path.
@@ -195,9 +194,9 @@ impl DoctorIssue {
 ///    - `V-A PinningOnly`: no additional check beyond the 7 stages (floor).
 ///    - `V-B TrustOnFirstUse`: `trust_store.check(package_id, candidate_identity)` — pin change
 ///      requires loud re-approval (owned `TrustPinChanged` error).
-///    - `V-C Signed`: UNAVAILABLE (bitty#743) — `verify_signature(...)` rejects
-///      every record fail-closed until a real scheme lands; unsigned input is
-///      rejected before that (plus `V-B` pin check preserved for the follow-up).
+///    - `V-C Signed`: Ed25519 `verify_signature(...)` against the key
+///      directory (bitty#767); unsigned input is rejected before that
+///      (plus the `V-B` pin check preserved after it, signature-first).
 /// 3. Generation integrity: if `inputs.environment` is `Some`, `env.verify_all()` — tampered
 ///    generation quarantined, never staged (PL-AC-008/009).
 ///
@@ -275,10 +274,10 @@ pub fn verify_install(inputs: &InstallInputs<'_>) -> Result<VerificationReport, 
             // No store yet (first install) -> any identity passes; caller pins after success.
         }
         TrustMode::Signed => {
-            // V-C: UNAVAILABLE (bitty#743) — `verify_signature` rejects every
-            // record fail-closed until a real scheme lands, so this arm always
-            // errors here. The pin check below is preserved (signature-first
-            // ordering) for the follow-up scheme, not removed.
+            // V-C (bitty#767): verify the Ed25519 record against the key
+            // directory fail-closed, then keep the pin check (signature-first
+            // ordering, CR-PKG-02) so a valid signature cannot rotate
+            // identity silently.
             let sig = inputs.signature.ok_or_else(|| {
                 PackageError::signature("trust V-C requires a signature record (fail-closed: unsigned artifact rejected)")
             })?;
@@ -414,9 +413,48 @@ mod tests {
     use super::*;
     use bitty_package::{
         CapabilityId, Compat, KeyRecord, KeyStore, PackageIdentity, PackageManifest,
-        SignatureRecord, TrustPin, TrustStore, sha256_hex,
+        SignatureRecord, TrustPin, TrustStore, sha256_hex, signing_message,
     };
     use std::collections::BTreeMap;
+
+    // V-C signing helpers (bitty#767): fixed seeds keep tests deterministic.
+    // Secret keys never leave the test; only the public half is enrolled.
+    fn test_signing_key(seed_byte: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    fn enroll(keys: &mut KeyStore, key_id: &str, signing: &ed25519_dalek::SigningKey) {
+        keys.insert(KeyRecord {
+            key_id: key_id.to_string(),
+            public_key_hex: hex_of(signing.verifying_key().as_bytes()),
+            revoked: false,
+        })
+        .unwrap();
+    }
+
+    fn sign_record(
+        signing: &ed25519_dalek::SigningKey,
+        key_id: &str,
+        m: &str,
+        a: &str,
+    ) -> SignatureRecord {
+        use ed25519_dalek::Signer as _;
+        let sig = signing.sign(&signing_message(m, a));
+        SignatureRecord {
+            key_id: key_id.to_string(),
+            signature_hex: hex_of(&sig.to_bytes()),
+            manifest_digest: m.to_string(),
+            artifact_digest: a.to_string(),
+        }
+    }
 
     fn minimal_package_manifest(id: &str) -> PackageManifest {
         PackageManifest {
@@ -678,31 +716,23 @@ mod tests {
     }
 
     #[test]
-    fn trust_vc_unavailable_fail_closed() {
-        // bitty#743 / CTX-0462: V-C has no signature scheme, so every Signed
-        // install is rejected fail-closed — including a well-formed record for
-        // a trusted key. Nothing signed can stage until the scheme lands.
+    fn trust_vc_signed_round_trip_and_fail_closed() {
+        // bitty#767: V-C verifies real Ed25519 signatures, so a correctly
+        // signed install proceeds. Every other shape — unsigned,
+        // unknown-key, tampered, revoked, rotated-but-unverifiable — is
+        // rejected fail-closed before staging.
         let manifest = minimal_package_manifest("xuepoo.c");
         let manifest_digest = manifest.canonical_digest();
         let artifact = b"artifact for signing";
         let artifact_digest = sha256_hex(artifact);
 
+        let signing = test_signing_key(0xC1);
         let mut keys = KeyStore::new();
-        keys.insert(KeyRecord {
-            key_id: "k1".to_string(),
-            public_key_hex: "a".repeat(64),
-            revoked: false,
-        })
-        .unwrap();
+        enroll(&mut keys, "k1", &signing);
 
-        let well_formed_sig = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: "d".repeat(128),
-            manifest_digest: manifest_digest.clone(),
-            artifact_digest: artifact_digest.clone(),
-        };
+        let valid_sig = sign_record(&signing, "k1", &manifest_digest, &artifact_digest);
 
-        // Well-formed record for a trusted key -> still blocked as unavailable.
+        // Correctly signed record for the enrolled key -> install proceeds.
         let inputs = InstallInputs {
             artifact_bytes: artifact,
             expected_artifact_digest: &artifact_digest,
@@ -722,19 +752,12 @@ mod tests {
             trust_mode: TrustMode::Signed,
             candidate_identity: None,
             trust_store: None,
-            signature: Some(&well_formed_sig),
+            signature: Some(&valid_sig),
             key_store: Some(&keys),
             environment: None,
         };
-        let err = verify_install(&inputs).unwrap_err();
-        assert!(
-            err.to_string().contains("unavailable"),
-            "expected unavailable fail-closed, got: {err}"
-        );
-        assert_eq!(
-            DoctorIssue::from_package_error("xuepoo.c", &err).stage,
-            "signature"
-        );
+        let report = verify_install(&inputs).unwrap();
+        assert!(report.is_passed());
 
         // Unsigned (no signature) -> blocked.
         let inputs_unsigned = InstallInputs {
@@ -774,72 +797,54 @@ mod tests {
         };
         assert!(verify_install(&inputs_different).is_err());
 
-        // Revoked key -> blocked (fail-closed even with well-formed bytes).
+        // Revoked key -> blocked (fail-closed even for a valid signature).
         let mut revoked_keys = keys.clone();
         revoked_keys.revoke("k1").unwrap();
         let inputs_revoked = InstallInputs {
             key_store: Some(&revoked_keys),
-            signature: Some(&well_formed_sig),
+            signature: Some(&valid_sig),
             ..inputs.clone()
         };
         let err = verify_install(&inputs_revoked).unwrap_err();
         assert!(DoctorIssue::from_package_error("xuepoo.c", &err).stage == "signature");
 
-        // Rotated-but-trusted key is still rejected: no scheme verifies it.
-        let mut rotated = KeyStore::new();
-        rotated
-            .insert(KeyRecord {
-                key_id: "k1".to_string(),
-                public_key_hex: "a".repeat(64),
-                revoked: false,
-            })
-            .unwrap();
-        rotated
-            .insert(KeyRecord {
-                key_id: "k2".to_string(),
-                public_key_hex: "b".repeat(64),
-                revoked: false,
-            })
-            .unwrap();
-        let sig_k2 = SignatureRecord {
-            key_id: "k2".to_string(),
-            signature_hex: "d".repeat(128),
-            manifest_digest: manifest_digest.clone(),
-            artifact_digest: artifact_digest.clone(),
-        };
+        // Rotation: enroll successor k2, revoke k1. The k2-signed install
+        // proceeds while the k1-signed one stops verifying.
+        let k2_signing = test_signing_key(0xC2);
+        let mut rotated = keys.clone();
+        enroll(&mut rotated, "k2", &k2_signing);
+        rotated.revoke("k1").unwrap();
+        let sig_k2 = sign_record(&k2_signing, "k2", &manifest_digest, &artifact_digest);
         let inputs_rotated = InstallInputs {
             signature: Some(&sig_k2),
             key_store: Some(&rotated),
             ..inputs.clone()
         };
-        assert!(verify_install(&inputs_rotated).is_err());
+        assert!(verify_install(&inputs_rotated).is_ok());
+        let inputs_stale_k1 = InstallInputs {
+            signature: Some(&valid_sig),
+            key_store: Some(&rotated),
+            ..inputs.clone()
+        };
+        assert!(verify_install(&inputs_stale_k1).is_err());
     }
 
     #[test]
     fn trust_vc_missing_candidate_with_store_fail_closed() {
-        // CR-PKG-02 regression, strengthened by bitty#743: TrustMode::Signed
-        // with a trust store present but `candidate_identity == None` must
-        // fail closed, not silently skip pinning. V-C is currently unavailable,
-        // so rejection now happens at the signature stage — strictly earlier
-        // than the preserved pin check, which the follow-up scheme re-enables.
+        // CR-PKG-02 regression: TrustMode::Signed with a trust store present
+        // but `candidate_identity == None` must fail closed, not silently
+        // skip pinning. The signature check runs first; the preserved pin
+        // check runs after it, so a valid signature plus a missing identity
+        // is still rejected.
         let manifest = minimal_package_manifest("xuepoo.c");
         let manifest_digest = manifest.canonical_digest();
         let artifact = b"artifact for signing";
         let artifact_digest = sha256_hex(artifact);
 
+        let signing = test_signing_key(0xC3);
         let mut keys = KeyStore::new();
-        keys.insert(KeyRecord {
-            key_id: "k1".to_string(),
-            public_key_hex: "a".repeat(64),
-            revoked: false,
-        })
-        .unwrap();
-        let well_formed_sig = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: "d".repeat(128),
-            manifest_digest: manifest_digest.clone(),
-            artifact_digest: artifact_digest.clone(),
-        };
+        enroll(&mut keys, "k1", &signing);
+        let valid_sig = sign_record(&signing, "k1", &manifest_digest, &artifact_digest);
 
         let mut pinned_store = TrustStore::new();
         pinned_store
@@ -887,7 +892,8 @@ mod tests {
             }
         }
 
-        // 1. Pinned store + missing candidate must fail closed (the bypass).
+        // 1. Pinned store + missing candidate must fail closed (the bypass):
+        // the signature verifies, then the missing identity is rejected.
         let inputs_missing = signed_inputs(
             artifact,
             &artifact_digest,
@@ -895,13 +901,13 @@ mod tests {
             &manifest_digest,
             None,
             Some(&pinned_store),
-            Some(&well_formed_sig),
+            Some(&valid_sig),
             Some(&keys),
         );
         let err = verify_install(&inputs_missing).unwrap_err();
         assert!(
-            err.to_string().contains("unavailable"),
-            "expected unavailable fail-closed, got: {err}"
+            err.to_string().contains("candidate identity"),
+            "expected missing-identity fail-closed, got: {err}"
         );
 
         // 2. Empty store (first install) + missing candidate must also fail closed.
@@ -913,17 +919,17 @@ mod tests {
             &manifest_digest,
             None,
             Some(&empty_store),
-            Some(&well_formed_sig),
+            Some(&valid_sig),
             Some(&keys),
         );
         let err = verify_install(&inputs_empty_missing).unwrap_err();
         assert!(
-            err.to_string().contains("unavailable"),
-            "expected unavailable fail-closed on empty store, got: {err}"
+            err.to_string().contains("candidate identity"),
+            "expected missing-identity fail-closed on empty store, got: {err}"
         );
 
-        // 3. TOFU unchanged in shape, V-C still closed: no store + no candidate
-        // is rejected at the signature stage until a real scheme lands.
+        // 3. No store + no candidate + valid signature proceeds: Signed
+        // installs work without a TOFU store; the signature is the trust.
         let inputs_no_store = signed_inputs(
             artifact,
             &artifact_digest,
@@ -931,16 +937,12 @@ mod tests {
             &manifest_digest,
             None,
             None,
-            Some(&well_formed_sig),
+            Some(&valid_sig),
             Some(&keys),
         );
-        let err = verify_install(&inputs_no_store).unwrap_err();
-        assert_eq!(
-            DoctorIssue::from_package_error("xuepoo.c", &err).stage,
-            "signature"
-        );
+        assert!(verify_install(&inputs_no_store).is_ok());
 
-        // 4. Matching candidate is still rejected: no scheme verifies the record.
+        // 4. Matching candidate + pinned store + valid signature proceeds.
         let inputs_matching = signed_inputs(
             artifact,
             &artifact_digest,
@@ -948,13 +950,13 @@ mod tests {
             &manifest_digest,
             Some("publisher-key"),
             Some(&pinned_store),
-            Some(&well_formed_sig),
+            Some(&valid_sig),
             Some(&keys),
         );
-        assert!(verify_install(&inputs_matching).is_err());
+        assert!(verify_install(&inputs_matching).is_ok());
 
         // 5. Pin enforcement intact in ordering: pinned store + rotated candidate
-        // is rejected (now at the signature stage, before the preserved pin check).
+        // passes the signature check, then the pin check rejects it.
         let inputs_rotated = signed_inputs(
             artifact,
             &artifact_digest,
@@ -962,7 +964,7 @@ mod tests {
             &manifest_digest,
             Some("attacker-key"),
             Some(&pinned_store),
-            Some(&well_formed_sig),
+            Some(&valid_sig),
             Some(&keys),
         );
         let err = verify_install(&inputs_rotated).unwrap_err();

@@ -24,22 +24,22 @@ behavior, stable formats, or settled publisher-trust policy.
 
 ## Boundaries
 
-- `Cargo.toml` declares no dependencies: the crate is network-free by
-  construction.
+- `Cargo.toml` depends only on `ed25519-dalek` 2.x for `V-C` verification:
+  pure Rust, no file I/O, no network, no process spawning — the crate stays
+  network-free by construction.
 - No file I/O, no network, no process spawning, and no plugin VM contact, per
   `src/lib.rs`.
 - No package code is ever executed: installation spans discovery through
   staging while activation is a separate transaction it never performs.
 - No runtime or platform coupling, and no registry or revocation
   infrastructure beyond in-memory stub stores.
-- `V-C` (`TrustMode::Signed`) signature verification is unimplemented and
-  fail-closed (bitty#743): `verify_signature` rejects every record — no
-  signature scheme exists, so nothing signed can verify until the `OQ-029`
-  key-management design lands. `V-A`/`V-B` are unaffected.
+- `V-C` (`TrustMode::Signed`) signature verification is Ed25519 (bitty#767,
+  OQ-029): `verify_signature` checks the record against the enrolled key
+  directory fail-closed. `V-A`/`V-B` are unaffected.
 
 ## Layout
 
-- `Cargo.toml` — package metadata; no dependency section.
+- `Cargo.toml` — package metadata; sole dependency is `ed25519-dalek` for V-C.
 - `src/lib.rs` — crate docs with draft status and the pipeline description.
 - `src/manifest.rs` and `src/lockfile.rs` — manifest and lockfile types.
 - `src/lifecycle.rs` — staged lifecycle with fail-closed transitions.

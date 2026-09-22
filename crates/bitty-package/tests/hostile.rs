@@ -14,7 +14,8 @@ use bitty_package::{
 };
 use bitty_package::{IndexEntry, PackageIndex, resolve, resolve_preserving_locked};
 use bitty_package::{
-    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, verify_signature,
+    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, signing_message,
+    verify_signature,
 };
 use bitty_package::{
     MANIFEST_MAX_BYTES, MAX_ARTIFACT_BYTES, VerificationInputs, VerificationStage,
@@ -66,6 +67,46 @@ fn manifest_with_deps(deps: Vec<PackageDependency>) -> PackageManifest {
 
 fn entry(id: &str, ver: &str, yanked: bool, deps: Vec<PackageDependency>) -> IndexEntry {
     IndexEntry::new(pid(id), ver.to_string(), yanked, deps).unwrap()
+}
+
+// ── V-C signing helpers (bitty#767) ───────────────────────────────────────
+// Fixed seeds keep the hostile suite deterministic. Secret keys never leave
+// the test: only the public half is enrolled in the `KeyStore`.
+fn test_signing_key(seed_byte: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32])
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn enroll(keys: &mut KeyStore, key_id: &str, signing: &ed25519_dalek::SigningKey) {
+    keys.insert(KeyRecord {
+        key_id: key_id.to_string(),
+        public_key_hex: hex_of(signing.verifying_key().as_bytes()),
+        revoked: false,
+    })
+    .unwrap();
+}
+
+fn sign_record(
+    signing: &ed25519_dalek::SigningKey,
+    key_id: &str,
+    m: &str,
+    a: &str,
+) -> SignatureRecord {
+    use ed25519_dalek::Signer as _;
+    let sig = signing.sign(&signing_message(m, a));
+    SignatureRecord {
+        key_id: key_id.to_string(),
+        signature_hex: hex_of(&sig.to_bytes()),
+        manifest_digest: m.to_string(),
+        artifact_digest: a.to_string(),
+    }
 }
 
 fn minimal_manifest(id: &str) -> PackageManifest {
@@ -708,26 +749,29 @@ fn signature_mismatch_bad_hex_len_rejected() {
 }
 
 #[test]
-fn signature_valid_then_revoked_fails_stale_snapshot() {
-    // V-C is unavailable (bitty#743): the record is rejected before and
-    // after revocation; revocation state itself is still tracked.
+fn signature_valid_round_trip_verifies() {
+    // bitty#767: a record signed by the enrolled key verifies — Signed
+    // installs can proceed.
+    let signing = test_signing_key(0xA1);
     let mut keys = KeyStore::new();
-    keys.insert(KeyRecord {
-        key_id: "k1".to_string(),
-        public_key_hex: "a".repeat(64),
-        revoked: false,
-    })
-    .unwrap();
+    enroll(&mut keys, "k1", &signing);
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
-    let sig = SignatureRecord {
-        key_id: "k1".to_string(),
-        signature_hex: "d".repeat(128),
-        manifest_digest: m.clone(),
-        artifact_digest: a.clone(),
-    };
-    let err = verify_signature(&sig, &keys, &m, &a).unwrap_err();
-    assert!(err.to_string().contains("unavailable"));
+    let sig = sign_record(&signing, "k1", &m, &a);
+    assert!(verify_signature(&sig, &keys, &m, &a).is_ok());
+}
+
+#[test]
+fn signature_valid_then_revoked_fails_stale_snapshot() {
+    // A signature that verified before revocation fails after it: stale
+    // snapshots of directory state cannot authorize installs.
+    let signing = test_signing_key(0xA2);
+    let mut keys = KeyStore::new();
+    enroll(&mut keys, "k1", &signing);
+    let m = sha256_hex(b"m");
+    let a = sha256_hex(b"a");
+    let sig = sign_record(&signing, "k1", &m, &a);
+    assert!(verify_signature(&sig, &keys, &m, &a).is_ok());
     keys.revoke("k1").unwrap();
     assert!(!keys.is_trusted("k1"));
     assert!(verify_signature(&sig, &keys, &m, &a).is_err());
@@ -737,44 +781,26 @@ fn signature_valid_then_revoked_fails_stale_snapshot() {
 
 #[test]
 fn publisher_key_rotation_new_key_valid_old_revoked_stale_fails() {
-    // V-C is unavailable (bitty#743), so both records are rejected; the
-    // store still enforces rotation semantics (revoked k1 untrusted, k2
-    // trusted) for the future scheme.
+    // Rotation: enroll successor k2, revoke predecessor k1. Both keys
+    // verify before the rotation; after it only k2 does.
+    let k1 = test_signing_key(0xB1);
+    let k2 = test_signing_key(0xB2);
     let mut keys = KeyStore::new();
-    keys.insert(KeyRecord {
-        key_id: "k1".to_string(),
-        public_key_hex: "a".repeat(64),
-        revoked: false,
-    })
-    .unwrap();
-    keys.insert(KeyRecord {
-        key_id: "k2".to_string(),
-        public_key_hex: "b".repeat(64),
-        revoked: false,
-    })
-    .unwrap();
+    enroll(&mut keys, "k1", &k1);
+    enroll(&mut keys, "k2", &k2);
     let m = sha256_hex(b"m");
     let a = sha256_hex(b"a");
-    let sig_k2 = SignatureRecord {
-        key_id: "k2".to_string(),
-        signature_hex: "d".repeat(128),
-        manifest_digest: m.clone(),
-        artifact_digest: a.clone(),
-    };
-    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_err());
+    let sig_k1 = sign_record(&k1, "k1", &m, &a);
+    let sig_k2 = sign_record(&k2, "k2", &m, &a);
+    assert!(verify_signature(&sig_k1, &keys, &m, &a).is_ok());
+    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_ok());
     // Rotate: revoke k1
     keys.revoke("k1").unwrap();
     assert!(!keys.is_trusted("k1"));
     assert!(keys.is_trusted("k2"));
-    let sig_k1 = SignatureRecord {
-        key_id: "k1".to_string(),
-        signature_hex: "d".repeat(128),
-        manifest_digest: m.clone(),
-        artifact_digest: a.clone(),
-    };
     assert!(verify_signature(&sig_k1, &keys, &m, &a).is_err());
-    // k2 still rejected as well: no scheme verifies anything yet.
-    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_err());
+    // k2 still verifies after the rotation.
+    assert!(verify_signature(&sig_k2, &keys, &m, &a).is_ok());
 }
 
 #[test]

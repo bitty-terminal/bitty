@@ -86,7 +86,7 @@
 //! | Lifecycle overview — 6 states | `lifecycle` | [`lifecycle::PackageState`] 6-state enum, [`lifecycle::can_transition`] gate table, [`lifecycle::LifecycleRegistry`] fail-closed registry |
 //! | Integrity verification chain — 7 stages | `integrity` | [`integrity::VerificationStage`] ordered 7-stage enum, [`integrity::verify_pipeline`] fan-in, [`integrity::sha256_hex`] SHA-256 hex, `H-A`/`H-B`/`H-C` binding |
 //! | Manifest hashing schemes H-A/B/C | `manifest`, `lockfile`, `integrity` | [`manifest::PackageManifest::canonical_bytes`] deterministic canonical form (`bitty-manifest-v1`), [`manifest::PackageManifest::canonical_digest`] `H-B`, [`lockfile::PackageDigests`] triple, [`integrity::verify_artifact_checksum`] `H-A`, `content_root` `H-C` |
-//! | Publisher trust options V-A/B/C | `trust` | [`trust::TrustMode`] `V-A`/`V-B`/`V-C`, [`trust::TrustStore`] TOFU pin with `check` -> `TrustPinChanged`, [`trust::KeyStore`] enrollment/revocation store, [`trust::verify_signature`] fail-closed `V-C` (unavailable until a real scheme lands, bitty#743) |
+//! | Publisher trust options V-A/B/C | `trust` | [`trust::TrustMode`] `V-A`/`V-B`/`V-C`, [`trust::TrustStore`] TOFU pin with `check` -> `TrustPinChanged`, [`trust::KeyStore`] enrollment/revocation directory, [`trust::verify_signature`] Ed25519 `V-C` (bitty#767) |
 //! | Local-path development packages | `source` | [`source::PackageSource::LocalPath`] degenerate record, [`source::digest_local_content`] + [`source::check_local_path_drift`] drift detection, [`source::ensure_no_promotion_without_chain`] provenance separation |
 //! | Staged activation lifecycle — phases + S1/S2 | `activation` | [`activation::ActivationPhase`] 5-phase txn, [`activation::Environment`] generation ring with atomic `current` pointer (`S1` rename/`S2` generations recommendation: generations history + one atomic select), [`activation::activate`] fault-injection per phase, all-or-nothing commit semantics |
 //! | Safe rollback — retained environments | `activation` | [`activation::Generation`] immutable entry + `verify_integrity` self-verification, [`activation::RetentionPolicy`] `N=2` (+current) bounded prune, never removes current |
@@ -100,12 +100,10 @@
 //!
 //! # Ownership rules (ADR-0003 / ADR-0004)
 //!
-//! - **Depends on:** nothing (pure `std`). No workspace-crate dependencies.
-//! - **No third-party dependencies** (pure `std` plus vendored SHA-256).
-//!   `V-C` signature verification is unimplemented and fail-closed
-//!   (bitty#743): no signature scheme exists, so `verify_signature` rejects
-//!   every record rather than accepting a forgeable one. Real signatures land
-//!   with the `OQ-029` key-management design.
+//! - **Depends on:** `ed25519-dalek` 2.x for `V-C` Ed25519 verification
+//!   only (pure Rust, no I/O, no network; BSD-3-Clause, rust-version 1.81,
+//!   inside the `deny.toml` allowlist). Everything else is pure `std`
+//!   plus vendored SHA-256. No workspace-crate dependencies.
 //! - **Never holds** GPU objects, window handles, PTY file descriptors, or
 //!   internal Rust hot-path objects. It is pure data + validation.
 //! - **`#![forbid(unsafe_code)]`** at crate and workspace level; `MSRV 1.85`,
@@ -160,7 +158,8 @@ pub use source::{
     PackageSource, check_local_path_drift, digest_local_content, ensure_no_promotion_without_chain,
 };
 pub use trust::{
-    KeyRecord, KeyStore, SignatureRecord, TrustMode, TrustPin, TrustStore, verify_signature,
+    KeyRecord, KeyStore, SIGNING_DOMAIN, SignatureRecord, TrustMode, TrustPin, TrustStore,
+    signing_message, verify_signature,
 };
 pub use version::{MAX_VERSION_LEN, Version};
 
@@ -350,6 +349,31 @@ mod integration_tests {
 
     #[test]
     fn trust_and_signature_flow() {
+        use ed25519_dalek::Signer as _;
+
+        fn hex_of(bytes: &[u8]) -> String {
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        }
+
+        fn sign_record(
+            signing: &ed25519_dalek::SigningKey,
+            key_id: &str,
+            m: &str,
+            a: &str,
+        ) -> SignatureRecord {
+            let sig = signing.sign(&signing_message(m, a));
+            SignatureRecord {
+                key_id: key_id.to_string(),
+                signature_hex: hex_of(&sig.to_bytes()),
+                manifest_digest: m.to_string(),
+                artifact_digest: a.to_string(),
+            }
+        }
+
         let mut trust = TrustStore::new();
         let pid = PackageId::new("xuepoo.pkg").unwrap();
         trust
@@ -363,25 +387,20 @@ mod integration_tests {
         // Publisher key change is loud.
         assert!(trust.check(&pid, "key-2").is_err());
 
-        // V-C signed verification is unavailable: even a well-formed record
-        // for a trusted key is rejected fail-closed (bitty#743).
+        // V-C signed verification (bitty#767): a record signed by the
+        // enrolled key verifies; anything else fails closed.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]);
         let mut keys = KeyStore::new();
         keys.insert(KeyRecord {
             key_id: "k1".to_string(),
-            public_key_hex: "a".repeat(64),
+            public_key_hex: hex_of(signing.verifying_key().as_bytes()),
             revoked: false,
         })
         .unwrap();
         let m = sha256_hex(b"m");
         let a = sha256_hex(b"a");
-        let sig = SignatureRecord {
-            key_id: "k1".to_string(),
-            signature_hex: "d".repeat(128),
-            manifest_digest: m.clone(),
-            artifact_digest: a.clone(),
-        };
-        let err = verify_signature(&sig, &keys, &m, &a).unwrap_err();
-        assert!(err.to_string().contains("unavailable"));
+        let sig = sign_record(&signing, "k1", &m, &a);
+        assert!(verify_signature(&sig, &keys, &m, &a).is_ok());
         // Revoked key fails closed as well.
         keys.revoke("k1").unwrap();
         assert!(verify_signature(&sig, &keys, &m, &a).is_err());

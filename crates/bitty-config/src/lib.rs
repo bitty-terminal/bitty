@@ -122,7 +122,7 @@ pub use types::{
     MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec, ReducedMotion,
     ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance, ScrollbarConfig,
     ScrollbarMode, SelectionConfig, TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget,
-    ViewContent, ViewOverride, ViewSelector, WindowConfig,
+    ViewContent, ViewOverride, ViewSelector, WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 

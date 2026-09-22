@@ -31,6 +31,12 @@ pub struct TerminalRegistry {
     active_workspace: Option<WorkspaceId>,
     terminal_to_view: HashMap<TerminalId, ViewId>,
     view_to_terminal: HashMap<ViewId, TerminalId>,
+    /// Registered layout providers with the `layout.provider` capability
+    /// gate (CW-07). Canonical providers are pre-registered at creation.
+    providers: UiProviderRegistry,
+    /// Default provider stamped on workspace creation (CW-07
+    /// `workspace.layout`). `None` preserves the current tree.
+    default_provider: Option<String>,
     disposed: bool,
     total_created: u64,
     errors: HashMap<String, u64>,
@@ -75,6 +81,8 @@ impl TerminalRegistry {
             active_workspace: None,
             terminal_to_view: HashMap::new(),
             view_to_terminal: HashMap::new(),
+            providers: UiProviderRegistry::with_canonical(),
+            default_provider: None,
             disposed: false,
             total_created: 0,
             errors: HashMap::new(),
@@ -353,6 +361,7 @@ impl TerminalRegistry {
             view_gens: HashMap::new(),
             view_visibility: HashMap::new(),
             active: self.workspaces.is_empty(),
+            provider: self.default_provider.clone(),
         };
         self.workspaces.insert(wid.0, ws);
         if self.active_workspace.is_none() {
@@ -1147,6 +1156,145 @@ impl TerminalRegistry {
         workspace_id: WorkspaceId,
     ) -> Result<&LayoutNode, RegistryError> {
         Ok(&self.get_workspace(workspace_id)?.layout)
+    }
+
+    // ------------------------------------------------------------------
+    // Layout providers — per-workspace selection plus validated recompose
+    // (CW-07). Providers propose geometry; Core validates and commits.
+    // ------------------------------------------------------------------
+
+    /// Registers a third-party layout provider.
+    ///
+    /// Requires the `layout.provider` capability grant
+    /// (`has_layout_provider_capability`); the built-in no-op tiler is
+    /// exempt. Bare `dwindle`/`master`/`grid` names stay reserved.
+    ///
+    /// # Errors
+    ///
+    /// `LayoutCapabilityDenied`, `LayoutProposalRejected` (reserved,
+    /// duplicate, or malformed registration), or `RegistryDisposed`.
+    pub fn register_layout_provider(
+        &mut self,
+        provider: Box<dyn UiLayoutProvider>,
+        has_layout_provider_capability: bool,
+    ) -> Result<(), RegistryError> {
+        self.ensure_not_disposed()?;
+        self.providers
+            .register(provider, has_layout_provider_capability)?;
+        Ok(())
+    }
+
+    /// Sets the default provider stamped on subsequently created
+    /// workspaces (CW-07 `workspace.layout`).
+    ///
+    /// # Errors
+    ///
+    /// `UnknownLayoutProvider` when the name is well-formed but
+    /// unregistered, `LayoutProposalRejected` for malformed names.
+    pub fn set_default_layout_provider(&mut self, name: &str) -> Result<(), RegistryError> {
+        self.ensure_not_disposed()?;
+        self.providers.require(name)?;
+        self.default_provider = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Clears the default provider: new workspaces preserve their tree.
+    pub fn clear_default_layout_provider(&mut self) {
+        self.default_provider = None;
+    }
+
+    /// Default provider for new workspaces, if any.
+    #[must_use]
+    pub fn default_layout_provider(&self) -> Option<&str> {
+        self.default_provider.as_deref()
+    }
+
+    /// Selects the active provider for one workspace. Each workspace may
+    /// use a different provider; the choice is per-workspace, not global.
+    /// Selection alone changes nothing: call [`Self::recompose_workspace`]
+    /// to recompose at the next presentation tick.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for unknown workspaces, `UnknownLayoutProvider` for
+    /// unregistered names, `LayoutProposalRejected` for malformed names.
+    pub fn set_workspace_provider(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: &str,
+    ) -> Result<(), RegistryError> {
+        self.ensure_not_disposed()?;
+        self.providers.require(name)?;
+        let ws = self.get_workspace_mut(workspace_id)?;
+        ws.provider = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Active provider for one workspace, if any (`None` preserves).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for unknown workspaces.
+    pub fn workspace_provider(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<&str>, RegistryError> {
+        Ok(self.get_workspace(workspace_id)?.provider.as_deref())
+    }
+
+    /// Recomposes one workspace through its selected provider.
+    ///
+    /// Builds a snapshot from the committed tree, proposes, validates via
+    /// [`validate_layout_proposal`](bitty_ui::provider::validate_proposal),
+    /// and commits through [`Self::set_workspace_layout`]. A workspace
+    /// without a selection or without views is a no-op returning `false`.
+    /// Invalid proposals are rejected with an attributed diagnostic and
+    /// the previous tree is retained (returns `Err`, state untouched).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `UnknownLayoutProvider`, or `LayoutProposalRejected`.
+    pub fn recompose_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        container: UiRect,
+    ) -> Result<bool, RegistryError> {
+        self.ensure_not_disposed()?;
+        let tree = match self.propose_workspace_tree(workspace_id, container) {
+            Ok(tree) => tree,
+            Err(error) => {
+                self.bump_error("LayoutProposalRejected");
+                return Err(error);
+            }
+        };
+        let Some(tree) = tree else {
+            return Ok(false);
+        };
+        self.set_workspace_layout(workspace_id, tree)?;
+        Ok(true)
+    }
+
+    /// Proposes a validated tree without committing (`None` = no-op).
+    fn propose_workspace_tree(
+        &self,
+        workspace_id: WorkspaceId,
+        container: UiRect,
+    ) -> Result<Option<LayoutNode>, RegistryError> {
+        let ws = self.get_workspace(workspace_id)?;
+        let provider_name = ws.provider.clone();
+        let Some(provider_name) = provider_name else {
+            return Ok(None);
+        };
+        let views = ws.layout.leaf_ids();
+        if views.is_empty() {
+            return Ok(None);
+        }
+        let snapshot = UiWorkspaceSnapshot::new(views.clone(), ws.layout.clone());
+        let area = bitty_ui::provider::LogicalRect::from_rect(container);
+        let provider = self.providers.require(&provider_name)?;
+        let tree = provider.propose(&snapshot, &views, area)?;
+        validate_layout_proposal(&tree, &views)?;
+        Ok(Some(tree))
     }
 
     pub fn reflow_workspace(

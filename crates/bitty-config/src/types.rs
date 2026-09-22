@@ -2012,6 +2012,36 @@ impl LayoutConfig {
     }
 }
 
+/// Default layout provider for workspaces (CW-07, issue #986).
+///
+/// Implements the workspace-compositor contract selection rule: the active
+/// provider for a `Workspace` is declared as `workspace.layout = "dwindle"`
+/// (bare canonical name or qualified `owner.name:algorithm`). `None` means
+/// "this layer says nothing" — new workspaces preserve their current tree
+/// via the built-in no-op tiler. Each workspace keeps its own selection at
+/// runtime (see `bitty-runtime` `set_workspace_provider`); this config is
+/// the default stamped on workspace creation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceConfig {
+    /// Default provider name (`workspace.layout`).
+    pub layout: Option<String>,
+}
+
+impl WorkspaceConfig {
+    /// Validate the provider name spelling (fail-closed).
+    ///
+    /// Membership (unknown but well-formed names) is enforced at apply
+    /// time by the runtime provider registry, which knows the registered
+    /// set; this check rejects malformed names with the field path.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(name) = &self.layout {
+            bitty_ui::provider::ProviderName::parse(name)
+                .map_err(|e| ConfigError::validation("workspace.layout", e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 /// Core-owned workspace decoration in logical pixels (CTX-0292).
 ///
 /// Implements the workspace-compositor contract
@@ -2678,6 +2708,9 @@ pub struct EffectiveConfig {
     pub close_confirm: CloseConfirm,
     /// Layout config (CTX-0177 panel gaps in cells; default edge-to-edge).
     pub layout: LayoutConfig,
+    /// Default layout provider for new workspaces (CW-07
+    /// `workspace.layout`; default preserves the current tree).
+    pub workspace: WorkspaceConfig,
     /// Core-owned workspace decoration in logical px (CTX-0292; accepted
     /// spec CTX-0118 defaults 4/6/2/6).
     pub decoration: DecorationConfig,
@@ -2719,6 +2752,7 @@ impl Default for EffectiveConfig {
             selection: SelectionConfig::default(),
             close_confirm: DEFAULT_CLOSE_CONFIRM,
             layout: LayoutConfig::default(),
+            workspace: WorkspaceConfig::default(),
             decoration: DecorationConfig::default(),
             views: Vec::new(),
             scrollbar: ScrollbarConfig::default(),

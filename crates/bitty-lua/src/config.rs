@@ -183,6 +183,19 @@ pub struct LayoutData {
     pub gaps_out: Option<i64>,
 }
 
+/// Layout-provider selection, plain data (CW-07; see [`FontData`] for
+/// `Option` semantics).
+///
+/// Per-workspace default provider name: `workspace = { layout = "dwindle" }`
+/// (bare canonical or qualified `owner.name:algorithm`). Absent means "says
+/// nothing" (preserve the current tree). Spelling is validated downstream
+/// in `bitty-config`; registration membership in `bitty-runtime`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WorkspaceData {
+    /// Provider name (present only when the key is set; raw string).
+    pub layout: Option<String>,
+}
+
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
 /// CTX-0333; see [`FontData`] for `Option` semantics).
 ///
@@ -374,6 +387,8 @@ pub struct ConfigData {
     pub selection: Option<SelectionData>,
     /// `layout` table (CTX-0177 panel gaps).
     pub layout: Option<LayoutData>,
+    /// `workspace` table (CW-07 default layout provider).
+    pub workspace: Option<WorkspaceData>,
     /// `decoration` table (CTX-0292 Core-owned workspace decoration).
     pub decoration: Option<DecorationData>,
     /// `views` table (RFC-0001/OQ-041 per-View appearance overrides,
@@ -415,6 +430,7 @@ impl ConfigData {
             && self.terminal.is_none()
             && self.selection.is_none()
             && self.layout.is_none()
+            && self.workspace.is_none()
             && self.decoration.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
@@ -1129,6 +1145,22 @@ impl ConfigData {
                         None => None,
                     };
                     out.layout = Some(LayoutData { gaps_in, gaps_out });
+                }
+                "workspace" => {
+                    // CW-07: `workspace = { layout = "dwindle" }` selects
+                    // the default layout provider for workspaces (bare
+                    // canonical or qualified `owner.name:algorithm`); absent
+                    // table/key means "says nothing" (preserve the current
+                    // tree). Spelling is validated downstream in
+                    // `bitty-config`; unknown provider names fail at apply
+                    // time in `bitty-runtime`.
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(key, nested, &["layout"])?;
+                    let layout = match get_field(nested, "layout") {
+                        Some(v) => Some(expect_string("workspace.layout", v)?),
+                        None => None,
+                    };
+                    out.workspace = Some(WorkspaceData { layout });
                 }
                 "decoration" => {
                     // CTX-0292/CTX-0333: `decoration = { gaps_in = 6,

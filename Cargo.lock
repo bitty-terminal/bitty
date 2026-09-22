@@ -209,6 +209,7 @@ name = "bitty-config"
 version = "0.0.20"
 dependencies = [
  "bitty-lua",
+ "bitty-ui",
 ]
 
 [[package]]

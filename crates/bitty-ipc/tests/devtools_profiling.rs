@@ -31,9 +31,9 @@
 use std::sync::{Mutex, OnceLock};
 
 use bitty_ipc::devtools::{
-    Dispatcher, FrameStatsPublish, ProcessStatsPublish, ServeContext, ServerInfo,
-    clear_profiling_for_tests, handle_envelope, publish_frame_stats, publish_grid_text,
-    publish_process_stats,
+    Dispatcher, FrameStatsPublish, InputEventPublish, ProcessStatsPublish, ServeContext,
+    ServerInfo, clear_profiling_for_tests, handle_envelope, publish_frame_stats, publish_grid_text,
+    publish_input_ring, publish_process_stats,
 };
 use bitty_ipc::scope::{Scope, ScopeSet};
 
@@ -831,6 +831,138 @@ fn profiling_dispatch_path_never_samples() {
     assert!(
         frame.contains("\"sample\":\"none\""),
         "dispatch must not sample: {frame}"
+    );
+    clear_profiling_for_tests();
+}
+
+// ── DT-05 admission: frame-family sustained floor load stays bounded ──────
+//
+// Acceptance item A1.4 (profiling neutrality, PB-4/PB-7 shape): sampling
+// at the interval floor is bounded work — the ring holds at most 32
+// records with counted drops, every drain fits the per-wakeup budget, and
+// getters converge to latest. Retained memory cannot grow with the sample
+// count, and one family under load never disturbs the other.
+#[test]
+fn profiling_frame_family_sustained_floor_load_stays_bounded() {
+    let _guard = hold_profiling_lock();
+    clear_profiling_for_tests();
+    for i in 1..=40u64 {
+        publish_frame_stats(i * 100, frame_sample("wgpu-vulkan"));
+    }
+    // Getters converge to the latest sample.
+    let (err, frame) = call(inspect_scopes(), "bitty.debug/getFrameStats", None);
+    assert!(!err, "getFrameStats must serve: {frame}");
+    assert!(frame.contains("\"seq\":40"), "got: {frame}");
+    assert!(frame.contains("\"nowMs\":4000"), "got: {frame}");
+    // Full drain: 32 newest (seq 9..=40) with 8 counted drops.
+    let (err, text) = call(
+        trace_scopes(),
+        "bitty.debug/streamFrameStats",
+        Some("{\"intervalMs\":100}"),
+    );
+    assert!(!err, "unexpected error: {text}");
+    assert!(text.contains("\"seq\":40"), "got: {text}");
+    assert!(text.contains("\"dropped\":8"), "got: {text}");
+    assert!(text.contains("\"truncated\":false"), "got: {text}");
+    assert!(
+        text.contains("\"seq\":9,"),
+        "oldest retained must be 9: {text}"
+    );
+    assert!(
+        !text.contains("\"seq\":8,"),
+        "seq 8 must have dropped: {text}"
+    );
+    assert_eq!(
+        text.matches("\"nowMs\":").count(),
+        32,
+        "drain must carry exactly the retained ring: {text}"
+    );
+    // The idle family is undisturbed by the loaded one.
+    let (err, process) = call(inspect_scopes(), "bitty.debug/getProcessStats", None);
+    assert!(!err);
+    assert!(
+        process.contains("\"sample\":\"none\""),
+        "loaded frame family must not disturb process: {process}"
+    );
+    clear_profiling_for_tests();
+}
+
+// ── DT-05 admission: render/input hot paths never feed the profiler ───────
+//
+// Acceptance item A1.4 (no hot-path registration): parser/render/input
+// publishing plus unrelated dispatches leave the profiling store empty —
+// sampling happens only through the explicit publish path at a sampled
+// cadence, so idle profiling costs nothing (PB-7) and hot-path latency
+// sees no profiler callback (PB-4).
+#[test]
+fn profiling_hot_path_publishes_never_feed_profiler() {
+    let _guard = hold_profiling_lock();
+    clear_profiling_for_tests();
+    // Simulate render + input hot-path publishing carrying secrets: the
+    // profiler must ignore both (zero terminal bytes by construction).
+    publish_grid_text(
+        vec![
+            "DB_PASSWORD=hunter2-hotpath".to_string(),
+            "clipboard bytes hotpath-probe".to_string(),
+        ],
+        1,
+        5,
+        true,
+        77,
+        80,
+        24,
+    );
+    publish_input_ring(vec![
+        InputEventPublish {
+            seq: 1,
+            kind: "key".to_string(),
+            label: "a".to_string(),
+            shift: false,
+            control: false,
+            alt: false,
+            button: None,
+            col: None,
+            row: None,
+            pressed: Some(true),
+        },
+        InputEventPublish {
+            seq: 2,
+            kind: "mouse".to_string(),
+            label: "click".to_string(),
+            shift: false,
+            control: false,
+            alt: false,
+            button: Some("Left".to_string()),
+            col: Some(10),
+            row: Some(5),
+            pressed: Some(true),
+        },
+    ]);
+    for _ in 0..16 {
+        let (err, _) = call(inspect_scopes(), "bitty.debug/ping", None);
+        assert!(!err);
+    }
+    let (err, process) = call(inspect_scopes(), "bitty.debug/getProcessStats", None);
+    assert!(!err);
+    assert!(
+        process.contains("\"sample\":\"none\""),
+        "hot-path activity must not sample: {process}"
+    );
+    let (err, frame) = call(inspect_scopes(), "bitty.debug/getFrameStats", None);
+    assert!(!err);
+    assert!(
+        frame.contains("\"sample\":\"none\""),
+        "hot-path activity must not sample: {frame}"
+    );
+    let (err, drained) = call(
+        trace_scopes(),
+        "bitty.debug/streamProcessStats",
+        Some("{\"intervalMs\":100}"),
+    );
+    assert!(!err);
+    assert!(
+        drained.contains("\"samples\":[]"),
+        "streams must stay empty: {drained}"
     );
     clear_profiling_for_tests();
 }

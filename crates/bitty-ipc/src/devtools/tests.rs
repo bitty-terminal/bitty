@@ -3391,3 +3391,511 @@ fn record_input_opt_in_and_bounds_fail_closed() {
     }
     clear_recordings_for_tests();
 }
+
+// ── DT-04 admission: no-bypass issuance audit (Amendment A1) ─────────────
+//
+// Acceptance item A1.5: no flag, variable, configuration key, or debug
+// build switch issues, persists, or widens an automation bearer. The only
+// issuance path is the explicit server-side consent minter
+// (`issue_automation_bearer*`): machine-checked here from the wire side —
+// no IPC method mints bearers, and even maximally elevated scopes never
+// substitute for a bearer.
+//
+// (Restored: first added under CTX-0660 for #1100, then lost when the
+// trace/record rewrite reworked this file.)
+
+// Candidate issuance method names a bypass would hide behind. Every one
+// must answer `UnknownMethod` (registration-deny, never scope-deny).
+const BYPASS_ISSUANCE_METHODS: &[&str] = &[
+    "bitty.debug/issueAutomationBearer",
+    "bitty.debug/grantAutomationBearer",
+    "bitty.debug/mintAutomationBearer",
+    "bitty.debug/elevateAutomation",
+    "bitty.debug/issueBearer",
+    "bitty.debug/grantBearer",
+];
+
+#[test]
+fn automation_no_issuance_path_over_ipc_env_or_elevation() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    // No IPC issuance method exists: bypass-shaped names fail closed as
+    // unknown methods (registration deny, not scope deny).
+    for method in BYPASS_ISSUANCE_METHODS {
+        let payload = format!(
+            "{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{{\"terminalId\":\"t:1\"}}}}"
+        );
+        let outcome = handle_envelope(payload.as_bytes(), &dispatcher, &test_context());
+        assert!(outcome.was_error, "{method} must not exist");
+        assert!(
+            response_text(&outcome).contains("UnknownMethod"),
+            "{method} must answer UnknownMethod, got: {}",
+            response_text(&outcome)
+        );
+    }
+    // Elevation alone never substitutes for a bearer: maximally elevated
+    // scopes (the `BITTY_CTL_ELEVATE` allowlist shape, built purely without
+    // touching process env) plus forged or hand-crafted tokens still fail
+    // closed with zero issued bearers.
+    let elevated = crate::ctl::elevation_from_env(Some(
+        "debug.control,debug.trace,debug.inspect,terminal.input,terminal.inspect",
+    ));
+    let ctx = automation_context(&server, elevated, "s1", 0);
+    for (id, token) in [
+        (11u64, "forged-token".to_string()),
+        (12u64, "deadbeef".repeat(4)),
+    ] {
+        let params = format!(
+            "{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"originLabel\":\"h\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+        );
+        let outcome = handle_envelope(&synth_envelope(id, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "forged bearer with full elevation must be ScopeDenied, got: {}",
+            response_text(&outcome)
+        );
+        let params =
+            format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{token}\",\"format\":\"semantic\"}}");
+        let outcome = handle_envelope(&capture_envelope(id + 100, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "forged capture with full elevation must be ScopeDenied, got: {}",
+            response_text(&outcome)
+        );
+    }
+    // Bearer tokens are opaque: a real token embeds neither the session
+    // nor the terminal id, so authority cannot be crafted.
+    let tok = issue_automation_bearer("sess-9", "t:3", AutomationFamily::Synthesize, 0).unwrap();
+    assert_eq!(tok.len(), 32, "token must stay 32 hex chars");
+    assert!(tok.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!tok.contains("sess-9") && !tok.contains("t:3"));
+    assert_eq!(automation_bearer_count_for_tests(), 1);
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn automation_shed_calls_leave_zero_partial_state() {
+    // Acceptance item A1.2: overruns shed with typed `budget` errors and
+    // leave zero partial state — no sequence advance, no input markers,
+    // no audit entries.
+    //
+    // (Restored: first added under CTX-0660 for #1100, then lost when the
+    // trace/record rewrite reworked this file.)
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+    let ctx = automation_context(&server, automation_scopes_synthesize(), "s1", 0);
+    let params = format!(
+        "{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+    );
+    let seq0 = synthetic_seq_for_tests();
+    let audit0 = frame_audit_len_for_tests();
+    let ring0 = live_input_store().lock().map(|g| g.len()).unwrap_or(0);
+    for id in 1..=MAX_SYNTH_CALLS_PER_SEC as u64 {
+        let outcome = handle_envelope(&synth_envelope(id, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error, "call {id} must pass under ceiling");
+    }
+    assert_eq!(
+        synthetic_seq_for_tests(),
+        seq0 + MAX_SYNTH_CALLS_PER_SEC as u64
+    );
+    let outcome = handle_envelope(
+        &synth_envelope(MAX_SYNTH_CALLS_PER_SEC as u64 + 1, &params),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(
+        text.contains("RateLimited") && text.contains("budget"),
+        "got: {text}"
+    );
+    assert_eq!(
+        synthetic_seq_for_tests(),
+        seq0 + MAX_SYNTH_CALLS_PER_SEC as u64,
+        "shed synth must not advance the sequence"
+    );
+    assert_eq!(
+        frame_audit_len_for_tests(),
+        audit0,
+        "shed synth must not audit"
+    );
+    assert_eq!(
+        live_input_store().lock().map(|g| g.len()).unwrap_or(0),
+        ring0 + MAX_SYNTH_CALLS_PER_SEC,
+        "shed synth must not publish markers"
+    );
+    // Same discipline for capture: the shed call appends no audit entry.
+    publish_grid_text(vec!["f".to_string()], 0, 1, true, 1, 80, 24);
+    let tok = issue_automation_bearer("c1", "t:1", AutomationFamily::Capture, 0).unwrap();
+    let ctx = automation_context(&server, automation_scopes_capture(), "c1", 0);
+    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"semantic\"}}");
+    for id in 1..=MAX_CAPTURE_FPS as u64 {
+        let outcome = handle_envelope(&capture_envelope(id, &params), &dispatcher, &ctx);
+        assert!(!outcome.was_error, "capture {id} must pass under ceiling");
+    }
+    let audit_mid = frame_audit_len_for_tests();
+    let outcome = handle_envelope(
+        &capture_envelope(MAX_CAPTURE_FPS as u64 + 1, &params),
+        &dispatcher,
+        &ctx,
+    );
+    assert!(outcome.was_error);
+    assert!(
+        response_text(&outcome).contains("RateLimited"),
+        "got: {}",
+        response_text(&outcome)
+    );
+    assert_eq!(
+        frame_audit_len_for_tests(),
+        audit_mid,
+        "shed capture must not audit"
+    );
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+// ── DT-04 admission: per-bearer ceilings, benign sessions unaffected ─────
+//
+// Acceptance item A1.2: sustained load above one bearer's ceiling sheds
+// with typed `budget` errors while a benign concurrent session on another
+// bearer keeps serving at the same instant (per-token rate windows —
+// shedding never spills across sessions).
+#[test]
+fn automation_rate_ceiling_is_per_bearer_benign_sessions_unaffected() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let synth_a =
+        issue_automation_bearer("sess-a", "t:1", AutomationFamily::Synthesize, 0).unwrap();
+    let synth_b =
+        issue_automation_bearer("sess-b", "t:2", AutomationFamily::Synthesize, 0).unwrap();
+    let ctx_a = automation_context(&server, automation_scopes_synthesize(), "sess-a", 0);
+    let ctx_b = automation_context(&server, automation_scopes_synthesize(), "sess-b", 0);
+    let params_a = format!(
+        "{{\"terminalId\":\"t:1\",\"bearer\":\"{synth_a}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+    );
+    let params_b = format!(
+        "{{\"terminalId\":\"t:2\",\"bearer\":\"{synth_b}\",\"originLabel\":\"load\",\"events\":[{{\"type\":\"key\",\"key\":\"a\"}}]}}"
+    );
+    for id in 1..=MAX_SYNTH_CALLS_PER_SEC as u64 {
+        let outcome = handle_envelope(&synth_envelope(id, &params_a), &dispatcher, &ctx_a);
+        assert!(
+            !outcome.was_error,
+            "hot bearer call {id} must pass under ceiling"
+        );
+    }
+    let outcome = handle_envelope(
+        &synth_envelope(MAX_SYNTH_CALLS_PER_SEC as u64 + 1, &params_a),
+        &dispatcher,
+        &ctx_a,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(
+        text.contains("RateLimited") && text.contains("budget"),
+        "hot bearer overrun must shed, got: {text}"
+    );
+    // Benign session serves at the same instant on its own window.
+    let outcome = handle_envelope(
+        &synth_envelope(MAX_SYNTH_CALLS_PER_SEC as u64 + 2, &params_b),
+        &dispatcher,
+        &ctx_b,
+    );
+    assert!(
+        !outcome.was_error,
+        "benign session must be unaffected: {}",
+        response_text(&outcome)
+    );
+    // Same discipline for capture.
+    publish_grid_text(vec!["f".to_string()], 0, 1, true, 1, 80, 24);
+    let cap_a = issue_automation_bearer("sess-a", "t:1", AutomationFamily::Capture, 0).unwrap();
+    let cap_b = issue_automation_bearer("sess-b", "t:2", AutomationFamily::Capture, 0).unwrap();
+    let ctx_a = automation_context(&server, automation_scopes_capture(), "sess-a", 0);
+    let ctx_b = automation_context(&server, automation_scopes_capture(), "sess-b", 0);
+    let params_a =
+        format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{cap_a}\",\"format\":\"semantic\"}}");
+    let params_b =
+        format!("{{\"terminalId\":\"t:2\",\"bearer\":\"{cap_b}\",\"format\":\"semantic\"}}");
+    for id in 1..=MAX_CAPTURE_FPS as u64 {
+        let outcome = handle_envelope(&capture_envelope(id, &params_a), &dispatcher, &ctx_a);
+        assert!(
+            !outcome.was_error,
+            "hot capture {id} must pass under ceiling"
+        );
+    }
+    let outcome = handle_envelope(
+        &capture_envelope(MAX_CAPTURE_FPS as u64 + 1, &params_a),
+        &dispatcher,
+        &ctx_a,
+    );
+    assert!(outcome.was_error);
+    assert!(
+        response_text(&outcome).contains("RateLimited"),
+        "got: {}",
+        response_text(&outcome)
+    );
+    let outcome = handle_envelope(
+        &capture_envelope(MAX_CAPTURE_FPS as u64 + 2, &params_b),
+        &dispatcher,
+        &ctx_b,
+    );
+    assert!(
+        !outcome.was_error,
+        "benign capture must be unaffected: {}",
+        response_text(&outcome)
+    );
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+// ── DT-04 admission: environment/private-key bytes never reach capture ───
+//
+// Acceptance item A1.3: environment bytes join seeded secrets and
+// clipboard bytes under whole-line redaction in `captureFrame` output;
+// benign lines survive verbatim and the response stays labeled
+// untrusted observation data.
+#[test]
+fn automation_capture_redacts_env_and_private_key_lines() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    publish_grid_text(
+        vec![
+            "AWS_SECRET_KEY=hunter2-env".to_string(),
+            "-----BEGIN PRIVATE KEY-----".to_string(),
+            "env=TOPSECRET-PLAN".to_string(),
+            "deploy token hunter2tok".to_string(),
+            "plain hello world".to_string(),
+        ],
+        0,
+        5,
+        true,
+        13,
+        80,
+        24,
+    );
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let tok = issue_automation_bearer("s1", "t:1", AutomationFamily::Capture, 7000).unwrap();
+    let ctx = automation_context(&server, automation_scopes_capture(), "s1", 7000);
+    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\",\"format\":\"semantic\"}}");
+    let outcome = handle_envelope(&capture_envelope(1, &params), &dispatcher, &ctx);
+    assert!(!outcome.was_error);
+    let text = response_text(&outcome);
+    for secret in [
+        "hunter2-env",
+        "BEGIN PRIVATE KEY",
+        "TOPSECRET-PLAN",
+        "hunter2tok",
+    ] {
+        assert!(!text.contains(secret), "environment bytes leaked: {text}");
+    }
+    assert!(
+        text.contains("plain hello world"),
+        "benign line must survive: {text}"
+    );
+    assert!(text.contains(REDACTED_MARKER), "got: {text}");
+    assert!(
+        text.contains("\"trust\":\"untrusted-observation\""),
+        "got: {text}"
+    );
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+// ── DT-06 admission: sustained ceiling, TTL adequacy, audit byte-accuracy ──
+//
+// Acceptance: the 120 s TTL and 2/s ceiling stay adequate under harness
+// load, and the digest audit stays byte-accurate under contention (every
+// attributable call — granted, shed, denied — leaves exactly one entry;
+// granted entries carry exactly the served digest).
+//
+// (Restored: first added under CTX-0660 for #1102, then lost when the
+// trace/record rewrite reworked this file.)
+#[test]
+fn frame_hash_sustained_ceiling_ttl_and_audit_byte_accuracy_under_load() {
+    use crate::frame_digest::{FRAME_DIGEST_TTL_MS, MAX_FRAME_DIGEST_PER_SEC, frame_digest_hex};
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    assert_eq!(FRAME_DIGEST_TTL_MS, 120_000);
+    assert_eq!(MAX_FRAME_DIGEST_PER_SEC, 2);
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let rgba = fixture_rgba(8, 8, 4);
+    publish_frame_rgba(8, 8, 7, rgba.clone());
+    let served = frame_digest_hex(8, 8, 7, &rgba);
+    let tok = issue_automation_bearer_with_ttl(
+        "load",
+        "t:1",
+        AutomationFamily::FrameDigest,
+        0,
+        FRAME_DIGEST_TTL_MS,
+    )
+    .unwrap();
+    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+    let forged = "{\"terminalId\":\"t:1\",\"bearer\":\"bogus\"}".to_string();
+    let audit0 = frame_audit_len_for_tests();
+    let mut id = 1u64;
+    // Five consecutive 1 s windows: 2 grants + 1 shed + 1 forged-denied
+    // each. Virtual clock only — no sleeps.
+    for window in 0..5u64 {
+        let now = window * 1_000;
+        let ctx = digest_context(&server, automation_scopes_capture(), "load", now);
+        for _ in 0..MAX_FRAME_DIGEST_PER_SEC {
+            id += 1;
+            let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+            assert!(
+                !outcome.was_error,
+                "window {window}: grant must serve under load"
+            );
+            assert!(
+                response_text(&outcome).contains(&served),
+                "window {window}: served digest must match: {}",
+                response_text(&outcome)
+            );
+        }
+        id += 1;
+        let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("RateLimited"),
+            "window {window}: overrun must shed, got: {}",
+            response_text(&outcome)
+        );
+        id += 1;
+        let outcome = handle_envelope(&digest_envelope(id, &forged), &dispatcher, &ctx);
+        assert!(outcome.was_error);
+        assert!(
+            response_text(&outcome).contains("ScopeDenied"),
+            "window {window}: forged bearer must deny, got: {}",
+            response_text(&outcome)
+        );
+    }
+    // TTL adequacy: the full-cap grant still serves 1 ms before expiry
+    // and denies exactly at issue + TTL.
+    let ctx = digest_context(&server, automation_scopes_capture(), "load", 119_999);
+    id += 1;
+    let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+    assert!(!outcome.was_error, "grant must serve at TTL - 1 ms");
+    assert!(response_text(&outcome).contains(&served));
+    let ctx = digest_context(&server, automation_scopes_capture(), "load", 120_000);
+    id += 1;
+    let outcome = handle_envelope(&digest_envelope(id, &params), &dispatcher, &ctx);
+    assert!(outcome.was_error);
+    assert!(
+        response_text(&outcome).contains("ScopeDenied"),
+        "grant must expire exactly at TTL, got: {}",
+        response_text(&outcome)
+    );
+    // Byte-accuracy: 5 windows x (2 granted + 1 shed + 1 denied) + 1
+    // granted + 1 expired = 22 entries, no loss, no duplication, no
+    // drop-oldest in range (cap is 64).
+    let snap = frame_audit_snapshot_for_tests();
+    assert_eq!(
+        snap.len(),
+        audit0 + 22,
+        "every attributable call leaves one entry"
+    );
+    assert!(snap.iter().all(|e| e.format == "digest"));
+    assert!(
+        snap.iter()
+            .all(|e| e.session_id == "load" && e.terminal_id == "t:1"),
+        "audit attribution must stay exact under load"
+    );
+    let with_digest: Vec<_> = snap.iter().filter(|e| !e.digest_hex.is_empty()).collect();
+    assert_eq!(with_digest.len(), 11, "exactly the 11 grants carry digests");
+    assert!(
+        with_digest
+            .iter()
+            .all(|e| e.digest_hex == served && e.frame_seq == 7),
+        "granted entries must carry exactly the served digest"
+    );
+    let denied: Vec<_> = snap.iter().filter(|e| e.digest_hex.is_empty()).collect();
+    assert_eq!(denied.len(), 11, "shed + forged + expired carry no digest");
+    assert!(denied.iter().all(|e| e.frame_seq == 0));
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}
+
+// ── DT-06 admission: digest-only wire, no pixel channel ───────────────────
+//
+// Acceptance: `frameHash` answers the equality question in 32 bytes with
+// zero pixel bytes on the wire, and no pixel-channel method ships under
+// any grant — admitting one needs its own reviewed amendment.
+#[test]
+fn frame_hash_serves_digest_only_no_pixel_channel() {
+    use crate::frame_digest::{FRAME_DIGEST_ALGO, frame_digest_hex};
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    clear_automation_for_tests();
+    let server = test_server_info();
+    let dispatcher = Dispatcher::with_defaults();
+    let rgba = fixture_rgba(8, 8, 4);
+    publish_frame_rgba(8, 8, 7, rgba.clone());
+    let served = frame_digest_hex(8, 8, 7, &rgba);
+    assert_eq!(served.len(), 64, "digest must be 32 bytes hex");
+    assert!(served.bytes().all(|b| b.is_ascii_hexdigit()));
+    let tok =
+        issue_automation_bearer_with_ttl("npx", "t:1", AutomationFamily::FrameDigest, 0, 60_000)
+            .unwrap();
+    let ctx = digest_context(&server, automation_scopes_capture(), "npx", 0);
+    let params = format!("{{\"terminalId\":\"t:1\",\"bearer\":\"{tok}\"}}");
+    let outcome = handle_envelope(&digest_envelope(1, &params), &dispatcher, &ctx);
+    assert!(!outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(
+        text.contains(&format!("\"digest\":\"{served}\"")),
+        "served digest must match: {text}"
+    );
+    assert!(text.contains(FRAME_DIGEST_ALGO), "got: {text}");
+    for key in [
+        "\"rgba\"",
+        "\"pixels\"",
+        "\"bytes\"",
+        "\"lines\"",
+        "\"grid\"",
+        "\"text\"",
+        "\"clipboard\"",
+        "\"env\"",
+        "FRAMEHASH-MARKER-NEVER-ON-WIRE",
+    ] {
+        assert!(
+            !text.contains(key),
+            "pixel-channel key {key} on the wire: {text}"
+        );
+    }
+    // No pixel-channel method ships: bypass-shaped names fail closed as
+    // unknown methods (registration deny, never scope deny).
+    for method in [
+        "bitty.debug/framePixels",
+        "bitty.debug/getFramePixels",
+        "bitty.debug/capturePixels",
+    ] {
+        let payload = format!(
+            "{{\"id\":1,\"method\":\"{method}\",\"version\":\"1.0\",\"params\":{{\"terminalId\":\"t:1\"}}}}"
+        );
+        let ctx = digest_context(&server, automation_scopes_capture(), "npx", 0);
+        let outcome = handle_envelope(payload.as_bytes(), &dispatcher, &ctx);
+        assert!(outcome.was_error, "{method} must not exist");
+        assert!(
+            response_text(&outcome).contains("UnknownMethod"),
+            "{method} must answer UnknownMethod, got: {}",
+            response_text(&outcome)
+        );
+    }
+    clear_automation_for_tests();
+    clear_introspection_for_tests();
+}

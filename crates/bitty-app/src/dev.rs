@@ -8,7 +8,7 @@
 //! # Contract (implemented)
 //!
 //! - Shape: `bitty dev <verb> [subverb] [name] [flags]` where `<verb>` is one
-//!   of `trace|capture|dump|overlay`:
+//!   of `trace|capture|synthesize|dump|overlay`:
 //!   - `trace startup` — headless PB-1 startup tracing via
 //!     `bitty-perf::startup::measure_headless_startup` (args parse, config,
 //!     runtime create, layout, PTY spawn attempt, winit/wgpu/font probes,
@@ -16,6 +16,14 @@
 //!   - `trace latency [--iterations N]` — headless PB-4 key-to-screen tracing
 //!     via `bitty-perf::latency::measure_latency` (bounded synthetic keys,
 //!     echo model, stage breakdown, p50/p99/mean/max).
+//!   - `synthesize` — fixed local input trajectory plus the paste-gate
+//!     probe: [`SYNTH_TRAJECTORY_LEN`] printable keys through the headless
+//!     input path (protocol `synthesizeInput` local-class parity), then the
+//!     multiline paste probe requested, verified pending, and cancelled
+//!     (T-04 parity, never delivered). Reports the protocol-shaped receipt
+//!     (`accepted`, `rejected`, `syntheticSeq`, `originLabel`) plus tick
+//!     stats. The IPC-backed `--terminal` form stays future
+//!     DevTools-protocol work, like every other runtime verb here.
 //!   - `capture [--layout single|split|stack|overlay]` — deterministic
 //!     headless frame capture reusing the `--headless` smoke pattern: fresh
 //!     [`Runtime`](bitty_runtime::Runtime), fixed synthetic VT corpus, one
@@ -143,6 +151,26 @@ pub const DEV_SYNTHETIC_CORPUS: &[u8] =
 /// newline) so `overlay show banner` can prove the transient banner paint
 /// pattern on a fresh headless runtime without delivering any bytes.
 pub const DEV_BANNER_PASTE: &str = "bitty overlay proof\nline2";
+
+/// Fixed printable alphabet cycled by `synthesize` trajectories.
+///
+/// Deterministic internal constant — never user input, no wall clock.
+const SYNTH_ALPHABET: &[u8] = b"bitty-dev";
+
+/// Fixed length of every `synthesize` trajectory (protocol per-call event
+/// cap parity: at most 64 events per call, and the local verb stays small
+/// and fast with 8).
+pub const SYNTH_TRAJECTORY_LEN: usize = 8;
+
+/// Fixed multiline paste probe for the `synthesize` T-04 gate proof.
+///
+/// Never delivered: the verb requests it, verifies the confirmation gate
+/// holds it pending, then cancels it.
+const SYNTH_PASTE_PROBE: &str = "bitty synthesize probe\nline2";
+
+/// Origin label reported in `synthesize` receipts (local-harness parity
+/// with the protocol `originLabel` attribution).
+pub const SYNTH_ORIGIN_LABEL: &str = "bitty-dev-synthesize";
 
 // ---------------------------------------------------------------------------
 // Format
@@ -317,6 +345,8 @@ pub enum DevRequest {
         /// Layout composition under capture.
         layout: CaptureLayout,
     },
+    /// `synthesize` (fixed local trajectory plus paste-gate probe).
+    Synthesize,
     /// `dump grid [--rows N] [--cols N]`.
     DumpGrid {
         /// Bounded row cap.
@@ -338,11 +368,12 @@ pub enum DevRequest {
 }
 
 impl DevRequest {
-    /// Verb token for output (`trace|capture|dump|overlay`).
+    /// Verb token for output (`trace|capture|synthesize|dump|overlay`).
     pub fn verb(&self) -> &'static str {
         match self {
             Self::TraceStartup | Self::TraceLatency { .. } => "trace",
             Self::Capture { .. } => "capture",
+            Self::Synthesize => "synthesize",
             Self::DumpGrid { .. } | Self::DumpScene | Self::DumpAtlas => "dump",
             Self::OverlayList | Self::OverlayShow { .. } => "overlay",
         }
@@ -354,6 +385,7 @@ impl DevRequest {
             Self::TraceStartup => "startup".to_string(),
             Self::TraceLatency { iterations } => format!("latency iterations={iterations}"),
             Self::Capture { layout } => layout.name().to_string(),
+            Self::Synthesize => format!("trajectory events={SYNTH_TRAJECTORY_LEN}"),
             Self::DumpGrid { rows, cols } => format!("grid rows={rows} cols={cols}"),
             Self::DumpScene => "scene".to_string(),
             Self::DumpAtlas => "atlas".to_string(),
@@ -398,7 +430,7 @@ impl DevParseError {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn dev_usage() -> String {
-    "usage: bitty dev <trace|capture|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)"
+    "usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n       bitty dev trace <startup|latency> [--iterations N]\n       bitty dev capture [--layout single|split|stack|overlay]\n       bitty dev synthesize\n       bitty dev dump <grid|scene|atlas> [--rows N] [--cols N]\n       bitty dev overlay <list|show <damage|cells|glyphs|images|layout|banner>>\n\nverbs:\n  trace     headless PB-1 startup / PB-4 latency tracing (bitty-perf, local)\n  capture   deterministic headless frame capture (stats + RGBA hash, local)\n  synthesize  fixed local input trajectory plus paste-gate probe (receipt, local)\n  dump      grid text / scene / atlas dumps from a headless capture (local)\n  overlay   renderer-overlay catalog and headless proofs (local; GPU-bound entries deferred)"
         .to_string()
 }
 
@@ -407,7 +439,7 @@ pub fn dev_usage() -> String {
 pub fn dev_help_text() -> String {
     "bitty dev — developer tracing, captures, dumps, and overlays (local)\n\
      \n\
-     Usage: bitty dev <trace|capture|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
+     Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
      \n\
      Verbs (all local class: no instance, safe-mode clean, no plugin VM):\n  \
        trace startup                 Headless PB-1 startup phases (bitty-perf).\n  \
@@ -418,6 +450,12 @@ pub fn dev_help_text() -> String {
                                      (default single). Reports present stats,\n  \
                                      cold-queue counters, and an FNV-1a hash\n  \
                                      of the headless RGBA buffer.\n  \
+       synthesize                    Fixed local input trajectory (8 printable\n  \
+                                     keys through the headless input path)\n  \
+                                     plus the multiline paste-gate probe\n  \
+                                     (requested, held pending, cancelled —\n  \
+                                     never delivered). Reports the protocol-\n  \
+                                     shaped receipt plus tick stats.\n  \
        dump grid [--rows N] [--cols N]  Bounded grid text plus cursor\n  \
                                      (defaults rows=64 cols=256, capped at\n  \
                                      64x256 like the inspect path).\n  \
@@ -459,6 +497,7 @@ pub fn dev_help_text() -> String {
        bitty dev trace startup\n  \
        bitty dev trace latency --iterations 50 --format json\n  \
        bitty dev capture --layout split\n  \
+       bitty dev synthesize --format json\n  \
        bitty dev dump grid --format json\n  \
        bitty dev overlay list\n"
     .to_string()
@@ -709,7 +748,7 @@ pub fn parse_dev_request(tokens: &[String]) -> Result<(DevRequest, DevOptions), 
 
     let verb_raw = verb.ok_or_else(|| {
         DevParseError::Usage(format!(
-            "bitty dev: missing <verb> (want trace|capture|dump|overlay)\n{}",
+            "bitty dev: missing <verb> (want trace|capture|synthesize|dump|overlay)\n{}",
             dev_usage()
         ))
     })?;
@@ -799,6 +838,28 @@ pub fn parse_dev_request(tokens: &[String]) -> Result<(DevRequest, DevOptions), 
                 })?,
             };
             Ok((DevRequest::Capture { layout }, options))
+        }
+        "synthesize" => {
+            if iterations_raw.is_some() {
+                return Err(no_verb_flags("iterations"));
+            }
+            if rows_raw.is_some() {
+                return Err(no_verb_flags("rows"));
+            }
+            if cols_raw.is_some() {
+                return Err(no_verb_flags("cols"));
+            }
+            if layout_raw.is_some() {
+                return Err(no_verb_flags("layout"));
+            }
+            if sub.is_some() {
+                return Err(DevParseError::Usage(format!(
+                    "bitty dev synthesize: unexpected argument '{}'\n{}",
+                    sub.unwrap_or_default(),
+                    dev_usage()
+                )));
+            }
+            Ok((DevRequest::Synthesize, options))
         }
         "dump" => {
             if iterations_raw.is_some() {
@@ -926,7 +987,7 @@ pub fn parse_dev_request(tokens: &[String]) -> Result<(DevRequest, DevOptions), 
             }
         }
         other => Err(DevParseError::Usage(format!(
-            "bitty dev: unknown verb {other:?} (want trace|capture|dump|overlay)\n{}",
+            "bitty dev: unknown verb {other:?} (want trace|capture|synthesize|dump|overlay)\n{}",
             dev_usage()
         ))),
     }
@@ -1279,6 +1340,70 @@ fn capture_output(layout: CaptureLayout) -> Result<DevOutput, String> {
     })
 }
 
+fn synth_key_event(byte: u8) -> bitty_platform::KeyEvent {
+    let ch = (byte as char).to_string();
+    bitty_platform::KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Character(ch.clone()),
+        text: Some(ch),
+        location: bitty_platform::KeyLocation::Standard,
+        state: bitty_platform::PressState::Pressed,
+        repeat: false,
+        // `is_synthetic` here means winit focus-change artifact (dropped in
+        // translation), not harness origin: headless callers drive real
+        // presses per the `handle_key_event` contract, and harness origin
+        // is carried by the receipt `originLabel` instead.
+        is_synthetic: false,
+    }
+}
+
+/// Process-wide synthetic-event sequence for `synthesize` receipts
+/// (monotonic, never reset: mirrors the protocol `syntheticSeq`).
+static SYNTH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fixed local input trajectory plus the paste-gate probe (DT-09).
+///
+/// Errors only when the headless runtime fails to build (generic
+/// failure). The paste probe is requested, verified pending (T-04
+/// confirmation gate), then cancelled — never delivered.
+fn synthesize_output() -> Result<DevOutput, String> {
+    use std::sync::atomic::Ordering;
+    let mut runtime = bitty_runtime::Runtime::with_defaults()
+        .map_err(|err| format!("bitty dev: headless runtime failed: {err}"))?;
+    runtime.set_layout(build_capture_layout(CaptureLayout::Single));
+    let mut accepted = 0usize;
+    let mut bytes_out = 0usize;
+    for i in 0..SYNTH_TRAJECTORY_LEN {
+        let byte = SYNTH_ALPHABET[i % SYNTH_ALPHABET.len()];
+        let produced = runtime.handle_key_event(synth_key_event(byte));
+        accepted += 1;
+        bytes_out += produced.map(|bytes| bytes.len()).unwrap_or(0);
+    }
+    let synthetic_seq = SYNTH_SEQ.fetch_add(accepted as u64, Ordering::SeqCst) + accepted as u64;
+    // T-04 parity: the fixed multiline probe must be held pending, never
+    // delivered silently; cancel it so no pending state escapes the verb.
+    let pending = runtime.request_paste(SYNTH_PASTE_PROBE.to_string());
+    let paste_gate = if pending {
+        "confirmation-required"
+    } else {
+        "delivered-directly"
+    };
+    let _ = runtime.cancel_pending_paste();
+    let (tick, frame) = match runtime.tick() {
+        Some(stats) => ("presented", stats.frame),
+        None => ("idle", 0),
+    };
+    let table = format!(
+        "bitty dev synthesize — origin={SYNTH_ORIGIN_LABEL} accepted={accepted} rejected=0 synthetic_seq={synthetic_seq}\n  trajectory: events={accepted} bytes_out={bytes_out}\n  paste gate: {paste_gate} (probe requested, held pending, cancelled)\n  tick: {tick} frame={frame}\n",
+    );
+    let result = format!(
+        "\"origin_label\":\"{SYNTH_ORIGIN_LABEL}\",\"accepted\":{accepted},\"rejected\":0,\"synthetic_seq\":{synthetic_seq},\"events\":{accepted},\"bytes_out\":{bytes_out},\"paste_gate\":\"{paste_gate}\",\"tick\":\"{tick}\",\"frame\":{frame}",
+    );
+    Ok(DevOutput {
+        table,
+        result_json: result,
+    })
+}
+
 fn dump_grid_output(rows: usize, cols: usize) -> Result<DevOutput, String> {
     let mut runtime = bitty_runtime::Runtime::with_defaults()
         .map_err(|err| format!("bitty dev: headless runtime failed: {err}"))?;
@@ -1611,6 +1736,7 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
         DevRequest::TraceStartup => Ok(trace_startup_output()),
         DevRequest::TraceLatency { iterations } => Ok(trace_latency_output(*iterations)),
         DevRequest::Capture { layout } => capture_output(*layout),
+        DevRequest::Synthesize => synthesize_output(),
         DevRequest::DumpGrid { rows, cols } => dump_grid_output(*rows, *cols),
         DevRequest::DumpScene => dump_scene_output(),
         DevRequest::DumpAtlas => dump_atlas_output(),
@@ -1762,7 +1888,7 @@ mod tests {
         match err {
             DevParseError::Usage(message) => {
                 assert!(message.contains("unknown verb"));
-                assert!(message.contains("trace|capture|dump|overlay"));
+                assert!(message.contains("trace|capture|synthesize|dump|overlay"));
             }
             DevParseError::Help => panic!("want usage"),
         }
@@ -1992,17 +2118,75 @@ mod tests {
     #[test]
     fn usage_and_help_name_verbs() {
         let usage = dev_usage();
-        for token in ["trace", "capture", "dump", "overlay"] {
+        for token in ["trace", "capture", "synthesize", "dump", "overlay"] {
             assert!(usage.contains(token), "usage must name {token}");
         }
         let help = dev_help_text();
         for token in [
             "trace startup",
             "trace latency",
+            "synthesize",
             "dump grid",
             "overlay list",
         ] {
             assert!(help.contains(token), "help must name {token}");
         }
+    }
+
+    #[test]
+    fn synthesize_parses_bare_and_rejects_positionals_and_foreign_flags() {
+        let (request, _) = parse(&["synthesize"]).unwrap();
+        assert_eq!(request, DevRequest::Synthesize);
+        assert_eq!(request.verb(), "synthesize");
+        assert!(request.detail().contains("trajectory"));
+        // Bare positionals and every verb-scoped flag fail closed.
+        assert!(parse(&["synthesize", "extra"]).is_err());
+        assert!(parse(&["synthesize", "--iterations", "5"]).is_err());
+        assert!(parse(&["synthesize", "--rows", "4"]).is_err());
+        assert!(parse(&["synthesize", "--cols", "4"]).is_err());
+        assert!(parse(&["synthesize", "--layout", "split"]).is_err());
+        assert!(parse(&["synthesize", "--socket", "/tmp/a.sock"]).is_err());
+        assert!(parse(&["synthesize", "--"]).is_err());
+    }
+
+    #[test]
+    fn synthesize_output_is_deterministic_with_held_paste_gate() {
+        let first = synthesize_output().expect("headless synthesize must succeed");
+        let second = synthesize_output().expect("headless synthesize must succeed");
+        assert!(first.table.contains("accepted=8"), "got: {}", first.table);
+        assert!(
+            first.table.contains("paste gate: confirmation-required"),
+            "multiline probe must be held pending, got: {}",
+            first.table
+        );
+        assert!(
+            first.result_json.contains("\"accepted\":8"),
+            "got: {}",
+            first.result_json
+        );
+        assert!(
+            first.result_json.contains("\"rejected\":0"),
+            "got: {}",
+            first.result_json
+        );
+        assert!(
+            first.result_json.contains("\"bytes_out\":8"),
+            "8 printable keys produce 8 PTY bytes, got: {}",
+            first.result_json
+        );
+        assert!(
+            first
+                .result_json
+                .contains("\"paste_gate\":\"confirmation-required\""),
+            "got: {}",
+            first.result_json
+        );
+        // Deterministic across runs except the monotonic synthetic_seq.
+        assert_eq!(first.table.lines().count(), second.table.lines().count());
+        assert!(
+            second.result_json.contains("\"accepted\":8"),
+            "got: {}",
+            second.result_json
+        );
     }
 }

@@ -1569,8 +1569,9 @@ pub(crate) fn help_text() -> String {
              inspect <target> <value>  Explain state and ownership (local, safe mode)\n  \
                               command|key|plugin|config|protocol\n  \
                               (--format table|json|jsonl; `bitty inspect --help`)\n  \
-            dev <verb>       Developer tracing, captures, dumps, overlays\n  \
-                             (trace|capture|dump|overlay; local only, no\n  \
+            dev <verb>       Developer tracing, captures, synthesis, dumps,\n  \
+                             overlays\n  \
+                             (trace|capture|synthesize|dump|overlay; local only, no\n  \
                              instance; `bitty dev --help` for detail)\n  \
            plugin <verb>     CLI-first plugin management (local, no VM):\n  \
                              list|install|remove|enable|disable|info over the\n  \

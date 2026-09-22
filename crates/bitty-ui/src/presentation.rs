@@ -172,6 +172,109 @@ pub const PRESENTATION_CMD_FULLSCREEN: &str = "bitty.workspace:presentation-full
 pub const PRESENTATION_CMD_SCRATCHPAD: &str = "bitty.workspace:presentation-scratchpad";
 pub const PRESENTATION_CMD_TILED: &str = "bitty.workspace:presentation-tiled";
 
+/// Workspace command toggling one leaf between tiled and floating
+/// (UX-03, Mod+V).
+///
+/// `<owner>.<name>:<command>` grammar (see
+/// [`QualifiedCommand`](crate::panel::QualifiedCommand)); routed by
+/// [`apply_floating_toggle`]. A single command (not two mode commands) so
+/// the keybinding never desyncs from the leaf state.
+///
+/// # Open-item resolutions
+///
+/// - Slot restore: automatic. The layout solver ignores `PresentationMode`,
+///   so toggling never moves the leaf in the tree; floating back to tiled
+///   restores the exact prior allocation with no anchor bookkeeping.
+/// - Focus/z-order: unchanged depth-first order; the toggle stamps the mode
+///   only and never re-parents.
+/// - Anchored vs free geometry: anchored (the solver allocation). Free
+///   floating rects are a follow-up once the float layer owns geometry.
+pub const FLOATING_CMD_TOGGLE: &str = "bitty.workspace:floating-toggle";
+
+/// Error for [`toggle_floating`] and [`apply_floating_toggle`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FloatingToggleError {
+    /// `command` is not [`FLOATING_CMD_TOGGLE`]; the tree is untouched.
+    UnknownCommand(String),
+    /// No leaf with `target` id exists in `tree`; untouched.
+    LeafNotFound(crate::view::ViewId),
+    /// The leaf is in neither [`PresentationMode::Tiled`] nor
+    /// [`PresentationMode::Floating`] (e.g. `Fullscreen`, `Scratchpad`,
+    /// which have their own commands); untouched.
+    UnsupportedMode { current: PresentationMode },
+    /// The [`PresentationMode::can_transition`] gate rejected the stamp;
+    /// the leaf is untouched.
+    Rejected {
+        from: PresentationMode,
+        to: PresentationMode,
+    },
+}
+
+impl std::fmt::Display for FloatingToggleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownCommand(cmd) => write!(f, "unknown floating toggle command: {cmd}"),
+            Self::LeafNotFound(id) => write!(f, "floating toggle target not found: {id}"),
+            Self::UnsupportedMode { current } => {
+                write!(
+                    f,
+                    "floating toggle needs a tiled or floating leaf, found {current}"
+                )
+            }
+            Self::Rejected { from, to } => {
+                write!(f, "floating transition rejected: {from} -> {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FloatingToggleError {}
+
+/// Toggles leaf `target` between [`PresentationMode::Tiled`] and
+/// [`PresentationMode::Floating`] through the CW-08 single gate.
+///
+/// Returns the new mode. Leaves in any other mode fail with
+/// [`FloatingToggleError::UnsupportedMode`]; gate rejections fail with
+/// [`FloatingToggleError::Rejected`]; both leave the tree untouched.
+pub fn toggle_floating(
+    tree: &mut crate::layout::LayoutNode,
+    target: crate::view::ViewId,
+) -> Result<PresentationMode, FloatingToggleError> {
+    let leaf = tree
+        .find_leaf(target)
+        .ok_or(FloatingToggleError::LeafNotFound(target))?;
+    let next = match leaf.presentation() {
+        PresentationMode::Tiled => PresentationMode::Floating,
+        PresentationMode::Floating => PresentationMode::Tiled,
+        current => return Err(FloatingToggleError::UnsupportedMode { current }),
+    };
+    let leaf = tree
+        .find_leaf_mut(target)
+        .ok_or(FloatingToggleError::LeafNotFound(target))?;
+    let from = leaf.presentation();
+    if !PresentationMode::request_transition(leaf, next) {
+        return Err(FloatingToggleError::Rejected { from, to: next });
+    }
+    Ok(next)
+}
+
+/// Applies workspace command `command` as a floating toggle on leaf
+/// `target` (UX-03 command-registry path).
+///
+/// Only [`FLOATING_CMD_TOGGLE`] is accepted; anything else fails with
+/// [`FloatingToggleError::UnknownCommand`] and touches nothing. Otherwise
+/// delegates to [`toggle_floating`].
+pub fn apply_floating_toggle(
+    tree: &mut crate::layout::LayoutNode,
+    command: &str,
+    target: crate::view::ViewId,
+) -> Result<PresentationMode, FloatingToggleError> {
+    if command != FLOATING_CMD_TOGGLE {
+        return Err(FloatingToggleError::UnknownCommand(command.to_owned()));
+    }
+    toggle_floating(tree, target)
+}
+
 /// Error for [`apply_presentation_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresentationCommandError {
@@ -455,5 +558,86 @@ mod tests {
             base.layout_with_gaps(bounds, crate::geometry::Gaps::ZERO),
             stamped.layout_with_gaps(bounds, crate::geometry::Gaps::ZERO)
         );
+    }
+
+    #[test]
+    fn floating_toggle_roundtrip_restores_allocation() {
+        // UX-03 (Mod+V): Tiled ⇄ Floating through the CW-08 gate; the
+        // solver ignores the stamp so allocations are byte-identical and
+        // the slot restores automatically.
+        use crate::geometry::{Rect, SplitAxis};
+        use crate::layout::LayoutNode;
+        use crate::view::{View, ViewId};
+
+        let bounds = Rect::new(0, 0, 80, 24);
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        );
+        let before = tree.layout(bounds);
+        assert_eq!(
+            toggle_floating(&mut tree, ViewId::new(1)).expect("to floating"),
+            PresentationMode::Floating
+        );
+        assert_eq!(
+            tree.find_leaf(ViewId::new(1)).expect("leaf").presentation(),
+            PresentationMode::Floating
+        );
+        assert_eq!(tree.layout(bounds), before);
+        assert_eq!(
+            toggle_floating(&mut tree, ViewId::new(1)).expect("to tiled"),
+            PresentationMode::Tiled
+        );
+        assert_eq!(
+            tree.find_leaf(ViewId::new(1)).expect("leaf").presentation(),
+            PresentationMode::Tiled
+        );
+        assert_eq!(tree.layout(bounds), before);
+    }
+
+    #[test]
+    fn floating_toggle_routes_through_registry_and_rejects() {
+        use crate::layout::LayoutNode;
+        use crate::view::{View, ViewId};
+
+        let mut registry = crate::panel::CommandRegistry::new();
+        let owner = crate::panel::PanelId::new(3);
+        registry
+            .register(owner, FLOATING_CMD_TOGGLE)
+            .expect("toggle command registers");
+        assert_eq!(registry.owner_of(FLOATING_CMD_TOGGLE), Some(owner));
+
+        let id = ViewId::new(5);
+        let mut tree = LayoutNode::leaf(View::new(id, 80, 24));
+        assert_eq!(
+            apply_floating_toggle(&mut tree, FLOATING_CMD_TOGGLE, id).expect("toggle"),
+            PresentationMode::Floating
+        );
+        // Unknown command touches nothing.
+        let before = tree.clone();
+        assert!(matches!(
+            apply_floating_toggle(&mut tree, "bitty.workspace:nope", id),
+            Err(FloatingToggleError::UnknownCommand(_))
+        ));
+        assert_eq!(tree, before);
+        // Missing leaf touches nothing.
+        assert!(matches!(
+            apply_floating_toggle(&mut tree, FLOATING_CMD_TOGGLE, ViewId::new(404)),
+            Err(FloatingToggleError::LeafNotFound(_))
+        ));
+        assert_eq!(tree, before);
+        // Fullscreen/Scratchpad leaves have their own commands: the toggle
+        // refuses them without stamping.
+        for mode in [PresentationMode::Fullscreen, PresentationMode::Scratchpad] {
+            let other = LayoutNode::leaf(View::with_presentation(id, 80, 24, mode));
+            let mut tree = other.clone();
+            assert_eq!(
+                toggle_floating(&mut tree, id),
+                Err(FloatingToggleError::UnsupportedMode { current: mode })
+            );
+            assert_eq!(tree, other);
+        }
     }
 }

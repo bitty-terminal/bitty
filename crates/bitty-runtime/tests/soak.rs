@@ -22,9 +22,14 @@
 //! GPU legs are `#[cfg(unix)]` / env-gated and skip gracefully when the
 //! resource is absent, so CI stays green.
 //!
-//! The hyprctl+grim capture leg is documented in the manual smoke checklist
-//! (`docs/product/manual-smoke.md`) and is **not** automated here (it requires
-//! a live Hyprland session).
+//! The hyprctl+grim capture leg is automated by the PERF-09 soak chain
+//! (`scripts/real-render-soak.sh`, planned by
+//! `crates/bitty-perf/src/real_soak.rs` with the runbook at
+//! `crates/bitty-perf/baselines/real-soak-evidence.md`): on a Tier 1
+//! Hyprland host the script drives a real window, screenshots it with
+//! `grim`, and pairs every pixel capture with a DevTools-preferred
+//! `bitty ctl terminal text` snapshot plus an RSS sample. The headless
+//! legs below stay the CI-verifiable half of that chain.
 //!
 //! This file proves the same bytes->snapshot->present
 //! plumbing that hyprctl+grim would screenshot, via `headless_rgba`.

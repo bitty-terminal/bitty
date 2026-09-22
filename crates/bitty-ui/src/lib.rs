@@ -113,6 +113,15 @@
 //!   `panel` -> `panel.open/move/close`): Lua sets targets, Rust
 //!   interpolates, reduced motion is mandatory, zero wakeups at rest
 //!   (UX-23, CTX-0671, candidate).
+//! - PW panel series (UX-06/UX-07/UX-08/UX-10/UX-11/UX-12, CTX-0684,
+//!   candidate): [`panel_identity`] (stable identity vs physical slots,
+//!   opaque handles, `Mod`+Number reseat — the one unblocked item),
+//!   [`panel_persist`] (restart manifest + policy, decision `RFC-OQ-9`
+//!   open), [`workspace_guard`] (never-empty close policies + focus
+//!   reconciliation, decision `OQ-058` open), [`drag_bar`] (drag-to-Bar
+//!   zones + undo, `OQ-052` open), [`panel_lua`] (Lua command/query/event
+//!   descriptors under capabilities, `OQ-056` open), and [`tab_strip`]
+//!   (tab bar as a Panel projection, `OQ-052` open).
 
 //!
 //! # Determinism
@@ -142,12 +151,16 @@ pub mod budget;
 pub mod canvas;
 pub mod decoration;
 pub mod drag;
+pub mod drag_bar;
 pub mod focus;
 pub mod geometry;
 pub mod gesture;
 pub mod layout;
 pub mod motion;
 pub mod panel;
+pub mod panel_identity;
+pub mod panel_lua;
+pub mod panel_persist;
 pub mod panel_rehydrate;
 pub mod panel_rules;
 pub mod panel_state;
@@ -158,12 +171,14 @@ pub mod scratchpad;
 pub mod scrollbar;
 pub mod search;
 pub mod selection;
+pub mod tab_strip;
 pub mod theme;
 pub mod ui_levels;
 pub mod uitree;
 pub mod view;
 pub mod widget_mech;
 pub mod window_chrome;
+pub mod workspace_guard;
 
 pub mod workspace_scene;
 
@@ -207,6 +222,11 @@ pub use drag::{
     apply_tiled_resize, detect_resize_edge, move_leaf_to_workspace, resize_floating_rect,
     workspace_drop_target,
 };
+pub use drag_bar::{
+    BAR_EDGE_CELLS, BAR_MOVE_CMD, BAR_SPLIT_CMD, BarDropPreview, BarDropSession, BarError,
+    BarOutcome, BarPhase, BarUndoStack, BarZone, MAX_BAR_UNDO, MAX_BAR_WORKSPACES,
+    classify_bar_drop, undo_bar_drop,
+};
 pub use focus::{Focus, FocusDirection};
 pub use geometry::{Gaps, Point, Rect, Size, SplitAxis};
 pub use gesture::{
@@ -226,6 +246,20 @@ pub use panel::{
     MAX_OVERLAY_TEXT_LEN, MAX_OVERLAY_TOOLTIP_LEN, MAX_OVERLAYS_PER_WINDOW, Overlay, OverlayError,
     OverlayKind, OverlayManager, PanelFocus, PanelId, PanelState, PanelType, QualifiedCommand,
     ViewContent, route_input, validate_panel_bounds,
+};
+pub use panel_identity::{
+    IdentityError, IdentityRegistry, MAX_IDENTITY_PANELS, MAX_IDENTITY_SLOTS,
+    MAX_IDENTITY_TITLE_LEN, OpaquePanelHandle, SlotNumber, tab_label,
+};
+pub use panel_lua::{
+    ApiScope, CapabilityGate, LuaApiError, LuaCapability, PANEL_LUA_COMMANDS, PANEL_LUA_EVENTS,
+    PANEL_LUA_QUERIES, PanelApiVersion, PanelLuaCommand, PanelLuaEvent, PanelLuaQuery,
+    lookup_command, validate_spellings,
+};
+pub use panel_persist::{
+    MAX_MANIFEST_LINE_LEN, MAX_PERSIST_PANELS, ManifestError, PERSIST_MANIFEST_VERSION,
+    PersistedPanel, PersistencePolicy, RestartManifest, decode_manifest, encode_manifest,
+    plan_restore,
 };
 pub use panel_rehydrate::{
     MAX_RECORD_LEN, MAX_SNAPSHOT_PANELS, PanelRecord, RehydrateError, RehydrateReport,
@@ -266,6 +300,7 @@ pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
 };
+pub use tab_strip::{MAX_TABS_PER_STRIP, TabCell, TabError, TabScope, TabStrip};
 pub use ui_levels::{
     LevelFlowError, U3_LEVELS_CONTRACT_VERSION, UiLevel, check_flow, level_of, may_depend_on,
 };
@@ -282,6 +317,10 @@ pub use widget_mech::{
 pub use window_chrome::{
     ChromeError, ChromeNotification, ChromeSurface, MAX_NOTIFICATION_TEXT_LEN, MAX_NOTIFICATIONS,
     MAX_OVERLAY_NODES, NotificationId, NotificationSeverity, WindowChromeRuntime,
+};
+pub use workspace_guard::{
+    CloseRequest, CloseResolution, FocusResolution, GuardError, GuardedWorkspace, LastPanelPolicy,
+    MAX_GUARD_PANELS, MAX_GUARDED_WORKSPACES, WorkspaceGuard,
 };
 pub use workspace_scene::{
     ActivityId, ActivityStack, LayerEntry, PanelAttachment, SceneError, SceneLayer,

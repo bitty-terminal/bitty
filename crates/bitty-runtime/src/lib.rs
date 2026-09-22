@@ -209,14 +209,22 @@ pub use config::{
 };
 pub use error::RuntimeError;
 pub use execution::{
-    AttachReceipt, DEFAULT_MAX_JOBS, DeliveryState, EventClass, EventReplay, JobCancel, JobError,
-    JobEvent, JobGrant, JobId, JobIo, JobKind, JobLifetime, JobOperation, JobOrigin, JobPrincipal,
-    JobRegistry, JobSignal, JobSnapshot, JobSpec, JobState, JobStop, JobTimeouts, MAX_EVENT_REPLAY,
-    MAX_GRANTS_PER_JOB, MAX_JOB_ORIGIN_BYTES, MAX_JOB_PRINCIPAL_BYTES, MAX_OUTPUT_BYTES_PER_JOB,
-    MAX_READ_BYTES, MAX_READ_LINES, MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW,
-    MAX_STORED_CRITICAL_EVENTS, MAX_STORED_JOB_EVENTS, MAX_STORED_OBSERVATION_EVENTS,
-    MAX_WRITE_INPUT_BYTES, MAX_WRITE_INPUT_WINDOW_MS, MAX_WRITES_PER_WINDOW, OutputFilter,
-    OutputIndex, OutputStream, OutputView, ReadOutput, SignalOutcome, StoredEvent, TransferReceipt,
+    AdoptedJob, AdoptionKind, AttachReceipt, CheckpointSummary, DEFAULT_MAX_JOBS,
+    DEFAULT_MAX_RUNNING, DaemonError, DeliveryState, EventClass, EventReplay, HANDOFF_FILE_NAME,
+    HandoffOffer, IdAllocator, JobCancel, JobError, JobEvent, JobGrant, JobId, JobIo, JobKind,
+    JobLifetime, JobOperation, JobOrigin, JobPrincipal, JobRegistry, JobSignal, JobSnapshot,
+    JobSpec, JobState, JobStop, JobStore, JobTimeouts, LOGS_DIR_NAME, MANIFEST_FILE_NAME,
+    MAX_EVENT_REPLAY, MAX_GRANTS_PER_JOB, MAX_HANDOFF_BYTES, MAX_HANDOFF_JOBS, MAX_HEARTBEAT_BYTES,
+    MAX_JOB_ORIGIN_BYTES, MAX_JOB_PRINCIPAL_BYTES, MAX_LOG_FILE_BYTES, MAX_MANIFEST_BYTES,
+    MAX_OUTPUT_BYTES_PER_JOB, MAX_PERSISTED_JOBS, MAX_READ_BYTES, MAX_READ_LINES,
+    MAX_SCHEDULE_RUNNING, MAX_SIGNAL_WINDOW_MS, MAX_SIGNALS_PER_WINDOW, MAX_STORED_CRITICAL_EVENTS,
+    MAX_STORED_JOB_EVENTS, MAX_STORED_OBSERVATION_EVENTS, MAX_WRITE_INPUT_BYTES,
+    MAX_WRITE_INPUT_WINDOW_MS, MAX_WRITES_PER_WINDOW, OutputFilter, OutputIndex, OutputStream,
+    OutputView, PERSIST_FORMAT_VERSION, PersistError, PersistedJob, PersistedStore, ReadOutput,
+    ReconciledJob, ResumeCursor, ResumeDecision, STALE_HEARTBEAT_MS, SUPERVISOR_FORMAT_VERSION,
+    SUPERVISOR_HEARTBEAT_NAME, SUPERVISOR_LOCK_NAME, ScheduleDecision, SchedulePolicy,
+    SignalOutcome, StoredEvent, SupervisorDaemon, TransferReceipt, adoption_plan, clear_handoff,
+    read_handoff, reconcile, write_handoff,
 };
 pub use queue::{ColdEvent, ColdQueue};
 pub use runtime::background_images::validate_background_images;

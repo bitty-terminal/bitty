@@ -1,6 +1,7 @@
 //! Phase-2 execution supervisor: async jobs plus bounded output,
-//! reliable event delivery, and capability-scoped operations
-//! (CTX-0511 + CTX-0513 + CTX-0514).
+//! reliable event delivery, capability-scoped operations, persistent
+//! metadata with file-held logs, and the detached-supervisor contract
+//! (CTX-0511 + CTX-0513 + CTX-0514 + CTX-0516).
 //!
 //! This module is the Core-side foundation of the execution-host boundary
 //! (research record 044, captured as DIR-026 in the `bitty-docs` draft
@@ -53,8 +54,15 @@
 //!   are what that boundary calls after authenticating the principal.
 //!   Effective-capability intersection and self-grant prohibition across
 //!   agent/plugin requests is the CTX-0524 seam (noted, not implemented).
-//! - Persistence, restart reconciliation, and a detached supervisor daemon:
-//!   CTX-0516 (Phase 2/3). Registry state is in-memory only.
+//! - Persistence, restart reconciliation, and the detached supervisor
+//!   contract: CTX-0516. [`JobStore`] checkpoints metadata plus the
+//!   metadata-only [`OutputIndex`] into a versioned manifest with retained
+//!   output spilled to per-job log files held by reference (never raw bytes
+//!   in the manifest); [`reconcile`] maps live-at-crash rows onto
+//!   [`ResumeDecision::UnknownOutcome`]; [`SupervisorDaemon`] owns one
+//!   supervised directory at a time with handoff/adoption and
+//!   [`SchedulePolicy`] admission. Grants are re-issued after a restart
+//!   (never persisted) and adoption never respawns by itself.
 //!
 //! # Invariants
 //!
@@ -77,7 +85,9 @@
 mod delivery;
 mod model;
 mod output;
+mod persistence;
 mod registry;
+mod supervisor;
 
 use std::process::{Command, Stdio};
 
@@ -98,7 +108,24 @@ pub use output::{
     MAX_OUTPUT_BYTES_PER_JOB, MAX_READ_BYTES, MAX_READ_LINES, OutputFilter, OutputIndex,
     OutputStream, OutputView, ReadOutput,
 };
+pub use persistence::{
+    CheckpointSummary, IdAllocator, JobStore, PersistError, PersistedJob, PersistedStore,
+    ReconciledJob, ResumeCursor, ResumeDecision, reconcile,
+};
+pub use persistence::{
+    LOGS_DIR_NAME, MANIFEST_FILE_NAME, MAX_LOG_FILE_BYTES, MAX_MANIFEST_BYTES, MAX_PERSISTED_JOBS,
+    PERSIST_FORMAT_VERSION,
+};
 pub use registry::{DEFAULT_MAX_JOBS, JobRegistry, MAX_STORED_JOB_EVENTS};
+pub use supervisor::{
+    AdoptedJob, AdoptionKind, DaemonError, HandoffOffer, ScheduleDecision, SchedulePolicy,
+    SupervisorDaemon, adoption_plan, clear_handoff, read_handoff, write_handoff,
+};
+pub use supervisor::{
+    DEFAULT_MAX_RUNNING, HANDOFF_FILE_NAME, MAX_HANDOFF_BYTES, MAX_HANDOFF_JOBS,
+    MAX_HEARTBEAT_BYTES, MAX_SCHEDULE_RUNNING, STALE_HEARTBEAT_MS, SUPERVISOR_FORMAT_VERSION,
+    SUPERVISOR_HEARTBEAT_NAME, SUPERVISOR_LOCK_NAME,
+};
 
 /// Builds the closed-environment pipe command shared by the CTX-0442
 /// synchronous provider and the job supervisor.

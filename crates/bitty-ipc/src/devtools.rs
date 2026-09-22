@@ -354,6 +354,7 @@ mod automation;
 mod automation_ops;
 mod handlers;
 mod json;
+mod mcp_adapter;
 mod profiling;
 mod record;
 mod serve;
@@ -374,6 +375,10 @@ pub use handlers::{
     publish_frame_rgba, publish_grid_text, publish_input_ring, publish_modifiers,
 };
 pub use json::{DevtoolsRequest, RequestFault, parse_request};
+pub use mcp_adapter::{
+    MCP_ADAPTER_VERSION, MCP_TOOL_PREFIX, debug_method_for_mcp_tool, is_mcp_exposed_debug_method,
+    mcp_denied_debug_methods, mcp_list_tools_json, mcp_tool_for_debug_method, mcp_tool_names,
+};
 pub use profiling::{
     FrameStatsPublish, ProcessStatsPublish, clear_profiling_for_tests, publish_frame_stats,
     publish_process_stats,

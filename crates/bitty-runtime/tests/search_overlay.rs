@@ -350,3 +350,86 @@ fn ctrl_chords_consumed_without_pty_effect() {
     };
     rt.handle_key_event(release);
 }
+
+// M1-14 case toggle (CTX-0665): `Ctrl+T` (or an explicit bind) flips
+// case sensitivity, keeps the query, and holds the navigation place.
+
+#[test]
+fn toggle_case_flips_sensitivity_and_keeps_place() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "Hello hello\n");
+    rt.enter_search_mode();
+    assert_eq!(rt.search_is_case_sensitive(), Some(true));
+    rt.search_set("hello", SearchOptions::default());
+    assert_eq!(rt.search_match_count(), 1);
+    rt.search_toggle_case();
+    assert_eq!(rt.search_is_case_sensitive(), Some(false));
+    assert_eq!(rt.search_pattern(), "hello");
+    assert_eq!(rt.search_match_count(), 2);
+    // Advance to the second match, then toggle back: the narrowed list
+    // wraps the kept index to its head instead of losing it.
+    rt.search_goto_next();
+    assert_eq!(rt.search_current_index(), Some(1));
+    rt.search_toggle_case();
+    assert_eq!(rt.search_is_case_sensitive(), Some(true));
+    assert_eq!(rt.search_match_count(), 1);
+    assert_eq!(rt.search_current_index(), Some(0));
+    assert_eq!(rt.pending_input_len(), 0);
+}
+
+#[test]
+fn toggle_case_noop_when_closed() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "hello\n");
+    assert_eq!(rt.search_is_case_sensitive(), None);
+    rt.search_toggle_case();
+    assert!(!rt.is_search_mode());
+    assert!(!rt.search_is_active());
+}
+
+#[test]
+fn ctrl_t_key_toggles_case_without_pty_effect() {
+    let mut rt = make_runtime();
+    feed_text(&mut rt, "Hello hello\n");
+    rt.enter_search_mode();
+    rt.search_set("hello", SearchOptions::default());
+    assert_eq!(rt.search_match_count(), 1);
+    rt.drain_pending_input();
+    // Hold Ctrl, press t: the overlay toggles instead of editing.
+    rt.handle_key_event(named_key(NamedKey::Control));
+    let out = rt.handle_key_event(char_key("t"));
+    assert!(out.is_none(), "modal must not leak to PTY");
+    assert_eq!(rt.search_pattern(), "hello");
+    assert_eq!(rt.search_is_case_sensitive(), Some(false));
+    assert_eq!(rt.search_match_count(), 2);
+    assert_eq!(rt.pending_input_len(), 0);
+    // Release Ctrl; typing resumes editing the query.
+    let release = KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Control),
+        text: None,
+        location: KeyLocation::Standard,
+        state: PressState::Released,
+        repeat: false,
+        is_synthetic: false,
+    };
+    rt.handle_key_event(release);
+    rt.handle_key_event(char_key("!"));
+    assert_eq!(rt.search_pattern(), "hello!");
+}
+
+#[test]
+fn toggle_case_action_parses_and_canonical() {
+    use bitty_config::ChromeAction;
+    assert_eq!(
+        ChromeAction::parse("search_toggle_case").expect("toggle"),
+        ChromeAction::SearchToggleCase
+    );
+    assert_eq!(
+        ChromeAction::parse("toggle_search_case").expect("alias"),
+        ChromeAction::SearchToggleCase
+    );
+    assert_eq!(
+        ChromeAction::SearchToggleCase.canonical(),
+        "search_toggle_case".to_string()
+    );
+}

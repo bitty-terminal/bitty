@@ -143,6 +143,7 @@ pub mod search;
 pub mod search_mode;
 pub mod selection;
 pub mod session;
+pub mod shell_jump;
 pub mod workspaces;
 
 pub use self::animations::{

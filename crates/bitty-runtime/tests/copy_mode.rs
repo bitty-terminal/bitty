@@ -300,3 +300,116 @@ fn mouse_selection_suppressed_while_active() {
     assert!(rt.selection_text().is_none());
     assert_eq!(rt.pending_input_len(), 0);
 }
+
+// M1-15 scrolled-history selection (CTX-0665): the copy cursor travels
+// into scrollback with the viewport and yank reads history text.
+
+fn feed_history(rt: &mut Runtime, rows: usize) {
+    for i in 0..rows {
+        feed_text(rt, &format!("cmd{i:02} output\r\n"));
+    }
+    feed_text(rt, "live tail");
+}
+
+fn view_offset(rt: &Runtime) -> usize {
+    let vid = rt.focused_view().expect("focused view");
+    rt.layout().find_leaf(vid).expect("leaf").scroll_offset()
+}
+
+fn cursor_is_visible(rt: &Runtime) -> bool {
+    let cur = rt.copy_mode_cursor().expect("cursor");
+    let vid = rt.focused_view().expect("focused view");
+    let view = rt.layout().find_leaf(vid).expect("leaf");
+    cur.row < view.rows() && cur.col < view.cols()
+}
+
+#[test]
+fn page_up_enters_history_with_cursor_visible_no_pty() {
+    let mut rt = make_runtime();
+    let h = rt.state().height();
+    feed_history(&mut rt, h + 8);
+    assert!(rt.state().scrollback_len() > 0);
+    rt.enter_copy_mode();
+    assert!(rt.is_copy_mode());
+    rt.drain_pending_input();
+    assert_eq!(view_offset(&rt), 0);
+    rt.handle_key_event(named_key(NamedKey::PageUp));
+    assert!(rt.is_copy_mode(), "paging keeps copy mode");
+    assert!(view_offset(&rt) > 0, "page up must scroll into history");
+    assert!(cursor_is_visible(&rt), "cursor must stay in view");
+    assert_eq!(rt.pending_input_len(), 0);
+    // Paging back down returns to live with the cursor visible.
+    rt.handle_key_event(named_key(NamedKey::PageDown));
+    assert_eq!(view_offset(&rt), 0, "page down returns to live");
+    assert!(cursor_is_visible(&rt));
+    assert_eq!(rt.pending_input_len(), 0);
+}
+
+#[test]
+fn history_line_visual_yank_copies_history_text() {
+    let mut rt = make_runtime();
+    let h = rt.state().height();
+    feed_history(&mut rt, h + 4);
+    rt.enter_copy_mode();
+    rt.drain_pending_input();
+    rt.handle_key_event(named_key(NamedKey::PageUp));
+    assert!(view_offset(&rt) > 0);
+    // Word motion works on history content (no panic, stays visible).
+    rt.handle_key_event(char_key("0"));
+    rt.handle_key_event(char_key("w"));
+    assert!(cursor_is_visible(&rt));
+    assert_eq!(rt.pending_input_len(), 0);
+    // Line visual over two history rows, then yank.
+    rt.handle_key_event(char_key("V"));
+    assert_eq!(rt.copy_mode_visual_kind(), Some(SelectionKind::Line));
+    // No stale live-grid highlight while scrolled.
+    assert!(rt.selection().is_none());
+    rt.handle_key_event(char_key("j"));
+    rt.handle_key_event(char_key("y"));
+    assert!(!rt.is_copy_mode(), "yank must exit copy mode");
+    let clip = rt.clipboard().headless_contents();
+    assert!(
+        clip.contains("cmd") && clip.contains('\n'),
+        "yanked history lines: {clip:?}"
+    );
+    assert_eq!(rt.primary_contents(), clip);
+    assert_eq!(rt.pending_input_len(), 0, "yank must not reach PTY");
+}
+
+#[test]
+fn history_simple_visual_yank_copies_word() {
+    let mut rt = make_runtime();
+    let h = rt.state().height();
+    feed_history(&mut rt, h + 4);
+    rt.enter_copy_mode();
+    rt.drain_pending_input();
+    rt.handle_key_event(named_key(NamedKey::PageUp));
+    assert!(view_offset(&rt) > 0);
+    rt.handle_key_event(char_key("0"));
+    rt.handle_key_event(char_key("v"));
+    rt.handle_key_event(char_key("w"));
+    rt.handle_key_event(char_key("y"));
+    assert!(!rt.is_copy_mode(), "yank must exit copy mode");
+    let clip = rt.clipboard().headless_contents();
+    assert!(
+        !clip.is_empty() && clip.contains("cmd"),
+        "yanked history word: {clip:?}"
+    );
+    assert_eq!(rt.pending_input_len(), 0);
+}
+
+#[test]
+fn history_yank_without_visual_stays_active() {
+    let mut rt = make_runtime();
+    let h = rt.state().height();
+    feed_history(&mut rt, h + 4);
+    rt.enter_copy_mode();
+    rt.drain_pending_input();
+    rt.handle_key_event(named_key(NamedKey::PageUp));
+    assert!(view_offset(&rt) > 0);
+    // No visual: y is a no-op that stays active (live-path parity).
+    rt.handle_key_event(char_key("y"));
+    assert!(rt.is_copy_mode());
+    assert_eq!(rt.clipboard().headless_contents(), "");
+    assert_eq!(rt.pending_input_len(), 0);
+}

@@ -727,6 +727,11 @@ pub enum ChromeAction {
     /// this action lets users bind an explicit closer. Fail-closed no-op
     /// when search is inactive.
     CloseSearch,
+    /// Toggle search case sensitivity (`search_toggle_case`, M1-14 CTX-0665).
+    ///
+    /// No default binding: driven from the overlay (`Ctrl+T`) or via an
+    /// explicit user bind. Fail-closed no-op when search is inactive.
+    SearchToggleCase,
     /// Toggle the command palette overlay (`toggle_palette`, CTX-0647 issue #1003).
     ///
     /// Manual open only: this action is never in [`DEFAULT_KEYMAPS`], so a
@@ -882,6 +887,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::CloseSearch)
             }
+            "search_toggle_case" | "toggle_search_case" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::SearchToggleCase)
+            }
             "toggle_palette" | "open_palette" | "palette_toggle" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePalette)
@@ -926,13 +935,14 @@ impl ChromeAction {
             Self::SearchNext => "search_next".to_string(),
             Self::SearchPrev => "search_prev".to_string(),
             Self::CloseSearch => "close_search".to_string(),
+            Self::SearchToggleCase => "search_toggle_case".to_string(),
             Self::TogglePalette => "toggle_palette".to_string(),
         }
     }
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {

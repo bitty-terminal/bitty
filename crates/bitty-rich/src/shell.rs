@@ -19,8 +19,13 @@ pub const SHELL_ZONE_MAX: usize = ZONE_RECORDS_MAX;
 /// may emit subsets; fields are `Option` to capture partial signals. Each
 /// region is bounded by the ordinals that produced it, not by grid rows.
 /// `OutputEnd` may carry an exit code (`OSC 133;D;code`).
-/// A future RFC may add row anchoring; this draft keeps the headless log
-/// view and groups by ordinal sequence only.
+///
+/// Row anchors (M1-18, CTX-0665): each `*_row` resolves the corresponding
+/// marker through [`State::zone_buffer_row`] at build time, anchoring the
+/// command block to stable scrollback identity for prompt-jump and fold.
+/// A row is `None` when its marker no longer resolves (pruned, cleared,
+/// resized, or recorded on the other screen) while the ordinal is still
+/// retained — ordinal presence and row presence are independent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommandRegion {
     /// Ordinal of the `PromptStart` (`A`) that opened this command, if seen.
@@ -33,6 +38,14 @@ pub struct CommandRegion {
     pub output_end: Option<u64>,
     /// Exit status for the command, if reported via `OSC 133;D;code`.
     pub exit_code: Option<i32>,
+    /// Current buffer row of the `PromptStart` marker, if resolvable.
+    pub prompt_row: Option<usize>,
+    /// Current buffer row of the `InputStart` marker, if resolvable.
+    pub input_row: Option<usize>,
+    /// Current buffer row of the `OutputStart` marker, if resolvable.
+    pub output_row: Option<usize>,
+    /// Current buffer row of the `OutputEnd` marker, if resolvable.
+    pub output_end_row: Option<usize>,
 }
 
 impl CommandRegion {
@@ -91,72 +104,134 @@ impl ShellIntegration {
     /// next one. Markers that do not start a region (`B`/`C`/`D`) attach
     /// to the current region, or to a fresh implicit region when no region
     /// is open.
+    ///
+    /// Row anchors resolve at build time through
+    /// [`State::zone_buffer_row`]: regions are a snapshot of where each
+    /// marker sits *now*, so callers re-query after scroll or prune
+    /// rather than caching rows.
     #[must_use]
     pub fn command_regions(state: &State) -> Vec<CommandRegion> {
+        /// Working region holding the winning record per slot (first wins,
+        /// mirroring the ordinal grouping below).
+        struct Work {
+            prompt: Option<ZoneRecord>,
+            input: Option<ZoneRecord>,
+            output: Option<ZoneRecord>,
+            output_end: Option<ZoneRecord>,
+        }
+
+        impl Work {
+            fn is_empty(&self) -> bool {
+                self.prompt.is_none()
+                    && self.input.is_none()
+                    && self.output.is_none()
+                    && self.output_end.is_none()
+            }
+
+            fn finish(self, state: &State) -> Option<CommandRegion> {
+                if self.is_empty() {
+                    return None;
+                }
+                let row = |r: Option<ZoneRecord>| r.and_then(|rec| state.zone_buffer_row(&rec));
+                let ord = |r: Option<ZoneRecord>| r.map(|rec| rec.ordinal);
+                Some(CommandRegion {
+                    prompt_start: ord(self.prompt),
+                    input_start: ord(self.input),
+                    output_start: ord(self.output),
+                    output_end: ord(self.output_end),
+                    exit_code: self.output_end.and_then(|rec| rec.exit_code),
+                    prompt_row: row(self.prompt),
+                    input_row: row(self.input),
+                    output_row: row(self.output),
+                    output_end_row: row(self.output_end),
+                })
+            }
+        }
+
         let mut regions: Vec<CommandRegion> = Vec::new();
-        let mut current: Option<CommandRegion> = None;
+        let mut current: Option<Work> = None;
 
         for record in state.zones().copied() {
             match record.kind {
                 ZoneKind::PromptStart => {
-                    if let Some(region) = current.take() {
-                        if !region.is_empty() {
-                            regions.push(region);
-                        }
+                    if let Some(work) = current.take() {
+                        regions.extend(work.finish(state));
                     }
-                    current = Some(CommandRegion {
-                        prompt_start: Some(record.ordinal),
-                        input_start: None,
-                        output_start: None,
+                    current = Some(Work {
+                        prompt: Some(record),
+                        input: None,
+                        output: None,
                         output_end: None,
-                        exit_code: None,
                     });
                 }
                 ZoneKind::InputStart => {
-                    let entry = current.get_or_insert(CommandRegion {
-                        prompt_start: None,
-                        input_start: None,
-                        output_start: None,
+                    let entry = current.get_or_insert(Work {
+                        prompt: None,
+                        input: None,
+                        output: None,
                         output_end: None,
-                        exit_code: None,
                     });
-                    if entry.input_start.is_none() {
-                        entry.input_start = Some(record.ordinal);
+                    if entry.input.is_none() {
+                        entry.input = Some(record);
                     }
                 }
                 ZoneKind::OutputStart => {
-                    let entry = current.get_or_insert(CommandRegion {
-                        prompt_start: None,
-                        input_start: None,
-                        output_start: None,
+                    let entry = current.get_or_insert(Work {
+                        prompt: None,
+                        input: None,
+                        output: None,
                         output_end: None,
-                        exit_code: None,
                     });
-                    if entry.output_start.is_none() {
-                        entry.output_start = Some(record.ordinal);
+                    if entry.output.is_none() {
+                        entry.output = Some(record);
                     }
                 }
                 ZoneKind::OutputEnd => {
-                    let entry = current.get_or_insert(CommandRegion {
-                        prompt_start: None,
-                        input_start: None,
-                        output_start: None,
+                    let entry = current.get_or_insert(Work {
+                        prompt: None,
+                        input: None,
+                        output: None,
                         output_end: None,
-                        exit_code: None,
                     });
                     if entry.output_end.is_none() {
-                        entry.output_end = Some(record.ordinal);
-                        entry.exit_code = record.exit_code;
+                        entry.output_end = Some(record);
                     }
                 }
             }
         }
-        if let Some(region) = current {
-            if !region.is_empty() {
-                regions.push(region);
-            }
+        if let Some(work) = current {
+            regions.extend(work.finish(state));
         }
         regions
+    }
+
+    /// Command-block row spans for prompt-jump and fold (M1-18, CTX-0665).
+    ///
+    /// Returns one `(start, end)` buffer-row span per resolvable
+    /// `PromptStart`, oldest first: `start` is the prompt's resolved row
+    /// and `end` is the next prompt's row, or the buffer end
+    /// (`scrollback_len + height`) for the last block. Unresolvable
+    /// prompts contribute no span; an empty prompt log yields no spans.
+    /// Bounded (at most one span per retained prompt) and deterministic.
+    #[must_use]
+    pub fn command_block_rows(state: &State) -> Vec<(usize, usize)> {
+        let mut starts: Vec<usize> = state
+            .zones()
+            .copied()
+            .filter(|record| record.kind == ZoneKind::PromptStart)
+            .filter_map(|record| state.zone_buffer_row(&record))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let end = state.scrollback_len() + state.height();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let stop = starts.get(i + 1).copied().unwrap_or(end);
+                (*start, stop.max(*start))
+            })
+            .collect()
     }
 
     /// Convenience: prompt markers (`A`) oldest first.
@@ -293,5 +368,104 @@ mod tests {
         });
         let zones = ShellIntegration::zones(&state);
         assert_eq!(zones[0].exit_code, None);
+    }
+
+    // M1-18 row anchors (CTX-0665).
+    use bitty_vt::{ControlChar, GraphemeCell};
+
+    fn feed_shell_line(state: &mut State, text: &str) {
+        for ch in text.chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    }
+
+    #[test]
+    fn regions_carry_live_row_anchors() {
+        let mut state = State::new();
+        mark(&mut state, ZoneKind::PromptStart);
+        for ch in "cmd".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        mark(&mut state, ZoneKind::InputStart);
+        mark(&mut state, ZoneKind::OutputStart);
+        mark_with_exit(&mut state, 3);
+        let regions = ShellIntegration::command_regions(&state);
+        assert_eq!(regions.len(), 1);
+        let region = &regions[0];
+        assert!(region.prompt_start.is_some());
+        assert_eq!(region.exit_code, Some(3));
+        // All four marks landed on the live cursor row: rows resolve and
+        // agree with each other.
+        let rows = [
+            region.prompt_row,
+            region.input_row,
+            region.output_row,
+            region.output_end_row,
+        ];
+        assert!(rows.iter().all(|r| r.is_some()), "rows: {rows:?}");
+        assert!(rows.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn regions_track_prompts_into_scrollback() {
+        let mut state = State::new();
+        mark(&mut state, ZoneKind::PromptStart);
+        feed_shell_line(&mut state, "first command");
+        mark(&mut state, ZoneKind::PromptStart);
+        feed_shell_line(&mut state, "second command");
+        let h = state.height();
+        for i in 0..(h + 2) {
+            feed_shell_line(&mut state, &format!("filler{i:02}"));
+        }
+        assert!(state.scrollback_len() > 0);
+        let regions = ShellIntegration::command_regions(&state);
+        assert_eq!(regions.len(), 2);
+        let first = regions[0].prompt_row.expect("first row");
+        let second = regions[1].prompt_row.expect("second row");
+        assert!(first < state.scrollback_len(), "first prompt is history");
+        assert!(first < second, "prompts stay ordered");
+        // Block spans partition the buffer in order for jump/fold.
+        let blocks = ShellIntegration::command_block_rows(&state);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, first);
+        assert_eq!(blocks[0].1, second);
+        assert_eq!(blocks[1].0, second);
+        assert_eq!(blocks[1].1, state.scrollback_len() + state.height());
+        for pair in blocks.windows(2) {
+            assert!(pair[0].0 < pair[1].0);
+        }
+    }
+
+    #[test]
+    fn pruned_prompt_keeps_ordinal_but_loses_row() {
+        let mut state = State::with_scrollback_lines(2);
+        mark(&mut state, ZoneKind::PromptStart);
+        feed_shell_line(&mut state, "doomed command");
+        let h = state.height();
+        for i in 0..(h + 8) {
+            feed_shell_line(&mut state, &format!("churn{i:02}"));
+        }
+        let regions = ShellIntegration::command_regions(&state);
+        assert_eq!(regions.len(), 1, "ordinal log still groups");
+        assert!(
+            regions[0].prompt_start.is_some(),
+            "ordinal retained (zone cap)"
+        );
+        assert_eq!(
+            regions[0].prompt_row, None,
+            "pruned line resolves to no row"
+        );
+        assert!(
+            ShellIntegration::command_block_rows(&state).is_empty(),
+            "no span without a resolvable prompt"
+        );
+    }
+
+    #[test]
+    fn empty_log_has_no_regions_or_blocks() {
+        let state = State::new();
+        assert!(ShellIntegration::command_regions(&state).is_empty());
+        assert!(ShellIntegration::command_block_rows(&state).is_empty());
     }
 }

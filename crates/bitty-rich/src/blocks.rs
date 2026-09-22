@@ -182,7 +182,8 @@ pub enum CommandState {
 
 /// One semantic command: stable identity plus ordinal-anchored ranges.
 ///
-/// Bridged from [`CommandRegion`] (ordinal groups) without row numbers.
+/// Bridged from [`CommandRegion`] (ordinal groups); the region's resolved
+/// row anchors (`prompt_row`, …) ride along for jump/fold consumers.
 /// `cwd` is the observation-time `OSC 7` report (`State::cwd_report`,
 /// verbatim clone, `<=4096` bytes enforced at the parser boundary), shared
 /// by every block derived in the same call; per-command cwd history awaits a
@@ -483,8 +484,9 @@ mod tests {
     }
 
     #[test]
-    fn command_region_records_ordinals_not_rows() {
-        // Proof: CommandRegion is ordinal-keyed (008 section 2 premise).
+    fn command_region_records_ordinals_plus_row_anchors() {
+        // Regions are ordinal-grouped (008 section 2 premise); M1-18
+        // (CTX-0665) adds resolved row anchors for jump/fold consumers.
         let mut state = State::new();
         full_cycle(&mut state, 0);
         let regions = ShellIntegration::command_regions(&state);
@@ -496,9 +498,16 @@ mod tests {
         assert_eq!(region.output_start, Some(3));
         assert_eq!(region.output_end, Some(4));
         assert_eq!(region.exit_code, Some(0));
-        // No row field exists: the struct surface is exactly these ordinals.
-        let debug = format!("{region:?}");
-        assert!(!debug.contains("row"), "region must not mention rows");
+        // All four marks landed on the live cursor row without printing:
+        // every row anchor resolves and they agree with each other.
+        let rows = [
+            region.prompt_row,
+            region.input_row,
+            region.output_row,
+            region.output_end_row,
+        ];
+        assert!(rows.iter().all(|r| r.is_some()), "rows: {rows:?}");
+        assert!(rows.windows(2).all(|w| w[0] == w[1]));
     }
 
     #[test]
@@ -756,17 +765,21 @@ mod tests {
     }
 
     #[test]
-    fn no_row_numbers_anywhere_in_block_surface() {
+    fn block_identity_is_ordinal_keyed_rows_ride_along() {
+        // Identity (id, ranges) is ordinal-derived and geometry-free;
+        // row anchors exist only on `region` for jump/fold consumers and
+        // never feed identity (M1-18, CTX-0665).
         let mut state = State::new();
         full_cycle(&mut state, 0);
         let all = blocks(&state);
         assert_eq!(all.len(), 1);
-        let debug = format!("{:?}", all[0]);
-        assert!(
-            !debug.contains("row"),
-            "CommandBlock must not key on rows: {debug}"
-        );
+        assert_eq!(all[0].id, CommandId(1));
+        assert_eq!(all[0].command_range.start_ordinal, 1);
+        assert_eq!(all[0].command_range.end_ordinal, 4);
         let range_debug = format!("{:?}", all[0].command_range);
         assert!(range_debug.contains("ordinal"));
+        // The row anchor resolves (marks share the live cursor row) but
+        // stays off the identity surface.
+        assert!(all[0].region.prompt_row.is_some());
     }
 }

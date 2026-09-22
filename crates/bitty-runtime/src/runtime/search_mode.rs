@@ -125,6 +125,46 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
+    /// Whether the overlay query matches case-sensitively (`None` when closed).
+    ///
+    /// Chrome-layer readout for the M1-14 case toggle (CTX-0665).
+    #[must_use]
+    pub fn search_is_case_sensitive(&self) -> Option<bool> {
+        if !self.search_mode {
+            return None;
+        }
+        Some(self.search_state.options().case_sensitive)
+    }
+
+    /// Toggles case sensitivity of the overlay query (M1-14, CTX-0665).
+    ///
+    /// Flips `case_sensitive`, re-runs the bounded search over the same
+    /// pattern, and keeps the navigation position stable: the previous
+    /// current index is clamped into the new match list (via wrapping
+    /// `advance` from the reset head), then revealed with live-selection
+    /// sync. Fail-closed no-op when the overlay is closed. Driven from
+    /// the overlay (`Ctrl+T`) or an explicit `search_toggle_case` bind.
+    pub fn search_toggle_case(&mut self) {
+        if !self.search_mode {
+            return;
+        }
+        let prev_index = self.search_state.current_index();
+        let pattern = self.search_state.pattern().to_string();
+        let opts = self.search_state.options();
+        let next = SearchOptions::new(!opts.case_sensitive, opts.max_results);
+        self.search_state.set_search(&self.state, &pattern, next);
+        // `set_search` resets current to the head; restore the clamped
+        // position so toggling does not lose the user's place.
+        if let Some(idx) = prev_index {
+            if self.search_state.match_count() > 0 {
+                self.search_state.advance(idx as isize);
+            }
+        }
+        self.search_reveal_current();
+        let _ = self.search_apply_selection();
+        self.pending_full_redraw = true;
+    }
+
     /// Reveals the current match in the focused viewport.
     ///
     /// Scrolls the focused view minimally so the current match becomes
@@ -308,7 +348,8 @@ impl Runtime {
     /// Character-key dispatch for the search overlay.
     ///
     /// Single printable chars (no Ctrl/Alt) append to the bounded query.
-    /// `Ctrl`-held chords are consumed without effect so shell control
+    /// `Ctrl+T` toggles case sensitivity (M1-14, CTX-0665); every other
+    /// `Ctrl`-held chord is consumed without effect so shell control
     /// bytes (SIGINT, etc.) never leak while modal. `Alt`-held chords are
     /// chrome-owned and consumed without effect. Multi-char compositions
     /// (IME shape) are no-ops while modal.
@@ -317,8 +358,15 @@ impl Runtime {
         if self.alt_pressed {
             return;
         }
-        // Any Ctrl-held chord is consumed without effect (no control bytes
-        // to the PTY while modal).
+        // The platform reports `Ctrl+T` either as control-held `t` or as
+        // `0x14`; both map here through the caller's modifier mirror
+        // (same shape as the copy-mode `Ctrl+V` precedent).
+        if self.control_pressed && (text == "t" || text == "T" || text == "\u{14}") {
+            self.search_toggle_case();
+            return;
+        }
+        // Any other Ctrl-held chord is consumed without effect (no control
+        // bytes to the PTY while modal).
         if self.control_pressed {
             return;
         }

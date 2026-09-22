@@ -121,7 +121,14 @@ impl State {
             if let Some(code) = record.exit_code {
                 h.u32(code as u32);
             }
+            // M1-18 anchors are observable (jump targets), so they
+            // participate in the hash like the rest of the record.
+            h.u64(record.buffer_row as u64);
+            h.u64(record.evicted_at_mark);
+            h.u64(record.epoch_at_mark);
+            h.option_tag(record.on_alt_screen);
         }
+        h.u64(self.buffer_epoch);
 
         h.u64(self.scrollback.next_line_id());
         h.u64(self.scrollback.total_written());

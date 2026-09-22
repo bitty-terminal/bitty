@@ -6,28 +6,38 @@
 //! preservation). No new dependencies.
 //!
 //! Design (scoped, fail-closed, bounded `O(1)` state):
-//! - `CopyModeState` holds a live-grid cursor plus an optional visual anchor
-//!   and kind. The cursor lives in snapshot grid coordinates and is always
-//!   clamped plus wide-snapped, so every motion is total over all inputs.
+//! - `CopyModeState` holds a cursor plus an optional visual anchor
+//!   and kind. The cursor lives in *cursor-space* snapshot coordinates
+//!   and is always clamped plus wide-snapped, so every motion is total
+//!   over all inputs.
+//! - Cursor space is the live grid while the focused view is live, and
+//!   the focused viewport (scrollback history composited with the live
+//!   grid via `View::visible_cells`) while it is scrolled into history
+//!   (M1-15, CTX-0665): the same motions drive both, so history rows are
+//!   navigable and selectable with the keyboard, and yank reads the
+//!   visible buffer text. While scrolled the live-grid `selection` stays
+//!   `None` (the draw path skips stale highlights there); the visual
+//!   lives in `CopyModeState` and is materialized at yank time.
 //! - While copy mode is active the runtime consumes all non-modifier key
 //!   presses (no PTY bytes, no viewport snap-to-live, no mouse-selection
 //!   clearing). Mouse selection and SGR wheel forwarding are suppressed;
-//!   viewport paging via keyboard still scrolls for history viewing.
+//!   viewport paging via keyboard moves through history with the cursor.
 //! - Visual `v` selects [`SelectionKind::Simple`], `V` selects
 //!   [`SelectionKind::Line`] (via [`Selection::line_drag`]), `Ctrl+V`
 //!   selects [`SelectionKind::Block`]. Yank (`y`/`Enter`) copies through the
 //!   existing clipboard plus primary paths, then exits.
-//! - Live-grid scope: the cursor and visual selection address the live
-//!   snapshot (the same grid the mouse path selects). `PgUp`/`PgDn` scroll
-//!   the focused viewport for history viewing; selecting scrolled-off
-//!   history rows is a follow-up (buffer-anchored copy).
+//! - History highlight rendering in the draw path is a follow-up: yank is
+//!   exact today, while the painted highlight still covers the live
+//!   window only (the present path skips selection paint when scrolled).
 use super::*;
 use bitty_ui::is_word_char;
 
 /// Bounded copy-mode state (`O(1)`: three small values, no heap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyModeState {
-    /// Live-grid cursor (clamped plus wide-snapped).
+    /// Cursor in cursor-space coordinates (live grid while the focused
+    /// view is live, focused-viewport rows while it is scrolled into
+    /// history). Always clamped plus wide-snapped.
     pub cursor: CellPos,
     /// Visual anchor when a visual selection is active.
     pub anchor: Option<CellPos>,
@@ -53,6 +63,64 @@ impl CopyModeState {
     }
 }
 
+/// Cursor-space snapshot plus the buffer row of its row 0.
+///
+/// M1-15 history support (CTX-0665): while the focused view is scrolled
+/// into history the copy cursor addresses viewport rows, so motions read
+/// the composited viewport (`View::visible_cells`: history plus live
+/// grid) instead of the live snapshot. While live this is exactly the
+/// live snapshot at buffer origin `scrollback_len`, preserving the
+/// pre-history behavior bit-for-bit.
+struct CopySpace {
+    snapshot: Snapshot,
+    /// Combined buffer row shown at snapshot row 0.
+    origin: usize,
+    /// Grid column shown at snapshot column 0 (viewport `col_offset`).
+    col_origin: usize,
+}
+
+impl Runtime {
+    /// Whether the copy cursor currently addresses scrolled history
+    /// (focused view offset nonzero and resolvable).
+    fn is_copy_space_scrolled(&self) -> bool {
+        self.focused_view()
+            .and_then(|id| self.layout.find_leaf(id))
+            .is_some_and(|view| view.scroll_offset() != 0)
+    }
+
+    /// Builds the cursor-space snapshot for copy motions.
+    fn copy_space(&self) -> CopySpace {
+        if let Some(id) = self.focused_view() {
+            if let Some(view) = self.layout.find_leaf(id) {
+                if view.scroll_offset() != 0 {
+                    let rows = view.rows() as usize;
+                    let cols = view.cols() as usize;
+                    if rows > 0 && cols > 0 {
+                        let sb_len = self.state.scrollback_len();
+                        let total = sb_len + self.state.height();
+                        let offset = view.scroll_offset().min(sb_len);
+                        let origin = total.saturating_sub(rows).saturating_sub(offset);
+                        let mut snapshot = self.state.snapshot();
+                        snapshot.width = cols;
+                        snapshot.height = rows;
+                        snapshot.cells = view.visible_cells(&self.state);
+                        return CopySpace {
+                            snapshot,
+                            origin,
+                            col_origin: view.col_offset() as usize,
+                        };
+                    }
+                }
+            }
+        }
+        CopySpace {
+            snapshot: self.state.snapshot(),
+            origin: self.state.scrollback_len(),
+            col_origin: 0,
+        }
+    }
+}
+
 impl Runtime {
     /// Whether keyboard copy mode is active.
     #[must_use]
@@ -60,7 +128,10 @@ impl Runtime {
         self.copy_mode.is_some()
     }
 
-    /// Copy-mode cursor in live-grid coordinates, if active.
+    /// Copy-mode cursor in cursor-space coordinates, if active.
+    ///
+    /// Live-grid rows while the focused view is live, focused-viewport
+    /// rows while it is scrolled into history (M1-15).
     #[must_use]
     pub fn copy_mode_cursor(&self) -> Option<CellPos> {
         self.copy_mode.map(|c| c.cursor)
@@ -91,9 +162,10 @@ impl Runtime {
 
     /// Enters keyboard copy mode (fail-closed: no-op when already active).
     ///
-    /// The cursor starts at the live terminal cursor (clamped plus
-    /// wide-snapped). Any existing mouse selection is cleared so the copy
-    /// cursor owns the highlight; no PTY bytes are produced.
+    /// The cursor starts at the live terminal cursor, mapped into cursor
+    /// space (clamped into the focused viewport when it is scrolled into
+    /// history) and wide-snapped. Any existing mouse selection is cleared
+    /// so the copy cursor owns the highlight; no PTY bytes are produced.
     pub fn enter_copy_mode(&mut self) {
         if self.copy_mode.is_some() {
             return;
@@ -102,10 +174,18 @@ impl Runtime {
         if self.search_mode {
             self.exit_search_mode();
         }
-        let snap = self.state.snapshot();
-        let term_cursor = snap.cursor.position;
-        let raw = CellPos::new(term_cursor.row, term_cursor.col);
-        let cursor = bitty_ui::snap_to_leading(&snap, clamp_copy_pos(&snap, raw));
+        let term = self.state.snapshot().cursor.position;
+        let space = self.copy_space();
+        let snap = &space.snapshot;
+        let buf_row = self.state.scrollback_len() + term.row as usize;
+        let rel = buf_row
+            .saturating_sub(space.origin)
+            .min(snap.height.saturating_sub(1)) as u16;
+        let col = (term.col as usize)
+            .saturating_sub(space.col_origin)
+            .min(snap.width.saturating_sub(1)) as u16;
+        let raw = CellPos::new(rel, col);
+        let cursor = bitty_ui::snap_to_leading(snap, clamp_copy_pos(snap, raw));
         self.clear_selection();
         self.copy_mode = Some(CopyModeState::new(cursor));
         self.pending_full_redraw = true;
@@ -132,14 +212,54 @@ impl Runtime {
     /// Reuses the existing fail-soft clipboard paths
     /// ([`Self::copy_selection_to_clipboard`] plus
     /// [`Self::copy_selection_to_primary`]) so headless determinism and
-    /// error recording stay identical to the mouse path. Returns the yanked
+    /// error recording stay identical to the mouse path. While the view
+    /// is scrolled into history the visual lives in viewport coordinates
+    /// and is materialized through the composited viewport instead
+    /// ([`Self::copy_mode_yank_viewport`]). Returns the yanked
     /// text, or `None` when no non-empty visual selection exists (stays in
     /// copy mode so the user can adjust).
     pub fn copy_mode_yank(&mut self) -> Option<String> {
         self.copy_mode?;
+        if self.is_copy_space_scrolled() {
+            return self.copy_mode_yank_viewport();
+        }
         let text = self.selection_text()?;
         let _ = self.copy_selection_to_clipboard();
         let _ = self.copy_selection_to_primary();
+        self.exit_copy_mode();
+        Some(text)
+    }
+
+    /// Yanks the copy-mode visual from the scrolled viewport (M1-15).
+    ///
+    /// Materializes the cursor-space visual (focused-viewport coordinates)
+    /// against the current composited viewport through the same CTX-0385
+    /// text algebra as the live path (`text`/`block_text` dispatch, edge
+    /// trim, wide-pair safety), then copies through the same clipboard
+    /// plus primary paths. Fail-soft and bounded like the live yank.
+    fn copy_mode_yank_viewport(&mut self) -> Option<String> {
+        let mode = self.copy_mode?;
+        let (anchor, kind) = mode.anchor.zip(mode.visual_kind)?;
+        let space = self.copy_space();
+        let snap = &space.snapshot;
+        let selection = match kind {
+            SelectionKind::Simple | SelectionKind::Word => Selection::simple(anchor, mode.cursor),
+            SelectionKind::Line => Selection::line_drag(snap, anchor, mode.cursor),
+            SelectionKind::Block => Selection::block(anchor, mode.cursor),
+        };
+        if selection.anchor == selection.focus {
+            return None;
+        }
+        let clamped = selection.clamped(snap).snapped(Some(snap));
+        if clamped.anchor == clamped.focus {
+            return None;
+        }
+        let text = clamped.text(snap);
+        if text.is_empty() {
+            return None;
+        }
+        let _ = self.clipboard.set_text(text.clone());
+        self.set_primary_text(text.clone());
         self.exit_copy_mode();
         Some(text)
     }
@@ -292,10 +412,11 @@ impl Runtime {
             self.pending_full_redraw = true;
             return;
         }
-        let snap = self.state.snapshot();
-        let cursor = bitty_ui::snap_to_leading(&snap, clamp_copy_pos(&snap, mode.cursor));
+        let space = self.copy_space();
+        let snap = &space.snapshot;
+        let cursor = bitty_ui::snap_to_leading(snap, clamp_copy_pos(snap, mode.cursor));
         let selection = match kind {
-            SelectionKind::Line => Selection::line_drag(&snap, cursor, cursor),
+            SelectionKind::Line => Selection::line_drag(snap, cursor, cursor),
             SelectionKind::Block => Selection::block(cursor, cursor),
             SelectionKind::Simple | SelectionKind::Word => Selection::simple(cursor, cursor),
         };
@@ -307,7 +428,11 @@ impl Runtime {
         // A collapsed visual is not a selection yet (mirrors mouse press
         // before drag); store it so rendering can show the cursor anchor
         // without exposing empty text through `selection_text`.
-        if selection.anchor == selection.focus {
+        // While scrolled the live selection stays clear: viewport coords
+        // are not live-grid coords and the draw path skips stale paint
+        // there (the visual survives in `CopyModeState` for yank).
+        let scrolled = self.is_copy_space_scrolled();
+        if selection.anchor == selection.focus || scrolled {
             self.selection = None;
         } else {
             self.selection = Some(selection);
@@ -326,8 +451,8 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let next = step_copy_cursor(&snap, mode.cursor, dx, dy);
+        let space = self.copy_space();
+        let next = step_copy_cursor(&space.snapshot, mode.cursor, dx, dy);
         self.copy_mode_apply_cursor(next);
     }
 
@@ -336,8 +461,9 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let cursor = bitty_ui::snap_to_leading(&snap, clamp_copy_pos(&snap, next));
+        let space = self.copy_space();
+        let snap = &space.snapshot;
+        let cursor = bitty_ui::snap_to_leading(snap, clamp_copy_pos(snap, next));
         let Some(anchor) = mode.anchor else {
             self.copy_mode = Some(CopyModeState::new(cursor));
             // Cursor-only motion clears any stale highlight.
@@ -353,7 +479,7 @@ impl Runtime {
         };
         let selection = match kind {
             SelectionKind::Simple | SelectionKind::Word => Selection::simple(anchor, cursor),
-            SelectionKind::Line => Selection::line_drag(&snap, anchor, cursor),
+            SelectionKind::Line => Selection::line_drag(snap, anchor, cursor),
             SelectionKind::Block => Selection::block(anchor, cursor),
         };
         self.copy_mode = Some(CopyModeState {
@@ -361,35 +487,70 @@ impl Runtime {
             anchor: Some(anchor),
             visual_kind: Some(kind),
         });
-        if selection.anchor == selection.focus {
+        // Viewport coords are not live-grid coords: while scrolled the
+        // live selection stays clear (same rationale as the visual
+        // toggle above); the visual survives in `CopyModeState`.
+        if selection.anchor == selection.focus || self.is_copy_space_scrolled() {
             self.selection = None;
         } else {
-            let clamped = selection.clamped(&snap).snapped(Some(&snap));
+            let clamped = selection.clamped(snap).snapped(Some(snap));
             self.selection = Some(clamped);
         }
         self.selection_dragging = false;
         self.pending_full_redraw = true;
     }
 
-    /// Pages the cursor plus the focused viewport (`PgUp`/`PgDn`).
+    /// Pages the cursor through the combined buffer, keeping it visible.
     ///
-    /// The viewport scroll keeps history viewing keyboard-only; the cursor
-    /// page keeps the motion total even with no scrollback.
+    /// The cursor moves `dir * page` buffer rows (clamped to the buffer)
+    /// and the focused viewport follows minimally so the cursor stays in
+    /// view: paging up from live enters history, paging down returns to
+    /// live. Arrow keys still clamp at the viewport edge; paging is the
+    /// history-travel motion.
     fn copy_mode_page(&mut self, dir: isize) {
         let page = self.copy_mode_page_rows().max(1) as isize;
-        let max = self.state.scrollback_len();
-        if let Some(id) = self.focused_view() {
-            if let Some(view) = self.layout.find_leaf_mut(id) {
-                view.scroll_by(dir * page, max);
-            }
-        }
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let row = (mode.cursor.row as isize + dir * page)
-            .clamp(0, snap.height.saturating_sub(1) as isize) as u16;
-        self.copy_mode_apply_cursor(CellPos::new(row, mode.cursor.col));
+        let total = self.state.scrollback_len() + self.state.height();
+        if total == 0 {
+            return;
+        }
+        let space = self.copy_space();
+        let buf = space.origin + mode.cursor.row as usize;
+        let new_buf = (buf as isize + dir * page).clamp(0, total as isize - 1) as usize;
+        // Follow with the focused viewport when the target leaves it.
+        if let Some(id) = self.focused_view() {
+            if let Some(view) = self.layout.find_leaf_mut(id) {
+                let rows = view.rows() as usize;
+                let max = self.state.scrollback_len();
+                if rows > 0 {
+                    let offset = view.scroll_offset().min(max);
+                    let start = total.saturating_sub(rows).saturating_sub(offset);
+                    let end = start + rows;
+                    if new_buf < start || new_buf >= end {
+                        // Leading edge in the direction of travel: top
+                        // when paging up, bottom when paging down.
+                        let new_start = if dir < 0 {
+                            new_buf
+                        } else {
+                            new_buf + 1 - rows.min(new_buf + 1)
+                        };
+                        let new_offset = total
+                            .saturating_sub(rows)
+                            .saturating_sub(new_start)
+                            .min(max);
+                        view.set_scroll_offset(new_offset, max);
+                    }
+                }
+            }
+        }
+        // Re-resolve the cursor in the (possibly new) cursor space.
+        let space = self.copy_space();
+        let rel = new_buf
+            .saturating_sub(space.origin)
+            .min(space.snapshot.height.saturating_sub(1)) as u16;
+        self.copy_mode_apply_cursor(CellPos::new(rel, mode.cursor.col));
         self.pending_full_redraw = true;
     }
 
@@ -413,8 +574,8 @@ impl Runtime {
 
     /// Jump to the last row, first column.
     fn copy_mode_bottom(&mut self) {
-        let snap = self.state.snapshot();
-        let row = snap.height.saturating_sub(1) as u16;
+        let space = self.copy_space();
+        let row = space.snapshot.height.saturating_sub(1) as u16;
         self.copy_mode_apply_cursor(CellPos::new(row, 0));
     }
 
@@ -431,8 +592,8 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let last = snap.width.saturating_sub(1) as u16;
+        let space = self.copy_space();
+        let last = space.snapshot.width.saturating_sub(1) as u16;
         self.copy_mode_apply_cursor(CellPos::new(mode.cursor.row, last));
     }
 
@@ -441,8 +602,8 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let next = copy_word_forward(&snap, mode.cursor);
+        let space = self.copy_space();
+        let next = copy_word_forward(&space.snapshot, mode.cursor);
         self.copy_mode_apply_cursor(next);
     }
 
@@ -451,8 +612,8 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let next = copy_word_backward(&snap, mode.cursor);
+        let space = self.copy_space();
+        let next = copy_word_backward(&space.snapshot, mode.cursor);
         self.copy_mode_apply_cursor(next);
     }
 
@@ -461,8 +622,8 @@ impl Runtime {
         let Some(mode) = self.copy_mode else {
             return;
         };
-        let snap = self.state.snapshot();
-        let next = copy_word_end(&snap, mode.cursor);
+        let space = self.copy_space();
+        let next = copy_word_end(&space.snapshot, mode.cursor);
         self.copy_mode_apply_cursor(next);
     }
 }

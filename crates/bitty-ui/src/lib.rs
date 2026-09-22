@@ -68,6 +68,16 @@
 //! - [`presentation::toggle_floating`] /
 //!   [`presentation::apply_floating_toggle`] toggle one leaf Tiled ⇄ Floating
 //!   (UX-03, `bitty.workspace:floating-toggle`).
+//! - [`ui_levels`] — U-3 five-level architecture contract (UX-16,
+//!   CTX-0668, candidate): L0 Rust mechanisms -> L1 Lua primitives ->
+//!   L2 core -> L3 domain -> L4 apps, with the downward-only dependency
+//!   flow rule. Governance and versioning are open.
+//! - [`widget_mech`] — U-3 complex-widget mechanism split (UX-17,
+//!   CTX-0668, candidate): Rust-owned virtualization windows, IME
+//!   composition state, scroll offsets, and canvas command budgets keyed
+//!   by the canonical [`uitree::UiNodeId`]; appearance stays Lua-side.
+//!   Headless only: no render, exec, or plugin coupling (beacon-style
+//!   plugin migration recorded as a follow-up in the module docs).
 //!
 //! # Determinism
 //!
@@ -104,8 +114,10 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod theme;
+pub mod ui_levels;
 pub mod uitree;
 pub mod view;
+pub mod widget_mech;
 pub mod workspace_scene;
 
 // Re-exports for ergonomic root access.
@@ -170,11 +182,19 @@ pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
 };
+pub use ui_levels::{
+    LevelFlowError, U3_LEVELS_CONTRACT_VERSION, UiLevel, check_flow, level_of, may_depend_on,
+};
 pub use uitree::{
     ApplyReport, UiChange, UiChangeKind, UiNode, UiNodeId, UiNodeKind, UiTree, UiTreeError,
     a11y_role_of, diff_trees,
 };
 pub use view::{View, ViewId};
+pub use widget_mech::{
+    CanvasMech, MAX_CANVAS_COMMANDS, MAX_CANVAS_DIM_PX, MAX_ITEM_HEIGHT_PX, MAX_SCROLL_CONTENT_PX,
+    MAX_VIEWPORT_PX, MAX_VIRTUAL_ITEMS, ScrollMech, TextInputMech, VirtualListMech,
+    WidgetMechError,
+};
 pub use workspace_scene::{
     ActivityId, ActivityStack, LayerEntry, PanelAttachment, SceneError, SceneLayer,
     TerminalBinding, WorkspaceScene, WorkspaceSceneId,

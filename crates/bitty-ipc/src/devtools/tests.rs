@@ -3899,3 +3899,461 @@ fn frame_hash_serves_digest_only_no_pixel_channel() {
     clear_automation_for_tests();
     clear_introspection_for_tests();
 }
+
+// ── DT batch2 (CTX-0685): transport hardening + contract + MCP + A3 ──────
+//
+// Closes #1109 (DT-13), #1107 (DT-11), #1106 (DT-10), #1103 (DT-07/A3).
+// Each section pins one issue's acceptance so the four sub-issues stay
+// machine-checked from the wire side. All bounds mirror the sibling
+// `bitty-devtools` repo (read-only here, never modified).
+
+// ── DT-13 (#1109): transport hardening follow-ups ─────────────────────────
+//
+// Regression pins for the CTX-0528..0531/0539/0540/0544 hardening line:
+// frame bound, JSON depth, RC-9 rate/connection caps, endpoint modes,
+// portable socket bound, envelope bounds, and the shared control-queue
+// budget. Values are asserted literally so an accidental bound change
+// fails fast here instead of silently widening the wire.
+
+#[test]
+fn dt13_transport_hardening_bounds_are_pinned() {
+    assert_eq!(MAX_FRAME_BYTES, 256 * 1024);
+    assert_eq!(crate::wire::MAX_JSON_DEPTH, 32);
+    assert_eq!(crate::limits::RC9_REQ_PER_SEC, 100);
+    assert_eq!(crate::limits::RC9_BURST_PER_SEC, 200);
+    assert_eq!(crate::limits::RC9_MAX_CONNECTIONS, 16);
+    assert_eq!(crate::limits::RC9_PAYLOAD_CAP_BYTES, 1024 * 1024);
+    #[cfg(unix)]
+    {
+        assert_eq!(crate::auth::DIR_MODE, 0o700);
+        assert_eq!(crate::auth::SOCKET_MODE, 0o600);
+    }
+    const {
+        assert!(MAX_SOCKET_PATH_BYTES <= 100);
+    }
+    const {
+        assert!(MAX_SOCKET_PATH_BYTES < SUN_LEN_MACOS);
+    }
+    assert_eq!(MAX_PARAMS_BYTES, 4096);
+    assert_eq!(MAX_ID_TOKEN_BYTES, 32);
+    assert_eq!(MAX_DEVTOOLS_METHOD_BYTES, 128);
+    assert_eq!(MAX_METHOD_SUFFIX_LEN, 64);
+    assert_eq!(MAX_ERROR_MESSAGE_CHARS, 512);
+    assert_eq!(MAX_ECHO_CHARS, 64);
+    assert_eq!(DEVTOOLS_PROTOCOL_VERSION, "1.0");
+    assert_eq!(DEVTOOLS_METHOD_PREFIX, "bitty.debug/");
+    assert_eq!(crate::ctl::CTL_TIMEOUT, std::time::Duration::from_secs(5));
+    assert_eq!(crate::ctl::MAX_QUEUED_CONTROLS, 64);
+}
+
+#[test]
+fn dt13_wire_fail_closed_regression_matrix() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    // Oversize payloads never encode (frame bound first, before dispatch).
+    let big = vec![0u8; MAX_FRAME_BYTES + 1];
+    assert!(encode_frame(&big).is_err());
+    // Deep nesting is rejected before dispatch.
+    let nested = "[".repeat(MAX_JSON_DEPTH + 1) + &"]".repeat(MAX_JSON_DEPTH + 1);
+    assert!(parse_request(nested.as_bytes()).is_err());
+    // Ambient authority fields are rejected outright.
+    for field in ["auth", "scope", "role"] {
+        let payload = format!(
+            "{{\"id\":1,\"method\":\"bitty.debug/ping\",\"version\":\"1.0\",\"{field}\":\"x\"}}"
+        );
+        let fault = parse_request(payload.as_bytes()).unwrap_err();
+        assert_eq!(fault.code, "ForbiddenField");
+    }
+    let dispatcher = Dispatcher::with_defaults();
+    // Version mismatch stays correlated.
+    let outcome = handle_envelope(
+        br#"{"id":11,"method":"bitty.debug/ping","version":"9.9"}"#,
+        &dispatcher,
+        &test_context(),
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("UnsupportedVersion"));
+    assert!(text.contains("\"id\":11"));
+    // Unknown methods fail closed as usage/UnknownMethod (never scope).
+    let outcome = handle_envelope(
+        br#"{"id":12,"method":"bitty.debug/nope","version":"1.0"}"#,
+        &dispatcher,
+        &test_context(),
+    );
+    assert!(outcome.was_error);
+    assert!(response_text(&outcome).contains("UnknownMethod"));
+    // Connection alone grants no debug scope: read surface denies.
+    let bare_server = test_server_info();
+    let bare = ServeContext::with_granted(&bare_server, crate::scope::ScopeSet::new());
+    let outcome = handle_envelope(
+        br#"{"id":13,"method":"bitty.debug/getSnapshot","version":"1.0"}"#,
+        &dispatcher,
+        &bare,
+    );
+    assert!(outcome.was_error);
+    assert!(response_text(&outcome).contains("ScopeDenied"));
+    // Socket-path grammar fails closed on length and NUL.
+    let long = "a".repeat(MAX_SOCKET_PATH_BYTES + 1);
+    assert!(resolve_socket_path(1000, None, Some(&long), None).is_err());
+    assert!(resolve_socket_path(1000, None, Some("/tmp/a\0b.sock"), None).is_err());
+    clear_introspection_for_tests();
+}
+
+// ── DT-11 (#1107): bitty-devtools cross-repo contract ─────────────────────
+//
+// CONSUMES debug-protocol 1.0 + ctl-envelope: version handshake on every
+// read reply, both sibling envelope shapes, and the trace-helper scope
+// contract. Guards the `bitty-devtools` parity documented at the top of
+// `devtools.rs` (`transport.ts` framing, `protocol.ts` envelope,
+// `auth.ts` endpoint).
+
+#[test]
+fn dt11_debug_protocol_version_handshake_contract() {
+    let dispatcher = Dispatcher::with_defaults();
+    let context = test_context();
+    // Handshake probe echoes protocol 1.0 over the transport shape.
+    let outcome = handle_envelope(
+        br#"{"id":21,"method":"bitty.debug/ping","version":"1.0"}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(!outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("\"version\":\"1.0\""));
+    assert!(text.contains("\"ok\":true"));
+    assert!(text.contains("\"id\":21"));
+    // Snapshot carries the same version over the protocol shape.
+    let outcome = handle_envelope(
+        br#"{"jsonrpc":"2.0","id":22,"method":"bitty.debug/getSnapshot","version":"1.0"}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(!outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("\"version\":\"1.0\""));
+    assert!(text.contains("\"snapshot\":\"runtime-stats\""));
+    // Test-mode handshake advertises the same 1.0 surface version.
+    assert_eq!(TEST_SURFACE_PROTOCOL, "1.0");
+    assert_eq!(TEST_SURFACE_NAME, "e2e");
+    let test_mode = Dispatcher::with_test_mode();
+    let outcome = handle_envelope(
+        br#"{"id":23,"method":"bitty.debug/testInfo","version":"1.0"}"#,
+        &test_mode,
+        &context,
+    );
+    assert!(!outcome.was_error);
+    assert!(response_text(&outcome).contains("\"protocol\":\"1.0\""));
+    // Wrong version is a correlated usage error, never a silent downgrade.
+    let outcome = handle_envelope(
+        br#"{"id":24,"method":"bitty.debug/ping","version":"2.0"}"#,
+        &dispatcher,
+        &context,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("UnsupportedVersion"));
+    assert!(text.contains("\"id\":24"));
+}
+
+#[test]
+fn dt11_trace_helpers_and_ctl_envelope_contract() {
+    let _guard = lock_trace_for_test();
+    clear_traces_for_tests();
+    let dispatcher = Dispatcher::with_defaults();
+    // Trace helpers are registered on the default table (DT-03 surface).
+    assert!(dispatcher.contains(METHOD_START_TRACE));
+    assert!(dispatcher.contains(METHOD_STOP_TRACE));
+    assert!(dispatcher.contains(METHOD_FETCH_TRACE_CHUNK));
+    // Trace scope contract: `debug.inspect` alone denies, `debug.trace`
+    // serves the params gate (fail-closed before any state).
+    let mut inspect_only = crate::scope::ScopeSet::cli_default();
+    inspect_only.insert(crate::scope::Scope::DebugInspect);
+    let server = test_server_info();
+    let inspect_ctx = ServeContext::with_granted(&server, inspect_only);
+    let outcome = handle_envelope(
+        br#"{"id":31,"method":"bitty.debug/startTrace","version":"1.0"}"#,
+        &dispatcher,
+        &inspect_ctx,
+    );
+    assert!(outcome.was_error);
+    assert!(response_text(&outcome).contains("ScopeDenied"));
+    // ctl-envelope: every control verb is registered with its mapped scope.
+    for method in crate::ctl::all_control_methods() {
+        assert!(dispatcher.contains(method), "{method} must be registered");
+        assert!(
+            crate::ctl::required_scope_for_ctl_method(method).is_some(),
+            "{method} must map to a scope"
+        );
+    }
+    // Unscoped control verbs deny on the debug-protocol taxonomy
+    // (`scope`/`ScopeDenied`) and name the elevation allowlist.
+    let empty = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let outcome = handle_envelope(
+        br#"{"id":32,"method":"bitty.debug/listViews","version":"1.0"}"#,
+        &dispatcher,
+        &empty,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("ScopeDenied"), "got: {text}");
+    assert!(text.contains("BITTY_CTL_ELEVATE"), "got: {text}");
+    clear_traces_for_tests();
+}
+
+// ── DT-10 (#1106): MCP adapter over debug protocol ─────────────────────────
+//
+// Thin read-only translation: the v1 default exposes observation only and
+// never the automation bearers, trace writers, control verbs, or the
+// test-mode surface.
+
+#[test]
+fn dt10_mcp_adapter_v1_hides_automation() {
+    assert_eq!(MCP_ADAPTER_VERSION, "1.0");
+    assert_eq!(DEVTOOLS_PROTOCOL_VERSION, "1.0");
+    // Read-only surface is exposed.
+    for method in [
+        "bitty.debug/ping",
+        "bitty.debug/getSnapshot",
+        "bitty.debug/getGridText",
+        "bitty.debug/getInputRing",
+        "bitty.debug/getModifiers",
+        "bitty.debug/getFocus",
+        "bitty.debug/getProcessStats",
+        "bitty.debug/getFrameStats",
+        "bitty.debug/streamProcessStats",
+        "bitty.debug/streamFrameStats",
+        "bitty.debug/fetchTraceChunk",
+    ] {
+        assert!(
+            is_mcp_exposed_debug_method(method),
+            "{method} must be MCP-exposed"
+        );
+        assert!(
+            mcp_tool_for_debug_method(method).is_some(),
+            "{method} must map to a tool"
+        );
+    }
+    assert_eq!(mcp_tool_names().len(), 11);
+    // Automation, trace writers, and test-mode surface stay hidden.
+    for method in mcp_denied_debug_methods() {
+        assert!(
+            !is_mcp_exposed_debug_method(method),
+            "{method} must stay hidden"
+        );
+        assert!(
+            mcp_tool_for_debug_method(method).is_none(),
+            "{method} must map to no tool"
+        );
+    }
+    assert!(mcp_denied_debug_methods().contains(&METHOD_SYNTHESIZE_INPUT));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_CAPTURE_FRAME));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_FRAME_HASH));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_START_TRACE));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_STOP_TRACE));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_TEST_INFO));
+    assert!(mcp_denied_debug_methods().contains(&METHOD_TEST_EXIT));
+    // Control verbs stay hidden too (MCP default is read-only).
+    for method in crate::ctl::all_control_methods() {
+        assert!(
+            !is_mcp_exposed_debug_method(method),
+            "control {method} must stay hidden"
+        );
+        assert!(mcp_tool_for_debug_method(method).is_none());
+    }
+}
+
+#[test]
+fn dt10_mcp_adapter_translation_roundtrip_and_listing() {
+    // Bidirectional round-trip over the exposed surface.
+    for tool in mcp_tool_names() {
+        assert!(
+            tool.starts_with(MCP_TOOL_PREFIX),
+            "{tool} must carry the prefix"
+        );
+        let method = debug_method_for_mcp_tool(tool).expect("exposed tool must map");
+        assert_eq!(mcp_tool_for_debug_method(method), Some(*tool));
+    }
+    // Unknown and denied names map to nothing in both directions.
+    assert!(debug_method_for_mcp_tool("bitty_debug_nope").is_none());
+    assert!(debug_method_for_mcp_tool("bitty_debug_synthesizeInput").is_none());
+    assert!(debug_method_for_mcp_tool("other_tool").is_none());
+    assert!(mcp_tool_for_debug_method("bitty.debug/synthesizeInput").is_none());
+    assert!(mcp_tool_for_debug_method("bitty.debug/testExit").is_none());
+    assert!(mcp_tool_for_debug_method("bitty.debug/doesNotExist").is_none());
+    // The JSON listing carries the version plus exactly the exposed tools,
+    // and never leaks a denied method name.
+    let listing = mcp_list_tools_json();
+    assert!(listing.contains("\"version\":\"1.0\""));
+    for tool in mcp_tool_names() {
+        assert!(listing.contains(tool), "listing must contain {tool}");
+    }
+    for denied in [
+        "synthesizeInput",
+        "captureFrame",
+        "frameHash",
+        "startTrace",
+        "stopTrace",
+        "testInfo",
+        "testExit",
+        "spawnTerminal",
+        "sendInput",
+    ] {
+        assert!(
+            !listing.contains(denied),
+            "listing must not leak {denied}: {listing}"
+        );
+    }
+}
+
+// ── DT-07/A3 (#1103): Amendment A3 test-mode E2E acceptance ────────────────
+//
+// `testInfo`/`testExit` are registration-gated (default-deny), `testExit`
+// additionally requires the `debug.control` elevation allowlist, and an
+// elevated `testExit` enqueues the deterministic teardown through the
+// existing control queue (no new authority, no bypass).
+
+#[test]
+fn a3_test_surface_default_deny_even_when_elevated() {
+    // Registration is the gate: without test mode even a fully elevated
+    // peer gets NotFound (never ScopeDenied, never success).
+    let default = Dispatcher::with_defaults();
+    let elevated = crate::ctl::elevation_from_env(Some("debug.control"));
+    let server = test_server_info();
+    let ctx = ServeContext::with_granted(&server, elevated);
+    for (id, method) in [(41u64, METHOD_TEST_INFO), (42u64, METHOD_TEST_EXIT)] {
+        let payload = format!("{{\"id\":{id},\"method\":\"{method}\",\"version\":\"1.0\"}}");
+        let outcome = handle_envelope(payload.as_bytes(), &default, &ctx);
+        assert!(
+            outcome.was_error,
+            "{method} must be denied without test mode"
+        );
+        assert!(
+            response_text(&outcome).contains("UnknownMethod"),
+            "{method} must answer UnknownMethod, got: {}",
+            response_text(&outcome)
+        );
+    }
+}
+
+#[test]
+fn a3_test_info_serves_without_scope_in_test_mode() {
+    // `testInfo` is read-only surface identity: no scope, no bearer, no
+    // terminal content — the only gate is test-mode registration.
+    let test_mode = Dispatcher::with_test_mode();
+    let server = test_server_info();
+    let bare = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let outcome = handle_envelope(
+        br#"{"id":43,"method":"bitty.debug/testInfo","version":"1.0"}"#,
+        &test_mode,
+        &bare,
+    );
+    assert!(!outcome.was_error, "testInfo must serve scoped or not");
+    let text = response_text(&outcome);
+    assert!(text.contains("\"test_mode\":true"), "got: {text}");
+    assert!(text.contains("\"surface\":\"e2e\""), "got: {text}");
+    assert!(text.contains("\"protocol\":\"1.0\""), "got: {text}");
+    assert!(text.contains("\"instance\":\"test-inst\""), "got: {text}");
+    for leaked in [
+        "\"grid\"",
+        "\"lines\"",
+        "\"text\"",
+        "\"rgba\"",
+        "\"pixels\"",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "testInfo must carry no terminal content ({leaked}): {text}"
+        );
+    }
+}
+
+#[test]
+fn a3_test_exit_elevation_matrix_over_wire() {
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    let test_mode = Dispatcher::with_test_mode();
+    let server = test_server_info();
+    // CLI default holds no debug scope: ScopeDenied with the elevate hint
+    // (auth fails before the queue, so no teardown is queued).
+    let cli = ServeContext::with_granted(&server, crate::scope::ScopeSet::cli_default());
+    let outcome = handle_envelope(
+        br#"{"id":44,"method":"bitty.debug/testExit","version":"1.0"}"#,
+        &test_mode,
+        &cli,
+    );
+    assert!(outcome.was_error);
+    let text = response_text(&outcome);
+    assert!(text.contains("ScopeDenied"), "got: {text}");
+    assert!(text.contains("BITTY_CTL_ELEVATE"), "got: {text}");
+    // A misspelled allowlist value grants nothing (fail-closed).
+    let bogus = ServeContext::with_granted(
+        &server,
+        crate::ctl::elevation_from_env(Some("debug-control")),
+    );
+    let outcome = handle_envelope(
+        br#"{"id":45,"method":"bitty.debug/testExit","version":"1.0"}"#,
+        &test_mode,
+        &bogus,
+    );
+    assert!(outcome.was_error);
+    assert!(response_text(&outcome).contains("ScopeDenied"));
+    // The explicit allowlist authorizes the teardown path (the queue step
+    // itself is owned by the `ctl` queue contract: `CTL_TIMEOUT` budget and
+    // `MAX_QUEUED_CONTROLS` cap pinned under DT-13).
+    let elevated = crate::ctl::elevation_from_env(Some("debug.control"));
+    assert!(
+        crate::ctl::authorize_ctl_method(METHOD_TEST_EXIT, &elevated).is_ok(),
+        "debug.control elevation must authorize testExit"
+    );
+    assert_eq!(
+        crate::ctl::required_scope_for_ctl_method(METHOD_TEST_EXIT),
+        Some(crate::scope::Scope::DebugControl)
+    );
+    clear_introspection_for_tests();
+}
+
+#[test]
+fn a3_test_exit_teardown_routes_through_control_queue() {
+    // Teardown grants no new authority: `testExit` shares the control-queue
+    // path (`handle_control` -> `enqueue_control_and_wait` -> authorize)
+    // with every other control verb. Proof here is wire-shape identity plus
+    // the authorize gate — the blocking enqueue/drain step itself is owned
+    // by the `ctl` queue contract (timed-out waiters withdraw, expired
+    // entries never apply) and must not be re-driven from this suite: the
+    // queue is process-global and driving it here races the `ctl` tests.
+    let _guard = lock_introspection_for_test();
+    clear_introspection_for_tests();
+    let test_mode = Dispatcher::with_test_mode();
+    let server = test_server_info();
+    // Registration: test-mode only, exactly one method beyond defaults.
+    assert!(test_mode.contains(METHOD_TEST_EXIT));
+    assert!(!Dispatcher::with_defaults().contains(METHOD_TEST_EXIT));
+    // Wire-shape identity with a sibling control verb: ungranted `testExit`
+    // and ungranted `listViews` deny identically (same handler path, same
+    // taxonomy, same elevation hint).
+    let empty = ServeContext::with_granted(&server, crate::scope::ScopeSet::new());
+    let exit_outcome = handle_envelope(
+        br#"{"id":46,"method":"bitty.debug/testExit","version":"1.0"}"#,
+        &test_mode,
+        &empty,
+    );
+    let views_outcome = handle_envelope(
+        br#"{"id":47,"method":"bitty.debug/listViews","version":"1.0"}"#,
+        &test_mode,
+        &empty,
+    );
+    assert!(exit_outcome.was_error);
+    assert!(views_outcome.was_error);
+    for (label, outcome) in [("testExit", exit_outcome), ("listViews", views_outcome)] {
+        let text = response_text(&outcome);
+        assert!(text.contains("ScopeDenied"), "{label} got: {text}");
+        assert!(text.contains("BITTY_CTL_ELEVATE"), "{label} got: {text}");
+    }
+    // Authorize gate: only the `debug.control` elevation opens it.
+    let elevated = crate::ctl::elevation_from_env(Some("debug.control"));
+    assert!(crate::ctl::authorize_ctl_method(METHOD_TEST_EXIT, &elevated).is_ok());
+    let cli = crate::scope::ScopeSet::cli_default();
+    assert!(crate::ctl::authorize_ctl_method(METHOD_TEST_EXIT, &cli).is_err());
+    clear_introspection_for_tests();
+}

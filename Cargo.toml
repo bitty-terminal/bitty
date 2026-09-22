@@ -46,6 +46,11 @@ categories = ["command-line-utilities", "emulators"]
 winit = "0.30.13"
 # Minimal one-shot executor for the composition root and perf trials.
 pollster = "1.0"
+# V-C package signatures (OQ-029, bitty#767): pure-Rust Ed25519
+# (`ed25519-dalek` 2.x, BSD-3-Clause, rust-version 1.81 <= MSRV 1.85,
+# no build script, no network/I/O). Pinned to the 2.x line: the 3.x major
+# is new and buys nothing here; re-evaluate on a dated ADR-0004 revision.
+ed25519-dalek = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

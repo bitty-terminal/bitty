@@ -14,3 +14,5 @@ publish = true
 workspace = true
 
 [dependencies]
+# V-C Ed25519 verification (OQ-029, bitty#767). Pure Rust, no I/O.
+ed25519-dalek.workspace = true

@@ -10,17 +10,17 @@ Branch: `ctx-0633/sec15-unsafety`. Risk state stays `Open`: this record is
 Workspace-wide `rg` over `crates/*/src` and `crates/*/tests` for `unsafe {`,
 `unsafe fn`, `unsafe impl`, `extern "`, `allow(unsafe_code)`, plus `transmute`,
 `from_raw`, raw-pointer, and `build.rs` sweeps; crate-root lint-attribute
- census; `deny.toml`, CI clippy/deny/audit steps; `fuzz/` target list;
- `bitty-lua` dependency pins.
+census; `deny.toml`, CI clippy/deny/audit steps; `fuzz/` target list;
+`bitty-lua` dependency pins.
 
 ## Inventory (verified 2026-09-22, worktree `ctx-0633`)
 
 Production (`src/`) `unsafe`, the full allowlist (2 blocks, 1 module):
 
-| # | Location | Form | SAFETY rationale | Verdict |
-|---|----------|------|------------------|---------|
-| 1 | `crates/bitty-render/src/gpu.rs:293` (`create_surface`) | `unsafe { instance.create_surface_unsafe(...) }` | Raw display/window handles originate from a live `SurfaceTarget`; returned `Surface` owns a clone keeping the window alive | Keep, sole allowance |
-| 2 | `crates/bitty-render/src/gpu.rs:302` (`create_surface`) | `unsafe { transmute(surface) }` to `'static` | Same ownership argument: `SurfaceKind::Gpu` stores the `SurfaceTarget` clone, so the window outlives the surface | Keep, documented this task |
+| #   | Location                                                | Form                                             | SAFETY rationale                                                                                                           | Verdict                    |
+| --- | ------------------------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| 1   | `crates/bitty-render/src/gpu.rs:293` (`create_surface`) | `unsafe { instance.create_surface_unsafe(...) }` | Raw display/window handles originate from a live `SurfaceTarget`; returned `Surface` owns a clone keeping the window alive | Keep, sole allowance       |
+| 2   | `crates/bitty-render/src/gpu.rs:302` (`create_surface`) | `unsafe { transmute(surface) }` to `'static`     | Same ownership argument: `SurfaceKind::Gpu` stores the `SurfaceTarget` clone, so the window outlives the surface           | Keep, documented this task |
 
 No `extern "..."` blocks, no `build.rs`, no raw-pointer dereference, no
 `mem::forget`/`ManuallyDrop` in any `src/`. `from_raw_*` hits are safe
@@ -29,11 +29,11 @@ hits are safe identity comparisons in tests.
 
 Test-only `unsafe` (each under explicit `#![allow]`/`#[allow]` with comment):
 
-| Location | Use | Why safe here |
-|----------|-----|---------------|
-| `bitty-pty/tests/spawn_smoke.rs:304,314` | `std::env::set_var`/`remove_var` (edition-2024 `unsafe`) | Single-threaded test, poison window narrowed to spawn, restored immediately after |
-| `bitty-rich/tests/background_peak_memory.rs:74-97` | `unsafe impl GlobalAlloc` delegating to `System` | Trait requires `unsafe`; counting only, no layout tricks |
-| `bitty-runtime/tests/soak.rs:710` | `Waker::from_raw` noop waker, null data pointer | All vtable entries no-op; waker never wakes |
+| Location                                           | Use                                                      | Why safe here                                                                     |
+| -------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `bitty-pty/tests/spawn_smoke.rs:304,314`           | `std::env::set_var`/`remove_var` (edition-2024 `unsafe`) | Single-threaded test, poison window narrowed to spawn, restored immediately after |
+| `bitty-rich/tests/background_peak_memory.rs:74-97` | `unsafe impl GlobalAlloc` delegating to `System`         | Trait requires `unsafe`; counting only, no layout tricks                          |
+| `bitty-runtime/tests/soak.rs:710`                  | `Waker::from_raw` noop waker, null data pointer          | All vtable entries no-op; waker never wakes                                       |
 
 ## Lint gate (P0-AC-033 clause 3: PASS)
 
@@ -44,7 +44,7 @@ Test-only `unsafe` (each under explicit `#![allow]`/`#[allow]` with comment):
   `bitty-render` (`#![deny]` + `#[allow(unsafe_code)] pub mod gpu;` only).
   This task added the two missing pins: `bitty-core`, `bitty-test-support`.
 - `just check` runs `cargo clippy --workspace --all-targets --locked --
-  -D warnings`; CI repeats it plus `cargo deny check` and `cargo audit`.
+-D warnings`; CI repeats it plus `cargo deny check` and `cargo audit`.
   An undocumented `unsafe` anywhere fails the gate (deny + `-D warnings`).
 
 ## Lua adapter (R-018 Lua leg)

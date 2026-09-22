@@ -94,6 +94,7 @@ pub mod dpi;
 pub mod error;
 pub mod event;
 pub mod keyboard;
+pub mod metrics;
 pub mod surface;
 pub mod url;
 

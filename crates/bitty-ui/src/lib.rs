@@ -111,7 +111,7 @@ pub use beacon_layer::{
 };
 pub use beacon_target::{
     CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
-    TargetRef, TargetRegistry, UiNodeId, UiNodeRef, WorkspaceId, WorkspaceRef,
+    TargetRef, TargetRegistry, UiNodeRef, WorkspaceId, WorkspaceRef,
 };
 pub use decoration::{
     DEFAULT_BORDER_PX, DEFAULT_CONTENT_INSET_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX,

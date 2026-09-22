@@ -53,7 +53,7 @@ syntax risk).
   `devtools_observability` (bitty-runtime): 3 passed.
 - P0-AC-025 (scopes distinct): `debug.inspect`/`trace`/`control` map to
   distinct `Scope::DebugInspect`/`DebugTrace`/`DebugControl`
-  (`crates/bitty-ipc/src/devtools.rs`); connection alone grants none and
+  (`crates/bitty-ipc/src/scope.rs`); connection alone grants none and
   each operation without its scope is denied (devtools scope-matrix tests).
 - P0-AC-026 (minimization/redaction): seeded-secret corpus never appears in
   default outputs (acceptance A1.3, `devtools/tests.rs`); clipboard and raw

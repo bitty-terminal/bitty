@@ -47,12 +47,12 @@ jobs:
           toolchain: ${{ steps.rust-channel.outputs.channel }}
 
       # PR cadence: Arch + Windows 11 (policy::GUESTS with first_cadence Pr).
-      # No --execute/--require: hosted runners cannot run guests, so the
-      # controller must report gated/dry-run and exit 0.
+      # Hosted runners have no VM root: pass an ephemeral --root (under
+      # RUNNER_TEMP) so the controller reports gated/dry-run and exits 0.
       - name: Smoke PR guests (gated dry-run)
         run: |
-          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest arch --cadence pr --run-id "ci-pr-${{ github.run_id }}"
-          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest windows11 --cadence pr --run-id "ci-pr-${{ github.run_id }}"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest arch --cadence pr --run-id "ci-pr-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest windows11 --cadence pr --run-id "ci-pr-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
 
   vm-main:
     name: VM tier (main)
@@ -78,9 +78,9 @@ jobs:
       # Main cadence additions: Ubuntu LTS, Fedora, Alpine (gated dry-run).
       - name: Smoke main guests (gated dry-run)
         run: |
-          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest ubuntu --cadence main --run-id "ci-main-${{ github.run_id }}"
-          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest fedora --cadence main --run-id "ci-main-${{ github.run_id }}"
-          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest alpine --cadence main --run-id "ci-main-${{ github.run_id }}"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest ubuntu --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest fedora --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
+          cargo run --locked -p bitty-test-vm --bin bitty-vm -- smoke --guest alpine --cadence main --run-id "ci-main-${{ github.run_id }}" --root "${{ runner.temp }}/bitty-vm"
 
   vm-nightly:
     name: VM tier (nightly ARM64)
@@ -109,3 +109,4 @@ jobs:
         run: >
           cargo run --locked -p bitty-test-vm --bin bitty-vm --
           smoke --guest arch-arm64 --cadence nightly --run-id "ci-nightly-${{ github.run_id }}"
+          --root "${{ runner.temp }}/bitty-vm"

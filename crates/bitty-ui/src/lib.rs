@@ -35,6 +35,13 @@
 //!   view-aware highlight mapping, `PersistentSelection` conversion, and
 //!   scroll-to-current for the viewport.
 //! - [`geometry`] — integer `Rect`, `Point`, `Size`, `SplitAxis`.
+//! - Beacon family (U-8, CTX-0661): [`beacon_target::TargetRef`] generation
+//!   handles (`Panel`/`Workspace`/`CommandBlock`/`UiNode`/`Link`, stale
+//!   fails closed, no `ViewId`); [`beacon_label::LabelAllocator`] home-row
+//!   first with two-char overflow and spatial left/right pools over a Lua
+//!   charset policy; [`beacon_layer::BeaconAnnotationLayer`] single batched
+//!   layer; [`beacon_dispatch::BeaconDispatcher`] label-to-typed-command
+//!   bridge that executes nothing.
 //! - [`scratchpad::ScratchpadSlot`] — single hidden per-window scratchpad
 //!   slot with anchor-preserving hide/show/toggle (CW-10), routed as
 //!   `bitty.workspace:scratchpad-toggle`.
@@ -65,6 +72,10 @@
 #![forbid(unsafe_code)]
 
 pub mod a11y;
+pub mod beacon_dispatch;
+pub mod beacon_label;
+pub mod beacon_layer;
+pub mod beacon_target;
 pub mod decoration;
 pub mod drag;
 pub mod focus;
@@ -81,6 +92,18 @@ pub mod theme;
 pub mod view;
 
 // Re-exports for ergonomic root access.
+pub use beacon_dispatch::{BeaconDispatcher, DispatchError, MAX_BEACON_BINDINGS};
+pub use beacon_label::{
+    DEFAULT_HOME_CHARSET, LabelAllocator, LabelError, LabelPolicy, MAX_BEACON_TARGETS,
+    MAX_CHARSET_LEN,
+};
+pub use beacon_layer::{
+    AnnotationLayerError, BeaconAnnotation, BeaconAnnotationLayer, MAX_BEACON_ANNOTATIONS,
+};
+pub use beacon_target::{
+    CommandBlockId, CommandBlockRef, LinkId, LinkRef, MAX_TARGETS_PER_KIND, PanelRef, TargetError,
+    TargetRef, TargetRegistry, UiNodeId, UiNodeRef, WorkspaceId, WorkspaceRef,
+};
 pub use decoration::{
     DEFAULT_BORDER_PX, DEFAULT_CONTENT_INSET_PX, DEFAULT_GAPS_IN_PX, DEFAULT_GAPS_OUT_PX,
     DEFAULT_RADIUS_PX, DecoratedView, Decoration, DecorationError, MAX_BORDER_PX,

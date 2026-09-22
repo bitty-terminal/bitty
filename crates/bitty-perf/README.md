@@ -56,6 +56,10 @@ referenced performance RFC and evidence notes, not here (see `src/lib.rs`).
 - `baselines/pb-real-window.json` — committed real-window evidence artifact
   (PB-1/PB-2 numbers plus host context and provenance);
   `baselines/real-window-evidence.md` records the runbook and limitations.
+- `baselines/pb-rss.json` — committed PB-2 idle-RSS artifact for #1190
+  (CTX-0694 re-measurement plus host context and provenance);
+  `baselines/rss-evidence.md` records the contributor breakdown and the
+  reduction path proposal.
 - `baselines/pb-real-soak.json` — committed long-duration soak artifact
   (PB-3/PB-7 numbers plus host context and provenance, `unavailable` until
   the first Tier 1 run is promoted);

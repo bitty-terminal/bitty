@@ -132,7 +132,11 @@ jobs:
       # cover exactly the sonames the linked binary needs. The fixture test
       # pins the gate logic; the debug-binary run catches nfpm.yaml and
       # packaging/linux/runtime-deps.toml drift on every PR.
+      # CTX-0697: deny rustc warnings on the workspace build so new build
+      # warnings fail CI going forward (clippy already runs with -D warnings).
       - name: Check runtime dependency declarations (ldd/readelf gate)
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           bash scripts/tests/check-runtime-deps.test.sh
           cargo build --locked -p bitty-app
@@ -197,7 +201,10 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-1.85
 
+      # CTX-0697: deny rustc warnings so new warnings fail CI going forward.
       - name: Check MSRV compilation
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo +1.85 check --workspace --all-targets --locked
 
   linux-x11:
@@ -389,7 +396,10 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
+      # CTX-0697: deny rustc warnings so new warnings fail CI going forward.
       - name: Check workspace compilation (macOS ARM64)
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets --locked
 
       - name: Run tests (macOS ARM64)
@@ -493,7 +503,10 @@ jobs:
         with:
           prefix-key: v1-rust-${{ runner.os }}-${{ steps.rust-channel.outputs.channel }}
 
+      # CTX-0697: deny rustc warnings so new warnings fail CI going forward.
       - name: Check workspace compilation
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo check --workspace --all-targets --locked
 
       - name: Run tests

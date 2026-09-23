@@ -665,19 +665,16 @@ impl KittyImageLayer {
         self.total_bytes = 0;
     }
 
-    /// Pixel rect for a placement in the current viewport, if visible.
+    /// Scroll-adjusted, unclamped pixel rect for a placement.
     ///
-    /// `viewport_cols`/`viewport_rows` are the live grid dimensions;
-    /// `scrollback_now` is the current `State::scrollback_len()`. Returns
-    /// `None` when the placement scrolled off the top or lies fully
-    /// outside the viewport (paints nothing). Otherwise returns the
-    /// cell-rect pixel extent intersected with the viewport.
+    /// Same anchor/scroll math as [`KittyImageLayer::placement_rect`] but
+    /// without the viewport intersection: the full cell-rect extent the
+    /// image scales into, even where it overflows the viewport. Returns
+    /// `None` only when the placement scrolled fully off the top.
     #[must_use]
-    pub fn placement_rect(
+    pub fn placement_full_rect(
         placement: &KittyPlacement,
         metrics: CellMetrics,
-        viewport_cols: u16,
-        viewport_rows: u16,
         scrollback_now: usize,
     ) -> Option<RectPx> {
         let scrolled = scrollback_now.saturating_sub(placement.scrollback_base);
@@ -688,15 +685,37 @@ impl KittyImageLayer {
         let y = row * u64::from(metrics.height);
         let w = u64::from(placement.cols) * u64::from(metrics.width);
         let h = u64::from(placement.rows) * u64::from(metrics.height);
-        let rect = RectPx::new(
+        Some(RectPx::new(
             saturating_i32(x),
             saturating_i32(y),
             saturating_u32(w),
             saturating_u32(h),
-        );
+        ))
+    }
+
+    /// Pixel rect for a placement in the current viewport, if visible.
+    ///
+    /// `viewport_cols`/`viewport_rows` are the live grid dimensions;
+    /// `scrollback_now` is the current `State::scrollback_len()`. Returns
+    /// `None` when the placement scrolled off the top or lies fully
+    /// outside the viewport (paints nothing). Otherwise returns the
+    /// full rect ([`KittyImageLayer::placement_full_rect`]) intersected
+    /// with the viewport. The caller must crop the scaled image to this
+    /// rect ([`rasterize_clipped`]), never re-scale the whole source
+    /// into it: re-scaling squeezes a partially visible image instead
+    /// of cropping it (#1334 first-paint squash).
+    #[must_use]
+    pub fn placement_rect(
+        placement: &KittyPlacement,
+        metrics: CellMetrics,
+        viewport_cols: u16,
+        viewport_rows: u16,
+        scrollback_now: usize,
+    ) -> Option<RectPx> {
+        let full = Self::placement_full_rect(placement, metrics, scrollback_now)?;
         // Viewport extent in pixels.
         let extent = metrics.extent_for(usize::from(viewport_cols), usize::from(viewport_rows));
-        intersect(RectPx::new(0, 0, extent.width, extent.height), rect)
+        intersect(RectPx::new(0, 0, extent.width, extent.height), full)
     }
 }
 
@@ -723,6 +742,22 @@ pub fn placement_rect_for(
     )
 }
 
+/// Scroll-adjusted, unclamped pixel rect for a placement, if retained.
+///
+/// Convenience wrapper over [`KittyImageLayer::placement_full_rect`]
+/// that resolves the id first (`None` for unknown placements, or when
+/// the placement scrolled fully off the top).
+#[must_use]
+pub fn placement_full_rect_for(
+    layer: &KittyImageLayer,
+    id: KittyPlacementId,
+    metrics: CellMetrics,
+    scrollback_now: usize,
+) -> Option<RectPx> {
+    let placement = layer.get_placement(id)?;
+    KittyImageLayer::placement_full_rect(placement, metrics, scrollback_now)
+}
+
 // ---------------------------------------------------------------------------
 // Rasterize (nearest-neighbor scale to the rect extent)
 // ---------------------------------------------------------------------------
@@ -738,10 +773,50 @@ pub fn placement_rect_for(
 /// composites.
 #[must_use]
 pub fn rasterize(image: &KittyPlacedImage, rect: RectPx) -> Option<Vec<u8>> {
-    if rect.width == 0 || rect.height == 0 {
+    rasterize_clipped(image, rect, rect)
+}
+
+/// Scales the visible window of a placement (nearest neighbor, #1334).
+///
+/// `full` is the unclamped placement extent (the image scales into this,
+/// exactly like [`rasterize`] would); `visible` is the viewport-clipped
+/// sub-rectangle to emit (`visible` must lie inside `full`). The output
+/// is bit-identical to scaling the whole image into `full` and then
+/// cropping `visible` — but only the visible bytes are ever allocated,
+/// so a placement overflowing the viewport paints its visible part at
+/// true scale instead of squeezing the whole image into it.
+///
+/// Returns `None` (paints nothing) when `visible` is empty or outside
+/// `full`, when the visible byte size fails checked validation against
+/// the 64 MiB cap, or when the source bitmap fails validation. No
+/// allocation occurs before validation.
+///
+/// The output is straight-alpha RGBA8, row-major, exactly
+/// `visible.width * visible.height * 4` bytes.
+#[must_use]
+pub fn rasterize_clipped(
+    image: &KittyPlacedImage,
+    full: RectPx,
+    visible: RectPx,
+) -> Option<Vec<u8>> {
+    if visible.width == 0 || visible.height == 0 || full.width == 0 || full.height == 0 {
         return None;
     }
-    let out_len = (u64::from(rect.width) * u64::from(rect.height))
+    // `visible` must lie inside `full` (same origin space); anything else
+    // is a caller bug and fails closed. `i64` differences of `i32`
+    // coordinates never overflow; non-negative after the origin guard,
+    // so the `as u64` casts are exact.
+    if visible.x < full.x || visible.y < full.y {
+        return None;
+    }
+    let offset_x = (i64::from(visible.x) - i64::from(full.x)) as u64;
+    let offset_y = (i64::from(visible.y) - i64::from(full.y)) as u64;
+    if offset_x + u64::from(visible.width) > u64::from(full.width)
+        || offset_y + u64::from(visible.height) > u64::from(full.height)
+    {
+        return None;
+    }
+    let out_len = (u64::from(visible.width) * u64::from(visible.height))
         .checked_mul(4)
         .filter(|&n| n <= KITTY_DECODE_MAX_BYTES as u64)?;
     // `out_len` fits `usize` on every supported target: it is at most
@@ -758,15 +833,18 @@ pub fn rasterize(image: &KittyPlacedImage, rect: RectPx) -> Option<Vec<u8>> {
     }
     let mut out = vec![0_u8; out_len];
     let (sw, sh) = (u64::from(image.width), u64::from(image.height));
-    let (dw, dh) = (u64::from(rect.width), u64::from(rect.height));
-    for dy in 0..dh {
-        // Nearest neighbor: `sy = dy * sh / dw... ` — division in u64,
-        // exact for the bounded ranges here.
-        let sy = (dy * sh / dh) as usize;
-        for dx in 0..dw {
-            let sx = (dx * sw / dw) as usize;
+    let (fw, fh) = (u64::from(full.width), u64::from(full.height));
+    let (vw, vh) = (u64::from(visible.width), u64::from(visible.height));
+    for dy in 0..vh {
+        // Nearest neighbor into the full extent, then the visible window:
+        // `sy = (offset_y + dy) * sh / fh` — division in u64, exact for
+        // the bounded ranges here. Bit-identical to scaling into `full`
+        // and cropping `visible`.
+        let sy = ((offset_y + dy) * sh / fh) as usize;
+        for dx in 0..vw {
+            let sx = ((offset_x + dx) * sw / fw) as usize;
             let s = (sy * image.width as usize + sx) * 4;
-            let d = (dy as usize * rect.width as usize + dx as usize) * 4;
+            let d = (dy as usize * visible.width as usize + dx as usize) * 4;
             out[d..d + 4].copy_from_slice(&image.rgba[s..s + 4]);
         }
     }
@@ -1227,6 +1305,106 @@ mod tests {
             KittyImageLayer::placement_rect(layer.get_placement(pid).unwrap(), METRICS, 80, 24, 0)
                 .unwrap();
         assert_eq!(rect, RectPx::new(78 * 8, 0, 2 * 8, 10 * 16));
+    }
+
+    #[test]
+    fn full_rect_stays_unclamped_when_placement_overflows() {
+        // #1334: a placement taller than the viewport keeps its full
+        // extent; the clamped rect is the visible window into it.
+        let mut layer = KittyImageLayer::new();
+        let id = stored_red(&mut layer);
+        // 2x4 cells at row 22 of a 24-row grid: 2 rows overflow.
+        let pid = layer.display(id, 0, 22, 2, 4, METRICS, 0, 0).unwrap();
+        let placement = layer.get_placement(pid).unwrap();
+        let full = KittyImageLayer::placement_full_rect(placement, METRICS, 0).unwrap();
+        assert_eq!(full, RectPx::new(0, 22 * 16, 2 * 8, 4 * 16));
+        let visible = KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 0).unwrap();
+        assert_eq!(visible, RectPx::new(0, 22 * 16, 2 * 8, 2 * 16));
+        // The id-resolving wrappers agree.
+        assert_eq!(placement_full_rect_for(&layer, pid, METRICS, 0), Some(full));
+        assert_eq!(
+            placement_rect_for(&layer, pid, METRICS, 80, 24, 0),
+            Some(visible)
+        );
+        assert_eq!(
+            placement_full_rect_for(&layer, KittyPlacementId(999), METRICS, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn rasterize_clipped_matches_crop_of_full_raster() {
+        // 4x4 px: top half red, bottom half blue. Visible = bottom-right
+        // 2x2 window of the 4x4 full extent: must equal the matching crop
+        // of the full raster, never a re-scaled whole image.
+        let rgba = {
+            let mut bytes = Vec::new();
+            for y in 0..4 {
+                let color = if y < 2 {
+                    [0xFF, 0, 0, 0xFF]
+                } else {
+                    [0, 0, 0xFF, 0xFF]
+                };
+                for _ in 0..4 {
+                    bytes.extend_from_slice(&color);
+                }
+            }
+            bytes
+        };
+        let image = KittyPlacedImage {
+            id: KittyImageId(1),
+            width: 4,
+            height: 4,
+            rgba,
+            compressed_len: 64,
+        };
+        let full = RectPx::new(0, 0, 4, 4);
+        let visible = RectPx::new(2, 2, 2, 2);
+        let clipped = rasterize_clipped(&image, full, visible).expect("clipped must rasterize");
+        assert_eq!(clipped.len(), 2 * 2 * 4);
+        // Bottom-right of the source is all blue.
+        assert!(clipped.chunks_exact(4).all(|px| px == [0, 0, 0xFF, 0xFF]));
+        // Identity (visible == full) matches the legacy entry point.
+        assert_eq!(
+            rasterize_clipped(&image, full, full),
+            rasterize(&image, full)
+        );
+        // A re-scaled whole image would mix red into the window.
+        let squeezed = rasterize(&image, visible).expect("legacy entry still works");
+        assert!(
+            squeezed.chunks_exact(4).any(|px| px == [0xFF, 0, 0, 0xFF]),
+            "legacy re-scale of the window mixes source halves (the #1334 squeeze)"
+        );
+    }
+
+    #[test]
+    fn rasterize_clipped_fails_closed() {
+        let (w, h, rgba) = tiny_red();
+        let image = KittyPlacedImage {
+            id: KittyImageId(1),
+            width: w,
+            height: h,
+            rgba,
+            compressed_len: 16,
+        };
+        let full = RectPx::new(0, 0, 2, 2);
+        // Empty visible paints nothing.
+        assert_eq!(
+            rasterize_clipped(&image, full, RectPx::new(0, 0, 0, 2)),
+            None
+        );
+        // Visible outside full is a caller bug: nothing paints.
+        assert_eq!(
+            rasterize_clipped(&image, full, RectPx::new(0, 2, 2, 2)),
+            None
+        );
+        assert_eq!(
+            rasterize_clipped(&image, full, RectPx::new(1, 1, 2, 2)),
+            None
+        );
+        // Visible bytes over the 64 MiB cap: refused before allocation.
+        let big = RectPx::new(0, 0, 9000, 9000);
+        assert_eq!(rasterize_clipped(&image, big, big), None);
     }
 
     #[test]

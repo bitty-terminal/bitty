@@ -151,8 +151,8 @@ pub use kitty_place::{
     KITTY_PRESENT_MAX_BLITS_PER_FRAME, KITTY_PRESENT_MAX_BYTES_PER_FRAME,
     KITTY_RASTER_CACHE_MAX_BYTES, KITTY_RASTER_CACHE_MAX_ENTRIES, KittyAction, KittyFrameBudget,
     KittyImageId, KittyImageLayer, KittyPlacedImage, KittyPlacement, KittyPlacementError,
-    KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_rect_for,
-    rasterize, viewport_extent,
+    KittyPlacementId, KittyRasterCache, KittyRasterKey, KittyRasterStats, placement_full_rect_for,
+    placement_rect_for, rasterize, rasterize_clipped, viewport_extent,
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
 pub use projection::{ProjectedBlock, ProjectionError, project_fragments};

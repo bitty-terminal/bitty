@@ -627,10 +627,12 @@ pub(crate) fn two_pane_layout() -> LayoutNode {
 ///    the only emergency gesture is `Esc` while a modal confirmation pends
 ///    (paste gate / workspace kill-confirm): it cancels, is consumed here,
 ///    and a user `escape` remap never steals it.
-/// 2. [`DispatchPriority::Modal`] — an active modal captures command
-///    dispatch: bound chrome chords that are NOT the modal's own confirm
-///    gesture are swallowed (consumed, no action, no PTY bytes) so no state
-///    mutates behind the dialog. Unbound keys still fall through to
+/// 2. [`DispatchPriority::Modal`] — a capturing modal (close-confirm or
+///    panel overlay) captures command dispatch: bound chrome chords that
+///    are NOT the modal's own confirm gesture are swallowed (consumed, no
+///    action, no PTY bytes) so no state mutates behind the dialog. A
+///    pending paste alone never captures (issue #1336: the banner is
+///    informational). Unbound keys still fall through to
 ///    [`DispatchPriority::Terminal`] (fall-through unchanged).
 /// 3. [`DispatchPriority::User`] — the resolved keymap table (shipped
 ///    defaults plus user overrides via [`bitty_config::match_keymap`]).
@@ -688,11 +690,16 @@ fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::C
 ///   path; a panel overlay does not take Esc onto that path).
 /// - `Esc` with only the panel-overlay modal -> `(Terminal, None)`: the
 ///   panel owns its own dismissal and a remapped `Esc` must not run.
-/// - modal pending + bound chord that confirms THAT modal (repeat the
-///   arming chord: `paste_from_clipboard` while a paste pends,
-///   `workspace_close` while a workspace-close pends, `close_view` while a
-///   view-close arm on the focused view pends) -> `(User, action)`.
-/// - modal pending + any other bound chord -> `(Modal, None)` (captured).
+/// - a capturing modal (workspace-close, view/window close, or panel
+///   overlay) + the bound chord that confirms THAT modal (repeat the arming
+///   chord: `workspace_close` while a workspace-close pends, `close_view`
+///   while a view-close arm on the focused view pends) -> `(User, action)`.
+/// - a capturing modal + any other bound chord -> `(Modal, None)`
+///   (captured).
+/// - a pending paste alone never captures (issue #1336): the banner is
+///   informational, so every bound chord — zoom, focus, splits, and the
+///   paste-again confirm — dispatches as `(User, action)` through the normal
+///   path below.
 /// - bound chord, no modal -> `(User, action)`.
 /// - unbound key while a modal pends -> `(Terminal, None)` (fall-through
 ///   unchanged: the dialog captures commands, not typing).
@@ -709,6 +716,13 @@ fn resolve_priority_for(
     use bitty_config::{ChromeAction as A, KeyName};
     let confirm_modal_active = paste_pending || ws_close_pending || close_confirm_pending;
     let modal_active = confirm_modal_active || panel_modal_active;
+    // Issue #1336: the paste banner is informational, never capturing. While
+    // only a paste pends, bound chords route normally (zoom, focus, splits
+    // keep working) and paste-again-to-confirm reuses the plain `User` path.
+    // The capturing set stays the close/panel modals, where running an
+    // action behind the dialog would mutate state under a destructive
+    // confirm.
+    let capturing = ws_close_pending || close_confirm_pending || panel_modal_active;
     // Emergency/reserved first: Esc cancels any pending confirmation even
     // when the user remapped `escape` (the remap only applies with no
     // modal active, where this arm never fires).
@@ -723,7 +737,7 @@ fn resolve_priority_for(
         return (DispatchPriority::Terminal, None);
     }
     match matched {
-        Some(action) if modal_active => {
+        Some(action) if capturing => {
             let confirms_paste = paste_pending && matches!(action, A::PasteFromClipboard);
             let confirms_ws = ws_close_pending && matches!(action, A::WorkspaceClose);
             // CTX-0370: repeating the pane-close chord confirms the pane
@@ -732,8 +746,9 @@ fn resolve_priority_for(
             let confirms_view_close = close_confirm_view && matches!(action, A::CloseView);
             if confirms_paste || confirms_ws || confirms_view_close {
                 // The modal's own confirm gesture reuses the normal user
-                // action path (identical re-paste delivers, repeat Alt+W
-                // kills); every other bound chord is captured below.
+                // action path (repeat Alt+W kills; a paste-again confirm
+                // behind a close/panel modal delivers through the same
+                // path); every other bound chord is captured below.
                 (DispatchPriority::User, Some(action))
             } else {
                 (DispatchPriority::Modal, None)
@@ -3292,7 +3307,9 @@ mod tests {
             resolve_priority_for(bare_x, None, true, true, false, false, false,),
             (DispatchPriority::Terminal, None)
         );
-        // Either gate captures a bound non-confirm chord...
+        // A close gate captures a bound non-confirm chord (a pending paste
+        // alone never captures — issue #1336 — so the same chord behind
+        // only a paste banner dispatches as User).
         assert_eq!(
             resolve_priority_for(
                 alt_h,
@@ -3303,7 +3320,8 @@ mod tests {
                 false,
                 false,
             ),
-            (DispatchPriority::Modal, None)
+            (DispatchPriority::User, Some(A::GotoSplit(SplitDir::Left))),
+            "paste pending alone: bound chords route normally"
         );
         assert_eq!(
             resolve_priority_for(
@@ -3317,7 +3335,10 @@ mod tests {
             ),
             (DispatchPriority::Modal, None)
         );
-        // ...but each modal's own repeat-confirm still dispatches as User...
+        // ...but each modal's own repeat-confirm still dispatches as User
+        // (the paste-again confirm needs no exemption: nothing captures
+        // behind a paste banner, so it takes the normal User path —
+        // issue #1336)...
         assert_eq!(
             resolve_priority_for(
                 paste_chord,
@@ -3342,8 +3363,10 @@ mod tests {
             ),
             (DispatchPriority::User, Some(A::WorkspaceClose))
         );
-        // ...and crossed gestures stay captured (a close chord never
-        // confirms a paste, a paste chord never confirms a close).
+        // ...and crossed gestures stay captured under a capturing modal (a
+        // close chord never confirms a paste, a paste chord never confirms
+        // a close). With only a paste pending there is no capture: the
+        // close chord arms normally (issue #1336).
         assert_eq!(
             resolve_priority_for(
                 alt_w,
@@ -3354,7 +3377,8 @@ mod tests {
                 false,
                 false,
             ),
-            (DispatchPriority::Modal, None)
+            (DispatchPriority::User, Some(A::WorkspaceClose)),
+            "paste pending alone: close chord arms normally"
         );
         assert_eq!(
             resolve_priority_for(
@@ -3449,10 +3473,11 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_priority_modal_captures_user_chords_but_not_typing() {
-        // Suspicious clipboard (embedded newline) arms the paste-confirm
-        // modal through the real chord; every later step drives the same
-        // `drive_chrome` dispatch `handle_event` performs.
+    fn dispatch_priority_paste_banner_routes_chords_normally() {
+        // Issue #1336: a pending paste is an informational banner, never a
+        // capturing modal. Suspicious clipboard (embedded newline) arms the
+        // pending paste through the real chord; every later step drives the
+        // same `drive_chrome` dispatch `handle_event` performs.
         let mut app = paste_test_app("line1\nline2");
         app.runtime.set_layout(two_pane_layout());
         app.runtime.set_focus(ViewId::new(1));
@@ -3460,19 +3485,14 @@ mod tests {
         press_paste_chord(&mut app);
         assert!(app.runtime.has_pending_paste());
         assert!(app.modal_capture_active());
-        // Bound focus chord behind the modal is captured: consumed, no
-        // focus move, no PTY bytes, no press-to-release ownership taken.
+        // Bound focus chord behind the banner runs normally: consumed, focus
+        // moves, no PTY bytes, press-to-release ownership taken and released.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("l", "l", false)));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
         assert!(app.runtime.drain_pending_input().is_empty());
-        assert!(!app.chrome.held.contains(&bitty_config::KeyName::Char('l')));
+        assert!(app.chrome.held.contains(&bitty_config::KeyName::Char('l')));
         assert!(!drive_chrome(&mut app, char_release("l")));
-        // Workspace close behind the modal is captured too: no arm, no kill.
-        assert!(drive_chrome(&mut app, char_press("w", "w", false)));
-        assert!(!app.runtime.has_pending_ws_close());
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert!(!drive_chrome(&mut app, char_release("w")));
         // Unbound typing still falls through to the terminal: unconsumed
         // with its byte delivered (fall-through unchanged). The alt latch
         // is cleared first so this proves plain typing, not Alt+X ESC-x.
@@ -3480,9 +3500,78 @@ mod tests {
         assert!(!drive_chrome(&mut app, char_press("x", "x", false)));
         assert_eq!(app.runtime.drain_pending_input(), b"x");
         assert!(!drive_chrome(&mut app, char_release("x")));
-        // The modal pends throughout: nothing above resolved it early.
+        // The paste pends throughout: nothing above resolved it early.
         assert!(app.runtime.has_pending_paste());
+        // Esc dismisses the pending paste: consumed, dropped, no bytes, no
+        // layout change.
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(!drive_chrome(&mut app, esc_release()));
         // Release hygiene for the owned paste key and the alt latch.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+    }
+
+    #[test]
+    fn paste_pending_zoom_toggle_routes_normally() {
+        // Issue #1336 (Mod+F dead): Alt+F toggle_zoom behind a pending paste
+        // engages/disengages zoom instead of being swallowed; the paste
+        // pends throughout until Esc dismisses it.
+        let mut app = paste_test_app("line1\nline2");
+        app.runtime.set_layout(two_pane_layout());
+        app.runtime.set_focus(ViewId::new(1));
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        // First Alt+F engages zoom on the focused leaf: consumed, layout
+        // collapses to the single-leaf proxy, paste still pending, no bytes.
+        assert!(!drive_chrome(&mut app, alt_mods_event()));
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        // Second Alt+F disengages: real tree restored, paste still pending.
+        assert!(drive_chrome(&mut app, char_press("f", "f", false)));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!drive_chrome(&mut app, char_release("f")));
+        // Esc still dismisses the paste afterwards.
+        assert!(!drive_chrome(&mut app, char_release("V")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        assert!(drive_chrome(&mut app, esc_press()));
+        assert!(!app.runtime.has_pending_paste());
+        assert!(!drive_chrome(&mut app, esc_release()));
+    }
+
+    #[test]
+    fn paste_pending_ctrl_d_dismisses_without_bytes() {
+        // Issue #1336: Ctrl+D while a paste pends drops the paste (no 0x04
+        // to the shell, no exit) instead of delivering EOF behind the banner.
+        let mut app = paste_test_app("line1\nline2");
+        // Ctrl+D with no paste pending encodes EOF normally (0x04).
+        assert!(!drive_chrome(&mut app, mods_event(false, true)));
+        assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"\x04");
+        assert!(!drive_chrome(&mut app, char_release("d")));
+        assert!(!drive_chrome(&mut app, clear_mods_event()));
+        // Arm the pending paste through the real chord.
+        press_paste_chord(&mut app);
+        assert!(app.runtime.has_pending_paste());
+        // Ctrl+D behind the banner drops the paste: no bytes, no exit.
+        assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
+        assert!(!app.runtime.has_pending_paste());
+        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!drive_chrome(&mut app, char_release("d")));
+        // Once the gate is gone Ctrl+D encodes EOF normally again.
+        assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
+        assert_eq!(app.runtime.drain_pending_input(), b"\x04");
+        assert!(!drive_chrome(&mut app, char_release("d")));
+        // Release hygiene for the owned paste key and the modifier latch.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
     }

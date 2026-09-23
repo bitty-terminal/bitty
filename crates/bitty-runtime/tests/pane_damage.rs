@@ -97,6 +97,58 @@ fn tile_bytes(rt: &Runtime, id: ViewId) -> Vec<u8> {
     out
 }
 
+/// Bytes of one leaf tile minus the in-grid status bar band (#1349): the
+/// bar text legitimately changes across a workspace round trip (one
+/// workspace becomes two), so chrome pixels are masked and only pane
+/// content is compared.
+///
+/// The band is the last snapshot row as the renderer paints it: top at
+/// `(rows - 1) * cell_h`, one cell row high, `cols * cell_w` wide. The
+/// division `content / rows` must NOT be used here — its floor remainder
+/// drifts from the renderer's live cell metrics (e.g. 428px / 22 rows =
+/// 19px cells with 10px spare, so the painted band starts 10px above the
+/// naive `height - 19` line). Cell metrics are the default headless
+/// 9x19 (same geometry the `mouse_chrome.rs` `cell_pixels` helper pins).
+fn tile_content_bytes(rt: &Runtime, id: ViewId) -> Vec<u8> {
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == id)
+        .unwrap_or_else(|| panic!("leaf {id:?} must have a present frame"));
+    strip_bar_band(
+        &tile_bytes(rt, id),
+        frame.content.width as usize,
+        frame.content.height as usize,
+        usize::from(frame.rows),
+        usize::from(frame.cols),
+    )
+}
+
+/// Masks the painted bar band from captured tile bytes (total: every
+/// index is clamped, never panics).
+fn strip_bar_band(bytes: &[u8], tile_w: usize, tile_h: usize, rows: usize, cols: usize) -> Vec<u8> {
+    const CELL_W: usize = 9;
+    const CELL_H: usize = 19;
+    let band_top = rows.saturating_sub(1).saturating_mul(CELL_H);
+    let band_w = cols.saturating_mul(CELL_W).min(tile_w);
+    let mut out = Vec::with_capacity(bytes.len());
+    for r in 0..tile_h {
+        let start = r.saturating_mul(tile_w).saturating_mul(4);
+        let end = start.saturating_add(tile_w.saturating_mul(4));
+        let Some(row) = bytes.get(start..end.min(bytes.len())) else {
+            break;
+        };
+        if r >= band_top && r < band_top.saturating_add(CELL_H) {
+            // Band row: keep only the right-of-bar remainder.
+            let cut = band_w.saturating_mul(4).min(row.len());
+            out.extend_from_slice(&row[cut..]);
+        } else {
+            out.extend_from_slice(row);
+        }
+    }
+    out
+}
+
 /// Viewport cell count of one leaf for this frame (the renderer's full-leaf
 /// work budget).
 fn pane_cells(rt: &Runtime, id: ViewId) -> u64 {
@@ -226,11 +278,23 @@ fn hidden_pane_output_paints_when_visible_again() {
 
     // Visible again: the committed output must paint, the owner marker must
     // survive the round trip, and no retained list may resurrect stale bytes.
+    // (#1349: chrome masked — the bar text changed with the workspace count.)
     assert!(rt.workspace_switch(0), "switch back to the split workspace");
     assert!(rt.tick().is_some(), "switch back must present");
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == ViewId::new(1))
+        .expect("owner leaf must have a present frame");
     assert_eq!(
-        tile_bytes(&rt, ViewId::new(1)),
-        owner_before,
+        tile_content_bytes(&rt, ViewId::new(1)),
+        strip_bar_band(
+            &owner_before,
+            frame.content.width as usize,
+            frame.content.height as usize,
+            usize::from(frame.rows),
+            usize::from(frame.cols),
+        ),
         "primary owner must repaint its marker after the visibility round trip"
     );
     assert_ne!(

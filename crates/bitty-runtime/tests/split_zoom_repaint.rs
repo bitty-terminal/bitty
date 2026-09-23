@@ -102,6 +102,22 @@ fn tile_ink_pixels(rt: &Runtime, id: ViewId) -> usize {
     );
     let bg = bitty_render::grid::DEFAULT_BG;
     let (tx, ty, tw, th) = tile_pixels(rt, id);
+    // Issue #1349: the in-grid status bar paints workspace chrome on the
+    // last cell row of every leaf, so bar pixels must not count as cloned
+    // primary-grid ink. The band is the last snapshot row as the renderer
+    // paints it — top-aligned at `(rows - 1) * cell_h` (same geometry the
+    // `pane_damage.rs` `strip_bar_band` helper pins: default headless
+    // 9x19 cells). Masked only while the bar is actually drawn.
+    let bar_band = rt.status_bar_text().is_some().then(|| {
+        let rows = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == id)
+            .map(|frame| usize::from(frame.rows))
+            .unwrap_or(0);
+        let top = ty + rows.saturating_sub(1).saturating_mul(19);
+        (top, 19)
+    });
     assert!(
         tx + tw <= sw && ty + th <= sh,
         "tile must sit in the surface"
@@ -118,6 +134,9 @@ fn tile_ink_pixels(rt: &Runtime, id: ViewId) -> usize {
     );
     let mut ink = 0usize;
     for y in y0..y0 + h {
+        if bar_band.is_some_and(|(top, band_h)| y >= top && y < top + band_h) {
+            continue;
+        }
         for x in x0..x0 + w {
             let i = (y * sw + x) * 4;
             if rgba[i..i + 4] != bg {

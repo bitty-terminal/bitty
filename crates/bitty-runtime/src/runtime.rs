@@ -102,7 +102,10 @@ use bitty_render::{
     grid_from_surface_extent, sanitize_dpi_scale,
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
-use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
+use bitty_term_state::{
+    Attributes, Cell, Damage, DamageRect, DamagedRegion, Snapshot, State, Style, TerminalAction,
+    Zerowidth, char_cell_width,
+};
 use bitty_ui::{
     CellPos, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
     Rect as UiRect, SearchHighlight, Selection, SelectionKind, View, ViewId, search::SearchState,
@@ -415,6 +418,14 @@ pub struct Runtime {
     /// allocations and generations are identical, so a focus change also
     /// forces a full present. Updated alongside the allocations.
     last_presented_focus: Option<ViewId>,
+    /// Status bar text at the last present (issue #1349).
+    ///
+    /// The bar overlays owned present copies, so a workspace
+    /// switch/new/close/rename with a quiet grid still needs a frame.
+    /// `tick` compares the current [`Runtime::status_bar_text`] against
+    /// this snapshot; any difference forces a full present. Updated on
+    /// every present alongside the allocations.
+    last_presented_bar: Option<String>,
     cols: usize,
     rows: usize,
     layout: LayoutNode,
@@ -1294,6 +1305,7 @@ impl Runtime {
             session_restored: false,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
+            last_presented_bar: None,
             help_visible: false,
             help_rows: Vec::new(),
             overlay_modal_active: false,
@@ -1500,6 +1512,7 @@ impl Runtime {
             session_restored: false,
             pending_ws_close: None,
             workspaceline_visible: config.workspaceline_visible,
+            last_presented_bar: None,
             help_visible: false,
             help_rows: Vec::new(),
             overlay_modal_active: false,

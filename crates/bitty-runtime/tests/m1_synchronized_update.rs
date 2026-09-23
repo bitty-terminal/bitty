@@ -246,7 +246,8 @@ fn synchronized_update_window_is_bounded_at_100ms() {
 /// Pixel-level golden: the exact committed frame of a synchronized-update
 /// batch is pinned by digest, so a future change to the hold/commit path that
 /// alters the presented pixels or counters is caught here rather than only in
-/// downstream visual review.
+/// downstream visual review. Since #1349 the digest also covers the
+/// default-on in-grid status bar row.
 #[test]
 fn golden_synchronized_update_commit_frame() {
     let mut rt = harness();
@@ -259,7 +260,7 @@ fn golden_synchronized_update_commit_frame() {
     let commit = rt.tick_at(t0 + Duration::from_millis(1)).expect("commit");
     let actual = digest(&rt, &commit);
     assert_eq!(
-        actual, 0x636f_64b4_dce4_c871,
+        actual, 0x6ca2_494c_9dd4_9df2,
         "synchronized-update commit digest changed (actual 0x{actual:016x})"
     );
 }

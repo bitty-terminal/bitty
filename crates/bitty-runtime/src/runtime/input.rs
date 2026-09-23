@@ -519,6 +519,12 @@ impl Runtime {
         if self.cancel_pending_on_escape(&event) {
             return None;
         }
+        // Issue #1336: Ctrl+D dismisses a pending paste (drop, no delivery)
+        // instead of sending EOF behind the banner. Close-confirm arms are
+        // untouched; with no paste pending the key encodes normally.
+        if self.cancel_pending_paste_on_ctrl_d(&event) {
+            return None;
+        }
         // CTX-0159: retain a bounded input trace for screenshots-free probes.
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
@@ -635,6 +641,10 @@ impl Runtime {
         }
         // CTX-0186/CTX-0475: scoped Esc cancel (see owned path).
         if self.cancel_pending_on_escape(event) {
+            return None;
+        }
+        // Issue #1336: Ctrl+D dismisses a pending paste (see owned path).
+        if self.cancel_pending_paste_on_ctrl_d(event) {
             return None;
         }
         let pressed = Some(event.state == PressState::Pressed);

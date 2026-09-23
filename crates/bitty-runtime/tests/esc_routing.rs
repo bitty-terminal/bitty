@@ -48,6 +48,28 @@ fn char_press(ch: char) -> KeyEvent {
     }
 }
 
+fn control_press() -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Control),
+        text: None,
+        location: KeyLocation::Left,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+fn ctrl_d(logical: char) -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Character(logical.to_string()),
+        text: Some("\u{4}".to_string()),
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
 fn show_help(rt: &mut Runtime) {
     rt.set_help_rows(vec![
         "alt+x  toggle_zoom".to_string(),
@@ -251,4 +273,102 @@ fn alt_esc_with_help_visible_dismisses_and_delivers() {
         "an Alt+Esc still routes instead of vanishing into the overlay"
     );
     assert!(!rt.pending_input().is_empty(), "bytes reached the PTY");
+}
+
+/// Issue #1336: `Ctrl+D` while a paste pends drops the paste (no `0x04`
+/// to the shell, no exit) instead of delivering EOF behind the banner.
+#[test]
+fn ctrl_d_with_pending_paste_drops_without_bytes() {
+    let mut rt = make_runtime();
+    rt.paste_text("line1\nline2");
+    assert!(rt.has_pending_paste(), "multi-line paste gates");
+    assert!(rt.paste_banner_text().is_some(), "banner shows");
+    // Latch Control the way a held modifier key does.
+    let _ = rt.handle_key_event(control_press());
+    rt.drain_pending_input();
+
+    let out = rt.handle_key_event(ctrl_d('d'));
+
+    assert_eq!(out, None, "dismissing Ctrl+D is consumed");
+    assert!(!rt.has_pending_paste(), "pending paste dropped");
+    assert!(
+        rt.drain_pending_input().is_empty(),
+        "no EOF byte behind the banner"
+    );
+    assert!(
+        rt.paste_banner_text().is_none(),
+        "banner clears with the gate"
+    );
+    // A second Ctrl+D with nothing pending encodes EOF normally again.
+    let out = rt.handle_key_event(ctrl_d('d'));
+    assert_eq!(out, Some(vec![0x04]), "EOF encodes once the gate is gone");
+    assert_eq!(rt.drain_pending_input(), b"\x04");
+}
+
+/// Issue #1336: the shifted (`D`) reporting of the same chord dismisses
+/// too — the exit-intent gesture wins while the banner shows.
+#[test]
+fn ctrl_shift_d_with_pending_paste_drops_without_bytes() {
+    let mut rt = make_runtime();
+    rt.paste_text("line1\nline2");
+    assert!(rt.has_pending_paste(), "multi-line paste gates");
+    let _ = rt.handle_key_event(control_press());
+    rt.drain_pending_input();
+
+    let out = rt.handle_key_event(ctrl_d('D'));
+
+    assert_eq!(out, None, "dismissing Ctrl+Shift+D is consumed");
+    assert!(!rt.has_pending_paste(), "pending paste dropped");
+    assert!(rt.drain_pending_input().is_empty());
+}
+
+/// Issue #1336: plain typing still passes behind the banner (the paste
+/// gate captures nothing); only the dismiss gestures consume.
+#[test]
+fn plain_typing_behind_pending_paste_still_delivers() {
+    let mut rt = make_runtime();
+    rt.paste_text("line1\nline2");
+    assert!(rt.has_pending_paste(), "multi-line paste gates");
+    rt.drain_pending_input();
+
+    let out = rt.handle_key_event(char_press('a'));
+
+    assert_eq!(out, Some(vec![b'a']), "typing is not swallowed");
+    assert!(rt.has_pending_paste(), "paste still pends");
+    assert_eq!(rt.drain_pending_input(), b"a");
+}
+
+/// Issue #1336: a `Ctrl+D` release (or a bare `d` without Control) never
+/// dismisses — only a real pressed `Ctrl+D` chord does.
+#[test]
+fn ctrl_d_release_and_bare_d_keep_pending_paste() {
+    let mut rt = make_runtime();
+    rt.paste_text("line1\nline2");
+    assert!(rt.has_pending_paste(), "multi-line paste gates");
+    let _ = rt.handle_key_event(control_press());
+    rt.drain_pending_input();
+
+    let mut released = ctrl_d('d');
+    released.state = PressState::Released;
+    assert_eq!(rt.handle_key_event(released), None);
+    assert!(rt.has_pending_paste(), "release dismisses nothing");
+
+    // Release Control: a bare `d` is typing, not a dismiss.
+    let control_up = KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Control),
+        text: None,
+        location: KeyLocation::Left,
+        state: PressState::Released,
+        repeat: false,
+        is_synthetic: false,
+    };
+    let _ = rt.handle_key_event(control_up);
+    rt.drain_pending_input();
+    assert_eq!(
+        rt.handle_key_event(char_press('d')),
+        Some(vec![b'd']),
+        "bare d types"
+    );
+    assert!(rt.has_pending_paste(), "bare d dismisses nothing");
+    assert_eq!(rt.drain_pending_input(), b"d");
 }

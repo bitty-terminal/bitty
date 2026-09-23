@@ -692,6 +692,53 @@ impl Runtime {
         true
     }
 
+    /// Scoped `Ctrl+D` routing (issue #1336): dismiss a pending paste
+    /// without delivery, mirroring [`Self::cancel_pending_on_escape`].
+    ///
+    /// `Ctrl+D` normally exits (shell EOF via `0x04`); while a paste pends
+    /// the byte must not reach the PTY and the shell must not exit behind
+    /// the banner — the press drops the pending paste and is consumed.
+    /// Only the paste gate is affected: close-confirm arms are untouched
+    /// (`Esc` remains their cancel gesture), and with no paste pending the
+    /// key encodes normally. Any `Ctrl+D` shape dismisses (shift/alt
+    /// variants included): the exit-intent gesture wins while the banner
+    /// shows. Copy/search modes and IME preedit own the keyboard above the
+    /// caller, so this never fires there.
+    ///
+    /// Returns `true` when a pending paste was dropped (caller consumes the
+    /// press); `false` otherwise.
+    pub(super) fn cancel_pending_paste_on_ctrl_d(&mut self, event: &KeyEvent) -> bool {
+        if event.state != PressState::Pressed {
+            return false;
+        }
+        if self.pending_paste.is_none() {
+            return false;
+        }
+        if !self.control_pressed {
+            return false;
+        }
+        if !matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Character(text) if text.eq_ignore_ascii_case("d")
+        ) {
+            return false;
+        }
+        self.snap_focused_to_live();
+        self.pending_paste = None;
+        self.pending_paste_since = None;
+        self.paste_banner_collapsed = false;
+        self.pending_full_redraw = true;
+        self.inspect_ring.push_key(
+            &key_inspect_label(event),
+            self.shift_pressed,
+            self.control_pressed,
+            self.alt_pressed,
+            Some(true),
+        );
+        self.publish_inspect_snapshot();
+        true
+    }
+
     pub(super) fn deliver_paste_bytes(&mut self, bytes: &[u8]) {
         self.write_input(bytes);
     }

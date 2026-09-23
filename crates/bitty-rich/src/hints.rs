@@ -698,6 +698,16 @@ impl HintBatch {
         self.labels.iter().find(|l| l.label == label)
     }
 
+    /// All allocated labels in batch order (CTX-0723, #981).
+    ///
+    /// Lets a present-path caller implement prefix completion over
+    /// sequential label keystrokes: a buffer dispatches once it resolves
+    /// exactly and no longer label extends it.
+    #[must_use]
+    pub fn labels(&self) -> &[HintLabel] {
+        &self.labels
+    }
+
     /// Label text for a target handle, if present.
     #[must_use]
     pub fn label_for(&self, id: TargetId) -> Option<&str> {

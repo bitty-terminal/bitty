@@ -8,15 +8,25 @@
 //!
 //! - issue #980 (CW-01): [`Runtime::cw_fold_apply`] +
 //!   [`Runtime::cw_fold_projection`] call [`crate::cw_present::apply_fold_action`]
-//!   and [`crate::cw_present::fold_present`];
+//!   and [`crate::cw_present::fold_present`]; [`Runtime::cw_fold_latest`]
+//!   applies a verb to the focused view's latest command block for the
+//!   `fold_toggle`/`fold_expand`/`fold_collapse` keymap actions;
+//! - issue #981 (CW-02): the Leader-armed [`Runtime::cw_hint_arm`] +
+//!   [`Runtime::cw_hint_push_key`] + [`Runtime::cw_hint_disarm`] own the
+//!   live [`bitty_rich::hints::HintSession`] behind the operator-conflict
+//!   gate with prefix-completion dispatch;
 //! - issue #982 (CW-03): [`Runtime::cw_input_route`] +
 //!   [`Runtime::cw_composer_feed`] + [`Runtime::cw_composer_snapshot`] call
 //!   [`crate::cw_present::route_present_input`],
 //!   [`crate::cw_present::feed_present`], and
 //!   [`crate::cw_present::composer_present`];
 //! - issue #983 (CW-04): [`Runtime::cw_hint_register`] +
-//!   [`Runtime::cw_hint_collect`] + [`Runtime::cw_hint_dispatch`] own one
+//!   [`Runtime::cw_hint_unregister`] + [`Runtime::cw_hint_collect`] +
+//!   [`Runtime::cw_hint_dispatch`] own one
 //!   [`crate::cw_present::CwHintEngine`] for labels, overlay, and dispatch;
+//! - issue #984 (CW-05): [`Runtime::cw_fold_snapshot_ordinals`] +
+//!   [`Runtime::cw_fold_restore_ordinals`] own fold persistence as anchor
+//!   ordinals (stable scrollback identity stays deferred per owner ruling);
 //! - all seven slices: [`Runtime::cw_present_plan`] calls
 //!   [`crate::cw_present::plan_present`] once per present derivation.
 //!
@@ -26,15 +36,19 @@
 
 use super::*;
 
-use bitty_rich::blocks::{CommandBlock, CommandId};
+use bitty_rich::blocks::{CommandBlock, CommandId, blocks};
 use bitty_rich::composer::{ComposerFeedError, ComposerKeyEvent};
-use bitty_rich::hints::{DispatchError, DispatchOutcome, HintAction, HintBatch, HintScope};
+use bitty_rich::hints::{
+    DispatchError, DispatchOutcome, HINT_LABEL_MAX_CHARS, HintAction, HintBatch, HintOperator,
+    HintScope, OperatorConflict,
+};
 use bitty_rich::scene::Scene;
 
 use crate::cw_present::{
     ComposerPresent, CwComposerFeed, CwFoldAction, CwHintProvider, CwInputRoute, CwPresentInputs,
-    CwPresentPlan, FoldPresent, apply_fold_action, composer_present, dispatch_present,
-    feed_present, fold_present, plan_present, route_present_input,
+    CwPresentPlan, FoldPresent, HintKeyOutcome, apply_fold_action, composer_present,
+    dispatch_present, feed_present, fold_present, persist_fold_ordinals, plan_present,
+    route_present_input,
 };
 
 impl Runtime {
@@ -132,6 +146,15 @@ impl Runtime {
         self.cw_hints.register_provider(provider)
     }
 
+    /// Unregisters one panel provider on the live hint engine (issue #983).
+    ///
+    /// Dispose symmetry for [`Runtime::cw_hint_register`]: a disposed panel
+    /// stops contributing targets so its labels cannot outlive the leaf.
+    /// Returns `true` when a provider was removed.
+    pub fn cw_hint_unregister(&mut self, panel: u64) -> bool {
+        self.cw_hints.unregister_provider(panel)
+    }
+
     /// Number of providers registered on the live hint engine.
     #[must_use]
     pub fn cw_hint_provider_count(&self) -> usize {
@@ -142,7 +165,8 @@ impl Runtime {
     ///
     /// One engine owns provider registration, label allocation, the overlay
     /// batch, and dispatch, so labels stay unique across panels and the
-    /// overlay stays one layer with zero overlay-slot cost.
+    /// overlay stays one layer with zero overlay-slot cost. Command-block
+    /// targets join every collection (the live engine enables them).
     #[must_use]
     pub fn cw_hint_collect(&self, scope: HintScope, generation: u64) -> HintBatch {
         self.cw_hints.collect(&self.state, scope, generation)
@@ -164,6 +188,165 @@ impl Runtime {
         action: HintAction,
     ) -> Result<DispatchOutcome, DispatchError> {
         dispatch_present(batch, &mut self.cw_fold, label, action)
+    }
+
+    /// Arms the live hint session from the live engine (issue #981).
+    ///
+    /// Collects one batch against live terminal state through the single
+    /// [`CwHintEngine`](crate::cw_present::CwHintEngine) (labels stay unique
+    /// across panels) and arms the session behind the operator-conflict
+    /// gate. Returns the armed label count so the caller can refuse an
+    /// empty batch loudly instead of arming a dead session.
+    ///
+    /// # Errors
+    ///
+    /// [`OperatorConflict`] when an operator key collides with
+    /// `bound_bare_keys`; the session stays disarmed and keeps no batch.
+    pub fn cw_hint_arm(
+        &mut self,
+        scope: HintScope,
+        generation: u64,
+        bound_bare_keys: &[char],
+    ) -> Result<usize, OperatorConflict> {
+        let batch = self.cw_hints.collect(&self.state, scope, generation);
+        let count = batch.len();
+        self.cw_hint_session.arm(batch, bound_bare_keys)?;
+        self.cw_hint_operator = None;
+        self.cw_hint_label.clear();
+        Ok(count)
+    }
+
+    /// Whether the live hint session currently owns operator/label keys.
+    #[must_use]
+    pub fn cw_hint_is_armed(&self) -> bool {
+        self.cw_hint_session.is_armed()
+    }
+
+    /// Disarms the live hint session, dropping the batch and any partial
+    /// operator/label keystrokes (issue #981).
+    ///
+    /// Hint chrome is ephemeral: disarm is always safe, idempotent, and
+    /// touches neither terminal truth nor the fold state.
+    pub fn cw_hint_disarm(&mut self) {
+        self.cw_hint_session.disarm();
+        self.cw_hint_operator = None;
+        self.cw_hint_label.clear();
+    }
+
+    /// Feeds one keystroke into the armed hint interaction (issue #981).
+    ///
+    /// The first letter selects the operator (`j`/`z`/`p`/`y`/`e`/`c`); the
+    /// following letters accumulate the label and dispatch once the buffer
+    /// resolves exactly with no longer label extending it (prefix
+    /// completion). A dead label buffer (resolves nothing and extends
+    /// nothing) is cleared so the caller can retry the label inside the
+    /// same armed window; the operator is kept. Dispatch disarms the
+    /// session. Fails closed with [`HintKeyOutcome::Invalid`] while
+    /// disarmed — keys belong to the shell then, never to this method.
+    pub fn cw_hint_push_key(&mut self, raw: char) -> HintKeyOutcome {
+        if !self.cw_hint_session.is_armed() {
+            return HintKeyOutcome::Invalid { key: raw };
+        }
+        let key = raw.to_ascii_lowercase();
+        if !key.is_ascii_lowercase() {
+            return HintKeyOutcome::Invalid { key: raw };
+        }
+        if self.cw_hint_operator.is_none() {
+            if HintOperator::from_key(key).is_some() {
+                self.cw_hint_operator = Some(key);
+                return HintKeyOutcome::NeedMore;
+            }
+            return HintKeyOutcome::Invalid { key: raw };
+        }
+        if self.cw_hint_label.len() >= HINT_LABEL_MAX_CHARS {
+            return HintKeyOutcome::Invalid { key: raw };
+        }
+        self.cw_hint_label.push(key);
+        let (resolves, extendable) = match self.cw_hint_session.batch() {
+            Some(batch) => {
+                let resolves = batch.resolve(&self.cw_hint_label).is_some();
+                let extendable = batch.labels().iter().any(|l| {
+                    l.label.len() > self.cw_hint_label.len()
+                        && l.label.starts_with(self.cw_hint_label.as_str())
+                });
+                (resolves, extendable)
+            }
+            None => (false, false),
+        };
+        if resolves && !extendable {
+            let operator = self.cw_hint_operator.unwrap_or(key);
+            let label = self.cw_hint_label.clone();
+            match self
+                .cw_hint_session
+                .feed(&mut self.cw_fold, operator, label.as_str())
+            {
+                Ok(outcome) => {
+                    self.cw_hint_disarm();
+                    HintKeyOutcome::Dispatched(outcome)
+                }
+                Err(_) => HintKeyOutcome::Invalid { key: raw },
+            }
+        } else if !resolves && !extendable {
+            self.cw_hint_label.clear();
+            HintKeyOutcome::Invalid { key: raw }
+        } else {
+            HintKeyOutcome::NeedMore
+        }
+    }
+
+    /// Latest semantic command block on the focused view's state, if shell
+    /// integration has marked any (issue #980).
+    ///
+    /// `None` with no `OSC 133` zones yet: the fold verbs below stay
+    /// fail-closed instead of inventing a target.
+    #[must_use]
+    pub fn cw_latest_command_id(&self) -> Option<CommandId> {
+        blocks(&self.state).last().map(|block| block.id)
+    }
+
+    /// Applies one present-path fold verb to the focused view's latest
+    /// command block (issue #980).
+    ///
+    /// Returns `None` when no command block exists yet; otherwise the
+    /// [`apply_fold_action`](crate::cw_present::apply_fold_action) end-state
+    /// contract. Terminal truth is untouched.
+    pub fn cw_fold_latest(&mut self, action: CwFoldAction) -> Option<bool> {
+        let id = self.cw_latest_command_id()?;
+        Some(apply_fold_action(&mut self.cw_fold, id, action))
+    }
+
+    /// Serializes live fold membership as anchor ordinals (issue #984).
+    ///
+    /// The present layer owns persistence: ordinals (never grid rows) leave
+    /// here and replay through [`Runtime::cw_fold_restore_ordinals`] on
+    /// rehydrate. Bounded by `FOLD_MAX` by construction.
+    #[must_use]
+    pub fn cw_fold_snapshot_ordinals(&self) -> Vec<u64> {
+        persist_fold_ordinals(&self.cw_fold)
+    }
+
+    /// Replays persisted fold ordinals into the live fold state, returning
+    /// the admitted count (issue #984).
+    ///
+    /// Each ordinal replays idempotently through
+    /// [`apply_fold_action`](crate::cw_present::apply_fold_action)
+    /// (`Collapse`); ordinals past the fold cap fail closed and are not
+    /// counted. Unknown ordinals (evicted history) are admitted harmlessly:
+    /// they contribute nothing to any projection until their blocks exist
+    /// again.
+    pub fn cw_fold_restore_ordinals(&mut self, ordinals: &[u64]) -> usize {
+        let mut admitted = 0usize;
+        for raw in ordinals {
+            // `Collapse` is idempotent: already-folded holds trivially and a
+            // fresh fold reports its insertion, so one call covers both arms
+            // (fail-closed past the cap reports `false` and is not counted).
+            if apply_fold_action(&mut self.cw_fold, CommandId(*raw), CwFoldAction::Collapse)
+                || self.cw_fold.is_folded(CommandId(*raw))
+            {
+                admitted += 1;
+            }
+        }
+        admitted
     }
 
     /// Derives the one-frame CW present enrichment for a live view

@@ -134,6 +134,10 @@ fn osc10_osc11_set_is_default_deny_and_pixel_inert() {
 #[test]
 fn granted_osc11_set_repaints_the_surface() {
     let mut rt = themed_deterministic();
+    // #1349: the subject here is background-override plumbing, so the
+    // default-on bar row is hidden to keep the `glyphs == 0` pin exact (a
+    // full re-render with chrome would legitimately re-emit bar glyphs).
+    rt.set_workspaceline_visible(false);
     assert!(rt.tick().is_some(), "baseline full redraw");
     let baseline = rt.headless_rgba().expect("baseline rgba");
     assert_eq!(

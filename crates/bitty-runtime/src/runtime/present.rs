@@ -335,6 +335,89 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
+/// Overlays the status bar text onto the last row of an owned present
+/// snapshot (issue #1349).
+///
+/// Presentation-only: the caller passes the per-leaf present copy, so
+/// grid truth is never mutated. The full row takes inverse video so it
+/// reads as a bar; `text` is laid out width-aware
+/// ([`char_cell_width`]) with wide-spacer halves, truncated at the frame
+/// edge, and the remainder padded with bar-styled spaces. Control
+/// scalars render as spaces so overlay columns stay aligned with the
+/// character columns [`Runtime::workspaceline_hit_test`] counts;
+/// zero-width scalars attach to the previous cell (dropped when full or
+/// leading). Total and fail-closed: empty/zero-size snapshots and length
+/// mismatches paint nothing and never panic.
+fn overlay_status_bar(snapshot: &mut Snapshot, text: &str) {
+    if snapshot.height == 0 || snapshot.width == 0 {
+        return;
+    }
+    if snapshot.cells.len() != snapshot.width.saturating_mul(snapshot.height) {
+        return;
+    }
+    let bar_style = Style {
+        foreground: None,
+        background: None,
+        underline_color: None,
+        attributes: Attributes {
+            inverse: true,
+            ..Default::default()
+        },
+    };
+    let bar_space = Cell {
+        glyph: ' ',
+        style: bar_style,
+        width: 1,
+        spacer: false,
+        hyperlink: None,
+        zerowidth: Zerowidth::new(),
+    };
+    let row_start = snapshot
+        .width
+        .saturating_mul(snapshot.height.saturating_sub(1));
+    for col in 0..snapshot.width {
+        snapshot.cells[row_start.saturating_add(col)] = bar_space;
+    }
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if col >= snapshot.width {
+            break;
+        }
+        if ch.is_control() {
+            // Column-preserving placeholder (see above); the space cell is
+            // already painted.
+            col = col.saturating_add(1);
+            continue;
+        }
+        let width = usize::from(char_cell_width(ch));
+        if width == 0 {
+            // Zero-width scalar: attach to the previous cell when there is
+            // one, else drop. Never advances the column.
+            if col > 0 {
+                let _ = snapshot.cells[row_start.saturating_add(col.saturating_sub(1))]
+                    .push_zerowidth(ch);
+            }
+            continue;
+        }
+        if col.saturating_add(width) > snapshot.width {
+            break;
+        }
+        snapshot.cells[row_start.saturating_add(col)] = Cell {
+            glyph: ch,
+            style: bar_style,
+            width: width as u8,
+            spacer: false,
+            hyperlink: None,
+            zerowidth: Zerowidth::new(),
+        };
+        if width == 2 {
+            snapshot.cells[row_start.saturating_add(col.saturating_add(1))] =
+                Cell::wide_spacer(bar_style);
+        }
+        col = col.saturating_add(width);
+    }
+}
+
 /// First source row of a viewport window that keeps `cursor_row` visible.
 ///
 /// The window is `window` rows tall inside `src_len` rows. It stays at the
@@ -867,6 +950,15 @@ impl Runtime {
             pending_full = true;
         }
 
+        // Issue #1349: the bar overlays owned present copies, so a
+        // workspace switch/new/close/rename with a quiet grid still needs
+        // a frame. The text comparison is the bar's damage signal;
+        // `set_workspaceline_visible` already forces via
+        // `pending_full_redraw`. Bounded (`WORKSPACELINE_MAX_CHARS`).
+        if self.status_bar_text() != self.last_presented_bar {
+            pending_full = true;
+        }
+
         // RFC-0002 (CTX-0341): derive open/close/focus/workspace transitions
         // from the last presented frame and arm the bounded animations. This
         // runs before the idle short-circuit so an armed transition forces the
@@ -1008,6 +1100,10 @@ impl Runtime {
         // the same pass), so the whole leaf set is rebuilt when a reset is
         // observed, bounded by [`ATLAS_REBUILD_LIMIT`].
         let mut attempt = 0u8;
+        // Issue #1349: the in-grid status bar text for this frame (owned:
+        // the leaf loop below takes `&mut self`). `None` when opted out
+        // via `workspace.show_bar`.
+        let status_bar = self.status_bar_text();
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
@@ -1188,7 +1284,7 @@ impl Runtime {
                     .unwrap_or(snapshot);
                 // Determine viewport snapshot: when view scroll_offset !=0,
                 // visible_cells composites scrollback.
-                let view_snapshot = if let Some(v) = view {
+                let mut view_snapshot = if let Some(v) = view {
                     // #1338 fail-closed: the alternate screen owns no
                     // scrollback view — a stale offset (scrolled on primary,
                     // then entered alt) must not composite primary history
@@ -1218,6 +1314,20 @@ impl Runtime {
                 } else {
                     viewport_snapshot(base_snap, frame.cols, frame.rows)
                 };
+
+                // Issue #1349: the in-grid status bar row overlays the last
+                // content row of this owned present copy — grid truth is
+                // never mutated. Skipped on the alternate screen (a
+                // fullscreen app owns every row there).
+                if let Some(bar) = status_bar.as_deref() {
+                    let leaf_on_alt = match self.pane_sessions.get(&view_id) {
+                        Some(sess) => sess.state.alt_screen_active(),
+                        None => self.state.alt_screen_active(),
+                    };
+                    if !leaf_on_alt {
+                        overlay_status_bar(&mut view_snapshot, bar);
+                    }
+                }
 
                 // A re-rendered leaf is redrawn in full. Sub-pane partial
                 // merges are deliberately not attempted: retained glyphs can
@@ -1999,6 +2109,7 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
+            self.last_presented_bar = self.status_bar_text();
             return None;
         }
 
@@ -2106,6 +2217,7 @@ impl Runtime {
             self.mark_frame_presented(snapshot.generation);
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
+            self.last_presented_bar = self.status_bar_text();
             return None;
         }
 
@@ -2140,6 +2252,7 @@ impl Runtime {
         self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
+        self.last_presented_bar = self.status_bar_text();
         self.kitty_last_frame_images = kitty_blits;
         // CTX-0244: publish the presented headless frame for `frameHash`
         // digesting — only while a digest grant is live (zero clone cost
@@ -2518,5 +2631,91 @@ mod content_padding_tests {
         );
         assert!(rt.set_decoration(Decoration::ZERO).is_ok());
         assert_eq!(rt.decoration(), Decoration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod status_bar_overlay_tests {
+    use super::overlay_status_bar;
+    use bitty_term_state::State;
+
+    fn blank(width: usize, height: usize) -> bitty_term_state::Snapshot {
+        let mut state = State::new();
+        state.resize(width, height);
+        state.snapshot()
+    }
+
+    #[test]
+    fn bar_row_takes_inverse_video_with_text_and_padding() {
+        let mut snap = blank(8, 3);
+        overlay_status_bar(&mut snap, "1:a*");
+        // Upper rows are untouched grid truth.
+        for row in 0..2 {
+            for col in 0..8 {
+                let cell = &snap.cells[row * 8 + col];
+                assert!(!cell.style.attributes.inverse, "row {row} col {col}");
+            }
+        }
+        // Last row: text then bar-styled spaces, all inverse.
+        let row = &snap.cells[16..24];
+        assert!(row.iter().all(|c| c.style.attributes.inverse));
+        let glyphs: String = row.iter().map(|c| c.glyph).collect();
+        assert_eq!(glyphs, "1:a*    ");
+        assert!(!row.iter().any(|c| c.spacer));
+        assert!(!row.iter().any(|c| c.hyperlink.is_some()));
+    }
+
+    #[test]
+    fn bar_lays_out_wide_chars_with_spacers_and_truncates() {
+        // 'a' + U+4E2D (wide) + 'b': spacer invariant holds, no orphans.
+        let mut snap = blank(4, 1);
+        overlay_status_bar(&mut snap, "a\u{4e2d}b");
+        let row = &snap.cells[0..4];
+        assert_eq!(row[0].glyph, 'a');
+        assert_eq!(row[1].glyph, '\u{4e2d}');
+        assert_eq!(row[1].width, 2);
+        assert!(row[2].spacer, "wide trailing half must be a spacer");
+        assert_eq!(row[3].glyph, 'b');
+        // A wide scalar with one cell left is truncated, never split.
+        let mut narrow = blank(2, 1);
+        overlay_status_bar(&mut narrow, "a\u{4e2d}");
+        assert_eq!(narrow.cells[0].glyph, 'a');
+        assert_eq!(narrow.cells[1].glyph, ' ');
+        assert!(!narrow.cells[1].spacer);
+        // Plain overlong text truncates at the frame edge.
+        let mut tiny = blank(2, 1);
+        overlay_status_bar(&mut tiny, "abc");
+        assert_eq!(tiny.cells[0].glyph, 'a');
+        assert_eq!(tiny.cells[1].glyph, 'b');
+    }
+
+    #[test]
+    fn bar_folds_controls_and_zero_width_without_shifting_columns() {
+        // '\n' keeps its column as a space; the combining acute attaches
+        // to 'a' without advancing, so 'b' still lands on column 2.
+        let mut snap = blank(5, 1);
+        overlay_status_bar(&mut snap, "a\u{301}\nb ");
+        let row = &snap.cells[0..5];
+        assert_eq!(row[0].glyph, 'a');
+        assert_eq!(row[0].zerowidth.len(), 1);
+        assert_eq!(row[1].glyph, ' ');
+        assert_eq!(row[2].glyph, 'b');
+        assert_eq!(row[3].glyph, ' ');
+        assert!(row.iter().all(|c| c.style.attributes.inverse));
+    }
+
+    #[test]
+    fn bar_is_noop_on_degenerate_snapshots() {
+        // Zero height: no last row exists (State::resize clamps to >= 1,
+        // so the degenerate shape is built by direct mutation).
+        let mut flat = blank(4, 2);
+        flat.height = 0;
+        overlay_status_bar(&mut flat, "1:a*");
+        assert!(flat.cells.iter().all(|c| !c.style.attributes.inverse));
+        // Length mismatch (defensive: never index out of bounds).
+        let mut short = blank(4, 2);
+        short.cells = short.cells[0..4].to_vec().into_boxed_slice();
+        overlay_status_bar(&mut short, "1:a*");
+        assert_eq!(short.cells.len(), 4);
     }
 }

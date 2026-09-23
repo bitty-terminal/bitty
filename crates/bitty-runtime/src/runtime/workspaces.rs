@@ -56,6 +56,13 @@ pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 /// Hard bound on the rendered workspaceline string.
 pub const WORKSPACELINE_MAX_CHARS: usize = 1024;
 
+/// Height of the in-grid status bar in terminal rows (issue #1349).
+///
+/// The bar occupies exactly the last content row of each rendered leaf.
+/// Terminal content behind it is occluded, never mutated: the overlay
+/// applies to the owned present snapshot copy, never to grid truth.
+pub const STATUS_BAR_ROWS: usize = 1;
+
 /// One workspace: name plus stashed layout + focus.
 #[derive(Debug, Clone)]
 pub struct WorkspaceSlot {
@@ -285,6 +292,39 @@ impl Runtime {
         }
     }
 
+    /// StatusBar text as chrome should present it, or `None` when opted
+    /// out (issue #1349).
+    ///
+    /// v1 composes the `workspace` module only (status-system design:
+    /// event-driven, fail-closed em-dash when no workspace slot exists).
+    /// The `cwd`/`git`/`clock`/metrics slots compose here once their
+    /// snapshots exist; `--safe` needs no stripping because no
+    /// configuration-dependent module is composed yet.
+    #[must_use]
+    pub fn status_bar_text(&self) -> Option<String> {
+        if !self.workspaceline_visible {
+            return None;
+        }
+        if self.workspaces.is_empty() {
+            return Some(String::from("\u{2014}"));
+        }
+        Some(self.workspaceline_text())
+    }
+
+    /// In-grid bar row (0-based) inside a leaf content frame `height_rows`
+    /// tall, or `None` when the bar is hidden or the frame has no bar row.
+    ///
+    /// Shared by the present overlay, the mouse routing, and headless
+    /// tests so the drawn row and its click geometry can never drift
+    /// apart.
+    #[must_use]
+    pub fn status_bar_row(&self, height_rows: usize) -> Option<usize> {
+        if !self.workspaceline_visible || height_rows < STATUS_BAR_ROWS {
+            return None;
+        }
+        Some(height_rows - STATUS_BAR_ROWS)
+    }
+
     /// Maps a bar column (0-based, in characters of
     /// [`Self::workspaceline_text`]) to a workspace index. `None` when the
     /// bar is hidden, when the column lands on a separator or the trailing
@@ -320,6 +360,59 @@ impl Runtime {
             return false;
         }
         self.workspace_switch(target)
+    }
+
+    /// Routes a left press on the drawn in-grid status bar band to the
+    /// workspace hit-test (issue #1349).
+    ///
+    /// Returns `true` (consume the press) when the last-known cursor sits
+    /// inside a drawn bar band: the band geometry reuses the same
+    /// [`PresentFrame`](super::layout_focus::PresentFrame) content rects
+    /// and [`Self::status_bar_row`] the present overlay paints, so a click
+    /// can only land where the bar was drawn. The click itself still fails
+    /// closed through [`Self::workspaceline_click`] (separators, the count
+    /// suffix, and the active workspace switch nothing); the press is
+    /// consumed regardless because the bar row is chrome — the terminal
+    /// cells underneath must not start a selection while hidden behind
+    /// the bar.
+    pub(super) fn status_bar_press(&mut self) -> bool {
+        if !self.workspaceline_visible {
+            return false;
+        }
+        let Some(pos) = self.last_cursor else {
+            return false;
+        };
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return false;
+        }
+        let live = self.live_cell_metrics();
+        if live.width == 0 || live.height == 0 {
+            return false;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let cell_w = f64::from(live.width);
+        let cell_h = f64::from(live.height);
+        for frame in self.present_frames() {
+            if frame.cols == 0 || frame.rows == 0 {
+                continue;
+            }
+            let Some(bar) = self.status_bar_row(usize::from(frame.rows)) else {
+                continue;
+            };
+            let origin_x = pad + f64::from(frame.content.x.max(0));
+            let origin_y = pad + f64::from(frame.content.y.max(0)) + (bar as f64) * cell_h;
+            let band_w = f64::from(frame.cols) * cell_w;
+            if pos.x >= origin_x
+                && pos.x < origin_x + band_w
+                && pos.y >= origin_y
+                && pos.y < origin_y + cell_h
+            {
+                let col = ((pos.x - origin_x) / cell_w).floor() as usize;
+                self.workspaceline_click(col);
+                return true;
+            }
+        }
+        false
     }
 
     /// Rename workspace `index` (0-based) to `name`.
@@ -1096,6 +1189,26 @@ mod tests {
         // Re-enabling restores the bar.
         rt.set_workspaceline_visible(true);
         assert_eq!(rt.workspaceline_present().as_deref(), Some("1:ws1* (1)"));
+    }
+
+    #[test]
+    fn status_bar_composes_workspace_module_with_shared_row_geometry() {
+        // Issue #1349: the composer serves the workspace module by
+        // default and hides with the same opt-out; the row helper names
+        // the last content row so overlay, mouse, and tests agree.
+        let rt = fresh();
+        assert_eq!(
+            rt.status_bar_text().as_deref(),
+            Some("1:ws1* (1)"),
+            "workspace module minimum"
+        );
+        assert_eq!(rt.status_bar_row(24), Some(23));
+        assert_eq!(rt.status_bar_row(1), Some(0));
+        assert_eq!(rt.status_bar_row(0), None, "no rows means no bar row");
+        let mut hidden = fresh();
+        hidden.set_workspaceline_visible(false);
+        assert_eq!(hidden.status_bar_text(), None);
+        assert_eq!(hidden.status_bar_row(24), None);
     }
 
     #[test]

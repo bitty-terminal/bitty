@@ -1029,6 +1029,18 @@ impl Runtime {
         {
             return;
         }
+        // Issue #1349: the in-grid status bar row is chrome. A left press
+        // on the drawn bar band routes to the workspace hit-test and
+        // consumes the event (Shift still forces the selection path
+        // above; capture returned earlier so a mouse-mode app keeps the
+        // pointer).
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self.status_bar_press()
+        {
+            return;
+        }
         // A left release always ends a thumb drag; the selection release
         // path below then runs harmlessly (`end_selection` early-returns
         // with no selection, and no selection was started while dragging).

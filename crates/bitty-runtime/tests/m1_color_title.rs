@@ -168,14 +168,15 @@ fn osc_title_reaches_state_and_cold_handoff() {
 
 /// The default themed, deterministic first frame is pinned by digest, so the
 /// default palette/theme application and the title path are regression-locked
-/// at the presentation boundary.
+/// at the presentation boundary. Since #1349 the digest also covers the
+/// default-on in-grid status bar row (workspace module, last content row).
 #[test]
 fn golden_default_theme_first_frame_digest() {
     let mut rt = themed_deterministic();
     let first = rt.tick().expect("first themed frame presents");
     let actual = digest(&rt, &first);
     assert_eq!(
-        actual, 0xf194_7117_d9e4_06d1,
+        actual, 0x1e25_17cf_ec40_3540,
         "default themed frame digest changed (actual 0x{actual:016x})"
     );
     let rgba = rt.headless_rgba().expect("rgba");

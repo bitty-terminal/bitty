@@ -203,6 +203,12 @@ pub mod statusline;
 pub mod tabs;
 pub mod workspace;
 
+// Re-export present-path interaction types for the app composition root
+// (CTX-0723): the Leader/hint/composer/fold input path consumes these
+// without taking a direct `bitty-rich` dependency in `bitty-app`.
+pub use bitty_rich::composer::{ComposerKey, ComposerKeyEvent};
+pub use bitty_rich::hints::{DispatchOutcome, HintScope};
+
 pub use config::{
     BACKGROUND_FITS, CloseConfirmMode, DEFAULT_BACKGROUND_FIT, MAX_BACKGROUND_IMAGE_PATH_BYTES,
     MAX_BACKGROUND_IMAGE_ROOTS, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline,

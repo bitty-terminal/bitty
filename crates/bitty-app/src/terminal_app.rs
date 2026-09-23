@@ -299,6 +299,16 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the effective-config Leader binding (CTX-0723 #981).
+    ///
+    /// Resolved once at startup from `leader_key` / `leader_timeout_ms`
+    /// via [`bitty_config::resolve_leader_for`]; the input path arms the
+    /// hint session on these chords.
+    pub(crate) fn with_leader(mut self, leader: bitty_config::ResolvedLeader) -> Self {
+        self.chrome = self.chrome.with_leader(leader);
+        self
+    }
+
     /// True when per-frame `bitty tick` stderr lines are emitted.
     ///
     /// Hot-path guard: a single comparison, checked before any formatting so

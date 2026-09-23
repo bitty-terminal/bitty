@@ -485,6 +485,12 @@ pub struct Runtime {
     cw_fold: bitty_rich::blocks::FoldState,
     cw_composer: bitty_rich::composer::ComposerSession,
     cw_hints: crate::cw_present::CwHintEngine,
+    /// Live hint interaction: armed batch plus per-keystroke operator/label
+    /// accumulation (CTX-0723, #981). The app arms on the Leader chord and
+    /// feeds operator/label letters; dispatch disarms.
+    cw_hint_session: bitty_rich::hints::HintSession,
+    cw_hint_operator: Option<char>,
+    cw_hint_label: String,
     container: UiRect,
     clipboard: Clipboard,
     selection: Option<Selection>,
@@ -1236,7 +1242,14 @@ impl Runtime {
             next_workspace_seq: 2,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             cw_composer: bitty_rich::composer::ComposerSession::new(),
-            cw_hints: crate::cw_present::CwHintEngine::new(),
+            // Command targets join every live collection: fold/jump/copy
+            // over shell commands is the core hint surface; panels join
+            // via `cw_hint_register`. Headless-neutral (zero zones yields
+            // zero command targets).
+            cw_hints: crate::cw_present::CwHintEngine::new().with_commands(true),
+            cw_hint_session: bitty_rich::hints::HintSession::new(),
+            cw_hint_operator: None,
+            cw_hint_label: String::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).
@@ -1419,7 +1432,14 @@ impl Runtime {
             next_workspace_seq: 2,
             cw_fold: bitty_rich::blocks::FoldState::new(),
             cw_composer: bitty_rich::composer::ComposerSession::new(),
-            cw_hints: crate::cw_present::CwHintEngine::new(),
+            // Command targets join every live collection: fold/jump/copy
+            // over shell commands is the core hint surface; panels join
+            // via `cw_hint_register`. Headless-neutral (zero zones yields
+            // zero command targets).
+            cw_hints: crate::cw_present::CwHintEngine::new().with_commands(true),
+            cw_hint_session: bitty_rich::hints::HintSession::new(),
+            cw_hint_operator: None,
+            cw_hint_label: String::new(),
         };
         // CTX-0355: install the resolved palette on both the renderer (cell
         // defaults, ANSI, emitted fills) and the surface (clear color).

@@ -491,6 +491,29 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // CTX-0723 (#981): resolve the effective Leader binding
+    // (`leader_key` / `leader_timeout_ms` overrides or the OQ-088 platform
+    // default). Invalid overrides fail closed here exactly as in `config
+    // check`; the input path arms the hint session on these chords.
+    let leader = match bitty_config::resolve_leader_for(
+        &app_config.effective,
+        bitty_config::LeaderPlatform::host(),
+    ) {
+        Ok(leader) => {
+            logging::info(|| {
+                format!(
+                    "bitty: leader resolved ({}, {}ms)",
+                    leader.primary_canonical(),
+                    leader.timeout_ms
+                )
+            });
+            leader
+        }
+        Err(err) => {
+            eprintln!("bitty: invalid leader config: {err}");
+            std::process::exit(2);
+        }
+    };
     let runtime_cfg = match runtime_config_from_effective(&app_config.effective) {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -664,6 +687,8 @@ fn main() {
         keymaps,
         spawn_spec.clone(),
     )
+    // CTX-0723 (#981): the effective Leader binding arms the hint session.
+    .with_leader(leader)
     // CTX-0223: `window.opacity` flows effective -> window creation
     // (sanitized by the platform config; fail-soft where unsupported).
     .with_window_opacity(app_config.effective.window.opacity)

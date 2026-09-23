@@ -60,6 +60,19 @@ pub(crate) struct ChromeState {
     pub(crate) held: HashSet<bitty_config::KeyName>,
     /// Pane zoom state (CTX-0481, #762).
     pub(crate) zoom: ZoomState,
+    /// Effective Leader binding (CTX-0715 / OQ-088, consumed CTX-0723 #981):
+    /// every chord that arms the hint session plus the armed-window budget.
+    /// Resolved from the effective config at startup; tests keep the
+    /// platform default.
+    pub(crate) leader: bitty_config::ResolvedLeader,
+    /// Leader arming window with a caller-owned clock (CTX-0715 timeout and
+    /// cancel semantics, consumed CTX-0723 #981). The clock base sits next
+    /// to the state so `now_ms` stays monotonic for one app lifetime.
+    pub(crate) leader_state: bitty_config::LeaderState,
+    pub(crate) leader_clock: std::time::Instant,
+    /// Hint collection generation, bumped once per Leader arming (CTX-0723,
+    /// #981). Fresh batches per arming keep stale labels unreachable.
+    pub(crate) hint_generation: u64,
 }
 
 impl ChromeState {
@@ -69,7 +82,27 @@ impl ChromeState {
             app_mods: AppModifiers::default(),
             held: HashSet::new(),
             zoom: ZoomState::new(),
+            leader: bitty_config::resolve_leader(None, None, bitty_config::LeaderPlatform::host())
+                .expect("internal leader defaults parse"),
+            leader_state: bitty_config::LeaderState::Idle,
+            leader_clock: std::time::Instant::now(),
+            hint_generation: 0,
         }
+    }
+
+    /// Injects the effective-config Leader binding (startup path).
+    pub(crate) fn with_leader(mut self, leader: bitty_config::ResolvedLeader) -> Self {
+        self.leader = leader;
+        self
+    }
+
+    /// Caller-clock milliseconds for [`Self::leader_state`].
+    pub(crate) fn leader_now_ms(&self) -> u64 {
+        self.leader_clock
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -703,6 +736,27 @@ impl TerminalApp {
         self.chrome.zoom.restore_for_mutation(&mut self.runtime)
     }
 
+    /// Applies one `fold_toggle`/`fold_expand`/`fold_collapse` verb to the
+    /// focused view's latest command block (CTX-0723 #980).
+    ///
+    /// `None` (no shell-integration marks yet) warns loudly instead of
+    /// inventing a target; terminal truth is untouched either way.
+    fn apply_fold_verb(&mut self, action: bitty_runtime::cw_present::CwFoldAction, name: &str) {
+        match self.runtime.cw_fold_latest(action) {
+            Some(folded) => {
+                eprintln!(
+                    "bitty: keymap {name} -> latest command {}",
+                    if folded { "folded" } else { "unfolded" }
+                );
+            }
+            None => {
+                eprintln!(
+                    "warning: keymap {name} has no command block yet (no shell integration marks) — ignoring"
+                );
+            }
+        }
+    }
+
     /// Execute one bound chrome action (single owner: the PTY never sees the
     /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
     /// refusals warn and keep the current layout.
@@ -759,20 +813,30 @@ impl TerminalApp {
                 }
             }
             A::OpenComposer => {
-                // CTX-0391 / GitHub #647 (unbind path): the composer session
-                // itself lives headless in `bitty-rich` and the overlay/panel
-                // presentation plus editor spawn are not yet wired into the
-                // app. Wiring here would need ComposerSession state, input
-                // routing, PTY submit, and process-spawn policy — a full
-                // feature, not a P2 fix. Until then `open_composer` parses
-                // for forward compat but is never in defaults: unbound Alt+E
-                // reaches the shell, and an explicitly bound chord is
-                // consumed here as inert with a loud warning (no editor, no
-                // routing change, Normal Mode stays byte-identical).
+                // CTX-0723 (#982): the composer session now opens for real.
+                // Input routing while open lives in `route_cw_modal`
+                // (modal tier, above the user keymap); submit writes one
+                // bracketed frame to the focused PTY; the external-editor
+                // request stays a loud routing flag there (no terminal fd to
+                // lend `$EDITOR` in this GUI root). Still never in defaults:
+                // unbound Alt+E reaches the shell.
+                self.runtime.cw_composer_open();
                 eprintln!(
-                    "warning: keymap open_composer is not yet shipped (see #647); chord ignored, no editor launched"
+                    "bitty: keymap open_composer -> composer open (Enter newline, Ctrl+Enter submit, Esc close, Alt+E editor flag)"
                 );
             }
+            A::FoldToggle => self.apply_fold_verb(
+                bitty_runtime::cw_present::CwFoldAction::Toggle,
+                "fold_toggle",
+            ),
+            A::FoldExpand => self.apply_fold_verb(
+                bitty_runtime::cw_present::CwFoldAction::Expand,
+                "fold_expand",
+            ),
+            A::FoldCollapse => self.apply_fold_verb(
+                bitty_runtime::cw_present::CwFoldAction::Collapse,
+                "fold_collapse",
+            ),
             A::TogglePalette => {
                 // CTX-0647 / GitHub #1003 (palette user entry): the palette
                 // panel exists via the public Panel Runtime path
@@ -1300,6 +1364,305 @@ impl TerminalApp {
         true
     }
 
+    /// Present-path modal routing (CTX-0723): Leader/hint arming plus
+    /// composer input routing, one tier below the copy/search modals and
+    /// above the user keymap.
+    ///
+    /// Ordering inside this tier:
+    /// 1. Reap an expired Leader window first (fail-open: the press keeps
+    ///    its normal owner and routes to the shell).
+    /// 2. An armed hint session owns letters (`operator + label` via
+    ///    [`Runtime::cw_hint_push_key`](bitty_runtime::Runtime::cw_hint_push_key));
+    ///    `Esc` cancels, the Leader re-arms, anything else disarms loudly
+    ///    and falls through.
+    /// 3. A bare Leader press arms a fresh session from the live engine.
+    /// 4. An open composer owns the press (submit writes one frame to the
+    ///    focused PTY; the external-editor request stays a loud routing
+    ///    flag — see [`Self::route_composer_press`]).
+    ///
+    /// Returns `true` when the press is consumed (the caller redraws and
+    /// returns); `false` lets normal dispatch run. Copy/search modals sit
+    /// above: while either is active this tier stays out of the way.
+    fn route_cw_modal(&mut self, key: &KeyEvent, keyref: &bitty_config::KeyRef) -> bool {
+        if self.runtime.is_copy_mode() || self.runtime.is_search_mode() {
+            return false;
+        }
+        let now_ms = self.chrome.leader_now_ms();
+        match self.chrome.leader_state.poll(now_ms) {
+            bitty_config::LeaderPoll::Expired => {
+                self.disarm_hint_session();
+                eprintln!("bitty: leader window expired — keys route to the shell");
+                return false;
+            }
+            bitty_config::LeaderPoll::Idle | bitty_config::LeaderPoll::Armed => {}
+        }
+        if self.runtime.cw_hint_is_armed() {
+            return self.route_hint_armed(key, keyref);
+        }
+        if self.chrome.leader.arms(*keyref) {
+            if !key.repeat {
+                self.arm_hint_session();
+            }
+            return true;
+        }
+        if self.runtime.cw_composer_is_open() {
+            return self.route_composer_press(key);
+        }
+        false
+    }
+
+    /// Disarms both halves of the hint interaction (Leader window plus live
+    /// session, CTX-0723 #981). Idempotent; terminal truth untouched.
+    fn disarm_hint_session(&mut self) {
+        self.chrome.leader_state = bitty_config::LeaderState::Idle;
+        self.runtime.cw_hint_disarm();
+    }
+
+    /// Arms a fresh hint session on a Leader press (CTX-0723 #981).
+    ///
+    /// Collects one batch against live terminal state through the single
+    /// cross-panel engine and opens the Leader window. Empty batches and
+    /// operator conflicts refuse loudly without arming (a dead session
+    /// must never swallow keystrokes). Always consumes the Leader press.
+    fn arm_hint_session(&mut self) {
+        use bitty_runtime::HintScope;
+        self.chrome.hint_generation = self.chrome.hint_generation.wrapping_add(1);
+        let generation = self.chrome.hint_generation;
+        let scope = self
+            .runtime
+            .focused_view()
+            .map_or(HintScope::default(), |view| HintScope(view.0));
+        let bound = self.bound_bare_keys();
+        match self.runtime.cw_hint_arm(scope, generation, &bound) {
+            Ok(0) => {
+                self.disarm_hint_session();
+                eprintln!("warning: leader armed an empty hint batch (no targets) — disarming");
+            }
+            Ok(count) => {
+                let timeout_ms = self.chrome.leader.timeout_ms;
+                self.chrome
+                    .leader_state
+                    .arm(self.chrome.leader_now_ms(), timeout_ms);
+                eprintln!(
+                    "bitty: hint armed ({count} labels, {timeout_ms}ms) — operator then label, Esc cancels"
+                );
+            }
+            Err(conflict) => {
+                self.disarm_hint_session();
+                eprintln!(
+                    "warning: leader refused — hint operators shadow bound keys {:?} — disarming",
+                    conflict.keys
+                );
+            }
+        }
+    }
+
+    /// Routes one press while the hint session is armed (CTX-0723 #981).
+    ///
+    /// `Esc` cancels, a repeated Leader press re-arms, bare letters feed
+    /// the operator/label accumulator, and anything else disarms loudly and
+    /// falls through so the press keeps its normal owner (fail-open).
+    fn route_hint_armed(&mut self, key: &KeyEvent, keyref: &bitty_config::KeyRef) -> bool {
+        use bitty_config::KeyName;
+        if keyref.key == KeyName::Escape && !keyref.ctrl && !keyref.alt && !keyref.super_held {
+            self.disarm_hint_session();
+            eprintln!("bitty: hint session cancelled");
+            return true;
+        }
+        if self.chrome.leader.arms(*keyref) {
+            if !key.repeat {
+                self.arm_hint_session();
+            }
+            return true;
+        }
+        match keyref.key {
+            KeyName::Char(c) if !keyref.ctrl && !keyref.alt && !keyref.super_held => {
+                if !key.repeat {
+                    self.push_hint_letter(c);
+                }
+                true
+            }
+            _ => {
+                eprintln!(
+                    "warning: hint session ignoring non-letter press — disarming, keys route normally"
+                );
+                self.disarm_hint_session();
+                false
+            }
+        }
+    }
+
+    /// Feeds one letter into the armed hint interaction and consumes the
+    /// outcome loudly (CTX-0723 #981).
+    fn push_hint_letter(&mut self, c: char) {
+        use bitty_runtime::cw_present::HintKeyOutcome;
+        match self.runtime.cw_hint_push_key(c) {
+            HintKeyOutcome::NeedMore => {}
+            HintKeyOutcome::Dispatched(outcome) => {
+                self.chrome.leader_state = bitty_config::LeaderState::Idle;
+                self.apply_hint_outcome(outcome);
+            }
+            HintKeyOutcome::Invalid { key } => {
+                eprintln!(
+                    "warning: hint session rejected '{key}' — retry the label within the leader window, or Esc to cancel"
+                );
+            }
+        }
+    }
+
+    /// Applies one hint dispatch outcome at the app boundary (CTX-0723 #981).
+    ///
+    /// Fold verbs are complete (the live fold state already mutated);
+    /// view-focus resolves through the live layout fail-closed. Jump
+    /// reveals (unfolds) but scroll-to-target, panel-focus resolution, and
+    /// target-byte clipboard extraction are loud follow-ups, each named so
+    /// no outcome is ever silent.
+    fn apply_hint_outcome(&mut self, outcome: bitty_runtime::DispatchOutcome) {
+        use bitty_runtime::DispatchOutcome;
+        match outcome {
+            DispatchOutcome::FoldToggled { id, folded } => {
+                eprintln!(
+                    "bitty: hint -> {id} {}",
+                    if folded { "folded" } else { "unfolded" }
+                );
+            }
+            DispatchOutcome::Expanded { id } => {
+                eprintln!("bitty: hint -> {id} unfolded");
+            }
+            DispatchOutcome::Collapsed { id } => {
+                eprintln!("bitty: hint -> {id} folded");
+            }
+            DispatchOutcome::Jump { target } => {
+                eprintln!(
+                    "bitty: hint -> jumped to target {} (revealed; scroll-to-target follows in panel-scroll work)",
+                    target.get()
+                );
+            }
+            DispatchOutcome::FocusView { view } => {
+                if self.runtime.set_focus(ViewId::new(view)) {
+                    eprintln!("bitty: hint -> focused view {view}");
+                } else {
+                    eprintln!("warning: hint -> view {view} is not a live leaf — focus unchanged");
+                }
+            }
+            DispatchOutcome::FocusPanel { panel } => {
+                eprintln!(
+                    "warning: hint -> panel {panel} focus needs the panel-host view map (OQ-051 placed-contract follow-up) — focus unchanged"
+                );
+            }
+            DispatchOutcome::CopyRequested { target } => {
+                eprintln!(
+                    "warning: hint -> copy of target {} needs the target-byte extraction seam (follow-up) — clipboard untouched",
+                    target.get()
+                );
+            }
+        }
+    }
+
+    /// Routes one press into the open composer session (CTX-0723 #982).
+    ///
+    /// `Enter`/`Ctrl+Enter`/`Esc`/`Alt+E` hit their composer roles;
+    /// produced text appends to the draft; a submit writes exactly one
+    /// bracketed frame to the focused PTY via the single input router.
+    /// The external-editor request stays a loud routing flag: this GUI root
+    /// owns no terminal file descriptor to lend a fullscreen editor, so
+    /// spawning `$EDITOR` here would attach it to the launch terminal and
+    /// block the event loop — the draft is preserved and the session stays
+    /// open instead (panel-hosted editor flow is the OQ-051 follow-up).
+    /// Non-text keys (arrows, F-keys, Backspace) have no composer role and
+    /// are captured quietly, matching the copy/search modal precedent.
+    /// Always consumes the press while open.
+    fn route_composer_press(&mut self, key: &KeyEvent) -> bool {
+        use bitty_platform::{LogicalKey, NamedKey};
+        use bitty_runtime::cw_present::CwComposerFeed;
+        use bitty_runtime::{ComposerKey, ComposerKeyEvent};
+        let event = match &key.logical_key {
+            LogicalKey::Named(NamedKey::Enter) => {
+                let keyref = key_ref_from_event(key, &self.chrome.app_mods);
+                let (ctrl, alt, shift) =
+                    keyref.map_or((false, false, false), |r| (r.ctrl, r.alt, r.shift));
+                ComposerKeyEvent {
+                    key: ComposerKey::Enter,
+                    ctrl,
+                    alt,
+                    shift,
+                    text: None,
+                }
+            }
+            LogicalKey::Named(NamedKey::Escape) => ComposerKeyEvent::escape(),
+            LogicalKey::Character(_) => match &key.text {
+                Some(text) if !text.is_empty() => {
+                    let keyref = key_ref_from_event(key, &self.chrome.app_mods);
+                    let (ctrl, alt, shift) =
+                        keyref.map_or((false, false, false), |r| (r.ctrl, r.alt, r.shift));
+                    let head = text.chars().next().map_or('?', |c| c.to_ascii_lowercase());
+                    ComposerKeyEvent {
+                        key: ComposerKey::Char(head),
+                        ctrl,
+                        alt,
+                        shift,
+                        text: Some(text.clone()),
+                    }
+                }
+                _ => return true,
+            },
+            _ => return true,
+        };
+        match self.runtime.cw_composer_feed(event) {
+            CwComposerFeed::PtyPassthrough => true,
+            CwComposerFeed::Inserted | CwComposerFeed::Newline => true,
+            CwComposerFeed::Closed => {
+                eprintln!("bitty: composer closed — draft kept for reopen");
+                true
+            }
+            CwComposerFeed::Submitted(frame) => {
+                let bytes = frame.len();
+                self.runtime.push_input_bytes(&frame);
+                eprintln!("bitty: composer submitted {bytes} bytes to the shell");
+                true
+            }
+            CwComposerFeed::EditorRequested => {
+                eprintln!(
+                    "warning: composer external editor not hosted in this GUI root (no terminal fd to lend `$EDITOR`; event loop must not block) — draft kept, session stays open"
+                );
+                true
+            }
+            CwComposerFeed::Ignored => true,
+            CwComposerFeed::TooLarge { wanted } => {
+                eprintln!(
+                    "warning: composer draft cap hit ({wanted} bytes wanted) — input dropped"
+                );
+                true
+            }
+        }
+    }
+
+    /// Bare (modifier-free) single-char keys bound in the keymap table, for
+    /// the hint operator-conflict gate (CTX-0723 #981).
+    ///
+    /// Operators are bare lowercase letters by construction; any keymap
+    /// chord on the same bare letter would be shadowed while armed, so the
+    /// gate refuses arming instead of hijacking the binding.
+    fn bound_bare_keys(&self) -> Vec<char> {
+        self.chrome
+            .keymaps
+            .iter()
+            .filter_map(|entry| {
+                if entry.chord.ctrl
+                    || entry.chord.alt
+                    || entry.chord.shift
+                    || entry.chord.super_held
+                {
+                    return None;
+                }
+                match entry.chord.key {
+                    bitty_config::KeyName::Char(c) => Some(c),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Single-owner chrome intercept (CTX-0153) with explicit dispatch
     /// priority (CTX-0275): emergency/reserved > active overlay-modal >
     /// user-defined keymap > plugin (inert, deny-by-default) > terminal
@@ -1415,7 +1778,22 @@ impl TerminalApp {
                             None => return false,
                         }
                     }
-                    let (priority, action) = self.resolve_dispatch(keyref, matched);
+                    let (priority, action) = {
+                        // CTX-0723: Leader/hint plus composer present-path
+                        // routing runs here — below the copy/search modals
+                        // above, above the user keymap below. Modal-consumed
+                        // presses intentionally skip the `held` set (the
+                        // modal owns the keyboard, not the chord); repeats
+                        // are handled per modal (hint swallows, composer
+                        // feeds text for typing repeat).
+                        if self.route_cw_modal(key, &keyref) {
+                            if let Some(win) = self.window.handle.as_ref() {
+                                win.request_redraw();
+                            }
+                            return true;
+                        }
+                        self.resolve_dispatch(keyref, matched)
+                    };
                     match priority {
                         DispatchPriority::Emergency => {
                             return self.handle_emergency_escape(key);
@@ -3312,11 +3690,10 @@ mod tests {
     }
 
     #[test]
-    fn open_composer_is_inert_and_unbound_by_default() {
-        // CTX-0391 / #647 unbind path: composer UI plus editor spawn are not
-        // yet wired (would need session state, routing, PTY submit, and
-        // process policy). Until then defaults stay unbound so Alt+E reaches
-        // the shell, and an explicitly bound chord is inert with a warning.
+    fn open_composer_opens_session_but_stays_unbound_by_default() {
+        // CTX-0723 (#982): the composer session now opens for real (input
+        // routing + submit), while defaults stay unbound so Alt+E reaches
+        // the shell until the user opts in.
         use bitty_config::{ChromeAction, KeyName, KeyRef, match_keymap, resolve_keymaps};
         let maps = resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
         assert!(
@@ -3335,17 +3712,169 @@ mod tests {
             None,
             "unbound Alt+E must fall through to the PTY"
         );
-        // Bound-but-inert: no runtime mutation, no editor, no routing change.
+        // Bound: the session opens and routes; layout/focus/help untouched.
         let mut app = help_test_app(maps);
+        assert!(!app.runtime.cw_composer_is_open(), "composer starts closed");
         let leafs = app.runtime.leaf_count();
         let leaves = app.runtime.layout().leaf_ids();
         let focused = app.runtime.focused_view();
         let help = app.runtime.help_visible();
         app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(app.runtime.cw_composer_is_open(), "composer opened");
+        assert_eq!(
+            app.runtime.cw_input_route(),
+            bitty_runtime::cw_present::CwInputRoute::Composer,
+            "input routes to the composer while open"
+        );
         assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
         assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
         assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
         assert_eq!(app.runtime.help_visible(), help, "help unchanged");
+    }
+
+    /// One marked `OSC 133` command cycle for the fold/hint live tests.
+    fn mark_test_command(app: &mut TerminalApp) {
+        app.runtime
+            .handle_pty_bytes(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07out\x1b]133;D;0\x07");
+    }
+
+    #[test]
+    fn fold_verbs_target_latest_command_live() {
+        // CTX-0723 (#980): bound fold verbs resolve the focused view's
+        // latest command block; with no shell marks they refuse loudly
+        // instead of inventing a target.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        app.apply_chrome_action(ChromeAction::FoldToggle);
+        assert_eq!(app.runtime.cw_latest_command_id(), None);
+        mark_test_command(&mut app);
+        mark_test_command(&mut app);
+        let latest = app.runtime.cw_latest_command_id().expect("marked");
+        app.apply_chrome_action(ChromeAction::FoldToggle);
+        assert!(app.runtime.cw_fold_is_folded(latest));
+        app.apply_chrome_action(ChromeAction::FoldExpand);
+        assert!(!app.runtime.cw_fold_is_folded(latest));
+        app.apply_chrome_action(ChromeAction::FoldCollapse);
+        assert!(app.runtime.cw_fold_is_folded(latest));
+    }
+
+    #[test]
+    fn leader_arms_hint_and_operator_label_dispatches() {
+        // CTX-0723 (#981): Alt+Space arms a live batch from the engine,
+        // `z` + `a` dispatches the fold toggle, and no PTY byte leaks.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        mark_test_command(&mut app);
+        let latest = app.runtime.cw_latest_command_id().expect("marked");
+        app.chrome.app_mods.alt = true;
+        let space = test_key(LogicalKey::Named(NamedKey::Space));
+        assert!(
+            drive_chrome(&mut app, WindowEventKind::KeyboardInput(space)),
+            "leader press is chrome-owned"
+        );
+        assert!(app.runtime.cw_hint_is_armed());
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "leader types no shell bytes"
+        );
+        app.chrome.app_mods.alt = false;
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_char_key("z"))
+        ));
+        assert!(app.runtime.cw_hint_is_armed(), "operator waits for label");
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_char_key("a"))
+        ));
+        assert!(!app.runtime.cw_hint_is_armed(), "dispatch disarms");
+        assert!(app.runtime.cw_fold_is_folded(latest));
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "hint keystrokes never reach the PTY"
+        );
+    }
+
+    #[test]
+    fn hint_esc_cancels_and_expiry_fails_open() {
+        // CTX-0723 (#981): Esc cancels an armed session (consumed); an
+        // expired Leader window fail-opens the press to normal routing.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        mark_test_command(&mut app);
+        app.chrome.app_mods.alt = true;
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
+        ));
+        assert!(app.runtime.cw_hint_is_armed());
+        app.chrome.app_mods.alt = false;
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Escape)))
+        ));
+        assert!(!app.runtime.cw_hint_is_armed(), "esc cancelled");
+
+        // Re-arm, then force the window into the past: the next press
+        // expires the Leader and keeps its normal owner (shell bytes).
+        app.chrome.app_mods.alt = true;
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
+        ));
+        assert!(app.runtime.cw_hint_is_armed());
+        app.chrome.app_mods.alt = false;
+        app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
+        assert!(
+            !drive_chrome(&mut app, WindowEventKind::KeyboardInput(test_char_key("x"))),
+            "expired leader falls through"
+        );
+        assert!(!app.runtime.cw_hint_is_armed(), "expiry disarmed");
+        assert_eq!(app.runtime.drain_pending_input(), b"x");
+    }
+
+    #[test]
+    fn composer_open_routes_typing_and_submit_to_pty() {
+        // CTX-0723 (#982): an open composer owns presses; Ctrl+Enter
+        // writes exactly one bracketed frame to the focused PTY.
+        use bitty_config::ChromeAction;
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps);
+        app.apply_chrome_action(ChromeAction::OpenComposer);
+        assert!(app.runtime.cw_composer_is_open());
+        let text_key = |s: &str| KeyEvent {
+            logical_key: LogicalKey::Character(s.to_string()),
+            text: Some(s.to_string()),
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(text_key("h"))
+        ));
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(text_key("i"))
+        ));
+        assert_eq!(app.runtime.cw_composer_content(), "hi");
+        app.chrome.app_mods.control = true;
+        assert!(drive_chrome(
+            &mut app,
+            WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Enter)))
+        ));
+        app.chrome.app_mods.control = false;
+        assert!(!app.runtime.cw_composer_is_open(), "submit closed");
+        // One bracketed frame (`ESC[200~` + content + `ESC[201~` + `CR`,
+        // the `frame_submit` contract) reached the focused PTY in one go.
+        let pending = app.runtime.drain_pending_input();
+        assert_eq!(pending, b"\x1b[200~hi\x1b[201~\r");
     }
 
     #[test]

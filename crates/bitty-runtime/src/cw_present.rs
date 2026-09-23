@@ -262,6 +262,30 @@ pub fn dispatch_present(
     dispatch(batch, fold, label, action)
 }
 
+/// Outcome of feeding one letter to an armed hint interaction (CW-02 live
+/// path, CTX-0723 issue #981).
+///
+/// The app maps each keystroke while the Leader window is armed to one
+/// [`Runtime::cw_hint_push_key`](crate::runtime::Runtime::cw_hint_push_key)
+/// call: the first letter selects the operator, following letters accumulate
+/// the label, and the buffer dispatches once it resolves exactly with no
+/// longer label extending it (prefix completion, so `a` fires immediately
+/// while `aa` waits for its second keystroke).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintKeyOutcome {
+    /// Operator or label prefix accepted; more keystrokes needed.
+    NeedMore,
+    /// Label completed uniquely and dispatched; the session is disarmed.
+    Dispatched(DispatchOutcome),
+    /// Key rejected: session disarmed, unknown operator, non-letter,
+    /// overlong label, or a label buffer no target extends. The caller
+    /// reports loudly and either retries the label or disarms.
+    Invalid {
+        /// The rejected keystroke.
+        key: char,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // CW-03 (#982): composer overlay + input routing + editor flag
 // ---------------------------------------------------------------------------
@@ -478,6 +502,18 @@ impl CwHintEngine {
         }
         self.providers.push(provider);
         true
+    }
+
+    /// Unregisters the provider for `panel` (CTX-0723, #983).
+    ///
+    /// Dispose symmetry for [`register_provider`](Self::register_provider):
+    /// a disposed panel must stop contributing targets, or its labels would
+    /// outlive the leaf they point at. Returns `true` when a provider was
+    /// removed; `false` (no-op) when `panel` was never registered.
+    pub fn unregister_provider(&mut self, panel: u64) -> bool {
+        let before = self.providers.len();
+        self.providers.retain(|p| p.panel != panel);
+        self.providers.len() != before
     }
 
     /// Number of registered providers.

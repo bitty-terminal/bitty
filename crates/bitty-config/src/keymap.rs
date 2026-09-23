@@ -52,9 +52,12 @@
 //!   (alias `show_help`; CTX-0265 help popup, defaults `alt+`` plus the
 //!   `alt+?` shifted-symbol spellings), `open_composer` (Command Composer
 //!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
-//!   so Normal Mode stays byte-identical until the user opts in; CTX-0391 /
-//!   #647: not yet shipped -- parses for forward compat but the app only
-//!   warns, so leave `alt+e` unbound for shell use until wired),
+//!   so Normal Mode stays byte-identical until the user opts in; CTX-0723 /
+//!   #982: opens the live session with input routing plus PTY submit, the
+//!   editor request stays a loud routing flag),
+//!   `fold_toggle` (alias `toggle_fold`), `fold_expand` (alias
+//!   `expand_fold`), `fold_collapse` (alias `collapse_fold`; CTX-0723 /
+//!   #980: latest-command fold verbs, manual bind only, never in defaults),
 //!   `workspace_new`, `workspace_close`, `workspace_prev`, `workspace_next`,
 //!   `workspace_last`, `workspace_focus:<1..=16>`, `workspace_move:<1..=16>`
 //!   (CTX-0257 workspace ops entry per DEC-0034 plus CTX-0259 move:
@@ -657,10 +660,27 @@ pub enum ChromeAction {
     /// fresh config keeps Normal Mode byte-identical (the 008 §14 boundary).
     /// The user opts in with `{ chord = "alt+e", action = "open_composer" }`;
     /// the single-character schema rule already forces a modifier, so the
-    /// open chord can never shadow bare shell typing. CTX-0391 / #647:
-    /// not yet shipped -- parses for forward compat but the app only warns,
-    /// so leave `alt+e` unbound for shell use until wired.
+    /// open chord can never shadow bare shell typing. CTX-0723 / #982: the
+    /// app opens the live session and routes input while open (submit
+    /// writes one frame to the focused PTY); the external-editor request
+    /// stays a loud routing flag (no terminal fd to lend `$EDITOR` in the
+    /// GUI root).
     OpenComposer,
+    /// Flip the latest command block's fold membership (CTX-0723, #980).
+    ///
+    /// Present-path verb over the live [`FoldState`](bitty_rich::blocks::FoldState):
+    /// the app resolves the focused view's latest semantic command block
+    /// and toggles it. Manual bind only, never in [`DEFAULT_KEYMAPS`]
+    /// (same byte-identical discipline as [`Self::OpenComposer`]); the
+    /// user opts in with e.g. `{ chord = "alt+z", action = "fold_toggle" }`.
+    FoldToggle,
+    /// Ensure the latest command block is unfolded, idempotent (CTX-0723,
+    /// #980). Manual bind only, never in [`DEFAULT_KEYMAPS`].
+    FoldExpand,
+    /// Ensure the latest command block is folded, idempotent and fail-closed
+    /// at the fold cap (CTX-0723, #980). Manual bind only, never in
+    /// [`DEFAULT_KEYMAPS`].
+    FoldCollapse,
     /// Create a fresh workspace and switch to it (`workspace_new`, CTX-0257
     /// DEC-0034 entry, default chord `alt+n`). The new workspace starts as
     /// a single idle leaf; no shell spawns until the user splits or types
@@ -839,6 +859,18 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::OpenComposer)
             }
+            "fold_toggle" | "toggle_fold" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::FoldToggle)
+            }
+            "fold_expand" | "expand_fold" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::FoldExpand)
+            }
+            "fold_collapse" | "collapse_fold" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::FoldCollapse)
+            }
             "workspace_new" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::WorkspaceNew)
@@ -923,6 +955,9 @@ impl ChromeAction {
             Self::DecreaseFontSize => "decrease_font_size".to_string(),
             Self::ResetFontSize => "reset_font_size".to_string(),
             Self::OpenComposer => "open_composer".to_string(),
+            Self::FoldToggle => "fold_toggle".to_string(),
+            Self::FoldExpand => "fold_expand".to_string(),
+            Self::FoldCollapse => "fold_collapse".to_string(),
             Self::WorkspaceNew => "workspace_new".to_string(),
             Self::WorkspaceClose => "workspace_close".to_string(),
             Self::WorkspacePrev => "workspace_prev".to_string(),
@@ -942,7 +977,7 @@ impl ChromeAction {
 }
 
 /// Hint listing the accepted action vocabulary.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_focus:<1..=16>, workspace_move:<1..=16>, enter_copy_mode, open_search, search_next, search_prev, close_search, search_toggle_case, toggle_palette";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -2104,6 +2139,46 @@ mod tests {
         assert!(Chord::parse("e").is_err());
         let open = Chord::parse("alt+e").expect("alt+e parses");
         assert_eq!(open.canonical(), "alt+e");
+    }
+
+    #[test]
+    fn fold_verbs_parse_but_are_never_defaults() {
+        // CTX-0723 (#980): fold verbs parse (with `toggle_fold` /
+        // `expand_fold` / `collapse_fold` aliases) but never ship in
+        // defaults, so fresh configs keep Normal Mode byte-identical.
+        // Users opt in explicitly, e.g. `{ chord = "alt+z", action =
+        // "fold_toggle" }`.
+        for (raw, canonical) in [
+            ("fold_toggle", "fold_toggle"),
+            ("toggle_fold", "fold_toggle"),
+            ("fold_expand", "fold_expand"),
+            ("expand_fold", "fold_expand"),
+            ("fold_collapse", "fold_collapse"),
+            ("collapse_fold", "fold_collapse"),
+        ] {
+            let action = ChromeAction::parse(raw).expect("fold verb parses");
+            assert_eq!(action.canonical(), canonical, "raw {raw}");
+        }
+        assert_eq!(
+            ChromeAction::parse("fold_toggle").expect("parses"),
+            ChromeAction::FoldToggle
+        );
+        let maps = default_keymaps().expect("defaults valid");
+        for action in [
+            ChromeAction::FoldToggle,
+            ChromeAction::FoldExpand,
+            ChromeAction::FoldCollapse,
+        ] {
+            assert!(
+                !maps.iter().any(|m| m.action == action),
+                "defaults must not bind {}",
+                action.canonical()
+            );
+        }
+        assert!(
+            KNOWN_ACTIONS_HINT.contains("fold_toggle"),
+            "fail-closed hint must name the fold verbs"
+        );
     }
 
     #[test]

@@ -39,6 +39,15 @@ pub(crate) struct Args {
     /// with a non-zero exit code (CTX-0481, issue #762). The default keeps
     /// the documented fail-soft path where headless smoke still ticks.
     pub(crate) fail_loud: bool,
+    /// When true (`--mascot`) print the Bittie mascot art to stdout and
+    /// exit 0 (issue #1318, CTX-0729). Local class: no config, no
+    /// instance, no plugin VM, no network, no stdin read; also records
+    /// the first-run splash marker best-effort so a later normal launch
+    /// does not repeat the greeting.
+    pub(crate) mascot: bool,
+    /// When true (`--no-splash`) suppress the first-run mascot splash for
+    /// one normal launch without touching the marker file.
+    pub(crate) no_splash: bool,
     /// When true print help and exit 0.
     pub(crate) help: bool,
     /// When true print version and exit 0.
@@ -298,6 +307,8 @@ impl Args {
             test_mode: false,
             safe: false,
             fail_loud: false,
+            mascot: false,
+            no_splash: false,
             help: false,
             version: false,
             program: None,
@@ -429,6 +440,8 @@ fn validate_split_value(val: &str) -> Result<(Option<SplitAxis>, Option<f32>), S
 /// - `--fail-loud` → a failed requested startup step (shell spawn, pane
 ///   shells, IPC servo) aborts with a non-zero exit code instead of the
 ///   default fail-soft warning path (CTX-0481; also `BITTY_FAIL_LOUD=1`)
+/// - `--mascot` → print the Bittie mascot art and exit 0 (#1318)
+/// - `--no-splash` → suppress the first-run mascot splash for one launch
 /// - `--split [AXIS]` → split layout (AXIS = horizontal|h / vertical|v, default horizontal)
 /// - `--split=AXIS[:RATIO]` → split with optional ratio
 /// - `--split-ratio RATIO` → ratio for split
@@ -788,6 +801,14 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--fail-loud" => {
                 out.fail_loud = true;
+                i += 1;
+            }
+            "--mascot" => {
+                out.mascot = true;
+                i += 1;
+            }
+            "--no-splash" => {
+                out.no_splash = true;
                 i += 1;
             }
             "--stack" => {
@@ -1478,6 +1499,8 @@ pub(crate) fn help_text() -> String {
                --fail-loud  Fail-loud startup: a failed shell/pane spawn or\n  \
                             IPC servo aborts with a non-zero exit code\n  \
                             instead of the default fail-soft warning path\n  \
+               --mascot      Print the Bittie mascot art and exit\n  \
+               --no-splash   Suppress the first-run mascot splash once\n  \
                --split [AXIS]  Split layout: AXIS = horizontal|h / vertical|v (default h, ratio 0.5)\n  \
                --split=AXIS[:RATIO]  Split with optional ratio (e.g. --split=h:0.3)\n  \
                --split-ratio RATIO  Ratio for --split (0.10..0.90, default 0.5)\n  \

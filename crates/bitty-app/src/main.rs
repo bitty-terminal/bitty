@@ -238,6 +238,7 @@ mod logging;
 mod plugin_runtime;
 
 mod list;
+mod mascot;
 mod plugin;
 mod run;
 mod spawn;
@@ -271,6 +272,12 @@ use layout_cmd::{
 
 #[cfg(test)]
 use terminal_app::window_title_for_theme;
+
+#[cfg(test)]
+use mascot::{
+    MASCOT_ART, MASCOT_MAX_LINES, MASCOT_MAX_WIDTH, SPLASH_MARKER_FILE, mascot_art_for_width,
+    mascot_width, record_splash_shown, should_show_splash, splash_marker_path,
+};
 
 #[cfg(test)]
 use init::{
@@ -363,6 +370,20 @@ fn main() {
     }
     if args.version {
         println!("{}", version_text());
+        std::process::exit(0);
+    }
+
+    // `bitty --mascot`: print the Bittie mascot art and exit 0 (issue
+    // #1318, CTX-0729, local class). Dispatched with `--help`/`--version`:
+    // no config, no instance, no plugin VM, no network, no stdin read.
+    // Records the splash marker best-effort so a later normal launch does
+    // not repeat the greeting.
+    if args.mascot {
+        let columns = init::init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
+        mascot::print_mascot_art(columns);
+        if let Some(marker) = mascot::splash_marker_path_live() {
+            mascot::record_splash_shown(&marker);
+        }
         std::process::exit(0);
     }
 
@@ -494,6 +515,22 @@ fn main() {
             &mut input,
             &mut output,
         ));
+    }
+
+    // First-run Bittie splash (issue #1318, CTX-0729): once-only stdout
+    // greeting on the normal startup path only. Every subcommand returned
+    // above, and the machine flows (`--headless`, `--test-mode`) skip it
+    // to keep CI/stdout deterministic; `--no-splash` suppresses one
+    // launch. Best-effort only: a missing data root or a failed marker
+    // write never blocks shell spawn.
+    if !args.headless && !args.test_mode {
+        if let Some(marker) = mascot::splash_marker_path_live() {
+            if mascot::should_show_splash(args.no_splash, Some(&marker)) {
+                let columns = init::init_columns_from_env(std::env::var("COLUMNS").ok().as_deref());
+                mascot::print_mascot_art(columns);
+                mascot::record_splash_shown(&marker);
+            }
+        }
     }
 
     // User config first (fail-closed): invalid files exit non-zero with a

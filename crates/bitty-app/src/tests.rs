@@ -4548,3 +4548,88 @@ fn consolidated_startup_assembly_matches_expected_layout_and_focus() {
         "focus spec 1 must be focused"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bittie mascot splash (issue #1318, CTX-0729)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_mascot_flags_default_off() {
+    let parsed = parse_args(&args_of(&["bitty"]));
+    assert!(!parsed.mascot);
+    assert!(!parsed.no_splash);
+}
+
+#[test]
+fn parse_mascot_and_no_splash_flags() {
+    let parsed = parse_args(&args_of(&["bitty", "--mascot"]));
+    assert!(parsed.mascot);
+    assert!(!parsed.no_splash);
+    let parsed = parse_args(&args_of(&["bitty", "--no-splash"]));
+    assert!(!parsed.mascot);
+    assert!(parsed.no_splash);
+}
+
+#[test]
+fn mascot_art_is_bounded_ascii() {
+    // Single-owned vendored asset: small, pure ASCII, fits 80 columns.
+    assert!(MASCOT_ART.is_ascii());
+    assert!(MASCOT_ART.lines().count() <= MASCOT_MAX_LINES);
+    let width = mascot_width();
+    assert!(width > 0 && width <= MASCOT_MAX_WIDTH, "art width {width}");
+}
+
+#[test]
+fn mascot_art_width_selection_matches_init_greeting() {
+    // Splash and `bitty init` greeting agree by construction (aliases).
+    let width = mascot_width();
+    assert_eq!(mascot_art_for_width(None), MASCOT_ART);
+    assert_eq!(mascot_art_for_width(Some(80)), MASCOT_ART);
+    assert_eq!(mascot_art_for_width(Some(width as u16)), MASCOT_ART);
+    let narrow = mascot_art_for_width(Some(20));
+    assert!(narrow.contains("too narrow"));
+    assert_eq!(narrow.lines().count(), 1);
+}
+
+#[test]
+fn splash_marker_path_follows_data_root_policy() {
+    // Explicit XDG root wins; empty roots fall back to $HOME/.local/share.
+    let xdg = splash_marker_path(Some("/tmp/xdg-ctx0729"), Some("/home/u"));
+    assert_eq!(
+        xdg,
+        Some(std::path::PathBuf::from(format!(
+            "/tmp/xdg-ctx0729/bitty/{SPLASH_MARKER_FILE}"
+        )))
+    );
+    let home = splash_marker_path(None, Some("/home/u"));
+    assert_eq!(
+        home,
+        Some(std::path::PathBuf::from(format!(
+            "/home/u/.local/share/bitty/{SPLASH_MARKER_FILE}"
+        )))
+    );
+    assert_eq!(splash_marker_path(None, None), None);
+    assert_eq!(splash_marker_path(Some("  "), Some("")), None);
+}
+
+#[test]
+fn splash_show_policy_is_once_only_and_suppressible() {
+    let dir = std::env::temp_dir().join(format!("bitty-ctx0729-{}", std::process::id()));
+    let marker = dir.join("splash-shown");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // No marker yet: show; --no-splash suppresses without touching it.
+    assert!(should_show_splash(false, Some(&marker)));
+    assert!(!should_show_splash(true, Some(&marker)));
+    // No data root: fail closed (never splash every launch).
+    assert!(!should_show_splash(false, None));
+
+    // Recording is best-effort and idempotent; afterwards no splash.
+    record_splash_shown(&marker);
+    assert!(marker.exists(), "marker written");
+    assert!(!should_show_splash(false, Some(&marker)));
+    record_splash_shown(&marker);
+    assert!(!should_show_splash(false, Some(&marker)));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

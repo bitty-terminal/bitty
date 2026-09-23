@@ -5,16 +5,25 @@ use std::io::IsTerminal as _;
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
 
-/// Hamster mascot art, vendored byte-identical from the workspace asset
-/// `recording/bitty-mascot/ascii/bitty_ascii.txt` (DEC-0002). Pure text so
-/// it renders anywhere stdout goes, including piped headless runs; the
-/// sixel/block variants stay out of the binary.
-pub(crate) const INIT_MASCOT_ART: &str = include_str!("../assets/mascot.txt");
-
+/// Wizard greeting art: thin alias over the single-owned mascot module
+/// ([`crate::mascot`], issue #1318) so the `bitty init` greeting and the
+/// startup splash can never disagree. The art stays vendored byte-identical
+/// from the workspace asset `recording/bitty-mascot/ascii/bitty_ascii.txt`
+/// (DEC-0002): pure text so it renders anywhere stdout goes, including
+/// piped headless runs; the sixel/block variants stay out of the binary.
+/// (Test-only: the wizard itself goes through [`init_greeting_art`].)
+#[cfg(test)]
+pub(crate) use crate::mascot::MASCOT_ART as INIT_MASCOT_ART;
 /// One-line fallback when the window is too narrow for the art: fail closed
-/// with an honest line instead of a wrapped mess.
-pub(crate) const INIT_MASCOT_FALLBACK: &str =
-    "bitty! (mascot skipped: window too narrow for the art)\n";
+/// with an honest line instead of a wrapped mess (see [`crate::mascot`]).
+#[cfg(test)]
+pub(crate) use crate::mascot::MASCOT_FALLBACK as INIT_MASCOT_FALLBACK;
+/// Greeting art for a known-or-unknown window width (see [`crate::mascot`]).
+pub(crate) use crate::mascot::mascot_art_for_width as init_greeting_art;
+/// Width of the vendored art in columns (see [`crate::mascot`]).
+/// (Test-only: runtime code goes through [`init_greeting_art`].)
+#[cfg(test)]
+pub(crate) use crate::mascot::mascot_width as init_mascot_width;
 
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
 /// garbage or a stuck key can never spin the wizard forever.
@@ -34,28 +43,6 @@ pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
     "/bin/fish",
     "/bin/sh",
 ];
-
-/// Widest art line in bytes (the art is pure ASCII, so bytes == columns).
-/// Computed from the vendored asset so an asset refresh cannot silently
-/// break the narrow-window bound.
-pub(crate) fn init_mascot_width() -> usize {
-    INIT_MASCOT_ART
-        .lines()
-        .map(|line| line.len())
-        .max()
-        .unwrap_or(0)
-}
-
-/// Picks the greeting art for a known-or-unknown window width: full art
-/// unless the window is provably too narrow, in which case the one-line
-/// fallback. `None` (unknown width, e.g. piped headless) prints the full
-/// pure-text art — always safe, tested headless.
-pub(crate) fn init_greeting_art(columns: Option<u16>) -> &'static str {
-    match columns {
-        Some(width) if (width as usize) < init_mascot_width() => INIT_MASCOT_FALLBACK,
-        _ => INIT_MASCOT_ART,
-    }
-}
 
 /// Parses a `COLUMNS`-style width value. Pure over the injected string so
 /// tests never touch the environment; `None`/garbage/zero means unknown.

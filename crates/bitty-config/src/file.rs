@@ -44,6 +44,9 @@
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
 //!     },
+//!     plugins = {
+//!         { id = "owner/name", enabled = true },
+//!     },
 //! }
 //! ```
 //!
@@ -108,8 +111,19 @@
 //!   CTX-0260), so existing configs without `mouse` keep working unchanged.
 //!   Partial tables fail closed rather than
 //!   silently filling defaults (which would corrupt attribution).
-//! - `plugins`, `extends`, and profile names remain non-user layers and are
-//!   rejected as undeclared here.
+//! - `plugins` is a fully-optional top-level array with the same
+//!   absent-means-silent contract (#1325): absent (or empty) means "this
+//!   layer says nothing". Each entry is `{ id, enabled? }`: `id` is the
+//!   globally unique plugin identifier (required string, validated
+//!   fail-closed by [`PluginSpec`](crate::types::PluginSpec)), `enabled`
+//!   is an optional boolean defaulting to `true`, so `{ id = "owner/name" }`
+//!   declares an enabled plugin and only an explicit `enabled = false` opts
+//!   out (useful to switch off a lower-precedence layer's entry under the
+//!   merge-by-id rule). Duplicate ids within one layer fail closed with the
+//!   `plugins[<n>].id` path. Bare strings are not accepted (tables only,
+//!   like `keymaps`).
+//! - `extends` and profile names remain non-user layers and are rejected
+//!   as undeclared here.
 //! - Empty chunk / no return / `return nil` means "no user overrides".
 //!
 //! # Bounds and failure posture (threat T-01)
@@ -147,8 +161,9 @@ use crate::plan::{ConfigPlan, ConfigSource, LayerKind, LayeredPlan};
 use crate::types::{
     AppearanceConfig, BackgroundFit, DecorationConfig, FontConfig, KeymapEntry, LayoutConfig,
     MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN,
-    MouseConfig, OutlineColor, ScrollbarConfig, ScrollbarMode, SelectionConfig, TerminalConfig,
-    ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
+    MAX_PLUGIN_ID_LEN, MouseConfig, OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode,
+    SelectionConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector,
+    WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1345,6 +1360,45 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
             Some(out)
         }
     };
+    // #1325: `plugins` is a fully-optional top-level array (absent or empty
+    // means "this layer says nothing", same contract as the module docs
+    // above). Each entry maps 1:1 to `PluginSpec`; per-entry ids validate
+    // fail-closed with the indexed `plugins[<n>].id` path. Duplicate ids
+    // within one layer reject here; cross-layer duplicates merge by id
+    // downstream, and `PluginSpec`/`EffectiveConfig` validation re-checks
+    // bounds as a backstop via `plan.validate()`.
+    // MSRV 1.85: no let-chains; match plus plain loops only.
+    let plugins = match data.plugins {
+        None => None,
+        Some(list) if list.is_empty() => None,
+        Some(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for (idx, p) in list.into_iter().enumerate() {
+                let path = format!("plugins[{}].id", idx + 1);
+                let id = p.id.trim();
+                if id.is_empty() {
+                    return Err(ConfigError::validation(path, "must not be empty"));
+                }
+                if id.len() > MAX_PLUGIN_ID_LEN {
+                    return Err(ConfigError::validation(
+                        path,
+                        format!("must be <= {MAX_PLUGIN_ID_LEN} bytes"),
+                    ));
+                }
+                if out.iter().any(|e: &PluginSpec| e.id.as_str() == id) {
+                    return Err(ConfigError::validation(
+                        path,
+                        format!("duplicate plugin id '{id}'"),
+                    ));
+                }
+                out.push(PluginSpec {
+                    id: id.to_string(),
+                    enabled: p.enabled,
+                });
+            }
+            Some(out)
+        }
+    };
     // CTX-0191: `selection` is fully optional (absent table means "this layer
     // says nothing" so merge keeps the lower-precedence value). When the
     // table is present but `auto_copy` is omitted, default to `false`
@@ -1837,7 +1891,7 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         leader_timeout_ms,
         hints_enabled,
         keymaps,
-        plugins: None,
+        plugins,
         profile_name: None,
         extends: None,
         undeclared_fields: Vec::new(),
@@ -2723,8 +2777,69 @@ mod tests {
 
     #[test]
     fn lua_undeclared_key_fails_closed() {
-        let err = parse_lua_config(r#"return { plugins = {} }"#, &test_source()).unwrap_err();
+        let err = parse_lua_config(r#"return { frobnicate = {} }"#, &test_source()).unwrap_err();
         assert!(matches!(err, ConfigError::UndeclaredField { .. }));
+    }
+
+    #[test]
+    fn lua_plugins_declared_with_enabled_default() {
+        // #1325: `plugins` is a declared init.lua key; an omitted `enabled`
+        // defaults to true and only an explicit `enabled = false` opts out.
+        let plan = parse_lua_config(
+            r#"return { plugins = { { id = "owner/a" }, { id = "owner/b", enabled = false } } }"#,
+            &test_source(),
+        )
+        .expect("plugins declared");
+        let plugins = plan.plugins.expect("plugins present");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(
+            plugins[0],
+            PluginSpec {
+                id: "owner/a".into(),
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            plugins[1],
+            PluginSpec {
+                id: "owner/b".into(),
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn lua_plugins_empty_means_silent() {
+        // #1325: an empty `plugins` table says nothing, like an absent one.
+        let plan =
+            parse_lua_config(r#"return { plugins = {} }"#, &test_source()).expect("empty accepted");
+        assert!(plan.plugins.is_none());
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn lua_plugins_bad_shapes_fail_closed_with_path() {
+        // #1325: every rejection names the offending `plugins[<n>]` path.
+        for (bad, want) in [
+            (r#"return { plugins = { "owner/a" } }"#, "plugins[1]"),
+            (r#"return { plugins = { {} } }"#, "plugins[1].id"),
+            (r#"return { plugins = { { id = "" } } }"#, "plugins[1].id"),
+            (
+                r#"return { plugins = { { id = "a" }, { id = "a" } } }"#,
+                "plugins[2].id",
+            ),
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(want), "must name the path: {bad} -> {msg}");
+        }
+        // Overlong ids fail closed without echoing the id itself.
+        let long = "a".repeat(MAX_PLUGIN_ID_LEN + 1);
+        let bad = format!(r#"return {{ plugins = {{ {{ id = "{long}" }} }} }}"#);
+        let err = parse_lua_config(&bad, &test_source()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("plugins[1].id"), "overlong id: {msg}");
+        assert!(!msg.contains(&long), "must not echo the id");
     }
 
     #[test]

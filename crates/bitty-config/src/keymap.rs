@@ -64,7 +64,11 @@
 //!   `alt+n` new, `alt+w` close with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
 //!   last-used, `alt+1..=9` jump to workspace N,
-//!   `shift+alt+1..=9` move focused window to workspace N).
+//!   `shift+alt+1..=9` move focused window to workspace N),
+//!   `enter_copy_mode` (alias `copy_mode`; CTX-0384 / #640: vi-style modal
+//!   scrollback copy cursor, default `ctrl+shift+space`, `global` only),
+//!   `open_search` (alias `search`; CTX-0383 / #639: keyboard-first
+//!   scrollback search overlay, default `ctrl+shift+f`, `global` only).
 //!   Anything else fails closed with the known-action list.
 //! - `context`: only `"global"` is supported today; anything else fails
 //!   closed so a future context cannot silently never-match.

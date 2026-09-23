@@ -46,6 +46,9 @@
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
 //!     },
+//!     plugins = {
+//!         { id = "owner/name", enabled = true },
+//!     },
 //! }
 //! ```
 //!
@@ -84,6 +87,10 @@ pub const MAX_CONFIG_NESTED_KEYS: usize = 32;
 /// host never iterates unbounded sequences outside fuel accounting).
 pub const MAX_CONFIG_KEYMAPS: usize = 1024;
 
+/// Maximum plugin entries read (mirrors `bitty-config` `MAX_PLUGINS` so the
+/// host never iterates unbounded sequences outside fuel accounting).
+pub const MAX_CONFIG_PLUGINS: usize = 1024;
+
 /// Maximum bytes per background-image path (CTX-0347, RFC-0001/OQ-042:
 /// `<= 4096` bytes). The general [`MAX_CONFIG_STRING_BYTES`] host cap is
 /// tighter, so background paths use their own accepted bound.
@@ -108,6 +115,22 @@ const VIEW_ACCEPTED_FIELDS: &[&str] = &[
 
 /// Fields rejected until their owning OQ accepts them (RFC-0001/OQ-041).
 const VIEW_RESERVED_FIELDS: &[&str] = &["opacity", "blur", "animations"];
+
+/// A single plugin declaration, plain data mirroring `bitty-config`
+/// `PluginSpec`.
+///
+/// `enabled` is concrete (never `Option`): an omitted key defaults to
+/// `true` at extraction, so `{ id = "owner/name" }` declares an enabled
+/// plugin and only an explicit `enabled = false` opts out (useful to
+/// switch off a lower-precedence layer's entry under the merge-by-id
+/// rule).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginData {
+    /// Globally unique plugin identifier, e.g. `"owner/name"`.
+    pub id: String,
+    /// Whether the plugin is enabled.
+    pub enabled: bool,
+}
 
 /// A single key mapping, plain data mirroring `bitty-config` `KeymapEntry`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,7 +443,10 @@ pub struct ConfigData {
     pub close_confirm: Option<String>,
     /// `keymaps` array.
     pub keymaps: Option<Vec<KeymapData>>,
-    /// Dotted unknown key paths (e.g. `"plugins"`, `"keymaps[2].foo"`),
+    /// `plugins` array (each entry `{ id, enabled? }`; absent means "this
+    /// layer says nothing").
+    pub plugins: Option<Vec<PluginData>>,
+    /// Dotted unknown key paths (e.g. `"frobnicate"`, `"keymaps[2].foo"`),
     /// sorted for deterministic messages.
     pub undeclared: Vec<String>,
 }
@@ -455,6 +481,7 @@ impl ConfigData {
             && self.hints_enabled.is_none()
             && self.close_confirm.is_none()
             && self.keymaps.is_none()
+            && self.plugins.is_none()
     }
 }
 
@@ -1457,6 +1484,9 @@ impl ConfigData {
                 "keymaps" => {
                     out.keymaps = Some(extract_keymaps(val)?);
                 }
+                "plugins" => {
+                    out.plugins = Some(extract_plugins(val)?);
+                }
                 // CTX-0236: top-level `mod_key` scalar (raw string; typed
                 // parsing and fail-closed validation live downstream in
                 // `bitty-config`, like the `theme` alias).
@@ -1667,6 +1697,56 @@ fn extract_keymaps(val: &ValueSnapshot) -> Result<Vec<KeymapData>, String> {
             action,
             context,
         });
+    }
+    Ok(out)
+}
+
+/// Extract the plugins array (1-based Lua sequence of `{id, enabled?}`
+/// tables; #1325).
+///
+/// Fail-closed like [`extract_keymaps`]: map keys, non-table entries, a
+/// missing/non-string `id`, a non-boolean `enabled`, and unknown entry
+/// fields all reject with the offending `plugins[<n>]` path. An omitted
+/// `enabled` defaults to `true` (listing a plugin declares intent to load
+/// it); only an explicit `enabled = false` opts out. Tighter per-field
+/// bounds (`MAX_PLUGIN_ID_LEN`) and duplicate-id rejection live
+/// downstream in `bitty-config` validation.
+fn extract_plugins(val: &ValueSnapshot) -> Result<Vec<PluginData>, String> {
+    let (pairs, seq, truncated, has_non_string_keys) = match val {
+        ValueSnapshot::Table {
+            pairs,
+            seq,
+            truncated,
+            has_non_string_keys,
+        } => (pairs, seq, *truncated, *has_non_string_keys),
+        ValueSnapshot::Nil => return Err("plugins: expected array (found nil)".to_string()),
+        other => {
+            return Err(format!("plugins: expected array (found {})", other.kind()));
+        }
+    };
+    if !pairs.is_empty() || has_non_string_keys {
+        return Err("plugins: expected array (found map keys)".to_string());
+    }
+    if truncated {
+        return Err(format!("plugins: exceeds {MAX_CONFIG_PLUGINS} entries"));
+    }
+    if seq.len() > MAX_CONFIG_PLUGINS {
+        return Err(format!("plugins: exceeds {MAX_CONFIG_PLUGINS} entries"));
+    }
+    let mut out = Vec::with_capacity(seq.len());
+    for (idx, entry) in seq.iter().enumerate() {
+        let path = format!("plugins[{}]", idx + 1);
+        let nested = expect_table(&path, entry)?;
+        check_nested_keys(&path, nested, &["id", "enabled"])?;
+        let id = match get_field(nested, "id") {
+            Some(v) => expect_string(&format!("{path}.id"), v)?,
+            None => return Err(format!("{path}.id: missing")),
+        };
+        let enabled = match get_field(nested, "enabled") {
+            Some(v) => expect_bool(&format!("{path}.enabled"), v)?,
+            None => true,
+        };
+        out.push(PluginData { id, enabled });
     }
     Ok(out)
 }
@@ -2403,9 +2483,70 @@ mod tests {
 
     #[test]
     fn undeclared_keys_collected_not_executed() {
-        let data = eval_ok(r#"return { theme = "dark", plugins = { "x" } }"#);
+        let data = eval_ok(r#"return { theme = "dark", frobnicate = { "x" } }"#);
         assert_eq!(data.theme.as_deref(), Some("dark"));
-        assert_eq!(data.undeclared, vec!["plugins".to_string()]);
+        assert_eq!(data.undeclared, vec!["frobnicate".to_string()]);
+    }
+
+    #[test]
+    fn plugins_extract_with_enabled_default_true() {
+        // #1325: `plugins` is a declared key; `enabled` omitted defaults
+        // to `true`, explicit `false` opts out.
+        let data = eval_ok(
+            r#"return { plugins = {
+                { id = "owner/a" },
+                { id = "owner/b", enabled = false },
+            } }"#,
+        );
+        assert!(data.undeclared.is_empty());
+        assert!(!data.is_empty());
+        let plugins = data.plugins.expect("plugins declared");
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(
+            plugins[0],
+            PluginData {
+                id: "owner/a".to_string(),
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            plugins[1],
+            PluginData {
+                id: "owner/b".to_string(),
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn plugins_bad_shapes_fail_closed_with_path() {
+        // Bare strings are not plugin specs (tables only, like keymaps).
+        for (code, want) in [
+            (
+                r#"return { plugins = { "owner/a" } }"#,
+                "plugins[1]: expected table",
+            ),
+            (r#"return { plugins = { {} } }"#, "plugins[1].id: missing"),
+            (
+                r#"return { plugins = { { id = 42 } } }"#,
+                "plugins[1].id: expected string",
+            ),
+            (
+                r#"return { plugins = { { id = "a", enabled = "yes" } } }"#,
+                "plugins[1].enabled: expected boolean",
+            ),
+            (
+                r#"return { plugins = { { id = "a", bogus = 1 } } }"#,
+                "undeclared field 'plugins[1].bogus'",
+            ),
+            (r#"return { plugins = 42 }"#, "plugins: expected array"),
+        ] {
+            let message = eval_err(code);
+            assert!(
+                message.contains(want),
+                "code: {code:?} -> {message:?} (want {want:?})"
+            );
+        }
     }
 
     #[test]

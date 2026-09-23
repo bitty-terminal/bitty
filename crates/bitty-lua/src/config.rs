@@ -39,6 +39,8 @@
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: hidden|always|auto (CTX-0181)
 //!     mouse = { focus_follows_mouse = true }, -- opt-in hover focus, default false = click-to-focus (CTX-0260)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
+//!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
+//!     leader_timeout_ms = 1500, -- leader fail-open timeout override in ms, 100..=60000 (default 1000; CTX-0715)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "ctrl+p", action = "palette:toggle", context = "global" },
@@ -401,6 +403,13 @@ pub struct ConfigData {
     /// Top-level `mod_key` scalar (CTX-0236 leader/mod for the shipped
     /// chrome map; raw string, parsed fail-closed downstream).
     pub mod_key: Option<String>,
+    /// Top-level `leader_key` scalar (CTX-0715 / OQ-088 leader chord
+    /// override, e.g. `"ctrl+q"`; raw chord string, parsed fail-closed
+    /// downstream via the shared chord grammar).
+    pub leader_key: Option<String>,
+    /// Top-level `leader_timeout_ms` scalar (CTX-0715 fail-open timeout
+    /// override; raw integer, range-checked fail-closed downstream).
+    pub leader_timeout_ms: Option<i64>,
     /// Top-level `close_confirm` scalar (CTX-0370 view/window close
     /// confirmation mode; raw string, parsed fail-closed downstream).
     pub close_confirm: Option<String>,
@@ -436,6 +445,8 @@ impl ConfigData {
             && self.scrollbar.is_none()
             && self.mouse.is_none()
             && self.mod_key.is_none()
+            && self.leader_key.is_none()
+            && self.leader_timeout_ms.is_none()
             && self.close_confirm.is_none()
             && self.keymaps.is_none()
     }
@@ -1444,6 +1455,16 @@ impl ConfigData {
                 // parsing and fail-closed validation live downstream in
                 // `bitty-config`, like the `theme` alias).
                 "mod_key" => out.mod_key = Some(expect_string(key, val)?),
+                // CTX-0715: top-level `leader_key` chord override (raw
+                // string; the shared chord grammar parses it fail-closed
+                // downstream in `bitty-config`).
+                "leader_key" => out.leader_key = Some(expect_string(key, val)?),
+                // CTX-0715: top-level `leader_timeout_ms` override (raw
+                // integer; range-checked fail-closed downstream in
+                // `bitty-config`).
+                "leader_timeout_ms" => {
+                    out.leader_timeout_ms = Some(expect_integer(key, val)?);
+                }
                 // CTX-0370: top-level `close_confirm` scalar (raw string;
                 // typed parsing and fail-closed validation live downstream
                 // in `bitty-config`).

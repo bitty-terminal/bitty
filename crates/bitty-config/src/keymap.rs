@@ -1320,6 +1320,264 @@ pub fn validate_entry(entry: &KeymapEntry) -> Result<(), ConfigError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Leader key contract (CTX-0715 / OQ-088; issues #981 + #1045 leader part)
+// ---------------------------------------------------------------------------
+//
+// The Leader arms the hint/overlay session (`bitty-rich` `HintSession`):
+// pressing the Leader chord arms, the keys pressed after it form the
+// operator+label chord, and `Esc`/timeout disarms. This section is the
+// binding half only (default chord, Windows fallback, override precedence,
+// timeout/cancel semantics). Engine sequencing — collecting batches from
+// truth, painting, routing — rides OQ-089 (#981); the app input path does
+// not consume this yet.
+//
+// The Leader is deliberately independent of [`ModKey`] (OQ-052 Mod
+// unification stays deferred, do NOT route the Leader through the mod
+// flip): an explicit `leader_key` keeps its exact spelling under any mod,
+// and the platform defaults below never rewrite.
+
+/// Default Leader chord (OQ-088 adopted): `Alt+Space`.
+///
+/// Free in [`DEFAULT_KEYMAPS`] (only `ctrl+shift+space` is bound, for copy
+/// mode), so the default never shadows a shipped chrome chord.
+pub const LEADER_DEFAULT_CHORD_RAW: &str = "alt+space";
+
+/// Windows fallback Leader chords (OQ-088): `Alt+Space` is OS-reserved on
+/// Windows (it opens the window system menu and cannot be intercepted
+/// reliably), so the Windows platform default is this set instead.
+///
+/// A set rather than a single chord so future fallbacks join without
+/// changing the resolution API. `ctrl+space` carries no shipped default
+/// binding; on Windows the Leader wins that byte (bare `ctrl+space` is
+/// shell NUL elsewhere) by explicit owner decision, and `leader_key`
+/// overrides it per user.
+pub const LEADER_WINDOWS_FALLBACK_CHORDS_RAW: &[&str] = &["ctrl+space"];
+
+/// Default fail-open Leader timeout in milliseconds (OQ-088): while armed,
+/// the follow-up chord must arrive within this window or the pending press
+/// expires and keys route back to the shell (fail-open, never swallowed).
+/// Generous enough for an operator+label follow-up, short enough that a
+/// stray Leader press releases quickly.
+pub const LEADER_TIMEOUT_MS_DEFAULT: u64 = 1000;
+
+/// Minimum accepted `leader_timeout_ms` override (fail-closed below).
+pub const LEADER_TIMEOUT_MS_MIN: u64 = 100;
+
+/// Maximum accepted `leader_timeout_ms` override (fail-closed above, so a
+/// stuck Leader cannot linger indefinitely).
+pub const LEADER_TIMEOUT_MS_MAX: u64 = 60_000;
+
+/// Host platform for Leader default selection.
+///
+/// [`LeaderPlatform::host`] reads the compile target; tests inject the
+/// variant so the Windows fallback is covered on Linux CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LeaderPlatform {
+    /// macOS / Linux / other non-Windows hosts: the default is
+    /// [`LEADER_DEFAULT_CHORD_RAW`].
+    #[default]
+    Other,
+    /// Windows: `Alt+Space` is OS-reserved, so
+    /// [`LEADER_WINDOWS_FALLBACK_CHORDS_RAW`] applies.
+    Windows,
+}
+
+impl LeaderPlatform {
+    /// The running host's platform.
+    #[must_use]
+    pub fn host() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Resolved Leader binding: every chord that arms plus the armed window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLeader {
+    /// Every chord that arms the Leader, canonical-sorted and deduped:
+    /// exactly the user override when set, else the platform default
+    /// ([`LEADER_DEFAULT_CHORD_RAW`], or
+    /// [`LEADER_WINDOWS_FALLBACK_CHORDS_RAW`] on Windows).
+    pub chords: Vec<Chord>,
+    /// Armed-window budget in milliseconds (override or
+    /// [`LEADER_TIMEOUT_MS_DEFAULT`).
+    pub timeout_ms: u64,
+    /// True when neither chord nor timeout was overridden (for `config
+    /// check` attribution).
+    pub from_default: bool,
+}
+
+impl ResolvedLeader {
+    /// True when this press arms the Leader (exact chord equality, the
+    /// single-owner rule: a Leader chord never fuzzy-matches).
+    #[must_use]
+    pub fn arms(&self, key: KeyRef) -> bool {
+        self.chords.iter().any(|c| key.matches(c))
+    }
+
+    /// Canonical spelling of the primary (first) arming chord, for reload
+    /// diffs and diagnostics. Never empty by construction.
+    #[must_use]
+    pub fn primary_canonical(&self) -> String {
+        self.chords
+            .first()
+            .map_or_else(String::new, |c| c.canonical())
+    }
+}
+
+/// Parse one internal Leader default (fail-closed only on a typo in the
+/// constants above, covered by tests; user input never reaches this path).
+fn parse_internal_leader(raw: &str) -> Result<Chord, ConfigError> {
+    Chord::parse(raw).map_err(|e| ConfigError::InvalidInput {
+        message: format!("internal default leader invalid: {e}"),
+    })
+}
+
+/// Validate a Leader timeout override (fail-closed outside
+/// [`LEADER_TIMEOUT_MS_MIN`]..=[`LEADER_TIMEOUT_MS_MAX`], named on the
+/// `leader_timeout_ms` field).
+pub fn validate_leader_timeout_ms(timeout_ms: u64) -> Result<(), ConfigError> {
+    if (LEADER_TIMEOUT_MS_MIN..=LEADER_TIMEOUT_MS_MAX).contains(&timeout_ms) {
+        Ok(())
+    } else {
+        Err(ConfigError::validation(
+            "leader_timeout_ms",
+            format!(
+                "must be {LEADER_TIMEOUT_MS_MIN}..={LEADER_TIMEOUT_MS_MAX} ms (got {timeout_ms})"
+            ),
+        ))
+    }
+}
+
+/// Resolve the effective Leader binding (OQ-088).
+///
+/// Precedence: explicit user chord wins over every platform default (and
+/// keeps its exact spelling — never rewritten by [`ModKey`]); explicit
+/// user timeout wins over [`LEADER_TIMEOUT_MS_DEFAULT`]. Chord and timeout
+/// override independently, so a timeout-only config keeps the platform
+/// chord and vice versa.
+pub fn resolve_leader(
+    user_chord: Option<Chord>,
+    user_timeout_ms: Option<u64>,
+    platform: LeaderPlatform,
+) -> Result<ResolvedLeader, ConfigError> {
+    let mut chords: Vec<Chord> = match user_chord {
+        Some(chord) => vec![chord],
+        None => match platform {
+            LeaderPlatform::Other => vec![parse_internal_leader(LEADER_DEFAULT_CHORD_RAW)?],
+            LeaderPlatform::Windows => LEADER_WINDOWS_FALLBACK_CHORDS_RAW
+                .iter()
+                .map(|raw| parse_internal_leader(raw))
+                .collect::<Result<Vec<Chord>, ConfigError>>()?,
+        },
+    };
+    chords.sort_by_key(|c| c.canonical());
+    chords.dedup();
+    let timeout_ms = match user_timeout_ms {
+        Some(ms) => {
+            validate_leader_timeout_ms(ms)?;
+            ms
+        }
+        None => LEADER_TIMEOUT_MS_DEFAULT,
+    };
+    Ok(ResolvedLeader {
+        chords,
+        timeout_ms,
+        from_default: user_chord.is_none() && user_timeout_ms.is_none(),
+    })
+}
+
+/// Resolve the Leader binding from an [`EffectiveConfig`]: the
+/// `leader_key` / `leader_timeout_ms` overrides when the layers declare
+/// them, else the `platform` default.
+pub fn resolve_leader_for(
+    effective: &EffectiveConfig,
+    platform: LeaderPlatform,
+) -> Result<ResolvedLeader, ConfigError> {
+    resolve_leader(effective.leader_key, effective.leader_timeout_ms, platform)
+}
+
+/// Armed-window routing for one Leader press (CTX-0715 / OQ-088 timeout and
+/// cancel semantics).
+///
+/// Pure and headless: the caller owns the clock (monotonic milliseconds)
+/// and the key routing. Arming never touches grid truth; expiry is
+/// fail-open (back to [`LeaderState::Idle`] — keys route to the shell,
+/// never swallowed); `Esc` cancels via [`cancel`](Self::cancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderState {
+    /// No pending Leader; every key keeps its normal owner (shell/chrome).
+    Idle,
+    /// A Leader press armed the overlay window; the follow-up chord must
+    /// arrive before `deadline_ms` (caller clock) or the press expires.
+    Armed {
+        /// Caller-clock milliseconds at which the armed window ends.
+        deadline_ms: u64,
+    },
+}
+
+/// Outcome of [`LeaderState::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderPoll {
+    /// Idle: nothing pending; route keys normally.
+    Idle,
+    /// Still armed: follow-up keys route to the overlay session.
+    Armed,
+    /// The armed window lapsed and the state returned to
+    /// [`LeaderState::Idle`]: fail-open — route keys to the shell.
+    Expired,
+}
+
+impl LeaderState {
+    /// True while a Leader press is pending.
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        matches!(self, Self::Armed { .. })
+    }
+
+    /// Arm on a Leader press: the follow-up must arrive within `timeout_ms`
+    /// of `now_ms` (both caller-clock milliseconds; saturating so a hostile
+    /// clock cannot wrap the deadline below `now_ms`).
+    pub fn arm(&mut self, now_ms: u64, timeout_ms: u64) {
+        *self = Self::Armed {
+            deadline_ms: now_ms.saturating_add(timeout_ms),
+        };
+    }
+
+    /// Cancel a pending Leader (`Esc`): returns true when a press was armed
+    /// (the `Esc` is consumed by the cancel); false when idle (the `Esc`
+    /// keeps its normal owner).
+    pub fn cancel(&mut self) -> bool {
+        if self.is_armed() {
+            *self = Self::Idle;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reap an expired press: [`LeaderPoll::Expired`] (now [`Idle`](Self::Idle))
+    /// once `now_ms` reaches the deadline, else the current state.
+    /// Idempotent: polling an idle state stays idle.
+    pub fn poll(&mut self, now_ms: u64) -> LeaderPoll {
+        match *self {
+            Self::Idle => LeaderPoll::Idle,
+            Self::Armed { deadline_ms } => {
+                if now_ms >= deadline_ms {
+                    *self = Self::Idle;
+                    LeaderPoll::Expired
+                } else {
+                    LeaderPoll::Armed
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2922,5 +3180,212 @@ mod tests {
             !rows3.iter().any(|r| r.starts_with("alt+")),
             "no Alt spellings survive the flip: {rows3:?}"
         );
+    }
+
+    // -- CTX-0715 / OQ-088 Leader key contract ---------------------------
+
+    fn alt_space() -> KeyRef {
+        key_ref(KeyName::Space, false, true, false)
+    }
+
+    fn ctrl_space() -> KeyRef {
+        key_ref(KeyName::Space, true, false, false)
+    }
+
+    #[test]
+    fn leader_default_resolution_is_alt_space() {
+        // OQ-088 default: no overrides on a non-Windows host arms on
+        // `Alt+Space` with the default fail-open timeout.
+        let effective = EffectiveConfig::default();
+        let leader =
+            resolve_leader_for(&effective, LeaderPlatform::Other).expect("default resolves");
+        assert_eq!(leader.timeout_ms, LEADER_TIMEOUT_MS_DEFAULT);
+        assert!(leader.from_default);
+        assert!(leader.arms(alt_space()), "alt+space arms the leader");
+        assert_eq!(leader.primary_canonical(), "alt+space");
+        // The default never shadows a shipped chrome chord (single-owner).
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, alt_space()),
+            None,
+            "alt+space must stay free of chrome bindings"
+        );
+        assert_eq!(
+            match_keymap(&maps, ctrl_space()),
+            None,
+            "ctrl+space must stay free of chrome bindings"
+        );
+    }
+
+    #[test]
+    fn leader_windows_fallback_set_applies() {
+        // OQ-088 Windows fallback: `Alt+Space` is OS-reserved there, so the
+        // fallback set arms instead and the default does not.
+        let effective = EffectiveConfig::default();
+        let leader =
+            resolve_leader_for(&effective, LeaderPlatform::Windows).expect("fallback resolves");
+        assert!(leader.from_default, "platform fallback is still default");
+        assert_eq!(leader.timeout_ms, LEADER_TIMEOUT_MS_DEFAULT);
+        assert!(
+            leader.arms(ctrl_space()),
+            "ctrl+space arms the leader on Windows"
+        );
+        assert!(
+            !leader.arms(alt_space()),
+            "alt+space must not arm on Windows (OS-reserved)"
+        );
+        for raw in LEADER_WINDOWS_FALLBACK_CHORDS_RAW {
+            let chord = Chord::parse(raw).expect("fallback parses");
+            assert!(
+                leader.chords.contains(&chord),
+                "fallback set member {raw} resolves"
+            );
+        }
+    }
+
+    #[test]
+    fn leader_override_precedence_wins_on_both_platforms() {
+        // OQ-088 override surface: an explicit `leader_key` + timeout wins
+        // over every platform default, on both platforms, and chord/timeout
+        // override independently.
+        let overridden = EffectiveConfig {
+            leader_key: Some(Chord::parse("ctrl+q").expect("override parses")),
+            leader_timeout_ms: Some(2500),
+            ..Default::default()
+        };
+        for platform in [LeaderPlatform::Other, LeaderPlatform::Windows] {
+            let leader = resolve_leader_for(&overridden, platform).expect("resolves");
+            assert!(!leader.from_default, "override is not default");
+            assert_eq!(leader.timeout_ms, 2500);
+            assert_eq!(leader.primary_canonical(), "ctrl+q");
+            assert!(
+                leader.arms(key_ref(KeyName::Char('q'), true, false, false)),
+                "override arms on {platform:?}"
+            );
+            assert!(
+                !leader.arms(alt_space()) && !leader.arms(ctrl_space()),
+                "platform defaults disarmed by override on {platform:?}"
+            );
+        }
+        // Timeout-only override keeps the platform chord.
+        let timeout_only = EffectiveConfig {
+            leader_timeout_ms: Some(2000),
+            ..Default::default()
+        };
+        let leader = resolve_leader_for(&timeout_only, LeaderPlatform::Other).expect("resolves");
+        assert!(!leader.from_default);
+        assert_eq!(leader.timeout_ms, 2000);
+        assert!(leader.arms(alt_space()), "platform chord kept");
+        // Chord-only override keeps the default timeout.
+        let chord_only = EffectiveConfig {
+            leader_key: Some(Chord::parse("alt+x").expect("parses")),
+            ..Default::default()
+        };
+        let leader = resolve_leader_for(&chord_only, LeaderPlatform::Other).expect("resolves");
+        assert_eq!(leader.timeout_ms, LEADER_TIMEOUT_MS_DEFAULT);
+        assert_eq!(leader.primary_canonical(), "alt+x");
+    }
+
+    #[test]
+    fn leader_timeout_fail_open_and_esc_cancel() {
+        // OQ-088 timeout/cancel semantics: expiry returns to Idle
+        // (fail-open: keys route back to the shell) and `Esc` consumes only
+        // while armed.
+        let mut state = LeaderState::Idle;
+        assert!(!state.is_armed());
+        assert_eq!(state.poll(0), LeaderPoll::Idle, "idle poll stays idle");
+        assert!(!state.cancel(), "idle Esc keeps its normal owner");
+
+        state.arm(10_000, LEADER_TIMEOUT_MS_DEFAULT);
+        assert!(state.is_armed());
+        assert_eq!(state.poll(10_000), LeaderPoll::Armed, "press instant armed");
+        assert_eq!(
+            state.poll(10_000 + LEADER_TIMEOUT_MS_DEFAULT - 1),
+            LeaderPoll::Armed,
+            "last ms still armed"
+        );
+        assert_eq!(
+            state.poll(10_000 + LEADER_TIMEOUT_MS_DEFAULT),
+            LeaderPoll::Expired,
+            "deadline expires fail-open"
+        );
+        assert!(!state.is_armed(), "expiry returns to idle");
+        assert_eq!(state.poll(u64::MAX), LeaderPoll::Idle, "post-expiry idle");
+
+        // `Esc` cancel consumes while armed, then releases.
+        state.arm(0, 500);
+        assert!(state.cancel(), "armed Esc is consumed by the cancel");
+        assert!(!state.is_armed());
+        assert_eq!(state.poll(60_000), LeaderPoll::Idle);
+
+        // Re-arm replaces the pending window (no stacked presses).
+        state.arm(100, 1000);
+        state.arm(200, 1000);
+        assert_eq!(state.poll(1100), LeaderPoll::Armed, "second arm wins");
+        assert_eq!(state.poll(1200), LeaderPoll::Expired);
+    }
+
+    #[test]
+    fn leader_bad_timeout_fails_closed() {
+        for bad in [
+            0,
+            1,
+            LEADER_TIMEOUT_MS_MIN - 1,
+            LEADER_TIMEOUT_MS_MAX + 1,
+            u64::MAX,
+        ] {
+            let err = validate_leader_timeout_ms(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("leader_timeout_ms"),
+                "must name field for {bad}: {err}"
+            );
+            assert!(
+                resolve_leader(None, Some(bad), LeaderPlatform::Other).is_err(),
+                "resolution rejects {bad}"
+            );
+        }
+        for good in [
+            LEADER_TIMEOUT_MS_MIN,
+            LEADER_TIMEOUT_MS_DEFAULT,
+            LEADER_TIMEOUT_MS_MAX,
+        ] {
+            validate_leader_timeout_ms(good).expect("boundary accepted");
+        }
+    }
+
+    #[test]
+    fn leader_is_independent_of_mod_flip() {
+        // OQ-052 Mod unification stays deferred: the Leader never routes
+        // through `ModKey` — a Super chrome map keeps the Alt+Space Leader.
+        let flipped = EffectiveConfig {
+            mod_key: ModKey::Super,
+            ..Default::default()
+        };
+        let leader = resolve_leader_for(&flipped, LeaderPlatform::Other).expect("resolves");
+        assert!(
+            leader.arms(alt_space()),
+            "leader stays alt+space under super"
+        );
+        // And an explicit leader keeps its exact spelling under Super too.
+        let explicit = EffectiveConfig {
+            mod_key: ModKey::Super,
+            leader_key: Some(Chord::parse("alt+space").expect("parses")),
+            ..Default::default()
+        };
+        let leader = resolve_leader_for(&explicit, LeaderPlatform::Other).expect("resolves");
+        assert!(!leader.from_default);
+        assert!(leader.arms(alt_space()));
+    }
+
+    #[test]
+    fn leader_platform_host_matches_target() {
+        // `host()` reflects the compile target (Windows CI covers the
+        // Windows arm; Linux/macOS cover Other).
+        assert_eq!(LeaderPlatform::host(), LeaderPlatform::default());
+        if cfg!(windows) {
+            assert_eq!(LeaderPlatform::host(), LeaderPlatform::Windows);
+        } else {
+            assert_eq!(LeaderPlatform::host(), LeaderPlatform::Other);
+        }
     }
 }

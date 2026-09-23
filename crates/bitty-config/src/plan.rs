@@ -66,6 +66,15 @@ pub struct ConfigPlan {
     /// `None` means "this layer says nothing" (lower-precedence value wins);
     /// the file layer parses it from the top-level `mod_key` string.
     pub mod_key: Option<ModKey>,
+    /// Leader key override chord (CTX-0715 / OQ-088; scalar-replace like
+    /// `mod_key`). `None` means "this layer says nothing"; the file layer
+    /// parses it from the top-level `leader_key` chord string.
+    pub leader_key: Option<crate::keymap::Chord>,
+    /// Leader fail-open timeout override in milliseconds (CTX-0715;
+    /// scalar-replace like `mod_key`). `None` means "this layer says
+    /// nothing"; the file layer parses it from the top-level
+    /// `leader_timeout_ms` integer.
+    pub leader_timeout_ms: Option<u64>,
     /// Key mappings (full set for this layer).
     pub keymaps: Option<Vec<KeymapEntry>>,
     /// Plugin set (full set for this layer).
@@ -204,6 +213,9 @@ impl ConfigPlan {
             m.validate()
                 .map_err(|e| ConfigError::validation("mod_key", e.to_string()))?;
         }
+        if let Some(ms) = self.leader_timeout_ms {
+            crate::keymap::validate_leader_timeout_ms(ms)?;
+        }
         if let Some(l) = &self.layout {
             l.validate()?;
         }
@@ -275,6 +287,8 @@ impl ConfigPlan {
             && self.mouse.is_none()
             && self.appearance.is_none()
             && self.mod_key.is_none()
+            && self.leader_key.is_none()
+            && self.leader_timeout_ms.is_none()
             && self.keymaps.is_none()
             && self.plugins.is_none()
             && self.extends.is_none()

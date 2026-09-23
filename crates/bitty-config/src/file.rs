@@ -37,6 +37,8 @@
 //!     scrollbar = { mode = "auto", width = 8 }, -- overlay scrollback thumb: auto (default) | hidden | always (CTX-0181, default auto/8)
 //!     mouse = { focus_follows_mouse = true, focus_follows_mouse_delay_ms = 0 }, -- opt-in hover focus, default false = click-to-focus (CTX-0260/CTX-0334)
 //!     mod_key = "alt", -- leader/mod for the shipped chrome map: "alt" (default) or "super" (CTX-0236)
+//!     leader_key = "ctrl+q", -- leader chord override: any chord spelling (default Alt+Space, Ctrl+Space on Windows; CTX-0715)
+//!     leader_timeout_ms = 1500, -- leader fail-open timeout in ms, 100..=60000 (default 1000; CTX-0715)
 //!     close_confirm = "when_busy", -- close safety: always | when_busy (default) | never (CTX-0370)
 //!     keymaps = {
 //!         { chord = "alt+h", action = "goto_split:left", context = "global" },
@@ -49,6 +51,19 @@
 //!   present it must be `"alt"` or `"super"` (case-insensitive, chord-mod
 //!   aliases accepted); anything else — including `ctrl`/`shift` — fails
 //!   closed with the field path.
+//!
+//! - `leader_key` is a fully-optional top-level scalar with the same
+//!   absent-means-silent contract (CTX-0715 / OQ-088). When present it must
+//!   be a chord spelling (`"ctrl+q"`, `"alt+space"`, ...; the shared chord
+//!   grammar, so a bare letter fails closed and can never steal shell
+//!   typing); anything else fails closed with the `leader_key` field path.
+//!   Absent means the platform default (`Alt+Space`, `Ctrl+Space` on
+//!   Windows).
+//!
+//! - `leader_timeout_ms` is a fully-optional top-level integer with the same
+//!   absent-means-silent contract (CTX-0715). When present it must be
+//!   `100..=60000` (default `1000`); anything else fails closed with the
+//!   `leader_timeout_ms` field path.
 //!
 //! - `close_confirm` is a fully-optional top-level scalar with the same
 //!   absent-means-silent contract (CTX-0370). When present it must be
@@ -1738,6 +1753,34 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         Some(raw) => Some(ModKey::parse(raw)?),
     };
 
+    // CTX-0715: `leader_key` is a fully-optional top-level scalar with the
+    // same absent-means-silent contract. When present it parses through the
+    // shared chord grammar fail-closed (re-mapped onto the `leader_key`
+    // field path so errors name the override, not `keymaps[].chord`), so
+    // existing configs without it keep the platform default.
+    let leader_key = match data.leader_key.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            crate::keymap::Chord::parse(raw)
+                .map_err(|e| ConfigError::validation("leader_key", e.to_string()))?,
+        ),
+    };
+
+    // CTX-0715: `leader_timeout_ms` is a fully-optional top-level scalar
+    // with the same absent-means-silent contract. When present it must be a
+    // non-negative integer inside the fail-open window
+    // (`validate_leader_timeout_ms` rejects the rest with the field path).
+    let leader_timeout_ms = match data.leader_timeout_ms {
+        None => None,
+        Some(raw) => {
+            let ms = u64::try_from(raw).map_err(|_| {
+                ConfigError::validation("leader_timeout_ms", format!("must be >= 0 ms (got {raw})"))
+            })?;
+            crate::keymap::validate_leader_timeout_ms(ms)?;
+            Some(ms)
+        }
+    };
+
     // CTX-0370: `close_confirm` is a fully-optional top-level scalar with the
     // same absent-means-silent contract. When present it parses fail-closed
     // (`CloseConfirm::parse` accepts only always/when_busy/never) so existing
@@ -1777,6 +1820,8 @@ pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPl
         mouse,
         appearance,
         mod_key,
+        leader_key,
+        leader_timeout_ms,
         keymaps,
         plugins: None,
         profile_name: None,
@@ -2863,6 +2908,63 @@ mod tests {
         let merged = resolve_effective(Some(layer), None).expect("merge");
         assert_eq!(merged.effective.mod_key, ModKey::Super);
         assert_eq!(merged.source_of("mod_key").unwrap().layer, LayerKind::User);
+    }
+
+    #[test]
+    fn lua_leader_parses_absent_means_silent_and_bad_fails_closed() {
+        // CTX-0715: absent says nothing (merge keeps lower, so the platform
+        // default resolves at use); present parses to the typed
+        // chord/timeout; bad values fail closed on their own field paths.
+        let src = test_source();
+        let plan = parse_lua_config(r#"return { theme = "dark" }"#, &src).expect("no leader");
+        assert!(plan.leader_key.is_none());
+        assert!(plan.leader_timeout_ms.is_none());
+        let plan = parse_lua_config(r#"return { leader_key = "ctrl+q" }"#, &src).expect("override");
+        assert_eq!(plan.leader_key.expect("chord").canonical(), "ctrl+q");
+        let plan =
+            parse_lua_config(r#"return { leader_timeout_ms = 1500 }"#, &src).expect("timeout");
+        assert_eq!(plan.leader_timeout_ms, Some(1500));
+        for content in [
+            r#"return { leader_key = "q" }"#,
+            r#"return { leader_key = "ctrl" }"#,
+            r#"return { leader_key = "hyper+q" }"#,
+            r#"return { leader_key = "" }"#,
+            r#"return { leader_key = 42 }"#,
+            r#"return { leader_timeout_ms = 50 }"#,
+            r#"return { leader_timeout_ms = 60001 }"#,
+            r#"return { leader_timeout_ms = -5 }"#,
+            r#"return { leader_timeout_ms = "1500" }"#,
+            r#"return { leader_timeout_ms = 1.5 }"#,
+        ] {
+            let err = parse_lua_config(content, &src).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("leader_key") || msg.contains("leader_timeout_ms"),
+                "must name field for {content:?}: {err}"
+            );
+        }
+        // End to end: the file layer's leader reaches the effective config
+        // with user attribution.
+        let plan = parse_lua_config(
+            r#"return { leader_key = "ctrl+q", leader_timeout_ms = 2500 }"#,
+            &src,
+        )
+        .expect("leader");
+        let layer = LayeredPlan::new(src, plan);
+        let merged = resolve_effective(Some(layer), None).expect("merge");
+        assert_eq!(
+            merged.effective.leader_key.expect("chord").canonical(),
+            "ctrl+q"
+        );
+        assert_eq!(merged.effective.leader_timeout_ms, Some(2500));
+        assert_eq!(
+            merged.source_of("leader_key").unwrap().layer,
+            LayerKind::User
+        );
+        assert_eq!(
+            merged.source_of("leader_timeout_ms").unwrap().layer,
+            LayerKind::User
+        );
     }
 
     #[test]

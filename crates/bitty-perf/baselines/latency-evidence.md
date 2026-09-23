@@ -66,7 +66,7 @@ After this task:
 
 - **Full hot path, stage-traced.** Every sample timestamps encode (≤64 B),
   `handle_key_event`, PTY→parser→state, and render→present; the sum is the
-  pipeline *work*, the `Instant` span is wall clock. Statistics are
+  pipeline _work_, the `Instant` span is wall clock. Statistics are
   p50/p99/mean/max over presented samples only — never a single point.
 - **Two paths, honestly labeled.** The committed capture is the deterministic
   injected-echo model (`mode=injected-echo`, 1,000/1,000 synthetic); the bench
@@ -105,22 +105,22 @@ crates/bitty-perf/baselines/pb-latency.json"`.
 
 Environment for this capture (host context is recorded inside the artifact):
 
-| Field         | Value                                                                                |
-| ------------- | ------------------------------------------------------------------------------------ |
-| Revision      | worktree `13d555649b47e07bf56a0d467ffb5332b3f86396`                                   |
-| Profile       | cargo `bench` release                                                                |
-| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)                                               |
-| OS            | CachyOS Linux (Arch derivative), x86_64                                              |
-| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe                                             |
-| Sample        | 1,000 headless injected-echo samples, all presented                                  |
+| Field         | Value                                               |
+| ------------- | --------------------------------------------------- |
+| Revision      | worktree `13d555649b47e07bf56a0d467ffb5332b3f86396` |
+| Profile       | cargo `bench` release                               |
+| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)              |
+| OS            | CachyOS Linux (Arch derivative), x86_64             |
+| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe            |
+| Sample        | 1,000 headless injected-echo samples, all presented |
 
-| Metric                          | Measured       | Budget                 | Verdict  |
-| ------------------------------- | -------------- | ---------------------- | -------- |
-| Wall p50 (key-to-screen)        | 1.654 ms       | ≤ 8 ms                 | `PASS`   |
-| Wall p99                        | 3.833 ms       | ≤ 15 ms                | `PASS`   |
-| Wall mean / max                 | 1.657 / 9.845 ms | —                    | anchor   |
-| Work p50 / p99 / min            | 1.653 / 3.833 / 0.414 ms | same budgets   | `PASS`   |
-| Real-PTY variant (secondary)    | p50 0.446 / p99 0.654 ms (`real-pty-echo`) | same budgets | `PASS` |
+| Metric                       | Measured                                   | Budget       | Verdict |
+| ---------------------------- | ------------------------------------------ | ------------ | ------- |
+| Wall p50 (key-to-screen)     | 1.654 ms                                   | ≤ 8 ms       | `PASS`  |
+| Wall p99                     | 3.833 ms                                   | ≤ 15 ms      | `PASS`  |
+| Wall mean / max              | 1.657 / 9.845 ms                           | —            | anchor  |
+| Work p50 / p99 / min         | 1.653 / 3.833 / 0.414 ms                   | same budgets | `PASS`  |
+| Real-PTY variant (secondary) | p50 0.446 / p99 0.654 ms (`real-pty-echo`) | same budgets | `PASS`  |
 
 Interpretation, stated honestly:
 
@@ -136,7 +136,7 @@ Interpretation, stated honestly:
   allowance the n=200 p99 estimator was sized for (#659) — at n=1,000 the p99
   excludes the 10 worst samples.
 - The real-PTY secondary leg confirms the injected-echo model is not
-  optimistic: real `cat` echo through `poll_pty` reads *faster* (0.446 ms
+  optimistic: real `cat` echo through `poll_pty` reads _faster_ (0.446 ms
   p50) than the synthetic path on this host.
 
 ## Verification

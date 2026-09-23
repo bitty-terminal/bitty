@@ -107,19 +107,19 @@ Command (exact): the `--write-baseline` line above with
 
 Environment for this capture (host context is recorded inside the artifact):
 
-| Field         | Value                                                                                |
-| ------------- | ------------------------------------------------------------------------------------ |
-| Revision      | worktree `c70b9f2b00facc4d848ce3f38df1f47a95a423fe`                                   |
-| Profile       | cargo `bench` release                                                                |
-| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)                                               |
-| OS            | CachyOS Linux (Arch derivative), x86_64                                              |
-| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe                                             |
-| Sample        | 1 MiB/round × 3 rounds, median reported; 128 renders/round (1 per 8 KiB chunk)       |
+| Field         | Value                                                                          |
+| ------------- | ------------------------------------------------------------------------------ |
+| Revision      | worktree `c70b9f2b00facc4d848ce3f38df1f47a95a423fe`                            |
+| Profile       | cargo `bench` release                                                          |
+| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)                                         |
+| OS            | CachyOS Linux (Arch derivative), x86_64                                        |
+| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe                                       |
+| Sample        | 1 MiB/round × 3 rounds, median reported; 128 renders/round (1 per 8 KiB chunk) |
 
-| Metric                         | Measured              | Budget            | Verdict         |
-| ------------------------------ | --------------------- | ----------------- | --------------- |
-| Sustained parse-and-render     | **6.06 MiB/s** median | ≥ 40 MiB/s        | `ABOVE_BUDGET`  |
-| Rounds                         | 5.94, 6.06, 6.20      | —                 | tight (±2 %)    |
+| Metric                     | Measured              | Budget     | Verdict        |
+| -------------------------- | --------------------- | ---------- | -------------- |
+| Sustained parse-and-render | **6.06 MiB/s** median | ≥ 40 MiB/s | `ABOVE_BUDGET` |
+| Rounds                     | 5.94, 6.06, 6.20      | —          | tight (±2 %)   |
 
 Stage breakdown on the same host (release, 1 MiB): parser alone ~71 MiB/s
 (14 ms), parse+apply ~6.5 MiB/s (155 ms) — `State::apply` dominates and

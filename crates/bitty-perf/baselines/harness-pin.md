@@ -17,14 +17,14 @@ sidebar_order: 57
 
 - Status: **draft pin record**. Repository-owned inventory of which harness
   owns each PB, which corpora are fixed, and which machines have captured
-  evidence. It pins the *means of measurement* so future captures are
+  evidence. It pins the _means of measurement_ so future captures are
   comparable. It does **not** turn any budget into a hard gate and does not
   claim Verified.
 - Ownership: bitty **CTX-0686** — _PERF leftover batch (PB-4 + PB-01)_.
   - Priority: P1 | Area: perf | Labels: chore,area:perf,P1 | Milestone: v0.1.0
   - Issue: #1055 (PERF-01, pin PB harness, corpora, reference machines)
   - RFC: `performance-budget-rfc.md`; OQ-100 (open) | Task: CTX-0686
-  - **Blocked:** the *gating* half of PERF-01 awaits an owner decision
+  - **Blocked:** the _gating_ half of PERF-01 awaits an owner decision
     ([BLOCKED: OQ-100]); this wave pins the harness/corpora/machines record
     only and changes no gate.
 - Scope: one inventory table (PB → module → bench → artifact → evidence doc
@@ -44,17 +44,19 @@ artifact, and one evidence doc. All harnesses are headless, bounded, and
 with exit 2 and every provenance block comes from the environment (no checkout
 path, username, or hostname is embedded — enforced by contract tests).
 
-| PB | Budget (accepted target) | Module | Bench | Artifact | Evidence doc | Capture status |
-| -- | ------------------------ | ------ | ----- | -------- | ------------ | -------------- |
-| PB-1 | cold startup p50 100 / p99 200 ms | `real_window.rs` | `real_window.rs` | `pb-real-window.json` | `real-window-evidence.md` | measured (Tier 1 opt-in) |
-| PB-2 | idle RSS p50 80 MB | `real_window.rs` | `real_window.rs` | `pb-real-window.json` | `real-window-evidence.md` | measured (Tier 1 opt-in) |
-| PB-3 | 8-tab 250 MB + 15 % reclaim | `typical_session.rs` | `typical_session.rs` | `pb-typical-session.json` | `typical-session-evidence.md` | measured headless anchor; reclaim `ABOVE_BUDGET` finding; real 4 h session deferred |
-| PB-4 | key-to-screen p50 8 / p99 15 ms | `latency.rs` | `latency_real.rs` | `pb-latency.json` | `latency-evidence.md` | measured headless anchor (this task) |
-| PB-5 | binary ≤ 25 MB, dist ≤ 40 MB | release-pipeline replication (no `bitty-perf` module) | — (recipe in evidence doc) | sizes recorded in-doc | `package-size-evidence.md` | measured first-link PASS |
-| PB-6 | parse-and-render ≥ 40 MiB/s | `throughput_floor.rs` | `throughput_floor.rs` | `pb-throughput-floor.json` | `throughput-floor-evidence.md` | measured headless anchor; `ABOVE_BUDGET` finding (6.06 vs 40) |
-| PB-7 | idle ≤ 1 % CPU, zero wakeups | `idle.rs` | `idle_real.rs` | `pb-idle.json` | `idle-evidence.md` | measured (60 s parked child, 0.0000 %) |
-| — | parser stage only (M1-11, not a PB) | `parser_throughput.rs` | `parser_throughput.rs` | `parser-throughput.json` | `baselines/README.md` | measured; explicitly not PB-6 |
-| — | PB-3 long-session vehicle | `real_soak.rs` / `dogfood_session.rs` | `real_soak.rs` / `dogfood_session.rs` | `pb-real-soak.json` / `pb-dogfood-session.json` | `real-soak-evidence.md` / `dogfood-session-evidence.md` | `unavailable` (no Tier 1 session yet) |
+| PB   | Budget (accepted target)            | Module                                                | Bench                                 | Artifact                                        | Evidence doc                                            | Capture status                                                                      |
+| ---- | ----------------------------------- | ----------------------------------------------------- | ------------------------------------- | ----------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| PB-1 | cold startup p50 100 / p99 200 ms   | `real_window.rs`                                      | `real_window.rs`                      | `pb-real-window.json`                           | `real-window-evidence.md`                               | measured (Tier 1 opt-in)                                                            |
+| PB-2 | idle RSS p50 80 MB                  | `real_window.rs`                                      | `real_window.rs`                      | `pb-real-window.json`                           | `real-window-evidence.md`                               | measured (Tier 1 opt-in)                                                            |
+| PB-3 | 8-tab 250 MB + 15 % reclaim         | `typical_session.rs`                                  | `typical_session.rs`                  | `pb-typical-session.json`                       | `typical-session-evidence.md`                           | measured headless anchor; reclaim `ABOVE_BUDGET` finding; real 4 h session deferred |
+| PB-4 | key-to-screen p50 8 / p99 15 ms     | `latency.rs`                                          | `latency_real.rs`                     | `pb-latency.json`                               | `latency-evidence.md`                                   | measured headless anchor (this task)                                                |
+| PB-5 | binary ≤ 25 MB, dist ≤ 40 MB        | release-pipeline replication (no `bitty-perf` module) | — (recipe in evidence doc)            | sizes recorded in-doc                           | `package-size-evidence.md`                              | measured first-link PASS                                                            |
+| PB-6 | parse-and-render ≥ 40 MiB/s         | `throughput_floor.rs`                                 | `throughput_floor.rs`                 | `pb-throughput-floor.json`                      | `throughput-floor-evidence.md`                          | measured headless anchor; `ABOVE_BUDGET` finding (6.06 vs 40)                       |
+| PB-7 | idle ≤ 1 % CPU, zero wakeups        | `idle.rs`                                             | `idle_real.rs`                        | `pb-idle.json`                                  | `idle-evidence.md`                                      | measured (60 s parked child, 0.0000 %)                                              |
+| —    | parser stage only (M1-11, not a PB) | `parser_throughput.rs`                                | `parser_throughput.rs`                | `parser-throughput.json`                        | `baselines/README.md`                                   | measured; explicitly not PB-6                                                       |
+| —    | PB-3 long-session vehicle           | `real_soak.rs` / `dogfood_session.rs`                 | `real_soak.rs` / `dogfood_session.rs` | `pb-real-soak.json` / `pb-dogfood-session.json` | `real-soak-evidence.md` / `dogfood-session-evidence.md` | `unavailable` (no Tier 1 session yet)                                               |
+
+PB-2 supplemental analysis (not a separate pinned harness): `rss-evidence.md` plus `pb-rss.json` (CTX-0694, issue #1190) re-measures idle RSS on the same real-window harness with a contributor breakdown and reduction proposal. The owning harness and pinned artifact for PB-2 remain the `real_window.rs` row above.
 
 Budget constants live in exactly one place: `crates/bitty-perf/src/lib.rs`
 (`PB1_STARTUP_MS_P50/P99`, `PB2_IDLE_RSS_MB`, `PB3_TYPICAL_RSS_MB` /
@@ -102,7 +104,7 @@ What is **not** pinned — the PERF-01 remainder, blocked on OQ-100:
 
 ## Gating status (explicit)
 
-No hard gates change in this wave. CI enforces the *harness contract*
+No hard gates change in this wave. CI enforces the _harness contract_
 (determinism, exact boundary math, artifact provenance, no host paths) via
 `cargo test -p bitty-perf`; CI does **not** fail on budget verdicts, because
 the budgets are accepted targets awaiting the OQ-100 reference-hardware

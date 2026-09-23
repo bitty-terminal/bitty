@@ -104,21 +104,21 @@ crates/bitty-perf/baselines/pb-typical-session.json"`.
 
 Environment for this capture (host context is recorded inside the artifact):
 
-| Field         | Value                                                                                |
-| ------------- | ------------------------------------------------------------------------------------ |
-| Revision      | worktree `c70b9f2b00facc4d848ce3f38df1f47a95a423fe`                                   |
-| Profile       | cargo `bench` release                                                                |
-| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)                                               |
-| OS            | CachyOS Linux (Arch derivative), x86_64                                              |
-| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe                                             |
-| Sample        | 8 tabs × 64 KiB fixed workload (512 KiB total), self-RSS before/open/close           |
+| Field         | Value                                                                      |
+| ------------- | -------------------------------------------------------------------------- |
+| Revision      | worktree `c70b9f2b00facc4d848ce3f38df1f47a95a423fe`                        |
+| Profile       | cargo `bench` release                                                      |
+| Toolchain     | `rustc 1.98.1` (`rust-toolchain.toml`)                                     |
+| OS            | CachyOS Linux (Arch derivative), x86_64                                    |
+| Machine class | desktop 24-core x86_64, 31 GiB RAM, NVMe                                   |
+| Sample        | 8 tabs × 64 KiB fixed workload (512 KiB total), self-RSS before/open/close |
 
-| Metric                          | Measured       | Budget                 | Verdict         |
-| ------------------------------- | -------------- | ---------------------- | --------------- |
-| 8-tab open RSS                   | 69.039 MB      | ≤ 250 MB               | `PASS`          |
-| Growth over baseline (2.754 MB)  | +66.285 MB     | — (anchor only)        | —               |
-| Post-close RSS (1 tab)           | 54.184 MB      | within 15 % of baseline| `ABOVE_BUDGET`  |
-| Reclaim distance                 | +1867.5 %      | ≤ +15 %                | `ABOVE_BUDGET`  |
+| Metric                          | Measured   | Budget                  | Verdict        |
+| ------------------------------- | ---------- | ----------------------- | -------------- |
+| 8-tab open RSS                  | 69.039 MB  | ≤ 250 MB                | `PASS`         |
+| Growth over baseline (2.754 MB) | +66.285 MB | — (anchor only)         | —              |
+| Post-close RSS (1 tab)          | 54.184 MB  | within 15 % of baseline | `ABOVE_BUDGET` |
+| Reclaim distance                | +1867.5 %  | ≤ +15 %                 | `ABOVE_BUDGET` |
 
 Repeat runs are stable (open 68.98–69.04 MB, close 54.13–54.18 MB across 4
 runs); the growth is dominated by per-tab `State` footprint (~8.3 MB/tab of

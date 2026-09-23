@@ -3944,7 +3944,7 @@ mod tests {
     fn decoration_merges_scalar_replace_with_attribution() {
         // CTX-0292/CTX-0333: user decoration lands in effective with user
         // attribution; CLI wins over file; absent layers keep the unified
-        // defaults (gaps 6/6, border 2, radius 6, content inset 6) with
+        // defaults (gaps 6/6, border 1, radius 6, content inset 6) with
         // core-defaults attribution.
         use crate::types::DecorationConfig;
         let user = LayeredPlan::new(

@@ -604,8 +604,10 @@ pub struct RuntimeConfig {
     /// Inset around the container edge in cells (CTX-0177
     /// `layout.gaps_out`). Same bounds and default as `gaps_in`.
     pub gaps_out: u16,
-    /// Core-owned workspace decoration in logical pixels (CTX-0292; accepted
-    /// spec CTX-0118 defaults `4/6/2/6`). Decoration is never part of a
+    /// Core-owned workspace decoration in logical pixels (CTX-0292; unified
+    /// defaults `6/6/1/6/6` since #1342; the accepted spec CTX-0118 snapshot
+    /// still pins border `2` — docs sync tracked by #1374). Decoration is
+    /// never part of a
     /// `LayoutTree` or a plugin proposal; it is carried here from the
     /// validated `EffectiveConfig` and applied by
     /// [`crate::Runtime::decorated_allocations`] / the future live present

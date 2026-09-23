@@ -62,10 +62,11 @@ fn dpi_adoption_derives_grid_from_physical_over_scaled_cells() {
     // are 14x30 (CTX-0157 readable 9x19 base) and the physical padding
     // is round(8 * 1.6) = 13px per side (CTX-0223). CTX-0375: the primary
     // grid follows the decorated content frame, so the Core-owned
-    // decoration (gaps_out 6 + border 2 + content_inset 6 = 14 logical px
-    // per side, round(14 * 1.6) = 23 physical px) is removed too:
-    // (2506-26-46)/14 x (1496-26-46)/30 = 173x47 (a window-sized 177x49
-    // grid would be cropped to the content frame).
+    // decoration (gaps_out 6 + border 1 + content_inset 6 = 13 logical px
+    // per side, scaled per component to 10 + 2 + 10 = 22 physical px) is
+    // removed too: the 177x49 container (2478x1470 px after the padding
+    // floor) crops to a 2434x1426 px content frame = 173x47 (a
+    // window-sized 177x49 grid would be cropped to the content frame).
     rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2506, 1496)));
     assert_eq!(rt.dpi_scale(), 1.6);
     let snap = rt.snapshot();

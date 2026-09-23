@@ -2240,7 +2240,7 @@ impl DecorationConfig {
     /// accepted CTX-0344 (RFC-0001 `OQ-045`) order.
     ///
     /// A width is available from, in increasing precedence:
-    /// 1. `decoration.border` (the base paint thickness, default `2`);
+    /// 1. `decoration.border` (the base paint thickness, default `1`);
     /// 2. `decoration.border_width` (base, both states);
     /// 3. the explicit `decoration.border_width_focused` /
     ///    `decoration.border_width_idle` pair.
@@ -2716,8 +2716,8 @@ pub struct EffectiveConfig {
     /// Default layout provider for new workspaces (CW-07
     /// `workspace.layout`; default preserves the current tree).
     pub workspace: WorkspaceConfig,
-    /// Core-owned workspace decoration in logical px (CTX-0292; accepted
-    /// spec CTX-0118 defaults 4/6/2/6).
+    /// Core-owned workspace decoration in logical px (CTX-0292; unified
+    /// defaults `6/6/1/6/6` since #1342, spec sync tracked by #1374).
     pub decoration: DecorationConfig,
     /// Merged per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343).
     ///
@@ -4627,7 +4627,7 @@ mod tests {
         assert_eq!(resolved.outline_idle, color("#0A0B0C"));
         assert_eq!(resolved.outline_width_focused, 5);
         // The unset idle width inherits the global resolved width
-        // (`decoration.border` default 2).
+        // (`decoration.border` default 1).
         assert_eq!(resolved.outline_width_idle, DEFAULT_DECORATION_BORDER_PX);
     }
 

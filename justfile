@@ -239,7 +239,7 @@ perf-idle:
 #   BITTY_PERF_TASK, BITTY_PERF_DATE, BITTY_PERF_REVISION,
 #   BITTY_PERF_TOOLCHAIN, BITTY_PERF_COMMAND, BITTY_PERF_PROFILE
 # (see benches/idle_real.rs). The window comes from BITTY_PERF_IDLE_SECS
-# (default 60, max 300); frame-on-demand must pass and the window must be
+# (default 60, max 600 = the PB-7 10-minute acceptance window); frame-on-demand must pass and the window must be
 # measured or the bench refuses to write (exit 2).
 perf-idle-baseline out="crates/bitty-perf/baselines/pb-idle.json":
     cargo bench -p bitty-perf --bench idle_real -- --nocapture --write-baseline {{out}}

@@ -105,9 +105,9 @@ BITTY_PERF_TASK=CTX-0636 BITTY_PERF_DATE=... BITTY_PERF_REVISION=... \
 
 Environment knobs (all optional, clamped):
 
-| Variable               | Default | Bound | Purpose                        |
-| ---------------------- | ------- | ----- | ------------------------------ |
-| `BITTY_PERF_IDLE_SECS` | 60      | 1–300 | Extended idle window (seconds) |
+| Variable               | Default | Bound | Purpose                                                        |
+| ---------------------- | ------- | ----- | -------------------------------------------------------------- |
+| `BITTY_PERF_IDLE_SECS` | 60      | 1–600 | Extended idle window (seconds); 600 = full PB-7 10-min window  |
 
 ## Captured baseline
 
@@ -155,6 +155,65 @@ Interpretation, stated honestly:
 - The harness is the deliverable; the within-budget reading on this host
   should feed the PERF-01 budget/harness decision, not pre-empt it.
 
+## 10-minute acceptance soak (CTX-0699)
+
+CTX-0699 ran the full PB-7 acceptance window — 600 s in one parked sample,
+not a stitched proxy — after raising `MAX_IDLE_WINDOW_SECS` from 300 to 600
+(`crates/bitty-perf/src/idle.rs`; `benches/idle_real.rs` and the
+`perf-idle-baseline` recipe document the new bound; the clamp test pins the
+600/601 behavior).
+
+Command (exact): `cargo bench -p bitty-perf --bench idle_real -- --nocapture
+--idle-window 600 --write-baseline crates/bitty-perf/baselines/pb-idle.json`
+with `BITTY_PERF_TASK=CTX-0699`, `BITTY_PERF_DATE=2026-09-23`,
+`BITTY_PERF_REVISION=436283e68543b42aa0b2dff1afcbe291c97ac1e9`, profile cargo
+`bench` release, toolchain `rustc 1.98.1`, on the same 24-core / 31 GiB
+desktop as the CTX-0636 capture. The committed `pb-idle.json` below was
+written by that run (`--write-baseline` refuses to write when unmeasured);
+the raw bench log sits in gitignored scratch at
+`recording/ctx-0699-soak10/headless-soak.log`.
+
+| Metric                               | Measured                 | Budget                      | Verdict |
+| ------------------------------------ | ------------------------ | --------------------------- | ------- |
+| Frame-on-demand (9 checks)           | 9/9 PASS                 | zero wakeups when idle      | `PASS`  |
+| Parked-`Runtime` avg CPU, 600 s      | 0.0017 % (1 tick @100Hz) | ≤ 1 % avg over 10 min       | `PASS`  |
+| Parked-`Runtime` wakeups, 600 s      | 14 (8v + 6i)             | zero periodic wakeups       | `PASS`  |
+| Idle tick mean                       | 2.053 µs                 | << 8 ms (PB-4 p50 headroom) | `PASS`  |
+| Clean render mean                    | 0.024 µs                 | << 8 ms                     | `PASS`  |
+
+One CPU tick in 600 s is 10 ms of CPU time. The 14 wakeups over 600 s
+(≈ 0.02/s) are spawn/settle/exit edge effects; the steady state shows zero
+periodic wakeups, consistent with the `tick == None → Wait` mechanism.
+
+### Real-window supplementary leg
+
+A real `bitty` 0.0.20 window (installed release binary) was parked idle on a
+scratch workspace — no input, no PTY output — while its `/proc` counters
+were sampled at t0/t1 600 s apart
+(`recording/ctx-0699-soak10/real-window-soak.sh`, gitignored scratch; raw
+log `recording/ctx-0699-soak10/real-window-soak.log`). The window was closed
+and the previous workspace restored afterwards.
+
+| Metric, 600 s window | Measured                   | Budget                | Verdict |
+| -------------------- | -------------------------- | --------------------- | ------- |
+| Real-window avg CPU  | 0.3867 % (232 ticks @100Hz)| ≤ 1 % avg over 10 min | `PASS`  |
+| Real-window wakeups  | 416 (400v + 16i, ≈ 0.7/s)  | — (informational)     | —       |
+| Real-window RSS      | 428.0 → 431.7 MB (+3.8 MB) | — (informational)     | —       |
+
+Unlike the headless park, the windowed session shows steady low-rate
+wakeups (≈ 0.7/s: compositor presentation plus shell upkeep) — expected
+outside `ControlFlow::Wait` purity — while CPU stays at about one-third of
+the budget. This leg is supplementary context, not the acceptance sample:
+the subject is the installed release binary, not the worktree build.
+
+### Verdict
+
+Both legs of the real 10-minute measurement sit within the PB-7 ≤ 1 %
+average on this host: headless 0.0017 %, real window 0.3867 %.
+Ownership: CTX-0699 closes the PB-7 measurement gap for #1062 on this host;
+formal Verified status on pinned Tier 1 reference hardware remains owned by
+PERF-01/OQ-100.
+
 ## Verification
 
 ```text
@@ -170,8 +229,10 @@ Expected: unit tests pass with no display; the 5 s smoke prints
 ## Limitations and confidence
 
 - Single-host capture; no multi-machine distribution and no variance study.
-- The extended window (60 s, max 300 s) is a bounded proxy for the accepted
-  10-minute average; the real 10-minute measurement stays gated on Tier 1.
+- Before CTX-0699 the extended window (60 s, max 300 s) was a bounded proxy
+  for the accepted 10-minute average; CTX-0699 ran the real 600 s window
+  (headless) plus a 600 s real-window supplementary leg — see
+  "10-minute acceptance soak (CTX-0699)" above.
 - Headless subject only: no winit event loop, no wgpu surface, no PTY bytes,
   no plugin timers. Panel-worker poll cadences (`panels_async.rs`) and plugin
   timers are out of this window by construction (not started in the subject);

@@ -9,7 +9,8 @@
 //! CTX-0636 (PERF-08) addition: an extended idle-CPU/wakeup measurement that
 //! re-execs this binary as a parked-`Runtime` child (`--idle-child`) and
 //! samples its `/proc` CPU and context-switch counters across a bounded
-//! window (`--idle-window`, default 60 s, max 300 s). `--write-baseline`
+//! window (`--idle-window`, default 60 s, max 600 s — the full PB-7
+//! 10-minute acceptance window). `--write-baseline`
 //! commits the numbers plus provenance to `pb-idle.json`; it refuses to
 //! write when the frame-on-demand checks fail or the window is unmeasured.
 //!

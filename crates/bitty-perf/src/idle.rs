@@ -446,13 +446,16 @@ pub const IDLE_CHILD_ARG: &str = "--idle-child";
 pub const IDLE_WINDOW_ENV: &str = "BITTY_PERF_IDLE_SECS";
 /// Default extended idle window in seconds.
 ///
-/// A bounded proxy: the accepted budget averages over 10 minutes, and the
-/// real 10-minute measurement is gated on the Tier 1 reference machine
-/// (PERF-01, blocked on OQ-100). A parked child shows its steady-state rate
-/// within a minute; the window stays configurable up to the maximum.
+/// A full-budget window: the accepted budget averages over 10 minutes, so
+/// the maximum covers the whole 600 s acceptance window in one parked
+/// sample (CTX-0699 runs the real 10-minute soak on Tier 1 / this host).
+/// A parked child shows its steady-state rate within a minute; the window
+/// stays configurable up to the maximum.
 pub const DEFAULT_IDLE_WINDOW_SECS: u64 = 60;
-/// Maximum extended idle window in seconds (mirrors the PB-2 idle clamp).
-pub const MAX_IDLE_WINDOW_SECS: u64 = 300;
+/// Maximum extended idle window in seconds: 600 s, exactly the PB-7
+/// 10-minute acceptance window (raised from 300 in CTX-0699 so the soak
+/// needs no stitching of sub-windows).
+pub const MAX_IDLE_WINDOW_SECS: u64 = 600;
 
 /// Idle-CPU/wakeup evidence for one parked-`Runtime` window.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1068,6 +1071,12 @@ mod tests {
     fn idle_window_clamp_bounds_the_window() {
         assert_eq!(super::clamp_window(0), 1);
         assert_eq!(super::clamp_window(60), 60);
+        assert_eq!(super::clamp_window(600), 600);
+        assert_eq!(
+            super::clamp_window(601),
+            super::MAX_IDLE_WINDOW_SECS,
+            "windows above the 10-minute acceptance window clamp to the maximum"
+        );
         assert_eq!(super::clamp_window(u64::MAX), super::MAX_IDLE_WINDOW_SECS);
         assert_eq!(
             super::idle_window_secs().clamp(1, super::MAX_IDLE_WINDOW_SECS),

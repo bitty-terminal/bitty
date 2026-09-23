@@ -2341,3 +2341,182 @@ mod viewport_follow_tests {
         assert_eq!(window, snapshot);
     }
 }
+
+#[cfg(test)]
+mod content_padding_tests {
+    //! Issue #1357: grid column 0 must never render flush against the
+    //! window/panel left edge.
+    //!
+    //! The default composition is `window.padding` (8 logical px) plus the
+    //! Core-owned decoration (`gaps_out` 6 + `border` 1 + `content_inset` 6).
+    //! For reference, ghostty ships 2px symmetric window padding and kitty
+    //! ships 0; the composed bitty default stays comfortably above both, so
+    //! text always has breathing room out of the box. These tests pin the
+    //! composed left offset end to end: frame geometry via
+    //! [`Runtime::present_frames`] *and* painted pixels via the headless
+    //! seam, for a single pane and for splits, plus fail-closed live
+    //! adoption of out-of-range values.
+    use super::*;
+    use crate::Decoration;
+    use crate::SplitAxis;
+    use crate::config::{
+        DEFAULT_WINDOW_PADDING, MAX_DECORATION_CONTENT_INSET_PX, MAX_WINDOW_PADDING,
+    };
+    use bitty_vt::GraphemeCell;
+
+    /// Fresh default runtime with one 80x24 leaf in a 736x472 window (80x24
+    /// at 9x19 cells = 720x456 grid plus twice the 8px window padding).
+    fn single_pane_runtime() -> Runtime {
+        let mut rt = Runtime::with_defaults().expect("default runtime builds");
+        assert_eq!(rt.dpi_scale(), 1.0, "defaults pin scale 1.0");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.handle_resize(PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        rt
+    }
+
+    #[test]
+    fn default_single_pane_left_offset_is_painted() {
+        let mut rt = single_pane_runtime();
+        // Print at row 0 so the first glyph sits in grid column 0.
+        for c in ['H', 'i'] {
+            rt.state
+                .apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        let deco = rt.decoration();
+        assert_eq!(rt.window_padding_physical(), DEFAULT_WINDOW_PADDING);
+
+        let frames = rt.present_frames();
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        // Content sits inside gaps_out + border + content_inset on the left:
+        // the frame starts after the outer gap, the content after the
+        // border ring and the inner content inset.
+        assert_eq!(frame.frame.x, i32::from(deco.gaps_out));
+        let frame_inset = i32::from(deco.border) + i32::from(deco.content_inset);
+        assert_eq!(frame_inset, 7, "1 + 6 default border + content inset");
+        assert_eq!(frame.content.x - frame.frame.x, frame_inset);
+        // Symmetric on the right edge too.
+        let frame_right = frame.frame.x + frame.frame.width as i32;
+        let content_right = frame.content.x + frame.content.width as i32;
+        assert_eq!(frame_right - content_right, frame_inset);
+
+        rt.tick().expect("headless tick presents");
+        let rgba = rt.headless_rgba().expect("headless rgba");
+        let extent = rt.present_plan_extent();
+        let (w, h) = (extent.width as usize, extent.height as usize);
+        assert_eq!(rgba.len(), w * h * 4);
+        let bg = [rgba[0], rgba[1], rgba[2], rgba[3]];
+        let px = |x: usize, y: usize| rgba[(y * w + x) * 4..(y * w + x) * 4 + 4] != bg;
+
+        // The decoration ring starts exactly at the window-padding inset.
+        let pad = rt.window_padding_physical() as usize;
+        let mut first_diff: Option<usize> = None;
+        for x in 0..w {
+            if (0..h).any(|y| px(x, y)) {
+                first_diff = Some(x);
+                break;
+            }
+        }
+        assert_eq!(
+            first_diff,
+            Some(pad + frame.frame.x as usize),
+            "nothing paints inside the window-padding band"
+        );
+
+        // First text row band: pad band clear, ring solid, inset clear,
+        // glyph ink only at/after the content origin.
+        let cell_h = rt.live_cell_metrics().height as usize;
+        let y0 = pad + frame.content.y as usize;
+        let ring_left = pad + frame.frame.x as usize;
+        let content_left = pad + frame.content.x as usize;
+        assert!(y0 + cell_h <= h);
+        let col_has_ink = |x: usize| (y0..y0 + cell_h).any(|y| px(x, y));
+        assert!(
+            (0..ring_left).all(|x| !col_has_ink(x)),
+            "window-padding band stays background"
+        );
+        assert!(
+            (ring_left..ring_left + deco.border as usize).all(col_has_ink),
+            "decoration ring paints at the frame edge"
+        );
+        assert!(
+            (ring_left + deco.border as usize..content_left).all(|x| !col_has_ink(x)),
+            "content inset stays background"
+        );
+        assert!(
+            (content_left..w).any(col_has_ink),
+            "first-column glyph ink paints at the content origin"
+        );
+        // Composed breathing room before the first ink: 8 + 6 + 1 + 6.
+        assert_eq!(content_left, 21);
+    }
+
+    #[test]
+    fn split_panes_keep_symmetric_content_inset() {
+        let mut rt = Runtime::with_defaults().expect("default runtime builds");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        ));
+        rt.handle_resize(PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        let deco = rt.decoration();
+        let inset = i32::from(deco.border) + i32::from(deco.content_inset);
+        let frames = rt.present_frames();
+        assert_eq!(frames.len(), 2);
+        for frame in &frames {
+            assert_eq!(
+                frame.content.x - frame.frame.x,
+                inset,
+                "no pane paints flush against its left frame edge"
+            );
+            let frame_right = frame.frame.x + frame.frame.width as i32;
+            let content_right = frame.content.x + frame.content.width as i32;
+            assert_eq!(
+                frame_right - content_right,
+                inset,
+                "inset is symmetric on the right edge"
+            );
+        }
+        // The sibling gap between the two frames survives the insets.
+        let (left, right) = (&frames[0], &frames[1]);
+        let (left, right) = if left.frame.x < right.frame.x {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        assert_eq!(
+            right.frame.x - (left.frame.x + left.frame.width as i32),
+            i32::from(deco.gaps_in),
+            "divider gap stays visible between pane frames"
+        );
+    }
+
+    #[test]
+    fn oversized_padding_and_inset_fail_closed_live() {
+        let mut rt = Runtime::with_defaults().expect("default runtime builds");
+        assert!(rt.set_window_padding(MAX_WINDOW_PADDING + 1).is_err());
+        assert_eq!(
+            rt.window_padding(),
+            DEFAULT_WINDOW_PADDING,
+            "rejected padding leaves the live value untouched"
+        );
+        assert!(rt.set_window_padding(0).is_ok(), "zero stays valid");
+        assert_eq!(rt.window_padding(), 0);
+        assert!(rt.set_window_padding(DEFAULT_WINDOW_PADDING).is_ok());
+
+        let bad = Decoration::new(6, 6, 1, 6, MAX_DECORATION_CONTENT_INSET_PX + 1);
+        assert!(rt.set_decoration(bad).is_err());
+        assert_eq!(
+            rt.decoration().content_inset,
+            Decoration::default().content_inset,
+            "rejected inset leaves the live decoration untouched"
+        );
+        assert!(rt.set_decoration(Decoration::ZERO).is_ok());
+        assert_eq!(rt.decoration(), Decoration::ZERO);
+    }
+}

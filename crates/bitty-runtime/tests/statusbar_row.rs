@@ -218,3 +218,22 @@ fn hidden_bar_press_falls_through_to_selection() {
     rt.handle_mouse_input(press());
     assert_eq!(rt.active_workspace_index(), 0);
 }
+
+#[test]
+fn alt_screen_press_falls_through_instead_of_hitting_chrome() {
+    let mut rt = Runtime::with_defaults().expect("default runtime builds");
+    let _ = rt.tick();
+    rt.workspace_new().expect("ws2");
+    assert_eq!(rt.active_workspace_index(), 1);
+    // A fullscreen app owns every row: the overlay skips the bar, so a
+    // press on the last row must not be consumed as workspace chrome.
+    rt.handle_pty_bytes(b"\x1b[?1049h\x1b[H\x1b[2J");
+    let _ = rt.tick();
+    rt.handle_cursor_moved(bar_pixels(&rt, 0));
+    rt.handle_mouse_input(press());
+    assert_eq!(
+        rt.active_workspace_index(),
+        1,
+        "press on alt screen must not switch workspaces"
+    );
+}

@@ -396,6 +396,16 @@ impl Runtime {
             if frame.cols == 0 || frame.rows == 0 {
                 continue;
             }
+            // Mirror the overlay skip in present.rs: no bar is drawn on the
+            // alternate screen (a fullscreen app owns every row there), so a
+            // press there must fall through instead of hitting chrome.
+            let leaf_on_alt = match self.pane_sessions.get(&frame.view) {
+                Some(sess) => sess.state.alt_screen_active(),
+                None => self.state.alt_screen_active(),
+            };
+            if leaf_on_alt {
+                continue;
+            }
             let Some(bar) = self.status_bar_row(usize::from(frame.rows)) else {
                 continue;
             };

@@ -73,7 +73,6 @@ pub(crate) struct ChromeState {
     /// Hint collection generation, bumped once per Leader arming (CTX-0723,
     /// #981). Fresh batches per arming keep stale labels unreachable.
     pub(crate) hint_generation: u64,
-<<<<<<< HEAD
     /// Panel-hosted external-editor session (CTX-0731, #982): at most one
     /// pending `$EDITOR` round trip; empty otherwise.
     pub(crate) editor: crate::editor_host::ExternalEditorHost,

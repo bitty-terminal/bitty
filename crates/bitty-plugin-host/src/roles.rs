@@ -1,31 +1,34 @@
-//! Candidate role contract for multi-agent work (OQ-057).
+//! Role contract for multi-agent work (OQ-057).
 //!
-//! `OQ-057` is still open: no ruling fixes the role-to-authority map,
-//! per-role prompt binding, subagent dispatch limits, or the enforcement
-//! points (including the execution-sandbox layer) for multi-agent work.
-//! This module records the candidate direction only — Commander,
-//! Implementer, Tester, Reviewer — as pure, bounded, fail-closed data.
+//! `OQ-057` is adopted (register accepted 2026-09-23): the role-to-authority
+//! map is Commander, Implementer, Tester, Reviewer, as pure, bounded,
+//! fail-closed data with the enforcement points below (including the
+//! execution-sandbox layer).
 //!
-//! Nothing here is wired into any live path: roles never grant
-//! authority by themselves, prompts never confer capability (there is
-//! deliberately no `bind_prompt` constructor), and delegation only
-//! narrows through the accepted intersection engine
-//! ([`crate::effective`]). The chat-message [`Role`](bitty-agent)
-//! distinction stays untouched; this kernel only answers "may role R
-//! act at enforcement point P, and under which sandbox restrictions".
-//! Unknown roles or points deny rather than default.
+//! One seam is enforced at a live call boundary: [`AgentRole::check_point`]
+//! (and [`AgentRole::check_request`] per privileged request kind) denies
+//! roles outside their mapped points, and
+//! [`crate::effective::authorize_with_role`] runs that gate before the
+//! six-layer grant intersection. Roles never grant authority by themselves,
+//! prompts never confer capability (there is deliberately no `bind_prompt`
+//! constructor), and delegation only narrows through the accepted
+//! intersection engine ([`crate::effective`]). The chat-message
+//! [`Role`](bitty-agent) distinction stays untouched; this kernel answers
+//! "may role R act at enforcement point P, and under which sandbox
+//! restrictions". Unknown roles or points deny rather than default.
 //!
 //! # Non-goals
 //!
 //! Model routing, memory, skill growth, dispatch budgets, and the shell
-//! write path (CRE-5) stay undecided until the OQ-057 ruling. There is
-//! no `unsafe`, no I/O, and no new dependency (`std` only).
+//! write path (CRE-5) stay open. There is no `unsafe`, no I/O, and no new
+//! dependency (`std` only).
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
 use crate::capability::CapabilityFamily;
+use crate::effective::RequestKind;
 use crate::error::PluginError;
 
 // ── bounds ────────────────────────────────────────────────────────────────
@@ -116,6 +119,33 @@ impl AgentRole {
             i += 1;
         }
         false
+    }
+
+    /// Check this role at one enforcement point (OQ-057 adopted).
+    ///
+    /// Call-boundary gate enforced by [`crate::effective::authorize_with_role`]:
+    /// roles act only at their mapped points, otherwise the request denies
+    /// fail-closed with a grant error naming the role and the point only
+    /// (never a prompt, plan, or payload).
+    pub fn check_point(self, point: EnforcementPoint) -> Result<(), PluginError> {
+        if self.may(point) {
+            Ok(())
+        } else {
+            Err(PluginError::grant(format!(
+                "role '{}' may not act at '{}' (OQ-057 adopted)",
+                self.as_str(),
+                point.as_str()
+            )))
+        }
+    }
+
+    /// Check this role for one privileged request kind.
+    ///
+    /// Routes through [`EnforcementPoint::for_request_kind`]: delegation-gated
+    /// kinds need dispatch authority, sandboxed execution needs the sandbox
+    /// point, and every other privileged kind invokes a granted tool.
+    pub fn check_request(self, kind: RequestKind) -> Result<(), PluginError> {
+        self.check_point(EnforcementPoint::for_request_kind(kind))
     }
 
     /// Execution-sandbox restrictions for this role (candidate).
@@ -213,6 +243,27 @@ impl EnforcementPoint {
             Self::ToolCall => "tool-call",
             Self::Delegation => "delegation",
             Self::SandboxExec => "sandbox-exec",
+        }
+    }
+
+    /// Enforcement point guarding one privileged request kind (OQ-057 adopted).
+    ///
+    /// Delegation-gated kinds (spawning agents or subagents) need the dispatch
+    /// point; sandboxed execution needs the sandbox point with its
+    /// [`AgentRole::sandbox`] restrictions; every other privileged kind
+    /// invokes a granted tool or lifecycle entry. Observation-only context
+    /// reads travel outside the privileged kinds, so no kind maps to
+    /// `ContextRead`.
+    #[must_use]
+    pub const fn for_request_kind(kind: RequestKind) -> EnforcementPoint {
+        match kind {
+            RequestKind::AgentSpawn => EnforcementPoint::Delegation,
+            RequestKind::ExecutionRun => EnforcementPoint::SandboxExec,
+            RequestKind::PanelAcquire
+            | RequestKind::FsRead
+            | RequestKind::FsWrite
+            | RequestKind::NetworkConnect
+            | RequestKind::PluginLifecycle => EnforcementPoint::ToolCall,
         }
     }
 }
@@ -346,5 +397,86 @@ mod tests {
         assert_eq!(EnforcementPoint::ToolCall.to_string(), "tool-call");
         assert_eq!(EnforcementPoint::Delegation.to_string(), "delegation");
         assert_eq!(EnforcementPoint::SandboxExec.to_string(), "sandbox-exec");
+    }
+
+    #[test]
+    fn request_kind_points_route_correctly() {
+        assert_eq!(
+            EnforcementPoint::for_request_kind(RequestKind::AgentSpawn),
+            EnforcementPoint::Delegation
+        );
+        assert_eq!(
+            EnforcementPoint::for_request_kind(RequestKind::ExecutionRun),
+            EnforcementPoint::SandboxExec
+        );
+        for kind in [
+            RequestKind::PanelAcquire,
+            RequestKind::FsRead,
+            RequestKind::FsWrite,
+            RequestKind::NetworkConnect,
+            RequestKind::PluginLifecycle,
+        ] {
+            assert_eq!(
+                EnforcementPoint::for_request_kind(kind),
+                EnforcementPoint::ToolCall,
+                "{kind} must route to tool-call"
+            );
+        }
+    }
+
+    #[test]
+    fn role_gate_denies_outside_points() {
+        assert!(
+            AgentRole::Commander
+                .check_request(RequestKind::AgentSpawn)
+                .is_ok()
+        );
+        // Implementers carry no dispatch authority.
+        assert!(
+            AgentRole::Implementer
+                .check_request(RequestKind::AgentSpawn)
+                .is_err()
+        );
+        assert!(
+            AgentRole::Implementer
+                .check_request(RequestKind::ExecutionRun)
+                .is_ok()
+        );
+        // Testers execute sandboxed but invoke no granted tools.
+        assert!(
+            AgentRole::Tester
+                .check_request(RequestKind::ExecutionRun)
+                .is_ok()
+        );
+        assert!(
+            AgentRole::Tester
+                .check_request(RequestKind::FsRead)
+                .is_err()
+        );
+        // Reviewers observe only: every privileged kind denies.
+        for kind in [
+            RequestKind::AgentSpawn,
+            RequestKind::ExecutionRun,
+            RequestKind::PanelAcquire,
+            RequestKind::FsRead,
+            RequestKind::FsWrite,
+            RequestKind::NetworkConnect,
+            RequestKind::PluginLifecycle,
+        ] {
+            assert!(
+                AgentRole::Reviewer.check_request(kind).is_err(),
+                "reviewer must deny {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_denial_names_role_and_point_only() {
+        let error = AgentRole::Reviewer
+            .check_request(RequestKind::FsWrite)
+            .expect_err("reviewer must deny writes");
+        let text = error.to_string();
+        assert!(text.contains("reviewer"), "{text}");
+        assert!(text.contains("tool-call"), "{text}");
     }
 }

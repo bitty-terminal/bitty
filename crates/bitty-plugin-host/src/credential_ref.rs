@@ -1,10 +1,12 @@
-//! Candidate `api_key_env` vs `api_key_cmd` credential semantics (OQ-054).
+//! `api_key_env` vs `api_key_cmd` credential semantics (OQ-054).
 //!
-//! `OQ-054` is still open: no ruling fixes the config semantics for
-//! `api_key_env` versus `api_key_cmd` credential references, their
-//! resolution order, or the project-level override boundary that cannot
-//! widen credentials. This module records the candidate direction only,
-//! as pure, bounded, fail-closed reference data.
+//! `OQ-054` is adopted (register accepted 2026-09-23): `api_key_env` versus
+//! `api_key_cmd` credential references, their resolution order, and the
+//! project-level override boundary that cannot widen credentials. This module
+//! records the adopted reference data as pure, bounded, fail-closed types,
+//! and enforces the exclusive-or order at the call boundary
+//! ([`resolve_choice`]) plus the narrow-only project boundary
+//! ([`check_project_override`]).
 //!
 //! Nothing here touches the environment or spawns a process: a
 //! [`CredentialRef`] names *where* a credential would come from without
@@ -12,16 +14,15 @@
 //! *which* reference wins without reading anything. Diagnostics quote
 //! variable and program names only — values never enter this module, so
 //! there is nothing to redact. Must compose with ADR-0006 and MP-10 per
-//! the OQ-054 state; the project-override check
-//! ([`check_project_override`]) encodes the "never widen" boundary as a
-//! pure comparison.
+//! the OQ-054 state.
 //!
 //! # Non-goals
 //!
 //! Provider schema, actual resolution, command execution and output
-//! handling, and the accepted config surface stay undecided until the
-//! OQ-054 ruling. There is no `unsafe`, no I/O, and no new dependency
-//! (`std` only).
+//! handling, and the accepted config surface stay open: no `api_key_env` /
+//! `api_key_cmd` config field exists yet, so this gate has no live caller
+//! and waits on the provider-schema follow-up. There is no `unsafe`, no
+//! I/O, and no new dependency (`std` only).
 
 #![forbid(unsafe_code)]
 
@@ -213,6 +214,33 @@ pub const fn resolve_precedence(env_set: bool, cmd_set: bool) -> CredentialPrece
     }
 }
 
+// ── call-boundary choice (pure, reads nothing) ────────────────────────────
+
+/// Call-boundary choice (OQ-054 adopted): enforce the exclusive-or order
+/// where two optional references meet.
+///
+/// At most one reference may be present: both present is a conflict that
+/// denies fail-closed with a grant error naming both references (names only —
+/// references carry no values, so there is nothing to redact), and neither
+/// present resolves to no credential. No environment is read and no command
+/// runs here; the winner's resolution stays with the provider schema (still
+/// open: no `api_key_env` / `api_key_cmd` config field exists yet, so this
+/// gate has no live caller and waits on the provider-schema follow-up).
+pub fn resolve_choice(
+    env: Option<&CredentialRef>,
+    cmd: Option<&CredentialRef>,
+) -> Result<Option<CredentialSource>, PluginError> {
+    match (env, cmd) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Ok(Some(CredentialSource::Env)),
+        (None, Some(_)) => Ok(Some(CredentialSource::Cmd)),
+        (Some(env_ref), Some(cmd_ref)) => Err(PluginError::grant(format!(
+            "credential conflict: '{env_ref}' and '{cmd_ref}' are both set; \
+             set at most one (OQ-054 adopted)"
+        ))),
+    }
+}
+
 // ── project override boundary (pure, never widens) ────────────────────────
 
 /// Candidate project-override boundary (OQ-054): a project layer may
@@ -321,5 +349,48 @@ mod tests {
     fn source_labels_stable() {
         assert_eq!(CredentialSource::Env.to_string(), "api_key_env");
         assert_eq!(CredentialSource::Cmd.to_string(), "api_key_cmd");
+    }
+
+    #[test]
+    fn choice_enforces_exclusive_or() {
+        let env = CredentialRef::from_env("MY_KEY").expect("valid env");
+        let cmd = CredentialRef::from_cmd("pass", vec!["show".to_string()]).expect("valid cmd");
+        assert_eq!(resolve_choice(None, None), Ok(None));
+        assert_eq!(
+            resolve_choice(Some(&env), None),
+            Ok(Some(CredentialSource::Env))
+        );
+        assert_eq!(
+            resolve_choice(None, Some(&cmd)),
+            Ok(Some(CredentialSource::Cmd))
+        );
+        // Both present denies, naming both references (names only).
+        let error = resolve_choice(Some(&env), Some(&cmd)).expect_err("both set must deny");
+        let text = error.to_string();
+        assert!(text.contains("api_key_env:MY_KEY"), "{text}");
+        assert!(text.contains("api_key_cmd:pass show"), "{text}");
+    }
+
+    #[test]
+    fn choice_agrees_with_precedence() {
+        let env = CredentialRef::from_env("MY_KEY").expect("valid env");
+        let cmd = CredentialRef::from_cmd("pass", vec!["show".to_string()]).expect("valid cmd");
+        for (env_set, cmd_set, precedence) in [
+            (false, false, CredentialPrecedence::Unset),
+            (true, false, CredentialPrecedence::Env),
+            (false, true, CredentialPrecedence::Cmd),
+            (true, true, CredentialPrecedence::Conflict),
+        ] {
+            assert_eq!(resolve_precedence(env_set, cmd_set), precedence);
+            let env_ref = if env_set { Some(&env) } else { None };
+            let cmd_ref = if cmd_set { Some(&cmd) } else { None };
+            match resolve_choice(env_ref, cmd_ref) {
+                Ok(choice) => assert!(
+                    precedence != CredentialPrecedence::Conflict,
+                    "conflict must deny, got {choice:?}"
+                ),
+                Err(_) => assert_eq!(precedence, CredentialPrecedence::Conflict),
+            }
+        }
     }
 }

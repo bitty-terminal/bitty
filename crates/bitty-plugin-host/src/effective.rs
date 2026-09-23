@@ -57,6 +57,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::capability::{CapabilityFamily, CapabilityId};
+use crate::roles::AgentRole;
+use crate::trust_levels::TrustLevel;
 
 // ── bounds ────────────────────────────────────────────────────────────────
 
@@ -801,6 +803,68 @@ pub fn authorize(
     })
 }
 
+// ── adopted-contract wrappers (OQ-085 trust, OQ-057 roles) ─────────────────
+
+/// Authorize with the adopted trust-level admission gate first (OQ-085).
+///
+/// Every requested capability's family must pass
+/// [`TrustLevel::check_family`] for `level` before the six-layer
+/// intersection runs; the first family outside the level's admitted domains
+/// denies fail-closed with [`DenialKind::PolicyConflict`], naming the level
+/// and the family only (never a value). Families the adopted matrix does not
+/// cover pass through to their grants. On success this is exactly
+/// [`authorize`]: trust narrows, never grants.
+pub fn authorize_with_trust(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    kind: RequestKind,
+    project_trusted: bool,
+    level: TrustLevel,
+) -> Result<EffectiveCapability, EffectiveDenial> {
+    for cap in &request.scope.caps {
+        if let Err(error) = level.check_family(cap.family()) {
+            return Err(EffectiveDenial {
+                kind: DenialKind::PolicyConflict,
+                request_kind: kind,
+                chain: vec![DenialStep {
+                    layer: None,
+                    detail: error.to_string(),
+                }],
+            });
+        }
+    }
+    authorize(stack, request, kind, project_trusted)
+}
+
+/// Authorize with the adopted role contract gate first (OQ-057).
+///
+/// `role` must admit the enforcement point guarding `kind`
+/// ([`crate::roles::EnforcementPoint::for_request_kind`]) before the six-layer
+/// intersection runs; otherwise the request denies fail-closed with
+/// [`DenialKind::PolicyConflict`], naming the role and the point only (never
+/// a prompt, plan, or payload). The role gate never grants: on success this
+/// is exactly [`authorize`], so capability ceilings still intersect with
+/// grants elsewhere.
+pub fn authorize_with_role(
+    stack: &EffectiveStack,
+    request: &AgentRequest,
+    kind: RequestKind,
+    project_trusted: bool,
+    role: AgentRole,
+) -> Result<EffectiveCapability, EffectiveDenial> {
+    if let Err(error) = role.check_request(kind) {
+        return Err(EffectiveDenial {
+            kind: DenialKind::PolicyConflict,
+            request_kind: kind,
+            chain: vec![DenialStep {
+                layer: None,
+                detail: error.to_string(),
+            }],
+        });
+    }
+    authorize(stack, request, kind, project_trusted)
+}
+
 /// Attenuate `request` under an already-computed `parent` set.
 ///
 /// The child is `parent ∩ request`, and any request excess over the parent
@@ -1263,6 +1327,116 @@ mod tests {
         assert_eq!(
             effective.caps,
             [cap("terminal.semantic-read")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn trust_gate_denies_before_intersection() {
+        // Every layer allows the filesystem capability, so plain `authorize`
+        // succeeds; the trust pre-check still denies for external tools.
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        let denial = authorize_with_trust(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            TrustLevel::ExternalTool,
+        )
+        .expect_err("external tools admit no filesystem domain");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        assert_eq!(denial.request_kind, RequestKind::FsRead);
+        let chain = denial.reason_chain().join("\n");
+        assert!(chain.contains("external-tool"), "{chain}");
+        // Core passes the gate and authorizes exactly like `authorize`.
+        let trusted = authorize_with_trust(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            TrustLevel::Core,
+        )
+        .expect("core admits filesystem");
+        assert_eq!(
+            trusted.caps,
+            [cap("fs.read:~/docs/*.md")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn trust_gate_defers_unmapped_families_to_grants() {
+        // `ui.rich` has no adopted domain: even external tools pass the gate
+        // and the grant intersection decides.
+        let stack = EffectiveStack {
+            host: scope_with("host", &["ui.rich"]),
+            user: scope_with("user", &["ui.rich"]),
+            project: None,
+            parent: scope_with("parent", &["ui.rich"]),
+            task: scope_with("task", &["ui.rich"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["ui.rich"]),
+            raw_wide: Vec::new(),
+        };
+        let effective = authorize_with_trust(
+            &stack,
+            &request,
+            RequestKind::PluginLifecycle,
+            true,
+            TrustLevel::ExternalTool,
+        )
+        .expect("unmapped families defer to grants");
+        assert_eq!(effective.caps, [cap("ui.rich")].into_iter().collect());
+    }
+
+    #[test]
+    fn role_gate_denies_before_intersection() {
+        let stack = EffectiveStack {
+            host: scope_with("host", &["fs.read:~/docs/*.md"]),
+            user: scope_with("user", &["fs.read:~/docs/*.md"]),
+            project: None,
+            parent: scope_with("parent", &["fs.read:~/docs/*.md"]),
+            task: scope_with("task", &["fs.read:~/docs/*.md"]),
+        };
+        let request = AgentRequest {
+            scope: scope_with("req", &["fs.read:~/docs/*.md"]),
+            raw_wide: Vec::new(),
+        };
+        // Reviewers observe only: the tool-call point denies first.
+        let denial = authorize_with_role(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            AgentRole::Reviewer,
+        )
+        .expect_err("reviewers invoke no tools");
+        assert_eq!(denial.kind, DenialKind::PolicyConflict);
+        assert_eq!(denial.request_kind, RequestKind::FsRead);
+        let chain = denial.reason_chain().join("\n");
+        assert!(chain.contains("reviewer"), "{chain}");
+        assert!(chain.contains("tool-call"), "{chain}");
+        // Commanders pass the gate and authorize exactly like `authorize`.
+        let effective = authorize_with_role(
+            &stack,
+            &request,
+            RequestKind::FsRead,
+            true,
+            AgentRole::Commander,
+        )
+        .expect("commanders act at every point their grants allow");
+        assert_eq!(
+            effective.caps,
+            [cap("fs.read:~/docs/*.md")].into_iter().collect()
         );
     }
 

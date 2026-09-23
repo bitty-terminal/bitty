@@ -3732,6 +3732,17 @@ mod tests {
         assert_eq!(app.runtime.help_visible(), help, "help unchanged");
     }
 
+    /// Hold or release the platform leader modifier for the hint live
+    /// tests (#1307: Alt+Space everywhere except Windows, where the OS
+    /// owns Alt+Space and the default falls back to Ctrl+Space).
+    fn set_leader_mods(app: &mut TerminalApp, held: bool) {
+        if cfg!(target_os = "windows") {
+            app.chrome.app_mods.control = held;
+        } else {
+            app.chrome.app_mods.alt = held;
+        }
+    }
+
     /// One marked `OSC 133` command cycle for the fold/hint live tests.
     fn mark_test_command(app: &mut TerminalApp) {
         app.runtime
@@ -3769,7 +3780,7 @@ mod tests {
         let mut app = help_test_app(maps);
         mark_test_command(&mut app);
         let latest = app.runtime.cw_latest_command_id().expect("marked");
-        app.chrome.app_mods.alt = true;
+        set_leader_mods(&mut app, true);
         let space = test_key(LogicalKey::Named(NamedKey::Space));
         assert!(
             drive_chrome(&mut app, WindowEventKind::KeyboardInput(space)),
@@ -3780,7 +3791,7 @@ mod tests {
             app.runtime.drain_pending_input().is_empty(),
             "leader types no shell bytes"
         );
-        app.chrome.app_mods.alt = false;
+        set_leader_mods(&mut app, false);
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_char_key("z"))
@@ -3806,13 +3817,13 @@ mod tests {
             .expect("defaults");
         let mut app = help_test_app(maps);
         mark_test_command(&mut app);
-        app.chrome.app_mods.alt = true;
+        set_leader_mods(&mut app, true);
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
         ));
         assert!(app.runtime.cw_hint_is_armed());
-        app.chrome.app_mods.alt = false;
+        set_leader_mods(&mut app, false);
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Escape)))
@@ -3821,13 +3832,13 @@ mod tests {
 
         // Re-arm, then force the window into the past: the next press
         // expires the Leader and keeps its normal owner (shell bytes).
-        app.chrome.app_mods.alt = true;
+        set_leader_mods(&mut app, true);
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
         ));
         assert!(app.runtime.cw_hint_is_armed());
-        app.chrome.app_mods.alt = false;
+        set_leader_mods(&mut app, false);
         app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
         assert!(
             !drive_chrome(&mut app, WindowEventKind::KeyboardInput(test_char_key("x"))),

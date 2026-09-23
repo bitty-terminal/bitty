@@ -16,6 +16,9 @@
 //! preedit unit test runs everywhere.
 
 #![forbid(unsafe_code)]
+// Live-shell helpers below are only exercised by the `#[cfg(unix)]` tests;
+// non-Unix targets would otherwise deny them as dead code under `-D warnings`.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use bitty_platform::{
     KeyEvent, KeyLocation, LogicalKey, ModifiersState, NamedKey, PlatformEvent, PressState,
